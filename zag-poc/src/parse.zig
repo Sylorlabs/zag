@@ -447,6 +447,13 @@ pub const Parser = struct {
             return s;
         }
 
+        // *T — pointer type
+        if (t.kind == .op and std.mem.eql(u8, t.val, "*")) {
+            _ = self.eat(.op, "*");
+            const inner = try self.parseType();
+            return std.fmt.allocPrint(self.alloc, "*{s}", .{inner});
+        }
+
         // Named type (possibly module-qualified or generic)
         var name = try self.alloc.dupe(u8, self.eat(.ident, null).val);
 
@@ -852,6 +859,19 @@ pub const Parser = struct {
                     wrap.* = .{ .force_unwrap = inner };
                     _ = ln;
                     e = wrap;
+                } else if (self.i + 1 < self.toks.len and
+                    self.toks[self.i + 1].kind == .op and
+                    std.mem.eql(u8, self.toks[self.i + 1].val, "*"))
+                {
+                    // ptr.* — pointer deref
+                    const ln = self.peek().line;
+                    _ = self.eat(.dot, null);
+                    _ = self.eat(.op, "*");
+                    e = try self.mkNode(.{ .field = .{
+                        .base = e,
+                        .fname = "*",
+                        .line = ln,
+                    } });
                 } else {
                     // field access
                     const ln = self.peek().line;
@@ -1191,8 +1211,8 @@ fn substType(alloc: Allocator, ty: []const u8, names: *const std.StringHashMap([
     // Direct lookup
     if (names.get(ty)) |replacement| return replacement;
 
-    // Handle prefix characters: !, ?, []
-    if (ty.len > 0 and (ty[0] == '!' or ty[0] == '?')) {
+    // Handle prefix characters: !, ?, *, []
+    if (ty.len > 0 and (ty[0] == '!' or ty[0] == '?' or ty[0] == '*')) {
         const inner = try substType(alloc, ty[1..], names);
         return std.fmt.allocPrint(alloc, "{c}{s}", .{ ty[0], inner });
     }

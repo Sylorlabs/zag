@@ -187,6 +187,18 @@ pub fn sliceInner(t: []const u8) []const u8 {
     return t[2..];
 }
 
+/// Returns true if t is a pointer type (*T).
+/// Does NOT match slice types (which start with "[").
+pub fn isPointer(t: []const u8) bool {
+    return t.len > 1 and t[0] == '*' and t[1] != '['; // avoid confusing with slice ops
+}
+
+/// Returns the inner type of *T, or t unchanged if not a pointer type.
+pub fn pointerInner(t: []const u8) []const u8 {
+    if (isPointer(t)) return t[1..];
+    return t;
+}
+
 // ── Named type sets ───────────────────────────────────────────────────────────
 
 pub const INT_TYPES = [_][]const u8{
@@ -362,10 +374,12 @@ pub fn isPosit(t: []const u8) bool {
 // ── defaultTy ─────────────────────────────────────────────────────────────────
 
 /// "int_lit" -> "i32", "float_lit" -> "f32", "str" -> "[]u8", else identity.
+/// Pointer types (*T) are returned as-is without any conversion.
 pub fn defaultTy(t: []const u8) []const u8 {
-    if (std.mem.eql(u8, t, "str"))       return "[]u8";
-    if (std.mem.eql(u8, t, "int_lit"))   return "i32";
-    if (std.mem.eql(u8, t, "float_lit")) return "f32";
+    if (isPointer(t))                     return t;
+    if (std.mem.eql(u8, t, "str"))        return "[]u8";
+    if (std.mem.eql(u8, t, "int_lit"))    return "i32";
+    if (std.mem.eql(u8, t, "float_lit"))  return "f32";
     return t;
 }
 
@@ -467,6 +481,11 @@ pub fn assignable(target: []const u8, source: []const u8) bool {
     }
     // T fits ?T if T assignable to inner (wrap)
     if (isOptional(target) and assignable(optionalInner(target), source)) return true;
+
+    // pointer: *T fits *T' if inner types are assignable
+    if (isPointer(target) and isPointer(source)) {
+        return assignable(pointerInner(target), pointerInner(source));
+    }
 
     return false;
 }

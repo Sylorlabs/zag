@@ -288,7 +288,7 @@ pub const Sema = struct {
         return null;
     }
 
-    fn fieldTypeOf(self: *Sema, struct_name: []const u8, fname: []const u8) ?[]const u8 {
+    pub fn fieldTypeOf(self: *const Sema, struct_name: []const u8, fname: []const u8) ?[]const u8 {
         const sn = self.structs.get(struct_name) orelse return null;
         for (sn.*.struct_decl.fields) |p| {
             if (std.mem.eql(u8, p.name, fname)) return p.pty;
@@ -299,6 +299,7 @@ pub const Sema = struct {
     // ── _checkTypeExists ──────────────────────────────────────────────────────
 
     fn checkTypeExists(self: *Sema, ty: []const u8, line: u32) void {
+        if (types.isPointer(ty))    { self.checkTypeExists(types.pointerInner(ty), line); return; }
         if (types.isErrorUnion(ty)) { self.checkTypeExists(types.errorInner(ty), line); return; }
         if (types.isOptional(ty))   { self.checkTypeExists(types.optionalInner(ty), line); return; }
         if (types.isFnType(ty)) {
@@ -777,14 +778,25 @@ pub const Sema = struct {
             }
         }
         const bt = self.typeOf(f.base, scope);
-        if (std.mem.startsWith(u8, bt, "[]")) {
+        // Pointer deref: ptr.*
+        if (std.mem.eql(u8, f.fname, "*")) {
+            if (!types.isPointer(bt)) {
+                self.errFmt(f.line, "'.* applied to non-pointer type '{s}'", .{bt});
+                return "i32";
+            }
+            return types.pointerInner(bt);
+        }
+        // Auto-deref through pointer
+        var bt2 = bt;
+        if (types.isPointer(bt2)) bt2 = types.pointerInner(bt2);
+        if (std.mem.startsWith(u8, bt2, "[]")) {
             if (std.mem.eql(u8, f.fname, "len")) return "i32";
             self.errFmt(f.line, "slice has no field '{s}'", .{f.fname});
             return "i32";
         }
         // RNS field access
-        if (types.isRns(bt)) {
-            const n = types.rnsChannels(bt);
+        if (types.isRns(bt2)) {
+            const n = types.rnsChannels(bt2);
             var valid = true;
             if (f.fname.len < 2 or f.fname[0] != 'r') {
                 valid = false;
@@ -796,7 +808,7 @@ pub const Sema = struct {
                 self.errFmt(f.line, "rns_{d} has no field '{s}'", .{ n, f.fname });
             return "u32";
         }
-        if (self.fieldTypeOf(bt, f.fname)) |ft| return ft;
+        if (self.fieldTypeOf(bt2, f.fname)) |ft| return ft;
         self.errFmt(f.line, "type {s} has no field '{s}'", .{ bt, f.fname });
         return "i32";
     }
@@ -897,6 +909,25 @@ pub const Sema = struct {
                 }
                 ast.setNodeType(call_node, meth.ret);
                 return meth.ret;
+            }
+        }
+        // new() / delete() builtins
+        if (callee.* == .var_) {
+            const vname_nd = callee.*.var_.name;
+            if (std.mem.eql(u8, vname_nd, "new")) {
+                if (c.args.len > 0) {
+                    const inner_ty = self.typeOf(c.args[0], scope);
+                    const ptr_ty = std.fmt.allocPrint(self.alloc, "*{s}", .{inner_ty}) catch "*void";
+                    ast.setNodeType(call_node, ptr_ty);
+                    return ptr_ty;
+                }
+                ast.setNodeType(call_node, "*void");
+                return "*void";
+            }
+            if (std.mem.eql(u8, vname_nd, "delete")) {
+                for (c.args) |a| _ = self.typeOf(a, scope);
+                ast.setNodeType(call_node, "void");
+                return "void";
             }
         }
         // Generic fn call
@@ -1605,6 +1636,20 @@ pub const Sema = struct {
                     }
                 }
                 if (cn) |cname| {
+                    // new() / delete() builtins
+                    if (std.mem.eql(u8, cname, "new")) {
+                        const chain_new = std.fmt.allocPrint(self.alloc,
+                            "new() at line {d} (heap allocation, may OOM)", .{c.line}) catch "new()";
+                        self.addEffect("Alloc", chain_new, label, eff_set, wit_map);
+                        self.addEffect("Panic", chain_new, label, eff_set, wit_map);
+                        return;
+                    }
+                    if (std.mem.eql(u8, cname, "delete")) {
+                        const chain_del = std.fmt.allocPrint(self.alloc,
+                            "delete() at line {d} (heap deallocation)", .{c.line}) catch "delete()";
+                        self.addEffect("Alloc", chain_del, label, eff_set, wit_map);
+                        return;
+                    }
                     // 1. If callee is a fn-valued local/param bound in local_lat, use its effects directly.
                     if (local_lat.get(cname)) |lat_entry| {
                         var eit = lat_entry.eff.iterator();

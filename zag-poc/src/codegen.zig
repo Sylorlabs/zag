@@ -114,6 +114,13 @@ fn ctype(alloc: std.mem.Allocator, zty_raw: []const u8) anyerror![]const u8 {
         return std.fmt.allocPrint(alloc, "ZagResult_{s}", .{mangle});
     }
 
+    // *T → T*  (pointer type)
+    if (zty.len > 1 and zty[0] == '*') {
+        const inner = zty[1..];
+        const inner_ct = try ctype(alloc, inner);
+        return std.fmt.allocPrint(alloc, "{s}*", .{inner_ct});
+    }
+
     if (std.mem.startsWith(u8, zty, "fn(")) {
         return ctypeClosure(alloc, zty);
     }
@@ -239,6 +246,14 @@ fn ctypeClosure(alloc: std.mem.Allocator, zty: []const u8) anyerror![]const u8 {
     return std.fmt.allocPrint(alloc, "ZagClo_{s}_{s}", .{ ret_m, param_buf.items });
 }
 
+/// Return a string of (indent * 4) spaces for pre-statement emission.
+fn indentStr(alloc: std.mem.Allocator, indent: u32) ![]const u8 {
+    const spaces = indent * 4;
+    const s = try alloc.alloc(u8, spaces);
+    @memset(s, ' ');
+    return s;
+}
+
 fn mangleType(alloc: std.mem.Allocator, ct: []const u8) ![]const u8 {
     var result = try alloc.alloc(u8, ct.len);
     for (ct, 0..) |c, i| {
@@ -263,16 +278,19 @@ const Ctx = struct {
     try_counter: u32,
     or_counter: u32,
     fu_counter: u32,
+    tmp_counter: u32,   // for new() temp var names
     indent: u32,
     cur_fn_ret: []const u8,
-    opt_types: std.StringHashMap(void),
-    result_types: std.StringHashMap(void),
+    opt_types: std.StringHashMap([]const u8),
+    result_types: std.StringHashMap([]const u8),
     closures_fwd: std.ArrayList(u8),
     closures_impl: std.ArrayList(u8),
     clo_typedefs: std.ArrayList(u8),  // ZagClo_ and __ClosEnv_ typedefs
     emitted_clo_types: std.StringHashMap(void),  // dedup
     thunks: std.ArrayList(u8),        // __thunk_fnname wrappers
     emitted_thunks: std.StringHashMap(void),     // dedup
+    pre_stmts: std.ArrayList(u8),     // statements to emit before the current statement
+    new_type_hint: ?[]const u8,       // hint for new() type when declared type is available
 
     fn init(alloc: std.mem.Allocator, s: *const sema_mod.Sema, target: []const u8) Ctx {
         return .{
@@ -285,16 +303,19 @@ const Ctx = struct {
             .try_counter = 0,
             .or_counter = 0,
             .fu_counter = 0,
+            .tmp_counter = 0,
             .indent = 0,
             .cur_fn_ret = "void",
-            .opt_types = std.StringHashMap(void).init(alloc),
-            .result_types = std.StringHashMap(void).init(alloc),
+            .opt_types = std.StringHashMap([]const u8).init(alloc),
+            .result_types = std.StringHashMap([]const u8).init(alloc),
             .closures_fwd = std.ArrayList(u8).init(alloc),
             .closures_impl = std.ArrayList(u8).init(alloc),
             .clo_typedefs = std.ArrayList(u8).init(alloc),
             .emitted_clo_types = std.StringHashMap(void).init(alloc),
             .thunks = std.ArrayList(u8).init(alloc),
             .emitted_thunks = std.StringHashMap(void).init(alloc),
+            .pre_stmts = std.ArrayList(u8).init(alloc),
+            .new_type_hint = null,
         };
     }
 
@@ -308,6 +329,15 @@ const Ctx = struct {
         self.emitted_clo_types.deinit();
         self.thunks.deinit();
         self.emitted_thunks.deinit();
+        self.pre_stmts.deinit();
+    }
+
+    /// Flush any accumulated pre-statements into buf (called before emitting a statement).
+    fn flushPreStmts(self: *Ctx) !void {
+        if (self.pre_stmts.items.len > 0) {
+            try self.buf.appendSlice(self.pre_stmts.items);
+            self.pre_stmts.clearRetainingCapacity();
+        }
     }
 
     fn w(self: *Ctx, s: []const u8) !void {
@@ -330,13 +360,13 @@ const Ctx = struct {
     fn registerOpt(self: *Ctx, inner_c: []const u8) !void {
         const mangle = try mangleType(self.alloc, inner_c);
         const key = try std.fmt.allocPrint(self.alloc, "ZagOpt_{s}", .{mangle});
-        try self.opt_types.put(key, {});
+        try self.opt_types.put(key, try self.alloc.dupe(u8, inner_c));
     }
 
     fn registerResult(self: *Ctx, inner_c: []const u8) !void {
         const mangle = try mangleType(self.alloc, inner_c);
         const key = try std.fmt.allocPrint(self.alloc, "ZagResult_{s}", .{mangle});
-        try self.result_types.put(key, {});
+        try self.result_types.put(key, try self.alloc.dupe(u8, inner_c));
     }
 
     /// Ensure a special slice typedef like ZagSlice_sat_i16 is emitted
@@ -548,6 +578,80 @@ fn genCall(ctx: *Ctx, c: ast.Call) !void {
     // Builtin
     if (c.callee.* == .var_) {
         const name = c.callee.var_.name;
+
+        // new(expr) — heap-allocate a value of type T, return *T
+        if (std.mem.eql(u8, name, "new") and c.args.len == 1) {
+            const arg = c.args[0];
+            // Determine type T from multiple sources (priority order):
+            // 1. ctx.new_type_hint (set by genLet from the declared *T type)
+            // 2. Call's own sema type "*T" → strip leading "*"
+            // 3. Arg has a concrete (non-raw-literal) type
+            // 4. Struct literal: use sname
+            // 5. Fall back to int32_t
+            const arg_ty: []const u8 = blk: {
+                // Highest priority: type hint from enclosing let
+                if (ctx.new_type_hint) |hint| {
+                    break :blk hint;
+                }
+                // Use call's own type "*T" → strip leading "*" to get T
+                if (c.ty) |call_ty| {
+                    if (call_ty.len > 1 and call_ty[0] == '*') {
+                        const inner = call_ty[1..];
+                        // Skip if still a raw literal kind
+                        if (!std.mem.eql(u8, inner, "int_lit") and
+                            !std.mem.eql(u8, inner, "float_lit"))
+                        {
+                            break :blk inner;
+                        }
+                    }
+                }
+                // Use arg type but skip raw literal kinds
+                if (ast.nodeType(arg)) |t| {
+                    if (!std.mem.eql(u8, t, "int_lit") and
+                        !std.mem.eql(u8, t, "float_lit") and
+                        !std.mem.eql(u8, t, "bool_") and
+                        !std.mem.eql(u8, t, "str"))
+                    {
+                        break :blk t;
+                    }
+                }
+                // Struct literal: use struct name
+                if (arg.* == .struct_lit) {
+                    break :blk (arg.struct_lit.inst_sname orelse arg.struct_lit.sname);
+                }
+                // Fallback
+                break :blk "int32_t";
+            };
+            const arg_ct = try ctype(ctx.alloc, arg_ty);
+            const n = ctx.tmp_counter;
+            ctx.tmp_counter += 1;
+            const tmp_name = try std.fmt.allocPrint(ctx.alloc, "__zag_new_{d}", .{n});
+            // Emit pre-statement: T* __zag_new_N = (T*)malloc(sizeof(T));
+            const ind = try indentStr(ctx.alloc, ctx.indent);
+            try ctx.pre_stmts.writer().print(
+                "{s}{s}* {s} = ({s}*)malloc(sizeof({s})); if (!{s}) {{ fprintf(stderr, \"OOM\\n\"); abort(); }} *{s} = ",
+                .{ ind, arg_ct, tmp_name, arg_ct, arg_ct, tmp_name, tmp_name },
+            );
+            // emit the value expression into pre_stmts temporarily
+            const saved_buf = ctx.buf;
+            ctx.buf = ctx.pre_stmts;
+            try genExpr(ctx, arg);
+            ctx.pre_stmts = ctx.buf;
+            ctx.buf = saved_buf;
+            try ctx.pre_stmts.writer().print(";\n", .{});
+            // The expression result is just the pointer name
+            try ctx.w(tmp_name);
+            return;
+        }
+
+        // delete(ptr) — free a heap pointer
+        if (std.mem.eql(u8, name, "delete") and c.args.len == 1) {
+            try ctx.w("free(");
+            try genExpr(ctx, c.args[0]);
+            try ctx.w(")");
+            return;
+        }
+
         if (std.mem.startsWith(u8, name, "@")) {
             const builtin = name[1..];
             // Map Zag builtins to C runtime functions
@@ -633,7 +737,9 @@ fn genCall(ctx: *Ctx, c: ast.Call) !void {
                 try ctx.w(")");
                 return;
             }
-            const ct = try ctype(ctx.alloc, bty);
+            // For pointer types *T, strip the * for method dispatch (method is on T, not *T)
+            const effective_bty = if (bty.len > 1 and bty[0] == '*') bty[1..] else bty;
+            const ct = try ctype(ctx.alloc, effective_bty);
             try ctx.wf("{s}_{s}(", .{ ct, f.fname });
             try genExpr(ctx, f.base);
             for (c.args) |arg| {
@@ -797,6 +903,14 @@ fn genCall(ctx: *Ctx, c: ast.Call) !void {
 }
 
 fn genField(ctx: *Ctx, f: ast.Field) !void {
+    // Pointer dereference: expr.* → (*expr)
+    if (std.mem.eql(u8, f.fname, "*")) {
+        try ctx.w("(*");
+        try genExpr(ctx, f.base);
+        try ctx.w(")");
+        return;
+    }
+
     if (f.base.* == .var_) {
         const base_name = f.base.var_.name;
         if (ctx.s.enums.get(base_name)) |_| {
@@ -804,6 +918,15 @@ fn genField(ctx: *Ctx, f: ast.Field) !void {
             return;
         }
     }
+
+    // Auto-deref: if base has pointer type *T, use -> instead of .
+    const base_ty = ast.nodeType(f.base) orelse "";
+    if (base_ty.len > 1 and base_ty[0] == '*') {
+        try genExpr(ctx, f.base);
+        try ctx.wf("->{s}", .{f.fname});
+        return;
+    }
+
     try ctx.w("(");
     try genExpr(ctx, f.base);
     try ctx.wf(").{s}", .{f.fname});
@@ -848,7 +971,31 @@ fn genStructLit(ctx: *Ctx, sl: ast.StructLit) !void {
     for (sl.fields, 0..) |fi, i| {
         if (i > 0) try ctx.w(", ");
         try ctx.wf(" .{s} = ", .{fi.name});
-        try genExpr(ctx, fi.val);
+        // If the field type is ?T and the expression is not null/optional, auto-wrap in Some
+        const field_zty = ctx.s.fieldTypeOf(sname, fi.name);
+        const needs_opt_wrap = blk: {
+            const fzty = field_zty orelse break :blk false;
+            if (fzty.len < 2 or fzty[0] != '?') break :blk false;
+            // The value itself: if it's a null literal it already handles wrapping
+            const val_ty = ast.nodeType(fi.val);
+            if (val_ty) |vt| {
+                if (vt.len > 0 and vt[0] == '?') break :blk false; // already optional
+            }
+            if (fi.val.* == .null_lit) break :blk false; // handled by genNullLit
+            break :blk true;
+        };
+        if (needs_opt_wrap) {
+            const fzty = field_zty.?;
+            const inner_zty = fzty[1..]; // strip '?'
+            const inner_c = try ctype(ctx.alloc, inner_zty);
+            const mangle = try mangleType(ctx.alloc, inner_c);
+            try ctx.registerOpt(inner_c);
+            try ctx.wf("(ZagOpt_{s}){{1, ", .{mangle});
+            try genExpr(ctx, fi.val);
+            try ctx.w("}");
+        } else {
+            try genExpr(ctx, fi.val);
+        }
     }
     try ctx.w(" }");
 }
@@ -1295,7 +1442,6 @@ fn genStmt(ctx: *Ctx, node: ast.NodeRef) anyerror!void {
 }
 
 fn genLet(ctx: *Ctx, l: ast.Let) !void {
-    try ctx.wIndent();
     const ty = l.dty orelse (ast.nodeType(l.expr) orelse "int32_t");
     const resolved_ty = resolveGenericType(ty);
     // For fn(...)RET types, ensure the closure typedef is emitted
@@ -1303,7 +1449,17 @@ fn genLet(ctx: *Ctx, l: ast.Let) !void {
         try ctx.ensureClosureTypedef(resolved_ty)
     else
         try ctype(ctx.alloc, resolved_ty);
-    try ctx.wf("{s} {s} = ", .{ ct, l.name });
+
+    // Generate the RHS expression into a scratch buffer so that any new() calls
+    // can emit their pre-statements first (before this let line).
+    const saved_buf = ctx.buf;
+    ctx.buf = std.ArrayList(u8).init(ctx.alloc);
+
+    // Set type hint for new() calls: if declared type is *T, hint T as the alloc type
+    const saved_hint = ctx.new_type_hint;
+    if (resolved_ty.len > 1 and resolved_ty[0] == '*') {
+        ctx.new_type_hint = resolved_ty[1..];
+    }
 
     // Auto-wrap: if let type is ?T and expr is not null/optional, wrap in Some
     if (std.mem.startsWith(u8, resolved_ty, "?")) {
@@ -1351,7 +1507,15 @@ fn genLet(ctx: *Ctx, l: ast.Let) !void {
     } else {
         try genExpr(ctx, l.expr);
     }
-    try ctx.w(";\n");
+
+    const rhs_text = try ctx.buf.toOwnedSlice();
+    ctx.buf = saved_buf;
+    ctx.new_type_hint = saved_hint;
+
+    // Flush any pre-statements accumulated during expression codegen (e.g. new())
+    try ctx.flushPreStmts();
+    try ctx.wIndent();
+    try ctx.wf("{s} {s} = {s};\n", .{ ct, l.name, rhs_text });
 }
 
 /// Resolve generic type applications like "Box[i32]" → "Box_i32"
@@ -1379,16 +1543,24 @@ fn mangleGenericName(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
 }
 
 fn genAssign(ctx: *Ctx, a: ast.Assign) !void {
-    try ctx.wIndent();
+    // Generate into scratch buffer first so new() pre-stmts are flushed before the line
+    const saved_buf = ctx.buf;
+    ctx.buf = std.ArrayList(u8).init(ctx.alloc);
     try genExpr(ctx, a.target);
     try ctx.w(" = ");
     try genExpr(ctx, a.expr);
-    try ctx.w(";\n");
+    const line_text = try ctx.buf.toOwnedSlice();
+    ctx.buf = saved_buf;
+    try ctx.flushPreStmts();
+    try ctx.wIndent();
+    try ctx.wf("{s};\n", .{line_text});
 }
 
 fn genReturn(ctx: *Ctx, r: ast.Return) !void {
-    try ctx.wIndent();
     if (r.expr) |expr| {
+        // Generate the return line into a scratch buffer so new() pre-stmts flush before it
+        const saved_buf = ctx.buf;
+        ctx.buf = std.ArrayList(u8).init(ctx.alloc);
         if (std.mem.startsWith(u8, ctx.cur_fn_ret, "!")) {
             const inner = ctx.cur_fn_ret[1..];
             const ct = try ctype(ctx.alloc, inner);
@@ -1396,46 +1568,50 @@ fn genReturn(ctx: *Ctx, r: ast.Return) !void {
             try ctx.registerResult(ct);
             try ctx.wf("return (ZagResult_{s}){{0, ", .{mangle});
             try genExpr(ctx, expr);
-            try ctx.w("};\n");
+            try ctx.w("};");
         } else if (std.mem.startsWith(u8, ctx.cur_fn_ret, "?")) {
             const inner = ctx.cur_fn_ret[1..];
             const ct = try ctype(ctx.alloc, inner);
             const mangle = try mangleType(ctx.alloc, ct);
             try ctx.registerOpt(ct);
-            // Check if returning null
             if (expr.* == .null_lit) {
-                try ctx.wf("return (ZagOpt_{s}){{0, {{0}}}};\n", .{mangle});
+                try ctx.wf("return (ZagOpt_{s}){{0, {{0}}}};", .{mangle});
             } else {
                 try ctx.wf("return (ZagOpt_{s}){{1, ", .{mangle});
                 try genExpr(ctx, expr);
-                try ctx.w("};\n");
+                try ctx.w("};");
             }
         } else if (std.mem.startsWith(u8, ctx.cur_fn_ret, "fn(")) {
-            // Returning a closure/function value
             const clo_ty = try ctx.ensureClosureTypedef(ctx.cur_fn_ret);
             if (expr.* == .var_) {
                 const vname = expr.var_.name;
                 if (ctx.s.fns.get(vname) != null) {
-                    // Named function — wrap as thunk
                     const expr_ty = ast.nodeType(expr) orelse ctx.cur_fn_ret;
                     try emitThunk(ctx, vname, expr_ty, clo_ty);
-                    try ctx.wf("return ({s}){{ &__thunk_{s}, (void*)0 }};\n", .{ clo_ty, vname });
+                    try ctx.wf("return ({s}){{ &__thunk_{s}, (void*)0 }};", .{ clo_ty, vname });
                 } else {
                     try ctx.w("return ");
                     try genExpr(ctx, expr);
-                    try ctx.w(";\n");
+                    try ctx.w(";");
                 }
             } else {
                 try ctx.w("return ");
                 try genExpr(ctx, expr);
-                try ctx.w(";\n");
+                try ctx.w(";");
             }
         } else {
             try ctx.w("return ");
             try genExpr(ctx, expr);
-            try ctx.w(";\n");
+            try ctx.w(";");
         }
+        const line_text = try ctx.buf.toOwnedSlice();
+        ctx.buf = saved_buf;
+        try ctx.flushPreStmts();
+        try ctx.wIndent();
+        try ctx.wf("{s}\n", .{line_text});
     } else {
+        try ctx.flushPreStmts();
+        try ctx.wIndent();
         if (std.mem.eql(u8, ctx.cur_fn_ret, "void")) {
             try ctx.w("return;\n");
         } else {
@@ -1445,6 +1621,7 @@ fn genReturn(ctx: *Ctx, r: ast.Return) !void {
 }
 
 fn genIf(ctx: *Ctx, i: ast.If) !void {
+    try ctx.flushPreStmts();
     try ctx.wIndent();
     if (i.cap) |cap| {
         const cond_ty = ast.nodeType(i.cond) orelse "?void";
@@ -1491,6 +1668,7 @@ fn genIf(ctx: *Ctx, i: ast.If) !void {
 }
 
 fn genWhile(ctx: *Ctx, w: ast.While) !void {
+    try ctx.flushPreStmts();
     try ctx.wIndent();
     if (w.cap) |cap| {
         const cond_ty = ast.nodeType(w.cond) orelse "?void";
@@ -1519,12 +1697,19 @@ fn genWhile(ctx: *Ctx, w: ast.While) !void {
 }
 
 fn genExprStmt(ctx: *Ctx, e: ast.ExprStmt) !void {
-    try ctx.wIndent();
+    // Generate into scratch buffer first so new() pre-stmts are flushed before the line
+    const saved_buf = ctx.buf;
+    ctx.buf = std.ArrayList(u8).init(ctx.alloc);
     try genExpr(ctx, e.expr);
-    try ctx.w(";\n");
+    const line_text = try ctx.buf.toOwnedSlice();
+    ctx.buf = saved_buf;
+    try ctx.flushPreStmts();
+    try ctx.wIndent();
+    try ctx.wf("{s};\n", .{line_text});
 }
 
 fn genSwitchStmt(ctx: *Ctx, sw: ast.Switch) !void {
+    try ctx.flushPreStmts();
     try ctx.wIndent();
     const subj_ty = ast.nodeType(sw.subject);
     const is_union = if (subj_ty) |sty| ctx.s.unions.get(sty) != null else false;
@@ -1727,7 +1912,18 @@ fn genStructDecl(ctx: *Ctx, sd: ast.StructDecl) !void {
             _ = try ctx.ensureClosureTypedef(f.pty);
         }
     }
-    try ctx.wf("typedef struct {{", .{});
+    // Use a named struct tag when the struct has pointer or optional-pointer fields
+    // (for forward-decl compatibility)
+    var has_ptr_field = false;
+    for (sd.fields) |f| {
+        if (f.pty.len > 1 and f.pty[0] == '*') { has_ptr_field = true; break; }
+        if (f.pty.len > 2 and f.pty[0] == '?' and f.pty[1] == '*') { has_ptr_field = true; break; }
+    }
+    if (has_ptr_field) {
+        try ctx.wf("typedef struct {s}_tag {{", .{sd.name});
+    } else {
+        try ctx.wf("typedef struct {{", .{});
+    }
     for (sd.fields) |f| {
         const ct = if (std.mem.startsWith(u8, f.pty, "fn("))
             try ctx.ensureClosureTypedef(f.pty)
@@ -1809,7 +2005,52 @@ pub fn gen(
         ctx.clo_typedefs.clearRetainingCapacity();
     }
 
-    // 3. Type declarations
+    // 3. Forward typedef declarations for structs that have pointer or optional-pointer fields
+    // (needed for self-referential or mutually-referential struct pointers)
+    for (decls) |node| {
+        if (node.* == .struct_decl) {
+            const sd = node.struct_decl;
+            if (sd.tparams.len > 0) continue;
+            var has_ptr_field = false;
+            for (sd.fields) |f| {
+                // *T direct pointer field
+                if (f.pty.len > 1 and f.pty[0] == '*') { has_ptr_field = true; break; }
+                // ?*T optional pointer field
+                if (f.pty.len > 2 and f.pty[0] == '?' and f.pty[1] == '*') { has_ptr_field = true; break; }
+            }
+            if (has_ptr_field) {
+                // emit: typedef struct Name_tag Name;
+                try ctx.wf("typedef struct {s}_tag {s};\n", .{ sd.name, sd.name });
+            }
+        }
+    }
+
+    // 3c. Pre-emit ZagOpt_ typedefs for optional-pointer struct fields
+    // These must come before the struct bodies that reference them.
+    // Track which opt typedefs were pre-emitted so we don't re-emit them later.
+    var pre_emitted_opts = std.StringHashMap(void).init(alloc);
+    defer pre_emitted_opts.deinit();
+    for (decls) |node| {
+        if (node.* == .struct_decl) {
+            const sd = node.struct_decl;
+            if (sd.tparams.len > 0) continue;
+            for (sd.fields) |f| {
+                if (f.pty.len > 2 and f.pty[0] == '?' and f.pty[1] == '*') {
+                    const inner_zty = f.pty[1..]; // e.g. "*Node"
+                    const inner_c = try ctype(alloc, inner_zty); // e.g. "Node*"
+                    const mangle = try mangleType(alloc, inner_c); // e.g. "Node_"
+                    const opt_name = try std.fmt.allocPrint(alloc, "ZagOpt_{s}", .{mangle});
+                    if (!pre_emitted_opts.contains(opt_name)) {
+                        try pre_emitted_opts.put(try alloc.dupe(u8, opt_name), {});
+                        try ctx.opt_types.put(try alloc.dupe(u8, opt_name), try alloc.dupe(u8, inner_c));
+                        try ctx.wf("typedef struct {{ int32_t _has; {s} _val; }} {s};\n", .{ inner_c, opt_name });
+                    }
+                }
+            }
+        }
+    }
+
+    // 3b. Type declarations
     for (decls) |node| {
         switch (node.*) {
             .struct_decl => |sd| try genStructDecl(&ctx, sd),
@@ -1896,26 +2137,21 @@ pub fn gen(
         }
     }
 
-    // Emit optional typedefs
+    // Emit optional typedefs (skip ones already pre-emitted in step 3c)
     var opt_it = ctx.opt_types.iterator();
     while (opt_it.next()) |entry| {
         const full_name = entry.key_ptr.*;
-        const inner_m = if (std.mem.startsWith(u8, full_name, "ZagOpt_"))
-            full_name["ZagOpt_".len..]
-        else
-            full_name;
-        try ctx.wf("typedef struct {{ int32_t _has; {s} _val; }} {s};\n", .{ inner_m, full_name });
+        if (pre_emitted_opts.contains(full_name)) continue;
+        const inner_c = entry.value_ptr.*;
+        try ctx.wf("typedef struct {{ int32_t _has; {s} _val; }} {s};\n", .{ inner_c, full_name });
     }
 
     // Emit result typedefs
     var res_it = ctx.result_types.iterator();
     while (res_it.next()) |entry| {
         const full_name = entry.key_ptr.*;
-        const inner_m = if (std.mem.startsWith(u8, full_name, "ZagResult_"))
-            full_name["ZagResult_".len..]
-        else
-            full_name;
-        try ctx.wf("typedef struct {{ ZagErrCode _err; {s} _val; }} {s};\n", .{ inner_m, full_name });
+        const inner_c = entry.value_ptr.*;
+        try ctx.wf("typedef struct {{ ZagErrCode _err; {s} _val; }} {s};\n", .{ inner_c, full_name });
     }
 
     // 4b. Pre-pass: collect ZagClo_ typedefs from fn params (closures used as params)
