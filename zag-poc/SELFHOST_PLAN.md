@@ -95,11 +95,18 @@ Notes for later stages:
        (Point→25), enums (Color.Green→7). Field-access disambiguation by convention
        (capitalized member = enum constant `Enum_Member`; lowercase = struct field
        `x.f`) since the self-hosted codegen is type-unaware.
-- [ ] C2b. Grow self-hosted codegen to the features selfhost/*.zag itself uses:
-       tagged unions + switch, generics monomorphization (ArrayList/StringMap),
-       optionals/orelse, slicing, @import. (Largest remaining work — generics +
-       monomorphization need the self-hosted SEMA to do type inference, which it
-       doesn't yet; currently sema.zag is effect-only.)
+- [~] C2b. Growing self-hosted codegen to the features selfhost/*.zag uses:
+       - [x] CLI: `zag build|check <file> [--run]` (selfhost/zagc.zag → `zag` binary).
+       - [x] generic FUNCTIONS via codegen-side monomorphization: parser captures
+             fn tparams + explicit call type-args foo[T](..); codegen collects
+             instantiations, emits specialized fns (subst type-params in sig),
+             mangles call sites. Verified: id[i32]/add[i32] → 42.
+       - [ ] generic STRUCTS (ArrayList[T]/StringMap[V]) — needs struct
+             monomorphization + body type-substitution (@sizeOf/casts/struct-lit[T]).
+       - [ ] tagged unions + switch, optionals/orelse, slicing, @import.
+       (Generic functions work without a full type-inference pass because explicit
+        type-args drive monomorphization. Inference-based generics + generic structs
+        remain the large piece toward compiling selfhost/*.zag itself.)
 - [ ] C3. `zagc2` compiles its own source → `zagc3`; verify fixpoint (zagc2 and
        zagc3 produce identical output). Blocked on C2b.
 

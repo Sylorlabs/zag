@@ -38,6 +38,75 @@ fn ctype(t: []u8) []u8 {
     return t;
 }
 
+// ── generics: monomorphization ───────────────────────────────────────────────
+// One concrete instantiation of a generic fn, e.g. id[i32] → "id_i32".
+struct Inst {
+    mangled: []u8,
+    f:       FnDecl,         // the generic fn template (captured by value; shares buffers)
+    targs:   ArrayList[[]u8],
+}
+
+fn cg_callee_name(n: *Node) []u8 {
+    return switch (n.*) {
+        .id  => |d| d.name,
+        .fld => |f| f.fname,
+        else => "",
+    };
+}
+
+// Sanitize one type arg into a C-identifier fragment (*→p, []→_, drop ]).
+fn mangle_targ(t: []u8) []u8 {
+    let buf: ArrayList[u8] = make[u8](8);
+    let i: i32 = 0;
+    while (i < t.len) {
+        let c: i32 = t[i] as i32;
+        if (c == '*') { push[u8](&buf, 'p'); }
+        else if (c == '[') { push[u8](&buf, '_'); }
+        else if (c == ']') { }
+        else { push[u8](&buf, t[i]); }
+        i = i + 1;
+    }
+    return buf.data[0..buf.len];
+}
+
+// name + "_" + each sanitized targ, e.g. ("id", ["i32"]) → "id_i32".
+fn mangle_generic(name: []u8, targs: ArrayList[[]u8]) []u8 {
+    let s: []u8 = name;
+    let i: i32 = 0;
+    while (i < len[[]u8](targs)) {
+        s = _zag_str_concat(s, "_");
+        s = _zag_str_concat(s, mangle_targ(get[[]u8](targs, i)));
+        i = i + 1;
+    }
+    return s;
+}
+
+// Substitute generic type-params (names) with concrete args (vals) in a type
+// string, honouring * and [] prefixes.
+fn subst_type(t: []u8, names: ArrayList[[]u8], vals: ArrayList[[]u8]) []u8 {
+    let i: i32 = 0;
+    while (i < len[[]u8](names)) {
+        if (@strEq(t, get[[]u8](names, i))) { return get[[]u8](vals, i); }
+        i = i + 1;
+    }
+    if (t.len > 1) {
+        if (t[0] == '*') { return _zag_str_concat("*", subst_type(t[1..], names, vals)); }
+    }
+    if (t.len > 2) {
+        if (t[0] == '[' && t[1] == ']') { return _zag_str_concat("[]", subst_type(t[2..], names, vals)); }
+    }
+    return t;
+}
+
+fn inst_seen(insts: ArrayList[Inst], mangled: []u8) bool {
+    let i: i32 = 0;
+    while (i < len[Inst](insts)) {
+        if (@strEq(get[Inst](insts, i).mangled, mangled)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
 // ── expressions ──────────────────────────────────────────────────────────────
 fn first_is_upper(s: []u8) bool {
     if (s.len == 0) { return false; }
@@ -81,7 +150,12 @@ fn gen_expr(buf: *ArrayList[u8], n: *Node) void {
             emit(buf, ")");
         }
         .call => |c| {
-            gen_expr(buf, c.callee);
+            // generic call foo[T](...) → mangled monomorphized name foo_T(...)
+            if (len[[]u8](c.targs) > 0) {
+                emit(buf, mangle_generic(cg_callee_name(c.callee), c.targs));
+            } else {
+                gen_expr(buf, c.callee);
+            }
             emit(buf, "(");
             gen_args(buf, c.args);
             emit(buf, ")");
@@ -214,6 +288,7 @@ fn gen_params(buf: *ArrayList[u8], params: ArrayList[Param]) void {
 
 fn gen_fn_proto(buf: *ArrayList[u8], f: FnDecl) void {
     if (@strEq(f.name, "main")) { return; }
+    if (len[[]u8](f.tparams) > 0) { return; }  // generic template: emitted via monomorphization
     // extern fn → C prototype with the literal symbol name (impl from libc/runtime).
     if (f.is_extern == 1) {
         emit(buf, "extern ");
@@ -236,6 +311,7 @@ fn gen_fn_proto(buf: *ArrayList[u8], f: FnDecl) void {
 
 fn gen_fn(buf: *ArrayList[u8], f: FnDecl) void {
     if (f.is_extern == 1) { return; }
+    if (len[[]u8](f.tparams) > 0) { return; }  // generic template: emitted via monomorphization
     let is_main: i32 = 0;
     if (@strEq(f.name, "main")) { is_main = 1; }
     if (is_main == 1) {
@@ -310,6 +386,109 @@ fn gen_decl(buf: *ArrayList[u8], d: *Node) void {
     }
 }
 
+// ── collect generic instantiations from the program ──────────────────────────
+fn collect_call(c: Call, decls: ArrayList[*Node], insts: *ArrayList[Inst]) void {
+    let ai: i32 = 0;
+    while (ai < len[*Node](c.args)) {
+        collect_expr(get[*Node](c.args, ai), decls, insts);
+        ai = ai + 1;
+    }
+    if (len[[]u8](c.targs) > 0) {
+        let cn: []u8 = cg_callee_name(c.callee);
+        let mangled: []u8 = mangle_generic(cn, c.targs);
+        if (!inst_seen(insts.*, mangled)) {
+            // find the generic fn template with this name
+            let di: i32 = 0;
+            while (di < len[*Node](decls)) {
+                let d: *Node = get[*Node](decls, di);
+                switch (d.*) {
+                    .fn_decl => |f| {
+                        if (len[[]u8](f.tparams) > 0 && @strEq(f.name, cn)) {
+                            push[Inst](insts, Inst{ .mangled = mangled, .f = f, .targs = c.targs });
+                        }
+                    }
+                    else => { }
+                }
+                di = di + 1;
+            }
+        }
+    }
+}
+
+fn collect_expr(n: *Node, decls: ArrayList[*Node], insts: *ArrayList[Inst]) void {
+    switch (n.*) {
+        .call  => |c| { collect_call(c, decls, insts); }
+        .bin   => |b| { collect_expr(b.l, decls, insts); collect_expr(b.r, decls, insts); }
+        .un    => |u| { collect_expr(u.e, decls, insts); }
+        .fld   => |f| { collect_expr(f.base, decls, insts); }
+        .idx   => |x| { collect_expr(x.base, decls, insts); collect_expr(x.idx, decls, insts); }
+        .slit_ => |s| {
+            let i: i32 = 0;
+            while (i < len[FieldInit](s.fields)) {
+                collect_expr(get[FieldInit](s.fields, i).val, decls, insts);
+                i = i + 1;
+            }
+        }
+        else => { }
+    }
+}
+
+fn collect_block(body: ArrayList[*Node], decls: ArrayList[*Node], insts: *ArrayList[Inst]) void {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        collect_stmt(get[*Node](body, i), decls, insts);
+        i = i + 1;
+    }
+}
+
+fn collect_stmt(n: *Node, decls: ArrayList[*Node], insts: *ArrayList[Inst]) void {
+    switch (n.*) {
+        .let_   => |l| { collect_expr(l.expr, decls, insts); }
+        .ret    => |r| { if (r.has_expr == 1) { collect_expr(r.expr, decls, insts); } }
+        .if_    => |x| { collect_expr(x.cond, decls, insts); collect_block(x.then_body, decls, insts); if (x.has_els == 1) { collect_block(x.els_body, decls, insts); } }
+        .while_ => |w| { collect_expr(w.cond, decls, insts); collect_block(w.body, decls, insts); }
+        .assign => |a| { collect_expr(a.target, decls, insts); collect_expr(a.expr, decls, insts); }
+        .estmt  => |e| { collect_expr(e.expr, decls, insts); }
+        else => { }
+    }
+}
+
+// Emit a monomorphized fn signature (used for both prototype and body header).
+fn emit_mono_sig(buf: *ArrayList[u8], inst: Inst) void {
+    let f: FnDecl = inst.f;
+    emit(buf, "static ");
+    emit(buf, ctype(subst_type(f.ret, f.tparams, inst.targs)));
+    emit(buf, " ");
+    emit(buf, inst.mangled);
+    emit(buf, "(");
+    if (len[Param](f.params) == 0) {
+        emit(buf, "void");
+    } else {
+        let i: i32 = 0;
+        while (i < len[Param](f.params)) {
+            if (i > 0) { emit(buf, ", "); }
+            let p: Param = get[Param](f.params, i);
+            emit(buf, ctype(subst_type(p.pty, f.tparams, inst.targs)));
+            emit(buf, " ");
+            emit(buf, p.name);
+            i = i + 1;
+        }
+    }
+    emit(buf, ")");
+}
+
+fn emit_mono_proto(buf: *ArrayList[u8], inst: Inst) void {
+    emit_mono_sig(buf, inst);
+    emit(buf, ";\n");
+}
+
+fn emit_mono_body(buf: *ArrayList[u8], inst: Inst) void {
+    emit_mono_sig(buf, inst);
+    emit(buf, " {\n");
+    gen_block(buf, inst.f.body);
+    emit(buf, "}\n");
+}
+
 // ── driver: source → C string ────────────────────────────────────────────────
 fn codegen(src: []u8) ArrayList[u8] {
     let decls: ArrayList[*Node] = parse_program(src);
@@ -323,13 +502,39 @@ fn codegen(src: []u8) ArrayList[u8] {
         gen_type_decl(&buf, get[*Node](decls, t));
         t = t + 1;
     }
-    // prototypes next (mutual / forward references)
+    // collect generic instantiations from all (non-generic) fn bodies
+    let insts: ArrayList[Inst] = make[Inst](8);
+    let ci: i32 = 0;
+    while (ci < len[*Node](decls)) {
+        let d: *Node = get[*Node](decls, ci);
+        switch (d.*) {
+            .fn_decl => |f| {
+                if (len[[]u8](f.tparams) == 0 && f.is_extern == 0) {
+                    collect_block(f.body, decls, &insts);
+                }
+            }
+            else => { }
+        }
+        ci = ci + 1;
+    }
+
+    // prototypes: monomorphized generics first, then regular fns
+    let mp: i32 = 0;
+    while (mp < len[Inst](insts)) {
+        emit_mono_proto(&buf, get[Inst](insts, mp));
+        mp = mp + 1;
+    }
     let i: i32 = 0;
     while (i < len[*Node](decls)) {
         gen_decl_proto(&buf, get[*Node](decls, i));
         i = i + 1;
     }
-    // bodies
+    // bodies: monomorphized generics, then regular fns
+    let mb: i32 = 0;
+    while (mb < len[Inst](insts)) {
+        emit_mono_body(&buf, get[Inst](insts, mb));
+        mb = mb + 1;
+    }
     let j: i32 = 0;
     while (j < len[*Node](decls)) {
         gen_decl(&buf, get[*Node](decls, j));

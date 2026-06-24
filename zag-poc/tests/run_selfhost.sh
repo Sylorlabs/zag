@@ -95,6 +95,17 @@ if $ZAGC build selfhost/zagc.zag >/dev/null 2>&1 && [ -x ./zagc ]; then
     else
         echo "  XX  stage-c (got '$seout', want 125)"; fail=$((fail+1))
     fi
+
+    # Stage C / generics: self-hosted zagc monomorphizes generic functions.
+    printf 'fn id[T](x: T) T { return x; }\nfn add[T](a: T, b: T) T { return a + b; }\nfn main() void { print_i32(add[i32](id[i32](40), 2)); }\n' > $SH/gen.zag
+    $SH/zagc $SH/gen.zag >/dev/null 2>&1
+    genout=""
+    if [ -x $SH/gen.zag.out ]; then genout=$($SH/gen.zag.out); fi
+    if [ "$genout" = "42" ]; then
+        echo "  ok  generics (monomorphize id[i32]/add[i32] → 42)"; pass=$((pass+1))
+    else
+        echo "  XX  generics (got '$genout', want 42)"; fail=$((fail+1))
+    fi
 else
     echo "  XX  driver (zagc failed to build)"; fail=$((fail+1))
 fi
