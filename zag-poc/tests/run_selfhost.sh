@@ -63,5 +63,29 @@ else
     echo "  XX  codegen (got '$cgout', want 55)"; fail=$((fail+1))
 fi
 
+# Driver: build the self-hosted compiler `zagc`, then use IT to compile a Zag
+# program to a native binary and run it — and confirm it refuses to build a
+# capability-violating program.
+echo "── selfhost: driver (zagc compiling Zag) ──"
+SH=/tmp/zsh_driver
+mkdir -p $SH
+if $ZAGC build selfhost/zagc.zag >/dev/null 2>&1 && [ -x ./zagc ]; then
+    cp ./zagc $SH/zagc
+    printf 'fn fact(n: i32) i32 { if (n < 2) { return 1; } return n * fact(n - 1); }\nfn main() void { print_i32(fact(6)); }\n' > $SH/ok.zag
+    printf 'extern fn grab(n: i32) *i8 @alloc;\nfn hot(n: i32) i32 @realtime { let p: *i8 = grab(n); return 0; }\nfn main() void { print_i32(hot(1)); }\n' > $SH/bad.zag
+    $SH/zagc $SH/ok.zag >/dev/null 2>&1
+    okout=""
+    if [ -x $SH/ok.zag.out ]; then okout=$($SH/ok.zag.out); fi
+    rm -f $SH/bad.zag.out
+    badmsg=$($SH/zagc $SH/bad.zag 2>&1)
+    if [ "$okout" = "720" ] && echo "$badmsg" | grep -q "VIOLATION in hot" && [ ! -e $SH/bad.zag.out ]; then
+        echo "  ok  driver (compiles fact→720; rejects @realtime-violating program)"; pass=$((pass+1))
+    else
+        echo "  XX  driver (okout='$okout', bad='$badmsg')"; fail=$((fail+1))
+    fi
+else
+    echo "  XX  driver (zagc failed to build)"; fail=$((fail+1))
+fi
+
 echo "════ selfhost pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]

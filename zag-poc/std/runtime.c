@@ -463,3 +463,39 @@ int64_t _zag_unix_time(void) { return (int64_t)time(NULL); }
  * Called by Zag's std.process.exit().
  */
 _Noreturn void _zag_exit(int32_t code) { exit((int)code); }
+
+/* ── command-line arguments (Linux, via /proc/self/cmdline) ──────────────── */
+static char     g_args_buf[65536];
+static int32_t  g_args_loaded = 0;
+static const char* g_argv[1024];
+static int32_t  g_argc = 0;
+
+static void _zag_args_load(void) {
+    if (g_args_loaded) return;
+    g_args_loaded = 1;
+    FILE* f = fopen("/proc/self/cmdline", "rb");
+    if (!f) return;
+    size_t n = fread(g_args_buf, 1, sizeof(g_args_buf) - 1, f);
+    fclose(f);
+    g_args_buf[n] = '\0';
+    size_t i = 0;
+    while (i < n && g_argc < 1024) {
+        g_argv[g_argc++] = &g_args_buf[i];
+        while (i < n && g_args_buf[i] != '\0') i++;
+        i++; /* skip the NUL separator */
+    }
+}
+
+/* Number of command-line arguments (argv[0] is the program path). [IO] */
+int32_t _zag_argc(void) { _zag_args_load(); return g_argc; }
+
+/* The idx-th command-line argument as a slice (empty if out of range). [IO] */
+ZagSliceU8 _zag_arg(int32_t idx) {
+    _zag_args_load();
+    ZagSliceU8 r; r.ptr = (const uint8_t*)""; r.len = 0;
+    if (idx >= 0 && idx < g_argc) {
+        r.ptr = (const uint8_t*)g_argv[idx];
+        r.len = (int32_t)strlen(g_argv[idx]);
+    }
+    return r;
+}

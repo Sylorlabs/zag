@@ -74,8 +74,14 @@ Enabling language features added for self-hosting (all in the bootstrap compiler
        TRANSITIVE IO violation (rt_io→uses_io→print_i32), intrinsic Panic (division).
        Still TODO for full sema: type inference/checking (currently effect-only), generics
        monomorphization, store checks. The effect system is the differentiator and is done.
-- [ ] B6. `codegen.zag`— C backend
-- [ ] B7. `main.zag`  — CLI driver (read file, pipeline, invoke cc)
+- [x] B6. `codegen.zag` — C backend in Zag: emits into ArrayList[u8], ctype mapping,
+       prelude + prototypes (incl extern) + bodies, exprs/stmts. Verified end-to-end:
+       codegens fib(10), the C compiles with cc and prints 55.
+- [x] B7. `zagc.zag` — the self-hosted compiler DRIVER (CLI). Reads argv (via runtime.c
+       /proc/self/cmdline), reads the source file, runs the effect/capability checker
+       (aborts the build on violations), codegens C, writes <src>.c, invokes cc → <src>.out.
+       Verified: `./zagc fact.zag` builds a binary that prints 720; a @realtime fn that
+       allocates is REJECTED ("VIOLATION in hot @realtime", build aborted).
 
 Notes for later stages:
 - map.zag must be imported `as map` (its make/get collide with list.zag's); the alias
