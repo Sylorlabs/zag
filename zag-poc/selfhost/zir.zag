@@ -1,0 +1,734 @@
+// selfhost/zir.zag — ZIR: Zag's native, lightweight, MLIR-shaped IR.
+//
+// This is the "MLIR design, none of the LLVM weight" path. ZIR adopts MLIR's
+// shape — everything is an Operation with SSA results/operands, named
+// attributes, and nested Regions/Blocks — as Zag's own in-memory middle-end.
+// There is NO dependency on libMLIR/LLVM: ~one file of Zag.
+//
+//   AST  ──build──▶  ZIR  ──verify/fold (passes)──▶  print
+//                                                      ├─ MLIR text (interop)
+//                                                      └─ C       (CPU backend)
+//
+// The same IR feeds two backends, and optimization passes (constant folding)
+// and the SSA verifier run once, on structured IR, instead of being re-derived
+// per backend. MLIR text becomes one *output* of ZIR, not a dependency.
+//
+// Scope of this core: scalar integer/float arithmetic, comparisons, mutable
+// locals (memref.alloca + load/store), `if`, calls, and return — enough to
+// lower real recursive functions end-to-end (AST→ZIR→C→cc→run). `while` and
+// the aggregate/GPU dialects are the documented next increments.
+
+@import("parse.zag")   // AST (Node/...) + ArrayList + string helpers
+
+// ── IR data structures (MLIR-shaped: Op / Region / Block / Value) ────────────
+struct ZVal  { name: []u8, ty: []u8 }            // an SSA value:  %name : ty
+struct ZAttr { key: []u8, val: []u8 }            // a named attribute
+struct ZOp {
+    name:     []u8,                  // "arith.addi", "scf.if", "func.return", ...
+    results:  ArrayList[ZVal],
+    operands: ArrayList[ZVal],
+    attrs:    ArrayList[ZAttr],
+    regions:  ArrayList[ZRegion],
+}
+struct ZBlock  { ops: ArrayList[ZOp] }
+struct ZRegion { blocks: ArrayList[ZBlock] }
+struct ZFunc   { name: []u8, params: ArrayList[ZVal], ret: []u8, body: ZBlock }
+struct ZModule { funcs: ArrayList[ZFunc] }
+
+// ── builder ──────────────────────────────────────────────────────────────────
+struct ZB { ctr: i32 }
+
+fn zfresh(b: *ZB, ty: []u8) ZVal {
+    b.*.ctr = b.*.ctr + 1;
+    return ZVal{ .name = _zag_str_concat("%v", _zag_i64_to_str(b.*.ctr as i64)), .ty = ty };
+}
+
+fn mk_op(name: []u8) ZOp {
+    return ZOp{ .name = name, .results = make[ZVal](1), .operands = make[ZVal](2),
+                .attrs = make[ZAttr](1), .regions = make[ZRegion](1) };
+}
+fn one_block() ZBlock { return ZBlock{ .ops = make[ZOp](8) }; }
+fn region_of(blk: ZBlock) ZRegion { let r: ZRegion = ZRegion{ .blocks = make[ZBlock](1) }; push[ZBlock](&r.blocks, blk); return r; }
+
+// ── locals environment (name → value or alloca slot) ─────────────────────────
+struct ZBind { name: []u8, val: ZVal, is_alloca: i32 }
+
+fn env_find(env: ArrayList[ZBind], name: []u8) ZBind {
+    let i: i32 = len[ZBind](env) - 1;
+    while (i >= 0) {
+        let b: ZBind = get[ZBind](env, i);
+        if (@strEq(b.name, name)) { return b; }
+        i = i - 1;
+    }
+    return ZBind{ .name = "", .val = ZVal{ .name = "%undef", .ty = "i32" }, .is_alloca = 0 };
+}
+
+// ── op constructors (emit into a block's op list, return the result value) ───
+fn op_const(b: *ZB, blk: *ZBlock, text: []u8, ty: []u8) ZVal {
+    let r: ZVal = zfresh(b, ty);
+    let o: ZOp = mk_op("arith.constant");
+    push[ZVal](&o.results, r);
+    push[ZAttr](&o.attrs, ZAttr{ .key = "value", .val = text });
+    push[ZOp](&blk.*.ops, o);
+    return r;
+}
+
+fn int_arith_name(op: []u8) []u8 {
+    if (@strEq(op, "+")) { return "arith.addi"; }
+    if (@strEq(op, "-")) { return "arith.subi"; }
+    if (@strEq(op, "*")) { return "arith.muli"; }
+    if (@strEq(op, "/")) { return "arith.divsi"; }
+    if (@strEq(op, "%")) { return "arith.remsi"; }
+    return "";
+}
+fn float_arith_name(op: []u8) []u8 {
+    if (@strEq(op, "+")) { return "arith.addf"; }
+    if (@strEq(op, "-")) { return "arith.subf"; }
+    if (@strEq(op, "*")) { return "arith.mulf"; }
+    if (@strEq(op, "/")) { return "arith.divf"; }
+    return "";
+}
+fn cmp_pred(op: []u8) []u8 {
+    if (@strEq(op, "==")) { return "eq"; }
+    if (@strEq(op, "!=")) { return "ne"; }
+    if (@strEq(op, "<"))  { return "slt"; }
+    if (@strEq(op, ">"))  { return "sgt"; }
+    if (@strEq(op, "<=")) { return "sle"; }
+    if (@strEq(op, ">=")) { return "sge"; }
+    return "";
+}
+fn is_cmp(op: []u8) i32 {
+    if (cmp_pred(op).len > 0) { return 1; }
+    return 0;
+}
+fn zir_is_float_ty(t: []u8) i32 {
+    if (@strEq(t, "f32") || @strEq(t, "f64")) { return 1; }
+    return 0;
+}
+
+fn op_bin(b: *ZB, blk: *ZBlock, op: []u8, l: ZVal, r: ZVal) ZVal {
+    if (is_cmp(op) == 1) {
+        let res: ZVal = zfresh(b, "bool");
+        let cn: []u8 = "arith.cmpi";
+        if (zir_is_float_ty(l.ty) == 1) { cn = "arith.cmpf"; }
+        let o: ZOp = mk_op(cn);
+        push[ZVal](&o.results, res);
+        push[ZVal](&o.operands, l);
+        push[ZVal](&o.operands, r);
+        push[ZAttr](&o.attrs, ZAttr{ .key = "predicate", .val = cmp_pred(op) });
+        push[ZOp](&blk.*.ops, o);
+        return res;
+    }
+    let res: ZVal = zfresh(b, l.ty);
+    let nm: []u8 = int_arith_name(op);
+    if (zir_is_float_ty(l.ty) == 1) { nm = float_arith_name(op); }
+    let o: ZOp = mk_op(nm);
+    push[ZVal](&o.results, res);
+    push[ZVal](&o.operands, l);
+    push[ZVal](&o.operands, r);
+    push[ZOp](&blk.*.ops, o);
+    return res;
+}
+
+fn op_alloca(b: *ZB, blk: *ZBlock, ty: []u8) ZVal {
+    let slot: ZVal = zfresh(b, _zag_str_concat(_zag_str_concat("memref<", ty), ">"));
+    let o: ZOp = mk_op("memref.alloca");
+    push[ZVal](&o.results, slot);
+    push[ZAttr](&o.attrs, ZAttr{ .key = "elem", .val = ty });
+    push[ZOp](&blk.*.ops, o);
+    return slot;
+}
+fn op_load(b: *ZB, blk: *ZBlock, slot: ZVal, ty: []u8) ZVal {
+    let r: ZVal = zfresh(b, ty);
+    let o: ZOp = mk_op("memref.load");
+    push[ZVal](&o.results, r);
+    push[ZVal](&o.operands, slot);
+    push[ZAttr](&o.attrs, ZAttr{ .key = "elem", .val = ty });
+    push[ZOp](&blk.*.ops, o);
+    return r;
+}
+fn op_store(b: *ZB, blk: *ZBlock, v: ZVal, slot: ZVal, ty: []u8) void {
+    let o: ZOp = mk_op("memref.store");
+    push[ZVal](&o.operands, v);
+    push[ZVal](&o.operands, slot);
+    push[ZAttr](&o.attrs, ZAttr{ .key = "elem", .val = ty });
+    push[ZOp](&blk.*.ops, o);
+}
+
+// ── AST → ZIR ────────────────────────────────────────────────────────────────
+fn ident_name(n: *Node) []u8 {
+    return switch (n.*) {
+        .id => |x| x.name,
+        else => "",
+    };
+}
+fn has_dot(s: []u8) i32 {
+    let i: i32 = 0;
+    while (i < s.len) { if (s[i] == '.') { return 1; } i = i + 1; }
+    return 0;
+}
+
+// reassigned-anywhere scan (mutable locals become alloca slots)
+fn assigned_in(body: ArrayList[*Node], name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        let s: *Node = get[*Node](body, i);
+        switch (s.*) {
+            .assign => |a| { if (@strEq(ident_name(a.target), name)) { return 1; } }
+            .if_    => |iff| {
+                if (assigned_in(iff.then_body, name) == 1) { return 1; }
+                if (iff.has_els == 1) { if (assigned_in(iff.els_body, name) == 1) { return 1; } }
+            }
+            .while_ => |w| { if (assigned_in(w.body, name) == 1) { return 1; } }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn lower_expr(b: *ZB, blk: *ZBlock, n: *Node, env: *ArrayList[ZBind], dl: ArrayList[*Node]) ZVal {
+    switch (n.*) {
+        .ilit => |x| {
+            let ty: []u8 = "i32";
+            if (has_dot(x.text) == 1) { ty = "f32"; }
+            return op_const(b, blk, x.text, ty);
+        }
+        .id => |x| {
+            let bd: ZBind = env_find(env.*, x.name);
+            if (bd.is_alloca == 1) {
+                return op_load(b, blk, bd.val, memref_elem(bd.val.ty));
+            }
+            return bd.val;
+        }
+        .bin => |bb| {
+            let l: ZVal = lower_expr(b, blk, bb.l, env, dl);
+            let r: ZVal = lower_expr(b, blk, bb.r, env, dl);
+            return op_bin(b, blk, bb.op, l, r);
+        }
+        .un => |u| {
+            let v: ZVal = lower_expr(b, blk, u.e, env, dl);
+            if (@strEq(u.op, "-")) {
+                let z: ZVal = op_const(b, blk, "0", v.ty);
+                return op_bin(b, blk, "-", z, v);
+            }
+            return v;
+        }
+        .call => |c| { return lower_call(b, blk, c, env, dl); }
+        else => { }
+    }
+    return op_const(b, blk, "0", "i32");
+}
+
+fn memref_elem(t: []u8) []u8 {
+    // "memref<i32>" → "i32"
+    if (t.len > 8 && t[0] == 'm') { return t[7..t.len - 1]; }
+    return t;
+}
+
+fn lower_call(b: *ZB, blk: *ZBlock, c: Call, env: *ArrayList[ZBind], dl: ArrayList[*Node]) ZVal {
+    let cn: []u8 = ident_name(c.callee);
+    let argvals: ArrayList[ZVal] = make[ZVal](2);
+    let i: i32 = 0;
+    while (i < len[*Node](c.args)) {
+        push[ZVal](&argvals, lower_expr(b, blk, get[*Node](c.args, i), env, dl));
+        i = i + 1;
+    }
+    let rty: []u8 = zir_fn_ret_type(dl, cn);
+    let o: ZOp = mk_op("func.call");
+    push[ZAttr](&o.attrs, ZAttr{ .key = "callee", .val = cn });
+    let k: i32 = 0;
+    while (k < len[ZVal](argvals)) { push[ZVal](&o.operands, get[ZVal](argvals, k)); k = k + 1; }
+    if (@strEq(rty, "void")) {
+        push[ZOp](&blk.*.ops, o);
+        return ZVal{ .name = "", .ty = "void" };
+    }
+    let r: ZVal = zfresh(b, rty);
+    push[ZVal](&o.results, r);
+    push[ZOp](&blk.*.ops, o);
+    return r;
+}
+
+fn zir_fn_ret_type(dl: ArrayList[*Node], name: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[*Node](dl)) {
+        switch (get[*Node](dl, i).*) {
+            .fn_decl => |f| { if (@strEq(f.name, name)) { return f.ret; } }
+            else => { }
+        }
+        i = i + 1;
+    }
+    if (@strEq(name, "print_i32")) { return "void"; }
+    return "i32";   // unknown callee → assume i32-returning
+}
+
+fn lower_block(b: *ZB, blk: *ZBlock, body: ArrayList[*Node], env: *ArrayList[ZBind], dl: ArrayList[*Node]) void {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        lower_stmt(b, blk, get[*Node](body, i), env, dl);
+        i = i + 1;
+    }
+}
+
+fn lower_stmt(b: *ZB, blk: *ZBlock, n: *Node, env: *ArrayList[ZBind], dl: ArrayList[*Node]) void {
+    switch (n.*) {
+        .let_ => |l| {
+            let v: ZVal = lower_expr(b, blk, l.expr, env, dl);
+            let bd: ZBind = env_find(env.*, l.name);
+            if (bd.is_alloca == 1) {
+                op_store(b, blk, v, bd.val, memref_elem(bd.val.ty));
+            } else {
+                push[ZBind](env, ZBind{ .name = l.name, .val = v, .is_alloca = 0 });
+            }
+        }
+        .assign => |a| {
+            let v: ZVal = lower_expr(b, blk, a.expr, env, dl);
+            let bd: ZBind = env_find(env.*, ident_name(a.target));
+            op_store(b, blk, v, bd.val, memref_elem(bd.val.ty));
+        }
+        .ret => |r| {
+            let o: ZOp = mk_op("func.return");
+            if (r.has_expr == 1) { push[ZVal](&o.operands, lower_expr(b, blk, r.expr, env, dl)); }
+            push[ZOp](&blk.*.ops, o);
+        }
+        .if_ => |iff| {
+            let c: ZVal = lower_expr(b, blk, iff.cond, env, dl);
+            let o: ZOp = mk_op("scf.if");
+            push[ZVal](&o.operands, c);
+            let tb: ZBlock = one_block();
+            lower_block(b, &tb, iff.then_body, env, dl);
+            push[ZRegion](&o.regions, region_of(tb));
+            if (iff.has_els == 1) {
+                let eb: ZBlock = one_block();
+                lower_block(b, &eb, iff.els_body, env, dl);
+                push[ZRegion](&o.regions, region_of(eb));
+            }
+            push[ZOp](&blk.*.ops, o);
+        }
+        .estmt => |e| { let _v: ZVal = lower_expr(b, blk, e.expr, env, dl); }
+        else => { }
+    }
+}
+
+fn lower_fn(b: *ZB, f: FnDecl, dl: ArrayList[*Node]) ZFunc {
+    let params: ArrayList[ZVal] = make[ZVal](2);
+    let env: ArrayList[ZBind] = make[ZBind](8);
+    let i: i32 = 0;
+    while (i < len[Param](f.params)) {
+        let p: Param = get[Param](f.params, i);
+        let pv: ZVal = ZVal{ .name = _zag_str_concat("%", p.name), .ty = p.pty };
+        push[ZVal](&params, pv);
+        push[ZBind](&env, ZBind{ .name = p.name, .val = pv, .is_alloca = 0 });
+        i = i + 1;
+    }
+    let blk: ZBlock = one_block();
+    // pre-alloca mutable locals (reassigned anywhere in the body)
+    let j: i32 = 0;
+    while (j < len[*Node](f.body)) {
+        switch (get[*Node](f.body, j).*) {
+            .let_ => |l| {
+                if (assigned_in(f.body, l.name) == 1) {
+                    let ty: []u8 = "i32";
+                    if (l.has_dty == 1) { ty = l.dty; }
+                    let slot: ZVal = op_alloca(b, &blk, ty);
+                    push[ZBind](&env, ZBind{ .name = l.name, .val = slot, .is_alloca = 1 });
+                }
+            }
+            else => { }
+        }
+        j = j + 1;
+    }
+    lower_block(b, &blk, f.body, &env, dl);
+    return ZFunc{ .name = f.name, .params = params, .ret = f.ret, .body = blk };
+}
+
+fn build_module(dl: ArrayList[*Node]) ZModule {
+    let b: ZB = ZB{ .ctr = 0 };
+    let m: ZModule = ZModule{ .funcs = make[ZFunc](4) };
+    let i: i32 = 0;
+    while (i < len[*Node](dl)) {
+        switch (get[*Node](dl, i).*) {
+            .fn_decl => |f| { if (f.is_extern == 0) { push[ZFunc](&m.funcs, lower_fn(&b, f, dl)); } }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return m;
+}
+
+// ── pass: SSA verifier (def-before-use) ──────────────────────────────────────
+fn verify_module(m: ZModule) i32 {
+    let errs: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[ZFunc](m.funcs)) {
+        let f: ZFunc = get[ZFunc](m.funcs, i);
+        let defined: ArrayList[[]u8] = make[[]u8](16);
+        let p: i32 = 0;
+        while (p < len[ZVal](f.params)) { push[[]u8](&defined, get[ZVal](f.params, p).name); p = p + 1; }
+        errs = errs + verify_block(f.body, &defined);
+        i = i + 1;
+    }
+    return errs;
+}
+fn name_seen(defined: ArrayList[[]u8], n: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[[]u8](defined)) { if (@strEq(get[[]u8](defined, i), n)) { return 1; } i = i + 1; }
+    return 0;
+}
+fn verify_block(blk: ZBlock, defined: *ArrayList[[]u8]) i32 {
+    let errs: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[ZOp](blk.ops)) {
+        let o: ZOp = get[ZOp](blk.ops, i);
+        let k: i32 = 0;
+        while (k < len[ZVal](o.operands)) {
+            let nm: []u8 = get[ZVal](o.operands, k).name;
+            if (nm.len > 0 && name_seen(defined.*, nm) == 0) { errs = errs + 1; }
+            k = k + 1;
+        }
+        // nested regions see the same outer definitions (slots) + their own
+        let rg: i32 = 0;
+        while (rg < len[ZRegion](o.regions)) {
+            let reg: ZRegion = get[ZRegion](o.regions, rg);
+            let bb: i32 = 0;
+            while (bb < len[ZBlock](reg.blocks)) { errs = errs + verify_block(get[ZBlock](reg.blocks, bb), defined); bb = bb + 1; }
+            rg = rg + 1;
+        }
+        let rr: i32 = 0;
+        while (rr < len[ZVal](o.results)) { push[[]u8](defined, get[ZVal](o.results, rr).name); rr = rr + 1; }
+        i = i + 1;
+    }
+    return errs;
+}
+
+// ── pass: integer constant folding ───────────────────────────────────────────
+struct ConstBind { name: []u8, val: i64 }
+fn const_find(cs: ArrayList[ConstBind], n: []u8, found: *i32) i64 {
+    let i: i32 = 0;
+    while (i < len[ConstBind](cs)) {
+        let c: ConstBind = get[ConstBind](cs, i);
+        if (@strEq(c.name, n)) { found.* = 1; return c.val; }
+        i = i + 1;
+    }
+    found.* = 0;
+    return 0;
+}
+fn parse_i64(s: []u8) i64 {
+    let neg: i32 = 0;
+    let i: i32 = 0;
+    if (s.len > 0 && s[0] == '-') { neg = 1; i = 1; }
+    let acc: i64 = 0;
+    while (i < s.len) {
+        let d: i32 = (s[i] as i32) - 48;
+        if (d < 0 || d > 9) { return acc; }
+        acc = acc * 10 + (d as i64);
+        i = i + 1;
+    }
+    if (neg == 1) { return 0 - acc; }
+    return acc;
+}
+fn apply_int_op(name: []u8, a: i64, b: i64, ok: *i32) i64 {
+    ok.* = 1;
+    if (@strEq(name, "arith.addi")) { return a + b; }
+    if (@strEq(name, "arith.subi")) { return a - b; }
+    if (@strEq(name, "arith.muli")) { return a * b; }
+    if (@strEq(name, "arith.divsi")) { if (b == 0) { ok.* = 0; return 0; } return a / b; }
+    if (@strEq(name, "arith.remsi")) { if (b == 0) { ok.* = 0; return 0; } return a % b; }
+    ok.* = 0;
+    return 0;
+}
+// returns a folded copy of the block; `folded` counts rewrites.
+fn fold_block(blk: ZBlock, cs: *ArrayList[ConstBind], folded: *i32) ZBlock {
+    let out: ZBlock = one_block();
+    let i: i32 = 0;
+    while (i < len[ZOp](blk.ops)) {
+        let o: ZOp = get[ZOp](blk.ops, i);
+        if (@strEq(o.name, "arith.constant") && len[ZVal](o.results) == 1) {
+            push[ConstBind](cs, ConstBind{ .name = get[ZVal](o.results, 0).name, .val = parse_i64(get[ZAttr](o.attrs, 0).val) });
+            push[ZOp](&out.ops, o);
+        } else if (len[ZVal](o.operands) == 2 && len[ZVal](o.results) == 1 && int_op(o.name) == 1) {
+            let f1: i32 = 0; let f2: i32 = 0;
+            let a: i64 = const_find(cs.*, get[ZVal](o.operands, 0).name, &f1);
+            let bb: i64 = const_find(cs.*, get[ZVal](o.operands, 1).name, &f2);
+            let ok: i32 = 0;
+            let v: i64 = apply_int_op(o.name, a, bb, &ok);
+            if (f1 == 1 && f2 == 1 && ok == 1) {
+                // rewrite to a constant
+                let res: ZVal = get[ZVal](o.results, 0);
+                let c: ZOp = mk_op("arith.constant");
+                push[ZVal](&c.results, res);
+                push[ZAttr](&c.attrs, ZAttr{ .key = "value", .val = _zag_i64_to_str(v) });
+                push[ZOp](&out.ops, c);
+                push[ConstBind](cs, ConstBind{ .name = res.name, .val = v });
+                folded.* = folded.* + 1;
+            } else {
+                push[ZOp](&out.ops, fold_regions(o, cs, folded));
+            }
+        } else {
+            push[ZOp](&out.ops, fold_regions(o, cs, folded));
+        }
+        i = i + 1;
+    }
+    return out;
+}
+fn int_op(name: []u8) i32 {
+    if (@strEq(name, "arith.addi") || @strEq(name, "arith.subi") || @strEq(name, "arith.muli")
+        || @strEq(name, "arith.divsi") || @strEq(name, "arith.remsi")) { return 1; }
+    return 0;
+}
+fn fold_regions(o: ZOp, cs: *ArrayList[ConstBind], folded: *i32) ZOp {
+    if (len[ZRegion](o.regions) == 0) { return o; }
+    let no: ZOp = ZOp{ .name = o.name, .results = o.results, .operands = o.operands, .attrs = o.attrs, .regions = make[ZRegion](1) };
+    let rg: i32 = 0;
+    while (rg < len[ZRegion](o.regions)) {
+        let reg: ZRegion = get[ZRegion](o.regions, rg);
+        let nr: ZRegion = ZRegion{ .blocks = make[ZBlock](1) };
+        let bb: i32 = 0;
+        while (bb < len[ZBlock](reg.blocks)) { push[ZBlock](&nr.blocks, fold_block(get[ZBlock](reg.blocks, bb), cs, folded)); bb = bb + 1; }
+        push[ZRegion](&no.regions, nr);
+        rg = rg + 1;
+    }
+    return no;
+}
+fn fold_module(m: ZModule) ZModule {
+    let out: ZModule = ZModule{ .funcs = make[ZFunc](4) };
+    let i: i32 = 0;
+    while (i < len[ZFunc](m.funcs)) {
+        let f: ZFunc = get[ZFunc](m.funcs, i);
+        let cs: ArrayList[ConstBind] = make[ConstBind](8);
+        let folded: i32 = 0;
+        let nb: ZBlock = fold_block(f.body, &cs, &folded);
+        push[ZFunc](&out.funcs, ZFunc{ .name = f.name, .params = f.params, .ret = f.ret, .body = nb });
+        i = i + 1;
+    }
+    return out;
+}
+
+// ── printer: MLIR text ───────────────────────────────────────────────────────
+fn pad(buf: *ArrayList[u8], n: i32) void { let i: i32 = 0; while (i < n) { emit_z(buf, "  "); i = i + 1; } }
+fn emit_z(buf: *ArrayList[u8], s: []u8) void { let i: i32 = 0; while (i < s.len) { push[u8](buf, s[i]); i = i + 1; } }
+
+fn print_mlir(m: ZModule) ArrayList[u8] {
+    let buf: ArrayList[u8] = make[u8](256);
+    emit_z(&buf, "// ZIR → MLIR (func/arith/memref/scf dialects)\n");
+    emit_z(&buf, "module {\n");
+    let i: i32 = 0;
+    while (i < len[ZFunc](m.funcs)) {
+        let f: ZFunc = get[ZFunc](m.funcs, i);
+        pad(&buf, 1); emit_z(&buf, "func.func @"); emit_z(&buf, f.name); emit_z(&buf, "(");
+        let p: i32 = 0;
+        while (p < len[ZVal](f.params)) {
+            if (p > 0) { emit_z(&buf, ", "); }
+            let pv: ZVal = get[ZVal](f.params, p);
+            emit_z(&buf, pv.name); emit_z(&buf, ": "); emit_z(&buf, pv.ty);
+            p = p + 1;
+        }
+        emit_z(&buf, ")");
+        if (!@strEq(f.ret, "void")) { emit_z(&buf, " -> "); emit_z(&buf, f.ret); }
+        emit_z(&buf, " {\n");
+        print_block_mlir(&buf, f.body, 2);
+        pad(&buf, 1); emit_z(&buf, "}\n");
+        i = i + 1;
+    }
+    emit_z(&buf, "}\n");
+    return buf;
+}
+fn attr_val(o: ZOp, key: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[ZAttr](o.attrs)) { let a: ZAttr = get[ZAttr](o.attrs, i); if (@strEq(a.key, key)) { return a.val; } i = i + 1; }
+    return "";
+}
+fn print_block_mlir(buf: *ArrayList[u8], blk: ZBlock, ind: i32) void {
+    let i: i32 = 0;
+    while (i < len[ZOp](blk.ops)) {
+        let o: ZOp = get[ZOp](blk.ops, i);
+        print_op_mlir(buf, o, ind);
+        i = i + 1;
+    }
+}
+fn print_op_mlir(buf: *ArrayList[u8], o: ZOp, ind: i32) void {
+    pad(buf, ind);
+    if (@strEq(o.name, "arith.constant")) {
+        let r: ZVal = get[ZVal](o.results, 0);
+        emit_z(buf, r.name); emit_z(buf, " = arith.constant "); emit_z(buf, attr_val(o, "value")); emit_z(buf, " : "); emit_z(buf, r.ty); emit_z(buf, "\n");
+    } else if (@strEq(o.name, "arith.cmpi") || @strEq(o.name, "arith.cmpf")) {
+        let r: ZVal = get[ZVal](o.results, 0);
+        emit_z(buf, r.name); emit_z(buf, " = "); emit_z(buf, o.name); emit_z(buf, " "); emit_z(buf, attr_val(o, "predicate")); emit_z(buf, ", ");
+        emit_z(buf, get[ZVal](o.operands, 0).name); emit_z(buf, ", "); emit_z(buf, get[ZVal](o.operands, 1).name);
+        emit_z(buf, " : "); emit_z(buf, get[ZVal](o.operands, 0).ty); emit_z(buf, "\n");
+    } else if (@strEq(o.name, "memref.alloca")) {
+        let r: ZVal = get[ZVal](o.results, 0);
+        emit_z(buf, r.name); emit_z(buf, " = memref.alloca() : memref<"); emit_z(buf, attr_val(o, "elem")); emit_z(buf, ">\n");
+    } else if (@strEq(o.name, "memref.load")) {
+        let r: ZVal = get[ZVal](o.results, 0);
+        emit_z(buf, r.name); emit_z(buf, " = memref.load "); emit_z(buf, get[ZVal](o.operands, 0).name); emit_z(buf, "[] : memref<"); emit_z(buf, attr_val(o, "elem")); emit_z(buf, ">\n");
+    } else if (@strEq(o.name, "memref.store")) {
+        emit_z(buf, "memref.store "); emit_z(buf, get[ZVal](o.operands, 0).name); emit_z(buf, ", "); emit_z(buf, get[ZVal](o.operands, 1).name); emit_z(buf, "[] : memref<"); emit_z(buf, attr_val(o, "elem")); emit_z(buf, ">\n");
+    } else if (@strEq(o.name, "func.call")) {
+        if (len[ZVal](o.results) == 1) { emit_z(buf, get[ZVal](o.results, 0).name); emit_z(buf, " = "); }
+        emit_z(buf, "func.call @"); emit_z(buf, attr_val(o, "callee")); emit_z(buf, "(");
+        print_operands(buf, o); emit_z(buf, ")\n");
+    } else if (@strEq(o.name, "func.return")) {
+        emit_z(buf, "func.return");
+        if (len[ZVal](o.operands) == 1) { emit_z(buf, " "); emit_z(buf, get[ZVal](o.operands, 0).name); emit_z(buf, " : "); emit_z(buf, get[ZVal](o.operands, 0).ty); }
+        emit_z(buf, "\n");
+    } else if (@strEq(o.name, "scf.if")) {
+        emit_z(buf, "scf.if "); emit_z(buf, get[ZVal](o.operands, 0).name); emit_z(buf, " {\n");
+        print_region0(buf, o, 0, ind + 1);
+        pad(buf, ind); emit_z(buf, "}");
+        if (len[ZRegion](o.regions) == 2) { emit_z(buf, " else {\n"); print_region0(buf, o, 1, ind + 1); pad(buf, ind); emit_z(buf, "}"); }
+        emit_z(buf, "\n");
+    } else {
+        // generic arith.* binary
+        let r: ZVal = get[ZVal](o.results, 0);
+        emit_z(buf, r.name); emit_z(buf, " = "); emit_z(buf, o.name); emit_z(buf, " ");
+        print_operands(buf, o); emit_z(buf, " : "); emit_z(buf, r.ty); emit_z(buf, "\n");
+    }
+}
+fn print_operands(buf: *ArrayList[u8], o: ZOp) void {
+    let i: i32 = 0;
+    while (i < len[ZVal](o.operands)) { if (i > 0) { emit_z(buf, ", "); } emit_z(buf, get[ZVal](o.operands, i).name); i = i + 1; }
+}
+fn print_region0(buf: *ArrayList[u8], o: ZOp, ri: i32, ind: i32) void {
+    let reg: ZRegion = get[ZRegion](o.regions, ri);
+    let bb: i32 = 0;
+    while (bb < len[ZBlock](reg.blocks)) { print_block_mlir(buf, get[ZBlock](reg.blocks, bb), ind); bb = bb + 1; }
+}
+
+// ── printer: C (the CPU backend, same IR) ────────────────────────────────────
+fn c_type(t: []u8) []u8 {
+    if (@strEq(t, "i32") || @strEq(t, "bool")) { return "int32_t"; }
+    if (@strEq(t, "i64")) { return "int64_t"; }
+    if (@strEq(t, "f32")) { return "float"; }
+    if (@strEq(t, "f64")) { return "double"; }
+    if (@strEq(t, "void")) { return "void"; }
+    return "int32_t";
+}
+fn cvar(name: []u8) []u8 { if (name.len > 0 && name[0] == '%') { return name[1..]; } return name; }
+
+fn print_c(m: ZModule) ArrayList[u8] {
+    let buf: ArrayList[u8] = make[u8](256);
+    emit_z(&buf, "#include <stdint.h>\n#include <stdio.h>\n");
+    emit_z(&buf, "static void print_i32(int32_t x){ printf(\"%d\\n\", x); }\n");
+    // forward declarations
+    let i: i32 = 0;
+    while (i < len[ZFunc](m.funcs)) { print_c_sig(&buf, get[ZFunc](m.funcs, i)); emit_z(&buf, ";\n"); i = i + 1; }
+    i = 0;
+    while (i < len[ZFunc](m.funcs)) {
+        let f: ZFunc = get[ZFunc](m.funcs, i);
+        print_c_sig(&buf, f); emit_z(&buf, " {\n");
+        print_block_c(&buf, f.body, 1);
+        emit_z(&buf, "}\n");
+        i = i + 1;
+    }
+    return buf;
+}
+fn print_c_sig(buf: *ArrayList[u8], f: ZFunc) void {
+    emit_z(buf, c_type(f.ret)); emit_z(buf, " "); emit_z(buf, f.name); emit_z(buf, "(");
+    if (len[ZVal](f.params) == 0) { emit_z(buf, "void"); }
+    let p: i32 = 0;
+    while (p < len[ZVal](f.params)) {
+        if (p > 0) { emit_z(buf, ", "); }
+        let pv: ZVal = get[ZVal](f.params, p);
+        emit_z(buf, c_type(pv.ty)); emit_z(buf, " "); emit_z(buf, cvar(pv.name));
+        p = p + 1;
+    }
+    emit_z(buf, ")");
+}
+fn cpad(buf: *ArrayList[u8], n: i32) void { let i: i32 = 0; while (i < n) { emit_z(buf, "    "); i = i + 1; } }
+fn print_block_c(buf: *ArrayList[u8], blk: ZBlock, ind: i32) void {
+    let i: i32 = 0;
+    while (i < len[ZOp](blk.ops)) { print_op_c(buf, get[ZOp](blk.ops, i), ind); i = i + 1; }
+}
+fn print_op_c(buf: *ArrayList[u8], o: ZOp, ind: i32) void {
+    cpad(buf, ind);
+    if (@strEq(o.name, "arith.constant")) {
+        let r: ZVal = get[ZVal](o.results, 0);
+        emit_z(buf, c_type(r.ty)); emit_z(buf, " "); emit_z(buf, cvar(r.name)); emit_z(buf, " = "); emit_z(buf, attr_val(o, "value")); emit_z(buf, ";\n");
+    } else if (@strEq(o.name, "memref.alloca")) {
+        let r: ZVal = get[ZVal](o.results, 0);
+        emit_z(buf, c_type(attr_val(o, "elem"))); emit_z(buf, " "); emit_z(buf, cvar(r.name)); emit_z(buf, ";\n");
+    } else if (@strEq(o.name, "memref.load")) {
+        let r: ZVal = get[ZVal](o.results, 0);
+        emit_z(buf, c_type(r.ty)); emit_z(buf, " "); emit_z(buf, cvar(r.name)); emit_z(buf, " = "); emit_z(buf, cvar(get[ZVal](o.operands, 0).name)); emit_z(buf, ";\n");
+    } else if (@strEq(o.name, "memref.store")) {
+        emit_z(buf, cvar(get[ZVal](o.operands, 1).name)); emit_z(buf, " = "); emit_z(buf, cvar(get[ZVal](o.operands, 0).name)); emit_z(buf, ";\n");
+    } else if (@strEq(o.name, "func.call")) {
+        if (len[ZVal](o.results) == 1) { let r: ZVal = get[ZVal](o.results, 0); emit_z(buf, c_type(r.ty)); emit_z(buf, " "); emit_z(buf, cvar(r.name)); emit_z(buf, " = "); }
+        emit_z(buf, attr_val(o, "callee")); emit_z(buf, "(");
+        print_operands_c(buf, o); emit_z(buf, ");\n");
+    } else if (@strEq(o.name, "func.return")) {
+        emit_z(buf, "return");
+        if (len[ZVal](o.operands) == 1) { emit_z(buf, " "); emit_z(buf, cvar(get[ZVal](o.operands, 0).name)); }
+        emit_z(buf, ";\n");
+    } else if (@strEq(o.name, "scf.if")) {
+        emit_z(buf, "if ("); emit_z(buf, cvar(get[ZVal](o.operands, 0).name)); emit_z(buf, ") {\n");
+        print_region0_c(buf, o, 0, ind + 1);
+        cpad(buf, ind); emit_z(buf, "}");
+        if (len[ZRegion](o.regions) == 2) { emit_z(buf, " else {\n"); print_region0_c(buf, o, 1, ind + 1); cpad(buf, ind); emit_z(buf, "}"); }
+        emit_z(buf, "\n");
+    } else {
+        // binary arith / cmp → C operator
+        let r: ZVal = get[ZVal](o.results, 0);
+        emit_z(buf, c_type(r.ty)); emit_z(buf, " "); emit_z(buf, cvar(r.name)); emit_z(buf, " = ");
+        emit_z(buf, cvar(get[ZVal](o.operands, 0).name)); emit_z(buf, " "); emit_z(buf, c_binop(o)); emit_z(buf, " "); emit_z(buf, cvar(get[ZVal](o.operands, 1).name)); emit_z(buf, ";\n");
+    }
+}
+fn c_binop(o: ZOp) []u8 {
+    if (@strEq(o.name, "arith.addi") || @strEq(o.name, "arith.addf")) { return "+"; }
+    if (@strEq(o.name, "arith.subi") || @strEq(o.name, "arith.subf")) { return "-"; }
+    if (@strEq(o.name, "arith.muli") || @strEq(o.name, "arith.mulf")) { return "*"; }
+    if (@strEq(o.name, "arith.divsi") || @strEq(o.name, "arith.divf")) { return "/"; }
+    if (@strEq(o.name, "arith.remsi")) { return "%"; }
+    if (@strEq(o.name, "arith.cmpi") || @strEq(o.name, "arith.cmpf")) { return c_pred(attr_val(o, "predicate")); }
+    return "+";
+}
+fn c_pred(p: []u8) []u8 {
+    if (@strEq(p, "eq")) { return "=="; }
+    if (@strEq(p, "ne")) { return "!="; }
+    if (@strEq(p, "slt")) { return "<"; }
+    if (@strEq(p, "sgt")) { return ">"; }
+    if (@strEq(p, "sle")) { return "<="; }
+    if (@strEq(p, "sge")) { return ">="; }
+    return "==";
+}
+fn print_operands_c(buf: *ArrayList[u8], o: ZOp) void {
+    let i: i32 = 0;
+    while (i < len[ZVal](o.operands)) { if (i > 0) { emit_z(buf, ", "); } emit_z(buf, cvar(get[ZVal](o.operands, i).name)); i = i + 1; }
+}
+fn print_region0_c(buf: *ArrayList[u8], o: ZOp, ri: i32, ind: i32) void {
+    let reg: ZRegion = get[ZRegion](o.regions, ri);
+    let bb: i32 = 0;
+    while (bb < len[ZBlock](reg.blocks)) { print_block_c(buf, get[ZBlock](reg.blocks, bb), ind); bb = bb + 1; }
+}
+
+// ── top-level entry points (used by the driver) ──────────────────────────────
+// Build ZIR from source, fold, verify; emit MLIR text.
+fn zir_to_mlir(src: []u8, dir: []u8) ArrayList[u8] {
+    let decls: ArrayList[*Node] = parse_program_dir(src, dir);
+    let m: ZModule = fold_module(build_module(decls));
+    let _e: i32 = verify_module(m);
+    return print_mlir(m);
+}
+// Build ZIR from source, fold, verify; emit C.
+fn zir_to_c(src: []u8, dir: []u8) ArrayList[u8] {
+    let decls: ArrayList[*Node] = parse_program_dir(src, dir);
+    let m: ZModule = fold_module(build_module(decls));
+    let _e: i32 = verify_module(m);
+    return print_c(m);
+}
+// Diagnostics line: "<nfuncs> funcs, <folded> folded, <errs> verify-errors"
+fn zir_stats(src: []u8, dir: []u8) ArrayList[u8] {
+    let decls: ArrayList[*Node] = parse_program_dir(src, dir);
+    let raw: ZModule = build_module(decls);
+    let cs_unused: i32 = 0;
+    let m: ZModule = fold_module(raw);
+    let errs: i32 = verify_module(m);
+    let buf: ArrayList[u8] = make[u8](64);
+    emit_z(&buf, "zir: ");
+    emit_z(&buf, _zag_i64_to_str(len[ZFunc](m.funcs) as i64));
+    emit_z(&buf, " funcs, verify-errors=");
+    emit_z(&buf, _zag_i64_to_str(errs as i64));
+    emit_z(&buf, "\n");
+    return buf;
+}

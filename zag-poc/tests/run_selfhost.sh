@@ -346,6 +346,32 @@ if $ZAGC build selfhost/zagc.zag >/dev/null 2>&1 && [ -x ./zagc ]; then
     else
         echo "  XX  gpu mlir target header"; fail=$((fail+1))
     fi
+
+    # ZIR: native MLIR-shaped IR (selfhost/zir.zag). The SAME in-memory IR
+    # (AST→ZIR→fold→verify) feeds two backends. Prove: (1) --via-zir lowers
+    # ZIR→C→cc→run with correct results; (2) constant folding really fires;
+    # (3) the MLIR printer emits valid func/arith/memref/scf from the IR.
+    printf 'fn fact(n: i32) i32 {\n    let r: i32 = 1;\n    if (n > 1) { r = n * fact(n - 1); }\n    return r;\n}\nfn konst() i32 { return (2 + 3) * 4; }\nfn main() void { print_i32(fact(5)); print_i32(konst()); }\n' > $SH/zir.zag
+    zout=$($SH/zagc build $SH/zir.zag --via-zir --run 2>/dev/null | grep -E '^[0-9]+$' | tr '\n' ' ' | sed 's/ *$//')
+    if [ "$zout" = "120 20" ]; then
+        echo "  ok  zir backend (AST→ZIR→C→cc→run: fact(5)=120, konst=20)"; pass=$((pass+1))
+    else
+        echo "  XX  zir backend (got '$zout', want '120 20')"; fail=$((fail+1))
+    fi
+    # fold pass: (2+3)*4 must become a constant 20 in the IR
+    if $SH/zagc zir $SH/zir.zag 2>/dev/null | grep -q 'arith.constant 20'; then
+        echo "  ok  zir fold pass (constant-folds (2+3)*4 → 20)"; pass=$((pass+1))
+    else
+        echo "  XX  zir fold pass"; fail=$((fail+1))
+    fi
+    # MLIR printer emits structured dialects from the IR
+    if $SH/zagc zir $SH/zir.zag 2>/dev/null | grep -q 'func.func @fact' && \
+       $SH/zagc zir $SH/zir.zag 2>/dev/null | grep -q 'scf.if' && \
+       $SH/zagc zir $SH/zir.zag 2>/dev/null | grep -q 'memref.alloca'; then
+        echo "  ok  zir mlir printer (func.func/scf.if/memref from one IR)"; pass=$((pass+1))
+    else
+        echo "  XX  zir mlir printer"; fail=$((fail+1))
+    fi
 else
     echo "  XX  driver (zagc failed to build)"; fail=$((fail+1))
 fi
