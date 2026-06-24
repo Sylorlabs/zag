@@ -1014,7 +1014,14 @@ fn genSlice(ctx: *Ctx, sl: ast.Slice) !void {
     try ctx.w(" + (");
     try genExpr(ctx, sl.lo);
     try ctx.w("), (");
-    try genExpr(ctx, sl.hi);
+    if (sl.has_hi) {
+        try genExpr(ctx, sl.hi);
+    } else {
+        // open-ended base[lo..] → length is base.len - lo (slices only)
+        try ctx.w("(");
+        try genExpr(ctx, sl.base);
+        try ctx.w(").len");
+    }
     try ctx.w(") - (");
     try genExpr(ctx, sl.lo);
     try ctx.w(") }");

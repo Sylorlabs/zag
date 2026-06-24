@@ -48,5 +48,20 @@ else
     echo "  XX  effects"; echo "      want: [$swant]"; echo "      got:  [$sgot]"; fail=$((fail+1))
 fi
 
+# C backend: codegen a recursive fib(10), compile the emitted C, run it → 55.
+# This is the full self-hosted front-to-back pipeline: lex→parse→codegen→C→exe.
+echo "── selfhost: codegen (end-to-end) ──"
+$ZAGC build selfhost/codegen_test.zag --run >/tmp/zsh4 2>/dev/null
+sed -n '/-- running/,/-- exit/p' /tmp/zsh4 | grep -v '^-- ' > /tmp/zsh_gen.c
+cgout=""
+if cc /tmp/zsh_gen.c -o /tmp/zsh_gen 2>/dev/null; then
+    cgout=$(/tmp/zsh_gen)
+fi
+if [ "$cgout" = "55" ]; then
+    echo "  ok  codegen (fib(10)→C→cc→55)"; pass=$((pass+1))
+else
+    echo "  XX  codegen (got '$cgout', want 55)"; fail=$((fail+1))
+fi
+
 echo "════ selfhost pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]

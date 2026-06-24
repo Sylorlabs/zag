@@ -2208,10 +2208,11 @@ pub const Sema = struct {
                 .line   = c.line,
             }},
             .slice => |*sl| ast.Node{ .slice = .{
-                .base = self.cloneExpr(sl.base, mp),
-                .lo   = self.cloneExpr(sl.lo, mp),
-                .hi   = self.cloneExpr(sl.hi, mp),
-                .line = sl.line,
+                .base   = self.cloneExpr(sl.base, mp),
+                .lo     = self.cloneExpr(sl.lo, mp),
+                .hi     = self.cloneExpr(sl.hi, mp),
+                .has_hi = sl.has_hi,
+                .line   = sl.line,
             }},
             .field => |*f| ast.Node{ .field = .{
                 .base  = self.cloneExpr(f.base, mp),

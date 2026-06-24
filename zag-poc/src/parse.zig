@@ -953,14 +953,26 @@ pub const Parser = struct {
                 {
                     _ = self.eat(.dot, null);
                     _ = self.eat(.dot, null);
-                    const hi = try self.parseExpr();
-                    _ = self.eat(.rbracket, null);
-                    e = try self.mkNode(.{ .slice = .{
-                        .base = e,
-                        .lo = idx,
-                        .hi = hi,
-                        .line = ln,
-                    } });
+                    // Open-ended `base[lo..]` — hi defaults to base.len at codegen.
+                    if (self.atKind(.rbracket)) {
+                        _ = self.eat(.rbracket, null);
+                        e = try self.mkNode(.{ .slice = .{
+                            .base = e,
+                            .lo = idx,
+                            .hi = idx, // placeholder; has_hi=false
+                            .has_hi = false,
+                            .line = ln,
+                        } });
+                    } else {
+                        const hi = try self.parseExpr();
+                        _ = self.eat(.rbracket, null);
+                        e = try self.mkNode(.{ .slice = .{
+                            .base = e,
+                            .lo = idx,
+                            .hi = hi,
+                            .line = ln,
+                        } });
+                    }
                 } else {
                     _ = self.eat(.rbracket, null);
                     e = try self.mkNode(.{ .index = .{
@@ -1446,10 +1458,11 @@ fn cloneExpr(alloc: Allocator, nr: NodeRef, names: *const std.StringHashMap([]co
             .line   = c.line,
         }},
         .slice       => |*sl| Node{ .slice = .{
-            .base = try cloneExpr(alloc, sl.base, names),
-            .lo   = try cloneExpr(alloc, sl.lo, names),
-            .hi   = try cloneExpr(alloc, sl.hi, names),
-            .line = sl.line,
+            .base   = try cloneExpr(alloc, sl.base, names),
+            .lo     = try cloneExpr(alloc, sl.lo, names),
+            .hi     = try cloneExpr(alloc, sl.hi, names),
+            .has_hi = sl.has_hi,
+            .line   = sl.line,
         }},
         .field       => |*f| Node{ .field = .{
             .base  = try cloneExpr(alloc, f.base, names),

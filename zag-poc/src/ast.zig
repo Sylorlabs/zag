@@ -258,11 +258,12 @@ pub const Cast = struct {
 };
 
 pub const Slice = struct {
-    base: NodeRef,
-    lo:   NodeRef,
-    hi:   NodeRef,
-    line: u32,
-    ty:   ?[]const u8 = null,
+    base:   NodeRef,
+    lo:     NodeRef,
+    hi:     NodeRef,
+    has_hi: bool = true,   // false for open-ended `base[lo..]` (hi = base.len)
+    line:   u32,
+    ty:     ?[]const u8 = null,
 };
 
 pub const Field = struct {
