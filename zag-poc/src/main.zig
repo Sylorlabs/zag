@@ -701,7 +701,13 @@ fn pickCc(alloc: std.mem.Allocator, target: []const u8, tinfo: *const TargetInfo
 pub fn main() u8 {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+    // The compiler is a short-lived process: route all compilation allocations
+    // through an arena so they're freed in bulk at exit. This makes the GPA's
+    // leak check clean (no per-allocation frees needed in the AST/sema/codegen
+    // passes) — the deferred "arena allocator in zagc" item from SELFHOST_PLAN.
+    var arena_state = std.heap.ArenaAllocator.init(gpa.allocator());
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
 
     const stderr = std.io.getStdErr().writer();
 
