@@ -68,20 +68,18 @@ ppu(){ ./zig-out/bin/zagc build examples/$1.zag --target ppu32 --emit-c >/tmp/zt
        else echo "  XX  $1 (ppu32)"; fail=$((fail+1)); cat /tmp/zt; fi
        rm -f $1.c 2>/dev/null; }
 ppu posit32
-echo "── P5: GPU/MLIR backend — gpu-nvidia (emit MLIR, check dialect constructs) ──"
-# gpu <example> <grep-pattern...>: build to MLIR, assert all patterns present.
-gpu(){ local ex="$1"; shift
+echo "── P5: GPU target — bootstrap proves capabilities, defers MLIR to the Zag compiler ──"
+# The GPU/MLIR backend is written in Zag (selfhost/mlir.zag) — see tests/run_selfhost.sh
+# for the real emit-and-check tests. The bootstrap deliberately has NO Zig MLIR emitter:
+# it proves the kernels are effect-safe, then points at the self-hosted compiler. It must
+# NOT write a .mlir (no Zig middleman, no fake output).
+gpu(){ local ex="$1"
        ./zig-out/bin/zagc build examples/$ex.zag --target gpu-nvidia >/tmp/zt 2>&1
-       # the gpu path writes <stem>.mlir into the cwd
-       local ok=1
-       if [ ! -f $ex.mlir ]; then ok=0; fi
-       for pat in "$@"; do
-           if ! grep -q "$pat" $ex.mlir 2>/dev/null; then ok=0; echo "    missing: $pat"; fi
-       done
-       if [ "$ok" -eq 1 ]; then echo "  ok  $ex (gpu-nvidia MLIR: kernels/dialects present)"; pass=$((pass+1))
-       else echo "  XX  $ex (gpu-nvidia)"; fail=$((fail+1)); cat /tmp/zt; fi
+       if grep -q 'capability proof OK' /tmp/zt && grep -q 'zag build' /tmp/zt && [ ! -f $ex.mlir ]; then
+           echo "  ok  $ex (bootstrap: cap-proof + defers to Zag compiler; no Zig MLIR)"; pass=$((pass+1))
+       else echo "  XX  $ex (gpu defer)"; fail=$((fail+1)); cat /tmp/zt; fi
        rm -f $ex.mlir 2>/dev/null; }
-gpu gpu_matmul_mx 'gpu.module @zag_kernels' 'gpu.func @matmulMxKernel' ' kernel {' 'f8E4M3FN' 'gpu.thread_id' 'gpu.block_id' 'scf.while' 'func.func @tileSize' 'gpu.return'
-gpu gpu_vsa_hd 'gpu.module @zag_kernels' 'gpu.func @vsaBindKernel' ' kernel {' 'gpu.barrier' 'gpu.thread_id' 'gpu.block_id' 'scf.while' 'func.func @runVsaPipeline'
+gpu gpu_matmul_mx
+gpu gpu_vsa_hd
 echo "════ pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]

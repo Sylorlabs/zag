@@ -390,26 +390,12 @@ fn cmdBuildGpu(
         }
     };
 
-    // Emit MLIR via codegen
-    const mlir_text = codegen.genMlir(alloc, decls, &s, resolved_target) catch |e| {
-        stderr.print("MLIR codegen error: {s}\n", .{@errorName(e)}) catch {};
-        return 1;
-    };
-
-    // Derive output base path (stem of source file)
-    const stem = stemOf(path);
-    const mlir_path = std.fmt.allocPrint(alloc, "{s}.mlir", .{stem}) catch {
-        stderr.print("OOM\n", .{}) catch {};
-        return 1;
-    };
-
-    std.fs.cwd().writeFile(.{ .sub_path = mlir_path, .data = mlir_text }) catch |e| {
-        stderr.print("could not write {s}: {s}\n", .{ mlir_path, @errorName(e) }) catch {};
-        return 1;
-    };
-    stdout.print("  [gpu-{s}] wrote MLIR: {s}\n", .{ resolved_target, mlir_path }) catch {};
-    stdout.print("  run: mlir-opt {s} | mlir-translate --mlir-to-llvmir | llc -march={s}\n",
-        .{ mlir_path, resolved_target }) catch {};
+    // The capability proof above is the bootstrap's job. MLIR emission is NOT:
+    // the GPU/MLIR backend is written in Zag (selfhost/mlir.zag) and owned by the
+    // self-hosted compiler — there is deliberately no Zig MLIR emitter here.
+    stdout.print("  [gpu-{s}] capability proof OK — kernels are effect-safe\n", .{resolved_target}) catch {};
+    stdout.print("  MLIR is emitted by the self-hosted Zag compiler (no Zig middleman):\n", .{}) catch {};
+    stdout.print("      zag build {s} --target gpu-{s}\n", .{ path, resolved_target }) catch {};
     return 0;
 }
 
