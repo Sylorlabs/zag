@@ -10,59 +10,120 @@ Pipeline (no Zig, no LLVM yet — those are later phases):
 .zag --lex--> tokens --parse--> AST --sema(types + EFFECT CHECK)--> C --cc--> native binary
 ```
 
+## Four "moat" features (real, not stubs)
+
+These target the breaking points developers hit in C/C++/Rust/Zig. Each is
+implemented end-to-end through the actual compiler — see the commands.
+
+### 1. Native runtime code patching (hot-reloading)
+Edit a function and swap it into a **running** process without a restart; live
+memory state is retained. The `--hot` backend routes every Zag→Zag call through
+a per-function pointer in a dispatch table; the linked runtime
+(`src/zag_hotreload.c`) `dlopen`s a freshly compiled patch `.so` and atomically
+re-aims those pointers at the new code at a safe point (SIGUSR1-driven).
+```bash
+bash examples/hotreload_demo.sh     # builds --hot, runs, live-patches label(), shows 1xxx→2xxx
+                                    # while the loop counter keeps climbing (state retained)
+# manual:
+zagc build --hot examples/hot_demo.zag        # host with a swappable dispatch table
+zagc hot-patch hot_demo.zag -o hot_demo_patch.so   # compile a live patch
+kill -USR1 <pid>                              # the running host swaps it in
+```
+Honest boundary: patch granularity is a whole function via an atomic pointer
+swap at a safe point (single-threaded-safe), not mid-instruction machine-code
+rewriting.
+
+### 2. AI-native structured diagnostics
+First-class machine-readable JSON for the three things an agent needs — instead
+of regex-scraping stderr. Diagnostics carry the **effect witness chain**; the
+AST is type-annotated; the dep graph carries declared annotations *and* inferred
+effects.
+```bash
+zagc check examples/audio_render_bad.zag --json   # diagnostics + capability witness chains
+zagc ast   examples/interfaces.zag                # type-annotated AST as JSON (schema zag.ast/v1)
+zagc deps  examples/audio_render.zag              # call/effect dependency graph (zag.depgraph/v1)
+```
+
+### 3. Compile-time structural ("duck") typing
+No `implements`, no hand-written vtables, no `anyopaque`/`void*` plumbing. The
+compiler scans each type's method set; if it structurally matches an interface,
+it **auto-emits** the vtable + adapter thunks and lets the value be passed where
+the interface is expected. A missing/mismatched method is a precise error.
+```bash
+zagc build examples/interfaces.zag --run    # Square & Rect satisfy Shape structurally → 75, 36
+```
+```zag
+interface Shape { fn area(self) i32; fn scaledArea(self, factor: i32) i32; }
+fn report(s: Shape) i32 { return s.area() + s.scaledArea(2); }   // dispatches via synthesized vtable
+```
+
+### 4. Immutable lockfile toolchains (`zag.mod`)
+A non-optional project manifest pins the compiler version, language **edition**,
+and required features. The compiler walks up from the source, parses it, and
+**enforces** it before lowering a token — a mismatch is a hard, actionable error,
+never a mystery parse failure. Solves the "no-indicator versioning trap."
+```bash
+zagc version                         # zagc 0.1.0 (edition phase0, build poc-phase0)
+zagc init myproject                  # write a zag.mod pinned to this compiler
+zagc build examples/numeric.zag      # discovers repo-root zag.mod, reports it satisfied
+zagc check file.zag --locked         # CI mode: missing zag.mod is fatal
+```
+A project pinned to `zag = "^0.2.0"` / `edition = "phase1"` is refused by this
+0.1.0/phase0 compiler with an explanation, instead of miscompiling.
+
 ## Run it
 
 ```bash
 # GOOD: a realtime audio render block — proven clean, compiled, run
-python3 zagc.py build examples/audio_render.zag --run
+zagc build examples/audio_render.zag --run
 
 # BAD: an allocation buried 3 calls deep inside @realtime — rejected with the call chain
-python3 zagc.py check examples/audio_render_bad.zag
+zagc check examples/audio_render_bad.zag
 
 # GOOD: mathpressor-shaped @noalloc synth + @total quantizer
-python3 zagc.py build examples/synth.zag --run
+zagc build examples/synth.zag --run
 
 # BAD: @total with a runtime divisor — rejected (the honest Z3 boundary)
-python3 zagc.py check examples/total_bad.zag
+zagc check examples/total_bad.zag
 
 # BAD: @realtime that locks and does IO — both rejected
-python3 zagc.py check examples/realtime_io_lock_bad.zag
+zagc check examples/realtime_io_lock_bad.zag
 
 # ── EFFECT POLYMORPHISM (the keystone) ──
 # GOOD: generic processBlock proven @realtime via the callback you pass; runs
-python3 zagc.py build examples/process_poly.zag --run
+zagc build examples/process_poly.zag --run
 # BAD: same generic with an allocating callback — witness crosses the generic boundary
-python3 zagc.py check examples/process_poly_bad.zag
+zagc check examples/process_poly_bad.zag
 # GOOD: generic self-annotated @realtime via a BOUNDED callback type; runs
-python3 zagc.py build examples/process_bounded.zag --run
+zagc build examples/process_bounded.zag --run
 # BAD: call-site bound violation, caught even though main is unannotated
-python3 zagc.py check examples/process_bounded_bad.zag
+zagc check examples/process_bounded_bad.zag
 ```
 
 # ── TYPE-LEVEL EFFECT VARIABLES (effects flow through values) ──
-python3 zagc.py build examples/effvar_local.zag --run    # callback in a typed local
-python3 zagc.py build examples/effvar_return.zag --run   # effect flows out of a return
-python3 zagc.py check examples/effvar_local_bad.zag      # rejected at the STORE
+zagc build examples/effvar_local.zag --run    # callback in a typed local
+zagc build examples/effvar_return.zag --run   # effect flows out of a return
+zagc check examples/effvar_local_bad.zag      # rejected at the STORE
 
 # ── STRUCTS + REAL SLICES (.len) ──
-python3 zagc.py build examples/struct_basic.zag --run
+zagc build examples/struct_basic.zag --run
 
 # ── CAPSTONE: callback stored in a struct field, called on the audio thread ──
-python3 zagc.py build examples/voice_struct.zag --run    # proven realtime-safe, runs
-python3 zagc.py check examples/voice_struct_bad.zag      # allocating op rejected at construction
+zagc build examples/voice_struct.zag --run    # proven realtime-safe, runs
+zagc check examples/voice_struct_bad.zag      # allocating op rejected at construction
 
 # ── CLOSURES (explicit capture, no heap) ──
-python3 zagc.py build examples/closure_basic.zag --run   # captures gain on the stack; runs
-python3 zagc.py build examples/closure_effvar.zag --run  # closure instantiates effect var ! e
-python3 zagc.py check examples/closure_bad.zag           # allocating closure rejected at realtime
-python3 zagc.py check examples/closure_effvar_bad.zag    # effect flows through ! e and is caught
-python3 zagc.py check examples/closure_escape_bad.zag    # capturing closure can't escape (no heap)
+zagc build examples/closure_basic.zag --run   # captures gain on the stack; runs
+zagc build examples/closure_effvar.zag --run  # closure instantiates effect var ! e
+zagc check examples/closure_bad.zag           # allocating closure rejected at realtime
+zagc check examples/closure_effvar_bad.zag    # effect flows through ! e and is caught
+zagc check examples/closure_escape_bad.zag    # capturing closure can't escape (no heap)
 
 # ── GENERICS OVER TYPES (monomorphization) ──
-python3 zagc.py build examples/generic_box.zag --run     # Box[T] + unbox[T] at i32 and f32
-python3 zagc.py build examples/generic_map.zag --run     # generic mapInPlace[T] at f32 and i32
-python3 zagc.py build examples/generic_map_rt.zag --run  # generic map + closure on audio thread, proven realtime
-python3 zagc.py check examples/generic_map_rt_bad.zag    # effect crosses the generic+closure boundary
+zagc build examples/generic_box.zag --run     # Box[T] + unbox[T] at i32 and f32
+zagc build examples/generic_map.zag --run     # generic mapInPlace[T] at f32 and i32
+zagc build examples/generic_map_rt.zag --run  # generic map + closure on audio thread, proven realtime
+zagc check examples/generic_map_rt_bad.zag    # effect crosses the generic+closure boundary
 ```
 
 Run everything at once: `bash run_tests.sh` (24 programs: 14 build+run, 10 rejected).

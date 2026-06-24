@@ -16,6 +16,43 @@ fn emit(buf: *ArrayList[u8], s: []u8) void {
     }
 }
 
+// ── type-string helpers ──────────────────────────────────────────────────────
+fn index_of(s: []u8, c: i32) i32 {
+    let i: i32 = 0;
+    while (i < s.len) {
+        if ((s[i] as i32) == c) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Split a generic-arg list "A,B[C]" on top-level commas (depth-aware on []).
+fn split_args(s: []u8) ArrayList[[]u8] {
+    let out: ArrayList[[]u8] = make[[]u8](2);
+    let depth: i32 = 0;
+    let start: i32 = 0;
+    let i: i32 = 0;
+    while (i < s.len) {
+        let c: i32 = s[i] as i32;
+        if (c == '[') { depth = depth + 1; }
+        else if (c == ']') { depth = depth - 1; }
+        else if (c == ',' && depth == 0) {
+            push[[]u8](&out, s[start..i]);
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    push[[]u8](&out, s[start..s.len]);
+    return out;
+}
+
+// True if t is a generic application Base[..] (NOT a slice []T, whose '[' is at 0).
+fn is_generic_app(t: []u8) bool {
+    let lb: i32 = index_of(t, '[');
+    if (lb <= 0) { return false; }
+    return (t[t.len - 1] as i32) == ']';
+}
+
 // ── Zag type → C type ────────────────────────────────────────────────────────
 fn ctype(t: []u8) []u8 {
     if (@strEq(t, "i8"))   { return "int8_t"; }
@@ -33,6 +70,13 @@ fn ctype(t: []u8) []u8 {
     // *T → "<ctype(T)>*"
     if (t.len > 1) {
         if (t[0] == '*') { return _zag_str_concat(ctype(t[1..]), "*"); }
+    }
+    // generic application Base[args] → Base_arg1_arg2 (monomorphized C name)
+    if (is_generic_app(t)) {
+        let lb: i32 = index_of(t, '[');
+        let base: []u8 = t[0..lb];
+        let arglist: ArrayList[[]u8] = split_args(t[lb + 1..t.len - 1]);
+        return mangle_generic(base, arglist);
     }
     // named type (struct/enum/union) — emit verbatim
     return t;
@@ -94,6 +138,20 @@ fn subst_type(t: []u8, names: ArrayList[[]u8], vals: ArrayList[[]u8]) []u8 {
     }
     if (t.len > 2) {
         if (t[0] == '[' && t[1] == ']') { return _zag_str_concat("[]", subst_type(t[2..], names, vals)); }
+    }
+    // generic application Base[args] → Base[subst(args)...]
+    if (is_generic_app(t)) {
+        let lb: i32 = index_of(t, '[');
+        let base: []u8 = t[0..lb];
+        let arglist: ArrayList[[]u8] = split_args(t[lb + 1..t.len - 1]);
+        let s: []u8 = _zag_str_concat(base, "[");
+        let i: i32 = 0;
+        while (i < len[[]u8](arglist)) {
+            if (i > 0) { s = _zag_str_concat(s, ","); }
+            s = _zag_str_concat(s, subst_type(get[[]u8](arglist, i), names, vals));
+            i = i + 1;
+        }
+        return _zag_str_concat(s, "]");
     }
     return t;
 }
@@ -185,9 +243,13 @@ fn gen_expr(buf: *ArrayList[u8], n: *Node) void {
             emit(buf, "]");
         }
         .slit_ => |s| {
-            // struct literal: (Name){ .field = val, ... }
+            // struct literal: (Name){ .field = val, ... }; generic → (Name_T){ ... }
             emit(buf, "(");
-            emit(buf, s.sname);
+            if (len[[]u8](s.targs) > 0) {
+                emit(buf, mangle_generic(s.sname, s.targs));
+            } else {
+                emit(buf, s.sname);
+            }
             emit(buf, "){ ");
             let i: i32 = 0;
             while (i < len[FieldInit](s.fields)) {
@@ -453,6 +515,100 @@ fn collect_stmt(n: *Node, decls: ArrayList[*Node], insts: *ArrayList[Inst]) void
     }
 }
 
+// ── generic struct instantiations ────────────────────────────────────────────
+struct SInst { mangled: []u8, decl: StructDecl, targs: ArrayList[[]u8] }
+
+fn sinst_seen(sinsts: ArrayList[SInst], mangled: []u8) bool {
+    let i: i32 = 0;
+    while (i < len[SInst](sinsts)) {
+        if (@strEq(get[SInst](sinsts, i).mangled, mangled)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn record_sinst(sname: []u8, targs: ArrayList[[]u8], decls: ArrayList[*Node], sinsts: *ArrayList[SInst]) void {
+    if (len[[]u8](targs) == 0) { return; }
+    let mangled: []u8 = mangle_generic(sname, targs);
+    if (sinst_seen(sinsts.*, mangled)) { return; }
+    let di: i32 = 0;
+    while (di < len[*Node](decls)) {
+        let d: *Node = get[*Node](decls, di);
+        switch (d.*) {
+            .struct_ => |s| {
+                if (len[[]u8](s.tparams) > 0 && @strEq(s.name, sname)) {
+                    push[SInst](sinsts, SInst{ .mangled = mangled, .decl = s, .targs = targs });
+                }
+            }
+            else => { }
+        }
+        di = di + 1;
+    }
+}
+
+fn collect_sinst_expr(n: *Node, decls: ArrayList[*Node], sinsts: *ArrayList[SInst]) void {
+    switch (n.*) {
+        .slit_ => |s| {
+            record_sinst(s.sname, s.targs, decls, sinsts);
+            let i: i32 = 0;
+            while (i < len[FieldInit](s.fields)) {
+                collect_sinst_expr(get[FieldInit](s.fields, i).val, decls, sinsts);
+                i = i + 1;
+            }
+        }
+        .call => |c| {
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) {
+                collect_sinst_expr(get[*Node](c.args, i), decls, sinsts);
+                i = i + 1;
+            }
+        }
+        .bin => |b| { collect_sinst_expr(b.l, decls, sinsts); collect_sinst_expr(b.r, decls, sinsts); }
+        .un  => |u| { collect_sinst_expr(u.e, decls, sinsts); }
+        .fld => |f| { collect_sinst_expr(f.base, decls, sinsts); }
+        .idx => |x| { collect_sinst_expr(x.base, decls, sinsts); collect_sinst_expr(x.idx, decls, sinsts); }
+        else => { }
+    }
+}
+
+fn collect_sinst_block(body: ArrayList[*Node], decls: ArrayList[*Node], sinsts: *ArrayList[SInst]) void {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        collect_sinst_stmt(get[*Node](body, i), decls, sinsts);
+        i = i + 1;
+    }
+}
+
+fn collect_sinst_stmt(n: *Node, decls: ArrayList[*Node], sinsts: *ArrayList[SInst]) void {
+    switch (n.*) {
+        .let_   => |l| { collect_sinst_expr(l.expr, decls, sinsts); }
+        .ret    => |r| { if (r.has_expr == 1) { collect_sinst_expr(r.expr, decls, sinsts); } }
+        .if_    => |x| { collect_sinst_expr(x.cond, decls, sinsts); collect_sinst_block(x.then_body, decls, sinsts); if (x.has_els == 1) { collect_sinst_block(x.els_body, decls, sinsts); } }
+        .while_ => |w| { collect_sinst_expr(w.cond, decls, sinsts); collect_sinst_block(w.body, decls, sinsts); }
+        .assign => |a| { collect_sinst_expr(a.target, decls, sinsts); collect_sinst_expr(a.expr, decls, sinsts); }
+        .estmt  => |e| { collect_sinst_expr(e.expr, decls, sinsts); }
+        else => { }
+    }
+}
+
+// Emit a monomorphized struct typedef (type-params substituted per field).
+fn emit_sinst(buf: *ArrayList[u8], si: SInst) void {
+    let s: StructDecl = si.decl;
+    emit(buf, "typedef struct { ");
+    let i: i32 = 0;
+    while (i < len[Param](s.fields)) {
+        let f: Param = get[Param](s.fields, i);
+        emit(buf, ctype(subst_type(f.pty, s.tparams, si.targs)));
+        emit(buf, " ");
+        emit(buf, f.name);
+        emit(buf, "; ");
+        i = i + 1;
+    }
+    emit(buf, "} ");
+    emit(buf, si.mangled);
+    emit(buf, ";\n");
+}
+
 // Emit a monomorphized fn signature (used for both prototype and body header).
 fn emit_mono_sig(buf: *ArrayList[u8], inst: Inst) void {
     let f: FnDecl = inst.f;
@@ -504,6 +660,7 @@ fn codegen(src: []u8) ArrayList[u8] {
     }
     // collect generic instantiations from all (non-generic) fn bodies
     let insts: ArrayList[Inst] = make[Inst](8);
+    let sinsts: ArrayList[SInst] = make[SInst](8);
     let ci: i32 = 0;
     while (ci < len[*Node](decls)) {
         let d: *Node = get[*Node](decls, ci);
@@ -511,11 +668,18 @@ fn codegen(src: []u8) ArrayList[u8] {
             .fn_decl => |f| {
                 if (len[[]u8](f.tparams) == 0 && f.is_extern == 0) {
                     collect_block(f.body, decls, &insts);
+                    collect_sinst_block(f.body, decls, &sinsts);
                 }
             }
             else => { }
         }
         ci = ci + 1;
+    }
+    // emit monomorphized struct typedefs (before any fn that uses them by value)
+    let sg: i32 = 0;
+    while (sg < len[SInst](sinsts)) {
+        emit_sinst(&buf, get[SInst](sinsts, sg));
+        sg = sg + 1;
     }
 
     // prototypes: monomorphized generics first, then regular fns

@@ -55,7 +55,7 @@ let poly:   rns_3     = coefficient;   // parallel mod-arithmetic over 3 coprime
 ```bash
 git clone https://github.com/Sylorlabs/zag.git
 cd zag/zag-poc
-python3 zagc.py
+zagc
 ```
 
 That's it. The bootstrap compiler has no Python dependencies. It lexes, parses, type-checks, proves capabilities, and emits C — all in one file. The system C compiler turns that into a native binary.
@@ -84,18 +84,18 @@ Without `mlir-opt`, `zagc` still writes the `.mlir` file for manual lowering.
 cd zag/zag-poc
 
 # Prove this function's effects are clean, build it, and run it
-python3 zagc.py build examples/audio_render.zag --run
+zagc build examples/audio_render.zag --run
 
 # Watch the prover reject an allocation buried 3 calls deep inside @realtime
-python3 zagc.py check examples/audio_render_bad.zag
+zagc check examples/audio_render_bad.zag
 
 # See the C that was generated instead of compiling it
-python3 zagc.py build examples/audio_render.zag --emit-c
+zagc build examples/audio_render.zag --emit-c
 
 # Try the heterogeneous numeric types
-python3 zagc.py build examples/embedded_sensor.zag --run   # u11 + sat_i16 + fixed_8_8
-python3 zagc.py build examples/hpc_rns.zag --run           # rns_3 residue arithmetic
-python3 zagc.py build examples/safe_bignum.zag --run       # u_any overflow-safe sums
+zagc build examples/embedded_sensor.zag --run   # u11 + sat_i16 + fixed_8_8
+zagc build examples/hpc_rns.zag --run           # rns_3 residue arithmetic
+zagc build examples/safe_bignum.zag --run       # u_any overflow-safe sums
 
 # Run the full test suite
 bash run_tests.sh
@@ -138,7 +138,7 @@ The compiler found the chain — `gain` calls `reverbScratch` which calls `zallo
     └── CPU targets ──► C codegen → cc → native binary
 ```
 
-The compiler is a single Python file (`zagc.py`, ~2,800 lines). This is the Phase-0 bootstrap. Phase 1 will be a self-hosting Zag compiler written in Zag.
+The compiler is a from-scratch **Zig** program (`zag-poc/src/`, ~8,400 lines; entry `src/main.zig`, build with `zig build` → `zig-out/bin/zagc`). This is the Phase-0 bootstrap; the original Python prototype has been retired. Phase 1 is a self-hosting Zag compiler written in Zag (`zag-poc/selfhost/`), in progress.
 
 ### The effect system
 
@@ -298,19 +298,19 @@ fn matmulKernel(A: []mx_fp8, B: []mx_fp8, C: []f32, M: i32, K: i32, N: i32) void
 
 ```bash
 # CPU targets
-python3 zagc.py build file.zag --target native    # default; host CPU
-python3 zagc.py build file.zag --target x86_64    # x86-64 v2; SSE2 saturating intrinsics
-python3 zagc.py build file.zag --target arm64     # ARMv8-A; SQADD/UQADD; bf16 on ARMv8.6+
-python3 zagc.py build file.zag --target riscv32   # RV32IMAC; single ANDI for u11 mask
-python3 zagc.py build file.zag --target riscv64   # RV64IMAC + RVV vectorised sat/arb-int
-python3 zagc.py build file.zag --target wasm      # WebAssembly SIMD; i16x8.add_sat
-python3 zagc.py build file.zag --target ppu32     # RISC-V posit hardware (padd.s/psub.s)
+zagc build file.zag --target native    # default; host CPU
+zagc build file.zag --target x86_64    # x86-64 v2; SSE2 saturating intrinsics
+zagc build file.zag --target arm64     # ARMv8-A; SQADD/UQADD; bf16 on ARMv8.6+
+zagc build file.zag --target riscv32   # RV32IMAC; single ANDI for u11 mask
+zagc build file.zag --target riscv64   # RV64IMAC + RVV vectorised sat/arb-int
+zagc build file.zag --target wasm      # WebAssembly SIMD; i16x8.add_sat
+zagc build file.zag --target ppu32     # RISC-V posit hardware (padd.s/psub.s)
 
 # GPU targets (require mlir-opt)
-python3 zagc.py build file.zag --target gpu-nvidia   # NVVM → PTX (CUDA)
-python3 zagc.py build file.zag --target gpu-amd      # ROCDL → GCN (ROCm)
-python3 zagc.py build file.zag --target gpu-vulkan   # SPIR-V (Vulkan portability fallback)
-python3 zagc.py build file.zag --target gpu-auto     # detect from nvidia-smi / rocm-smi
+zagc build file.zag --target gpu-nvidia   # NVVM → PTX (CUDA)
+zagc build file.zag --target gpu-amd      # ROCDL → GCN (ROCm)
+zagc build file.zag --target gpu-vulkan   # SPIR-V (Vulkan portability fallback)
+zagc build file.zag --target gpu-auto     # detect from nvidia-smi / rocm-smi
 ```
 
 ---
@@ -373,7 +373,9 @@ Test suite: **pass=35 fail=0** (`bash run_tests.sh`).
 README.md               this file
 ZAG_DESIGN.md           full language design document with implementation notes
 zag-poc/
-  zagc.py               bootstrap compiler (~2,800 lines; no dependencies)
+  src/                  bootstrap compiler in Zig (~8,400 lines; entry main.zig)
+  selfhost/             self-hosting compiler written in Zag (in progress)
+  build.zig             `zig build` → zig-out/bin/zagc
   run_tests.sh          full test suite (35 programs)
   prove.sh              Z3 / ghost_engine integration demo
   examples/             35 .zag programs (good ones that run + bad ones that are rejected)

@@ -159,6 +159,8 @@ pub const Parser = struct {
                 try decls.append(try self.parseEnum());
             } else if (self.atKind(.kw_union)) {
                 try decls.append(try self.parseUnion());
+            } else if (self.atKind(.kw_interface)) {
+                try decls.append(try self.parseInterface());
             } else if (self.atKind(.kw_error)) {
                 try decls.append(try self.parseErrorDecl());
             } else if (self.at(.ident, "@import")) {
@@ -325,6 +327,45 @@ pub const Parser = struct {
         return self.mkNode(.{ .union_decl = .{
             .name = name,
             .fields = try fields.toOwnedSlice(),
+            .line = ln,
+        } });
+    }
+
+    // ── interface decl ──────────────────────────────────────────────────────────
+    //   interface Reader {
+    //       fn read(self) i32;
+    //       fn fill(self, buf: []u8) i32;
+    //   }
+    // Each method takes an implicit `self` receiver (no type) followed by zero or
+    // more typed value params.  Bodies are forbidden; signatures only.
+    fn parseInterface(self: *Parser) !NodeRef {
+        const ln = self.eat(.kw_interface, null).line;
+        const name = try self.alloc.dupe(u8, self.eat(.ident, null).val);
+        _ = self.eat(.lbrace, null);
+        var methods = std.ArrayList(ast.IfaceMethod).init(self.alloc);
+        while (!self.atKind(.rbrace)) {
+            _ = self.eat(.kw_fn, null);
+            const mname = try self.alloc.dupe(u8, self.eat(.ident, null).val);
+            _ = self.eat(.lp, null);
+            // first param must be the implicit receiver `self`
+            _ = self.eat(.ident, null); // "self"
+            var params = std.ArrayList(Param).init(self.alloc);
+            while (self.atKind(.comma)) {
+                _ = self.eat(.comma, null);
+                const pn = try self.alloc.dupe(u8, self.eat(.ident, null).val);
+                _ = self.eat(.colon, null);
+                const pt = try self.parseType();
+                try params.append(.{ .name = pn, .pty = pt });
+            }
+            _ = self.eat(.rp, null);
+            const ret = try self.parseType();
+            if (self.atKind(.semi)) _ = self.eat(.semi, null);
+            try methods.append(.{ .name = mname, .params = try params.toOwnedSlice(), .ret = ret });
+        }
+        _ = self.eat(.rbrace, null);
+        return self.mkNode(.{ .interface_decl = .{
+            .name = name,
+            .methods = try methods.toOwnedSlice(),
             .line = ln,
         } });
     }

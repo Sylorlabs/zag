@@ -14,6 +14,13 @@ pub const FieldInit = struct {
     val:  NodeRef,
 };
 
+// ── IfaceMethod: one required method signature in an interface ──
+pub const IfaceMethod = struct {
+    name:   []const u8,
+    params: []Param,     // does NOT include the implicit `self` receiver
+    ret:    []const u8,
+};
+
 // ── SwitchArm: one arm of a switch statement/expression ──
 pub const SwitchArm = struct {
     tags: [][]const u8,  // one or more patterns (ident strings or decimal int strings)
@@ -29,6 +36,7 @@ pub const Node = union(enum) {
     enum_decl:   EnumDecl,
     union_decl:  UnionDecl,
     error_decl:  ErrorDecl,
+    interface_decl: InterfaceDecl,
     mod_alias:   ModAlias,
 
     // ── statements ──
@@ -130,6 +138,13 @@ pub const ErrorDecl = struct {
     names: [][]const u8,
     line:  u32,
     ty:    ?[]const u8 = null,
+};
+
+pub const InterfaceDecl = struct {
+    name:    []const u8,
+    methods: []IfaceMethod,
+    line:    u32,
+    ty:      ?[]const u8 = null,
 };
 
 pub const ModAlias = struct {

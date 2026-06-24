@@ -14,13 +14,13 @@ echo
 
 echo "════════ WITHOUT a prover (forced) — conservative ════════"
 echo "Same source, but no prover reachable -> the variable divisor must be rejected:"
-GHOST_ENGINE=/nonexistent python3 zagc.py check examples/total_guarded.zag 2>&1 | grep -E 'VIOLATED|note:'
+GHOST_ENGINE=/nonexistent zagc check examples/total_guarded.zag 2>&1 | grep -E 'VIOLATED|note:'
 
 echo
 echo "════════ WITH ghost_engine — proven ════════"
 for f in total_guarded total_nonzero; do
   echo "── $f ──"
-  python3 zagc.py build examples/$f.zag --run 2>&1 | grep -E '✓ proven|🔒|-- running|-- exit'
+  zagc build examples/$f.zag --run 2>&1 | grep -E '✓ proven|🔒|-- running|-- exit'
 done
 echo "── total_bad: ghost_engine returns a concrete counterexample ──"
-python3 zagc.py check examples/total_bad.zag 2>&1 | grep -E 'counterexample'
+zagc check examples/total_bad.zag 2>&1 | grep -E 'counterexample'

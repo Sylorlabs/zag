@@ -25,6 +25,13 @@ pub const Report = struct {
     annotations: []AnnotationEntry,
 };
 
+/// A proven (interface, concrete-type) satisfaction recorded during type
+/// checking.  Codegen turns each one into a vtable + adapter thunks.
+pub const IfaceImpl = struct {
+    iface:    []const u8,
+    concrete: []const u8,
+};
+
 // ── Scope: name → type string ─────────────────────────────────────────────────
 
 pub const Scope = std.StringHashMap([]const u8);
@@ -41,6 +48,11 @@ pub const Sema = struct {
     unions:          std.StringHashMap(ast.NodeRef),
     /// key = "RecvType_methodName"
     methods:         std.StringHashMap(ast.NodeRef),
+    /// interface name → InterfaceDecl node
+    interfaces:      std.StringHashMap(ast.NodeRef),
+    /// (interface, concrete) pairs proven to satisfy structurally — codegen
+    /// emits one vtable + thunk set per entry.
+    iface_impls:     std.ArrayList(IfaceImpl),
     /// alias → module prefix string
     modules:         std.StringHashMap([]const u8),
     err_names:       std.ArrayList([]const u8),
@@ -64,6 +76,8 @@ pub const Sema = struct {
             .enums           = std.StringHashMap(ast.NodeRef).init(alloc),
             .unions          = std.StringHashMap(ast.NodeRef).init(alloc),
             .methods         = std.StringHashMap(ast.NodeRef).init(alloc),
+            .interfaces      = std.StringHashMap(ast.NodeRef).init(alloc),
+            .iface_impls     = std.ArrayList(IfaceImpl).init(alloc),
             .modules         = std.StringHashMap([]const u8).init(alloc),
             .err_names       = std.ArrayList([]const u8).init(alloc),
             .errors          = std.ArrayList([]const u8).init(alloc),
@@ -96,6 +110,7 @@ pub const Sema = struct {
                 },
                 .enum_decl   => |*ed| try s.enums.put(ed.name, n),
                 .union_decl  => |*ud| try s.unions.put(ud.name, n),
+                .interface_decl => |*id| try s.interfaces.put(id.name, n),
                 .error_decl  => |*ed| {
                     for (ed.names) |nm| {
                         var found = false;
@@ -122,6 +137,8 @@ pub const Sema = struct {
         self.enums.deinit();
         self.unions.deinit();
         self.methods.deinit();
+        self.interfaces.deinit();
+        self.iface_impls.deinit();
         self.modules.deinit();
         self.err_names.deinit();
         self.errors.deinit();
@@ -336,7 +353,91 @@ pub const Sema = struct {
         if (self.structs.contains(base)) return;
         if (self.enums.contains(base))   return;
         if (self.unions.contains(base))  return;
+        if (self.interfaces.contains(base)) return;
         self.errFmt(line, "unknown type '{s}'", .{ty});
+    }
+
+    // ── Structural ("duck") typing ───────────────────────────────────────────
+
+    /// Look up an interface's method signature by name, or null.
+    fn ifaceMethod(self: *Sema, iface: []const u8, mname: []const u8) ?ast.IfaceMethod {
+        const node = self.interfaces.get(iface) orelse return null;
+        for (node.*.interface_decl.methods) |m| {
+            if (std.mem.eql(u8, m.name, mname)) return m;
+        }
+        return null;
+    }
+
+    /// Two types are compatible for structural matching when they are equal
+    /// after literal-default normalization, or mutually assignable.
+    fn typeCompatible(a: []const u8, b: []const u8) bool {
+        if (std.mem.eql(u8, a, b)) return true;
+        const da = types.defaultTy(a);
+        const db = types.defaultTy(b);
+        if (std.mem.eql(u8, da, db)) return true;
+        return types.assignable(a, b) and types.assignable(b, a);
+    }
+
+    /// Does concrete type `concrete` structurally satisfy interface `iface`?
+    /// When it does NOT and `report_line != 0`, emit a precise diagnostic
+    /// naming the missing/mismatched method.  On success, record the impl for
+    /// codegen (deduplicated).
+    pub fn structurallySatisfies(self: *Sema, concrete: []const u8, iface: []const u8, report_line: u32) bool {
+        const inode = self.interfaces.get(iface) orelse return false;
+        const idecl = inode.*.interface_decl;
+
+        var ok = true;
+        for (idecl.methods) |m| {
+            const key = std.fmt.allocPrint(self.alloc, "{s}_{s}", .{ concrete, m.name }) catch continue;
+            const meth_node = self.methods.get(key) orelse {
+                ok = false;
+                if (report_line != 0)
+                    self.errFmt(report_line,
+                        "type '{s}' does not satisfy interface '{s}': missing method '{s}(self) {s}'",
+                        .{ concrete, iface, m.name, m.ret });
+                continue;
+            };
+            const meth = &meth_node.*.fn_decl;
+            // Arity (excluding the receiver, which neither side counts in params).
+            if (meth.params.len != m.params.len) {
+                ok = false;
+                if (report_line != 0)
+                    self.errFmt(report_line,
+                        "type '{s}' does not satisfy interface '{s}': method '{s}' has {d} params, interface requires {d}",
+                        .{ concrete, iface, m.name, meth.params.len, m.params.len });
+                continue;
+            }
+            // Param types.
+            var sig_ok = true;
+            for (m.params, meth.params) |ip, cp| {
+                if (!typeCompatible(ip.pty, cp.pty)) {
+                    sig_ok = false;
+                    if (report_line != 0)
+                        self.errFmt(report_line,
+                            "type '{s}' does not satisfy interface '{s}': method '{s}' param '{s}' is {s}, interface requires {s}",
+                            .{ concrete, iface, m.name, cp.name, cp.pty, ip.pty });
+                }
+            }
+            // Return type.
+            if (!typeCompatible(m.ret, meth.ret)) {
+                sig_ok = false;
+                if (report_line != 0)
+                    self.errFmt(report_line,
+                        "type '{s}' does not satisfy interface '{s}': method '{s}' returns {s}, interface requires {s}",
+                        .{ concrete, iface, m.name, meth.ret, m.ret });
+            }
+            if (!sig_ok) ok = false;
+        }
+
+        if (ok) self.recordImpl(iface, concrete);
+        return ok;
+    }
+
+    fn recordImpl(self: *Sema, iface: []const u8, concrete: []const u8) void {
+        for (self.iface_impls.items) |it| {
+            if (std.mem.eql(u8, it.iface, iface) and std.mem.eql(u8, it.concrete, concrete)) return;
+        }
+        self.iface_impls.append(.{ .iface = iface, .concrete = concrete }) catch {};
     }
 
     // ── checkTypes: top-level type-check pass ────────────────────────────────
@@ -958,6 +1059,20 @@ pub const Sema = struct {
             }
             // Method call: obj.method(args)
             const base_ty = self.typeOf(fld.base, scope);
+            // Interface dynamic dispatch: base is an interface fat-pointer.
+            if (self.interfaces.contains(base_ty)) {
+                for (c.args) |a| _ = self.typeOf(a, scope);
+                if (self.ifaceMethod(base_ty, fld.fname)) |m| {
+                    if (m.params.len != c.args.len)
+                        self.errFmt(c.line, "interface method '{s}.{s}' expects {d} args, got {d}",
+                            .{ base_ty, fld.fname, m.params.len, c.args.len });
+                    ast.setNodeType(call_node, m.ret);
+                    return m.ret;
+                }
+                self.errFmt(c.line, "interface '{s}' has no method '{s}'", .{ base_ty, fld.fname });
+                ast.setNodeType(call_node, "i32");
+                return "i32";
+            }
             const method_key = std.fmt.allocPrint(self.alloc, "{s}_{s}", .{ base_ty, fld.fname }) catch fld.fname;
             if (self.methods.get(method_key)) |meth_node| {
                 const meth = &meth_node.*.fn_decl;
@@ -1042,6 +1157,14 @@ pub const Sema = struct {
                 if (decl.params.len == c.args.len) {
                     for (c.args, decl.params) |a, p| {
                         const arg_ty = ast.nodeType(a) orelse "i32";
+                        // Structural ("duck") coercion: a concrete type may be
+                        // passed where an interface is expected if it implements it.
+                        if (self.interfaces.contains(p.pty)) {
+                            if (!types.assignable(p.pty, arg_ty)) {
+                                _ = self.structurallySatisfies(arg_ty, p.pty, c.line);
+                            }
+                            continue;
+                        }
                         annotateOptionalArg(a, p.pty, arg_ty);
                         if (!types.assignable(p.pty, arg_ty))
                             self.errFmt(c.line, "arg '{s}': expected {s}, got {s}", .{ p.name, p.pty, arg_ty });
@@ -1346,6 +1469,24 @@ pub const Sema = struct {
             .violations  = try violations.toOwnedSlice(),
             .annotations = try proven_list.toOwnedSlice(),
         };
+    }
+
+    /// Public accessor: the inferred latent effect set of a named function, as
+    /// a freshly-allocated, sorted slice of effect-name strings.  Used by the
+    /// AI-native dependency-graph emitter (`zagc deps`).
+    pub fn effectsOfFn(self: *Sema, name: []const u8) [][]const u8 {
+        var eff_set = std.StringHashMap(void).init(self.alloc);
+        defer eff_set.deinit();
+        var wit_map = WitMap.init(self.alloc);
+        defer wit_map.deinit();
+        self.analyzeFn(name, &eff_set, &wit_map);
+
+        var out = std.ArrayList([]const u8).init(self.alloc);
+        // Emit in the canonical ALL_EFFECTS order for stable output.
+        for (types.ALL_EFFECTS) |e| {
+            if (eff_set.contains(e)) out.append(e) catch {};
+        }
+        return out.toOwnedSlice() catch &.{};
     }
 
     /// Analyze a named function's effects (no call-site env; uses memo cache).

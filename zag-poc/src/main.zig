@@ -12,6 +12,9 @@ const std = @import("std");
 const lex_mod   = @import("lex.zig");
 const parse_mod = @import("parse.zig");
 const sema_mod  = @import("sema.zig");
+const version   = @import("version.zig");
+const toolchain = @import("toolchain.zig");
+const jsonout   = @import("jsonout.zig");
 // codegen.zig does not exist yet; we stub it below via a comptime shim.
 // When codegen.zig is present alongside main.zig the stub is replaced.
 
@@ -62,13 +65,28 @@ fn isGpuTarget(target: []const u8) bool {
 
 const codegen = @import("codegen.zig");
 
+// Embedded hot-reload runtime, written next to the generated C and linked into
+// `zagc build --hot` host executables.
+const HOTRT_C = @embedFile("zag_hotreload.c");
+
 // ── Usage string ─────────────────────────────────────────────────────────────
 
 const USAGE =
     \\zagc — Zag bootstrap compiler  (universal heterogeneous computing edition)
     \\usage:
-    \\  zagc check <file.zag>
-    \\  zagc build <file.zag> [-o out] [--run] [--emit-c] [--target <target>]
+    \\  zagc version
+    \\  zagc init [name]                      write a zag.mod lockfile pinned to this compiler
+    \\  zagc check <file.zag> [--locked] [--json]
+    \\  zagc build <file.zag> [-o out] [--run] [--emit-c] [--target <target>] [--locked]
+    \\  zagc ast  <file.zag>                  emit the type-annotated AST as JSON
+    \\  zagc deps <file.zag>                  emit the call/effect dependency graph as JSON
+    \\  zagc hot-patch <file.zag> [-o so]     build a live patch for a running --hot host
+    \\
+    \\  --locked   require a zag.mod (CI / reproducible builds); fail if absent
+    \\  --json     emit machine-readable diagnostics (AI-native)
+    \\  --hot      build with a swappable dispatch table (runtime code patching)
+    \\
+    \\note: paths under examples/ are governed by the repo-root zag.mod (walk-up discovery)
     \\
     \\cpu targets:
     \\  native      (default) host cpu
@@ -175,9 +193,97 @@ fn printReport(
     _ = s; // future: check s.proverAvailable() once that method exists
 }
 
+// ── toolchain (zag.mod) enforcement ───────────────────────────────────────────
+
+/// Discover & enforce the zag.mod governing `src_dir`.  Returns true when the
+/// build may proceed; prints a clear, actionable failure otherwise.
+fn enforceToolchain(alloc: std.mem.Allocator, src_dir: []const u8, locked: bool) bool {
+    const stdout = std.io.getStdOut().writer();
+    const stderr = std.io.getStdErr().writer();
+
+    const outcome = toolchain.enforce(alloc, src_dir, locked);
+    if (!outcome.ok) {
+        stderr.print("toolchain: build refused — zag.mod constraints not satisfied:\n", .{}) catch {};
+        for (outcome.problems) |p| stderr.print("  - {s}\n", .{p}) catch {};
+        return false;
+    }
+    if (outcome.manifest) |m| {
+        stdout.print("toolchain: zag.mod '{s}' satisfied (zagc {s}, edition {s})\n", .{
+            m.name, version.ZAG_VERSION, version.ZAG_EDITION,
+        }) catch {};
+    } else if (locked) {
+        // unreachable: locked + not found is reported as not-ok above
+    }
+    return true;
+}
+
+fn emitToolchainJson(writer: anytype, path: []const u8, problems: []const []const u8) void {
+    writer.print(
+        \\{{"schema": "zag.diagnostics/v1", "compiler": {{"version": "{s}", "edition": "{s}"}}, "file": "{s}", "ok": false, "diagnostics": [
+    , .{ version.ZAG_VERSION, version.ZAG_EDITION, path }) catch {};
+    for (problems, 0..) |p, i| {
+        if (i > 0) writer.writeAll(", ") catch {};
+        writer.writeAll("{\"severity\": \"error\", \"code\": \"ZAG-TOOLCHAIN\", \"message\": \"") catch {};
+        for (p) |c| {
+            switch (c) {
+                '"' => writer.writeAll("\\\"") catch {},
+                '\\' => writer.writeAll("\\\\") catch {},
+                '\n' => writer.writeAll("\\n") catch {},
+                else => writer.writeByte(c) catch {},
+            }
+        }
+        writer.writeAll("\"}") catch {};
+    }
+    writer.writeAll("]}\n") catch {};
+}
+
+// ── cmd_ast / cmd_deps (AI-native emitters) ───────────────────────────────────
+
+/// Run the front-end pipeline best-effort and return decls + sema for emitters.
+/// Returns false (and prints) on a hard lex/parse failure.
+fn frontEnd(
+    alloc:   std.mem.Allocator,
+    path:    []const u8,
+    decls_out: *[]ast.NodeRef,
+    sema_out:  *sema_mod.Sema,
+) bool {
+    const stderr = std.io.getStdErr().writer();
+    const abs = std.fs.realpathAlloc(alloc, path) catch {
+        stderr.print("{s}: error: file not found\n", .{path}) catch {};
+        return false;
+    };
+    const src_dir = std.fs.path.dirname(abs) orelse ".";
+    var report: sema_mod.Report = undefined;
+    compileFile(alloc, path, src_dir, decls_out, sema_out, &report) catch |e| {
+        stderr.print("{s}: error: {s}\n", .{ path, @errorName(e) }) catch {};
+        return false;
+    };
+    return true;
+}
+
+fn cmdAst(alloc: std.mem.Allocator, path: []const u8) u8 {
+    var decls: []ast.NodeRef = undefined;
+    var s: sema_mod.Sema = undefined;
+    if (!frontEnd(alloc, path, &decls, &s)) return 1;
+    defer s.deinit();
+    const doc = jsonout.emitAst(alloc, path, decls) catch return 1;
+    std.io.getStdOut().writeAll(doc) catch {};
+    return 0;
+}
+
+fn cmdDeps(alloc: std.mem.Allocator, path: []const u8) u8 {
+    var decls: []ast.NodeRef = undefined;
+    var s: sema_mod.Sema = undefined;
+    if (!frontEnd(alloc, path, &decls, &s)) return 1;
+    defer s.deinit();
+    const doc = jsonout.emitDeps(alloc, path, decls, &s) catch return 1;
+    std.io.getStdOut().writeAll(doc) catch {};
+    return 0;
+}
+
 // ── cmd_check ─────────────────────────────────────────────────────────────────
 
-fn cmdCheck(alloc: std.mem.Allocator, path: []const u8) u8 {
+fn cmdCheck(alloc: std.mem.Allocator, path: []const u8, locked: bool, json: bool) u8 {
     const stdout = std.io.getStdOut().writer();
     const stderr = std.io.getStdErr().writer();
 
@@ -188,6 +294,18 @@ fn cmdCheck(alloc: std.mem.Allocator, path: []const u8) u8 {
     };
     const src_dir = std.fs.path.dirname(abs) orelse ".";
 
+    // Toolchain gate (zag.mod) before any compilation work.
+    // In --json mode keep stdout pure JSON: report toolchain refusal as JSON too.
+    if (!json) {
+        if (!enforceToolchain(alloc, src_dir, locked)) return 1;
+    } else {
+        const outcome = toolchain.enforce(alloc, src_dir, locked);
+        if (!outcome.ok) {
+            emitToolchainJson(stdout, path, outcome.problems);
+            return 1;
+        }
+    }
+
     var decls:  []ast.NodeRef    = undefined;
     var s:      sema_mod.Sema    = undefined;
     var report: sema_mod.Report  = undefined;
@@ -197,6 +315,16 @@ fn cmdCheck(alloc: std.mem.Allocator, path: []const u8) u8 {
         return 1;
     };
     defer s.deinit();
+
+    // ── AI-native structured diagnostics ──────────────────────────────────────
+    if (json) {
+        const doc = jsonout.emitReport(alloc, path, s.errors.items, report, decls) catch {
+            stderr.print("OOM building JSON report\n", .{}) catch {};
+            return 1;
+        };
+        stdout.writeAll(doc) catch {};
+        return if (s.errors.items.len > 0 or report.violations.len > 0) @as(u8, 1) else 0;
+    }
 
     printReport(stdout, path, report, &s);
 
@@ -294,6 +422,8 @@ fn cmdBuild(
     run_bin:  bool,
     emit_c:   bool,
     target:   []const u8,
+    locked:   bool,
+    hot:      bool,
 ) u8 {
     // GPU targets take a separate MLIR path
     if (isGpuTarget(target)) {
@@ -308,6 +438,9 @@ fn cmdBuild(
         return 1;
     };
     const src_dir = std.fs.path.dirname(abs) orelse ".";
+
+    // Toolchain gate (zag.mod) before any compilation work.
+    if (!enforceToolchain(alloc, src_dir, locked)) return 1;
 
     // ── 1-4: front-end pipeline ───────────────────────────────────────────────
     var decls:  []ast.NodeRef   = undefined;
@@ -332,7 +465,7 @@ fn cmdBuild(
     }
 
     // ── 6: codegen → C source ────────────────────────────────────────────────
-    const c_src = codegen.gen(alloc, decls, &s, target) catch |e| {
+    const c_src = codegen.gen(alloc, decls, &s, target, hot) catch |e| {
         stderr.print("codegen error: {s}\n", .{@errorName(e)}) catch {};
         return 1;
     };
@@ -375,10 +508,24 @@ fn cmdBuild(
     argv.append(c_path)  catch return 1;
     // Link any C runtime files discovered next to imported modules (std/runtime.c).
     for (parse_mod.linkCFiles(alloc)) |cf| argv.append(cf) catch return 1;
+    // Hot mode: also compile in the hot-reload runtime and export host symbols
+    // so a patch .so can resolve runtime calls and we can dlopen patches.
+    if (hot) {
+        const rt_path = "zag_hotreload_rt.c";
+        std.fs.cwd().writeFile(.{ .sub_path = rt_path, .data = HOTRT_C }) catch |e| {
+            stderr.print("could not write hot-reload runtime: {s}\n", .{@errorName(e)}) catch {};
+            return 1;
+        };
+        argv.append(rt_path) catch return 1;
+    }
     argv.append("-o")    catch return 1;
     argv.append(bin_path) catch return 1;
     argv.append("-lm")   catch return 1;
     argv.append("-w")    catch return 1;
+    if (hot) {
+        argv.append("-ldl")       catch return 1;
+        argv.append("-rdynamic")  catch return 1;
+    }
     for (tinfo.cc_flags) |f| argv.append(f) catch return 1;
 
     var cc_child = std.process.Child.init(argv.items, alloc);
@@ -402,6 +549,13 @@ fn cmdBuild(
     }
 
     stdout.print("\nbuilt native binary: {s}\n", .{bin_path}) catch {};
+    if (hot) {
+        stdout.print(
+            "  [hot] dispatch table linked; functions are live-swappable.\n" ++
+                "  patch with:  zagc hot-patch {s}.zag   then   kill -USR1 <pid>\n",
+            .{stem},
+        ) catch {};
+    }
 
     // ── 9: optionally run the binary ─────────────────────────────────────────
     if (run_bin) {
@@ -425,6 +579,87 @@ fn cmdBuild(
         stdout.print("-- exit {d} --\n", .{run_code}) catch {};
     }
 
+    return 0;
+}
+
+// ── cmd_hot_patch ─────────────────────────────────────────────────────────────
+
+/// Recompile a (possibly edited) source into a patch shared object that a
+/// running `--hot` host can dlopen and swap in live.  Default output:
+/// <stem>_patch.so — point the host at it via ZAG_HOT_PATCH.
+fn cmdHotPatch(alloc: std.mem.Allocator, path: []const u8, out: ?[]const u8) u8 {
+    const stdout = std.io.getStdOut().writer();
+    const stderr = std.io.getStdErr().writer();
+
+    const abs = std.fs.realpathAlloc(alloc, path) catch {
+        stderr.print("{s}: error: file not found\n", .{path}) catch {};
+        return 1;
+    };
+    const src_dir = std.fs.path.dirname(abs) orelse ".";
+
+    var decls:  []ast.NodeRef   = undefined;
+    var s:      sema_mod.Sema   = undefined;
+    var report: sema_mod.Report = undefined;
+    compileFile(alloc, path, src_dir, &decls, &s, &report) catch |e| {
+        stderr.print("{s}: error: {s}\n", .{ path, @errorName(e) }) catch {};
+        return 1;
+    };
+    defer s.deinit();
+
+    if (s.errors.items.len > 0) {
+        stdout.print("patch rejected — capability/type errors:\n", .{}) catch {};
+        for (s.errors.items) |msg| stdout.print("  {s}: error: {s}\n", .{ path, msg }) catch {};
+        return 1;
+    }
+
+    // Hot codegen so the patch exports the same __impl symbols the host rebinds.
+    const c_src = codegen.gen(alloc, decls, &s, "native", true) catch |e| {
+        stderr.print("codegen error: {s}\n", .{@errorName(e)}) catch {};
+        return 1;
+    };
+
+    const stem = stemOf(path);
+    const c_path = std.fmt.allocPrint(alloc, "{s}_patch.c", .{stem}) catch return 1;
+    const so_path: []const u8 = out orelse (std.fmt.allocPrint(alloc, "{s}_patch.so", .{stem}) catch return 1);
+
+    std.fs.cwd().writeFile(.{ .sub_path = c_path, .data = c_src }) catch |e| {
+        stderr.print("could not write {s}: {s}\n", .{ c_path, @errorName(e) }) catch {};
+        return 1;
+    };
+
+    // cc -shared -fPIC -o <so> <c> -lm -w   (undefined runtime symbols resolve
+    // against the -rdynamic host at dlopen time).
+    var argv = std.ArrayList([]const u8).init(alloc);
+    defer argv.deinit();
+    argv.append("cc") catch return 1;
+    argv.append("-shared") catch return 1;
+    argv.append("-fPIC") catch return 1;
+    argv.append("-O2") catch return 1;
+    argv.append("-o") catch return 1;
+    argv.append(so_path) catch return 1;
+    argv.append(c_path) catch return 1;
+    argv.append("-lm") catch return 1;
+    argv.append("-w") catch return 1;
+
+    var child = std.process.Child.init(argv.items, alloc);
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    const term = child.spawnAndWait() catch |e| {
+        stderr.print("failed to invoke cc: {s}\n", .{@errorName(e)}) catch {};
+        return 1;
+    };
+    switch (term) {
+        .Exited => |code| if (code != 0) {
+            stderr.print("C backend failed (exit {d})\n", .{code}) catch {};
+            return 1;
+        },
+        else => {
+            stderr.print("cc terminated abnormally\n", .{}) catch {};
+            return 1;
+        },
+    }
+
+    stdout.print("built patch: {s}\n  apply to a running host:  ZAG_HOT_PATCH={s} ./<host> ; kill -USR1 <pid>\n", .{ so_path, so_path }) catch {};
     return 0;
 }
 
@@ -485,23 +720,64 @@ pub fn main() u8 {
         return 2;
     };
 
-    if (std.mem.eql(u8, cmd, "check")) {
-        const path = args_it.next() orelse {
-            stderr.print("usage: zagc check <file.zag>\n", .{}) catch {};
+    if (std.mem.eql(u8, cmd, "version")) {
+        std.io.getStdOut().writer().print(
+            "zagc {s}  (edition {s}, build {s})\n",
+            .{ version.ZAG_VERSION, version.ZAG_EDITION, version.ZAG_COMMIT },
+        ) catch {};
+        return 0;
+    }
+
+    if (std.mem.eql(u8, cmd, "init")) {
+        // optional project name (else derive from cwd basename)
+        const name: []const u8 = args_it.next() orelse blk: {
+            const cwd = std.fs.cwd().realpathAlloc(alloc, ".") catch break :blk "myproject";
+            break :blk std.fs.path.basename(cwd);
+        };
+        return cmdInit(alloc, name);
+    }
+
+    if (std.mem.eql(u8, cmd, "ast") or std.mem.eql(u8, cmd, "deps")) {
+        var path: ?[]const u8 = null;
+        while (args_it.next()) |arg| {
+            // --json is implied for these commands; accept it for symmetry.
+            if (std.mem.eql(u8, arg, "--json")) continue;
+            if (path == null and !std.mem.startsWith(u8, arg, "-")) path = arg;
+        }
+        const p = path orelse {
+            stderr.print("usage: zagc {s} <file.zag>\n", .{cmd}) catch {};
             return 2;
         };
-        return cmdCheck(alloc, path);
+        return if (std.mem.eql(u8, cmd, "ast")) cmdAst(alloc, p) else cmdDeps(alloc, p);
+    }
+
+    if (std.mem.eql(u8, cmd, "check")) {
+        var path: ?[]const u8 = null;
+        var locked = false;
+        var json = false;
+        while (args_it.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--locked")) {
+                locked = true;
+            } else if (std.mem.eql(u8, arg, "--json")) {
+                json = true;
+            } else if (path == null and !std.mem.startsWith(u8, arg, "-")) {
+                path = arg;
+            }
+        }
+        const p = path orelse {
+            stderr.print("usage: zagc check <file.zag> [--locked] [--json]\n", .{}) catch {};
+            return 2;
+        };
+        return cmdCheck(alloc, p, locked, json);
     }
 
     if (std.mem.eql(u8, cmd, "build")) {
-        const path = args_it.next() orelse {
-            stderr.print("usage: zagc build <file.zag> [options]\n", .{}) catch {};
-            return 2;
-        };
-
+        var path:   ?[]const u8 = null;
         var out:    ?[]const u8 = null;
         var run_bin = false;
         var emit_c  = false;
+        var locked  = false;
+        var hot     = false;
         var target: []const u8 = "native";
 
         // Parse remaining flags
@@ -515,18 +791,74 @@ pub fn main() u8 {
                 run_bin = true;
             } else if (std.mem.eql(u8, arg, "--emit-c")) {
                 emit_c = true;
+            } else if (std.mem.eql(u8, arg, "--locked")) {
+                locked = true;
+            } else if (std.mem.eql(u8, arg, "--hot")) {
+                hot = true;
             } else if (std.mem.eql(u8, arg, "--target")) {
                 target = args_it.next() orelse {
                     stderr.print("--target requires an argument\n", .{}) catch {};
                     return 2;
                 };
+            } else if (path == null and !std.mem.startsWith(u8, arg, "-")) {
+                path = arg;
             }
             // Unknown flags are silently ignored (same as Python driver)
         }
 
-        return cmdBuild(alloc, path, out, run_bin, emit_c, target);
+        const p = path orelse {
+            stderr.print("usage: zagc build <file.zag> [options]\n", .{}) catch {};
+            return 2;
+        };
+
+        return cmdBuild(alloc, p, out, run_bin, emit_c, target, locked, hot);
+    }
+
+    if (std.mem.eql(u8, cmd, "hot-patch")) {
+        var path: ?[]const u8 = null;
+        var out:  ?[]const u8 = null;
+        while (args_it.next()) |arg| {
+            if (std.mem.eql(u8, arg, "-o")) {
+                out = args_it.next() orelse {
+                    stderr.print("-o requires an argument\n", .{}) catch {};
+                    return 2;
+                };
+            } else if (path == null and !std.mem.startsWith(u8, arg, "-")) {
+                path = arg;
+            }
+        }
+        const p = path orelse {
+            stderr.print("usage: zagc hot-patch <file.zag> [-o out.so]\n", .{}) catch {};
+            return 2;
+        };
+        return cmdHotPatch(alloc, p, out);
     }
 
     std.io.getStdOut().writeAll(USAGE) catch {};
     return 2;
+}
+
+// ── cmd_init ──────────────────────────────────────────────────────────────────
+
+fn cmdInit(alloc: std.mem.Allocator, name: []const u8) u8 {
+    const stdout = std.io.getStdOut().writer();
+    const stderr = std.io.getStdErr().writer();
+
+    if (std.fs.cwd().access(toolchain.MANIFEST_NAME, .{})) |_| {
+        stderr.print("zag.mod already exists — refusing to overwrite a lockfile.\n", .{}) catch {};
+        return 1;
+    } else |_| {}
+
+    const body = toolchain.renderInit(alloc, name) catch {
+        stderr.print("OOM rendering zag.mod\n", .{}) catch {};
+        return 1;
+    };
+    std.fs.cwd().writeFile(.{ .sub_path = toolchain.MANIFEST_NAME, .data = body }) catch |e| {
+        stderr.print("could not write zag.mod: {s}\n", .{@errorName(e)}) catch {};
+        return 1;
+    };
+    stdout.print("wrote zag.mod (project '{s}', pinned to zagc {s} / edition {s})\n", .{
+        name, version.ZAG_VERSION, version.ZAG_EDITION,
+    }) catch {};
+    return 0;
 }

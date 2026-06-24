@@ -46,6 +46,12 @@ fn ctype(alloc: std.mem.Allocator, zty_raw: []const u8) anyerror![]const u8 {
         break :blk zty_raw[0..best];
     };
 
+    // Normalize raw literal kinds to their default concrete C-mappable type so a
+    // type-inferred `let i = 0` (type "int_lit") lowers to int32_t, not the
+    // literal text "int_lit". (defaultTy: int_lit→i32, float_lit→f32, str→[]u8.)
+    const norm = types.defaultTy(zty);
+    if (!std.mem.eql(u8, norm, zty)) return ctype(alloc, norm);
+
     const exact_map = .{
         .{ "i8", "int8_t" },
         .{ "i16", "int16_t" },
@@ -305,10 +311,14 @@ const Ctx = struct {
     emitted_clo_types: std.StringHashMap(void),  // dedup
     thunks: std.ArrayList(u8),        // __thunk_fnname wrappers
     emitted_thunks: std.StringHashMap(void),     // dedup
+    iface_defs: std.ArrayList(u8),    // interface vtable thunks + static vtables
     pre_stmts: std.ArrayList(u8),     // statements to emit before the current statement
     new_type_hint: ?[]const u8,       // hint for new() type when declared type is available
+    hot: bool,                        // --hot: route fns through a swappable dispatch table
+    hot_defs: std.ArrayList(u8),      // fp globals + trampolines + registry (hot mode)
+    hot_names: std.ArrayList([]const u8), // impl symbol names registered for hot-swap
 
-    fn init(alloc: std.mem.Allocator, s: *const sema_mod.Sema, target: []const u8) Ctx {
+    fn init(alloc: std.mem.Allocator, s: *const sema_mod.Sema, target: []const u8, hot: bool) Ctx {
         return .{
             .buf = std.ArrayList(u8).init(alloc),
             .alloc = alloc,
@@ -330,8 +340,12 @@ const Ctx = struct {
             .emitted_clo_types = std.StringHashMap(void).init(alloc),
             .thunks = std.ArrayList(u8).init(alloc),
             .emitted_thunks = std.StringHashMap(void).init(alloc),
+            .iface_defs = std.ArrayList(u8).init(alloc),
             .pre_stmts = std.ArrayList(u8).init(alloc),
             .new_type_hint = null,
+            .hot = hot,
+            .hot_defs = std.ArrayList(u8).init(alloc),
+            .hot_names = std.ArrayList([]const u8).init(alloc),
         };
     }
 
@@ -345,6 +359,9 @@ const Ctx = struct {
         self.emitted_clo_types.deinit();
         self.thunks.deinit();
         self.emitted_thunks.deinit();
+        self.iface_defs.deinit();
+        self.hot_defs.deinit();
+        self.hot_names.deinit();
         self.pre_stmts.deinit();
     }
 
@@ -768,6 +785,21 @@ fn genCall(ctx: *Ctx, c: ast.Call) !void {
                 try ctx.w(")");
                 return;
             }
+            // Interface dynamic dispatch: base is an interface fat-pointer, so
+            // call through the vtable — (b).vt->m((b).self, args...).
+            if (ctx.s.interfaces.contains(bty)) {
+                try ctx.w("(");
+                try genExpr(ctx, f.base);
+                try ctx.wf(").vt->{s}((", .{f.fname});
+                try genExpr(ctx, f.base);
+                try ctx.w(").self");
+                for (c.args) |arg| {
+                    try ctx.w(", ");
+                    try genExpr(ctx, arg);
+                }
+                try ctx.w(")");
+                return;
+            }
             // For pointer types *T, strip the * for method dispatch (method is on T, not *T)
             const effective_bty = if (bty.len > 1 and bty[0] == '*') bty[1..] else bty;
             const ct = try ctype(ctx.alloc, effective_bty);
@@ -886,6 +918,28 @@ fn genCall(ctx: *Ctx, c: ast.Call) !void {
             try genExpr(ctx, arg);
             try ctx.w("}");
         } else {
+            // Structural duck-typing: callee param is an interface and the arg
+            // is a concrete value → box it into the interface fat-pointer with
+            // the compiler-synthesized vtable for (interface, concrete).
+            if (c.callee.* == .var_) {
+                const callee_name = c.callee.var_.name;
+                if (ctx.s.fns.get(callee_name)) |fn_node| {
+                    if (fn_node.* == .fn_decl) {
+                        const fd = fn_node.fn_decl;
+                        if (i < fd.params.len) {
+                            const param_ty = fd.params[i].pty;
+                            const arg_ty = ast.nodeType(arg) orelse "";
+                            if (ctx.s.interfaces.contains(param_ty) and !std.mem.eql(u8, arg_ty, param_ty)) {
+                                const cct = try ctype(ctx.alloc, arg_ty);
+                                try ctx.wf("({s}){{ (void*)&(", .{param_ty});
+                                try genExpr(ctx, arg);
+                                try ctx.wf("), &{s}__vt__{s} }}", .{ param_ty, cct });
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
             // Check if named function being passed as closure param
             if (arg.* == .var_) {
                 const vname = arg.var_.name;
@@ -1916,6 +1970,84 @@ fn fnCName(alloc: std.mem.Allocator, f: ast.FnDecl) ![]const u8 {
     return mangleGenericName(alloc, f.name);
 }
 
+/// Is this function hot-swappable (gets a trampoline + dispatch slot)?
+fn hotTrampolined(ctx: *const Ctx, f: ast.FnDecl) bool {
+    return ctx.hot and !f.is_extern and f.body != null and f.tparams.len == 0 and !isMainFn(f);
+}
+
+/// Comma-separated C parameter *types* (receiver first), or "void" if none.
+fn paramTypeList(ctx: *Ctx, f: ast.FnDecl) ![]const u8 {
+    var out = std.ArrayList(u8).init(ctx.alloc);
+    const w = out.writer();
+    var first = true;
+    if (f.recv_type) |rt| {
+        try w.writeAll(try ctype(ctx.alloc, rt));
+        first = false;
+    }
+    for (f.params) |p| {
+        if (!first) try w.writeAll(", ");
+        first = false;
+        try w.writeAll(try ctype(ctx.alloc, p.pty));
+    }
+    if (first) try w.writeAll("void");
+    return out.toOwnedSlice();
+}
+
+/// Comma-separated C parameter *declarations* ("T self, U p0"), or empty.
+fn paramDeclList(ctx: *Ctx, f: ast.FnDecl) ![]const u8 {
+    var out = std.ArrayList(u8).init(ctx.alloc);
+    const w = out.writer();
+    var first = true;
+    if (f.recv_type) |rt| {
+        try w.print("{s} self", .{try ctype(ctx.alloc, rt)});
+        first = false;
+    }
+    for (f.params) |p| {
+        if (!first) try w.writeAll(", ");
+        first = false;
+        try w.print("{s} {s}", .{ try ctype(ctx.alloc, p.pty), p.name });
+    }
+    return out.toOwnedSlice();
+}
+
+/// Comma-separated argument *names* ("self, p0, p1"), or empty.
+fn argNameList(ctx: *Ctx, f: ast.FnDecl) ![]const u8 {
+    var out = std.ArrayList(u8).init(ctx.alloc);
+    const w = out.writer();
+    var first = true;
+    if (f.recv_type != null) {
+        try w.writeAll("self");
+        first = false;
+    }
+    for (f.params) |p| {
+        if (!first) try w.writeAll(", ");
+        first = false;
+        try w.writeAll(p.name);
+    }
+    return out.toOwnedSlice();
+}
+
+/// Emit the swappable function pointer + trampoline for a hot fn into hot_defs.
+///   static RET (*__zag_fp_foo)(TYPES) = foo__impl;
+///   RET foo(DECLS) { return __zag_fp_foo(ARGS); }
+/// Real call sites keep calling `foo`; the trampoline forwards through the
+/// pointer, which the runtime atomically re-aims at the reloaded impl.
+fn emitHotTrampoline(ctx: *Ctx, f: ast.FnDecl) !void {
+    const ret_ct = try ctype(ctx.alloc, f.ret);
+    const name = try fnCName(ctx.alloc, f);
+    const types_s = try paramTypeList(ctx, f);
+    const decls_s = try paramDeclList(ctx, f);
+    const args_s = try argNameList(ctx, f);
+    const hd = ctx.hot_defs.writer();
+    try hd.print("static {s} (*__zag_fp_{s})({s}) = {s}__impl;\n", .{ ret_ct, name, types_s, name });
+    try hd.print("{s} {s}({s}) {{ {s}__zag_fp_{s}({s}); }}\n", .{
+        ret_ct, name, decls_s,
+        if (std.mem.eql(u8, f.ret, "void")) "" else "return ",
+        name, args_s,
+    });
+    try ctx.hot_names.append(name);
+}
+
 fn genFnForwardDecl(ctx: *Ctx, f: ast.FnDecl) !void {
     if (f.tparams.len > 0) return;
     // Extern fn: emit a non-static C prototype with the literal (unmangled) name.
@@ -1939,6 +2071,16 @@ fn genFnForwardDecl(ctx: *Ctx, f: ast.FnDecl) !void {
 
     const ret_ct = try ctype(ctx.alloc, f.ret);
     const fn_name = try fnCName(ctx.alloc, f);
+
+    // Hot mode: forward-declare both the impl and the trampoline (non-static so
+    // a patch .so exports the impl for dlsym), and emit the trampoline now.
+    if (hotTrampolined(ctx, f)) {
+        const types_s = try paramTypeList(ctx, f);
+        try ctx.wf("{s} {s}__impl({s});\n", .{ ret_ct, fn_name, types_s });
+        try ctx.wf("{s} {s}({s});\n", .{ ret_ct, fn_name, types_s });
+        try emitHotTrampoline(ctx, f);
+        return;
+    }
 
     try ctx.wf("static {s} {s}(", .{ ret_ct, fn_name });
     var first = true;
@@ -1964,11 +2106,19 @@ fn genFnBody(ctx: *Ctx, f: ast.FnDecl) !void {
     if (f.tparams.len > 0) return;
 
     const is_main = isMainFn(f);
-    const is_static = !is_main;
+    const trampolined = hotTrampolined(ctx, f);
+    // Hot mode exports all impls (non-static) so a patch .so is dlsym-able.
+    const is_static = !is_main and !ctx.hot;
 
     // main always returns C int, not int32_t
     const ret_ct = if (is_main) "int" else try ctype(ctx.alloc, f.ret);
-    const fn_name = try fnCName(ctx.alloc, f);
+    const base_name = try fnCName(ctx.alloc, f);
+    // Trampolined fns put their real body under `<name>__impl`; `<name>` is the
+    // trampoline emitted in hot_defs.
+    const fn_name = if (trampolined)
+        try std.fmt.allocPrint(ctx.alloc, "{s}__impl", .{base_name})
+    else
+        base_name;
 
     if (is_static) {
         try ctx.wf("static {s} {s}(", .{ ret_ct, fn_name });
@@ -2012,6 +2162,63 @@ fn genFnBody(ctx: *Ctx, f: ast.FnDecl) !void {
 
     ctx.indent = 0;
     try ctx.w("}\n\n");
+}
+
+// ── Interface (structural duck-typing) lowering ────────────────────────────────
+
+/// Emit, for every interface, a vtable struct + a fat-pointer typedef:
+///   typedef struct Reader_vtable { int32_t (*read)(void* self); } Reader_vtable;
+///   typedef struct { void* self; const Reader_vtable* vt; } Reader;
+/// These go in the type-declaration section, before any fn forward decls.
+fn emitIfaceTypedefs(ctx: *Ctx, decls: []ast.NodeRef) !void {
+    for (decls) |node| {
+        if (node.* != .interface_decl) continue;
+        const id = node.interface_decl;
+        try ctx.wf("typedef struct {s}_vtable {{\n", .{id.name});
+        for (id.methods) |m| {
+            const ret_ct = try ctype(ctx.alloc, m.ret);
+            try ctx.wf("    {s} (*{s})(void* self", .{ ret_ct, m.name });
+            for (m.params) |p| {
+                const pc = try ctype(ctx.alloc, p.pty);
+                try ctx.wf(", {s}", .{pc});
+            }
+            try ctx.w(");\n");
+        }
+        try ctx.wf("}} {s}_vtable;\n", .{id.name});
+        try ctx.wf("typedef struct {{ void* self; const {s}_vtable* vt; }} {s};\n", .{ id.name, id.name });
+    }
+}
+
+/// For each proven (interface, concrete) impl recorded by sema, emit adapter
+/// thunks (which unbox `void* self` back to the concrete and forward to the
+/// real method) plus a static vtable instance. The compiler synthesizes the
+/// vtable layout — the programmer writes zero interface boilerplate.
+fn emitIfaceImpls(ctx: *Ctx) !void {
+    const w = ctx.iface_defs.writer();
+    for (ctx.s.iface_impls.items) |impl| {
+        const inode = ctx.s.interfaces.get(impl.iface) orelse continue;
+        const id = inode.*.interface_decl;
+        const cct = try ctype(ctx.alloc, impl.concrete); // concrete C type / identifier
+        for (id.methods) |m| {
+            const ret_ct = try ctype(ctx.alloc, m.ret);
+            try w.print("static {s} {s}__{s}__{s}(void* self", .{ ret_ct, impl.iface, cct, m.name });
+            for (m.params) |p| {
+                const pc = try ctype(ctx.alloc, p.pty);
+                try w.print(", {s} {s}", .{ pc, p.name });
+            }
+            try w.writeAll(") { ");
+            if (!std.mem.eql(u8, m.ret, "void")) try w.writeAll("return ");
+            try w.print("{s}_{s}(*({s}*)self", .{ cct, m.name, cct });
+            for (m.params) |p| try w.print(", {s}", .{p.name});
+            try w.writeAll("); }\n");
+        }
+        try w.print("static const {s}_vtable {s}__vt__{s} = {{ ", .{ id.name, impl.iface, cct });
+        for (id.methods, 0..) |m, i| {
+            if (i > 0) try w.writeAll(", ");
+            try w.print("{s}__{s}__{s}", .{ impl.iface, cct, m.name });
+        }
+        try w.writeAll(" };\n");
+    }
 }
 
 // ── Top-level type declarations ────────────────────────────────────────────────
@@ -2082,8 +2289,9 @@ pub fn gen(
     decls: []ast.NodeRef,
     s: *const sema_mod.Sema,
     target: []const u8,
+    hot: bool,
 ) ![]const u8 {
-    var ctx = Ctx.init(alloc, s, target);
+    var ctx = Ctx.init(alloc, s, target, hot);
     defer ctx.deinit();
 
     // 1. Prelude
@@ -2206,6 +2414,10 @@ pub fn gen(
             }
         }
     }
+
+    // 3d. Interface vtable + fat-pointer typedefs (structural duck typing).
+    //     Must precede fn forward decls that take interface params by value.
+    try emitIfaceTypedefs(&ctx, decls);
 
     // 4. Collect optional/result types from fn signatures, and closure typedefs for fn return types
     for (decls) |node| {
@@ -2378,6 +2590,21 @@ pub fn gen(
     }
     try ctx.w("\n");
 
+    // 5b. Hot-reload registry: a table the runtime walks to re-aim every
+    //     dispatch pointer at a freshly dlopen'd patch .so.
+    if (ctx.hot) {
+        const hd = ctx.hot_defs.writer();
+        try hd.writeAll("typedef struct { const char* sym; void** slot; } ZagHotEntry;\n");
+        const n = ctx.hot_names.items.len;
+        try hd.print("ZagHotEntry __zag_hot_entries[{d}] = {{\n", .{if (n == 0) @as(usize, 1) else n});
+        for (ctx.hot_names.items) |name| {
+            try hd.print("  {{ \"{s}__impl\", (void**)&__zag_fp_{s} }},\n", .{ name, name });
+        }
+        if (n == 0) try hd.writeAll("  { 0, 0 },\n");
+        try hd.writeAll("};\n");
+        try hd.print("int __zag_hot_entry_count = {d};\n", .{n});
+    }
+
     // 6. Generate fn bodies; closure defs accumulate in closures_fwd/impl
     const after_fwd = try ctx.buf.toOwnedSlice();
     ctx.buf = std.ArrayList(u8).init(alloc);
@@ -2404,8 +2631,15 @@ pub fn gen(
     const bodies = try ctx.buf.toOwnedSlice();
     ctx.buf = std.ArrayList(u8).init(alloc);
 
-    // Assemble: prelude+types+typedefs+fwddecls | new clo_typedefs | clo_fwd | clo_impl | fn bodies
+    // Interface adapter thunks + static vtables (reference the fn forward decls
+    // emitted in after_fwd; referenced in turn by boxing exprs in the bodies).
+    try emitIfaceImpls(&ctx);
+
+    // Assemble: prelude+types+typedefs+fwddecls | hot defs | new clo_typedefs | clo_fwd | clo_impl | fn bodies
     try ctx.buf.appendSlice(after_fwd);
+    if (ctx.hot_defs.items.len > 0) {
+        try ctx.buf.appendSlice(ctx.hot_defs.items);
+    }
     // Any new closure typedefs discovered during body gen (should be empty if pre-pass caught all)
     if (ctx.clo_typedefs.items.len > 0) {
         try ctx.buf.appendSlice(ctx.clo_typedefs.items);
@@ -2416,6 +2650,9 @@ pub fn gen(
     }
     if (ctx.thunks.items.len > 0) {
         try ctx.buf.appendSlice(ctx.thunks.items);
+    }
+    if (ctx.iface_defs.items.len > 0) {
+        try ctx.buf.appendSlice(ctx.iface_defs.items);
     }
     try ctx.buf.appendSlice(bodies);
 

@@ -577,7 +577,7 @@ earn its keep across the tree. Do not let the Phase-4 dream block the Phase-0 wi
 
 ### Completeness of THIS repo right now
 - Design: **100%** of the v0.1 scope above.
-- Compiler (`zag-poc/zagc.py`, ~1100 lines): lexer/parser **~90%** of the subset grammar,
+- Compiler (`zag-poc/src/` in Zig, ~8,400 lines; the Python prototype is retired): lexer/parser **~90%** of the subset grammar,
   effect checker (decidable cases) **~85%**, **effect polymorphism ~90%** — call-site
   inference, bounded callback types, effects-as-types through locals/returns/struct fields,
   and **allocation-free closures** that instantiate the effect variable `! e`,
