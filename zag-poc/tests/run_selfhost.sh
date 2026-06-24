@@ -117,6 +117,30 @@ if $ZAGC build selfhost/zagc.zag >/dev/null 2>&1 && [ -x ./zagc ]; then
     else
         echo "  XX  generic structs (got '$gsout', want '42 123')"; fail=$((fail+1))
     fi
+
+    # @-builtins + casts: @sizeOf (direct & generic-substituted) and `as` casts.
+    printf 'fn esize[T]() i32 { return @sizeOf[T](); }\nfn main() void {\n  let n: i64 = 300;\n  print_i32(n as i32);\n  print_i32(@sizeOf[i32]());\n  print_i32(esize[i32]());\n  print_i32(esize[f64]());\n}\n' > $SH/bi.zag
+    $SH/zagc $SH/bi.zag >/dev/null 2>&1
+    biout=""
+    if [ -x $SH/bi.zag.out ]; then biout=$($SH/bi.zag.out | tr '\n' ' ' | sed 's/ *$//'); fi
+    if [ "$biout" = "300 4 4 8" ]; then
+        echo "  ok  builtins (@sizeOf direct/generic + as cast)"; pass=$((pass+1))
+    else
+        echo "  XX  builtins (got '$biout', want '300 4 4 8')"; fail=$((fail+1))
+    fi
+
+    # Generic heap container (the ArrayList pattern): generic struct + extern
+    # malloc + @sizeOf[T] + `as *T` + pointer indexing. zagc emits the .c; we
+    # link std/runtime.c (the self-hosted driver does not auto-link it yet).
+    printf 'extern fn _zag_malloc(n: i32) *i8 @alloc @panic;\nstruct Vec[T] { data: *T, len: i32, cap: i32 }\nfn vnew[T](cap: i32) Vec[T] { let r: *i8 = _zag_malloc(cap * @sizeOf[T]()); return Vec[T]{ .data = r as *T, .len = 0, .cap = cap }; }\nfn vset[T](v: *Vec[T], i: i32, x: T) void { v.*.data[i] = x; }\nfn vget[T](v: Vec[T], i: i32) T { return v.data[i]; }\nfn main() void { let v: Vec[i32] = vnew[i32](4); vset[i32](&v, 0, 10); vset[i32](&v, 1, 32); print_i32(vget[i32](v, 0) + vget[i32](v, 1)); }\n' > $SH/vec.zag
+    $SH/zagc $SH/vec.zag >/dev/null 2>&1   # writes vec.zag.c (link fails: no runtime.c — expected)
+    vout=""
+    if cc $SH/vec.zag.c std/runtime.c -o $SH/vec 2>/dev/null; then vout=$($SH/vec); fi
+    if [ "$vout" = "42" ]; then
+        echo "  ok  generic heap container (Vec[i32] via malloc/@sizeOf/as*T → 42)"; pass=$((pass+1))
+    else
+        echo "  XX  generic heap container (got '$vout', want 42)"; fail=$((fail+1))
+    fi
 else
     echo "  XX  driver (zagc failed to build)"; fail=$((fail+1))
 fi
