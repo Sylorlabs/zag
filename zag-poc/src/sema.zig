@@ -462,10 +462,21 @@ pub const Sema = struct {
             const sd = &kv.value_ptr.*.*.struct_decl;
             for (sd.fields) |p| self.checkTypeExists(p.pty, sd.line);
         }
-        // Type-check all concrete fns
+        // Type-check all concrete fns.
+        //
+        // checkFn → instFn adds monomorphized instances to self.fns. Mutating the
+        // map while iterating it corrupts the iterator and can silently skip
+        // functions, leaving their generic calls without an inst_name (codegen
+        // then emits a bare, undefined name). So snapshot the current functions
+        // first; newly-created instantiations are checked by instFn directly.
+        var to_check = std.ArrayList(ast.NodeRef).init(self.alloc);
+        defer to_check.deinit();
         var fit2 = self.fns.iterator();
         while (fit2.next()) |kv| {
-            self.checkFn(kv.value_ptr.*);
+            to_check.append(kv.value_ptr.*) catch {};
+        }
+        for (to_check.items) |node| {
+            self.checkFn(node);
         }
     }
 
