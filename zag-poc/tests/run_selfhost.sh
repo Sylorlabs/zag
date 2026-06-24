@@ -83,6 +83,18 @@ if $ZAGC build selfhost/zagc.zag >/dev/null 2>&1 && [ -x ./zagc ]; then
     else
         echo "  XX  driver (okout='$okout', bad='$badmsg')"; fail=$((fail+1))
     fi
+
+    # Stage C progress: self-hosted zagc compiles structs + enums (field access
+    # disambiguation, struct literals, enum constants) to correct native code.
+    printf 'struct Point { x: i32, y: i32 }\nenum Tag { Lo, Hi }\nfn dist2(p: Point) i32 { return p.x * p.x + p.y * p.y; }\nfn pick(t: Tag) i32 { if (t == Tag.Hi) { return 100; } return 1; }\nfn main() void { let p: Point = Point{ .x = 3, .y = 4 }; print_i32(dist2(p) + pick(Tag.Hi)); }\n' > $SH/se.zag
+    $SH/zagc $SH/se.zag >/dev/null 2>&1
+    seout=""
+    if [ -x $SH/se.zag.out ]; then seout=$($SH/se.zag.out); fi
+    if [ "$seout" = "125" ]; then
+        echo "  ok  stage-c (structs + enums: dist2(3,4)+pick(Hi)=125)"; pass=$((pass+1))
+    else
+        echo "  XX  stage-c (got '$seout', want 125)"; fail=$((fail+1))
+    fi
 else
     echo "  XX  driver (zagc failed to build)"; fail=$((fail+1))
 fi

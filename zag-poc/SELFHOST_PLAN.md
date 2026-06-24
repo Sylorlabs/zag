@@ -88,11 +88,20 @@ Notes for later stages:
   propagates through flat re-imports. list.zag is imported flat for ArrayList.
 - `|` (bitwise OR) is unusable as a binary op (lexes as capture pipe); use arithmetic.
 
-## Stage C — Bootstrap verification
+## Stage C — Bootstrap verification (IN PROGRESS)
 
-- [ ] C1. zig-zagc compiles zag-zagc → `zagc2`
-- [ ] C2. `zagc2` compiles the full test suite with identical output
-- [ ] C3. `zagc2` compiles itself → `zagc3`; `diff` zagc2-output vs zagc3-output (fixpoint)
+- [x] C1. zig-zagc compiles zag-zagc → `zagc2` (selfhost/zagc.zag → ./zagc binary).
+- [x] C2a. `zagc2` compiles real programs: fns+recursion (fact→720), structs
+       (Point→25), enums (Color.Green→7). Field-access disambiguation by convention
+       (capitalized member = enum constant `Enum_Member`; lowercase = struct field
+       `x.f`) since the self-hosted codegen is type-unaware.
+- [ ] C2b. Grow self-hosted codegen to the features selfhost/*.zag itself uses:
+       tagged unions + switch, generics monomorphization (ArrayList/StringMap),
+       optionals/orelse, slicing, @import. (Largest remaining work — generics +
+       monomorphization need the self-hosted SEMA to do type inference, which it
+       doesn't yet; currently sema.zag is effect-only.)
+- [ ] C3. `zagc2` compiles its own source → `zagc3`; verify fixpoint (zagc2 and
+       zagc3 produce identical output). Blocked on C2b.
 
 ## Status log
 
