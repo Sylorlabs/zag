@@ -6,6 +6,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const sema_mod = @import("sema.zig");
 const types = @import("types.zig");
+const gpu_mlir = @import("gpu_mlir.zig");
 
 // ── Embedded prelude ──────────────────────────────────────────────────────────
 const NUMERIC_C = @embedFile("numeric_prelude.c");
@@ -2752,11 +2753,6 @@ pub fn genMlir(
     s:      *const sema_mod.Sema,
     target: []const u8,
 ) ![]const u8 {
-    _ = decls;
-    _ = s;
-    return try std.fmt.allocPrint(alloc,
-        \\// MLIR stub — target: {s}
-        \\module {{}}
-        \\
-    , .{target});
+    // Real MLIR emitter lives in gpu_mlir.zig (faithful port of gpu/mlir_emitter.py).
+    return gpu_mlir.genMlir(alloc, decls, s, target);
 }

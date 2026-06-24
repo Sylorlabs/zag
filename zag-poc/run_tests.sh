@@ -68,5 +68,20 @@ ppu(){ ./zig-out/bin/zagc build examples/$1.zag --target ppu32 --emit-c >/tmp/zt
        else echo "  XX  $1 (ppu32)"; fail=$((fail+1)); cat /tmp/zt; fi
        rm -f $1.c 2>/dev/null; }
 ppu posit32
+echo "── P5: GPU/MLIR backend — gpu-nvidia (emit MLIR, check dialect constructs) ──"
+# gpu <example> <grep-pattern...>: build to MLIR, assert all patterns present.
+gpu(){ local ex="$1"; shift
+       ./zig-out/bin/zagc build examples/$ex.zag --target gpu-nvidia >/tmp/zt 2>&1
+       # the gpu path writes <stem>.mlir into the cwd
+       local ok=1
+       if [ ! -f $ex.mlir ]; then ok=0; fi
+       for pat in "$@"; do
+           if ! grep -q "$pat" $ex.mlir 2>/dev/null; then ok=0; echo "    missing: $pat"; fi
+       done
+       if [ "$ok" -eq 1 ]; then echo "  ok  $ex (gpu-nvidia MLIR: kernels/dialects present)"; pass=$((pass+1))
+       else echo "  XX  $ex (gpu-nvidia)"; fail=$((fail+1)); cat /tmp/zt; fi
+       rm -f $ex.mlir 2>/dev/null; }
+gpu gpu_matmul_mx 'gpu.module @zag_kernels' 'gpu.func @matmulMxKernel' ' kernel {' 'f8E4M3FN' 'gpu.thread_id' 'gpu.block_id' 'scf.while' 'func.func @tileSize' 'gpu.return'
+gpu gpu_vsa_hd 'gpu.module @zag_kernels' 'gpu.func @vsaBindKernel' ' kernel {' 'gpu.barrier' 'gpu.thread_id' 'gpu.block_id' 'scf.while' 'func.func @runVsaPipeline'
 echo "════ pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]
