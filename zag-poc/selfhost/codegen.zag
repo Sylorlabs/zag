@@ -86,8 +86,9 @@ fn ctype(t: []u8) []u8 {
 // One concrete instantiation of a generic fn, e.g. id[i32] → "id_i32".
 struct Inst {
     mangled: []u8,
-    f:       FnDecl,         // the generic fn template (captured by value; shares buffers)
+    f:       FnDecl,             // the generic fn template (for the substituted signature)
     targs:   ArrayList[[]u8],
+    cbody:   ArrayList[*Node],   // body cloned with type-params substituted to concrete types
 }
 
 fn cg_callee_name(n: *Node) []u8 {
@@ -163,6 +164,78 @@ fn inst_seen(insts: ArrayList[Inst], mangled: []u8) bool {
         i = i + 1;
     }
     return false;
+}
+
+// ── clone AST with type-param substitution (for monomorphizing fn bodies) ─────
+fn subst_targs(targs: ArrayList[[]u8], tp: ArrayList[[]u8], ta: ArrayList[[]u8]) ArrayList[[]u8] {
+    let out: ArrayList[[]u8] = make[[]u8](2);
+    let i: i32 = 0;
+    while (i < len[[]u8](targs)) {
+        push[[]u8](&out, subst_type(get[[]u8](targs, i), tp, ta));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn clone_call(c: Call, tp: ArrayList[[]u8], ta: ArrayList[[]u8]) *Node {
+    let args: ArrayList[*Node] = make[*Node](4);
+    let i: i32 = 0;
+    while (i < len[*Node](c.args)) {
+        push[*Node](&args, clone_expr(get[*Node](c.args, i), tp, ta));
+        i = i + 1;
+    }
+    if (len[[]u8](c.targs) > 0) {
+        return mk_gcall(clone_expr(c.callee, tp, ta), args, subst_targs(c.targs, tp, ta));
+    }
+    return mk_call(clone_expr(c.callee, tp, ta), args);
+}
+
+fn clone_slit(s: StructLit, tp: ArrayList[[]u8], ta: ArrayList[[]u8]) *Node {
+    let flds: ArrayList[FieldInit] = make[FieldInit](4);
+    let i: i32 = 0;
+    while (i < len[FieldInit](s.fields)) {
+        let f: FieldInit = get[FieldInit](s.fields, i);
+        push[FieldInit](&flds, FieldInit{ .name = f.name, .val = clone_expr(f.val, tp, ta) });
+        i = i + 1;
+    }
+    return new(Node{ .slit_ = StructLit{ .sname = s.sname, .fields = flds, .targs = subst_targs(s.targs, tp, ta) } });
+}
+
+fn clone_expr(n: *Node, tp: ArrayList[[]u8], ta: ArrayList[[]u8]) *Node {
+    return switch (n.*) {
+        .ilit  => |x| mk_int(x.text),
+        .slit  => |x| mk_str(x.text),
+        .id    => |x| mk_ident(x.name),
+        .bin   => |b| mk_bin(b.op, clone_expr(b.l, tp, ta), clone_expr(b.r, tp, ta)),
+        .un    => |u| mk_un(u.op, clone_expr(u.e, tp, ta)),
+        .call  => |c| clone_call(c, tp, ta),
+        .fld   => |f| mk_field(clone_expr(f.base, tp, ta), f.fname),
+        .idx   => |x| mk_index(clone_expr(x.base, tp, ta), clone_expr(x.idx, tp, ta)),
+        .slit_ => |s| clone_slit(s, tp, ta),
+        else   => n,
+    };
+}
+
+fn clone_block(body: ArrayList[*Node], tp: ArrayList[[]u8], ta: ArrayList[[]u8]) ArrayList[*Node] {
+    let out: ArrayList[*Node] = make[*Node](8);
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        push[*Node](&out, clone_stmt(get[*Node](body, i), tp, ta));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn clone_stmt(n: *Node, tp: ArrayList[[]u8], ta: ArrayList[[]u8]) *Node {
+    return switch (n.*) {
+        .let_   => |l| mk_let(l.name, subst_type(l.dty, tp, ta), l.has_dty, clone_expr(l.expr, tp, ta)),
+        .ret    => |r| mk_ret(r.has_expr, clone_expr(r.expr, tp, ta)),
+        .if_    => |x| mk_if(clone_expr(x.cond, tp, ta), clone_block(x.then_body, tp, ta), clone_block(x.els_body, tp, ta), x.has_els),
+        .while_ => |w| mk_while(clone_expr(w.cond, tp, ta), clone_block(w.body, tp, ta)),
+        .assign => |a| mk_assign(clone_expr(a.target, tp, ta), clone_expr(a.expr, tp, ta)),
+        .estmt  => |e| mk_estmt(clone_expr(e.expr, tp, ta)),
+        else    => n,
+    };
 }
 
 // ── expressions ──────────────────────────────────────────────────────────────
@@ -466,7 +539,8 @@ fn collect_call(c: Call, decls: ArrayList[*Node], insts: *ArrayList[Inst]) void 
                 switch (d.*) {
                     .fn_decl => |f| {
                         if (len[[]u8](f.tparams) > 0 && @strEq(f.name, cn)) {
-                            push[Inst](insts, Inst{ .mangled = mangled, .f = f, .targs = c.targs });
+                            let cb: ArrayList[*Node] = clone_block(f.body, f.tparams, c.targs);
+                            push[Inst](insts, Inst{ .mangled = mangled, .f = f, .targs = c.targs, .cbody = cb });
                         }
                     }
                     else => { }
@@ -579,9 +653,18 @@ fn collect_sinst_block(body: ArrayList[*Node], decls: ArrayList[*Node], sinsts: 
     }
 }
 
+// Record a struct instantiation implied by a type string like "Pair[i32]".
+fn record_type_sinst(t: []u8, decls: ArrayList[*Node], sinsts: *ArrayList[SInst]) void {
+    if (!is_generic_app(t)) { return; }
+    let lb: i32 = index_of(t, '[');
+    let base: []u8 = t[0..lb];
+    let arglist: ArrayList[[]u8] = split_args(t[lb + 1..t.len - 1]);
+    record_sinst(base, arglist, decls, sinsts);
+}
+
 fn collect_sinst_stmt(n: *Node, decls: ArrayList[*Node], sinsts: *ArrayList[SInst]) void {
     switch (n.*) {
-        .let_   => |l| { collect_sinst_expr(l.expr, decls, sinsts); }
+        .let_   => |l| { record_type_sinst(l.dty, decls, sinsts); collect_sinst_expr(l.expr, decls, sinsts); }
         .ret    => |r| { if (r.has_expr == 1) { collect_sinst_expr(r.expr, decls, sinsts); } }
         .if_    => |x| { collect_sinst_expr(x.cond, decls, sinsts); collect_sinst_block(x.then_body, decls, sinsts); if (x.has_els == 1) { collect_sinst_block(x.els_body, decls, sinsts); } }
         .while_ => |w| { collect_sinst_expr(w.cond, decls, sinsts); collect_sinst_block(w.body, decls, sinsts); }
@@ -641,7 +724,7 @@ fn emit_mono_proto(buf: *ArrayList[u8], inst: Inst) void {
 fn emit_mono_body(buf: *ArrayList[u8], inst: Inst) void {
     emit_mono_sig(buf, inst);
     emit(buf, " {\n");
-    gen_block(buf, inst.f.body);
+    gen_block(buf, inst.cbody);   // concrete (type-params already substituted)
     emit(buf, "}\n");
 }
 
@@ -674,6 +757,15 @@ fn codegen(src: []u8) ArrayList[u8] {
             else => { }
         }
         ci = ci + 1;
+    }
+    // also collect struct instantiations from the monomorphized (concrete) fn
+    // bodies — e.g. make_pair[i32]'s body builds Pair[i32]{...}
+    let mi: i32 = 0;
+    while (mi < len[Inst](insts)) {
+        let inst: Inst = get[Inst](insts, mi);
+        collect_sinst_block(inst.cbody, decls, &sinsts);
+        record_type_sinst(subst_type(inst.f.ret, inst.f.tparams, inst.targs), decls, &sinsts);
+        mi = mi + 1;
     }
     // emit monomorphized struct typedefs (before any fn that uses them by value)
     let sg: i32 = 0;
