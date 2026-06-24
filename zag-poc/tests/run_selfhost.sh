@@ -178,6 +178,20 @@ if $ZAGC build selfhost/zagc.zag >/dev/null 2>&1 && [ -x ./zagc ]; then
         echo "  XX  @import as name (got '$qiout', want '1 2 12 7')"; fail=$((fail+1))
     fi
 
+    # qualified import of a GENERIC module: g.Box[i32] / g.make_box[i32] /
+    # g.unwrap[i32] — type substitution must descend into Base[args] so the
+    # module's own generic types get the g__ prefix (g__Box[i32] → g__Box_i32).
+    mkdir -p $SH/qg
+    printf 'struct Box[T] { v: T }\nfn make_box[T](x: T) Box[T] { return Box[T]{ .v = x }; }\nfn unwrap[T](b: Box[T]) T { return b.v; }\n' > $SH/qg/gmod.zag
+    printf '@import("gmod.zag") as g\nfn main() void {\n  let b: g.Box[i32] = g.make_box[i32](42);\n  print_i32(g.unwrap[i32](b));\n}\n' > $SH/qg/main.zag
+    $SH/zagc $SH/qg/main.zag >/dev/null 2>&1
+    qgout=""; if [ -x $SH/qg/main.zag.out ]; then qgout=$($SH/qg/main.zag.out); fi
+    if [ "$qgout" = "42" ]; then
+        echo "  ok  @import as name (generic): g.Box[i32]/g.make_box[i32]/g.unwrap[i32] → 42"; pass=$((pass+1))
+    else
+        echo "  XX  @import as name (generic) (got '$qgout', want 42)"; fail=$((fail+1))
+    fi
+
     # tagged unions + statement switch: union construction (tag + payload),
     # switch over a union tag with |capture|, and switch over a plain enum.
     printf 'enum OpClass { Numeric, Control, Memory }\nunion WasmOp { local_get: i32, i32_const: i64, i32_add: bool }\nfn classify(op: WasmOp) OpClass {\n  let cls: OpClass = OpClass.Control;\n  switch (op) {\n    .local_get => |idx| { cls = OpClass.Memory; }\n    .i32_const => |v| { cls = OpClass.Numeric; }\n    .i32_add => |_x| { cls = OpClass.Numeric; }\n  }\n  return cls;\n}\nfn code(c: OpClass) i32 {\n  let r: i32 = 0;\n  switch (c) { .Numeric => { r = 1; } .Control => { r = 2; } .Memory => { r = 3; } }\n  return r;\n}\nfn main() void {\n  let a: WasmOp = WasmOp{ .local_get = 5 };\n  let b: WasmOp = WasmOp{ .i32_const = 42 };\n  print_i32(code(classify(a)));\n  print_i32(code(classify(b)));\n}\n' > $SH/uni.zag

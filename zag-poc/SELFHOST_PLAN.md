@@ -140,16 +140,26 @@ Notes for later stages:
              - expression switch → a C ternary chain over a `__auto_type __sw` temp,
                with `__auto_type` payload captures; C infers the result type from the
                branches. Works for union and enum value-switches, with/without `else`.
-       - [ ] if-let `if (opt) |v| {..}` (orelse covers the common consumption); and
-             extending qualified-import type substitution to descend into generic
-             applications `Base[args]` — the remaining gap before a qualified generic
-             container (map.zag's StringMap[V]/MapEntry[V] imported `as map`) compiles.
-       (Generic functions/structs work via explicit type-args + monomorphization;
-        optionals/switch/strings/slicing now work type-unaware via the tricks above.)
+       - [x] qualified import of GENERIC modules — q_subst_type now descends into
+             generic applications `Base[args]` (so `as g` renames g's own MapEntry[V]/
+             Box[T]), and q_rewrite_expr substitutes call/struct-lit type-args (e.g.
+             @sizeOf[MapEntry[V]] → @sizeOf[g__MapEntry[V]]); codegen subst_type also
+             handles ?/! prefixes for monomorphizing optional returns. Verified:
+             `@import("gmod.zag") as g; g.make_box[i32](42)` → 42 (g__Box_i32 etc.).
+       - [ ] TYPE-AWARE slice-vs-pointer for index and slice expressions — the one
+             remaining wall. `key[i]` (a []u8 slice → key.ptr[i]) and `e[i]` (a *T
+             pointer → e[i]) are both ident-based, so no shape heuristic can tell them
+             apart; this needs a small typeOf/scope pass (params + let dtys + struct
+             field types). It's the concrete blocker for compiling std/map.zag (which
+             does `key[i]` AND `m.entries[idx]`) through the self-hosted compiler.
+       - [ ] if-let `if (opt) |v| {..}` (minor; orelse covers the common consumption).
+       (Generic functions/structs + qualified generic imports work via explicit
+        type-args + monomorphization; optionals/switch/strings/slicing work type-unaware
+        via __auto_type + wrap-at-annotation + shape heuristics. The last real gap is the
+        slice-vs-pointer type pass above.)
 - [ ] C3. `zagc2` compiles its own source → `zagc3`; verify fixpoint (zagc2 and
-       zagc3 produce identical output). Now unblocked on language features; remaining
-       work is the qualified-generic-import descent (map.zag) plus driving the full
-       selfhost/* + std/* source through `zagc2` and fixing whatever surfaces.
+       zagc3 produce identical output). Last language gap: the slice-vs-pointer type
+       pass (above), then driving full selfhost/* + std/* through `zagc2`.
 
 ## Status log
 
