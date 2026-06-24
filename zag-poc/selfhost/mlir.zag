@@ -1,0 +1,1417 @@
+// selfhost/mlir.zag — Zag → MLIR textual IR emitter, written in Zag.
+//
+// The self-hosted twin of the bootstrap's gpu/mlir_emitter.py (and the Zig
+// reference src/gpu_mlir.zig). Walks the ast.zag Node tree of a GPU program and
+// emits a complete, self-contained MLIR module into a byte buffer
+// (ArrayList[u8]). Used by the self-hosted driver (zagc.zag) when a
+// `--target gpu-*` flag is present.
+//
+// Output shape (matches examples/gpu_matmul_mx.mlir):
+//   module attributes {gpu.container_module} {
+//     gpu.module @zag_kernels {
+//       gpu.func @name(params) kernel { ... gpu.return }    // @kernel / @device fns
+//     }
+//     func.func @name(params) -> ret { ... return }         // host fns
+//   }
+//
+// The self-hosted compiler is type-UNAWARE (no .ty on nodes), so this emitter
+// reuses the Binding/build_env idea from codegen.zag plus a small type_of()
+// that propagates types well enough for the (heavily-annotated) GPU examples:
+//   ilit → i32 (or f32 if the literal text has a '.'), bin → lhs type (or "bool"
+//   for comparisons / && / ||), id → scope lookup, call → callee fn's ret (from
+//   decls) or a builtin return type, idx → element type of base ([]T → T),
+//   fld .len → i32.
+
+@import("codegen.zag")
+
+// ── output buffer / SSA counter ──────────────────────────────────────────────
+// emit() lives in codegen.zag; reuse it. The SSA counter and per-module target
+// are carried in a Ctx threaded by pointer (Zag passes structs by value).
+struct Ctx { ctr: i32, target: []u8 }
+
+// result of emitting an expression: its MLIR value name + its Zag type string.
+struct EResult { val: []u8, zty: []u8 }
+
+fn fresh(c: *Ctx, prefix: []u8) []u8 {
+    c.*.ctr = c.*.ctr + 1;
+    return _zag_str_concat(_zag_str_concat("%", prefix), _zag_i64_to_str(c.*.ctr as i64));
+}
+
+fn emit_indent(buf: *ArrayList[u8], n: i32) void {
+    let i: i32 = 0;
+    while (i < n) { emit(buf, "  "); i = i + 1; }
+}
+
+// ── Zag type → MLIR type string ──────────────────────────────────────────────
+fn zag_to_mlir(t: []u8) []u8 {
+    if (@strEq(t, "void"))   { return ""; }
+    if (@strEq(t, "bool"))   { return "i1"; }
+    if (@strEq(t, "i8"))     { return "i8"; }
+    if (@strEq(t, "i16"))    { return "i16"; }
+    if (@strEq(t, "i32"))    { return "i32"; }
+    if (@strEq(t, "i64"))    { return "i64"; }
+    if (@strEq(t, "u8"))     { return "i8"; }
+    if (@strEq(t, "u16"))    { return "i16"; }
+    if (@strEq(t, "u32"))    { return "i32"; }
+    if (@strEq(t, "u64"))    { return "i64"; }
+    if (@strEq(t, "usize"))  { return "index"; }
+    if (@strEq(t, "f32"))    { return "f32"; }
+    if (@strEq(t, "f64"))    { return "f64"; }
+    if (@strEq(t, "bf16"))   { return "bf16"; }
+    if (@strEq(t, "p8"))     { return "i8"; }
+    if (@strEq(t, "p16"))    { return "i16"; }
+    if (@strEq(t, "p32"))    { return "i32"; }
+    if (@strEq(t, "p64"))    { return "i64"; }
+    if (@strEq(t, "l16"))    { return "i16"; }
+    if (@strEq(t, "l32"))    { return "i32"; }
+    if (@strEq(t, "mx_fp8")) { return "f8E4M3FN"; }
+    if (@strEq(t, "mx_fp4")) { return "f4E2M1FN"; }
+    if (@strEq(t, "quire"))  { return "memref<8xi64>"; }
+    // []T → memref<?xElem>
+    if (t.len > 2 && t[0] == '[' && t[1] == ']') {
+        return _zag_str_concat(_zag_str_concat("memref<?x", zag_to_mlir(t[2..])), ">");
+    }
+    // vsa_b<N> → vector<Nxi1>
+    if (is_vsa(t)) {
+        return _zag_str_concat(_zag_str_concat("vector<", vsa_dim(t)), "xi1>");
+    }
+    // gpu_buf<T> → memref<?xElem, 1>
+    if (is_gpu_buf(t)) {
+        return _zag_str_concat(_zag_str_concat("memref<?x", zag_to_mlir(gpu_buf_elem(t))), ", 1>");
+    }
+    // struct / enum / union name → llvm struct passthrough
+    return _zag_str_concat(_zag_str_concat("!llvm.struct<", mlir_mangle(t)), ">");
+}
+
+fn mlir_mangle(name: []u8) []u8 {
+    let buf: ArrayList[u8] = make[u8](8);
+    let i: i32 = 0;
+    while (i < name.len) {
+        let c: i32 = name[i] as i32;
+        if (c == '[')      { push[u8](&buf, '_'); }
+        else if (c == ']') { }
+        else if (c == ',') { push[u8](&buf, '_'); }
+        else if (c == '@') { }
+        else               { push[u8](&buf, name[i]); }
+        i = i + 1;
+    }
+    return buf.data[0..buf.len];
+}
+
+// strip '@' from a callee/fn name for MLIR symbol use.
+fn sym_mangle(name: []u8) []u8 { return mlir_mangle(name); }
+
+// ── vsa_b<N> / gpu_buf<T> predicates ─────────────────────────────────────────
+fn is_vsa(t: []u8) bool {
+    return t.len > 7 && t[0] == 'v' && t[1] == 's' && t[2] == 'a' && t[3] == '_' && t[4] == 'b' && t[5] == '<';
+}
+fn vsa_dim(t: []u8) []u8 {
+    // 'vsa_b<10000>' → '10000'  (drop "vsa_b<" .. trailing '>')
+    return t[6..t.len - 1];
+}
+fn is_gpu_buf(t: []u8) bool {
+    return t.len > 9 && t[0] == 'g' && t[1] == 'p' && t[2] == 'u' && t[3] == '_'
+        && t[4] == 'b' && t[5] == 'u' && t[6] == 'f' && t[7] == '<';
+}
+fn gpu_buf_elem(t: []u8) []u8 { return t[8..t.len - 1]; }
+
+// ── float / posit / lns predicates (mirror gpu/mlir_emitter.py) ──────────────
+fn is_float_ty(t: []u8) bool {
+    return @strEq(t, "f32") || @strEq(t, "f64") || @strEq(t, "bf16")
+        || @strEq(t, "mx_fp8") || @strEq(t, "mx_fp4") || @strEq(t, "float_lit");
+}
+fn is_posit_ty(t: []u8) bool {
+    return @strEq(t, "p8") || @strEq(t, "p16") || @strEq(t, "p32") || @strEq(t, "p64");
+}
+fn is_lns_ty(t: []u8) bool { return @strEq(t, "l16") || @strEq(t, "l32"); }
+
+fn is_cmp_op(op: []u8) bool {
+    return @strEq(op, "==") || @strEq(op, "!=") || @strEq(op, "<")
+        || @strEq(op, ">") || @strEq(op, "<=") || @strEq(op, ">=");
+}
+fn float_arith(op: []u8) []u8 {
+    if (@strEq(op, "+")) { return "addf"; }
+    if (@strEq(op, "-")) { return "subf"; }
+    if (@strEq(op, "*")) { return "mulf"; }
+    if (@strEq(op, "/")) { return "divf"; }
+    return "addf";
+}
+fn cmp_pred_i(op: []u8) []u8 {
+    if (@strEq(op, "==")) { return "eq"; }
+    if (@strEq(op, "!=")) { return "ne"; }
+    if (@strEq(op, "<"))  { return "slt"; }
+    if (@strEq(op, ">"))  { return "sgt"; }
+    if (@strEq(op, "<=")) { return "sle"; }
+    if (@strEq(op, ">=")) { return "sge"; }
+    return "eq";
+}
+fn cmp_pred_f(op: []u8) []u8 {
+    if (@strEq(op, "==")) { return "oeq"; }
+    if (@strEq(op, "!=")) { return "one"; }
+    if (@strEq(op, "<"))  { return "olt"; }
+    if (@strEq(op, ">"))  { return "ogt"; }
+    if (@strEq(op, "<=")) { return "ole"; }
+    if (@strEq(op, ">=")) { return "oge"; }
+    return "oeq";
+}
+
+// GPU dim literal → x/y/z
+fn gpu_dim_name(n: *Node) []u8 {
+    let lit: []u8 = "";
+    switch (n.*) {
+        .ilit => |x| { lit = x.text; }
+        else  => { }
+    }
+    if (@strEq(lit, "1")) { return "y"; }
+    if (@strEq(lit, "2")) { return "z"; }
+    return "x";
+}
+
+// ── callee name of a call ────────────────────────────────────────────────────
+fn mlir_callee_name(n: *Node) []u8 {
+    return switch (n.*) {
+        .id  => |d| d.name,
+        .fld => |f| f.fname,
+        else => "",
+    };
+}
+
+// ── enum / union introspection ───────────────────────────────────────────────
+// Index of `member` within enum `ename` (or -1).
+fn enum_member_index(dl: ArrayList[*Node], ename: []u8, member: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](dl)) {
+        switch (get[*Node](dl, i).*) {
+            .enum_ => |e| {
+                if (@strEq(e.name, ename)) {
+                    let j: i32 = 0;
+                    while (j < len[[]u8](e.members)) {
+                        if (@strEq(get[[]u8](e.members, j), member)) { return j; }
+                        j = j + 1;
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Is `name` the name of a declared enum?
+fn is_enum_name(dl: ArrayList[*Node], name: []u8) bool {
+    let i: i32 = 0;
+    while (i < len[*Node](dl)) {
+        switch (get[*Node](dl, i).*) {
+            .enum_ => |e| { if (@strEq(e.name, name)) { return true; } }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Index of field `fname` within struct `sname` (strips a generic application), or -1.
+fn struct_field_index(dl: ArrayList[*Node], sname: []u8, fname: []u8) i32 {
+    let base: []u8 = strip_gapp(sname);
+    let i: i32 = 0;
+    while (i < len[*Node](dl)) {
+        switch (get[*Node](dl, i).*) {
+            .struct_ => |s| {
+                if (@strEq(s.name, base)) {
+                    let j: i32 = 0;
+                    while (j < len[Param](s.fields)) {
+                        if (@strEq(get[Param](s.fields, j).name, fname)) { return j; }
+                        j = j + 1;
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Is `name` a declared struct?
+fn is_struct_name(dl: ArrayList[*Node], name: []u8) bool {
+    let base: []u8 = strip_gapp(name);
+    let i: i32 = 0;
+    while (i < len[*Node](dl)) {
+        switch (get[*Node](dl, i).*) {
+            .struct_ => |s| { if (@strEq(s.name, base)) { return true; } }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// The pty of the i-th field of struct `sname`, or "" out of range.
+fn struct_field_pty_at(dl: ArrayList[*Node], sname: []u8, idx: i32) []u8 {
+    let base: []u8 = strip_gapp(sname);
+    let i: i32 = 0;
+    while (i < len[*Node](dl)) {
+        switch (get[*Node](dl, i).*) {
+            .struct_ => |s| {
+                if (@strEq(s.name, base)) {
+                    if (idx >= 0 && idx < len[Param](s.fields)) { return get[Param](s.fields, idx).pty; }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// First '@kernel' fn name in the module (the gpu.launch_func target), or "".
+fn first_kernel_name(dl: ArrayList[*Node]) []u8 {
+    let i: i32 = 0;
+    while (i < len[*Node](dl)) {
+        switch (get[*Node](dl, i).*) {
+            .fn_decl => |f| {
+                if (f.is_extern == 0) {
+                    let aj: i32 = 0;
+                    while (aj < len[[]u8](f.annots)) {
+                        if (@strEq(get[[]u8](f.annots, aj), "@kernel")) { return f.name; }
+                        aj = aj + 1;
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// ── hard compile error (constructs that cannot run on a GPU) ─────────────────
+fn mlir_fatal(msg: []u8) void {
+    _zag_eprintln(_zag_str_concat("zag: gpu codegen error: ", msg));
+    _zag_exit(1);
+}
+
+// ── lookup a fn decl's return type by name (for typing calls) ────────────────
+fn fn_ret_type(dl: ArrayList[*Node], name: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[*Node](dl)) {
+        switch (get[*Node](dl, i).*) {
+            .fn_decl => |f| { if (@strEq(f.name, name)) { return f.ret; } }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// ── builtin return types (the @-builtins that appear in GPU kernels) ─────────
+fn builtin_ret_type(name: []u8) []u8 {
+    if (@strEq(name, "@gpuThreadIdx")) { return "i32"; }
+    if (@strEq(name, "@gpuBlockIdx"))  { return "i32"; }
+    if (@strEq(name, "@gpuBlockDim"))  { return "i32"; }
+    if (@strEq(name, "@gpuGridDim"))   { return "i32"; }
+    if (@strEq(name, "@mxFp8ToFloat")) { return "f32"; }
+    if (@strEq(name, "@floatToMxFp8")) { return "mx_fp8"; }
+    if (@strEq(name, "@gpuAlloc"))     { return "[]f32"; }
+    if (@strEq(name, "@positToFloat")) { return "f64"; }
+    if (@strEq(name, "@floatToPosit")) { return "p32"; }
+    if (@strEq(name, "@logToFloat"))   { return "f32"; }
+    if (@strEq(name, "@floatToLog"))   { return "l32"; }
+    return "";
+}
+
+// ── type_of: propagate a coarse type for an expression ───────────────────────
+fn type_of(n: *Node, env: ArrayList[Binding], dl: ArrayList[*Node]) []u8 {
+    return switch (n.*) {
+        .ilit => |x| ilit_type(x.text),
+        .id   => |x| env_lookup(env, x.name),
+        .bin  => |b| bin_type(b, env, dl),
+        .un   => |u| type_of(u.e, env, dl),
+        .idx  => |x| base_elem_type(type_of(x.base, env, dl)),
+        .fld  => |f| fld_type(f, env, dl),
+        .cast_ => |c| c.target,
+        .call => |c| call_type(c, dl),
+        .slit_ => |s| slit_type(s),
+        .slice_ => |x| type_of(x.base, env, dl),
+        else  => "",
+    };
+}
+
+fn slit_type(s: StructLit) []u8 {
+    if (len[[]u8](s.targs) > 0) {
+        let nm: []u8 = _zag_str_concat(s.sname, "[");
+        let i: i32 = 0;
+        while (i < len[[]u8](s.targs)) {
+            if (i > 0) { nm = _zag_str_concat(nm, ","); }
+            nm = _zag_str_concat(nm, get[[]u8](s.targs, i));
+            i = i + 1;
+        }
+        return _zag_str_concat(nm, "]");
+    }
+    return s.sname;
+}
+
+fn ilit_type(text: []u8) []u8 {
+    // a literal containing '.' is a float; else an integer.
+    let i: i32 = 0;
+    while (i < text.len) {
+        if (text[i] == '.') { return "f32"; }
+        i = i + 1;
+    }
+    return "i32";
+}
+
+fn bin_type(b: Bin, env: ArrayList[Binding], dl: ArrayList[*Node]) []u8 {
+    if (is_cmp_op(b.op) || @strEq(b.op, "&&") || @strEq(b.op, "||")) { return "bool"; }
+    let lt: []u8 = type_of(b.l, env, dl);
+    if (lt.len > 0) { return lt; }
+    return type_of(b.r, env, dl);
+}
+
+fn fld_type(f: Field, env: ArrayList[Binding], dl: ArrayList[*Node]) []u8 {
+    // enum member access `Enum.Member` is a value of the enum type
+    switch (f.base.*) {
+        .id => |bn| { if (is_enum_name(dl, bn.name)) { return bn.name; } }
+        else => { }
+    }
+    if (@strEq(f.fname, "len")) { return "i32"; }
+    return struct_field_type(type_of(f.base, env, dl), f.fname, dl);
+}
+
+fn call_type(c: Call, dl: ArrayList[*Node]) []u8 {
+    let cn: []u8 = mlir_callee_name(c.callee);
+    if (cn.len > 0 && cn[0] == '@') {
+        let bt: []u8 = builtin_ret_type(cn);
+        if (bt.len > 0) { return bt; }
+        return "i32";
+    }
+    let rt: []u8 = fn_ret_type(dl, cn);
+    if (rt.len > 0) { return rt; }
+    return "i32";
+}
+
+// ── mutated-var detection (a let that is later `assign`ed → needs alloca) ─────
+fn assigned_in_block(body: ArrayList[*Node], name: []u8) bool {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        if (assigned_in_stmt(get[*Node](body, i), name)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn assigned_in_stmt(n: *Node, name: []u8) bool {
+    return switch (n.*) {
+        .assign => |a| ident_is(a.target, name),
+        .if_    => |x| assigned_in_block(x.then_body, name) || (x.has_els == 1 && assigned_in_block(x.els_body, name)),
+        .while_ => |w| assigned_in_block(w.body, name),
+        .switch_ => |sw| assigned_in_switch(sw, name),
+        else => false,
+    };
+}
+
+fn assigned_in_switch(sw: Switch, name: []u8) bool {
+    let i: i32 = 0;
+    while (i < len[SwitchArm](sw.arms)) {
+        if (assigned_in_block(get[SwitchArm](sw.arms, i).body, name)) { return true; }
+        i = i + 1;
+    }
+    if (sw.has_els == 1) { return assigned_in_block(sw.els_body, name); }
+    return false;
+}
+
+fn ident_is(n: *Node, name: []u8) bool {
+    return switch (n.*) {
+        .id => |x| @strEq(x.name, name),
+        else => false,
+    };
+}
+
+// declared type of a let `name` in a body (for the alloca memref<T>).
+fn let_decl_type(body: ArrayList[*Node], name: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        switch (get[*Node](body, i).*) {
+            .let_ => |l| { if (@strEq(l.name, name) && l.has_dty == 1) { return l.dty; } }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return "i32";
+}
+
+// ── scope: a name → MLIR value mapping, with an alloca flag ───────────────────
+// Reuses Binding for the type map; a parallel ArrayList tracks the MLIR value
+// name and whether the binding is an alloca slot.
+struct Slot { name: []u8, val: []u8, is_alloca: i32, zty: []u8 }
+
+fn slot_lookup(slots: ArrayList[Slot], name: []u8) Slot {
+    let i: i32 = 0;
+    while (i < len[Slot](slots)) {
+        if (@strEq(get[Slot](slots, i).name, name)) { return get[Slot](slots, i); }
+        i = i + 1;
+    }
+    return Slot{ .name = "", .val = "", .is_alloca = 0, .zty = "" };
+}
+
+fn slot_set(slots: *ArrayList[Slot], name: []u8, val: []u8, is_alloca: i32, zty: []u8) void {
+    let i: i32 = 0;
+    while (i < len[Slot](slots.*)) {
+        if (@strEq(get[Slot](slots.*, i).name, name)) {
+            set[Slot](slots, i, Slot{ .name = name, .val = val, .is_alloca = is_alloca, .zty = zty });
+            return;
+        }
+        i = i + 1;
+    }
+    push[Slot](slots, Slot{ .name = name, .val = val, .is_alloca = is_alloca, .zty = zty });
+}
+
+fn slot_clone(slots: ArrayList[Slot]) ArrayList[Slot] {
+    let out: ArrayList[Slot] = make[Slot](8);
+    let i: i32 = 0;
+    while (i < len[Slot](slots)) { push[Slot](&out, get[Slot](slots, i)); i = i + 1; }
+    return out;
+}
+
+// the type-binding env derived from the live slot set (for type_of lookups).
+fn env_of_slots(slots: ArrayList[Slot]) ArrayList[Binding] {
+    let env: ArrayList[Binding] = make[Binding](8);
+    let i: i32 = 0;
+    while (i < len[Slot](slots)) {
+        let s: Slot = get[Slot](slots, i);
+        push[Binding](&env, Binding{ .name = s.name, .ty = s.zty });
+        i = i + 1;
+    }
+    return env;
+}
+
+// ── expression emission ──────────────────────────────────────────────────────
+fn emit_expr(buf: *ArrayList[u8], c: *Ctx, n: *Node, slots: *ArrayList[Slot], indent: i32, dl: ArrayList[*Node]) EResult {
+    return switch (n.*) {
+        .ilit => |x| emit_lit(buf, c, x.text, indent),
+        .id   => |x| emit_ident(buf, c, x.name, slots, indent, dl),
+        .bin  => |b| emit_bin(buf, c, b, slots, indent, dl),
+        .un   => |u| emit_un(buf, c, u, slots, indent, dl),
+        .idx  => |x| emit_index(buf, c, x, slots, indent, dl),
+        .fld  => |f| emit_field(buf, c, f, slots, indent, dl),
+        .call => |cc| emit_call(buf, c, cc, slots, indent, dl),
+        .slit_ => |s| emit_struct_lit(buf, c, s, slots, indent, dl),
+        .slice_ => |x| emit_slice(buf, c, x, slots, indent, dl),
+        .cast_ => |x| emit_cast(buf, c, x, slots, indent, dl),
+        .slit => |s| emit_str_lit(buf, c, s.text, indent),
+        else  => emit_unknown(buf, c, indent),
+    };
+}
+
+// String literals are not GPU values — reject rather than fake one.
+fn emit_str_lit(buf: *ArrayList[u8], c: *Ctx, text: []u8, indent: i32) EResult {
+    mlir_fatal("string literal in GPU context is not lowerable to MLIR");
+    return EResult{ .val = "", .zty = "[]u8" };
+}
+
+fn emit_unknown(buf: *ArrayList[u8], c: *Ctx, indent: i32) EResult {
+    mlir_fatal("expression kind cannot be lowered to GPU MLIR");
+    return EResult{ .val = "", .zty = "i32" };
+}
+
+fn emit_lit(buf: *ArrayList[u8], c: *Ctx, text: []u8, indent: i32) EResult {
+    let r: []u8 = fresh(c, "c");
+    let ty: []u8 = ilit_type(text);
+    emit_indent(buf, indent);
+    emit(buf, r); emit(buf, " = arith.constant "); emit(buf, text);
+    if (@strEq(ty, "f32")) { emit(buf, " : f32\n"); } else { emit(buf, " : i32\n"); }
+    return EResult{ .val = r, .zty = ty };
+}
+
+fn emit_ident(buf: *ArrayList[u8], c: *Ctx, name: []u8, slots: *ArrayList[Slot], indent: i32, dl: ArrayList[*Node]) EResult {
+    let s: Slot = slot_lookup(slots.*, name);
+    if (s.name.len > 0) {
+        if (s.is_alloca == 1) {
+            let ld: []u8 = fresh(c, "ld");
+            emit_indent(buf, indent);
+            emit(buf, ld); emit(buf, " = memref.load "); emit(buf, s.val);
+            emit(buf, "[] : memref<"); emit(buf, zag_to_mlir(s.zty)); emit(buf, ">\n");
+            return EResult{ .val = ld, .zty = s.zty };
+        }
+        return EResult{ .val = s.val, .zty = s.zty };
+    }
+    // unknown ident — emit as a %name reference (e.g. a param not in slots)
+    return EResult{ .val = _zag_str_concat("%", name), .zty = "i32" };
+}
+
+fn emit_un(buf: *ArrayList[u8], c: *Ctx, u: Un, slots: *ArrayList[Slot], indent: i32, dl: ArrayList[*Node]) EResult {
+    let e: EResult = emit_expr(buf, c, u.e, slots, indent, dl);
+    let r: []u8 = fresh(c, "u");
+    if (@strEq(u.op, "!")) {
+        let t: []u8 = fresh(c, "t");
+        emit_indent(buf, indent); emit(buf, t); emit(buf, " = arith.constant true : i1\n");
+        emit_indent(buf, indent); emit(buf, r); emit(buf, " = arith.xori ");
+        emit(buf, e.val); emit(buf, ", "); emit(buf, t); emit(buf, " : i1\n");
+        return EResult{ .val = r, .zty = "bool" };
+    }
+    if (@strEq(u.op, "-")) {
+        emit_indent(buf, indent); emit(buf, r); emit(buf, " = ");
+        if (is_float_ty(e.zty)) { emit(buf, "arith.negf "); } else { emit(buf, "arith.negsi "); }
+        emit(buf, e.val); emit(buf, " : "); emit(buf, zag_to_mlir(e.zty)); emit(buf, "\n");
+        return EResult{ .val = r, .zty = e.zty };
+    }
+    return EResult{ .val = e.val, .zty = e.zty };
+}
+
+fn emit_index(buf: *ArrayList[u8], c: *Ctx, x: Index, slots: *ArrayList[Slot], indent: i32, dl: ArrayList[*Node]) EResult {
+    let base: EResult = emit_expr(buf, c, x.base, slots, indent, dl);
+    let idx: EResult = emit_expr(buf, c, x.idx, slots, indent, dl);
+    let r: []u8 = fresh(c, "el");
+    if (base.zty.len > 2 && base.zty[0] == '[' && base.zty[1] == ']') {
+        let elem: []u8 = base.zty[2..];
+        emit_indent(buf, indent);
+        emit(buf, r); emit(buf, " = memref.load "); emit(buf, base.val);
+        emit(buf, "["); emit(buf, idx.val); emit(buf, "] : memref<?x");
+        emit(buf, zag_to_mlir(elem)); emit(buf, ">\n");
+        return EResult{ .val = r, .zty = elem };
+    }
+    emit_indent(buf, indent); emit(buf, "// index into unsupported base type "); emit(buf, base.zty); emit(buf, "\n");
+    return EResult{ .val = r, .zty = "i32" };
+}
+
+fn emit_field(buf: *ArrayList[u8], c: *Ctx, f: Field, slots: *ArrayList[Slot], indent: i32, dl: ArrayList[*Node]) EResult {
+    // Enum member access  `Enum.Member` → arith.constant <index> : i32
+    switch (f.base.*) {
+        .id => |bn| {
+            if (is_enum_name(dl, bn.name)) {
+                let idx: i32 = enum_member_index(dl, bn.name, f.fname);
+                if (idx < 0) { idx = 0; }
+                let v: []u8 = fresh(c, "enum");
+                emit_indent(buf, indent);
+                emit(buf, v); emit(buf, " = arith.constant "); emit(buf, _zag_i64_to_str(idx as i64)); emit(buf, " : i32\n");
+                return EResult{ .val = v, .zty = bn.name };
+            }
+        }
+        else => { }
+    }
+    let base: EResult = emit_expr(buf, c, f.base, slots, indent, dl);
+    // slice `.len` → memref.dim
+    if (base.zty.len > 2 && base.zty[0] == '[' && base.zty[1] == ']' && @strEq(f.fname, "len")) {
+        let r: []u8 = fresh(c, "len");
+        emit_indent(buf, indent);
+        emit(buf, r); emit(buf, " = memref.dim "); emit(buf, base.val);
+        emit(buf, ", %c0 : memref<?x"); emit(buf, zag_to_mlir(base.zty[2..])); emit(buf, ">\n");
+        return EResult{ .val = r, .zty = "i32" };
+    }
+    // struct field access → llvm.extractvalue
+    if (is_struct_name(dl, base.zty)) {
+        let fidx: i32 = struct_field_index(dl, base.zty, f.fname);
+        if (fidx < 0) { fidx = 0; }
+        let fty: []u8 = struct_field_pty_at(dl, base.zty, fidx);
+        if (fty.len == 0) { fty = "i32"; }
+        let r: []u8 = fresh(c, "field");
+        emit_indent(buf, indent);
+        emit(buf, r); emit(buf, " = llvm.extractvalue "); emit(buf, base.val);
+        emit(buf, "["); emit(buf, _zag_i64_to_str(fidx as i64)); emit(buf, "] : "); emit(buf, zag_to_mlir(base.zty)); emit(buf, "\n");
+        return EResult{ .val = r, .zty = fty };
+    }
+    mlir_fatal(_zag_str_concat("unsupported field access .", f.fname));
+    return EResult{ .val = "", .zty = "i32" };
+}
+
+// ── struct literal: llvm.mlir.undef + chained llvm.insertvalue ───────────────
+fn emit_struct_lit(buf: *ArrayList[u8], c: *Ctx, s: StructLit, slots: *ArrayList[Slot], indent: i32, dl: ArrayList[*Node]) EResult {
+    let nm: []u8 = slit_type(s);
+    // emit each field value first (source order)
+    let vals: ArrayList[EResult] = make[EResult](4);
+    let i: i32 = 0;
+    while (i < len[FieldInit](s.fields)) {
+        push[EResult](&vals, emit_expr(buf, c, get[FieldInit](s.fields, i).val, slots, indent, dl));
+        i = i + 1;
+    }
+    let mlir_ty: []u8 = zag_to_mlir(nm);
+    let cur: []u8 = fresh(c, "st");
+    emit_indent(buf, indent); emit(buf, cur); emit(buf, " = llvm.mlir.undef : "); emit(buf, mlir_ty); emit(buf, "\n");
+    let j: i32 = 0;
+    while (j < len[EResult](vals)) {
+        let tmp: []u8 = fresh(c, "ins");
+        emit_indent(buf, indent);
+        emit(buf, tmp); emit(buf, " = llvm.insertvalue "); emit(buf, get[EResult](vals, j).val);
+        emit(buf, ", "); emit(buf, cur); emit(buf, "["); emit(buf, _zag_i64_to_str(j as i64)); emit(buf, "] : "); emit(buf, mlir_ty); emit(buf, "\n");
+        cur = tmp;
+        j = j + 1;
+    }
+    return EResult{ .val = cur, .zty = nm };
+}
+
+// ── slice expr `base[lo..hi]` → memref.subview on the dynamic-shaped memref ───
+fn emit_slice(buf: *ArrayList[u8], c: *Ctx, x: Slice, slots: *ArrayList[Slot], indent: i32, dl: ArrayList[*Node]) EResult {
+    let base: EResult = emit_expr(buf, c, x.base, slots, indent, dl);
+    let lo: EResult = emit_expr(buf, c, x.lo, slots, indent, dl);
+    let elem: []u8 = "i32";
+    if (base.zty.len > 2 && base.zty[0] == '[' && base.zty[1] == ']') { elem = base.zty[2..]; }
+    let melem: []u8 = zag_to_mlir(elem);
+    // offset = lo (as index); size = hi - lo (or dim(base) - lo when open-ended)
+    let lo_idx: []u8 = fresh(c, "off");
+    emit_indent(buf, indent); emit(buf, lo_idx); emit(buf, " = arith.index_cast "); emit(buf, lo.val); emit(buf, " : i32 to index\n");
+    let size_idx: []u8 = fresh(c, "sz");
+    if (x.has_hi == 1) {
+        let hi: EResult = emit_expr(buf, c, x.hi, slots, indent, dl);
+        let diff: []u8 = fresh(c, "b");
+        emit_indent(buf, indent); emit(buf, diff); emit(buf, " = arith.subi "); emit(buf, hi.val); emit(buf, ", "); emit(buf, lo.val); emit(buf, " : i32\n");
+        emit_indent(buf, indent); emit(buf, size_idx); emit(buf, " = arith.index_cast "); emit(buf, diff); emit(buf, " : i32 to index\n");
+    } else {
+        let dimv: []u8 = fresh(c, "dim");
+        emit_indent(buf, indent); emit(buf, dimv); emit(buf, " = memref.dim "); emit(buf, base.val); emit(buf, ", %c0 : memref<?x"); emit(buf, melem); emit(buf, ">\n");
+        emit_indent(buf, indent); emit(buf, size_idx); emit(buf, " = arith.subi "); emit(buf, dimv); emit(buf, ", "); emit(buf, lo_idx); emit(buf, " : index\n");
+    }
+    let r: []u8 = fresh(c, "sub");
+    emit_indent(buf, indent);
+    emit(buf, r); emit(buf, " = memref.subview "); emit(buf, base.val);
+    emit(buf, "["); emit(buf, lo_idx); emit(buf, "] ["); emit(buf, size_idx); emit(buf, "] [1] : memref<?x"); emit(buf, melem);
+    emit(buf, "> to memref<?x"); emit(buf, melem); emit(buf, ", strided<[1], offset: ?>>\n");
+    return EResult{ .val = r, .zty = base.zty };
+}
+
+// ── cast expr `e as T` → the appropriate arith conversion ────────────────────
+fn emit_cast(buf: *ArrayList[u8], c: *Ctx, x: Cast, slots: *ArrayList[Slot], indent: i32, dl: ArrayList[*Node]) EResult {
+    let src: EResult = emit_expr(buf, c, x.expr, slots, indent, dl);
+    let dst: []u8 = x.target;
+    let sm: []u8 = zag_to_mlir(src.zty);
+    let dm: []u8 = zag_to_mlir(dst);
+    // identity / same MLIR type → passthrough (no op needed)
+    if (@strEq(sm, dm)) { return EResult{ .val = src.val, .zty = dst }; }
+    let r: []u8 = fresh(c, "cv");
+    let sf: bool = is_float_ty(src.zty);
+    let df: bool = is_float_ty(dst);
+    let s_index: bool = @strEq(src.zty, "usize");
+    let d_index: bool = @strEq(dst, "usize");
+    emit_indent(buf, indent); emit(buf, r); emit(buf, " = ");
+    if (s_index || d_index) {
+        // int ↔ index
+        emit(buf, "arith.index_cast "); emit(buf, src.val); emit(buf, " : "); emit(buf, sm); emit(buf, " to "); emit(buf, dm); emit(buf, "\n");
+    } else if (sf && df) {
+        // float → float: widen vs narrow by bit width
+        if (mlir_float_rank(dst) > mlir_float_rank(src.zty)) { emit(buf, "arith.extf "); }
+        else { emit(buf, "arith.truncf "); }
+        emit(buf, src.val); emit(buf, " : "); emit(buf, sm); emit(buf, " to "); emit(buf, dm); emit(buf, "\n");
+    } else if (sf && !df) {
+        // float → int
+        emit(buf, "arith.fptosi "); emit(buf, src.val); emit(buf, " : "); emit(buf, sm); emit(buf, " to "); emit(buf, dm); emit(buf, "\n");
+    } else if (!sf && df) {
+        // int → float
+        emit(buf, "arith.sitofp "); emit(buf, src.val); emit(buf, " : "); emit(buf, sm); emit(buf, " to "); emit(buf, dm); emit(buf, "\n");
+    } else {
+        // int → int: extend vs truncate by bit width
+        if (mlir_int_rank(dst) > mlir_int_rank(src.zty)) { emit(buf, "arith.extsi "); }
+        else { emit(buf, "arith.trunci "); }
+        emit(buf, src.val); emit(buf, " : "); emit(buf, sm); emit(buf, " to "); emit(buf, dm); emit(buf, "\n");
+    }
+    return EResult{ .val = r, .zty = dst };
+}
+
+// approximate bit-rank of a float type (for ext vs trunc selection)
+fn mlir_float_rank(t: []u8) i32 {
+    if (@strEq(t, "f64")) { return 64; }
+    if (@strEq(t, "f32")) { return 32; }
+    if (@strEq(t, "float_lit")) { return 32; }
+    if (@strEq(t, "bf16")) { return 16; }
+    if (@strEq(t, "mx_fp8")) { return 8; }
+    if (@strEq(t, "mx_fp4")) { return 4; }
+    return 32;
+}
+fn mlir_int_rank(t: []u8) i32 {
+    if (@strEq(t, "i64") || @strEq(t, "u64")) { return 64; }
+    if (@strEq(t, "i32") || @strEq(t, "u32")) { return 32; }
+    if (@strEq(t, "i16") || @strEq(t, "u16")) { return 16; }
+    if (@strEq(t, "i8") || @strEq(t, "u8")) { return 8; }
+    if (@strEq(t, "bool")) { return 1; }
+    return 32;
+}
+
+// ── binary op emission ───────────────────────────────────────────────────────
+fn emit_bin(buf: *ArrayList[u8], c: *Ctx, b: Bin, slots: *ArrayList[Slot], indent: i32, dl: ArrayList[*Node]) EResult {
+    let lr: EResult = emit_expr(buf, c, b.l, slots, indent, dl);
+    let rr: EResult = emit_expr(buf, c, b.r, slots, indent, dl);
+    let env: ArrayList[Binding] = env_of_slots(slots.*);
+    let ty: []u8 = type_of(b.l, env, dl);
+    if (ty.len == 0) { ty = type_of(b.r, env, dl); }
+    if (ty.len == 0) { ty = "i32"; }
+    let r: []u8 = fresh(c, "b");
+
+    // ── posit ──
+    if (is_posit_ty(ty)) {
+        if (@strEq(b.op, "+") || @strEq(b.op, "-") || @strEq(b.op, "*") || @strEq(b.op, "/")) {
+            let sym: []u8 = posit_op_sym(b.op);
+            emit_indent(buf, indent); emit(buf, r); emit(buf, " = func.call @"); emit(buf, sym);
+            emit(buf, "("); emit(buf, lr.val); emit(buf, ", "); emit(buf, rr.val);
+            emit(buf, ") : (i32, i32) -> i32\n");
+            return EResult{ .val = r, .zty = ty };
+        }
+        let lf: []u8 = fresh(c, "pf"); let rf: []u8 = fresh(c, "pf");
+        emit_indent(buf, indent); emit(buf, lf); emit(buf, " = func.call @zag_p32_to_f64("); emit(buf, lr.val); emit(buf, ") : (i32) -> f64\n");
+        emit_indent(buf, indent); emit(buf, rf); emit(buf, " = func.call @zag_p32_to_f64("); emit(buf, rr.val); emit(buf, ") : (i32) -> f64\n");
+        emit_indent(buf, indent); emit(buf, r); emit(buf, " = arith.cmpf "); emit(buf, cmp_pred_f(b.op));
+        emit(buf, ", "); emit(buf, lf); emit(buf, ", "); emit(buf, rf); emit(buf, " : f64\n");
+        return EResult{ .val = r, .zty = "bool" };
+    }
+
+    // ── lns ──
+    if (is_lns_ty(ty)) {
+        if (@strEq(b.op, "+") || @strEq(b.op, "-") || @strEq(b.op, "*") || @strEq(b.op, "/")) {
+            let sym: []u8 = lns_op_sym(b.op);
+            emit_indent(buf, indent); emit(buf, r); emit(buf, " = func.call @"); emit(buf, sym);
+            emit(buf, "("); emit(buf, lr.val); emit(buf, ", "); emit(buf, rr.val);
+            emit(buf, ") : (i32, i32) -> i32\n");
+            return EResult{ .val = r, .zty = ty };
+        }
+        let lf: []u8 = fresh(c, "lf"); let rf: []u8 = fresh(c, "lf");
+        emit_indent(buf, indent); emit(buf, lf); emit(buf, " = func.call @zag_l32_to_f32("); emit(buf, lr.val); emit(buf, ") : (i32) -> f32\n");
+        emit_indent(buf, indent); emit(buf, rf); emit(buf, " = func.call @zag_l32_to_f32("); emit(buf, rr.val); emit(buf, ") : (i32) -> f32\n");
+        emit_indent(buf, indent); emit(buf, r); emit(buf, " = arith.cmpf "); emit(buf, cmp_pred_f(b.op));
+        emit(buf, ", "); emit(buf, lf); emit(buf, ", "); emit(buf, rf); emit(buf, " : f32\n");
+        return EResult{ .val = r, .zty = "bool" };
+    }
+
+    // ── vsa (bind = XOR, bundle = OR) ──
+    if (is_vsa(ty)) {
+        let vty: []u8 = _zag_str_concat(_zag_str_concat("vector<", vsa_dim(ty)), "xi1>");
+        emit_indent(buf, indent); emit(buf, r); emit(buf, " = ");
+        if (@strEq(b.op, "^"))      { emit(buf, "arith.xori "); }
+        else if (@strEq(b.op, "|")) { emit(buf, "arith.ori "); }
+        else                        { emit(buf, "arith.xori "); }
+        emit(buf, lr.val); emit(buf, ", "); emit(buf, rr.val); emit(buf, " : "); emit(buf, vty); emit(buf, "\n");
+        return EResult{ .val = r, .zty = ty };
+    }
+
+    // ── mx_fp8: upcast → op → downcast ──
+    if (@strEq(ty, "mx_fp8")) {
+        let lu: []u8 = fresh(c, "fp32"); let ru: []u8 = fresh(c, "fp32");
+        emit_indent(buf, indent); emit(buf, lu); emit(buf, " = arith.extf "); emit(buf, lr.val); emit(buf, " : f8E4M3FN to f32\n");
+        emit_indent(buf, indent); emit(buf, ru); emit(buf, " = arith.extf "); emit(buf, rr.val); emit(buf, " : f8E4M3FN to f32\n");
+        let mid: []u8 = fresh(c, "m");
+        emit_indent(buf, indent); emit(buf, mid); emit(buf, " = arith."); emit(buf, float_arith(b.op));
+        emit(buf, " "); emit(buf, lu); emit(buf, ", "); emit(buf, ru); emit(buf, " : f32\n");
+        emit_indent(buf, indent); emit(buf, r); emit(buf, " = arith.truncf "); emit(buf, mid); emit(buf, " : f32 to f8E4M3FN\n");
+        return EResult{ .val = r, .zty = "mx_fp8" };
+    }
+
+    // ── standard float ──
+    if (is_float_ty(ty)) {
+        let mty: []u8 = zag_to_mlir(ty);
+        if (@strEq(b.op, "+") || @strEq(b.op, "-") || @strEq(b.op, "*") || @strEq(b.op, "/")) {
+            emit_indent(buf, indent); emit(buf, r); emit(buf, " = arith."); emit(buf, float_arith(b.op));
+            emit(buf, " "); emit(buf, lr.val); emit(buf, ", "); emit(buf, rr.val); emit(buf, " : "); emit(buf, mty); emit(buf, "\n");
+            return EResult{ .val = r, .zty = ty };
+        }
+        emit_indent(buf, indent); emit(buf, r); emit(buf, " = arith.cmpf "); emit(buf, cmp_pred_f(b.op));
+        emit(buf, ", "); emit(buf, lr.val); emit(buf, ", "); emit(buf, rr.val); emit(buf, " : "); emit(buf, mty); emit(buf, "\n");
+        return EResult{ .val = r, .zty = "bool" };
+    }
+
+    // ── standard integer ──
+    let mty: []u8 = zag_to_mlir(ty);
+    emit_indent(buf, indent); emit(buf, r); emit(buf, " = ");
+    if (@strEq(b.op, "+"))      { emit(buf, "arith.addi "); }
+    else if (@strEq(b.op, "-")) { emit(buf, "arith.subi "); }
+    else if (@strEq(b.op, "*")) { emit(buf, "arith.muli "); }
+    else if (@strEq(b.op, "/")) { emit(buf, "arith.divsi "); }
+    else if (@strEq(b.op, "%")) { emit(buf, "arith.remsi "); }
+    else if (@strEq(b.op, "^")) { emit(buf, "arith.xori "); }
+    else if (@strEq(b.op, "&")) { emit(buf, "arith.andi "); }
+    else if (@strEq(b.op, "|")) { emit(buf, "arith.ori "); }
+    else if (@strEq(b.op, "<<")) { emit(buf, "arith.shli "); }
+    else if (@strEq(b.op, ">>")) { emit(buf, "arith.shrsi "); }
+    else if (is_cmp_op(b.op)) {
+        emit(buf, "arith.cmpi "); emit(buf, cmp_pred_i(b.op)); emit(buf, ", ");
+        emit(buf, lr.val); emit(buf, ", "); emit(buf, rr.val); emit(buf, " : "); emit(buf, mty); emit(buf, "\n");
+        return EResult{ .val = r, .zty = "bool" };
+    }
+    else if (@strEq(b.op, "&&")) {
+        emit(buf, "arith.andi "); emit(buf, lr.val); emit(buf, ", "); emit(buf, rr.val); emit(buf, " : i1\n");
+        return EResult{ .val = r, .zty = "bool" };
+    }
+    else if (@strEq(b.op, "||")) {
+        emit(buf, "arith.ori "); emit(buf, lr.val); emit(buf, ", "); emit(buf, rr.val); emit(buf, " : i1\n");
+        return EResult{ .val = r, .zty = "bool" };
+    }
+    else {
+        // No MLIR arith equivalent for this operator on an integer type — this is
+        // a real compile error, not a silent fallback.
+        mlir_fatal(_zag_str_concat("integer operator not lowerable to MLIR: ", b.op));
+        return EResult{ .val = r, .zty = ty };
+    }
+    emit(buf, lr.val); emit(buf, ", "); emit(buf, rr.val); emit(buf, " : "); emit(buf, mty); emit(buf, "\n");
+    return EResult{ .val = r, .zty = ty };
+}
+
+fn posit_op_sym(op: []u8) []u8 {
+    if (@strEq(op, "+")) { return "zag_p32_add"; }
+    if (@strEq(op, "-")) { return "zag_p32_sub"; }
+    if (@strEq(op, "*")) { return "zag_p32_mul"; }
+    return "zag_p32_div";
+}
+fn lns_op_sym(op: []u8) []u8 {
+    if (@strEq(op, "*")) { return "zag_l32_mul"; }
+    if (@strEq(op, "/")) { return "zag_l32_div"; }
+    if (@strEq(op, "+")) { return "zag_l32_add"; }
+    return "zag_l32_sub";
+}
+
+// ── call emission (intrinsics + named calls) ─────────────────────────────────
+fn emit_call(buf: *ArrayList[u8], c: *Ctx, cc: Call, slots: *ArrayList[Slot], indent: i32, dl: ArrayList[*Node]) EResult {
+    let cn: []u8 = mlir_callee_name(cc.callee);
+
+    // GPU thread/block index intrinsics
+    if (@strEq(cn, "@gpuThreadIdx") || @strEq(cn, "@gpuBlockIdx") || @strEq(cn, "@gpuBlockDim") || @strEq(cn, "@gpuGridDim")) {
+        let dim: []u8 = "x";
+        if (len[*Node](cc.args) > 0) { dim = gpu_dim_name(get[*Node](cc.args, 0)); }
+        let intr: []u8 = "gpu.thread_id";
+        if (@strEq(cn, "@gpuBlockIdx"))  { intr = "gpu.block_id"; }
+        if (@strEq(cn, "@gpuBlockDim"))  { intr = "gpu.block_dim"; }
+        if (@strEq(cn, "@gpuGridDim"))   { intr = "gpu.grid_dim"; }
+        let r: []u8 = fresh(c, "tid");
+        emit_indent(buf, indent); emit(buf, r); emit(buf, " = "); emit(buf, intr); emit(buf, " "); emit(buf, dim); emit(buf, " : index\n");
+        let cast: []u8 = fresh(c, "cast");
+        emit_indent(buf, indent); emit(buf, cast); emit(buf, " = arith.index_cast "); emit(buf, r); emit(buf, " : index to i32\n");
+        return EResult{ .val = cast, .zty = "i32" };
+    }
+
+    if (@strEq(cn, "@gpuSyncThreads")) {
+        emit_indent(buf, indent); emit(buf, "gpu.barrier\n");
+        return EResult{ .val = "", .zty = "void" };
+    }
+
+    // posit casts
+    if (@strEq(cn, "@floatToPosit")) {
+        let a: EResult = emit_expr(buf, c, get[*Node](cc.args, 0), slots, indent, dl);
+        let r: []u8 = fresh(c, "p");
+        emit_indent(buf, indent); emit(buf, r); emit(buf, " = func.call @zag_f64_to_p32("); emit(buf, a.val); emit(buf, ") : (f64) -> i32\n");
+        return EResult{ .val = r, .zty = "p32" };
+    }
+    if (@strEq(cn, "@positToFloat")) {
+        let a: EResult = emit_expr(buf, c, get[*Node](cc.args, 0), slots, indent, dl);
+        let r: []u8 = fresh(c, "f");
+        emit_indent(buf, indent); emit(buf, r); emit(buf, " = func.call @zag_p32_to_f64("); emit(buf, a.val); emit(buf, ") : (i32) -> f64\n");
+        return EResult{ .val = r, .zty = "f64" };
+    }
+
+    // host GPU memory
+    if (@strEq(cn, "@gpuAlloc")) {
+        let a: EResult = emit_expr(buf, c, get[*Node](cc.args, 0), slots, indent, dl);
+        let r: []u8 = fresh(c, "gbuf");
+        emit_indent(buf, indent); emit(buf, r); emit(buf, " = gpu.alloc("); emit(buf, a.val); emit(buf, ") : memref<?xf32, 1>\n");
+        return EResult{ .val = r, .zty = "[]f32" };
+    }
+    if (@strEq(cn, "@gpuFree")) {
+        let a: EResult = emit_expr(buf, c, get[*Node](cc.args, 0), slots, indent, dl);
+        let elem: []u8 = "f32";
+        if (a.zty.len > 2 && a.zty[0] == '[' && a.zty[1] == ']') { elem = a.zty[2..]; }
+        emit_indent(buf, indent); emit(buf, "gpu.dealloc "); emit(buf, a.val); emit(buf, " : memref<?x"); emit(buf, zag_to_mlir(elem)); emit(buf, ", 1>\n");
+        return EResult{ .val = "", .zty = "void" };
+    }
+
+    // mx casts
+    if (@strEq(cn, "@floatToMxFp8")) {
+        let a: EResult = emit_expr(buf, c, get[*Node](cc.args, 0), slots, indent, dl);
+        let r: []u8 = fresh(c, "mx");
+        emit_indent(buf, indent); emit(buf, r); emit(buf, " = arith.truncf "); emit(buf, a.val); emit(buf, " : f32 to f8E4M3FN\n");
+        return EResult{ .val = r, .zty = "mx_fp8" };
+    }
+    if (@strEq(cn, "@mxFp8ToFloat")) {
+        let a: EResult = emit_expr(buf, c, get[*Node](cc.args, 0), slots, indent, dl);
+        let r: []u8 = fresh(c, "f32");
+        emit_indent(buf, indent); emit(buf, r); emit(buf, " = arith.extf "); emit(buf, a.val); emit(buf, " : f8E4M3FN to f32\n");
+        return EResult{ .val = r, .zty = "f32" };
+    }
+
+    // lns casts
+    if (@strEq(cn, "@floatToLog")) {
+        let a: EResult = emit_expr(buf, c, get[*Node](cc.args, 0), slots, indent, dl);
+        let r: []u8 = fresh(c, "l");
+        emit_indent(buf, indent); emit(buf, r); emit(buf, " = func.call @zag_f32_to_l32("); emit(buf, a.val); emit(buf, ") : (f32) -> i32\n");
+        return EResult{ .val = r, .zty = "l32" };
+    }
+    if (@strEq(cn, "@logToFloat")) {
+        let a: EResult = emit_expr(buf, c, get[*Node](cc.args, 0), slots, indent, dl);
+        let r: []u8 = fresh(c, "f");
+        emit_indent(buf, indent); emit(buf, r); emit(buf, " = func.call @zag_l32_to_f32("); emit(buf, a.val); emit(buf, ") : (i32) -> f32\n");
+        return EResult{ .val = r, .zty = "f32" };
+    }
+
+    // print_* extern builtins
+    if (cn.len > 6 && cn[0] == 'p' && cn[1] == 'r' && cn[2] == 'i' && cn[3] == 'n' && cn[4] == 't' && cn[5] == '_') {
+        let av: ArrayList[EResult] = emit_args(buf, c, cc.args, slots, indent, dl);
+        emit_indent(buf, indent); emit(buf, "func.call @"); emit(buf, cn); emit(buf, "(");
+        emit_arg_vals(buf, av); emit(buf, ") : (");
+        emit_arg_tys(buf, av); emit(buf, ") -> ()\n");
+        return EResult{ .val = "", .zty = "void" };
+    }
+
+    // @gpuLaunch(gx,gy,gz,bx,by,bz, extra…) → real gpu.launch_func op
+    if (@strEq(cn, "@gpuLaunch")) {
+        let av: ArrayList[EResult] = emit_args(buf, c, cc.args, slots, indent, dl);
+        if (len[EResult](av) < 6) { mlir_fatal("@gpuLaunch needs at least 6 args (gx,gy,gz,bx,by,bz)"); }
+        let kname: []u8 = first_kernel_name(dl);
+        if (kname.len == 0) { mlir_fatal("@gpuLaunch with no @kernel function defined in the module"); }
+        emit_indent(buf, indent);
+        emit(buf, "gpu.launch_func @zag_kernels::@"); emit(buf, sym_mangle(kname));
+        emit(buf, " blocks in (");
+        emit(buf, get[EResult](av, 0).val); emit(buf, ", "); emit(buf, get[EResult](av, 1).val); emit(buf, ", "); emit(buf, get[EResult](av, 2).val); emit(buf, ")");
+        emit(buf, " threads in (");
+        emit(buf, get[EResult](av, 3).val); emit(buf, ", "); emit(buf, get[EResult](av, 4).val); emit(buf, ", "); emit(buf, get[EResult](av, 5).val); emit(buf, ")");
+        if (len[EResult](av) > 6) {
+            emit(buf, " args(");
+            let k: i32 = 6;
+            while (k < len[EResult](av)) {
+                if (k > 6) { emit(buf, ", "); }
+                emit(buf, get[EResult](av, k).val); emit(buf, " : "); emit(buf, zag_to_mlir(get[EResult](av, k).zty));
+                k = k + 1;
+            }
+            emit(buf, ")");
+        }
+        emit(buf, "\n");
+        return EResult{ .val = "", .zty = "void" };
+    }
+
+    // standard named call
+    let rt: []u8 = fn_ret_type(dl, cn);
+    let av: ArrayList[EResult] = emit_args(buf, c, cc.args, slots, indent, dl);
+    if (@strEq(rt, "void")) {
+        emit_indent(buf, indent); emit(buf, "func.call @"); emit(buf, sym_mangle(cn)); emit(buf, "(");
+        emit_arg_vals(buf, av); emit(buf, ") : (");
+        emit_arg_tys(buf, av); emit(buf, ") -> ()\n");
+        return EResult{ .val = "", .zty = "void" };
+    }
+    let r: []u8 = fresh(c, "r");
+    let mret: []u8 = zag_to_mlir(rt);
+    if (rt.len == 0) { mret = "i32"; rt = "i32"; }
+    emit_indent(buf, indent); emit(buf, r); emit(buf, " = func.call @"); emit(buf, sym_mangle(cn)); emit(buf, "(");
+    emit_arg_vals(buf, av); emit(buf, ") : (");
+    emit_arg_tys(buf, av); emit(buf, ") -> "); emit(buf, mret); emit(buf, "\n");
+    return EResult{ .val = r, .zty = rt };
+}
+
+fn emit_args(buf: *ArrayList[u8], c: *Ctx, args: ArrayList[*Node], slots: *ArrayList[Slot], indent: i32, dl: ArrayList[*Node]) ArrayList[EResult] {
+    let out: ArrayList[EResult] = make[EResult](4);
+    let i: i32 = 0;
+    while (i < len[*Node](args)) {
+        push[EResult](&out, emit_expr(buf, c, get[*Node](args, i), slots, indent, dl));
+        i = i + 1;
+    }
+    return out;
+}
+
+fn emit_arg_vals(buf: *ArrayList[u8], av: ArrayList[EResult]) void {
+    let i: i32 = 0;
+    while (i < len[EResult](av)) {
+        if (i > 0) { emit(buf, ", "); }
+        emit(buf, get[EResult](av, i).val);
+        i = i + 1;
+    }
+}
+
+fn emit_arg_tys(buf: *ArrayList[u8], av: ArrayList[EResult]) void {
+    let i: i32 = 0;
+    while (i < len[EResult](av)) {
+        if (i > 0) { emit(buf, ", "); }
+        emit(buf, zag_to_mlir(get[EResult](av, i).zty));
+        i = i + 1;
+    }
+}
+
+// ── statement emission ───────────────────────────────────────────────────────
+fn emit_block(buf: *ArrayList[u8], c: *Ctx, body: ArrayList[*Node], slots: *ArrayList[Slot], indent: i32, ret_ty: []u8, dl: ArrayList[*Node]) void {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        emit_stmt(buf, c, get[*Node](body, i), slots, indent, ret_ty, dl);
+        i = i + 1;
+    }
+}
+
+fn emit_stmt(buf: *ArrayList[u8], c: *Ctx, n: *Node, slots: *ArrayList[Slot], indent: i32, ret_ty: []u8, dl: ArrayList[*Node]) void {
+    switch (n.*) {
+        .let_ => |l| {
+            let r: EResult = emit_expr(buf, c, l.expr, slots, indent, dl);
+            let declared: []u8 = r.zty;
+            if (l.has_dty == 1) { declared = l.dty; }
+            let s: Slot = slot_lookup(slots.*, l.name);
+            if (s.name.len > 0 && s.is_alloca == 1) {
+                emit_indent(buf, indent); emit(buf, "memref.store "); emit(buf, r.val); emit(buf, ", "); emit(buf, s.val);
+                emit(buf, "[] : memref<"); emit(buf, zag_to_mlir(declared)); emit(buf, ">\n");
+            } else {
+                slot_set(slots, l.name, r.val, 0, declared);
+            }
+        }
+        .assign => |a| {
+            let r: EResult = emit_expr(buf, c, a.expr, slots, indent, dl);
+            switch (a.target.*) {
+                .idx => |ix| {
+                    let base: EResult = emit_expr(buf, c, ix.base, slots, indent, dl);
+                    let idx: EResult = emit_expr(buf, c, ix.idx, slots, indent, dl);
+                    let elem: []u8 = "i32";
+                    if (base.zty.len > 2 && base.zty[0] == '[' && base.zty[1] == ']') { elem = base.zty[2..]; }
+                    emit_indent(buf, indent); emit(buf, "memref.store "); emit(buf, r.val); emit(buf, ", "); emit(buf, base.val);
+                    emit(buf, "["); emit(buf, idx.val); emit(buf, "] : memref<?x"); emit(buf, zag_to_mlir(elem)); emit(buf, ">\n");
+                }
+                .id => |tid| {
+                    let s: Slot = slot_lookup(slots.*, tid.name);
+                    if (s.name.len > 0 && s.is_alloca == 1) {
+                        emit_indent(buf, indent); emit(buf, "memref.store "); emit(buf, r.val); emit(buf, ", "); emit(buf, s.val);
+                        emit(buf, "[] : memref<"); emit(buf, zag_to_mlir(s.zty)); emit(buf, ">\n");
+                    } else {
+                        slot_set(slots, tid.name, r.val, 0, s.zty);
+                    }
+                }
+                else => { mlir_fatal("assignment target is neither a variable nor an array index"); }
+            }
+        }
+        .ret => |rr| {
+            if (rr.has_expr == 1) {
+                let r: EResult = emit_expr(buf, c, rr.expr, slots, indent, dl);
+                let t: []u8 = r.zty;
+                if (t.len == 0) { t = ret_ty; }
+                emit_indent(buf, indent); emit(buf, "return "); emit(buf, r.val); emit(buf, " : "); emit(buf, zag_to_mlir(t)); emit(buf, "\n");
+            } else {
+                emit_indent(buf, indent); emit(buf, "return\n");
+            }
+        }
+        .if_ => |x| {
+            let cnd: EResult = emit_expr(buf, c, x.cond, slots, indent, dl);
+            emit_indent(buf, indent); emit(buf, "scf.if "); emit(buf, cnd.val); emit(buf, " {\n");
+            let th: ArrayList[Slot] = slot_clone(slots.*);
+            emit_block(buf, c, x.then_body, &th, indent + 1, ret_ty, dl);
+            if (x.has_els == 1) {
+                emit_indent(buf, indent); emit(buf, "} else {\n");
+                let es: ArrayList[Slot] = slot_clone(slots.*);
+                emit_block(buf, c, x.els_body, &es, indent + 1, ret_ty, dl);
+            }
+            emit_indent(buf, indent); emit(buf, "}\n");
+        }
+        .while_ => |w| {
+            let _pre: EResult = emit_expr(buf, c, w.cond, slots, indent, dl);
+            emit_indent(buf, indent); emit(buf, "scf.while : () -> () {\n");
+            let cnd: EResult = emit_expr(buf, c, w.cond, slots, indent + 1, dl);
+            emit_indent(buf, indent + 1); emit(buf, "scf.condition("); emit(buf, cnd.val); emit(buf, ")\n");
+            emit_indent(buf, indent); emit(buf, "} do {\n");
+            let bs: ArrayList[Slot] = slot_clone(slots.*);
+            emit_block(buf, c, w.body, &bs, indent + 1, "void", dl);
+            emit_indent(buf, indent + 1); emit(buf, "scf.yield\n");
+            emit_indent(buf, indent); emit(buf, "}\n");
+        }
+        .estmt => |e| { let _r: EResult = emit_expr(buf, c, e.expr, slots, indent, dl); }
+        .switch_ => |sw| { emit_switch(buf, c, sw, slots, indent, dl); }
+        else => { }
+    }
+}
+
+// Index of the union variant named `tag` within union `uname`, or -1.
+fn union_field_index(dl: ArrayList[*Node], uname: []u8, tag: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](dl)) {
+        switch (get[*Node](dl, i).*) {
+            .union_ => |u| {
+                if (@strEq(u.name, uname)) {
+                    let j: i32 = 0;
+                    while (j < len[Param](u.fields)) {
+                        if (@strEq(get[Param](u.fields, j).name, tag)) { return j; }
+                        j = j + 1;
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// ── switch lowering: enum → tag-index cmp chain; union → tag extract + cmp ────
+fn emit_switch(buf: *ArrayList[u8], c: *Ctx, sw: Switch, slots: *ArrayList[Slot], indent: i32, dl: ArrayList[*Node]) void {
+    let subj: EResult = emit_expr(buf, c, sw.subject, slots, indent, dl);
+
+    if (is_enum_name(dl, subj.zty)) {
+        let ai: i32 = 0;
+        while (ai < len[SwitchArm](sw.arms)) {
+            let arm: SwitchArm = get[SwitchArm](sw.arms, ai);
+            let ti: i32 = 0;
+            while (ti < len[[]u8](arm.tags)) {
+                let tag: []u8 = get[[]u8](arm.tags, ti);
+                let tag_idx: i32 = enum_member_index(dl, subj.zty, tag);
+                if (tag_idx < 0) { tag_idx = 0; }
+                let tc: []u8 = fresh(c, "tag");
+                emit_indent(buf, indent); emit(buf, tc); emit(buf, " = arith.constant "); emit(buf, _zag_i64_to_str(tag_idx as i64)); emit(buf, " : i32\n");
+                let eq: []u8 = fresh(c, "eq");
+                emit_indent(buf, indent); emit(buf, eq); emit(buf, " = arith.cmpi eq, "); emit(buf, subj.val); emit(buf, ", "); emit(buf, tc); emit(buf, " : i32\n");
+                emit_indent(buf, indent); emit(buf, "scf.if "); emit(buf, eq); emit(buf, " {\n");
+                let as_: ArrayList[Slot] = slot_clone(slots.*);
+                emit_block(buf, c, arm.body, &as_, indent + 1, "void", dl);
+                emit_indent(buf, indent); emit(buf, "}\n");
+                ti = ti + 1;
+            }
+            ai = ai + 1;
+        }
+        if (sw.has_els == 1) { emit_switch_else(buf, c, sw.els_body, slots, indent, dl); }
+        return;
+    }
+
+    // union switch: extract the tag (field 0), then per-arm cmp + payload bind
+    let uname: []u8 = subj.zty;
+    let tag_field: []u8 = fresh(c, "tag");
+    emit_indent(buf, indent); emit(buf, tag_field); emit(buf, " = llvm.extractvalue "); emit(buf, subj.val); emit(buf, "[0] : "); emit(buf, zag_to_mlir(uname)); emit(buf, "\n");
+    let ai: i32 = 0;
+    while (ai < len[SwitchArm](sw.arms)) {
+        let arm: SwitchArm = get[SwitchArm](sw.arms, ai);
+        if (len[[]u8](arm.tags) > 0) {
+            let tag: []u8 = get[[]u8](arm.tags, 0);
+            let fidx: i32 = union_field_index(dl, uname, tag);
+            if (fidx < 0) { fidx = 0; }
+            let tc: []u8 = fresh(c, "tc");
+            emit_indent(buf, indent); emit(buf, tc); emit(buf, " = arith.constant "); emit(buf, _zag_i64_to_str(fidx as i64)); emit(buf, " : i32\n");
+            let eq: []u8 = fresh(c, "eq");
+            emit_indent(buf, indent); emit(buf, eq); emit(buf, " = arith.cmpi eq, "); emit(buf, tag_field); emit(buf, ", "); emit(buf, tc); emit(buf, " : i32\n");
+            emit_indent(buf, indent); emit(buf, "scf.if "); emit(buf, eq); emit(buf, " {\n");
+            let as_: ArrayList[Slot] = slot_clone(slots.*);
+            if (arm.has_cap == 1) {
+                let payload: []u8 = fresh(c, "payload");
+                let pty: []u8 = union_payload_type(dl, tag);
+                if (pty.len == 0) { pty = "i32"; }
+                emit_indent(buf, indent + 1); emit(buf, payload); emit(buf, " = llvm.extractvalue "); emit(buf, subj.val);
+                emit(buf, "[1, "); emit(buf, _zag_i64_to_str(fidx as i64)); emit(buf, "] : "); emit(buf, zag_to_mlir(uname)); emit(buf, "\n");
+                slot_set(&as_, arm.cap, payload, 0, pty);
+            }
+            emit_block(buf, c, arm.body, &as_, indent + 1, "void", dl);
+            emit_indent(buf, indent); emit(buf, "}\n");
+        }
+        ai = ai + 1;
+    }
+    if (sw.has_els == 1) { emit_switch_else(buf, c, sw.els_body, slots, indent, dl); }
+}
+
+fn emit_switch_else(buf: *ArrayList[u8], c: *Ctx, body: ArrayList[*Node], slots: *ArrayList[Slot], indent: i32, dl: ArrayList[*Node]) void {
+    // default arm: emit unconditionally (after the matched arms above)
+    let es: ArrayList[Slot] = slot_clone(slots.*);
+    emit_block(buf, c, body, &es, indent, "void", dl);
+}
+
+// ── function emission ────────────────────────────────────────────────────────
+fn emit_params(buf: *ArrayList[u8], params: ArrayList[Param]) void {
+    let i: i32 = 0;
+    while (i < len[Param](params)) {
+        if (i > 0) { emit(buf, ", "); }
+        let p: Param = get[Param](params, i);
+        emit(buf, "%"); emit(buf, p.name); emit(buf, ": "); emit(buf, zag_to_mlir(p.pty));
+        i = i + 1;
+    }
+}
+
+// seed slots with params + alloca every mutated local up front.
+fn emit_fn_prologue(buf: *ArrayList[u8], c: *Ctx, f: FnDecl, indent: i32) ArrayList[Slot] {
+    let slots: ArrayList[Slot] = make[Slot](8);
+    let i: i32 = 0;
+    while (i < len[Param](f.params)) {
+        let p: Param = get[Param](f.params, i);
+        slot_set(&slots, p.name, _zag_str_concat("%", p.name), 0, p.pty);
+        i = i + 1;
+    }
+    // alloca every mutated local, in source-declaration order.
+    let j: i32 = 0;
+    while (j < len[*Node](f.body)) {
+        switch (get[*Node](f.body, j).*) {
+            .let_ => |l| {
+                if (assigned_in_block(f.body, l.name)) {
+                    let already: Slot = slot_lookup(slots, l.name);
+                    if (already.is_alloca == 0) {
+                        let ty: []u8 = let_decl_type(f.body, l.name);
+                        let slot: []u8 = fresh(c, "slot");
+                        emit_indent(buf, indent); emit(buf, slot); emit(buf, " = memref.alloca() : memref<"); emit(buf, zag_to_mlir(ty)); emit(buf, ">\n");
+                        slot_set(&slots, l.name, slot, 1, ty);
+                    }
+                }
+            }
+            else => { }
+        }
+        j = j + 1;
+    }
+    return slots;
+}
+
+fn emit_kernel_fn(buf: *ArrayList[u8], c: *Ctx, f: FnDecl, dl: ArrayList[*Node]) void {
+    emit_indent(buf, 2); emit(buf, "gpu.func @"); emit(buf, sym_mangle(f.name)); emit(buf, "(");
+    emit_params(buf, f.params); emit(buf, ") kernel {\n");
+    let slots: ArrayList[Slot] = emit_fn_prologue(buf, c, f, 3);
+    emit_block(buf, c, f.body, &slots, 3, "void", dl);
+    emit_indent(buf, 3); emit(buf, "gpu.return\n");
+    emit_indent(buf, 2); emit(buf, "} // gpu.func @"); emit(buf, sym_mangle(f.name)); emit(buf, "\n");
+    emit(buf, "\n");
+}
+
+fn emit_host_fn(buf: *ArrayList[u8], c: *Ctx, f: FnDecl, dl: ArrayList[*Node]) void {
+    let mret: []u8 = zag_to_mlir(f.ret);
+    emit_indent(buf, 1); emit(buf, "func.func @"); emit(buf, sym_mangle(f.name)); emit(buf, "(");
+    emit_params(buf, f.params); emit(buf, ")");
+    if (mret.len > 0) { emit(buf, " -> "); emit(buf, mret); }
+    // carry capability annotations as documentation attributes
+    if (len[[]u8](f.annots) > 0) {
+        emit(buf, " attributes {zag.caps = [");
+        let ai: i32 = 0;
+        while (ai < len[[]u8](f.annots)) {
+            if (ai > 0) { emit(buf, ", "); }
+            emit(buf, "\""); emit(buf, get[[]u8](f.annots, ai)); emit(buf, "\"");
+            ai = ai + 1;
+        }
+        emit(buf, "]}");
+    }
+    emit(buf, " {\n");
+    let slots: ArrayList[Slot] = emit_fn_prologue(buf, c, f, 2);
+    emit_block(buf, c, f.body, &slots, 2, f.ret, dl);
+    if (@strEq(f.ret, "void")) { emit_indent(buf, 2); emit(buf, "return\n"); }
+    emit_indent(buf, 1); emit(buf, "} // func.func @"); emit(buf, sym_mangle(f.name)); emit(buf, "\n");
+    emit(buf, "\n");
+}
+
+fn is_gpu_fn(f: FnDecl) bool {
+    let i: i32 = 0;
+    while (i < len[[]u8](f.annots)) {
+        let a: []u8 = get[[]u8](f.annots, i);
+        if (@strEq(a, "@kernel") || @strEq(a, "@device")) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// types used across all fns (for runtime-decl emission)
+fn types_use_posit(dl: ArrayList[*Node]) bool { return any_type_pred(dl, 1); }
+fn types_use_lns(dl: ArrayList[*Node]) bool   { return any_type_pred(dl, 2); }
+
+// kind: 1 = posit, 2 = lns
+fn any_type_pred(dl: ArrayList[*Node], kind: i32) bool {
+    let i: i32 = 0;
+    while (i < len[*Node](dl)) {
+        switch (get[*Node](dl, i).*) {
+            .fn_decl => |f| {
+                let pj: i32 = 0;
+                while (pj < len[Param](f.params)) {
+                    if (type_matches_kind(get[Param](f.params, pj).pty, kind)) { return true; }
+                    pj = pj + 1;
+                }
+                if (type_matches_kind(f.ret, kind)) { return true; }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn type_matches_kind(t: []u8, kind: i32) bool {
+    let bare: []u8 = t;
+    if (bare.len > 2 && bare[0] == '[' && bare[1] == ']') { bare = bare[2..]; }
+    if (kind == 1) { return is_posit_ty(bare); }
+    return is_lns_ty(bare);
+}
+
+// ── header ───────────────────────────────────────────────────────────────────
+fn emit_header(buf: *ArrayList[u8], target: []u8) void {
+    emit(buf, "// Zag MLIR — generated by zag (self-hosted) gpu backend\n");
+    if (@strEq(target, "nvidia")) {
+        emit(buf, "// Target: NVIDIA NVVM/CUDA (nvvm + gpu + llvm dialects)\n");
+        emit(buf, "//\n// Lower with:\n");
+        emit(buf, "//   mlir-opt --pass-pipeline='builtin.module(gpu-kernel-outlining,\n");
+        emit(buf, "//     convert-gpu-to-nvvm,gpu-to-llvm,convert-func-to-llvm)' \\\n");
+        emit(buf, "//     | mlir-translate --mlir-to-llvmir | llc -march=nvptx64\n");
+    } else if (@strEq(target, "amd")) {
+        emit(buf, "// Target: AMD ROCDL/HIP (rocdl + gpu + llvm dialects)\n");
+        emit(buf, "//\n// Lower with:\n");
+        emit(buf, "//   mlir-opt --pass-pipeline='builtin.module(gpu-kernel-outlining,\n");
+        emit(buf, "//     convert-gpu-to-rocdl,gpu-to-llvm,convert-func-to-llvm)' \\\n");
+        emit(buf, "//     | mlir-translate --mlir-to-llvmir\n");
+    } else if (@strEq(target, "vulkan")) {
+        emit(buf, "// Target: Vulkan SPIR-V portability fallback (spirv dialect)\n");
+        emit(buf, "//\n// Lower with:\n");
+        emit(buf, "//   mlir-opt --convert-gpu-to-spirv --serialize-spirv \\\n");
+        emit(buf, "//     | spirv-dis  (or load the .spv binary directly)\n");
+    } else {
+        emit(buf, "// Target: "); emit(buf, target); emit(buf, "\n");
+    }
+    emit(buf, "\n");
+}
+
+// ── runtime helper declarations (posit / lns) ────────────────────────────────
+fn emit_runtime_decls(buf: *ArrayList[u8], dl: ArrayList[*Node]) void {
+    if (types_use_posit(dl)) {
+        emit_indent(buf, 1); emit(buf, "func.func private @zag_p32_add(i32, i32) -> i32\n");
+        emit_indent(buf, 1); emit(buf, "func.func private @zag_p32_sub(i32, i32) -> i32\n");
+        emit_indent(buf, 1); emit(buf, "func.func private @zag_p32_mul(i32, i32) -> i32\n");
+        emit_indent(buf, 1); emit(buf, "func.func private @zag_p32_div(i32, i32) -> i32\n");
+        emit_indent(buf, 1); emit(buf, "func.func private @zag_p32_to_f64(i32) -> f64\n");
+        emit_indent(buf, 1); emit(buf, "func.func private @zag_f64_to_p32(f64) -> i32\n");
+    }
+    if (types_use_lns(dl)) {
+        emit_indent(buf, 1); emit(buf, "func.func private @zag_l32_mul(i32, i32) -> i32\n");
+        emit_indent(buf, 1); emit(buf, "func.func private @zag_l32_div(i32, i32) -> i32\n");
+        emit_indent(buf, 1); emit(buf, "func.func private @zag_l32_add(i32, i32) -> i32\n");
+        emit_indent(buf, 1); emit(buf, "func.func private @zag_l32_sub(i32, i32) -> i32\n");
+        emit_indent(buf, 1); emit(buf, "func.func private @zag_l32_to_f32(i32) -> f32\n");
+        emit_indent(buf, 1); emit(buf, "func.func private @zag_f32_to_l32(f32) -> i32\n");
+    }
+}
+
+// ── module emission ──────────────────────────────────────────────────────────
+fn emit_module(buf: *ArrayList[u8], c: *Ctx, dl: ArrayList[*Node]) void {
+    emit_header(buf, c.*.target);
+    emit(buf, "module attributes {gpu.container_module} {\n");
+    emit_runtime_decls(buf, dl);
+
+    // count kernels first (to decide whether to open the gpu.module)
+    let nkern: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[*Node](dl)) {
+        switch (get[*Node](dl, i).*) {
+            .fn_decl => |f| { if (f.is_extern == 0 && is_gpu_fn(f)) { nkern = nkern + 1; } }
+            else => { }
+        }
+        i = i + 1;
+    }
+
+    if (nkern > 0) {
+        emit_indent(buf, 1); emit(buf, "gpu.module @zag_kernels {\n");
+        let ki: i32 = 0;
+        while (ki < len[*Node](dl)) {
+            switch (get[*Node](dl, ki).*) {
+                .fn_decl => |f| { if (f.is_extern == 0 && is_gpu_fn(f)) { emit_kernel_fn(buf, c, f, dl); } }
+                else => { }
+            }
+            ki = ki + 1;
+        }
+        emit_indent(buf, 1); emit(buf, "} // gpu.module @zag_kernels\n");
+        emit(buf, "\n");
+    }
+
+    // host fns at module level
+    let hi: i32 = 0;
+    while (hi < len[*Node](dl)) {
+        switch (get[*Node](dl, hi).*) {
+            .fn_decl => |f| { if (f.is_extern == 0 && !is_gpu_fn(f)) { emit_host_fn(buf, c, f, dl); } }
+            else => { }
+        }
+        hi = hi + 1;
+    }
+
+    emit(buf, "} // module\n");
+}
+
+// ── public entry point ───────────────────────────────────────────────────────
+// Parse `src`, walk it, return the MLIR module text.
+fn emit_mlir(src: []u8, target: []u8) ArrayList[u8] {
+    let decls: ArrayList[*Node] = parse_program(src);
+    let buf: ArrayList[u8] = make[u8](4096);
+    let c: Ctx = Ctx{ .ctr = 0, .target = target };
+    emit_module(&buf, &c, decls);
+    return buf;
+}
+
+// Parse with @imports resolved relative to `base_dir`.
+fn emit_mlir_dir(src: []u8, base_dir: []u8, target: []u8) ArrayList[u8] {
+    let decls: ArrayList[*Node] = parse_program_dir(src, base_dir);
+    let buf: ArrayList[u8] = make[u8](4096);
+    let c: Ctx = Ctx{ .ctr = 0, .target = target };
+    emit_module(&buf, &c, decls);
+    return buf;
+}
