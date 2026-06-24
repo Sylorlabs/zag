@@ -661,21 +661,18 @@ fn genCall(ctx: *Ctx, c: ast.Call) !void {
             const n = ctx.tmp_counter;
             ctx.tmp_counter += 1;
             const tmp_name = try std.fmt.allocPrint(ctx.alloc, "__zag_new_{d}", .{n});
-            // Emit pre-statement: T* __zag_new_N = (T*)malloc(sizeof(T));
-            const ind = try indentStr(ctx.alloc, ctx.indent);
-            try ctx.pre_stmts.writer().print(
-                "{s}{s}* {s} = ({s}*)malloc(sizeof({s})); if (!{s}) {{ fprintf(stderr, \"OOM\\n\"); abort(); }} *{s} = ",
-                .{ ind, arg_ct, tmp_name, arg_ct, arg_ct, tmp_name, tmp_name },
+            // Emit as a self-contained GCC statement-expression, INLINE at the
+            // call site, rather than hoisting the malloc+init to a pre-statement.
+            // Hoisting escapes any local scope the expression sits in — notably a
+            // switch-expression arm's capture binding (`.x => |v| new(...v...)`),
+            // where the hoisted init would reference `v` outside its block.
+            try ctx.wf(
+                "__extension__({{ {s}* {s} = ({s}*)malloc(sizeof({s})); if (!{s}) {{ fprintf(stderr, \"OOM\\n\"); abort(); }} *{s} = ",
+                .{ arg_ct, tmp_name, arg_ct, arg_ct, tmp_name, tmp_name },
             );
-            // emit the value expression into pre_stmts temporarily
-            const saved_buf = ctx.buf;
-            ctx.buf = ctx.pre_stmts;
             try genExpr(ctx, arg);
-            ctx.pre_stmts = ctx.buf;
-            ctx.buf = saved_buf;
-            try ctx.pre_stmts.writer().print(";\n", .{});
-            // The expression result is just the pointer name
-            try ctx.w(tmp_name);
+            // The statement-expression yields the pointer as its value.
+            try ctx.wf("; {s}; }})", .{tmp_name});
             return;
         }
 
