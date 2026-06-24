@@ -146,20 +146,29 @@ Notes for later stages:
              @sizeOf[MapEntry[V]] → @sizeOf[g__MapEntry[V]]); codegen subst_type also
              handles ?/! prefixes for monomorphizing optional returns. Verified:
              `@import("gmod.zag") as g; g.make_box[i32](42)` → 42 (g__Box_i32 etc.).
-       - [ ] TYPE-AWARE slice-vs-pointer for index and slice expressions — the one
-             remaining wall. `key[i]` (a []u8 slice → key.ptr[i]) and `e[i]` (a *T
-             pointer → e[i]) are both ident-based, so no shape heuristic can tell them
-             apart; this needs a small typeOf/scope pass (params + let dtys + struct
-             field types). It's the concrete blocker for compiling std/map.zag (which
-             does `key[i]` AND `m.entries[idx]`) through the self-hosted compiler.
+       - [x] TYPE-AWARE slice-vs-pointer for index/slice — a small per-function type
+             pass (codegen.zag) builds a name→type scope (params + typed lets) and a
+             coarse base_type (ident/field/deref/cast/index) over the struct decls,
+             then stamps each Index/Slice node's ptr_base flag: `key[i]` ([]u8 →
+             key.ptr[i]) vs `e[i]` (*T → e[i]). Plus the supporting fixes it exposed:
+             transitive fn-instantiation fixpoint (make[i32]→alloc_table[i32]→grow…),
+             struct-instantiation field-dependency ordering (MapEntry[i32] before
+             StringMap[i32]), record_type_sinst strips */?/!/[], subst_type handles
+             ?/!, opt-typedef collection skips generic templates, join_path passes
+             absolute paths, and `zag build --run` prefixes "./" for relative outputs.
+       - [x] CAPSTONE: the self-hosted compiler compiles the real std/map.zag
+             (StringMap[V]) imported `as map` — generics + *T pointers + slice/pointer
+             indexing + ?V optionals + orelse + runtime.c — → 10 20 30 99 3. (test in
+             run_selfhost.sh)
        - [ ] if-let `if (opt) |v| {..}` (minor; orelse covers the common consumption).
-       (Generic functions/structs + qualified generic imports work via explicit
-        type-args + monomorphization; optionals/switch/strings/slicing work type-unaware
-        via __auto_type + wrap-at-annotation + shape heuristics. The last real gap is the
-        slice-vs-pointer type pass above.)
+       (Generic functions/structs + qualified generic imports + optionals/switch/
+        strings/slicing all work; the slice-vs-pointer type pass closed the last
+        language wall. std/map.zag now compiles end to end.)
 - [ ] C3. `zagc2` compiles its own source → `zagc3`; verify fixpoint (zagc2 and
-       zagc3 produce identical output). Last language gap: the slice-vs-pointer type
-       pass (above), then driving full selfhost/* + std/* through `zagc2`.
+       zagc3 produce identical output). Language features are in place (std/map.zag
+       compiles); remaining work is driving the full selfhost/* + std/* source
+       through `zagc2` and fixing whatever surfaces (e.g. if-let, std/list.zag,
+       larger files), then comparing zagc2/zagc3 output.
 
 ## Status log
 
@@ -171,6 +180,13 @@ Notes for later stages:
 - 2026-06-24 (cont.): self-hosted codegen — added optionals/orelse, expression switch,
   and pointer-base slicing, all WITHOUT a full type-inference pass (ZagOpt structs +
   wrap-at-annotation, `__auto_type` orelse/captures, ternary-chain expr-switch, shape-
-  based pointer-vs-slice). selfhost suite 15→18; all green (core 40, stdlib 3,
-  selfhost 18, selfhost-features 2 = 63 total). Remaining for C3: if-let, qualified-
-  import descent into generic applications (map.zag), then driving full self-source.
+  based pointer-vs-slice). selfhost suite 15→18.
+- 2026-06-24 (cont.): qualified import of GENERIC modules (Base[args] type-substitution
+  descent + call/struct-lit targ subst + subst_type ?/! ) → selfhost 19.
+- 2026-06-24 (cont.): TYPE PASS — a small per-function name→type scope + coarse base_type
+  classifies slice-vs-pointer for index/slice (key.ptr[i] vs e[i]); plus transitive
+  fn-instantiation fixpoint, struct field-dependency ordering, record_type_sinst prefix
+  strip, generic-template opt-collection skip, absolute join_path, `--run` ./ prefix.
+  CAPSTONE: the self-hosted compiler now compiles the real std/map.zag (StringMap[V]
+  as map) → 10 20 30 99 3. selfhost 19→20; all green (core 40, stdlib 3, selfhost 20,
+  selfhost-features 2 = 65 total). C3 next: drive full selfhost/* + std/* through zagc2.

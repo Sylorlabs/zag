@@ -458,26 +458,25 @@ fn gen_expr(buf: *ArrayList[u8], n: *Node, dl: ArrayList[*Node]) void {
             }
         }
         .idx  => |x| {
-            gen_expr(buf, x.base, dl);
-            emit(buf, "[");
+            // slice base ([]T) indexes through .ptr; pointer/array base is direct
+            if (x.ptr_base == 0) {
+                emit(buf, "(");
+                gen_expr(buf, x.base, dl);
+                emit(buf, ").ptr[");
+            } else {
+                gen_expr(buf, x.base, dl);
+                emit(buf, "[");
+            }
             gen_expr(buf, x.idx, dl);
             emit(buf, "]");
         }
         .slice_ => |s| {
             // (ZagSliceU8){ <ptr> + lo, (hi | base.len) - lo }
-            // The codegen is type-unaware, so we pick the pointer expression by
-            // shape: a (non-deref) struct-field base like `container.data` is a
-            // pointer field → slice it directly; anything else is treated as a
-            // []T slice value → use `.ptr`/`.len`. (Slicing a slice-typed struct
-            // field would need the type-inference pass; not used in this tree.)
-            let ptr_base: i32 = 0;
-            switch (s.base.*) {
-                .fld => |f| { if (!@strEq(f.fname, "*")) { ptr_base = 1; } }
-                else => { }
-            }
+            // s.ptr_base (stamped by the type pass) is 1 for a *T pointer base
+            // (slice it directly) and 0 for a []T slice value (use .ptr/.len).
             emit(buf, "(ZagSliceU8){ (");
             gen_expr(buf, s.base, dl);
-            if (ptr_base == 1) { emit(buf, ") + ("); } else { emit(buf, ").ptr + ("); }
+            if (s.ptr_base == 1) { emit(buf, ") + ("); } else { emit(buf, ").ptr + ("); }
             gen_expr(buf, s.lo, dl);
             emit(buf, "), (");
             if (s.has_hi == 1) {
@@ -718,6 +717,185 @@ fn gen_stmt(buf: *ArrayList[u8], n: *Node, dl: ArrayList[*Node], fnret: []u8) vo
     }
 }
 
+// ── type pass: classify index/slice bases as slice (.ptr) vs pointer ──────────
+// The codegen is otherwise type-unaware, but `s[i]` on a []T slice must become
+// `s.ptr[i]` while `p[i]` on a *T pointer stays `p[i]`. Both are ident-based, so
+// we run a small per-function pass that builds a name→type scope (params + typed
+// lets) and stamps each Index/Slice node's `ptr_base` flag before codegen.
+struct Binding { name: []u8, ty: []u8 }
+
+fn env_lookup(env: ArrayList[Binding], name: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[Binding](env)) {
+        if (@strEq(get[Binding](env, i).name, name)) { return get[Binding](env, i).ty; }
+        i = i + 1;
+    }
+    return "";
+}
+
+// "StringMap[V]" → "StringMap"; leaves a plain name unchanged.
+fn strip_gapp(t: []u8) []u8 {
+    if (is_generic_app(t)) { return t[0..index_of(t, '[')]; }
+    return t;
+}
+
+// Declared type of `field` on a struct value of type `sty` (or "" if unknown).
+fn struct_field_type(sty: []u8, field: []u8, dl: ArrayList[*Node]) []u8 {
+    let base: []u8 = strip_gapp(sty);
+    let i: i32 = 0;
+    while (i < len[*Node](dl)) {
+        switch (get[*Node](dl, i).*) {
+            .struct_ => |s| {
+                if (@strEq(s.name, base)) {
+                    let j: i32 = 0;
+                    while (j < len[Param](s.fields)) {
+                        if (@strEq(get[Param](s.fields, j).name, field)) { return get[Param](s.fields, j).pty; }
+                        j = j + 1;
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// The fname of a field access (or "" if `n` is not a field).
+fn field_fname(n: *Node) []u8 {
+    return switch (n.*) {
+        .fld => |f| f.fname,
+        else => "",
+    };
+}
+
+// Coarse type of an expression — enough to tell []T (slice) from *T (pointer).
+fn base_type(n: *Node, env: ArrayList[Binding], dl: ArrayList[*Node]) []u8 {
+    return switch (n.*) {
+        .id  => |x| env_lookup(env, x.name),
+        .cast_ => |c| c.target,
+        .fld => |f| base_field_type(f, env, dl),
+        .idx => |x| base_elem_type(base_type(x.base, env, dl)),
+        else => "",
+    };
+}
+
+fn base_field_type(f: Field, env: ArrayList[Binding], dl: ArrayList[*Node]) []u8 {
+    if (@strEq(f.fname, "*")) {
+        // pointer deref: *T → T
+        let bt: []u8 = base_type(f.base, env, dl);
+        if (bt.len > 1 && bt[0] == '*') { return bt[1..]; }
+        return "";
+    }
+    return struct_field_type(base_type(f.base, env, dl), f.fname, dl);
+}
+
+// Element type of an indexable: []T → T, *T → T.
+fn base_elem_type(bt: []u8) []u8 {
+    if (bt.len > 2 && bt[0] == '[' && bt[1] == ']') { return bt[2..]; }
+    if (bt.len > 1 && bt[0] == '*') { return bt[1..]; }
+    return "";
+}
+
+// index `base[i]`: 1 (direct) unless base is a known []T slice → 0 (use .ptr).
+fn classify_idx(base: *Node, env: ArrayList[Binding], dl: ArrayList[*Node]) i32 {
+    let bt: []u8 = base_type(base, env, dl);
+    if (bt.len > 2 && bt[0] == '[' && bt[1] == ']') { return 0; }
+    return 1;
+}
+
+// slice `base[lo..hi]`: 1 if base is a *T pointer, 0 if a []T slice; when the
+// type is unknown, fall back to shape (a non-deref struct field is a pointer).
+fn classify_slice(base: *Node, env: ArrayList[Binding], dl: ArrayList[*Node]) i32 {
+    let bt: []u8 = base_type(base, env, dl);
+    if (bt.len > 1 && bt[0] == '*') { return 1; }
+    if (bt.len > 2 && bt[0] == '[' && bt[1] == ']') { return 0; }
+    let fn_: []u8 = field_fname(base);
+    if (fn_.len > 0 && !@strEq(fn_, "*")) { return 1; }
+    return 0;
+}
+
+fn build_env_block(body: ArrayList[*Node], env: *ArrayList[Binding]) void {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) { build_env_stmt(get[*Node](body, i), env); i = i + 1; }
+}
+
+fn build_env_stmt(n: *Node, env: *ArrayList[Binding]) void {
+    switch (n.*) {
+        .let_   => |l| { if (l.has_dty == 1) { push[Binding](env, Binding{ .name = l.name, .ty = l.dty }); } }
+        .if_    => |x| { build_env_block(x.then_body, env); if (x.has_els == 1) { build_env_block(x.els_body, env); } }
+        .while_ => |w| { build_env_block(w.body, env); }
+        .switch_ => |sw| {
+            let ai: i32 = 0;
+            while (ai < len[SwitchArm](sw.arms)) { build_env_block(get[SwitchArm](sw.arms, ai).body, env); ai = ai + 1; }
+            if (sw.has_els == 1) { build_env_block(sw.els_body, env); }
+        }
+        else => { }
+    }
+}
+
+fn build_env(params: ArrayList[Param], body: ArrayList[*Node]) ArrayList[Binding] {
+    let env: ArrayList[Binding] = make[Binding](8);
+    let i: i32 = 0;
+    while (i < len[Param](params)) {
+        push[Binding](&env, Binding{ .name = get[Param](params, i).name, .ty = get[Param](params, i).pty });
+        i = i + 1;
+    }
+    build_env_block(body, &env);
+    return env;
+}
+
+// Walk the body, stamping ptr_base on every Index/Slice node.
+fn annotate_expr(n: *Node, env: ArrayList[Binding], dl: ArrayList[*Node]) void {
+    switch (n.*) {
+        .bin => |b| { annotate_expr(b.l, env, dl); annotate_expr(b.r, env, dl); }
+        .un  => |u| { annotate_expr(u.e, env, dl); }
+        .call => |c| {
+            annotate_expr(c.callee, env, dl);
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) { annotate_expr(get[*Node](c.args, i), env, dl); i = i + 1; }
+        }
+        .fld => |f| { annotate_expr(f.base, env, dl); }
+        .cast_ => |c| { annotate_expr(c.expr, env, dl); }
+        .idx => |x| {
+            annotate_expr(x.base, env, dl); annotate_expr(x.idx, env, dl);
+            n.* = Node{ .idx = Index{ .base = x.base, .idx = x.idx, .ptr_base = classify_idx(x.base, env, dl) } };
+        }
+        .slice_ => |s| {
+            annotate_expr(s.base, env, dl); annotate_expr(s.lo, env, dl); annotate_expr(s.hi, env, dl);
+            n.* = Node{ .slice_ = Slice{ .base = s.base, .lo = s.lo, .hi = s.hi, .has_hi = s.has_hi, .ptr_base = classify_slice(s.base, env, dl) } };
+        }
+        .slit_ => |s| {
+            let i: i32 = 0;
+            while (i < len[FieldInit](s.fields)) { annotate_expr(get[FieldInit](s.fields, i).val, env, dl); i = i + 1; }
+        }
+        else => { }
+    }
+}
+
+fn annotate_block(body: ArrayList[*Node], env: ArrayList[Binding], dl: ArrayList[*Node]) void {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) { annotate_stmt(get[*Node](body, i), env, dl); i = i + 1; }
+}
+
+fn annotate_stmt(n: *Node, env: ArrayList[Binding], dl: ArrayList[*Node]) void {
+    switch (n.*) {
+        .let_   => |l| { annotate_expr(l.expr, env, dl); }
+        .ret    => |r| { if (r.has_expr == 1) { annotate_expr(r.expr, env, dl); } }
+        .if_    => |x| { annotate_expr(x.cond, env, dl); annotate_block(x.then_body, env, dl); if (x.has_els == 1) { annotate_block(x.els_body, env, dl); } }
+        .while_ => |w| { annotate_expr(w.cond, env, dl); annotate_block(w.body, env, dl); }
+        .assign => |a| { annotate_expr(a.target, env, dl); annotate_expr(a.expr, env, dl); }
+        .switch_ => |sw| {
+            annotate_expr(sw.subject, env, dl);
+            let ai: i32 = 0;
+            while (ai < len[SwitchArm](sw.arms)) { annotate_block(get[SwitchArm](sw.arms, ai).body, env, dl); ai = ai + 1; }
+            if (sw.has_els == 1) { annotate_block(sw.els_body, env, dl); }
+        }
+        .estmt  => |e| { annotate_expr(e.expr, env, dl); }
+        else => { }
+    }
+}
+
 // ── function declarations ────────────────────────────────────────────────────
 fn gen_params(buf: *ArrayList[u8], params: ArrayList[Param]) void {
     if (len[Param](params) == 0) {
@@ -774,6 +952,7 @@ fn gen_fn(buf: *ArrayList[u8], f: FnDecl, dl: ArrayList[*Node]) void {
         gen_params(buf, f.params);
         emit(buf, ") {\n");
     }
+    annotate_block(f.body, build_env(f.params, f.body), dl);   // classify index/slice bases
     gen_block(buf, f.body, dl, f.ret);
     if (is_main == 1) { emit(buf, "    return 0;\n"); }
     emit(buf, "}\n");
@@ -953,7 +1132,18 @@ fn record_sinst(sname: []u8, targs: ArrayList[[]u8], decls: ArrayList[*Node], si
         switch (d.*) {
             .struct_ => |s| {
                 if (len[[]u8](s.tparams) > 0 && @strEq(s.name, sname)) {
-                    push[SInst](sinsts, SInst{ .mangled = mangled, .decl = s, .targs = targs });
+                    // Record field-type instantiations FIRST so a dependency like
+                    // StringMap[i32].entries: *MapEntry[i32] emits MapEntry[i32]
+                    // before StringMap[i32]. (The codebase has no cyclic generic
+                    // structs, so this terminates.)
+                    let fi: i32 = 0;
+                    while (fi < len[Param](s.fields)) {
+                        record_type_sinst(subst_type(get[Param](s.fields, fi).pty, s.tparams, targs), decls, sinsts);
+                        fi = fi + 1;
+                    }
+                    if (!sinst_seen(sinsts.*, mangled)) {
+                        push[SInst](sinsts, SInst{ .mangled = mangled, .decl = s, .targs = targs });
+                    }
                 }
             }
             else => { }
@@ -998,11 +1188,19 @@ fn collect_sinst_block(body: ArrayList[*Node], decls: ArrayList[*Node], sinsts: 
 }
 
 // Record a struct instantiation implied by a type string like "Pair[i32]".
+// Strips leading * / ? / ! / [] so e.g. `*MapEntry[i32]` records MapEntry[i32].
 fn record_type_sinst(t: []u8, decls: ArrayList[*Node], sinsts: *ArrayList[SInst]) void {
-    if (!is_generic_app(t)) { return; }
-    let lb: i32 = index_of(t, '[');
-    let base: []u8 = t[0..lb];
-    let arglist: ArrayList[[]u8] = split_args(t[lb + 1..t.len - 1]);
+    let u: []u8 = t;
+    let go: bool = true;
+    while (go) {
+        if (u.len > 1 && (u[0] == '*' || u[0] == '?' || u[0] == '!')) { u = u[1..]; }
+        else if (u.len > 2 && u[0] == '[' && u[1] == ']') { u = u[2..]; }
+        else { go = false; }
+    }
+    if (!is_generic_app(u)) { return; }
+    let lb: i32 = index_of(u, '[');
+    let base: []u8 = u[0..lb];
+    let arglist: ArrayList[[]u8] = split_args(u[lb + 1..u.len - 1]);
     record_sinst(base, arglist, decls, sinsts);
 }
 
@@ -1068,6 +1266,17 @@ fn emit_mono_proto(buf: *ArrayList[u8], inst: Inst) void {
 fn emit_mono_body(buf: *ArrayList[u8], inst: Inst, dl: ArrayList[*Node]) void {
     emit_mono_sig(buf, inst);
     emit(buf, " {\n");
+    // build the scope from substituted param types + the (already-substituted)
+    // body so index/slice bases classify against concrete types
+    let penv: ArrayList[Binding] = make[Binding](8);
+    let pi: i32 = 0;
+    while (pi < len[Param](inst.f.params)) {
+        let p: Param = get[Param](inst.f.params, pi);
+        push[Binding](&penv, Binding{ .name = p.name, .ty = subst_type(p.pty, inst.f.tparams, inst.targs) });
+        pi = pi + 1;
+    }
+    build_env_block(inst.cbody, &penv);
+    annotate_block(inst.cbody, penv, dl);
     // the instance's return type drives ?T wrapping inside the body
     gen_block(buf, inst.cbody, dl, subst_type(inst.f.ret, inst.f.tparams, inst.targs));
     emit(buf, "}\n");
@@ -1219,6 +1428,14 @@ fn codegen_decls(decls: ArrayList[*Node]) ArrayList[u8] {
         }
         ci = ci + 1;
     }
+    // fixpoint: a generic fn body may call other generics (make[i32] calls
+    // alloc_table[i32]; put[i32] calls grow[i32]). Walk each instance's
+    // (substituted) body, appending newly-needed instances until stable.
+    let fp: i32 = 0;
+    while (fp < len[Inst](insts)) {
+        collect_block(get[Inst](insts, fp).cbody, decls, &insts);
+        fp = fp + 1;
+    }
     // also collect struct instantiations from the monomorphized (concrete) fn
     // bodies — e.g. make_pair[i32]'s body builds Pair[i32]{...}
     let mi: i32 = 0;
@@ -1242,11 +1459,15 @@ fn codegen_decls(decls: ArrayList[*Node]) ArrayList[u8] {
     while (oi < len[*Node](decls)) {
         switch (get[*Node](decls, oi).*) {
             .fn_decl => |f| {
-                collect_opts_params(f.params, &opts);
-                collect_opt(f.ret, &opts);
-                if (f.is_extern == 0 && len[[]u8](f.tparams) == 0) { collect_opts_block(f.body, &opts); }
+                // skip generic templates — their ?V would emit ZagOpt_V; the
+                // concrete ?i32 etc. come from the monomorphized instances below.
+                if (len[[]u8](f.tparams) == 0) {
+                    collect_opts_params(f.params, &opts);
+                    collect_opt(f.ret, &opts);
+                    if (f.is_extern == 0) { collect_opts_block(f.body, &opts); }
+                }
             }
-            .struct_ => |s| { collect_opts_params(s.fields, &opts); }
+            .struct_ => |s| { if (len[[]u8](s.tparams) == 0) { collect_opts_params(s.fields, &opts); } }
             .union_  => |u| { collect_opts_params(u.fields, &opts); }
             else => { }
         }

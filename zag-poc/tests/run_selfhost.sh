@@ -192,6 +192,18 @@ if $ZAGC build selfhost/zagc.zag >/dev/null 2>&1 && [ -x ./zagc ]; then
         echo "  XX  @import as name (generic) (got '$qgout', want 42)"; fail=$((fail+1))
     fi
 
+    # The capstone: the self-hosted compiler compiles the real std/map.zag
+    # (StringMap[V]) imported `as map` — generics + *T pointers + slice/pointer
+    # indexing + ?V optionals + orelse + runtime.c auto-link, all at once.
+    printf '@import("%s/std/map.zag") as map\nfn main() void {\n  let m: map.StringMap[i32] = map.make[i32](8);\n  map.put[i32](&m, "x", 10);\n  map.put[i32](&m, "y", 20);\n  map.put[i32](&m, "z", 30);\n  print_i32(map.get[i32](m, "x") orelse 0);\n  print_i32(map.get[i32](m, "y") orelse 0);\n  print_i32(map.get[i32](m, "z") orelse 0);\n  print_i32(map.get[i32](m, "missing") orelse 99);\n  print_i32(map.count[i32](m));\n}\n' "$(pwd)" > $SH/mapuse.zag
+    $SH/zagc $SH/mapuse.zag >/dev/null 2>&1
+    mapout=""; if [ -x $SH/mapuse.zag.out ]; then mapout=$($SH/mapuse.zag.out | tr '\n' ' ' | sed 's/ *$//'); fi
+    if [ "$mapout" = "10 20 30 99 3" ]; then
+        echo "  ok  std/map.zag (as map): StringMap[i32] put/get/orelse/count → 10 20 30 99 3"; pass=$((pass+1))
+    else
+        echo "  XX  std/map.zag (as map) (got '$mapout', want '10 20 30 99 3')"; fail=$((fail+1))
+    fi
+
     # tagged unions + statement switch: union construction (tag + payload),
     # switch over a union tag with |capture|, and switch over a plain enum.
     printf 'enum OpClass { Numeric, Control, Memory }\nunion WasmOp { local_get: i32, i32_const: i64, i32_add: bool }\nfn classify(op: WasmOp) OpClass {\n  let cls: OpClass = OpClass.Control;\n  switch (op) {\n    .local_get => |idx| { cls = OpClass.Memory; }\n    .i32_const => |v| { cls = OpClass.Numeric; }\n    .i32_add => |_x| { cls = OpClass.Numeric; }\n  }\n  return cls;\n}\nfn code(c: OpClass) i32 {\n  let r: i32 = 0;\n  switch (c) { .Numeric => { r = 1; } .Control => { r = 2; } .Memory => { r = 3; } }\n  return r;\n}\nfn main() void {\n  let a: WasmOp = WasmOp{ .local_get = 5 };\n  let b: WasmOp = WasmOp{ .i32_const = 42 };\n  print_i32(code(classify(a)));\n  print_i32(code(classify(b)));\n}\n' > $SH/uni.zag
