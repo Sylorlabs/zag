@@ -22,13 +22,14 @@ else
     fail=$((fail+1))
 fi
 
-# Parser: pre-order AST dump (node codes + key strings) of a recursive fib fn.
+# Parser: pre-order AST dump of fib (precedence) + enum/struct/union decls +
+# struct literal + pointer-deref field chain (p.*.x).
 echo "── selfhost: parser ──"
 $ZAGC build selfhost/parse_test.zag --run >/tmp/zsh2 2>/dev/null
 pgot=$(sed -n '/-- running/,/-- exit/p' /tmp/zsh2 | grep -vE 'running|exit|--' | tr '\n' ' ' | sed 's/ *$//')
-pwant="1 fib i32 4 13 < 12 n 10 2 3 12 n 3 13 + 15 12 fib 13 - 12 n 10 1 15 12 fib 13 - 12 n 10 2"
+pwant="1 fib i32 4 13 < 12 n 10 2 3 12 n 3 13 + 15 12 fib 13 - 12 n 10 1 15 12 fib 13 - 12 n 10 2 31 Color Red Green Blue 30 Point x i32 y i32 32 Val num i32 flag bool 1 origin Point 3 18 Point x 10 0 y 10 0 1 getx i32 3 17 17 12 p * x"
 if [ "$pgot" = "$pwant" ]; then
-    echo "  ok  parser (fib: if/return/call/precedence)"; pass=$((pass+1))
+    echo "  ok  parser (fib precedence; enum/struct/union; struct-lit; p.*.x)"; pass=$((pass+1))
 else
     echo "  XX  parser"; echo "      want: [$pwant]"; echo "      got:  [$pgot]"; fail=$((fail+1))
 fi

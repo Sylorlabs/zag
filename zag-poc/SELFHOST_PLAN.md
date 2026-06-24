@@ -53,8 +53,18 @@ Enabling language features added for self-hosting (all in the bootstrap compiler
 - [x] B1. `lex.zag` — tokenizer in Zag. 38 token kinds, keywords, annotations,
        two-char ops, char/string/number scanning, comments. Test: selfhost/lex_test.zag
        verifies 30-token kind sequence + slice-extracted token texts. tests/run_selfhost.sh.
-- [ ] B2. `ast.zag`   — node tags + constructors (tagged unions over *Node)
-- [ ] B3. `parse.zag` — recursive descent; verify AST shape
+- [x] B2. `ast.zag` — tagged-union Node (19 variants) over *Node; child lists as
+       ArrayList[*Node], params ArrayList[Param], enum members ArrayList[[]u8];
+       struct/enum/union decls + struct-lit; constructor helpers.
+- [x] B3. `parse.zag` — recursive descent: fn/extern, struct/enum/union decls,
+       params, types (* ? [] named), blocks, let/return/if/else-if/while/assign/expr,
+       full precedence expr chain, struct literals, postfix call/index/field/deref.
+       Verified via selfhost/parse_test.zag: fib precedence, enum/struct/union, struct
+       literal, and `p.*.x` deref chain all dump to the expected AST.
+       Enabling fixes: generic arg + fn-name mangling sanitize illegal C chars;
+       instantiated generics emitted before user structs; isPointer matches `*[]u8`.
+       (Not yet: @import, generic struct-lit `Foo[T]{}`, slicing/cast/try/catch/orelse
+        in expressions, switch — add when sema/codegen need them.)
 - [ ] B4. `types.zag` — type helpers, builtin table
 - [ ] B5. `sema.zag`  — type checker + effect system
 - [ ] B6. `codegen.zag`— C backend

@@ -187,10 +187,10 @@ pub fn sliceInner(t: []const u8) []const u8 {
     return t[2..];
 }
 
-/// Returns true if t is a pointer type (*T).
-/// Does NOT match slice types (which start with "[").
+/// Returns true if t is a pointer type (*T). A leading '*' is unambiguous:
+/// `*[]u8` is pointer-to-slice, `*Node` pointer-to-struct, etc.
 pub fn isPointer(t: []const u8) bool {
-    return t.len > 1 and t[0] == '*' and t[1] != '['; // avoid confusing with slice ops
+    return t.len > 1 and t[0] == '*';
 }
 
 /// Returns the inner type of *T, or t unchanged if not a pointer type.
