@@ -169,20 +169,36 @@ fn ctype(alloc: std.mem.Allocator, zty_raw: []const u8) anyerror![]const u8 {
                 else if (c == ',' and dep == 0) {
                     const seg = std.mem.trim(u8, args_str[start..j], " ");
                     try result.append('_');
-                    try result.appendSlice(seg);
+                    try appendMangledArg(&result, seg);
                     start = j + 1;
                 }
             }
             const seg = std.mem.trim(u8, args_str[start..], " ");
             if (seg.len > 0) {
                 try result.append('_');
-                try result.appendSlice(seg);
+                try appendMangledArg(&result, seg);
             }
             return result.toOwnedSlice();
         }
     }
 
     return zty;
+}
+
+/// Append a generic type argument to a C struct name, sanitizing characters
+/// that are illegal in C identifiers. Deterministic so the same Zag type always
+/// yields the same C name (e.g. "*Node" → "pNode", "Box[i32]" → "Box_i32").
+fn appendMangledArg(result: *std.ArrayList(u8), seg: []const u8) !void {
+    for (seg) |c| {
+        switch (c) {
+            '*' => try result.append('p'),
+            '?' => try result.append('o'),
+            '!' => try result.append('e'),
+            '[', ',', '.', '<' => try result.append('_'),
+            ']', '>', ' ' => {}, // dropped
+            else => try result.append(c),
+        }
+    }
 }
 
 fn ctypeClosure(alloc: std.mem.Allocator, zty: []const u8) anyerror![]const u8 {
@@ -1604,9 +1620,11 @@ fn mangleGenericName(alloc: std.mem.Allocator, name: []const u8) ![]const u8 {
     defer result.deinit();
     for (name) |c| {
         switch (c) {
-            '[', ',' => try result.append('_'),
-            ']' => {}, // skip
-            ' ' => {}, // skip spaces
+            '*' => try result.append('p'),
+            '?' => try result.append('o'),
+            '!' => try result.append('e'),
+            '[', ',', '.', '<' => try result.append('_'),
+            ']', '>', ' ' => {}, // dropped
             else => try result.append(c),
         }
     }
@@ -2137,17 +2155,11 @@ pub fn gen(
         }
     }
 
-    // 3b. Type declarations
-    for (decls) |node| {
-        switch (node.*) {
-            .struct_decl => |sd| try genStructDecl(&ctx, sd),
-            .enum_decl => |ed| try genEnumDecl(&ctx, ed),
-            .union_decl => |ud| try genUnionDecl(&ctx, ud),
-            else => {},
-        }
-    }
-    // 3b. Emit instantiated generic structs from s.structs
-    // Collect which struct names are already emitted from decls
+    // 3b. Emit instantiated generic structs from s.structs FIRST — user structs
+    // may contain them by value (e.g. struct Block { stmts: ArrayList[*Node] }),
+    // so the generic's full definition must precede the user struct. Generics only
+    // ever hold their element via *T (pointer), so they have no by-value dependency
+    // on user types and are safe to emit before them.
     {
         var emitted_structs = std.StringHashMap(void).init(alloc);
         defer emitted_structs.deinit();
@@ -2174,6 +2186,17 @@ pub fn gen(
                 try ctx.wf(" {s} {s};", .{ ft, f.name });
             }
             try ctx.wf(" }} {s};\n", .{c_name});
+        }
+    }
+    // 3b. Type declarations (user structs/enums/unions, after instantiated generics)
+    {
+        for (decls) |node| {
+            switch (node.*) {
+                .struct_decl => |sd| try genStructDecl(&ctx, sd),
+                .enum_decl => |ed| try genEnumDecl(&ctx, ed),
+                .union_decl => |ud| try genUnionDecl(&ctx, ud),
+                else => {},
+            }
         }
     }
 

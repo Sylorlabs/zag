@@ -22,5 +22,16 @@ else
     fail=$((fail+1))
 fi
 
+# Parser: pre-order AST dump (node codes + key strings) of a recursive fib fn.
+echo "── selfhost: parser ──"
+$ZAGC build selfhost/parse_test.zag --run >/tmp/zsh2 2>/dev/null
+pgot=$(sed -n '/-- running/,/-- exit/p' /tmp/zsh2 | grep -vE 'running|exit|--' | tr '\n' ' ' | sed 's/ *$//')
+pwant="1 fib i32 4 13 < 12 n 10 2 3 12 n 3 13 + 15 12 fib 13 - 12 n 10 1 15 12 fib 13 - 12 n 10 2"
+if [ "$pgot" = "$pwant" ]; then
+    echo "  ok  parser (fib: if/return/call/precedence)"; pass=$((pass+1))
+else
+    echo "  XX  parser"; echo "      want: [$pwant]"; echo "      got:  [$pgot]"; fail=$((fail+1))
+fi
+
 echo "════ selfhost pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]
