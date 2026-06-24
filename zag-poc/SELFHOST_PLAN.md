@@ -101,9 +101,14 @@ Notes for later stages:
              fn tparams + explicit call type-args foo[T](..); codegen collects
              instantiations, emits specialized fns (subst type-params in sig),
              mangles call sites. Verified: id[i32]/add[i32] → 42.
-       - [ ] generic STRUCTS (ArrayList[T]/StringMap[V]) — needs struct
-             monomorphization + body type-substitution (@sizeOf/casts/struct-lit[T]).
-       - [ ] tagged unions + switch, optionals/orelse, slicing, @import.
+       - [x] generic STRUCTS via struct monomorphization + clone-with-substitution:
+             ctype mangles Base[args]→Base_args; subst_type substitutes inside [..];
+             generic struct literals Foo[T]{..}; clone_block/clone_stmt/clone_expr
+             deep-copy generic fn bodies with type-params substituted (Inst.cbody);
+             struct instantiations collected from concrete bodies + let-dtys + ret types.
+             Verified: Box[T]→42; Pair[i32]→42 & Pair[i64]→123 in one program.
+       - [ ] @sizeOf/cast in bodies (needed for ArrayList[T]/StringMap[V]), tagged
+             unions + switch, optionals/orelse, slicing, @import.
        (Generic functions work without a full type-inference pass because explicit
         type-args drive monomorphization. Inference-based generics + generic structs
         remain the large piece toward compiling selfhost/*.zag itself.)

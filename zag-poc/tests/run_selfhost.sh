@@ -106,6 +106,17 @@ if $ZAGC build selfhost/zagc.zag >/dev/null 2>&1 && [ -x ./zagc ]; then
     else
         echo "  XX  generics (got '$genout', want 42)"; fail=$((fail+1))
     fi
+
+    # Generic STRUCTS: monomorphize struct + generic fns over it, two type args.
+    printf 'struct Pair[T] { a: T, b: T }\nfn sum[T](p: Pair[T]) T { return p.a + p.b; }\nfn make_pair[T](x: T, y: T) Pair[T] { return Pair[T]{ .a = x, .b = y }; }\nfn main() void {\n    let p: Pair[i32] = make_pair[i32](30, 12);\n    print_i32(sum[i32](p));\n    let q: Pair[i64] = Pair[i64]{ .a = 100, .b = 23 };\n    print_i32(sum[i64](q));\n}\n' > $SH/gs.zag
+    $SH/zagc $SH/gs.zag >/dev/null 2>&1
+    gsout=""
+    if [ -x $SH/gs.zag.out ]; then gsout=$($SH/gs.zag.out | tr '\n' ' ' | sed 's/ *$//'); fi
+    if [ "$gsout" = "42 123" ]; then
+        echo "  ok  generic structs (Pair[i32]→42, Pair[i64]→123)"; pass=$((pass+1))
+    else
+        echo "  XX  generic structs (got '$gsout', want '42 123')"; fail=$((fail+1))
+    fi
 else
     echo "  XX  driver (zagc failed to build)"; fail=$((fail+1))
 fi
