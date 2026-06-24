@@ -27,6 +27,7 @@ pub const TokenKind = enum {
     kw_catch,
     kw_null,
     kw_orelse,
+    kw_operator,
     lp,       // (
     rp,       // )
     lbrace,   // {
@@ -70,6 +71,7 @@ fn keywordKind(word: []const u8) ?TokenKind {
         .{ "catch",  .kw_catch  },
         .{ "null",   .kw_null   },
         .{ "orelse", .kw_orelse },
+        .{ "operator", .kw_operator },
     });
     return map.get(word);
 }

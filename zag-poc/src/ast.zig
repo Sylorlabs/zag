@@ -6,6 +6,7 @@ pub const NodeRef = *Node;
 pub const Param = struct {
     name: []const u8,
     pty:  []const u8,   // type string (e.g. "i32", "?bool", "[]u8")
+    cache_align: ?u32 = null,   // @cacheAlign(N) on a struct field → _Alignas(N)
 };
 
 // ── FieldInit: one field in a struct literal ──
@@ -37,6 +38,7 @@ pub const Node = union(enum) {
     union_decl:  UnionDecl,
     error_decl:  ErrorDecl,
     interface_decl: InterfaceDecl,
+    operator_decl: OperatorDecl,
     mod_alias:   ModAlias,
 
     // ── statements ──
@@ -140,6 +142,21 @@ pub const ErrorDecl = struct {
     ty:    ?[]const u8 = null,
 };
 
+// One `op => fn` mapping in an operator contract.
+pub const OpEntry = struct {
+    op:      []const u8,   // "+", "-", "*", "/"
+    fn_name: []const u8,   // the named decode function
+};
+
+// `operator T { + => fn, - => fn, * => fn }` — explicit operator config for a
+// custom numeric unit: maps arithmetic operators on T to named decode functions.
+pub const OperatorDecl = struct {
+    type_name: []const u8,
+    ops:       []OpEntry,
+    line:      u32,
+    ty:        ?[]const u8 = null,
+};
+
 pub const InterfaceDecl = struct {
     name:    []const u8,
     methods: []IfaceMethod,
@@ -164,6 +181,7 @@ pub const Let = struct {
     expr: NodeRef,
     line: u32,
     ty:   ?[]const u8 = null,
+    cache_align: ?u32 = null,   // @cacheAlign(N) prefix → _Alignas(N) on the binding
 };
 
 pub const Assign = struct {

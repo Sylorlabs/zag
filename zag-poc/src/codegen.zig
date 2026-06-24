@@ -10,6 +10,44 @@ const types = @import("types.zig");
 // ── Embedded prelude ──────────────────────────────────────────────────────────
 const NUMERIC_C = @embedFile("numeric_prelude.c");
 
+// Manual cache-line control runtime — appended after the numeric prelude. All
+// portable C: prefetch hints lower to __builtin_prefetch (PREFETCHT0/PLD/PRFM),
+// aligned allocation to C11 aligned_alloc. Prefetch has no effects, so it is
+// legal on a @realtime / @noalloc path. <stdalign.h> brings in _Alignas for the
+// @cacheAlign(N) declaration prefix.
+const PRELUDE_CACHE =
+    \\
+    \\#include <stdalign.h>
+    \\#ifndef ZAG_CACHE_LINE
+    \\#define ZAG_CACHE_LINE 64
+    \\#endif
+    \\#if defined(__GNUC__) || defined(__clang__)
+    \\#  define ZAG_PREFETCH(p, rw, loc) __builtin_prefetch((const void*)(p), (rw), (loc))
+    \\#else
+    \\#  define ZAG_PREFETCH(p, rw, loc) ((void)(p))
+    \\#endif
+    \\static void zag_prefetch_f32(ZagSliceF32 s){ ZAG_PREFETCH(s.ptr, 0, 3); }
+    \\static void zag_prefetch_w_f32(ZagSliceF32 s){ ZAG_PREFETCH(s.ptr, 1, 3); }
+    \\static void zag_prefetch_i32(ZagSliceI32 s){ ZAG_PREFETCH(s.ptr, 0, 3); }
+    \\static int32_t zag_cache_line_size(void){ return (int32_t)ZAG_CACHE_LINE; }
+    \\static ZagSliceF32 zag_cache_aligned_alloc(int32_t n){
+    \\    ZagSliceF32 s; size_t bytes = (size_t)n * sizeof(float);
+    \\    size_t rounded = (bytes + (ZAG_CACHE_LINE - 1)) & ~((size_t)ZAG_CACHE_LINE - 1);
+    \\    if (!rounded) rounded = (size_t)ZAG_CACHE_LINE;
+    \\#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+    \\    s.ptr = (float*)aligned_alloc(ZAG_CACHE_LINE, rounded);
+    \\#elif defined(_POSIX_C_SOURCE) || defined(__unix__) || defined(__APPLE__)
+    \\    void* p = (void*)0; if (posix_memalign(&p, ZAG_CACHE_LINE, rounded)) p = (void*)0;
+    \\    s.ptr = (float*)p;
+    \\#else
+    \\    s.ptr = (float*)malloc(rounded);
+    \\#endif
+    \\    s.len = n; return s;
+    \\}
+    \\static void zag_cache_aligned_free(ZagSliceF32 s){ free(s.ptr); }
+    \\
+;
+
 fn getPrelude() []const u8 {
     var count: u32 = 0;
     var i: usize = 0;
@@ -552,9 +590,21 @@ fn genVar(ctx: *Ctx, v: ast.Var) !void {
 }
 
 fn genBin(ctx: *Ctx, b: ast.Bin) !void {
-    // RNS arithmetic: rns_3 + rns_3 → zag_rns_add(a, b)
     const lty = ast.nodeType(b.l) orelse "";
     const rty = ast.nodeType(b.r) orelse "";
+    // Operator contract takes precedence: `a <op> b` on a contracted type T
+    // lowers to the user-named decode fn — decodeFn(a, b).
+    if (lty.len > 0 and std.mem.eql(u8, lty, rty)) {
+        if (ctx.s.opContractFn(lty, b.op)) |decode| {
+            try ctx.wf("{s}(", .{decode});
+            try genExpr(ctx, b.l);
+            try ctx.w(", ");
+            try genExpr(ctx, b.r);
+            try ctx.w(")");
+            return;
+        }
+    }
+    // RNS arithmetic: rns_3 + rns_3 → zag_rns_add(a, b)
     const is_rns = std.mem.startsWith(u8, lty, "rns_") or std.mem.startsWith(u8, rty, "rns_");
     if (is_rns) {
         const fn_name: []const u8 = if (std.mem.eql(u8, b.op, "+")) "zag_rns_add"
@@ -716,6 +766,13 @@ fn genCall(ctx: *Ctx, c: ast.Call) !void {
                 if (std.mem.eql(u8, builtin, "quireZero")) break :blk "zag_quire_zero";
                 if (std.mem.eql(u8, builtin, "quireFMA")) break :blk "zag_quire_fma";
                 if (std.mem.eql(u8, builtin, "quireToPosit")) break :blk "zag_quire_to_p32";
+                // cache-line control runtime (defined in PRELUDE_CACHE)
+                if (std.mem.eql(u8, builtin, "prefetch")) break :blk "zag_prefetch_f32";
+                if (std.mem.eql(u8, builtin, "prefetchWrite")) break :blk "zag_prefetch_w_f32";
+                if (std.mem.eql(u8, builtin, "prefetchI")) break :blk "zag_prefetch_i32";
+                if (std.mem.eql(u8, builtin, "cacheAlignedAlloc")) break :blk "zag_cache_aligned_alloc";
+                if (std.mem.eql(u8, builtin, "cacheAlignedFree")) break :blk "zag_cache_aligned_free";
+                if (std.mem.eql(u8, builtin, "cacheLineSize")) break :blk "zag_cache_line_size";
                 if (std.mem.eql(u8, builtin, "intCast") or std.mem.eql(u8, builtin, "floatCast") or std.mem.eql(u8, builtin, "truncate")) {
                     // Just emit the argument directly
                     try genExpr(ctx, c.args[0]);
@@ -1660,6 +1717,8 @@ fn genLet(ctx: *Ctx, l: ast.Let) !void {
     // Flush any pre-statements accumulated during expression codegen (e.g. new())
     try ctx.flushPreStmts();
     try ctx.wIndent();
+    // @cacheAlign(N) → C11 _Alignas(N) on the stack binding (cache-line layout)
+    if (l.cache_align) |a| try ctx.wf("_Alignas({d}) ", .{a});
     try ctx.wf("{s} {s} = {s};\n", .{ ct, l.name, rhs_text });
 }
 
@@ -2236,6 +2295,8 @@ fn genStructDecl(ctx: *Ctx, sd: ast.StructDecl) !void {
             try ctx.ensureClosureTypedef(f.pty)
         else
             try ctype(ctx.alloc, f.pty);
+        // @cacheAlign(N) on a field → _Alignas(N) (kill false sharing)
+        if (f.cache_align) |a| try ctx.wf(" _Alignas({d})", .{a});
         try ctx.wf(" {s} {s};", .{ ct, f.name });
     }
     try ctx.wf(" }} {s};\n", .{sd.name});
@@ -2295,6 +2356,7 @@ pub fn gen(
     const prelude = getPrelude();
     try ctx.w(prelude);
     try ctx.w("\n");
+    try ctx.w(PRELUDE_CACHE);   // manual cache-line control runtime
 
     // 2. Error enum
     try genErrorEnum(&ctx);

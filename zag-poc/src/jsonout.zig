@@ -304,6 +304,23 @@ fn writeNode(w: anytype, n: ast.NodeRef) anyerror!void {
             try strArray(w, ed.names);
             try w.writeAll("}");
         },
+        .operator_decl => |od| {
+            try w.writeAll("{");
+            try kvStr(w, "kind", "operator_decl");
+            try w.print(", \"line\": {d}", .{od.line});
+            try w.writeAll(", ");
+            try kvStr(w, "type", od.type_name);
+            try w.writeAll(", \"ops\": [");
+            for (od.ops, 0..) |e, i| {
+                if (i > 0) try w.writeAll(", ");
+                try w.writeAll("{");
+                try kvStr(w, "op", e.op);
+                try w.writeAll(", ");
+                try kvStr(w, "fn", e.fn_name);
+                try w.writeAll("}");
+            }
+            try w.writeAll("]}");
+        },
         .mod_alias => |ma| {
             try w.writeAll("{");
             try kvStr(w, "kind", "mod_alias");

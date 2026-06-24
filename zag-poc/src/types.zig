@@ -96,6 +96,18 @@ const BUILTIN_TABLE = [_]Builtin{
     // string helpers
     .{ .name = "@strEq",          .info = .{ .params = p_u8s_u8s,       .ret = "bool",        .eff = bi_no_eff    } },
     .{ .name = "@strLen",         .info = .{ .params = p_u8s,           .ret = "i32",         .eff = bi_no_eff    } },
+    // ── Manual cache-line control (CPU memory hierarchy) ────────────────────────
+    // prefetch is a pure HINT (no Alloc/Lock/IO/Panic) → legal inside @realtime/
+    // @noalloc: warm L1 for the next buffer without breaking the capability proof.
+    // (Lowers to __builtin_prefetch → PREFETCHT0 on x86, PLD/PRFM on ARM.)
+    .{ .name = "@prefetch",       .info = .{ .params = p_f32s_ret,      .ret = "void",        .eff = bi_no_eff    } },
+    .{ .name = "@prefetchWrite",  .info = .{ .params = p_f32s_ret,      .ret = "void",        .eff = bi_no_eff    } },
+    .{ .name = "@prefetchI",      .info = .{ .params = p_i32s_ret,      .ret = "void",        .eff = bi_no_eff    } },
+    // cache-line (64-byte) aligned heap buffer — DOES allocate (honest {Alloc}).
+    .{ .name = "@cacheAlignedAlloc", .info = .{ .params = p_i32,        .ret = "[]f32",       .eff = bi_eff_alloc } },
+    .{ .name = "@cacheAlignedFree",  .info = .{ .params = p_f32s_ret,   .ret = "void",        .eff = bi_eff_alloc } },
+    // target cache-line width — a compile-time const, so pure (usable in @realtime).
+    .{ .name = "@cacheLineSize",  .info = .{ .params = p_none,          .ret = "i32",         .eff = bi_no_eff    } },
     // math
     .{ .name = "sinf",            .info = .{ .params = p_f32,           .ret = "f32",         .eff = bi_no_eff    } },
     .{ .name = "sqrtf",           .info = .{ .params = p_f32,           .ret = "f32",         .eff = bi_no_eff    } },

@@ -163,6 +163,8 @@ pub const Parser = struct {
                 try decls.append(try self.parseInterface());
             } else if (self.atKind(.kw_error)) {
                 try decls.append(try self.parseErrorDecl());
+            } else if (self.atKind(.kw_operator)) {
+                try decls.append(try self.parseOperatorDecl());
             } else if (self.at(.ident, "@import")) {
                 const imported = try self.importDecl();
                 try decls.appendSlice(imported);
@@ -275,10 +277,11 @@ pub const Parser = struct {
         _ = self.eat(.lbrace, null);
         var fields = std.ArrayList(Param).init(self.alloc);
         while (!self.atKind(.rbrace)) {
+            const falign = self.cacheAlignOpt();   // @cacheAlign(N) field prefix
             const fn_ = try self.alloc.dupe(u8, self.eat(.ident, null).val);
             _ = self.eat(.colon, null);
             const ft = try self.parseType();
-            try fields.append(.{ .name = fn_, .pty = ft });
+            try fields.append(.{ .name = fn_, .pty = ft, .cache_align = falign });
             if (self.atKind(.comma)) _ = self.eat(.comma, null);
         }
         _ = self.eat(.rbrace, null);
@@ -383,6 +386,31 @@ pub const Parser = struct {
         _ = self.eat(.rbrace, null);
         return self.mkNode(.{ .error_decl = .{
             .names = try names.toOwnedSlice(),
+            .line = ln,
+        } });
+    }
+
+    // ── operator contract ──────────────────────────────────────────────────────
+    // operator <Type> { + => fn, - => fn, * => fn, / => fn }
+    fn parseOperatorDecl(self: *Parser) !NodeRef {
+        const ln = self.eat(.kw_operator, null).line;
+        const type_name = try self.parseType();
+        _ = self.eat(.lbrace, null);
+        var ops = std.ArrayList(ast.OpEntry).init(self.alloc);
+        while (!self.atKind(.rbrace)) {
+            const op = try self.alloc.dupe(u8, self.eat(.op, null).val);
+            if (!(std.mem.eql(u8, op, "+") or std.mem.eql(u8, op, "-") or
+                std.mem.eql(u8, op, "*") or std.mem.eql(u8, op, "/")))
+                parseErr(ln, "operator contract: only +, -, *, / may be mapped (got '{s}')", .{op});
+            _ = self.eat(.op, "=>");
+            const fn_name = try self.alloc.dupe(u8, self.eat(.ident, null).val);
+            try ops.append(.{ .op = op, .fn_name = fn_name });
+            if (self.atKind(.comma)) _ = self.eat(.comma, null);
+        }
+        _ = self.eat(.rbrace, null);
+        return self.mkNode(.{ .operator_decl = .{
+            .type_name = type_name,
+            .ops = try ops.toOwnedSlice(),
             .line = ln,
         } });
     }
@@ -569,7 +597,23 @@ pub const Parser = struct {
 
     // ── statement ─────────────────────────────────────────────────────────────
 
+    // Optional `@cacheAlign(N)` prefix → N (cache-line alignment, a power of two),
+    // else null. Lowers to C11 `_Alignas(N)` on the declaration.
+    fn cacheAlignOpt(self: *Parser) ?u32 {
+        if (!self.at(.ident, "@cacheAlign")) return null;
+        const ln = self.eat(.ident, "@cacheAlign").line;
+        _ = self.eat(.lp, null);
+        const ntok = self.eat(.int, null);
+        _ = self.eat(.rp, null);
+        const n = std.fmt.parseInt(u32, ntok.val, 10) catch
+            parseErr(ln, "@cacheAlign: invalid alignment '{s}'", .{ntok.val});
+        if (n == 0 or (n & (n - 1)) != 0)
+            parseErr(ln, "@cacheAlign({d}): alignment must be a positive power of two", .{n});
+        return n;
+    }
+
     fn parseStmt(self: *Parser) !NodeRef {
+        const cache_align = self.cacheAlignOpt();
         const t = self.peek();
 
         // let
@@ -589,8 +633,11 @@ pub const Parser = struct {
                 .dty = ty,
                 .expr = e,
                 .line = t.line,
+                .cache_align = cache_align,
             } });
         }
+        if (cache_align != null)
+            parseErr(t.line, "@cacheAlign(N) may only prefix a `let` binding or a struct field", .{});
 
         // return
         if (t.kind == .kw_return) {

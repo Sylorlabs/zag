@@ -52,6 +52,12 @@ echo "── heterogeneous: HPC (rns_3 parallel residues, fixed_16_16, @pure) �
 g hpc_rns
 echo "── heterogeneous: desktop security (u_any bignum, u7 arb-width) ──"
 g safe_bignum
+echo "── manual cache-line control (@prefetch/@cacheAlign/@cacheAlignedAlloc) ──"
+g cache_control
+b cache_control_bad
+echo "── operator contracts (operator T { + => fn }; effect flows into proof) ──"
+g operator_contract
+b operator_contract_bad
 echo "── P4: hardware posit target — ppu32 (emit-c, check asm opcodes) ──"
 ppu(){ ./zig-out/bin/zagc build examples/$1.zag --target ppu32 --emit-c >/tmp/zt 2>&1
        if grep -q 'padd\.s' examples/$1.c 2>/dev/null && \

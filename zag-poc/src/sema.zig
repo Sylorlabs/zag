@@ -53,6 +53,8 @@ pub const Sema = struct {
     /// (interface, concrete) pairs proven to satisfy structurally — codegen
     /// emits one vtable + thunk set per entry.
     iface_impls:     std.ArrayList(IfaceImpl),
+    /// type name → OperatorDecl node (operator contracts: +/-/* → named fn)
+    operators:       std.StringHashMap(ast.NodeRef),
     /// alias → module prefix string
     modules:         std.StringHashMap([]const u8),
     err_names:       std.ArrayList([]const u8),
@@ -78,6 +80,7 @@ pub const Sema = struct {
             .methods         = std.StringHashMap(ast.NodeRef).init(alloc),
             .interfaces      = std.StringHashMap(ast.NodeRef).init(alloc),
             .iface_impls     = std.ArrayList(IfaceImpl).init(alloc),
+            .operators       = std.StringHashMap(ast.NodeRef).init(alloc),
             .modules         = std.StringHashMap([]const u8).init(alloc),
             .err_names       = std.ArrayList([]const u8).init(alloc),
             .errors          = std.ArrayList([]const u8).init(alloc),
@@ -111,6 +114,7 @@ pub const Sema = struct {
                 .enum_decl   => |*ed| try s.enums.put(ed.name, n),
                 .union_decl  => |*ud| try s.unions.put(ud.name, n),
                 .interface_decl => |*id| try s.interfaces.put(id.name, n),
+                .operator_decl => |*od| try s.operators.put(od.type_name, n),
                 .error_decl  => |*ed| {
                     for (ed.names) |nm| {
                         var found = false;
@@ -318,6 +322,56 @@ pub const Sema = struct {
         return null;
     }
 
+    // ── operator contracts ────────────────────────────────────────────────────
+    fn isArithOp(op: []const u8) bool {
+        return std.mem.eql(u8, op, "+") or std.mem.eql(u8, op, "-") or
+            std.mem.eql(u8, op, "*") or std.mem.eql(u8, op, "/");
+    }
+
+    /// The OperatorDecl for type `ty`, resolving a generic application to its
+    /// base (so `Box[i32]` still finds `operator Box { .. }`), or null.
+    pub fn opContractNode(self: *const Sema, ty: []const u8) ?ast.NodeRef {
+        if (self.operators.get(ty)) |n| return n;
+        if (std.mem.indexOfScalar(u8, ty, '[')) |i| {
+            if (self.operators.get(ty[0..i])) |n| return n;
+        }
+        return null;
+    }
+
+    /// The decode-fn name mapped to `op` for `ty` under its contract, or null.
+    pub fn opContractFn(self: *const Sema, ty: []const u8, op: []const u8) ?[]const u8 {
+        const node = self.opContractNode(ty) orelse return null;
+        for (node.*.operator_decl.ops) |e| {
+            if (std.mem.eql(u8, e.op, op)) return e.fn_name;
+        }
+        return null;
+    }
+
+    /// Validate each `operator T { + => f, .. }`: T must exist and every named
+    /// fn must be a real (T, T) -> T function. This makes the contract checked.
+    fn checkOperatorContracts(self: *Sema) void {
+        var it = self.operators.valueIterator();
+        while (it.next()) |np| {
+            const od = &np.*.*.operator_decl;
+            self.checkTypeExists(od.type_name, od.line);
+            for (od.ops) |e| {
+                const ft = self.fnTypeOfNamed(e.fn_name) orelse {
+                    self.errFmt(od.line, "operator '{s}' for {s}: unknown function '{s}'", .{ e.op, od.type_name, e.fn_name });
+                    continue;
+                };
+                var fba_buf: [512]u8 = undefined;
+                var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
+                const parts = types.fnParts(fba.allocator(), ft) catch continue;
+                if (parts.params.len != 2 or
+                    !types.assignable(od.type_name, parts.params[0]) or
+                    !types.assignable(od.type_name, parts.params[1]))
+                    self.errFmt(od.line, "operator '{s}' for {s}: '{s}' must take ({s}, {s})", .{ e.op, od.type_name, e.fn_name, od.type_name, od.type_name });
+                if (!types.assignable(od.type_name, parts.ret))
+                    self.errFmt(od.line, "operator '{s}' for {s}: '{s}' must return {s} (got {s})", .{ e.op, od.type_name, e.fn_name, od.type_name, parts.ret });
+            }
+        }
+    }
+
     // ── _checkTypeExists ──────────────────────────────────────────────────────
 
     fn checkTypeExists(self: *Sema, ty: []const u8, line: u32) void {
@@ -443,6 +497,7 @@ pub const Sema = struct {
     // ── checkTypes: top-level type-check pass ────────────────────────────────
 
     pub fn checkTypes(self: *Sema) !void {
+        self.checkOperatorContracts();
         // Canonicalize struct field types
         var sit = self.structs.iterator();
         while (sit.next()) |kv| {
@@ -784,6 +839,12 @@ pub const Sema = struct {
         const cmp_ops = [_][]const u8{ "==", "!=", "<", ">", "<=", ">=", "&&", "||" };
         for (&cmp_ops) |op| {
             if (std.mem.eql(u8, b.op, op)) return "bool";
+        }
+        // Operator contract: `operator T { + => f, .. }` makes +/-/*// on T dispatch
+        // to f. Checked first so a custom unit (even a fresh struct) gets real
+        // arithmetic. (typeOf only needs to know the result is T.)
+        if (std.mem.eql(u8, lt, rt) and isArithOp(b.op)) {
+            if (self.opContractFn(lt, b.op) != null) return lt;
         }
         // Bignum arithmetic
         if (types.isBignum(lt) or types.isBignum(rt)) {
@@ -1796,6 +1857,18 @@ pub const Sema = struct {
             .bin => |*b| {
                 const lt = ast.nodeType(b.l) orelse "";
                 const rt = ast.nodeType(b.r) orelse "";
+                // Operator contract: +/-/*// on a contracted type inherits the
+                // effect of the named decode fn — so a contract naming an
+                // allocating decoder breaks @realtime with a precise witness.
+                if (lt.len > 0 and std.mem.eql(u8, lt, rt)) {
+                    if (self.opContractFn(lt, b.op)) |decode| {
+                        for (self.effectsOfFn(decode)) |ef| {
+                            const chain = std.fmt.allocPrint(self.alloc,
+                                "'{s}' on {s} → {s}() at line {d}", .{ b.op, lt, decode, b.line }) catch decode;
+                            self.addEffect(ef, chain, label, eff_set, wit_map);
+                        }
+                    }
+                }
                 // bignum arithmetic may heap-allocate
                 if (types.isBignum(lt) or types.isBignum(rt)) {
                     const chain = std.fmt.allocPrint(self.alloc,
