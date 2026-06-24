@@ -2,10 +2,10 @@
 # Reproducible test suite for zagc. Good programs must build+run; bad ones must be rejected.
 cd "$(dirname "$0")"
 pass=0; fail=0
-g(){ python3 zagc.py build examples/$1.zag --run >/tmp/zt 2>&1
+g(){ ./zig-out/bin/zagc build examples/$1.zag --run >/tmp/zt 2>&1
      if grep -q 'exit 0' /tmp/zt; then echo "  ok  $1  -> $(grep -A20 running /tmp/zt | grep -vE 'running|exit|--' | tr '\n' ' ')"; pass=$((pass+1))
      else echo "  XX  $1"; fail=$((fail+1)); sed -n '1,40p' /tmp/zt; fi; }
-b(){ python3 zagc.py check examples/$1.zag >/tmp/zt 2>&1
+b(){ ./zig-out/bin/zagc check examples/$1.zag >/tmp/zt 2>&1
      if [ $? -ne 0 ] && grep -qi 'violation\|error:' /tmp/zt; then echo "  ok  $1 (rejected)"; pass=$((pass+1))
      else echo "  XX  $1 (should fail)"; fail=$((fail+1)); sed -n '1,40p' /tmp/zt; fi; }
 
@@ -40,6 +40,12 @@ echo "── error unions (!T, error.X, try, catch) ──"
 g error_union
 echo "── strings and []u8 (literals, .len, indexing, @strEq) ──"
 g strings
+echo "── enums/patterns (expr switch, multi-pattern, exhaustiveness, int-literal) ──"
+g patterns
+echo "── modules (@import flat merge + qualified as name) ──"
+g modules; g modules_struct
+echo "── optionals (?T, null, orelse, if-let, force-unwrap) ──"
+g optionals
 echo "── heterogeneous: embedded (sat_i16, u11, fixed_8_8, @realtime) ──"
 g embedded_sensor
 echo "── heterogeneous: HPC (rns_3 parallel residues, fixed_16_16, @pure) ──"
@@ -47,7 +53,7 @@ g hpc_rns
 echo "── heterogeneous: desktop security (u_any bignum, u7 arb-width) ──"
 g safe_bignum
 echo "── P4: hardware posit target — ppu32 (emit-c, check asm opcodes) ──"
-ppu(){ python3 zagc.py build examples/$1.zag --target ppu32 --emit-c >/tmp/zt 2>&1
+ppu(){ ./zig-out/bin/zagc build examples/$1.zag --target ppu32 --emit-c >/tmp/zt 2>&1
        if grep -q 'padd\.s' examples/$1.c 2>/dev/null && \
           grep -q 'ZAG_TARGET_PPU32' examples/$1.c 2>/dev/null; then
            echo "  ok  $1 (ppu32: padd.s/psub.s/pmul.s/pdiv.s in C)"
