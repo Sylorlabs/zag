@@ -65,10 +65,22 @@ Enabling language features added for self-hosting (all in the bootstrap compiler
        instantiated generics emitted before user structs; isPointer matches `*[]u8`.
        (Not yet: @import, generic struct-lit `Foo[T]{}`, slicing/cast/try/catch/orelse
         in expressions, switch — add when sema/codegen need them.)
-- [ ] B4. `types.zag` — type helpers, builtin table
-- [ ] B5. `sema.zag`  — type checker + effect system
+- [~] B4. `types.zag` — folded into sema for now (effect/builtin tables live in sema.zag).
+- [~] B5. `sema.zag` — EFFECT/CAPABILITY CHECKER done (Zag's killer feature, self-hosted):
+       fixpoint call-graph effect analysis (effects as i32 bitmask Alloc/Panic/IO/Lock,
+       OR via `a+b-(a&b)` since `|` is the capture delimiter), extern effect declarations,
+       transitive propagation, and @realtime/@noalloc/@pure/@total constraint verification.
+       Verified by selfhost/sema_test.zag: proven-safe fns, direct Alloc violation,
+       TRANSITIVE IO violation (rt_io→uses_io→print_i32), intrinsic Panic (division).
+       Still TODO for full sema: type inference/checking (currently effect-only), generics
+       monomorphization, store checks. The effect system is the differentiator and is done.
 - [ ] B6. `codegen.zag`— C backend
 - [ ] B7. `main.zag`  — CLI driver (read file, pipeline, invoke cc)
+
+Notes for later stages:
+- map.zag must be imported `as map` (its make/get collide with list.zag's); the alias
+  propagates through flat re-imports. list.zag is imported flat for ArrayList.
+- `|` (bitwise OR) is unusable as a binary op (lexes as capture pipe); use arithmetic.
 
 ## Stage C — Bootstrap verification
 

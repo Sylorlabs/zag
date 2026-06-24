@@ -34,5 +34,19 @@ else
     echo "  XX  parser"; echo "      want: [$pwant]"; echo "      got:  [$pgot]"; fail=$((fail+1))
 fi
 
+# Effect/capability checker: fixpoint call-graph analysis + constraint verify.
+# Prints "<fn> <violated-mask>" per constrained fn (0 = proven safe).
+echo "── selfhost: effect checker ──"
+$ZAGC build selfhost/sema_test.zag --run >/tmp/zsh3 2>/dev/null
+sgot=$(sed -n '/-- running/,/-- exit/p' /tmp/zsh3 | grep -vE 'running|exit|--' | tr '\n' ' ' | sed 's/ *$//')
+# safe_add: realtime, clean → 0; bad_rt: Alloc(1); rt_io: transitive IO(4);
+# pure_calc: total, clean → 0; total_div: Panic(2).
+swant="safe_add 0 bad_rt 1 rt_io 4 pure_calc 0 total_div 2"
+if [ "$sgot" = "$swant" ]; then
+    echo "  ok  effects (proven safe; direct Alloc; transitive IO; intrinsic Panic)"; pass=$((pass+1))
+else
+    echo "  XX  effects"; echo "      want: [$swant]"; echo "      got:  [$sgot]"; fail=$((fail+1))
+fi
+
 echo "════ selfhost pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]

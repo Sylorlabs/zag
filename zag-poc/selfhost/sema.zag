@@ -1,0 +1,189 @@
+// selfhost/sema.zag — the effect/capability checker, written in Zag.
+//
+// Zag's defining feature: functions annotated @realtime / @noalloc / @pure /
+// @total are proven NOT to perform forbidden effects, transitively through the
+// whole call graph. This module computes each function's latent effects by
+// fixpoint iteration over the call graph, then checks every constrained
+// function against its forbidden set.
+//
+// Effects are an i32 bitmask:  Alloc=1, Panic=2, IO=4, Lock=8.
+// (Bitwise OR is written `bor(a,b)` because `|` lexes as the capture delimiter,
+//  not a binary operator; `a + b - (a & b)` is the OR of two masks.)
+
+@import("parse.zag")
+@import("../std/map.zag") as map
+
+fn bor(a: i32, b: i32) i32 { return a + b - (a & b); }
+
+// ── effect sources ──────────────────────────────────────────────────────────
+fn builtin_eff(name: []u8) i32 {
+    if (@strEq(name, "zalloc"))     { return 1; }
+    if (@strEq(name, "zfree"))      { return 1; }
+    if (@strEq(name, "zalloc_i"))   { return 1; }
+    if (@strEq(name, "zfree_i"))    { return 1; }
+    if (@strEq(name, "lock"))       { return 8; }
+    if (@strEq(name, "print_str"))  { return 4; }
+    if (@strEq(name, "print_i32"))  { return 4; }
+    if (@strEq(name, "print_i64"))  { return 4; }
+    if (@strEq(name, "print_u64"))  { return 4; }
+    if (@strEq(name, "print_f32"))  { return 4; }
+    if (@strEq(name, "print_f64"))  { return 4; }
+    return 0;
+}
+
+// effect an annotation DECLARES (on extern fns): @alloc/@panic/@io/@lock
+fn annot_eff(a: []u8) i32 {
+    if (@strEq(a, "@alloc")) { return 1; }
+    if (@strEq(a, "@panic")) { return 2; }
+    if (@strEq(a, "@io"))    { return 4; }
+    if (@strEq(a, "@lock"))  { return 8; }
+    return 0;
+}
+
+// effects an annotation FORBIDS (a capability constraint to verify)
+fn forbidden_bits(a: []u8) i32 {
+    if (@strEq(a, "@realtime")) { return 13; }  // Alloc + IO + Lock
+    if (@strEq(a, "@pure"))     { return 13; }
+    if (@strEq(a, "@noalloc"))  { return 1; }   // Alloc
+    if (@strEq(a, "@total"))    { return 2; }   // Panic
+    return 0;
+}
+
+fn declared_eff(annots: ArrayList[[]u8]) i32 {
+    let acc: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[[]u8](annots)) {
+        acc = bor(acc, annot_eff(get[[]u8](annots, i)));
+        i = i + 1;
+    }
+    return acc;
+}
+
+// ── call-graph walk ─────────────────────────────────────────────────────────
+fn callee_name(n: *Node) []u8 {
+    return switch (n.*) {
+        .id  => |d| d.name,
+        .fld => |f| f.fname,
+        else => "",
+    };
+}
+
+// Panic from integer division/modulo by a non-literal divisor.
+fn div_eff(b: Bin) i32 {
+    if (@strEq(b.op, "/") || @strEq(b.op, "%")) { return 2; }
+    return 0;
+}
+
+fn ret_eff(r: Return, eff: map.StringMap[i32]) i32 {
+    if (r.has_expr == 1) { return expr_eff(r.expr, eff); }
+    return 0;
+}
+
+fn flds_eff(fields: ArrayList[FieldInit], eff: map.StringMap[i32]) i32 {
+    let acc: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[FieldInit](fields)) {
+        acc = bor(acc, expr_eff(get[FieldInit](fields, i).val, eff));
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn call_eff(c: Call, eff: map.StringMap[i32]) i32 {
+    let acc: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[*Node](c.args)) {
+        acc = bor(acc, expr_eff(get[*Node](c.args, i), eff));
+        i = i + 1;
+    }
+    let cn: []u8 = callee_name(c.callee);
+    if (@strEq(cn, "new"))    { return bor(acc, 3); }  // Alloc + Panic
+    if (@strEq(cn, "delete")) { return bor(acc, 1); }  // Alloc
+    let b: i32 = builtin_eff(cn);
+    if (b != 0) { return bor(acc, b); }
+    return bor(acc, map.get[i32](eff, cn) orelse 0);       // transitive user-fn effects
+}
+
+fn expr_eff(n: *Node, eff: map.StringMap[i32]) i32 {
+    return switch (n.*) {
+        .call  => |c| call_eff(c, eff),
+        .bin   => |b| bor(bor(expr_eff(b.l, eff), expr_eff(b.r, eff)), div_eff(b)),
+        .un    => |u| expr_eff(u.e, eff),
+        .idx   => |x| bor(expr_eff(x.base, eff), expr_eff(x.idx, eff)),
+        .fld   => |f| expr_eff(f.base, eff),
+        .slit_ => |s| flds_eff(s.fields, eff),
+        else   => 0,
+    };
+}
+
+fn stmt_eff(n: *Node, eff: map.StringMap[i32]) i32 {
+    return switch (n.*) {
+        .let_   => |l| expr_eff(l.expr, eff),
+        .ret    => |r| ret_eff(r, eff),
+        .if_    => |x| bor(bor(expr_eff(x.cond, eff), body_eff(x.then_body, eff)), body_eff(x.els_body, eff)),
+        .while_ => |w| bor(expr_eff(w.cond, eff), body_eff(w.body, eff)),
+        .assign => |a| bor(expr_eff(a.target, eff), expr_eff(a.expr, eff)),
+        .estmt  => |e| expr_eff(e.expr, eff),
+        else    => 0,
+    };
+}
+
+fn body_eff(body: ArrayList[*Node], eff: map.StringMap[i32]) i32 {
+    let acc: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        acc = bor(acc, stmt_eff(get[*Node](body, i), eff));
+        i = i + 1;
+    }
+    return acc;
+}
+
+// ── fixpoint analysis ───────────────────────────────────────────────────────
+fn seed_extern(d: *Node, eff: *map.StringMap[i32]) void {
+    switch (d.*) {
+        .fn_decl => |f| {
+            if (f.is_extern == 1) {
+                map.put[i32](eff, f.name, declared_eff(f.annots));
+            }
+        }
+        else => { }
+    }
+}
+
+fn recompute(d: *Node, eff: *map.StringMap[i32]) bool {
+    return switch (d.*) {
+        .fn_decl => |f| recompute_fn(f, eff),
+        else     => false,
+    };
+}
+
+fn recompute_fn(f: FnDecl, eff: *map.StringMap[i32]) bool {
+    if (f.is_extern == 1) { return false; }
+    let old: i32 = map.get[i32](eff.*, f.name) orelse 0;
+    let ne: i32 = bor(old, body_eff(f.body, eff.*));
+    if (ne != old) {
+        map.put[i32](eff, f.name, ne);
+        return true;
+    }
+    return false;
+}
+
+// Compute the latent-effect mask of every function (fixpoint over the call graph).
+fn analyze(decls: ArrayList[*Node]) map.StringMap[i32] {
+    let eff: map.StringMap[i32] = map.make[i32](64);
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        seed_extern(get[*Node](decls, i), &eff);
+        i = i + 1;
+    }
+    let changed: bool = true;
+    while (changed) {
+        changed = false;
+        let j: i32 = 0;
+        while (j < len[*Node](decls)) {
+            if (recompute(get[*Node](decls, j), &eff)) { changed = true; }
+            j = j + 1;
+        }
+    }
+    return eff;
+}
