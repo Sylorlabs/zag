@@ -215,6 +215,26 @@ if $ZAGC build selfhost/zagc.zag >/dev/null 2>&1 && [ -x ./zagc ]; then
         echo "  XX  char literals (got '$chrout', want '65 25 10')"; fail=$((fail+1))
     fi
 
+    # ── C3 FIXPOINT ──────────────────────────────────────────────────────────
+    # The self-hosted compiler compiles its OWN source to a working zagc2; zagc2
+    # recompiles that source to byte-identical C. True self-hosting (zagc2≡zagc3).
+    ./zagc build selfhost/zagc.zag >/dev/null 2>&1          # zagc1 → C1 + zagc2
+    cp selfhost/zagc.zag.c $SH/c3_C1.c 2>/dev/null
+    cp selfhost/zagc.zag.out $SH/zagc2 2>/dev/null
+    fixpoint="no"
+    if [ -x $SH/zagc2 ]; then
+        $SH/zagc2 build selfhost/zagc.zag >/dev/null 2>&1  # zagc2 → C2
+        if [ -f selfhost/zagc.zag.c ] && diff -q $SH/c3_C1.c selfhost/zagc.zag.c >/dev/null 2>&1; then
+            fixpoint="yes"
+        fi
+    fi
+    rm -f selfhost/zagc.zag.c selfhost/zagc.zag.out $SH/c3_C1.c $SH/zagc2 2>/dev/null
+    if [ "$fixpoint" = "yes" ]; then
+        echo "  ok  C3 fixpoint (zagc compiles itself → zagc2 reproduces identical C)"; pass=$((pass+1))
+    else
+        echo "  XX  C3 fixpoint (zagc2 did not reproduce identical C)"; fail=$((fail+1))
+    fi
+
     # tagged unions + statement switch: union construction (tag + payload),
     # switch over a union tag with |capture|, and switch over a plain enum.
     printf 'enum OpClass { Numeric, Control, Memory }\nunion WasmOp { local_get: i32, i32_const: i64, i32_add: bool }\nfn classify(op: WasmOp) OpClass {\n  let cls: OpClass = OpClass.Control;\n  switch (op) {\n    .local_get => |idx| { cls = OpClass.Memory; }\n    .i32_const => |v| { cls = OpClass.Numeric; }\n    .i32_add => |_x| { cls = OpClass.Numeric; }\n  }\n  return cls;\n}\nfn code(c: OpClass) i32 {\n  let r: i32 = 0;\n  switch (c) { .Numeric => { r = 1; } .Control => { r = 2; } .Memory => { r = 3; } }\n  return r;\n}\nfn main() void {\n  let a: WasmOp = WasmOp{ .local_get = 5 };\n  let b: WasmOp = WasmOp{ .i32_const = 42 };\n  print_i32(code(classify(a)));\n  print_i32(code(classify(b)));\n}\n' > $SH/uni.zag
