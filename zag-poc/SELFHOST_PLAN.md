@@ -107,8 +107,15 @@ Notes for later stages:
              deep-copy generic fn bodies with type-params substituted (Inst.cbody);
              struct instantiations collected from concrete bodies + let-dtys + ret types.
              Verified: Box[T]→42; Pair[i32]→42 & Pair[i64]→123 in one program.
-       - [ ] @sizeOf/cast in bodies (needed for ArrayList[T]/StringMap[V]), tagged
-             unions + switch, optionals/orelse, slicing, @import.
+       - [x] @-builtins (@sizeOf[T]/@len/@intCast/@strEq/...) + `as` casts + null,
+             with type-param substitution inside monomorphized bodies. Verified the
+             full ArrayList allocation pattern: generic struct + extern malloc +
+             cap*@sizeOf[T]() + (raw as *T) + pointer indexing → 42.
+       - [ ] @import (module resolution + qualification) and driver auto-linking of
+             std/runtime.c — the last gap before the self-hosted zagc can compile
+             std/list.zag & std/map.zag (and ultimately its own source).
+       - [ ] tagged unions + switch, optionals/orelse, slicing in self-hosted codegen
+             ([]u8/strings + ZagSliceU8 prelude needed for StringMap).
        (Generic functions work without a full type-inference pass because explicit
         type-args drive monomorphization. Inference-based generics + generic structs
         remain the large piece toward compiling selfhost/*.zag itself.)
