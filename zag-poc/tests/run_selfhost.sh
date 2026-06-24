@@ -200,6 +200,42 @@ if $ZAGC build selfhost/zagc.zag >/dev/null 2>&1 && [ -x ./zagc ]; then
         echo "  XX  []u8 strings + slicing (got '$strout', want 'hi 3 1 hel llo 3')"; fail=$((fail+1))
     fi
 
+    # optionals + orelse: ?T return (null + wrapped value), `orelse`, ?T let with
+    # value/null/passthrough (no double-wrap).
+    printf 'fn sd(a: i32, b: i32) ?i32 { if (b == 0) { return null; } return a / b; }\nfn pt(x: i32) ?i32 { return sd(x, 2); }\nfn main() void {\n  print_i32(sd(10, 2) orelse 0);\n  print_i32(sd(1, 0) orelse 99);\n  let x: ?i32 = 7;\n  print_i32(x orelse 0);\n  let y: ?i32 = null;\n  print_i32(y orelse 42);\n  let z: ?i32 = sd(20, 4);\n  print_i32(z orelse 0);\n  print_i32(pt(8) orelse 0);\n}\n' > $SH/opt.zag
+    $SH/zagc $SH/opt.zag >/dev/null 2>&1
+    optout=""; if [ -x $SH/opt.zag.out ]; then optout=$($SH/opt.zag.out | tr '\n' ' ' | sed 's/ *$//'); fi
+    if [ "$optout" = "5 99 7 42 5 4" ]; then
+        echo "  ok  optionals + orelse (?T return/let; null; orelse; passthrough → 5 99 7 42 5 4)"; pass=$((pass+1))
+    else
+        echo "  XX  optionals + orelse (got '$optout', want '5 99 7 42 5 4')"; fail=$((fail+1))
+    fi
+
+    # expression switch (switch as a value): enum exhaustive, union with |capture|,
+    # and a switch with an `else` arm.
+    printf 'enum Day { Mon, Tue, Wed }\nunion Val { num: i32, neg: i32 }\nfn dc(d: Day) i32 { return switch (d) { .Mon => 1, .Tue => 2, .Wed => 3, }; }\nfn ev(v: Val) i32 { return switch (v) { .num => |x| x, .neg => |x| 0 - x, }; }\nfn cl(d: Day) i32 { let c: i32 = switch (d) { .Mon => 10, else => 99, }; return c; }\nfn main() void {\n  print_i32(dc(Day.Tue));\n  print_i32(ev(Val{ .num = 42 }));\n  print_i32(ev(Val{ .neg = 5 }));\n  print_i32(cl(Day.Mon));\n  print_i32(cl(Day.Wed));\n}\n' > $SH/esw.zag
+    $SH/zagc $SH/esw.zag >/dev/null 2>&1
+    eswout=""; if [ -x $SH/esw.zag.out ]; then eswout=$($SH/esw.zag.out | tr '\n' ' ' | sed 's/ *$//'); fi
+    if [ "$eswout" = "2 42 -5 10 99" ]; then
+        echo "  ok  expression switch (enum/union value-switch + capture + else → 2 42 -5 10 99)"; pass=$((pass+1))
+    else
+        echo "  XX  expression switch (got '$eswout', want '2 42 -5 10 99')"; fail=$((fail+1))
+    fi
+
+    # pointer-base slicing: a struct's *u8 field sliced directly (container.data
+    # pattern), backed by a sibling runtime.c.
+    mkdir -p $SH/ps
+    printf '#include <stdint.h>\nstatic uint8_t b[6]={\x27h\x27,\x27e\x27,\x27l\x27,\x27l\x27,\x27o\x27,0};\nuint8_t* mkbytes(void){ return b; }\n' > $SH/ps/runtime.c
+    printf 'extern fn mkbytes() *u8;\n' > $SH/ps/cmod.zag
+    printf '@import("cmod.zag")\nstruct Buf { data: *u8, n: i32 }\nfn view(b: Buf) []u8 { return b.data[1..4]; }\nfn main() void { let b: Buf = Buf{ .data = mkbytes(), .n = 5 }; print_str(view(b)); }\n' > $SH/ps/main.zag
+    $SH/zagc $SH/ps/main.zag >/dev/null 2>&1
+    psout=""; if [ -x $SH/ps/main.zag.out ]; then psout=$($SH/ps/main.zag.out); fi
+    if [ "$psout" = "ell" ]; then
+        echo "  ok  pointer-base slicing (struct *u8 field b.data[1..4] → ell)"; pass=$((pass+1))
+    else
+        echo "  XX  pointer-base slicing (got '$psout', want 'ell')"; fail=$((fail+1))
+    fi
+
     # Generic heap container (the ArrayList pattern): generic struct + extern
     # malloc + @sizeOf[T] + `as *T` + pointer indexing. zagc emits the .c; we
     # link std/runtime.c (the self-hosted driver does not auto-link it yet).

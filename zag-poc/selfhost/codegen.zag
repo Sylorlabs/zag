@@ -69,6 +69,10 @@ fn ctype(t: []u8) []u8 {
     if (@strEq(t, "void")) { return "void"; }
     if (@strEq(t, ""))     { return "int32_t"; }
     if (@strEq(t, "[]u8")) { return "ZagSliceU8"; }
+    // ?T → ZagOpt_<mangled T> (an optional struct { _has; _val; })
+    if (t.len > 1) {
+        if (t[0] == '?') { return _zag_str_concat("ZagOpt_", mangle_targ(t[1..])); }
+    }
     // *T → "<ctype(T)>*"
     if (t.len > 1) {
         if (t[0] == '*') { return _zag_str_concat(ctype(t[1..]), "*"); }
@@ -361,6 +365,47 @@ fn gen_args(buf: *ArrayList[u8], args: ArrayList[*Node], dl: ArrayList[*Node]) v
     }
 }
 
+// ── expression switch (switch as a value) → C ternary chain ──────────────────
+// Value expression of an arm/else body (expr arms hold a single estmt).
+fn body_expr(body: ArrayList[*Node]) *Node {
+    if (len[*Node](body) == 0) { return mk_int("0"); }
+    let s: *Node = get[*Node](body, 0);
+    return switch (s.*) {
+        .estmt => |e| e.expr,
+        else   => s,
+    };
+}
+
+// OR of the arm's tag tests against the fixed `__sw` temp.
+fn gen_arm_cond(buf: *ArrayList[u8], arm: SwitchArm, prefix: []u8, is_u: i32) void {
+    emit(buf, "(");
+    let ti: i32 = 0;
+    while (ti < len[[]u8](arm.tags)) {
+        if (ti > 0) { emit(buf, " || "); }
+        if (is_u == 1) { emit(buf, "__sw.tag == "); } else { emit(buf, "__sw == "); }
+        emit(buf, prefix); emit(buf, "_"); emit(buf, get[[]u8](arm.tags, ti));
+        ti = ti + 1;
+    }
+    emit(buf, ")");
+}
+
+// The arm's value, with the payload bound via __auto_type for union captures.
+fn gen_arm_value(buf: *ArrayList[u8], arm: SwitchArm, is_u: i32, dl: ArrayList[*Node]) void {
+    if (is_u == 1 && arm.has_cap == 1) {
+        emit(buf, "({ __auto_type ");
+        emit(buf, arm.cap);
+        emit(buf, " = __sw.u.");
+        emit(buf, get[[]u8](arm.tags, 0));
+        emit(buf, "; (");
+        gen_expr(buf, body_expr(arm.body), dl);
+        emit(buf, "); })");
+    } else {
+        emit(buf, "(");
+        gen_expr(buf, body_expr(arm.body), dl);
+        emit(buf, ")");
+    }
+}
+
 fn gen_expr(buf: *ArrayList[u8], n: *Node, dl: ArrayList[*Node]) void {
     switch (n.*) {
         .ilit => |x| { emit(buf, x.text); }
@@ -385,13 +430,22 @@ fn gen_expr(buf: *ArrayList[u8], n: *Node, dl: ArrayList[*Node]) void {
             emit(buf, "))");
         }
         .bin  => |b| {
-            emit(buf, "(");
-            gen_expr(buf, b.l, dl);
-            emit(buf, " ");
-            emit(buf, b.op);
-            emit(buf, " ");
-            gen_expr(buf, b.r, dl);
-            emit(buf, ")");
+            if (@strEq(b.op, "orelse")) {
+                // opt orelse default → ({ __auto_type __o = opt; __o._has ? __o._val : default; })
+                emit(buf, "({ __auto_type __o = ");
+                gen_expr(buf, b.l, dl);
+                emit(buf, "; __o._has ? __o._val : (");
+                gen_expr(buf, b.r, dl);
+                emit(buf, "); })");
+            } else {
+                emit(buf, "(");
+                gen_expr(buf, b.l, dl);
+                emit(buf, " ");
+                emit(buf, b.op);
+                emit(buf, " ");
+                gen_expr(buf, b.r, dl);
+                emit(buf, ")");
+            }
         }
         .un   => |u| {
             emit(buf, "(");
@@ -442,16 +496,26 @@ fn gen_expr(buf: *ArrayList[u8], n: *Node, dl: ArrayList[*Node]) void {
             emit(buf, "]");
         }
         .slice_ => |s| {
-            // slice over a []u8 base: (ZagSliceU8){ base.ptr + lo, (hi|base.len) - lo }
-            // (slice-base form; pointer bases need type info — see note in codegen)
+            // (ZagSliceU8){ <ptr> + lo, (hi | base.len) - lo }
+            // The codegen is type-unaware, so we pick the pointer expression by
+            // shape: a (non-deref) struct-field base like `container.data` is a
+            // pointer field → slice it directly; anything else is treated as a
+            // []T slice value → use `.ptr`/`.len`. (Slicing a slice-typed struct
+            // field would need the type-inference pass; not used in this tree.)
+            let ptr_base: i32 = 0;
+            switch (s.base.*) {
+                .fld => |f| { if (!@strEq(f.fname, "*")) { ptr_base = 1; } }
+                else => { }
+            }
             emit(buf, "(ZagSliceU8){ (");
             gen_expr(buf, s.base, dl);
-            emit(buf, ").ptr + (");
+            if (ptr_base == 1) { emit(buf, ") + ("); } else { emit(buf, ").ptr + ("); }
             gen_expr(buf, s.lo, dl);
             emit(buf, "), (");
             if (s.has_hi == 1) {
                 gen_expr(buf, s.hi, dl);
             } else {
+                // open-ended is only meaningful for slice bases (a pointer has no len)
                 emit(buf, "(");
                 gen_expr(buf, s.base, dl);
                 emit(buf, ").len");
@@ -494,15 +558,67 @@ fn gen_expr(buf: *ArrayList[u8], n: *Node, dl: ArrayList[*Node]) void {
                 emit(buf, " }");
             }
         }
+        .switch_ => |sw| {
+            // expression switch → ({ __auto_type __sw = subj; cond?val:cond?val:final; })
+            let tag0: []u8 = switch_first_tag(sw);
+            let uname: []u8 = union_name_for_tag(dl, tag0);
+            let is_u: i32 = 0;
+            let prefix: []u8 = "";
+            if (uname.len > 0) { is_u = 1; prefix = uname; }
+            else { prefix = enum_name_for_tag(dl, tag0); }
+            emit(buf, "({ __auto_type __sw = ");
+            gen_expr(buf, sw.subject, dl);
+            emit(buf, "; ");
+            let nn: i32 = len[SwitchArm](sw.arms);
+            let last_uncond: i32 = 0;
+            if (sw.has_els == 0) { last_uncond = 1; }   // exhaustive: last arm is the tail
+            let ai: i32 = 0;
+            while (ai < nn) {
+                let arm: SwitchArm = get[SwitchArm](sw.arms, ai);
+                if (last_uncond == 1 && ai == nn - 1) {
+                    gen_arm_value(buf, arm, is_u, dl);
+                } else {
+                    gen_arm_cond(buf, arm, prefix, is_u);
+                    emit(buf, " ? ");
+                    gen_arm_value(buf, arm, is_u, dl);
+                    emit(buf, " : ");
+                }
+                ai = ai + 1;
+            }
+            if (sw.has_els == 1) {
+                emit(buf, "(");
+                gen_expr(buf, body_expr(sw.els_body), dl);
+                emit(buf, ")");
+            }
+            emit(buf, "; })");
+        }
         else => { emit(buf, "0"); }
     }
 }
 
+fn is_opt_type(t: []u8) bool { return t.len > 1 && t[0] == '?'; }
+
+// Emit `e` coerced to the optional type `optty` (?T): null → {0}; an existing
+// optional → passthrough; a bare value → { _has=1, _val=e }.
+fn gen_opt_value(buf: *ArrayList[u8], optty: []u8, e: *Node, dl: ArrayList[*Node]) void {
+    if (is_null_expr(e)) {
+        emit(buf, "("); emit(buf, ctype(optty)); emit(buf, "){0}");
+    } else if (expr_is_optional(e, dl)) {
+        gen_expr(buf, e, dl);
+    } else {
+        emit(buf, "("); emit(buf, ctype(optty)); emit(buf, "){1, ");
+        gen_expr(buf, e, dl);
+        emit(buf, "}");
+    }
+}
+
 // ── statements ───────────────────────────────────────────────────────────────
-fn gen_block(buf: *ArrayList[u8], body: ArrayList[*Node], dl: ArrayList[*Node]) void {
+// `fnret` is the enclosing function's return type, needed to wrap `return v;`
+// when the function returns ?T.
+fn gen_block(buf: *ArrayList[u8], body: ArrayList[*Node], dl: ArrayList[*Node], fnret: []u8) void {
     let i: i32 = 0;
     while (i < len[*Node](body)) {
-        gen_stmt(buf, get[*Node](body, i), dl);
+        gen_stmt(buf, get[*Node](body, i), dl, fnret);
         i = i + 1;
     }
 }
@@ -516,7 +632,7 @@ fn switch_first_tag(sw: Switch) []u8 {
 }
 
 // Emit the case labels + body for one arm. `prefix` is the union/enum name.
-fn gen_switch_arm(buf: *ArrayList[u8], arm: SwitchArm, prefix: []u8, is_u: i32, dl: ArrayList[*Node]) void {
+fn gen_switch_arm(buf: *ArrayList[u8], arm: SwitchArm, prefix: []u8, is_u: i32, dl: ArrayList[*Node], fnret: []u8) void {
     let ti: i32 = 0;
     while (ti < len[[]u8](arm.tags)) {
         emit(buf, "    case ");
@@ -533,11 +649,11 @@ fn gen_switch_arm(buf: *ArrayList[u8], arm: SwitchArm, prefix: []u8, is_u: i32, 
         emit(buf, get[[]u8](arm.tags, 0));
         emit(buf, ";\n");
     }
-    gen_block(buf, arm.body, dl);
+    gen_block(buf, arm.body, dl, fnret);
     emit(buf, "        break;\n    }\n");
 }
 
-fn gen_switch(buf: *ArrayList[u8], sw: Switch, dl: ArrayList[*Node]) void {
+fn gen_switch(buf: *ArrayList[u8], sw: Switch, dl: ArrayList[*Node], fnret: []u8) void {
     let tag0: []u8 = switch_first_tag(sw);
     let uname: []u8 = union_name_for_tag(dl, tag0);
     let is_u: i32 = 0;
@@ -559,18 +675,18 @@ fn gen_switch(buf: *ArrayList[u8], sw: Switch, dl: ArrayList[*Node]) void {
     }
     let ai: i32 = 0;
     while (ai < len[SwitchArm](sw.arms)) {
-        gen_switch_arm(buf, get[SwitchArm](sw.arms, ai), prefix, is_u, dl);
+        gen_switch_arm(buf, get[SwitchArm](sw.arms, ai), prefix, is_u, dl, fnret);
         ai = ai + 1;
     }
     if (sw.has_els == 1) {
         emit(buf, "    default:\n    {\n");
-        gen_block(buf, sw.els_body, dl);
+        gen_block(buf, sw.els_body, dl, fnret);
         emit(buf, "        break;\n    }\n");
     }
     emit(buf, "    }\n    }\n");
 }
 
-fn gen_stmt(buf: *ArrayList[u8], n: *Node, dl: ArrayList[*Node]) void {
+fn gen_stmt(buf: *ArrayList[u8], n: *Node, dl: ArrayList[*Node], fnret: []u8) void {
     switch (n.*) {
         .let_ => |l| {
             emit(buf, "    ");
@@ -578,14 +694,22 @@ fn gen_stmt(buf: *ArrayList[u8], n: *Node, dl: ArrayList[*Node]) void {
             emit(buf, " ");
             emit(buf, l.name);
             emit(buf, " = ");
-            gen_expr(buf, l.expr, dl);
+            if (is_opt_type(l.dty)) {
+                gen_opt_value(buf, l.dty, l.expr, dl);   // ?T = null | value | optional
+            } else {
+                gen_expr(buf, l.expr, dl);
+            }
             emit(buf, ";\n");
         }
         .ret => |r| {
             emit(buf, "    return");
             if (r.has_expr == 1) {
                 emit(buf, " ");
-                gen_expr(buf, r.expr, dl);
+                if (is_opt_type(fnret)) {
+                    gen_opt_value(buf, fnret, r.expr, dl);   // wrap into the ?T return
+                } else {
+                    gen_expr(buf, r.expr, dl);
+                }
             }
             emit(buf, ";\n");
         }
@@ -593,11 +717,11 @@ fn gen_stmt(buf: *ArrayList[u8], n: *Node, dl: ArrayList[*Node]) void {
             emit(buf, "    if (");
             gen_expr(buf, x.cond, dl);
             emit(buf, ") {\n");
-            gen_block(buf, x.then_body, dl);
+            gen_block(buf, x.then_body, dl, fnret);
             emit(buf, "    }");
             if (x.has_els == 1) {
                 emit(buf, " else {\n");
-                gen_block(buf, x.els_body, dl);
+                gen_block(buf, x.els_body, dl, fnret);
                 emit(buf, "    }");
             }
             emit(buf, "\n");
@@ -606,7 +730,7 @@ fn gen_stmt(buf: *ArrayList[u8], n: *Node, dl: ArrayList[*Node]) void {
             emit(buf, "    while (");
             gen_expr(buf, w.cond, dl);
             emit(buf, ") {\n");
-            gen_block(buf, w.body, dl);
+            gen_block(buf, w.body, dl, fnret);
             emit(buf, "    }\n");
         }
         .assign => |a| {
@@ -616,7 +740,7 @@ fn gen_stmt(buf: *ArrayList[u8], n: *Node, dl: ArrayList[*Node]) void {
             gen_expr(buf, a.expr, dl);
             emit(buf, ";\n");
         }
-        .switch_ => |sw| { gen_switch(buf, sw, dl); }
+        .switch_ => |sw| { gen_switch(buf, sw, dl, fnret); }
         .estmt => |e| {
             emit(buf, "    ");
             gen_expr(buf, e.expr, dl);
@@ -682,7 +806,7 @@ fn gen_fn(buf: *ArrayList[u8], f: FnDecl, dl: ArrayList[*Node]) void {
         gen_params(buf, f.params);
         emit(buf, ") {\n");
     }
-    gen_block(buf, f.body, dl);
+    gen_block(buf, f.body, dl, f.ret);
     if (is_main == 1) { emit(buf, "    return 0;\n"); }
     emit(buf, "}\n");
 }
@@ -976,8 +1100,109 @@ fn emit_mono_proto(buf: *ArrayList[u8], inst: Inst) void {
 fn emit_mono_body(buf: *ArrayList[u8], inst: Inst, dl: ArrayList[*Node]) void {
     emit_mono_sig(buf, inst);
     emit(buf, " {\n");
-    gen_block(buf, inst.cbody, dl);   // concrete (type-params already substituted)
+    // the instance's return type drives ?T wrapping inside the body
+    gen_block(buf, inst.cbody, dl, subst_type(inst.f.ret, inst.f.tparams, inst.targs));
     emit(buf, "}\n");
+}
+
+// ── optional types: collect every ?T so we can emit its ZagOpt_ typedef ───────
+// Strip * and [] prefixes; if what remains is an optional ?T, record it.
+fn collect_opt(t: []u8, out: *ArrayList[[]u8]) void {
+    let inner: []u8 = t;
+    let go: bool = true;
+    while (go) {
+        if (inner.len > 1 && inner[0] == '*') { inner = inner[1..]; }
+        else if (inner.len > 2 && inner[0] == '[' && inner[1] == ']') { inner = inner[2..]; }
+        else { go = false; }
+    }
+    if (inner.len > 1 && inner[0] == '?') {
+        if (!seen_has(out.*, inner)) { push[[]u8](out, inner); }
+    }
+}
+
+fn collect_opts_block(body: ArrayList[*Node], out: *ArrayList[[]u8]) void {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        collect_opts_stmt(get[*Node](body, i), out);
+        i = i + 1;
+    }
+}
+
+fn collect_opts_stmt(n: *Node, out: *ArrayList[[]u8]) void {
+    switch (n.*) {
+        .let_   => |l| { collect_opt(l.dty, out); }
+        .if_    => |x| { collect_opts_block(x.then_body, out); if (x.has_els == 1) { collect_opts_block(x.els_body, out); } }
+        .while_ => |w| { collect_opts_block(w.body, out); }
+        .switch_ => |sw| {
+            let ai: i32 = 0;
+            while (ai < len[SwitchArm](sw.arms)) {
+                collect_opts_block(get[SwitchArm](sw.arms, ai).body, out);
+                ai = ai + 1;
+            }
+            if (sw.has_els == 1) { collect_opts_block(sw.els_body, out); }
+        }
+        else => { }
+    }
+}
+
+fn collect_opts_params(params: ArrayList[Param], out: *ArrayList[[]u8]) void {
+    let i: i32 = 0;
+    while (i < len[Param](params)) {
+        collect_opt(get[Param](params, i).pty, out);
+        i = i + 1;
+    }
+}
+
+// Emit `typedef struct { int32_t _has; <T> _val; } ZagOpt_<T>;` for each ?T.
+fn emit_opt_typedefs(buf: *ArrayList[u8], opts: ArrayList[[]u8]) void {
+    let i: i32 = 0;
+    while (i < len[[]u8](opts)) {
+        let ot: []u8 = get[[]u8](opts, i);          // "?T"
+        let inner: []u8 = ot[1..];                  // "T"
+        emit(buf, "typedef struct { int32_t _has; ");
+        emit(buf, ctype(inner));
+        emit(buf, " _val; } ");
+        emit(buf, ctype(ot));                        // ZagOpt_<mangle(inner)>
+        emit(buf, ";\n");
+        i = i + 1;
+    }
+}
+
+// Is `callee` a (non-extern) fn whose declared return type is optional?
+fn callee_returns_opt(callee: *Node, dl: ArrayList[*Node]) bool {
+    let nm: []u8 = cg_callee_name(callee);
+    if (nm.len == 0) { return false; }
+    let i: i32 = 0;
+    while (i < len[*Node](dl)) {
+        switch (get[*Node](dl, i).*) {
+            .fn_decl => |f| {
+                if (@strEq(f.name, nm)) {
+                    if (f.ret.len > 0 && f.ret[0] == '?') { return true; }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+// True if expr is the `null` literal (parser lowers null to an ident).
+fn is_null_expr(n: *Node) bool {
+    return switch (n.*) {
+        .id  => |x| @strEq(x.name, "null"),
+        else => false,
+    };
+}
+
+// True if expr is already an optional value (null, or a call to a ?-returning
+// fn, or an orelse). Used to decide wrap-vs-passthrough at ?T assignment sites.
+fn expr_is_optional(n: *Node, dl: ArrayList[*Node]) bool {
+    return switch (n.*) {
+        .id   => |x| @strEq(x.name, "null"),
+        .call => |c| callee_returns_opt(c.callee, dl),
+        else  => false,
+    };
 }
 
 // ── driver: source → C string ────────────────────────────────────────────────
@@ -1041,6 +1266,37 @@ fn codegen_decls(decls: ArrayList[*Node]) ArrayList[u8] {
         emit_sinst(&buf, get[SInst](sinsts, sg));
         sg = sg + 1;
     }
+
+    // collect optional types (?T) from signatures, bodies, and mono instances,
+    // then emit a ZagOpt_ struct typedef for each (after the structs they wrap).
+    let opts: ArrayList[[]u8] = make[[]u8](4);
+    let oi: i32 = 0;
+    while (oi < len[*Node](decls)) {
+        switch (get[*Node](decls, oi).*) {
+            .fn_decl => |f| {
+                collect_opts_params(f.params, &opts);
+                collect_opt(f.ret, &opts);
+                if (f.is_extern == 0 && len[[]u8](f.tparams) == 0) { collect_opts_block(f.body, &opts); }
+            }
+            .struct_ => |s| { collect_opts_params(s.fields, &opts); }
+            .union_  => |u| { collect_opts_params(u.fields, &opts); }
+            else => { }
+        }
+        oi = oi + 1;
+    }
+    let omi: i32 = 0;
+    while (omi < len[Inst](insts)) {
+        let minst: Inst = get[Inst](insts, omi);
+        let pj: i32 = 0;
+        while (pj < len[Param](minst.f.params)) {
+            collect_opt(subst_type(get[Param](minst.f.params, pj).pty, minst.f.tparams, minst.targs), &opts);
+            pj = pj + 1;
+        }
+        collect_opt(subst_type(minst.f.ret, minst.f.tparams, minst.targs), &opts);
+        collect_opts_block(minst.cbody, &opts);
+        omi = omi + 1;
+    }
+    emit_opt_typedefs(&buf, opts);
 
     // prototypes: monomorphized generics first, then regular fns
     let mp: i32 = 0;

@@ -127,17 +127,29 @@ Notes for later stages:
              arm's tag up against the decls; fresh `{ }` block scopes a fixed `__sw` temp.
        - [x] []u8 / ZagSliceU8 prelude + print_str + inline _zag_str_eq/_zag_str_len;
              string literals lowered to `(ZagSliceU8){ptr,len}`; slicing `s[lo..hi]` and
-             open-ended `s[lo..]` over []u8 slice bases (new `..` token + Slice node).
-       - [ ] optionals/orelse and EXPRESSION switch (switch as a value) — both require a
-             type-inference pass in the self-hosted codegen (a `?i32` value optional can't
-             be lowered without its inner type; expr-switch needs the arm result type for
-             the C temp). Pointer-base slicing (`arrayList.data[..]`) likewise needs to know
-             slice-vs-pointer. This inference pass is the remaining "large piece" for C3.
-       (Generic functions/structs work via explicit type-args + monomorphization. The
-        type-inference pass — porting the bootstrap's typeOf into Zag — is what remains.)
+             open-ended `s[lo..]` (new `..` token + Slice node). Pointer-base slicing
+             (`container.data[..]`) lowered by shape: a non-deref struct-field base is a
+             pointer field (slice directly), else a []T slice value (use .ptr/.len).
+       - [x] optionals/orelse + EXPRESSION switch — done WITHOUT a full type-inference
+             pass, using two tricks:
+             - ?T → `ZagOpt_<T>` struct (typedefs collected from every ?T annotation +
+               mono instance); wrapping happens at annotated sites (let dty / fn ret):
+               null→{0}, an already-optional (null / call to ?-returning fn)→passthrough,
+               bare value→{1,val}. `a orelse b` → `({__auto_type __o=a; __o._has?__o._val:b;})`
+               so the use site needs no type.
+             - expression switch → a C ternary chain over a `__auto_type __sw` temp,
+               with `__auto_type` payload captures; C infers the result type from the
+               branches. Works for union and enum value-switches, with/without `else`.
+       - [ ] if-let `if (opt) |v| {..}` (orelse covers the common consumption); and
+             extending qualified-import type substitution to descend into generic
+             applications `Base[args]` — the remaining gap before a qualified generic
+             container (map.zag's StringMap[V]/MapEntry[V] imported `as map`) compiles.
+       (Generic functions/structs work via explicit type-args + monomorphization;
+        optionals/switch/strings/slicing now work type-unaware via the tricks above.)
 - [ ] C3. `zagc2` compiles its own source → `zagc3`; verify fixpoint (zagc2 and
-       zagc3 produce identical output). Blocked on the type-inference pass (optionals,
-       expression switch) above.
+       zagc3 produce identical output). Now unblocked on language features; remaining
+       work is the qualified-generic-import descent (map.zag) plus driving the full
+       selfhost/* + std/* source through `zagc2` and fixing whatever surfaces.
 
 ## Status log
 
@@ -145,6 +157,10 @@ Notes for later stages:
 - 2026-06-24: Bootstrap (Zig) compiler — routed all allocations through an arena in
   main.zig; GPA leak report is now clean (0 leaks). Self-hosted compiler — landed
   @import (flat + qualified + runtime.c auto-link), tagged unions + statement switch,
-  and []u8/ZagSliceU8 strings + slicing. selfhost suite 10→15 tests, all green
-  (core 40, stdlib 3, selfhost 15, selfhost-features 2 = 60 total). Remaining for C3:
-  the type-inference pass (optionals/orelse, expression switch, pointer-base slicing).
+  and []u8/ZagSliceU8 strings + slicing. selfhost suite 10→15 tests.
+- 2026-06-24 (cont.): self-hosted codegen — added optionals/orelse, expression switch,
+  and pointer-base slicing, all WITHOUT a full type-inference pass (ZagOpt structs +
+  wrap-at-annotation, `__auto_type` orelse/captures, ternary-chain expr-switch, shape-
+  based pointer-vs-slice). selfhost suite 15→18; all green (core 40, stdlib 3,
+  selfhost 18, selfhost-features 2 = 63 total). Remaining for C3: if-let, qualified-
+  import descent into generic applications (map.zag), then driving full self-source.
