@@ -47,6 +47,7 @@ pub const Node = union(enum) {
     un:           Un,
     call:         Call,
     index:        Index,
+    slice:        Slice,
     cast:         Cast,
     field:        Field,
     struct_lit:   StructLit,
@@ -254,6 +255,14 @@ pub const Cast = struct {
     target: []const u8,        // the `as Type` target type
     line:   u32,
     ty:     ?[]const u8 = null,
+};
+
+pub const Slice = struct {
+    base: NodeRef,
+    lo:   NodeRef,
+    hi:   NodeRef,
+    line: u32,
+    ty:   ?[]const u8 = null,
 };
 
 pub const Field = struct {

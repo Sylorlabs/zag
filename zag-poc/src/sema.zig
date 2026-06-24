@@ -603,6 +603,18 @@ pub const Sema = struct {
                 return self.resolveType(c.target);
             },
 
+            .slice => |*sl| {
+                const bt = self.typeOf(sl.base, scope);
+                _ = self.typeOf(sl.lo, scope);
+                _ = self.typeOf(sl.hi, scope);
+                // []T[a..b] -> []T ; *T[a..b] -> []T
+                if (std.mem.startsWith(u8, bt, "[]")) return bt;
+                if (types.isPointer(bt))
+                    return std.fmt.allocPrint(self.alloc, "[]{s}", .{types.pointerInner(bt)}) catch bt;
+                self.errFmt(sl.line, "cannot slice non-sliceable type {s}", .{bt});
+                return "[]u8";
+            },
+
             .field => |*f| return self.typeOfField(f, scope),
 
             .struct_lit => |*sl| return self.typeOfStructLit(sl, scope),
@@ -1667,6 +1679,11 @@ pub const Sema = struct {
                 self.effectsExpr(i.idx, label, eff_set, wit_map, local_lat);
             },
             .cast => |*c| self.effectsExpr(c.expr, label, eff_set, wit_map, local_lat),
+            .slice => |*sl| {
+                self.effectsExpr(sl.base, label, eff_set, wit_map, local_lat);
+                self.effectsExpr(sl.lo, label, eff_set, wit_map, local_lat);
+                self.effectsExpr(sl.hi, label, eff_set, wit_map, local_lat);
+            },
             .field => |*f| self.effectsExpr(f.base, label, eff_set, wit_map, local_lat),
             .struct_lit => |*sl| {
                 for (sl.fields) |fi| self.effectsExpr(fi.val, label, eff_set, wit_map, local_lat);
@@ -2189,6 +2206,12 @@ pub const Sema = struct {
                 .expr   = self.cloneExpr(c.expr, mp),
                 .target = types.substType(self.alloc, c.target, mp.*) catch c.target,
                 .line   = c.line,
+            }},
+            .slice => |*sl| ast.Node{ .slice = .{
+                .base = self.cloneExpr(sl.base, mp),
+                .lo   = self.cloneExpr(sl.lo, mp),
+                .hi   = self.cloneExpr(sl.hi, mp),
+                .line = sl.line,
             }},
             .field => |*f| ast.Node{ .field = .{
                 .base  = self.cloneExpr(f.base, mp),

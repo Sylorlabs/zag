@@ -446,6 +446,7 @@ fn genExpr(ctx: *Ctx, node: ast.NodeRef) anyerror!void {
         .call => |c| try genCall(ctx, c),
         .field => |f| try genField(ctx, f),
         .index => |idx| try genIndex(ctx, idx),
+        .slice => |sl| try genSlice(ctx, sl),
         .cast => |c| try genCast(ctx, c),
         .struct_lit => |sl| try genStructLit(ctx, sl),
         .null_lit => |nl| try genNullLit(ctx, nl),
@@ -980,6 +981,27 @@ fn registerSigOptResult(ctx: *Ctx, ret: []const u8, params: []const ast.Param) !
             try ctx.registerOpt(try ctype(ctx.alloc, p.pty[1..]));
         }
     }
+}
+
+fn genSlice(ctx: *Ctx, sl: ast.Slice) !void {
+    const bt = ast.nodeType(sl.base) orelse "[]u8";
+    const is_ptr = bt.len > 0 and bt[0] == '*';
+    const result_zty = if (is_ptr)
+        try std.fmt.allocPrint(ctx.alloc, "[]{s}", .{bt[1..]})
+    else
+        bt;
+    try ctx.ensureSpecialSliceTypedef(result_zty);
+    const slice_ct = try ctype(ctx.alloc, result_zty);
+    try ctx.wf("({s}){{ (", .{slice_ct});
+    try genExpr(ctx, sl.base);
+    if (is_ptr) try ctx.w(")") else try ctx.w(").ptr");
+    try ctx.w(" + (");
+    try genExpr(ctx, sl.lo);
+    try ctx.w("), (");
+    try genExpr(ctx, sl.hi);
+    try ctx.w(") - (");
+    try genExpr(ctx, sl.lo);
+    try ctx.w(") }");
 }
 
 fn genCast(ctx: *Ctx, c: ast.Cast) !void {

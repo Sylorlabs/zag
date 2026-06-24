@@ -578,7 +578,16 @@ pub const Parser = struct {
             var els: ?[]NodeRef = null;
             if (self.atKind(.kw_else)) {
                 _ = self.eat(.kw_else, null);
-                els = try self.parseBlock();
+                // `else if ...` — treat the chained if as a one-statement else block,
+                // so users don't have to write `else { if ... }`.
+                if (self.atKind(.kw_if)) {
+                    const chained = try self.parseStmt();
+                    const blk = try self.alloc.alloc(NodeRef, 1);
+                    blk[0] = chained;
+                    els = blk;
+                } else {
+                    els = try self.parseBlock();
+                }
             }
             return self.mkNode(.{ .if_ = .{
                 .cond = cond,
@@ -935,16 +944,37 @@ pub const Parser = struct {
                         continue;
                     }
                 }
-                // index
+                // index or slice
                 const ln = self.eat(.lbracket, null).line;
                 const idx = try self.parseExpr();
-                _ = self.eat(.rbracket, null);
-                e = try self.mkNode(.{ .index = .{
-                    .base = e,
-                    .idx = idx,
-                    .line = ln,
-                } });
+                // slice: base[lo..hi]  ('..' lexes as two dot tokens)
+                if (self.atKind(.dot) and self.i + 1 < self.toks.len and
+                    self.toks[self.i + 1].kind == .dot)
+                {
+                    _ = self.eat(.dot, null);
+                    _ = self.eat(.dot, null);
+                    const hi = try self.parseExpr();
+                    _ = self.eat(.rbracket, null);
+                    e = try self.mkNode(.{ .slice = .{
+                        .base = e,
+                        .lo = idx,
+                        .hi = hi,
+                        .line = ln,
+                    } });
+                } else {
+                    _ = self.eat(.rbracket, null);
+                    e = try self.mkNode(.{ .index = .{
+                        .base = e,
+                        .idx = idx,
+                        .line = ln,
+                    } });
+                }
             } else if (self.atKind(.dot)) {
+                // '..' is the slice range operator, not a field access — stop here
+                // so the enclosing index/slice parser can consume it.
+                if (self.i + 1 < self.toks.len and self.toks[self.i + 1].kind == .dot) {
+                    break;
+                }
                 // check for .? (force unwrap)
                 if (self.i + 1 < self.toks.len and
                     self.toks[self.i + 1].kind == .op and
@@ -1414,6 +1444,12 @@ fn cloneExpr(alloc: Allocator, nr: NodeRef, names: *const std.StringHashMap([]co
             .expr   = try cloneExpr(alloc, c.expr, names),
             .target = substType(alloc, c.target, names) catch c.target,
             .line   = c.line,
+        }},
+        .slice       => |*sl| Node{ .slice = .{
+            .base = try cloneExpr(alloc, sl.base, names),
+            .lo   = try cloneExpr(alloc, sl.lo, names),
+            .hi   = try cloneExpr(alloc, sl.hi, names),
+            .line = sl.line,
         }},
         .field       => |*f| Node{ .field = .{
             .base  = try cloneExpr(alloc, f.base, names),

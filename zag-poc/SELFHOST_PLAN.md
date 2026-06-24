@@ -42,10 +42,18 @@ arena allocator in zagc itself (currently leaks parse allocations — cosmetic).
 
 ## Stage B — Self-hosted compiler (Zag source in `selfhost/`)
 
-Build bottom-up, each module compiled by zig-zagc and tested against the Zig version's behavior:
+Build bottom-up, each module compiled by zig-zagc and tested against the Zig version's behavior.
 
-- [ ] B1. `lex.zag`   — tokenizer; verify token stream matches on sample inputs
-- [ ] B2. `ast.zag`   — node tags + constructors
+Enabling language features added for self-hosting (all in the bootstrap compiler):
+- char literals `'a'` → integer
+- slicing `s[lo..hi]` (Slice node) for slices and pointers
+- `else if` chaining (no more `else { if }`)
+- fixed lexer bug: `&&`/`||` now tokenize correctly (was split into `&`+`&`)
+
+- [x] B1. `lex.zag` — tokenizer in Zag. 38 token kinds, keywords, annotations,
+       two-char ops, char/string/number scanning, comments. Test: selfhost/lex_test.zag
+       verifies 30-token kind sequence + slice-extracted token texts. tests/run_selfhost.sh.
+- [ ] B2. `ast.zag`   — node tags + constructors (tagged unions over *Node)
 - [ ] B3. `parse.zag` — recursive descent; verify AST shape
 - [ ] B4. `types.zag` — type helpers, builtin table
 - [ ] B5. `sema.zag`  — type checker + effect system

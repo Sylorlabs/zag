@@ -126,12 +126,9 @@ pub fn lex(alloc: std.mem.Allocator, src: []const u8) LexError![]Token {
             continue;
         }
 
-        // ── & bitwise AND ─────────────────────────────────────────────
-        if (c == '&') {
-            try tokens.append(.{ .kind = .op, .val = src[i .. i + 1], .line = line });
-            i += 1;
-            continue;
-        }
+        // NOTE: '&' is NOT handled here — it must reach the two-char operator
+        // check below so that '&&' (logical AND) is recognized before the
+        // single-char '&' (bitwise AND / address-of).
 
         // ── @ annotation or built-in ident ───────────────────────────
         if (c == '@') {
@@ -151,6 +148,37 @@ pub fn lex(alloc: std.mem.Allocator, src: []const u8) LexError![]Token {
             const word = src[i..j];
             const kind: TokenKind = keywordKind(word) orelse .ident;
             try tokens.append(.{ .kind = kind, .val = word, .line = line });
+            i = j;
+            continue;
+        }
+
+        // ── char literal ──────────────────────────────────────────────
+        // 'a', '\n', '\\', '\'', '\0', '\t', '\r' → an integer (byte value)
+        if (c == '\'') {
+            var val: u8 = 0;
+            var j = i + 1;
+            if (j < n and src[j] == '\\') {
+                if (j + 1 >= n) return LexError.UnterminatedString;
+                val = switch (src[j + 1]) {
+                    'n' => '\n',
+                    't' => '\t',
+                    'r' => '\r',
+                    '0' => 0,
+                    '\\' => '\\',
+                    '\'' => '\'',
+                    '"' => '"',
+                    else => src[j + 1],
+                };
+                j += 2;
+            } else if (j < n) {
+                val = src[j];
+                j += 1;
+            } else return LexError.UnterminatedString;
+            if (j >= n or src[j] != '\'') return LexError.UnexpectedChar;
+            j += 1; // closing quote
+            // Emit as an integer literal (decimal text), so it flows like any int.
+            const txt = try std.fmt.allocPrint(alloc, "{d}", .{val});
+            try tokens.append(.{ .kind = .int, .val = txt, .line = line });
             i = j;
             continue;
         }
@@ -251,7 +279,7 @@ pub fn lex(alloc: std.mem.Allocator, src: []const u8) LexError![]Token {
             '.' => { try tokens.append(.{ .kind = .dot,      .val = src[i .. i + 1], .line = line }); i += 1; continue; },
             '|' => { try tokens.append(.{ .kind = .pipe,     .val = src[i .. i + 1], .line = line }); i += 1; continue; },
             // Chars classified as "op":
-            '+', '-', '*', '/', '%', '<', '>', '=', '!', '?' => {
+            '+', '-', '*', '/', '%', '<', '>', '=', '!', '?', '&', '^' => {
                 try tokens.append(.{ .kind = .op, .val = src[i .. i + 1], .line = line });
                 i += 1;
                 continue;
