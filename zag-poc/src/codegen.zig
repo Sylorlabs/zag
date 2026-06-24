@@ -446,6 +446,7 @@ fn genExpr(ctx: *Ctx, node: ast.NodeRef) anyerror!void {
         .call => |c| try genCall(ctx, c),
         .field => |f| try genField(ctx, f),
         .index => |idx| try genIndex(ctx, idx),
+        .cast => |c| try genCast(ctx, c),
         .struct_lit => |sl| try genStructLit(ctx, sl),
         .null_lit => |nl| try genNullLit(ctx, nl),
         .err_lit => |el| try genErrLit(ctx, el),
@@ -654,6 +655,13 @@ fn genCall(ctx: *Ctx, c: ast.Call) !void {
 
         if (std.mem.startsWith(u8, name, "@")) {
             const builtin = name[1..];
+            // @sizeOf[T]() — compile-time byte size of T
+            if (std.mem.eql(u8, builtin, "sizeOf")) {
+                const t = if (c.targs.len > 0) c.targs[0] else "i32";
+                const ct = try ctype(ctx.alloc, t);
+                try ctx.wf("((int32_t)sizeof({s}))", .{ct});
+                return;
+            }
             // Map Zag builtins to C runtime functions
             const c_fn: []const u8 = blk: {
                 if (std.mem.eql(u8, builtin, "strEq")) break :blk "_zag_str_eq";
@@ -709,7 +717,13 @@ fn genCall(ctx: *Ctx, c: ast.Call) !void {
         if (f.base.* == .var_) {
             const mod_name = f.base.var_.name;
             if (ctx.s.modules.get(mod_name)) |_| {
-                try ctx.wf("{s}__{s}(", .{ mod_name, f.fname });
+                // Generic module fn: use the monomorphized name sema computed.
+                if (c.inst_name) |iname| {
+                    try ctx.w(try mangleGenericName(ctx.alloc, iname));
+                } else {
+                    try ctx.wf("{s}__{s}", .{ mod_name, f.fname });
+                }
+                try ctx.w("(");
                 for (c.args, 0..) |arg, i| {
                     if (i > 0) try ctx.w(", ");
                     try genExpr(ctx, arg);
@@ -933,11 +947,46 @@ fn genField(ctx: *Ctx, f: ast.Field) !void {
 }
 
 fn genIndex(ctx: *Ctx, idx: ast.Index) !void {
+    const bt = ast.nodeType(idx.base) orelse "";
+    // Pointer indexing: C pointers index natively, no .ptr field.
+    if (bt.len > 0 and bt[0] == '*') {
+        try ctx.w("(");
+        try genExpr(ctx, idx.base);
+        try ctx.w(")[(");
+        try genExpr(ctx, idx.idx);
+        try ctx.w(")]");
+        return;
+    }
+    // Slice indexing: slices are { ptr, len } structs.
     try ctx.w("(");
     try genExpr(ctx, idx.base);
     try ctx.w(").ptr[(");
     try genExpr(ctx, idx.idx);
     try ctx.w(")]");
+}
+
+/// Register ZagOpt_/ZagResult_ typedefs implied by a fn signature's
+/// `?T` / `!T` return and parameter types.
+fn registerSigOptResult(ctx: *Ctx, ret: []const u8, params: []const ast.Param) !void {
+    if (std.mem.startsWith(u8, ret, "!")) {
+        try ctx.registerResult(try ctype(ctx.alloc, ret[1..]));
+    } else if (std.mem.startsWith(u8, ret, "?")) {
+        try ctx.registerOpt(try ctype(ctx.alloc, ret[1..]));
+    }
+    for (params) |p| {
+        if (std.mem.startsWith(u8, p.pty, "!")) {
+            try ctx.registerResult(try ctype(ctx.alloc, p.pty[1..]));
+        } else if (std.mem.startsWith(u8, p.pty, "?")) {
+            try ctx.registerOpt(try ctype(ctx.alloc, p.pty[1..]));
+        }
+    }
+}
+
+fn genCast(ctx: *Ctx, c: ast.Cast) !void {
+    const ct = try ctype(ctx.alloc, c.target);
+    try ctx.wf("(({s})(", .{ct});
+    try genExpr(ctx, c.expr);
+    try ctx.w("))");
 }
 
 fn genStructLit(ctx: *Ctx, sl: ast.StructLit) !void {
@@ -1821,9 +1870,25 @@ fn fnCName(alloc: std.mem.Allocator, f: ast.FnDecl) ![]const u8 {
 }
 
 fn genFnForwardDecl(ctx: *Ctx, f: ast.FnDecl) !void {
-    if (f.is_extern or f.body == null) return;
-    if (isMainFn(f)) return;
     if (f.tparams.len > 0) return;
+    // Extern fn: emit a non-static C prototype with the literal (unmangled) name.
+    // The definition is provided by the linked runtime (std/runtime.c) or libc.
+    if (f.is_extern) {
+        const eret = try ctype(ctx.alloc, f.ret);
+        try ctx.wf("extern {s} {s}(", .{ eret, f.name });
+        if (f.params.len == 0) {
+            try ctx.w("void");
+        } else {
+            for (f.params, 0..) |p, i| {
+                if (i > 0) try ctx.w(", ");
+                try ctx.w(try ctype(ctx.alloc, p.pty));
+            }
+        }
+        try ctx.w(");\n");
+        return;
+    }
+    if (f.body == null) return;
+    if (isMainFn(f)) return;
 
     const ret_ct = try ctype(ctx.alloc, f.ret);
     const fn_name = try fnCName(ctx.alloc, f);
@@ -2112,28 +2177,26 @@ pub fn gen(
                     try ctx.ensureSpecialSliceTypedef(f.ret);
                 }
             }
-            if (std.mem.startsWith(u8, f.ret, "!")) {
-                const inner = f.ret[1..];
-                const ct = try ctype(alloc, inner);
-                try ctx.registerResult(ct);
+            // Register optional/result typedefs from signature — but ONLY for
+            // concrete (non-generic) fns; generic templates carry type-param
+            // types like ?V that must never reach C (would emit `V _val`).
+            if (f.tparams.len == 0) {
+                try registerSigOptResult(&ctx, f.ret, f.params);
             }
-            if (std.mem.startsWith(u8, f.ret, "?")) {
-                const inner = f.ret[1..];
-                const ct = try ctype(alloc, inner);
-                try ctx.registerOpt(ct);
-            }
-            for (f.params) |p| {
-                if (std.mem.startsWith(u8, p.pty, "!")) {
-                    const inner = p.pty[1..];
-                    const ct = try ctype(alloc, inner);
-                    try ctx.registerResult(ct);
-                }
-                if (std.mem.startsWith(u8, p.pty, "?")) {
-                    const inner = p.pty[1..];
-                    const ct = try ctype(alloc, inner);
-                    try ctx.registerOpt(ct);
-                }
-            }
+        }
+    }
+
+    // 4a. Also register optional/result typedefs from instantiated generic fns
+    //     in s.fns — these hold the concrete types (?i32 → ZagOpt_int32_t) and
+    //     must be collected BEFORE the typedef section is emitted below.
+    {
+        var fit = s.fns.iterator();
+        while (fit.next()) |entry| {
+            const fn_node = entry.value_ptr.*;
+            if (fn_node.* != .fn_decl) continue;
+            const f = fn_node.fn_decl;
+            if (f.tparams.len > 0) continue;
+            try registerSigOptResult(&ctx, f.ret, f.params);
         }
     }
 

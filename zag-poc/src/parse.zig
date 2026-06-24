@@ -22,9 +22,16 @@ const SwitchArm = ast.SwitchArm;
 // the parse call; we just use the same allocator that is passed to the parser.
 var g_import_seen: ?std.StringHashMap(void) = null;
 
+// Set of C runtime files (e.g. std/runtime.c) discovered next to imported
+// modules. main.zig links these into the final binary.
+var g_link_c: ?std.StringHashMap(void) = null;
+
 fn importSeenInit(alloc: Allocator) void {
     if (g_import_seen == null) {
         g_import_seen = std.StringHashMap(void).init(alloc);
+    }
+    if (g_link_c == null) {
+        g_link_c = std.StringHashMap(void).init(alloc);
     }
 }
 
@@ -33,6 +40,20 @@ fn importSeenReset(alloc: Allocator) void {
         m.deinit();
     }
     g_import_seen = std.StringHashMap(void).init(alloc);
+    if (g_link_c) |*m| {
+        m.deinit();
+    }
+    g_link_c = std.StringHashMap(void).init(alloc);
+}
+
+/// Return the list of C files to link (collected from imported modules' dirs).
+pub fn linkCFiles(alloc: Allocator) [][]const u8 {
+    var out = std.ArrayList([]const u8).init(alloc);
+    if (g_link_c) |m| {
+        var it = m.keyIterator();
+        while (it.next()) |k| out.append(k.*) catch {};
+    }
+    return out.toOwnedSlice() catch &[_][]const u8{};
 }
 
 fn importSeenContains(path: []const u8) bool {
@@ -190,6 +211,16 @@ pub const Parser = struct {
 
         // Determine the child src_dir
         const child_dir = std.fs.path.dirname(full_path) orelse ".";
+
+        // If this module's directory has a runtime.c, mark it for linking.
+        if (g_link_c) |*m| {
+            const rt = std.fs.path.resolve(self.alloc, &.{ child_dir, "runtime.c" }) catch null;
+            if (rt) |rtp| {
+                if (std.fs.cwd().access(rtp, .{})) |_| {
+                    m.put(rtp, {}) catch {};
+                } else |_| {}
+            }
+        }
 
         // Lex
         const child_toks = lex_mod.lex(self.alloc, src) catch |e| {
@@ -807,6 +838,16 @@ pub const Parser = struct {
 
     fn parseUnary(self: *Parser) !NodeRef {
         const t = self.peek();
+        // address-of: &expr  (prefix '&'; infix '&' is bitwise-and, handled in parseBinExpr)
+        if (t.kind == .op and std.mem.eql(u8, t.val, "&")) {
+            const op_tok = self.eat(.op, null);
+            const inner = try self.parseUnary();
+            return self.mkNode(.{ .un = .{
+                .op = try self.alloc.dupe(u8, op_tok.val),
+                .e = inner,
+                .line = op_tok.line,
+            } });
+        }
         if (t.kind == .op and (std.mem.eql(u8, t.val, "-") or std.mem.eql(u8, t.val, "!"))) {
             const op_tok = self.eat(.op, null);
             const inner = try self.parseUnary();
@@ -819,9 +860,39 @@ pub const Parser = struct {
         return self.parsePostfix();
     }
 
+    /// Given the index of a '[' token, return the index of its matching ']'
+    /// (accounting for nesting), or null if unmatched.
+    fn matchingBracket(self: *Parser, open: usize) ?usize {
+        var depth: i32 = 0;
+        var k = open;
+        while (k < self.toks.len) : (k += 1) {
+            switch (self.toks[k].kind) {
+                .lbracket => depth += 1,
+                .rbracket => {
+                    depth -= 1;
+                    if (depth == 0) return k;
+                },
+                .eof => return null,
+                else => {},
+            }
+        }
+        return null;
+    }
+
     fn parsePostfix(self: *Parser) !NodeRef {
         var e = try self.parsePrimary();
         while (true) {
+            // cast: expr as Type
+            if (self.at(.ident, "as")) {
+                const ln = self.eat(.ident, "as").line;
+                const ty = try self.parseType();
+                e = try self.mkNode(.{ .cast = .{
+                    .expr = e,
+                    .target = ty,
+                    .line = ln,
+                } });
+                continue;
+            }
             // function call
             if (self.atKind(.lp)) {
                 const ln = self.eat(.lp, null).line;
@@ -837,6 +908,33 @@ pub const Parser = struct {
                     .line = ln,
                 } });
             } else if (self.atKind(.lbracket)) {
+                // Disambiguate generic-call `foo[T1,T2](args)` from index `arr[i]`:
+                // if the matching ']' is immediately followed by '(', it's a generic call.
+                if (self.matchingBracket(self.i)) |close| {
+                    if (close + 1 < self.toks.len and self.toks[close + 1].kind == .lp) {
+                        _ = self.eat(.lbracket, null);
+                        var targs = std.ArrayList([]const u8).init(self.alloc);
+                        while (!self.atKind(.rbracket)) {
+                            try targs.append(try self.parseType());
+                            if (self.atKind(.comma)) _ = self.eat(.comma, null);
+                        }
+                        _ = self.eat(.rbracket, null);
+                        const ln = self.eat(.lp, null).line;
+                        var cargs = std.ArrayList(NodeRef).init(self.alloc);
+                        while (!self.atKind(.rp)) {
+                            try cargs.append(try self.parseExpr());
+                            if (self.atKind(.comma)) _ = self.eat(.comma, null);
+                        }
+                        _ = self.eat(.rp, null);
+                        e = try self.mkNode(.{ .call = .{
+                            .callee = e,
+                            .args = try cargs.toOwnedSlice(),
+                            .line = ln,
+                            .targs = try targs.toOwnedSlice(),
+                        } });
+                        continue;
+                    }
+                }
                 // index
                 const ln = self.eat(.lbracket, null).line;
                 const idx = try self.parseExpr();
@@ -1116,7 +1214,9 @@ fn qualifyDecls(alloc: Allocator, decls: []NodeRef, prefix: []const u8) ![]NodeR
 
     for (decls) |nr| {
         switch (nr.*) {
-            .fn_decl => |f| try names.put(f.name, try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, f.name })),
+            // extern fns keep their literal FFI symbol name — never qualified.
+            .fn_decl => |f| if (!f.is_extern)
+                try names.put(f.name, try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, f.name })),
             .struct_decl => |s| try names.put(s.name, try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, s.name })),
             .enum_decl => |e| try names.put(e.name, try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, e.name })),
             .union_decl => |u| try names.put(u.name, try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, u.name })),
@@ -1128,7 +1228,10 @@ fn qualifyDecls(alloc: Allocator, decls: []NodeRef, prefix: []const u8) ![]NodeR
     for (decls) |nr| {
         switch (nr.*) {
             .fn_decl => |f| {
-                const new_name = names.get(f.name) orelse try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, f.name });
+                const new_name = if (f.is_extern)
+                    f.name
+                else
+                    names.get(f.name) orelse try std.fmt.allocPrint(alloc, "{s}{s}", .{ prefix, f.name });
                 var new_params = try alloc.alloc(Param, f.params.len);
                 for (f.params, 0..) |p, i| {
                     new_params[i] = .{
@@ -1138,7 +1241,18 @@ fn qualifyDecls(alloc: Allocator, decls: []NodeRef, prefix: []const u8) ![]NodeR
                 }
                 const new_ret = substType(alloc, f.ret, &names) catch f.ret;
                 const new_recv = if (f.recv_type) |rt| substType(alloc, rt, &names) catch rt else null;
-                const new_body = if (f.body) |b| try cloneStmts(alloc, b, &names) else null;
+                // Build a body-rename map that EXCLUDES names shadowed by this
+                // fn's params or locals, so e.g. a param `cap` is not rewritten
+                // to the sibling function `mod__cap`.
+                var body_names = std.StringHashMap([]const u8).init(alloc);
+                defer body_names.deinit();
+                {
+                    var nit = names.iterator();
+                    while (nit.next()) |kv| body_names.put(kv.key_ptr.*, kv.value_ptr.*) catch {};
+                    for (f.params) |p| _ = body_names.remove(p.name);
+                    if (f.body) |b| removeBoundLetNames(b, &body_names);
+                }
+                const new_body = if (f.body) |b| try cloneStmts(alloc, b, &body_names) else null;
                 const np = try alloc.create(Node);
                 np.* = .{ .fn_decl = .{
                     .name = new_name,
@@ -1235,6 +1349,36 @@ fn substType(alloc: Allocator, ty: []const u8, names: *const std.StringHashMap([
 /// Shallow clone a statement list, substituting type strings in Let nodes.
 /// A full deep clone is complex; here we substitute type annotations only —
 /// this mirrors what the Python compiler does (it only subs types in params/ret).
+/// Remove from `names` every identifier bound by a `let` anywhere in `stmts`
+/// (including nested blocks). Used so module qualification never rewrites a
+/// local that shadows a sibling top-level declaration.
+fn removeBoundLetNames(stmts: []NodeRef, names: *std.StringHashMap([]const u8)) void {
+    for (stmts) |nr| {
+        switch (nr.*) {
+            .let => |*l| {
+                _ = names.remove(l.name);
+            },
+            .if_ => |*i| {
+                removeBoundLetNames(i.then, names);
+                if (i.els) |e| removeBoundLetNames(e, names);
+                if (i.cap) |c| _ = names.remove(c);
+            },
+            .while_ => |*w| {
+                removeBoundLetNames(w.body, names);
+                if (w.cap) |c| _ = names.remove(c);
+            },
+            .switch_ => |*sw| {
+                for (sw.arms) |arm| {
+                    removeBoundLetNames(arm.body, names);
+                    if (arm.cap) |c| _ = names.remove(c);
+                }
+                if (sw.els) |e| removeBoundLetNames(e, names);
+            },
+            else => {},
+        }
+    }
+}
+
 fn cloneStmts(alloc: Allocator, stmts: []NodeRef, names: *const std.StringHashMap([]const u8)) anyerror![]NodeRef {
     var out = try alloc.alloc(NodeRef, stmts.len);
     for (stmts, 0..) |nr, i| {
@@ -1247,7 +1391,9 @@ fn cloneExpr(alloc: Allocator, nr: NodeRef, names: *const std.StringHashMap([]co
     const np = try alloc.create(Node);
     np.* = switch (nr.*) {
         .lit         => |*l| Node{ .lit = .{ .lty = l.lty, .val = l.val, .line = l.line } },
-        .var_        => |*v| Node{ .var_ = .{ .name = v.name, .line = v.line } },
+        // Rename references to module-qualified top-level decls (fn/struct/...).
+        // `names` only contains top-level names, so locals/params pass through.
+        .var_        => |*v| Node{ .var_ = .{ .name = names.get(v.name) orelse v.name, .line = v.line } },
         .un          => |*u| Node{ .un = .{
             .op   = u.op,
             .e    = try cloneExpr(alloc, u.e, names),
@@ -1263,6 +1409,11 @@ fn cloneExpr(alloc: Allocator, nr: NodeRef, names: *const std.StringHashMap([]co
             .base = try cloneExpr(alloc, i.base, names),
             .idx  = try cloneExpr(alloc, i.idx, names),
             .line = i.line,
+        }},
+        .cast        => |*c| Node{ .cast = .{
+            .expr   = try cloneExpr(alloc, c.expr, names),
+            .target = substType(alloc, c.target, names) catch c.target,
+            .line   = c.line,
         }},
         .field       => |*f| Node{ .field = .{
             .base  = try cloneExpr(alloc, f.base, names),
@@ -1290,10 +1441,13 @@ fn cloneExpr(alloc: Allocator, nr: NodeRef, names: *const std.StringHashMap([]co
         .call        => |*c| blk: {
             var new_args = try alloc.alloc(NodeRef, c.args.len);
             for (c.args, 0..) |a, idx| new_args[idx] = try cloneExpr(alloc, a, names);
+            var new_targs = try alloc.alloc([]const u8, c.targs.len);
+            for (c.targs, 0..) |a, idx| new_targs[idx] = substType(alloc, a, names) catch a;
             break :blk Node{ .call = .{
                 .callee = try cloneExpr(alloc, c.callee, names),
                 .args   = new_args,
                 .line   = c.line,
+                .targs  = new_targs,
             }};
         },
         .err_lit     => |*el| Node{ .err_lit = .{ .errname = el.errname, .line = el.line } },

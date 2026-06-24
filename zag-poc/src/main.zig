@@ -373,6 +373,8 @@ fn cmdBuild(
     defer argv.deinit();
     argv.append(cc)      catch return 1;
     argv.append(c_path)  catch return 1;
+    // Link any C runtime files discovered next to imported modules (std/runtime.c).
+    for (parse_mod.linkCFiles(alloc)) |cf| argv.append(cf) catch return 1;
     argv.append("-o")    catch return 1;
     argv.append(bin_path) catch return 1;
     argv.append("-lm")   catch return 1;

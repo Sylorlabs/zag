@@ -82,6 +82,11 @@ fn isAnnotation(word: []const u8) bool {
         .{ "@pure",     {} },
         .{ "@kernel",   {} },
         .{ "@device",   {} },
+        // effect-declaration annotations (used on extern fns to declare latent effects)
+        .{ "@alloc",    {} },
+        .{ "@panic",    {} },
+        .{ "@io",       {} },
+        .{ "@lock",     {} },
     });
     return annots.has(word);
 }

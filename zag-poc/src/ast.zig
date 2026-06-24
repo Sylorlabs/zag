@@ -47,6 +47,7 @@ pub const Node = union(enum) {
     un:           Un,
     call:         Call,
     index:        Index,
+    cast:         Cast,
     field:        Field,
     struct_lit:   StructLit,
     closure:      Closure,
@@ -237,6 +238,8 @@ pub const Call = struct {
     ty:        ?[]const u8 = null,
     /// sema flag: this call-site argument should be wrapped into ?T at codegen
     opt_wrap:  ?[]const u8 = null,
+    /// explicit generic type arguments: foo[T1,T2](args) and @sizeOf[T]()
+    targs:     [][]const u8 = &.{},
 };
 
 pub const Index = struct {
@@ -244,6 +247,13 @@ pub const Index = struct {
     idx:  NodeRef,
     line: u32,
     ty:   ?[]const u8 = null,
+};
+
+pub const Cast = struct {
+    expr:   NodeRef,
+    target: []const u8,        // the `as Type` target type
+    line:   u32,
+    ty:     ?[]const u8 = null,
 };
 
 pub const Field = struct {

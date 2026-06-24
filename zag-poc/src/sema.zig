@@ -152,6 +152,11 @@ pub const Sema = struct {
             const r = std.fmt.allocPrint(self.alloc, "[]{s}", .{inner}) catch ty;
             return r;
         }
+        // Pointer / optional prefixes: resolve the pointee, re-attach the prefix.
+        if (ty[0] == '*' or ty[0] == '?' or ty[0] == '!') {
+            const inner = self.resolveType(ty[1..]);
+            return std.fmt.allocPrint(self.alloc, "{c}{s}", .{ ty[0], inner }) catch ty;
+        }
         if (types.isFnType(ty)) {
             var buf: [4096]u8 = undefined;
             var fba = std.heap.FixedBufferAllocator.init(&buf);
@@ -569,22 +574,33 @@ pub const Sema = struct {
 
             .un => |*u| {
                 const t = self.typeOf(u.e, scope);
-                return if (std.mem.eql(u8, u.op, "!")) "bool" else t;
+                if (std.mem.eql(u8, u.op, "!")) return "bool";
+                if (std.mem.eql(u8, u.op, "&"))
+                    return std.fmt.allocPrint(self.alloc, "*{s}", .{t}) catch t;
+                return t;
             },
 
             .bin => |*b| return self.typeOfBin(b, scope),
 
             .index => |*idx| {
                 const bt = self.typeOf(idx.base, scope);
-                if (!std.mem.startsWith(u8, bt, "[]")) {
+                const el: []const u8 = if (std.mem.startsWith(u8, bt, "[]"))
+                    bt[2..]
+                else if (types.isPointer(bt))
+                    types.pointerInner(bt)
+                else {
                     self.errFmt(idx.line, "cannot index non-slice type {s}", .{bt});
                     return "i32";
-                }
-                const el = bt[2..];
+                };
                 const idx_ty = self.typeOf(idx.idx, scope);
                 if (!types.isInt(idx_ty))
                     self.errFmt(idx.line, "index must be an integer", .{});
                 return el;
+            },
+
+            .cast => |*c| {
+                _ = self.typeOf(c.expr, scope); // type inner for node-type recording
+                return self.resolveType(c.target);
             },
 
             .field => |*f| return self.typeOfField(f, scope),
@@ -862,6 +878,11 @@ pub const Sema = struct {
 
     fn typeOfCall(self: *Sema, c: *ast.Call, call_node: ast.NodeRef, scope: *Scope) []const u8 {
         const callee = c.callee;
+        // @sizeOf[T]() — compile-time byte size of T, returns i32
+        if (callee.* == .var_ and std.mem.eql(u8, callee.*.var_.name, "@sizeOf")) {
+            ast.setNodeType(call_node, "i32");
+            return "i32";
+        }
         // Module call: mod.fn(args)
         if (callee.* == .field) {
             const fld = &callee.*.field;
@@ -871,6 +892,38 @@ pub const Sema = struct {
                     const prefix = self.modules.get(vname).?;
                     const mangled = std.fmt.allocPrint(self.alloc, "{s}{s}", .{ prefix, fld.fname }) catch fld.fname;
                     ast.setNodeType(fld.base, std.fmt.allocPrint(self.alloc, "module:{s}", .{vname}) catch "module");
+                    // Generic module fn: mod.fn[T](args) or mod.fn(args) with inference
+                    if (self.generic_fns.get(mangled)) |g_node| {
+                        const g = &g_node.*.fn_decl;
+                        for (c.args) |a| _ = self.typeOf(a, scope);
+                        var cargs = std.ArrayList([]const u8).init(self.alloc);
+                        defer cargs.deinit();
+                        if (c.targs.len > 0) {
+                            for (c.targs) |ta| cargs.append(self.resolveType(ta)) catch {};
+                        } else {
+                            var argtys = std.ArrayList([]const u8).init(self.alloc);
+                            defer argtys.deinit();
+                            for (c.args) |a| argtys.append(ast.nodeType(a) orelse "i32") catch {};
+                            var sub = std.StringHashMap([]const u8).init(self.alloc);
+                            defer sub.deinit();
+                            for (g.params, 0..) |p, i| {
+                                if (i < argtys.items.len)
+                                    types.unify(self.alloc, p.pty, argtys.items[i], g.tparams, &sub);
+                            }
+                            for (g.tparams) |tp| {
+                                if (sub.get(tp)) |ct| cargs.append(ct) catch {}
+                                else {
+                                    self.errFmt(c.line, "cannot infer type parameter '{s}' of '{s}'", .{ tp, fld.fname });
+                                    cargs.append("i32") catch {};
+                                }
+                            }
+                        }
+                        const inst_name = self.instFn(mangled, cargs.items);
+                        c.inst_name = inst_name;
+                        const ret = self.fns.get(inst_name).?.*.fn_decl.ret;
+                        ast.setNodeType(call_node, ret);
+                        return ret;
+                    }
                     if (self.fns.get(mangled)) |decl_node| {
                         const decl = &decl_node.*.fn_decl;
                         for (c.args) |a| _ = self.typeOf(a, scope);
@@ -935,23 +988,33 @@ pub const Sema = struct {
             const vname = callee.*.var_.name;
             if (self.generic_fns.get(vname)) |g_node| {
                 const g = &g_node.*.fn_decl;
-                var argtys = std.ArrayList([]const u8).init(self.alloc);
-                defer argtys.deinit();
-                for (c.args) |a| argtys.append(self.typeOf(a, scope)) catch {};
-                var sub = std.StringHashMap([]const u8).init(self.alloc);
-                defer sub.deinit();
-                for (g.params, 0..) |p, i| {
-                    if (i < argtys.items.len)
-                        types.unify(self.alloc, p.pty, argtys.items[i], g.tparams, &sub);
-                }
+                for (c.args) |a| _ = self.typeOf(a, scope);
                 var cargs = std.ArrayList([]const u8).init(self.alloc);
                 defer cargs.deinit();
-                for (g.tparams) |tp| {
-                    if (sub.get(tp)) |ct| {
-                        cargs.append(ct) catch {};
-                    } else {
-                        self.errFmt(c.line, "cannot infer type parameter '{s}' of '{s}'", .{ tp, vname });
-                        cargs.append("i32") catch {};
+                if (c.targs.len > 0) {
+                    // Explicit instantiation: foo[T1,T2](args)
+                    if (c.targs.len != g.tparams.len)
+                        self.errFmt(c.line, "fn '{s}' expects {d} type args, got {d}",
+                            .{ vname, g.tparams.len, c.targs.len });
+                    for (c.targs) |ta| cargs.append(self.resolveType(ta)) catch {};
+                } else {
+                    // Infer type params from value-argument types.
+                    var argtys = std.ArrayList([]const u8).init(self.alloc);
+                    defer argtys.deinit();
+                    for (c.args) |a| argtys.append(ast.nodeType(a) orelse "i32") catch {};
+                    var sub = std.StringHashMap([]const u8).init(self.alloc);
+                    defer sub.deinit();
+                    for (g.params, 0..) |p, i| {
+                        if (i < argtys.items.len)
+                            types.unify(self.alloc, p.pty, argtys.items[i], g.tparams, &sub);
+                    }
+                    for (g.tparams) |tp| {
+                        if (sub.get(tp)) |ct| {
+                            cargs.append(ct) catch {};
+                        } else {
+                            self.errFmt(c.line, "cannot infer type parameter '{s}' of '{s}'", .{ tp, vname });
+                            cargs.append("i32") catch {};
+                        }
                     }
                 }
                 const inst_name = self.instFn(vname, cargs.items);
@@ -1603,6 +1666,7 @@ pub const Sema = struct {
                 self.effectsExpr(i.base, label, eff_set, wit_map, local_lat);
                 self.effectsExpr(i.idx, label, eff_set, wit_map, local_lat);
             },
+            .cast => |*c| self.effectsExpr(c.expr, label, eff_set, wit_map, local_lat),
             .field => |*f| self.effectsExpr(f.base, label, eff_set, wit_map, local_lat),
             .struct_lit => |*sl| {
                 for (sl.fields) |fi| self.effectsExpr(fi.val, label, eff_set, wit_map, local_lat);
@@ -1665,6 +1729,21 @@ pub const Sema = struct {
                             }
                         }
                         return;
+                    }
+                    // 1b. Extern fn: latent effects are DECLARED via annotations
+                    //     (@alloc/@panic/@io/@lock). There is no body to analyze.
+                    if (self.fns.get(cname)) |decl_node| {
+                        const decl = &decl_node.*.fn_decl;
+                        if (decl.is_extern) {
+                            for (decl.annots) |an| {
+                                if (externEffectName(an)) |e| {
+                                    const chain = std.fmt.allocPrint(self.alloc,
+                                        "extern '{s}' at line {d} declares {s}", .{ cname, c.line, e }) catch "extern";
+                                    self.addEffect(e, chain, label, eff_set, wit_map);
+                                }
+                            }
+                            return;
+                        }
                     }
                     // 2. Call into known fn or builtin — build callsite env from fn-type args.
                     if (self.fns.contains(cname) or types.getBuiltin(cname) != null) {
@@ -2106,6 +2185,11 @@ pub const Sema = struct {
                 .idx  = self.cloneExpr(i.idx, mp),
                 .line = i.line,
             }},
+            .cast => |*c| ast.Node{ .cast = .{
+                .expr   = self.cloneExpr(c.expr, mp),
+                .target = types.substType(self.alloc, c.target, mp.*) catch c.target,
+                .line   = c.line,
+            }},
             .field => |*f| ast.Node{ .field = .{
                 .base  = self.cloneExpr(f.base, mp),
                 .fname = f.fname,
@@ -2148,10 +2232,13 @@ pub const Sema = struct {
             .call => |*c| blk: {
                 var new_args = self.alloc.alloc(ast.NodeRef, c.args.len) catch break :blk e.*;
                 for (c.args, 0..) |a, i| new_args[i] = self.cloneExpr(a, mp);
+                var new_targs = self.alloc.alloc([]const u8, c.targs.len) catch break :blk e.*;
+                for (c.targs, 0..) |a, i| new_targs[i] = types.substType(self.alloc, a, mp.*) catch a;
                 break :blk ast.Node{ .call = .{
                     .callee = self.cloneExpr(c.callee, mp),
                     .args   = new_args,
                     .line   = c.line,
+                    .targs  = new_targs,
                 }};
             },
             .err_lit => |*el| ast.Node{ .err_lit = .{ .errname = el.errname, .line = el.line } },
@@ -2261,6 +2348,15 @@ pub const Sema = struct {
 };
 
 // ── Module-level helpers ──────────────────────────────────────────────────────
+
+/// Map an effect-declaration annotation (used on extern fns) to its effect name.
+fn externEffectName(annot: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, annot, "@alloc")) return "Alloc";
+    if (std.mem.eql(u8, annot, "@panic")) return "Panic";
+    if (std.mem.eql(u8, annot, "@io")) return "IO";
+    if (std.mem.eql(u8, annot, "@lock")) return "Lock";
+    return null;
+}
 
 /// When param expects ?T and arg is NullLit or bare T, annotate the arg node.
 fn annotateOptionalArg(arg_node: ast.NodeRef, param_ty: []const u8, arg_ty: []const u8) void {
