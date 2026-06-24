@@ -164,11 +164,18 @@ Notes for later stages:
        (Generic functions/structs + qualified generic imports + optionals/switch/
         strings/slicing all work; the slice-vs-pointer type pass closed the last
         language wall. std/map.zag now compiles end to end.)
-- [ ] C3. `zagc2` compiles its own source → `zagc3`; verify fixpoint (zagc2 and
-       zagc3 produce identical output). Language features are in place (std/map.zag
-       compiles); remaining work is driving the full selfhost/* + std/* source
-       through `zagc2` and fixing whatever surfaces (e.g. if-let, std/list.zag,
-       larger files), then comparing zagc2/zagc3 output.
+- [~] C3. `zagc2` compiles its own source → `zagc3`; verify fixpoint.
+       MILESTONE 2026-06-24: the self-hosted compiler now lexes, parses, effect-checks,
+       and CODEGENS its entire own source (selfhost/zagc.zag + the imported graph) end
+       to end — ~168 KB of C emitted (was: segfault). Enabling fixes: char literals
+       `'x'`/`'\n'` → integer tokens in selfhost/lex.zag (its own source is full of
+       `c == '\n'`); check_file resolves @imports relative to the source dir.
+       Remaining: a handful of CODEGEN TYPE-CORRECTNESS bugs that only surface on the
+       compiler's own source — the first is a union-capture + generic-call field access
+       (`get[[]u8](f.annots, i)` where `f` is a `.fn_decl => |f|` capture) emitting an
+       arg the C compiler sees as `int` rather than `ArrayList[[]u8]`. Fixing these
+       one at a time is the path to a clean-compiling zagc2, then the zagc2/zagc3
+       fixpoint. (if-let still unimplemented but not yet on the critical path.)
 
 ## Status log
 

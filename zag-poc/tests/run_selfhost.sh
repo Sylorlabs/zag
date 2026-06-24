@@ -204,6 +204,17 @@ if $ZAGC build selfhost/zagc.zag >/dev/null 2>&1 && [ -x ./zagc ]; then
         echo "  XX  std/map.zag (as map) (got '$mapout', want '10 20 30 99 3')"; fail=$((fail+1))
     fi
 
+    # char literals 'x' / '\n' → integer codes (the self-hosted lexer needs these
+    # to lex its own source, which is full of c == '\n' style comparisons).
+    printf "fn main() void { print_i32('A'); print_i32('z' - 'a'); print_i32('\\\\n'); }\n" > $SH/chr.zag
+    $SH/zagc $SH/chr.zag >/dev/null 2>&1
+    chrout=""; if [ -x $SH/chr.zag.out ]; then chrout=$($SH/chr.zag.out | tr '\n' ' ' | sed 's/ *$//'); fi
+    if [ "$chrout" = "65 25 10" ]; then
+        echo "  ok  char literals ('A'=65, 'z'-'a'=25, '\\n'=10)"; pass=$((pass+1))
+    else
+        echo "  XX  char literals (got '$chrout', want '65 25 10')"; fail=$((fail+1))
+    fi
+
     # tagged unions + statement switch: union construction (tag + payload),
     # switch over a union tag with |capture|, and switch over a plain enum.
     printf 'enum OpClass { Numeric, Control, Memory }\nunion WasmOp { local_get: i32, i32_const: i64, i32_add: bool }\nfn classify(op: WasmOp) OpClass {\n  let cls: OpClass = OpClass.Control;\n  switch (op) {\n    .local_get => |idx| { cls = OpClass.Memory; }\n    .i32_const => |v| { cls = OpClass.Numeric; }\n    .i32_add => |_x| { cls = OpClass.Numeric; }\n  }\n  return cls;\n}\nfn code(c: OpClass) i32 {\n  let r: i32 = 0;\n  switch (c) { .Numeric => { r = 1; } .Control => { r = 2; } .Memory => { r = 3; } }\n  return r;\n}\nfn main() void {\n  let a: WasmOp = WasmOp{ .local_get = 5 };\n  let b: WasmOp = WasmOp{ .i32_const = 42 };\n  print_i32(code(classify(a)));\n  print_i32(code(classify(b)));\n}\n' > $SH/uni.zag
