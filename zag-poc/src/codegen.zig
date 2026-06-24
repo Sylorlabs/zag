@@ -48,6 +48,30 @@ const PRELUDE_CACHE =
     \\
 ;
 
+// RISC-V PPU hardware posit path (--target ppu32). The software posit math in
+// numeric_prelude.c is `#ifndef ZAG_TARGET_PPU32`'d out (we emit the #define for
+// ppu32), and these hardware ops — padd.s/psub.s/pmul.s/pdiv.s — replace it.
+// p32 bits move through 32-bit float registers; memcpy bit-punning is a single
+// fmv.w.x/fmv.x.w at -O1+. (--emit-c only; actual build needs a riscv64 cc.)
+const PRELUDE_PPU_MATH =
+    \\
+    \\/* ── P4: RISC-V PPU hardware posit path — padd.s/psub.s/pmul.s/pdiv.s ── */
+    \\#if !defined(__riscv)
+    \\#warning "zagc --target ppu32: generated for RISC-V PPU; cross-compile with a riscv64 toolchain"
+    \\#endif
+    \\static inline float   _zp_load(uint32_t b){ float f; __builtin_memcpy(&f,&b,4); return f; }
+    \\static inline uint32_t _zp_store(float f){ uint32_t b; __builtin_memcpy(&b,&f,4); return b; }
+    \\static uint32_t zag_p32_add(uint32_t a, uint32_t b){
+    \\    float _r; __asm__ volatile("padd.s %0,%1,%2":"=f"(_r):"f"(_zp_load(a)),"f"(_zp_load(b))); return _zp_store(_r); }
+    \\static uint32_t zag_p32_sub(uint32_t a, uint32_t b){
+    \\    float _r; __asm__ volatile("psub.s %0,%1,%2":"=f"(_r):"f"(_zp_load(a)),"f"(_zp_load(b))); return _zp_store(_r); }
+    \\static uint32_t zag_p32_mul(uint32_t a, uint32_t b){
+    \\    float _r; __asm__ volatile("pmul.s %0,%1,%2":"=f"(_r):"f"(_zp_load(a)),"f"(_zp_load(b))); return _zp_store(_r); }
+    \\static uint32_t zag_p32_div(uint32_t a, uint32_t b){
+    \\    float _r; __asm__ volatile("pdiv.s %0,%1,%2":"=f"(_r):"f"(_zp_load(a)),"f"(_zp_load(b))); return _zp_store(_r); }
+    \\
+;
+
 fn getPrelude() []const u8 {
     var count: u32 = 0;
     var i: usize = 0;
@@ -2353,10 +2377,13 @@ pub fn gen(
     defer ctx.deinit();
 
     // 1. Prelude
+    const is_ppu32 = std.mem.eql(u8, target, "ppu32");
+    if (is_ppu32) try ctx.w("#define ZAG_TARGET_PPU32\n");  // compile out the software posit math
     const prelude = getPrelude();
     try ctx.w(prelude);
     try ctx.w("\n");
     try ctx.w(PRELUDE_CACHE);   // manual cache-line control runtime
+    if (is_ppu32) try ctx.w(PRELUDE_PPU_MATH);   // RISC-V PPU hardware posit ops
 
     // 2. Error enum
     try genErrorEnum(&ctx);

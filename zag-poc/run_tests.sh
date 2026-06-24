@@ -60,11 +60,13 @@ g operator_contract
 b operator_contract_bad
 echo "── P4: hardware posit target — ppu32 (emit-c, check asm opcodes) ──"
 ppu(){ ./zig-out/bin/zagc build examples/$1.zag --target ppu32 --emit-c >/tmp/zt 2>&1
-       if grep -q 'padd\.s' examples/$1.c 2>/dev/null && \
-          grep -q 'ZAG_TARGET_PPU32' examples/$1.c 2>/dev/null; then
+       # --emit-c writes <stem>.c into the cwd
+       if grep -q 'padd\.s' $1.c 2>/dev/null && \
+          grep -q 'ZAG_TARGET_PPU32' $1.c 2>/dev/null; then
            echo "  ok  $1 (ppu32: padd.s/psub.s/pmul.s/pdiv.s in C)"
            pass=$((pass+1))
-       else echo "  XX  $1 (ppu32)"; fail=$((fail+1)); cat /tmp/zt; fi; }
+       else echo "  XX  $1 (ppu32)"; fail=$((fail+1)); cat /tmp/zt; fi
+       rm -f $1.c 2>/dev/null; }
 ppu posit32
 echo "════ pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]
