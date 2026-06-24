@@ -111,17 +111,40 @@ Notes for later stages:
              with type-param substitution inside monomorphized bodies. Verified the
              full ArrayList allocation pattern: generic struct + extern malloc +
              cap*@sizeOf[T]() + (raw as *T) + pointer indexing → 42.
-       - [ ] @import (module resolution + qualification) and driver auto-linking of
-             std/runtime.c — the last gap before the self-hosted zagc can compile
-             std/list.zag & std/map.zag (and ultimately its own source).
-       - [ ] tagged unions + switch, optionals/orelse, slicing in self-hosted codegen
-             ([]u8/strings + ZagSliceU8 prelude needed for StringMap).
-       (Generic functions work without a full type-inference pass because explicit
-        type-args drive monomorphization. Inference-based generics + generic structs
-        remain the large piece toward compiling selfhost/*.zag itself.)
+       - [x] @import in the self-hosted compiler (parse.zag/codegen.zag/zagc.zag):
+             - flat merge `@import("p.zag")` with diamond-import dedup (seen-paths set);
+             - qualified `@import("p.zag") as name` — true namespacing: module decls
+               renamed `name__X`, internal refs + types rewritten, importing-side
+               `name.member` / `name.Type` / `name.Type{}` collapsed to the prefix;
+               extern fns keep literal FFI names; `mod.Type` handled in parse_type;
+             - driver auto-links sibling `runtime.c` of imported modules (cfiles list).
+             Limitation: qualifying a module that re-exports a flat-imported generic
+             container (map.zag over ArrayList) needs generic-application type descent
+             — deferred with the type-inference work below.
+       - [x] tagged unions (decl → tag enum + {tag; union u;}; construction → tag+payload),
+             STATEMENT switch over unions (`switch(x){ .tag => |cap| {..} }`, __auto_type
+             captures) and enums; union/enum identified type-unaware by looking the first
+             arm's tag up against the decls; fresh `{ }` block scopes a fixed `__sw` temp.
+       - [x] []u8 / ZagSliceU8 prelude + print_str + inline _zag_str_eq/_zag_str_len;
+             string literals lowered to `(ZagSliceU8){ptr,len}`; slicing `s[lo..hi]` and
+             open-ended `s[lo..]` over []u8 slice bases (new `..` token + Slice node).
+       - [ ] optionals/orelse and EXPRESSION switch (switch as a value) — both require a
+             type-inference pass in the self-hosted codegen (a `?i32` value optional can't
+             be lowered without its inner type; expr-switch needs the arm result type for
+             the C temp). Pointer-base slicing (`arrayList.data[..]`) likewise needs to know
+             slice-vs-pointer. This inference pass is the remaining "large piece" for C3.
+       (Generic functions/structs work via explicit type-args + monomorphization. The
+        type-inference pass — porting the bootstrap's typeOf into Zag — is what remains.)
 - [ ] C3. `zagc2` compiles its own source → `zagc3`; verify fixpoint (zagc2 and
-       zagc3 produce identical output). Blocked on C2b.
+       zagc3 produce identical output). Blocked on the type-inference pass (optionals,
+       expression switch) above.
 
 ## Status log
 
 - 2026-06-23: Plan created. Foundation gaps catalogued. Starting Stage A.
+- 2026-06-24: Bootstrap (Zig) compiler — routed all allocations through an arena in
+  main.zig; GPA leak report is now clean (0 leaks). Self-hosted compiler — landed
+  @import (flat + qualified + runtime.c auto-link), tagged unions + statement switch,
+  and []u8/ZagSliceU8 strings + slicing. selfhost suite 10→15 tests, all green
+  (core 40, stdlib 3, selfhost 15, selfhost-features 2 = 60 total). Remaining for C3:
+  the type-inference pass (optionals/orelse, expression switch, pointer-base slicing).

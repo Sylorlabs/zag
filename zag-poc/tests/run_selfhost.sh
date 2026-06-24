@@ -129,6 +129,77 @@ if $ZAGC build selfhost/zagc.zag >/dev/null 2>&1 && [ -x ./zagc ]; then
         echo "  XX  builtins (got '$biout', want '300 4 4 8')"; fail=$((fail+1))
     fi
 
+    # @import: flat module merge + diamond dedup. m.zag defines square; the
+    # diamond pulls c.zag in via two paths — it must appear exactly once.
+    mkdir -p $SH/imp
+    printf 'fn square(x: i32) i32 { return x * x; }\n' > $SH/imp/m.zag
+    printf '@import("m.zag")\nfn main() void { print_i32(square(7)); }\n' > $SH/imp/use.zag
+    $SH/zagc $SH/imp/use.zag >/dev/null 2>&1
+    impout=""; if [ -x $SH/imp/use.zag.out ]; then impout=$($SH/imp/use.zag.out); fi
+    printf 'fn fc() i32 { return 3; }\n' > $SH/imp/c.zag
+    printf '@import("c.zag")\nfn fa() i32 { return 1; }\n' > $SH/imp/a.zag
+    printf '@import("c.zag")\nfn fb() i32 { return 2; }\n' > $SH/imp/b.zag
+    printf '@import("a.zag")\n@import("b.zag")\nfn main() void { print_i32(fa() + fb() + fc()); }\n' > $SH/imp/d.zag
+    $SH/zagc $SH/imp/d.zag >/dev/null 2>&1
+    dout=""; if [ -x $SH/imp/d.zag.out ]; then dout=$($SH/imp/d.zag.out); fi
+    ndef=$(grep -c "int32_t fc(void) {" $SH/imp/d.zag.c 2>/dev/null)
+    if [ "$impout" = "49" ] && [ "$dout" = "6" ] && [ "$ndef" = "1" ]; then
+        echo "  ok  @import (flat merge square→49; diamond dedup fa+fb+fc=6, fc once)"; pass=$((pass+1))
+    else
+        echo "  XX  @import (impout='$impout' want 49; dout='$dout' want 6; fc defs=$ndef want 1)"; fail=$((fail+1))
+    fi
+
+    # @import runtime.c auto-linking: a module with an extern backed by a sibling
+    # runtime.c — the driver must collect that .c and hand it to cc.
+    mkdir -p $SH/rt
+    printf '#include <stdint.h>\nint32_t add_in_c(int32_t a, int32_t b){ return a + b; }\n' > $SH/rt/runtime.c
+    printf 'extern fn add_in_c(a: i32, b: i32) i32;\n' > $SH/rt/cmod.zag
+    printf '@import("cmod.zag")\nfn main() void { print_i32(add_in_c(40, 2)); }\n' > $SH/rt/rtmain.zag
+    $SH/zagc $SH/rt/rtmain.zag >/dev/null 2>&1
+    rtout=""; if [ -x $SH/rt/rtmain.zag.out ]; then rtout=$($SH/rt/rtmain.zag.out); fi
+    if [ "$rtout" = "42" ]; then
+        echo "  ok  @import runtime.c auto-link (extern add_in_c → 42)"; pass=$((pass+1))
+    else
+        echo "  XX  @import runtime.c auto-link (got '$rtout', want 42)"; fail=$((fail+1))
+    fi
+
+    # @import ... as name (qualified): true namespacing. flat dup()=1 and the
+    # qualified q.dup()=2 coexist; q.helper()'s internal dup() resolves to q__dup;
+    # q.Box type / q.Box{} literal / q.unbox() all route through the q__ prefix.
+    mkdir -p $SH/qi
+    printf 'fn dup() i32 { return 1; }\n' > $SH/qi/flatmod.zag
+    printf 'struct Box { v: i32 }\nfn dup() i32 { return 2; }\nfn helper() i32 { return dup() + 10; }\nfn unbox(b: Box) i32 { return b.v; }\n' > $SH/qi/qmod.zag
+    printf '@import("flatmod.zag")\n@import("qmod.zag") as q\nfn main() void {\n  print_i32(dup());\n  print_i32(q.dup());\n  print_i32(q.helper());\n  let bx: q.Box = q.Box{ .v = 7 };\n  print_i32(q.unbox(bx));\n}\n' > $SH/qi/main.zag
+    $SH/zagc $SH/qi/main.zag >/dev/null 2>&1
+    qiout=""; if [ -x $SH/qi/main.zag.out ]; then qiout=$($SH/qi/main.zag.out | tr '\n' ' ' | sed 's/ *$//'); fi
+    if [ "$qiout" = "1 2 12 7" ]; then
+        echo "  ok  @import as name (namespacing: flat dup=1, q.dup=2, q.helper=12, q.unbox=7)"; pass=$((pass+1))
+    else
+        echo "  XX  @import as name (got '$qiout', want '1 2 12 7')"; fail=$((fail+1))
+    fi
+
+    # tagged unions + statement switch: union construction (tag + payload),
+    # switch over a union tag with |capture|, and switch over a plain enum.
+    printf 'enum OpClass { Numeric, Control, Memory }\nunion WasmOp { local_get: i32, i32_const: i64, i32_add: bool }\nfn classify(op: WasmOp) OpClass {\n  let cls: OpClass = OpClass.Control;\n  switch (op) {\n    .local_get => |idx| { cls = OpClass.Memory; }\n    .i32_const => |v| { cls = OpClass.Numeric; }\n    .i32_add => |_x| { cls = OpClass.Numeric; }\n  }\n  return cls;\n}\nfn code(c: OpClass) i32 {\n  let r: i32 = 0;\n  switch (c) { .Numeric => { r = 1; } .Control => { r = 2; } .Memory => { r = 3; } }\n  return r;\n}\nfn main() void {\n  let a: WasmOp = WasmOp{ .local_get = 5 };\n  let b: WasmOp = WasmOp{ .i32_const = 42 };\n  print_i32(code(classify(a)));\n  print_i32(code(classify(b)));\n}\n' > $SH/uni.zag
+    $SH/zagc $SH/uni.zag >/dev/null 2>&1
+    uniout=""; if [ -x $SH/uni.zag.out ]; then uniout=$($SH/uni.zag.out | tr '\n' ' ' | sed 's/ *$//'); fi
+    if [ "$uniout" = "3 1" ]; then
+        echo "  ok  unions + switch (union tag/payload + |cap|; enum switch → 3 1)"; pass=$((pass+1))
+    else
+        echo "  XX  unions + switch (got '$uniout', want '3 1')"; fail=$((fail+1))
+    fi
+
+    # []u8 strings: string literals → ZagSliceU8, print_str, @strLen, @strEq, and
+    # []u8 slicing s[lo..hi] / open-ended s[lo..].
+    printf 'fn first3(s: []u8) []u8 { return s[0..3]; }\nfn rest(s: []u8) []u8 { return s[2..]; }\nfn main() void {\n  print_str("hi");\n  print_i32(@strLen("abc"));\n  print_i32(@strEq("ab", "ab"));\n  print_str(first3("hello"));\n  print_str(rest("hello"));\n  print_i32(first3("hello").len);\n}\n' > $SH/str.zag
+    $SH/zagc $SH/str.zag >/dev/null 2>&1
+    strout=""; if [ -x $SH/str.zag.out ]; then strout=$($SH/str.zag.out | tr '\n' ' ' | sed 's/ *$//'); fi
+    if [ "$strout" = "hi 3 1 hel llo 3" ]; then
+        echo "  ok  []u8 strings + slicing (literals/print_str/@strLen/@strEq; s[0..3]=hel, s[2..]=llo)"; pass=$((pass+1))
+    else
+        echo "  XX  []u8 strings + slicing (got '$strout', want 'hi 3 1 hel llo 3')"; fail=$((fail+1))
+    fi
+
     # Generic heap container (the ArrayList pattern): generic struct + extern
     # malloc + @sizeOf[T] + `as *T` + pointer indexing. zagc emits the .c; we
     # link std/runtime.c (the self-hosted driver does not auto-link it yet).
