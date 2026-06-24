@@ -1999,18 +1999,9 @@ fn genStructDecl(ctx: *Ctx, sd: ast.StructDecl) !void {
             _ = try ctx.ensureClosureTypedef(f.pty);
         }
     }
-    // Use a named struct tag when the struct has pointer or optional-pointer fields
-    // (for forward-decl compatibility)
-    var has_ptr_field = false;
-    for (sd.fields) |f| {
-        if (f.pty.len > 1 and f.pty[0] == '*') { has_ptr_field = true; break; }
-        if (f.pty.len > 2 and f.pty[0] == '?' and f.pty[1] == '*') { has_ptr_field = true; break; }
-    }
-    if (has_ptr_field) {
-        try ctx.wf("typedef struct {s}_tag {{", .{sd.name});
-    } else {
-        try ctx.wf("typedef struct {{", .{});
-    }
+    // Always emit with a named `<name>_tag` so it matches the forward typedef
+    // declared earlier (enables mutually-recursive pointer fields).
+    try ctx.wf("typedef struct {s}_tag {{", .{sd.name});
     for (sd.fields) |f| {
         const ct = if (std.mem.startsWith(u8, f.pty, "fn("))
             try ctx.ensureClosureTypedef(f.pty)
@@ -2039,8 +2030,9 @@ fn genUnionDecl(ctx: *Ctx, ud: ast.UnionDecl) !void {
     }
     try ctx.w(" };\n");
 
-    // Emit: typedef struct { int32_t tag; union { Ta A; Tb B; ... } u; } Name;
-    try ctx.wf("typedef struct {{ int32_t tag; union {{", .{});
+    // Emit: typedef struct Name_tag { int32_t tag; union { Ta A; ... } u; } Name;
+    // Named tag matches the forward typedef so other types can hold *Name.
+    try ctx.wf("typedef struct {s}_tag {{ int32_t tag; union {{", .{ud.name});
     for (ud.fields) |f| {
         const ct = try ctype(ctx.alloc, f.pty);
         try ctx.wf(" {s} {s};", .{ ct, f.name });
@@ -2092,23 +2084,31 @@ pub fn gen(
         ctx.clo_typedefs.clearRetainingCapacity();
     }
 
-    // 3. Forward typedef declarations for structs that have pointer or optional-pointer fields
-    // (needed for self-referential or mutually-referential struct pointers)
+    // 3. Forward typedef declarations for ALL aggregate types (structs + unions),
+    // so any *T / ?*T pointer field resolves regardless of declaration order or
+    // mutual recursion (e.g. a recursive AST: struct Bin { l: *Node } union Node {...}).
+    // Every struct/union body below emits with a matching `<name>_tag` tag.
     for (decls) |node| {
-        if (node.* == .struct_decl) {
-            const sd = node.struct_decl;
-            if (sd.tparams.len > 0) continue;
-            var has_ptr_field = false;
-            for (sd.fields) |f| {
-                // *T direct pointer field
-                if (f.pty.len > 1 and f.pty[0] == '*') { has_ptr_field = true; break; }
-                // ?*T optional pointer field
-                if (f.pty.len > 2 and f.pty[0] == '?' and f.pty[1] == '*') { has_ptr_field = true; break; }
-            }
-            if (has_ptr_field) {
-                // emit: typedef struct Name_tag Name;
+        switch (node.*) {
+            .struct_decl => |sd| {
+                if (sd.tparams.len > 0) continue;
                 try ctx.wf("typedef struct {s}_tag {s};\n", .{ sd.name, sd.name });
-            }
+            },
+            .union_decl => |ud| {
+                try ctx.wf("typedef struct {s}_tag {s};\n", .{ ud.name, ud.name });
+            },
+            else => {},
+        }
+    }
+    // Forward decls for instantiated generic structs from s.structs.
+    {
+        var sit = s.structs.iterator();
+        while (sit.next()) |entry| {
+            const node = entry.value_ptr.*;
+            if (node.* != .struct_decl) continue;
+            if (node.struct_decl.tparams.len > 0) continue;
+            const c_name = try ctype(ctx.alloc, entry.key_ptr.*);
+            try ctx.wf("typedef struct {s}_tag {s};\n", .{ c_name, c_name });
         }
     }
 
@@ -2166,8 +2166,9 @@ pub fn gen(
             const sd = node.struct_decl;
             // Convert sema name "Box[i32]" to C name "Box_i32"
             const c_name = try ctype(ctx.alloc, inst_name);
-            // Emit as typedef struct
-            try ctx.wf("typedef struct {{", .{});
+            // Emit with named `_tag` so it matches its forward typedef (enables
+            // generic structs with self/mutual pointer fields, e.g. ArrayList[*Node]).
+            try ctx.wf("typedef struct {s}_tag {{", .{c_name});
             for (sd.fields) |f| {
                 const ft = try ctype(ctx.alloc, f.pty);
                 try ctx.wf(" {s} {s};", .{ ft, f.name });
