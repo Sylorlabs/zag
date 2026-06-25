@@ -608,12 +608,7 @@ pub const RowInfo = struct {
 /// Parse the effect-row suffix of a fn type.
 /// Returns null when there is no suffix (plain/opaque fn type).
 /// Uses `alloc` only for the .row case that must split the comma-separated list.
-pub fn rowOf(t: []const u8) ?struct { kind: RowKind, effects: []const []const u8, varname: []const u8 } {
-    // We need a small alloc for fnParts; use a fixed-buffer allocator.
-    var buf: [4096]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buf);
-    const alloc = fba.allocator();
-
+pub fn rowOf(alloc: std.mem.Allocator, t: []const u8) ?struct { kind: RowKind, effects: []const []const u8, varname: []const u8 } {
     const parts = fnParts(alloc, t) catch return null;
     const suf = parts.suffix;
     if (suf.len == 0) return null;
@@ -645,8 +640,6 @@ pub fn rowOf(t: []const u8) ?struct { kind: RowKind, effects: []const []const u8
             eff_slice[idx] = part;
             idx += 1;
         }
-        // NOTE: eff_slice points into fba memory; callers must not outlive this call.
-        // For the satisfies() use-case this is fine since we only iterate it.
         return .{ .kind = .row, .effects = eff_slice, .varname = "" };
     }
     // bare effect variable name
@@ -656,8 +649,8 @@ pub fn rowOf(t: []const u8) ?struct { kind: RowKind, effects: []const []const u8
 /// Does a function with the given effect set `actual_eff` (slice of effect name strings)
 /// satisfy the constraint imposed by the fn type `t`?
 /// Returns true when the call is allowed.
-pub fn satisfies(actual_eff: []const []const u8, t: []const u8) bool {
-    const r = rowOf(t) orelse return true; // no suffix -> no constraint
+pub fn satisfies(alloc: std.mem.Allocator, actual_eff: []const []const u8, t: []const u8) bool {
+    const r = rowOf(alloc, t) orelse return true; // no suffix -> no constraint
     switch (r.kind) {
         .bound => {
             // forbidden: actual_eff must not intersect r.effects

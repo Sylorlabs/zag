@@ -1740,7 +1740,7 @@ pub const Sema = struct {
                 if (types.isFnType(ty)) {
                     // Use latent_when_opaque: for bound annotations, effects are ALL_EFFECTS minus forbidden
                     // For plain fn type, all effects
-                    const row = types.rowOf(ty);
+                    const row = types.rowOf(self.alloc, ty);
                     if (row) |r| {
                         switch (r.kind) {
                             .bound => {
@@ -2033,7 +2033,7 @@ pub const Sema = struct {
                 if (callee.* == .field) {
                     const field_ty = ast.nodeType(callee) orelse "";
                     if (types.isFnType(field_ty)) {
-                        const row = types.rowOf(field_ty);
+                        const row = types.rowOf(self.alloc, field_ty);
                         if (row) |r| {
                             switch (r.kind) {
                                 .bound => {
@@ -2098,7 +2098,7 @@ pub const Sema = struct {
                     if (types.isFnType(lty)) {
                         // If the declared type has a row constraint, use it (it's a contract).
                         // Otherwise, compute from the expression.
-                        const row = types.rowOf(lty);
+                        const row = types.rowOf(self.alloc, lty);
                         const entry = if (row != null) blk: {
                             // The declared type provides the bound; use latentExprEntry on
                             // a synthetic var with this type so it goes through rowOf logic.
@@ -2174,7 +2174,7 @@ pub const Sema = struct {
                         defer wit_map.deinit();
                         self.latentExpr(l.expr, &eff_set, &wit_map);
                         // Check satisfies — use rowOf to get forbidden set from full type
-                        const row_sl = types.rowOf(sl);
+                        const row_sl = types.rowOf(self.alloc, sl);
                         if (row_sl) |r| {
                             const forbidden: []const []const u8 = switch (r.kind) {
                                 .bound => r.effects,
@@ -2216,7 +2216,7 @@ pub const Sema = struct {
                         var wit_map = WitMap.init(self.alloc);
                         defer wit_map.deinit();
                         self.latentExpr(re, &eff_set, &wit_map);
-                        const row_ret = types.rowOf(f.ret);
+                        const row_ret = types.rowOf(self.alloc, f.ret);
                         if (row_ret) |r_ret| {
                             const forbidden_ret: []const []const u8 = switch (r_ret.kind) {
                                 .bound => r_ret.effects,
@@ -2300,7 +2300,7 @@ pub const Sema = struct {
                                     var wit_map = WitMap.init(self.alloc);
                                     defer wit_map.deinit();
                                     self.latentExpr(a, &eff_set, &wit_map);
-                                    const row_p = types.rowOf(p.pty);
+                                    const row_p = types.rowOf(self.alloc, p.pty);
                                     if (row_p) |rp| {
                                         const forbidden_p: []const []const u8 = switch (rp.kind) {
                                             .bound => rp.effects,
@@ -2343,7 +2343,7 @@ pub const Sema = struct {
                                 var wit_map = WitMap.init(self.alloc);
                                 defer wit_map.deinit();
                                 self.latentExpr(fi.val, &eff_set, &wit_map);
-                                const row_sf = types.rowOf(sf.pty);
+                                const row_sf = types.rowOf(self.alloc, sf.pty);
                                 if (row_sf) |rsf| {
                                     const forbidden_sf: []const []const u8 = switch (rsf.kind) {
                                         .bound => rsf.effects,

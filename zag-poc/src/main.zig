@@ -508,6 +508,7 @@ fn cmdBuild(
     argv.append(bin_path) catch return 1;
     argv.append("-lm")   catch return 1;
     argv.append("-w")    catch return 1;
+    argv.append("-fwrapv") catch return 1;
     if (hot) {
         argv.append("-ldl")       catch return 1;
         argv.append("-rdynamic")  catch return 1;
@@ -626,6 +627,7 @@ fn cmdHotPatch(alloc: std.mem.Allocator, path: []const u8, out: ?[]const u8) u8 
     argv.append(c_path) catch return 1;
     argv.append("-lm") catch return 1;
     argv.append("-w") catch return 1;
+    argv.append("-fwrapv") catch return 1;
 
     var child = std.process.Child.init(argv.items, alloc);
     child.stdout_behavior = .Inherit;
