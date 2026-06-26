@@ -79,6 +79,11 @@ nt  "nested struct as arg" 'struct P { x: i32, y: i32 } fn sum(p: P) i32 { retur
 nt  "&s.field write-thru"  'struct P { x: i32, y: i32 } fn setx(p: *i32) void { p.* = 42; } fn main() i32 { let s: P = P{ .x = 1, .y = 0 }; setx(&s.x); return s.x; }' 42
 nt  "optional orelse val"  'fn f(b: i32) ?i32 { if (b == 1) { return 42; } return null; } fn main() i32 { return f(1) orelse 7; }' 42
 nt  "optional orelse def"  'fn f(b: i32) ?i32 { if (b == 1) { return 42; } return null; } fn main() i32 { return f(0) orelse 7; }' 7
+# `orelse` UNWRAPS to a scalar; when used directly as a CALL ARGUMENT its type
+# must be the inner T, not the optional `?T`. Mis-typing it as the optional
+# aggregate made the caller copy the scalar result as a 16-byte block pointer →
+# NULL deref / SIGSEGV (the bug that crashed the znc-built native zagc).
+nt  "orelse as call arg"   'fn id(a: i32) i32 { return a; } fn f(b: i32) ?i32 { if (b == 1) { return 7; } return null; } fn main() i32 { let o: ?i32 = f(1); return id(o orelse 0); }' 7
 
 echo "── floating-point (f64/f32 via SSE — no libc) ──"
 nt  "f64 add+cmp"     'fn main() i32 { let x: f64 = 1.5; let y: f64 = 2.5; if (x + y == 4.0) { return 1; } return 0; }' 1
