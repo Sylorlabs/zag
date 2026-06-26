@@ -1,0 +1,368 @@
+// selfhost/native/regalloc.zag — a conservative, semantics-preserving REGISTER
+// PROMOTION pass for Zag's from-scratch native x86-64 backend.
+//
+// ncodegen.zag is a naive STACK MACHINE: every scalar local lives in an
+// rbp-relative memory slot and is touched with `mov reg,[rbp-d]` (K_LOAD) /
+// `mov [rbp-d],reg` (K_STORE). That is a LOT of redundant memory traffic. This
+// pass keeps eligible scalar locals in CALLEE-SAVED registers ({rbx, r12, r13,
+// r14}) for the whole lifetime of a function, rewriting every load/store of a
+// promoted slot into a register-to-register move and leaving the slot's memory
+// word unused. It runs on the flat ArrayList[Instr] (see isa.zag) AFTER codegen
+// and BEFORE peephole/encode (znc.zag wires it in: regalloc → peephole → encode).
+//
+// An optimization that changes program behavior is a CATASTROPHIC bug, so the
+// rule set is deliberately conservative: when in doubt, the slot stays in
+// memory. Each decision below carries a soundness argument.
+//
+// ── WHY CALLEE-SAVED REGISTERS ARE SAFE HERE ─────────────────────────────────
+// ncodegen NEVER allocates rbx(3)/r12(12)/r13(13)/r14(14) — its entire register
+// repertoire is rax,rcx,rdx,rsi,rdi,r8,r9,r10,rbp,rsp (r15 is reserved for the
+// argv base). EVERY function znc emits (user functions, and the hand-written
+// runtime helpers __print_int/__print_f64/__alloc/...) therefore preserves
+// rbx/r12/r13/r14 across a `call` for free. After THIS pass, a promoted function
+// also saves+restores exactly the callee-saved regs it uses (prologue push /
+// epilogue restore), so the callee-saved discipline is maintained end to end and
+// there are no external (libc) callees to worry about. A value held in such a
+// register thus survives every `i_call` in the function body — which is what
+// makes promotion across calls sound.
+//
+// ── WHAT IS A "FUNCTION" HERE ────────────────────────────────────────────────
+// ncodegen emits each function as a contiguous run. A STANDARD function (the
+// only shape we touch) has the exact prologue
+//     K_LABEL ; push rbp ; mov rbp,rsp ; sub rsp, F          (F a multiple of 16)
+// and the exact epilogue
+//     <epilogue label> ; mov rsp,rbp ; pop rbp ; ret
+// with EVERY `return` lowered to `jmp <epilogue label>` (never an inline ret).
+// We match those two shapes exactly; anything else (the _start stub, __print_str
+// which has no frame, or any routine we cannot prove fits this mold) is copied
+// verbatim and never promoted.
+//
+// ── ELIGIBILITY (a slot disp `d`, d<0, is promotable iff ALL hold) ───────────
+//  (E1) `d` is touched ONLY by whole-word i_load(_,rbp,d) / i_store(rbp,d,_)
+//       in the body. (K_LOAD/K_STORE are always 64-bit REX.W moves, so there is
+//       no sub-register aliasing.) This is implied by collecting candidates from
+//       exactly those instructions.
+//  (E2) `d`'s ADDRESS is never formed. The ONLY way ncodegen materializes the
+//       address of a frame location is `lea reg,[rbp + b]` (K_LEA, base=rbp) at
+//       the block's base disp `b`; aggregates (struct/slice/optional) and any
+//       &local / by-ref / pointer use this. An aggregate block occupies words at
+//       disps b, b+8, b+16, ... (all >= b — field offsets are POSITIVE, see
+//       ncodegen's layout) and its interior words are reached through that
+//       pointer, which we CANNOT see as an rbp-relative access. So a slot is
+//       only safe if NO lea base `b` satisfies b <= d (which would put `d` at or
+//       above some aggregate base, i.e. possibly inside it). Equivalently:
+//           promote d   iff   d < min(all rbp lea bases in the function)
+//       (and unconditionally when the function has no rbp lea at all). This is
+//       deliberately conservative — a single deep lea disables promotion for
+//       every slot at-or-above it — but it is provably free of aliasing: a
+//       promoted slot's address is never taken, so no pointer (and therefore no
+//       callee, no aggregate field access) can reach it; the register is a
+//       faithful 1:1 stand-in for that memory word across the whole function.
+//
+// Pure integer functions (fib, the while-loop sum, factorial, ...) contain NO
+// rbp lea, so ALL their scalar slots are promotable — that is where the win is
+// largest. Aggregate-heavy functions keep their aliased words in memory.
+//
+// ── ALLOCATION ───────────────────────────────────────────────────────────────
+// Eligible slots are taken in first-appearance order and assigned, in order, the
+// free callee-saved registers rbx,r12,r13,r14 (NOT r15 — argv; NOT rbp/rsp).
+// At most 4 slots are promoted per function; any extras stay in memory untouched.
+//
+// ── PROLOGUE / EPILOGUE (and STACK ALIGNMENT) ────────────────────────────────
+// We keep `push rbp ; mov rbp,rsp` and the `mov rsp,rbp ; pop rbp ; ret`
+// intact. After `sub rsp, F`, we `push` each used callee-saved reg (below the
+// frame, so they never overlap a local slot, which lives in [rbp-F .. rbp-8]).
+//
+// ALIGNMENT: ncodegen relies on rsp ≡ 0 (mod 16) after the prologue (every inner
+// `call` is aligned relative to that). `push rbp` made rsp ≡ 0 and F is a
+// multiple of 16, so the k pushes shift it by 8*k. To keep it ≡ 0 we widen the
+// prologue `sub` by 8 when k is ODD (F' = F+8): then F'+8k is a multiple of 16
+// for either parity, so the body's call-alignment reasoning is unchanged.
+//
+// RESTORE via rbp-relative LOADS, not `pop`: at the epilogue rsp is NOT known
+// (an early `jmp epilogue` can arrive with stack-machine temporaries still
+// pushed — that is precisely why ncodegen recovers rsp with `mov rsp,rbp`). So
+// `pop` would read the wrong words. Instead each saved reg sits at the FIXED
+// address rbp - F' - 8*(j+1) (j is its push order), and we reload it from there
+// with `mov reg,[rbp+sd]` placed right AFTER the epilogue label and BEFORE
+// `mov rsp,rbp` — so every return path (fall-through and every `jmp epilogue`)
+// executes the restores while rbp is still valid, and the body never writes
+// those words (they sit at-or-above the body's rsp). This is unconditionally
+// correct regardless of the rsp state at the epilogue.
+//
+// LANGUAGE SUBSET: stmts end ';'. No `<<`/`>>`, no `|`/`||`. `&`,`&&`,`%`,`/`,
+// `*`,`+`,`-`, comparisons are OK. No break/continue (flag-guarded while). No
+// switch here (plain if). Deref pointer fields as `p.*.field`.
+
+@import("isa.zag")
+
+// ── the callee-saved register pool (deterministic order) ─────────────────────
+fn ra_pool(i: i32) i32 {
+    if (i == 0) { return 3; }    // rbx
+    if (i == 1) { return 12; }   // r12
+    if (i == 2) { return 13; }   // r13
+    return 14;                   // r14
+}
+fn ra_pool_size() i32 { return 4; }
+
+// Is the instruction at index `p` the start of a STANDARD prologue?
+//   [p] K_LABEL ; [p+1] push rbp ; [p+2] mov rbp,rsp ; [p+3] sub rsp, imm
+fn ra_is_prologue(prog: ArrayList[Instr], p: i32, n: i32) i32 {
+    if (p + 3 >= n) { return 0; }
+    let i0: Instr = get[Instr](prog, p);
+    let i1: Instr = get[Instr](prog, p + 1);
+    let i2: Instr = get[Instr](prog, p + 2);
+    let i3: Instr = get[Instr](prog, p + 3);
+    if (i0.kind != K_LABEL()) { return 0; }
+    if (i1.kind != K_PUSH()) { return 0; }
+    if (i1.dst != R_RBP()) { return 0; }
+    if (i2.kind != K_MOV_RR()) { return 0; }
+    if (i2.dst != R_RBP()) { return 0; }
+    if (i2.src != R_RSP()) { return 0; }
+    if (i3.kind != K_SUB_RI()) { return 0; }
+    if (i3.dst != R_RSP()) { return 0; }
+    return 1;
+}
+
+// Index of the first epilogue sequence `mov rsp,rbp ; pop rbp ; ret` at or after
+// `from` (returns the index of the `mov rsp,rbp`), or -1 if none.
+fn ra_find_epilogue(prog: ArrayList[Instr], from: i32, n: i32) i32 {
+    let i: i32 = from;
+    while (i + 2 < n) {
+        let a: Instr = get[Instr](prog, i);
+        let b: Instr = get[Instr](prog, i + 1);
+        let c: Instr = get[Instr](prog, i + 2);
+        if (a.kind == K_MOV_RR() && a.dst == R_RSP() && a.src == R_RBP()) {
+            if (b.kind == K_POP() && b.dst == R_RBP()) {
+                if (c.kind == K_RET()) { return i; }
+            }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Does this instruction WRITE the rbp register as a value? (A K_STORE's dst is a
+// memory BASE, not a register write, so it is explicitly NOT a write.) Used to
+// reject any function whose body manipulates rbp — our rbp-relative reasoning
+// then would not hold, so we leave it in memory.
+fn ra_writes_rbp(ins: Instr) i32 {
+    let k: i32 = ins.kind;
+    if (k == K_STORE()) { return 0; }
+    if (ins.dst != R_RBP()) { return 0; }
+    if (k == K_MOV_RR())  { return 1; }
+    if (k == K_MOV_IMM()) { return 1; }
+    if (k == K_LOAD())    { return 1; }
+    if (k == K_LEA())     { return 1; }
+    if (k == K_POP())     { return 1; }
+    if (k == K_ADD_RR())  { return 1; }
+    if (k == K_SUB_RR())  { return 1; }
+    if (k == K_ADD_RI())  { return 1; }
+    if (k == K_SUB_RI())  { return 1; }
+    if (k == K_IMUL_RR()) { return 1; }
+    if (k == K_AND_RR())  { return 1; }
+    if (k == K_OR_RR())   { return 1; }
+    if (k == K_XOR_RR())  { return 1; }
+    if (k == K_NEG())     { return 1; }
+    if (k == K_SETCC())   { return 1; }
+    return 0;
+}
+
+// Is the body [bstart, bend) a clean, single-epilogue straight-line stack-machine
+// body (the shape ncodegen produces)? We BAIL on anything we cannot reason about:
+// an inline `ret`, an inline `mov rsp,rbp` (would mean a second/mis-scoped
+// epilogue), a `push rbp` (nested prologue), or any write to rbp.
+fn ra_body_clean(prog: ArrayList[Instr], bstart: i32, bend: i32) i32 {
+    let s: i32 = bstart;
+    while (s < bend) {
+        let ins: Instr = get[Instr](prog, s);
+        if (ins.kind == K_RET()) { return 0; }
+        if (ins.kind == K_MOV_RR() && ins.dst == R_RSP() && ins.src == R_RBP()) { return 0; }
+        if (ins.kind == K_PUSH() && ins.dst == R_RBP()) { return 0; }
+        if (ra_writes_rbp(ins) == 1) { return 0; }
+        s = s + 1;
+    }
+    return 1;
+}
+
+// Membership in an i32 list.
+fn ra_contains(xs: ArrayList[i32], v: i32) i32 {
+    let i: i32 = 0;
+    while (i < len[i32](xs)) {
+        if (get[i32](xs, i) == v) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// The register assigned to slot disp `d`, or -1 if `d` is not promoted.
+fn ra_reg_for(slots: ArrayList[i32], regs: ArrayList[i32], d: i32) i32 {
+    let i: i32 = 0;
+    while (i < len[i32](slots)) {
+        if (get[i32](slots, i) == d) { return get[i32](regs, i); }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Copy prog[a .. b] (inclusive) verbatim into out.
+fn ra_copy_range(out: *ArrayList[Instr], prog: ArrayList[Instr], a: i32, b: i32) void {
+    let j: i32 = a;
+    while (j <= b) {
+        push[Instr](out, get[Instr](prog, j));
+        j = j + 1;
+    }
+}
+
+// ── the pass ─────────────────────────────────────────────────────────────────
+fn regalloc(prog: ArrayList[Instr]) ArrayList[Instr] {
+    let n: i32 = len[Instr](prog);
+    let out: ArrayList[Instr] = make[Instr](n + 16);
+
+    let i: i32 = 0;
+    while (i < n) {
+        if (ra_is_prologue(prog, i, n) == 0) {
+            // Not a standard prologue: emit as-is.
+            push[Instr](&out, get[Instr](prog, i));
+            i = i + 1;
+        } else {
+            let epi: i32 = ra_find_epilogue(prog, i + 4, n);
+
+            // Detection guards. We require: an epilogue exists; what follows the
+            // `ret` is either end-of-stream or the next function's K_LABEL (so
+            // `epi` truly ends THIS function — never a helper's inline early
+            // return); and the body is a clean single-epilogue body.
+            let ok_struct: i32 = 0;
+            if (epi >= 0) {
+                let after: i32 = epi + 3;
+                let tail_ok: i32 = 0;
+                if (after >= n) { tail_ok = 1; }
+                else { if (get[Instr](prog, after).kind == K_LABEL()) { tail_ok = 1; } }
+                if (tail_ok == 1) {
+                    if (ra_body_clean(prog, i + 4, epi) == 1) { ok_struct = 1; }
+                }
+            }
+
+            if (ok_struct == 0) {
+                // Cannot prove the shape: copy this region verbatim and move on.
+                if (epi >= 0) {
+                    ra_copy_range(&out, prog, i, epi + 2);
+                    i = epi + 3;
+                } else {
+                    push[Instr](&out, get[Instr](prog, i));
+                    i = i + 1;
+                }
+            } else {
+                let bstart: i32 = i + 4;
+                let bend: i32 = epi;   // exclusive
+
+                // ── collect candidate scalar slots + the min rbp lea base ──
+                let cands: ArrayList[i32] = make[i32](8);
+                let have_lea: i32 = 0;
+                let min_lea: i32 = 0;
+                let s: i32 = bstart;
+                while (s < bend) {
+                    let ins: Instr = get[Instr](prog, s);
+                    if (ins.kind == K_LOAD() && ins.src == R_RBP() && ins.disp < 0) {
+                        if (ra_contains(cands, ins.disp) == 0) { push[i32](&cands, ins.disp); }
+                    }
+                    if (ins.kind == K_STORE() && ins.dst == R_RBP() && ins.disp < 0) {
+                        if (ra_contains(cands, ins.disp) == 0) { push[i32](&cands, ins.disp); }
+                    }
+                    if (ins.kind == K_LEA() && ins.src == R_RBP()) {
+                        if (have_lea == 0) { min_lea = ins.disp; have_lea = 1; }
+                        else { if (ins.disp < min_lea) { min_lea = ins.disp; } }
+                    }
+                    s = s + 1;
+                }
+
+                // ── select eligible slots (d < min_lea) and assign registers ──
+                let slots: ArrayList[i32] = make[i32](8);
+                let regs:  ArrayList[i32] = make[i32](8);
+                let ci: i32 = 0;
+                while (ci < len[i32](cands)) {
+                    let d: i32 = get[i32](cands, ci);
+                    let eligible: i32 = 0;
+                    if (have_lea == 0) { eligible = 1; }
+                    else { if (d < min_lea) { eligible = 1; } }
+                    if (eligible == 1) {
+                        if (len[i32](slots) < ra_pool_size()) {
+                            push[i32](&slots, d);
+                            push[i32](&regs, ra_pool(len[i32](regs)));
+                        }
+                    }
+                    ci = ci + 1;
+                }
+
+                let k: i32 = len[i32](slots);
+                if (k == 0) {
+                    // Nothing to promote: emit the whole function verbatim.
+                    ra_copy_range(&out, prog, i, epi + 2);
+                    i = epi + 3;
+                } else {
+                    // ── prologue: label, push rbp, mov rbp,rsp (verbatim) ──
+                    push[Instr](&out, get[Instr](prog, i));
+                    push[Instr](&out, get[Instr](prog, i + 1));
+                    push[Instr](&out, get[Instr](prog, i + 2));
+
+                    // widen the frame by 8 if we push an odd number of regs, so
+                    // post-prologue rsp stays 16-aligned for the body's calls.
+                    let subins: Instr = get[Instr](prog, i + 3);
+                    let frame: i32 = subins.imm as i32;
+                    let framep: i32 = frame;
+                    if (k % 2 == 1) { framep = frame + 8; }
+                    push[Instr](&out, i_sub_imm(R_RSP(), framep as i64));
+
+                    // save each used callee-saved reg below the frame.
+                    let pj: i32 = 0;
+                    while (pj < k) {
+                        push[Instr](&out, i_push(get[i32](regs, pj)));
+                        pj = pj + 1;
+                    }
+
+                    // ── body, with promoted slots rewritten to reg moves ──
+                    let b2: i32 = bstart;
+                    while (b2 < bend) {
+                        let bi: Instr = get[Instr](prog, b2);
+                        let did: i32 = 0;
+                        // store [rbp+d], rS  →  mov regd, rS
+                        if (bi.kind == K_STORE() && bi.dst == R_RBP() && bi.disp < 0) {
+                            let rg: i32 = ra_reg_for(slots, regs, bi.disp);
+                            if (rg >= 0) {
+                                push[Instr](&out, i_mov_rr(rg, bi.src));
+                                did = 1;
+                            }
+                        }
+                        // load rD, [rbp+d]  →  mov rD, regd
+                        if (did == 0 && bi.kind == K_LOAD() && bi.src == R_RBP() && bi.disp < 0) {
+                            let rg2: i32 = ra_reg_for(slots, regs, bi.disp);
+                            if (rg2 >= 0) {
+                                push[Instr](&out, i_mov_rr(bi.dst, rg2));
+                                did = 1;
+                            }
+                        }
+                        if (did == 0) { push[Instr](&out, bi); }
+                        b2 = b2 + 1;
+                    }
+
+                    // ── restore the saved regs (rbp-relative loads), after the
+                    //    epilogue label, before `mov rsp,rbp` ──
+                    let rj: i32 = 0;
+                    while (rj < k) {
+                        let sd: i32 = (0 - framep) - 8 * (rj + 1);
+                        push[Instr](&out, i_load(get[i32](regs, rj), R_RBP(), sd));
+                        rj = rj + 1;
+                    }
+
+                    // ── epilogue: mov rsp,rbp ; pop rbp ; ret (verbatim) ──
+                    push[Instr](&out, get[Instr](prog, epi));
+                    push[Instr](&out, get[Instr](prog, epi + 1));
+                    push[Instr](&out, get[Instr](prog, epi + 2));
+                    i = epi + 3;
+                }
+            }
+        }
+    }
+
+    return out;
+}
