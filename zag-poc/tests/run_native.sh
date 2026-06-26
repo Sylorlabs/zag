@@ -80,6 +80,19 @@ nt  "&s.field write-thru"  'struct P { x: i32, y: i32 } fn setx(p: *i32) void { 
 nt  "optional orelse val"  'fn f(b: i32) ?i32 { if (b == 1) { return 42; } return null; } fn main() i32 { return f(1) orelse 7; }' 42
 nt  "optional orelse def"  'fn f(b: i32) ?i32 { if (b == 1) { return 42; } return null; } fn main() i32 { return f(0) orelse 7; }' 7
 
+echo "── floating-point (f64/f32 via SSE — no libc) ──"
+nt  "f64 add+cmp"     'fn main() i32 { let x: f64 = 1.5; let y: f64 = 2.5; if (x + y == 4.0) { return 1; } return 0; }' 1
+nt  "f64 div trunc"   'fn main() i32 { let x: f64 = 7.0; let y: f64 = 2.0; return (x / y) as i32; }' 3
+nt  "int->f64->int"   'fn main() i32 { let n: i32 = 7; let f: f64 = n as f64; return f as i32; }' 7
+nt  "f64 lt/ge"       'fn main() i32 { if (1.5 < 2.5 && 2.5 >= 2.5) { return 1; } return 0; }' 1
+nt  "f64 param/ret"   'fn sq(x: f64) f64 { return x * x; } fn main() i32 { return sq(3.0) as i32; }' 9
+nt  "f32 struct math" 'struct V { x: f32, y: f32 } fn main() i32 { let v: V = V{ .x = 1.5, .y = 2.5 }; return (v.x + v.y) as i32; }' 4
+nto "print_f64 frac"  'fn main() i32 { print_f64(0.5); return 0; }' "0.5" 0
+nto "print_f64 div"   'fn main() i32 { let x: f64 = 3.0; let y: f64 = 2.0; print_f64(x / y); return 0; }' "1.5" 0
+nto "print_f64 int"   'fn main() i32 { print_f64(440.0); return 0; }' "440" 0
+nto "print_f64 neg"   'fn main() i32 { let x: f64 = 1.5; print_f64(-x); return 0; }' "-1.5" 0
+nto "print_f32"       'fn main() i32 { print_f32(0.25); return 0; }' "0.25" 0
+
 # The emitted artifact must be a real static ELF with no interpreter (no libc).
 "$ZNC" nt_src.zag -o /tmp/nt_elf >/dev/null 2>&1
 if file /tmp/nt_elf | grep -q 'statically linked' && ! readelf -l /tmp/nt_elf 2>/dev/null | grep -q 'INTERP'; then
@@ -90,13 +103,14 @@ fi
 rm -f /tmp/nt_elf nt_src.zag
 
 # Hardening: an unsupported construct must ABORT the build, never miscompile.
+# (Float literals are now SUPPORTED; a hex literal is still rejected loudly.)
 rm -f /tmp/nt_bin
-printf 'fn main() i32 { let x: f64 = 1.5; return 0; }' > nt_src.zag
+printf 'fn main() i32 { let x: i32 = 0xff; return 0; }' > nt_src.zag
 "$ZNC" nt_src.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
 if grep -q 'build aborted' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
-    echo "  ok  rejects float literal loudly (aborts, emits no binary)"; pass=$((pass+1))
+    echo "  ok  rejects hex literal loudly (aborts, emits no binary)"; pass=$((pass+1))
 else
-    echo "  XX  float literal not rejected loudly"; fail=$((fail+1))
+    echo "  XX  hex literal not rejected loudly"; fail=$((fail+1))
 fi
 rm -f /tmp/nt_bin nt_src.zag
 
