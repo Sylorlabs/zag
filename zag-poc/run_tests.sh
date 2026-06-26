@@ -2,10 +2,10 @@
 # Reproducible test suite for zagc. Good programs must build+run; bad ones must be rejected.
 cd "$(dirname "$0")"
 pass=0; fail=0
-g(){ ./zig-out/bin/zagc build examples/$1.zag --run >/tmp/zt 2>&1
+g(){ ./zagc build examples/$1.zag --run >/tmp/zt 2>&1
      if grep -q 'exit 0' /tmp/zt; then echo "  ok  $1  -> $(grep -A20 running /tmp/zt | grep -vE 'running|exit|--' | tr '\n' ' ')"; pass=$((pass+1))
      else echo "  XX  $1"; fail=$((fail+1)); sed -n '1,40p' /tmp/zt; fi; }
-b(){ ./zig-out/bin/zagc check examples/$1.zag >/tmp/zt 2>&1
+b(){ ./zagc check examples/$1.zag >/tmp/zt 2>&1
      if [ $? -ne 0 ] && grep -qi 'violation\|error:' /tmp/zt; then echo "  ok  $1 (rejected)"; pass=$((pass+1))
      else echo "  XX  $1 (should fail)"; fail=$((fail+1)); sed -n '1,40p' /tmp/zt; fi; }
 
@@ -59,7 +59,7 @@ echo "── operator contracts (operator T { + => fn }; effect flows into proof
 g operator_contract
 b operator_contract_bad
 echo "── P4: hardware posit target — ppu32 (emit-c, check asm opcodes) ──"
-ppu(){ ./zig-out/bin/zagc build examples/$1.zag --target ppu32 --emit-c >/tmp/zt 2>&1
+ppu(){ ./zagc build examples/$1.zag --target ppu32 --emit-c >/tmp/zt 2>&1
        # --emit-c writes <stem>.c into the cwd
        if grep -q 'padd\.s' $1.c 2>/dev/null && \
           grep -q 'ZAG_TARGET_PPU32' $1.c 2>/dev/null; then
@@ -68,16 +68,16 @@ ppu(){ ./zig-out/bin/zagc build examples/$1.zag --target ppu32 --emit-c >/tmp/zt
        else echo "  XX  $1 (ppu32)"; fail=$((fail+1)); cat /tmp/zt; fi
        rm -f $1.c 2>/dev/null; }
 ppu posit32
-echo "── P5: GPU target — bootstrap proves capabilities, defers MLIR to the Zag compiler ──"
+echo "── P5: GPU target — the self-hosted Zag compiler emits the GPU MLIR ──"
 # The GPU/MLIR backend is written in Zag (selfhost/mlir.zag) — see tests/run_selfhost.sh
-# for the real emit-and-check tests. The bootstrap deliberately has NO Zig MLIR emitter:
-# it proves the kernels are effect-safe, then points at the self-hosted compiler. It must
-# NOT write a .mlir (no Zig middleman, no fake output).
+# for the deep emit-and-check tests. The self-hosted compiler proves the kernels are
+# effect-safe (cap-proof), THEN emits valid GPU MLIR (gpu/func/memref dialects).
 gpu(){ local ex="$1"
-       ./zig-out/bin/zagc build examples/$ex.zag --target gpu-nvidia >/tmp/zt 2>&1
-       if grep -q 'capability proof OK' /tmp/zt && grep -q 'zag build' /tmp/zt && [ ! -f $ex.mlir ]; then
-           echo "  ok  $ex (bootstrap: cap-proof + defers to Zag compiler; no Zig MLIR)"; pass=$((pass+1))
-       else echo "  XX  $ex (gpu defer)"; fail=$((fail+1)); cat /tmp/zt; fi
+       rm -f $ex.mlir 2>/dev/null
+       ./zagc build examples/$ex.zag --target gpu-nvidia >/tmp/zt 2>&1
+       if [ -f $ex.mlir ] && grep -q 'func.func' $ex.mlir && grep -qiE 'gpu|launch|memref|barrier' $ex.mlir; then
+           echo "  ok  $ex (self-hosted: cap-proof + valid GPU MLIR)"; pass=$((pass+1))
+       else echo "  XX  $ex (gpu)"; fail=$((fail+1)); cat /tmp/zt; fi
        rm -f $ex.mlir 2>/dev/null; }
 gpu gpu_matmul_mx
 gpu gpu_vsa_hd

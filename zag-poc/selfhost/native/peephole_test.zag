@@ -1,0 +1,261 @@
+// selfhost/native/peephole_test.zag — verifies the native peephole optimizer.
+//
+// Two layers of proof:
+//   (1) STRUCTURAL — hand-built Instr lists for each rule; assert the optimized
+//       output is EXACTLY the expected reduced sequence (kind/dst/src checked
+//       per instruction, plus length). Includes the multi-pass case and the
+//       label-SAFETY case (push ; LABEL ; pop must come back UNCHANGED).
+//   (2) END-TO-END EQUIVALENCE — complete `_start` programs that exit with a
+//       known code, each peppered with redundant push/pop / push-pop / mov r,r
+//       the optimizer simplifies. We encode BOTH the original and the optimized
+//       program, write both as real ELF executables, run them, and assert the
+//       exit codes are IDENTICAL and the optimized byte count is <= the original.
+//
+// Run:  ./zagc build selfhost/native/peephole_test.zag --run
+
+@import("isa.zag")
+@import("x86.zag")
+@import("elf.zag")
+@import("peephole.zag")
+
+// ── tiny test bookkeeping ────────────────────────────────────────────────────
+fn ph_pi(v: i32) void { _zag_print(_zag_i64_to_str(v as i64)); }
+
+fn ph_check(tag: []u8, got: i32, want: i32, fails: *i32) void {
+    if (got == want) {
+        _zag_print("  ok   ");
+        _zag_print(tag);
+        _zag_print(" = ");
+        ph_pi(got);
+        _zag_println("");
+    } else {
+        _zag_print("  FAIL ");
+        _zag_print(tag);
+        _zag_print(" got ");
+        ph_pi(got);
+        _zag_print(" want ");
+        ph_pi(want);
+        _zag_println("");
+        fails.* = fails.* + 1;
+    }
+}
+
+// Print the full instruction stream (one line per instr: kind dst src).
+fn ph_dump(label: []u8, prog: ArrayList[Instr]) void {
+    _zag_print(label);
+    _zag_print(" [");
+    ph_pi(len[Instr](prog));
+    _zag_println(" instrs]");
+    let i: i32 = 0;
+    while (i < len[Instr](prog)) {
+        let ins: Instr = get[Instr](prog, i);
+        _zag_print("    k=");
+        ph_pi(ins.kind);
+        _zag_print(" dst=");
+        ph_pi(ins.dst);
+        _zag_print(" src=");
+        ph_pi(ins.src);
+        _zag_print(" lbl=");
+        ph_pi(ins.lbl);
+        _zag_println("");
+        i = i + 1;
+    }
+}
+
+// Assert instruction at index i has the given kind/dst/src.
+fn ph_assert_ins(tag: []u8, prog: ArrayList[Instr], i: i32, k: i32, d: i32, s: i32, fails: *i32) void {
+    let ins: Instr = get[Instr](prog, i);
+    ph_check(tag, ins.kind, k, fails);
+    ph_check(tag, ins.dst,  d, fails);
+    ph_check(tag, ins.src,  s, fails);
+}
+
+// ── (2) e2e helper: encode original + optimized, run both, compare exit codes ─
+// Returns 0 on success (identical exit codes AND optimized no larger), else 1.
+fn ph_e2e(tag: []u8, prog: ArrayList[Instr], want_code: i32, fails: *i32) void {
+    let a: ArrayList[u8] = encode(prog);
+    let opt: ArrayList[Instr] = peephole(prog);
+    let b: ArrayList[u8] = encode(opt);
+
+    // distinct /tmp paths per tag
+    let pa: []u8 = _zag_str_concat("/tmp/ph_", tag);
+    let pa2: []u8 = _zag_str_concat(pa, "_orig");
+    let pb: []u8 = _zag_str_concat(pa, "_opt");
+
+    let rwa: i32 = write_elf_exec(pa2, a, 0);
+    let rwb: i32 = write_elf_exec(pb, b, 0);
+
+    let ea: i32 = _zag_exec_cmd(pa2);
+    let eb: i32 = _zag_exec_cmd(pb);
+
+    _zag_print(tag);
+    _zag_print(": instrs ");
+    ph_pi(len[Instr](prog));
+    _zag_print(" -> ");
+    ph_pi(len[Instr](opt));
+    _zag_print(" | bytes ");
+    ph_pi(a.len);
+    _zag_print(" -> ");
+    ph_pi(b.len);
+    _zag_print(" | exit ");
+    ph_pi(ea);
+    _zag_print(" -> ");
+    ph_pi(eb);
+    _zag_println("");
+
+    // write ok
+    ph_check("  write-orig rc", rwa, 0, fails);
+    ph_check("  write-opt  rc", rwb, 0, fails);
+    // original program actually produced the expected code (sanity)
+    ph_check("  orig exit", ea, want_code, fails);
+    // EQUIVALENCE: optimized exit code identical to original
+    ph_check("  opt  exit (== orig)", eb, ea, fails);
+    // and the optimizer never grew the program
+    if (b.len <= a.len) {
+        ph_check("  bytes b<=a", 1, 1, fails);
+    } else {
+        ph_check("  bytes b<=a", 0, 1, fails);
+    }
+}
+
+// Build a complete `_start` that exits with `code`, sprinkled with redundancy.
+// _start (entry_off 0): set rdi = code, then exit via rax=60 ; syscall.
+// The redundant instructions are inserted so they CANNOT change the exit code.
+fn ph_build_exit_prog(code: i32) ArrayList[Instr] {
+    let p: ArrayList[Instr] = make[Instr](16);
+
+    // rdi = code
+    push[Instr](&p, i_mov_imm(R_RDI(), code as i64));   // mov rdi, code
+
+    // R1: push rdi ; pop rdi  → removed; rdi preserved exactly.
+    push[Instr](&p, i_push(R_RDI()));
+    push[Instr](&p, i_pop(R_RDI()));
+
+    // R3: mov rbx, rbx → removed (no-op).
+    push[Instr](&p, i_mov_rr(R_RBX(), R_RBX()));
+
+    // R2: push rdi ; pop rax → mov rax, rdi (rax is scratch here, overwritten
+    // below by mov rax,60 before syscall, so this is harmless either way).
+    push[Instr](&p, i_push(R_RDI()));
+    push[Instr](&p, i_pop(R_RAX()));
+
+    // exit(rdi)
+    push[Instr](&p, i_mov_imm(R_RAX(), 60));            // mov rax, 60
+    push[Instr](&p, i_syscall());                       // syscall
+    return p;
+}
+
+// A second program that requires the FIXPOINT: an inner `push rcx ; pop rcx`
+// removal makes a surrounding `push rdi ; pop rdi` adjacent. Built as:
+//   mov rdi, code
+//   push rdi ; push rcx ; pop rcx ; pop rdi   (nested, balanced)
+//   mov rax, 60 ; syscall
+// Pass 1 removes the inner rcx pair, exposing push rdi ; pop rdi for pass 2.
+fn ph_build_nested_prog(code: i32) ArrayList[Instr] {
+    let p: ArrayList[Instr] = make[Instr](16);
+    push[Instr](&p, i_mov_imm(R_RDI(), code as i64));
+    push[Instr](&p, i_push(R_RDI()));
+    push[Instr](&p, i_push(R_RCX()));
+    push[Instr](&p, i_pop(R_RCX()));
+    push[Instr](&p, i_pop(R_RDI()));
+    push[Instr](&p, i_mov_imm(R_RAX(), 60));
+    push[Instr](&p, i_syscall());
+    return p;
+}
+
+fn main() void {
+    let fails: i32 = 0;
+
+    _zag_println("== peephole: STRUCTURAL ==");
+
+    // ── S1: push r ; pop r (same reg) → BOTH removed ─────────────────────────
+    let s1: ArrayList[Instr] = make[Instr](4);
+    push[Instr](&s1, i_push(R_RBX()));
+    push[Instr](&s1, i_pop(R_RBX()));
+    let o1: ArrayList[Instr] = peephole(s1);
+    ph_dump("S1 in ", s1);
+    ph_dump("S1 out", o1);
+    ph_check("S1 len == 0", len[Instr](o1), 0, &fails);
+
+    // ── S2: push r1 ; pop r2 (r1 != r2) → mov r2, r1 ─────────────────────────
+    let s2: ArrayList[Instr] = make[Instr](4);
+    push[Instr](&s2, i_push(R_RSI()));   // r1 = rsi (6)
+    push[Instr](&s2, i_pop(R_RDX()));    // r2 = rdx (2)
+    let o2: ArrayList[Instr] = peephole(s2);
+    ph_dump("S2 in ", s2);
+    ph_dump("S2 out", o2);
+    ph_check("S2 len == 1", len[Instr](o2), 1, &fails);
+    // expect: mov rdx, rsi  →  K_MOV_RR, dst=rdx(2), src=rsi(6)
+    ph_assert_ins("S2 mov", o2, 0, K_MOV_RR(), R_RDX(), R_RSI(), &fails);
+
+    // ── S3: mov r, r → removed ───────────────────────────────────────────────
+    let s3: ArrayList[Instr] = make[Instr](4);
+    push[Instr](&s3, i_mov_imm(R_RAX(), 7));   // a real instr we KEEP
+    push[Instr](&s3, i_mov_rr(R_RAX(), R_RAX()));  // mov rax, rax → drop
+    push[Instr](&s3, i_ret());                     // a real instr we KEEP
+    let o3: ArrayList[Instr] = peephole(s3);
+    ph_dump("S3 in ", s3);
+    ph_dump("S3 out", o3);
+    ph_check("S3 len == 2", len[Instr](o3), 2, &fails);
+    ph_assert_ins("S3 [0] mov_imm", o3, 0, K_MOV_IMM(), R_RAX(), 0, &fails);
+    ph_assert_ins("S3 [1] ret",     o3, 1, K_RET(),     0,       0, &fails);
+
+    // ── S4: MULTI-PASS — inner pair removal exposes outer pair ───────────────
+    //   push rdi ; push rcx ; pop rcx ; pop rdi   → (empty)
+    let s4: ArrayList[Instr] = make[Instr](8);
+    push[Instr](&s4, i_push(R_RDI()));
+    push[Instr](&s4, i_push(R_RCX()));
+    push[Instr](&s4, i_pop(R_RCX()));
+    push[Instr](&s4, i_pop(R_RDI()));
+    let o4: ArrayList[Instr] = peephole(s4);
+    ph_dump("S4 in ", s4);
+    ph_dump("S4 out", o4);
+    ph_check("S4 len == 0 (fixpoint)", len[Instr](o4), 0, &fails);
+
+    // ── S5: SAFETY — push rax ; LABEL ; pop rax must stay UNCHANGED ───────────
+    // A label between the pair means control can ARRIVE in between; they are NOT
+    // adjacent in execution, so the optimizer must NOT fuse them.
+    let s5: ArrayList[Instr] = make[Instr](4);
+    push[Instr](&s5, i_push(R_RAX()));
+    push[Instr](&s5, i_label(7));
+    push[Instr](&s5, i_pop(R_RAX()));
+    let o5: ArrayList[Instr] = peephole(s5);
+    ph_dump("S5 in ", s5);
+    ph_dump("S5 out", o5);
+    ph_check("S5 len == 3 (UNCHANGED)", len[Instr](o5), 3, &fails);
+    ph_assert_ins("S5 [0] push", o5, 0, K_PUSH(),  R_RAX(), 0, &fails);
+    ph_check("S5 [1] is label", get[Instr](o5, 1).kind, K_LABEL(), &fails);
+    ph_check("S5 [1] label id", get[Instr](o5, 1).lbl,  7,         &fails);
+    ph_assert_ins("S5 [2] pop",  o5, 2, K_POP(),   R_RAX(), 0, &fails);
+
+    // ── S6: SAFETY — push r ; SYSCALL ; pop r must stay UNCHANGED ─────────────
+    // A transfer between them also blocks fusion.
+    let s6: ArrayList[Instr] = make[Instr](4);
+    push[Instr](&s6, i_push(R_RBX()));
+    push[Instr](&s6, i_syscall());
+    push[Instr](&s6, i_pop(R_RBX()));
+    let o6: ArrayList[Instr] = peephole(s6);
+    ph_dump("S6 in ", s6);
+    ph_dump("S6 out", o6);
+    ph_check("S6 len == 3 (UNCHANGED)", len[Instr](o6), 3, &fails);
+
+    // ── (2) END-TO-END EQUIVALENCE ───────────────────────────────────────────
+    _zag_println("");
+    _zag_println("== peephole: END-TO-END EQUIVALENCE ==");
+
+    ph_e2e("e42",  ph_build_exit_prog(42),  42,  &fails);
+    ph_e2e("e0",   ph_build_exit_prog(0),   0,   &fails);
+    ph_e2e("e123", ph_build_exit_prog(123), 123, &fails);
+    ph_e2e("e200", ph_build_exit_prog(200), 200, &fails);
+    ph_e2e("nest55", ph_build_nested_prog(55), 55, &fails);
+
+    // ── summary ──────────────────────────────────────────────────────────────
+    _zag_println("");
+    if (fails == 0) {
+        _zag_println("PEEPHOLE: ALL CHECKS PASSED");
+    } else {
+        _zag_print("PEEPHOLE: FAILURES = ");
+        ph_pi(fails);
+        _zag_println("");
+    }
+}

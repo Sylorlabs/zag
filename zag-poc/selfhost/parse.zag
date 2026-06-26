@@ -9,8 +9,11 @@
 @import("lex.zag")
 
 struct Parser {
-    toks: ArrayList[Token],
-    i:    i32,
+    toks:     ArrayList[Token],
+    i:        i32,
+    closures: ArrayList[*Node],   // closure literals hoisted to top-level fns
+    cctr:     i32,                // unique-name counter for hoisted closures
+    fn_eff:   []u8,               // effect row of the most recently parsed fn type ("" if none/non-fn)
 }
 
 // ── cursor helpers ──────────────────────────────────────────────────────────
@@ -76,8 +79,37 @@ fn parse_targs(p: *Parser) ArrayList[[]u8] {
     return targs;
 }
 
+// Function type `fn(P1,P2) Ret` (effect annotations `@x` / `! e` are erased).
+// Canonical string form: "fn(P1,P2)Ret" — codegen maps it to a C fn pointer.
+fn parse_fn_type(p: *Parser) []u8 {
+    let _fn: Token = adv(p);   // fn
+    let _o: Token = adv(p);    // (
+    let s: []u8 = "fn(";
+    let cnt: i32 = 0;
+    while (!at_k(p, Tk.Rp)) {
+        if (cnt > 0) { s = _zag_str_concat(s, ","); }
+        s = _zag_str_concat(s, parse_type(p));
+        cnt = cnt + 1;
+        if (at_k(p, Tk.Comma)) { let _c: Token = adv(p); }
+    }
+    let _r: Token = adv(p);    // )
+    let ret: []u8 = parse_type(p);
+    s = _zag_str_concat(_zag_str_concat(s, ")"), ret);
+    // capture (not erase) the trailing effect-row annotation so the effect
+    // checker can read the fn type's contract. `@realtime` / `! e` / `! pure`.
+    let eff: []u8 = "";
+    while (at_k(p, Tk.Annot)) { eff = adv(p).val; }                 // @realtime / @noalloc / ...
+    if (at_op(p, "!")) {
+        let _b: Token = adv(p);
+        if (at_k(p, Tk.Ident)) { eff = _zag_str_concat("!", adv(p).val); }  // ! pure → "!pure", ! e → "!e"
+    }
+    p.*.fn_eff = eff;
+    return s;
+}
+
 // ── types (returns the type as a []u8 string) ───────────────────────────────
 fn parse_type(p: *Parser) []u8 {
+    if (at_k(p, Tk.KwFn)) { return parse_fn_type(p); }
     if (at_op(p, "*")) { let _t: Token = adv(p); return _zag_str_concat("*", parse_type(p)); }
     if (at_op(p, "?")) { let _t: Token = adv(p); return _zag_str_concat("?", parse_type(p)); }
     if (at_op(p, "!")) { let _t: Token = adv(p); return _zag_str_concat("!", parse_type(p)); }
@@ -129,6 +161,28 @@ fn parse_expr(p: *Parser) *Node {
         let _o: Token = adv(p);
         return mk_bin("orelse", e, parse_bin(p, 1));
     }
+    // `result catch fallback` / `result catch |err| fallback` (error unions).
+    // Lowered to a call to a codegen-recognised pseudo-builtin so no new AST node
+    // is needed: __catch(e, fb) or __catchc(e, err, fb).
+    if (at_k(p, Tk.KwCatch)) {
+        let _c: Token = adv(p);
+        if (at_k(p, Tk.Pipe)) {
+            let _p1: Token = adv(p);          // |
+            let cap: []u8 = adv(p).val;        // err
+            let _p2: Token = adv(p);          // |
+            let fb: *Node = parse_bin(p, 1);
+            let args: ArrayList[*Node] = make[*Node](3);
+            push[*Node](&args, e);
+            push[*Node](&args, mk_ident(cap));
+            push[*Node](&args, fb);
+            return mk_call(mk_ident("__catchc"), args);
+        }
+        let fb: *Node = parse_bin(p, 1);
+        let args: ArrayList[*Node] = make[*Node](2);
+        push[*Node](&args, e);
+        push[*Node](&args, fb);
+        return mk_call(mk_ident("__catch"), args);
+    }
     return e;
 }
 
@@ -154,6 +208,11 @@ fn parse_bin(p: *Parser, min: i32) *Node {
 }
 
 fn parse_unary(p: *Parser) *Node {
+    // `try expr` — propagate an error union upward (lowered as Un("try", expr))
+    if (at_k(p, Tk.KwTry)) {
+        let _t: Token = adv(p);
+        return mk_un("try", parse_unary(p));
+    }
     if (at_op(p, "-") || at_op(p, "!") || at_op(p, "&")) {
         let op: []u8 = adv(p).val;
         return mk_un(op, parse_unary(p));
@@ -225,7 +284,52 @@ fn parse_postfix(p: *Parser) *Node {
     return e;
 }
 
+// Closure literal `fn[caps](params) ret { body }`. Hoisted to a top-level fn;
+// the expression is replaced by a reference to that fn (it decays to a C fn
+// pointer). Captures are recorded but, in the plain-pointer model, only an empty
+// capture list `[]` is sound (a capturing closure needs an environment).
+fn parse_closure(p: *Parser) *Node {
+    let _fn: Token = adv(p);    // fn
+    let _ob: Token = adv(p);    // [
+    let ncaps: i32 = 0;
+    let capnames: []u8 = "";
+    while (!at_k(p, Tk.Rbracket)) {
+        if (!at_k(p, Tk.Comma)) {
+            if (ncaps > 0) { capnames = _zag_str_concat(capnames, ","); }
+            capnames = _zag_str_concat(capnames, cur(p).val);   // record capture name
+            ncaps = ncaps + 1;
+        }
+        let _c: Token = adv(p);
+    }
+    let _cb: Token = adv(p);    // ]
+    let _op: Token = adv(p);    // (
+    let params: ArrayList[Param] = make[Param](4);
+    while (!at_k(p, Tk.Rp)) {
+        let pn: []u8 = adv(p).val;
+        let _co: Token = adv(p);    // :
+        p.*.fn_eff = "";
+        let pt: []u8 = parse_type(p);
+        push[Param](&params, Param{ .name = pn, .pty = pt, .eff = p.*.fn_eff, .calign = 0 });
+        if (at_k(p, Tk.Comma)) { let _c: Token = adv(p); }
+    }
+    let _rp: Token = adv(p);    // )
+    p.*.fn_eff = "";
+    let ret: []u8 = parse_type(p);
+    let reff: []u8 = p.*.fn_eff;
+    while (at_k(p, Tk.Annot)) { let _a: Token = adv(p); }   // erase the closure's own effect annotation
+    let body: ArrayList[*Node] = parse_block(p);
+    let name: []u8 = _zag_str_concat("__clos_", _zag_i64_to_str(p.*.cctr as i64));
+    p.*.cctr = p.*.cctr + 1;
+    let fd: *Node = new(Node{ .fn_decl = FnDecl{
+        .name = name, .tparams = make[[]u8](1), .params = params, .ret = ret,
+        .annots = make[[]u8](1), .body = body, .is_extern = 0, .ret_eff = reff, .caps = ncaps,
+        .cap_names = capnames, .cap_types = "" } });
+    push[*Node](&p.*.closures, fd);
+    return mk_ident(name);
+}
+
 fn parse_primary(p: *Parser) *Node {
+    if (at_k(p, Tk.KwFn)) { return parse_closure(p); }      // closure literal (expression)
     if (at_k(p, Tk.KwSwitch)) { return parse_switch(p); }   // switch as an expression
     if (at_k(p, Tk.Int))   { return mk_int(adv(p).val); }
     if (at_k(p, Tk.Float)) { return mk_int(adv(p).val); }
@@ -266,6 +370,8 @@ fn parse_primary(p: *Parser) *Node {
     if (at_k(p, Tk.KwTrue))  { let _t: Token = adv(p); return mk_ident("true"); }
     if (at_k(p, Tk.KwFalse)) { let _t: Token = adv(p); return mk_ident("false"); }
     if (at_k(p, Tk.KwNull))  { let _t: Token = adv(p); return mk_ident("null"); }
+    // `error.Name` — postfix `.Name` turns this into Field(ident "error", Name)
+    if (at_k(p, Tk.KwError)) { let _t: Token = adv(p); return mk_ident("error"); }
     // @-builtin in expression position: @strEq(..), @sizeOf[T](), @len(..), ...
     // Returned as an ident; parse_postfix turns the following ( or [T]( into a call.
     if (at_k(p, Tk.Annot))   { return mk_ident(adv(p).val); }
@@ -332,12 +438,12 @@ fn parse_switch(p: *Parser) *Node {
             els_body = parse_arm_body(p);
             has_els = 1;
         } else {
-            // one or more `.tag` patterns
+            // one or more patterns: `.tag` (enum/union) or a bare value (int switch)
             let tags: ArrayList[[]u8] = make[[]u8](2);
             let more: bool = true;
             while (more) {
-                let _dot: Token = adv(p);          // .
-                push[[]u8](&tags, adv(p).val);     // tag name
+                if (at_k(p, Tk.Dot)) { let _dot: Token = adv(p); }   // optional leading '.'
+                push[[]u8](&tags, adv(p).val);     // tag name or literal value
                 if (at_k(p, Tk.Comma)) { let _cm: Token = adv(p); } else { more = false; }
             }
             let _arrow: Token = adv(p);    // =>
@@ -359,20 +465,25 @@ fn parse_switch(p: *Parser) *Node {
 
 fn parse_stmt(p: *Parser) *Node {
     if (at_k(p, Tk.KwSwitch)) { return parse_switch(p); }
+    // `@cacheAlign(N) let x: T = ...` — pin a hot local to its own cache line.
+    let calign: i32 = cache_align_opt(p);
     if (at_k(p, Tk.KwLet)) {
         let _t: Token = adv(p);
         let name: []u8 = adv(p).val;
         let dty: []u8 = "";
         let has_dty: i32 = 0;
+        let leff: []u8 = "";
         if (at_k(p, Tk.Colon)) {
             let _c: Token = adv(p);
+            p.*.fn_eff = "";
             dty = parse_type(p);
+            leff = p.*.fn_eff;
             has_dty = 1;
         }
         let _eq: Token = adv(p);  // =
         let e: *Node = parse_expr(p);
         eat_semi(p);
-        return new(Node{ .let_ = Let{ .name = name, .dty = dty, .has_dty = has_dty, .expr = e } });
+        return new(Node{ .let_ = Let{ .name = name, .dty = dty, .has_dty = has_dty, .expr = e, .eff = leff, .calign = calign } });
     }
     if (at_k(p, Tk.KwReturn)) {
         let _t: Token = adv(p);
@@ -391,6 +502,15 @@ fn parse_stmt(p: *Parser) *Node {
         let _o: Token = adv(p);  // (
         let cond: *Node = parse_expr(p);
         let _c: Token = adv(p);  // )
+        // if-let capture: `if (opt) |x| { ... }`
+        let cap: []u8 = "";
+        let has_cap: i32 = 0;
+        if (at_k(p, Tk.Pipe)) {
+            let _p1: Token = adv(p);   // |
+            cap = adv(p).val;          // capture name
+            has_cap = 1;
+            let _p2: Token = adv(p);   // |
+        }
         let then_body: ArrayList[*Node] = parse_block(p);
         let els_body: ArrayList[*Node] = make[*Node](2);
         let has_els: i32 = 0;
@@ -403,7 +523,7 @@ fn parse_stmt(p: *Parser) *Node {
                 els_body = parse_block(p);
             }
         }
-        return new(Node{ .if_ = If{ .cond = cond, .then_body = then_body, .els_body = els_body, .has_els = has_els } });
+        return new(Node{ .if_ = If{ .cond = cond, .then_body = then_body, .els_body = els_body, .has_els = has_els, .cap = cap, .has_cap = has_cap } });
     }
     if (at_k(p, Tk.KwWhile)) {
         let _t: Token = adv(p);
@@ -430,7 +550,21 @@ fn parse_fn(p: *Parser) *Node {
     let is_extern: i32 = 0;
     if (at_k(p, Tk.KwExtern)) { let _e: Token = adv(p); is_extern = 1; }
     let _fn: Token = adv(p);  // fn
+    // method receiver: `fn (self: T) name(args) ret` — the receiver becomes the
+    // first param and the C name is mangled to `T_name` (matches the bootstrap).
+    let recv_name: []u8 = "";
+    let recv_ty: []u8 = "";
+    let is_method: i32 = 0;
+    if (at_k(p, Tk.Lp)) {
+        let _rp1: Token = adv(p);    // (
+        recv_name = adv(p).val;      // self
+        let _rc: Token = adv(p);     // :
+        recv_ty = parse_type(p);     // receiver type
+        let _rp2: Token = adv(p);    // )
+        is_method = 1;
+    }
     let name: []u8 = adv(p).val;
+    if (is_method == 1) { name = _zag_str_concat(_zag_str_concat(recv_ty, "_"), name); }
     // optional generic type-params: fn name[T1,T2](...)
     let tparams: ArrayList[[]u8] = make[[]u8](2);
     if (at_k(p, Tk.Lbracket)) {
@@ -443,15 +577,19 @@ fn parse_fn(p: *Parser) *Node {
     }
     let _o: Token = adv(p);  // (
     let params: ArrayList[Param] = make[Param](4);
+    if (is_method == 1) { push[Param](&params, Param{ .name = recv_name, .pty = recv_ty, .eff = "", .calign = 0 }); }
     while (!at_k(p, Tk.Rp)) {
         let pn: []u8 = adv(p).val;
         let _co: Token = adv(p);  // :
+        p.*.fn_eff = "";
         let pt: []u8 = parse_type(p);
-        push[Param](&params, Param{ .name = pn, .pty = pt });
+        push[Param](&params, Param{ .name = pn, .pty = pt, .eff = p.*.fn_eff, .calign = 0 });
         if (at_k(p, Tk.Comma)) { let _c: Token = adv(p); }
     }
     let _r: Token = adv(p);  // )
+    p.*.fn_eff = "";
     let ret: []u8 = parse_type(p);
+    let reff: []u8 = p.*.fn_eff;
     let annots: ArrayList[[]u8] = make[[]u8](2);
     while (at_k(p, Tk.Annot)) { push[[]u8](&annots, adv(p).val); }
     let body: ArrayList[*Node] = make[*Node](8);
@@ -460,7 +598,21 @@ fn parse_fn(p: *Parser) *Node {
     } else {
         body = parse_block(p);
     }
-    return new(Node{ .fn_decl = FnDecl{ .name = name, .tparams = tparams, .params = params, .ret = ret, .annots = annots, .body = body, .is_extern = is_extern } });
+    return new(Node{ .fn_decl = FnDecl{ .name = name, .tparams = tparams, .params = params, .ret = ret, .annots = annots, .body = body, .is_extern = is_extern, .ret_eff = reff, .caps = 0, .cap_names = "", .cap_types = "" } });
+}
+
+// Optional `@cacheAlign(N)` prefix → N (a positive integer), else 0. Consumes
+// the `@cacheAlign ( N )` tokens when present. Pins a hot field / local to its
+// own cache line (codegen lowers to C11 `_Alignas(N)`). Pure hint, no effect.
+fn cache_align_opt(p: *Parser) i32 {
+    if (at_k(p, Tk.Annot) && @strEq(cur(p).val, "@cacheAlign")) {
+        let _a: Token = adv(p);   // @cacheAlign
+        let _o: Token = adv(p);   // (
+        let n: i32 = _zag_str_to_i64(adv(p).val) as i32;   // N
+        let _c: Token = adv(p);   // )
+        return n;
+    }
+    return 0;
 }
 
 // Parse a field list `{ name: Type, ... }` into an ArrayList[Param].
@@ -469,13 +621,17 @@ fn parse_field_list(p: *Parser) ArrayList[Param] {
     let _lb: Token = adv(p);  // {
     let fields: ArrayList[Param] = make[Param](4);
     while (!at_k(p, Tk.Rbrace)) {
+        let cal: i32 = cache_align_opt(p);   // optional @cacheAlign(N) field prefix
         let fname: []u8 = adv(p).val;
         let ft: []u8 = "void";
+        let feff: []u8 = "";
         if (at_k(p, Tk.Colon)) {
             let _co: Token = adv(p);
+            p.*.fn_eff = "";
             ft = parse_type(p);
+            feff = p.*.fn_eff;
         }
-        push[Param](&fields, Param{ .name = fname, .pty = ft });
+        push[Param](&fields, Param{ .name = fname, .pty = ft, .eff = feff, .calign = cal });
         if (at_k(p, Tk.Comma)) { let _c: Token = adv(p); }
     }
     let _rb: Token = adv(p);  // }
@@ -503,6 +659,75 @@ fn parse_union(p: *Parser) *Node {
     let name: []u8 = adv(p).val;
     let fields: ArrayList[Param] = parse_field_list(p);
     return new(Node{ .union_ = UnionDecl{ .name = name, .fields = fields } });
+}
+
+// `error { NotFound, OutOfRange, ParseFail }` — the program's error set. Modeled
+// as an EnumDecl named "__zag_errors" so no new AST node is required; codegen
+// recognises that name and emits the ZAG_OK / ZAG_ERR_* constants.
+fn parse_error_decl(p: *Parser) *Node {
+    let _e: Token = adv(p);   // error
+    let _lb: Token = adv(p);  // {
+    let members: ArrayList[[]u8] = make[[]u8](4);
+    while (!at_k(p, Tk.Rbrace)) {
+        push[[]u8](&members, adv(p).val);
+        if (at_k(p, Tk.Comma)) { let _c: Token = adv(p); }
+    }
+    let _rb: Token = adv(p);  // }
+    return new(Node{ .enum_ = EnumDecl{ .name = "__zag_errors", .members = members } });
+}
+
+// `operator T { + => fnAdd, - => fnSub, * => fnMul, / => fnDiv }` — an operator
+// contract mapping arithmetic operators on a user type T to named decode fns.
+// Stored as a magic FnDecl named "__op_T" whose params encode op→fn pairs
+// (param.name = the operator symbol, param.pty = the decode fn name). Codegen
+// and the effect checker consult it via op_contract_fn(); it emits no C itself.
+fn parse_operator(p: *Parser) *Node {
+    let _o: Token = adv(p);            // operator
+    let tyname: []u8 = parse_type(p);  // T
+    let _lb: Token = adv(p);           // {
+    let entries: ArrayList[Param] = make[Param](4);
+    while (!at_k(p, Tk.Rbrace)) {
+        let opsym: []u8 = adv(p).val;          // + - * /  (an Op token)
+        let _arrow: Token = adv(p);            // =>
+        let fnname: []u8 = adv(p).val;         // decode fn name
+        push[Param](&entries, Param{ .name = opsym, .pty = fnname, .eff = "", .calign = 0 });
+        if (at_k(p, Tk.Comma)) { let _c: Token = adv(p); }
+    }
+    let _rb: Token = adv(p);           // }
+    return new(Node{ .fn_decl = FnDecl{
+        .name = _zag_str_concat("__op_", tyname), .tparams = make[[]u8](1),
+        .params = entries, .ret = "void", .annots = make[[]u8](1),
+        .body = make[*Node](1), .is_extern = 0, .ret_eff = "", .caps = 0,
+        .cap_names = "", .cap_types = "" } });
+}
+
+// Resolve an operator contract: the decode fn mapped to `op` on type `ty`, or
+// "" if none. Consulted by both the effect checker and codegen. Handles a
+// generic application base (Box[i32] → looks up the contract for Box).
+fn op_contract_fn(decls: ArrayList[*Node], ty: []u8, op: []u8) []u8 {
+    if (ty.len == 0) { return ""; }
+    let base: []u8 = ty;
+    let lb: i32 = index_of(ty, '[');
+    if (lb > 0) { base = ty[0..lb]; }
+    let key: []u8 = _zag_str_concat("__op_", base);
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .fn_decl => |f| {
+                if (@strEq(f.name, key)) {
+                    let j: i32 = 0;
+                    while (j < len[Param](f.params)) {
+                        let e: Param = get[Param](f.params, j);
+                        if (@strEq(e.name, op)) { return e.pty; }
+                        j = j + 1;
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return "";
 }
 
 fn parse_enum(p: *Parser) *Node {
@@ -700,7 +925,7 @@ fn q_rewrite_stmt(n: *Node, names: ArrayList[[]u8], qual: []u8) void {
     switch (n.*) {
         .let_ => |l| {
             q_rewrite_expr(l.expr, names, qual);
-            n.* = Node{ .let_ = Let{ .name = l.name, .dty = q_subst_type(l.dty, names, qual), .has_dty = l.has_dty, .expr = l.expr } };
+            n.* = Node{ .let_ = Let{ .name = l.name, .dty = q_subst_type(l.dty, names, qual), .has_dty = l.has_dty, .expr = l.expr, .eff = l.eff, .calign = l.calign } };
         }
         .ret => |r| { if (r.has_expr == 1) { q_rewrite_expr(r.expr, names, qual); } }
         .if_ => |x| {
@@ -745,7 +970,7 @@ fn qualify_params(params: ArrayList[Param], names: ArrayList[[]u8], qual: []u8) 
     let i: i32 = 0;
     while (i < len[Param](params)) {
         let p: Param = get[Param](params, i);
-        push[Param](&out, Param{ .name = p.name, .pty = q_subst_type(p.pty, names, qual) });
+        push[Param](&out, Param{ .name = p.name, .pty = q_subst_type(p.pty, names, qual), .eff = p.eff, .calign = p.calign });
         i = i + 1;
     }
     return out;
@@ -764,7 +989,11 @@ fn qualify_decl(d: *Node, names: ArrayList[[]u8], qual: []u8) *Node {
                 .ret = q_subst_type(f.ret, names, qual),
                 .annots = f.annots,
                 .body = f.body,
-                .is_extern = 0 } });
+                .is_extern = 0,
+                .ret_eff = f.ret_eff,
+                .caps = f.caps,
+                .cap_names = f.cap_names,
+                .cap_types = f.cap_types } });
         }
         .struct_ => |s| {
             return new(Node{ .struct_ = StructDecl{
@@ -904,7 +1133,7 @@ fn load_module(path: []u8, qual: []u8, has_qual: i32, seen: *ArrayList[[]u8], ou
 // so `alias.member` rewriting is applied once over all decls afterward.
 fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayList[*Node], cfiles: *ArrayList[[]u8], aliases: *ArrayList[[]u8]) void {
     let toks: ArrayList[Token] = lex(src);
-    let p: Parser = Parser{ .toks = toks, .i = 0 };
+    let p: Parser = Parser{ .toks = toks, .i = 0, .closures = make[*Node](2), .cctr = 0, .fn_eff = "" };
     while (!at_k(&p, Tk.Eof)) {
         if (at_k(&p, Tk.Annot) && @strEq(cur(&p).val, "@import")) {
             let _imp: Token = adv(&p);     // @import
@@ -927,9 +1156,19 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
             push[*Node](out, parse_union(&p));
         } else if (at_k(&p, Tk.KwEnum)) {
             push[*Node](out, parse_enum(&p));
+        } else if (at_k(&p, Tk.KwError)) {
+            push[*Node](out, parse_error_decl(&p));
+        } else if (at_k(&p, Tk.Ident) && @strEq(cur(&p).val, "operator")) {
+            push[*Node](out, parse_operator(&p));
         } else {
             push[*Node](out, parse_fn(&p));
         }
+    }
+    // splice hoisted closure literals (now top-level fns) into the decl stream
+    let ci: i32 = 0;
+    while (ci < len[*Node](p.closures)) {
+        push[*Node](out, get[*Node](p.closures, ci));
+        ci = ci + 1;
     }
 }
 

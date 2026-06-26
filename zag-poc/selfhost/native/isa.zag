@@ -1,0 +1,151 @@
+// selfhost/native/isa.zag — the SHARED CONTRACT for Zag's native x86-64 backend.
+//
+// This is the single source of truth that three modules agree on:
+//   • native codegen  (ncodegen.zag) PRODUCES an ArrayList[Instr]
+//   • the assembler   (x86.zag)      CONSUMES it → machine-code bytes
+//   • the ELF writer  (elf.zag)      wraps those bytes into a runnable file
+//
+// A flat, encoder-friendly instruction. `kind` selects the form; the other
+// fields are interpreted per-kind (see each K_* below). Authored centrally so
+// nobody invents an incompatible representation.
+//
+// Register field values are the x86-64 HARDWARE encoding numbers:
+//   rax=0 rcx=1 rdx=2 rbx=3 rsp=4 rbp=5 rsi=6 rdi=7  r8=8 r9=9 .. r15=15
+// Registers r8..r15 (>=8) need the REX.B / REX.R extension bit — the assembler
+// is responsible for emitting it. The System V AMD64 calling convention used by
+// codegen: integer args in rdi,rsi,rdx,rcx,r8,r9; integer return in rax;
+// callee-saved rbx,rbp,r12..r15; rsp 16-byte aligned at a `call`.
+//
+// Memory operands are base-register + signed displacement: [base + disp].
+// Codegen uses rbp as the frame base for locals (base = R_RBP()). The assembler
+// MUST still correctly encode rsp/r12 bases (SIB byte) and rbp/r13 bases
+// (forced disp) for completeness.
+//
+// LANGUAGE SUBSET NOTE (self-hosted compiler): there is NO `<<`/`>>` (the lexer
+// splits them) and `|` is the capture pipe, so the assembler builds bytes with
+// arithmetic — disjoint bit-fields combine with `+`, a byte is split with `/`
+// and `% 256`. `&` works for masking. No `break`/`continue` (use a flag-guarded
+// while). Deref a pointer field as `p.*.field`.
+
+@import("../../std/list.zag")
+
+struct Instr {
+    kind: i32,   // one of the K_* kinds below
+    dst:  i32,   // dest register 0..15 (or base reg for STORE; sole op for push/pop/idiv)
+    src:  i32,   // source register 0..15 (or base reg for LOAD/LEA)
+    imm:  i64,   // immediate (mov/add/sub/cmp imm forms); condition code for SETCC
+    disp: i32,   // signed displacement for LOAD/STORE/LEA memory operands
+    lbl:  i32,   // label id for LABEL / CALL / JMP / Jcc; NOLBL() otherwise
+}
+
+// sentinel "no label" value (the subset dislikes bare negative literals)
+fn NOLBL() i32 { return 0 - 1; }
+
+// Shared between the codegen and the linker: the fixed virtual address where the
+// read-only DATA segment (string/constant blob) is mapped. Codegen references a
+// constant at byte `off` in the blob as the absolute address DATA_VBASE()+off
+// (via movabs), so addresses are known at codegen time — no relocation needed.
+// Far from the code segment (0x400000) so they never overlap.
+fn DATA_VBASE() i64 { return 6291456; }   // 0x600000
+
+// ── instruction kinds (with their canonical x86-64 encodings, for the asm) ────
+fn K_LABEL()   i32 { return 0; }   // position marker for label `lbl`; emits 0 bytes
+fn K_MOV_IMM() i32 { return 1; }   // mov dst, imm : REX.W C7 /0 id if imm fits int32,
+                                   //               else REX.W B8+rd io (movabs imm64)
+fn K_MOV_RR()  i32 { return 2; }   // mov  dst, src : REX.W 89 /r  (src→dst)
+fn K_ADD_RR()  i32 { return 3; }   // add  dst, src : REX.W 01 /r
+fn K_SUB_RR()  i32 { return 4; }   // sub  dst, src : REX.W 29 /r
+fn K_IMUL_RR() i32 { return 5; }   // imul dst, src : REX.W 0F AF /r
+fn K_CMP_RR()  i32 { return 6; }   // cmp  dst, src : REX.W 39 /r
+fn K_PUSH()    i32 { return 7; }   // push dst      : (REX.B?) 50+rd
+fn K_POP()     i32 { return 8; }   // pop  dst      : (REX.B?) 58+rd
+fn K_CALL()    i32 { return 9; }   // call lbl      : E8 rel32
+fn K_JMP()     i32 { return 10; }  // jmp  lbl      : E9 rel32
+fn K_JE()      i32 { return 11; }  // je   lbl      : 0F 84 rel32
+fn K_JNE()     i32 { return 12; }  // jne  lbl      : 0F 85 rel32
+fn K_JL()      i32 { return 13; }  // jl   lbl      : 0F 8C rel32 (signed)
+fn K_JLE()     i32 { return 14; }  // jle  lbl      : 0F 8E rel32 (signed)
+fn K_JG()      i32 { return 15; }  // jg   lbl      : 0F 8F rel32 (signed)
+fn K_JGE()     i32 { return 16; }  // jge  lbl      : 0F 8D rel32 (signed)
+fn K_RET()     i32 { return 17; }  // ret           : C3
+fn K_SYSCALL() i32 { return 18; }  // syscall       : 0F 05
+fn K_IDIV()    i32 { return 19; }  // cqo (REX.W 99) ; idiv src (REX.W F7 /7): rax=quot rdx=rem
+fn K_AND_RR()  i32 { return 20; }  // and  dst, src : REX.W 21 /r
+fn K_OR_RR()   i32 { return 21; }  // or   dst, src : REX.W 09 /r
+fn K_XOR_RR()  i32 { return 22; }  // xor  dst, src : REX.W 31 /r
+fn K_LOAD()    i32 { return 23; }  // mov dst, [src + disp]  : REX.W 8B /r
+fn K_STORE()   i32 { return 24; }  // mov [dst + disp], src  : REX.W 89 /r
+fn K_LEA()     i32 { return 25; }  // lea dst, [src + disp]  : REX.W 8D /r
+fn K_ADD_RI()  i32 { return 26; }  // add dst, imm32 : REX.W 81 /0 id
+fn K_SUB_RI()  i32 { return 27; }  // sub dst, imm32 : REX.W 81 /5 id
+fn K_CMP_RI()  i32 { return 28; }  // cmp dst, imm32 : REX.W 81 /7 id
+fn K_SETCC()   i32 { return 29; }  // dst = (cc in imm) ? 1 : 0 : setcc dl/al + movzx to 64
+fn K_NEG()     i32 { return 30; }  // neg dst       : REX.W F7 /3
+
+// condition codes for K_SETCC (imm field)
+fn CC_E()  i32 { return 0; }
+fn CC_NE() i32 { return 1; }
+fn CC_L()  i32 { return 2; }
+fn CC_LE() i32 { return 3; }
+fn CC_G()  i32 { return 4; }
+fn CC_GE() i32 { return 5; }
+
+// ── named registers (System V arg/return regs) ───────────────────────────────
+fn R_RAX() i32 { return 0; }
+fn R_RCX() i32 { return 1; }
+fn R_RDX() i32 { return 2; }
+fn R_RBX() i32 { return 3; }
+fn R_RSP() i32 { return 4; }
+fn R_RBP() i32 { return 5; }
+fn R_RSI() i32 { return 6; }
+fn R_RDI() i32 { return 7; }
+fn R_R8()  i32 { return 8; }
+fn R_R9()  i32 { return 9; }
+fn R_R10() i32 { return 10; }
+
+// System V integer argument register for argument index 0..5 (else returns -1).
+fn arg_reg(i: i32) i32 {
+    if (i == 0) { return 7; }   // rdi
+    if (i == 1) { return 6; }   // rsi
+    if (i == 2) { return 2; }   // rdx
+    if (i == 3) { return 1; }   // rcx
+    if (i == 4) { return 8; }   // r8
+    if (i == 5) { return 9; }   // r9
+    return 0 - 1;
+}
+
+// ── constructors (codegen calls these; the assembler matches on .kind) ───────
+fn ins6(kind: i32, dst: i32, src: i32, imm: i64, disp: i32, lbl: i32) Instr {
+    return Instr{ .kind = kind, .dst = dst, .src = src, .imm = imm, .disp = disp, .lbl = lbl };
+}
+fn i_label(id: i32)             Instr { return ins6(0,  0,   0,   0, 0, id); }
+fn i_mov_imm(dst: i32, v: i64)  Instr { return ins6(1,  dst, 0,   v, 0, 0 - 1); }
+fn i_mov_rr(dst: i32, src: i32) Instr { return ins6(2,  dst, src, 0, 0, 0 - 1); }
+fn i_add(dst: i32, src: i32)    Instr { return ins6(3,  dst, src, 0, 0, 0 - 1); }
+fn i_sub(dst: i32, src: i32)    Instr { return ins6(4,  dst, src, 0, 0, 0 - 1); }
+fn i_imul(dst: i32, src: i32)   Instr { return ins6(5,  dst, src, 0, 0, 0 - 1); }
+fn i_cmp(dst: i32, src: i32)    Instr { return ins6(6,  dst, src, 0, 0, 0 - 1); }
+fn i_push(r: i32)               Instr { return ins6(7,  r,   0,   0, 0, 0 - 1); }
+fn i_pop(r: i32)                Instr { return ins6(8,  r,   0,   0, 0, 0 - 1); }
+fn i_call(id: i32)              Instr { return ins6(9,  0,   0,   0, 0, id); }
+fn i_jmp(id: i32)               Instr { return ins6(10, 0,   0,   0, 0, id); }
+fn i_je(id: i32)                Instr { return ins6(11, 0,   0,   0, 0, id); }
+fn i_jne(id: i32)               Instr { return ins6(12, 0,   0,   0, 0, id); }
+fn i_jl(id: i32)                Instr { return ins6(13, 0,   0,   0, 0, id); }
+fn i_jle(id: i32)               Instr { return ins6(14, 0,   0,   0, 0, id); }
+fn i_jg(id: i32)                Instr { return ins6(15, 0,   0,   0, 0, id); }
+fn i_jge(id: i32)               Instr { return ins6(16, 0,   0,   0, 0, id); }
+fn i_ret()                      Instr { return ins6(17, 0,   0,   0, 0, 0 - 1); }
+fn i_syscall()                  Instr { return ins6(18, 0,   0,   0, 0, 0 - 1); }
+fn i_idiv(src: i32)             Instr { return ins6(19, 0,   src, 0, 0, 0 - 1); }
+fn i_and(dst: i32, src: i32)    Instr { return ins6(20, dst, src, 0, 0, 0 - 1); }
+fn i_or(dst: i32, src: i32)     Instr { return ins6(21, dst, src, 0, 0, 0 - 1); }
+fn i_xor(dst: i32, src: i32)    Instr { return ins6(22, dst, src, 0, 0, 0 - 1); }
+fn i_load(dst: i32, base: i32, disp: i32)  Instr { return ins6(23, dst,  base, 0, disp, 0 - 1); }
+fn i_store(base: i32, disp: i32, src: i32) Instr { return ins6(24, base, src,  0, disp, 0 - 1); }
+fn i_lea(dst: i32, base: i32, disp: i32)   Instr { return ins6(25, dst,  base, 0, disp, 0 - 1); }
+fn i_add_imm(dst: i32, v: i64)  Instr { return ins6(26, dst, 0,   v, 0, 0 - 1); }
+fn i_sub_imm(dst: i32, v: i64)  Instr { return ins6(27, dst, 0,   v, 0, 0 - 1); }
+fn i_cmp_imm(dst: i32, v: i64)  Instr { return ins6(28, dst, 0,   v, 0, 0 - 1); }
+fn i_setcc(dst: i32, cc: i32)   Instr { return ins6(29, dst, 0,   cc as i64, 0, 0 - 1); }
+fn i_neg(dst: i32)              Instr { return ins6(30, dst, 0,   0, 0, 0 - 1); }

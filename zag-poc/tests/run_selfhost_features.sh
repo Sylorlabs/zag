@@ -3,7 +3,7 @@
 # selfhost/astjson.zag): `zag version` and `zag ast` (AST → JSON, zag.ast/v1).
 # Kept separate from run_selfhost.sh so the two suites can evolve independently.
 cd "$(dirname "$0")/.."
-ZAGC=./zig-out/bin/zagc
+ZAGC=./zagc
 pass=0; fail=0
 
 # Build the self-hosted compiler via the Zig bootstrap.

@@ -1,0 +1,205 @@
+// selfhost/native/peephole.zag — a correctness-preserving, instruction-level
+// PEEPHOLE optimizer for Zag's from-scratch native x86-64 backend.
+//
+// It runs on the flat ArrayList[Instr] (see isa.zag) AFTER codegen and BEFORE
+// the assembler (x86.zag `encode`). It only ever rewrites STRICTLY-ADJACENT
+// instructions in straight-line code, and every rewrite is required to be
+// observationally equivalent to the code it replaces (same architectural state,
+// same flags-relevant behavior, same control flow). An optimizer that changes
+// program behavior is a catastrophic bug, so the rule set here is deliberately
+// tiny and each rule carries a soundness argument.
+//
+// ── RULES (each strictly adjacent, straight-line only) ───────────────────────
+//   R1  push r ; pop r        (same reg)  → (nothing)           net no-op
+//   R2  push r1 ; pop r2       (r1 != r2) → mov r2, r1
+//   R3  mov r, r              (K_MOV_RR, dst == src)            → (nothing)
+//   R4  store [b+d], rS ; load rD, [b+d]  (same b, same d)
+//                              → store [b+d], rS ; mov rD, rS   (store-to-load)
+//   R5a mov_imm r, a ; mov_imm r, b   (same r)  → mov_imm r, b  (dead first imm)
+//   R5b mov_imm r, a ; mov_rr  r, x   (x != r)  → mov_rr  r, x  (dead first imm)
+//
+// ── SOUNDNESS ────────────────────────────────────────────────────────────────
+// R1  `push r` writes [rsp-8]=r then rsp-=8; the immediately following `pop r`
+//     reads [rsp]→r (restoring the same value already in r) then rsp+=8. Net
+//     effect: rsp unchanged, r unchanged, and the 8 bytes written below the
+//     (restored) stack pointer are dead (a later push would overwrite them; the
+//     ABI red zone is not relied on here). Neither push nor pop touches RFLAGS.
+//     Because the two are adjacent, nothing observes the transient rsp or the
+//     scratch slot in between → removing both is sound.
+// R2  `push r1 ; pop r2` writes [rsp-8]=r1, rsp-=8, then r2=[rsp]=r1, rsp+=8.
+//     Architectural net effect: r2 = r1, rsp unchanged, flags unchanged. That is
+//     exactly `mov r2, r1` (REX.W 89 /r, which also leaves flags untouched). The
+//     only difference is the dead scratch write to [rsp-8], which — since the
+//     pair is adjacent and rsp is restored — is unobservable. Sound.
+// R3  `mov r, r` copies r into itself: no architectural change, no flags change
+//     (mov never touches flags). Removing it is a pure no-op. Sound.
+// R4  `store [b+d], rS` writes memory cell M=[b+d] := rS; it READS rS and the
+//     base reg b, and WRITES neither (a store mutates memory only — it does not
+//     change rS, b, or any register, and `mov [m],r` touches no flags). The
+//     immediately-following `load rD, [b+d]` reads that SAME cell M back into rD,
+//     so afterwards rD == rS. Because the pair is strictly adjacent with the SAME
+//     (base,disp), nothing between the store and the load can have changed cell
+//     M or the value in rS, so the load is guaranteed to observe exactly rS.
+//     Replacing the load with `mov rD, rS` therefore yields the IDENTICAL rD and
+//     leaves M (the store) untouched and flags untouched. It is sound for EVERY
+//     register choice: if b==rS the store still leaves rS intact; if rD==b the
+//     `mov rD,rS` writes the same value the memory load would have produced; and
+//     if rD==rS it degenerates to `mov r,r` (R3 then deletes it), matching the
+//     original load-of-own-stored-value no-op. Sound.
+// R5a `mov_imm r, a ; mov_imm r, b` (same r): the second UNCONDITIONALLY writes
+//     r := b and its source is an immediate, so it never READS r — the value a is
+//     therefore dead (and, being adjacent, unread by anything in between). Both
+//     movs leave flags untouched. Dropping the first leaves r := b with identical
+//     final state. Sound. (Same dest is required; otherwise both writes matter.)
+// R5b `mov_imm r, a ; mov_rr r, x` with x != r: `mov r, x` reads x (NOT r, since
+//     x != r) and unconditionally writes r := (value of x). The value a is again
+//     dead and unread between. Flags untouched. Dropping the first imm yields the
+//     identical r := x. The x != r guard is ESSENTIAL: if x == r the second is
+//     `mov r,r` (a no-op that R3 removes) and the first imm is the live writer of
+//     r — dropping it would CHANGE behavior. So we only fire when src != dst.
+//
+// ── WHY ADJACENCY IS SAFE (the place peepholes introduce bugs) ───────────────
+// A pair is "fusable" ONLY when the two instructions sit at consecutive list
+// indices i and i+1 with NOTHING between them. This single-pass shape makes the
+// dangerous cases impossible by construction:
+//   • A K_LABEL between two candidates is itself at index i+1, so the instruction
+//     at i+1 is a label, not the partner we need — the per-rule guard on the
+//     i+1 KIND fails and we leave instruction i alone. This matters because
+//     control can ARRIVE at the label, so the pair is NOT adjacent in execution.
+//   • A branch/transfer (K_JMP/K_JE../K_CALL/K_RET/K_SYSCALL) between them is the
+//     same story: it occupies i+1, so the kind guard fails and nothing is fused.
+// We therefore never need an explicit "is there a label/branch between them?"
+// scan — there is never anything *between* i and i+1 to begin with. Every rule
+// below inspects ONLY get(prog,i) and get(prog,i+1).
+//
+// ── FIXPOINT ─────────────────────────────────────────────────────────────────
+// One pass can expose a new opportunity for the next (e.g. R3 deleting a
+// `mov r,r` can make a surrounding push/pop adjacent; R4 can produce a `mov r,r`
+// that R3 then removes). `peephole` repeats passes until a whole pass makes no
+// change, then returns the result.
+//
+// LANGUAGE SUBSET: stmts end ';'. No `<<`/`>>`, no `|`/`||`. `&`,`%`,`/`,`*`,
+// `+`,`-`, comparisons and `&&` are OK. No break/continue (flag-guarded while).
+// Deref a pointer field as `p.*.field`. switch only for unions — here plain if.
+
+@import("isa.zag")
+
+// ── one optimization pass ────────────────────────────────────────────────────
+// Scans `prog` left-to-right, emitting a new list with all rules applied to
+// strictly-adjacent pairs. Sets `changed.*` to 1 if anything was rewritten.
+//
+// NOTE on length: R2/R4 are length-neutral (1 instr in, 1 instr out via the mov
+// they emit plus the kept store), R1/R3/R5 shrink, and the no-op default copies
+// one. A pass therefore never GROWS the program, so n+1 capacity always suffices.
+fn ph_pass(prog: ArrayList[Instr], changed: *i32) ArrayList[Instr] {
+    let n: i32 = len[Instr](prog);
+    let out: ArrayList[Instr] = make[Instr](n + 1);
+
+    let i: i32 = 0;
+    while (i < n) {
+        let cur: Instr = get[Instr](prog, i);
+
+        // ── R3: mov r, r  →  (drop) ──────────────────────────────────────────
+        // Single-instruction rule; no adjacency needed.
+        if (cur.kind == K_MOV_RR() && cur.dst == cur.src) {
+            changed.* = 1;
+            i = i + 1;
+        } else {
+            // ── pair rules need a strictly-adjacent successor at i+1 ─────────
+            let have_next: i32 = 0;
+            if (i + 1 < n) { have_next = 1; }
+
+            let handled: i32 = 0;
+
+            // ── R1 / R2: push then pop ───────────────────────────────────────
+            if (have_next == 1 && handled == 0 && cur.kind == K_PUSH()) {
+                let nxt: Instr = get[Instr](prog, i + 1);
+                // The instruction at i+1 must itself be the POP — if a K_LABEL,
+                // a branch, or anything else sits there, this guard fails and we
+                // fall through to "emit cur unchanged". That is precisely the
+                // label/branch safety property.
+                if (nxt.kind == K_POP()) {
+                    if (cur.dst == nxt.dst) {
+                        // ── R1: push r ; pop r  →  (drop both) ──────────────
+                        changed.* = 1;
+                        i = i + 2;
+                        handled = 1;
+                    } else {
+                        // ── R2: push r1 ; pop r2  →  mov r2, r1 ─────────────
+                        push[Instr](&out, i_mov_rr(nxt.dst, cur.dst));
+                        changed.* = 1;
+                        i = i + 2;
+                        handled = 1;
+                    }
+                }
+            }
+
+            // ── R4: store [b+d], rS ; load rD, [b+d]  (same b, same d) ───────
+            // store: kind=K_STORE, dst=base, src=rS, disp=d   (i_store(base,disp,src))
+            // load : kind=K_LOAD,  dst=rD,   src=base, disp=d  (i_load(dst,base,disp))
+            // Keep the store; replace the load with `mov rD, rS`.
+            if (have_next == 1 && handled == 0 && cur.kind == K_STORE()) {
+                let nxt4: Instr = get[Instr](prog, i + 1);
+                if (nxt4.kind == K_LOAD()) {
+                    // SAME base register AND SAME displacement, else do nothing.
+                    if (cur.dst == nxt4.src && cur.disp == nxt4.disp) {
+                        push[Instr](&out, cur);                       // keep the store
+                        push[Instr](&out, i_mov_rr(nxt4.dst, cur.src)); // mov rD, rS
+                        changed.* = 1;
+                        i = i + 2;
+                        handled = 1;
+                    }
+                }
+            }
+
+            // ── R5: mov_imm r, a ; (mov_imm r, b | mov_rr r, x≠r)  → drop first
+            if (have_next == 1 && handled == 0 && cur.kind == K_MOV_IMM()) {
+                let nxt5: Instr = get[Instr](prog, i + 1);
+                let drop_first: i32 = 0;
+                // R5a: next is mov_imm into the SAME register (unconditional
+                // overwrite, immediate source never reads r).
+                if (nxt5.kind == K_MOV_IMM() && nxt5.dst == cur.dst) {
+                    drop_first = 1;
+                }
+                // R5b: next is mov_rr into the SAME register from a DIFFERENT
+                // source (so it does not read r). src==dst is `mov r,r`, which
+                // would NOT overwrite r meaningfully — we must NOT drop then.
+                if (nxt5.kind == K_MOV_RR() && nxt5.dst == cur.dst && nxt5.src != cur.dst) {
+                    drop_first = 1;
+                }
+                if (drop_first == 1) {
+                    // Skip emitting `cur` (the dead imm); keep the overwriter for
+                    // the next loop iteration to emit/optimize normally.
+                    changed.* = 1;
+                    i = i + 1;
+                    handled = 1;
+                }
+            }
+
+            if (handled == 0) {
+                // No rule applied at this position: emit the instruction as-is.
+                push[Instr](&out, cur);
+                i = i + 1;
+            }
+        }
+    }
+
+    return out;
+}
+
+// ── public entry: apply the rules to a FIXPOINT ──────────────────────────────
+// Repeats single passes until one pass makes no change, then returns the
+// optimized list. Terminates because every pass either shrinks the program
+// (R1/R3/R5 remove instructions; R2/R4 are length-neutral) or makes no change —
+// and a no-change pass stops the loop.
+fn peephole(prog: ArrayList[Instr]) ArrayList[Instr] {
+    let cur: ArrayList[Instr] = prog;
+    let going: i32 = 1;
+    while (going == 1) {
+        let changed: i32 = 0;
+        let next: ArrayList[Instr] = ph_pass(cur, &changed);
+        cur = next;
+        if (changed == 0) { going = 0; }
+    }
+    return cur;
+}

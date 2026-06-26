@@ -2,7 +2,7 @@
 # Standard-library regression tests: each program must build, link std/runtime.c,
 # run, and produce the exact expected output.
 cd "$(dirname "$0")/.."
-ZAGC=./zig-out/bin/zagc
+ZAGC=./zagc
 pass=0; fail=0
 
 check() { # name  expected-output(space-joined)

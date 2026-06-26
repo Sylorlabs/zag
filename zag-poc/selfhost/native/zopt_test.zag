@@ -1,0 +1,179 @@
+// selfhost/native/zopt_test.zag — proof harness for the ZIR optimizer.
+//
+// Each test PRINTS the before/after IR (via zir.zag's MLIR printer) so the
+// transformation is visible and auditable. We prove four transformations:
+//   (1) constant fold:  (2 + 3) * 4  → a single constant 20
+//   (2) algebraic:      x * 1        → op removed, uses rewired to x
+//   (3) DCE:            a dead pure op → gone
+//   (4) CSE:            two identical arith.addi %a,%b → collapsed to one
+//
+// Run:  ./zagc build selfhost/native/zopt_test.zag --run
+
+@import("../zir.zag")
+@import("zopt.zag")
+
+// ── tiny helpers to print an IR module with a banner ─────────────────────────
+fn show(banner: []u8, m: ZModule) void {
+    _zag_print(banner);
+    _zag_print("\n");
+    let buf: ArrayList[u8] = print_mlir(m);
+    _zag_print(buf.data[0..buf.len]);
+    _zag_print("\n");
+}
+
+// ── direct ZOp/ZModule construction helpers (precise control for tests) ──────
+fn tval(name: []u8, ty: []u8) ZVal { return ZVal{ .name = name, .ty = ty }; }
+
+fn tconst(name: []u8, v: []u8) ZOp {
+    let o: ZOp = mk_op("arith.constant");
+    push[ZVal](&o.results, tval(name, "i32"));
+    push[ZAttr](&o.attrs, ZAttr{ .key = "value", .val = v });
+    return o;
+}
+fn tbin(opname: []u8, res: []u8, l: ZVal, r: ZVal) ZOp {
+    let o: ZOp = mk_op(opname);
+    push[ZVal](&o.results, tval(res, "i32"));
+    push[ZVal](&o.operands, l);
+    push[ZVal](&o.operands, r);
+    return o;
+}
+fn tret(v: ZVal) ZOp {
+    let o: ZOp = mk_op("func.return");
+    push[ZVal](&o.operands, v);
+    return o;
+}
+// wrap a block of ops into a single-function module returning i32.
+fn tmodule(fname: []u8, blk: ZBlock) ZModule {
+    let m: ZModule = ZModule{ .funcs = make[ZFunc](1) };
+    push[ZFunc](&m.funcs, ZFunc{ .name = fname, .params = make[ZVal](1), .ret = "i32", .body = blk });
+    return m;
+}
+
+fn main() void {
+    // ════════════════════════════════════════════════════════════════════════
+    //  (1) CONSTANT FOLD — (2 + 3) * 4  → constant 20   (then DCE removes the
+    //      now-dead intermediate constants). Built from real source via the
+    //      zir.zag AST→ZIR lowerer.
+    // ════════════════════════════════════════════════════════════════════════
+    _zag_print("########## TEST 1: constant folding (2+3)*4 -> 20 ##########\n");
+    let src: []u8 = "fn konst() i32 { return (2 + 3) * 4; }\n";
+    let m1: ZModule = build_module(parse_program(src));
+    show("--- BEFORE (raw lowering) ---", m1);
+    let m1f: ZModule = opt_fold(m1);
+    show("--- AFTER opt_fold (arith ops folded to constant 20) ---", m1f);
+    let m1d: ZModule = opt_dce(m1f);
+    show("--- AFTER opt_dce (dead intermediate constants removed) ---", m1d);
+    _zag_print("EXPECT: final IR has a single 'arith.constant 20' returned, no addi/muli.\n\n");
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  (2) ALGEBRAIC — x * 1 → x. We build:  %p1 = const 1 ; %t = muli %x,%p1 ;
+    //      return %t.  After simplify: the muli is gone and the return uses %x.
+    // ════════════════════════════════════════════════════════════════════════
+    _zag_print("########## TEST 2: algebraic identity  x * 1 -> x ##########\n");
+    let b2: ZBlock = one_block();
+    let x2: ZVal = tval("%x", "i32");
+    push[ZOp](&b2.ops, tconst("%one", "1"));
+    push[ZOp](&b2.ops, tbin("arith.muli", "%t", x2, tval("%one", "i32")));
+    push[ZOp](&b2.ops, tret(tval("%t", "i32")));
+    // give the function a param %x so the IR is well-formed.
+    let m2: ZModule = ZModule{ .funcs = make[ZFunc](1) };
+    let prm2: ArrayList[ZVal] = make[ZVal](1);
+    push[ZVal](&prm2, tval("%x", "i32"));
+    push[ZFunc](&m2.funcs, ZFunc{ .name = "mul1", .params = prm2, .ret = "i32", .body = b2 });
+    show("--- BEFORE (%t = muli %x, %one) ---", m2);
+    let m2s: ZModule = opt_simplify(m2);
+    show("--- AFTER opt_simplify (muli dropped, return rewired to %x) ---", m2s);
+    let m2d: ZModule = opt_dce(m2s);
+    show("--- AFTER opt_dce (dead 'const 1' removed) ---", m2d);
+    _zag_print("EXPECT: no arith.muli; 'func.return %x'.\n\n");
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  (3) DCE — a dead pure op. Build:  %a=const 7 ; %dead = addi %a,%a (never
+    //      used) ; %b=const 9 ; return %b.  DCE must remove %dead and %a.
+    // ════════════════════════════════════════════════════════════════════════
+    _zag_print("########## TEST 3: dead-code elimination ##########\n");
+    let b3: ZBlock = one_block();
+    push[ZOp](&b3.ops, tconst("%a", "7"));
+    push[ZOp](&b3.ops, tbin("arith.addi", "%dead", tval("%a", "i32"), tval("%a", "i32")));
+    push[ZOp](&b3.ops, tconst("%b", "9"));
+    push[ZOp](&b3.ops, tret(tval("%b", "i32")));
+    let m3: ZModule = tmodule("deadcode", b3);
+    show("--- BEFORE (%dead = addi %a,%a is never used) ---", m3);
+    let m3d: ZModule = opt_dce(m3);
+    show("--- AFTER opt_dce (%dead and now-dead %a removed) ---", m3d);
+    _zag_print("EXPECT: no '%dead' addi and no '%a' constant; only 'const 9' + return.\n\n");
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  (4) CSE — two identical arith.addi %a,%b collapse to one. Build:
+    //      %s1 = addi %a,%b ; %s2 = addi %a,%b ; %r = muli %s1,%s2 ; return %r.
+    //      CSE rewrites %s2→%s1; DCE removes the duplicate add.
+    // ════════════════════════════════════════════════════════════════════════
+    _zag_print("########## TEST 4: common-subexpression elimination ##########\n");
+    let b4: ZBlock = one_block();
+    let a4: ZVal = tval("%a", "i32");
+    let bb4: ZVal = tval("%b", "i32");
+    push[ZOp](&b4.ops, tbin("arith.addi", "%s1", a4, bb4));
+    push[ZOp](&b4.ops, tbin("arith.addi", "%s2", a4, bb4));
+    push[ZOp](&b4.ops, tbin("arith.muli", "%r", tval("%s1", "i32"), tval("%s2", "i32")));
+    push[ZOp](&b4.ops, tret(tval("%r", "i32")));
+    let m4: ZModule = ZModule{ .funcs = make[ZFunc](1) };
+    let prm4: ArrayList[ZVal] = make[ZVal](2);
+    push[ZVal](&prm4, tval("%a", "i32"));
+    push[ZVal](&prm4, tval("%b", "i32"));
+    push[ZFunc](&m4.funcs, ZFunc{ .name = "cse", .params = prm4, .ret = "i32", .body = b4 });
+    show("--- BEFORE (%s1 and %s2 are identical addi %a,%b) ---", m4);
+    let m4c: ZModule = opt_cse(m4);
+    show("--- AFTER opt_cse (%s2 rewired to %s1; muli uses %s1,%s1) ---", m4c);
+    let m4d: ZModule = opt_dce(m4c);
+    show("--- AFTER opt_dce (duplicate %s2 add removed) ---", m4d);
+    _zag_print("EXPECT: exactly ONE 'arith.addi %a, %b'; muli operands both %s1.\n\n");
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  EDGE A — cmpi folding: const compare folds to 0/1.
+    //      %c1=7 ; %c2=9 ; %lt = cmpi slt %c1,%c2  → constant 1.
+    // ════════════════════════════════════════════════════════════════════════
+    _zag_print("########## EDGE A: cmpi folding (7 < 9 -> 1) ##########\n");
+    let ba: ZBlock = one_block();
+    push[ZOp](&ba.ops, tconst("%c1", "7"));
+    push[ZOp](&ba.ops, tconst("%c2", "9"));
+    let cmpo: ZOp = mk_op("arith.cmpi");
+    push[ZVal](&cmpo.results, tval("%lt", "bool"));
+    push[ZVal](&cmpo.operands, tval("%c1", "i32"));
+    push[ZVal](&cmpo.operands, tval("%c2", "i32"));
+    push[ZAttr](&cmpo.attrs, ZAttr{ .key = "predicate", .val = "slt" });
+    push[ZOp](&ba.ops, cmpo);
+    push[ZOp](&ba.ops, tret(tval("%lt", "bool")));
+    let ma: ZModule = tmodule("cmpfold", ba);
+    show("--- BEFORE (%lt = cmpi slt %c1,%c2) ---", ma);
+    let maf: ZModule = opt_fold(ma);
+    show("--- AFTER opt_fold (cmpi folded to constant 1) ---", maf);
+    _zag_print("EXPECT: '%lt = arith.constant 1', no arith.cmpi.\n\n");
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  EDGE B — division by zero is NEVER folded (semantics preserved).
+    //      %z=0 ; %n=8 ; %d = divsi %n,%z  → must stay a divsi.
+    // ════════════════════════════════════════════════════════════════════════
+    _zag_print("########## EDGE B: divsi by ZERO is NOT folded ##########\n");
+    let bd: ZBlock = one_block();
+    push[ZOp](&bd.ops, tconst("%n", "8"));
+    push[ZOp](&bd.ops, tconst("%z", "0"));
+    push[ZOp](&bd.ops, tbin("arith.divsi", "%d", tval("%n", "i32"), tval("%z", "i32")));
+    push[ZOp](&bd.ops, tret(tval("%d", "i32")));
+    let md: ZModule = tmodule("divzero", bd);
+    show("--- BEFORE (%d = divsi %n, %z where %z = 0) ---", md);
+    let mdf: ZModule = opt_fold(md);
+    show("--- AFTER opt_fold (UNCHANGED: divsi by 0 kept) ---", mdf);
+    _zag_print("EXPECT: 'arith.divsi %n, %z' still present (no fold).\n\n");
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  (5) opt_all — combined fixpoint on test 1's source.
+    // ════════════════════════════════════════════════════════════════════════
+    _zag_print("########## TEST 5: opt_all combined fixpoint ##########\n");
+    let m5: ZModule = build_module(parse_program(src));
+    show("--- BEFORE ---", m5);
+    let m5o: ZModule = opt_all(m5);
+    show("--- AFTER opt_all (simplify->fold->cse->dce to fixpoint) ---", m5o);
+    _zag_print("EXPECT: a single 'arith.constant 20' returned.\n\n");
+
+    _zag_print("ALL ZOPT TESTS RAN.\n");
+}

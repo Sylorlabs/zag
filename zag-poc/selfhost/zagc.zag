@@ -90,6 +90,58 @@ fn stem_of(path: []u8) []u8 {
     return base;
 }
 
+// ── ppu32 hardware-posit target detection ────────────────────────────────────
+// Returns 1 if a `--target ppu32` (two-arg) or `--target=ppu32` flag is present.
+fn ppu32_target() i32 {
+    let i: i32 = 0;
+    while (i < _zag_argc()) {
+        let a: []u8 = _zag_arg(i);
+        if (@strEq(a, "--target")) {
+            if (i + 1 < _zag_argc()) {
+                if (@strEq(_zag_arg(i + 1), "ppu32")) { return 1; }
+            }
+        }
+        if (@strEq(a, "--target=ppu32")) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// `--emit-c`: emit the generated C to <stem>.c in the CWD and STOP — no cc, no
+// run. `ppu32` selects the RISC-V PPU hardware-posit path (padd.s/psub.s/…)
+// behind #ifdef ZAG_TARGET_PPU32; otherwise the portable software posit math.
+fn build_emit_c(path: []u8, ppu32: i32) void {
+    if (path.len == 0) { _zag_println("zag: no source file"); return; }
+    let src: []u8 = _zag_read_file(path);
+    if (src.len < 0) {
+        _zag_print("zag: cannot read ");
+        _zag_println(path);
+        return;
+    }
+    let cfiles: ArrayList[[]u8] = make[[]u8](2);
+    let decls: ArrayList[*Node] = parse_program_collect(src, dir_of(path), &cfiles);
+    lower_operators(decls);
+    let eff: map.StringMap[i32] = analyze(decls);
+    let nviol: i32 = count_violations(decls, eff);
+    if (nviol > 0) {
+        _zag_println("zag: build aborted (capability violations above)");
+        return;
+    }
+    let cbuf: ArrayList[u8] = codegen_decls_t(decls, ppu32);
+    // <stem>.c in the CWD (basename without extension), e.g. examples/posit32.zag → posit32.c
+    let cpath: []u8 = _zag_str_concat(stem_of(path), ".c");
+    let wrc: i32 = _zag_write_file(cpath, cbuf.data[0..cbuf.len]);
+    if (wrc != 0) {
+        _zag_println("zag: failed to write C output");
+        return;
+    }
+    if (ppu32 == 1) {
+        _zag_println("zag: [ppu32] hardware posit path — padd.s/psub.s/pmul.s/pdiv.s inline asm");
+    }
+    _zag_print("zag: wrote C ");
+    _zag_println(cpath);
+}
+
 // Build a GPU program to MLIR: parse, emit MLIR, write <stem>.mlir, return.
 fn build_gpu(path: []u8, target: []u8) void {
     if (path.len == 0) { _zag_println("zag: no source file"); return; }
@@ -103,6 +155,7 @@ fn build_gpu(path: []u8, target: []u8) void {
     // now guarding GPU kernels: a kernel that calls a forbidden op is rejected
     // before any MLIR is emitted.
     let decls: ArrayList[*Node] = parse_program_dir(src, dir_of(path));
+    lower_operators(decls);
     let eff: map.StringMap[i32] = analyze(decls);
     let nviol: i32 = count_violations(decls, eff);
     if (nviol > 0) {
@@ -141,6 +194,7 @@ fn build_via_zir(path: []u8, do_run: i32) void {
     if (src.len < 0) { _zag_print("zag: cannot read "); _zag_println(path); return; }
     // capability proof first (same guarantee as the normal path)
     let decls: ArrayList[*Node] = parse_program_dir(src, dir_of(path));
+    lower_operators(decls);
     let eff: map.StringMap[i32] = analyze(decls);
     if (count_violations(decls, eff) > 0) { _zag_println("zag: build aborted (capability violations above)"); return; }
     let cbuf: ArrayList[u8] = zir_to_c(src, dir_of(path));
@@ -158,43 +212,11 @@ fn build_via_zir(path: []u8, do_run: i32) void {
 }
 
 // ── effect/capability reporting ──────────────────────────────────────────────
+// Delegates to the self-hosted checker (selfhost/sema.zag), which performs the
+// context-sensitive (effect-polymorphic) latent-effect analysis AND the fn-type
+// contract/store checks, printing each violation and returning the count.
 fn count_violations(decls: ArrayList[*Node], eff: map.StringMap[i32]) i32 {
-    let total: i32 = 0;
-    let i: i32 = 0;
-    while (i < len[*Node](decls)) {
-        total = total + decl_violations(get[*Node](decls, i), eff);
-        i = i + 1;
-    }
-    return total;
-}
-
-fn decl_violations(d: *Node, eff: map.StringMap[i32]) i32 {
-    return switch (d.*) {
-        .fn_decl => |f| fn_violations(f, eff),
-        else     => 0,
-    };
-}
-
-fn fn_violations(f: FnDecl, eff: map.StringMap[i32]) i32 {
-    let myeff: i32 = map.get[i32](eff, f.name) orelse 0;
-    let count: i32 = 0;
-    let i: i32 = 0;
-    while (i < len[[]u8](f.annots)) {
-        let a: []u8 = get[[]u8](f.annots, i);
-        let forb: i32 = forbidden_bits(a);
-        if (forb != 0) {
-            let bad: i32 = myeff & forb;
-            if (bad != 0) {
-                _zag_print("zag: VIOLATION in ");
-                _zag_print(f.name);
-                _zag_print(" ");
-                _zag_println(a);
-                count = count + 1;
-            }
-        }
-        i = i + 1;
-    }
-    return count;
+    return report_violations(decls, eff);
 }
 
 // ── subcommands ──────────────────────────────────────────────────────────────
@@ -208,10 +230,14 @@ fn check_file(path: []u8) void {
     }
     // resolve @imports relative to the source file's directory (same as build)
     let decls: ArrayList[*Node] = parse_program_dir(src, dir_of(path));
+    lower_operators(decls);
     let eff: map.StringMap[i32] = analyze(decls);
     let nviol: i32 = count_violations(decls, eff);
     if (nviol == 0) {
         _zag_println("zag: OK — all capability claims proven");
+    } else {
+        _zag_println("zag: capability check FAILED");
+        _zag_exit(1);
     }
 }
 
@@ -241,6 +267,7 @@ fn build_file(path: []u8, do_run: i32) void {
     // runtime.c files to link.
     let cfiles: ArrayList[[]u8] = make[[]u8](2);
     let decls: ArrayList[*Node] = parse_program_collect(src, dir_of(path), &cfiles);
+    lower_operators(decls);
     let eff: map.StringMap[i32] = analyze(decls);
     let nviol: i32 = count_violations(decls, eff);
     if (nviol > 0) {
@@ -267,6 +294,7 @@ fn build_file(path: []u8, do_run: i32) void {
     }
     cmd = _zag_str_concat(cmd, " -o ");
     cmd = _zag_str_concat(cmd, binpath);
+    cmd = _zag_str_concat(cmd, " -lm");   // posit/quire runtime uses libm (ldexp/frexp)
     let rc: i32 = _zag_exec_cmd(cmd);
     if (rc != 0) {
         _zag_println("zag: cc failed");
@@ -292,17 +320,28 @@ fn print_version() void {
     _zag_println("  the Zag compiler, written in Zag, bootstrapped by zig zagc");
 }
 
+// `version` subcommand and the `--version` / `-v` flags all map here.
+// (kept as a helper rather than `a || b` — `|` lexes as the capture pipe.)
+fn is_version(c: []u8) i32 {
+    if (@strEq(c, "version"))   { return 1; }
+    if (@strEq(c, "--version")) { return 1; }
+    if (@strEq(c, "-v"))        { return 1; }
+    return 0;
+}
+
 fn main() void {
     if (_zag_argc() < 2) {
         _zag_println("usage: zag build|check|ast|version <source.zag> [--run]");
+        _zag_println("       zag --version | -v");
         return;
     }
     let cmd: []u8 = _zag_arg(1);
     let gtarget: []u8 = gpu_target();
-    if (@strEq(cmd, "version")) {
+    if (is_version(cmd) == 1) {
         print_version();
     } else if (@strEq(cmd, "build")) {
         if (gtarget.len > 0) { build_gpu(find_path(2), gtarget); }
+        else if (has_flag("--emit-c") == 1) { build_emit_c(find_path(2), ppu32_target()); }
         else if (has_flag("--via-zir") == 1) { build_via_zir(find_path(2), has_flag("--run")); }
         else { build_file(find_path(2), has_flag("--run")); }
     } else if (@strEq(cmd, "zir")) {

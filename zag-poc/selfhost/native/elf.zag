@@ -1,0 +1,256 @@
+// selfhost/native/elf.zag — the LINKER / ELF64 executable WRITER.
+//
+// The final stage of Zag's from-scratch native x86-64 backend. Given a flat
+// blob of already-assembled machine code, it wraps that code into a minimal,
+// statically-linked, runnable ELF64 x86-64 executable and writes it to disk
+// (executable) via the runtime. There is NO cc/as/ld/LLVM anywhere here — the
+// bytes of a valid ELF file are emitted directly, little-endian, by hand.
+//
+// Layout (the classic single PT_LOAD flat executable):
+//
+//     file offset 0    ┌──────────────────────────────┐  vaddr VBASE (0x400000)
+//                      │ ELF64 header        (64 bytes)│
+//     file offset 64   ├──────────────────────────────┤
+//                      │ program header      (56 bytes)│  PT_LOAD, R+X
+//     file offset 120  ├──────────────────────────────┤  vaddr VBASE+120
+//                      │ machine code (`text`)         │
+//                      └──────────────────────────────┘
+//
+// The single PT_LOAD segment covers the whole file (offset 0, vaddr VBASE), so
+// the headers themselves are mapped — the simplest correct scheme. Entry point
+// is VBASE + 120 + entry_off, i.e. `entry_off` bytes into the text blob.
+//
+// LANGUAGE SUBSET NOTE (self-hosted compiler): no `<<`/`>>` and no `|`/`||`.
+// Multi-byte little-endian fields are emitted with arithmetic in emit_le: a low
+// byte is masked with `&`, peeled off, and the value divided down by 256. Deref
+// a pointer field as `p.*.field`. No break/continue.
+
+@import("../../std/list.zag")
+@import("../../std/rt.zag")
+
+// ── ELF / layout constants ───────────────────────────────────────────────────
+// Virtual base address the segment is mapped at (the classic 0x400000).
+fn VBASE() i64 { return 4194304; }
+// Size of the header region: ELF64 header (64) + one program header (56).
+fn HDRS()  i64 { return 120; }
+
+// Fixed virtual base of the read-only DATA segment (mirrors isa.zag's
+// DATA_VBASE() = 0x600000). Kept as a local literal so elf.zag stays
+// self-contained and importable alongside isa.zag without a duplicate symbol.
+fn DVBASE() i64 { return 6291456; }   // 0x600000
+// Header region for the 2-segment layout: ELF64 header (64) + TWO program
+// headers (2 * 56 = 112) = 176 bytes.
+fn HDRS2() i64 { return 176; }
+// Page size used for the p_offset ≡ p_vaddr (mod p_align) alignment rule.
+fn PAGE()  i64 { return 4096; }
+
+// ── byte emitters (the verified helpers) ─────────────────────────────────────
+// Append the low byte of `b`.
+fn elf_eb(buf: *ArrayList[u8], b: i32) void { push[u8](buf, (b % 256) as u8); }
+
+// Append `v` as `n` little-endian bytes (sign-correct: works for any width).
+fn elf_emit_le(buf: *ArrayList[u8], v: i64, n: i32) void {
+    let x: i64 = v;
+    let k: i32 = 0;
+    while (k < n) {
+        let b: i64 = x & 255;
+        elf_eb(buf, b as i32);
+        x = (x - b) / 256;
+        k = k + 1;
+    }
+}
+
+// ── the writer ───────────────────────────────────────────────────────────────
+// Wrap `text` (raw machine code) into a minimal ELF64 x86-64 executable, write
+// it to `path` (chmod +x), and return the runtime's rc (0 = success).
+//
+//   path      — destination file path.
+//   text      — the assembled machine-code bytes (may be empty).
+//   entry_off — byte offset into `text` of the program entry point.
+fn write_elf_exec(path: []u8, text: ArrayList[u8], entry_off: i32) i32 {
+    let tlen: i64 = text.len as i64;
+    let filesz: i64 = HDRS() + tlen;            // segment covers headers + text
+    let entry: i64 = VBASE() + HDRS() + (entry_off as i64);
+
+    // Reserve enough capacity up front to dodge re-growth churn (not required
+    // for correctness — push grows on demand — but keeps it tidy).
+    let buf: ArrayList[u8] = make[u8](128 + text.len);
+
+    // ── ELF64 header (64 bytes) ──────────────────────────────────────────────
+    // e_ident (16 bytes)
+    elf_eb(&buf, 127);          // 0x7F  EI_MAG0
+    elf_eb(&buf, 69);           // 'E'   EI_MAG1
+    elf_eb(&buf, 76);           // 'L'   EI_MAG2
+    elf_eb(&buf, 70);           // 'F'   EI_MAG3
+    elf_eb(&buf, 2);            // EI_CLASS   = ELFCLASS64
+    elf_eb(&buf, 1);            // EI_DATA    = ELFDATA2LSB (little-endian)
+    elf_eb(&buf, 1);            // EI_VERSION = EV_CURRENT
+    elf_eb(&buf, 0);            // EI_OSABI   = System V
+    elf_eb(&buf, 0);            // EI_ABIVERSION
+    elf_eb(&buf, 0);            // EI_PAD[0]
+    elf_eb(&buf, 0);            // EI_PAD[1]
+    elf_eb(&buf, 0);            // EI_PAD[2]
+    elf_eb(&buf, 0);            // EI_PAD[3]
+    elf_eb(&buf, 0);            // EI_PAD[4]
+    elf_eb(&buf, 0);            // EI_PAD[5]
+    elf_eb(&buf, 0);            // EI_PAD[6]   (16 e_ident bytes total)
+
+    elf_emit_le(&buf, 2, 2);            // e_type      u16 = ET_EXEC
+    elf_emit_le(&buf, 62, 2);           // e_machine   u16 = EM_X86_64
+    elf_emit_le(&buf, 1, 4);            // e_version   u32 = EV_CURRENT
+    elf_emit_le(&buf, entry, 8);        // e_entry     u64 = VBASE + 120 + entry_off
+    elf_emit_le(&buf, 64, 8);           // e_phoff     u64 = 64 (phdr right after ehdr)
+    elf_emit_le(&buf, 0, 8);            // e_shoff     u64 = 0 (no section headers)
+    elf_emit_le(&buf, 0, 4);            // e_flags     u32 = 0
+    elf_emit_le(&buf, 64, 2);           // e_ehsize    u16 = 64
+    elf_emit_le(&buf, 56, 2);           // e_phentsize u16 = 56
+    elf_emit_le(&buf, 1, 2);            // e_phnum     u16 = 1
+    elf_emit_le(&buf, 0, 2);            // e_shentsize u16 = 0
+    elf_emit_le(&buf, 0, 2);            // e_shnum     u16 = 0
+    elf_emit_le(&buf, 0, 2);            // e_shstrndx  u16 = 0
+
+    // ── program header (56 bytes), PT_LOAD ───────────────────────────────────
+    // NOTE: in ELF64 p_flags comes right after p_type.
+    elf_emit_le(&buf, 1, 4);            // p_type   u32 = PT_LOAD
+    elf_emit_le(&buf, 5, 4);            // p_flags  u32 = R(4) + X(1)
+    elf_emit_le(&buf, 0, 8);            // p_offset u64 = 0 (map from file start)
+    elf_emit_le(&buf, VBASE(), 8);      // p_vaddr  u64 = VBASE
+    elf_emit_le(&buf, VBASE(), 8);      // p_paddr  u64 = VBASE
+    elf_emit_le(&buf, filesz, 8);       // p_filesz u64 = 120 + text.len
+    elf_emit_le(&buf, filesz, 8);       // p_memsz  u64 = 120 + text.len
+    elf_emit_le(&buf, 4096, 8);         // p_align  u64 = 0x1000
+
+    // At this point exactly HDRS() (120) bytes have been written. The text blob
+    // begins here, at file offset 120 / vaddr VBASE+120.
+
+    // ── machine code ─────────────────────────────────────────────────────────
+    let i: i32 = 0;
+    let n: i32 = text.len;
+    while (i < n) {
+        elf_eb(&buf, get[u8](text, i) as i32);
+        i = i + 1;
+    }
+
+    // Emit the file executable (0755) and hand back the runtime's status.
+    return _zag_write_exec(path, buf.data[0..buf.len]);
+}
+
+// ── the 2-segment writer ─────────────────────────────────────────────────────
+// Wrap `text` (code, R+X at 0x400000) and `data` (read-only blob, R at
+// 0x600000) into a statically-linked ELF64 x86-64 executable with TWO PT_LOAD
+// segments, write it to `path` (chmod +x), and return the runtime's rc.
+//
+//   path      — destination file path.
+//   text      — the assembled machine-code bytes (may be empty).
+//   entry_off — byte offset into `text` of the program entry point.
+//   data      — the read-only data blob mapped at DVBASE() (may be empty).
+//
+// LAYOUT
+//   [64B ehdr][56B phdr1 code][56B phdr2 data][text bytes][zero pad][data bytes]
+//
+//   header region = 64 + 2*56 = 176 (HDRS2). Code begins at file offset 176,
+//   vaddr 0x400000+176. e_entry = 0x400000 + 176 + entry_off.
+//
+//   ELF requires p_offset ≡ p_vaddr (mod p_align). DVBASE (0x600000) is page
+//   aligned, so the data's FILE OFFSET must be a multiple of 0x1000. After
+//   writing headers(176)+code(text.len), zero-pad up to the next page boundary
+//   → that is data_file_off.
+fn write_elf_exec_data(path: []u8, text: ArrayList[u8], entry_off: i32, data: ArrayList[u8]) i32 {
+    let tlen: i64 = text.len as i64;
+    let dlen: i64 = data.len as i64;
+
+    // Code PT_LOAD covers headers + text (mapped from file offset 0 / DVBASE).
+    let code_filesz: i64 = HDRS2() + tlen;
+    let entry: i64 = VBASE() + HDRS2() + (entry_off as i64);
+
+    // Page-align the data's file offset. `used` is the byte count after the
+    // headers and the code blob; pad with zeros up to the next page boundary.
+    let used: i64 = HDRS2() + tlen;
+    let pad: i64 = (PAGE() - (used % PAGE())) % PAGE();
+    let data_file_off: i64 = used + pad;
+
+    // Reserve enough capacity up front to dodge re-growth churn (push grows on
+    // demand, so this is only a courtesy, not required for correctness).
+    let buf: ArrayList[u8] = make[u8](192 + text.len + (pad as i32) + data.len);
+
+    // ── ELF64 header (64 bytes) ──────────────────────────────────────────────
+    // e_ident (16 bytes)
+    elf_eb(&buf, 127);          // 0x7F  EI_MAG0
+    elf_eb(&buf, 69);           // 'E'   EI_MAG1
+    elf_eb(&buf, 76);           // 'L'   EI_MAG2
+    elf_eb(&buf, 70);           // 'F'   EI_MAG3
+    elf_eb(&buf, 2);            // EI_CLASS   = ELFCLASS64
+    elf_eb(&buf, 1);            // EI_DATA    = ELFDATA2LSB (little-endian)
+    elf_eb(&buf, 1);            // EI_VERSION = EV_CURRENT
+    elf_eb(&buf, 0);            // EI_OSABI   = System V
+    elf_eb(&buf, 0);            // EI_ABIVERSION
+    elf_eb(&buf, 0);            // EI_PAD[0]
+    elf_eb(&buf, 0);            // EI_PAD[1]
+    elf_eb(&buf, 0);            // EI_PAD[2]
+    elf_eb(&buf, 0);            // EI_PAD[3]
+    elf_eb(&buf, 0);            // EI_PAD[4]
+    elf_eb(&buf, 0);            // EI_PAD[5]
+    elf_eb(&buf, 0);            // EI_PAD[6]   (16 e_ident bytes total)
+
+    elf_emit_le(&buf, 2, 2);            // e_type      u16 = ET_EXEC
+    elf_emit_le(&buf, 62, 2);           // e_machine   u16 = EM_X86_64
+    elf_emit_le(&buf, 1, 4);            // e_version   u32 = EV_CURRENT
+    elf_emit_le(&buf, entry, 8);        // e_entry     u64 = VBASE + 176 + entry_off
+    elf_emit_le(&buf, 64, 8);           // e_phoff     u64 = 64 (phdrs right after ehdr)
+    elf_emit_le(&buf, 0, 8);            // e_shoff     u64 = 0 (no section headers)
+    elf_emit_le(&buf, 0, 4);            // e_flags     u32 = 0
+    elf_emit_le(&buf, 64, 2);           // e_ehsize    u16 = 64
+    elf_emit_le(&buf, 56, 2);           // e_phentsize u16 = 56
+    elf_emit_le(&buf, 2, 2);            // e_phnum     u16 = 2  ← two segments
+    elf_emit_le(&buf, 0, 2);            // e_shentsize u16 = 0
+    elf_emit_le(&buf, 0, 2);            // e_shnum     u16 = 0
+    elf_emit_le(&buf, 0, 2);            // e_shstrndx  u16 = 0
+
+    // ── program header 1 (56 bytes), PT_LOAD code (R+X) ──────────────────────
+    elf_emit_le(&buf, 1, 4);            // p_type   u32 = PT_LOAD
+    elf_emit_le(&buf, 5, 4);            // p_flags  u32 = R(4) + X(1)
+    elf_emit_le(&buf, 0, 8);            // p_offset u64 = 0 (map from file start)
+    elf_emit_le(&buf, VBASE(), 8);      // p_vaddr  u64 = 0x400000
+    elf_emit_le(&buf, VBASE(), 8);      // p_paddr  u64 = 0x400000
+    elf_emit_le(&buf, code_filesz, 8);  // p_filesz u64 = 176 + text.len
+    elf_emit_le(&buf, code_filesz, 8);  // p_memsz  u64 = 176 + text.len
+    elf_emit_le(&buf, PAGE(), 8);       // p_align  u64 = 0x1000
+
+    // ── program header 2 (56 bytes), PT_LOAD data (R only) ───────────────────
+    elf_emit_le(&buf, 1, 4);              // p_type   u32 = PT_LOAD
+    elf_emit_le(&buf, 4, 4);              // p_flags  u32 = R(4)
+    elf_emit_le(&buf, data_file_off, 8);  // p_offset u64 = page-aligned data offset
+    elf_emit_le(&buf, DVBASE(), 8);       // p_vaddr  u64 = 0x600000
+    elf_emit_le(&buf, DVBASE(), 8);       // p_paddr  u64 = 0x600000
+    elf_emit_le(&buf, dlen, 8);           // p_filesz u64 = data.len (0 ok)
+    elf_emit_le(&buf, dlen, 8);           // p_memsz  u64 = data.len (0 ok)
+    elf_emit_le(&buf, PAGE(), 8);         // p_align  u64 = 0x1000
+
+    // At this point exactly HDRS2() (176) bytes have been written.
+
+    // ── machine code ─────────────────────────────────────────────────────────
+    let i: i32 = 0;
+    let n: i32 = text.len;
+    while (i < n) {
+        elf_eb(&buf, get[u8](text, i) as i32);
+        i = i + 1;
+    }
+
+    // ── zero pad up to the page-aligned data file offset ─────────────────────
+    let p: i64 = 0;
+    while (p < pad) {
+        elf_eb(&buf, 0);
+        p = p + 1;
+    }
+
+    // ── data blob ────────────────────────────────────────────────────────────
+    let d: i32 = 0;
+    let dn: i32 = data.len;
+    while (d < dn) {
+        elf_eb(&buf, get[u8](data, d) as i32);
+        d = d + 1;
+    }
+
+    // Emit the file executable (0755) and hand back the runtime's status.
+    return _zag_write_exec(path, buf.data[0..buf.len]);
+}

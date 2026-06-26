@@ -2,7 +2,7 @@
 # Self-hosted compiler tests: each stage of the Zag-in-Zag compiler must build
 # (via the bootstrap zig zagc) and produce the expected result.
 cd "$(dirname "$0")/.."
-ZAGC=./zig-out/bin/zagc
+ZAGC=./zagc
 pass=0; fail=0
 
 # Lexer: token-kind codes (numeric lines) followed by three token texts.

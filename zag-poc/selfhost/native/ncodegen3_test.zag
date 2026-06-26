@@ -1,0 +1,163 @@
+// selfhost/native/ncodegen3_test.zag — REAL end-to-end verification of the
+// NATIVE x86-64 codegen's GAP-CLOSING features:
+//   1. struct BY-VALUE arguments (callee gets its own copy → mutation isolation)
+//   2. struct BY-VALUE returns (sret convention via R_R10)
+//   3. general []u8 SLICE values (2-word {ptr,len} aggregate)
+//   4. new(T{..}) HEAP allocation (mmap)
+//   5. CONDITIONAL support routines (no print/alloc body if unused)
+// PLUS non-regression of the existing integer/print/struct/string behaviour and
+// loud rejection of what is still unsupported.
+//
+// For each program we run the full from-scratch pipeline (no cc/as/ld/LLVM):
+//   parse → lower_program(decls,&err,&data) → encode(prog)
+//         → write_elf_exec_data(path, code, 0, data)
+// The proof is the process STDOUT + EXIT CODE (checked from bash) and, for the
+// bloat case, an objdump of the emitted binary.
+//
+//   Run:  ./zagc build selfhost/native/ncodegen3_test.zag --run
+//   Then: run each /tmp/g_* and check its stdout + `echo $?`.
+
+@import("x86.zag")
+@import("elf.zag")
+@import("ncodegen.zag")
+
+// Build an expected-OK program (writes a real runnable ELF, 2 segments).
+fn build(tag: []u8, path: []u8, src: []u8) void {
+    let decls: ArrayList[*Node] = parse_program_dir(src, ".");
+    let nerr: i32 = 0;
+    let data: ArrayList[u8] = make[u8](16);
+    let prog: ArrayList[Instr] = lower_program(decls, &nerr, &data);
+    let code: ArrayList[u8] = encode(prog);
+    let rc: i32 = write_elf_exec_data(path, code, 0, data);
+    _zag_print(tag);
+    _zag_print(": err=");
+    _zag_print(_zag_i64_to_str(nerr as i64));
+    _zag_print(" instrs=");
+    _zag_print(_zag_i64_to_str(prog.len as i64));
+    _zag_print(" code=");
+    _zag_print(_zag_i64_to_str(code.len as i64));
+    _zag_print(" data=");
+    _zag_print(_zag_i64_to_str(data.len as i64));
+    _zag_print(" -> ");
+    _zag_print(path);
+    if (rc == 0) { _zag_println(" OK"); }
+    else { _zag_println(" WRITE-FAILED"); }
+}
+
+// A program we EXPECT to be rejected loudly: confirm err > 0 (driver aborts).
+fn build_reject(tag: []u8, path: []u8, src: []u8) void {
+    let decls: ArrayList[*Node] = parse_program_dir(src, ".");
+    let nerr: i32 = 0;
+    let data: ArrayList[u8] = make[u8](16);
+    let prog: ArrayList[Instr] = lower_program(decls, &nerr, &data);
+    let _code: ArrayList[u8] = encode(prog);
+    _zag_print(tag);
+    _zag_print(": err=");
+    _zag_print(_zag_i64_to_str(nerr as i64));
+    if (nerr > 0) { _zag_println("  REJECTED-LOUDLY (good)"); }
+    else { _zag_println("  *** NOT REJECTED (BAD) ***"); }
+}
+
+fn main() void {
+    // ══ 1. STRUCT BY-VALUE ARGS — mutation isolation ════════════════════════════
+    // bump(p) reads p.x; q.x must still be 41 after the call. Expect exit 42.
+    build("a1_byval_read", "/tmp/g_a1",
+        "struct P{x:i32} fn bump(p:P) i32 { return p.x + 1; } fn main() i32 { let q:P=P{.x=41}; let r:i32=bump(q); return r + (q.x - 41); }");
+
+    // Callee WRITES p.x (mutates its own copy); caller's q.x must be UNCHANGED.
+    // setx mutates its copy to 999 and returns it; main returns q.x (still 7) +
+    // (got - 999). got==999 so the second term is 0 → exit 7. Proves isolation.
+    build("a2_byval_write", "/tmp/g_a2",
+        "struct P{x:i32} fn setx(p:P) i32 { p.x = 999; return p.x; } fn main() i32 { let q:P=P{.x=7}; let got:i32=setx(q); return q.x + (got - 999); }");
+
+    // MULTI-FIELD by-value arg isolation: callee mutates BOTH fields of its copy.
+    // sum2 sets p.x=100,p.y=200, returns p.x+p.y=300. Caller's q stays {3,4}.
+    // main returns (q.x+q.y) + (got-300) = 7 + 0 = 7. Proves full-block isolation.
+    build("a3_byval_multi", "/tmp/g_a3",
+        "struct P{x:i32,y:i32} fn sum2(p:P) i32 { p.x=100; p.y=200; return p.x+p.y; } fn main() i32 { let q:P=P{.x=3,.y=4}; let got:i32=sum2(q); return (q.x+q.y) + (got-300); }");
+
+    // ══ 2. STRUCT BY-VALUE RETURNS — sret ═══════════════════════════════════════
+    build("b1_byval_ret", "/tmp/g_b1",
+        "struct P{x:i32,y:i32} fn mk(a:i32,b:i32) P { return P{.x=a,.y=b}; } fn main() i32 { let p:P=mk(30,12); return p.x+p.y; }");
+
+    // return a struct built from a struct PARAM passed by value, then consumed.
+    build("b2_ret_chain", "/tmp/g_b2",
+        "struct P{x:i32,y:i32} fn id(p:P) P { return P{.x=p.x,.y=p.y}; } fn main() i32 { let a:P=P{.x=40,.y=2}; let b:P=id(a); return b.x+b.y; }");
+
+    // ══ 3. []u8 SLICE VALUES ════════════════════════════════════════════════════
+    // slen(s) returns s.len for a slice PARAM. Expect exit 5.
+    build("c1_slice_len", "/tmp/g_c1",
+        "fn slen(s:[]u8) i32 { return s.len; } fn main() i32 { let s:[]u8=\"hello\"; return slen(s); }");
+
+    // index a slice variable: s[1] == 'e' == 101. Expect exit 101.
+    build("c2_slice_index", "/tmp/g_c2",
+        "fn main() i32 { let s:[]u8=\"hello\"; return s[1]; }");
+
+    // print_str of a slice VARIABLE prints "hello".
+    build("c3_slice_print", "/tmp/g_c3",
+        "fn main() i32 { let s:[]u8=\"hello\"; print_str(s); return 0; }");
+
+    // pass a slice to a fn that prints it (by pointer, like a struct).
+    build("c4_slice_arg_print", "/tmp/g_c4",
+        "fn show(s:[]u8) void { print_str(s); } fn main() i32 { let s:[]u8=\"hi!\\n\"; show(s); return 0; }");
+
+    // empty slice: len 0, prints nothing, exit 0.
+    build("c5_slice_empty", "/tmp/g_c5",
+        "fn main() i32 { let s:[]u8=\"\"; print_str(s); return s.len; }");
+
+    // slice copy: let t = s; t.len still 4 ("abcd"). Expect exit 4.
+    build("c6_slice_copy", "/tmp/g_c6",
+        "fn main() i32 { let s:[]u8=\"abcd\"; let t:[]u8=s; return t.len; }");
+
+    // string literal passed DIRECTLY (not via a var) to a []u8 param.
+    build("c7_litarg", "/tmp/g_c7",
+        "fn slen(s:[]u8) i32 { return s.len; } fn main() i32 { return slen(\"worldly\"); }");
+
+    // ══ 4. new(T{..}) HEAP ALLOCATION ═══════════════════════════════════════════
+    build("d1_new", "/tmp/g_d1",
+        "struct P{x:i32,y:i32} fn main() i32 { let p:*P = new(P{.x=40,.y=2}); return p.*.x + p.*.y; }");
+
+    // mutate through the heap pointer, then read back.
+    build("d2_new_mut", "/tmp/g_d2",
+        "struct P{x:i32,y:i32} fn main() i32 { let p:*P = new(P{.x=1,.y=2}); p.*.x = 40; return p.*.x + p.*.y; }");
+
+    // two distinct allocations are independent (different pages).
+    build("d3_new_two", "/tmp/g_d3",
+        "struct P{x:i32} fn main() i32 { let a:*P = new(P{.x=10}); let b:*P = new(P{.x=32}); a.*.x = a.*.x + 0; return a.*.x + b.*.x; }");
+
+    // THREE allocations + locals in one frame — stresses the per-`new` pslot
+    // frame reservation (an unreserved pslot overran the aligned frame → segfault
+    // for >=2 news; this regression-guards that fix). 10+12+20 = 42.
+    build("d4_new_three", "/tmp/g_d4",
+        "struct P{x:i32} fn main() i32 { let a:*P=new(P{.x=10}); let b:*P=new(P{.x=12}); let c:*P=new(P{.x=20}); return a.*.x + b.*.x + c.*.x; }");
+
+    // ══ 5. CONDITIONAL SUPPORT ROUTINES (bloat) ═════════════════════════════════
+    // No print, no alloc → binary must contain NONE of the support-routine bodies.
+    build("e1_bare42", "/tmp/g_e1",
+        "fn main() i32 { return 42; }");
+
+    // ══ NON-REGRESSION ══════════════════════════════════════════════════════════
+    build("f1_ret42", "/tmp/g_f1", "fn main() i32 { return 42; }");
+    build("f2_fib10", "/tmp/g_f2",
+        "fn fib(n:i32) i32 { if (n < 2) { return n; } return fib(n-1) + fib(n-2); } fn main() i32 { return fib(10); }");
+    build("f3_print12345", "/tmp/g_f3",
+        "fn main() i32 { print_int(12345); return 0; }");
+    build("f4_printstr", "/tmp/g_f4",
+        "fn main() i32 { print_str(\"hi\\n\"); return 0; }");
+    build("f5_struct42", "/tmp/g_f5",
+        "struct P{x:i32,y:i32} fn main() i32 { let p:P=P{.x=30,.y=12}; return p.x+p.y; }");
+    build("f6_while55", "/tmp/g_f6",
+        "fn main() i32 { let s:i32=0; let i:i32=1; while (i <= 10) { s = s + i; i = i + 1; } return s; }");
+
+    // ══ STILL-UNSUPPORTED → must be REJECTED LOUDLY ═════════════════════════════
+    // a non-string, non-aggregate value passed where the codegen can't address it:
+    // taking the address of a plain scalar local is rejected.
+    build_reject("r1_addr_scalar", "/tmp/g_r1",
+        "fn main() i32 { let a:i32=5; let p:*i32 = &a; return p.*; }");
+
+    // bare struct literal used as a non-let, non-arg, non-return VALUE.
+    build_reject("r2_bare_slit", "/tmp/g_r2",
+        "struct P{x:i32} fn id(n:i32) i32 { return n; } fn main() i32 { return id(P{.x=1}.x) + (P{.x=2}); }");
+
+    _zag_println("ncodegen3_test: all programs processed");
+}

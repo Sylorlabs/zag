@@ -1,0 +1,296 @@
+// selfhost/native/x86.zag — the ASSEMBLER (instruction encoder) for Zag's
+// from-scratch native x86-64 backend.
+//
+// Consumes the flat ArrayList[Instr] produced by codegen (see isa.zag for the
+// shared contract) and emits raw x86-64 machine-code bytes — no cc/as/ld/LLVM.
+//
+// Encoding strategy:
+//   • All operations are 64-bit, so every reg/reg + memory op carries REX.W.
+//   • Instruction lengths are FIXED (rel32 for every branch — no short-jump
+//     optimization), which makes a clean two-pass label resolver possible:
+//       pass 1 measures each instruction's offset into a scratch buffer and
+//       records every label's byte offset; pass 2 re-emits with resolved labels.
+//     Because the per-instruction length is identical in both passes, the
+//     offsets measured in pass 1 are exactly the offsets emitted in pass 2.
+//
+// LANGUAGE SUBSET (must compile under the self-hosted compiler):
+//   no `<<`/`>>` (lexer splits them) — bit fields are combined with `+`, a byte
+//   is extracted with `& 255` then `/ 256`. `|`/`||` are forbidden. No
+//   break/continue (flag-guarded while). Deref pointer field as `p.*.field`.
+
+@import("isa.zag")
+
+// ── verified little-endian byte emitter (sign-correct for two's complement) ──
+fn eb(buf: *ArrayList[u8], b: i32) void {
+    push[u8](buf, (b % 256) as u8);
+}
+
+fn emit_le(buf: *ArrayList[u8], v: i64, n: i32) void {
+    let x: i64 = v;
+    let k: i32 = 0;
+    while (k < n) {
+        let b: i64 = x & 255;
+        eb(buf, b as i32);
+        x = (x - b) / 256;
+        k = k + 1;
+    }
+}
+
+// ── REX prefix ───────────────────────────────────────────────────────────────
+// REX = 0100 WRXB. W=1 → 64-bit operand. R extends ModRM.reg, B extends
+// ModRM.rm / base, X extends SIB.index (always 0 here).
+fn rex(buf: *ArrayList[u8], w: i32, r: i32, x: i32, b: i32) void {
+    eb(buf, 64 + 8 * w + 4 * r + 2 * x + 1 * b);
+}
+
+// bool-ish: 1 if reg is an extended register (r8..r15), else 0.
+fn ext(r: i32) i32 {
+    if (r >= 8) { return 1; }
+    return 0;
+}
+
+// low 3 bits of the hardware register number (reg % 8).
+fn lo3(r: i32) i32 {
+    return r % 8;
+}
+
+// ModRM for a register-register operand: mod=3 → 0xC0 + reg3*8 + rm3.
+fn modrm_rr(reg: i32, rm: i32) i32 {
+    return 192 + lo3(reg) * 8 + lo3(rm);
+}
+
+// Emit a base+disp32 memory operand (ModRM mod=2). reg_field is the opcode's
+// /r register (or /digit extension); base is the base register.
+//   ModRM = 0x80 + reg3*8 + base3
+//   if base3 == 4 (rsp/r12) a SIB byte 0x24 is required (index=none, base=rsp)
+//   base3 == 5 (rbp/r13) is fine with mod=2 (explicit disp present)
+// disp is always emitted as a 4-byte signed value.
+fn mem(buf: *ArrayList[u8], reg_field: i32, base: i32, disp: i32) void {
+    eb(buf, 128 + lo3(reg_field) * 8 + lo3(base));
+    if (lo3(base) == 4) { eb(buf, 36); }   // SIB: scale=0 index=4(none) base=4 → 0x24
+    emit_le(buf, disp as i64, 4);
+}
+
+// setcc opcode (the second byte of the 0F xx form) for a CC_* code.
+fn setcc_op(cc: i32) i32 {
+    if (cc == CC_E())  { return 148; }   // 0x94 sete
+    if (cc == CC_NE()) { return 149; }   // 0x95 setne
+    if (cc == CC_L())  { return 156; }   // 0x9C setl
+    if (cc == CC_LE()) { return 158; }   // 0x9E setle
+    if (cc == CC_G())  { return 159; }   // 0x9F setg
+    return 157;                          // 0x9D setge (CC_GE)
+}
+
+// jcc opcode (the second byte of the 0F xx rel32 form) for a jump kind.
+fn jcc_op(kind: i32) i32 {
+    if (kind == K_JE())  { return 132; }  // 0x84
+    if (kind == K_JNE()) { return 133; }  // 0x85
+    if (kind == K_JL())  { return 140; }  // 0x8C
+    if (kind == K_JLE()) { return 142; }  // 0x8E
+    if (kind == K_JG())  { return 143; }  // 0x8F
+    return 141;                           // 0x8D (K_JGE)
+}
+
+fn is_jcc(kind: i32) i32 {
+    if (kind == K_JE())  { return 1; }
+    if (kind == K_JNE()) { return 1; }
+    if (kind == K_JL())  { return 1; }
+    if (kind == K_JLE()) { return 1; }
+    if (kind == K_JG())  { return 1; }
+    if (kind == K_JGE()) { return 1; }
+    return 0;
+}
+
+// ── core: encode a single instruction into `buf` ─────────────────────────────
+// `labels[lbl]` holds the resolved byte offset of each label (valid in pass 2;
+// zero-filled in pass 1, which is fine because lengths don't depend on it).
+// `base_off` is the offset of THIS instruction's first byte in the final image
+// (== the offset within `buf` since we always emit from offset 0).
+fn encode_one(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32], base_off: i32) void {
+    let k: i32 = ins.kind;
+
+    if (k == K_LABEL()) {
+        // emits nothing; its offset was recorded during pass 1.
+        return;
+    }
+
+    // ── mov dst, imm ─────────────────────────────────────────────────────────
+    if (k == K_MOV_IMM()) {
+        let d: i32 = ins.dst;
+        let v: i64 = ins.imm;
+        if (v >= (0 - 2147483648) && v <= 2147483647) {
+            rex(buf, 1, 0, 0, ext(d));
+            eb(buf, 199);                 // 0xC7
+            eb(buf, 192 + lo3(d));        // ModRM mod=3 reg=/0 rm=dst
+            emit_le(buf, v, 4);
+        } else {
+            rex(buf, 1, 0, 0, ext(d));
+            eb(buf, 184 + lo3(d));        // 0xB8 + rd (movabs)
+            emit_le(buf, v, 8);
+        }
+        return;
+    }
+
+    // ── reg-reg ALU/mov: opcode /r with reg=src, rm=dst ─────────────────────
+    if (k == K_MOV_RR()) { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 137); eb(buf, modrm_rr(ins.src, ins.dst)); return; }  // 0x89
+    if (k == K_ADD_RR()) { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 1);   eb(buf, modrm_rr(ins.src, ins.dst)); return; }  // 0x01
+    if (k == K_SUB_RR()) { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 41);  eb(buf, modrm_rr(ins.src, ins.dst)); return; }  // 0x29
+    if (k == K_CMP_RR()) { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 57);  eb(buf, modrm_rr(ins.src, ins.dst)); return; }  // 0x39
+    if (k == K_AND_RR()) { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 33);  eb(buf, modrm_rr(ins.src, ins.dst)); return; }  // 0x21
+    if (k == K_OR_RR())  { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 9);   eb(buf, modrm_rr(ins.src, ins.dst)); return; }  // 0x09
+    if (k == K_XOR_RR()) { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 49);  eb(buf, modrm_rr(ins.src, ins.dst)); return; }  // 0x31
+
+    // ── imul dst, src : 0F AF /r with reg=dst, rm=src (operands SWAPPED) ─────
+    if (k == K_IMUL_RR()) {
+        rex(buf, 1, ext(ins.dst), 0, ext(ins.src));
+        eb(buf, 15); eb(buf, 175);                 // 0F AF
+        eb(buf, modrm_rr(ins.dst, ins.src));
+        return;
+    }
+
+    // ── push / pop ───────────────────────────────────────────────────────────
+    if (k == K_PUSH()) {
+        let r: i32 = ins.dst;
+        if (r >= 8) { eb(buf, 65); }               // 0x41 = REX.B
+        eb(buf, 80 + lo3(r));                       // 0x50 + rd
+        return;
+    }
+    if (k == K_POP()) {
+        let r: i32 = ins.dst;
+        if (r >= 8) { eb(buf, 65); }               // 0x41 = REX.B
+        eb(buf, 88 + lo3(r));                       // 0x58 + rd
+        return;
+    }
+
+    // ── ret / syscall ─────────────────────────────────────────────────────────
+    if (k == K_RET())     { eb(buf, 195); return; }            // 0xC3
+    if (k == K_SYSCALL()) { eb(buf, 15); eb(buf, 5); return; } // 0F 05
+
+    // ── neg dst : F7 /3 ───────────────────────────────────────────────────────
+    if (k == K_NEG()) {
+        rex(buf, 1, 0, 0, ext(ins.dst));
+        eb(buf, 247);                              // 0xF7
+        eb(buf, 192 + 3 * 8 + lo3(ins.dst));       // ModRM reg=/3 rm=dst
+        return;
+    }
+
+    // ── idiv src : CQO (48 99) then F7 /7 ──────────────────────────────────────
+    if (k == K_IDIV()) {
+        eb(buf, 72); eb(buf, 153);                 // 48 99  cqo
+        rex(buf, 1, 0, 0, ext(ins.src));
+        eb(buf, 247);                              // 0xF7
+        eb(buf, 192 + 7 * 8 + lo3(ins.src));       // ModRM reg=/7 rm=src
+        return;
+    }
+
+    // ── reg-imm32 ALU : 81 /digit id ──────────────────────────────────────────
+    if (k == K_ADD_RI()) { rex(buf, 1, 0, 0, ext(ins.dst)); eb(buf, 129); eb(buf, 192 + 0 * 8 + lo3(ins.dst)); emit_le(buf, ins.imm, 4); return; }  // /0
+    if (k == K_SUB_RI()) { rex(buf, 1, 0, 0, ext(ins.dst)); eb(buf, 129); eb(buf, 192 + 5 * 8 + lo3(ins.dst)); emit_le(buf, ins.imm, 4); return; }  // /5
+    if (k == K_CMP_RI()) { rex(buf, 1, 0, 0, ext(ins.dst)); eb(buf, 129); eb(buf, 192 + 7 * 8 + lo3(ins.dst)); emit_le(buf, ins.imm, 4); return; }  // /7
+
+    // ── memory ops (base+disp32) ───────────────────────────────────────────────
+    if (k == K_LOAD()) {
+        // mov dst, [src + disp] : 8B /r  reg=dst rm=[base=src]
+        rex(buf, 1, ext(ins.dst), 0, ext(ins.src));
+        eb(buf, 139);                              // 0x8B
+        mem(buf, ins.dst, ins.src, ins.disp);
+        return;
+    }
+    if (k == K_STORE()) {
+        // mov [dst + disp], src : 89 /r  reg=src rm=[base=dst]
+        rex(buf, 1, ext(ins.src), 0, ext(ins.dst));
+        eb(buf, 137);                              // 0x89
+        mem(buf, ins.src, ins.dst, ins.disp);
+        return;
+    }
+    if (k == K_LEA()) {
+        // lea dst, [src + disp] : 8D /r  reg=dst rm=[base=src]
+        rex(buf, 1, ext(ins.dst), 0, ext(ins.src));
+        eb(buf, 141);                              // 0x8D
+        mem(buf, ins.dst, ins.src, ins.disp);
+        return;
+    }
+
+    // ── setcc → movzx (dst = cc ? 1 : 0) ───────────────────────────────────────
+    if (k == K_SETCC()) {
+        let d: i32 = ins.dst;
+        // setcc r/m8 : REX (40 + B) 0F op /0 — REX present so sil/dil/bpl encode.
+        eb(buf, 64 + ext(d));
+        eb(buf, 15); eb(buf, setcc_op(ins.imm as i32));
+        eb(buf, 192 + lo3(d));                     // ModRM reg=/0 rm=dst
+        // movzx dst, dst-byte : REX.W 0F B6 /r  reg=dst rm=dst
+        rex(buf, 1, ext(d), 0, ext(d));
+        eb(buf, 15); eb(buf, 182);                 // 0F B6
+        eb(buf, modrm_rr(d, d));
+        return;
+    }
+
+    // ── relative branches (rel32) ──────────────────────────────────────────────
+    // `here` = base_off (offset of this instruction's first byte). The rel is
+    // computed against the offset of the byte AFTER the full instruction.
+    if (k == K_CALL()) {
+        let target: i32 = get[i32](labels, ins.lbl);
+        eb(buf, 232);                              // 0xE8
+        emit_le(buf, (target - (base_off + 5)) as i64, 4);
+        return;
+    }
+    if (k == K_JMP()) {
+        let target: i32 = get[i32](labels, ins.lbl);
+        eb(buf, 233);                              // 0xE9
+        emit_le(buf, (target - (base_off + 5)) as i64, 4);
+        return;
+    }
+    if (is_jcc(k) == 1) {
+        let target: i32 = get[i32](labels, ins.lbl);
+        eb(buf, 15); eb(buf, jcc_op(k));           // 0F op
+        emit_le(buf, (target - (base_off + 6)) as i64, 4);
+        return;
+    }
+
+    // unknown kind: emit nothing (should never happen for a valid program).
+    return;
+}
+
+// ── two-pass label resolution + assembly ──────────────────────────────────────
+fn encode(prog: ArrayList[Instr]) ArrayList[u8] {
+    let n: i32 = len[Instr](prog);
+
+    // Size the labels table to (max label id)+1.
+    let maxlbl: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let ins: Instr = get[Instr](prog, i);
+        if (ins.lbl > maxlbl) { maxlbl = ins.lbl; }
+        i = i + 1;
+    }
+    let nlbl: i32 = maxlbl + 1;
+
+    let labels: ArrayList[i32] = make[i32](nlbl + 1);
+    let j: i32 = 0;
+    while (j < nlbl) { push[i32](&labels, 0); j = j + 1; }
+
+    // ── pass 1: measure offsets, record label positions ──────────────────────
+    let scratch: ArrayList[u8] = make[u8](64);
+    i = 0;
+    while (i < n) {
+        let ins1: Instr = get[Instr](prog, i);
+        let here: i32 = scratch.len;
+        if (ins1.kind == K_LABEL()) {
+            set[i32](&labels, ins1.lbl, here);
+        }
+        encode_one(&scratch, ins1, labels, here);
+        i = i + 1;
+    }
+
+    // ── pass 2: emit final bytes with resolved labels ────────────────────────
+    let out: ArrayList[u8] = make[u8](scratch.len + 8);
+    i = 0;
+    while (i < n) {
+        let ins2: Instr = get[Instr](prog, i);
+        let off: i32 = out.len;
+        encode_one(&out, ins2, labels, off);
+        i = i + 1;
+    }
+
+    return out;
+}

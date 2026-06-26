@@ -28,6 +28,7 @@
 #include <time.h>
 #include <assert.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 
 /* ── Zag ABI slice types ──────────────────────────────────────────────────── */
 
@@ -192,16 +193,15 @@ ZagSliceU8 _zag_f64_to_str(double v) {
     return r;
 }
 
-/* [pure] — parse decimal integer; sets *ok=1 on success, 0 on error */
-int64_t _zag_str_to_i64(ZagSliceU8 s, int32_t* ok) {
-    if (s.len == 0) { if (ok) *ok = 0; return 0; }
+/* [pure] — parse decimal integer; returns 0 on empty/invalid input.
+   Single-arg ABI: every declaration (std/rt.zag + generated externs) expects
+   one parameter, so the signature must match — a stray out-pointer param made
+   callers write through an uninitialized register (segfault). */
+int64_t _zag_str_to_i64(ZagSliceU8 s) {
+    if (s.len == 0) { return 0; }
     char* cstr = _zag_slice_to_cstr(s);
-    char* end;
-    errno = 0;
-    int64_t v = (int64_t)strtoll(cstr, &end, 10);
-    int valid = (errno == 0 && end == cstr + s.len);
+    int64_t v = (int64_t)strtoll(cstr, NULL, 10);
     free(cstr);
-    if (ok) *ok = valid ? 1 : 0;
     return v;
 }
 
@@ -277,6 +277,20 @@ int32_t _zag_write_file(ZagSliceU8 path, ZagSliceU8 content) {
     int err = ferror(f);
     fclose(f);
     return (err || written != (size_t)content.len) ? -1 : 0;
+}
+
+/*
+ * Write raw bytes to a file and mark it executable (rwxr-xr-x). Used by the
+ * native backend to emit a runnable ELF straight from the compiler.
+ * Returns 0 on success, -1 on error.
+ */
+int32_t _zag_write_exec(ZagSliceU8 path, ZagSliceU8 content) {
+    int32_t rc = _zag_write_file(path, content);
+    if (rc != 0) return rc;
+    char* cpath = _zag_slice_to_cstr(path);
+    int crc = chmod(cpath, 0755);
+    free(cpath);
+    return (crc == 0) ? 0 : -1;
 }
 
 /*
