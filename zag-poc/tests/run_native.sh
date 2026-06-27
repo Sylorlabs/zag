@@ -59,6 +59,12 @@ nt  "struct byval arg iso" 'struct P { x: i32 } fn wr(p: P) i32 { p.x = 999; ret
 nt  "slice value len"     'fn slen(s: []u8) i32 { return s.len; } fn main() i32 { let s: []u8 = "hello"; return slen(s); }' 5
 nt  "slice index"         'fn main() i32 { let s: []u8 = "hello"; return s[1]; }' 101
 nto "print slice var"     'fn main() i32 { let s: []u8 = "hello\n"; print_str(s); return 0; }' "hello" 0
+# `_zag_println` on a SLICE VALUE (not a literal) must STILL append the trailing
+# '\n'. The native lowerer baked the newline into the interned bytes for the
+# literal branch but forgot the slice branch, so a println'd slice ran into the
+# next line (e.g. `zag: built …out` merged with `-- running --`) → the self-host
+# codegen/zir tests saw mangled output. Two lines prove the newline is there.
+nto "println slice newline" 'fn main() i32 { let s: []u8 = "AB"; _zag_println(s); _zag_println("CD"); return 0; }' "$(printf 'AB\nCD')" 0
 nt  "new heap (mmap)"     'struct P { x: i32, y: i32 } fn main() i32 { let p: *P = new(P{ .x = 40, .y = 2 }); return p.*.x + p.*.y; }' 42
 nt  "new x3 (frame)"      'struct P { x: i32 } fn main() i32 { let a: *P = new(P{ .x = 10 }); let b: *P = new(P{ .x = 20 }); let c: *P = new(P{ .x = 12 }); return a.*.x + b.*.x + c.*.x; }' 42
 echo "── generics · unions · @-builtins (native self-hosting round 1) ──"
