@@ -84,6 +84,17 @@ nt  "optional orelse def"  'fn f(b: i32) ?i32 { if (b == 1) { return 42; } retur
 # aggregate made the caller copy the scalar result as a 16-byte block pointer →
 # NULL deref / SIGSEGV (the bug that crashed the znc-built native zagc).
 nt  "orelse as call arg"   'fn id(a: i32) i32 { return a; } fn f(b: i32) ?i32 { if (b == 1) { return 7; } return null; } fn main() i32 { let o: ?i32 = f(1); return id(o orelse 0); }' 7
+# A switch that REUSES a capture name across arms whose payloads are DIFFERENT
+# struct types: `.a => |s| ...` (s : *A) then `.b => |s| ...` (s : *B). The
+# frame pre-scan's name→type map returned the FIRST recorded type (stale *A) for
+# `s`, so an aggregate field `s.*.items` (an ArrayList passed BY VALUE to suml)
+# was mis-sized as a scalar → the per-call copy was under-reserved → the frame
+# overran and a nested call clobbered the copied aggregate (returned 86, not 42).
+# The pre-scan now REFRESHES a reused name's type in place, mirroring lowering's
+# slot shadowing. (This single bug crashed the znc-built native zagc on BOTH
+# examples/methods.zag — via sema's struct_field_type — and examples/patterns.zag
+# — via codegen's gen_expr.)
+nt  "switch capture reuse + agg field" '@import("std/list.zag") struct A { tag: i32 } struct B { items: ArrayList[i32] } union U { a: A, b: B } fn suml(xs: ArrayList[i32]) i32 { let acc: i32 = 0; let i: i32 = 0; while (i < len[i32](xs)) { acc = acc + get[i32](xs, i); i = i + 1; } return acc; } fn eval(u: *U) i32 { return switch (u.*) { .a => |s| s.*.tag, .b => |s| suml(s.*.items) }; } fn main() i32 { let xs: ArrayList[i32] = make[i32](4); push[i32](&xs, 10); push[i32](&xs, 20); push[i32](&xs, 12); let u: *U = new(U{ .b = B{ .items = xs } }); return eval(u); }' 42
 
 echo "── floating-point (f64/f32 via SSE — no libc) ──"
 nt  "f64 add+cmp"     'fn main() i32 { let x: f64 = 1.5; let y: f64 = 2.5; if (x + y == 4.0) { return 1; } return 0; }' 1
