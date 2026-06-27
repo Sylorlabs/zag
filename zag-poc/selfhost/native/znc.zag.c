@@ -940,6 +940,7 @@ static int32_t cg_field_offset(Cg* cg, ZagSliceU8 sname, ZagSliceU8 fname);
 static int32_t cg_type_is_struct(Cg* cg, ZagSliceU8 ty);
 static ZagSliceU8 cg_slice_elem(ZagSliceU8 ty);
 static int32_t cg_is_word_int_elem(ZagSliceU8 e);
+static int32_t cg_is_float_elem(ZagSliceU8 e);
 static int32_t cg_type_is_slice(Cg* cg, ZagSliceU8 ty);
 static int32_t cg_slice_is_word(ZagSliceU8 ty);
 static int32_t cg_type_is_opt(Cg* cg, ZagSliceU8 ty);
@@ -7009,6 +7010,15 @@ static int32_t cg_is_word_int_elem(ZagSliceU8 e) {
     }
     return 0;
 }
+static int32_t cg_is_float_elem(ZagSliceU8 e) {
+    if (_zag_str_eq(e, (ZagSliceU8){(const uint8_t*)"f32", 3})) {
+    return 1;
+    }
+    if (_zag_str_eq(e, (ZagSliceU8){(const uint8_t*)"f64", 3})) {
+    return 1;
+    }
+    return 0;
+}
 static int32_t cg_type_is_slice(Cg* cg, ZagSliceU8 ty) {
     int32_t _u = (*cg).err;
     if (_zag_str_eq(ty, (ZagSliceU8){(const uint8_t*)"[]u8", 4})) {
@@ -7028,6 +7038,9 @@ static int32_t cg_type_is_slice(Cg* cg, ZagSliceU8 ty) {
     return 1;
     }
     if ((cg_is_word_int_elem(e) == 1)) {
+    return 1;
+    }
+    if ((cg_is_float_elem(e) == 1)) {
     return 1;
     }
     return 0;
@@ -7050,6 +7063,9 @@ static int32_t cg_slice_is_word(ZagSliceU8 ty) {
     return 1;
     }
     if ((cg_is_word_int_elem(e) == 1)) {
+    return 1;
+    }
+    if ((cg_is_float_elem(e) == 1)) {
     return 1;
     }
     return 0;
@@ -7512,6 +7528,12 @@ static ZagSliceU8 cg_scan_typeof(ScanCtx* sc, Cg* cg, Node* n) {
     if ((cg_is_native_rt(cid.name) == 1)) {
     return cg_native_rt_ret(cid.name);
     }
+    if (_zag_str_eq(cid.name, (ZagSliceU8){(const uint8_t*)"zalloc", 6})) {
+    return (ZagSliceU8){(const uint8_t*)"[]f32", 5};
+    }
+    if (_zag_str_eq(cid.name, (ZagSliceU8){(const uint8_t*)"zalloc_i", 8})) {
+    return (ZagSliceU8){(const uint8_t*)"[]i32", 5};
+    }
     ZagSliceU8 fn2 = cid.name;
     if ((len__u8(c.targs) > 0)) {
     fn2 = cg_mangle_generic(cid.name, c.targs);
@@ -7603,6 +7625,13 @@ static void cg_scan_call(Cg* cg, ScanCtx* sc, Call c) {
     return;
     }
     if (_zag_str_eq(fname, (ZagSliceU8){(const uint8_t*)"_zag_free", 9})) {
+    return;
+    }
+    if ((_zag_str_eq(fname, (ZagSliceU8){(const uint8_t*)"zalloc", 6}) || _zag_str_eq(fname, (ZagSliceU8){(const uint8_t*)"zalloc_i", 8}))) {
+    (*(*sc).words) = ((*(*sc).words) + 2);
+    return;
+    }
+    if ((_zag_str_eq(fname, (ZagSliceU8){(const uint8_t*)"zfree", 5}) || _zag_str_eq(fname, (ZagSliceU8){(const uint8_t*)"zfree_i", 7}))) {
     return;
     }
     if ((len__u8(c.targs) > 0)) {
@@ -8241,6 +8270,12 @@ static ZagSliceU8 cg_expr_type(Node* n, Env* env, ArrayList_FnSym syms, Cg* cg) 
     if ((cg_is_native_rt(cid.name) == 1)) {
     return cg_native_rt_ret(cid.name);
     }
+    if (_zag_str_eq(cid.name, (ZagSliceU8){(const uint8_t*)"zalloc", 6})) {
+    return (ZagSliceU8){(const uint8_t*)"[]f32", 5};
+    }
+    if (_zag_str_eq(cid.name, (ZagSliceU8){(const uint8_t*)"zalloc_i", 8})) {
+    return (ZagSliceU8){(const uint8_t*)"[]i32", 5};
+    }
     ZagSliceU8 fn2 = cid.name;
     if ((len__u8(c.targs) > 0)) {
     fn2 = cg_mangle_generic(cid.name, c.targs);
@@ -8694,6 +8729,39 @@ static void cg_lower_expr(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     di = (di + 1);
     }
     if ((caps.len > 0)) {
+    ArrayList__u8 cnames0 = split_args(caps);
+    ZagSliceU8 tys = (ZagSliceU8){(const uint8_t*)"", 0};
+    int32_t ti = 0;
+    while ((ti < len__u8(cnames0))) {
+    ZagSliceU8 cn = get__u8(cnames0, ti);
+    if ((ti > 0)) {
+    tys = _zag_str_concat(tys, (ZagSliceU8){(const uint8_t*)",", 1});
+    }
+    tys = _zag_str_concat(tys, cg_slot_type((*env), cn));
+    ti = (ti + 1);
+    }
+    int32_t di2 = 0;
+    while ((di2 < len_pNode((*cg).decls))) {
+    Node* dn = get_pNode((*cg).decls, di2);
+    {
+    Node __sw = (*dn);
+    switch (__sw.tag) {
+    case Node_fn_decl:
+    {
+        __auto_type fd2 = __sw.u.fn_decl;
+    if ((_zag_str_eq(fd2.name, x.name) && (fd2.cap_types.len == 0))) {
+    (*dn) = (Node){ .tag = Node_fn_decl, .u = { .fn_decl = (FnDecl){ .name = fd2.name, .tparams = fd2.tparams, .params = fd2.params, .ret = fd2.ret, .annots = fd2.annots, .body = fd2.body, .is_extern = fd2.is_extern, .ret_eff = fd2.ret_eff, .caps = fd2.caps, .cap_names = fd2.cap_names, .cap_types = tys } } };
+    }
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+    di2 = (di2 + 1);
+    }
     int32_t ncaps = cg_count_caps(caps);
     push_Instr(out, i_mov_imm(R_RDI(), ((int64_t)((ncaps * 8)))));
     push_Instr(out, i_call((*cg).ml_lbl));
@@ -10378,6 +10446,31 @@ static void cg_lower_call(ArrayList_Instr* out, Call c, Env* env, ArrayList_FnSy
     cg_lower_new(out, c, env, syms, cg);
     return;
     }
+    if ((_zag_str_eq(fname, (ZagSliceU8){(const uint8_t*)"zalloc", 6}) || _zag_str_eq(fname, (ZagSliceU8){(const uint8_t*)"zalloc_i", 8}))) {
+    cg_lower_expr(out, get_pNode(c.args, 0), env, syms, cg);
+    push_Instr(out, i_pop(R_RDI()));
+    push_Instr(out, i_mov_imm(R_RAX(), 8));
+    push_Instr(out, i_imul(R_RDI(), R_RAX()));
+    (*cg).use_al = 1;
+    push_Instr(out, i_call((*cg).al_lbl));
+    int32_t sb = cg_slot_scratch_n(env, 2);
+    push_Instr(out, i_store(R_RBP(), (sb + 0), R_RAX()));
+    cg_lower_expr(out, get_pNode(c.args, 0), env, syms, cg);
+    push_Instr(out, i_pop(R_RCX()));
+    push_Instr(out, i_store(R_RBP(), (sb + 8), R_RCX()));
+    push_Instr(out, i_lea(R_RAX(), R_RBP(), sb));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    if ((_zag_str_eq(fname, (ZagSliceU8){(const uint8_t*)"zfree", 5}) || _zag_str_eq(fname, (ZagSliceU8){(const uint8_t*)"zfree_i", 7}))) {
+    if ((len_pNode(c.args) > 0)) {
+    cg_lower_expr(out, get_pNode(c.args, 0), env, syms, cg);
+    push_Instr(out, i_pop(R_RAX()));
+    }
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
     if ((cg_lower_runtime(out, fname, c, env, syms, cg) == 1)) {
     return;
     }
@@ -11239,11 +11332,21 @@ static void cg_lower_fn(ArrayList_Instr* out, FnDecl f, int32_t lbl, ArrayList_F
     }
     if (((is_clos == 1) && (f.cap_names.len > 0))) {
     ArrayList__u8 cnames = split_args(f.cap_names);
+    ArrayList__u8 ctypes = split_args(f.cap_types);
     push_Instr(out, i_load(R_RDI(), R_RBP(), zenv_disp));
     int32_t ci = 0;
     while ((ci < len__u8(cnames))) {
     ZagSliceU8 cname = get__u8(cnames, ci);
-    int32_t cdisp = cg_slot_alloc((&env), cname);
+    ZagSliceU8 cty = (ZagSliceU8){(const uint8_t*)"", 0};
+    if ((ci < len__u8(ctypes))) {
+    cty = get__u8(ctypes, ci);
+    }
+    int32_t cdisp = 0;
+    if ((cty.len > 0)) {
+    cdisp = cg_slot_alloc_typed((&env), cname, cty, 1);
+    } else {
+    cdisp = cg_slot_alloc((&env), cname);
+    }
     push_Instr(out, i_load(R_RAX(), R_RDI(), (8 * ci)));
     push_Instr(out, i_store(R_RBP(), cdisp, R_RAX()));
     ci = (ci + 1);
