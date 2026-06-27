@@ -768,6 +768,34 @@ fn cg_callee_name(n: *Node) []u8 {
     };
 }
 
+fn cg_starts_with(s: []u8, p: []u8) i32 {
+    if (s.len < p.len) { return 0; }
+    let i: i32 = 0;
+    while (i < p.len) {
+        if (s[i] != p[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn cg_is_fn_type(ty: []u8) i32 {
+    if (ty.len < 3) { return 0; }
+    if (ty[0] == 'f' && ty[1] == 'n' && ty[2] == '(') { return 1; }
+    return 0;
+}
+
+fn cg_is_clos_name(name: []u8) i32 {
+    return cg_starts_with(name, "__clos_");
+}
+
+fn cg_count_caps(caps: []u8) i32 {
+    if (caps.len == 0) { return 0; }
+    let n: i32 = 1;
+    let i: i32 = 0;
+    while (i < caps.len) { if (caps[i] == ',') { n = n + 1; } i = i + 1; }
+    return n;
+}
+
 // ── instance collection (fixpoint) ───────────────────────────────────────────
 // EXP holds the growing expanded decl list (originals + mangled instances) and a
 // `seen` set of mangled instance names so we never duplicate one. `gnames` lists
@@ -1386,6 +1414,7 @@ fn cg_type_is_opt(cg: *Cg, ty: []u8) i32 {
 // pointer): a user struct, a []u8 slice, a tagged union {tag,payload}, or an
 // optional `?T` {has,val}. A leading '*' is a scalar pointer (the address).
 fn cg_type_is_agg(cg: *Cg, ty: []u8) i32 {
+    if (@strEq(ty, "fat_fn")) { return 1; }
     if (cg_type_is_struct(cg, ty) == 1) { return 1; }
     if (cg_type_is_slice(cg, ty) == 1) { return 1; }
     if (ty.len > 0) {
@@ -1400,6 +1429,7 @@ fn cg_type_is_agg(cg: *Cg, ty: []u8) i32 {
 // sizes are 8-aligned). Callers gate this with cg_type_is_agg; returns 1
 // defensively for a non-aggregate.
 fn cg_agg_words(cg: *Cg, ty: []u8) i32 {
+    if (@strEq(ty, "fat_fn")) { return 2; }
     if (cg_type_is_agg(cg, ty) == 0) { return 1; }
     let sz: i32 = cg_type_size(cg, ty);
     let w: i32 = sz / 8;
@@ -1750,6 +1780,7 @@ fn cg_scan_rectype(sc: *ScanCtx, name: []u8, ty: []u8) void {
 fn cg_scan_typeof(sc: *ScanCtx, cg: *Cg, n: *Node) []u8 {
     switch (n.*) {
         .id => |x| {
+            if (cg_is_clos_name(x.name) == 1) { return "fat_fn"; }
             let i: i32 = 0;
             while (i < len[[]u8](sc.*.names)) {
                 if (@strEq(get[[]u8](sc.*.names, i), x.name)) { return get[[]u8](sc.*.types, i); }
@@ -2053,6 +2084,11 @@ fn cg_scan_expr(cg: *Cg, sc: *ScanCtx, n: *Node) void {
                 ai = ai + 1;
             }
             if (sw.has_els == 1) { cg_scan_body(cg, sc, sw.els_body); }
+        }
+        .id => |x| {
+            if (cg_is_clos_name(x.name) == 1) {
+                sc.*.words.* = sc.*.words.* + 2;   // fat_fn block: {code_ptr, env_ptr}
+            }
         }
         else => { }
     }
@@ -2674,6 +2710,60 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                 }
                 if (@strEq(x.name, "false")) {
                     push[Instr](out, i_mov_imm(R_RAX(), 0));
+                    push[Instr](out, i_push(R_RAX()));
+                    return;
+                }
+                // __clos_N: build fat_fn block {code_ptr, env_ptr} in frame, push its addr
+                if (cg_is_clos_name(x.name) == 1) {
+                    let lbl: i32 = cg_find_fn(syms, x.name);
+                    if (lbl < 0) {
+                        cg_err(cg, "native: unknown closure reference");
+                        push[Instr](out, i_mov_imm(R_RAX(), 0));
+                        push[Instr](out, i_push(R_RAX()));
+                        return;
+                    }
+                    // Allocate 2-word fat_fn block in frame
+                    let fb: i32 = cg_slot_scratch_n(env, 2);
+                    // Word 0: code_ptr = address of __clos_N function
+                    push[Instr](out, i_lea_lbl(R_RAX(), lbl));
+                    push[Instr](out, i_store(R_RBP(), fb, R_RAX()));
+                    // Word 1: env_ptr = malloc(ncaps * 8) or 0 if non-capturing
+                    let caps: []u8 = "";
+                    let di: i32 = 0;
+                    while (di < len[*Node](cg.*.decls)) {
+                        switch (get[*Node](cg.*.decls, di).*) {
+                            .fn_decl => |fd| { if (@strEq(fd.name, x.name)) { caps = fd.cap_names; } }
+                            else => { }
+                        }
+                        di = di + 1;
+                    }
+                    if (caps.len > 0) {
+                        // malloc(ncaps * 8) for the env
+                        let ncaps: i32 = cg_count_caps(caps);
+                        push[Instr](out, i_mov_imm(R_RDI(), (ncaps * 8) as i64));
+                        push[Instr](out, i_call(cg.*.ml_lbl));
+                        cg.*.use_ml = 1;
+                        // rax = malloced env ptr; rsi = env ptr for stores
+                        push[Instr](out, i_mov_rr(R_RSI(), R_RAX()));
+                        let cnames: ArrayList[[]u8] = split_args(caps);
+                        let ci: i32 = 0;
+                        while (ci < len[[]u8](cnames)) {
+                            let cname: []u8 = get[[]u8](cnames, ci);
+                            let cdisp: i32 = cg_slot_find(env.*, cname);
+                            if (cdisp != cg_not_found()) {
+                                // load capture value (scalar) and store at [rsi + 8*ci]
+                                push[Instr](out, i_load(R_RAX(), R_RBP(), cdisp));
+                                push[Instr](out, i_store(R_RSI(), 8 * ci, R_RAX()));
+                            }
+                            ci = ci + 1;
+                        }
+                        push[Instr](out, i_store(R_RBP(), fb + 8, R_RSI()));  // env_ptr = malloced
+                    } else {
+                        push[Instr](out, i_mov_imm(R_RAX(), 0));
+                        push[Instr](out, i_store(R_RBP(), fb + 8, R_RAX()));  // env_ptr = null
+                    }
+                    // Push address of the fat_fn block
+                    push[Instr](out, i_lea(R_RAX(), R_RBP(), fb));
                     push[Instr](out, i_push(R_RAX()));
                     return;
                 }
@@ -4291,6 +4381,75 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
     // foo_T (registered by monomorphization). Non-generic calls keep their name.
     if (len[[]u8](c.targs) > 0) { fname = cg_mangle_generic(fname, c.targs); }
 
+    // ── Indirect call through a fn-value (fat_fn) variable ───────────────────
+    let fname_ty: []u8 = cg_slot_type(env.*, fname);
+    if (@strEq(fname_ty, "fat_fn")) {
+        let fp_disp: i32 = cg_slot_find(env.*, fname);
+        let is_byref: i32 = cg_slot_byref(env.*, fname);
+        // Spill env_ptr into a scratch slot
+        let env_slot: i32 = cg_slot_scratch(env);
+        if (is_byref == 1) {
+            push[Instr](out, i_load(R_RCX(), R_RBP(), fp_disp));   // rcx = byref ptr
+            push[Instr](out, i_load(R_RCX(), R_RCX(), 8));          // rcx = env_ptr
+        } else {
+            push[Instr](out, i_load(R_RCX(), R_RBP(), fp_disp + 8)); // rcx = env_ptr
+        }
+        push[Instr](out, i_store(R_RBP(), env_slot, R_RCX()));
+        // Spill user args
+        let aslot: ArrayList[i32] = make[i32](nargs + 2);
+        push[i32](&aslot, env_slot);
+        let ui: i32 = 0;
+        while (ui < nargs) {
+            let arg: *Node = get[*Node](c.args, ui);
+            let at: []u8 = cg_expr_type(arg, env, syms, cg);
+            let is_slit: i32 = 0;
+            switch (arg.*) { .slit => |_s| { is_slit = 1; } else => { } }
+            let sl: i32 = cg_slot_scratch(env);
+            push[i32](&aslot, sl);
+            if (cg_type_is_agg(cg, at) == 1 && is_slit == 0) {
+                let nf: i32 = cg_agg_words(cg, at);
+                let cpy: i32 = cg_slot_scratch_n(env, nf);
+                cg_lower_expr(out, arg, env, syms, cg);
+                push[Instr](out, i_pop(R_RSI()));
+                let k: i32 = 0;
+                while (k < nf) {
+                    push[Instr](out, i_load(R_RAX(), R_RSI(), 8 * k));
+                    push[Instr](out, i_store(R_RBP(), cpy + 8 * k, R_RAX()));
+                    k = k + 1;
+                }
+                push[Instr](out, i_lea(R_RAX(), R_RBP(), cpy));
+            } else {
+                cg_lower_expr(out, arg, env, syms, cg);
+                push[Instr](out, i_pop(R_RAX()));
+            }
+            push[Instr](out, i_store(R_RBP(), sl, R_RAX()));
+            ui = ui + 1;
+        }
+        // Load code_ptr into rax
+        if (is_byref == 1) {
+            push[Instr](out, i_load(R_RAX(), R_RBP(), fp_disp));   // rax = byref ptr
+            push[Instr](out, i_load(R_RAX(), R_RAX(), 0));          // rax = code_ptr
+        } else {
+            push[Instr](out, i_load(R_RAX(), R_RBP(), fp_disp));    // rax = code_ptr
+        }
+        // Place args: slot 0 = env_ptr → rdi, slots 1..nargs = user args → rsi, rdx, ...
+        let total_args: i32 = nargs + 1;
+        let ai: i32 = 0;
+        while (ai < total_args) {
+            if (ai < 6) {
+                push[Instr](out, i_load(arg_reg(ai), R_RBP(), get[i32](aslot, ai)));
+            } else {
+                push[Instr](out, i_load(R_RCX(), R_RBP(), get[i32](aslot, ai)));
+                push[Instr](out, i_push(R_RCX()));
+            }
+            ai = ai + 1;
+        }
+        // call through rax
+        push[Instr](out, i_call_reg(R_RAX()));
+        push[Instr](out, i_push(R_RAX()));   // result
+        return;
+    }
+
     let lbl: i32 = cg_find_fn(syms, fname);
     if (lbl < 0) {
         cg_err(cg, "native: call to unknown function");
@@ -4997,6 +5156,12 @@ fn cg_lower_fn(out: *ArrayList[Instr], f: FnDecl, lbl: i32, syms: ArrayList[FnSy
     let fn_ret_agg: i32 = cg_type_is_agg(cg, fret);
     if (fn_ret_agg == 1) { words = words + 1; }   // saved-sret-pointer slot
 
+    let is_clos: i32 = cg_is_clos_name(f.name);
+    if (is_clos == 1) {
+        words = words + 1;   // __zenv slot
+        words = words + cg_count_caps(f.cap_names);   // capture unpack slots
+    }
+
     // Build the scan's name→type and fn→ret maps so it can size aggregate flow.
     let sc: ScanCtx = ScanCtx{
         .seen = &seen, .words = &words,
@@ -5012,7 +5177,9 @@ fn cg_lower_fn(out: *ArrayList[Instr], f: FnDecl, lbl: i32, syms: ArrayList[FnSy
     let pi: i32 = 0;
     while (pi < len[Param](f.params)) {
         let prm: Param = get[Param](f.params, pi);
-        cg_scan_rectype(&sc, prm.name, cg_norm_type(prm.pty));   // param static type
+        let prm_pty: []u8 = cg_norm_type(prm.pty);
+        if (cg_is_fn_type(prm.pty) == 1) { prm_pty = "fat_fn"; }
+        cg_scan_rectype(&sc, prm.name, prm_pty);   // param static type
         let _dup: i32 = cg_scan_seen(&seen, prm.name);
         words = words + 1;
         pi = pi + 1;
@@ -5041,6 +5208,15 @@ fn cg_lower_fn(out: *ArrayList[Instr], f: FnDecl, lbl: i32, syms: ArrayList[FnSy
         push[Instr](out, i_store(R_RBP(), sd, R_R10()));
     }
 
+    // ── closure: spill hidden env ptr (rdi) + shift user params ──
+    let param_shift: i32 = 0;
+    let zenv_disp: i32 = 0;
+    if (is_clos == 1) {
+        param_shift = 1;
+        zenv_disp = cg_slot_alloc_typed(&env, "__zenv", "*void", 1);
+        push[Instr](out, i_store(R_RBP(), zenv_disp, R_RDI()));
+    }
+
     // ── spill incoming args (arg_reg(i)) into their local slots ──
     // Each param is recorded with its declared type. A by-value AGGREGATE param
     // (struct or []u8 slice) is BY-REF: the arg register holds a POINTER to the
@@ -5052,23 +5228,37 @@ fn cg_lower_fn(out: *ArrayList[Instr], f: FnDecl, lbl: i32, syms: ArrayList[FnSy
     while (i < len[Param](f.params)) {
         let p: Param = get[Param](f.params, i);
         let pty: []u8 = cg_norm_type(p.pty);
+        if (cg_is_fn_type(p.pty) == 1) { pty = "fat_fn"; }
         let pdisp: i32 = 0;
         if (cg_type_is_agg(cg, pty) == 1) {
             pdisp = cg_slot_alloc_br(&env, p.name, pty, 1, 1);   // byref pointer
         } else {
             pdisp = cg_slot_alloc_typed(&env, p.name, pty, 1);
         }
-        if (i < 6) {
-            // args 0..5 arrive in registers rdi,rsi,rdx,rcx,r8,r9.
-            push[Instr](out, i_store(R_RBP(), pdisp, arg_reg(i)));
+        if (i + param_shift < 6) {
+            // args arrive in registers rdi,rsi,rdx,rcx,r8,r9.
+            push[Instr](out, i_store(R_RBP(), pdisp, arg_reg(i + param_shift)));
         } else {
-            // args 6+ arrive on the stack: at the `call`, arg6 was at [rsp], so
-            // after `push rbp` the callee reads arg i at [rbp + 16 + 8*(i-6)]
-            // ([rbp]=saved rbp, [rbp+8]=return addr, [rbp+16]=arg6, …).
-            push[Instr](out, i_load(R_RAX(), R_RBP(), 16 + 8 * (i - 6)));
+            // args arrive on the stack: at the `call`, the first stack arg was at
+            // [rsp], so after `push rbp` the callee reads it at [rbp + 16 + 8*(i+shift-6)].
+            push[Instr](out, i_load(R_RAX(), R_RBP(), 16 + 8 * (i + param_shift - 6)));
             push[Instr](out, i_store(R_RBP(), pdisp, R_RAX()));
         }
         i = i + 1;
+    }
+
+    // ── closure: unpack captures from __zenv env ptr ──
+    if (is_clos == 1 && f.cap_names.len > 0) {
+        let cnames: ArrayList[[]u8] = split_args(f.cap_names);
+        push[Instr](out, i_load(R_RDI(), R_RBP(), zenv_disp));
+        let ci: i32 = 0;
+        while (ci < len[[]u8](cnames)) {
+            let cname: []u8 = get[[]u8](cnames, ci);
+            let cdisp: i32 = cg_slot_alloc(&env, cname);
+            push[Instr](out, i_load(R_RAX(), R_RDI(), 8 * ci));
+            push[Instr](out, i_store(R_RBP(), cdisp, R_RAX()));
+            ci = ci + 1;
+        }
     }
 
     // ── body ──
