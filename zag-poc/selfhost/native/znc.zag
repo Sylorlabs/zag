@@ -17,6 +17,123 @@
 @import("optimize.zag")   // optimize(ArrayList[Instr]) -> ArrayList[Instr] (fold/stack-elim/DCE)
 @import("peephole.zag")   // peephole(ArrayList[Instr]) -> ArrayList[Instr] (optimizer)
 @import("ncodegen.zag")   // lower_program(decls, *errcount, *databuf) -> ArrayList[Instr]
+@import("../sema.zag")    // analyze(decls)->eff  report_violations(decls,eff)->i32
+
+// ── operator-contract lowering (pre-sema) ────────────────────────────────────
+// Rewrites binary ops on user types to their decode fn calls BEFORE sema runs,
+// so the effect checker sees `big_add(x, y)` instead of `x + y` and can
+// correctly flag @realtime functions that use an allocating operator.
+// Mirrors zagc.zag's lower_operators() call, but without pulling in codegen.zag.
+struct LoEnv { name: []u8, ty: []u8 }
+fn lo_env_get(env: ArrayList[LoEnv], name: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[LoEnv](env)) {
+        if (@strEq(get[LoEnv](env, i).name, name)) { return get[LoEnv](env, i).ty; }
+        i = i + 1;
+    }
+    return "";
+}
+fn lo_id_ty(n: *Node, env: ArrayList[LoEnv]) []u8 {
+    switch (n.*) {
+        .id => |x| { return lo_env_get(env, x.name); }
+        else => { return ""; }
+    }
+}
+fn lo_mk_call2(fname: []u8, a: *Node, b: *Node) *Node {
+    let args: ArrayList[*Node] = make[*Node](2);
+    push[*Node](&args, a);
+    push[*Node](&args, b);
+    return mk_call(mk_ident(fname), args);
+}
+fn lo_expr(n: *Node, env: ArrayList[LoEnv], dl: ArrayList[*Node]) void {
+    switch (n.*) {
+        .bin => |b| {
+            lo_expr(b.l, env, dl);
+            lo_expr(b.r, env, dl);
+            if (@strEq(b.op, "+") || @strEq(b.op, "-") || @strEq(b.op, "*") || @strEq(b.op, "/")) {
+                let lt: []u8 = lo_id_ty(b.l, env);
+                if (lt.len > 0) {
+                    let decode: []u8 = op_contract_fn(dl, lt, b.op);
+                    if (decode.len > 0) {
+                        n.* = lo_mk_call2(decode, b.l, b.r).*;
+                    }
+                }
+            }
+        }
+        .un    => |u| { lo_expr(u.e, env, dl); }
+        .call  => |c| {
+            lo_expr(c.callee, env, dl);
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) { lo_expr(get[*Node](c.args, i), env, dl); i = i + 1; }
+        }
+        .idx   => |x| { lo_expr(x.base, env, dl); lo_expr(x.idx, env, dl); }
+        .fld   => |f| { lo_expr(f.base, env, dl); }
+        .slit_ => |s| {
+            let i: i32 = 0;
+            while (i < len[FieldInit](s.fields)) { lo_expr(get[FieldInit](s.fields, i).val, env, dl); i = i + 1; }
+        }
+        else => { }
+    }
+}
+fn lo_block(body: ArrayList[*Node], env: *ArrayList[LoEnv], dl: ArrayList[*Node]) void {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) { lo_stmt(get[*Node](body, i), env, dl); i = i + 1; }
+}
+fn lo_stmt(n: *Node, env: *ArrayList[LoEnv], dl: ArrayList[*Node]) void {
+    switch (n.*) {
+        .let_   => |l| {
+            lo_expr(l.expr, env.*, dl);
+            // Track declared-type let bindings so we can resolve `x+y` when x is a let var.
+            if (l.has_dty == 1 && l.dty.len > 0) {
+                push[LoEnv](env, LoEnv{ .name = l.name, .ty = l.dty });
+            }
+        }
+        .ret    => |r| { if (r.has_expr == 1) { lo_expr(r.expr, env.*, dl); } }
+        .if_    => |x| { lo_expr(x.cond, env.*, dl); lo_block(x.then_body, env, dl); lo_block(x.els_body, env, dl); }
+        .while_ => |w| { lo_expr(w.cond, env.*, dl); lo_block(w.body, env, dl); }
+        .assign => |a| { lo_expr(a.target, env.*, dl); lo_expr(a.expr, env.*, dl); }
+        .switch_ => |sw| {
+            lo_expr(sw.subject, env.*, dl);
+            let i: i32 = 0;
+            while (i < len[SwitchArm](sw.arms)) { lo_block(get[SwitchArm](sw.arms, i).body, env, dl); i = i + 1; }
+            if (sw.has_els == 1) { lo_block(sw.els_body, env, dl); }
+        }
+        .estmt  => |e| { lo_expr(e.expr, env.*, dl); }
+        else    => { }
+    }
+}
+fn lo_build_env(params: ArrayList[Param]) ArrayList[LoEnv] {
+    let env: ArrayList[LoEnv] = make[LoEnv](8);
+    let i: i32 = 0;
+    while (i < len[Param](params)) {
+        let p: Param = get[Param](params, i);
+        push[LoEnv](&env, LoEnv{ .name = p.name, .ty = p.pty });
+        i = i + 1;
+    }
+    return env;
+}
+fn lo_operators(decls: ArrayList[*Node]) void {
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .fn_decl => |f| {
+                // skip externs, generics, and operator-contract pseudo-fns
+                if (f.is_extern == 0 && len[[]u8](f.tparams) == 0) {
+                    let is_op: i32 = 0;
+                    if (f.name.len >= 5) {
+                        if (f.name[0] == '_' && f.name[1] == '_' && f.name[2] == 'o' && f.name[3] == 'p' && f.name[4] == '_') { is_op = 1; }
+                    }
+                    if (is_op == 0) {
+                        let lenv: ArrayList[LoEnv] = lo_build_env(f.params);
+                        lo_block(f.body, &lenv, decls);
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+}
 
 // Is `name` present anywhere in argv?
 fn has_flag(name: []u8) i32 {
@@ -82,8 +199,20 @@ fn main() i32 {
         return 1;
     }
 
-    // parse → lower → optimize → encode → ELF (code + data segments)
+    // parse → effect-check → lower → optimize → encode → ELF (code + data segments)
     let decls: ArrayList[*Node] = parse_program_dir(src, dir_of(path));
+
+    // Lower operator contracts (x + y → big_add(x, y)) so sema sees the real calls.
+    lo_operators(decls);
+
+    // Effect/capability check (sema.zag): reject @total/@realtime/@noalloc violations.
+    let eff: map__StringMap[i32] = analyze(decls);
+    let viols: i32 = report_violations(decls, eff);
+    if (viols > 0) {
+        _zag_println("znc: capability check FAILED");
+        return 1;
+    }
+
     let nerr: i32 = 0;
     let data: ArrayList[u8] = make[u8](16);
     let prog:  ArrayList[Instr] = lower_program(decls, &nerr, &data);
