@@ -129,6 +129,26 @@ nto "p64 round-trip 3.0"  'fn main() i32 { let a: p64 = @floatToP64(1.0); let b:
 # A non-posit program must NOT pull in the runtime (byte-identical to no-posit).
 nto "no-posit unaffected" 'fn main() i32 { print_int(7); return 0; }' "7" 0
 
+echo "── saturating / fixed-point / arbitrary-width (Round 2, native, no libc) ──"
+# Saturating: clamps to the type's bounds (NO wrap, NO Panic). sat_i8 100+100→127.
+nt  "sat_i8 clamp (exit)" 'fn main() i32 { let a: sat_i8 = 100; let b: sat_i8 = 100; let c: sat_i8 = a + b; return c; }' 127
+nto "sat_i16 add clamps"  'fn main() i32 { let a: sat_i16 = 25000; let b: sat_i16 = 20000; let c: sat_i16 = a + b; print_i32(c); return 0; }' "32767" 0
+nto "sat_i16 sub clamps"  'fn main() i32 { let a: sat_i16 = 0 - 30000; let b: sat_i16 = 10000; let c: sat_i16 = a - b; print_i32(c); return 0; }' "-32768" 0
+nto "sat_u8 sub floor 0"  'fn main() i32 { let a: sat_u8 = 10; let b: sat_u8 = 50; let c: sat_u8 = a - b; print_i32(c); return 0; }' "0" 0
+# Fixed-point Q8.8: mul rescales by 2^F → (32*25000)/256 = 3125. +/- are plain
+# ints; fixed `/` is plain int division too (bit-identical to the C backend, which
+# lowers ONLY fixed `*`), so fixed_8_8 5+3 = 8 and 100/7 = 14.
+nto "fixed_8_8 mul (Q8.8)" 'fn main() i32 { let a: fixed_8_8 = 32; let b: fixed_8_8 = 25000; let c: fixed_8_8 = a * b; print_i32(c); return 0; }' "3125" 0
+nto "fixed_8_8 add native" 'fn main() i32 { let a: fixed_8_8 = 5; let b: fixed_8_8 = 3; let c: fixed_8_8 = a + b; print_i32(c); return 0; }' "8" 0
+# Arbitrary-width UNSIGNED: result masked to N bits. SIGNED iN and div fall through
+# unmasked (exactly the C backend), so i12 -100-50 = -150 prints plainly.
+nto "u11 mask (2100&0x7FF)" 'fn main() i32 { let a: u11 = 2000; let b: u11 = 100; let c: u11 = a + b; print_i32(c); return 0; }' "52" 0
+nto "i12 signed native"     'fn main() i32 { let a: i12 = 0 - 100; let b: i12 = 50; let c: i12 = a - b; print_i32(c); return 0; }' "-150" 0
+# []sat_i16 slice indexing must compile (word-stride element load).
+nto "[]sat_i16 index compiles" 'fn pick(s: []sat_i16) sat_i16 { return s[0] + s[1]; } fn main() i32 { print_int(7); return 0; }' "7" 0
+# A sat/fixed-free program must NOT pull in the rt2 runtime (no extra fns).
+nto "no-satfixed unaffected" 'fn main() i32 { let x: u32 = 7; print_int(x as i32); return 0; }' "7" 0
+
 # The emitted artifact must be a real static ELF with no interpreter (no libc).
 "$ZNC" nt_src.zag -o /tmp/nt_elf >/dev/null 2>&1
 if file /tmp/nt_elf | grep -q 'statically linked' && ! readelf -l /tmp/nt_elf 2>/dev/null | grep -q 'INTERP'; then
