@@ -1,0 +1,668 @@
+// selfhost/native/optimize.zag — a correctness-preserving LOCAL OPTIMIZER for
+// Zag's from-scratch native x86-64 backend. It removes the remaining overhead of
+// the STACK MACHINE that ncodegen.zag emits: expression temporaries shuttled
+// through the CPU stack (push/pop), immediates loaded into a register and then
+// used register-form, and constant sub-expressions left unfolded.
+//
+// It runs on the flat ArrayList[Instr] (see isa.zag) AFTER regalloc and BEFORE
+// peephole/encode (znc.zag wires it: regalloc → optimize → peephole → encode).
+// An optimization that changes behavior is a CATASTROPHIC bug, so EVERY rewrite
+// here is required to be observationally equivalent (same architectural state at
+// every point control can be observed) and each carries a soundness argument.
+//
+// ── THE STRAIGHT-LINE RUN (the unit of analysis) ─────────────────────────────
+// A "run" is a maximal sequence of instructions containing NO control-flow and
+// NO call: it is broken by K_LABEL, K_CALL, K_JMP, the conditional jumps, K_RET
+// and K_SYSCALL ("breakers"). Like peephole, we NEVER reason across a breaker.
+// Within a run, control enters only at the top and leaves only at the bottom, so
+// rewrites that preserve the run's exit state (registers + memory + the CPU
+// stack pointer + any live flags) are safe. Across a breaker we reset ALL
+// analysis state (constants forgotten, model stack emptied) — the conservative,
+// provably-safe choice.
+//
+// ── OPT 1 · CONSTANT-STACK ELIMINATION + FOLDING (the big one) ────────────────
+// The stack machine evaluates `a OP b` as: <push a> ; <push b> ; pop rcx ;
+// pop rax ; OP rax,rcx ; push rax. Constants therefore flow THROUGH the CPU
+// stack. We model the stack symbolically per run: a `push r` whose register r
+// holds a KNOWN CONSTANT and whose matching `pop` lies in the SAME run (over a
+// gap that touches rsp only via balanced push/pop) is DELETED, and its matching
+// pop is replaced by `mov reg, const` (the constant is rematerialized — it needs
+// no register and no scratch slot). This is exactly equivalent: the original
+// pushed the constant to [rsp-8] and the pop read it back; rematerializing the
+// same constant at the pop yields the identical register value, the push/pop
+// were balanced so rsp is unchanged across the pair, and nothing in the gap
+// observes the transient slot or rsp (we verify the gap is rsp-clean). A push
+// whose value is NOT a known constant, or whose pop is in another run, is KEPT
+// verbatim — we never juggle a live unknown value through a scratch register
+// (that needs liveness we don't have here), so correctness never depends on it.
+//
+// Once constants are rematerialized at their pops, a register-tracking forward
+// pass FOLDS `OP rax,rcx` with both operands constant into `mov rax, <folded>`
+// (wrapping i64, matching x86), and an `OP rax,rcx` with only the SOURCE
+// constant into the immediate form (add/sub → add_imm/sub_imm; cmp → cmp_imm) —
+// removing the dependency on the source register. Folding a flag-setting op into
+// a mov is only done when the op's output FLAGS ARE DEAD (no consumer before
+// they are overwritten or the run ends into a non-conditional breaker); the
+// flag-live case (a cmp feeding a branch/setcc) is left untouched.
+//
+// ── OPT 2 · DEAD pure-register-write ELIMINATION (cleanup) ───────────────────
+// Folding/immediate-selection leaves behind register writes (the rematerialized
+// `mov rcx, c`, the now-unread operand loads) that are dead. A backward,
+// run-scoped liveness pass removes a `mov_imm`/`mov_rr` whose destination is
+// provably dead (overwritten later in the run before any read). Live-OUT of a
+// run is assumed to be ALL registers (conservative — we can only remove a write
+// killed WITHIN its run), and any instruction we don't model as a pure register
+// write is treated as reading every register (so we never remove a value it
+// might consume). Only flag-free, memory-free pure writes (mov_imm/mov_rr) are
+// ever removed, so flags and memory are never disturbed.
+//
+// ── SOUNDNESS OF THE STACK MODEL (why the LIFO matching is exact) ─────────────
+// A pre-scan pairs each `push` with its matching `pop` using a run-scoped index
+// stack (push → record index; pop → pop the index, recording the pair; cleared
+// at each breaker). The forward pass maintains a model stack in LOCKSTEP (a push
+// → one model entry; a pop → consume one entry iff non-empty; cleared at each
+// breaker), so its depth equals the pre-scan's at every point and the entry a
+// pop consumes is exactly the push the pre-scan paired. We only DELETE a push
+// when the pre-scan paired it inside the run, so every CONST model entry is
+// consumed by its pop before the run ends — never stranded across a breaker
+// (where the real CPU stack must be intact). Kept (unknown) pushes stay real on
+// the stack and are popped, in later runs, as ordinary "external" pops.
+//
+// LANGUAGE SUBSET: stmts end ';'. No `<<`/`>>`, no `|`/`||`/`^` (we fold only
+// +,-,* — never bitwise, so the operators we need are exactly +,-,*,&,%,/, and
+// comparisons). No break/continue (flag-guarded while / single-step loops).
+// Deref a pointer field as `p.*.field`. switch only for unions — here plain if.
+
+@import("isa.zag")
+
+// ── run-breaker / classification helpers ─────────────────────────────────────
+
+// A "breaker" ends a straight-line run: any control transfer or call, plus the
+// position-marker label (control can ARRIVE at a label).
+fn opt_is_breaker(k: i32) i32 {
+    if (k == K_LABEL())   { return 1; }
+    if (k == K_CALL())    { return 1; }
+    if (k == K_JMP())     { return 1; }
+    if (k == K_JE())      { return 1; }
+    if (k == K_JNE())     { return 1; }
+    if (k == K_JL())      { return 1; }
+    if (k == K_JLE())     { return 1; }
+    if (k == K_JG())      { return 1; }
+    if (k == K_JGE())     { return 1; }
+    if (k == K_RET())     { return 1; }
+    if (k == K_SYSCALL()) { return 1; }
+    return 0;
+}
+
+// A conditional jump READS the flags set by the run it terminates, so when a run
+// ends in one its trailing flags are LIVE-OUT (we must not fold the cmp away).
+fn opt_is_jcc(k: i32) i32 {
+    if (k == K_JE())  { return 1; }
+    if (k == K_JNE()) { return 1; }
+    if (k == K_JL())  { return 1; }
+    if (k == K_JLE()) { return 1; }
+    if (k == K_JG())  { return 1; }
+    if (k == K_JGE()) { return 1; }
+    return 0;
+}
+
+// Does this instruction DEFINE the EFLAGS used by setcc/Jcc? (mov/lea/load/
+// store/push/pop/mov_imm do NOT.)
+fn opt_writes_flags(k: i32) i32 {
+    if (k == K_ADD_RR())  { return 1; }
+    if (k == K_SUB_RR())  { return 1; }
+    if (k == K_IMUL_RR()) { return 1; }
+    if (k == K_CMP_RR())  { return 1; }
+    if (k == K_AND_RR())  { return 1; }
+    if (k == K_OR_RR())   { return 1; }
+    if (k == K_XOR_RR())  { return 1; }
+    if (k == K_ADD_RI())  { return 1; }
+    if (k == K_SUB_RI())  { return 1; }
+    if (k == K_CMP_RI())  { return 1; }
+    if (k == K_NEG())     { return 1; }
+    if (k == K_IDIV())    { return 1; }
+    if (k == K_FUCOMI())  { return 1; }
+    return 0;
+}
+
+// Does this instruction READ the flags? Within a run only K_SETCC does (the Jcc
+// readers are breakers, handled via the run's live-out).
+fn opt_reads_flags(k: i32) i32 {
+    if (k == K_SETCC()) { return 1; }
+    return 0;
+}
+
+// int32 range test — the immediate forms (add_imm/sub_imm/cmp_imm encode a
+// sign-extended imm32, so the constant must fit a signed 32-bit field).
+fn opt_fits32(v: i64) i32 {
+    let lo: i64 = 0 - 2147483648;
+    let hi: i64 = 2147483647;
+    if (v < lo) { return 0; }
+    if (v > hi) { return 0; }
+    return 1;
+}
+
+// Wrapping i64 fold for the three foldable binary ops (host +,-,* compile to the
+// same x86-64 add/sub/imul, so wrapping matches the hardware exactly).
+fn opt_fold(k: i32, a: i64, b: i64) i64 {
+    if (k == K_ADD_RR())  { return a + b; }
+    if (k == K_SUB_RR())  { return a - b; }
+    if (k == K_IMUL_RR()) { return a * b; }
+    return 0;
+}
+
+// ── 16-entry register-state arrays (indexed by hardware register number) ─────
+fn opt_mk16i32() ArrayList[i32] {
+    let a: ArrayList[i32] = make[i32](16);
+    let i: i32 = 0;
+    while (i < 16) { push[i32](&a, 0); i = i + 1; }
+    return a;
+}
+fn opt_mk16i64() ArrayList[i64] {
+    let a: ArrayList[i64] = make[i64](16);
+    let i: i32 = 0;
+    while (i < 16) { push[i64](&a, 0); i = i + 1; }
+    return a;
+}
+fn opt_reset16(known: *ArrayList[i32]) void {
+    let i: i32 = 0;
+    while (i < 16) { set[i32](known, i, 0); i = i + 1; }
+}
+
+// ── gap rsp-cleanliness ──────────────────────────────────────────────────────
+// A const push at index `p` with matching pop at index `q` (p < q, same run) is
+// only deletable if NOTHING in the open gap (p,q) touches rsp except balanced
+// push/pop. Deleting the pair leaves rsp 8 higher across the gap; the ONLY
+// instructions sensitive to the absolute rsp are push/pop (modeled consistently
+// — every kept pair shifts by the same 8 and stays balanced) and any rsp-operand
+// instruction. ncodegen never emits an rsp-relative load/store/lea in a body and
+// only writes rsp via push/pop (and `add rsp,N` to reclaim call args, which sits
+// in a post-call run, never inside an expression gap), so this nearly always
+// holds; when it does not we simply keep the push. We reject the gap if any
+// non-push/pop instruction names rsp (reg 4) in dst or src (covers mov rsp,
+// add/sub rsp, and rsp-base load/store/lea since the base lives in dst/src), or
+// if a breaker somehow appears (it never should inside a matched in-run pair).
+fn opt_gap_clean(prog: ArrayList[Instr], p: i32, q: i32) i32 {
+    let i: i32 = p + 1;
+    while (i < q) {
+        let ins: Instr = get[Instr](prog, i);
+        let k: i32 = ins.kind;
+        if (opt_is_breaker(k) == 1) { return 0; }
+        if (k != K_PUSH() && k != K_POP()) {
+            if (ins.dst == R_RSP()) { return 0; }
+            if (ins.src == R_RSP()) { return 0; }
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// ── PRE-SCAN: pair pushes↔pops (run-scoped LIFO), record matched + pop index ──
+// matched[i]==1  ⟺  prog[i] is a push whose matching pop is in the same run.
+// pop_of[i]      =  that pop's index (or -1).
+fn opt_prescan_matched(prog: ArrayList[Instr], n: i32, matched: *ArrayList[i32], pop_of: *ArrayList[i32]) void {
+    let stk: ArrayList[i32] = make[i32](16);   // indices of open pushes
+    let i: i32 = 0;
+    while (i < n) {
+        let k: i32 = get[Instr](prog, i).kind;
+        if (opt_is_breaker(k) == 1) {
+            stk = make[i32](16);               // clear at run boundary
+        } else {
+            if (k == K_PUSH()) {
+                push[i32](&stk, i);
+            } else {
+                if (k == K_POP()) {
+                    if (len[i32](stk) > 0) {
+                        let j: i32 = pop[i32](&stk);
+                        set[i32](matched, j, 1);
+                        set[i32](pop_of, j, i);
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// ── PRE-SCAN: backward flag liveness → flags_dead[i] for flag-writers ─────────
+// flags_dead[i]==1  ⟺  the EFLAGS that instruction i defines are never read
+// before being overwritten or the run ending into a non-conditional breaker.
+// We sweep the whole program backward; at each breaker we set the live-out of
+// the run that PRECEDES it (1 iff that breaker is a conditional jump).
+fn opt_prescan_flags(prog: ArrayList[Instr], n: i32, flags_dead: *ArrayList[i32]) void {
+    let live: i32 = 0;                          // flags live AFTER current position
+    let i: i32 = n - 1;
+    while (i >= 0) {
+        let k: i32 = get[Instr](prog, i).kind;
+        if (opt_is_breaker(k) == 1) {
+            // This breaker determines the flag live-out of the preceding run.
+            if (opt_is_jcc(k) == 1) { live = 1; } else { live = 0; }
+        } else {
+            let w: i32 = opt_writes_flags(k);
+            let r: i32 = opt_reads_flags(k);
+            if (w == 1) {
+                if (live == 0) { set[i32](flags_dead, i, 1); }
+            }
+            // live-in of i (= live-out of i-1): a reader makes flags live; a pure
+            // writer kills upward liveness; anything else leaves it unchanged.
+            if (r == 1) { live = 1; }
+            else { if (w == 1) { live = 0; } }
+        }
+        i = i - 1;
+    }
+}
+
+// ── invalidate the constant-knowledge an OPAQUE instruction destroys ─────────
+// For instructions the forward pass does not interpret, we forget the constant
+// value of every GPR they may write. Kinds whose GPR write-set we know exactly
+// invalidate just those; SSE ops that write only an xmm (separate register file)
+// invalidate nothing; any kind we do not recognize invalidates ALL registers
+// (the safe default — we never keep a stale constant).
+fn opt_invalidate(known: *ArrayList[i32], ins: Instr) void {
+    let k: i32 = ins.kind;
+    if (k == K_LOAD())     { set[i32](known, ins.dst, 0); return; }
+    if (k == K_LEA())      { set[i32](known, ins.dst, 0); return; }
+    if (k == K_NEG())      { set[i32](known, ins.dst, 0); return; }
+    if (k == K_SETCC())    { set[i32](known, ins.dst, 0); return; }
+    if (k == K_STORE())    { return; }                 // writes memory only
+    if (k == K_IDIV())     { set[i32](known, R_RAX(), 0); set[i32](known, R_RDX(), 0); return; }
+    if (k == K_FMOVQ_XG()) { set[i32](known, ins.dst, 0); return; }   // gpr ← xmm bits
+    if (k == K_FTSD2SI())  { set[i32](known, ins.dst, 0); return; }   // gpr ← (i64)xmm
+    if (k == K_FMOVQ_GX()) { return; }                 // xmm ← gpr (no gpr write)
+    if (k == K_FADD())     { return; }
+    if (k == K_FSUB())     { return; }
+    if (k == K_FMUL())     { return; }
+    if (k == K_FDIV())     { return; }
+    if (k == K_FUCOMI())   { return; }
+    if (k == K_FSI2SD())   { return; }                 // xmm ← gpr
+    if (k == K_FSD2SS())   { return; }
+    if (k == K_FSS2SD())   { return; }
+    if (k == K_FXORPS())   { return; }
+    // Unknown kind: forget everything (safe default).
+    opt_reset16(known);
+}
+
+// ── does instruction `ins` READ register r? (GPR read-set, conservative) ─────
+// Used only to GATE immediate-form selection (a decision that is semantics-
+// neutral either way), so an over-approximation merely makes us miss an
+// optimization — never miscompile. Unknown kinds are treated as reading r.
+fn opt_reads_reg(ins: Instr, r: i32) i32 {
+    let k: i32 = ins.kind;
+    let d: i32 = ins.dst;
+    let s: i32 = ins.src;
+    if (k == K_MOV_RR())  { if (s == r) { return 1; } return 0; }
+    if (k == K_ADD_RR() || k == K_SUB_RR() || k == K_IMUL_RR() ||
+        k == K_AND_RR() || k == K_OR_RR()  || k == K_XOR_RR() || k == K_CMP_RR()) {
+        if (d == r) { return 1; } if (s == r) { return 1; } return 0;
+    }
+    if (k == K_ADD_RI() || k == K_SUB_RI() || k == K_CMP_RI() || k == K_NEG()) {
+        if (d == r) { return 1; } return 0;
+    }
+    if (k == K_PUSH())  { if (d == r) { return 1; } return 0; }
+    if (k == K_STORE()) { if (d == r) { return 1; } if (s == r) { return 1; } return 0; }
+    if (k == K_LOAD())  { if (s == r) { return 1; } return 0; }
+    if (k == K_LEA())   { if (s == r) { return 1; } return 0; }
+    if (k == K_IDIV())  { if (r == R_RAX()) { return 1; } if (r == R_RDX()) { return 1; } if (s == r) { return 1; } return 0; }
+    if (k == K_FMOVQ_GX()) { if (s == r) { return 1; } return 0; }
+    if (k == K_FSI2SD())   { if (s == r) { return 1; } return 0; }
+    if (k == K_MOV_IMM())  { return 0; }
+    if (k == K_POP())      { return 0; }
+    if (k == K_SETCC())    { return 0; }
+    if (k == K_FMOVQ_XG()) { return 0; }
+    if (k == K_FTSD2SI())  { return 0; }
+    if (k == K_FADD())   { return 0; }
+    if (k == K_FSUB())   { return 0; }
+    if (k == K_FMUL())   { return 0; }
+    if (k == K_FDIV())   { return 0; }
+    if (k == K_FUCOMI()) { return 0; }
+    if (k == K_FSD2SS()) { return 0; }
+    if (k == K_FSS2SD()) { return 0; }
+    if (k == K_FXORPS()) { return 0; }
+    return 1;   // unknown → assume it reads r (gate stays off — safe)
+}
+
+// ── does instruction `ins` OVERWRITE register r without reading it first? ─────
+// (Used only for the immediate-form gate.) A clean kill makes r's prior value
+// (the constant we would have loaded) dead — so the load becomes removable.
+fn opt_writes_reg(ins: Instr, r: i32) i32 {
+    let k: i32 = ins.kind;
+    let d: i32 = ins.dst;
+    if (k == K_MOV_IMM() || k == K_MOV_RR() || k == K_POP() ||
+        k == K_LOAD()    || k == K_LEA()    || k == K_SETCC() ||
+        k == K_FMOVQ_XG()|| k == K_FTSD2SI()) {
+        if (d == r) { return 1; } return 0;
+    }
+    if (k == K_IDIV()) { if (r == R_RAX()) { return 1; } if (r == R_RDX()) { return 1; } return 0; }
+    return 0;
+}
+
+// ── could instruction `ins` WRITE register R? (CONSERVATIVE over-approx) ──────
+// Used to prove a copy source survives a push→pop gap unchanged: if this ever
+// answers 1 for any instruction in the gap, we DO NOT remat (we keep the push).
+// Unknown kinds and breakers answer 1 (assume they clobber R) — safe.
+fn opt_reg_written(ins: Instr, R: i32) i32 {
+    let k: i32 = ins.kind;
+    if (k == K_MOV_IMM() || k == K_MOV_RR() || k == K_ADD_RR() || k == K_SUB_RR() ||
+        k == K_IMUL_RR() || k == K_AND_RR() || k == K_OR_RR()  || k == K_XOR_RR() ||
+        k == K_ADD_RI()  || k == K_SUB_RI() || k == K_POP()    || k == K_LOAD()   ||
+        k == K_LEA()     || k == K_NEG()    || k == K_SETCC()  || k == K_FMOVQ_XG()||
+        k == K_FTSD2SI()) {
+        if (ins.dst == R) { return 1; } return 0;
+    }
+    if (k == K_IDIV()) { if (R == R_RAX()) { return 1; } if (R == R_RDX()) { return 1; } return 0; }
+    // pure flag/memory/xmm writers (cmp, cmp_ri, push, store, ucomisd, fadd…) and
+    // gpr→xmm moves write no GPR.
+    if (k == K_CMP_RR() || k == K_CMP_RI() || k == K_PUSH() || k == K_STORE() ||
+        k == K_FUCOMI() || k == K_FMOVQ_GX() || k == K_FSI2SD() || k == K_FADD() ||
+        k == K_FSUB()   || k == K_FMUL()   || k == K_FDIV()   || k == K_FSD2SS() ||
+        k == K_FSS2SD() || k == K_FXORPS()) {
+        return 0;
+    }
+    return 1;   // breaker / unknown → assume it writes R (safe: blocks the remat)
+}
+
+// Is register R possibly written anywhere in the OPEN gap (p, q)?
+fn opt_reg_written_in(prog: ArrayList[Instr], p: i32, q: i32, R: i32) i32 {
+    let i: i32 = p + 1;
+    while (i < q) {
+        if (opt_reg_written(get[Instr](prog, i), R) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ── will the source register's constant-load be REMOVABLE after immediate form?
+// We only convert `op dst, src` (src a known const) to its immediate form when
+// the freed `src` register is OVERWRITTEN before any read AND before the run's
+// next breaker — i.e. the constant load that fed it is dead and the run-scoped
+// DCE will delete it. Otherwise the immediate form would strand a now-dead (and,
+// near a call/branch, un-removable) `mov src, c`, GROWING the code; in that case
+// we keep the register form (where that same load is still used) — no regression.
+fn opt_src_killed_in_run(prog: ArrayList[Instr], op: i32, src: i32, n: i32) i32 {
+    let i: i32 = op + 1;
+    let res: i32 = 0;
+    let going: i32 = 1;
+    while (going == 1 && i < n) {
+        let ins: Instr = get[Instr](prog, i);
+        if (opt_is_breaker(ins.kind) == 1) { going = 0; }
+        else {
+            if (opt_reads_reg(ins, src) == 1) { going = 0; }                    // still needed
+            else { if (opt_writes_reg(ins, src) == 1) { res = 1; going = 0; } } // killed → removable
+        }
+        i = i + 1;
+    }
+    return res;
+}
+
+// ── THE FORWARD PASS: stack elimination + constant folding + immediate form ──
+fn opt_fold_pass(prog: ArrayList[Instr]) ArrayList[Instr] {
+    let n: i32 = len[Instr](prog);
+    let out: ArrayList[Instr] = make[Instr](n + 16);
+
+    // pre-computed analyses
+    let matched: ArrayList[i32] = make[i32](n + 1);
+    let pop_of:  ArrayList[i32] = make[i32](n + 1);
+    let flagsd:  ArrayList[i32] = make[i32](n + 1);
+    let z: i32 = 0;
+    while (z < n) { push[i32](&matched, 0); push[i32](&pop_of, 0 - 1); push[i32](&flagsd, 0); z = z + 1; }
+    opt_prescan_matched(prog, n, &matched, &pop_of);
+    opt_prescan_flags(prog, n, &flagsd);
+
+    // forward register/stack state
+    let known: ArrayList[i32] = opt_mk16i32();   // 1 ⟺ cval[r] is a known const
+    let cval:  ArrayList[i64] = opt_mk16i64();   // the known constant
+    let ms_tag: ArrayList[i32] = make[i32](16);  // model stack: 1=CONST, 0=KEEP
+    let ms_val: ArrayList[i64] = make[i64](16);
+
+    let i: i32 = 0;
+    while (i < n) {
+        let ins: Instr = get[Instr](prog, i);
+        let k: i32 = ins.kind;
+
+        if (opt_is_breaker(k) == 1) {
+            // Cross a run boundary: emit verbatim, forget all constants, empty
+            // the model stack (any leftover entries are KEEP pushes whose real
+            // value still sits on the CPU stack for a later run to pop).
+            push[Instr](&out, ins);
+            opt_reset16(&known);
+            ms_tag = make[i32](16);
+            ms_val = make[i64](16);
+
+        } else { if (k == K_PUSH()) {
+            let r: i32 = ins.dst;
+            let done: i32 = 0;
+            // (1) CONSTANT rematerialization: r holds a known constant and its pop
+            //     is in-run over an rsp-clean gap → delete, remat the pop as mov_imm.
+            if (done == 0 && get[i32](matched, i) == 1 && get[i32](known, r) == 1) {
+                if (opt_gap_clean(prog, i, get[i32](pop_of, i)) == 1) {
+                    push[i32](&ms_tag, 1);
+                    push[i64](&ms_val, get[i64](cval, r));
+                    done = 1;
+                }
+            }
+            // (2) REGISTER-COPY rematerialization: the push is fed by an adjacent
+            //     `mov r, R` and R survives the whole (rsp-clean) gap unwritten →
+            //     delete, remat the pop as `mov rY, R` (and the feeding mov dies in
+            //     DCE). Equivalent: the pushed value was exactly R's value, R is
+            //     unchanged at the pop, so reloading rY from R reproduces it.
+            if (done == 0 && get[i32](matched, i) == 1 && i > 0) {
+                let prev: Instr = get[Instr](prog, i - 1);
+                if (prev.kind == K_MOV_RR() && prev.dst == r && prev.src != R_RSP()) {
+                    let q: i32 = get[i32](pop_of, i);
+                    if (opt_gap_clean(prog, i, q) == 1 && opt_reg_written_in(prog, i, q, prev.src) == 0) {
+                        push[i32](&ms_tag, 2);
+                        push[i64](&ms_val, prev.src as i64);
+                        done = 1;
+                    }
+                }
+            }
+            // (3) KEEP: emit the real push, record a placeholder model entry.
+            if (done == 0) {
+                push[i32](&ms_tag, 0);
+                push[i64](&ms_val, 0);
+                push[Instr](&out, ins);
+            }
+
+        } else { if (k == K_POP()) {
+            let r: i32 = ins.dst;
+            if (len[i32](ms_tag) > 0) {
+                let tag: i32 = pop[i32](&ms_tag);
+                let v:   i64 = pop[i64](&ms_val);
+                if (tag == 1) {
+                    // matching push was a deleted constant — rematerialize it.
+                    push[Instr](&out, i_mov_imm(r, v));
+                    set[i32](&known, r, 1);
+                    set[i64](&cval, r, v);
+                } else { if (tag == 2) {
+                    // matching push was a deleted register copy — reload from R.
+                    push[Instr](&out, i_mov_rr(r, v as i32));
+                    set[i32](&known, r, 0);
+                } else {
+                    push[Instr](&out, ins);
+                    set[i32](&known, r, 0);
+                } }
+            } else {
+                // external pop (matches a push from before this run) — keep it.
+                push[Instr](&out, ins);
+                set[i32](&known, r, 0);
+            }
+
+        } else { if (k == K_ADD_RR() || k == K_SUB_RR() || k == K_IMUL_RR()) {
+            let d: i32 = ins.dst;
+            let s: i32 = ins.src;
+            let dk: i32 = get[i32](known, d);
+            let sk: i32 = get[i32](known, s);
+            if (dk == 1 && sk == 1 && get[i32](flagsd, i) == 1) {
+                // both operands constant, output flags dead → fold to a mov.
+                let fv: i64 = opt_fold(k, get[i64](cval, d), get[i64](cval, s));
+                push[Instr](&out, i_mov_imm(d, fv));
+                set[i32](&known, d, 1);
+                set[i64](&cval, d, fv);
+            } else { if (sk == 1 && (k == K_ADD_RR() || k == K_SUB_RR()) && opt_fits32(get[i64](cval, s)) == 1 && opt_src_killed_in_run(prog, i, s, n) == 1) {
+                // source constant AND its load is dead afterwards → immediate form
+                // (drops the source-register dependency; the load is DCE'd). Gated
+                // so it never strands a non-removable mov (no byte regression).
+                if (k == K_ADD_RR()) { push[Instr](&out, i_add_imm(d, get[i64](cval, s))); }
+                else                 { push[Instr](&out, i_sub_imm(d, get[i64](cval, s))); }
+                set[i32](&known, d, 0);
+            } else {
+                push[Instr](&out, ins);
+                set[i32](&known, d, 0);
+            } }
+
+        } else { if (k == K_AND_RR() || k == K_OR_RR() || k == K_XOR_RR()) {
+            // not folded (we avoid bitwise folds); just track the dst as unknown.
+            push[Instr](&out, ins);
+            set[i32](&known, ins.dst, 0);
+
+        } else { if (k == K_CMP_RR()) {
+            let d2: i32 = ins.dst;
+            let s2: i32 = ins.src;
+            if (get[i32](known, s2) == 1 && opt_fits32(get[i64](cval, s2)) == 1 && opt_src_killed_in_run(prog, i, s2, n) == 1) {
+                // immediate compare — identical flags, frees the source register;
+                // gated so the freed source's load is provably removable.
+                push[Instr](&out, i_cmp_imm(d2, get[i64](cval, s2)));
+            } else {
+                push[Instr](&out, ins);
+            }
+            // cmp writes no register; constant state unchanged.
+
+        } else { if (k == K_MOV_IMM()) {
+            push[Instr](&out, ins);
+            set[i32](&known, ins.dst, 1);
+            set[i64](&cval, ins.dst, ins.imm);
+
+        } else { if (k == K_MOV_RR()) {
+            // emit verbatim, but PROPAGATE the source's known-ness so downstream
+            // folds can fire (the mov itself becomes dead and is dropped by DCE).
+            push[Instr](&out, ins);
+            if (get[i32](known, ins.src) == 1) {
+                set[i32](&known, ins.dst, 1);
+                set[i64](&cval, ins.dst, get[i64](cval, ins.src));
+            } else {
+                set[i32](&known, ins.dst, 0);
+            }
+
+        } else { if (k == K_ADD_RI() || k == K_SUB_RI()) {
+            let d3: i32 = ins.dst;
+            if (get[i32](known, d3) == 1 && get[i32](flagsd, i) == 1) {
+                let nv: i64 = get[i64](cval, d3);
+                if (k == K_ADD_RI()) { nv = nv + ins.imm; } else { nv = nv - ins.imm; }
+                push[Instr](&out, i_mov_imm(d3, nv));
+                set[i32](&known, d3, 1);
+                set[i64](&cval, d3, nv);
+            } else {
+                push[Instr](&out, ins);
+                set[i32](&known, d3, 0);
+            }
+
+        } else {
+            // OPAQUE (load/store/lea/idiv/setcc/neg/SSE/...): emit verbatim and
+            // forget the constants it may clobber.
+            push[Instr](&out, ins);
+            opt_invalidate(&known, ins);
+        } } } } } } } } }
+
+        i = i + 1;
+    }
+
+    return out;
+}
+
+// ── BACKWARD DCE: drop dead pure-register writes (run-scoped) ─────────────────
+// Removes a `mov_imm`/`mov_rr` whose destination register is dead — overwritten
+// later in the run before any read. Live-out of a run is ALL registers
+// (conservative). Any instruction not modeled as a pure register write is
+// treated as reading all registers (so nothing it might consume is removed). We
+// only ever remove flag-free, memory-free moves, so flags and memory are intact.
+fn opt_dce(prog: ArrayList[Instr]) ArrayList[Instr] {
+    let n: i32 = len[Instr](prog);
+    let keep: ArrayList[i32] = make[i32](n + 1);
+    let live: ArrayList[i32] = opt_mk16i32();
+    let z: i32 = 0;
+    while (z < n) { push[i32](&keep, 1); z = z + 1; }
+
+    // assume every register live at end of program
+    let r0: i32 = 0;
+    while (r0 < 16) { set[i32](&live, r0, 1); r0 = r0 + 1; }
+
+    let i: i32 = n - 1;
+    while (i >= 0) {
+        let ins: Instr = get[Instr](prog, i);
+        let k: i32 = ins.kind;
+
+        if (opt_is_breaker(k) == 1) {
+            // run boundary → conservative live-out (all registers live)
+            let rr: i32 = 0;
+            while (rr < 16) { set[i32](&live, rr, 1); rr = rr + 1; }
+        } else { if (k == K_MOV_IMM() || k == K_MOV_RR()) {
+            let d: i32 = ins.dst;
+            if (get[i32](live, d) == 0) {
+                set[i32](&keep, i, 0);             // dead pure write → remove
+            } else {
+                // kept: kill dst, then mark source(s) read
+                set[i32](&live, d, 0);
+                if (k == K_MOV_RR()) { set[i32](&live, ins.src, 1); }
+            }
+        } else {
+            // any other kept instruction: apply its GPR read/write liveness
+            opt_dce_liveness(&live, ins);
+        } }
+
+        i = i - 1;
+    }
+
+    let out: ArrayList[Instr] = make[Instr](n + 1);
+    let j: i32 = 0;
+    while (j < n) {
+        if (get[i32](keep, j) == 1) { push[Instr](&out, get[Instr](prog, j)); }
+        j = j + 1;
+    }
+    return out;
+}
+
+// Update register liveness for a KEPT, non-mov instruction (write-set killed
+// first, then read-set made live; reg both read & written stays live). Unknown
+// kinds are treated as reading every register (safe over-approximation).
+fn opt_dce_liveness(live: *ArrayList[i32], ins: Instr) void {
+    let k: i32 = ins.kind;
+    let d: i32 = ins.dst;
+    let s: i32 = ins.src;
+    if (k == K_ADD_RR() || k == K_SUB_RR() || k == K_IMUL_RR() ||
+        k == K_AND_RR() || k == K_OR_RR()  || k == K_XOR_RR()) {
+        set[i32](live, d, 0); set[i32](live, d, 1); set[i32](live, s, 1); return;
+    }
+    if (k == K_CMP_RR())  { set[i32](live, d, 1); set[i32](live, s, 1); return; }
+    if (k == K_ADD_RI() || k == K_SUB_RI()) { set[i32](live, d, 1); return; }   // reads+writes d
+    if (k == K_CMP_RI())  { set[i32](live, d, 1); return; }
+    if (k == K_PUSH())    { set[i32](live, d, 1); return; }                     // reads d
+    if (k == K_POP())     { set[i32](live, d, 0); return; }                     // writes d
+    if (k == K_LOAD())    { set[i32](live, d, 0); set[i32](live, s, 1); return; }
+    if (k == K_STORE())   { set[i32](live, d, 1); set[i32](live, s, 1); return; }
+    if (k == K_LEA())     { set[i32](live, d, 0); set[i32](live, s, 1); return; }
+    if (k == K_NEG())     { set[i32](live, d, 1); return; }                     // reads+writes d
+    if (k == K_SETCC())   { set[i32](live, d, 0); return; }                     // writes d (reads flags)
+    if (k == K_IDIV())    { set[i32](live, R_RAX(), 1); set[i32](live, R_RDX(), 1); set[i32](live, s, 1); return; }
+    if (k == K_FMOVQ_GX()) { set[i32](live, s, 1); return; }                    // reads gpr src
+    if (k == K_FMOVQ_XG()) { set[i32](live, d, 0); return; }                    // writes gpr dst
+    if (k == K_FSI2SD())  { set[i32](live, s, 1); return; }                     // reads gpr src
+    if (k == K_FTSD2SI()) { set[i32](live, d, 0); return; }                     // writes gpr dst
+    if (k == K_FADD())   { return; }
+    if (k == K_FSUB())   { return; }
+    if (k == K_FMUL())   { return; }
+    if (k == K_FDIV())   { return; }
+    if (k == K_FUCOMI()) { return; }
+    if (k == K_FSD2SS()) { return; }
+    if (k == K_FSS2SD()) { return; }
+    if (k == K_FXORPS()) { return; }
+    // Unknown kind: assume it reads every register (keep everything live).
+    let r: i32 = 0;
+    while (r < 16) { set[i32](live, r, 1); r = r + 1; }
+}
+
+// ── public entry: fold pass then dead-code elimination ───────────────────────
+fn optimize(prog: ArrayList[Instr]) ArrayList[Instr] {
+    let folded: ArrayList[Instr] = opt_fold_pass(prog);
+    let cleaned: ArrayList[Instr] = opt_dce(folded);
+    return cleaned;
+}
