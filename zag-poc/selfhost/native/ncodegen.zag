@@ -846,6 +846,149 @@ fn cg_find_generic_struct(decls: ArrayList[*Node], name: []u8, out: *StructDecl)
     return 0;
 }
 
+// ── generic type-argument INFERENCE ─────────────────────────────────────────
+// For calls like `unbox(bi)` where `unbox` is generic `fn unbox[T](b: Box[T]) T`
+// and `bi: Box[i32]`, infer T=i32 from the argument types and fill c.targs.
+// This must run BEFORE cg_expand_generics so the mono pass sees explicit targs.
+
+// Unify param type `pty` against arg type `aty`, returning the binding for
+// type-param `tp` (or "" if undetermined here). Mirrors codegen.zag unify_bind.
+fn cg_unify_bind(pty: []u8, aty: []u8, tp: []u8) []u8 {
+    if (aty.len == 0) { return ""; }
+    if (@strEq(pty, tp)) { return aty; }
+    if (pty.len > 2 && pty[0] == '[' && pty[1] == ']' && aty.len > 2 && aty[0] == '[' && aty[1] == ']') {
+        return cg_unify_bind(pty[2..], aty[2..], tp);
+    }
+    if (pty.len > 1 && pty[0] == '*' && aty.len > 1 && aty[0] == '*') {
+        return cg_unify_bind(pty[1..], aty[1..], tp);
+    }
+    if (is_generic_app(pty) && is_generic_app(aty)) {
+        let pl: i32 = index_of(pty, '[');
+        let al: i32 = index_of(aty, '[');
+        let pargs: ArrayList[[]u8] = split_args(pty[pl + 1..pty.len - 1]);
+        let aargs: ArrayList[[]u8] = split_args(aty[al + 1..aty.len - 1]);
+        let k: i32 = 0;
+        while (k < len[[]u8](pargs) && k < len[[]u8](aargs)) {
+            let b: []u8 = cg_unify_bind(get[[]u8](pargs, k), get[[]u8](aargs, k), tp);
+            if (b.len > 0) { return b; }
+            k = k + 1;
+        }
+    }
+    return "";
+}
+
+// Get the declared type of an expression node from a local let-type map `lenv`.
+// Returns "" for expressions we can't determine cheaply.
+fn cg_ginfer_argty(n: *Node, lenv: ArrayList[Param]) []u8 {
+    switch (n.*) {
+        .id => |x| {
+            let i: i32 = 0;
+            while (i < len[Param](lenv)) {
+                if (@strEq(get[Param](lenv, i).name, x.name)) { return get[Param](lenv, i).pty; }
+                i = i + 1;
+            }
+            return "";
+        }
+        .slit_ => |s| {
+            if (len[[]u8](s.targs) > 0) { return cg_mangle_generic(s.sname, s.targs); }
+            return s.sname;
+        }
+        else => { return ""; }
+    }
+}
+
+// Walk an expression, filling in targs for generic calls with empty targs.
+fn cg_ginfer_expr(n: *Node, lenv: ArrayList[Param], decls: ArrayList[*Node]) void {
+    switch (n.*) {
+        .call => |c| {
+            let i2: i32 = 0;
+            while (i2 < len[*Node](c.args)) { cg_ginfer_expr(get[*Node](c.args, i2), lenv, decls); i2 = i2 + 1; }
+            if (len[[]u8](c.targs) == 0) {
+                let cn: []u8 = cg_callee_name(c.callee);
+                if (cn.len > 0) {
+                    let gf: FnDecl = FnDecl{ .name = "", .tparams = make[[]u8](1), .params = make[Param](1), .ret = "", .annots = make[[]u8](1), .body = make[*Node](1), .is_extern = 0, .ret_eff = "", .caps = 0, .cap_names = "", .cap_types = "" };
+                    if (cg_find_generic_fn(decls, cn, &gf) == 1) {
+                        let targs: ArrayList[[]u8] = make[[]u8](len[[]u8](gf.tparams) + 1);
+                        let ok: i32 = 1;
+                        let ti: i32 = 0;
+                        while (ti < len[[]u8](gf.tparams)) {
+                            let tp: []u8 = get[[]u8](gf.tparams, ti);
+                            let bound: []u8 = "";
+                            let pi: i32 = 0;
+                            while (pi < len[Param](gf.params) && pi < len[*Node](c.args)) {
+                                let aty: []u8 = cg_ginfer_argty(get[*Node](c.args, pi), lenv);
+                                if (aty.len > 0) {
+                                    let b: []u8 = cg_unify_bind(get[Param](gf.params, pi).pty, aty, tp);
+                                    if (b.len > 0) { bound = b; pi = len[Param](gf.params); } else { pi = pi + 1; }
+                                } else { pi = pi + 1; }
+                            }
+                            if (bound.len == 0) { ok = 0; }
+                            push[[]u8](&targs, bound);
+                            ti = ti + 1;
+                        }
+                        if (ok == 1) {
+                            n.* = Node{ .call = Call{ .callee = c.callee, .args = c.args, .targs = targs } };
+                        }
+                    }
+                }
+            }
+        }
+        .bin   => |b| { cg_ginfer_expr(b.l, lenv, decls); cg_ginfer_expr(b.r, lenv, decls); }
+        .un    => |u| { cg_ginfer_expr(u.e, lenv, decls); }
+        .fld   => |f| { cg_ginfer_expr(f.base, lenv, decls); }
+        .idx   => |x| { cg_ginfer_expr(x.base, lenv, decls); cg_ginfer_expr(x.idx, lenv, decls); }
+        .cast_ => |c| { cg_ginfer_expr(c.expr, lenv, decls); }
+        .slice_=> |s| { cg_ginfer_expr(s.base, lenv, decls); cg_ginfer_expr(s.lo, lenv, decls); cg_ginfer_expr(s.hi, lenv, decls); }
+        .slit_ => |s| { let i2: i32 = 0; while (i2 < len[FieldInit](s.fields)) { cg_ginfer_expr(get[FieldInit](s.fields, i2).val, lenv, decls); i2 = i2 + 1; } }
+        else => { }
+    }
+}
+
+fn cg_ginfer_stmt(n: *Node, lenv: *ArrayList[Param], decls: ArrayList[*Node]) void {
+    switch (n.*) {
+        .let_ => |l| {
+            cg_ginfer_expr(l.expr, lenv.*, decls);
+            push[Param](lenv, Param{ .name = l.name, .pty = l.dty, .eff = "", .calign = 0 });
+        }
+        .ret     => |r| { if (r.has_expr == 1) { cg_ginfer_expr(r.expr, lenv.*, decls); } }
+        .assign  => |a| { cg_ginfer_expr(a.expr, lenv.*, decls); }
+        .estmt   => |s| { cg_ginfer_expr(s.expr, lenv.*, decls); }
+        .if_     => |x| {
+            cg_ginfer_expr(x.cond, lenv.*, decls);
+            let ai: i32 = 0; while (ai < len[*Node](x.then_body)) { cg_ginfer_stmt(get[*Node](x.then_body, ai), lenv, decls); ai = ai + 1; }
+            if (x.has_els == 1) { let bi: i32 = 0; while (bi < len[*Node](x.els_body)) { cg_ginfer_stmt(get[*Node](x.els_body, bi), lenv, decls); bi = bi + 1; } }
+        }
+        .while_  => |w| {
+            cg_ginfer_expr(w.cond, lenv.*, decls);
+            let wi: i32 = 0; while (wi < len[*Node](w.body)) { cg_ginfer_stmt(get[*Node](w.body, wi), lenv, decls); wi = wi + 1; }
+        }
+        else => { }
+    }
+}
+
+// Run type-arg inference on all non-generic fn bodies before monomorphization.
+fn cg_ginfer_pass(decls: ArrayList[*Node]) void {
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .fn_decl => |f| {
+                if (len[[]u8](f.tparams) == 0 && f.is_extern == 0) {
+                    let lenv: ArrayList[Param] = make[Param](8);
+                    let pi: i32 = 0;
+                    while (pi < len[Param](f.params)) {
+                        push[Param](&lenv, get[Param](f.params, pi));
+                        pi = pi + 1;
+                    }
+                    let bi: i32 = 0;
+                    while (bi < len[*Node](f.body)) { cg_ginfer_stmt(get[*Node](f.body, bi), &lenv, decls); bi = bi + 1; }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+}
+
 // Register the generic STRUCT instance Base[targs] (and, transitively, any
 // generic struct types its substituted fields reference) as concrete mangled
 // StructDecls appended to e.decls. Dependencies are recorded first.
@@ -1277,6 +1420,7 @@ fn cg_type_size(cg: *Cg, ty0: []u8) i32 {
     if (ty[0] == '*') { return 8; }                 // pointer = scalar
     if (@strEq(ty, "fat_fn")) { return 16; }         // fat_fn = {code_ptr, env_ptr}
     if (cg_is_fn_type(ty) == 1) { return 16; }      // fn-typed = fat_fn = 2 words
+    if (ty.len > 1 && ty[0] == '!') { return 16; } // !T error union = {err_code, val}
     if (cg_type_is_slice(cg, ty) == 1) { return 16; }  // []u8 = {ptr,len}
     if (ty[0] == '?') {                             // optional ?T = {has, val}
         return 8 + cg_round8(cg_type_size(cg, ty[1..]));
@@ -1426,6 +1570,7 @@ fn cg_type_is_opt(cg: *Cg, ty: []u8) i32 {
 fn cg_type_is_agg(cg: *Cg, ty: []u8) i32 {
     if (@strEq(ty, "fat_fn")) { return 1; }
     if (cg_is_fn_type(ty) == 1) { return 1; }  // fn(A)B is natively a fat_fn (2 words)
+    if (ty.len > 1 && ty[0] == '!') { return 1; }  // !T error union = {err_code, val}
     if (cg_type_is_struct(cg, ty) == 1) { return 1; }
     if (cg_type_is_slice(cg, ty) == 1) { return 1; }
     if (ty.len > 0) {
@@ -1442,6 +1587,7 @@ fn cg_type_is_agg(cg: *Cg, ty: []u8) i32 {
 fn cg_agg_words(cg: *Cg, ty: []u8) i32 {
     if (@strEq(ty, "fat_fn")) { return 2; }
     if (cg_is_fn_type(ty) == 1) { return 2; }  // fn(A)B is a fat_fn, always 2 words
+    if (ty.len > 1 && ty[0] == '!') { return 2; }  // !T error union = {err_code, val}
     if (cg_type_is_agg(cg, ty) == 0) { return 1; }
     let sz: i32 = cg_type_size(cg, ty);
     let w: i32 = sz / 8;
@@ -1950,6 +2096,13 @@ fn cg_scan_call(cg: *Cg, sc: *ScanCtx, c: Call) void {
             }
             return;
         }
+    }
+    // __catch/__catchc: evaluate expr (may have agg scratch), plus 1 err-slot.
+    if (@strEq(fname, "__catch") || @strEq(fname, "__catchc")) {
+        sc.*.words.* = sc.*.words.* + 1;
+        let ai2: i32 = 0;
+        while (ai2 < len[*Node](c.args)) { cg_scan_expr(cg, sc, get[*Node](c.args, ai2)); ai2 = ai2 + 1; }
+        return;
     }
     // Native-runtime externs (_zag_*) take slice args by their EXISTING block
     // pointer (no caller copy) and return a pointer in rax (no frame result
@@ -2960,6 +3113,28 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                 // lvalue's ADDRESS. Taking the address of a non-addressable
                 // value is rejected loudly inside cg_lower_addr.
                 cg_lower_addr(out, u.e, env, syms, cg);
+            } else if (@strEq(u.op, "try")) {
+                // try expr — expr is !T; err_code==0 means success.
+                // If error: propagate (write {err,0} to sret buffer, jump epilogue).
+                // If success: leave val on stack as the expression's value.
+                let l_ok3: i32 = cg_fresh(cg);
+                cg_lower_expr(out, u.e, env, syms, cg);   // pushes ptr to {err,val}
+                push[Instr](out, i_pop(R_RSI()));
+                push[Instr](out, i_load(R_RAX(), R_RSI(), 0));   // err code
+                push[Instr](out, i_cmp_imm(R_RAX(), 0));
+                push[Instr](out, i_je(l_ok3));                    // err==0 → ok
+                // propagate: write {err, 0} into caller's sret buffer
+                if (env.*.sret_type.len > 1 && env.*.sret_type[0] == '!') {
+                    push[Instr](out, i_load(R_RCX(), R_RBP(), env.*.sret_disp));
+                    push[Instr](out, i_store(R_RCX(), 0, R_RAX()));
+                    push[Instr](out, i_mov_imm(R_RAX(), 0));
+                    push[Instr](out, i_store(R_RCX(), 8, R_RAX()));
+                    push[Instr](out, i_load(R_RAX(), R_RBP(), env.*.sret_disp));
+                }
+                push[Instr](out, i_jmp(env.*.epilogue));
+                push[Instr](out, i_label(l_ok3));
+                push[Instr](out, i_load(R_RAX(), R_RSI(), 8));   // val on success
+                push[Instr](out, i_push(R_RAX()));
             } else {
                 cg_err(cg, "native: unsupported unary operator");
                 cg_lower_expr(out, u.e, env, syms, cg);
@@ -3068,6 +3243,24 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                 push[Instr](out, i_load(R_RAX(), R_RAX(), 0));
                 push[Instr](out, i_push(R_RAX()));
                 return;
+            }
+            // error.X → integer code (index+1 in __zag_errors enum).
+            switch (f.base.*) {
+                .id => |errid| {
+                    if (@strEq(errid.name, "error")) {
+                        let ec: i32 = cg_enum_member_index(cg, "__zag_errors", f.fname);
+                        if (ec >= 0) {
+                            push[Instr](out, i_mov_imm(R_RAX(), (ec + 1) as i64));
+                            push[Instr](out, i_push(R_RAX()));
+                            return;
+                        }
+                        // unknown error name → code 1 (non-zero = error)
+                        push[Instr](out, i_mov_imm(R_RAX(), 1));
+                        push[Instr](out, i_push(R_RAX()));
+                        return;
+                    }
+                }
+                else => { }
             }
             // enum member access `Color.Green` → the member's integer index. The
             // base must be a plain ident naming a declared enum that has the member.
@@ -4637,6 +4830,53 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
     if (fname.len > 0) {
         if (fname[0] == '@') { cg_lower_builtin(out, fname, c, env, syms, cg); return; }
     }
+    // __catch(expr, fallback) — error union: if expr._err == 0 use val, else fallback.
+    if (@strEq(fname, "__catch")) {
+        let l_ok_c: i32 = cg_fresh(cg);
+        let l_done_c: i32 = cg_fresh(cg);
+        cg_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);  // ptr to !T
+        push[Instr](out, i_pop(R_RSI()));
+        push[Instr](out, i_load(R_RAX(), R_RSI(), 0));   // err code
+        push[Instr](out, i_cmp_imm(R_RAX(), 0));
+        push[Instr](out, i_je(l_ok_c));                   // err==0 → success
+        cg_lower_expr(out, get[*Node](c.args, 1), env, syms, cg);  // fallback (pushed)
+        push[Instr](out, i_jmp(l_done_c));
+        push[Instr](out, i_label(l_ok_c));
+        push[Instr](out, i_load(R_RAX(), R_RSI(), 8));   // val
+        push[Instr](out, i_push(R_RAX()));
+        push[Instr](out, i_label(l_done_c));
+        return;
+    }
+    // __catchc(expr, err_name, fallback) — catch with captured error code binding.
+    if (@strEq(fname, "__catchc")) {
+        let l_ok_cc: i32 = cg_fresh(cg);
+        let l_done_cc: i32 = cg_fresh(cg);
+        let err_slot: i32 = cg_slot_scratch(env);
+        cg_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);  // ptr to !T
+        push[Instr](out, i_pop(R_RSI()));
+        push[Instr](out, i_load(R_RAX(), R_RSI(), 0));   // err code
+        push[Instr](out, i_cmp_imm(R_RAX(), 0));
+        push[Instr](out, i_je(l_ok_cc));
+        // error: bind err_name = err code in scratch, then eval fallback
+        push[Instr](out, i_store(R_RBP(), err_slot, R_RAX()));
+        // bind the capture name as a local pointing to that scratch slot
+        let ename: []u8 = "";
+        switch (get[*Node](c.args, 1).*) { .id => |eid| { ename = eid.name; } else => { } }
+        if (ename.len > 0) {
+            push[[]u8](&env.*.names, ename);
+            push[i32](&env.*.disps, err_slot);
+            push[[]u8](&env.*.types, "i32");
+            push[i32](&env.*.byref, 0);
+            env.*.count = env.*.count + 1;
+        }
+        cg_lower_expr(out, get[*Node](c.args, 2), env, syms, cg);  // fallback (pushed)
+        push[Instr](out, i_jmp(l_done_cc));
+        push[Instr](out, i_label(l_ok_cc));
+        push[Instr](out, i_load(R_RAX(), R_RSI(), 8));   // val on success
+        push[Instr](out, i_push(R_RAX()));
+        push[Instr](out, i_label(l_done_cc));
+        return;
+    }
     // OUTPUT builtins are intercepted before the user-function lookup.
     if (cg_lower_print(out, fname, c, env, syms, cg) == 1) { return; }
     // scalar math: sinf/cosf/sqrtf/sin/cos/sqrt → x87 or SSE.
@@ -5303,7 +5543,40 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                 }
                 let rty: []u8 = cg_norm_type(env.*.sret_type);
                 let sps: i32 = env.*.sret_disp;
-                if (cg_type_is_opt(cg, rty) == 1) {
+                if (rty.len > 1 && rty[0] == '!') {
+                    // !T error union return. Two cases:
+                    //   return error.X     → {code, 0} (error path)
+                    //   return val         → {0, val}  (success path)
+                    // IMPORTANT: evaluate the expression BEFORE loading RCX to avoid
+                    // expression evaluation (e.g. idiv uses rcx) clobbering the sret ptr.
+                    let is_err_ret: i32 = 0;
+                    switch (r.expr.*) {
+                        .fld => |ef| {
+                            switch (ef.base.*) {
+                                .id => |eid2| { if (@strEq(eid2.name, "error")) { is_err_ret = 1; } }
+                                else => { }
+                            }
+                        }
+                        else => { }
+                    }
+                    cg_lower_expr(out, r.expr, env, syms, cg);  // evaluate FIRST
+                    push[Instr](out, i_pop(R_RAX()));             // rax = err code OR val
+                    push[Instr](out, i_load(R_RCX(), R_RBP(), sps)); // rcx = caller's buf
+                    if (is_err_ret == 1) {
+                        // {err_code, 0}
+                        push[Instr](out, i_store(R_RCX(), 0, R_RAX()));
+                        push[Instr](out, i_mov_imm(R_RAX(), 0));
+                        push[Instr](out, i_store(R_RCX(), 8, R_RAX()));
+                    } else {
+                        // {0, val}
+                        push[Instr](out, i_store(R_RCX(), 8, R_RAX()));  // val
+                        push[Instr](out, i_mov_imm(R_RAX(), 0));
+                        push[Instr](out, i_store(R_RCX(), 0, R_RAX()));  // err = 0
+                    }
+                    push[Instr](out, i_load(R_RAX(), R_RBP(), sps));
+                    push[Instr](out, i_jmp(env.*.epilogue));
+                    return;
+                } else if (cg_type_is_opt(cg, rty) == 1) {
                     // wrap into the ?T result block (null / value / optional).
                     cg_store_opt_into(out, sps, 0, rty, r.expr, env, syms, cg);
                 } else {
@@ -8108,6 +8381,11 @@ fn lower_program(decls0in: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u
         while (ui3 < len[*Node](decls0)) { push[*Node](&merged3, get[*Node](decls0, ui3)); ui3 = ui3 + 1; }
         decls0 = merged3;
     }
+
+    // ── pass 0a: INFER generic targs for calls without explicit type args ───────
+    // e.g. `unbox(bi)` where bi:Box[i32] → infer T=i32, fill c.targs so the
+    // monomorphization pass below sees explicit targs on every generic call.
+    cg_ginfer_pass(decls0);
 
     // ── pass 0: MONOMORPHIZE — expand the program with one concrete mangled
     // decl per generic instantiation (fns + structs), to a fixpoint. The rest of

@@ -907,6 +907,11 @@ static int32_t cg_count_caps(ZagSliceU8 caps);
 static int32_t cg_exp_seen(Exp* e, ZagSliceU8 m);
 static int32_t cg_find_generic_fn(ArrayList_pNode decls, ZagSliceU8 name, FnDecl* out);
 static int32_t cg_find_generic_struct(ArrayList_pNode decls, ZagSliceU8 name, StructDecl* out);
+static ZagSliceU8 cg_unify_bind(ZagSliceU8 pty, ZagSliceU8 aty, ZagSliceU8 tp);
+static ZagSliceU8 cg_ginfer_argty(Node* n, ArrayList_Param lenv);
+static void cg_ginfer_expr(Node* n, ArrayList_Param lenv, ArrayList_pNode decls);
+static void cg_ginfer_stmt(Node* n, ArrayList_Param* lenv, ArrayList_pNode decls);
+static void cg_ginfer_pass(ArrayList_pNode decls);
 static void cg_inst_struct(Exp* e, ZagSliceU8 base, ArrayList__u8 targs, ArrayList_pNode orig);
 static void cg_inst_type(Exp* e, ZagSliceU8 t, ArrayList_pNode orig);
 static void cg_inst_sinst_expr(Exp* e, Node* n, ArrayList_pNode orig);
@@ -6408,6 +6413,278 @@ static int32_t cg_find_generic_struct(ArrayList_pNode decls, ZagSliceU8 name, St
     }
     return 0;
 }
+static ZagSliceU8 cg_unify_bind(ZagSliceU8 pty, ZagSliceU8 aty, ZagSliceU8 tp) {
+    if ((aty.len == 0)) {
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+    }
+    if (_zag_str_eq(pty, tp)) {
+    return aty;
+    }
+    if (((((((pty.len > 2) && ((pty).ptr[0] == 91)) && ((pty).ptr[1] == 93)) && (aty.len > 2)) && ((aty).ptr[0] == 91)) && ((aty).ptr[1] == 93))) {
+    return cg_unify_bind((ZagSliceU8){ (pty).ptr + (2), ((pty).len) - (2) }, (ZagSliceU8){ (aty).ptr + (2), ((aty).len) - (2) }, tp);
+    }
+    if (((((pty.len > 1) && ((pty).ptr[0] == 42)) && (aty.len > 1)) && ((aty).ptr[0] == 42))) {
+    return cg_unify_bind((ZagSliceU8){ (pty).ptr + (1), ((pty).len) - (1) }, (ZagSliceU8){ (aty).ptr + (1), ((aty).len) - (1) }, tp);
+    }
+    if ((is_generic_app(pty) && is_generic_app(aty))) {
+    int32_t pl = index_of(pty, 91);
+    int32_t al = index_of(aty, 91);
+    ArrayList__u8 pargs = split_args((ZagSliceU8){ (pty).ptr + ((pl + 1)), ((pty.len - 1)) - ((pl + 1)) });
+    ArrayList__u8 aargs = split_args((ZagSliceU8){ (aty).ptr + ((al + 1)), ((aty.len - 1)) - ((al + 1)) });
+    int32_t k = 0;
+    while (((k < len__u8(pargs)) && (k < len__u8(aargs)))) {
+    ZagSliceU8 b = cg_unify_bind(get__u8(pargs, k), get__u8(aargs, k), tp);
+    if ((b.len > 0)) {
+    return b;
+    }
+    k = (k + 1);
+    }
+    }
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+}
+static ZagSliceU8 cg_ginfer_argty(Node* n, ArrayList_Param lenv) {
+    {
+    Node __sw = (*n);
+    switch (__sw.tag) {
+    case Node_id:
+    {
+        __auto_type x = __sw.u.id;
+    int32_t i = 0;
+    while ((i < len_Param(lenv))) {
+    if (_zag_str_eq(get_Param(lenv, i).name, x.name)) {
+    return get_Param(lenv, i).pty;
+    }
+    i = (i + 1);
+    }
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+        break;
+    }
+    case Node_slit_:
+    {
+        __auto_type s = __sw.u.slit_;
+    if ((len__u8(s.targs) > 0)) {
+    return cg_mangle_generic(s.sname, s.targs);
+    }
+    return s.sname;
+        break;
+    }
+    default:
+    {
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+        break;
+    }
+    }
+    }
+}
+static void cg_ginfer_expr(Node* n, ArrayList_Param lenv, ArrayList_pNode decls) {
+    {
+    Node __sw = (*n);
+    switch (__sw.tag) {
+    case Node_call:
+    {
+        __auto_type c = __sw.u.call;
+    int32_t i2 = 0;
+    while ((i2 < len_pNode(c.args))) {
+    cg_ginfer_expr(get_pNode(c.args, i2), lenv, decls);
+    i2 = (i2 + 1);
+    }
+    if ((len__u8(c.targs) == 0)) {
+    ZagSliceU8 cn = cg_callee_name(c.callee);
+    if ((cn.len > 0)) {
+    FnDecl gf = (FnDecl){ .name = (ZagSliceU8){(const uint8_t*)"", 0}, .tparams = make__u8(1), .params = make_Param(1), .ret = (ZagSliceU8){(const uint8_t*)"", 0}, .annots = make__u8(1), .body = make_pNode(1), .is_extern = 0, .ret_eff = (ZagSliceU8){(const uint8_t*)"", 0}, .caps = 0, .cap_names = (ZagSliceU8){(const uint8_t*)"", 0}, .cap_types = (ZagSliceU8){(const uint8_t*)"", 0} };
+    if ((cg_find_generic_fn(decls, cn, (&gf)) == 1)) {
+    ArrayList__u8 targs = make__u8((len__u8(gf.tparams) + 1));
+    int32_t ok = 1;
+    int32_t ti = 0;
+    while ((ti < len__u8(gf.tparams))) {
+    ZagSliceU8 tp = get__u8(gf.tparams, ti);
+    ZagSliceU8 bound = (ZagSliceU8){(const uint8_t*)"", 0};
+    int32_t pi = 0;
+    while (((pi < len_Param(gf.params)) && (pi < len_pNode(c.args)))) {
+    ZagSliceU8 aty = cg_ginfer_argty(get_pNode(c.args, pi), lenv);
+    if ((aty.len > 0)) {
+    ZagSliceU8 b = cg_unify_bind(get_Param(gf.params, pi).pty, aty, tp);
+    if ((b.len > 0)) {
+    bound = b;
+    pi = len_Param(gf.params);
+    } else {
+    pi = (pi + 1);
+    }
+    } else {
+    pi = (pi + 1);
+    }
+    }
+    if ((bound.len == 0)) {
+    ok = 0;
+    }
+    push__u8((&targs), bound);
+    ti = (ti + 1);
+    }
+    if ((ok == 1)) {
+    (*n) = (Node){ .tag = Node_call, .u = { .call = (Call){ .callee = c.callee, .args = c.args, .targs = targs } } };
+    }
+    }
+    }
+    }
+        break;
+    }
+    case Node_bin:
+    {
+        __auto_type b = __sw.u.bin;
+    cg_ginfer_expr(b.l, lenv, decls);
+    cg_ginfer_expr(b.r, lenv, decls);
+        break;
+    }
+    case Node_un:
+    {
+        __auto_type u = __sw.u.un;
+    cg_ginfer_expr(u.e, lenv, decls);
+        break;
+    }
+    case Node_fld:
+    {
+        __auto_type f = __sw.u.fld;
+    cg_ginfer_expr(f.base, lenv, decls);
+        break;
+    }
+    case Node_idx:
+    {
+        __auto_type x = __sw.u.idx;
+    cg_ginfer_expr(x.base, lenv, decls);
+    cg_ginfer_expr(x.idx, lenv, decls);
+        break;
+    }
+    case Node_cast_:
+    {
+        __auto_type c = __sw.u.cast_;
+    cg_ginfer_expr(c.expr, lenv, decls);
+        break;
+    }
+    case Node_slice_:
+    {
+        __auto_type s = __sw.u.slice_;
+    cg_ginfer_expr(s.base, lenv, decls);
+    cg_ginfer_expr(s.lo, lenv, decls);
+    cg_ginfer_expr(s.hi, lenv, decls);
+        break;
+    }
+    case Node_slit_:
+    {
+        __auto_type s = __sw.u.slit_;
+    int32_t i2 = 0;
+    while ((i2 < len_FieldInit(s.fields))) {
+    cg_ginfer_expr(get_FieldInit(s.fields, i2).val, lenv, decls);
+    i2 = (i2 + 1);
+    }
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+}
+static void cg_ginfer_stmt(Node* n, ArrayList_Param* lenv, ArrayList_pNode decls) {
+    {
+    Node __sw = (*n);
+    switch (__sw.tag) {
+    case Node_let_:
+    {
+        __auto_type l = __sw.u.let_;
+    cg_ginfer_expr(l.expr, (*lenv), decls);
+    push_Param(lenv, (Param){ .name = l.name, .pty = l.dty, .eff = (ZagSliceU8){(const uint8_t*)"", 0}, .calign = 0 });
+        break;
+    }
+    case Node_ret:
+    {
+        __auto_type r = __sw.u.ret;
+    if ((r.has_expr == 1)) {
+    cg_ginfer_expr(r.expr, (*lenv), decls);
+    }
+        break;
+    }
+    case Node_assign:
+    {
+        __auto_type a = __sw.u.assign;
+    cg_ginfer_expr(a.expr, (*lenv), decls);
+        break;
+    }
+    case Node_estmt:
+    {
+        __auto_type s = __sw.u.estmt;
+    cg_ginfer_expr(s.expr, (*lenv), decls);
+        break;
+    }
+    case Node_if_:
+    {
+        __auto_type x = __sw.u.if_;
+    cg_ginfer_expr(x.cond, (*lenv), decls);
+    int32_t ai = 0;
+    while ((ai < len_pNode(x.then_body))) {
+    cg_ginfer_stmt(get_pNode(x.then_body, ai), lenv, decls);
+    ai = (ai + 1);
+    }
+    if ((x.has_els == 1)) {
+    int32_t bi = 0;
+    while ((bi < len_pNode(x.els_body))) {
+    cg_ginfer_stmt(get_pNode(x.els_body, bi), lenv, decls);
+    bi = (bi + 1);
+    }
+    }
+        break;
+    }
+    case Node_while_:
+    {
+        __auto_type w = __sw.u.while_;
+    cg_ginfer_expr(w.cond, (*lenv), decls);
+    int32_t wi = 0;
+    while ((wi < len_pNode(w.body))) {
+    cg_ginfer_stmt(get_pNode(w.body, wi), lenv, decls);
+    wi = (wi + 1);
+    }
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+}
+static void cg_ginfer_pass(ArrayList_pNode decls) {
+    int32_t i = 0;
+    while ((i < len_pNode(decls))) {
+    {
+    Node __sw = (*get_pNode(decls, i));
+    switch (__sw.tag) {
+    case Node_fn_decl:
+    {
+        __auto_type f = __sw.u.fn_decl;
+    if (((len__u8(f.tparams) == 0) && (f.is_extern == 0))) {
+    ArrayList_Param lenv = make_Param(8);
+    int32_t pi = 0;
+    while ((pi < len_Param(f.params))) {
+    push_Param((&lenv), get_Param(f.params, pi));
+    pi = (pi + 1);
+    }
+    int32_t bi = 0;
+    while ((bi < len_pNode(f.body))) {
+    cg_ginfer_stmt(get_pNode(f.body, bi), (&lenv), decls);
+    bi = (bi + 1);
+    }
+    }
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+    i = (i + 1);
+    }
+}
 static void cg_inst_struct(Exp* e, ZagSliceU8 base, ArrayList__u8 targs, ArrayList_pNode orig) {
     if ((len__u8(targs) == 0)) {
     return;
@@ -6997,6 +7274,9 @@ static int32_t cg_type_size(Cg* cg, ZagSliceU8 ty0) {
     if ((cg_is_fn_type(ty) == 1)) {
     return 16;
     }
+    if (((ty.len > 1) && ((ty).ptr[0] == 33))) {
+    return 16;
+    }
     if ((cg_type_is_slice(cg, ty) == 1)) {
     return 16;
     }
@@ -7173,6 +7453,9 @@ static int32_t cg_type_is_agg(Cg* cg, ZagSliceU8 ty) {
     if ((cg_is_fn_type(ty) == 1)) {
     return 1;
     }
+    if (((ty.len > 1) && ((ty).ptr[0] == 33))) {
+    return 1;
+    }
     if ((cg_type_is_struct(cg, ty) == 1)) {
     return 1;
     }
@@ -7196,6 +7479,9 @@ static int32_t cg_agg_words(Cg* cg, ZagSliceU8 ty) {
     return 2;
     }
     if ((cg_is_fn_type(ty) == 1)) {
+    return 2;
+    }
+    if (((ty.len > 1) && ((ty).ptr[0] == 33))) {
     return 2;
     }
     if ((cg_type_is_agg(cg, ty) == 0)) {
@@ -7742,6 +8028,15 @@ static void cg_scan_call(Cg* cg, ScanCtx* sc, Call c) {
     }
     return;
     }
+    }
+    if ((_zag_str_eq(fname, (ZagSliceU8){(const uint8_t*)"__catch", 7}) || _zag_str_eq(fname, (ZagSliceU8){(const uint8_t*)"__catchc", 8}))) {
+    (*(*sc).words) = ((*(*sc).words) + 1);
+    int32_t ai2 = 0;
+    while ((ai2 < len_pNode(c.args))) {
+    cg_scan_expr(cg, sc, get_pNode(c.args, ai2));
+    ai2 = (ai2 + 1);
+    }
+    return;
     }
     if ((cg_is_native_rt(fname) == 1)) {
     return;
@@ -9045,8 +9340,28 @@ static void cg_lower_expr(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     if (_zag_str_eq(u.op, (ZagSliceU8){(const uint8_t*)"&", 1})) {
     cg_lower_addr(out, u.e, env, syms, cg);
     } else {
+    if (_zag_str_eq(u.op, (ZagSliceU8){(const uint8_t*)"try", 3})) {
+    int32_t l_ok3 = cg_fresh(cg);
+    cg_lower_expr(out, u.e, env, syms, cg);
+    push_Instr(out, i_pop(R_RSI()));
+    push_Instr(out, i_load(R_RAX(), R_RSI(), 0));
+    push_Instr(out, i_cmp_imm(R_RAX(), 0));
+    push_Instr(out, i_je(l_ok3));
+    if ((((*env).sret_type.len > 1) && (((*env).sret_type).ptr[0] == 33))) {
+    push_Instr(out, i_load(R_RCX(), R_RBP(), (*env).sret_disp));
+    push_Instr(out, i_store(R_RCX(), 0, R_RAX()));
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_store(R_RCX(), 8, R_RAX()));
+    push_Instr(out, i_load(R_RAX(), R_RBP(), (*env).sret_disp));
+    }
+    push_Instr(out, i_jmp((*env).epilogue));
+    push_Instr(out, i_label(l_ok3));
+    push_Instr(out, i_load(R_RAX(), R_RSI(), 8));
+    push_Instr(out, i_push(R_RAX()));
+    } else {
     cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: unsupported unary operator", 34});
     cg_lower_expr(out, u.e, env, syms, cg);
+    }
     }
     }
     }
@@ -9168,6 +9483,31 @@ static void cg_lower_expr(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     push_Instr(out, i_load(R_RAX(), R_RAX(), 0));
     push_Instr(out, i_push(R_RAX()));
     return;
+    }
+    {
+    Node __sw = (*f.base);
+    switch (__sw.tag) {
+    case Node_id:
+    {
+        __auto_type errid = __sw.u.id;
+    if (_zag_str_eq(errid.name, (ZagSliceU8){(const uint8_t*)"error", 5})) {
+    int32_t ec = cg_enum_member_index(cg, (ZagSliceU8){(const uint8_t*)"__zag_errors", 12}, f.fname);
+    if ((ec >= 0)) {
+    push_Instr(out, i_mov_imm(R_RAX(), ((int64_t)((ec + 1)))));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    push_Instr(out, i_mov_imm(R_RAX(), 1));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
     }
     {
     Node __sw = (*f.base);
@@ -10783,6 +11123,63 @@ static void cg_lower_call(ArrayList_Instr* out, Call c, Env* env, ArrayList_FnSy
     return;
     }
     }
+    if (_zag_str_eq(fname, (ZagSliceU8){(const uint8_t*)"__catch", 7})) {
+    int32_t l_ok_c = cg_fresh(cg);
+    int32_t l_done_c = cg_fresh(cg);
+    cg_lower_expr(out, get_pNode(c.args, 0), env, syms, cg);
+    push_Instr(out, i_pop(R_RSI()));
+    push_Instr(out, i_load(R_RAX(), R_RSI(), 0));
+    push_Instr(out, i_cmp_imm(R_RAX(), 0));
+    push_Instr(out, i_je(l_ok_c));
+    cg_lower_expr(out, get_pNode(c.args, 1), env, syms, cg);
+    push_Instr(out, i_jmp(l_done_c));
+    push_Instr(out, i_label(l_ok_c));
+    push_Instr(out, i_load(R_RAX(), R_RSI(), 8));
+    push_Instr(out, i_push(R_RAX()));
+    push_Instr(out, i_label(l_done_c));
+    return;
+    }
+    if (_zag_str_eq(fname, (ZagSliceU8){(const uint8_t*)"__catchc", 8})) {
+    int32_t l_ok_cc = cg_fresh(cg);
+    int32_t l_done_cc = cg_fresh(cg);
+    int32_t err_slot = cg_slot_scratch(env);
+    cg_lower_expr(out, get_pNode(c.args, 0), env, syms, cg);
+    push_Instr(out, i_pop(R_RSI()));
+    push_Instr(out, i_load(R_RAX(), R_RSI(), 0));
+    push_Instr(out, i_cmp_imm(R_RAX(), 0));
+    push_Instr(out, i_je(l_ok_cc));
+    push_Instr(out, i_store(R_RBP(), err_slot, R_RAX()));
+    ZagSliceU8 ename = (ZagSliceU8){(const uint8_t*)"", 0};
+    {
+    Node __sw = (*get_pNode(c.args, 1));
+    switch (__sw.tag) {
+    case Node_id:
+    {
+        __auto_type eid = __sw.u.id;
+    ename = eid.name;
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+    if ((ename.len > 0)) {
+    push__u8((&(*env).names), ename);
+    push_i32((&(*env).disps), err_slot);
+    push__u8((&(*env).types), (ZagSliceU8){(const uint8_t*)"i32", 3});
+    push_i32((&(*env).byref), 0);
+    (*env).count = ((*env).count + 1);
+    }
+    cg_lower_expr(out, get_pNode(c.args, 2), env, syms, cg);
+    push_Instr(out, i_jmp(l_done_cc));
+    push_Instr(out, i_label(l_ok_cc));
+    push_Instr(out, i_load(R_RAX(), R_RSI(), 8));
+    push_Instr(out, i_push(R_RAX()));
+    push_Instr(out, i_label(l_done_cc));
+    return;
+    }
     if ((cg_lower_print(out, fname, c, env, syms, cg) == 1)) {
     return;
     }
@@ -11416,6 +11813,55 @@ static void cg_lower_stmt(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     }
     ZagSliceU8 rty = cg_norm_type((*env).sret_type);
     int32_t sps = (*env).sret_disp;
+    if (((rty.len > 1) && ((rty).ptr[0] == 33))) {
+    int32_t is_err_ret = 0;
+    {
+    Node __sw = (*r.expr);
+    switch (__sw.tag) {
+    case Node_fld:
+    {
+        __auto_type ef = __sw.u.fld;
+    {
+    Node __sw = (*ef.base);
+    switch (__sw.tag) {
+    case Node_id:
+    {
+        __auto_type eid2 = __sw.u.id;
+    if (_zag_str_eq(eid2.name, (ZagSliceU8){(const uint8_t*)"error", 5})) {
+    is_err_ret = 1;
+    }
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+    cg_lower_expr(out, r.expr, env, syms, cg);
+    push_Instr(out, i_pop(R_RAX()));
+    push_Instr(out, i_load(R_RCX(), R_RBP(), sps));
+    if ((is_err_ret == 1)) {
+    push_Instr(out, i_store(R_RCX(), 0, R_RAX()));
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_store(R_RCX(), 8, R_RAX()));
+    } else {
+    push_Instr(out, i_store(R_RCX(), 8, R_RAX()));
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_store(R_RCX(), 0, R_RAX()));
+    }
+    push_Instr(out, i_load(R_RAX(), R_RBP(), sps));
+    push_Instr(out, i_jmp((*env).epilogue));
+    return;
+    } else {
     if ((cg_type_is_opt(cg, rty) == 1)) {
     cg_store_opt_into(out, sps, 0, rty, r.expr, env, syms, cg);
     } else {
@@ -11452,6 +11898,7 @@ static void cg_lower_stmt(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     push_Instr(out, i_load(R_RAX(), R_RSI(), (8 * k)));
     cg_emit_store_at(out, sps, (8 * k));
     k = (k + 1);
+    }
     }
     }
     }
@@ -14238,6 +14685,7 @@ static ArrayList_Instr lower_program(ArrayList_pNode decls0in, int32_t* errout, 
     }
     decls0 = merged3;
     }
+    cg_ginfer_pass(decls0);
     ArrayList_pNode decls = cg_expand_generics(decls0);
     ArrayList_FnSym syms = make_FnSym(8);
     int32_t next_id = 1;
