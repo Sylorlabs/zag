@@ -647,8 +647,6 @@ fn callee_param_type(cn: []u8, idx: i32, dl: ArrayList[*Node]) []u8 {
     return "";
 }
 
-// Emit call args, coercing a bare value / null into the optional when the
-// matching parameter type is `?T` (e.g. print_opt(77) → wrap, print_opt(null) → {0}).
 fn gen_args_typed(buf: *ArrayList[u8], cn: []u8, args: ArrayList[*Node], dl: ArrayList[*Node]) void {
     let i: i32 = 0;
     while (i < len[*Node](args)) {
@@ -834,6 +832,42 @@ fn gen_expr(buf: *ArrayList[u8], n: *Node, dl: ArrayList[*Node]) void {
             if (cn.len > 0 && cn[0] == '@') {
                 // @-builtin: @sizeOf[T](), @strEq(..), @len(..), @intCast(..), ...
                 gen_builtin(buf, cn, c, dl);
+            } else if (cg_starts_with(cn, "__icrc_") == 1) {
+                // Interface coercion: __icrc_IfaceName_ConcreteName(arg)
+                // Decode: strip "__icrc_", then split on last '_' (which may be inside a type name)
+                // The encoding is: __icrc_<iface>_<concrete> where iface+concrete were joined.
+                // We stored it as __icrc_<pt>_<argty> — so scan cn[7..] to find the split:
+                // actually we just need iface (pt) and concrete (argty).
+                // Approach: find the second separator by looking for a known iface name.
+                // Simpler: the iface name is the part after "__icrc_" up to the point where
+                // `iface_method_count(dl, prefix) > 0`. Try prefixes from left.
+                let tail: []u8 = cn[7..];  // strip "__icrc_"
+                let iname: []u8 = "";
+                let cname: []u8 = "";
+                let ti: i32 = 1;
+                while (ti <= tail.len) {
+                    let candidate: []u8 = tail[0..ti];
+                    if (iface_method_count(dl, candidate) > 0) {
+                        iname = candidate;
+                        // cname is the rest after the '_' separator
+                        if (ti + 1 < tail.len) { cname = tail[ti+1..]; }
+                        ti = tail.len + 1;  // break
+                    } else {
+                        ti = ti + 1;
+                    }
+                }
+                // Emit: ({ ConcreteName __zit = <arg>; (IfaceName){.vtbl=&__vtbl_C_I,.data=(void*)&__zit}; })
+                emit(buf, "({ ");
+                emit(buf, cname);
+                emit(buf, " __zit = ");
+                gen_expr(buf, get[*Node](c.args, 0), dl);
+                emit(buf, "; (");
+                emit(buf, iname);
+                emit(buf, "){.vtbl=&__vtbl_");
+                emit(buf, cname);
+                emit(buf, "_");
+                emit(buf, iname);
+                emit(buf, ",.data=(void*)&__zit}; })");
             } else if (@strEq(cn, "__catch")) {
                 // `e catch fb` → ({ __auto_type __t = e; __t._err ? (fb) : __t._val; })
                 emit(buf, "({ __auto_type __t = ");
@@ -1597,6 +1631,17 @@ fn try_method_call(n: *Node, c: Call, env: ArrayList[Binding], dl: ArrayList[*No
             if (bn.len > 0 && find_enum(dl, bn) && first_is_upper(f.fname)) { return; }
             let rt: []u8 = recv_type(f.base, env, dl);
             if (rt.len == 0) { return; }
+            // Interface dispatch: s.method(args) → __idsp_IfaceName_method(s, args)
+            if (iface_method_count(dl, rt) > 0) {
+                let dname: []u8 = _zag_str_concat("__idsp_", _zag_str_concat(rt, _zag_str_concat("_", f.fname)));
+                let nargs: ArrayList[*Node] = make[*Node](4);
+                push[*Node](&nargs, f.base);
+                let k: i32 = 0;
+                while (k < len[*Node](c.args)) { push[*Node](&nargs, get[*Node](c.args, k)); k = k + 1; }
+                n.* = Node{ .call = Call{ .callee = mk_ident(dname), .args = nargs, .targs = c.targs } };
+                return;
+            }
+            // Concrete method: value.method(args) → RecvType_method(value, args)
             let mname: []u8 = _zag_str_concat(_zag_str_concat(rt, "_"), f.fname);
             if (!fn_exists(dl, mname)) { return; }
             let nargs: ArrayList[*Node] = make[*Node](4);
@@ -1607,6 +1652,50 @@ fn try_method_call(n: *Node, c: Call, env: ArrayList[Binding], dl: ArrayList[*No
         }
         else => { }
     }
+}
+
+// Interface coercion in the annotate pass: when a call has an interface-typed
+// parameter and the argument is a concrete struct, insert a special marker call
+// `__icrc_IfaceName_ConcreteName(arg)` so gen_expr can emit the fat-pointer.
+// We rebuild the entire args list (and thus n.*) to avoid circular aliasing.
+fn try_iface_coerce(n: *Node, c: Call, env: ArrayList[Binding], dl: ArrayList[*Node]) void {
+    let cn: []u8 = cg_callee_name(c.callee);
+    if (cn.len == 0) { return; }
+    // First pass: check if any coercion is needed.
+    let needs: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[*Node](c.args)) {
+        let pt: []u8 = callee_param_type(cn, i, dl);
+        if (iface_method_count(dl, pt) > 0) {
+            let argty: []u8 = expr_type(get[*Node](c.args, i), env, dl);
+            if (argty.len > 0 && iface_method_count(dl, argty) == 0) { needs = 1; }
+        }
+        i = i + 1;
+    }
+    if (needs == 0) { return; }
+    // Second pass: build fresh args list with coercions inserted.
+    let nargs: ArrayList[*Node] = make[*Node](4);
+    let j: i32 = 0;
+    while (j < len[*Node](c.args)) {
+        let pt: []u8 = callee_param_type(cn, j, dl);
+        let arg: *Node = get[*Node](c.args, j);
+        if (iface_method_count(dl, pt) > 0) {
+            let argty: []u8 = expr_type(arg, env, dl);
+            if (argty.len > 0 && iface_method_count(dl, argty) == 0) {
+                // Wrap: __icrc_IfaceName_ConcreteName(arg)
+                let marker: []u8 = _zag_str_concat("__icrc_", _zag_str_concat(pt, _zag_str_concat("_", argty)));
+                let ca: ArrayList[*Node] = make[*Node](1);
+                push[*Node](&ca, arg);   // arg is a *Node — reuse the existing heap node
+                push[*Node](&nargs, mk_call(mk_ident(marker), ca));
+            } else {
+                push[*Node](&nargs, arg);
+            }
+        } else {
+            push[*Node](&nargs, arg);
+        }
+        j = j + 1;
+    }
+    n.* = Node{ .call = Call{ .callee = c.callee, .args = nargs, .targs = c.targs } };
 }
 
 // ── heterogeneous-numeric op lowering ────────────────────────────────────────
@@ -1704,8 +1793,10 @@ fn annotate_expr(n: *Node, env: ArrayList[Binding], dl: ArrayList[*Node]) void {
             annotate_expr(c.callee, env, dl);
             let i: i32 = 0;
             while (i < len[*Node](c.args)) { annotate_expr(get[*Node](c.args, i), env, dl); i = i + 1; }
-            // rewrite `value.method(args)` → `RecvType_method(value, args)`
+            // rewrite `value.method(args)` → `RecvType_method(value, args)` or `__idsp_*(args)`
             try_method_call(n, c, env, dl);
+            // after method-call rewrite, coerce concrete→interface args
+            switch (n.*) { .call => |c2| { try_iface_coerce(n, c2, env, dl); } else => { } }
         }
         .fld => |f| { annotate_expr(f.base, env, dl); }
         .cast_ => |c| { annotate_expr(c.expr, env, dl); }
@@ -2118,6 +2209,7 @@ fn gen_clos_unpack(buf: *ArrayList[u8], f: FnDecl) void {
 fn gen_fn_proto(buf: *ArrayList[u8], f: FnDecl) void {
     if (@strEq(f.name, "main")) { return; }
     if (cg_starts_with(f.name, "__op_") == 1) { return; }   // operator contract: a sema/codegen table, emits no C
+    if (cg_starts_with(f.name, "__iface_") == 1) { return; } // interface decl: synthesized vtable, not a fn
     if (len[[]u8](f.tparams) > 0) { return; }  // generic template: emitted via monomorphization
     if (cg_starts_with(f.name, "__clos_") == 1) {
         // hoisted closure: env-first signature
@@ -2148,6 +2240,7 @@ fn gen_fn_proto(buf: *ArrayList[u8], f: FnDecl) void {
 fn gen_fn(buf: *ArrayList[u8], f: FnDecl, dl: ArrayList[*Node]) void {
     if (f.is_extern == 1) { return; }
     if (cg_starts_with(f.name, "__op_") == 1) { return; }   // operator contract: emits no C
+    if (cg_starts_with(f.name, "__iface_") == 1) { return; } // interface decl: synthesised vtable, not a fn
     if (len[[]u8](f.tparams) > 0) { return; }  // generic template: emitted via monomorphization
     let is_clos: i32 = cg_starts_with(f.name, "__clos_");
     let is_main: i32 = 0;
@@ -3554,6 +3647,307 @@ fn emit_ppu_math(buf: *ArrayList[u8]) void {
     emit(buf, "\n");
 }
 
+// ── interface vtable emission ─────────────────────────────────────────────────
+fn iface_pi_str(pi: i32) []u8 {
+    if (pi == 0) { return "0"; }
+    if (pi == 1) { return "1"; }
+    if (pi == 2) { return "2"; }
+    if (pi == 3) { return "3"; }
+    return _zag_i64_to_str(pi as i64);
+}
+// Count comma-separated tokens in ptys that are NOT "self". Used for extra
+// thunk params beyond the implicit void* receiver.
+fn iface_extra_param_count(ptys: []u8) i32 {
+    let n: i32 = 0;
+    let i: i32 = 0;
+    // collect one token at a time, skip "self"
+    let tok_start: i32 = 0;
+    while (i <= ptys.len) {
+        if (i == ptys.len || ptys[i] == ',') {
+            // token: ptys[tok_start..i]
+            let tlen: i32 = i - tok_start;
+            if (tlen > 0) {
+                // check if it's "self"
+                let is_self: i32 = 0;
+                if (tlen == 4) {
+                    if (ptys[tok_start] == 's' && ptys[tok_start+1] == 'e' && ptys[tok_start+2] == 'l' && ptys[tok_start+3] == 'f') { is_self = 1; }
+                }
+                if (is_self == 0) { n = n + 1; }
+            }
+            tok_start = i + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+// Emit vtable struct + fat-pointer struct for one interface.
+// Produces: typedef struct { ret (*mname)(void*, extra...); } __vtbl_Iname_t;
+//           typedef struct { __vtbl_Iname_t *vtbl; void *data; } Iname;
+fn emit_one_iface_type(buf: *ArrayList[u8], iname: []u8, methods: ArrayList[Param]) void {
+    emit(buf, "typedef struct { ");
+    let m: i32 = 0;
+    while (m < len[Param](methods)) {
+        let meth: Param = get[Param](methods, m);
+        emit(buf, ctype(meth.pty));
+        emit(buf, " (*");
+        emit(buf, meth.name);
+        emit(buf, ")(void*");
+        // extra params (non-self types from meth.eff)
+        let ptys: []u8 = meth.eff;
+        let i: i32 = 0;
+        let tok_start: i32 = 0;
+        let pi: i32 = 0;
+        while (i <= ptys.len) {
+            if (i == ptys.len || ptys[i] == ',') {
+                let tlen: i32 = i - tok_start;
+                if (tlen > 0) {
+                    let is_self: i32 = 0;
+                    if (tlen == 4) {
+                        if (ptys[tok_start] == 's' && ptys[tok_start+1] == 'e' && ptys[tok_start+2] == 'l' && ptys[tok_start+3] == 'f') { is_self = 1; }
+                    }
+                    if (is_self == 0) {
+                        emit(buf, ", ");
+                        emit(buf, ctype(ptys[tok_start..i]));
+                        pi = pi + 1;
+                    }
+                }
+                tok_start = i + 1;
+            }
+            i = i + 1;
+        }
+        emit(buf, "); ");
+        m = m + 1;
+    }
+    emit(buf, "} __vtbl_");
+    emit(buf, iname);
+    emit(buf, "_t;\n");
+    emit(buf, "typedef struct { __vtbl_");
+    emit(buf, iname);
+    emit(buf, "_t *vtbl; void *data; } ");
+    emit(buf, iname);
+    emit(buf, ";\n");
+}
+
+// Check if a concrete type implements an interface (has all methods as fn decls).
+fn concrete_impls_iface(dl: ArrayList[*Node], cname: []u8, iname: []u8) i32 {
+    let methods: ArrayList[Param] = find_iface(dl, iname);
+    let nm: i32 = len[Param](methods);
+    if (nm == 0) { return 0; }
+    let m: i32 = 0;
+    while (m < nm) {
+        let mname: []u8 = get[Param](methods, m).name;
+        let full: []u8 = _zag_str_concat(_zag_str_concat(cname, "_"), mname);
+        if (!fn_exists(dl, full)) { return 0; }
+        m = m + 1;
+    }
+    return 1;
+}
+
+// Collect all struct names that implement the interface `iname`.
+fn collect_iface_impls(dl: ArrayList[*Node], iname: []u8) ArrayList[[]u8] {
+    let out: ArrayList[[]u8] = make[[]u8](4);
+    let i: i32 = 0;
+    while (i < len[*Node](dl)) {
+        switch (get[*Node](dl, i).*) {
+            .struct_ => |s| {
+                if (len[[]u8](s.tparams) == 0 && concrete_impls_iface(dl, s.name, iname) == 1) {
+                    push[[]u8](&out, s.name);
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+// Emit thunks + vtable instance for (cname, iname) pair.
+fn emit_iface_thunks_for(buf: *ArrayList[u8], cname: []u8, iname: []u8, dl: ArrayList[*Node]) void {
+    let methods: ArrayList[Param] = find_iface(dl, iname);
+    let m: i32 = 0;
+    while (m < len[Param](methods)) {
+        let meth: Param = get[Param](methods, m);
+        let thunk: []u8 = _zag_str_concat("__thunk_", _zag_str_concat(cname, _zag_str_concat("_", _zag_str_concat(iname, _zag_str_concat("_", meth.name)))));
+        emit(buf, "static ");
+        emit(buf, ctype(meth.pty));
+        emit(buf, " ");
+        emit(buf, thunk);
+        emit(buf, "(void* _d");
+        // extra params
+        let ptys: []u8 = meth.eff;
+        let i: i32 = 0;
+        let tok_start: i32 = 0;
+        let pi: i32 = 0;
+        while (i <= ptys.len) {
+            if (i == ptys.len || ptys[i] == ',') {
+                let tlen: i32 = i - tok_start;
+                if (tlen > 0) {
+                    let is_self: i32 = 0;
+                    if (tlen == 4) {
+                        if (ptys[tok_start] == 's' && ptys[tok_start+1] == 'e' && ptys[tok_start+2] == 'l' && ptys[tok_start+3] == 'f') { is_self = 1; }
+                    }
+                    if (is_self == 0) {
+                        emit(buf, ", ");
+                        emit(buf, ctype(ptys[tok_start..i]));
+                        emit(buf, " _p");
+                        emit(buf, iface_pi_str(pi));
+                        pi = pi + 1;
+                    }
+                }
+                tok_start = i + 1;
+            }
+            i = i + 1;
+        }
+        emit(buf, ") { ");
+        emit(buf, cname);
+        emit(buf, " _s = *(");
+        emit(buf, cname);
+        emit(buf, "*)_d; return ");
+        emit(buf, cname);
+        emit(buf, "_");
+        emit(buf, meth.name);
+        emit(buf, "(_s");
+        let pi2: i32 = 0;
+        while (pi2 < pi) {
+            emit(buf, ", _p");
+            emit(buf, iface_pi_str(pi2));
+            pi2 = pi2 + 1;
+        }
+        emit(buf, "); }\n");
+        m = m + 1;
+    }
+    // vtable instance
+    emit(buf, "static __vtbl_");
+    emit(buf, iname);
+    emit(buf, "_t __vtbl_");
+    emit(buf, cname);
+    emit(buf, "_");
+    emit(buf, iname);
+    emit(buf, " = { ");
+    let k: i32 = 0;
+    while (k < len[Param](methods)) {
+        if (k > 0) { emit(buf, ", "); }
+        let meth: Param = get[Param](methods, k);
+        emit(buf, "__thunk_");
+        emit(buf, cname);
+        emit(buf, "_");
+        emit(buf, iname);
+        emit(buf, "_");
+        emit(buf, meth.name);
+        k = k + 1;
+    }
+    emit(buf, " };\n");
+}
+
+// Emit dispatch-helper fns for each interface: __idsp_Shape_area(Shape s) → s.vtbl->area(s.data)
+fn emit_iface_dispatch_helpers(buf: *ArrayList[u8], iname: []u8, methods: ArrayList[Param]) void {
+    let m: i32 = 0;
+    while (m < len[Param](methods)) {
+        let meth: Param = get[Param](methods, m);
+        emit(buf, "static inline ");
+        emit(buf, ctype(meth.pty));
+        emit(buf, " __idsp_");
+        emit(buf, iname);
+        emit(buf, "_");
+        emit(buf, meth.name);
+        emit(buf, "(");
+        emit(buf, iname);
+        emit(buf, " _s");
+        // extra params
+        let ptys: []u8 = meth.eff;
+        let i: i32 = 0;
+        let tok_start: i32 = 0;
+        let pi: i32 = 0;
+        while (i <= ptys.len) {
+            if (i == ptys.len || ptys[i] == ',') {
+                let tlen: i32 = i - tok_start;
+                if (tlen > 0) {
+                    let is_self: i32 = 0;
+                    if (tlen == 4) {
+                        if (ptys[tok_start] == 's' && ptys[tok_start+1] == 'e' && ptys[tok_start+2] == 'l' && ptys[tok_start+3] == 'f') { is_self = 1; }
+                    }
+                    if (is_self == 0) {
+                        emit(buf, ", ");
+                        emit(buf, ctype(ptys[tok_start..i]));
+                        emit(buf, " _p");
+                        emit(buf, iface_pi_str(pi));
+                        pi = pi + 1;
+                    }
+                }
+                tok_start = i + 1;
+            }
+            i = i + 1;
+        }
+        emit(buf, ") { return _s.vtbl->");
+        emit(buf, meth.name);
+        emit(buf, "(_s.data");
+        let pi2: i32 = 0;
+        while (pi2 < pi) {
+            emit(buf, ", _p");
+            emit(buf, iface_pi_str(pi2));
+            pi2 = pi2 + 1;
+        }
+        emit(buf, "); }\n");
+        m = m + 1;
+    }
+}
+
+// Phase 1 (before protos): emit vtable struct typedefs + interface fat-pointer types.
+fn emit_iface_types(buf: *ArrayList[u8], dl: ArrayList[*Node]) void {
+    let i: i32 = 0;
+    while (i < len[*Node](dl)) {
+        switch (get[*Node](dl, i).*) {
+            .fn_decl => |f| {
+                if (cg_starts_with(f.name, "__iface_") == 1) {
+                    let iname: []u8 = f.name[8..];
+                    emit_one_iface_type(buf, iname, f.params);
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+}
+
+// Phase 2 (after protos): emit thunks, vtable instances, dispatch helpers.
+fn emit_iface_impls(buf: *ArrayList[u8], dl: ArrayList[*Node]) void {
+    let i: i32 = 0;
+    while (i < len[*Node](dl)) {
+        switch (get[*Node](dl, i).*) {
+            .fn_decl => |f| {
+                if (cg_starts_with(f.name, "__iface_") == 1) {
+                    let iname: []u8 = f.name[8..];
+                    let impls: ArrayList[[]u8] = collect_iface_impls(dl, iname);
+                    let k: i32 = 0;
+                    while (k < len[[]u8](impls)) {
+                        emit_iface_thunks_for(buf, get[[]u8](impls, k), iname, dl);
+                        k = k + 1;
+                    }
+                    emit_iface_dispatch_helpers(buf, iname, f.params);
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+}
+
+// Emit all interface infrastructure: types, thunks, vtable instances, dispatch helpers.
+fn emit_iface_all(buf: *ArrayList[u8], dl: ArrayList[*Node]) void {
+    emit_iface_types(buf, dl);
+    emit_iface_impls(buf, dl);
+}
+
+// Interface type name of the receiver at a call site (for method rewriting).
+// Returns "" if the receiver is not an interface type.
+fn iface_recv_type(n: *Node, env: ArrayList[Binding], dl: ArrayList[*Node]) []u8 {
+    let rt: []u8 = recv_type(n, env, dl);
+    if (rt.len == 0) { return ""; }
+    if (iface_method_count(dl, rt) > 0) { return rt; }
+    return "";
+}
+
 fn codegen_decls(decls: ArrayList[*Node]) ArrayList[u8] {
     return codegen_decls_t(decls, 0);
 }
@@ -3716,6 +4110,8 @@ fn codegen_decls_t(decls: ArrayList[*Node], ppu32: i32) ArrayList[u8] {
     //    the instance structs they hold by value are now complete).
     let tb: i32 = 0;
     while (tb < len[*Node](decls)) { gen_type_body(&buf, get[*Node](decls, tb)); tb = tb + 1; }
+    // 4. interface vtable struct typedefs + fat-pointer types (after concrete structs they wrap).
+    emit_iface_types(&buf, decls);
     // capturing-closure environment structs (after user structs they may hold).
     let ce: i32 = 0;
     while (ce < len[*Node](decls)) { emit_clos_env(&buf, get[*Node](decls, ce)); ce = ce + 1; }
@@ -3786,6 +4182,9 @@ fn codegen_decls_t(decls: ArrayList[*Node], ppu32: i32) ArrayList[u8] {
         gen_decl_proto(&buf, get[*Node](decls, i));
         i = i + 1;
     }
+    // interface thunks, vtable instances, and dispatch helpers
+    // (after fn protos so they can reference the concrete-type fns by forward decl).
+    emit_iface_impls(&buf, decls);
     // thunks: adapt a named fn to the env-first closure calling convention.
     let ti: i32 = 0;
     while (ti < len[[]u8](thunks)) {

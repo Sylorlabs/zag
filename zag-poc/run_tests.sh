@@ -60,6 +60,8 @@ b cache_control_bad
 echo "── operator contracts (operator T { + => fn }; effect flows into proof) ──"
 g operator_contract
 b operator_contract_bad
+echo "── structural interfaces (compiler auto-emits vtable + thunks; zero boilerplate) ──"
+g interfaces
 echo "── P4: hardware posit target — ppu32 (emit-c, check asm opcodes) ──"
 ppu(){ ./zagc build examples/$1.zag --target ppu32 --emit-c >/tmp/zt 2>&1
        # --emit-c writes <stem>.c into the cwd
