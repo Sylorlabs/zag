@@ -149,6 +149,21 @@ nto "[]sat_i16 index compiles" 'fn pick(s: []sat_i16) sat_i16 { return s[0] + s[
 # A sat/fixed-free program must NOT pull in the rt2 runtime (no extra fns).
 nto "no-satfixed unaffected" 'fn main() i32 { let x: u32 = 7; print_int(x as i32); return 0; }' "7" 0
 
+echo "── RNS (rns_3) and the 512-bit QUIRE (Round 3, native, no libc) ──"
+# rns_3: an int literal builds 3 residues (mod 65521/65531/65533); +/* are
+# per-residue modular (no carry between lanes). (12345+67890) mod 65521 = 14714;
+# 12345*67890 mod 65521 = 22939. The .r1 field is the first residue.
+nto "rns_3 add residue1"  'fn main() i32 { let x: rns_3 = 12345; let y: rns_3 = 67890; let s: rns_3 = x + y; print_i32(s.r1); return 0; }' "14714" 0
+nto "rns_3 mul residue1"  'fn main() i32 { let x: rns_3 = 12345; let y: rns_3 = 67890; let m: rns_3 = x * y; print_i32(m.r1); return 0; }' "22939" 0
+nto "rns_3 sub residue1"  'fn main() i32 { let x: rns_3 = 67890; let y: rns_3 = 12345; let d: rns_3 = x - y; print_i32(d.r1); return 0; }' "55545" 0
+# QUIRE: exact dot product [2,4]·[3,5] = 26 with ONE final rounding.
+nto "quire dot product=26" 'fn main() i32 { let q: quire = @quireZero(); q = @quireFMA(q, @intToPosit(2), @intToPosit(3)); q = @quireFMA(q, @intToPosit(4), @intToPosit(5)); print_f64(@positToFloat(@quireToPosit(q))); return 0; }' "26" 0
+# QUIRE beats naive p32 on catastrophic cancellation: (2^30+1)-2^30 = 1 (exact),
+# vs naive p32 = 0 (the +1 is below the p32 ULP at 2^30 and is lost on rounding).
+nto "quire cancellation=1" 'fn main() i32 { let one: p32 = @intToPosit(1); let big: p32 = @intToPosit(1073741824); let nb: p32 = @intToPosit(0 - 1073741824); let q: quire = @quireZero(); q = @quireFMA(q, big, one); q = @quireFMA(q, one, one); q = @quireFMA(q, nb, one); print_f64(@positToFloat(@quireToPosit(q))); return 0; }' "1" 0
+# An rns/quire-free program must NOT pull in the rt3/quire runtime.
+nto "no-rns unaffected" 'fn main() i32 { print_int(7); return 0; }' "7" 0
+
 # The emitted artifact must be a real static ELF with no interpreter (no libc).
 "$ZNC" nt_src.zag -o /tmp/nt_elf >/dev/null 2>&1
 if file /tmp/nt_elf | grep -q 'statically linked' && ! readelf -l /tmp/nt_elf 2>/dev/null | grep -q 'INTERP'; then
@@ -178,6 +193,17 @@ if grep -q 'build aborted' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
     echo "  ok  rejects mixed posit/non-posit arithmetic loudly"; pass=$((pass+1))
 else
     echo "  XX  mixed posit/non-posit not rejected loudly"; fail=$((fail+1))
+fi
+rm -f /tmp/nt_bin nt_src.zag
+
+# Hardening: mixing an rns_3 and a non-rns operand must ABORT, never miscompile.
+rm -f /tmp/nt_bin
+printf 'fn main() i32 { let x: rns_3 = 5; let y: i32 = 2; let z: rns_3 = x + y; return 0; }' > nt_src.zag
+"$ZNC" nt_src.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
+if grep -q 'build aborted' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
+    echo "  ok  rejects mixed rns/non-rns arithmetic loudly"; pass=$((pass+1))
+else
+    echo "  XX  mixed rns/non-rns not rejected loudly"; fail=$((fail+1))
 fi
 rm -f /tmp/nt_bin nt_src.zag
 

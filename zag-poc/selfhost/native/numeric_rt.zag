@@ -624,3 +624,341 @@ fn znrt_pow2(f: i64) i64 {
     return r;
 }
 fn znrt_fixed_mul(a: i64, b: i64, f: i64) i64 { return (a * b) / znrt_pow2(f); }
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║ ROUND 3 — RESIDUE NUMBER SYSTEM (rns_N) and the 512-bit QUIRE.              ║
+// ║ Both are AGGREGATES (Zag structs); ncodegen sizes/passes them with the     ║
+// ║ existing by-value struct machinery and lowers their ops to the calls below.║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+// ZnrtRns is the runtime struct backing the user-facing `rns_3` type; ZnrtQuire
+// backs `quire`. ncodegen.zag NORMALIZES `rns_3` → `ZnrtRns` and `quire` →
+// `ZnrtQuire` (cg_norm_type), so the existing by-value struct machinery sizes,
+// passes, and field-accesses them with no special cases. We use distinct names
+// (not `rns_3`/`quire`) so this file still compiles under ./zagc, where those two
+// names are BUILT-IN numeric types (ZagRns / ZagQuire) with different field shapes.
+struct ZnrtRns { r1: i64, r2: i64, r3: i64 }
+struct ZnrtQuire { l0: i64, l1: i64, l2: i64, l3: i64, l4: i64, l5: i64, l6: i64, l7: i64, nar: i64 }
+
+// private 2^f helper (so the quire runtime needs no rt2/posit helper — kept
+// self-contained under its own name to avoid any duplicate-symbol clash).
+fn znrt_q_pow2(f: i64) i64 {
+    let r: i64 = 1;
+    let i: i64 = 0;
+    while (i < f) { r = r * 2; i = i + 1; }
+    return r;
+}
+
+// ── Residue Number System: ZnrtRns over the coprime moduli M1=2^16-15, M2=2^16-5,
+// M3=2^16-3 (all prime). A value is stored as (x mod M1, x mod M2, x mod M3); add
+// and multiply are PER-RESIDUE modular ops (no carry between lanes). Mirrors the
+// C reference zag_rns_* EXACTLY (selfhost/codegen.zag).
+fn znrt_rns_m1() i64 { return 65521; }
+fn znrt_rns_m2() i64 { return 65531; }
+fn znrt_rns_m3() i64 { return 65533; }
+// non-negative remainder of x mod m (the C reference does ((x%m)+m)%m so a
+// negative x maps into [0,m); our `%` truncates toward zero, same as C's).
+fn znrt_rns_mod(x: i64, m: i64) i64 {
+    let r: i64 = x - ((x / m) * m);          // x % m, may be negative
+    if (r < 0) { r = r + m; }
+    return r;
+}
+fn znrt_rns_from_i64(x: i64) ZnrtRns {
+    return ZnrtRns{ .r1 = znrt_rns_mod(x, znrt_rns_m1()),
+                  .r2 = znrt_rns_mod(x, znrt_rns_m2()),
+                  .r3 = znrt_rns_mod(x, znrt_rns_m3()) };
+}
+fn znrt_rns_add(a: ZnrtRns, b: ZnrtRns) ZnrtRns {
+    return ZnrtRns{ .r1 = (a.r1 + b.r1) - (((a.r1 + b.r1) / znrt_rns_m1()) * znrt_rns_m1()),
+                  .r2 = (a.r2 + b.r2) - (((a.r2 + b.r2) / znrt_rns_m2()) * znrt_rns_m2()),
+                  .r3 = (a.r3 + b.r3) - (((a.r3 + b.r3) / znrt_rns_m3()) * znrt_rns_m3()) };
+}
+fn znrt_rns_sub(a: ZnrtRns, b: ZnrtRns) ZnrtRns {
+    let m1: i64 = znrt_rns_m1(); let m2: i64 = znrt_rns_m2(); let m3: i64 = znrt_rns_m3();
+    return ZnrtRns{ .r1 = ((a.r1 + m1) - b.r1) - ((((a.r1 + m1) - b.r1) / m1) * m1),
+                  .r2 = ((a.r2 + m2) - b.r2) - ((((a.r2 + m2) - b.r2) / m2) * m2),
+                  .r3 = ((a.r3 + m3) - b.r3) - ((((a.r3 + m3) - b.r3) / m3) * m3) };
+}
+fn znrt_rns_mul(a: ZnrtRns, b: ZnrtRns) ZnrtRns {
+    // residues are < 2^16, so the product < 2^32 fits an i64 exactly — no widening.
+    return ZnrtRns{ .r1 = (a.r1 * b.r1) - (((a.r1 * b.r1) / znrt_rns_m1()) * znrt_rns_m1()),
+                  .r2 = (a.r2 * b.r2) - (((a.r2 * b.r2) / znrt_rns_m2()) * znrt_rns_m2()),
+                  .r3 = (a.r3 * b.r3) - (((a.r3 * b.r3) / znrt_rns_m3()) * znrt_rns_m3()) };
+}
+
+// ── Quire: a 512-bit fixed-point exact accumulator for p32 FMA (Posit Standard:
+// 8 × 64-bit limbs, LSB weight 2^-240). Holds sums of products with NO rounding
+// until read out. The C reference (selfhost/codegen.zag zag_quire_*) uses 64-bit
+// limbs and 128-bit carries; we replicate the carry with signed i64 wraparound
+// (i64 `+`/`*` wrap mod 2^64) plus unsigned compares for the carry/borrow bit.
+// ZnrtQuire is a struct { l0..l7: i64, nar: i64 } declared in the injected source.
+
+// unsigned-less-than on two i64 bit patterns (flip the sign bit → signed compare).
+fn znrt_q_ult(a: i64, b: i64) i32 {
+    let mn: i64 = (0 - 9223372036854775807) - 1;     // 2^63 as a toggle mask
+    let sa: i64 = a + mn;
+    let sb: i64 = b + mn;
+    if (sa < sb) { return 1; }
+    return 0;
+}
+// logical right shift of an UNSIGNED i64 bit pattern by s. s>=64 → 0 (all bits
+// shifted out); s<=0 → x. (q_get asks for bit bo+1 with bo up to 63, i.e. s=64,
+// so this guard is load-bearing: znrt_q_pow2(64) would WRAP to 0 → a divide-by-
+// zero SIGFPE without it.)
+fn znrt_q_lshr(x: i64, s: i64) i64 {
+    if (s <= 0) { return x; }
+    if (s >= 64) { return 0; }
+    // x / 2^s, but `/` is signed; for s>=1 split off the top bit so it stays logical.
+    let mn: i64 = (0 - 9223372036854775807) - 1;
+    if (x >= 0) { return x / znrt_q_pow2(s); }
+    // x has the top (2^63) bit set: subtract it, divide, then add 2^(63-s).
+    let lo: i64 = x - mn;                              // clear bit 63 → non-negative
+    return (lo / znrt_q_pow2(s)) + znrt_q_pow2(63 - s);
+}
+// low 64 bits of (x << s), s in [0,63]; x is treated as an unsigned bit pattern.
+// Built by doubling so the overflow wraps mod 2^64 (matches C's uint64 << ).
+fn znrt_q_shl(x: i64, s: i64) i64 {
+    let r: i64 = x;
+    let i: i64 = 0;
+    while (i < s) { r = r * 2; i = i + 1; }            // i64 `*2` wraps mod 2^64
+    return r;
+}
+// bit i (0=LSB across the 8 limbs, i in [0,511]) of the limb array carried as 8
+// scalars l0..l7. Returns 0/1.
+fn znrt_q_get(l0: i64, l1: i64, l2: i64, l3: i64, l4: i64, l5: i64, l6: i64, l7: i64, i: i64) i64 {
+    let w: i64 = i / 64;
+    let bo: i64 = i - w * 64;
+    let v: i64 = 0;
+    if (w == 0) { v = l0; } else if (w == 1) { v = l1; } else if (w == 2) { v = l2; }
+    else if (w == 3) { v = l3; } else if (w == 4) { v = l4; } else if (w == 5) { v = l5; }
+    else if (w == 6) { v = l6; } else { v = l7; }
+    return znrt_q_lshr(v, bo) - (znrt_q_lshr(v, bo + 1) * 2);   // bit bo of v
+}
+
+// p32 → integer fields: value = (-1)^neg * sig * 2^sexp (sig an integer). Mirrors
+// the C reference zag_p32_fields (the branchless CLZ decode) but with a counting
+// loop. Returns via out params; bits==0 → sig 0.
+fn znrt_p32_fields(bits: i64, neg: *i64, sexp: *i64, sig: *i64) void {
+    if (bits == 0) { neg.* = 0; sexp.* = 0; sig.* = 0; return; }
+    let n: i64 = 0;
+    let u: i64 = bits;
+    if (bits >= 2147483648) { n = 1; u = 4294967296 - bits; }   // magnitude (2^32 - bits)
+    // first regime bit is bit 30 of u; scan the run from bit 30 downward.
+    let first: i64 = znrt_q_lshr(u, 30) - (znrt_q_lshr(u, 31) * 2);
+    let run: i64 = 0;
+    let b: i64 = 30;
+    let done: i32 = 0;
+    while (done == 0) {
+        if (b >= 0) {
+            let bit: i64 = znrt_q_lshr(u, b) - (znrt_q_lshr(u, b + 1) * 2);
+            if (bit == first) { run = run + 1; b = b - 1; } else { done = 1; }
+        } else { done = 1; }
+    }
+    let k: i64 = 0;
+    if (first == 1) { k = run - 1; } else { k = 0 - run; }
+    let rembits: i64 = 30 - run;
+    let e: i64 = 0;
+    let F: i64 = 0;
+    let frac: i64 = 0;
+    if (rembits >= 2) {
+        let field: i64 = nrt_lowbits(u, rembits);
+        e = znrt_q_lshr(field, rembits - 2);
+        F = rembits - 2;
+        frac = nrt_lowbits(field, F);
+    } else if (rembits == 1) {
+        e = nrt_lowbits(u, 1) * 2; F = 0; frac = 0;
+    } else { e = 0; F = 0; frac = 0; }
+    neg.* = n;
+    sig.* = znrt_q_pow2(F) + frac;
+    sexp.* = (4 * k + e) - F;
+}
+
+fn znrt_quire_zero() ZnrtQuire {
+    return ZnrtQuire{ .l0 = 0, .l1 = 0, .l2 = 0, .l3 = 0, .l4 = 0, .l5 = 0, .l6 = 0, .l7 = 0, .nar = 0 };
+}
+// q += a*b EXACTLY (a, b are p32 bit patterns). Places the 57-bit product at its
+// true bit position (ea+eb+240) and adds/subtracts it into the 512-bit limb array
+// with carry/borrow propagation. Mirrors the C reference zag_quire_fma.
+fn znrt_quire_fma(q: ZnrtQuire, a: i64, b: i64) ZnrtQuire {
+    if (a == 2147483648) { let r: ZnrtQuire = q; r.nar = 1; return r; }
+    if (b == 2147483648) { let r2: ZnrtQuire = q; r2.nar = 1; return r2; }
+    if (q.nar != 0) { let r3: ZnrtQuire = q; r3.nar = 1; return r3; }
+    let na: i64 = 0; let ea: i64 = 0; let sa: i64 = 0;
+    let nb: i64 = 0; let eb: i64 = 0; let sb: i64 = 0;
+    znrt_p32_fields(a, &na, &ea, &sa);
+    znrt_p32_fields(b, &nb, &eb, &sb);
+    if (sa == 0) { return q; }
+    if (sb == 0) { return q; }
+    let P: i64 = sa * sb;                            // <= 2^57, exact in i64
+    let shift: i64 = (ea + eb) + 240;                // exact bit position
+    if (shift < 0) { return q; }                     // below ZnrtQuire LSB (unreachable)
+    let off: i64 = shift / 64;
+    let bo: i64 = shift - off * 64;
+    let lo: i64 = P;
+    let hi: i64 = 0;
+    if (bo != 0) { lo = znrt_q_shl(P, bo); hi = znrt_q_lshr(P, 64 - bo); }
+    // sign of the product = na xor nb.
+    let sub: i32 = 0;
+    if (na != nb) { sub = 1; }
+    // load limbs, apply add/sub-at-offset with carry, store back.
+    let r: ZnrtQuire = q;
+    let limb0: i64 = q.l0; let limb1: i64 = q.l1; let limb2: i64 = q.l2; let limb3: i64 = q.l3;
+    let limb4: i64 = q.l4; let limb5: i64 = q.l5; let limb6: i64 = q.l6; let limb7: i64 = q.l7;
+    // We add a 128-bit value {lo, hi} starting at limb index `off`. To keep the
+    // code straight-line over 8 limbs without an array, build a small dispatch by
+    // shifting {lo,hi} into the correct limb pair via `off`, then ripple the carry.
+    // Step 1: add `lo` at `off`, `hi` at `off+1`, then ripple carry from `off+2`.
+    if (sub == 0) {
+        // ── ADD ──
+        // add lo at off
+        let i: i64 = off;
+        let addend: i64 = lo;
+        let nexta: i64 = hi;
+        let carry: i64 = 0;
+        let stage: i64 = 0;             // 0 = adding lo, 1 = adding hi, 2 = ripple carry
+        let go: i32 = 1;
+        while (go == 1) {
+            if (i > 7) { go = 0; }
+            else {
+                let cur: i64 = 0;
+                if (i == 0) { cur = limb0; } else if (i == 1) { cur = limb1; } else if (i == 2) { cur = limb2; }
+                else if (i == 3) { cur = limb3; } else if (i == 4) { cur = limb4; } else if (i == 5) { cur = limb5; }
+                else if (i == 6) { cur = limb6; } else { cur = limb7; }
+                // value to add at this limb = addend + carry (with carry-out detection)
+                let s1: i64 = cur + addend;
+                let c1: i64 = 0;
+                if (znrt_q_ult(s1, cur) == 1) { c1 = 1; }       // wrapped adding addend
+                let s2: i64 = s1 + carry;
+                let c2: i64 = 0;
+                if (znrt_q_ult(s2, s1) == 1) { c2 = 1; }        // wrapped adding carry
+                let outc: i64 = c1 + c2;                        // 0,1 (can't both wrap)
+                if (i == 0) { limb0 = s2; } else if (i == 1) { limb1 = s2; } else if (i == 2) { limb2 = s2; }
+                else if (i == 3) { limb3 = s2; } else if (i == 4) { limb4 = s2; } else if (i == 5) { limb5 = s2; }
+                else if (i == 6) { limb6 = s2; } else { limb7 = s2; }
+                carry = outc;
+                // advance addend: next limb gets `nexta` then 0 thereafter.
+                addend = nexta;
+                nexta = 0;
+                if (stage == 0) { stage = 1; }
+                else if (stage == 1) { stage = 2; }
+                // stop once we've placed lo+hi AND the carry has died.
+                if (stage >= 2) { if (carry == 0) { if (addend == 0) { go = 0; } } }
+                i = i + 1;
+            }
+        }
+    } else {
+        // ── SUB ──  (q -= {lo,hi} at off, with borrow ripple)
+        let i: i64 = off;
+        let suba: i64 = lo;
+        let nexts: i64 = hi;
+        let borrow: i64 = 0;
+        let stage: i64 = 0;
+        let go: i32 = 1;
+        while (go == 1) {
+            if (i > 7) { go = 0; }
+            else {
+                let cur: i64 = 0;
+                if (i == 0) { cur = limb0; } else if (i == 1) { cur = limb1; } else if (i == 2) { cur = limb2; }
+                else if (i == 3) { cur = limb3; } else if (i == 4) { cur = limb4; } else if (i == 5) { cur = limb5; }
+                else if (i == 6) { cur = limb6; } else { cur = limb7; }
+                let d1: i64 = cur - suba;
+                let b1: i64 = 0;
+                if (znrt_q_ult(cur, suba) == 1) { b1 = 1; }     // borrow from suba
+                let d2: i64 = d1 - borrow;
+                let b2: i64 = 0;
+                if (znrt_q_ult(d1, borrow) == 1) { b2 = 1; }    // borrow from prev borrow
+                let outb: i64 = b1 + b2;
+                if (i == 0) { limb0 = d2; } else if (i == 1) { limb1 = d2; } else if (i == 2) { limb2 = d2; }
+                else if (i == 3) { limb3 = d2; } else if (i == 4) { limb4 = d2; } else if (i == 5) { limb5 = d2; }
+                else if (i == 6) { limb6 = d2; } else { limb7 = d2; }
+                borrow = outb;
+                suba = nexts;
+                nexts = 0;
+                if (stage == 0) { stage = 1; }
+                else if (stage == 1) { stage = 2; }
+                if (stage >= 2) { if (borrow == 0) { if (suba == 0) { go = 0; } } }
+                i = i + 1;
+            }
+        }
+    }
+    r.l0 = limb0; r.l1 = limb1; r.l2 = limb2; r.l3 = limb3;
+    r.l4 = limb4; r.l5 = limb5; r.l6 = limb6; r.l7 = limb7;
+    return r;
+}
+// Round the exact 512-bit value to a p32 (round-to-nearest-even). Mirrors the C
+// reference zag_quire_to_p32: two's-complement the limbs if negative, find the
+// top set bit M, take the top 53 bits + sticky, ldexp, then encode via f64→p32.
+fn znrt_quire_to_p32(q: ZnrtQuire) i64 {
+    if (q.nar != 0) { return 2147483648; }
+    let l0: i64 = q.l0; let l1: i64 = q.l1; let l2: i64 = q.l2; let l3: i64 = q.l3;
+    let l4: i64 = q.l4; let l5: i64 = q.l5; let l6: i64 = q.l6; let l7: i64 = q.l7;
+    // sign = top bit of limb7 (bit 63).
+    let neg: i64 = znrt_q_lshr(l7, 63);
+    if (neg == 1) {
+        // two's-complement: m = ~limb + 1 (ripple carry across 8 limbs).
+        let carry: i64 = 1;
+        let mn: i64 = (0 - 9223372036854775807) - 1;
+        let arr0: i64 = 0; let arr1: i64 = 0; let arr2: i64 = 0; let arr3: i64 = 0;
+        let arr4: i64 = 0; let arr5: i64 = 0; let arr6: i64 = 0; let arr7: i64 = 0;
+        let i: i64 = 0;
+        while (i < 8) {
+            let v: i64 = 0;
+            if (i == 0) { v = l0; } else if (i == 1) { v = l1; } else if (i == 2) { v = l2; }
+            else if (i == 3) { v = l3; } else if (i == 4) { v = l4; } else if (i == 5) { v = l5; }
+            else if (i == 6) { v = l6; } else { v = l7; }
+            // ~v = (-1) - v  in two's complement (0xFFFF... is -1 as i64 bit pattern).
+            let notv: i64 = (0 - 1) - v;
+            let s: i64 = notv + carry;
+            let c: i64 = 0;
+            if (znrt_q_ult(s, notv) == 1) { c = 1; }
+            if (i == 0) { arr0 = s; } else if (i == 1) { arr1 = s; } else if (i == 2) { arr2 = s; }
+            else if (i == 3) { arr3 = s; } else if (i == 4) { arr4 = s; } else if (i == 5) { arr5 = s; }
+            else if (i == 6) { arr6 = s; } else { arr7 = s; }
+            carry = c;
+            i = i + 1;
+        }
+        l0 = arr0; l1 = arr1; l2 = arr2; l3 = arr3; l4 = arr4; l5 = arr5; l6 = arr6; l7 = arr7;
+    }
+    // find M = index of the highest set bit (511..0), -1 if all zero.
+    let M: i64 = 0 - 1;
+    let bi: i64 = 511;
+    let foundM: i32 = 0;
+    while (foundM == 0) {
+        if (bi < 0) { foundM = 1; }
+        else {
+            if (znrt_q_get(l0, l1, l2, l3, l4, l5, l6, l7, bi) == 1) { M = bi; foundM = 1; }
+            else { bi = bi - 1; }
+        }
+    }
+    if (M < 0) { return 0; }
+    // top 53 bits, MSB-first, into hi53.
+    let hi53: i64 = 0;
+    let j: i64 = 0;
+    while (j < 53) {
+        let pos: i64 = M - j;
+        let bit: i64 = 0;
+        if (pos >= 0) { bit = znrt_q_get(l0, l1, l2, l3, l4, l5, l6, l7, pos); }
+        hi53 = hi53 * 2 + bit;
+        j = j + 1;
+    }
+    // sticky over the bits below the 53 we kept.
+    let sticky: i32 = 0;
+    let si: i64 = 0;
+    let limit: i64 = M - 53;
+    let sdone: i32 = 0;
+    while (sdone == 0) {
+        if (si > limit) { sdone = 1; }
+        else {
+            if (znrt_q_get(l0, l1, l2, l3, l4, l5, l6, l7, si) == 1) { sticky = 1; sdone = 1; }
+            else { si = si + 1; }
+        }
+    }
+    if (sticky == 1) {
+        // round-to-odd: set the LSB of hi53 (makes the final f64→p32 RNE correct).
+        if (nrt_lowbits(hi53, 1) == 0) { hi53 = hi53 + 1; }
+    }
+    // value = hi53 * 2^((M-52) - 240).
+    let val: f64 = nrt_ldexp(hi53 as f64, (M - 52) - 240);
+    if (neg == 1) { val = 0.0 - val; }
+    return nrt_encode(val, 32, 2);
+}
