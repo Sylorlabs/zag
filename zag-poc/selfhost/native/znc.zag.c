@@ -8026,6 +8026,9 @@ static void cg_scan_call(Cg* cg, ScanCtx* sc, Call c) {
     ai = (ai + 1);
     }
     }
+    if (_zag_str_eq((ZagSliceU8){ (fname).ptr + (1), ((fname).len) - (1) }, (ZagSliceU8){(const uint8_t*)"cacheAlignedAlloc", 17})) {
+    (*(*sc).words) = ((*(*sc).words) + 2);
+    }
     return;
     }
     }
@@ -8710,6 +8713,9 @@ static ZagSliceU8 cg_expr_type(Node* n, Env* env, ArrayList_FnSym syms, Cg* cg) 
     ZagSliceU8 qr = cg_quire_builtin_ret((ZagSliceU8){ (cid.name).ptr + (1), ((cid.name).len) - (1) });
     if ((qr.len > 0)) {
     return cg_norm_type(qr);
+    }
+    if (_zag_str_eq((ZagSliceU8){ (cid.name).ptr + (1), ((cid.name).len) - (1) }, (ZagSliceU8){(const uint8_t*)"cacheAlignedAlloc", 17})) {
+    return (ZagSliceU8){(const uint8_t*)"[]f32", 5};
     }
     return (ZagSliceU8){(const uint8_t*)"", 0};
     }
@@ -10753,6 +10759,45 @@ static void cg_lower_builtin(ArrayList_Instr* out, ZagSliceU8 fname, Call c, Env
     cg_lower_expr(out, get_pNode(c.args, 0), env, syms, cg);
     push_Instr(out, i_pop(R_RDI()));
     push_Instr(out, i_call(pl));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"cacheLineSize", 13})) {
+    push_Instr(out, i_mov_imm(R_RAX(), 64));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"prefetch", 8})) {
+    if ((nargs > 0)) {
+    cg_lower_expr(out, get_pNode(c.args, 0), env, syms, cg);
+    push_Instr(out, i_pop(R_RAX()));
+    }
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"cacheAlignedAlloc", 17})) {
+    cg_lower_expr(out, get_pNode(c.args, 0), env, syms, cg);
+    push_Instr(out, i_pop(R_RDI()));
+    push_Instr(out, i_mov_imm(R_RAX(), 8));
+    push_Instr(out, i_imul(R_RDI(), R_RAX()));
+    (*cg).use_al = 1;
+    push_Instr(out, i_call((*cg).al_lbl));
+    int32_t sb2 = cg_slot_scratch_n(env, 2);
+    push_Instr(out, i_store(R_RBP(), (sb2 + 0), R_RAX()));
+    cg_lower_expr(out, get_pNode(c.args, 0), env, syms, cg);
+    push_Instr(out, i_pop(R_RCX()));
+    push_Instr(out, i_store(R_RBP(), (sb2 + 8), R_RCX()));
+    push_Instr(out, i_lea(R_RAX(), R_RBP(), sb2));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"cacheAlignedFree", 16})) {
+    if ((nargs > 0)) {
+    cg_lower_expr(out, get_pNode(c.args, 0), env, syms, cg);
+    push_Instr(out, i_pop(R_RAX()));
+    }
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
     push_Instr(out, i_push(R_RAX()));
     return;
     }
