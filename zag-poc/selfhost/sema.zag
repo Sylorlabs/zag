@@ -94,6 +94,220 @@ fn div_eff(b: Bin) i32 {
     return 0;
 }
 
+// ── precise @total safety check (path-sensitive + algebraic) ────────────────
+// Called when the fixpoint analysis flags Panic in a @total fn. We re-walk the
+// body with a "known-nonzero" set to discharge guards and algebraic proofs that
+// the coarse bitmask analysis cannot see.
+
+fn is_zero_lit(n: *Node) i32 {
+    switch (n.*) {
+        .ilit => |x| { if (@strEq(x.text, "0")) { return 1; } return 0; }
+        else  => { return 0; }
+    }
+}
+fn is_pos_lit(n: *Node) i32 {
+    switch (n.*) {
+        .ilit => |x| {
+            if (x.text.len == 0) { return 0; }
+            if (@strEq(x.text, "0")) { return 0; }
+            if (x.text[0] == '-') { return 0; }
+            return 1;
+        }
+        else => { return 0; }
+    }
+}
+// Is expr algebraically always > 0? Handles: positive lit; a*a+c (c>0).
+fn expr_always_pos(n: *Node) i32 {
+    switch (n.*) {
+        .ilit => |_| { return is_pos_lit(n); }
+        .bin  => |b| {
+            if (@strEq(b.op, "+")) {
+                // x*x + c  (c > 0)  →  x^2 >= 0 so result >= c > 0
+                if (is_pos_lit(b.r) == 1) {
+                    switch (b.l.*) {
+                        .bin => |bl| {
+                            if (@strEq(bl.op, "*")) {
+                                switch (bl.l.*) {
+                                    .id => |li| {
+                                        switch (bl.r.*) {
+                                            .id => |ri| {
+                                                if (@strEq(li.name, ri.name)) { return 1; }
+                                            }
+                                            else => { }
+                                        }
+                                    }
+                                    else => { }
+                                }
+                            }
+                        }
+                        else => { }
+                    }
+                }
+                if (is_pos_lit(b.l) == 1) {
+                    switch (b.r.*) {
+                        .bin => |br| {
+                            if (@strEq(br.op, "*")) {
+                                switch (br.l.*) {
+                                    .id => |li| {
+                                        switch (br.r.*) {
+                                            .id => |ri| {
+                                                if (@strEq(li.name, ri.name)) { return 1; }
+                                            }
+                                            else => { }
+                                        }
+                                    }
+                                    else => { }
+                                }
+                            }
+                        }
+                        else => { }
+                    }
+                }
+                if (expr_always_pos(b.l) == 1 && expr_always_pos(b.r) == 1) { return 1; }
+                return 0;
+            }
+            if (@strEq(b.op, "*")) {
+                return expr_always_pos(b.l) & expr_always_pos(b.r);
+            }
+            return 0;
+        }
+        else => { return 0; }
+    }
+}
+// Is divisor r provably nonzero given nz (known-nonzero var names)?
+fn nz_div_safe(r: *Node, nz: ArrayList[[]u8]) i32 {
+    if (divisor_safe(r) == 1) { return 1; }
+    if (expr_always_pos(r) == 1) { return 1; }
+    switch (r.*) {
+        .id => |x| {
+            let i: i32 = 0;
+            while (i < len[[]u8](nz)) {
+                if (@strEq(get[[]u8](nz, i), x.name)) { return 1; }
+                i = i + 1;
+            }
+        }
+        else => { }
+    }
+    return 0;
+}
+// Extract nonzero var bindings from a condition into nz.
+//   Handles: v != 0,  0 != v,  c1 && c2 (recursively).
+fn extract_nz(cond: *Node, nz: *ArrayList[[]u8]) void {
+    switch (cond.*) {
+        .bin => |b| {
+            if (@strEq(b.op, "!=")) {
+                if (is_zero_lit(b.r) == 1) {
+                    switch (b.l.*) {
+                        .id => |x| { push[[]u8](nz, x.name); }
+                        else => { }
+                    }
+                }
+                if (is_zero_lit(b.l) == 1) {
+                    switch (b.r.*) {
+                        .id => |x| { push[[]u8](nz, x.name); }
+                        else => { }
+                    }
+                }
+            }
+            if (@strEq(b.op, "&&")) {
+                extract_nz(b.l, nz);
+                extract_nz(b.r, nz);
+            }
+        }
+        else => { }
+    }
+}
+// Count unguarded divisions in expr given nz. Returns > 0 if unsafe.
+fn total_unsafe_expr(n: *Node, nz: ArrayList[[]u8]) i32 {
+    switch (n.*) {
+        .bin => |b| {
+            let sub: i32 = total_unsafe_expr(b.l, nz) + total_unsafe_expr(b.r, nz);
+            if (@strEq(b.op, "/") || @strEq(b.op, "%")) {
+                if (nz_div_safe(b.r, nz) == 0) { return sub + 1; }
+            }
+            return sub;
+        }
+        .un    => |u| { return total_unsafe_expr(u.e, nz); }
+        .call  => |c| {
+            let acc: i32 = 0;
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) {
+                acc = acc + total_unsafe_expr(get[*Node](c.args, i), nz);
+                i = i + 1;
+            }
+            return acc;
+        }
+        .idx   => |x| { return total_unsafe_expr(x.base, nz) + total_unsafe_expr(x.idx, nz); }
+        .fld   => |f| { return total_unsafe_expr(f.base, nz); }
+        .slit_ => |s| {
+            let acc: i32 = 0;
+            let i: i32 = 0;
+            while (i < len[FieldInit](s.fields)) {
+                acc = acc + total_unsafe_expr(get[FieldInit](s.fields, i).val, nz);
+                i = i + 1;
+            }
+            return acc;
+        }
+        else   => { return 0; }
+    }
+}
+fn total_unsafe_body(body: ArrayList[*Node], nz: *ArrayList[[]u8]) i32 {
+    let acc: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        acc = acc + total_unsafe_stmt(get[*Node](body, i), nz);
+        i = i + 1;
+    }
+    return acc;
+}
+fn total_unsafe_stmt(n: *Node, nz: *ArrayList[[]u8]) i32 {
+    switch (n.*) {
+        .let_ => |l| {
+            let e: i32 = total_unsafe_expr(l.expr, nz.*);
+            // If let x = <always-positive expr>, record x as nonzero for scope.
+            if (expr_always_pos(l.expr) == 1) { push[[]u8](nz, l.name); }
+            return e;
+        }
+        .ret  => |r| {
+            if (r.has_expr == 1) { return total_unsafe_expr(r.expr, nz.*); }
+            return 0;
+        }
+        .if_  => |x| {
+            let cu: i32 = total_unsafe_expr(x.cond, nz.*);
+            let prev: i32 = len[[]u8](nz.*);
+            extract_nz(x.cond, nz);
+            let tu: i32 = total_unsafe_body(x.then_body, nz);
+            while (len[[]u8](nz.*) > prev) { let _ignored: []u8 = pop[[]u8](nz); }
+            let eu: i32 = total_unsafe_body(x.els_body, nz);
+            return cu + tu + eu;
+        }
+        .while_ => |w| {
+            return total_unsafe_expr(w.cond, nz.*) + total_unsafe_body(w.body, nz);
+        }
+        .assign => |a| {
+            return total_unsafe_expr(a.target, nz.*) + total_unsafe_expr(a.expr, nz.*);
+        }
+        .switch_ => |sw| {
+            let acc: i32 = total_unsafe_expr(sw.subject, nz.*);
+            let i: i32 = 0;
+            while (i < len[SwitchArm](sw.arms)) {
+                acc = acc + total_unsafe_body(get[SwitchArm](sw.arms, i).body, nz);
+                i = i + 1;
+            }
+            if (sw.has_els == 1) { acc = acc + total_unsafe_body(sw.els_body, nz); }
+            return acc;
+        }
+        .estmt => |e| { return total_unsafe_expr(e.expr, nz.*); }
+        else   => { return 0; }
+    }
+}
+// Returns 1 if every integer division in f's body is provably safe.
+fn fn_total_safe(f: FnDecl) i32 {
+    let nz: ArrayList[[]u8] = make[[]u8](8);
+    let bad: i32 = total_unsafe_body(f.body, &nz);
+    return (bad == 0) as i32;
+}
+
 fn ret_eff(r: Return, eff: map.StringMap[i32]) i32 {
     if (r.has_expr == 1) { return expr_eff(r.expr, eff); }
     return 0;
@@ -479,14 +693,26 @@ fn report_fn(f: FnDecl, decls: ArrayList[*Node], eff: map.StringMap[i32]) i32 {
         let forb: i32 = forbidden_bits(a);
         if (forb != 0) {
             if ((myeff & forb) != 0) {
-                _zag_print("zag: VIOLATION in ");
-                _zag_print(f.name);
-                _zag_print(" ");
-                _zag_println(a);
-                count = count + 1;
+                // For @total, run the precise path-sensitive + algebraic prover
+                // before reporting. It can discharge guards like `if (d != 0)`
+                // and algebraic invariants like `n*n + 1` that the coarse fixpoint
+                // conservatively flags as Panic.
+                if (@strEq(a, "@total") && fn_total_safe(f) == 1) {
+                    i = i + 1;
+                } else {
+                    _zag_print("zag: VIOLATION in ");
+                    _zag_print(f.name);
+                    _zag_print(" ");
+                    _zag_println(a);
+                    count = count + 1;
+                    i = i + 1;
+                }
+            } else {
+                i = i + 1;
             }
+        } else {
+            i = i + 1;
         }
-        i = i + 1;
     }
     return count;
 }

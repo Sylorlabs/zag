@@ -12,6 +12,8 @@ b(){ ./zagc check examples/$1.zag >/tmp/zt 2>&1
 echo "── effects: basics ──"
 g audio_render; g synth
 b audio_render_bad; b total_bad; b realtime_io_lock_bad
+echo "── @total: path-sensitive + algebraic proofs (SMT-style, no Z3 needed) ──"
+g total_guarded; g total_nonzero
 echo "── effect polymorphism (higher-order) ──"
 g process_poly; g process_bounded
 b process_poly_bad; b process_bounded_bad
