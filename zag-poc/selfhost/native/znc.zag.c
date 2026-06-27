@@ -623,6 +623,8 @@ static int32_t K_FTSD2SI(void);
 static int32_t K_FSD2SS(void);
 static int32_t K_FSS2SD(void);
 static int32_t K_FXORPS(void);
+static int32_t K_CALL_REG(void);
+static int32_t K_LEA_LBL(void);
 static int32_t CC_E(void);
 static int32_t CC_NE(void);
 static int32_t CC_L(void);
@@ -693,6 +695,8 @@ static Instr i_ftsd2si(int32_t gpr, int32_t xmm);
 static Instr i_fsd2ss(int32_t d, int32_t s);
 static Instr i_fss2sd(int32_t d, int32_t s);
 static Instr i_fxorps(int32_t d, int32_t s);
+static Instr i_call_reg(int32_t r);
+static Instr i_lea_lbl(int32_t dst, int32_t id);
 static void eb(ArrayList_u8* buf, int32_t b);
 static void emit_le(ArrayList_u8* buf, int64_t v, int32_t n);
 static void rex(ArrayList_u8* buf, int32_t w, int32_t r, int32_t x, int32_t b);
@@ -884,6 +888,10 @@ static SwitchArm cg_clone_arm(SwitchArm a, ArrayList__u8 tp, ArrayList__u8 ta);
 static Node* cg_clone_stmt(Node* n, ArrayList__u8 tp, ArrayList__u8 ta);
 static Node* cg_clone_switch(Switch sw, ArrayList__u8 tp, ArrayList__u8 ta);
 static ZagSliceU8 cg_callee_name(Node* n);
+static int32_t cg_starts_with(ZagSliceU8 s, ZagSliceU8 p);
+static int32_t cg_is_fn_type(ZagSliceU8 ty);
+static int32_t cg_is_clos_name(ZagSliceU8 name);
+static int32_t cg_count_caps(ZagSliceU8 caps);
 static int32_t cg_exp_seen(Exp* e, ZagSliceU8 m);
 static int32_t cg_find_generic_fn(ArrayList_pNode decls, ZagSliceU8 name, FnDecl* out);
 static int32_t cg_find_generic_struct(ArrayList_pNode decls, ZagSliceU8 name, StructDecl* out);
@@ -1512,6 +1520,12 @@ static int32_t K_FSS2SD(void) {
 static int32_t K_FXORPS(void) {
     return 42;
 }
+static int32_t K_CALL_REG(void) {
+    return 43;
+}
+static int32_t K_LEA_LBL(void) {
+    return 44;
+}
 static int32_t CC_E(void) {
     return 0;
 }
@@ -1739,6 +1753,12 @@ static Instr i_fss2sd(int32_t d, int32_t s) {
 }
 static Instr i_fxorps(int32_t d, int32_t s) {
     return ins6(42, d, s, 0, 0, (0 - 1));
+}
+static Instr i_call_reg(int32_t r) {
+    return ins6(43, r, 0, 0, 0, (0 - 1));
+}
+static Instr i_lea_lbl(int32_t dst, int32_t id) {
+    return ins6(44, dst, 0, 0, 0, id);
 }
 static void eb(ArrayList_u8* buf, int32_t b) {
     push_u8(buf, ((uint8_t)((b % 256))));
@@ -2024,6 +2044,30 @@ static void encode_one(ArrayList_u8* buf, Instr ins, ArrayList_i32 labels, int32
     eb(buf, 15);
     eb(buf, 182);
     eb(buf, modrm_rr(d, d));
+    return;
+    }
+    if ((k == K_CALL_REG())) {
+    int32_t r = ins.dst;
+    if ((r >= 8)) {
+    eb(buf, 65);
+    r = (r - 8);
+    }
+    eb(buf, 255);
+    eb(buf, (208 + lo3(r)));
+    return;
+    }
+    if ((k == K_LEA_LBL())) {
+    int32_t target = get_i32(labels, ins.lbl);
+    int32_t dst = ins.dst;
+    int32_t rexb = 72;
+    if ((dst >= 8)) {
+    rexb = (rexb + 4);
+    dst = (dst - 8);
+    }
+    eb(buf, rexb);
+    eb(buf, 141);
+    eb(buf, (5 + (lo3(dst) * 8)));
+    emit_le(buf, ((int64_t)((target - (base_off + 7)))), 4);
     return;
     }
     if ((k == K_CALL())) {
@@ -6178,6 +6222,45 @@ static Node* cg_clone_switch(Switch sw, ArrayList__u8 tp, ArrayList__u8 ta) {
 static ZagSliceU8 cg_callee_name(Node* n) {
     return ({ __auto_type __sw = (*n); (__sw.tag == Node_id) ? ({ __auto_type d = __sw.u.id; (d.name); }) : (__sw.tag == Node_fld) ? ({ __auto_type f = __sw.u.fld; (f.fname); }) : ((ZagSliceU8){(const uint8_t*)"", 0}); });
 }
+static int32_t cg_starts_with(ZagSliceU8 s, ZagSliceU8 p) {
+    if ((s.len < p.len)) {
+    return 0;
+    }
+    int32_t i = 0;
+    while ((i < p.len)) {
+    if (((s).ptr[i] != (p).ptr[i])) {
+    return 0;
+    }
+    i = (i + 1);
+    }
+    return 1;
+}
+static int32_t cg_is_fn_type(ZagSliceU8 ty) {
+    if ((ty.len < 3)) {
+    return 0;
+    }
+    if (((((ty).ptr[0] == 102) && ((ty).ptr[1] == 110)) && ((ty).ptr[2] == 40))) {
+    return 1;
+    }
+    return 0;
+}
+static int32_t cg_is_clos_name(ZagSliceU8 name) {
+    return cg_starts_with(name, (ZagSliceU8){(const uint8_t*)"__clos_", 7});
+}
+static int32_t cg_count_caps(ZagSliceU8 caps) {
+    if ((caps.len == 0)) {
+    return 0;
+    }
+    int32_t n = 1;
+    int32_t i = 0;
+    while ((i < caps.len)) {
+    if (((caps).ptr[i] == 44)) {
+    n = (n + 1);
+    }
+    i = (i + 1);
+    }
+    return n;
+}
 static int32_t cg_exp_seen(Exp* e, ZagSliceU8 m) {
     int32_t i = 0;
     while ((i < len__u8((*e).seen))) {
@@ -6976,6 +7059,9 @@ static int32_t cg_type_is_opt(Cg* cg, ZagSliceU8 ty) {
     return 0;
 }
 static int32_t cg_type_is_agg(Cg* cg, ZagSliceU8 ty) {
+    if (_zag_str_eq(ty, (ZagSliceU8){(const uint8_t*)"fat_fn", 6})) {
+    return 1;
+    }
     if ((cg_type_is_struct(cg, ty) == 1)) {
     return 1;
     }
@@ -6995,6 +7081,9 @@ static int32_t cg_type_is_agg(Cg* cg, ZagSliceU8 ty) {
     return 0;
 }
 static int32_t cg_agg_words(Cg* cg, ZagSliceU8 ty) {
+    if (_zag_str_eq(ty, (ZagSliceU8){(const uint8_t*)"fat_fn", 6})) {
+    return 2;
+    }
     if ((cg_type_is_agg(cg, ty) == 0)) {
     return 1;
     }
@@ -7277,6 +7366,9 @@ static ZagSliceU8 cg_scan_typeof(ScanCtx* sc, Cg* cg, Node* n) {
     case Node_id:
     {
         __auto_type x = __sw.u.id;
+    if ((cg_is_clos_name(x.name) == 1)) {
+    return (ZagSliceU8){(const uint8_t*)"fat_fn", 6};
+    }
     int32_t i = 0;
     while ((i < len__u8((*sc).names))) {
     if (_zag_str_eq(get__u8((*sc).names, i), x.name)) {
@@ -7710,6 +7802,14 @@ static void cg_scan_expr(Cg* cg, ScanCtx* sc, Node* n) {
     }
     if ((sw.has_els == 1)) {
     cg_scan_body(cg, sc, sw.els_body);
+    }
+        break;
+    }
+    case Node_id:
+    {
+        __auto_type x = __sw.u.id;
+    if ((cg_is_clos_name(x.name) == 1)) {
+    (*(*sc).words) = ((*(*sc).words) + 2);
     }
         break;
     }
@@ -8552,6 +8652,65 @@ static void cg_lower_expr(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     }
     if (_zag_str_eq(x.name, (ZagSliceU8){(const uint8_t*)"false", 5})) {
     push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    if ((cg_is_clos_name(x.name) == 1)) {
+    int32_t lbl = cg_find_fn(syms, x.name);
+    if ((lbl < 0)) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: unknown closure reference", 33});
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    int32_t fb = cg_slot_scratch_n(env, 2);
+    push_Instr(out, i_lea_lbl(R_RAX(), lbl));
+    push_Instr(out, i_store(R_RBP(), fb, R_RAX()));
+    ZagSliceU8 caps = (ZagSliceU8){(const uint8_t*)"", 0};
+    int32_t di = 0;
+    while ((di < len_pNode((*cg).decls))) {
+    {
+    Node __sw = (*get_pNode((*cg).decls, di));
+    switch (__sw.tag) {
+    case Node_fn_decl:
+    {
+        __auto_type fd = __sw.u.fn_decl;
+    if (_zag_str_eq(fd.name, x.name)) {
+    caps = fd.cap_names;
+    }
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+    di = (di + 1);
+    }
+    if ((caps.len > 0)) {
+    int32_t ncaps = cg_count_caps(caps);
+    push_Instr(out, i_mov_imm(R_RDI(), ((int64_t)((ncaps * 8)))));
+    push_Instr(out, i_call((*cg).ml_lbl));
+    (*cg).use_ml = 1;
+    push_Instr(out, i_mov_rr(R_RSI(), R_RAX()));
+    ArrayList__u8 cnames = split_args(caps);
+    int32_t ci = 0;
+    while ((ci < len__u8(cnames))) {
+    ZagSliceU8 cname = get__u8(cnames, ci);
+    int32_t cdisp = cg_slot_find((*env), cname);
+    if ((cdisp != cg_not_found())) {
+    push_Instr(out, i_load(R_RAX(), R_RBP(), cdisp));
+    push_Instr(out, i_store(R_RSI(), (8 * ci), R_RAX()));
+    }
+    ci = (ci + 1);
+    }
+    push_Instr(out, i_store(R_RBP(), (fb + 8), R_RSI()));
+    } else {
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_store(R_RBP(), (fb + 8), R_RAX()));
+    }
+    push_Instr(out, i_lea(R_RAX(), R_RBP(), fb));
     push_Instr(out, i_push(R_RAX()));
     return;
     }
@@ -10223,6 +10382,82 @@ static void cg_lower_call(ArrayList_Instr* out, Call c, Env* env, ArrayList_FnSy
     if ((len__u8(c.targs) > 0)) {
     fname = cg_mangle_generic(fname, c.targs);
     }
+    ZagSliceU8 fname_ty = cg_slot_type((*env), fname);
+    if (_zag_str_eq(fname_ty, (ZagSliceU8){(const uint8_t*)"fat_fn", 6})) {
+    int32_t fp_disp = cg_slot_find((*env), fname);
+    int32_t is_byref = cg_slot_byref((*env), fname);
+    int32_t env_slot = cg_slot_scratch(env);
+    if ((is_byref == 1)) {
+    push_Instr(out, i_load(R_RCX(), R_RBP(), fp_disp));
+    push_Instr(out, i_load(R_RCX(), R_RCX(), 8));
+    } else {
+    push_Instr(out, i_load(R_RCX(), R_RBP(), (fp_disp + 8)));
+    }
+    push_Instr(out, i_store(R_RBP(), env_slot, R_RCX()));
+    ArrayList_i32 aslot = make_i32((nargs + 2));
+    push_i32((&aslot), env_slot);
+    int32_t ui = 0;
+    while ((ui < nargs)) {
+    Node* arg = get_pNode(c.args, ui);
+    ZagSliceU8 at = cg_expr_type(arg, env, syms, cg);
+    int32_t is_slit = 0;
+    {
+    Node __sw = (*arg);
+    switch (__sw.tag) {
+    case Node_slit:
+    {
+        __auto_type _s = __sw.u.slit;
+    is_slit = 1;
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+    int32_t sl = cg_slot_scratch(env);
+    push_i32((&aslot), sl);
+    if (((cg_type_is_agg(cg, at) == 1) && (is_slit == 0))) {
+    int32_t nf = cg_agg_words(cg, at);
+    int32_t cpy = cg_slot_scratch_n(env, nf);
+    cg_lower_expr(out, arg, env, syms, cg);
+    push_Instr(out, i_pop(R_RSI()));
+    int32_t k = 0;
+    while ((k < nf)) {
+    push_Instr(out, i_load(R_RAX(), R_RSI(), (8 * k)));
+    push_Instr(out, i_store(R_RBP(), (cpy + (8 * k)), R_RAX()));
+    k = (k + 1);
+    }
+    push_Instr(out, i_lea(R_RAX(), R_RBP(), cpy));
+    } else {
+    cg_lower_expr(out, arg, env, syms, cg);
+    push_Instr(out, i_pop(R_RAX()));
+    }
+    push_Instr(out, i_store(R_RBP(), sl, R_RAX()));
+    ui = (ui + 1);
+    }
+    if ((is_byref == 1)) {
+    push_Instr(out, i_load(R_RAX(), R_RBP(), fp_disp));
+    push_Instr(out, i_load(R_RAX(), R_RAX(), 0));
+    } else {
+    push_Instr(out, i_load(R_RAX(), R_RBP(), fp_disp));
+    }
+    int32_t total_args = (nargs + 1);
+    int32_t ai = 0;
+    while ((ai < total_args)) {
+    if ((ai < 6)) {
+    push_Instr(out, i_load(arg_reg(ai), R_RBP(), get_i32(aslot, ai)));
+    } else {
+    push_Instr(out, i_load(R_RCX(), R_RBP(), get_i32(aslot, ai)));
+    push_Instr(out, i_push(R_RCX()));
+    }
+    ai = (ai + 1);
+    }
+    push_Instr(out, i_call_reg(R_RAX()));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
     int32_t lbl = cg_find_fn(syms, fname);
     if ((lbl < 0)) {
     cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: call to unknown function", 32});
@@ -10926,6 +11161,11 @@ static void cg_lower_fn(ArrayList_Instr* out, FnDecl f, int32_t lbl, ArrayList_F
     if ((fn_ret_agg == 1)) {
     words = (words + 1);
     }
+    int32_t is_clos = cg_is_clos_name(f.name);
+    if ((is_clos == 1)) {
+    words = (words + 1);
+    words = (words + cg_count_caps(f.cap_names));
+    }
     ScanCtx sc = (ScanCtx){ .seen = (&seen), .words = (&words), .names = make__u8(8), .types = make__u8(8), .fnames = make__u8(8), .frets = make__u8(8) };
     int32_t si = 0;
     while ((si < len_FnSym(syms))) {
@@ -10936,7 +11176,11 @@ static void cg_lower_fn(ArrayList_Instr* out, FnDecl f, int32_t lbl, ArrayList_F
     int32_t pi = 0;
     while ((pi < len_Param(f.params))) {
     Param prm = get_Param(f.params, pi);
-    cg_scan_rectype((&sc), prm.name, cg_norm_type(prm.pty));
+    ZagSliceU8 prm_pty = cg_norm_type(prm.pty);
+    if ((cg_is_fn_type(prm.pty) == 1)) {
+    prm_pty = (ZagSliceU8){(const uint8_t*)"fat_fn", 6};
+    }
+    cg_scan_rectype((&sc), prm.name, prm_pty);
     int32_t _dup = cg_scan_seen((&seen), prm.name);
     words = (words + 1);
     pi = (pi + 1);
@@ -10956,23 +11200,45 @@ static void cg_lower_fn(ArrayList_Instr* out, FnDecl f, int32_t lbl, ArrayList_F
     env.sret_type = fret;
     push_Instr(out, i_store(R_RBP(), sd, R_R10()));
     }
+    int32_t param_shift = 0;
+    int32_t zenv_disp = 0;
+    if ((is_clos == 1)) {
+    param_shift = 1;
+    zenv_disp = cg_slot_alloc_typed((&env), (ZagSliceU8){(const uint8_t*)"__zenv", 6}, (ZagSliceU8){(const uint8_t*)"*void", 5}, 1);
+    push_Instr(out, i_store(R_RBP(), zenv_disp, R_RDI()));
+    }
     int32_t i = 0;
     while ((i < len_Param(f.params))) {
     Param p = get_Param(f.params, i);
     ZagSliceU8 pty = cg_norm_type(p.pty);
+    if ((cg_is_fn_type(p.pty) == 1)) {
+    pty = (ZagSliceU8){(const uint8_t*)"fat_fn", 6};
+    }
     int32_t pdisp = 0;
     if ((cg_type_is_agg(cg, pty) == 1)) {
     pdisp = cg_slot_alloc_br((&env), p.name, pty, 1, 1);
     } else {
     pdisp = cg_slot_alloc_typed((&env), p.name, pty, 1);
     }
-    if ((i < 6)) {
-    push_Instr(out, i_store(R_RBP(), pdisp, arg_reg(i)));
+    if (((i + param_shift) < 6)) {
+    push_Instr(out, i_store(R_RBP(), pdisp, arg_reg((i + param_shift))));
     } else {
-    push_Instr(out, i_load(R_RAX(), R_RBP(), (16 + (8 * (i - 6)))));
+    push_Instr(out, i_load(R_RAX(), R_RBP(), (16 + (8 * ((i + param_shift) - 6)))));
     push_Instr(out, i_store(R_RBP(), pdisp, R_RAX()));
     }
     i = (i + 1);
+    }
+    if (((is_clos == 1) && (f.cap_names.len > 0))) {
+    ArrayList__u8 cnames = split_args(f.cap_names);
+    push_Instr(out, i_load(R_RDI(), R_RBP(), zenv_disp));
+    int32_t ci = 0;
+    while ((ci < len__u8(cnames))) {
+    ZagSliceU8 cname = get__u8(cnames, ci);
+    int32_t cdisp = cg_slot_alloc((&env), cname);
+    push_Instr(out, i_load(R_RAX(), R_RDI(), (8 * ci)));
+    push_Instr(out, i_store(R_RBP(), cdisp, R_RAX()));
+    ci = (ci + 1);
+    }
     }
     cg_lower_block(out, f.body, (&env), syms, cg);
     push_Instr(out, i_label(epilogue));
