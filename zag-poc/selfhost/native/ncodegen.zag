@@ -650,6 +650,7 @@ fn cg_norm_type(t: []u8) []u8 {
     // accesses them with NO special cases.
     if (@strEq(t, "rns_3")) { return "ZnrtRns"; }
     if (@strEq(t, "quire")) { return "ZnrtQuire"; }
+    if (@strEq(t, "bool")) { return "i32"; }
     if (is_generic_app(t)) {
         let lb: i32 = index_of(t, '[');
         let base: []u8 = t[0..lb];
@@ -1274,6 +1275,8 @@ fn cg_type_size(cg: *Cg, ty0: []u8) i32 {
     let ty: []u8 = cg_norm_type(ty0);
     if (ty.len == 0) { return 8; }
     if (ty[0] == '*') { return 8; }                 // pointer = scalar
+    if (@strEq(ty, "fat_fn")) { return 16; }         // fat_fn = {code_ptr, env_ptr}
+    if (cg_is_fn_type(ty) == 1) { return 16; }      // fn-typed = fat_fn = 2 words
     if (cg_type_is_slice(cg, ty) == 1) { return 16; }  // []u8 = {ptr,len}
     if (ty[0] == '?') {                             // optional ?T = {has, val}
         return 8 + cg_round8(cg_type_size(cg, ty[1..]));
@@ -1422,6 +1425,7 @@ fn cg_type_is_opt(cg: *Cg, ty: []u8) i32 {
 // optional `?T` {has,val}. A leading '*' is a scalar pointer (the address).
 fn cg_type_is_agg(cg: *Cg, ty: []u8) i32 {
     if (@strEq(ty, "fat_fn")) { return 1; }
+    if (cg_is_fn_type(ty) == 1) { return 1; }  // fn(A)B is natively a fat_fn (2 words)
     if (cg_type_is_struct(cg, ty) == 1) { return 1; }
     if (cg_type_is_slice(cg, ty) == 1) { return 1; }
     if (ty.len > 0) {
@@ -1437,6 +1441,7 @@ fn cg_type_is_agg(cg: *Cg, ty: []u8) i32 {
 // defensively for a non-aggregate.
 fn cg_agg_words(cg: *Cg, ty: []u8) i32 {
     if (@strEq(ty, "fat_fn")) { return 2; }
+    if (cg_is_fn_type(ty) == 1) { return 2; }  // fn(A)B is a fat_fn, always 2 words
     if (cg_type_is_agg(cg, ty) == 0) { return 1; }
     let sz: i32 = cg_type_size(cg, ty);
     let w: i32 = sz / 8;
@@ -1793,6 +1798,12 @@ fn cg_scan_typeof(sc: *ScanCtx, cg: *Cg, n: *Node) []u8 {
                 if (@strEq(get[[]u8](sc.*.names, i), x.name)) { return get[[]u8](sc.*.types, i); }
                 i = i + 1;
             }
+            // Plain function name used as a value → fat_fn.
+            let j: i32 = 0;
+            while (j < len[[]u8](sc.*.fnames)) {
+                if (@strEq(get[[]u8](sc.*.fnames, j), x.name)) { return "fat_fn"; }
+                j = j + 1;
+            }
             return "";
         }
         .slit_ => |s| { return cg_norm_type(cg_slit_sname(s)); }
@@ -1858,6 +1869,10 @@ fn cg_scan_typeof(sc: *ScanCtx, cg: *Cg, n: *Node) []u8 {
                     // zalloc/zalloc_i → typed slice.
                     if (@strEq(cid.name, "zalloc")) { return "[]f32"; }
                     if (@strEq(cid.name, "zalloc_i")) { return "[]i32"; }
+                    // scalar math builtins.
+                    if (@strEq(cid.name, "sinf") || @strEq(cid.name, "sin") || @strEq(cid.name, "sinl")) { return "f64"; }
+                    if (@strEq(cid.name, "cosf") || @strEq(cid.name, "cos") || @strEq(cid.name, "cosl")) { return "f64"; }
+                    if (@strEq(cid.name, "sqrtf") || @strEq(cid.name, "sqrt") || @strEq(cid.name, "sqrtl")) { return "f64"; }
                     // generic call foo[T](..) → look up the mangled instance ret.
                     let fn2: []u8 = cid.name;
                     if (len[[]u8](c.targs) > 0) { fn2 = cg_mangle_generic(cid.name, c.targs); }
@@ -1890,10 +1905,26 @@ fn cg_scan_typeof(sc: *ScanCtx, cg: *Cg, n: *Node) []u8 {
 // the frame). print builtins take no aggregate by-value args we copy. The same
 // per-call worst case is reserved by lowering, so the frame never overruns.
 fn cg_scan_call(cg: *Cg, sc: *ScanCtx, c: Call) void {
-    // callee name
+    // callee name — detect and resolve method calls (recv.method → RecvType_method)
     let fname: []u8 = "";
     switch (c.callee.*) {
         .id => |x| { fname = x.name; }
+        .fld => |f| {
+            if (!@strEq(f.fname, "*") && !@strEq(f.fname, "?") && !@strEq(f.fname, "has") && !@strEq(f.fname, "val")) {
+                let rty2: []u8 = cg_scan_typeof(sc, cg, f.base);
+                if (rty2.len > 1 && rty2[0] == '*') { rty2 = rty2[1..]; }
+                if (rty2.len > 0) {
+                    let mname2: []u8 = _zag_str_concat(_zag_str_concat(rty2, "_"), f.fname);
+                    // check if this is a method OR a fn-typed field call
+                    let fty2: []u8 = cg_scan_typeof(sc, cg, new(Node{ .fld = f }));
+                    if (cg_is_fn_type(fty2) == 1 || @strEq(fty2, "fat_fn")) {
+                        // fn-field call: reserve fb3(2) + env_slot(1) + per-arg slot(1 each)
+                        sc.*.words.* = sc.*.words.* + 3 + len[*Node](c.args);
+                    }
+                    fname = mname2;
+                }
+            }
+        }
         else => { }
     }
     // @-builtins reserve no aggregate scratch (no by-value agg args/returns here)
@@ -2102,6 +2133,14 @@ fn cg_scan_expr(cg: *Cg, sc: *ScanCtx, n: *Node) void {
             if (cg_is_clos_name(x.name) == 1) {
                 sc.*.words.* = sc.*.words.* + 2;   // fat_fn block: {code_ptr, env_ptr}
             }
+            // Plain function used as a value → also needs a 2-word fat_fn block.
+            let j: i32 = 0;
+            while (j < len[[]u8](sc.*.fnames)) {
+                if (@strEq(get[[]u8](sc.*.fnames, j), x.name)) {
+                    sc.*.words.* = sc.*.words.* + 2;
+                }
+                j = j + 1;
+            }
         }
         else => { }
     }
@@ -2117,6 +2156,8 @@ fn cg_scan_body(cg: *Cg, sc: *ScanCtx, body: ArrayList[*Node]) void {
                 let lty: []u8 = "";
                 if (l.has_dty == 1) { lty = cg_norm_type(l.dty); }
                 else { lty = cg_scan_typeof(sc, cg, l.expr); }
+                // fn-typed let → fat_fn (same normalization as fn-typed params).
+                if (cg_is_fn_type(lty) == 1) { lty = "fat_fn"; }
                 cg_scan_rectype(sc, l.name, lty);
                 if (cg_scan_seen(sc.*.seen, l.name) == 0) {
                     sc.*.words.* = sc.*.words.* + cg_type_words(cg, lty);
@@ -2327,7 +2368,12 @@ fn cg_is_native_rt(name: []u8) i32 {
 fn cg_fn_ret(syms: ArrayList[FnSym], name: []u8) []u8 {
     let i: i32 = 0;
     while (i < len[FnSym](syms)) {
-        if (@strEq(get[FnSym](syms, i).name, name)) { return get[FnSym](syms, i).ret; }
+        if (@strEq(get[FnSym](syms, i).name, name)) {
+            let r: []u8 = get[FnSym](syms, i).ret;
+            // A fn-typed return (fn(...) ...) is natively a fat_fn aggregate.
+            if (cg_is_fn_type(r) == 1) { return "fat_fn"; }
+            return r;
+        }
         i = i + 1;
     }
     return "";
@@ -2343,7 +2389,12 @@ fn cg_fn_ret(syms: ArrayList[FnSym], name: []u8) []u8 {
 fn cg_expr_type(n: *Node, env: *Env, syms: ArrayList[FnSym], cg: *Cg) []u8 {
     switch (n.*) {
         .id => |x| {
-            return cg_slot_type(env.*, x.name);
+            let sty: []u8 = cg_slot_type(env.*, x.name);
+            if (sty.len > 0) { return sty; }
+            // closure or plain fn used as a value → fat_fn aggregate.
+            if (cg_is_clos_name(x.name) == 1) { return "fat_fn"; }
+            if (cg_find_fn(syms, x.name) >= 0) { return "fat_fn"; }
+            return "";
         }
         .slit_ => |s| {
             // struct/union literal: its type is the (possibly mangled) name.
@@ -2379,10 +2430,46 @@ fn cg_expr_type(n: *Node, env: *Env, syms: ArrayList[FnSym], cg: *Cg) []u8 {
                     // zalloc/zalloc_i → typed float/int slice ([]f32/[]i32 in C, []f64 equivalent natively).
                     if (@strEq(cid.name, "zalloc")) { return "[]f32"; }
                     if (@strEq(cid.name, "zalloc_i")) { return "[]i32"; }
+                    // scalar math builtins → f64 (promoted from f32).
+                    if (@strEq(cid.name, "sinf") || @strEq(cid.name, "sin") || @strEq(cid.name, "sinl")) { return "f64"; }
+                    if (@strEq(cid.name, "cosf") || @strEq(cid.name, "cos") || @strEq(cid.name, "cosl")) { return "f64"; }
+                    if (@strEq(cid.name, "sqrtf") || @strEq(cid.name, "sqrt") || @strEq(cid.name, "sqrtl")) { return "f64"; }
                     // generic call foo[T](..) → mangled instance's return type.
                     let fn2: []u8 = cid.name;
                     if (len[[]u8](c.targs) > 0) { fn2 = cg_mangle_generic(cid.name, c.targs); }
                     return cg_fn_ret(syms, fn2);
+                }
+                .fld => |mf| {
+                    // method call: recv.method(args) → RecvType_method return type
+                    if (!@strEq(mf.fname, "*") && !@strEq(mf.fname, "?") && !@strEq(mf.fname, "has") && !@strEq(mf.fname, "val")) {
+                        let mrty: []u8 = cg_expr_type(mf.base, env, syms, cg);
+                        if (mrty.len > 1 && mrty[0] == '*') { mrty = mrty[1..]; }
+                        if (mrty.len > 0) {
+                            let mmname: []u8 = _zag_str_concat(_zag_str_concat(mrty, "_"), mf.fname);
+                            let mret: []u8 = cg_fn_ret(syms, mmname);
+                            if (mret.len > 0) { return mret; }
+                            // fn-typed struct field call: look up field type, extract return.
+                            let fty2: []u8 = cg_expr_type(new(Node{ .fld = mf }), env, syms, cg);
+                            if (cg_is_fn_type(fty2) == 1) {
+                                // fn(A) R → return "R" (the part after the closing paren)
+                                // Skip "fn(" ... ")" to find the return type.
+                                let fi3: i32 = 3;
+                                let depth: i32 = 1;
+                                while (fi3 < fty2.len && depth > 0) {
+                                    if (fty2[fi3] == '(') { depth = depth + 1; }
+                                    if (fty2[fi3] == ')') { depth = depth - 1; }
+                                    fi3 = fi3 + 1;
+                                }
+                                // fi3 now points past the closing ')'; skip space
+                                while (fi3 < fty2.len && fty2[fi3] == ' ') { fi3 = fi3 + 1; }
+                                // extract return type (up to optional ' !' or ' @')
+                                let rstart: i32 = fi3;
+                                while (fi3 < fty2.len && fty2[fi3] != ' ') { fi3 = fi3 + 1; }
+                                if (rstart < fi3) { return cg_norm_type(fty2[rstart..fi3]); }
+                            }
+                        }
+                    }
+                    return "";
                 }
                 else => { return ""; }
             }
@@ -2729,6 +2816,12 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                     push[Instr](out, i_push(R_RAX()));
                     return;
                 }
+                // null literal — push 0 (optionals treat 0 has-field as null)
+                if (@strEq(x.name, "null")) {
+                    push[Instr](out, i_mov_imm(R_RAX(), 0));
+                    push[Instr](out, i_push(R_RAX()));
+                    return;
+                }
                 // __clos_N: build fat_fn block {code_ptr, env_ptr} in frame, push its addr
                 if (cg_is_clos_name(x.name) == 1) {
                     let lbl: i32 = cg_find_fn(syms, x.name);
@@ -2810,6 +2903,18 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                     }
                     // Push address of the fat_fn block
                     push[Instr](out, i_lea(R_RAX(), R_RBP(), fb));
+                    push[Instr](out, i_push(R_RAX()));
+                    return;
+                }
+                // Plain function used as a first-class value: build fat_fn {lbl, 0}.
+                let fn_lbl: i32 = cg_find_fn(syms, x.name);
+                if (fn_lbl >= 0) {
+                    let fb2: i32 = cg_slot_scratch_n(env, 2);
+                    push[Instr](out, i_lea_lbl(R_RAX(), fn_lbl));
+                    push[Instr](out, i_store(R_RBP(), fb2, R_RAX()));
+                    push[Instr](out, i_mov_imm(R_RAX(), 0));
+                    push[Instr](out, i_store(R_RBP(), fb2 + 8, R_RAX()));
+                    push[Instr](out, i_lea(R_RAX(), R_RBP(), fb2));
                     push[Instr](out, i_push(R_RAX()));
                     return;
                 }
@@ -4031,6 +4136,42 @@ fn cg_lower_print(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, syms:
     return 0;
 }
 
+// ── scalar math builtins: sinf/cosf/sqrtf/sin/cos/sqrt via x87 or SSE ─────────
+// Strategy: pop the argument's 64-bit double bits from the stack into rax,
+// store to a frame temp slot, run the x87/SSE op on that slot, reload bits into
+// rax, push. sqrtf uses SSE SQRTSD (exact, no precision quirks); sin/cos use x87
+// FSIN/FCOS (IEEE-754 correct for |x| < 2^63).
+fn cg_lower_math1(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, syms: ArrayList[FnSym], cg: *Cg) i32 {
+    let is_sqrt: i32 = 0;
+    let is_sin: i32 = 0;
+    let is_cos: i32 = 0;
+    if (@strEq(fname, "sqrtf") || @strEq(fname, "sqrt") || @strEq(fname, "sqrtl")) { is_sqrt = 1; }
+    if (@strEq(fname, "sinf")  || @strEq(fname, "sin")  || @strEq(fname, "sinl"))  { is_sin = 1; }
+    if (@strEq(fname, "cosf")  || @strEq(fname, "cos")  || @strEq(fname, "cosl"))  { is_cos = 1; }
+    if (is_sqrt == 0 && is_sin == 0 && is_cos == 0) { return 0; }
+    // Allocate a 1-word temp slot for the double bits.
+    let ts: i32 = cg_slot_scratch_n(env, 1);
+    // Evaluate arg → push double bits onto machine stack.
+    cg_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+    push[Instr](out, i_pop(R_RAX()));
+    push[Instr](out, i_store(R_RBP(), ts, R_RAX()));   // [rbp+ts] = arg bits
+    if (is_sqrt == 1) {
+        // sqrtsd xmm0, [rbp+ts] via: movq xmm0←rax + sqrtsd xmm0,xmm0 + movq rax←xmm0
+        push[Instr](out, i_fmovq_gx(R_XMM0(), R_RAX()));
+        push[Instr](out, i_fsqrtsd(R_XMM0(), R_XMM0()));
+        push[Instr](out, i_fmovq_xg(R_RAX(), R_XMM0()));
+    } else {
+        // x87: fldl [rbp+ts]; fsin/fcos; fstpl [rbp+ts]; mov rax, [rbp+ts]
+        push[Instr](out, i_x87_load(R_RBP(), ts));
+        if (is_sin == 1) { push[Instr](out, i_x87_sin()); }
+        else             { push[Instr](out, i_x87_cos()); }
+        push[Instr](out, i_x87_store(R_RBP(), ts));
+        push[Instr](out, i_load(R_RAX(), R_RBP(), ts));
+    }
+    push[Instr](out, i_push(R_RAX()));
+    return 1;
+}
+
 // new(T{..}) heap allocation. Lowered to: rdi = sizeof(T); call __alloc (one
 // mmap → rax = ptr); stash ptr in a frame pslot; materialize the (struct OR
 // union) literal's fields INLINE into the heap block via the unified
@@ -4398,6 +4539,92 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
     let ok: i32 = 0;
     switch (c.callee.*) {
         .id => |x| { fname = x.name; ok = 1; }
+        .fld => |f| {
+            // method call: recv.method(args) → RecvType_method(recv, args)
+            // Skip deref/unwrap pseudo-fields and obvious enum member access.
+            if (!@strEq(f.fname, "*") && !@strEq(f.fname, "?") && !@strEq(f.fname, "has") && !@strEq(f.fname, "val")) {
+                let rty: []u8 = cg_expr_type(f.base, env, syms, cg);
+                if (rty.len > 1 && rty[0] == '*') { rty = rty[1..]; }
+                if (rty.len > 0) {
+                    let mname: []u8 = _zag_str_concat(_zag_str_concat(rty, "_"), f.fname);
+                    if (cg_find_fn(syms, mname) >= 0) {
+                        let nargs2: ArrayList[*Node] = make[*Node](4);
+                        push[*Node](&nargs2, f.base);
+                        let ki: i32 = 0;
+                        while (ki < len[*Node](c.args)) {
+                            push[*Node](&nargs2, get[*Node](c.args, ki));
+                            ki = ki + 1;
+                        }
+                        cg_lower_call(out, Call{ .callee = mk_ident(mname), .args = nargs2, .targs = c.targs }, env, syms, cg);
+                        return;
+                    }
+                    // fn-typed struct field: v.op(args) — indirect fat_fn call.
+                    let fty: []u8 = cg_expr_type(new(Node{ .fld = f }), env, syms, cg);
+                    if (@strEq(fty, "fat_fn") || cg_is_fn_type(fty) == 1) {
+                        // Materialize the field's fat_fn block in a scratch slot.
+                        let fb3: i32 = cg_slot_scratch_n(env, 2);
+                        cg_lower_expr(out, f.base, env, syms, cg);   // push base addr
+                        push[Instr](out, i_pop(R_RSI()));
+                        // field offset: look up the struct's field index for fname
+                        let foff: i32 = 0;
+                        let fsd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1), .tparams = make[[]u8](1) };
+                        if (cg_find_struct(cg, rty, &fsd) == 1) {
+                            let fi2: i32 = 0;
+                            while (fi2 < len[Param](fsd.fields)) {
+                                let fp2: Param = get[Param](fsd.fields, fi2);
+                                if (@strEq(fp2.name, f.fname)) { fi2 = len[Param](fsd.fields); }
+                                else { foff = foff + cg_type_words(cg, cg_norm_type(fp2.pty)) * 8; fi2 = fi2 + 1; }
+                            }
+                        }
+                        push[Instr](out, i_load(R_RAX(), R_RSI(), foff));         // code_ptr
+                        push[Instr](out, i_store(R_RBP(), fb3, R_RAX()));
+                        push[Instr](out, i_load(R_RAX(), R_RSI(), foff + 8));     // env_ptr
+                        push[Instr](out, i_store(R_RBP(), fb3 + 8, R_RAX()));
+                        // Now dispatch via the materialized fat_fn block, same as local var.
+                        let env_slot2: i32 = cg_slot_scratch(env);
+                        push[Instr](out, i_load(R_RCX(), R_RBP(), fb3 + 8));
+                        push[Instr](out, i_store(R_RBP(), env_slot2, R_RCX()));
+                        let aslot2: ArrayList[i32] = make[i32](nargs + 2);
+                        push[i32](&aslot2, env_slot2);
+                        let ui2: i32 = 0;
+                        while (ui2 < nargs) {
+                            let sl2: i32 = cg_slot_scratch(env);
+                            push[i32](&aslot2, sl2);
+                            cg_lower_expr(out, get[*Node](c.args, ui2), env, syms, cg);
+                            push[Instr](out, i_pop(R_RAX()));
+                            push[Instr](out, i_store(R_RBP(), sl2, R_RAX()));
+                            ui2 = ui2 + 1;
+                        }
+                        push[Instr](out, i_load(R_RAX(), R_RBP(), fb3));    // code_ptr
+                        push[Instr](out, i_load(R_RCX(), R_RBP(), env_slot2));
+                        push[Instr](out, i_cmp_imm(R_RCX(), 0));
+                        let l_fenv: i32 = cg_fresh(cg);
+                        let l_fdone: i32 = cg_fresh(cg);
+                        push[Instr](out, i_jne(l_fenv));
+                        // env==0: standard ABI
+                        let si2: i32 = 0;
+                        while (si2 < nargs) {
+                            push[Instr](out, i_load(arg_reg(si2), R_RBP(), get[i32](aslot2, si2 + 1)));
+                            si2 = si2 + 1;
+                        }
+                        push[Instr](out, i_call_reg(R_RAX()));
+                        push[Instr](out, i_jmp(l_fdone));
+                        push[Instr](out, i_label(l_fenv));
+                        // env!=0: env-first ABI
+                        let ai2: i32 = 0;
+                        while (ai2 < nargs + 1) {
+                            push[Instr](out, i_load(arg_reg(ai2), R_RBP(), get[i32](aslot2, ai2)));
+                            ai2 = ai2 + 1;
+                        }
+                        push[Instr](out, i_call_reg(R_RAX()));
+                        push[Instr](out, i_label(l_fdone));
+                        push[Instr](out, i_push(R_RAX()));
+                        return;
+                    }
+                }
+            }
+            ok = 0;
+        }
         else => { ok = 0; }
     }
     if (ok == 0) {
@@ -4412,6 +4639,8 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
     }
     // OUTPUT builtins are intercepted before the user-function lookup.
     if (cg_lower_print(out, fname, c, env, syms, cg) == 1) { return; }
+    // scalar math: sinf/cosf/sqrtf/sin/cos/sqrt → x87 or SSE.
+    if (cg_lower_math1(out, fname, c, env, syms, cg) == 1) { return; }
     // new(T{..}) heap allocation.
     if (@strEq(fname, "new")) { cg_lower_new(out, c, env, syms, cg); return; }
     // zalloc(n) / zfree(s): typed slice allocator for []f32, []f64, etc.
@@ -4502,14 +4731,35 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
             push[Instr](out, i_store(R_RBP(), sl, R_RAX()));
             ui = ui + 1;
         }
-        // Load code_ptr into rax
+        // Load code_ptr into rax. env_ptr is in env_slot.
         if (is_byref == 1) {
             push[Instr](out, i_load(R_RAX(), R_RBP(), fp_disp));   // rax = byref ptr
             push[Instr](out, i_load(R_RAX(), R_RAX(), 0));          // rax = code_ptr
         } else {
             push[Instr](out, i_load(R_RAX(), R_RBP(), fp_disp));    // rax = code_ptr
         }
-        // Place args: slot 0 = env_ptr → rdi, slots 1..nargs = user args → rsi, rdx, ...
+        // Runtime check: if env_ptr == 0 use standard ABI (rdi=arg0, rsi=arg1, ...);
+        // if env_ptr != 0 use env-first ABI (rdi=env_ptr, rsi=arg0, rdx=arg1, ...).
+        push[Instr](out, i_load(R_RCX(), R_RBP(), env_slot));   // rcx = env_ptr
+        push[Instr](out, i_cmp_imm(R_RCX(), 0));
+        let l_with_env: i32 = cg_fresh(cg);
+        let l_call_done: i32 = cg_fresh(cg);
+        push[Instr](out, i_jne(l_with_env));                     // jump if env != 0
+        // ── branch: env_ptr == 0 → standard ABI, skip env slot ──
+        let si: i32 = 0;
+        while (si < nargs) {
+            if (si < 6) {
+                push[Instr](out, i_load(arg_reg(si), R_RBP(), get[i32](aslot, si + 1)));
+            } else {
+                push[Instr](out, i_load(R_RCX(), R_RBP(), get[i32](aslot, si + 1)));
+                push[Instr](out, i_push(R_RCX()));
+            }
+            si = si + 1;
+        }
+        push[Instr](out, i_call_reg(R_RAX()));
+        push[Instr](out, i_jmp(l_call_done));
+        // ── branch: env_ptr != 0 → env-first ABI ──
+        push[Instr](out, i_label(l_with_env));
         let total_args: i32 = nargs + 1;
         let ai: i32 = 0;
         while (ai < total_args) {
@@ -4521,8 +4771,8 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
             }
             ai = ai + 1;
         }
-        // call through rax
         push[Instr](out, i_call_reg(R_RAX()));
+        push[Instr](out, i_label(l_call_done));
         push[Instr](out, i_push(R_RAX()));   // result
         return;
     }
@@ -4839,6 +5089,8 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
             let lty: []u8 = "";
             if (l.has_dty == 1) { lty = cg_norm_type(l.dty); }
             else { lty = cg_expr_type(l.expr, env, syms, cg); }
+            // fn-typed let → fat_fn (same normalization as fn-typed params).
+            if (cg_is_fn_type(lty) == 1) { lty = "fat_fn"; }
 
             if (cg_type_is_opt(cg, lty) == 1) {
                 // OPTIONAL-typed let `let o: ?T = <null | value | optional>`.
