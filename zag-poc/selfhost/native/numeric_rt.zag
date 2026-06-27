@@ -1,0 +1,486 @@
+// selfhost/native/numeric_rt.zag — POSIT RUNTIME, written in Zag.
+//
+// The native x86-64 backend (znc) owns the heterogeneous numeric system; this
+// file is the posit (p8/p16/p32/p64) software implementation. ncodegen.zag
+// auto-includes these decls into any program that uses a posit type or a posit
+// `@`-builtin, and lowers posit + - * / / comparisons + the conversion builtins
+// to ORDINARY CALLS into the functions below (znc compiles them to native code
+// for free — there is no hand-written machine code for posit math).
+//
+// VALUE REPRESENTATION: a posit value is its BIT PATTERN, carried in an i64
+// (the low n bits are meaningful: p8→8, p16→16, p32→32, p64→63+sign). All math
+// goes decode → f64 value domain → encode with round-to-nearest-even, exactly
+// mirroring the C reference (selfhost/codegen.zag emit_numeric_runtime). f64's
+// 53-bit mantissa ≥ every posit's fraction width in the normal range, so the
+// result is bit-identical to the C backend on the exact-integer examples.
+//
+// SUBSET DISCIPLINE (compiles under BOTH ./zagc and znc):
+//   • NO `<<` / `>>`         → shifts are `* p2(k)` / `/ p2(k)` (p2 = 2^k as i64).
+//   • NO `|` / `||`          → disjoint-bit OR is `+`; `&` is fine for masking.
+//   • NO break / continue    → loops use an explicit `done` flag.
+//   • scalars: i64 everywhere (the posit bit pattern and all bit math).
+
+// ── small integer helpers (no shift operators) ───────────────────────────────
+
+// 2^k as an i64, for 0 <= k <= 62. (k<0 → 0, used only where the caller guards.)
+fn nrt_p2(k: i64) i64 {
+    if (k < 0) { return 0; }
+    let r: i64 = 1;
+    let i: i64 = 0;
+    while (i < k) { r = r * 2; i = i + 1; }
+    return r;
+}
+
+// bit i (0 = LSB) of a non-negative magnitude x.
+fn nrt_bit(x: i64, i: i64) i64 {
+    return (x / nrt_p2(i)) - ((x / nrt_p2(i + 1)) * 2);
+}
+
+// low `n` bits of x as a mask (x mod 2^n), n in [0,62].
+fn nrt_lowbits(x: i64, n: i64) i64 {
+    if (n <= 0) { return 0; }
+    let m: i64 = nrt_p2(n);
+    return x - ((x / m) * m);
+}
+
+// ── frexp / ldexp over f64, integer-only exponent handling ───────────────────
+// Decompose a strictly-positive double ax into (m, E) with ax = m * 2^E and
+// m in [1, 2). Returned via out params (m in *mo, E in *eo).
+fn nrt_frexp(ax: f64, mo: *f64, eo: *i64) void {
+    let m: f64 = ax;
+    let e: i64 = 0;
+    let done: i32 = 0;
+    while (done == 0) {
+        if (m >= 2.0) { m = m / 2.0; e = e + 1; }
+        else if (m < 1.0) { m = m * 2.0; e = e - 1; }
+        else { done = 1; }
+    }
+    mo.* = m;
+    eo.* = e;
+}
+
+// m * 2^E for a double m and integer E (any sign). Exact for the magnitudes here.
+fn nrt_ldexp(m: f64, e: i64) f64 {
+    let r: f64 = m;
+    let i: i64 = 0;
+    if (e >= 0) {
+        while (i < e) { r = r * 2.0; i = i + 1; }
+    } else {
+        let n: i64 = 0 - e;
+        while (i < n) { r = r / 2.0; i = i + 1; }
+    }
+    return r;
+}
+
+// floor(E / D) for D > 0 (works for negative E too; the `/` op truncates toward 0).
+fn nrt_floordiv(e: i64, d: i64) i64 {
+    if (e >= 0) { return e / d; }
+    let n: i64 = 0 - e;
+    return 0 - ((n + d - 1) / d);
+}
+
+// ── generic posit DECODE: bits → f64 ─────────────────────────────────────────
+// Parameterized by nbits (8/16/32/64) and es (0/1/2/3). `nar` is the NaR pattern
+// (sign bit set, rest 0). Mirrors zag_pN_to_f64 in the C reference exactly.
+fn nrt_decode(bits: i64, nbits: i64, es: i64) f64 {
+    if (bits == 0) { return 0.0; }
+    // magnitude: clear the sign by negating modulo 2^nbits when sign bit set.
+    let modn: i64 = nrt_p2(nbits);
+    let signbit: i64 = nrt_p2(nbits - 1);
+    let neg: i32 = 0;
+    let u: i64 = bits;
+    if (bits >= signbit) { neg = 1; u = modn - bits; }   // two's-complement magnitude
+    // regime: scan from bit (nbits-2) downward.
+    let b: i64 = nbits - 2;
+    let first: i64 = nrt_bit(u, b);
+    let k: i64 = 0;
+    if (first == 1) {                                    // run of 1s
+        let run: i64 = 0;
+        let done: i32 = 0;
+        while (done == 0) {
+            if (b >= 0) {
+                if (nrt_bit(u, b) == 1) { run = run + 1; b = b - 1; } else { done = 1; }
+            } else { done = 1; }
+        }
+        if (b >= 0) { b = b - 1; }                       // consume the 0 terminator
+        k = run - 1;
+    } else {                                             // run of 0s
+        let run: i64 = 0;
+        let done: i32 = 0;
+        while (done == 0) {
+            if (b >= 0) {
+                if (nrt_bit(u, b) == 0) { run = run + 1; b = b - 1; } else { done = 1; }
+            } else { done = 1; }
+        }
+        if (b >= 0) { b = b - 1; }                       // consume the 1 terminator
+        k = 0 - run;
+    }
+    // es exponent bits (zero-padded on the right when they run off the word).
+    let e: i64 = 0;
+    let ei: i64 = 0;
+    while (ei < es) {
+        e = e * 2;
+        if (b >= 0) { e = e + nrt_bit(u, b); b = b - 1; }
+        ei = ei + 1;
+    }
+    let fbits: i64 = b + 1;                               // remaining fraction bits
+    let fraction: f64 = 1.0;
+    if (fbits > 0) {
+        let fr: i64 = nrt_lowbits(u, fbits);
+        fraction = 1.0 + (fr as f64) / (nrt_p2(fbits) as f64);
+    }
+    // useed = 2^(2^es); value = useed^k * 2^e * fraction = fraction * 2^(2^es*k + e)
+    let scale: i64 = nrt_p2(es);                          // 2^es
+    let val: f64 = nrt_ldexp(fraction, scale * k + e);
+    if (neg == 1) { return 0.0 - val; }
+    return val;
+}
+
+// ── generic posit ENCODE: f64 → bits (round-to-nearest, ties to even) ────────
+// Builds the magnitude bit pattern MSB-first (regime, then es exp bits, then
+// fraction), rounds at width n, and applies two's complement for negatives.
+// Mirrors znrt_f64_to_pN in the C reference exactly.
+fn nrt_encode(x: f64, nbits: i64, es: i64) i64 {
+    if (x == 0.0) { return 0; }
+    let signbit: i64 = nrt_p2(nbits - 1);
+    if (x != x) { return signbit; }                      // NaN → NaR
+    let neg: i32 = 0;
+    let ax: f64 = x;
+    if (x < 0.0) { neg = 1; ax = 0.0 - x; }
+    // ax = m * 2^E, m in [1,2)  →  E is the unbiased binary exponent.
+    let m: f64 = 0.0;
+    let E: i64 = 0;
+    nrt_frexp(ax, &m, &E);
+    let useedexp: i64 = nrt_p2(es);                       // 2^es
+    let k: i64 = nrt_floordiv(E, useedexp);
+    let e: i64 = E - useedexp * k;                        // 0 .. 2^es-1
+    let fr: f64 = m - 1.0;                                // fraction in [0,1)
+
+    // MSB-first magnitude bit stream `bs[0..n)`; we collect up to nbits+2 bits.
+    // Use an i64 accumulator: `mag` holds the first (nbits-1) bits, then a round
+    // bit and a sticky bit. We track total emitted count to know when to stop.
+    let total: i64 = nbits + 32;                          // plenty (regime+exp+frac+guard)
+    // regime bits
+    let bits_emitted: i64 = 0;
+    let mag: i64 = 0;                                     // first (nbits-1) magnitude bits
+    let roundb: i64 = 0;
+    let sticky: i64 = 0;
+    let cap: i64 = nbits - 1;                             // mag holds this many bits
+
+    // helper-free inline emit: append bit `bit` to the stream.
+    // index < cap → into mag; index == cap → round bit; index > cap → OR into sticky.
+    // (implemented by replicating the append in each loop below.)
+
+    // --- regime ---
+    if (k >= 0) {
+        let i: i64 = 0;
+        while (i <= k) {
+            // emit 1
+            if (bits_emitted < cap) { mag = mag * 2 + 1; }
+            else if (bits_emitted == cap) { roundb = 1; }
+            else { sticky = sticky + 1; }
+            bits_emitted = bits_emitted + 1;
+            i = i + 1;
+        }
+        // emit 0 (terminator)
+        if (bits_emitted < cap) { mag = mag * 2; }
+        else if (bits_emitted == cap) { roundb = 0; }
+        else { sticky = sticky + 0; }
+        bits_emitted = bits_emitted + 1;
+    } else {
+        let nn: i64 = 0 - k;
+        let i: i64 = 0;
+        while (i < nn) {
+            // emit 0
+            if (bits_emitted < cap) { mag = mag * 2; }
+            else if (bits_emitted == cap) { roundb = 0; }
+            else { sticky = sticky + 0; }
+            bits_emitted = bits_emitted + 1;
+            i = i + 1;
+        }
+        // emit 1 (terminator)
+        if (bits_emitted < cap) { mag = mag * 2 + 1; }
+        else if (bits_emitted == cap) { roundb = 1; }
+        else { sticky = sticky + 1; }
+        bits_emitted = bits_emitted + 1;
+    }
+
+    // --- es exponent bits (MSB-first) ---
+    let ej: i64 = es - 1;
+    while (ej >= 0) {
+        let ebit: i64 = nrt_bit(e, ej);
+        if (bits_emitted < cap) { mag = mag * 2 + ebit; }
+        else if (bits_emitted == cap) { roundb = ebit; }
+        else { if (ebit == 1) { sticky = sticky + 1; } }
+        bits_emitted = bits_emitted + 1;
+        ej = ej - 1;
+    }
+
+    // --- fraction bits, generated by repeated *2 (binary expansion of fr) ---
+    let frac: f64 = fr;
+    while (bits_emitted < total) {
+        frac = frac * 2.0;
+        let dbit: i64 = 0;
+        if (frac >= 1.0) { dbit = 1; frac = frac - 1.0; }
+        if (bits_emitted < cap) { mag = mag * 2 + dbit; }
+        else if (bits_emitted == cap) { roundb = dbit; }
+        else { if (dbit == 1) { sticky = sticky + 1; } }
+        bits_emitted = bits_emitted + 1;
+    }
+
+    // round to nearest, ties to even: bump if round bit set AND (sticky OR mag odd).
+    let lsb: i64 = nrt_lowbits(mag, 1);
+    if (roundb == 1) {
+        if (sticky > 0) { mag = mag + 1; }
+        else if (lsb == 1) { mag = mag + 1; }
+    }
+    // clamp to the n-1 magnitude bits, and never round a nonzero value down to 0.
+    let word: i64 = nrt_lowbits(mag, nbits - 1);
+    if (word == 0) { word = 1; }
+    if (neg == 1) { return nrt_p2(nbits) - word; }       // two's complement
+    return word;
+}
+
+// ── p32 (es=2, useed=16) ─────────────────────────────────────────────────────
+fn znrt_p32_to_f64(b: i64) f64 { return nrt_decode(b, 32, 2); }
+fn znrt_f64_to_p32(x: f64) i64 { return nrt_encode(x, 32, 2); }
+fn znrt_p32_from_i64(v: i64) i64 { return nrt_encode(v as f64, 32, 2); }
+fn znrt_p32_bits(b: i64) i64 { return nrt_lowbits(b, 32); }
+fn znrt_p32_add(a: i64, b: i64) i64 {
+    if (a == 2147483648) { return 2147483648; }
+    if (b == 2147483648) { return 2147483648; }
+    if (a == 0) { return b; }
+    if (b == 0) { return a; }
+    return nrt_encode(nrt_decode(a, 32, 2) + nrt_decode(b, 32, 2), 32, 2);
+}
+fn znrt_p32_sub(a: i64, b: i64) i64 {
+    if (a == 2147483648) { return 2147483648; }
+    if (b == 2147483648) { return 2147483648; }
+    return nrt_encode(nrt_decode(a, 32, 2) - nrt_decode(b, 32, 2), 32, 2);
+}
+fn znrt_p32_mul(a: i64, b: i64) i64 {
+    if (a == 2147483648) { return 2147483648; }
+    if (b == 2147483648) { return 2147483648; }
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
+    return nrt_encode(nrt_decode(a, 32, 2) * nrt_decode(b, 32, 2), 32, 2);
+}
+fn znrt_p32_div(a: i64, b: i64) i64 {
+    if (a == 2147483648) { return 2147483648; }
+    if (b == 2147483648) { return 2147483648; }
+    if (b == 0) { return 2147483648; }
+    if (a == 0) { return 0; }
+    return nrt_encode(nrt_decode(a, 32, 2) / nrt_decode(b, 32, 2), 32, 2);
+}
+
+// ── p8 (es=0, useed=2) ───────────────────────────────────────────────────────
+fn znrt_p8_to_f64(b: i64) f64 { return nrt_decode(b, 8, 0); }
+fn znrt_f64_to_p8(x: f64) i64 { return nrt_encode(x, 8, 0); }
+fn znrt_p8_from_i64(v: i64) i64 { return nrt_encode(v as f64, 8, 0); }
+fn znrt_p8_bits(b: i64) i64 { return nrt_lowbits(b, 8); }
+fn znrt_p8_add(a: i64, b: i64) i64 {
+    if (a == 128) { return 128; }
+    if (b == 128) { return 128; }
+    if (a == 0) { return b; }
+    if (b == 0) { return a; }
+    return nrt_encode(nrt_decode(a, 8, 0) + nrt_decode(b, 8, 0), 8, 0);
+}
+fn znrt_p8_sub(a: i64, b: i64) i64 {
+    if (a == 128) { return 128; }
+    if (b == 128) { return 128; }
+    return nrt_encode(nrt_decode(a, 8, 0) - nrt_decode(b, 8, 0), 8, 0);
+}
+fn znrt_p8_mul(a: i64, b: i64) i64 {
+    if (a == 128) { return 128; }
+    if (b == 128) { return 128; }
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
+    return nrt_encode(nrt_decode(a, 8, 0) * nrt_decode(b, 8, 0), 8, 0);
+}
+fn znrt_p8_div(a: i64, b: i64) i64 {
+    if (a == 128) { return 128; }
+    if (b == 128) { return 128; }
+    if (b == 0) { return 128; }
+    if (a == 0) { return 0; }
+    return nrt_encode(nrt_decode(a, 8, 0) / nrt_decode(b, 8, 0), 8, 0);
+}
+
+// ── p16 (es=1, useed=4) ──────────────────────────────────────────────────────
+fn znrt_p16_to_f64(b: i64) f64 { return nrt_decode(b, 16, 1); }
+fn znrt_f64_to_p16(x: f64) i64 { return nrt_encode(x, 16, 1); }
+fn znrt_p16_from_i64(v: i64) i64 { return nrt_encode(v as f64, 16, 1); }
+fn znrt_p16_bits(b: i64) i64 { return nrt_lowbits(b, 16); }
+fn znrt_p16_add(a: i64, b: i64) i64 {
+    if (a == 32768) { return 32768; }
+    if (b == 32768) { return 32768; }
+    if (a == 0) { return b; }
+    if (b == 0) { return a; }
+    return nrt_encode(nrt_decode(a, 16, 1) + nrt_decode(b, 16, 1), 16, 1);
+}
+fn znrt_p16_sub(a: i64, b: i64) i64 {
+    if (a == 32768) { return 32768; }
+    if (b == 32768) { return 32768; }
+    return nrt_encode(nrt_decode(a, 16, 1) - nrt_decode(b, 16, 1), 16, 1);
+}
+fn znrt_p16_mul(a: i64, b: i64) i64 {
+    if (a == 32768) { return 32768; }
+    if (b == 32768) { return 32768; }
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
+    return nrt_encode(nrt_decode(a, 16, 1) * nrt_decode(b, 16, 1), 16, 1);
+}
+fn znrt_p16_div(a: i64, b: i64) i64 {
+    if (a == 32768) { return 32768; }
+    if (b == 32768) { return 32768; }
+    if (b == 0) { return 32768; }
+    if (a == 0) { return 0; }
+    return nrt_encode(nrt_decode(a, 16, 1) / nrt_decode(b, 16, 1), 16, 1);
+}
+
+// ── p64 (es=3, useed=256) ────────────────────────────────────────────────────
+// NaR = 0x8000000000000000. In an i64 that is the minimum (most-negative) value;
+// we detect it by comparing against that exact constant. Decode/encode use the
+// same nbits/es machinery; f64 (53-bit mantissa) covers the example round-trips
+// (1,2,3,4) exactly, matching the C long-double path on those values.
+fn znrt_p64_nar() i64 { return 0 - 9223372036854775807 - 1; }   // 0x8000000000000000
+fn znrt_p64_to_f64(b: i64) f64 {
+    if (b == znrt_p64_nar()) { return 0.0; }                    // NaR → 0 in f64 print
+    return nrt_decode64(b, 3);
+}
+fn znrt_f64_to_p64(x: f64) i64 { return nrt_encode64(x, 3); }
+fn znrt_ld_to_p64(x: f64) i64 { return nrt_encode64(x, 3); }
+fn znrt_p64_from_i64(v: i64) i64 { return nrt_encode64(v as f64, 3); }
+fn znrt_p64_bits(b: i64) i64 { return b; }
+fn znrt_p64_add(a: i64, b: i64) i64 {
+    if (a == znrt_p64_nar()) { return znrt_p64_nar(); }
+    if (b == znrt_p64_nar()) { return znrt_p64_nar(); }
+    if (a == 0) { return b; }
+    if (b == 0) { return a; }
+    return nrt_encode64(nrt_decode64(a, 3) + nrt_decode64(b, 3), 3);
+}
+fn znrt_p64_sub(a: i64, b: i64) i64 {
+    if (a == znrt_p64_nar()) { return znrt_p64_nar(); }
+    if (b == znrt_p64_nar()) { return znrt_p64_nar(); }
+    return nrt_encode64(nrt_decode64(a, 3) - nrt_decode64(b, 3), 3);
+}
+fn znrt_p64_mul(a: i64, b: i64) i64 {
+    if (a == znrt_p64_nar()) { return znrt_p64_nar(); }
+    if (b == znrt_p64_nar()) { return znrt_p64_nar(); }
+    if (a == 0) { return 0; }
+    if (b == 0) { return 0; }
+    return nrt_encode64(nrt_decode64(a, 3) * nrt_decode64(b, 3), 3);
+}
+fn znrt_p64_div(a: i64, b: i64) i64 {
+    if (a == znrt_p64_nar()) { return znrt_p64_nar(); }
+    if (b == znrt_p64_nar()) { return znrt_p64_nar(); }
+    if (b == 0) { return znrt_p64_nar(); }
+    if (a == 0) { return 0; }
+    return nrt_encode64(nrt_decode64(a, 3) / nrt_decode64(b, 3), 3);
+}
+
+// ── p64-specific decode/encode (nbits = 64) ──────────────────────────────────
+// p64's sign bit is bit 63 which doesn't fit the generic nrt_p2(nbits-1) helper
+// cleanly inside a signed i64 (2^63 overflows). We handle the 64-bit width by
+// treating the raw i64 sign directly: a negative i64 IS a posit with its sign
+// bit set, and its two's-complement magnitude is `0 - bits`.
+fn nrt_decode64(bits: i64, es: i64) f64 {
+    if (bits == 0) { return 0.0; }
+    let neg: i32 = 0;
+    let u: i64 = bits;
+    if (bits < 0) { neg = 1; u = 0 - bits; }             // two's-complement magnitude
+    // regime scan from bit 62 down (bit 63 is the sign, already removed).
+    let b: i64 = 62;
+    let first: i64 = nrt_bit(u, b);
+    let k: i64 = 0;
+    if (first == 1) {
+        let run: i64 = 0; let done: i32 = 0;
+        while (done == 0) {
+            if (b >= 0) { if (nrt_bit(u, b) == 1) { run = run + 1; b = b - 1; } else { done = 1; } }
+            else { done = 1; }
+        }
+        if (b >= 0) { b = b - 1; }
+        k = run - 1;
+    } else {
+        let run: i64 = 0; let done: i32 = 0;
+        while (done == 0) {
+            if (b >= 0) { if (nrt_bit(u, b) == 0) { run = run + 1; b = b - 1; } else { done = 1; } }
+            else { done = 1; }
+        }
+        if (b >= 0) { b = b - 1; }
+        k = 0 - run;
+    }
+    let e: i64 = 0; let ei: i64 = 0;
+    while (ei < es) {
+        e = e * 2;
+        if (b >= 0) { e = e + nrt_bit(u, b); b = b - 1; }
+        ei = ei + 1;
+    }
+    let fbits: i64 = b + 1;
+    let fraction: f64 = 1.0;
+    if (fbits > 0) {
+        let fr: i64 = nrt_lowbits(u, fbits);
+        fraction = 1.0 + (fr as f64) / (nrt_p2(fbits) as f64);
+    }
+    let scale: i64 = nrt_p2(es);
+    let val: f64 = nrt_ldexp(fraction, scale * k + e);
+    if (neg == 1) { return 0.0 - val; }
+    return val;
+}
+fn nrt_encode64(x: f64, es: i64) i64 {
+    if (x == 0.0) { return 0; }
+    if (x != x) { return znrt_p64_nar(); }
+    let neg: i32 = 0;
+    let ax: f64 = x;
+    if (x < 0.0) { neg = 1; ax = 0.0 - x; }
+    let m: f64 = 0.0; let E: i64 = 0;
+    nrt_frexp(ax, &m, &E);
+    let useedexp: i64 = nrt_p2(es);
+    let k: i64 = nrt_floordiv(E, useedexp);
+    let e: i64 = E - useedexp * k;
+    let fr: f64 = m - 1.0;
+    let cap: i64 = 63;                                   // magnitude is bits 0..62
+    let total: i64 = 96;
+    let bits_emitted: i64 = 0;
+    let mag: i64 = 0;
+    let roundb: i64 = 0;
+    let sticky: i64 = 0;
+    if (k >= 0) {
+        let i: i64 = 0;
+        while (i <= k) {
+            if (bits_emitted < cap) { mag = mag * 2 + 1; } else if (bits_emitted == cap) { roundb = 1; } else { sticky = sticky + 1; }
+            bits_emitted = bits_emitted + 1; i = i + 1;
+        }
+        if (bits_emitted < cap) { mag = mag * 2; } else if (bits_emitted == cap) { roundb = 0; }
+        bits_emitted = bits_emitted + 1;
+    } else {
+        let nn: i64 = 0 - k; let i: i64 = 0;
+        while (i < nn) {
+            if (bits_emitted < cap) { mag = mag * 2; } else if (bits_emitted == cap) { roundb = 0; }
+            bits_emitted = bits_emitted + 1; i = i + 1;
+        }
+        if (bits_emitted < cap) { mag = mag * 2 + 1; } else if (bits_emitted == cap) { roundb = 1; } else { sticky = sticky + 1; }
+        bits_emitted = bits_emitted + 1;
+    }
+    let ej: i64 = es - 1;
+    while (ej >= 0) {
+        let ebit: i64 = nrt_bit(e, ej);
+        if (bits_emitted < cap) { mag = mag * 2 + ebit; } else if (bits_emitted == cap) { roundb = ebit; } else { if (ebit == 1) { sticky = sticky + 1; } }
+        bits_emitted = bits_emitted + 1; ej = ej - 1;
+    }
+    let frac: f64 = fr;
+    while (bits_emitted < total) {
+        frac = frac * 2.0;
+        let dbit: i64 = 0;
+        if (frac >= 1.0) { dbit = 1; frac = frac - 1.0; }
+        if (bits_emitted < cap) { mag = mag * 2 + dbit; } else if (bits_emitted == cap) { roundb = dbit; } else { if (dbit == 1) { sticky = sticky + 1; } }
+        bits_emitted = bits_emitted + 1;
+    }
+    let lsb: i64 = nrt_lowbits(mag, 1);
+    if (roundb == 1) {
+        if (sticky > 0) { mag = mag + 1; } else if (lsb == 1) { mag = mag + 1; }
+    }
+    let word: i64 = nrt_lowbits(mag, 63);
+    if (word == 0) { word = 1; }
+    if (neg == 1) { return 0 - word; }                   // two's complement (sign in bit 63)
+    return word;
+}

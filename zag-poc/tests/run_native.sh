@@ -115,6 +115,20 @@ nto "print_f64 int"   'fn main() i32 { print_f64(440.0); return 0; }' "440" 0
 nto "print_f64 neg"   'fn main() i32 { let x: f64 = 1.5; print_f64(-x); return 0; }' "-1.5" 0
 nto "print_f32"       'fn main() i32 { print_f32(0.25); return 0; }' "0.25" 0
 
+echo "── posits (p8/p16/p32/p64 — Zag posit runtime, native, no libc) ──"
+# Round-trip: @floatToPosit then @positToFloat → exact for 0.5.
+nto "p32 round-trip 0.5"  'fn main() i32 { let h: p32 = @floatToPosit(0.5); print_f64(@positToFloat(h)); return 0; }' "0.5" 0
+# Exact posit bit patterns (must match the IEEE/Posit-standard encodings).
+nto "p32 bits of 1.0"     'fn main() i32 { let o: p32 = @intToPosit(1); print_u64(@positToBits(o)); return 0; }' "1073741824" 0
+nto "p32 add 1+2=3"       'fn main() i32 { let a: p32 = @intToPosit(1); let b: p32 = @intToPosit(2); let c: p32 = a + b; print_u64(@positToBits(c)); return 0; }' "1275068416" 0
+nto "p32 mul 2*2=4"       'fn main() i32 { let t: p32 = @intToPosit(2); let f: p32 = t * t; print_f64(@positToFloat(f)); return 0; }' "4" 0
+# All four widths encode 1.0 to the right bit pattern.
+nto "p8 bits of 1.0"      'fn main() i32 { let o: p8  = @floatToP8(1.0);  print_u64(@p8ToBits(o));  return 0; }' "64" 0
+nto "p16 bits of 1.0"     'fn main() i32 { let o: p16 = @floatToP16(1.0); print_u64(@p16ToBits(o)); return 0; }' "16384" 0
+nto "p64 round-trip 3.0"  'fn main() i32 { let a: p64 = @floatToP64(1.0); let b: p64 = @floatToP64(2.0); print_f64(@p64ToFloat(a + b)); return 0; }' "3" 0
+# A non-posit program must NOT pull in the runtime (byte-identical to no-posit).
+nto "no-posit unaffected" 'fn main() i32 { print_int(7); return 0; }' "7" 0
+
 # The emitted artifact must be a real static ELF with no interpreter (no libc).
 "$ZNC" nt_src.zag -o /tmp/nt_elf >/dev/null 2>&1
 if file /tmp/nt_elf | grep -q 'statically linked' && ! readelf -l /tmp/nt_elf 2>/dev/null | grep -q 'INTERP'; then
@@ -133,6 +147,17 @@ if grep -q 'build aborted' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
     echo "  ok  rejects hex literal loudly (aborts, emits no binary)"; pass=$((pass+1))
 else
     echo "  XX  hex literal not rejected loudly"; fail=$((fail+1))
+fi
+rm -f /tmp/nt_bin nt_src.zag
+
+# Hardening: mixing a posit and a non-posit operand must ABORT, never miscompile.
+rm -f /tmp/nt_bin
+printf 'fn main() i32 { let p: p32 = @intToPosit(1); let q: i32 = 2; let r: p32 = p + q; return 0; }' > nt_src.zag
+"$ZNC" nt_src.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
+if grep -q 'build aborted' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
+    echo "  ok  rejects mixed posit/non-posit arithmetic loudly"; pass=$((pass+1))
+else
+    echo "  XX  mixed posit/non-posit not rejected loudly"; fail=$((fail+1))
 fi
 rm -f /tmp/nt_bin nt_src.zag
 
