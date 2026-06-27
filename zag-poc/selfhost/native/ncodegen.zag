@@ -740,8 +740,8 @@ fn cg_clone_stmt(n: *Node, tp: ArrayList[[]u8], ta: ArrayList[[]u8]) *Node {
     return switch (n.*) {
         .let_    => |l| mk_let(l.name, cg_subst_type(l.dty, tp, ta), l.has_dty, cg_clone_expr(l.expr, tp, ta)),
         .ret     => |r| mk_ret(r.has_expr, cg_clone_expr(r.expr, tp, ta)),
-        .if_     => |x| mk_if(cg_clone_expr(x.cond, tp, ta), cg_clone_block(x.then_body, tp, ta), cg_clone_block(x.els_body, tp, ta), x.has_els),
-        .while_  => |w| mk_while(cg_clone_expr(w.cond, tp, ta), cg_clone_block(w.body, tp, ta)),
+        .if_     => |x| new(Node{ .if_ = If{ .cond = cg_clone_expr(x.cond, tp, ta), .then_body = cg_clone_block(x.then_body, tp, ta), .els_body = cg_clone_block(x.els_body, tp, ta), .has_els = x.has_els, .cap = x.cap, .has_cap = x.has_cap } }),
+        .while_  => |w| new(Node{ .while_ = While{ .cond = cg_clone_expr(w.cond, tp, ta), .body = cg_clone_block(w.body, tp, ta), .cap = w.cap, .has_cap = w.has_cap } }),
         .assign  => |a| mk_assign(cg_clone_expr(a.target, tp, ta), cg_clone_expr(a.expr, tp, ta)),
         .estmt   => |e| mk_estmt(cg_clone_expr(e.expr, tp, ta)),
         .switch_ => |sw| cg_clone_switch(sw, tp, ta),
@@ -1780,13 +1780,14 @@ fn cg_scan_typeof(sc: *ScanCtx, cg: *Cg, n: *Node) []u8 {
                 if (bt0.len > 1 && bt0[0] == '*') { return bt0[1..]; }
                 return "";
             }
-            // optional .has/.val
+            // optional .has/.val/.?
             let obt0: []u8 = cg_scan_typeof(sc, cg, f.base);
             let obt1: []u8 = obt0;
             if (obt1.len > 1 && obt1[0] == '*') { obt1 = obt1[1..]; }
             if (cg_type_is_opt(cg, obt1) == 1) {
                 if (@strEq(f.fname, "has")) { return "i32"; }
                 if (@strEq(f.fname, "val")) { return cg_norm_type(obt1[1..]); }
+                if (@strEq(f.fname, "?")) { return cg_norm_type(obt1[1..]); }  // force-unwrap
                 return "";
             }
             // struct field: peel a leading '*' (p.*.field collapses *S → S).
@@ -2015,7 +2016,11 @@ fn cg_scan_expr(cg: *Cg, sc: *ScanCtx, n: *Node) void {
             cg_scan_expr(cg, sc, b.l); cg_scan_expr(cg, sc, b.r);
         }
         .un   => |u| { cg_scan_expr(cg, sc, u.e); }
-        .fld  => |f| { cg_scan_expr(cg, sc, f.base); }
+        .fld  => |f| {
+            // force-unwrap `.?` materializes the optional into a scratch block + pslot.
+            if (@strEq(f.fname, "?")) { sc.*.words.* = sc.*.words.* + 4; }
+            cg_scan_expr(cg, sc, f.base);
+        }
         .idx  => |x| { cg_scan_expr(cg, sc, x.base); cg_scan_expr(cg, sc, x.idx); }
         .cast_=> |c2| { cg_scan_expr(cg, sc, c2.expr); }
         .slice_ => |s2| {
@@ -2095,11 +2100,43 @@ fn cg_scan_body(cg: *Cg, sc: *ScanCtx, body: ArrayList[*Node]) void {
             .estmt  => |e| { cg_scan_expr(cg, sc, e.expr); }
             .if_    => |iff| {
                 cg_scan_expr(cg, sc, iff.cond);
+                if (iff.has_cap == 1) {
+                    // if-let: scratch optional block + capture slot.
+                    sc.*.words.* = sc.*.words.* + 4;  // scratch optional block (conservative)
+                    sc.*.words.* = sc.*.words.* + 1;  // capture slot (scalar value or pointer)
+                    let ct: []u8 = cg_scan_typeof(sc, cg, iff.cond);
+                    if (ct.len > 1) {
+                        if (ct[0] == '?') {
+                            let inner: []u8 = ct[1..];
+                            if (cg_type_is_agg(cg, cg_norm_type(inner)) == 1) {
+                                cg_scan_rectype(sc, iff.cap, _zag_str_concat("*", inner));
+                            } else {
+                                cg_scan_rectype(sc, iff.cap, inner);
+                            }
+                        }
+                    }
+                }
                 cg_scan_body(cg, sc, iff.then_body);
                 if (iff.has_els == 1) { cg_scan_body(cg, sc, iff.els_body); }
             }
             .while_ => |w2| {
                 cg_scan_expr(cg, sc, w2.cond);
+                if (w2.has_cap == 1) {
+                    // while-let: scratch optional block + capture slot.
+                    sc.*.words.* = sc.*.words.* + 4;  // scratch optional block (conservative)
+                    sc.*.words.* = sc.*.words.* + 1;  // capture slot
+                    let ct: []u8 = cg_scan_typeof(sc, cg, w2.cond);
+                    if (ct.len > 1) {
+                        if (ct[0] == '?') {
+                            let inner: []u8 = ct[1..];
+                            if (cg_type_is_agg(cg, cg_norm_type(inner)) == 1) {
+                                cg_scan_rectype(sc, w2.cap, _zag_str_concat("*", inner));
+                            } else {
+                                cg_scan_rectype(sc, w2.cap, inner);
+                            }
+                        }
+                    }
+                }
                 cg_scan_body(cg, sc, w2.body);
             }
             .switch_ => |sw| {
@@ -2310,13 +2347,14 @@ fn cg_expr_type(n: *Node, env: *Env, syms: ArrayList[FnSym], cg: *Cg) []u8 {
                 }
                 return "";
             }
-            // OPTIONAL field access: o.has → scalar (i32); o.val → T.
+            // OPTIONAL field access: o.has → scalar (i32); o.val → T; o.? → T.
             let obt0: []u8 = cg_expr_type(f.base, env, syms, cg);
             let obt1: []u8 = obt0;
             if (obt1.len > 1 && obt1[0] == '*') { obt1 = obt1[1..]; }
             if (cg_type_is_opt(cg, obt1) == 1) {
                 if (@strEq(f.fname, "has")) { return "i32"; }
                 if (@strEq(f.fname, "val")) { return cg_norm_type(obt1[1..]); }
+                if (@strEq(f.fname, "?")) { return cg_norm_type(obt1[1..]); }  // force-unwrap
                 return "";
             }
             // enum member access `Color.Green` → the value's type is the enum
@@ -2506,11 +2544,22 @@ fn cg_lower_addr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
             let obt: []u8 = bt;
             if (obt.len > 1 && obt[0] == '*') { obt = obt[1..]; }
             if (cg_type_is_opt(cg, obt) == 1) {
+                // force-unwrap `opt.?` → load val word (T) directly; no null check.
+                if (@strEq(f.fname, "?")) {
+                    let aty: []u8 = obt;
+                    let onf: i32 = cg_agg_words(cg, aty);
+                    let blk: i32 = cg_slot_scratch_n(env, onf);
+                    let ps: i32 = cg_pslot_for_frame(out, blk, env);
+                    cg_store_opt_into(out, ps, 0, aty, f.base, env, syms, cg);
+                    push[Instr](out, i_load(R_RAX(), R_RBP(), blk + 8));
+                    push[Instr](out, i_push(R_RAX()));
+                    return;
+                }
                 let ooff: i32 = 0 - 1;
                 if (@strEq(f.fname, "has")) { ooff = 0; }
                 else if (@strEq(f.fname, "val")) { ooff = 8; }
                 if (ooff < 0) {
-                    cg_err(cg, "native: optional has only .has / .val fields");
+                    cg_err(cg, "native: optional has only .has / .val / .? fields");
                     push[Instr](out, i_mov_imm(R_RAX(), 0));
                     push[Instr](out, i_push(R_RAX()));
                     return;
@@ -2725,6 +2774,21 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
             cg_lower_struct_lit(out, s, env, syms, cg);
         }
         .fld => |f| {
+            // force-unwrap `opt.?` — materialize optional, load val word directly.
+            if (@strEq(f.fname, "?")) {
+                let bt2: []u8 = cg_expr_type(f.base, env, syms, cg);
+                let obt2: []u8 = bt2;
+                if (obt2.len > 1 && obt2[0] == '*') { obt2 = obt2[1..]; }
+                if (cg_type_is_opt(cg, obt2) == 1) {
+                    let onf2: i32 = cg_agg_words(cg, obt2);
+                    let blk2: i32 = cg_slot_scratch_n(env, onf2);
+                    let ps2: i32 = cg_pslot_for_frame(out, blk2, env);
+                    cg_store_opt_into(out, ps2, 0, obt2, f.base, env, syms, cg);
+                    push[Instr](out, i_load(R_RAX(), R_RBP(), blk2 + 8));
+                    push[Instr](out, i_push(R_RAX()));
+                    return;
+                }
+            }
             // "literal".len → compile-time constant DECODED length.
             if (@strEq(f.fname, "len")) {
                 switch (f.base.*) {
@@ -3215,9 +3279,8 @@ fn cg_store_union_lit(out: *ArrayList[Instr], s: StructLit, uname: []u8, base: i
 //   a bare value `x`  → { has = 1, val = x }.
 //   an existing ?T    → copied verbatim (a call returning ?T, or null).
 //   a orelse b        → if a.has then a.val else b (b is the non-optional default).
-// `if (opt) |v| {..}` if-let is NOT representable in this parser/AST (the If node
-// carries no capture), so it is not implemented; the optional is consumed via
-// `orelse` (and, where the program writes it, the .has/.val fields directly).
+// `if (opt) |v| {..}` if-let: the If node carries cap/has_cap; ncodegen materializes
+// opt into a scratch block, tests has, and binds cap = &val in the then-body.
 // ════════════════════════════════════════════════════════════════════════════
 
 // True if expression `n` is the `null` literal (the parser lowers null to an
@@ -4786,29 +4849,116 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
         .if_ => |iff| {
             let else_lbl: i32 = cg_fresh(cg);
             let end_lbl: i32 = cg_fresh(cg);
-            cg_lower_expr(out, iff.cond, env, syms, cg);
-            push[Instr](out, i_pop(R_RAX()));
-            push[Instr](out, i_cmp_imm(R_RAX(), 0));
-            push[Instr](out, i_je(else_lbl));
-            cg_lower_block(out, iff.then_body, env, syms, cg);
-            push[Instr](out, i_jmp(end_lbl));
-            push[Instr](out, i_label(else_lbl));
-            if (iff.has_els == 1) {
-                cg_lower_block(out, iff.els_body, env, syms, cg);
+            if (iff.has_cap == 1) {
+                // if-let: `if (opt) |cap| { ... }`
+                // Materialize opt into a scratch block, check has, bind cap = val.
+                // Scalar T: cap = T (value loaded from blk+8).
+                // Aggregate T: cap = *T (pointer to blk+8, requires cap.* / cap.*.field).
+                let aty: []u8 = cg_expr_type(iff.cond, env, syms, cg);
+                let onf: i32 = 2;
+                if (aty.len > 1) { if (aty[0] == '?') { onf = cg_agg_words(cg, aty); } }
+                let blk: i32 = cg_slot_scratch_n(env, onf);
+                let ps: i32 = cg_pslot_for_frame(out, blk, env);
+                if (aty.len > 1) {
+                    if (aty[0] == '?') {
+                        cg_store_opt_into(out, ps, 0, aty, iff.cond, env, syms, cg);
+                    } else {
+                        cg_store_opt_into(out, ps, 0, "?i64", iff.cond, env, syms, cg);
+                    }
+                } else {
+                    cg_store_opt_into(out, ps, 0, "?i64", iff.cond, env, syms, cg);
+                }
+                // if has == 0, jump to else
+                push[Instr](out, i_load(R_RAX(), R_RBP(), blk + 0));
+                push[Instr](out, i_cmp_imm(R_RAX(), 0));
+                push[Instr](out, i_je(else_lbl));
+                // bind cap: scalar T → value in slot; aggregate T → pointer to blk+8
+                let inner: []u8 = "i64";
+                if (aty.len > 1) { if (aty[0] == '?') { inner = cg_norm_type(aty[1..]); } }
+                if (cg_type_is_agg(cg, inner) == 1) {
+                    // aggregate cap: bind as *T pointer (use cap.* or cap.*.field)
+                    let capty: []u8 = _zag_str_concat("*", inner);
+                    let cdisp: i32 = cg_slot_alloc_typed(env, iff.cap, capty, 1);
+                    push[Instr](out, i_lea(R_RAX(), R_RBP(), blk + 8));
+                    push[Instr](out, i_store(R_RBP(), cdisp, R_RAX()));
+                } else {
+                    // scalar cap: load val word and store into named slot
+                    let cdisp: i32 = cg_slot_alloc_typed(env, iff.cap, inner, 1);
+                    push[Instr](out, i_load(R_RAX(), R_RBP(), blk + 8));
+                    push[Instr](out, i_store(R_RBP(), cdisp, R_RAX()));
+                }
+                cg_lower_block(out, iff.then_body, env, syms, cg);
+                push[Instr](out, i_jmp(end_lbl));
+                push[Instr](out, i_label(else_lbl));
+                if (iff.has_els == 1) { cg_lower_block(out, iff.els_body, env, syms, cg); }
+                push[Instr](out, i_label(end_lbl));
+            } else {
+                cg_lower_expr(out, iff.cond, env, syms, cg);
+                push[Instr](out, i_pop(R_RAX()));
+                push[Instr](out, i_cmp_imm(R_RAX(), 0));
+                push[Instr](out, i_je(else_lbl));
+                cg_lower_block(out, iff.then_body, env, syms, cg);
+                push[Instr](out, i_jmp(end_lbl));
+                push[Instr](out, i_label(else_lbl));
+                if (iff.has_els == 1) { cg_lower_block(out, iff.els_body, env, syms, cg); }
+                push[Instr](out, i_label(end_lbl));
             }
-            push[Instr](out, i_label(end_lbl));
         }
         .while_ => |w| {
             let top: i32 = cg_fresh(cg);
             let end: i32 = cg_fresh(cg);
-            push[Instr](out, i_label(top));
-            cg_lower_expr(out, w.cond, env, syms, cg);
-            push[Instr](out, i_pop(R_RAX()));
-            push[Instr](out, i_cmp_imm(R_RAX(), 0));
-            push[Instr](out, i_je(end));
-            cg_lower_block(out, w.body, env, syms, cg);
-            push[Instr](out, i_jmp(top));
-            push[Instr](out, i_label(end));
+            if (w.has_cap == 1) {
+                // while-let: `while (opt) |cap| { body }` — loop while optional has value
+                let aty: []u8 = cg_expr_type(w.cond, env, syms, cg);
+                let onf: i32 = 2;
+                if (aty.len > 1) { if (aty[0] == '?') { onf = cg_agg_words(cg, aty); } }
+                let blk: i32 = cg_slot_scratch_n(env, onf);
+                let ps: i32 = cg_pslot_for_frame(out, blk, env);
+                let inner: []u8 = "i64";
+                if (aty.len > 1) { if (aty[0] == '?') { inner = cg_norm_type(aty[1..]); } }
+                // pre-allocate the cap slot so it's stable across iterations
+                let cdisp: i32 = 0;
+                if (cg_type_is_agg(cg, inner) == 1) {
+                    let capty: []u8 = _zag_str_concat("*", inner);
+                    cdisp = cg_slot_alloc_typed(env, w.cap, capty, 1);
+                } else {
+                    cdisp = cg_slot_alloc_typed(env, w.cap, inner, 1);
+                }
+                push[Instr](out, i_label(top));
+                // materialize opt fresh each iteration
+                if (aty.len > 1) {
+                    if (aty[0] == '?') {
+                        cg_store_opt_into(out, ps, 0, aty, w.cond, env, syms, cg);
+                    } else {
+                        cg_store_opt_into(out, ps, 0, "?i64", w.cond, env, syms, cg);
+                    }
+                } else {
+                    cg_store_opt_into(out, ps, 0, "?i64", w.cond, env, syms, cg);
+                }
+                push[Instr](out, i_load(R_RAX(), R_RBP(), blk + 0));   // has
+                push[Instr](out, i_cmp_imm(R_RAX(), 0));
+                push[Instr](out, i_je(end));
+                // bind cap
+                if (cg_type_is_agg(cg, inner) == 1) {
+                    push[Instr](out, i_lea(R_RAX(), R_RBP(), blk + 8));
+                    push[Instr](out, i_store(R_RBP(), cdisp, R_RAX()));
+                } else {
+                    push[Instr](out, i_load(R_RAX(), R_RBP(), blk + 8));
+                    push[Instr](out, i_store(R_RBP(), cdisp, R_RAX()));
+                }
+                cg_lower_block(out, w.body, env, syms, cg);
+                push[Instr](out, i_jmp(top));
+                push[Instr](out, i_label(end));
+            } else {
+                push[Instr](out, i_label(top));
+                cg_lower_expr(out, w.cond, env, syms, cg);
+                push[Instr](out, i_pop(R_RAX()));
+                push[Instr](out, i_cmp_imm(R_RAX(), 0));
+                push[Instr](out, i_je(end));
+                cg_lower_block(out, w.body, env, syms, cg);
+                push[Instr](out, i_jmp(top));
+                push[Instr](out, i_label(end));
+            }
         }
         .estmt => |e| {
             cg_lower_expr(out, e.expr, env, syms, cg);

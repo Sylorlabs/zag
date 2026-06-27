@@ -85,6 +85,12 @@ nt  "nested struct as arg" 'struct P { x: i32, y: i32 } fn sum(p: P) i32 { retur
 nt  "&s.field write-thru"  'struct P { x: i32, y: i32 } fn setx(p: *i32) void { p.* = 42; } fn main() i32 { let s: P = P{ .x = 1, .y = 0 }; setx(&s.x); return s.x; }' 42
 nt  "optional orelse val"  'fn f(b: i32) ?i32 { if (b == 1) { return 42; } return null; } fn main() i32 { return f(1) orelse 7; }' 42
 nt  "optional orelse def"  'fn f(b: i32) ?i32 { if (b == 1) { return 42; } return null; } fn main() i32 { return f(0) orelse 7; }' 7
+nt  "while-let sum"        'fn cnt(x: *i32) ?i32 { if (x.* > 0) { let v: i32 = x.*; x.* = x.* - 1; return v; } return null; } fn main() i32 { let n: i32 = 3; let s: i32 = 0; while (cnt(&n)) |v| { s = s + v; } return s; }' 6
+nt  "if-let present"       'fn f(b: i32) ?i32 { if (b == 1) { return 42; } return null; } fn main() i32 { let r: i32 = 0; if (f(1)) |v| { r = v; } return r; }' 42
+nt  "if-let null skip"     'fn f(b: i32) ?i32 { if (b == 1) { return 5; } return null; } fn main() i32 { let r: i32 = 99; if (f(0)) |v| { r = v; } return r; }' 99
+nt  "if-let else branch"   'fn f(b: i32) ?i32 { if (b == 1) { return 3; } return null; } fn main() i32 { if (f(0)) |v| { return v; } else { return 77; } return 0; }' 77
+nt  "force-unwrap .?"      'fn safe_div(a: i32, b: i32) ?i32 { if (b == 0) { return null; } return a / b; } fn must_div(a: i32, b: i32) i32 { return safe_div(a, b).?; } fn main() i32 { return must_div(10, 2); }' 5
+nt  "force-unwrap local"   'fn main() i32 { let o: ?i32 = 42; return o.?; }' 42
 # `orelse` UNWRAPS to a scalar; when used directly as a CALL ARGUMENT its type
 # must be the inner T, not the optional `?T`. Mis-typing it as the optional
 # aggregate made the caller copy the scalar result as a 16-byte block pointer →

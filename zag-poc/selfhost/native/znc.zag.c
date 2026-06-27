@@ -1,8 +1,10 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <stdbool.h>
 #include <math.h>
+static void* _zag_heap_dup(const void* p, size_t n){ void* q=malloc(n); if(q) memcpy(q,p,n); return q; }
 typedef struct { const uint8_t* ptr; int32_t len; } ZagSliceU8;
 #define ZAG_CACHE_LINE 64
 typedef struct { float* ptr; int32_t len; } ZagSlice_f32;
@@ -448,6 +450,7 @@ typedef struct ScanCtx_s ScanCtx;
 typedef struct ArrayList_i32_s ArrayList_i32;
 typedef struct ArrayList_u8_s ArrayList_u8;
 typedef struct ArrayList_Instr_s ArrayList_Instr;
+typedef struct ArrayList_i64_s ArrayList_i64;
 typedef struct ArrayList_Token_s ArrayList_Token;
 typedef struct ArrayList__u8_s ArrayList__u8;
 typedef struct ArrayList_pNode_s ArrayList_pNode;
@@ -458,6 +461,7 @@ typedef struct ArrayList_FnSym_s ArrayList_FnSym;
 struct ArrayList_i32_s { int32_t* data; int32_t len; int32_t cap; };
 struct ArrayList_u8_s { uint8_t* data; int32_t len; int32_t cap; };
 struct ArrayList_Instr_s { Instr* data; int32_t len; int32_t cap; };
+struct ArrayList_i64_s { int64_t* data; int32_t len; int32_t cap; };
 struct ArrayList_Token_s { Token* data; int32_t len; int32_t cap; };
 struct ArrayList__u8_s { ZagSliceU8* data; int32_t len; int32_t cap; };
 struct ArrayList_pNode_s { Node** data; int32_t len; int32_t cap; };
@@ -475,7 +479,7 @@ struct FnDecl_s { ZagSliceU8 name; ArrayList__u8 tparams; ArrayList_Param params
 struct Let_s { ZagSliceU8 name; ZagSliceU8 dty; int32_t has_dty; Node* expr; ZagSliceU8 eff; int32_t calign; };
 struct Return_s { int32_t has_expr; Node* expr; };
 struct If_s { Node* cond; ArrayList_pNode then_body; ArrayList_pNode els_body; int32_t has_els; ZagSliceU8 cap; int32_t has_cap; };
-struct While_s { Node* cond; ArrayList_pNode body; };
+struct While_s { Node* cond; ArrayList_pNode body; ZagSliceU8 cap; int32_t has_cap; };
 struct Assign_s { Node* target; Node* expr; };
 struct ExprStmt_s { Node* expr; };
 struct SwitchArm_s { ArrayList__u8 tags; ZagSliceU8 cap; int32_t has_cap; ArrayList_pNode body; };
@@ -495,7 +499,7 @@ struct Node_s { int32_t tag; union { FnDecl fn_decl; Let let_; Return ret; If if
 struct Token_s { Tk kind; ZagSliceU8 val; int32_t line; };
 struct Parser_s { ArrayList_Token toks; int32_t i; ArrayList_pNode closures; int32_t cctr; ZagSliceU8 fn_eff; };
 struct Exp_s { ArrayList_pNode decls; ArrayList__u8 seen; };
-struct Cg_s { int32_t next; int32_t err; ArrayList_u8* data; ArrayList_pNode decls; int32_t pi_lbl; int32_t ps_lbl; int32_t al_lbl; int32_t se_lbl; int32_t ml_lbl; int32_t rl_lbl; int32_t use_pi; int32_t use_ps; int32_t use_al; int32_t use_se; int32_t use_ml; int32_t use_rl; int32_t rt_base; ArrayList_i32* rt_used; };
+struct Cg_s { int32_t next; int32_t err; ArrayList_u8* data; ArrayList_pNode decls; int32_t pi_lbl; int32_t ps_lbl; int32_t al_lbl; int32_t se_lbl; int32_t ml_lbl; int32_t rl_lbl; int32_t pf_lbl; int32_t use_pi; int32_t use_pf; int32_t use_ps; int32_t use_al; int32_t use_se; int32_t use_ml; int32_t use_rl; int32_t rt_base; ArrayList_i32* rt_used; };
 struct FnSym_s { ZagSliceU8 name; int32_t lbl; ZagSliceU8 ret; int32_t nparams; };
 struct Env_s { ArrayList__u8 names; ArrayList_i32 disps; ArrayList__u8 types; ArrayList_i32 byref; int32_t count; int32_t frame_words; int32_t epilogue; int32_t sret_disp; int32_t sret_words; ZagSliceU8 sret_type; };
 struct ScanCtx_s { ArrayList__u8* seen; int32_t* words; ArrayList__u8 names; ArrayList__u8 types; ArrayList__u8 fnames; ArrayList__u8 frets; };
@@ -508,8 +512,15 @@ static void push_i32(ArrayList_i32* xs, int32_t val);
 static ArrayList_u8 make_u8(int32_t cap);
 static void set_i32(ArrayList_i32* xs, int32_t i, int32_t val);
 static uint8_t get_u8(ArrayList_u8 xs, int32_t i);
-static ArrayList_Instr make_Instr(int32_t cap);
+static int32_t len_i32(ArrayList_i32 xs);
 static void push_Instr(ArrayList_Instr* xs, Instr val);
+static ArrayList_Instr make_Instr(int32_t cap);
+static ArrayList_i64 make_i64(int32_t cap);
+static void push_i64(ArrayList_i64* xs, int64_t val);
+static int32_t pop_i32(ArrayList_i32* xs);
+static int64_t get_i64(ArrayList_i64 xs, int32_t i);
+static int64_t pop_i64(ArrayList_i64* xs);
+static void set_i64(ArrayList_i64* xs, int32_t i, int64_t val);
 static ArrayList__u8 make__u8(int32_t cap);
 static ArrayList_Token make_Token(int32_t cap);
 static void push_Token(ArrayList_Token* xs, Token val);
@@ -600,12 +611,28 @@ static int32_t K_SUB_RI(void);
 static int32_t K_CMP_RI(void);
 static int32_t K_SETCC(void);
 static int32_t K_NEG(void);
+static int32_t K_FMOVQ_GX(void);
+static int32_t K_FMOVQ_XG(void);
+static int32_t K_FADD(void);
+static int32_t K_FSUB(void);
+static int32_t K_FMUL(void);
+static int32_t K_FDIV(void);
+static int32_t K_FUCOMI(void);
+static int32_t K_FSI2SD(void);
+static int32_t K_FTSD2SI(void);
+static int32_t K_FSD2SS(void);
+static int32_t K_FSS2SD(void);
+static int32_t K_FXORPS(void);
 static int32_t CC_E(void);
 static int32_t CC_NE(void);
 static int32_t CC_L(void);
 static int32_t CC_LE(void);
 static int32_t CC_G(void);
 static int32_t CC_GE(void);
+static int32_t CC_B(void);
+static int32_t CC_BE(void);
+static int32_t CC_A(void);
+static int32_t CC_AE(void);
 static int32_t R_RAX(void);
 static int32_t R_RCX(void);
 static int32_t R_RDX(void);
@@ -617,6 +644,10 @@ static int32_t R_RDI(void);
 static int32_t R_R8(void);
 static int32_t R_R9(void);
 static int32_t R_R10(void);
+static int32_t R_XMM0(void);
+static int32_t R_XMM1(void);
+static int32_t R_XMM2(void);
+static int32_t R_XMM3(void);
 static int32_t arg_reg(int32_t i);
 static Instr ins6(int32_t kind, int32_t dst, int32_t src, int64_t imm, int32_t disp, int32_t lbl);
 static Instr i_label(int32_t id);
@@ -650,6 +681,18 @@ static Instr i_sub_imm(int32_t dst, int64_t v);
 static Instr i_cmp_imm(int32_t dst, int64_t v);
 static Instr i_setcc(int32_t dst, int32_t cc);
 static Instr i_neg(int32_t dst);
+static Instr i_fmovq_gx(int32_t xmm, int32_t gpr);
+static Instr i_fmovq_xg(int32_t gpr, int32_t xmm);
+static Instr i_fadd(int32_t d, int32_t s);
+static Instr i_fsub(int32_t d, int32_t s);
+static Instr i_fmul(int32_t d, int32_t s);
+static Instr i_fdiv(int32_t d, int32_t s);
+static Instr i_fucomi(int32_t d, int32_t s);
+static Instr i_fsi2sd(int32_t xmm, int32_t gpr);
+static Instr i_ftsd2si(int32_t gpr, int32_t xmm);
+static Instr i_fsd2ss(int32_t d, int32_t s);
+static Instr i_fss2sd(int32_t d, int32_t s);
+static Instr i_fxorps(int32_t d, int32_t s);
 static void eb(ArrayList_u8* buf, int32_t b);
 static void emit_le(ArrayList_u8* buf, int64_t v, int32_t n);
 static void rex(ArrayList_u8* buf, int32_t w, int32_t r, int32_t x, int32_t b);
@@ -658,6 +701,7 @@ static int32_t lo3(int32_t r);
 static int32_t modrm_rr(int32_t reg, int32_t rm);
 static void mem(ArrayList_u8* buf, int32_t reg_field, int32_t base, int32_t disp);
 static int32_t setcc_op(int32_t cc);
+static void sse_op(ArrayList_u8* buf, int32_t pfx, int32_t w, int32_t A, int32_t B, int32_t op);
 static int32_t jcc_op(int32_t kind);
 static int32_t is_jcc(int32_t kind);
 static void encode_one(ArrayList_u8* buf, Instr ins, ArrayList_i32 labels, int32_t base_off);
@@ -671,6 +715,38 @@ static void elf_eb(ArrayList_u8* buf, int32_t b);
 static void elf_emit_le(ArrayList_u8* buf, int64_t v, int32_t n);
 static int32_t write_elf_exec(ZagSliceU8 path, ArrayList_u8 text, int32_t entry_off);
 static int32_t write_elf_exec_data(ZagSliceU8 path, ArrayList_u8 text, int32_t entry_off, ArrayList_u8 data);
+static int32_t ra_pool(int32_t i);
+static int32_t ra_pool_size(void);
+static int32_t ra_is_prologue(ArrayList_Instr prog, int32_t p, int32_t n);
+static int32_t ra_find_epilogue(ArrayList_Instr prog, int32_t from, int32_t n);
+static int32_t ra_writes_rbp(Instr ins);
+static int32_t ra_body_clean(ArrayList_Instr prog, int32_t bstart, int32_t bend);
+static int32_t ra_contains(ArrayList_i32 xs, int32_t v);
+static int32_t ra_reg_for(ArrayList_i32 slots, ArrayList_i32 regs, int32_t d);
+static void ra_copy_range(ArrayList_Instr* out, ArrayList_Instr prog, int32_t a, int32_t b);
+static ArrayList_Instr regalloc(ArrayList_Instr prog);
+static int32_t opt_is_breaker(int32_t k);
+static int32_t opt_is_jcc(int32_t k);
+static int32_t opt_writes_flags(int32_t k);
+static int32_t opt_reads_flags(int32_t k);
+static int32_t opt_fits32(int64_t v);
+static int64_t opt_fold(int32_t k, int64_t a, int64_t b);
+static ArrayList_i32 opt_mk16i32(void);
+static ArrayList_i64 opt_mk16i64(void);
+static void opt_reset16(ArrayList_i32* known);
+static int32_t opt_gap_clean(ArrayList_Instr prog, int32_t p, int32_t q);
+static void opt_prescan_matched(ArrayList_Instr prog, int32_t n, ArrayList_i32* matched, ArrayList_i32* pop_of);
+static void opt_prescan_flags(ArrayList_Instr prog, int32_t n, ArrayList_i32* flags_dead);
+static void opt_invalidate(ArrayList_i32* known, Instr ins);
+static int32_t opt_reads_reg(Instr ins, int32_t r);
+static int32_t opt_writes_reg(Instr ins, int32_t r);
+static int32_t opt_reg_written(Instr ins, int32_t R);
+static int32_t opt_reg_written_in(ArrayList_Instr prog, int32_t p, int32_t q, int32_t R);
+static int32_t opt_src_killed_in_run(ArrayList_Instr prog, int32_t op, int32_t src, int32_t n);
+static ArrayList_Instr opt_fold_pass(ArrayList_Instr prog);
+static ArrayList_Instr opt_dce(ArrayList_Instr prog);
+static void opt_dce_liveness(ArrayList_i32* live, Instr ins);
+static ArrayList_Instr optimize(ArrayList_Instr prog);
 static ArrayList_Instr ph_pass(ArrayList_Instr prog, int32_t* changed);
 static ArrayList_Instr peephole(ArrayList_Instr prog);
 static int32_t node_code(Node* n);
@@ -766,6 +842,35 @@ static ArrayList_pNode parse_program_dir(ZagSliceU8 src, ZagSliceU8 base_dir);
 static ArrayList_pNode parse_program(ZagSliceU8 src);
 static int64_t cg_parse_i64(ZagSliceU8 s);
 static int32_t cg_is_int_text(ZagSliceU8 s);
+static int32_t cg_is_float_ty(ZagSliceU8 t);
+static int32_t cg_is_posit_ty(ZagSliceU8 t);
+static ZagSliceU8 cg_posit_op_fn(ZagSliceU8 pty, ZagSliceU8 op);
+static ZagSliceU8 cg_posit_builtin_fn(ZagSliceU8 b);
+static ZagSliceU8 cg_posit_builtin_ret(ZagSliceU8 b);
+static int32_t cg_str_prefix(ZagSliceU8 t, ZagSliceU8 p);
+static int32_t cg_all_digits(ZagSliceU8 t, int32_t lo, int32_t hi);
+static int64_t cg_parse_uint(ZagSliceU8 t, int32_t lo, int32_t hi);
+static int32_t cg_is_sat_ty(ZagSliceU8 t);
+static ZagSliceU8 cg_sat_base(ZagSliceU8 t);
+static int32_t cg_is_fixed_ty(ZagSliceU8 t);
+static int64_t cg_fixed_frac_bits(ZagSliceU8 t);
+static int32_t cg_is_arb_int_ty(ZagSliceU8 t);
+static int64_t cg_arb_int_bits(ZagSliceU8 t);
+static int32_t cg_arb_int_signed(ZagSliceU8 t);
+static int64_t cg_arb_mask(int64_t bits);
+static int32_t cg_is_satfixarb_ty(ZagSliceU8 t);
+static ZagSliceU8 cg_sat_op_fn(ZagSliceU8 sty, ZagSliceU8 op);
+static int32_t cg_is_rns_ty(ZagSliceU8 t);
+static int32_t cg_is_quire_ty(ZagSliceU8 t);
+static ZagSliceU8 cg_rns_op_fn(ZagSliceU8 op);
+static ZagSliceU8 cg_quire_builtin_fn(ZagSliceU8 b);
+static ZagSliceU8 cg_quire_builtin_ret(ZagSliceU8 b);
+static int32_t cg_ty_is_numeric(ZagSliceU8 t);
+static int32_t cg_is_float_text(ZagSliceU8 s);
+static int64_t cg_i64_max(void);
+static int64_t cg_pow2(int32_t k);
+static int64_t cg_sign_bit(void);
+static int64_t cg_f64_bits(ZagSliceU8 s, Cg* cg);
 static ZagSliceU8 cg_mangle_targ(ZagSliceU8 t);
 static ZagSliceU8 cg_mangle_generic(ZagSliceU8 name, ArrayList__u8 targs);
 static ZagSliceU8 cg_subst_type(ZagSliceU8 t, ArrayList__u8 names, ArrayList__u8 vals);
@@ -825,7 +930,10 @@ static int32_t cg_elem_is_byte(ZagSliceU8 ty);
 static int32_t cg_elem_stride(Cg* cg, ZagSliceU8 ty);
 static int32_t cg_field_offset(Cg* cg, ZagSliceU8 sname, ZagSliceU8 fname);
 static int32_t cg_type_is_struct(Cg* cg, ZagSliceU8 ty);
+static ZagSliceU8 cg_slice_elem(ZagSliceU8 ty);
+static int32_t cg_is_word_int_elem(ZagSliceU8 e);
 static int32_t cg_type_is_slice(Cg* cg, ZagSliceU8 ty);
+static int32_t cg_slice_is_word(ZagSliceU8 ty);
 static int32_t cg_type_is_opt(Cg* cg, ZagSliceU8 ty);
 static int32_t cg_type_is_agg(Cg* cg, ZagSliceU8 ty);
 static int32_t cg_agg_words(Cg* cg, ZagSliceU8 ty);
@@ -882,10 +990,16 @@ static int32_t cg_is_null_expr(Node* n, Env* env);
 static int32_t cg_expr_is_opt(Node* n, Env* env, ArrayList_FnSym syms, Cg* cg);
 static void cg_store_opt_into(ArrayList_Instr* out, int32_t pslot, int32_t off, ZagSliceU8 optty, Node* val, Env* env, ArrayList_FnSym syms, Cg* cg);
 static void cg_lower_orelse(ArrayList_Instr* out, Bin bb, Env* env, ArrayList_FnSym syms, Cg* cg);
+static int32_t cg_float_cmp_cc(ZagSliceU8 op);
+static void cg_lower_bin_float(ArrayList_Instr* out, Bin bb, int32_t lf, int32_t rf, Env* env, ArrayList_FnSym syms, Cg* cg);
 static void cg_lower_bin(ArrayList_Instr* out, Bin bb, Env* env, ArrayList_FnSym syms, Cg* cg);
 static int32_t cg_is_print_int(ZagSliceU8 name);
+static int32_t cg_is_print_int_nl(ZagSliceU8 name);
+static int32_t cg_is_print_i32_w(ZagSliceU8 name);
+static int32_t cg_is_print_u32_w(ZagSliceU8 name);
 static int32_t cg_is_print_str(ZagSliceU8 name);
 static int32_t cg_is_println_str(ZagSliceU8 name);
+static int32_t cg_is_print_float(ZagSliceU8 name);
 static int32_t cg_lower_print(ArrayList_Instr* out, ZagSliceU8 fname, Call c, Env* env, ArrayList_FnSym syms, Cg* cg);
 static void cg_lower_new(ArrayList_Instr* out, Call c, Env* env, ArrayList_FnSym syms, Cg* cg);
 static int32_t cg_sizeof_type(Cg* cg, ZagSliceU8 t0);
@@ -907,6 +1021,13 @@ static void cg_lower_block(ArrayList_Instr* out, ArrayList_pNode body, Env* env,
 static void cg_lower_fn(ArrayList_Instr* out, FnDecl f, int32_t lbl, ArrayList_FnSym syms, Cg* cg);
 static void cg_emit_print_str(ArrayList_Instr* out, int32_t lbl);
 static void cg_emit_print_int(ArrayList_Instr* out, int32_t lbl, Cg* cg);
+static int64_t PF_TEN(void);
+static int64_t PF_ONE(void);
+static int64_t PF_HALF(void);
+static int64_t PF_E5(void);
+static void pf_putc(ArrayList_Instr* out, int32_t c);
+static void pf_put_ds(ArrayList_Instr* out);
+static void cg_emit_print_f64(ArrayList_Instr* out, int32_t lbl, Cg* cg);
 static void cg_emit_alloc(ArrayList_Instr* out, int32_t lbl);
 static void cg_emit_streq(ArrayList_Instr* out, int32_t lbl, Cg* cg);
 static void cg_emit_malloc(ArrayList_Instr* out, int32_t lbl, Cg* cg);
@@ -933,7 +1054,21 @@ static void cg_emit_rt_memcmp(ArrayList_Instr* out, Cg* cg);
 static void cg_emit_rt_str2i(ArrayList_Instr* out, Cg* cg);
 static void cg_rt_close_deps(Cg* cg);
 static void cg_emit_native_rt(ArrayList_Instr* out, Cg* cg);
-static ArrayList_Instr lower_program(ArrayList_pNode decls0, int32_t* errout, ArrayList_u8* dataout);
+static ZagSliceU8 cg_numeric_rt_src(void);
+static ZagSliceU8 cg_numeric_rt2_src(void);
+static ZagSliceU8 cg_numeric_rt3_src(void);
+static int32_t cg_ty_is_posit(ZagSliceU8 t);
+static int32_t cg_expr_uses_posit(Node* n);
+static int32_t cg_body_uses_posit(ArrayList_pNode body);
+static int32_t cg_decls_use_posit(ArrayList_pNode decls);
+static int32_t cg_ty_is_satfixed(ZagSliceU8 t);
+static int32_t cg_expr_uses_satfixed(Node* n);
+static int32_t cg_body_uses_satfixed(ArrayList_pNode body);
+static int32_t cg_decls_use_satfixed(ArrayList_pNode decls);
+static int32_t cg_ty_is_rns(ZagSliceU8 t);
+static int32_t cg_body_uses_rns(ArrayList_pNode body);
+static int32_t cg_decls_use_rns(ArrayList_pNode decls);
+static ArrayList_Instr lower_program(ArrayList_pNode decls0in, int32_t* errout, ArrayList_u8* dataout);
 static int32_t has_flag(ZagSliceU8 name);
 static ZagSliceU8 src_arg(void);
 static ZagSliceU8 out_flag(void);
@@ -993,13 +1128,8 @@ static void set_i32(ArrayList_i32* xs, int32_t i, int32_t val) {
 static uint8_t get_u8(ArrayList_u8 xs, int32_t i) {
     return xs.data[i];
 }
-static ArrayList_Instr make_Instr(int32_t cap) {
-    int32_t c = cap;
-    if ((c < 1)) {
-    c = 1;
-    }
-    int8_t* raw = _zag_malloc((c * ((int32_t)sizeof(Instr))));
-    return (ArrayList_Instr){ .data = ((Instr*)(raw)), .len = 0, .cap = c };
+static int32_t len_i32(ArrayList_i32 xs) {
+    return xs.len;
 }
 static void push_Instr(ArrayList_Instr* xs, Instr val) {
     if (((*xs).len >= (*xs).cap)) {
@@ -1012,6 +1142,52 @@ static void push_Instr(ArrayList_Instr* xs, Instr val) {
     }
     (*xs).data[(*xs).len] = val;
     (*xs).len = ((*xs).len + 1);
+}
+static ArrayList_Instr make_Instr(int32_t cap) {
+    int32_t c = cap;
+    if ((c < 1)) {
+    c = 1;
+    }
+    int8_t* raw = _zag_malloc((c * ((int32_t)sizeof(Instr))));
+    return (ArrayList_Instr){ .data = ((Instr*)(raw)), .len = 0, .cap = c };
+}
+static ArrayList_i64 make_i64(int32_t cap) {
+    int32_t c = cap;
+    if ((c < 1)) {
+    c = 1;
+    }
+    int8_t* raw = _zag_malloc((c * ((int32_t)sizeof(int64_t))));
+    return (ArrayList_i64){ .data = ((int64_t*)(raw)), .len = 0, .cap = c };
+}
+static void push_i64(ArrayList_i64* xs, int64_t val) {
+    if (((*xs).len >= (*xs).cap)) {
+    int32_t nc = ((*xs).cap * 2);
+    if ((nc < 4)) {
+    nc = 4;
+    }
+    (*xs).data = ((int64_t*)(_zag_realloc(((int8_t*)((*xs).data)), (nc * ((int32_t)sizeof(int64_t))))));
+    (*xs).cap = nc;
+    }
+    (*xs).data[(*xs).len] = val;
+    (*xs).len = ((*xs).len + 1);
+}
+static int32_t pop_i32(ArrayList_i32* xs) {
+    int32_t last = ((*xs).len - 1);
+    int32_t v = (*xs).data[last];
+    (*xs).len = last;
+    return v;
+}
+static int64_t get_i64(ArrayList_i64 xs, int32_t i) {
+    return xs.data[i];
+}
+static int64_t pop_i64(ArrayList_i64* xs) {
+    int32_t last = ((*xs).len - 1);
+    int64_t v = (*xs).data[last];
+    (*xs).len = last;
+    return v;
+}
+static void set_i64(ArrayList_i64* xs, int32_t i, int64_t val) {
+    (*xs).data[i] = val;
 }
 static ArrayList__u8 make__u8(int32_t cap) {
     int32_t c = cap;
@@ -1300,6 +1476,42 @@ static int32_t K_SETCC(void) {
 static int32_t K_NEG(void) {
     return 30;
 }
+static int32_t K_FMOVQ_GX(void) {
+    return 31;
+}
+static int32_t K_FMOVQ_XG(void) {
+    return 32;
+}
+static int32_t K_FADD(void) {
+    return 33;
+}
+static int32_t K_FSUB(void) {
+    return 34;
+}
+static int32_t K_FMUL(void) {
+    return 35;
+}
+static int32_t K_FDIV(void) {
+    return 36;
+}
+static int32_t K_FUCOMI(void) {
+    return 37;
+}
+static int32_t K_FSI2SD(void) {
+    return 38;
+}
+static int32_t K_FTSD2SI(void) {
+    return 39;
+}
+static int32_t K_FSD2SS(void) {
+    return 40;
+}
+static int32_t K_FSS2SD(void) {
+    return 41;
+}
+static int32_t K_FXORPS(void) {
+    return 42;
+}
 static int32_t CC_E(void) {
     return 0;
 }
@@ -1317,6 +1529,18 @@ static int32_t CC_G(void) {
 }
 static int32_t CC_GE(void) {
     return 5;
+}
+static int32_t CC_B(void) {
+    return 6;
+}
+static int32_t CC_BE(void) {
+    return 7;
+}
+static int32_t CC_A(void) {
+    return 8;
+}
+static int32_t CC_AE(void) {
+    return 9;
 }
 static int32_t R_RAX(void) {
     return 0;
@@ -1350,6 +1574,18 @@ static int32_t R_R9(void) {
 }
 static int32_t R_R10(void) {
     return 10;
+}
+static int32_t R_XMM0(void) {
+    return 0;
+}
+static int32_t R_XMM1(void) {
+    return 1;
+}
+static int32_t R_XMM2(void) {
+    return 2;
+}
+static int32_t R_XMM3(void) {
+    return 3;
 }
 static int32_t arg_reg(int32_t i) {
     if ((i == 0)) {
@@ -1468,6 +1704,42 @@ static Instr i_setcc(int32_t dst, int32_t cc) {
 static Instr i_neg(int32_t dst) {
     return ins6(30, dst, 0, 0, 0, (0 - 1));
 }
+static Instr i_fmovq_gx(int32_t xmm, int32_t gpr) {
+    return ins6(31, xmm, gpr, 0, 0, (0 - 1));
+}
+static Instr i_fmovq_xg(int32_t gpr, int32_t xmm) {
+    return ins6(32, gpr, xmm, 0, 0, (0 - 1));
+}
+static Instr i_fadd(int32_t d, int32_t s) {
+    return ins6(33, d, s, 0, 0, (0 - 1));
+}
+static Instr i_fsub(int32_t d, int32_t s) {
+    return ins6(34, d, s, 0, 0, (0 - 1));
+}
+static Instr i_fmul(int32_t d, int32_t s) {
+    return ins6(35, d, s, 0, 0, (0 - 1));
+}
+static Instr i_fdiv(int32_t d, int32_t s) {
+    return ins6(36, d, s, 0, 0, (0 - 1));
+}
+static Instr i_fucomi(int32_t d, int32_t s) {
+    return ins6(37, d, s, 0, 0, (0 - 1));
+}
+static Instr i_fsi2sd(int32_t xmm, int32_t gpr) {
+    return ins6(38, xmm, gpr, 0, 0, (0 - 1));
+}
+static Instr i_ftsd2si(int32_t gpr, int32_t xmm) {
+    return ins6(39, gpr, xmm, 0, 0, (0 - 1));
+}
+static Instr i_fsd2ss(int32_t d, int32_t s) {
+    return ins6(40, d, s, 0, 0, (0 - 1));
+}
+static Instr i_fss2sd(int32_t d, int32_t s) {
+    return ins6(41, d, s, 0, 0, (0 - 1));
+}
+static Instr i_fxorps(int32_t d, int32_t s) {
+    return ins6(42, d, s, 0, 0, (0 - 1));
+}
 static void eb(ArrayList_u8* buf, int32_t b) {
     push_u8(buf, ((uint8_t)((b % 256))));
 }
@@ -1519,7 +1791,42 @@ static int32_t setcc_op(int32_t cc) {
     if ((cc == CC_G())) {
     return 159;
     }
+    if ((cc == CC_GE())) {
     return 157;
+    }
+    if ((cc == CC_B())) {
+    return 146;
+    }
+    if ((cc == CC_BE())) {
+    return 150;
+    }
+    if ((cc == CC_A())) {
+    return 151;
+    }
+    return 147;
+}
+static void sse_op(ArrayList_u8* buf, int32_t pfx, int32_t w, int32_t A, int32_t B, int32_t op) {
+    if ((pfx != 0)) {
+    eb(buf, pfx);
+    }
+    int32_t r = ext(A);
+    int32_t b = ext(B);
+    int32_t need = 0;
+    if ((w == 1)) {
+    need = 1;
+    }
+    if ((r == 1)) {
+    need = 1;
+    }
+    if ((b == 1)) {
+    need = 1;
+    }
+    if ((need == 1)) {
+    rex(buf, w, r, 0, b);
+    }
+    eb(buf, 15);
+    eb(buf, op);
+    eb(buf, modrm_rr(A, B));
 }
 static int32_t jcc_op(int32_t kind) {
     if ((kind == K_JE())) {
@@ -1738,6 +2045,54 @@ static void encode_one(ArrayList_u8* buf, Instr ins, ArrayList_i32 labels, int32
     emit_le(buf, ((int64_t)((target - (base_off + 6)))), 4);
     return;
     }
+    if ((k == K_FMOVQ_GX())) {
+    sse_op(buf, 102, 1, ins.dst, ins.src, 110);
+    return;
+    }
+    if ((k == K_FMOVQ_XG())) {
+    sse_op(buf, 102, 1, ins.src, ins.dst, 126);
+    return;
+    }
+    if ((k == K_FADD())) {
+    sse_op(buf, 242, 0, ins.dst, ins.src, 88);
+    return;
+    }
+    if ((k == K_FSUB())) {
+    sse_op(buf, 242, 0, ins.dst, ins.src, 92);
+    return;
+    }
+    if ((k == K_FMUL())) {
+    sse_op(buf, 242, 0, ins.dst, ins.src, 89);
+    return;
+    }
+    if ((k == K_FDIV())) {
+    sse_op(buf, 242, 0, ins.dst, ins.src, 94);
+    return;
+    }
+    if ((k == K_FUCOMI())) {
+    sse_op(buf, 102, 0, ins.dst, ins.src, 46);
+    return;
+    }
+    if ((k == K_FSI2SD())) {
+    sse_op(buf, 242, 1, ins.dst, ins.src, 42);
+    return;
+    }
+    if ((k == K_FTSD2SI())) {
+    sse_op(buf, 242, 1, ins.dst, ins.src, 44);
+    return;
+    }
+    if ((k == K_FSD2SS())) {
+    sse_op(buf, 242, 0, ins.dst, ins.src, 90);
+    return;
+    }
+    if ((k == K_FSS2SD())) {
+    sse_op(buf, 243, 0, ins.dst, ins.src, 90);
+    return;
+    }
+    if ((k == K_FXORPS())) {
+    sse_op(buf, 0, 0, ins.dst, ins.src, 87);
+    return;
+    }
     return;
 }
 static ArrayList_u8 encode(ArrayList_Instr prog) {
@@ -1930,6 +2285,1127 @@ static int32_t write_elf_exec_data(ZagSliceU8 path, ArrayList_u8 text, int32_t e
     }
     return _zag_write_exec(path, (ZagSliceU8){ (buf.data) + (0), (buf.len) - (0) });
 }
+static int32_t ra_pool(int32_t i) {
+    if ((i == 0)) {
+    return 3;
+    }
+    if ((i == 1)) {
+    return 12;
+    }
+    if ((i == 2)) {
+    return 13;
+    }
+    return 14;
+}
+static int32_t ra_pool_size(void) {
+    return 4;
+}
+static int32_t ra_is_prologue(ArrayList_Instr prog, int32_t p, int32_t n) {
+    if (((p + 3) >= n)) {
+    return 0;
+    }
+    Instr i0 = get_Instr(prog, p);
+    Instr i1 = get_Instr(prog, (p + 1));
+    Instr i2 = get_Instr(prog, (p + 2));
+    Instr i3 = get_Instr(prog, (p + 3));
+    if ((i0.kind != K_LABEL())) {
+    return 0;
+    }
+    if ((i1.kind != K_PUSH())) {
+    return 0;
+    }
+    if ((i1.dst != R_RBP())) {
+    return 0;
+    }
+    if ((i2.kind != K_MOV_RR())) {
+    return 0;
+    }
+    if ((i2.dst != R_RBP())) {
+    return 0;
+    }
+    if ((i2.src != R_RSP())) {
+    return 0;
+    }
+    if ((i3.kind != K_SUB_RI())) {
+    return 0;
+    }
+    if ((i3.dst != R_RSP())) {
+    return 0;
+    }
+    return 1;
+}
+static int32_t ra_find_epilogue(ArrayList_Instr prog, int32_t from, int32_t n) {
+    int32_t i = from;
+    while (((i + 2) < n)) {
+    Instr a = get_Instr(prog, i);
+    Instr b = get_Instr(prog, (i + 1));
+    Instr c = get_Instr(prog, (i + 2));
+    if ((((a.kind == K_MOV_RR()) && (a.dst == R_RSP())) && (a.src == R_RBP()))) {
+    if (((b.kind == K_POP()) && (b.dst == R_RBP()))) {
+    if ((c.kind == K_RET())) {
+    return i;
+    }
+    }
+    }
+    i = (i + 1);
+    }
+    return (0 - 1);
+}
+static int32_t ra_writes_rbp(Instr ins) {
+    int32_t k = ins.kind;
+    if ((k == K_STORE())) {
+    return 0;
+    }
+    if ((ins.dst != R_RBP())) {
+    return 0;
+    }
+    if ((k == K_MOV_RR())) {
+    return 1;
+    }
+    if ((k == K_MOV_IMM())) {
+    return 1;
+    }
+    if ((k == K_LOAD())) {
+    return 1;
+    }
+    if ((k == K_LEA())) {
+    return 1;
+    }
+    if ((k == K_POP())) {
+    return 1;
+    }
+    if ((k == K_ADD_RR())) {
+    return 1;
+    }
+    if ((k == K_SUB_RR())) {
+    return 1;
+    }
+    if ((k == K_ADD_RI())) {
+    return 1;
+    }
+    if ((k == K_SUB_RI())) {
+    return 1;
+    }
+    if ((k == K_IMUL_RR())) {
+    return 1;
+    }
+    if ((k == K_AND_RR())) {
+    return 1;
+    }
+    if ((k == K_OR_RR())) {
+    return 1;
+    }
+    if ((k == K_XOR_RR())) {
+    return 1;
+    }
+    if ((k == K_NEG())) {
+    return 1;
+    }
+    if ((k == K_SETCC())) {
+    return 1;
+    }
+    return 0;
+}
+static int32_t ra_body_clean(ArrayList_Instr prog, int32_t bstart, int32_t bend) {
+    int32_t s = bstart;
+    while ((s < bend)) {
+    Instr ins = get_Instr(prog, s);
+    if ((ins.kind == K_RET())) {
+    return 0;
+    }
+    if ((((ins.kind == K_MOV_RR()) && (ins.dst == R_RSP())) && (ins.src == R_RBP()))) {
+    return 0;
+    }
+    if (((ins.kind == K_PUSH()) && (ins.dst == R_RBP()))) {
+    return 0;
+    }
+    if ((ra_writes_rbp(ins) == 1)) {
+    return 0;
+    }
+    s = (s + 1);
+    }
+    return 1;
+}
+static int32_t ra_contains(ArrayList_i32 xs, int32_t v) {
+    int32_t i = 0;
+    while ((i < len_i32(xs))) {
+    if ((get_i32(xs, i) == v)) {
+    return 1;
+    }
+    i = (i + 1);
+    }
+    return 0;
+}
+static int32_t ra_reg_for(ArrayList_i32 slots, ArrayList_i32 regs, int32_t d) {
+    int32_t i = 0;
+    while ((i < len_i32(slots))) {
+    if ((get_i32(slots, i) == d)) {
+    return get_i32(regs, i);
+    }
+    i = (i + 1);
+    }
+    return (0 - 1);
+}
+static void ra_copy_range(ArrayList_Instr* out, ArrayList_Instr prog, int32_t a, int32_t b) {
+    int32_t j = a;
+    while ((j <= b)) {
+    push_Instr(out, get_Instr(prog, j));
+    j = (j + 1);
+    }
+}
+static ArrayList_Instr regalloc(ArrayList_Instr prog) {
+    int32_t n = len_Instr(prog);
+    ArrayList_Instr out = make_Instr((n + 16));
+    int32_t i = 0;
+    while ((i < n)) {
+    if ((ra_is_prologue(prog, i, n) == 0)) {
+    push_Instr((&out), get_Instr(prog, i));
+    i = (i + 1);
+    } else {
+    int32_t epi = ra_find_epilogue(prog, (i + 4), n);
+    int32_t ok_struct = 0;
+    if ((epi >= 0)) {
+    int32_t after = (epi + 3);
+    int32_t tail_ok = 0;
+    if ((after >= n)) {
+    tail_ok = 1;
+    } else {
+    if ((get_Instr(prog, after).kind == K_LABEL())) {
+    tail_ok = 1;
+    }
+    }
+    if ((tail_ok == 1)) {
+    if ((ra_body_clean(prog, (i + 4), epi) == 1)) {
+    ok_struct = 1;
+    }
+    }
+    }
+    if ((ok_struct == 0)) {
+    if ((epi >= 0)) {
+    ra_copy_range((&out), prog, i, (epi + 2));
+    i = (epi + 3);
+    } else {
+    push_Instr((&out), get_Instr(prog, i));
+    i = (i + 1);
+    }
+    } else {
+    int32_t bstart = (i + 4);
+    int32_t bend = epi;
+    ArrayList_i32 cands = make_i32(8);
+    int32_t have_lea = 0;
+    int32_t min_lea = 0;
+    int32_t s = bstart;
+    while ((s < bend)) {
+    Instr ins = get_Instr(prog, s);
+    if ((((ins.kind == K_LOAD()) && (ins.src == R_RBP())) && (ins.disp < 0))) {
+    if ((ra_contains(cands, ins.disp) == 0)) {
+    push_i32((&cands), ins.disp);
+    }
+    }
+    if ((((ins.kind == K_STORE()) && (ins.dst == R_RBP())) && (ins.disp < 0))) {
+    if ((ra_contains(cands, ins.disp) == 0)) {
+    push_i32((&cands), ins.disp);
+    }
+    }
+    if (((ins.kind == K_LEA()) && (ins.src == R_RBP()))) {
+    if ((have_lea == 0)) {
+    min_lea = ins.disp;
+    have_lea = 1;
+    } else {
+    if ((ins.disp < min_lea)) {
+    min_lea = ins.disp;
+    }
+    }
+    }
+    s = (s + 1);
+    }
+    ArrayList_i32 slots = make_i32(8);
+    ArrayList_i32 regs = make_i32(8);
+    int32_t ci = 0;
+    while ((ci < len_i32(cands))) {
+    int32_t d = get_i32(cands, ci);
+    int32_t eligible = 0;
+    if ((have_lea == 0)) {
+    eligible = 1;
+    } else {
+    if ((d < min_lea)) {
+    eligible = 1;
+    }
+    }
+    if ((eligible == 1)) {
+    if ((len_i32(slots) < ra_pool_size())) {
+    push_i32((&slots), d);
+    push_i32((&regs), ra_pool(len_i32(regs)));
+    }
+    }
+    ci = (ci + 1);
+    }
+    int32_t k = len_i32(slots);
+    if ((k == 0)) {
+    ra_copy_range((&out), prog, i, (epi + 2));
+    i = (epi + 3);
+    } else {
+    push_Instr((&out), get_Instr(prog, i));
+    push_Instr((&out), get_Instr(prog, (i + 1)));
+    push_Instr((&out), get_Instr(prog, (i + 2)));
+    Instr subins = get_Instr(prog, (i + 3));
+    int32_t frame = ((int32_t)(subins.imm));
+    int32_t framep = frame;
+    if (((k % 2) == 1)) {
+    framep = (frame + 8);
+    }
+    push_Instr((&out), i_sub_imm(R_RSP(), ((int64_t)(framep))));
+    int32_t pj = 0;
+    while ((pj < k)) {
+    push_Instr((&out), i_push(get_i32(regs, pj)));
+    pj = (pj + 1);
+    }
+    int32_t b2 = bstart;
+    while ((b2 < bend)) {
+    Instr bi = get_Instr(prog, b2);
+    int32_t did = 0;
+    if ((((bi.kind == K_STORE()) && (bi.dst == R_RBP())) && (bi.disp < 0))) {
+    int32_t rg = ra_reg_for(slots, regs, bi.disp);
+    if ((rg >= 0)) {
+    push_Instr((&out), i_mov_rr(rg, bi.src));
+    did = 1;
+    }
+    }
+    if (((((did == 0) && (bi.kind == K_LOAD())) && (bi.src == R_RBP())) && (bi.disp < 0))) {
+    int32_t rg2 = ra_reg_for(slots, regs, bi.disp);
+    if ((rg2 >= 0)) {
+    push_Instr((&out), i_mov_rr(bi.dst, rg2));
+    did = 1;
+    }
+    }
+    if ((did == 0)) {
+    push_Instr((&out), bi);
+    }
+    b2 = (b2 + 1);
+    }
+    int32_t rj = 0;
+    while ((rj < k)) {
+    int32_t sd = ((0 - framep) - (8 * (rj + 1)));
+    push_Instr((&out), i_load(get_i32(regs, rj), R_RBP(), sd));
+    rj = (rj + 1);
+    }
+    push_Instr((&out), get_Instr(prog, epi));
+    push_Instr((&out), get_Instr(prog, (epi + 1)));
+    push_Instr((&out), get_Instr(prog, (epi + 2)));
+    i = (epi + 3);
+    }
+    }
+    }
+    }
+    return out;
+}
+static int32_t opt_is_breaker(int32_t k) {
+    if ((k == K_LABEL())) {
+    return 1;
+    }
+    if ((k == K_CALL())) {
+    return 1;
+    }
+    if ((k == K_JMP())) {
+    return 1;
+    }
+    if ((k == K_JE())) {
+    return 1;
+    }
+    if ((k == K_JNE())) {
+    return 1;
+    }
+    if ((k == K_JL())) {
+    return 1;
+    }
+    if ((k == K_JLE())) {
+    return 1;
+    }
+    if ((k == K_JG())) {
+    return 1;
+    }
+    if ((k == K_JGE())) {
+    return 1;
+    }
+    if ((k == K_RET())) {
+    return 1;
+    }
+    if ((k == K_SYSCALL())) {
+    return 1;
+    }
+    return 0;
+}
+static int32_t opt_is_jcc(int32_t k) {
+    if ((k == K_JE())) {
+    return 1;
+    }
+    if ((k == K_JNE())) {
+    return 1;
+    }
+    if ((k == K_JL())) {
+    return 1;
+    }
+    if ((k == K_JLE())) {
+    return 1;
+    }
+    if ((k == K_JG())) {
+    return 1;
+    }
+    if ((k == K_JGE())) {
+    return 1;
+    }
+    return 0;
+}
+static int32_t opt_writes_flags(int32_t k) {
+    if ((k == K_ADD_RR())) {
+    return 1;
+    }
+    if ((k == K_SUB_RR())) {
+    return 1;
+    }
+    if ((k == K_IMUL_RR())) {
+    return 1;
+    }
+    if ((k == K_CMP_RR())) {
+    return 1;
+    }
+    if ((k == K_AND_RR())) {
+    return 1;
+    }
+    if ((k == K_OR_RR())) {
+    return 1;
+    }
+    if ((k == K_XOR_RR())) {
+    return 1;
+    }
+    if ((k == K_ADD_RI())) {
+    return 1;
+    }
+    if ((k == K_SUB_RI())) {
+    return 1;
+    }
+    if ((k == K_CMP_RI())) {
+    return 1;
+    }
+    if ((k == K_NEG())) {
+    return 1;
+    }
+    if ((k == K_IDIV())) {
+    return 1;
+    }
+    if ((k == K_FUCOMI())) {
+    return 1;
+    }
+    return 0;
+}
+static int32_t opt_reads_flags(int32_t k) {
+    if ((k == K_SETCC())) {
+    return 1;
+    }
+    return 0;
+}
+static int32_t opt_fits32(int64_t v) {
+    int64_t lo = (0 - 2147483648);
+    int64_t hi = 2147483647;
+    if ((v < lo)) {
+    return 0;
+    }
+    if ((v > hi)) {
+    return 0;
+    }
+    return 1;
+}
+static int64_t opt_fold(int32_t k, int64_t a, int64_t b) {
+    if ((k == K_ADD_RR())) {
+    return (a + b);
+    }
+    if ((k == K_SUB_RR())) {
+    return (a - b);
+    }
+    if ((k == K_IMUL_RR())) {
+    return (a * b);
+    }
+    return 0;
+}
+static ArrayList_i32 opt_mk16i32(void) {
+    ArrayList_i32 a = make_i32(16);
+    int32_t i = 0;
+    while ((i < 16)) {
+    push_i32((&a), 0);
+    i = (i + 1);
+    }
+    return a;
+}
+static ArrayList_i64 opt_mk16i64(void) {
+    ArrayList_i64 a = make_i64(16);
+    int32_t i = 0;
+    while ((i < 16)) {
+    push_i64((&a), 0);
+    i = (i + 1);
+    }
+    return a;
+}
+static void opt_reset16(ArrayList_i32* known) {
+    int32_t i = 0;
+    while ((i < 16)) {
+    set_i32(known, i, 0);
+    i = (i + 1);
+    }
+}
+static int32_t opt_gap_clean(ArrayList_Instr prog, int32_t p, int32_t q) {
+    int32_t i = (p + 1);
+    while ((i < q)) {
+    Instr ins = get_Instr(prog, i);
+    int32_t k = ins.kind;
+    if ((opt_is_breaker(k) == 1)) {
+    return 0;
+    }
+    if (((k != K_PUSH()) && (k != K_POP()))) {
+    if ((ins.dst == R_RSP())) {
+    return 0;
+    }
+    if ((ins.src == R_RSP())) {
+    return 0;
+    }
+    }
+    i = (i + 1);
+    }
+    return 1;
+}
+static void opt_prescan_matched(ArrayList_Instr prog, int32_t n, ArrayList_i32* matched, ArrayList_i32* pop_of) {
+    ArrayList_i32 stk = make_i32(16);
+    int32_t i = 0;
+    while ((i < n)) {
+    int32_t k = get_Instr(prog, i).kind;
+    if ((opt_is_breaker(k) == 1)) {
+    stk = make_i32(16);
+    } else {
+    if ((k == K_PUSH())) {
+    push_i32((&stk), i);
+    } else {
+    if ((k == K_POP())) {
+    if ((len_i32(stk) > 0)) {
+    int32_t j = pop_i32((&stk));
+    set_i32(matched, j, 1);
+    set_i32(pop_of, j, i);
+    }
+    }
+    }
+    }
+    i = (i + 1);
+    }
+}
+static void opt_prescan_flags(ArrayList_Instr prog, int32_t n, ArrayList_i32* flags_dead) {
+    int32_t live = 0;
+    int32_t i = (n - 1);
+    while ((i >= 0)) {
+    int32_t k = get_Instr(prog, i).kind;
+    if ((opt_is_breaker(k) == 1)) {
+    if ((opt_is_jcc(k) == 1)) {
+    live = 1;
+    } else {
+    live = 0;
+    }
+    } else {
+    int32_t w = opt_writes_flags(k);
+    int32_t r = opt_reads_flags(k);
+    if ((w == 1)) {
+    if ((live == 0)) {
+    set_i32(flags_dead, i, 1);
+    }
+    }
+    if ((r == 1)) {
+    live = 1;
+    } else {
+    if ((w == 1)) {
+    live = 0;
+    }
+    }
+    }
+    i = (i - 1);
+    }
+}
+static void opt_invalidate(ArrayList_i32* known, Instr ins) {
+    int32_t k = ins.kind;
+    if ((k == K_LOAD())) {
+    set_i32(known, ins.dst, 0);
+    return;
+    }
+    if ((k == K_LEA())) {
+    set_i32(known, ins.dst, 0);
+    return;
+    }
+    if ((k == K_NEG())) {
+    set_i32(known, ins.dst, 0);
+    return;
+    }
+    if ((k == K_SETCC())) {
+    set_i32(known, ins.dst, 0);
+    return;
+    }
+    if ((k == K_STORE())) {
+    return;
+    }
+    if ((k == K_IDIV())) {
+    set_i32(known, R_RAX(), 0);
+    set_i32(known, R_RDX(), 0);
+    return;
+    }
+    if ((k == K_FMOVQ_XG())) {
+    set_i32(known, ins.dst, 0);
+    return;
+    }
+    if ((k == K_FTSD2SI())) {
+    set_i32(known, ins.dst, 0);
+    return;
+    }
+    if ((k == K_FMOVQ_GX())) {
+    return;
+    }
+    if ((k == K_FADD())) {
+    return;
+    }
+    if ((k == K_FSUB())) {
+    return;
+    }
+    if ((k == K_FMUL())) {
+    return;
+    }
+    if ((k == K_FDIV())) {
+    return;
+    }
+    if ((k == K_FUCOMI())) {
+    return;
+    }
+    if ((k == K_FSI2SD())) {
+    return;
+    }
+    if ((k == K_FSD2SS())) {
+    return;
+    }
+    if ((k == K_FSS2SD())) {
+    return;
+    }
+    if ((k == K_FXORPS())) {
+    return;
+    }
+    opt_reset16(known);
+}
+static int32_t opt_reads_reg(Instr ins, int32_t r) {
+    int32_t k = ins.kind;
+    int32_t d = ins.dst;
+    int32_t s = ins.src;
+    if ((k == K_MOV_RR())) {
+    if ((s == r)) {
+    return 1;
+    }
+    return 0;
+    }
+    if ((((((((k == K_ADD_RR()) || (k == K_SUB_RR())) || (k == K_IMUL_RR())) || (k == K_AND_RR())) || (k == K_OR_RR())) || (k == K_XOR_RR())) || (k == K_CMP_RR()))) {
+    if ((d == r)) {
+    return 1;
+    }
+    if ((s == r)) {
+    return 1;
+    }
+    return 0;
+    }
+    if (((((k == K_ADD_RI()) || (k == K_SUB_RI())) || (k == K_CMP_RI())) || (k == K_NEG()))) {
+    if ((d == r)) {
+    return 1;
+    }
+    return 0;
+    }
+    if ((k == K_PUSH())) {
+    if ((d == r)) {
+    return 1;
+    }
+    return 0;
+    }
+    if ((k == K_STORE())) {
+    if ((d == r)) {
+    return 1;
+    }
+    if ((s == r)) {
+    return 1;
+    }
+    return 0;
+    }
+    if ((k == K_LOAD())) {
+    if ((s == r)) {
+    return 1;
+    }
+    return 0;
+    }
+    if ((k == K_LEA())) {
+    if ((s == r)) {
+    return 1;
+    }
+    return 0;
+    }
+    if ((k == K_IDIV())) {
+    if ((r == R_RAX())) {
+    return 1;
+    }
+    if ((r == R_RDX())) {
+    return 1;
+    }
+    if ((s == r)) {
+    return 1;
+    }
+    return 0;
+    }
+    if ((k == K_FMOVQ_GX())) {
+    if ((s == r)) {
+    return 1;
+    }
+    return 0;
+    }
+    if ((k == K_FSI2SD())) {
+    if ((s == r)) {
+    return 1;
+    }
+    return 0;
+    }
+    if ((k == K_MOV_IMM())) {
+    return 0;
+    }
+    if ((k == K_POP())) {
+    return 0;
+    }
+    if ((k == K_SETCC())) {
+    return 0;
+    }
+    if ((k == K_FMOVQ_XG())) {
+    return 0;
+    }
+    if ((k == K_FTSD2SI())) {
+    return 0;
+    }
+    if ((k == K_FADD())) {
+    return 0;
+    }
+    if ((k == K_FSUB())) {
+    return 0;
+    }
+    if ((k == K_FMUL())) {
+    return 0;
+    }
+    if ((k == K_FDIV())) {
+    return 0;
+    }
+    if ((k == K_FUCOMI())) {
+    return 0;
+    }
+    if ((k == K_FSD2SS())) {
+    return 0;
+    }
+    if ((k == K_FSS2SD())) {
+    return 0;
+    }
+    if ((k == K_FXORPS())) {
+    return 0;
+    }
+    return 1;
+}
+static int32_t opt_writes_reg(Instr ins, int32_t r) {
+    int32_t k = ins.kind;
+    int32_t d = ins.dst;
+    if (((((((((k == K_MOV_IMM()) || (k == K_MOV_RR())) || (k == K_POP())) || (k == K_LOAD())) || (k == K_LEA())) || (k == K_SETCC())) || (k == K_FMOVQ_XG())) || (k == K_FTSD2SI()))) {
+    if ((d == r)) {
+    return 1;
+    }
+    return 0;
+    }
+    if ((k == K_IDIV())) {
+    if ((r == R_RAX())) {
+    return 1;
+    }
+    if ((r == R_RDX())) {
+    return 1;
+    }
+    return 0;
+    }
+    return 0;
+}
+static int32_t opt_reg_written(Instr ins, int32_t R) {
+    int32_t k = ins.kind;
+    if ((((((((((((((((((k == K_MOV_IMM()) || (k == K_MOV_RR())) || (k == K_ADD_RR())) || (k == K_SUB_RR())) || (k == K_IMUL_RR())) || (k == K_AND_RR())) || (k == K_OR_RR())) || (k == K_XOR_RR())) || (k == K_ADD_RI())) || (k == K_SUB_RI())) || (k == K_POP())) || (k == K_LOAD())) || (k == K_LEA())) || (k == K_NEG())) || (k == K_SETCC())) || (k == K_FMOVQ_XG())) || (k == K_FTSD2SI()))) {
+    if ((ins.dst == R)) {
+    return 1;
+    }
+    return 0;
+    }
+    if ((k == K_IDIV())) {
+    if ((R == R_RAX())) {
+    return 1;
+    }
+    if ((R == R_RDX())) {
+    return 1;
+    }
+    return 0;
+    }
+    if (((((((((((((((k == K_CMP_RR()) || (k == K_CMP_RI())) || (k == K_PUSH())) || (k == K_STORE())) || (k == K_FUCOMI())) || (k == K_FMOVQ_GX())) || (k == K_FSI2SD())) || (k == K_FADD())) || (k == K_FSUB())) || (k == K_FMUL())) || (k == K_FDIV())) || (k == K_FSD2SS())) || (k == K_FSS2SD())) || (k == K_FXORPS()))) {
+    return 0;
+    }
+    return 1;
+}
+static int32_t opt_reg_written_in(ArrayList_Instr prog, int32_t p, int32_t q, int32_t R) {
+    int32_t i = (p + 1);
+    while ((i < q)) {
+    if ((opt_reg_written(get_Instr(prog, i), R) == 1)) {
+    return 1;
+    }
+    i = (i + 1);
+    }
+    return 0;
+}
+static int32_t opt_src_killed_in_run(ArrayList_Instr prog, int32_t op, int32_t src, int32_t n) {
+    int32_t i = (op + 1);
+    int32_t res = 0;
+    int32_t going = 1;
+    while (((going == 1) && (i < n))) {
+    Instr ins = get_Instr(prog, i);
+    if ((opt_is_breaker(ins.kind) == 1)) {
+    going = 0;
+    } else {
+    if ((opt_reads_reg(ins, src) == 1)) {
+    going = 0;
+    } else {
+    if ((opt_writes_reg(ins, src) == 1)) {
+    res = 1;
+    going = 0;
+    }
+    }
+    }
+    i = (i + 1);
+    }
+    return res;
+}
+static ArrayList_Instr opt_fold_pass(ArrayList_Instr prog) {
+    int32_t n = len_Instr(prog);
+    ArrayList_Instr out = make_Instr((n + 16));
+    ArrayList_i32 matched = make_i32((n + 1));
+    ArrayList_i32 pop_of = make_i32((n + 1));
+    ArrayList_i32 flagsd = make_i32((n + 1));
+    int32_t z = 0;
+    while ((z < n)) {
+    push_i32((&matched), 0);
+    push_i32((&pop_of), (0 - 1));
+    push_i32((&flagsd), 0);
+    z = (z + 1);
+    }
+    opt_prescan_matched(prog, n, (&matched), (&pop_of));
+    opt_prescan_flags(prog, n, (&flagsd));
+    ArrayList_i32 known = opt_mk16i32();
+    ArrayList_i64 cval = opt_mk16i64();
+    ArrayList_i32 ms_tag = make_i32(16);
+    ArrayList_i64 ms_val = make_i64(16);
+    int32_t i = 0;
+    while ((i < n)) {
+    Instr ins = get_Instr(prog, i);
+    int32_t k = ins.kind;
+    if ((opt_is_breaker(k) == 1)) {
+    push_Instr((&out), ins);
+    opt_reset16((&known));
+    ms_tag = make_i32(16);
+    ms_val = make_i64(16);
+    } else {
+    if ((k == K_PUSH())) {
+    int32_t r = ins.dst;
+    int32_t done = 0;
+    if ((((done == 0) && (get_i32(matched, i) == 1)) && (get_i32(known, r) == 1))) {
+    if ((opt_gap_clean(prog, i, get_i32(pop_of, i)) == 1)) {
+    push_i32((&ms_tag), 1);
+    push_i64((&ms_val), get_i64(cval, r));
+    done = 1;
+    }
+    }
+    if ((((done == 0) && (get_i32(matched, i) == 1)) && (i > 0))) {
+    Instr prev = get_Instr(prog, (i - 1));
+    if ((((prev.kind == K_MOV_RR()) && (prev.dst == r)) && (prev.src != R_RSP()))) {
+    int32_t q = get_i32(pop_of, i);
+    if (((opt_gap_clean(prog, i, q) == 1) && (opt_reg_written_in(prog, i, q, prev.src) == 0))) {
+    push_i32((&ms_tag), 2);
+    push_i64((&ms_val), ((int64_t)(prev.src)));
+    done = 1;
+    }
+    }
+    }
+    if ((done == 0)) {
+    push_i32((&ms_tag), 0);
+    push_i64((&ms_val), 0);
+    push_Instr((&out), ins);
+    }
+    } else {
+    if ((k == K_POP())) {
+    int32_t r = ins.dst;
+    if ((len_i32(ms_tag) > 0)) {
+    int32_t tag = pop_i32((&ms_tag));
+    int64_t v = pop_i64((&ms_val));
+    if ((tag == 1)) {
+    push_Instr((&out), i_mov_imm(r, v));
+    set_i32((&known), r, 1);
+    set_i64((&cval), r, v);
+    } else {
+    if ((tag == 2)) {
+    push_Instr((&out), i_mov_rr(r, ((int32_t)(v))));
+    set_i32((&known), r, 0);
+    } else {
+    push_Instr((&out), ins);
+    set_i32((&known), r, 0);
+    }
+    }
+    } else {
+    push_Instr((&out), ins);
+    set_i32((&known), r, 0);
+    }
+    } else {
+    if ((((k == K_ADD_RR()) || (k == K_SUB_RR())) || (k == K_IMUL_RR()))) {
+    int32_t d = ins.dst;
+    int32_t s = ins.src;
+    int32_t dk = get_i32(known, d);
+    int32_t sk = get_i32(known, s);
+    if ((((dk == 1) && (sk == 1)) && (get_i32(flagsd, i) == 1))) {
+    int64_t fv = opt_fold(k, get_i64(cval, d), get_i64(cval, s));
+    push_Instr((&out), i_mov_imm(d, fv));
+    set_i32((&known), d, 1);
+    set_i64((&cval), d, fv);
+    } else {
+    if (((((sk == 1) && ((k == K_ADD_RR()) || (k == K_SUB_RR()))) && (opt_fits32(get_i64(cval, s)) == 1)) && (opt_src_killed_in_run(prog, i, s, n) == 1))) {
+    if ((k == K_ADD_RR())) {
+    push_Instr((&out), i_add_imm(d, get_i64(cval, s)));
+    } else {
+    push_Instr((&out), i_sub_imm(d, get_i64(cval, s)));
+    }
+    set_i32((&known), d, 0);
+    } else {
+    push_Instr((&out), ins);
+    set_i32((&known), d, 0);
+    }
+    }
+    } else {
+    if ((((k == K_AND_RR()) || (k == K_OR_RR())) || (k == K_XOR_RR()))) {
+    push_Instr((&out), ins);
+    set_i32((&known), ins.dst, 0);
+    } else {
+    if ((k == K_CMP_RR())) {
+    int32_t d2 = ins.dst;
+    int32_t s2 = ins.src;
+    if ((((get_i32(known, s2) == 1) && (opt_fits32(get_i64(cval, s2)) == 1)) && (opt_src_killed_in_run(prog, i, s2, n) == 1))) {
+    push_Instr((&out), i_cmp_imm(d2, get_i64(cval, s2)));
+    } else {
+    push_Instr((&out), ins);
+    }
+    } else {
+    if ((k == K_MOV_IMM())) {
+    push_Instr((&out), ins);
+    set_i32((&known), ins.dst, 1);
+    set_i64((&cval), ins.dst, ins.imm);
+    } else {
+    if ((k == K_MOV_RR())) {
+    push_Instr((&out), ins);
+    if ((get_i32(known, ins.src) == 1)) {
+    set_i32((&known), ins.dst, 1);
+    set_i64((&cval), ins.dst, get_i64(cval, ins.src));
+    } else {
+    set_i32((&known), ins.dst, 0);
+    }
+    } else {
+    if (((k == K_ADD_RI()) || (k == K_SUB_RI()))) {
+    int32_t d3 = ins.dst;
+    if (((get_i32(known, d3) == 1) && (get_i32(flagsd, i) == 1))) {
+    int64_t nv = get_i64(cval, d3);
+    if ((k == K_ADD_RI())) {
+    nv = (nv + ins.imm);
+    } else {
+    nv = (nv - ins.imm);
+    }
+    push_Instr((&out), i_mov_imm(d3, nv));
+    set_i32((&known), d3, 1);
+    set_i64((&cval), d3, nv);
+    } else {
+    push_Instr((&out), ins);
+    set_i32((&known), d3, 0);
+    }
+    } else {
+    push_Instr((&out), ins);
+    opt_invalidate((&known), ins);
+    }
+    }
+    }
+    }
+    }
+    }
+    }
+    }
+    }
+    i = (i + 1);
+    }
+    return out;
+}
+static ArrayList_Instr opt_dce(ArrayList_Instr prog) {
+    int32_t n = len_Instr(prog);
+    ArrayList_i32 keep = make_i32((n + 1));
+    ArrayList_i32 live = opt_mk16i32();
+    int32_t z = 0;
+    while ((z < n)) {
+    push_i32((&keep), 1);
+    z = (z + 1);
+    }
+    int32_t r0 = 0;
+    while ((r0 < 16)) {
+    set_i32((&live), r0, 1);
+    r0 = (r0 + 1);
+    }
+    int32_t i = (n - 1);
+    while ((i >= 0)) {
+    Instr ins = get_Instr(prog, i);
+    int32_t k = ins.kind;
+    if ((opt_is_breaker(k) == 1)) {
+    int32_t rr = 0;
+    while ((rr < 16)) {
+    set_i32((&live), rr, 1);
+    rr = (rr + 1);
+    }
+    } else {
+    if (((k == K_MOV_IMM()) || (k == K_MOV_RR()))) {
+    int32_t d = ins.dst;
+    if ((get_i32(live, d) == 0)) {
+    set_i32((&keep), i, 0);
+    } else {
+    set_i32((&live), d, 0);
+    if ((k == K_MOV_RR())) {
+    set_i32((&live), ins.src, 1);
+    }
+    }
+    } else {
+    opt_dce_liveness((&live), ins);
+    }
+    }
+    i = (i - 1);
+    }
+    ArrayList_Instr out = make_Instr((n + 1));
+    int32_t j = 0;
+    while ((j < n)) {
+    if ((get_i32(keep, j) == 1)) {
+    push_Instr((&out), get_Instr(prog, j));
+    }
+    j = (j + 1);
+    }
+    return out;
+}
+static void opt_dce_liveness(ArrayList_i32* live, Instr ins) {
+    int32_t k = ins.kind;
+    int32_t d = ins.dst;
+    int32_t s = ins.src;
+    if (((((((k == K_ADD_RR()) || (k == K_SUB_RR())) || (k == K_IMUL_RR())) || (k == K_AND_RR())) || (k == K_OR_RR())) || (k == K_XOR_RR()))) {
+    set_i32(live, d, 0);
+    set_i32(live, d, 1);
+    set_i32(live, s, 1);
+    return;
+    }
+    if ((k == K_CMP_RR())) {
+    set_i32(live, d, 1);
+    set_i32(live, s, 1);
+    return;
+    }
+    if (((k == K_ADD_RI()) || (k == K_SUB_RI()))) {
+    set_i32(live, d, 1);
+    return;
+    }
+    if ((k == K_CMP_RI())) {
+    set_i32(live, d, 1);
+    return;
+    }
+    if ((k == K_PUSH())) {
+    set_i32(live, d, 1);
+    return;
+    }
+    if ((k == K_POP())) {
+    set_i32(live, d, 0);
+    return;
+    }
+    if ((k == K_LOAD())) {
+    set_i32(live, d, 0);
+    set_i32(live, s, 1);
+    return;
+    }
+    if ((k == K_STORE())) {
+    set_i32(live, d, 1);
+    set_i32(live, s, 1);
+    return;
+    }
+    if ((k == K_LEA())) {
+    set_i32(live, d, 0);
+    set_i32(live, s, 1);
+    return;
+    }
+    if ((k == K_NEG())) {
+    set_i32(live, d, 1);
+    return;
+    }
+    if ((k == K_SETCC())) {
+    set_i32(live, d, 0);
+    return;
+    }
+    if ((k == K_IDIV())) {
+    set_i32(live, R_RAX(), 1);
+    set_i32(live, R_RDX(), 1);
+    set_i32(live, s, 1);
+    return;
+    }
+    if ((k == K_FMOVQ_GX())) {
+    set_i32(live, s, 1);
+    return;
+    }
+    if ((k == K_FMOVQ_XG())) {
+    set_i32(live, d, 0);
+    return;
+    }
+    if ((k == K_FSI2SD())) {
+    set_i32(live, s, 1);
+    return;
+    }
+    if ((k == K_FTSD2SI())) {
+    set_i32(live, d, 0);
+    return;
+    }
+    if ((k == K_FADD())) {
+    return;
+    }
+    if ((k == K_FSUB())) {
+    return;
+    }
+    if ((k == K_FMUL())) {
+    return;
+    }
+    if ((k == K_FDIV())) {
+    return;
+    }
+    if ((k == K_FUCOMI())) {
+    return;
+    }
+    if ((k == K_FSD2SS())) {
+    return;
+    }
+    if ((k == K_FSS2SD())) {
+    return;
+    }
+    if ((k == K_FXORPS())) {
+    return;
+    }
+    int32_t r = 0;
+    while ((r < 16)) {
+    set_i32(live, r, 1);
+    r = (r + 1);
+    }
+}
+static ArrayList_Instr optimize(ArrayList_Instr prog) {
+    ArrayList_Instr folded = opt_fold_pass(prog);
+    ArrayList_Instr cleaned = opt_dce(folded);
+    return cleaned;
+}
 static ArrayList_Instr ph_pass(ArrayList_Instr prog, int32_t* changed) {
     int32_t n = len_Instr(prog);
     ArrayList_Instr out = make_Instr((n + 1));
@@ -2060,7 +3536,7 @@ static Node* mk_if(Node* cond, ArrayList_pNode then_body, ArrayList_pNode els_bo
     return ({ Node* __n = (Node*)malloc(sizeof(Node)); *__n = (Node){ .tag = Node_if_, .u = { .if_ = (If){ .cond = cond, .then_body = then_body, .els_body = els_body, .has_els = has_els, .cap = (ZagSliceU8){(const uint8_t*)"", 0}, .has_cap = 0 } } }; __n; });
 }
 static Node* mk_while(Node* cond, ArrayList_pNode body) {
-    return ({ Node* __n = (Node*)malloc(sizeof(Node)); *__n = (Node){ .tag = Node_while_, .u = { .while_ = (While){ .cond = cond, .body = body } } }; __n; });
+    return ({ Node* __n = (Node*)malloc(sizeof(Node)); *__n = (Node){ .tag = Node_while_, .u = { .while_ = (While){ .cond = cond, .body = body, .cap = (ZagSliceU8){(const uint8_t*)"", 0}, .has_cap = 0 } } }; __n; });
 }
 static Node* mk_switch(Node* subject, ArrayList_SwitchArm arms, ArrayList_pNode els_body, int32_t has_els) {
     return ({ Node* __n = (Node*)malloc(sizeof(Node)); *__n = (Node){ .tag = Node_switch_, .u = { .switch_ = (Switch){ .subject = subject, .arms = arms, .els_body = els_body, .has_els = has_els } } }; __n; });
@@ -2915,8 +4391,16 @@ static Node* parse_stmt(Parser* p) {
     Token _o = adv(p);
     Node* cond = parse_expr(p);
     Token _c = adv(p);
+    ZagSliceU8 wcap = (ZagSliceU8){(const uint8_t*)"", 0};
+    int32_t whas_cap = 0;
+    if (at_k(p, Tk_Pipe)) {
+    Token _wp1 = adv(p);
+    wcap = adv(p).val;
+    whas_cap = 1;
+    Token _wp2 = adv(p);
+    }
     ArrayList_pNode body = parse_block(p);
-    return ({ Node* __n = (Node*)malloc(sizeof(Node)); *__n = (Node){ .tag = Node_while_, .u = { .while_ = (While){ .cond = cond, .body = body } } }; __n; });
+    return ({ Node* __n = (Node*)malloc(sizeof(Node)); *__n = (Node){ .tag = Node_while_, .u = { .while_ = (While){ .cond = cond, .body = body, .cap = wcap, .has_cap = whas_cap } } }; __n; });
     }
     Node* e = parse_expr(p);
     if (at_op(p, (ZagSliceU8){(const uint8_t*)"=", 1})) {
@@ -3870,6 +5354,667 @@ static int32_t cg_is_int_text(ZagSliceU8 s) {
     }
     return 1;
 }
+static int32_t cg_is_float_ty(ZagSliceU8 t) {
+    if (_zag_str_eq(t, (ZagSliceU8){(const uint8_t*)"f64", 3})) {
+    return 1;
+    }
+    if (_zag_str_eq(t, (ZagSliceU8){(const uint8_t*)"f32", 3})) {
+    return 1;
+    }
+    return 0;
+}
+static int32_t cg_is_posit_ty(ZagSliceU8 t) {
+    if (_zag_str_eq(t, (ZagSliceU8){(const uint8_t*)"p8", 2})) {
+    return 1;
+    }
+    if (_zag_str_eq(t, (ZagSliceU8){(const uint8_t*)"p16", 3})) {
+    return 1;
+    }
+    if (_zag_str_eq(t, (ZagSliceU8){(const uint8_t*)"p32", 3})) {
+    return 1;
+    }
+    if (_zag_str_eq(t, (ZagSliceU8){(const uint8_t*)"p64", 3})) {
+    return 1;
+    }
+    return 0;
+}
+static ZagSliceU8 cg_posit_op_fn(ZagSliceU8 pty, ZagSliceU8 op) {
+    ZagSliceU8 suf = (ZagSliceU8){(const uint8_t*)"", 0};
+    if (_zag_str_eq(op, (ZagSliceU8){(const uint8_t*)"+", 1})) {
+    suf = (ZagSliceU8){(const uint8_t*)"add", 3};
+    } else {
+    if (_zag_str_eq(op, (ZagSliceU8){(const uint8_t*)"-", 1})) {
+    suf = (ZagSliceU8){(const uint8_t*)"sub", 3};
+    } else {
+    if (_zag_str_eq(op, (ZagSliceU8){(const uint8_t*)"*", 1})) {
+    suf = (ZagSliceU8){(const uint8_t*)"mul", 3};
+    } else {
+    if (_zag_str_eq(op, (ZagSliceU8){(const uint8_t*)"/", 1})) {
+    suf = (ZagSliceU8){(const uint8_t*)"div", 3};
+    } else {
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+    }
+    }
+    }
+    }
+    return _zag_str_concat(_zag_str_concat(_zag_str_concat((ZagSliceU8){(const uint8_t*)"znrt_", 5}, pty), (ZagSliceU8){(const uint8_t*)"_", 1}), suf);
+}
+static ZagSliceU8 cg_posit_builtin_fn(ZagSliceU8 b) {
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"intToPosit", 10})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_p32_from_i64", 17};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"floatToPosit", 12})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_f64_to_p32", 15};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"positToFloat", 12})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_p32_to_f64", 15};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"positToBits", 11})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_p32_bits", 13};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"intToP8", 7})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_p8_from_i64", 16};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"intToP16", 8})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_p16_from_i64", 17};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"intToP64", 8})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_p64_from_i64", 17};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"floatToP8", 9})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_f64_to_p8", 14};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"floatToP16", 10})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_f64_to_p16", 15};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"floatToP64", 10})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_ld_to_p64", 14};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"p8ToFloat", 9})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_p8_to_f64", 14};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"p16ToFloat", 10})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_p16_to_f64", 15};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"p64ToFloat", 10})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_p64_to_f64", 15};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"p8ToBits", 8})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_p8_bits", 12};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"p16ToBits", 9})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_p16_bits", 13};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"p64ToBits", 9})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_p64_bits", 13};
+    }
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+}
+static ZagSliceU8 cg_posit_builtin_ret(ZagSliceU8 b) {
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"intToPosit", 10})) {
+    return (ZagSliceU8){(const uint8_t*)"p32", 3};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"floatToPosit", 12})) {
+    return (ZagSliceU8){(const uint8_t*)"p32", 3};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"intToP8", 7})) {
+    return (ZagSliceU8){(const uint8_t*)"p8", 2};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"floatToP8", 9})) {
+    return (ZagSliceU8){(const uint8_t*)"p8", 2};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"intToP16", 8})) {
+    return (ZagSliceU8){(const uint8_t*)"p16", 3};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"floatToP16", 10})) {
+    return (ZagSliceU8){(const uint8_t*)"p16", 3};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"intToP64", 8})) {
+    return (ZagSliceU8){(const uint8_t*)"p64", 3};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"floatToP64", 10})) {
+    return (ZagSliceU8){(const uint8_t*)"p64", 3};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"positToFloat", 12})) {
+    return (ZagSliceU8){(const uint8_t*)"f64", 3};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"p8ToFloat", 9})) {
+    return (ZagSliceU8){(const uint8_t*)"f64", 3};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"p16ToFloat", 10})) {
+    return (ZagSliceU8){(const uint8_t*)"f64", 3};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"p64ToFloat", 10})) {
+    return (ZagSliceU8){(const uint8_t*)"f64", 3};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"positToBits", 11})) {
+    return (ZagSliceU8){(const uint8_t*)"u64", 3};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"p8ToBits", 8})) {
+    return (ZagSliceU8){(const uint8_t*)"u64", 3};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"p16ToBits", 9})) {
+    return (ZagSliceU8){(const uint8_t*)"u64", 3};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"p64ToBits", 9})) {
+    return (ZagSliceU8){(const uint8_t*)"u64", 3};
+    }
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+}
+static int32_t cg_str_prefix(ZagSliceU8 t, ZagSliceU8 p) {
+    if ((t.len < p.len)) {
+    return 0;
+    }
+    int32_t i = 0;
+    while ((i < p.len)) {
+    if (((t).ptr[i] != (p).ptr[i])) {
+    return 0;
+    }
+    i = (i + 1);
+    }
+    return 1;
+}
+static int32_t cg_all_digits(ZagSliceU8 t, int32_t lo, int32_t hi) {
+    if ((lo >= hi)) {
+    return 0;
+    }
+    int32_t i = lo;
+    while ((i < hi)) {
+    int32_t c = ((int32_t)((t).ptr[i]));
+    if ((c < 48)) {
+    return 0;
+    }
+    if ((c > 57)) {
+    return 0;
+    }
+    i = (i + 1);
+    }
+    return 1;
+}
+static int64_t cg_parse_uint(ZagSliceU8 t, int32_t lo, int32_t hi) {
+    int64_t v = 0;
+    int32_t i = lo;
+    while ((i < hi)) {
+    v = ((v * 10) + (((int64_t)((t).ptr[i])) - 48));
+    i = (i + 1);
+    }
+    return v;
+}
+static int32_t cg_is_sat_ty(ZagSliceU8 t) {
+    if ((cg_str_prefix(t, (ZagSliceU8){(const uint8_t*)"sat_", 4}) == 0)) {
+    return 0;
+    }
+    ZagSliceU8 b = (ZagSliceU8){ (t).ptr + (4), ((t).len) - (4) };
+    if ((((_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"i8", 2}) || _zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"i16", 3})) || _zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"i32", 3})) || _zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"i64", 3}))) {
+    return 1;
+    }
+    if ((((_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"u8", 2}) || _zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"u16", 3})) || _zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"u32", 3})) || _zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"u64", 3}))) {
+    return 1;
+    }
+    return 0;
+}
+static ZagSliceU8 cg_sat_base(ZagSliceU8 t) {
+    return (ZagSliceU8){ (t).ptr + (4), ((t).len) - (4) };
+}
+static int32_t cg_is_fixed_ty(ZagSliceU8 t) {
+    if ((cg_str_prefix(t, (ZagSliceU8){(const uint8_t*)"fixed_", 6}) == 0)) {
+    return 0;
+    }
+    int32_t us = 6;
+    while ((us < t.len)) {
+    if ((((int32_t)((t).ptr[us])) == 95)) {
+    if ((cg_all_digits(t, 6, us) == 0)) {
+    return 0;
+    }
+    if ((cg_all_digits(t, (us + 1), t.len) == 0)) {
+    return 0;
+    }
+    return 1;
+    }
+    us = (us + 1);
+    }
+    return 0;
+}
+static int64_t cg_fixed_frac_bits(ZagSliceU8 t) {
+    int32_t us = 6;
+    while ((us < t.len)) {
+    if ((((int32_t)((t).ptr[us])) == 95)) {
+    return cg_parse_uint(t, (us + 1), t.len);
+    }
+    us = (us + 1);
+    }
+    return 0;
+}
+static int32_t cg_is_arb_int_ty(ZagSliceU8 t) {
+    if ((t.len < 2)) {
+    return 0;
+    }
+    int32_t c0 = ((int32_t)((t).ptr[0]));
+    if (((c0 != 117) && (c0 != 105))) {
+    return 0;
+    }
+    if ((cg_all_digits(t, 1, t.len) == 0)) {
+    return 0;
+    }
+    int64_t n = cg_parse_uint(t, 1, t.len);
+    if ((n < 1)) {
+    return 0;
+    }
+    if ((n > 127)) {
+    return 0;
+    }
+    if (((((n == 8) || (n == 16)) || (n == 32)) || (n == 64))) {
+    return 0;
+    }
+    return 1;
+}
+static int64_t cg_arb_int_bits(ZagSliceU8 t) {
+    return cg_parse_uint(t, 1, t.len);
+}
+static int32_t cg_arb_int_signed(ZagSliceU8 t) {
+    if ((((int32_t)((t).ptr[0])) == 105)) {
+    return 1;
+    }
+    return 0;
+}
+static int64_t cg_arb_mask(int64_t bits) {
+    int64_t m = 0;
+    int64_t i = 0;
+    while ((i < bits)) {
+    m = ((m * 2) + 1);
+    i = (i + 1);
+    }
+    return m;
+}
+static int32_t cg_is_satfixarb_ty(ZagSliceU8 t) {
+    if ((cg_is_sat_ty(t) == 1)) {
+    return 1;
+    }
+    if ((cg_is_fixed_ty(t) == 1)) {
+    return 1;
+    }
+    if ((cg_is_arb_int_ty(t) == 1)) {
+    return 1;
+    }
+    return 0;
+}
+static ZagSliceU8 cg_sat_op_fn(ZagSliceU8 sty, ZagSliceU8 op) {
+    ZagSliceU8 suf = (ZagSliceU8){(const uint8_t*)"", 0};
+    if (_zag_str_eq(op, (ZagSliceU8){(const uint8_t*)"+", 1})) {
+    suf = (ZagSliceU8){(const uint8_t*)"add", 3};
+    } else {
+    if (_zag_str_eq(op, (ZagSliceU8){(const uint8_t*)"-", 1})) {
+    suf = (ZagSliceU8){(const uint8_t*)"sub", 3};
+    } else {
+    if (_zag_str_eq(op, (ZagSliceU8){(const uint8_t*)"*", 1})) {
+    suf = (ZagSliceU8){(const uint8_t*)"mul", 3};
+    } else {
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+    }
+    }
+    }
+    return _zag_str_concat(_zag_str_concat(_zag_str_concat((ZagSliceU8){(const uint8_t*)"znrt_sat_", 9}, cg_sat_base(sty)), (ZagSliceU8){(const uint8_t*)"_", 1}), suf);
+}
+static int32_t cg_is_rns_ty(ZagSliceU8 t) {
+    if (_zag_str_eq(t, (ZagSliceU8){(const uint8_t*)"rns_3", 5})) {
+    return 1;
+    }
+    if (_zag_str_eq(t, (ZagSliceU8){(const uint8_t*)"ZnrtRns", 7})) {
+    return 1;
+    }
+    return 0;
+}
+static int32_t cg_is_quire_ty(ZagSliceU8 t) {
+    if (_zag_str_eq(t, (ZagSliceU8){(const uint8_t*)"quire", 5})) {
+    return 1;
+    }
+    if (_zag_str_eq(t, (ZagSliceU8){(const uint8_t*)"ZnrtQuire", 9})) {
+    return 1;
+    }
+    return 0;
+}
+static ZagSliceU8 cg_rns_op_fn(ZagSliceU8 op) {
+    if (_zag_str_eq(op, (ZagSliceU8){(const uint8_t*)"+", 1})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_rns_add", 12};
+    }
+    if (_zag_str_eq(op, (ZagSliceU8){(const uint8_t*)"-", 1})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_rns_sub", 12};
+    }
+    if (_zag_str_eq(op, (ZagSliceU8){(const uint8_t*)"*", 1})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_rns_mul", 12};
+    }
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+}
+static ZagSliceU8 cg_quire_builtin_fn(ZagSliceU8 b) {
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"quireZero", 9})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_quire_zero", 15};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"quireFMA", 8})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_quire_fma", 14};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"quireToPosit", 12})) {
+    return (ZagSliceU8){(const uint8_t*)"znrt_quire_to_p32", 17};
+    }
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+}
+static ZagSliceU8 cg_quire_builtin_ret(ZagSliceU8 b) {
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"quireZero", 9})) {
+    return (ZagSliceU8){(const uint8_t*)"quire", 5};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"quireFMA", 8})) {
+    return (ZagSliceU8){(const uint8_t*)"quire", 5};
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"quireToPosit", 12})) {
+    return (ZagSliceU8){(const uint8_t*)"p32", 3};
+    }
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+}
+static int32_t cg_ty_is_numeric(ZagSliceU8 t) {
+    ZagSliceU8 s = t;
+    if ((s.len > 1)) {
+    if (((s).ptr[0] == 42)) {
+    s = (ZagSliceU8){ (s).ptr + (1), ((s).len) - (1) };
+    }
+    }
+    if ((cg_is_posit_ty(s) == 1)) {
+    return 1;
+    }
+    if ((cg_is_satfixarb_ty(s) == 1)) {
+    return 1;
+    }
+    return 0;
+}
+static int32_t cg_is_float_text(ZagSliceU8 s) {
+    int32_t i = 0;
+    if ((s.len > 0)) {
+    if (((s).ptr[0] == 45)) {
+    i = 1;
+    } else {
+    if (((s).ptr[0] == 43)) {
+    i = 1;
+    }
+    }
+    }
+    if ((i >= s.len)) {
+    return 0;
+    }
+    int32_t dots = 0;
+    int32_t exps = 0;
+    int32_t digits = 0;
+    while ((i < s.len)) {
+    uint8_t c = (s).ptr[i];
+    if ((c == 95)) {
+    i = (i + 1);
+    } else {
+    if ((c == 46)) {
+    dots = (dots + 1);
+    i = (i + 1);
+    } else {
+    if (((c == 101) || (c == 69))) {
+    exps = (exps + 1);
+    i = (i + 1);
+    if ((i < s.len)) {
+    if ((((s).ptr[i] == 45) || ((s).ptr[i] == 43))) {
+    i = (i + 1);
+    }
+    }
+    } else {
+    if (((c >= 48) && (c <= 57))) {
+    digits = (digits + 1);
+    i = (i + 1);
+    } else {
+    return 0;
+    }
+    }
+    }
+    }
+    }
+    if ((digits == 0)) {
+    return 0;
+    }
+    if ((dots > 1)) {
+    return 0;
+    }
+    if ((exps > 1)) {
+    return 0;
+    }
+    if (((dots == 0) && (exps == 0))) {
+    return 0;
+    }
+    return 1;
+}
+static int64_t cg_i64_max(void) {
+    return 9223372036854775807;
+}
+static int64_t cg_pow2(int32_t k) {
+    int64_t v = 1;
+    int32_t i = 0;
+    while ((i < k)) {
+    v = (v * 2);
+    i = (i + 1);
+    }
+    return v;
+}
+static int64_t cg_sign_bit(void) {
+    return ((0 - cg_i64_max()) - 1);
+}
+static int64_t cg_f64_bits(ZagSliceU8 s, Cg* cg) {
+    int32_t n = s.len;
+    int32_t i = 0;
+    int32_t neg = 0;
+    if ((i < n)) {
+    if (((s).ptr[i] == 45)) {
+    neg = 1;
+    i = 1;
+    } else {
+    if (((s).ptr[i] == 43)) {
+    i = 1;
+    }
+    }
+    }
+    int64_t m = 0;
+    int32_t sigcnt = 0;
+    int32_t fracdigits = 0;
+    int32_t seen_dot = 0;
+    int32_t expval = 0;
+    int32_t done = 0;
+    while (((i < n) && (done == 0))) {
+    uint8_t c = (s).ptr[i];
+    if ((c == 46)) {
+    seen_dot = 1;
+    i = (i + 1);
+    } else {
+    if (((c == 101) || (c == 69))) {
+    i = (i + 1);
+    int32_t esign = 1;
+    if ((i < n)) {
+    if (((s).ptr[i] == 45)) {
+    esign = (0 - 1);
+    i = (i + 1);
+    } else {
+    if (((s).ptr[i] == 43)) {
+    i = (i + 1);
+    }
+    }
+    }
+    int32_t ev = 0;
+    while ((i < n)) {
+    uint8_t ec = (s).ptr[i];
+    if (((ec >= 48) && (ec <= 57))) {
+    ev = ((ev * 10) + (((int32_t)(ec)) - 48));
+    i = (i + 1);
+    } else {
+    i = (i + 1);
+    }
+    }
+    expval = (esign * ev);
+    done = 1;
+    } else {
+    if ((c == 95)) {
+    i = (i + 1);
+    } else {
+    if (((c >= 48) && (c <= 57))) {
+    int32_t d = (((int32_t)(c)) - 48);
+    if ((sigcnt < 18)) {
+    int32_t skip = 0;
+    if ((((m == 0) && (d == 0)) && (seen_dot == 0))) {
+    skip = 1;
+    }
+    if ((skip == 0)) {
+    m = ((m * 10) + ((int64_t)(d)));
+    sigcnt = (sigcnt + 1);
+    if ((seen_dot == 1)) {
+    fracdigits = (fracdigits + 1);
+    }
+    }
+    } else {
+    if ((seen_dot == 0)) {
+    expval = (expval + 1);
+    }
+    }
+    i = (i + 1);
+    } else {
+    i = (i + 1);
+    }
+    }
+    }
+    }
+    }
+    if ((m == 0)) {
+    if ((neg == 1)) {
+    return cg_sign_bit();
+    }
+    return 0;
+    }
+    int32_t dexp = (expval - fracdigits);
+    int64_t imax = cg_i64_max();
+    int64_t num = m;
+    int64_t den = 1;
+    if ((dexp >= 0)) {
+    int32_t k = 0;
+    while ((k < dexp)) {
+    if ((num > (imax / 10))) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: float literal magnitude out of supported range", 54});
+    return 0;
+    }
+    num = (num * 10);
+    k = (k + 1);
+    }
+    } else {
+    int32_t k2 = 0;
+    int32_t kk = (0 - dexp);
+    while ((k2 < kk)) {
+    if ((den > (imax / 10))) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: float literal magnitude out of supported range", 54});
+    return 0;
+    }
+    den = (den * 10);
+    k2 = (k2 + 1);
+    }
+    }
+    int64_t intq = (num / den);
+    int64_t rem = (num - (intq * den));
+    int64_t sig = 0;
+    int32_t e2 = 0;
+    int32_t need = 54;
+    int32_t sticky = 0;
+    if ((intq > 0)) {
+    int32_t nb = 0;
+    int64_t t = intq;
+    while ((t > 0)) {
+    nb = (nb + 1);
+    t = (t / 2);
+    }
+    e2 = (nb - 1);
+    if ((nb <= need)) {
+    sig = intq;
+    int32_t bc = nb;
+    while ((bc < need)) {
+    rem = (rem * 2);
+    int64_t bit = 0;
+    if ((rem >= den)) {
+    bit = 1;
+    rem = (rem - den);
+    }
+    sig = ((sig * 2) + bit);
+    bc = (bc + 1);
+    }
+    } else {
+    int32_t drop = (nb - need);
+    int64_t p2 = cg_pow2(drop);
+    if (((intq - ((intq / p2) * p2)) != 0)) {
+    sticky = 1;
+    }
+    sig = (intq / p2);
+    if ((rem != 0)) {
+    sticky = 1;
+    }
+    }
+    } else {
+    int32_t pos = 0;
+    int32_t found = 0;
+    while ((found == 0)) {
+    rem = (rem * 2);
+    int64_t bit2 = 0;
+    if ((rem >= den)) {
+    bit2 = 1;
+    rem = (rem - den);
+    }
+    pos = (pos + 1);
+    if ((bit2 == 1)) {
+    found = 1;
+    }
+    }
+    e2 = (0 - pos);
+    sig = 1;
+    int32_t bc2 = 1;
+    while ((bc2 < need)) {
+    rem = (rem * 2);
+    int64_t bit3 = 0;
+    if ((rem >= den)) {
+    bit3 = 1;
+    rem = (rem - den);
+    }
+    sig = ((sig * 2) + bit3);
+    bc2 = (bc2 + 1);
+    }
+    }
+    if ((rem != 0)) {
+    sticky = 1;
+    }
+    int64_t roundbit = (sig - ((sig / 2) * 2));
+    int64_t sig53 = (sig / 2);
+    if ((roundbit == 1)) {
+    int64_t lsb = (sig53 - ((sig53 / 2) * 2));
+    if (((sticky == 1) || (lsb == 1))) {
+    sig53 = (sig53 + 1);
+    if ((sig53 == cg_pow2(53))) {
+    sig53 = (sig53 / 2);
+    e2 = (e2 + 1);
+    }
+    }
+    }
+    int32_t expfield = (e2 + 1023);
+    if ((expfield <= 0)) {
+    if ((neg == 1)) {
+    return cg_sign_bit();
+    }
+    return 0;
+    }
+    if ((expfield >= 2047)) {
+    int64_t inf = (((int64_t)(2047)) * cg_pow2(52));
+    if ((neg == 1)) {
+    return (inf + cg_sign_bit());
+    }
+    return inf;
+    }
+    int64_t mant = (sig53 - ((sig53 / cg_pow2(52)) * cg_pow2(52)));
+    int64_t bits = ((((int64_t)(expfield)) * cg_pow2(52)) + mant);
+    if ((neg == 1)) {
+    bits = (bits + cg_sign_bit());
+    }
+    return bits;
+}
 static ZagSliceU8 cg_mangle_targ(ZagSliceU8 t) {
     ArrayList_u8 buf = make_u8(8);
     int32_t i = 0;
@@ -3952,6 +6097,12 @@ static ZagSliceU8 cg_norm_type(ZagSliceU8 t) {
     return _zag_str_concat((ZagSliceU8){(const uint8_t*)"*", 1}, cg_norm_type((ZagSliceU8){ (t).ptr + (1), ((t).len) - (1) }));
     }
     }
+    if (_zag_str_eq(t, (ZagSliceU8){(const uint8_t*)"rns_3", 5})) {
+    return (ZagSliceU8){(const uint8_t*)"ZnrtRns", 7};
+    }
+    if (_zag_str_eq(t, (ZagSliceU8){(const uint8_t*)"quire", 5})) {
+    return (ZagSliceU8){(const uint8_t*)"ZnrtQuire", 9};
+    }
     if (is_generic_app(t)) {
     int32_t lb = index_of(t, 91);
     ZagSliceU8 base = (ZagSliceU8){ (t).ptr + (0), (lb) - (0) };
@@ -4013,7 +6164,7 @@ static SwitchArm cg_clone_arm(SwitchArm a, ArrayList__u8 tp, ArrayList__u8 ta) {
     return (SwitchArm){ .tags = a.tags, .cap = a.cap, .has_cap = a.has_cap, .body = cg_clone_block(a.body, tp, ta) };
 }
 static Node* cg_clone_stmt(Node* n, ArrayList__u8 tp, ArrayList__u8 ta) {
-    return ({ __auto_type __sw = (*n); (__sw.tag == Node_let_) ? ({ __auto_type l = __sw.u.let_; (mk_let(l.name, cg_subst_type(l.dty, tp, ta), l.has_dty, cg_clone_expr(l.expr, tp, ta))); }) : (__sw.tag == Node_ret) ? ({ __auto_type r = __sw.u.ret; (mk_ret(r.has_expr, cg_clone_expr(r.expr, tp, ta))); }) : (__sw.tag == Node_if_) ? ({ __auto_type x = __sw.u.if_; (mk_if(cg_clone_expr(x.cond, tp, ta), cg_clone_block(x.then_body, tp, ta), cg_clone_block(x.els_body, tp, ta), x.has_els)); }) : (__sw.tag == Node_while_) ? ({ __auto_type w = __sw.u.while_; (mk_while(cg_clone_expr(w.cond, tp, ta), cg_clone_block(w.body, tp, ta))); }) : (__sw.tag == Node_assign) ? ({ __auto_type a = __sw.u.assign; (mk_assign(cg_clone_expr(a.target, tp, ta), cg_clone_expr(a.expr, tp, ta))); }) : (__sw.tag == Node_estmt) ? ({ __auto_type e = __sw.u.estmt; (mk_estmt(cg_clone_expr(e.expr, tp, ta))); }) : (__sw.tag == Node_switch_) ? ({ __auto_type sw = __sw.u.switch_; (cg_clone_switch(sw, tp, ta)); }) : (n); });
+    return ({ __auto_type __sw = (*n); (__sw.tag == Node_let_) ? ({ __auto_type l = __sw.u.let_; (mk_let(l.name, cg_subst_type(l.dty, tp, ta), l.has_dty, cg_clone_expr(l.expr, tp, ta))); }) : (__sw.tag == Node_ret) ? ({ __auto_type r = __sw.u.ret; (mk_ret(r.has_expr, cg_clone_expr(r.expr, tp, ta))); }) : (__sw.tag == Node_if_) ? ({ __auto_type x = __sw.u.if_; (({ Node* __n = (Node*)malloc(sizeof(Node)); *__n = (Node){ .tag = Node_if_, .u = { .if_ = (If){ .cond = cg_clone_expr(x.cond, tp, ta), .then_body = cg_clone_block(x.then_body, tp, ta), .els_body = cg_clone_block(x.els_body, tp, ta), .has_els = x.has_els, .cap = x.cap, .has_cap = x.has_cap } } }; __n; })); }) : (__sw.tag == Node_while_) ? ({ __auto_type w = __sw.u.while_; (({ Node* __n = (Node*)malloc(sizeof(Node)); *__n = (Node){ .tag = Node_while_, .u = { .while_ = (While){ .cond = cg_clone_expr(w.cond, tp, ta), .body = cg_clone_block(w.body, tp, ta), .cap = w.cap, .has_cap = w.has_cap } } }; __n; })); }) : (__sw.tag == Node_assign) ? ({ __auto_type a = __sw.u.assign; (mk_assign(cg_clone_expr(a.target, tp, ta), cg_clone_expr(a.expr, tp, ta))); }) : (__sw.tag == Node_estmt) ? ({ __auto_type e = __sw.u.estmt; (mk_estmt(cg_clone_expr(e.expr, tp, ta))); }) : (__sw.tag == Node_switch_) ? ({ __auto_type sw = __sw.u.switch_; (cg_clone_switch(sw, tp, ta)); }) : (n); });
 }
 static Node* cg_clone_switch(Switch sw, ArrayList__u8 tp, ArrayList__u8 ta) {
     ArrayList_SwitchArm arms = make_SwitchArm(4);
@@ -4749,9 +6900,71 @@ static int32_t cg_type_is_struct(Cg* cg, ZagSliceU8 ty) {
     StructDecl sd = (StructDecl){ .name = (ZagSliceU8){(const uint8_t*)"", 0}, .fields = make_Param(1), .tparams = make__u8(1) };
     return cg_find_struct(cg, ty, (&sd));
 }
+static ZagSliceU8 cg_slice_elem(ZagSliceU8 ty) {
+    if ((ty.len < 3)) {
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+    }
+    if (((ty).ptr[0] != 91)) {
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+    }
+    if (((ty).ptr[1] != 93)) {
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+    }
+    return (ZagSliceU8){ (ty).ptr + (2), ((ty).len) - (2) };
+}
+static int32_t cg_is_word_int_elem(ZagSliceU8 e) {
+    if (((_zag_str_eq(e, (ZagSliceU8){(const uint8_t*)"i16", 3}) || _zag_str_eq(e, (ZagSliceU8){(const uint8_t*)"i32", 3})) || _zag_str_eq(e, (ZagSliceU8){(const uint8_t*)"i64", 3}))) {
+    return 1;
+    }
+    if (((_zag_str_eq(e, (ZagSliceU8){(const uint8_t*)"u16", 3}) || _zag_str_eq(e, (ZagSliceU8){(const uint8_t*)"u32", 3})) || _zag_str_eq(e, (ZagSliceU8){(const uint8_t*)"u64", 3}))) {
+    return 1;
+    }
+    return 0;
+}
 static int32_t cg_type_is_slice(Cg* cg, ZagSliceU8 ty) {
     int32_t _u = (*cg).err;
-    return _zag_str_eq(ty, (ZagSliceU8){(const uint8_t*)"[]u8", 4});
+    if (_zag_str_eq(ty, (ZagSliceU8){(const uint8_t*)"[]u8", 4})) {
+    return 1;
+    }
+    if (_zag_str_eq(ty, (ZagSliceU8){(const uint8_t*)"[]i8", 4})) {
+    return 1;
+    }
+    ZagSliceU8 e = cg_slice_elem(ty);
+    if ((e.len == 0)) {
+    return 0;
+    }
+    if ((cg_is_posit_ty(e) == 1)) {
+    return 1;
+    }
+    if ((cg_is_satfixarb_ty(e) == 1)) {
+    return 1;
+    }
+    if ((cg_is_word_int_elem(e) == 1)) {
+    return 1;
+    }
+    return 0;
+}
+static int32_t cg_slice_is_word(ZagSliceU8 ty) {
+    if (_zag_str_eq(ty, (ZagSliceU8){(const uint8_t*)"[]u8", 4})) {
+    return 0;
+    }
+    if (_zag_str_eq(ty, (ZagSliceU8){(const uint8_t*)"[]i8", 4})) {
+    return 0;
+    }
+    ZagSliceU8 e = cg_slice_elem(ty);
+    if ((e.len == 0)) {
+    return 0;
+    }
+    if ((cg_is_posit_ty(e) == 1)) {
+    return 1;
+    }
+    if ((cg_is_satfixarb_ty(e) == 1)) {
+    return 1;
+    }
+    if ((cg_is_word_int_elem(e) == 1)) {
+    return 1;
+    }
+    return 0;
 }
 static int32_t cg_type_is_opt(Cg* cg, ZagSliceU8 ty) {
     int32_t _u = (*cg).err;
@@ -5046,6 +7259,14 @@ static int32_t cg_type_words(Cg* cg, ZagSliceU8 ty) {
     return 1;
 }
 static void cg_scan_rectype(ScanCtx* sc, ZagSliceU8 name, ZagSliceU8 ty) {
+    int32_t i = 0;
+    while ((i < len__u8((*sc).names))) {
+    if (_zag_str_eq(get__u8((*sc).names, i), name)) {
+    set__u8((&(*sc).types), i, ty);
+    return;
+    }
+    i = (i + 1);
+    }
     push__u8((&(*sc).names), name);
     push__u8((&(*sc).types), ty);
 }
@@ -5149,6 +7370,9 @@ static ZagSliceU8 cg_scan_typeof(ScanCtx* sc, Cg* cg, Node* n) {
     if (_zag_str_eq(f.fname, (ZagSliceU8){(const uint8_t*)"val", 3})) {
     return cg_norm_type((ZagSliceU8){ (obt1).ptr + (1), ((obt1).len) - (1) });
     }
+    if (_zag_str_eq(f.fname, (ZagSliceU8){(const uint8_t*)"?", 1})) {
+    return cg_norm_type((ZagSliceU8){ (obt1).ptr + (1), ((obt1).len) - (1) });
+    }
     return (ZagSliceU8){(const uint8_t*)"", 0};
     }
     ZagSliceU8 sname = obt0;
@@ -5179,6 +7403,15 @@ static ZagSliceU8 cg_scan_typeof(ScanCtx* sc, Cg* cg, Node* n) {
     case Node_id:
     {
         __auto_type cid = __sw.u.id;
+    if ((cid.name.len > 0)) {
+    if (((cid.name).ptr[0] == 64)) {
+    ZagSliceU8 qr = cg_quire_builtin_ret((ZagSliceU8){ (cid.name).ptr + (1), ((cid.name).len) - (1) });
+    if ((qr.len > 0)) {
+    return cg_norm_type(qr);
+    }
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+    }
+    }
     if ((cg_is_native_rt(cid.name) == 1)) {
     return cg_native_rt_ret(cid.name);
     }
@@ -5203,6 +7436,20 @@ static ZagSliceU8 cg_scan_typeof(ScanCtx* sc, Cg* cg, Node* n) {
     }
     }
     }
+        break;
+    }
+    case Node_bin:
+    {
+        __auto_type b = __sw.u.bin;
+    ZagSliceU8 lt = cg_scan_typeof(sc, cg, b.l);
+    if ((cg_is_rns_ty(lt) == 1)) {
+    return cg_norm_type(lt);
+    }
+    ZagSliceU8 rt = cg_scan_typeof(sc, cg, b.r);
+    if ((cg_is_rns_ty(rt) == 1)) {
+    return cg_norm_type(rt);
+    }
+    return (ZagSliceU8){(const uint8_t*)"", 0};
         break;
     }
     default:
@@ -5232,6 +7479,20 @@ static void cg_scan_call(Cg* cg, ScanCtx* sc, Call c) {
     }
     if ((fname.len > 0)) {
     if (((fname).ptr[0] == 64)) {
+    ZagSliceU8 qbf = cg_quire_builtin_fn((ZagSliceU8){ (fname).ptr + (1), ((fname).len) - (1) });
+    if ((qbf.len > 0)) {
+    int32_t qw = cg_agg_words(cg, (ZagSliceU8){(const uint8_t*)"ZnrtQuire", 9});
+    (*(*sc).words) = ((*(*sc).words) + qw);
+    int32_t ai = 0;
+    while ((ai < len_pNode(c.args))) {
+    ZagSliceU8 at = cg_scan_typeof(sc, cg, get_pNode(c.args, ai));
+    if ((cg_type_is_agg(cg, at) == 1)) {
+    (*(*sc).words) = ((*(*sc).words) + cg_agg_words(cg, at));
+    }
+    (*(*sc).words) = ((*(*sc).words) + 1);
+    ai = (ai + 1);
+    }
+    }
     return;
     }
     }
@@ -5378,6 +7639,12 @@ static void cg_scan_expr(Cg* cg, ScanCtx* sc, Node* n) {
     if (_zag_str_eq(b.op, (ZagSliceU8){(const uint8_t*)"orelse", 6})) {
     (*(*sc).words) = ((*(*sc).words) + 4);
     }
+    ZagSliceU8 blt = cg_scan_typeof(sc, cg, b.l);
+    ZagSliceU8 brt = cg_scan_typeof(sc, cg, b.r);
+    if (((cg_is_rns_ty(blt) == 1) || (cg_is_rns_ty(brt) == 1))) {
+    int32_t rw = cg_agg_words(cg, (ZagSliceU8){(const uint8_t*)"ZnrtRns", 7});
+    (*(*sc).words) = (((((*(*sc).words) + rw) + rw) + rw) + 2);
+    }
     cg_scan_expr(cg, sc, b.l);
     cg_scan_expr(cg, sc, b.r);
         break;
@@ -5391,6 +7658,9 @@ static void cg_scan_expr(Cg* cg, ScanCtx* sc, Node* n) {
     case Node_fld:
     {
         __auto_type f = __sw.u.fld;
+    if (_zag_str_eq(f.fname, (ZagSliceU8){(const uint8_t*)"?", 1})) {
+    (*(*sc).words) = ((*(*sc).words) + 4);
+    }
     cg_scan_expr(cg, sc, f.base);
         break;
     }
@@ -5473,6 +7743,12 @@ static void cg_scan_body(Cg* cg, ScanCtx* sc, ArrayList_pNode body) {
     if ((cg_type_is_agg(cg, lty) == 1)) {
     (*(*sc).words) = ((*(*sc).words) + 1);
     }
+    if ((cg_is_rns_ty(lty) == 1)) {
+    ZagSliceU8 rt0 = cg_scan_typeof(sc, cg, l.expr);
+    if ((cg_type_is_agg(cg, rt0) == 0)) {
+    (*(*sc).words) = (((*(*sc).words) + cg_agg_words(cg, (ZagSliceU8){(const uint8_t*)"ZnrtRns", 7})) + 1);
+    }
+    }
     cg_scan_expr(cg, sc, l.expr);
         break;
     }
@@ -5518,6 +7794,21 @@ static void cg_scan_body(Cg* cg, ScanCtx* sc, ArrayList_pNode body) {
     {
         __auto_type iff = __sw.u.if_;
     cg_scan_expr(cg, sc, iff.cond);
+    if ((iff.has_cap == 1)) {
+    (*(*sc).words) = ((*(*sc).words) + 4);
+    (*(*sc).words) = ((*(*sc).words) + 1);
+    ZagSliceU8 ct = cg_scan_typeof(sc, cg, iff.cond);
+    if ((ct.len > 1)) {
+    if (((ct).ptr[0] == 63)) {
+    ZagSliceU8 inner = (ZagSliceU8){ (ct).ptr + (1), ((ct).len) - (1) };
+    if ((cg_type_is_agg(cg, cg_norm_type(inner)) == 1)) {
+    cg_scan_rectype(sc, iff.cap, _zag_str_concat((ZagSliceU8){(const uint8_t*)"*", 1}, inner));
+    } else {
+    cg_scan_rectype(sc, iff.cap, inner);
+    }
+    }
+    }
+    }
     cg_scan_body(cg, sc, iff.then_body);
     if ((iff.has_els == 1)) {
     cg_scan_body(cg, sc, iff.els_body);
@@ -5528,6 +7819,21 @@ static void cg_scan_body(Cg* cg, ScanCtx* sc, ArrayList_pNode body) {
     {
         __auto_type w2 = __sw.u.while_;
     cg_scan_expr(cg, sc, w2.cond);
+    if ((w2.has_cap == 1)) {
+    (*(*sc).words) = ((*(*sc).words) + 4);
+    (*(*sc).words) = ((*(*sc).words) + 1);
+    ZagSliceU8 ct = cg_scan_typeof(sc, cg, w2.cond);
+    if ((ct.len > 1)) {
+    if (((ct).ptr[0] == 63)) {
+    ZagSliceU8 inner = (ZagSliceU8){ (ct).ptr + (1), ((ct).len) - (1) };
+    if ((cg_type_is_agg(cg, cg_norm_type(inner)) == 1)) {
+    cg_scan_rectype(sc, w2.cap, _zag_str_concat((ZagSliceU8){(const uint8_t*)"*", 1}, inner));
+    } else {
+    cg_scan_rectype(sc, w2.cap, inner);
+    }
+    }
+    }
+    }
     cg_scan_body(cg, sc, w2.body);
         break;
     }
@@ -5804,6 +8110,26 @@ static ZagSliceU8 cg_expr_type(Node* n, Env* env, ArrayList_FnSym syms, Cg* cg) 
         __auto_type cid = __sw.u.id;
     if ((cid.name.len > 0)) {
     if (((cid.name).ptr[0] == 64)) {
+    if (_zag_str_eq(cid.name, (ZagSliceU8){(const uint8_t*)"@intToFloat", 11})) {
+    return (ZagSliceU8){(const uint8_t*)"f64", 3};
+    }
+    if (_zag_str_eq(cid.name, (ZagSliceU8){(const uint8_t*)"@floatToInt", 11})) {
+    return (ZagSliceU8){(const uint8_t*)"i32", 3};
+    }
+    if (_zag_str_eq(cid.name, (ZagSliceU8){(const uint8_t*)"@floatCast", 10})) {
+    if ((len_pNode(c.args) == 1)) {
+    return cg_expr_type(get_pNode(c.args, 0), env, syms, cg);
+    }
+    return (ZagSliceU8){(const uint8_t*)"f64", 3};
+    }
+    ZagSliceU8 pr = cg_posit_builtin_ret((ZagSliceU8){ (cid.name).ptr + (1), ((cid.name).len) - (1) });
+    if ((pr.len > 0)) {
+    return pr;
+    }
+    ZagSliceU8 qr = cg_quire_builtin_ret((ZagSliceU8){ (cid.name).ptr + (1), ((cid.name).len) - (1) });
+    if ((qr.len > 0)) {
+    return cg_norm_type(qr);
+    }
     return (ZagSliceU8){(const uint8_t*)"", 0};
     }
     }
@@ -5848,6 +8174,9 @@ static ZagSliceU8 cg_expr_type(Node* n, Env* env, ArrayList_FnSym syms, Cg* cg) 
     return (ZagSliceU8){(const uint8_t*)"i32", 3};
     }
     if (_zag_str_eq(f.fname, (ZagSliceU8){(const uint8_t*)"val", 3})) {
+    return cg_norm_type((ZagSliceU8){ (obt1).ptr + (1), ((obt1).len) - (1) });
+    }
+    if (_zag_str_eq(f.fname, (ZagSliceU8){(const uint8_t*)"?", 1})) {
     return cg_norm_type((ZagSliceU8){ (obt1).ptr + (1), ((obt1).len) - (1) });
     }
     return (ZagSliceU8){(const uint8_t*)"", 0};
@@ -5897,7 +8226,7 @@ static ZagSliceU8 cg_expr_type(Node* n, Env* env, ArrayList_FnSym syms, Cg* cg) 
         __auto_type ix = __sw.u.idx;
     ZagSliceU8 bt3 = cg_expr_type(ix.base, env, syms, cg);
     if ((cg_type_is_slice(cg, bt3) == 1)) {
-    return (ZagSliceU8){(const uint8_t*)"u8", 2};
+    return cg_slice_elem(bt3);
     }
     if ((bt3.len > 1)) {
     if (((bt3).ptr[0] == 42)) {
@@ -5945,6 +8274,69 @@ static ZagSliceU8 cg_expr_type(Node* n, Env* env, ArrayList_FnSym syms, Cg* cg) 
     return (ZagSliceU8){(const uint8_t*)"[]u8", 4};
     }
     return (ZagSliceU8){(const uint8_t*)"", 0};
+        break;
+    }
+    case Node_ilit:
+    {
+        __auto_type x = __sw.u.ilit;
+    if ((cg_is_float_text(x.text) == 1)) {
+    return (ZagSliceU8){(const uint8_t*)"f64", 3};
+    }
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+        break;
+    }
+    case Node_un:
+    {
+        __auto_type u = __sw.u.un;
+    if (_zag_str_eq(u.op, (ZagSliceU8){(const uint8_t*)"-", 1})) {
+    return cg_expr_type(u.e, env, syms, cg);
+    }
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+        break;
+    }
+    case Node_bin:
+    {
+        __auto_type b = __sw.u.bin;
+    if ((cg_is_cmp_op(b.op) == 1)) {
+    return (ZagSliceU8){(const uint8_t*)"i32", 3};
+    }
+    if ((_zag_str_eq(b.op, (ZagSliceU8){(const uint8_t*)"&&", 2}) || _zag_str_eq(b.op, (ZagSliceU8){(const uint8_t*)"||", 2}))) {
+    return (ZagSliceU8){(const uint8_t*)"i32", 3};
+    }
+    if (_zag_str_eq(b.op, (ZagSliceU8){(const uint8_t*)"orelse", 6})) {
+    ZagSliceU8 oaty = cg_expr_type(b.l, env, syms, cg);
+    if (((oaty.len > 1) && ((oaty).ptr[0] == 63))) {
+    return cg_norm_type((ZagSliceU8){ (oaty).ptr + (1), ((oaty).len) - (1) });
+    }
+    return oaty;
+    }
+    ZagSliceU8 lt = cg_expr_type(b.l, env, syms, cg);
+    if ((cg_is_float_ty(lt) == 1)) {
+    return lt;
+    }
+    ZagSliceU8 rt = cg_expr_type(b.r, env, syms, cg);
+    if ((cg_is_float_ty(rt) == 1)) {
+    return rt;
+    }
+    if ((cg_is_satfixarb_ty(lt) == 1)) {
+    return lt;
+    }
+    if ((cg_is_satfixarb_ty(rt) == 1)) {
+    return rt;
+    }
+    if ((cg_is_posit_ty(lt) == 1)) {
+    return lt;
+    }
+    if ((cg_is_posit_ty(rt) == 1)) {
+    return rt;
+    }
+    if ((cg_is_rns_ty(lt) == 1)) {
+    return cg_norm_type(lt);
+    }
+    if ((cg_is_rns_ty(rt) == 1)) {
+    return cg_norm_type(rt);
+    }
+    return lt;
         break;
     }
     default:
@@ -6014,6 +8406,16 @@ static void cg_lower_addr(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     obt = (ZagSliceU8){ (obt).ptr + (1), ((obt).len) - (1) };
     }
     if ((cg_type_is_opt(cg, obt) == 1)) {
+    if (_zag_str_eq(f.fname, (ZagSliceU8){(const uint8_t*)"?", 1})) {
+    ZagSliceU8 aty = obt;
+    int32_t onf = cg_agg_words(cg, aty);
+    int32_t blk = cg_slot_scratch_n(env, onf);
+    int32_t ps = cg_pslot_for_frame(out, blk, env);
+    cg_store_opt_into(out, ps, 0, aty, f.base, env, syms, cg);
+    push_Instr(out, i_load(R_RAX(), R_RBP(), (blk + 8)));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
     int32_t ooff = (0 - 1);
     if (_zag_str_eq(f.fname, (ZagSliceU8){(const uint8_t*)"has", 3})) {
     ooff = 0;
@@ -6023,7 +8425,7 @@ static void cg_lower_addr(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     }
     }
     if ((ooff < 0)) {
-    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: optional has only .has / .val fields", 44});
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: optional has only .has / .val / .? fields", 49});
     push_Instr(out, i_mov_imm(R_RAX(), 0));
     push_Instr(out, i_push(R_RAX()));
     return;
@@ -6082,6 +8484,10 @@ static void cg_lower_addr(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     return;
     }
     if ((cg_type_is_slice(cg, ixt) == 1)) {
+    int32_t wstride = 1;
+    if ((cg_slice_is_word(ixt) == 1)) {
+    wstride = 8;
+    }
     cg_push_base_addr(out, ix.base, env, syms, cg);
     push_Instr(out, i_pop(R_RAX()));
     push_Instr(out, i_load(R_RAX(), R_RAX(), 0));
@@ -6089,6 +8495,10 @@ static void cg_lower_addr(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     cg_lower_expr(out, ix.idx, env, syms, cg);
     push_Instr(out, i_pop(R_RCX()));
     push_Instr(out, i_pop(R_RAX()));
+    if ((wstride != 1)) {
+    push_Instr(out, i_mov_imm(R_RDX(), ((int64_t)(wstride))));
+    push_Instr(out, i_imul(R_RCX(), R_RDX()));
+    }
     push_Instr(out, i_add(R_RAX(), R_RCX()));
     push_Instr(out, i_push(R_RAX()));
     return;
@@ -6115,11 +8525,19 @@ static void cg_lower_expr(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     case Node_ilit:
     {
         __auto_type x = __sw.u.ilit;
-    if ((cg_is_int_text(x.text) == 0)) {
-    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: non-integer literal (float/hex) unsupported", 51});
-    }
+    if ((cg_is_int_text(x.text) == 1)) {
     push_Instr(out, i_mov_imm(R_RAX(), cg_parse_i64(x.text)));
     push_Instr(out, i_push(R_RAX()));
+    } else {
+    if ((cg_is_float_text(x.text) == 1)) {
+    push_Instr(out, i_mov_imm(R_RAX(), cg_f64_bits(x.text, cg)));
+    push_Instr(out, i_push(R_RAX()));
+    } else {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: unsupported numeric literal (hex/binary/malformed)", 58});
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    }
+    }
         break;
     }
     case Node_id:
@@ -6157,7 +8575,12 @@ static void cg_lower_expr(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     if (_zag_str_eq(u.op, (ZagSliceU8){(const uint8_t*)"-", 1})) {
     cg_lower_expr(out, u.e, env, syms, cg);
     push_Instr(out, i_pop(R_RAX()));
+    if ((cg_is_float_ty(cg_expr_type(u.e, env, syms, cg)) == 1)) {
+    push_Instr(out, i_mov_imm(R_RCX(), cg_sign_bit()));
+    push_Instr(out, i_xor(R_RAX(), R_RCX()));
+    } else {
     push_Instr(out, i_neg(R_RAX()));
+    }
     push_Instr(out, i_push(R_RAX()));
     } else {
     if (_zag_str_eq(u.op, (ZagSliceU8){(const uint8_t*)"!", 1})) {
@@ -6192,7 +8615,24 @@ static void cg_lower_expr(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     case Node_cast_:
     {
         __auto_type cst = __sw.u.cast_;
+    ZagSliceU8 stp = cg_expr_type(cst.expr, env, syms, cg);
+    ZagSliceU8 ttp = cg_norm_type(cst.target);
+    int32_t sf = cg_is_float_ty(stp);
+    int32_t tf = cg_is_float_ty(ttp);
     cg_lower_expr(out, cst.expr, env, syms, cg);
+    if (((tf == 1) && (sf == 0))) {
+    push_Instr(out, i_pop(R_RAX()));
+    push_Instr(out, i_fsi2sd(R_XMM0(), R_RAX()));
+    push_Instr(out, i_fmovq_xg(R_RAX(), R_XMM0()));
+    push_Instr(out, i_push(R_RAX()));
+    } else {
+    if (((tf == 0) && (sf == 1))) {
+    push_Instr(out, i_pop(R_RAX()));
+    push_Instr(out, i_fmovq_gx(R_XMM0(), R_RAX()));
+    push_Instr(out, i_ftsd2si(R_RAX(), R_XMM0()));
+    push_Instr(out, i_push(R_RAX()));
+    }
+    }
         break;
     }
     case Node_slit:
@@ -6218,6 +8658,22 @@ static void cg_lower_expr(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     case Node_fld:
     {
         __auto_type f = __sw.u.fld;
+    if (_zag_str_eq(f.fname, (ZagSliceU8){(const uint8_t*)"?", 1})) {
+    ZagSliceU8 bt2 = cg_expr_type(f.base, env, syms, cg);
+    ZagSliceU8 obt2 = bt2;
+    if (((obt2.len > 1) && ((obt2).ptr[0] == 42))) {
+    obt2 = (ZagSliceU8){ (obt2).ptr + (1), ((obt2).len) - (1) };
+    }
+    if ((cg_type_is_opt(cg, obt2) == 1)) {
+    int32_t onf2 = cg_agg_words(cg, obt2);
+    int32_t blk2 = cg_slot_scratch_n(env, onf2);
+    int32_t ps2 = cg_pslot_for_frame(out, blk2, env);
+    cg_store_opt_into(out, ps2, 0, obt2, f.base, env, syms, cg);
+    push_Instr(out, i_load(R_RAX(), R_RBP(), (blk2 + 8)));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    }
     if (_zag_str_eq(f.fname, (ZagSliceU8){(const uint8_t*)"len", 3})) {
     {
     Node __sw = (*f.base);
@@ -6325,6 +8781,7 @@ static void cg_lower_expr(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     }
     ZagSliceU8 ixt = cg_expr_type(ix.base, env, syms, cg);
     if ((cg_type_is_slice(cg, ixt) == 1)) {
+    int32_t word = cg_slice_is_word(ixt);
     cg_push_base_addr(out, ix.base, env, syms, cg);
     push_Instr(out, i_pop(R_RAX()));
     push_Instr(out, i_load(R_RAX(), R_RAX(), 0));
@@ -6332,10 +8789,16 @@ static void cg_lower_expr(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     cg_lower_expr(out, ix.idx, env, syms, cg);
     push_Instr(out, i_pop(R_RCX()));
     push_Instr(out, i_pop(R_RAX()));
+    if ((word == 1)) {
+    push_Instr(out, i_mov_imm(R_RDX(), 8));
+    push_Instr(out, i_imul(R_RCX(), R_RDX()));
+    }
     push_Instr(out, i_add(R_RAX(), R_RCX()));
     push_Instr(out, i_load(R_RAX(), R_RAX(), 0));
+    if ((word == 0)) {
     push_Instr(out, i_mov_imm(R_RCX(), 255));
     push_Instr(out, i_and(R_RAX(), R_RCX()));
+    }
     push_Instr(out, i_push(R_RAX()));
     return;
     }
@@ -6421,6 +8884,12 @@ static void cg_lower_slice(ArrayList_Instr* out, Slice sl, Env* env, ArrayList_F
     }
     if ((handled == 0)) {
     ZagSliceU8 bt = cg_expr_type(sl.base, env, syms, cg);
+    if ((cg_slice_is_word(bt) == 1)) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: sub-slicing a numeric-element slice is not supported (index it instead)", 79});
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
     if ((cg_type_is_slice(cg, bt) == 1)) {
     cg_lower_expr(out, sl.base, env, syms, cg);
     push_Instr(out, i_pop(R_RSI()));
@@ -6757,6 +9226,62 @@ static void cg_lower_orelse(ArrayList_Instr* out, Bin bb, Env* env, ArrayList_Fn
     cg_lower_expr(out, bb.r, env, syms, cg);
     push_Instr(out, i_label(l_end));
 }
+static int32_t cg_float_cmp_cc(ZagSliceU8 op) {
+    if (_zag_str_eq(op, (ZagSliceU8){(const uint8_t*)"<", 1})) {
+    return CC_B();
+    }
+    if (_zag_str_eq(op, (ZagSliceU8){(const uint8_t*)"<=", 2})) {
+    return CC_BE();
+    }
+    if (_zag_str_eq(op, (ZagSliceU8){(const uint8_t*)">", 1})) {
+    return CC_A();
+    }
+    if (_zag_str_eq(op, (ZagSliceU8){(const uint8_t*)">=", 2})) {
+    return CC_AE();
+    }
+    if (_zag_str_eq(op, (ZagSliceU8){(const uint8_t*)"==", 2})) {
+    return CC_E();
+    }
+    return CC_NE();
+}
+static void cg_lower_bin_float(ArrayList_Instr* out, Bin bb, int32_t lf, int32_t rf, Env* env, ArrayList_FnSym syms, Cg* cg) {
+    if (((lf == 0) || (rf == 0))) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: mixed int/float arithmetic — add an explicit `as f64`/`as f32` cast", 77});
+    cg_lower_expr(out, bb.l, env, syms, cg);
+    return;
+    }
+    cg_lower_expr(out, bb.l, env, syms, cg);
+    cg_lower_expr(out, bb.r, env, syms, cg);
+    push_Instr(out, i_pop(R_RCX()));
+    push_Instr(out, i_pop(R_RAX()));
+    push_Instr(out, i_fmovq_gx(R_XMM0(), R_RAX()));
+    push_Instr(out, i_fmovq_gx(R_XMM1(), R_RCX()));
+    if ((cg_is_cmp_op(bb.op) == 1)) {
+    push_Instr(out, i_fucomi(R_XMM0(), R_XMM1()));
+    push_Instr(out, i_setcc(R_RAX(), cg_float_cmp_cc(bb.op)));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    if (_zag_str_eq(bb.op, (ZagSliceU8){(const uint8_t*)"+", 1})) {
+    push_Instr(out, i_fadd(R_XMM0(), R_XMM1()));
+    } else {
+    if (_zag_str_eq(bb.op, (ZagSliceU8){(const uint8_t*)"-", 1})) {
+    push_Instr(out, i_fsub(R_XMM0(), R_XMM1()));
+    } else {
+    if (_zag_str_eq(bb.op, (ZagSliceU8){(const uint8_t*)"*", 1})) {
+    push_Instr(out, i_fmul(R_XMM0(), R_XMM1()));
+    } else {
+    if (_zag_str_eq(bb.op, (ZagSliceU8){(const uint8_t*)"/", 1})) {
+    push_Instr(out, i_fdiv(R_XMM0(), R_XMM1()));
+    } else {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: operator not supported on floats (only + - * / and comparisons)", 71});
+    }
+    }
+    }
+    }
+    push_Instr(out, i_fmovq_xg(R_RAX(), R_XMM0()));
+    push_Instr(out, i_push(R_RAX()));
+}
 static void cg_lower_bin(ArrayList_Instr* out, Bin bb, Env* env, ArrayList_FnSym syms, Cg* cg) {
     if (_zag_str_eq(bb.op, (ZagSliceU8){(const uint8_t*)"orelse", 6})) {
     cg_lower_orelse(out, bb, env, syms, cg);
@@ -6799,6 +9324,169 @@ static void cg_lower_bin(ArrayList_Instr* out, Bin bb, Env* env, ArrayList_FnSym
     push_Instr(out, i_label(lend));
     push_Instr(out, i_push(R_RAX()));
     return;
+    }
+    ZagSliceU8 lty = cg_expr_type(bb.l, env, syms, cg);
+    ZagSliceU8 rty = cg_expr_type(bb.r, env, syms, cg);
+    int32_t lf = cg_is_float_ty(lty);
+    int32_t rf = cg_is_float_ty(rty);
+    if (((lf == 1) || (rf == 1))) {
+    cg_lower_bin_float(out, bb, lf, rf, env, syms, cg);
+    return;
+    }
+    int32_t lp = cg_is_posit_ty(lty);
+    int32_t rp = cg_is_posit_ty(rty);
+    if (((lp == 1) || (rp == 1))) {
+    if ((cg_is_cmp_op(bb.op) == 1)) {
+    } else {
+    if (((lp == 0) || (rp == 0))) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: mixed posit/non-posit arithmetic — add an explicit @floatToPosit/@positToFloat cast", 93});
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    ZagSliceU8 pty = lty;
+    if ((lp == 0)) {
+    pty = rty;
+    }
+    ZagSliceU8 opfn = cg_posit_op_fn(pty, bb.op);
+    if ((opfn.len == 0)) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: operator not supported on posits (only + - * / and comparisons)", 71});
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    int32_t opl = cg_find_fn(syms, opfn);
+    if ((opl < 0)) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: posit runtime not linked (internal: missing znrt_ op)", 61});
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    cg_lower_expr(out, bb.l, env, syms, cg);
+    cg_lower_expr(out, bb.r, env, syms, cg);
+    push_Instr(out, i_pop(R_RSI()));
+    push_Instr(out, i_pop(R_RDI()));
+    push_Instr(out, i_call(opl));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    }
+    int32_t lr = cg_is_rns_ty(lty);
+    int32_t rr = cg_is_rns_ty(rty);
+    if (((lr == 1) || (rr == 1))) {
+    if (((lr == 0) || (rr == 0))) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: mixed rns/non-rns arithmetic (construct both via a typed rns_3 let)", 75});
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    ZagSliceU8 rfn = cg_rns_op_fn(bb.op);
+    if ((rfn.len == 0)) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: rns_3 supports only + - * (use CRT for compare/convert)", 63});
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    ArrayList_pNode rargs = make_pNode(2);
+    push_pNode((&rargs), bb.l);
+    push_pNode((&rargs), bb.r);
+    cg_lower_call(out, (Call){ .callee = mk_ident(rfn), .args = rargs, .targs = make__u8(1) }, env, syms, cg);
+    return;
+    }
+    int32_t lsf = cg_is_satfixarb_ty(lty);
+    int32_t rsf = cg_is_satfixarb_ty(rty);
+    if (((lsf == 1) || (rsf == 1))) {
+    if ((cg_is_cmp_op(bb.op) == 1)) {
+    } else {
+    ZagSliceU8 nty = lty;
+    if ((lsf == 0)) {
+    nty = rty;
+    }
+    if ((cg_is_sat_ty(nty) == 1)) {
+    ZagSliceU8 opfn = cg_sat_op_fn(nty, bb.op);
+    if ((opfn.len == 0)) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: saturating type supports only + - * (and comparisons)", 61});
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    int32_t opl = cg_find_fn(syms, opfn);
+    if ((opl < 0)) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: numeric runtime not linked (internal: missing znrt_sat op)", 66});
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    cg_lower_expr(out, bb.l, env, syms, cg);
+    cg_lower_expr(out, bb.r, env, syms, cg);
+    push_Instr(out, i_pop(R_RSI()));
+    push_Instr(out, i_pop(R_RDI()));
+    push_Instr(out, i_call(opl));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    if ((cg_is_fixed_ty(nty) == 1)) {
+    if (_zag_str_eq(bb.op, (ZagSliceU8){(const uint8_t*)"*", 1})) {
+    int32_t fl = cg_find_fn(syms, (ZagSliceU8){(const uint8_t*)"znrt_fixed_mul", 14});
+    if ((fl < 0)) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: numeric runtime not linked (internal: missing znrt_fixed op)", 68});
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    int64_t fbits = cg_fixed_frac_bits(nty);
+    cg_lower_expr(out, bb.l, env, syms, cg);
+    cg_lower_expr(out, bb.r, env, syms, cg);
+    push_Instr(out, i_pop(R_RSI()));
+    push_Instr(out, i_pop(R_RDI()));
+    push_Instr(out, i_mov_imm(R_RDX(), fbits));
+    push_Instr(out, i_call(fl));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    }
+    if (((cg_is_arb_int_ty(nty) == 1) && (cg_arb_int_signed(nty) == 0))) {
+    int32_t is_mask_op = 0;
+    if ((((((_zag_str_eq(bb.op, (ZagSliceU8){(const uint8_t*)"+", 1}) || _zag_str_eq(bb.op, (ZagSliceU8){(const uint8_t*)"-", 1})) || _zag_str_eq(bb.op, (ZagSliceU8){(const uint8_t*)"*", 1})) || _zag_str_eq(bb.op, (ZagSliceU8){(const uint8_t*)"&", 1})) || _zag_str_eq(bb.op, (ZagSliceU8){(const uint8_t*)"^", 1})) || _zag_str_eq(bb.op, (ZagSliceU8){(const uint8_t*)"|", 1}))) {
+    is_mask_op = 1;
+    }
+    if ((is_mask_op == 1)) {
+    int64_t nbits = cg_arb_int_bits(nty);
+    cg_lower_expr(out, bb.l, env, syms, cg);
+    cg_lower_expr(out, bb.r, env, syms, cg);
+    push_Instr(out, i_pop(R_RCX()));
+    push_Instr(out, i_pop(R_RAX()));
+    if (_zag_str_eq(bb.op, (ZagSliceU8){(const uint8_t*)"+", 1})) {
+    push_Instr(out, i_add(R_RAX(), R_RCX()));
+    } else {
+    if (_zag_str_eq(bb.op, (ZagSliceU8){(const uint8_t*)"-", 1})) {
+    push_Instr(out, i_sub(R_RAX(), R_RCX()));
+    } else {
+    if (_zag_str_eq(bb.op, (ZagSliceU8){(const uint8_t*)"*", 1})) {
+    push_Instr(out, i_imul(R_RAX(), R_RCX()));
+    } else {
+    if (_zag_str_eq(bb.op, (ZagSliceU8){(const uint8_t*)"&", 1})) {
+    push_Instr(out, i_and(R_RAX(), R_RCX()));
+    } else {
+    if (_zag_str_eq(bb.op, (ZagSliceU8){(const uint8_t*)"^", 1})) {
+    push_Instr(out, i_xor(R_RAX(), R_RCX()));
+    } else {
+    if (_zag_str_eq(bb.op, (ZagSliceU8){(const uint8_t*)"|", 1})) {
+    push_Instr(out, i_or(R_RAX(), R_RCX()));
+    }
+    }
+    }
+    }
+    }
+    }
+    int64_t mask = cg_arb_mask(nbits);
+    push_Instr(out, i_mov_imm(R_RCX(), mask));
+    push_Instr(out, i_and(R_RAX(), R_RCX()));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    }
+    }
     }
     cg_lower_expr(out, bb.l, env, syms, cg);
     cg_lower_expr(out, bb.r, env, syms, cg);
@@ -6855,6 +9543,39 @@ static int32_t cg_is_print_int(ZagSliceU8 name) {
     }
     return 0;
 }
+static int32_t cg_is_print_int_nl(ZagSliceU8 name) {
+    if (_zag_str_eq(name, (ZagSliceU8){(const uint8_t*)"print_u64", 9})) {
+    return 1;
+    }
+    if (_zag_str_eq(name, (ZagSliceU8){(const uint8_t*)"print_i64", 9})) {
+    return 1;
+    }
+    if (_zag_str_eq(name, (ZagSliceU8){(const uint8_t*)"_zag_print_i64", 14})) {
+    return 1;
+    }
+    if (_zag_str_eq(name, (ZagSliceU8){(const uint8_t*)"_zag_print_u64", 14})) {
+    return 1;
+    }
+    if (_zag_str_eq(name, (ZagSliceU8){(const uint8_t*)"print_i32", 9})) {
+    return 1;
+    }
+    if (_zag_str_eq(name, (ZagSliceU8){(const uint8_t*)"print_u32", 9})) {
+    return 1;
+    }
+    return 0;
+}
+static int32_t cg_is_print_i32_w(ZagSliceU8 name) {
+    if (_zag_str_eq(name, (ZagSliceU8){(const uint8_t*)"print_i32", 9})) {
+    return 1;
+    }
+    return 0;
+}
+static int32_t cg_is_print_u32_w(ZagSliceU8 name) {
+    if (_zag_str_eq(name, (ZagSliceU8){(const uint8_t*)"print_u32", 9})) {
+    return 1;
+    }
+    return 0;
+}
 static int32_t cg_is_print_str(ZagSliceU8 name) {
     if (_zag_str_eq(name, (ZagSliceU8){(const uint8_t*)"print_str", 9})) {
     return 1;
@@ -6866,6 +9587,24 @@ static int32_t cg_is_print_str(ZagSliceU8 name) {
 }
 static int32_t cg_is_println_str(ZagSliceU8 name) {
     if (_zag_str_eq(name, (ZagSliceU8){(const uint8_t*)"_zag_println", 12})) {
+    return 1;
+    }
+    return 0;
+}
+static int32_t cg_is_print_float(ZagSliceU8 name) {
+    if (_zag_str_eq(name, (ZagSliceU8){(const uint8_t*)"print_f64", 9})) {
+    return 1;
+    }
+    if (_zag_str_eq(name, (ZagSliceU8){(const uint8_t*)"print_f32", 9})) {
+    return 1;
+    }
+    if (_zag_str_eq(name, (ZagSliceU8){(const uint8_t*)"print_float", 11})) {
+    return 1;
+    }
+    if (_zag_str_eq(name, (ZagSliceU8){(const uint8_t*)"_zag_print_f64", 14})) {
+    return 1;
+    }
+    if (_zag_str_eq(name, (ZagSliceU8){(const uint8_t*)"_zag_print_f32", 14})) {
     return 1;
     }
     return 0;
@@ -6883,6 +9622,57 @@ static int32_t cg_lower_print(ArrayList_Instr* out, ZagSliceU8 fname, Call c, En
     push_Instr(out, i_pop(R_RDI()));
     (*cg).use_pi = 1;
     push_Instr(out, i_call((*cg).pi_lbl));
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return 1;
+    }
+    if ((cg_is_print_int_nl(fname) == 1)) {
+    if ((nargs != 1)) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: print_u64/print_i64 expects exactly one argument", 56});
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return 1;
+    }
+    cg_lower_expr(out, get_pNode(c.args, 0), env, syms, cg);
+    push_Instr(out, i_pop(R_RDI()));
+    if ((cg_is_print_i32_w(fname) == 1)) {
+    push_Instr(out, i_mov_imm(R_RCX(), 4294967295));
+    push_Instr(out, i_and(R_RDI(), R_RCX()));
+    push_Instr(out, i_mov_imm(R_RCX(), 2147483648));
+    push_Instr(out, i_xor(R_RDI(), R_RCX()));
+    push_Instr(out, i_sub(R_RDI(), R_RCX()));
+    }
+    if ((cg_is_print_u32_w(fname) == 1)) {
+    push_Instr(out, i_mov_imm(R_RCX(), 4294967295));
+    push_Instr(out, i_and(R_RDI(), R_RCX()));
+    }
+    (*cg).use_pi = 1;
+    push_Instr(out, i_call((*cg).pi_lbl));
+    int32_t nloff = cg_intern_str(cg, (ZagSliceU8){(const uint8_t*)"", 0}, 1);
+    push_Instr(out, i_mov_imm(R_RSI(), (DATA_VBASE() + ((int64_t)(nloff)))));
+    push_Instr(out, i_mov_imm(R_RDX(), 1));
+    (*cg).use_ps = 1;
+    push_Instr(out, i_call((*cg).ps_lbl));
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return 1;
+    }
+    if ((cg_is_print_float(fname) == 1)) {
+    if ((nargs != 1)) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: print_f64/print_f32 expects exactly one argument", 56});
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return 1;
+    }
+    Node* parg = get_pNode(c.args, 0);
+    cg_lower_expr(out, parg, env, syms, cg);
+    push_Instr(out, i_pop(R_RDI()));
+    if ((cg_is_float_ty(cg_expr_type(parg, env, syms, cg)) == 0)) {
+    push_Instr(out, i_fsi2sd(R_XMM0(), R_RDI()));
+    push_Instr(out, i_fmovq_xg(R_RDI(), R_XMM0()));
+    }
+    (*cg).use_pf = 1;
+    push_Instr(out, i_call((*cg).pf_lbl));
     push_Instr(out, i_mov_imm(R_RAX(), 0));
     push_Instr(out, i_push(R_RAX()));
     return 1;
@@ -6932,6 +9722,13 @@ static int32_t cg_lower_print(ArrayList_Instr* out, ZagSliceU8 fname, Call c, En
     push_Instr(out, i_load(R_RDX(), R_RAX(), 8));
     (*cg).use_ps = 1;
     push_Instr(out, i_call((*cg).ps_lbl));
+    if ((is_pl == 1)) {
+    int32_t nloff = cg_intern_str(cg, (ZagSliceU8){(const uint8_t*)"", 0}, 1);
+    push_Instr(out, i_mov_imm(R_RSI(), (DATA_VBASE() + ((int64_t)(nloff)))));
+    push_Instr(out, i_mov_imm(R_RDX(), 1));
+    (*cg).use_ps = 1;
+    push_Instr(out, i_call((*cg).ps_lbl));
+    }
     handled = 1;
     }
     }
@@ -6997,6 +9794,17 @@ static int32_t cg_sizeof_type(Cg* cg, ZagSliceU8 t0) {
 static void cg_lower_builtin(ArrayList_Instr* out, ZagSliceU8 fname, Call c, Env* env, ArrayList_FnSym syms, Cg* cg) {
     ZagSliceU8 b = (ZagSliceU8){ (fname).ptr + (1), ((fname).len) - (1) };
     int32_t nargs = len_pNode(c.args);
+    ZagSliceU8 qbf = cg_quire_builtin_fn(b);
+    if ((qbf.len > 0)) {
+    ArrayList_pNode qargs = make_pNode((nargs + 1));
+    int32_t qi = 0;
+    while ((qi < nargs)) {
+    push_pNode((&qargs), get_pNode(c.args, qi));
+    qi = (qi + 1);
+    }
+    cg_lower_call(out, (Call){ .callee = mk_ident(qbf), .args = qargs, .targs = make__u8(1) }, env, syms, cg);
+    return;
+    }
     if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"sizeOf", 6})) {
     ZagSliceU8 t = (ZagSliceU8){(const uint8_t*)"i32", 3};
     if ((len__u8(c.targs) > 0)) {
@@ -7068,6 +9876,55 @@ static void cg_lower_builtin(ArrayList_Instr* out, ZagSliceU8 fname, Call c, Env
     return;
     }
     cg_lower_expr(out, get_pNode(c.args, 0), env, syms, cg);
+    return;
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"intToFloat", 10})) {
+    if ((nargs != 1)) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: @intToFloat expects one argument", 40});
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    cg_lower_expr(out, get_pNode(c.args, 0), env, syms, cg);
+    push_Instr(out, i_pop(R_RAX()));
+    push_Instr(out, i_fsi2sd(R_XMM0(), R_RAX()));
+    push_Instr(out, i_fmovq_xg(R_RAX(), R_XMM0()));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    if (_zag_str_eq(b, (ZagSliceU8){(const uint8_t*)"floatToInt", 10})) {
+    if ((nargs != 1)) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: @floatToInt expects one argument", 40});
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    cg_lower_expr(out, get_pNode(c.args, 0), env, syms, cg);
+    push_Instr(out, i_pop(R_RAX()));
+    push_Instr(out, i_fmovq_gx(R_XMM0(), R_RAX()));
+    push_Instr(out, i_ftsd2si(R_RAX(), R_XMM0()));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    ZagSliceU8 pbf = cg_posit_builtin_fn(b);
+    if ((pbf.len > 0)) {
+    if ((nargs != 1)) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: posit conversion builtin expects one argument", 53});
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    int32_t pl = cg_find_fn(syms, pbf);
+    if ((pl < 0)) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: posit runtime not linked (internal: missing znrt_ conversion)", 69});
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_push(R_RAX()));
+    return;
+    }
+    cg_lower_expr(out, get_pNode(c.args, 0), env, syms, cg);
+    push_Instr(out, i_pop(R_RDI()));
+    push_Instr(out, i_call(pl));
+    push_Instr(out, i_push(R_RAX()));
     return;
     }
     cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: unsupported @-builtin", 29});
@@ -7693,11 +10550,18 @@ static void cg_lower_stmt(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     }
     }
     if ((done == 0)) {
-    ZagSliceU8 rt = cg_expr_type(l.expr, env, syms, cg);
+    Node* initexpr = l.expr;
+    ZagSliceU8 rt0 = cg_expr_type(l.expr, env, syms, cg);
+    if (((cg_is_rns_ty(lty) == 1) && (cg_type_is_agg(cg, rt0) == 0))) {
+    ArrayList_pNode fargs = make_pNode(1);
+    push_pNode((&fargs), l.expr);
+    initexpr = mk_call(mk_ident((ZagSliceU8){(const uint8_t*)"znrt_rns_from_i64", 17}), fargs);
+    }
+    ZagSliceU8 rt = cg_expr_type(initexpr, env, syms, cg);
     if ((cg_type_is_agg(cg, rt) == 0)) {
     cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: aggregate let needs an aggregate initializer", 52});
     } else {
-    cg_lower_expr(out, l.expr, env, syms, cg);
+    cg_lower_expr(out, initexpr, env, syms, cg);
     push_Instr(out, i_pop(R_RSI()));
     int32_t k = 0;
     while ((k < nf)) {
@@ -7710,6 +10574,12 @@ static void cg_lower_stmt(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     } else {
     cg_lower_expr(out, l.expr, env, syms, cg);
     push_Instr(out, i_pop(R_RAX()));
+    if ((cg_is_float_ty(lty) == 1)) {
+    if ((cg_is_float_ty(cg_expr_type(l.expr, env, syms, cg)) == 0)) {
+    push_Instr(out, i_fsi2sd(R_XMM0(), R_RAX()));
+    push_Instr(out, i_fmovq_xg(R_RAX(), R_XMM0()));
+    }
+    }
     int32_t disp = cg_slot_alloc_typed(env, l.name, lty, 1);
     push_Instr(out, i_store(R_RBP(), disp, R_RAX()));
     }
@@ -7897,6 +10767,52 @@ static void cg_lower_stmt(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
         __auto_type iff = __sw.u.if_;
     int32_t else_lbl = cg_fresh(cg);
     int32_t end_lbl = cg_fresh(cg);
+    if ((iff.has_cap == 1)) {
+    ZagSliceU8 aty = cg_expr_type(iff.cond, env, syms, cg);
+    int32_t onf = 2;
+    if ((aty.len > 1)) {
+    if (((aty).ptr[0] == 63)) {
+    onf = cg_agg_words(cg, aty);
+    }
+    }
+    int32_t blk = cg_slot_scratch_n(env, onf);
+    int32_t ps = cg_pslot_for_frame(out, blk, env);
+    if ((aty.len > 1)) {
+    if (((aty).ptr[0] == 63)) {
+    cg_store_opt_into(out, ps, 0, aty, iff.cond, env, syms, cg);
+    } else {
+    cg_store_opt_into(out, ps, 0, (ZagSliceU8){(const uint8_t*)"?i64", 4}, iff.cond, env, syms, cg);
+    }
+    } else {
+    cg_store_opt_into(out, ps, 0, (ZagSliceU8){(const uint8_t*)"?i64", 4}, iff.cond, env, syms, cg);
+    }
+    push_Instr(out, i_load(R_RAX(), R_RBP(), (blk + 0)));
+    push_Instr(out, i_cmp_imm(R_RAX(), 0));
+    push_Instr(out, i_je(else_lbl));
+    ZagSliceU8 inner = (ZagSliceU8){(const uint8_t*)"i64", 3};
+    if ((aty.len > 1)) {
+    if (((aty).ptr[0] == 63)) {
+    inner = cg_norm_type((ZagSliceU8){ (aty).ptr + (1), ((aty).len) - (1) });
+    }
+    }
+    if ((cg_type_is_agg(cg, inner) == 1)) {
+    ZagSliceU8 capty = _zag_str_concat((ZagSliceU8){(const uint8_t*)"*", 1}, inner);
+    int32_t cdisp = cg_slot_alloc_typed(env, iff.cap, capty, 1);
+    push_Instr(out, i_lea(R_RAX(), R_RBP(), (blk + 8)));
+    push_Instr(out, i_store(R_RBP(), cdisp, R_RAX()));
+    } else {
+    int32_t cdisp = cg_slot_alloc_typed(env, iff.cap, inner, 1);
+    push_Instr(out, i_load(R_RAX(), R_RBP(), (blk + 8)));
+    push_Instr(out, i_store(R_RBP(), cdisp, R_RAX()));
+    }
+    cg_lower_block(out, iff.then_body, env, syms, cg);
+    push_Instr(out, i_jmp(end_lbl));
+    push_Instr(out, i_label(else_lbl));
+    if ((iff.has_els == 1)) {
+    cg_lower_block(out, iff.els_body, env, syms, cg);
+    }
+    push_Instr(out, i_label(end_lbl));
+    } else {
     cg_lower_expr(out, iff.cond, env, syms, cg);
     push_Instr(out, i_pop(R_RAX()));
     push_Instr(out, i_cmp_imm(R_RAX(), 0));
@@ -7908,6 +10824,7 @@ static void cg_lower_stmt(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     cg_lower_block(out, iff.els_body, env, syms, cg);
     }
     push_Instr(out, i_label(end_lbl));
+    }
         break;
     }
     case Node_while_:
@@ -7915,6 +10832,53 @@ static void cg_lower_stmt(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
         __auto_type w = __sw.u.while_;
     int32_t top = cg_fresh(cg);
     int32_t end = cg_fresh(cg);
+    if ((w.has_cap == 1)) {
+    ZagSliceU8 aty = cg_expr_type(w.cond, env, syms, cg);
+    int32_t onf = 2;
+    if ((aty.len > 1)) {
+    if (((aty).ptr[0] == 63)) {
+    onf = cg_agg_words(cg, aty);
+    }
+    }
+    int32_t blk = cg_slot_scratch_n(env, onf);
+    int32_t ps = cg_pslot_for_frame(out, blk, env);
+    ZagSliceU8 inner = (ZagSliceU8){(const uint8_t*)"i64", 3};
+    if ((aty.len > 1)) {
+    if (((aty).ptr[0] == 63)) {
+    inner = cg_norm_type((ZagSliceU8){ (aty).ptr + (1), ((aty).len) - (1) });
+    }
+    }
+    int32_t cdisp = 0;
+    if ((cg_type_is_agg(cg, inner) == 1)) {
+    ZagSliceU8 capty = _zag_str_concat((ZagSliceU8){(const uint8_t*)"*", 1}, inner);
+    cdisp = cg_slot_alloc_typed(env, w.cap, capty, 1);
+    } else {
+    cdisp = cg_slot_alloc_typed(env, w.cap, inner, 1);
+    }
+    push_Instr(out, i_label(top));
+    if ((aty.len > 1)) {
+    if (((aty).ptr[0] == 63)) {
+    cg_store_opt_into(out, ps, 0, aty, w.cond, env, syms, cg);
+    } else {
+    cg_store_opt_into(out, ps, 0, (ZagSliceU8){(const uint8_t*)"?i64", 4}, w.cond, env, syms, cg);
+    }
+    } else {
+    cg_store_opt_into(out, ps, 0, (ZagSliceU8){(const uint8_t*)"?i64", 4}, w.cond, env, syms, cg);
+    }
+    push_Instr(out, i_load(R_RAX(), R_RBP(), (blk + 0)));
+    push_Instr(out, i_cmp_imm(R_RAX(), 0));
+    push_Instr(out, i_je(end));
+    if ((cg_type_is_agg(cg, inner) == 1)) {
+    push_Instr(out, i_lea(R_RAX(), R_RBP(), (blk + 8)));
+    push_Instr(out, i_store(R_RBP(), cdisp, R_RAX()));
+    } else {
+    push_Instr(out, i_load(R_RAX(), R_RBP(), (blk + 8)));
+    push_Instr(out, i_store(R_RBP(), cdisp, R_RAX()));
+    }
+    cg_lower_block(out, w.body, env, syms, cg);
+    push_Instr(out, i_jmp(top));
+    push_Instr(out, i_label(end));
+    } else {
     push_Instr(out, i_label(top));
     cg_lower_expr(out, w.cond, env, syms, cg);
     push_Instr(out, i_pop(R_RAX()));
@@ -7923,6 +10887,7 @@ static void cg_lower_stmt(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     cg_lower_block(out, w.body, env, syms, cg);
     push_Instr(out, i_jmp(top));
     push_Instr(out, i_label(end));
+    }
         break;
     }
     case Node_estmt:
@@ -8084,6 +11049,262 @@ static void cg_emit_print_int(ArrayList_Instr* out, int32_t lbl, Cg* cg) {
     push_Instr(out, i_mov_imm(R_RDI(), 1));
     push_Instr(out, i_lea(R_RSI(), R_RBP(), (0 - 64)));
     push_Instr(out, i_mov_rr(R_RDX(), R_R9()));
+    push_Instr(out, i_syscall());
+    push_Instr(out, i_mov_rr(R_RSP(), R_RBP()));
+    push_Instr(out, i_pop(R_RBP()));
+    push_Instr(out, i_ret());
+}
+static int64_t PF_TEN(void) {
+    return 4621819117588971520;
+}
+static int64_t PF_ONE(void) {
+    return 4607182418800017408;
+}
+static int64_t PF_HALF(void) {
+    return 4602678819172646912;
+}
+static int64_t PF_E5(void) {
+    return 4681608360884174848;
+}
+static void pf_putc(ArrayList_Instr* out, int32_t c) {
+    push_Instr(out, i_mov_imm(R_RAX(), ((int64_t)(c))));
+    push_Instr(out, i_store(R_RSI(), 0, R_RAX()));
+    push_Instr(out, i_add_imm(R_RSI(), 1));
+}
+static void pf_put_ds(ArrayList_Instr* out) {
+    push_Instr(out, i_load(R_RAX(), R_R10(), 0));
+    push_Instr(out, i_add_imm(R_RAX(), 48));
+    push_Instr(out, i_store(R_RSI(), 0, R_RAX()));
+    push_Instr(out, i_add_imm(R_RSI(), 1));
+}
+static void cg_emit_print_f64(ArrayList_Instr* out, int32_t lbl, Cg* cg) {
+    int32_t l_nosign = cg_fresh(cg);
+    int32_t l_nonzero = cg_fresh(cg);
+    int32_t l_finish = cg_fresh(cg);
+    int32_t l_nhi = cg_fresh(cg);
+    int32_t l_nhi_done = cg_fresh(cg);
+    int32_t l_nlo = cg_fresh(cg);
+    int32_t l_nlo_done = cg_fresh(cg);
+    int32_t l_dok = cg_fresh(cg);
+    int32_t l_last = cg_fresh(cg);
+    int32_t l_last_done = cg_fresh(cg);
+    int32_t l_sci = cg_fresh(cg);
+    int32_t l_fixed_neg = cg_fresh(cg);
+    int32_t l_fi_int = cg_fresh(cg);
+    int32_t l_fi_int_d = cg_fresh(cg);
+    int32_t l_fi_frac = cg_fresh(cg);
+    int32_t l_fixdone = cg_fresh(cg);
+    int32_t l_nz = cg_fresh(cg);
+    int32_t l_nz_done = cg_fresh(cg);
+    int32_t l_ndig = cg_fresh(cg);
+    int32_t l_scifrac = cg_fresh(cg);
+    int32_t l_sci_e = cg_fresh(cg);
+    int32_t l_sci_eneg = cg_fresh(cg);
+    int32_t l_sci_emit = cg_fresh(cg);
+    int32_t l_sci_ebig = cg_fresh(cg);
+    int32_t l_sci_peel = cg_fresh(cg);
+    int32_t l_sci_peeld = cg_fresh(cg);
+    int32_t l_sci_pop = cg_fresh(cg);
+    push_Instr(out, i_label(lbl));
+    push_Instr(out, i_push(R_RBP()));
+    push_Instr(out, i_mov_rr(R_RBP(), R_RSP()));
+    push_Instr(out, i_sub_imm(R_RSP(), 128));
+    push_Instr(out, i_lea(R_RSI(), R_RBP(), (0 - 128)));
+    push_Instr(out, i_cmp_imm(R_RDI(), 0));
+    push_Instr(out, i_jge(l_nosign));
+    pf_putc(out, 45);
+    push_Instr(out, i_label(l_nosign));
+    push_Instr(out, i_mov_rr(R_RAX(), R_RDI()));
+    push_Instr(out, i_mov_imm(R_RCX(), cg_i64_max()));
+    push_Instr(out, i_and(R_RAX(), R_RCX()));
+    push_Instr(out, i_cmp_imm(R_RAX(), 0));
+    push_Instr(out, i_jne(l_nonzero));
+    pf_putc(out, 48);
+    push_Instr(out, i_jmp(l_finish));
+    push_Instr(out, i_label(l_nonzero));
+    push_Instr(out, i_fmovq_gx(R_XMM0(), R_RAX()));
+    push_Instr(out, i_mov_imm(R_R8(), 0));
+    push_Instr(out, i_mov_imm(R_RAX(), PF_TEN()));
+    push_Instr(out, i_fmovq_gx(R_XMM1(), R_RAX()));
+    push_Instr(out, i_label(l_nhi));
+    push_Instr(out, i_fucomi(R_XMM0(), R_XMM1()));
+    push_Instr(out, i_setcc(R_RAX(), CC_AE()));
+    push_Instr(out, i_cmp_imm(R_RAX(), 0));
+    push_Instr(out, i_je(l_nhi_done));
+    push_Instr(out, i_fdiv(R_XMM0(), R_XMM1()));
+    push_Instr(out, i_add_imm(R_R8(), 1));
+    push_Instr(out, i_jmp(l_nhi));
+    push_Instr(out, i_label(l_nhi_done));
+    push_Instr(out, i_mov_imm(R_RAX(), PF_ONE()));
+    push_Instr(out, i_fmovq_gx(R_XMM2(), R_RAX()));
+    push_Instr(out, i_label(l_nlo));
+    push_Instr(out, i_fucomi(R_XMM0(), R_XMM2()));
+    push_Instr(out, i_setcc(R_RAX(), CC_B()));
+    push_Instr(out, i_cmp_imm(R_RAX(), 0));
+    push_Instr(out, i_je(l_nlo_done));
+    push_Instr(out, i_fmul(R_XMM0(), R_XMM1()));
+    push_Instr(out, i_sub_imm(R_R8(), 1));
+    push_Instr(out, i_jmp(l_nlo));
+    push_Instr(out, i_label(l_nlo_done));
+    push_Instr(out, i_mov_imm(R_RAX(), PF_E5()));
+    push_Instr(out, i_fmovq_gx(R_XMM3(), R_RAX()));
+    push_Instr(out, i_fmul(R_XMM0(), R_XMM3()));
+    push_Instr(out, i_mov_imm(R_RAX(), PF_HALF()));
+    push_Instr(out, i_fmovq_gx(R_XMM3(), R_RAX()));
+    push_Instr(out, i_fadd(R_XMM0(), R_XMM3()));
+    push_Instr(out, i_ftsd2si(R_RAX(), R_XMM0()));
+    push_Instr(out, i_cmp_imm(R_RAX(), 1000000));
+    push_Instr(out, i_jl(l_dok));
+    push_Instr(out, i_mov_imm(R_RCX(), 10));
+    push_Instr(out, i_idiv(R_RCX()));
+    push_Instr(out, i_add_imm(R_R8(), 1));
+    push_Instr(out, i_label(l_dok));
+    push_Instr(out, i_mov_imm(R_RCX(), 10));
+    push_Instr(out, i_idiv(R_RCX()));
+    push_Instr(out, i_store(R_RBP(), ((0 - 64) + 40), R_RDX()));
+    push_Instr(out, i_idiv(R_RCX()));
+    push_Instr(out, i_store(R_RBP(), ((0 - 64) + 32), R_RDX()));
+    push_Instr(out, i_idiv(R_RCX()));
+    push_Instr(out, i_store(R_RBP(), ((0 - 64) + 24), R_RDX()));
+    push_Instr(out, i_idiv(R_RCX()));
+    push_Instr(out, i_store(R_RBP(), ((0 - 64) + 16), R_RDX()));
+    push_Instr(out, i_idiv(R_RCX()));
+    push_Instr(out, i_store(R_RBP(), ((0 - 64) + 8), R_RDX()));
+    push_Instr(out, i_idiv(R_RCX()));
+    push_Instr(out, i_store(R_RBP(), ((0 - 64) + 0), R_RDX()));
+    push_Instr(out, i_mov_imm(R_RCX(), 5));
+    push_Instr(out, i_lea(R_R10(), R_RBP(), ((0 - 64) + 40)));
+    push_Instr(out, i_label(l_last));
+    push_Instr(out, i_cmp_imm(R_RCX(), 0));
+    push_Instr(out, i_jle(l_last_done));
+    push_Instr(out, i_load(R_RAX(), R_R10(), 0));
+    push_Instr(out, i_mov_imm(R_RDX(), 255));
+    push_Instr(out, i_and(R_RAX(), R_RDX()));
+    push_Instr(out, i_cmp_imm(R_RAX(), 0));
+    push_Instr(out, i_jne(l_last_done));
+    push_Instr(out, i_sub_imm(R_RCX(), 1));
+    push_Instr(out, i_sub_imm(R_R10(), 8));
+    push_Instr(out, i_jmp(l_last));
+    push_Instr(out, i_label(l_last_done));
+    push_Instr(out, i_mov_rr(R_RDI(), R_RCX()));
+    push_Instr(out, i_cmp_imm(R_R8(), (0 - 4)));
+    push_Instr(out, i_jl(l_sci));
+    push_Instr(out, i_cmp_imm(R_R8(), 6));
+    push_Instr(out, i_jge(l_sci));
+    push_Instr(out, i_cmp_imm(R_R8(), 0));
+    push_Instr(out, i_jl(l_fixed_neg));
+    push_Instr(out, i_lea(R_R10(), R_RBP(), (0 - 64)));
+    push_Instr(out, i_mov_imm(R_RCX(), 0));
+    push_Instr(out, i_label(l_fi_int));
+    push_Instr(out, i_cmp(R_RCX(), R_R8()));
+    push_Instr(out, i_jg(l_fi_int_d));
+    pf_put_ds(out);
+    push_Instr(out, i_add_imm(R_R10(), 8));
+    push_Instr(out, i_add_imm(R_RCX(), 1));
+    push_Instr(out, i_jmp(l_fi_int));
+    push_Instr(out, i_label(l_fi_int_d));
+    push_Instr(out, i_cmp(R_RDI(), R_R8()));
+    push_Instr(out, i_jle(l_fixdone));
+    pf_putc(out, 46);
+    push_Instr(out, i_mov_rr(R_RCX(), R_R8()));
+    push_Instr(out, i_add_imm(R_RCX(), 1));
+    push_Instr(out, i_label(l_fi_frac));
+    push_Instr(out, i_cmp(R_RCX(), R_RDI()));
+    push_Instr(out, i_jg(l_fixdone));
+    pf_put_ds(out);
+    push_Instr(out, i_add_imm(R_R10(), 8));
+    push_Instr(out, i_add_imm(R_RCX(), 1));
+    push_Instr(out, i_jmp(l_fi_frac));
+    push_Instr(out, i_label(l_fixdone));
+    push_Instr(out, i_jmp(l_finish));
+    push_Instr(out, i_label(l_fixed_neg));
+    pf_putc(out, 48);
+    pf_putc(out, 46);
+    push_Instr(out, i_mov_imm(R_RCX(), 0));
+    push_Instr(out, i_sub(R_RCX(), R_R8()));
+    push_Instr(out, i_sub_imm(R_RCX(), 1));
+    push_Instr(out, i_label(l_nz));
+    push_Instr(out, i_cmp_imm(R_RCX(), 0));
+    push_Instr(out, i_jle(l_nz_done));
+    pf_putc(out, 48);
+    push_Instr(out, i_sub_imm(R_RCX(), 1));
+    push_Instr(out, i_jmp(l_nz));
+    push_Instr(out, i_label(l_nz_done));
+    push_Instr(out, i_lea(R_R10(), R_RBP(), (0 - 64)));
+    push_Instr(out, i_mov_imm(R_RCX(), 0));
+    push_Instr(out, i_label(l_ndig));
+    push_Instr(out, i_cmp(R_RCX(), R_RDI()));
+    push_Instr(out, i_jg(l_finish));
+    pf_put_ds(out);
+    push_Instr(out, i_add_imm(R_R10(), 8));
+    push_Instr(out, i_add_imm(R_RCX(), 1));
+    push_Instr(out, i_jmp(l_ndig));
+    push_Instr(out, i_label(l_sci));
+    push_Instr(out, i_lea(R_R10(), R_RBP(), (0 - 64)));
+    pf_put_ds(out);
+    push_Instr(out, i_add_imm(R_R10(), 8));
+    push_Instr(out, i_cmp_imm(R_RDI(), 1));
+    push_Instr(out, i_jl(l_sci_e));
+    pf_putc(out, 46);
+    push_Instr(out, i_mov_imm(R_RCX(), 1));
+    push_Instr(out, i_label(l_scifrac));
+    push_Instr(out, i_cmp(R_RCX(), R_RDI()));
+    push_Instr(out, i_jg(l_sci_e));
+    pf_put_ds(out);
+    push_Instr(out, i_add_imm(R_R10(), 8));
+    push_Instr(out, i_add_imm(R_RCX(), 1));
+    push_Instr(out, i_jmp(l_scifrac));
+    push_Instr(out, i_label(l_sci_e));
+    pf_putc(out, 101);
+    push_Instr(out, i_cmp_imm(R_R8(), 0));
+    push_Instr(out, i_jl(l_sci_eneg));
+    pf_putc(out, 43);
+    push_Instr(out, i_mov_rr(R_RAX(), R_R8()));
+    push_Instr(out, i_jmp(l_sci_emit));
+    push_Instr(out, i_label(l_sci_eneg));
+    pf_putc(out, 45);
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    push_Instr(out, i_sub(R_RAX(), R_R8()));
+    push_Instr(out, i_label(l_sci_emit));
+    push_Instr(out, i_cmp_imm(R_RAX(), 10));
+    push_Instr(out, i_jge(l_sci_ebig));
+    push_Instr(out, i_mov_rr(R_RDX(), R_RAX()));
+    pf_putc(out, 48);
+    push_Instr(out, i_mov_rr(R_RAX(), R_RDX()));
+    push_Instr(out, i_add_imm(R_RAX(), 48));
+    push_Instr(out, i_store(R_RSI(), 0, R_RAX()));
+    push_Instr(out, i_add_imm(R_RSI(), 1));
+    push_Instr(out, i_jmp(l_finish));
+    push_Instr(out, i_label(l_sci_ebig));
+    push_Instr(out, i_mov_imm(R_RCX(), 0));
+    push_Instr(out, i_label(l_sci_peel));
+    push_Instr(out, i_cmp_imm(R_RAX(), 0));
+    push_Instr(out, i_je(l_sci_peeld));
+    push_Instr(out, i_push(R_RCX()));
+    push_Instr(out, i_mov_imm(R_R10(), 10));
+    push_Instr(out, i_idiv(R_R10()));
+    push_Instr(out, i_add_imm(R_RDX(), 48));
+    push_Instr(out, i_pop(R_RCX()));
+    push_Instr(out, i_push(R_RDX()));
+    push_Instr(out, i_add_imm(R_RCX(), 1));
+    push_Instr(out, i_jmp(l_sci_peel));
+    push_Instr(out, i_label(l_sci_peeld));
+    push_Instr(out, i_label(l_sci_pop));
+    push_Instr(out, i_cmp_imm(R_RCX(), 0));
+    push_Instr(out, i_je(l_finish));
+    push_Instr(out, i_pop(R_RAX()));
+    push_Instr(out, i_store(R_RSI(), 0, R_RAX()));
+    push_Instr(out, i_add_imm(R_RSI(), 1));
+    push_Instr(out, i_sub_imm(R_RCX(), 1));
+    push_Instr(out, i_jmp(l_sci_pop));
+    push_Instr(out, i_label(l_finish));
+    pf_putc(out, 10);
+    push_Instr(out, i_mov_rr(R_RDX(), R_RSI()));
+    push_Instr(out, i_lea(R_RAX(), R_RBP(), (0 - 128)));
+    push_Instr(out, i_sub(R_RDX(), R_RAX()));
+    push_Instr(out, i_mov_imm(R_RAX(), 1));
+    push_Instr(out, i_mov_imm(R_RDI(), 1));
+    push_Instr(out, i_lea(R_RSI(), R_RBP(), (0 - 128)));
     push_Instr(out, i_syscall());
     push_Instr(out, i_mov_rr(R_RSP(), R_RBP()));
     push_Instr(out, i_pop(R_RBP()));
@@ -8619,7 +11840,12 @@ static void cg_emit_rt_exec(ArrayList_Instr* out, Cg* cg) {
     push_Instr(out, i_mov_imm(R_RAX(), 59));
     push_Instr(out, i_mov_imm(R_RDI(), (DATA_VBASE() + ((int64_t)(sh_off)))));
     push_Instr(out, i_lea(R_RSI(), R_RBP(), (0 - 48)));
-    push_Instr(out, i_mov_imm(R_RDX(), 0));
+    push_Instr(out, i_load(R_RDX(), 15, 0));
+    push_Instr(out, i_mov_imm(R_RCX(), 8));
+    push_Instr(out, i_imul(R_RDX(), R_RCX()));
+    push_Instr(out, i_add_imm(R_RDX(), 16));
+    push_Instr(out, i_mov_rr(R_RCX(), 15));
+    push_Instr(out, i_add(R_RDX(), R_RCX()));
     push_Instr(out, i_syscall());
     push_Instr(out, i_mov_imm(R_RAX(), 60));
     push_Instr(out, i_mov_imm(R_RDI(), 127));
@@ -8957,9 +12183,1314 @@ static void cg_emit_native_rt(ArrayList_Instr* out, Cg* cg) {
     cg_emit_rt_str2i(out, cg);
     }
 }
-static ArrayList_Instr lower_program(ArrayList_pNode decls0, int32_t* errout, ArrayList_u8* dataout) {
+static ZagSliceU8 cg_numeric_rt_src(void) {
+    ZagSliceU8 s = (ZagSliceU8){(const uint8_t*)"", 0};
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn nrt_p2(k: i64) i64 {\n", 24});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (k < 0) { return 0; }\n", 29});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let r: i64 = 1;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let i: i64 = 0;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    while (i < k) { r = r * 2; i = i + 1; }\n", 44});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return r;\n", 14});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn nrt_bit(x: i64, i: i64) i64 {\n", 33});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return (x / nrt_p2(i)) - ((x / nrt_p2(i + 1)) * 2);\n", 56});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn nrt_lowbits(x: i64, n: i64) i64 {\n", 37});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (n <= 0) { return 0; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let m: i64 = nrt_p2(n);\n", 28});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return x - ((x / m) * m);\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn nrt_frexp(ax: f64, mo: *f64, eo: *i64) void {\n", 49});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let m: f64 = ax;\n", 21});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let e: i64 = 0;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let done: i32 = 0;\n", 23});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    while (done == 0) {\n", 24});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (m >= 2.0) { m = m / 2.0; e = e + 1; }\n", 50});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        else if (m < 1.0) { m = m * 2.0; e = e - 1; }\n", 54});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        else { done = 1; }\n", 27});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    mo.* = m;\n", 14});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    eo.* = e;\n", 14});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn nrt_ldexp(m: f64, e: i64) f64 {\n", 35});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let r: f64 = m;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let i: i64 = 0;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (e >= 0) {\n", 18});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        while (i < e) { r = r * 2.0; i = i + 1; }\n", 50});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    } else {\n", 13});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let n: i64 = 0 - e;\n", 28});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        while (i < n) { r = r / 2.0; i = i + 1; }\n", 50});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return r;\n", 14});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn nrt_floordiv(e: i64, d: i64) i64 {\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (e >= 0) { return e / d; }\n", 34});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let n: i64 = 0 - e;\n", 24});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return 0 - ((n + d - 1) / d);\n", 34});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn nrt_decode(bits: i64, nbits: i64, es: i64) f64 {\n", 52});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (bits == 0) { return 0.0; }\n", 35});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let modn: i64 = nrt_p2(nbits);\n", 35});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let signbit: i64 = nrt_p2(nbits - 1);\n", 42});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let neg: i32 = 0;\n", 22});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let u: i64 = bits;\n", 23});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (bits >= signbit) { neg = 1; u = modn - bits; }\n", 55});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let b: i64 = nbits - 2;\n", 28});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let first: i64 = nrt_bit(u, b);\n", 36});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let k: i64 = 0;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (first == 1) {\n", 22});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let run: i64 = 0;\n", 26});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let done: i32 = 0;\n", 27});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        while (done == 0) {\n", 28});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            if (b >= 0) {\n", 26});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                if (nrt_bit(u, b) == 1) { run = run + 1; b = b - 1; } else { done = 1; }\n", 89});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            } else { done = 1; }\n", 33});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        }\n", 10});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (b >= 0) { b = b - 1; }\n", 35});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        k = run - 1;\n", 21});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    } else {\n", 13});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let run: i64 = 0;\n", 26});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let done: i32 = 0;\n", 27});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        while (done == 0) {\n", 28});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            if (b >= 0) {\n", 26});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                if (nrt_bit(u, b) == 0) { run = run + 1; b = b - 1; } else { done = 1; }\n", 89});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            } else { done = 1; }\n", 33});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        }\n", 10});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (b >= 0) { b = b - 1; }\n", 35});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        k = 0 - run;\n", 21});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let e: i64 = 0;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let ei: i64 = 0;\n", 21});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    while (ei < es) {\n", 22});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        e = e * 2;\n", 19});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (b >= 0) { e = e + nrt_bit(u, b); b = b - 1; }\n", 58});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        ei = ei + 1;\n", 21});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let fbits: i64 = b + 1;\n", 28});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let fraction: f64 = 1.0;\n", 29});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (fbits > 0) {\n", 21});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let fr: i64 = nrt_lowbits(u, fbits);\n", 45});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        fraction = 1.0 + (fr as f64) / (nrt_p2(fbits) as f64);\n", 63});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let scale: i64 = nrt_p2(es);\n", 33});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let val: f64 = nrt_ldexp(fraction, scale * k + e);\n", 55});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (neg == 1) { return 0.0 - val; }\n", 40});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return val;\n", 16});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn nrt_encode(x: f64, nbits: i64, es: i64) i64 {\n", 49});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (x == 0.0) { return 0; }\n", 32});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let signbit: i64 = nrt_p2(nbits - 1);\n", 42});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (x != x) { return signbit; }\n", 36});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let neg: i32 = 0;\n", 22});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let ax: f64 = x;\n", 21});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (x < 0.0) { neg = 1; ax = 0.0 - x; }\n", 44});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let m: f64 = 0.0;\n", 22});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let E: i64 = 0;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    nrt_frexp(ax, &m, &E);\n", 27});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let useedexp: i64 = nrt_p2(es);\n", 36});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let k: i64 = nrt_floordiv(E, useedexp);\n", 44});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let e: i64 = E - useedexp * k;\n", 35});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let fr: f64 = m - 1.0;\n", 27});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let total: i64 = nbits + 32;\n", 33});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let bits_emitted: i64 = 0;\n", 31});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let mag: i64 = 0;\n", 22});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let roundb: i64 = 0;\n", 25});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let sticky: i64 = 0;\n", 25});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let cap: i64 = nbits - 1;\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (k >= 0) {\n", 18});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let i: i64 = 0;\n", 24});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        while (i <= k) {\n", 25});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            if (bits_emitted < cap) { mag = mag * 2 + 1; }\n", 59});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            else if (bits_emitted == cap) { roundb = 1; }\n", 58});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            else { sticky = sticky + 1; }\n", 42});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            bits_emitted = bits_emitted + 1;\n", 45});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            i = i + 1;\n", 23});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        }\n", 10});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (bits_emitted < cap) { mag = mag * 2; }\n", 51});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        else if (bits_emitted == cap) { roundb = 0; }\n", 54});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        else { sticky = sticky + 0; }\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        bits_emitted = bits_emitted + 1;\n", 41});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    } else {\n", 13});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let nn: i64 = 0 - k;\n", 29});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let i: i64 = 0;\n", 24});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        while (i < nn) {\n", 25});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            if (bits_emitted < cap) { mag = mag * 2; }\n", 55});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            else if (bits_emitted == cap) { roundb = 0; }\n", 58});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            else { sticky = sticky + 0; }\n", 42});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            bits_emitted = bits_emitted + 1;\n", 45});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            i = i + 1;\n", 23});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        }\n", 10});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (bits_emitted < cap) { mag = mag * 2 + 1; }\n", 55});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        else if (bits_emitted == cap) { roundb = 1; }\n", 54});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        else { sticky = sticky + 1; }\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        bits_emitted = bits_emitted + 1;\n", 41});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let ej: i64 = es - 1;\n", 26});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    while (ej >= 0) {\n", 22});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let ebit: i64 = nrt_bit(e, ej);\n", 40});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (bits_emitted < cap) { mag = mag * 2 + ebit; }\n", 58});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        else if (bits_emitted == cap) { roundb = ebit; }\n", 57});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        else { if (ebit == 1) { sticky = sticky + 1; } }\n", 57});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        bits_emitted = bits_emitted + 1;\n", 41});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        ej = ej - 1;\n", 21});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let frac: f64 = fr;\n", 24});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    while (bits_emitted < total) {\n", 35});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        frac = frac * 2.0;\n", 27});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let dbit: i64 = 0;\n", 27});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (frac >= 1.0) { dbit = 1; frac = frac - 1.0; }\n", 58});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (bits_emitted < cap) { mag = mag * 2 + dbit; }\n", 58});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        else if (bits_emitted == cap) { roundb = dbit; }\n", 57});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        else { if (dbit == 1) { sticky = sticky + 1; } }\n", 57});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        bits_emitted = bits_emitted + 1;\n", 41});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let lsb: i64 = nrt_lowbits(mag, 1);\n", 40});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (roundb == 1) {\n", 23});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (sticky > 0) { mag = mag + 1; }\n", 43});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        else if (lsb == 1) { mag = mag + 1; }\n", 46});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let word: i64 = nrt_lowbits(mag, nbits - 1);\n", 49});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (word == 0) { word = 1; }\n", 33});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (neg == 1) { return nrt_p2(nbits) - word; }\n", 51});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return word;\n", 17});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p32_to_f64(b: i64) f64 { return nrt_decode(b, 32, 2); }\n", 64});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_f64_to_p32(x: f64) i64 { return nrt_encode(x, 32, 2); }\n", 64});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p32_from_i64(v: i64) i64 { return nrt_encode(v as f64, 32, 2); }\n", 73});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p32_bits(b: i64) i64 { return nrt_lowbits(b, 32); }\n", 60});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p32_add(a: i64, b: i64) i64 {\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 2147483648) { return 2147483648; }\n", 48});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 2147483648) { return 2147483648; }\n", 48});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 0) { return b; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 0) { return a; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return nrt_encode(nrt_decode(a, 32, 2) + nrt_decode(b, 32, 2), 32, 2);\n", 75});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p32_sub(a: i64, b: i64) i64 {\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 2147483648) { return 2147483648; }\n", 48});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 2147483648) { return 2147483648; }\n", 48});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return nrt_encode(nrt_decode(a, 32, 2) - nrt_decode(b, 32, 2), 32, 2);\n", 75});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p32_mul(a: i64, b: i64) i64 {\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 2147483648) { return 2147483648; }\n", 48});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 2147483648) { return 2147483648; }\n", 48});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 0) { return 0; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 0) { return 0; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return nrt_encode(nrt_decode(a, 32, 2) * nrt_decode(b, 32, 2), 32, 2);\n", 75});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p32_div(a: i64, b: i64) i64 {\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 2147483648) { return 2147483648; }\n", 48});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 2147483648) { return 2147483648; }\n", 48});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 0) { return 2147483648; }\n", 39});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 0) { return 0; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return nrt_encode(nrt_decode(a, 32, 2) / nrt_decode(b, 32, 2), 32, 2);\n", 75});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p8_to_f64(b: i64) f64 { return nrt_decode(b, 8, 0); }\n", 62});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_f64_to_p8(x: f64) i64 { return nrt_encode(x, 8, 0); }\n", 62});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p8_from_i64(v: i64) i64 { return nrt_encode(v as f64, 8, 0); }\n", 71});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p8_bits(b: i64) i64 { return nrt_lowbits(b, 8); }\n", 58});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p8_add(a: i64, b: i64) i64 {\n", 37});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 128) { return 128; }\n", 34});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 128) { return 128; }\n", 34});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 0) { return b; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 0) { return a; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return nrt_encode(nrt_decode(a, 8, 0) + nrt_decode(b, 8, 0), 8, 0);\n", 72});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p8_sub(a: i64, b: i64) i64 {\n", 37});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 128) { return 128; }\n", 34});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 128) { return 128; }\n", 34});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return nrt_encode(nrt_decode(a, 8, 0) - nrt_decode(b, 8, 0), 8, 0);\n", 72});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p8_mul(a: i64, b: i64) i64 {\n", 37});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 128) { return 128; }\n", 34});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 128) { return 128; }\n", 34});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 0) { return 0; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 0) { return 0; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return nrt_encode(nrt_decode(a, 8, 0) * nrt_decode(b, 8, 0), 8, 0);\n", 72});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p8_div(a: i64, b: i64) i64 {\n", 37});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 128) { return 128; }\n", 34});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 128) { return 128; }\n", 34});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 0) { return 128; }\n", 32});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 0) { return 0; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return nrt_encode(nrt_decode(a, 8, 0) / nrt_decode(b, 8, 0), 8, 0);\n", 72});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p16_to_f64(b: i64) f64 { return nrt_decode(b, 16, 1); }\n", 64});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_f64_to_p16(x: f64) i64 { return nrt_encode(x, 16, 1); }\n", 64});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p16_from_i64(v: i64) i64 { return nrt_encode(v as f64, 16, 1); }\n", 73});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p16_bits(b: i64) i64 { return nrt_lowbits(b, 16); }\n", 60});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p16_add(a: i64, b: i64) i64 {\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 32768) { return 32768; }\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 32768) { return 32768; }\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 0) { return b; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 0) { return a; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return nrt_encode(nrt_decode(a, 16, 1) + nrt_decode(b, 16, 1), 16, 1);\n", 75});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p16_sub(a: i64, b: i64) i64 {\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 32768) { return 32768; }\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 32768) { return 32768; }\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return nrt_encode(nrt_decode(a, 16, 1) - nrt_decode(b, 16, 1), 16, 1);\n", 75});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p16_mul(a: i64, b: i64) i64 {\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 32768) { return 32768; }\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 32768) { return 32768; }\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 0) { return 0; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 0) { return 0; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return nrt_encode(nrt_decode(a, 16, 1) * nrt_decode(b, 16, 1), 16, 1);\n", 75});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p16_div(a: i64, b: i64) i64 {\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 32768) { return 32768; }\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 32768) { return 32768; }\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 0) { return 32768; }\n", 34});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 0) { return 0; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return nrt_encode(nrt_decode(a, 16, 1) / nrt_decode(b, 16, 1), 16, 1);\n", 75});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p64_nar() i64 { return 0 - 9223372036854775807 - 1; }\n", 62});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p64_to_f64(b: i64) f64 {\n", 33});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == znrt_p64_nar()) { return 0.0; }\n", 45});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return nrt_decode64(b, 3);\n", 31});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_f64_to_p64(x: f64) i64 { return nrt_encode64(x, 3); }\n", 62});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_ld_to_p64(x: f64) i64 { return nrt_encode64(x, 3); }\n", 61});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p64_from_i64(v: i64) i64 { return nrt_encode64(v as f64, 3); }\n", 71});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p64_bits(b: i64) i64 { return b; }\n", 43});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p64_add(a: i64, b: i64) i64 {\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == znrt_p64_nar()) { return znrt_p64_nar(); }\n", 56});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == znrt_p64_nar()) { return znrt_p64_nar(); }\n", 56});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 0) { return b; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 0) { return a; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return nrt_encode64(nrt_decode64(a, 3) + nrt_decode64(b, 3), 3);\n", 69});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p64_sub(a: i64, b: i64) i64 {\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == znrt_p64_nar()) { return znrt_p64_nar(); }\n", 56});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == znrt_p64_nar()) { return znrt_p64_nar(); }\n", 56});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return nrt_encode64(nrt_decode64(a, 3) - nrt_decode64(b, 3), 3);\n", 69});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p64_mul(a: i64, b: i64) i64 {\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == znrt_p64_nar()) { return znrt_p64_nar(); }\n", 56});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == znrt_p64_nar()) { return znrt_p64_nar(); }\n", 56});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 0) { return 0; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 0) { return 0; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return nrt_encode64(nrt_decode64(a, 3) * nrt_decode64(b, 3), 3);\n", 69});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p64_div(a: i64, b: i64) i64 {\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == znrt_p64_nar()) { return znrt_p64_nar(); }\n", 56});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == znrt_p64_nar()) { return znrt_p64_nar(); }\n", 56});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 0) { return znrt_p64_nar(); }\n", 43});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 0) { return 0; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return nrt_encode64(nrt_decode64(a, 3) / nrt_decode64(b, 3), 3);\n", 69});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn nrt_decode64(bits: i64, es: i64) f64 {\n", 42});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (bits == 0) { return 0.0; }\n", 35});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let neg: i32 = 0;\n", 22});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let u: i64 = bits;\n", 23});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (bits < 0) { neg = 1; u = 0 - bits; }\n", 45});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let b: i64 = 62;\n", 21});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let first: i64 = nrt_bit(u, b);\n", 36});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let k: i64 = 0;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (first == 1) {\n", 22});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let run: i64 = 0; let done: i32 = 0;\n", 45});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        while (done == 0) {\n", 28});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            if (b >= 0) { if (nrt_bit(u, b) == 1) { run = run + 1; b = b - 1; } else { done = 1; } }\n", 101});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            else { done = 1; }\n", 31});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        }\n", 10});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (b >= 0) { b = b - 1; }\n", 35});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        k = run - 1;\n", 21});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    } else {\n", 13});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let run: i64 = 0; let done: i32 = 0;\n", 45});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        while (done == 0) {\n", 28});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            if (b >= 0) { if (nrt_bit(u, b) == 0) { run = run + 1; b = b - 1; } else { done = 1; } }\n", 101});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            else { done = 1; }\n", 31});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        }\n", 10});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (b >= 0) { b = b - 1; }\n", 35});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        k = 0 - run;\n", 21});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let e: i64 = 0; let ei: i64 = 0;\n", 37});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    while (ei < es) {\n", 22});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        e = e * 2;\n", 19});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (b >= 0) { e = e + nrt_bit(u, b); b = b - 1; }\n", 58});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        ei = ei + 1;\n", 21});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let fbits: i64 = b + 1;\n", 28});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let fraction: f64 = 1.0;\n", 29});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (fbits > 0) {\n", 21});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let fr: i64 = nrt_lowbits(u, fbits);\n", 45});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        fraction = 1.0 + (fr as f64) / (nrt_p2(fbits) as f64);\n", 63});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let scale: i64 = nrt_p2(es);\n", 33});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let val: f64 = nrt_ldexp(fraction, scale * k + e);\n", 55});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (neg == 1) { return 0.0 - val; }\n", 40});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return val;\n", 16});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn nrt_encode64(x: f64, es: i64) i64 {\n", 39});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (x == 0.0) { return 0; }\n", 32});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (x != x) { return znrt_p64_nar(); }\n", 43});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let neg: i32 = 0;\n", 22});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let ax: f64 = x;\n", 21});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (x < 0.0) { neg = 1; ax = 0.0 - x; }\n", 44});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let m: f64 = 0.0; let E: i64 = 0;\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    nrt_frexp(ax, &m, &E);\n", 27});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let useedexp: i64 = nrt_p2(es);\n", 36});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let k: i64 = nrt_floordiv(E, useedexp);\n", 44});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let e: i64 = E - useedexp * k;\n", 35});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let fr: f64 = m - 1.0;\n", 27});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let cap: i64 = 63;\n", 23});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let total: i64 = 96;\n", 25});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let bits_emitted: i64 = 0;\n", 31});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let mag: i64 = 0;\n", 22});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let roundb: i64 = 0;\n", 25});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let sticky: i64 = 0;\n", 25});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (k >= 0) {\n", 18});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let i: i64 = 0;\n", 24});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        while (i <= k) {\n", 25});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            if (bits_emitted < cap) { mag = mag * 2 + 1; } else if (bits_emitted == cap) { roundb = 1; } else { sticky = sticky + 1; }\n", 135});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            bits_emitted = bits_emitted + 1; i = i + 1;\n", 56});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        }\n", 10});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (bits_emitted < cap) { mag = mag * 2; } else if (bits_emitted == cap) { roundb = 0; }\n", 97});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        bits_emitted = bits_emitted + 1;\n", 41});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    } else {\n", 13});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let nn: i64 = 0 - k; let i: i64 = 0;\n", 45});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        while (i < nn) {\n", 25});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            if (bits_emitted < cap) { mag = mag * 2; } else if (bits_emitted == cap) { roundb = 0; }\n", 101});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            bits_emitted = bits_emitted + 1; i = i + 1;\n", 56});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        }\n", 10});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (bits_emitted < cap) { mag = mag * 2 + 1; } else if (bits_emitted == cap) { roundb = 1; } else { sticky = sticky + 1; }\n", 131});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        bits_emitted = bits_emitted + 1;\n", 41});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let ej: i64 = es - 1;\n", 26});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    while (ej >= 0) {\n", 22});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let ebit: i64 = nrt_bit(e, ej);\n", 40});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (bits_emitted < cap) { mag = mag * 2 + ebit; } else if (bits_emitted == cap) { roundb = ebit; } else { if (ebit == 1) { sticky = sticky + 1; } }\n", 156});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        bits_emitted = bits_emitted + 1; ej = ej - 1;\n", 54});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let frac: f64 = fr;\n", 24});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    while (bits_emitted < total) {\n", 35});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        frac = frac * 2.0;\n", 27});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let dbit: i64 = 0;\n", 27});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (frac >= 1.0) { dbit = 1; frac = frac - 1.0; }\n", 58});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (bits_emitted < cap) { mag = mag * 2 + dbit; } else if (bits_emitted == cap) { roundb = dbit; } else { if (dbit == 1) { sticky = sticky + 1; } }\n", 156});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        bits_emitted = bits_emitted + 1;\n", 41});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let lsb: i64 = nrt_lowbits(mag, 1);\n", 40});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (roundb == 1) {\n", 23});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (sticky > 0) { mag = mag + 1; } else if (lsb == 1) { mag = mag + 1; }\n", 81});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let word: i64 = nrt_lowbits(mag, 63);\n", 42});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (word == 0) { word = 1; }\n", 33});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (neg == 1) { return 0 - word; }\n", 39});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return word;\n", 17});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"struct ZnrtQuire { l0: i64, l1: i64, l2: i64, l3: i64, l4: i64, l5: i64, l6: i64, l7: i64, nar: i64 }\n", 102});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_q_pow2(f: i64) i64 {\n", 29});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let r: i64 = 1;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let i: i64 = 0;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    while (i < f) { r = r * 2; i = i + 1; }\n", 44});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return r;\n", 14});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_q_ult(a: i64, b: i64) i32 {\n", 36});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let mn: i64 = (0 - 9223372036854775807) - 1;\n", 49});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let sa: i64 = a + mn;\n", 26});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let sb: i64 = b + mn;\n", 26});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (sa < sb) { return 1; }\n", 31});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return 0;\n", 14});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_q_lshr(x: i64, s: i64) i64 {\n", 37});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (s <= 0) { return x; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (s >= 64) { return 0; }\n", 31});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let mn: i64 = (0 - 9223372036854775807) - 1;\n", 49});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (x >= 0) { return x / znrt_q_pow2(s); }\n", 47});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let lo: i64 = x - mn;\n", 26});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return (lo / znrt_q_pow2(s)) + znrt_q_pow2(63 - s);\n", 56});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_q_shl(x: i64, s: i64) i64 {\n", 36});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let r: i64 = x;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let i: i64 = 0;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    while (i < s) { r = r * 2; i = i + 1; }\n", 44});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return r;\n", 14});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_q_get(l0: i64, l1: i64, l2: i64, l3: i64, l4: i64, l5: i64, l6: i64, l7: i64, i: i64) i64 {\n", 100});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let w: i64 = i / 64;\n", 25});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let bo: i64 = i - w * 64;\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let v: i64 = 0;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (w == 0) { v = l0; } else if (w == 1) { v = l1; } else if (w == 2) { v = l2; }\n", 86});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    else if (w == 3) { v = l3; } else if (w == 4) { v = l4; } else if (w == 5) { v = l5; }\n", 91});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    else if (w == 6) { v = l6; } else { v = l7; }\n", 50});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return znrt_q_lshr(v, bo) - (znrt_q_lshr(v, bo + 1) * 2);\n", 62});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_p32_fields(bits: i64, neg: *i64, sexp: *i64, sig: *i64) void {\n", 71});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (bits == 0) { neg.* = 0; sexp.* = 0; sig.* = 0; return; }\n", 65});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let n: i64 = 0;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let u: i64 = bits;\n", 23});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (bits >= 2147483648) { n = 1; u = 4294967296 - bits; }\n", 62});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let first: i64 = znrt_q_lshr(u, 30) - (znrt_q_lshr(u, 31) * 2);\n", 68});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let run: i64 = 0;\n", 22});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let b: i64 = 30;\n", 21});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let done: i32 = 0;\n", 23});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    while (done == 0) {\n", 24});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (b >= 0) {\n", 22});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            let bit: i64 = znrt_q_lshr(u, b) - (znrt_q_lshr(u, b + 1) * 2);\n", 76});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            if (bit == first) { run = run + 1; b = b - 1; } else { done = 1; }\n", 79});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        } else { done = 1; }\n", 29});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let k: i64 = 0;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (first == 1) { k = run - 1; } else { k = 0 - run; }\n", 59});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let rembits: i64 = 30 - run;\n", 33});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let e: i64 = 0;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let F: i64 = 0;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let frac: i64 = 0;\n", 23});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (rembits >= 2) {\n", 24});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let field: i64 = nrt_lowbits(u, rembits);\n", 50});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        e = znrt_q_lshr(field, rembits - 2);\n", 45});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        F = rembits - 2;\n", 25});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        frac = nrt_lowbits(field, F);\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    } else if (rembits == 1) {\n", 31});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        e = nrt_lowbits(u, 1) * 2; F = 0; frac = 0;\n", 52});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    } else { e = 0; F = 0; frac = 0; }\n", 39});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    neg.* = n;\n", 15});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    sig.* = znrt_q_pow2(F) + frac;\n", 35});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    sexp.* = (4 * k + e) - F;\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_quire_zero() ZnrtQuire {\n", 33});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return ZnrtQuire{ .l0 = 0, .l1 = 0, .l2 = 0, .l3 = 0, .l4 = 0, .l5 = 0, .l6 = 0, .l7 = 0, .nar = 0 };\n", 106});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_quire_fma(q: ZnrtQuire, a: i64, b: i64) ZnrtQuire {\n", 60});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 2147483648) { let r: ZnrtQuire = q; r.nar = 1; return r; }\n", 72});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 2147483648) { let r2: ZnrtQuire = q; r2.nar = 1; return r2; }\n", 75});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (q.nar != 0) { let r3: ZnrtQuire = q; r3.nar = 1; return r3; }\n", 70});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let na: i64 = 0; let ea: i64 = 0; let sa: i64 = 0;\n", 55});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let nb: i64 = 0; let eb: i64 = 0; let sb: i64 = 0;\n", 55});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    znrt_p32_fields(a, &na, &ea, &sa);\n", 39});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    znrt_p32_fields(b, &nb, &eb, &sb);\n", 39});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (sa == 0) { return q; }\n", 31});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (sb == 0) { return q; }\n", 31});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let P: i64 = sa * sb;\n", 26});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let shift: i64 = (ea + eb) + 240;\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (shift < 0) { return q; }\n", 33});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let off: i64 = shift / 64;\n", 31});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let bo: i64 = shift - off * 64;\n", 36});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let lo: i64 = P;\n", 21});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let hi: i64 = 0;\n", 21});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (bo != 0) { lo = znrt_q_shl(P, bo); hi = znrt_q_lshr(P, 64 - bo); }\n", 75});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let sub: i32 = 0;\n", 22});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (na != nb) { sub = 1; }\n", 31});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let r: ZnrtQuire = q;\n", 26});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let limb0: i64 = q.l0; let limb1: i64 = q.l1; let limb2: i64 = q.l2; let limb3: i64 = q.l3;\n", 96});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let limb4: i64 = q.l4; let limb5: i64 = q.l5; let limb6: i64 = q.l6; let limb7: i64 = q.l7;\n", 96});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (sub == 0) {\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let i: i64 = off;\n", 26});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let addend: i64 = lo;\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let nexta: i64 = hi;\n", 29});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let carry: i64 = 0;\n", 28});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let stage: i64 = 0;\n", 28});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let go: i32 = 1;\n", 25});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        while (go == 1) {\n", 26});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            if (i > 7) { go = 0; }\n", 35});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            else {\n", 19});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                let cur: i64 = 0;\n", 34});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                if (i == 0) { cur = limb0; } else if (i == 1) { cur = limb1; } else if (i == 2) { cur = limb2; }\n", 113});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                else if (i == 3) { cur = limb3; } else if (i == 4) { cur = limb4; } else if (i == 5) { cur = limb5; }\n", 118});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                else if (i == 6) { cur = limb6; } else { cur = limb7; }\n", 72});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                let s1: i64 = cur + addend;\n", 44});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                let c1: i64 = 0;\n", 33});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                if (znrt_q_ult(s1, cur) == 1) { c1 = 1; }\n", 58});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                let s2: i64 = s1 + carry;\n", 42});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                let c2: i64 = 0;\n", 33});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                if (znrt_q_ult(s2, s1) == 1) { c2 = 1; }\n", 57});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                let outc: i64 = c1 + c2;\n", 41});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                if (i == 0) { limb0 = s2; } else if (i == 1) { limb1 = s2; } else if (i == 2) { limb2 = s2; }\n", 110});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                else if (i == 3) { limb3 = s2; } else if (i == 4) { limb4 = s2; } else if (i == 5) { limb5 = s2; }\n", 115});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                else if (i == 6) { limb6 = s2; } else { limb7 = s2; }\n", 70});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                carry = outc;\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                addend = nexta;\n", 32});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                nexta = 0;\n", 27});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                if (stage == 0) { stage = 1; }\n", 47});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                else if (stage == 1) { stage = 2; }\n", 52});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                if (stage >= 2) { if (carry == 0) { if (addend == 0) { go = 0; } } }\n", 85});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                i = i + 1;\n", 27});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            }\n", 14});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        }\n", 10});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    } else {\n", 13});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let i: i64 = off;\n", 26});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let suba: i64 = lo;\n", 28});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let nexts: i64 = hi;\n", 29});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let borrow: i64 = 0;\n", 29});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let stage: i64 = 0;\n", 28});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let go: i32 = 1;\n", 25});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        while (go == 1) {\n", 26});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            if (i > 7) { go = 0; }\n", 35});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            else {\n", 19});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                let cur: i64 = 0;\n", 34});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                if (i == 0) { cur = limb0; } else if (i == 1) { cur = limb1; } else if (i == 2) { cur = limb2; }\n", 113});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                else if (i == 3) { cur = limb3; } else if (i == 4) { cur = limb4; } else if (i == 5) { cur = limb5; }\n", 118});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                else if (i == 6) { cur = limb6; } else { cur = limb7; }\n", 72});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                let d1: i64 = cur - suba;\n", 42});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                let b1: i64 = 0;\n", 33});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                if (znrt_q_ult(cur, suba) == 1) { b1 = 1; }\n", 60});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                let d2: i64 = d1 - borrow;\n", 43});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                let b2: i64 = 0;\n", 33});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                if (znrt_q_ult(d1, borrow) == 1) { b2 = 1; }\n", 61});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                let outb: i64 = b1 + b2;\n", 41});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                if (i == 0) { limb0 = d2; } else if (i == 1) { limb1 = d2; } else if (i == 2) { limb2 = d2; }\n", 110});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                else if (i == 3) { limb3 = d2; } else if (i == 4) { limb4 = d2; } else if (i == 5) { limb5 = d2; }\n", 115});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                else if (i == 6) { limb6 = d2; } else { limb7 = d2; }\n", 70});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                borrow = outb;\n", 31});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                suba = nexts;\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                nexts = 0;\n", 27});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                if (stage == 0) { stage = 1; }\n", 47});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                else if (stage == 1) { stage = 2; }\n", 52});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                if (stage >= 2) { if (borrow == 0) { if (suba == 0) { go = 0; } } }\n", 84});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                i = i + 1;\n", 27});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            }\n", 14});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        }\n", 10});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    r.l0 = limb0; r.l1 = limb1; r.l2 = limb2; r.l3 = limb3;\n", 60});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    r.l4 = limb4; r.l5 = limb5; r.l6 = limb6; r.l7 = limb7;\n", 60});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return r;\n", 14});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_quire_to_p32(q: ZnrtQuire) i64 {\n", 41});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (q.nar != 0) { return 2147483648; }\n", 43});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let l0: i64 = q.l0; let l1: i64 = q.l1; let l2: i64 = q.l2; let l3: i64 = q.l3;\n", 84});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let l4: i64 = q.l4; let l5: i64 = q.l5; let l6: i64 = q.l6; let l7: i64 = q.l7;\n", 84});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let neg: i64 = znrt_q_lshr(l7, 63);\n", 40});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (neg == 1) {\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let carry: i64 = 1;\n", 28});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let mn: i64 = (0 - 9223372036854775807) - 1;\n", 53});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let arr0: i64 = 0; let arr1: i64 = 0; let arr2: i64 = 0; let arr3: i64 = 0;\n", 84});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let arr4: i64 = 0; let arr5: i64 = 0; let arr6: i64 = 0; let arr7: i64 = 0;\n", 84});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let i: i64 = 0;\n", 24});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        while (i < 8) {\n", 24});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            let v: i64 = 0;\n", 28});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            if (i == 0) { v = l0; } else if (i == 1) { v = l1; } else if (i == 2) { v = l2; }\n", 94});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            else if (i == 3) { v = l3; } else if (i == 4) { v = l4; } else if (i == 5) { v = l5; }\n", 99});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            else if (i == 6) { v = l6; } else { v = l7; }\n", 58});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            let notv: i64 = (0 - 1) - v;\n", 41});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            let s: i64 = notv + carry;\n", 39});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            let c: i64 = 0;\n", 28});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            if (znrt_q_ult(s, notv) == 1) { c = 1; }\n", 53});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            if (i == 0) { arr0 = s; } else if (i == 1) { arr1 = s; } else if (i == 2) { arr2 = s; }\n", 100});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            else if (i == 3) { arr3 = s; } else if (i == 4) { arr4 = s; } else if (i == 5) { arr5 = s; }\n", 105});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            else if (i == 6) { arr6 = s; } else { arr7 = s; }\n", 62});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            carry = c;\n", 23});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            i = i + 1;\n", 23});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        }\n", 10});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        l0 = arr0; l1 = arr1; l2 = arr2; l3 = arr3; l4 = arr4; l5 = arr5; l6 = arr6; l7 = arr7;\n", 96});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let M: i64 = 0 - 1;\n", 24});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let bi: i64 = 511;\n", 23});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let foundM: i32 = 0;\n", 25});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    while (foundM == 0) {\n", 26});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (bi < 0) { foundM = 1; }\n", 36});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        else {\n", 15});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            if (znrt_q_get(l0, l1, l2, l3, l4, l5, l6, l7, bi) == 1) { M = bi; foundM = 1; }\n", 93});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            else { bi = bi - 1; }\n", 34});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        }\n", 10});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (M < 0) { return 0; }\n", 29});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let hi53: i64 = 0;\n", 23});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let j: i64 = 0;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    while (j < 53) {\n", 21});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let pos: i64 = M - j;\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let bit: i64 = 0;\n", 26});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (pos >= 0) { bit = znrt_q_get(l0, l1, l2, l3, l4, l5, l6, l7, pos); }\n", 81});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        hi53 = hi53 * 2 + bit;\n", 31});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        j = j + 1;\n", 19});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let sticky: i32 = 0;\n", 25});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let si: i64 = 0;\n", 21});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let limit: i64 = M - 53;\n", 29});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let sdone: i32 = 0;\n", 24});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    while (sdone == 0) {\n", 25});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (si > limit) { sdone = 1; }\n", 39});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        else {\n", 15});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            if (znrt_q_get(l0, l1, l2, l3, l4, l5, l6, l7, si) == 1) { sticky = 1; sdone = 1; }\n", 96});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            else { si = si + 1; }\n", 34});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        }\n", 10});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (sticky == 1) {\n", 23});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (nrt_lowbits(hi53, 1) == 0) { hi53 = hi53 + 1; }\n", 60});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let val: f64 = nrt_ldexp(hi53 as f64, (M - 52) - 240);\n", 59});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (neg == 1) { val = 0.0 - val; }\n", 39});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return nrt_encode(val, 32, 2);\n", 35});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    return s;
+}
+static ZagSliceU8 cg_numeric_rt2_src(void) {
+    ZagSliceU8 s = (ZagSliceU8){(const uint8_t*)"", 0};
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_clamp(r: i64, lo: i64, hi: i64) i64 {\n", 46});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (r > hi) { return hi; }\n", 31});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (r < lo) { return lo; }\n", 31});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return r;\n", 14});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_i8_add(a: i64, b: i64) i64 { return znrt_clamp(a + b, 0 - 128, 127); }\n", 83});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_i8_sub(a: i64, b: i64) i64 { return znrt_clamp(a - b, 0 - 128, 127); }\n", 83});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_i8_mul(a: i64, b: i64) i64 { return znrt_clamp(a * b, 0 - 128, 127); }\n", 83});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_i16_add(a: i64, b: i64) i64 { return znrt_clamp(a + b, 0 - 32768, 32767); }\n", 88});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_i16_sub(a: i64, b: i64) i64 { return znrt_clamp(a - b, 0 - 32768, 32767); }\n", 88});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_i16_mul(a: i64, b: i64) i64 { return znrt_clamp(a * b, 0 - 32768, 32767); }\n", 88});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_i32_add(a: i64, b: i64) i64 { return znrt_clamp(a + b, 0 - 2147483648, 2147483647); }\n", 98});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_i32_sub(a: i64, b: i64) i64 { return znrt_clamp(a - b, 0 - 2147483648, 2147483647); }\n", 98});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_i32_mul(a: i64, b: i64) i64 { return znrt_clamp(a * b, 0 - 2147483648, 2147483647); }\n", 98});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_u8_add(a: i64, b: i64) i64 { return znrt_clamp(a + b, 0, 255); }\n", 77});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_u8_sub(a: i64, b: i64) i64 { if (a > b) { return a - b; } return 0; }\n", 82});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_u8_mul(a: i64, b: i64) i64 { return znrt_clamp(a * b, 0, 255); }\n", 77});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_u16_add(a: i64, b: i64) i64 { return znrt_clamp(a + b, 0, 65535); }\n", 80});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_u16_sub(a: i64, b: i64) i64 { if (a > b) { return a - b; } return 0; }\n", 83});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_u16_mul(a: i64, b: i64) i64 { return znrt_clamp(a * b, 0, 65535); }\n", 80});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_u32_add(a: i64, b: i64) i64 { return znrt_clamp(a + b, 0, 4294967295); }\n", 85});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_u32_sub(a: i64, b: i64) i64 { if (a > b) { return a - b; } return 0; }\n", 83});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_u32_mul(a: i64, b: i64) i64 { return znrt_clamp(a * b, 0, 4294967295); }\n", 85});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_i64_max() i64 { return 9223372036854775807; }\n", 54});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_i64_min() i64 { return 0 - 9223372036854775807 - 1; }\n", 62});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_i64_add(a: i64, b: i64) i64 {\n", 42});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let r: i64 = a + b;\n", 24});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b > 0) { if (r < a) { return znrt_i64_max(); } }\n", 57});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b < 0) { if (r > a) { return znrt_i64_min(); } }\n", 57});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return r;\n", 14});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_i64_sub(a: i64, b: i64) i64 {\n", 42});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let r: i64 = a - b;\n", 24});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b < 0) { if (r < a) { return znrt_i64_max(); } }\n", 57});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b > 0) { if (r > a) { return znrt_i64_min(); } }\n", 57});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return r;\n", 14});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_i64_mul(a: i64, b: i64) i64 {\n", 42});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 0) { return 0; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 0) { return 0; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let r: i64 = a * b;\n", 24});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let neg: i32 = 0;\n", 22});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a < 0) { neg = 1 - neg; }\n", 34});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b < 0) { neg = 1 - neg; }\n", 34});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (r / b == a) {\n", 22});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (a == znrt_i64_min()) { if (b == 0 - 1) { return znrt_i64_max(); } }\n", 80});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (b == znrt_i64_min()) { if (a == 0 - 1) { return znrt_i64_max(); } }\n", 80});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        return r;\n", 18});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (neg == 1) { return znrt_i64_min(); }\n", 45});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return znrt_i64_max();\n", 27});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_u64_max() i64 { return 0 - 1; }\n", 40});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_ult(a: i64, b: i64) i32 {\n", 34});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let sa: i64 = a + znrt_i64_min();\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let sb: i64 = b + znrt_i64_min();\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (sa < sb) { return 1; }\n", 31});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return 0;\n", 14});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_u64_add(a: i64, b: i64) i64 {\n", 42});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let r: i64 = a + b;\n", 24});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (znrt_ult(r, a) == 1) { return znrt_u64_max(); }\n", 56});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return r;\n", 14});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_u64_sub(a: i64, b: i64) i64 {\n", 42});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (znrt_ult(a, b) == 1) { return 0; }\n", 43});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return a - b;\n", 18});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_ugt(a: i64, b: i64) i32 { return znrt_ult(b, a); }\n", 59});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_udiv(a: i64, b: i64) i64 {\n", 35});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (znrt_ult(a, b) == 1) { return 0; }\n", 43});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let q: i64 = 0;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let rem: i64 = 0;\n", 22});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let p: i64 = 63;\n", 21});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let done: i32 = 0;\n", 23});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    while (done == 0) {\n", 24});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        let bit: i64 = 0;\n", 26});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (p == 63) {\n", 23});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            if (a < 0) { bit = 1; }\n", 36});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        } else {\n", 17});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            let pw: i64 = znrt_pow2(p);\n", 40});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"            if ((a & pw) != 0) { bit = 1; }\n", 44});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        }\n", 10});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        rem = rem * 2 + bit;\n", 29});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        q = q * 2;\n", 19});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (znrt_ult(rem, b) == 0) { rem = rem - b; q = q + 1; }\n", 65});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"        if (p == 0) { done = 1; } else { p = p - 1; }\n", 54});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    }\n", 6});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return q;\n", 14});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_sat_u64_mul(a: i64, b: i64) i64 {\n", 42});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (a == 0) { return 0; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (b == 0) { return 0; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (znrt_ugt(a, znrt_udiv(znrt_u64_max(), b)) == 1) { return znrt_u64_max(); }\n", 83});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return a * b;\n", 18});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_pow2(f: i64) i64 {\n", 27});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let r: i64 = 1;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let i: i64 = 0;\n", 20});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    while (i < f) { r = r * 2; i = i + 1; }\n", 44});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return r;\n", 14});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_fixed_mul(a: i64, b: i64, f: i64) i64 { return (a * b) / znrt_pow2(f); }\n", 81});
+    return s;
+}
+static ZagSliceU8 cg_numeric_rt3_src(void) {
+    ZagSliceU8 s = (ZagSliceU8){(const uint8_t*)"", 0};
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"struct ZnrtRns { r1: i64, r2: i64, r3: i64 }\n", 45});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_rns_m1() i64 { return 65521; }\n", 39});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_rns_m2() i64 { return 65531; }\n", 39});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_rns_m3() i64 { return 65533; }\n", 39});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_rns_mod(x: i64, m: i64) i64 {\n", 38});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let r: i64 = x - ((x / m) * m);\n", 36});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    if (r < 0) { r = r + m; }\n", 30});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return r;\n", 14});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_rns_from_i64(x: i64) ZnrtRns {\n", 39});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return ZnrtRns{ .r1 = znrt_rns_mod(x, znrt_rns_m1()),\n", 58});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                  .r2 = znrt_rns_mod(x, znrt_rns_m2()),\n", 56});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                  .r3 = znrt_rns_mod(x, znrt_rns_m3()) };\n", 58});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_rns_add(a: ZnrtRns, b: ZnrtRns) ZnrtRns {\n", 50});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return ZnrtRns{ .r1 = (a.r1 + b.r1) - (((a.r1 + b.r1) / znrt_rns_m1()) * znrt_rns_m1()),\n", 93});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                  .r2 = (a.r2 + b.r2) - (((a.r2 + b.r2) / znrt_rns_m2()) * znrt_rns_m2()),\n", 91});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                  .r3 = (a.r3 + b.r3) - (((a.r3 + b.r3) / znrt_rns_m3()) * znrt_rns_m3()) };\n", 93});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_rns_sub(a: ZnrtRns, b: ZnrtRns) ZnrtRns {\n", 50});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    let m1: i64 = znrt_rns_m1(); let m2: i64 = znrt_rns_m2(); let m3: i64 = znrt_rns_m3();\n", 91});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return ZnrtRns{ .r1 = ((a.r1 + m1) - b.r1) - ((((a.r1 + m1) - b.r1) / m1) * m1),\n", 85});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                  .r2 = ((a.r2 + m2) - b.r2) - ((((a.r2 + m2) - b.r2) / m2) * m2),\n", 83});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                  .r3 = ((a.r3 + m3) - b.r3) - ((((a.r3 + m3) - b.r3) / m3) * m3) };\n", 85});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"fn znrt_rns_mul(a: ZnrtRns, b: ZnrtRns) ZnrtRns {\n", 50});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"    return ZnrtRns{ .r1 = (a.r1 * b.r1) - (((a.r1 * b.r1) / znrt_rns_m1()) * znrt_rns_m1()),\n", 93});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                  .r2 = (a.r2 * b.r2) - (((a.r2 * b.r2) / znrt_rns_m2()) * znrt_rns_m2()),\n", 91});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"                  .r3 = (a.r3 * b.r3) - (((a.r3 * b.r3) / znrt_rns_m3()) * znrt_rns_m3()) };\n", 93});
+    s = _zag_str_concat(s, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    return s;
+}
+static int32_t cg_ty_is_posit(ZagSliceU8 t) {
+    ZagSliceU8 s = t;
+    if ((s.len > 1)) {
+    if (((s).ptr[0] == 42)) {
+    s = (ZagSliceU8){ (s).ptr + (1), ((s).len) - (1) };
+    }
+    }
+    if ((cg_is_posit_ty(s) == 1)) {
+    return 1;
+    }
+    if ((cg_is_quire_ty(s) == 1)) {
+    return 1;
+    }
+    return 0;
+}
+static int32_t cg_expr_uses_posit(Node* n) {
+    {
+    Node __sw = (*n);
+    switch (__sw.tag) {
+    case Node_call:
+    {
+        __auto_type c = __sw.u.call;
+    {
+    Node __sw = (*c.callee);
+    switch (__sw.tag) {
+    case Node_id:
+    {
+        __auto_type cid = __sw.u.id;
+    if ((cid.name.len > 1)) {
+    if (((cid.name).ptr[0] == 64)) {
+    if ((cg_posit_builtin_fn((ZagSliceU8){ (cid.name).ptr + (1), ((cid.name).len) - (1) }).len > 0)) {
+    return 1;
+    }
+    if ((cg_quire_builtin_fn((ZagSliceU8){ (cid.name).ptr + (1), ((cid.name).len) - (1) }).len > 0)) {
+    return 1;
+    }
+    }
+    }
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+    int32_t i = 0;
+    while ((i < len_pNode(c.args))) {
+    if ((cg_expr_uses_posit(get_pNode(c.args, i)) == 1)) {
+    return 1;
+    }
+    i = (i + 1);
+    }
+    return 0;
+        break;
+    }
+    case Node_bin:
+    {
+        __auto_type b = __sw.u.bin;
+    if ((cg_expr_uses_posit(b.l) == 1)) {
+    return 1;
+    }
+    if ((cg_expr_uses_posit(b.r) == 1)) {
+    return 1;
+    }
+    return 0;
+        break;
+    }
+    case Node_un:
+    {
+        __auto_type u = __sw.u.un;
+    return cg_expr_uses_posit(u.e);
+        break;
+    }
+    default:
+    {
+    return 0;
+        break;
+    }
+    }
+    }
+}
+static int32_t cg_body_uses_posit(ArrayList_pNode body) {
+    int32_t i = 0;
+    while ((i < len_pNode(body))) {
+    {
+    Node __sw = (*get_pNode(body, i));
+    switch (__sw.tag) {
+    case Node_let_:
+    {
+        __auto_type l = __sw.u.let_;
+    if ((l.has_dty == 1)) {
+    if ((cg_ty_is_posit(l.dty) == 1)) {
+    return 1;
+    }
+    }
+    if ((cg_expr_uses_posit(l.expr) == 1)) {
+    return 1;
+    }
+        break;
+    }
+    case Node_assign:
+    {
+        __auto_type a = __sw.u.assign;
+    if ((cg_expr_uses_posit(a.expr) == 1)) {
+    return 1;
+    }
+        break;
+    }
+    case Node_estmt:
+    {
+        __auto_type e = __sw.u.estmt;
+    if ((cg_expr_uses_posit(e.expr) == 1)) {
+    return 1;
+    }
+        break;
+    }
+    case Node_ret:
+    {
+        __auto_type r = __sw.u.ret;
+    if ((r.has_expr == 1)) {
+    if ((cg_expr_uses_posit(r.expr) == 1)) {
+    return 1;
+    }
+    }
+        break;
+    }
+    case Node_if_:
+    {
+        __auto_type x = __sw.u.if_;
+    if ((cg_expr_uses_posit(x.cond) == 1)) {
+    return 1;
+    }
+    if ((cg_body_uses_posit(x.then_body) == 1)) {
+    return 1;
+    }
+    if ((x.has_els == 1)) {
+    if ((cg_body_uses_posit(x.els_body) == 1)) {
+    return 1;
+    }
+    }
+        break;
+    }
+    case Node_while_:
+    {
+        __auto_type w = __sw.u.while_;
+    if ((cg_expr_uses_posit(w.cond) == 1)) {
+    return 1;
+    }
+    if ((cg_body_uses_posit(w.body) == 1)) {
+    return 1;
+    }
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+    i = (i + 1);
+    }
+    return 0;
+}
+static int32_t cg_decls_use_posit(ArrayList_pNode decls) {
+    int32_t i = 0;
+    while ((i < len_pNode(decls))) {
+    {
+    Node __sw = (*get_pNode(decls, i));
+    switch (__sw.tag) {
+    case Node_fn_decl:
+    {
+        __auto_type f = __sw.u.fn_decl;
+    int32_t pj = 0;
+    while ((pj < len_Param(f.params))) {
+    if ((cg_ty_is_posit(get_Param(f.params, pj).pty) == 1)) {
+    return 1;
+    }
+    pj = (pj + 1);
+    }
+    if ((cg_ty_is_posit(f.ret) == 1)) {
+    return 1;
+    }
+    if ((f.is_extern == 0)) {
+    if ((cg_body_uses_posit(f.body) == 1)) {
+    return 1;
+    }
+    }
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+    i = (i + 1);
+    }
+    return 0;
+}
+static int32_t cg_ty_is_satfixed(ZagSliceU8 t) {
+    ZagSliceU8 s = t;
+    if ((s.len > 1)) {
+    if (((s).ptr[0] == 42)) {
+    s = (ZagSliceU8){ (s).ptr + (1), ((s).len) - (1) };
+    }
+    }
+    if ((s.len > 2)) {
+    if ((((s).ptr[0] == 91) && ((s).ptr[1] == 93))) {
+    s = (ZagSliceU8){ (s).ptr + (2), ((s).len) - (2) };
+    }
+    }
+    if ((cg_is_sat_ty(s) == 1)) {
+    return 1;
+    }
+    if ((cg_is_fixed_ty(s) == 1)) {
+    return 1;
+    }
+    return 0;
+}
+static int32_t cg_expr_uses_satfixed(Node* n) {
+    {
+    Node __sw = (*n);
+    switch (__sw.tag) {
+    case Node_cast_:
+    {
+        __auto_type c = __sw.u.cast_;
+    if ((cg_ty_is_satfixed(cg_norm_type(c.target)) == 1)) {
+    return 1;
+    }
+    return cg_expr_uses_satfixed(c.expr);
+        break;
+    }
+    case Node_call:
+    {
+        __auto_type c = __sw.u.call;
+    int32_t i = 0;
+    while ((i < len_pNode(c.args))) {
+    if ((cg_expr_uses_satfixed(get_pNode(c.args, i)) == 1)) {
+    return 1;
+    }
+    i = (i + 1);
+    }
+    return 0;
+        break;
+    }
+    case Node_bin:
+    {
+        __auto_type b = __sw.u.bin;
+    if ((cg_expr_uses_satfixed(b.l) == 1)) {
+    return 1;
+    }
+    if ((cg_expr_uses_satfixed(b.r) == 1)) {
+    return 1;
+    }
+    return 0;
+        break;
+    }
+    case Node_un:
+    {
+        __auto_type u = __sw.u.un;
+    return cg_expr_uses_satfixed(u.e);
+        break;
+    }
+    default:
+    {
+    return 0;
+        break;
+    }
+    }
+    }
+}
+static int32_t cg_body_uses_satfixed(ArrayList_pNode body) {
+    int32_t i = 0;
+    while ((i < len_pNode(body))) {
+    {
+    Node __sw = (*get_pNode(body, i));
+    switch (__sw.tag) {
+    case Node_let_:
+    {
+        __auto_type l = __sw.u.let_;
+    if ((l.has_dty == 1)) {
+    if ((cg_ty_is_satfixed(l.dty) == 1)) {
+    return 1;
+    }
+    }
+    if ((cg_expr_uses_satfixed(l.expr) == 1)) {
+    return 1;
+    }
+        break;
+    }
+    case Node_assign:
+    {
+        __auto_type a = __sw.u.assign;
+    if ((cg_expr_uses_satfixed(a.expr) == 1)) {
+    return 1;
+    }
+        break;
+    }
+    case Node_estmt:
+    {
+        __auto_type e = __sw.u.estmt;
+    if ((cg_expr_uses_satfixed(e.expr) == 1)) {
+    return 1;
+    }
+        break;
+    }
+    case Node_ret:
+    {
+        __auto_type r = __sw.u.ret;
+    if ((r.has_expr == 1)) {
+    if ((cg_expr_uses_satfixed(r.expr) == 1)) {
+    return 1;
+    }
+    }
+        break;
+    }
+    case Node_if_:
+    {
+        __auto_type x = __sw.u.if_;
+    if ((cg_expr_uses_satfixed(x.cond) == 1)) {
+    return 1;
+    }
+    if ((cg_body_uses_satfixed(x.then_body) == 1)) {
+    return 1;
+    }
+    if ((x.has_els == 1)) {
+    if ((cg_body_uses_satfixed(x.els_body) == 1)) {
+    return 1;
+    }
+    }
+        break;
+    }
+    case Node_while_:
+    {
+        __auto_type w = __sw.u.while_;
+    if ((cg_expr_uses_satfixed(w.cond) == 1)) {
+    return 1;
+    }
+    if ((cg_body_uses_satfixed(w.body) == 1)) {
+    return 1;
+    }
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+    i = (i + 1);
+    }
+    return 0;
+}
+static int32_t cg_decls_use_satfixed(ArrayList_pNode decls) {
+    int32_t i = 0;
+    while ((i < len_pNode(decls))) {
+    {
+    Node __sw = (*get_pNode(decls, i));
+    switch (__sw.tag) {
+    case Node_fn_decl:
+    {
+        __auto_type f = __sw.u.fn_decl;
+    int32_t pj = 0;
+    while ((pj < len_Param(f.params))) {
+    if ((cg_ty_is_satfixed(get_Param(f.params, pj).pty) == 1)) {
+    return 1;
+    }
+    pj = (pj + 1);
+    }
+    if ((cg_ty_is_satfixed(f.ret) == 1)) {
+    return 1;
+    }
+    if ((f.is_extern == 0)) {
+    if ((cg_body_uses_satfixed(f.body) == 1)) {
+    return 1;
+    }
+    }
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+    i = (i + 1);
+    }
+    return 0;
+}
+static int32_t cg_ty_is_rns(ZagSliceU8 t) {
+    ZagSliceU8 s = t;
+    if ((s.len > 1)) {
+    if (((s).ptr[0] == 42)) {
+    s = (ZagSliceU8){ (s).ptr + (1), ((s).len) - (1) };
+    }
+    }
+    if ((s.len > 2)) {
+    if ((((s).ptr[0] == 91) && ((s).ptr[1] == 93))) {
+    s = (ZagSliceU8){ (s).ptr + (2), ((s).len) - (2) };
+    }
+    }
+    return cg_is_rns_ty(s);
+}
+static int32_t cg_body_uses_rns(ArrayList_pNode body) {
+    int32_t i = 0;
+    while ((i < len_pNode(body))) {
+    {
+    Node __sw = (*get_pNode(body, i));
+    switch (__sw.tag) {
+    case Node_let_:
+    {
+        __auto_type l = __sw.u.let_;
+    if ((l.has_dty == 1)) {
+    if ((cg_ty_is_rns(l.dty) == 1)) {
+    return 1;
+    }
+    }
+        break;
+    }
+    case Node_if_:
+    {
+        __auto_type x = __sw.u.if_;
+    if ((cg_body_uses_rns(x.then_body) == 1)) {
+    return 1;
+    }
+    if ((x.has_els == 1)) {
+    if ((cg_body_uses_rns(x.els_body) == 1)) {
+    return 1;
+    }
+    }
+        break;
+    }
+    case Node_while_:
+    {
+        __auto_type w = __sw.u.while_;
+    if ((cg_body_uses_rns(w.body) == 1)) {
+    return 1;
+    }
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+    i = (i + 1);
+    }
+    return 0;
+}
+static int32_t cg_decls_use_rns(ArrayList_pNode decls) {
+    int32_t i = 0;
+    while ((i < len_pNode(decls))) {
+    {
+    Node __sw = (*get_pNode(decls, i));
+    switch (__sw.tag) {
+    case Node_fn_decl:
+    {
+        __auto_type f = __sw.u.fn_decl;
+    int32_t pj = 0;
+    while ((pj < len_Param(f.params))) {
+    if ((cg_ty_is_rns(get_Param(f.params, pj).pty) == 1)) {
+    return 1;
+    }
+    pj = (pj + 1);
+    }
+    if ((cg_ty_is_rns(f.ret) == 1)) {
+    return 1;
+    }
+    if ((f.is_extern == 0)) {
+    if ((cg_body_uses_rns(f.body) == 1)) {
+    return 1;
+    }
+    }
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+    i = (i + 1);
+    }
+    return 0;
+}
+static ArrayList_Instr lower_program(ArrayList_pNode decls0in, int32_t* errout, ArrayList_u8* dataout) {
     ArrayList_Instr out = make_Instr(128);
     int32_t top_err = 0;
+    ArrayList_pNode decls0 = decls0in;
+    if ((cg_decls_use_posit(decls0in) == 1)) {
+    ArrayList_pNode rtdecls = parse_program_dir(cg_numeric_rt_src(), (ZagSliceU8){(const uint8_t*)"", 0});
+    ArrayList_pNode merged = make_pNode(((len_pNode(rtdecls) + len_pNode(decls0)) + 1));
+    int32_t ri = 0;
+    while ((ri < len_pNode(rtdecls))) {
+    push_pNode((&merged), get_pNode(rtdecls, ri));
+    ri = (ri + 1);
+    }
+    int32_t ui = 0;
+    while ((ui < len_pNode(decls0))) {
+    push_pNode((&merged), get_pNode(decls0, ui));
+    ui = (ui + 1);
+    }
+    decls0 = merged;
+    }
+    if ((cg_decls_use_satfixed(decls0in) == 1)) {
+    ArrayList_pNode rt2decls = parse_program_dir(cg_numeric_rt2_src(), (ZagSliceU8){(const uint8_t*)"", 0});
+    ArrayList_pNode merged2 = make_pNode(((len_pNode(rt2decls) + len_pNode(decls0)) + 1));
+    int32_t ri2 = 0;
+    while ((ri2 < len_pNode(rt2decls))) {
+    push_pNode((&merged2), get_pNode(rt2decls, ri2));
+    ri2 = (ri2 + 1);
+    }
+    int32_t ui2 = 0;
+    while ((ui2 < len_pNode(decls0))) {
+    push_pNode((&merged2), get_pNode(decls0, ui2));
+    ui2 = (ui2 + 1);
+    }
+    decls0 = merged2;
+    }
+    if ((cg_decls_use_rns(decls0in) == 1)) {
+    ArrayList_pNode rt3decls = parse_program_dir(cg_numeric_rt3_src(), (ZagSliceU8){(const uint8_t*)"", 0});
+    ArrayList_pNode merged3 = make_pNode(((len_pNode(rt3decls) + len_pNode(decls0)) + 1));
+    int32_t ri3 = 0;
+    while ((ri3 < len_pNode(rt3decls))) {
+    push_pNode((&merged3), get_pNode(rt3decls, ri3));
+    ri3 = (ri3 + 1);
+    }
+    int32_t ui3 = 0;
+    while ((ui3 < len_pNode(decls0))) {
+    push_pNode((&merged3), get_pNode(decls0, ui3));
+    ui3 = (ui3 + 1);
+    }
+    decls0 = merged3;
+    }
     ArrayList_pNode decls = cg_expand_generics(decls0);
     ArrayList_FnSym syms = make_FnSym(8);
     int32_t next_id = 1;
@@ -9013,14 +13544,15 @@ static ArrayList_Instr lower_program(ArrayList_pNode decls0, int32_t* errout, Ar
     int32_t se_lbl = (next_id + 3);
     int32_t ml_lbl = (next_id + 4);
     int32_t rl_lbl = (next_id + 5);
-    int32_t rt_base = (next_id + 6);
+    int32_t pf_lbl = (next_id + 6);
+    int32_t rt_base = (next_id + 7);
     ArrayList_i32 rt_used = make_i32((RT_COUNT() + 1));
     int32_t rti = 0;
     while ((rti < RT_COUNT())) {
     push_i32((&rt_used), 0);
     rti = (rti + 1);
     }
-    Cg cg = (Cg){ .next = (rt_base + RT_COUNT()), .err = top_err, .data = dataout, .decls = decls, .pi_lbl = pi_lbl, .ps_lbl = ps_lbl, .al_lbl = al_lbl, .se_lbl = se_lbl, .ml_lbl = ml_lbl, .rl_lbl = rl_lbl, .use_pi = 0, .use_ps = 0, .use_al = 0, .use_se = 0, .use_ml = 0, .use_rl = 0, .rt_base = rt_base, .rt_used = (&rt_used) };
+    Cg cg = (Cg){ .next = (rt_base + RT_COUNT()), .err = top_err, .data = dataout, .decls = decls, .pi_lbl = pi_lbl, .ps_lbl = ps_lbl, .al_lbl = al_lbl, .se_lbl = se_lbl, .ml_lbl = ml_lbl, .rl_lbl = rl_lbl, .pf_lbl = pf_lbl, .use_pi = 0, .use_pf = 0, .use_ps = 0, .use_al = 0, .use_se = 0, .use_ml = 0, .use_rl = 0, .rt_base = rt_base, .rt_used = (&rt_used) };
     int32_t main_lbl = cg_find_fn(syms, (ZagSliceU8){(const uint8_t*)"main", 4});
     if ((main_lbl < 0)) {
     _zag_eprintln((ZagSliceU8){(const uint8_t*)"native: no main function found", 30});
@@ -9068,6 +13600,9 @@ static ArrayList_Instr lower_program(ArrayList_pNode decls0, int32_t* errout, Ar
     }
     if ((cg.use_pi == 1)) {
     cg_emit_print_int((&out), cg.pi_lbl, (&cg));
+    }
+    if ((cg.use_pf == 1)) {
+    cg_emit_print_f64((&out), cg.pf_lbl, (&cg));
     }
     if ((cg.use_ps == 1)) {
     cg_emit_print_str((&out), cg.ps_lbl);
@@ -9162,7 +13697,9 @@ int main(void) {
     _zag_println((ZagSliceU8){(const uint8_t*)"znc: build aborted — unsupported constructs (see messages above)", 66});
     return 1;
     }
-    ArrayList_Instr opt = peephole(prog);
+    ArrayList_Instr prog2 = regalloc(prog);
+    ArrayList_Instr prog3 = optimize(prog2);
+    ArrayList_Instr opt = peephole(prog3);
     ArrayList_u8 code = encode(opt);
     ZagSliceU8 out = out_flag();
     if ((out.len == 0)) {
