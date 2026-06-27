@@ -476,7 +476,7 @@ struct StructDecl_s { ZagSliceU8 name; ArrayList_Param fields; ArrayList__u8 tpa
 struct EnumDecl_s { ZagSliceU8 name; ArrayList__u8 members; };
 struct UnionDecl_s { ZagSliceU8 name; ArrayList_Param fields; };
 struct FnDecl_s { ZagSliceU8 name; ArrayList__u8 tparams; ArrayList_Param params; ZagSliceU8 ret; ArrayList__u8 annots; ArrayList_pNode body; int32_t is_extern; ZagSliceU8 ret_eff; int32_t caps; ZagSliceU8 cap_names; ZagSliceU8 cap_types; };
-struct Let_s { ZagSliceU8 name; ZagSliceU8 dty; int32_t has_dty; Node* expr; ZagSliceU8 eff; int32_t calign; };
+struct Let_s { ZagSliceU8 name; ZagSliceU8 dty; int32_t has_dty; int32_t has_init; Node* expr; ZagSliceU8 eff; int32_t calign; };
 struct Return_s { int32_t has_expr; Node* expr; };
 struct If_s { Node* cond; ArrayList_pNode then_body; ArrayList_pNode els_body; int32_t has_els; ZagSliceU8 cap; int32_t has_cap; };
 struct While_s { Node* cond; ArrayList_pNode body; ZagSliceU8 cap; int32_t has_cap; };
@@ -767,7 +767,7 @@ static Node* mk_call(Node* callee, ArrayList_pNode args);
 static Node* mk_gcall(Node* callee, ArrayList_pNode args, ArrayList__u8 targs);
 static Node* mk_estmt(Node* e);
 static Node* mk_assign(Node* t, Node* e);
-static Node* mk_let(ZagSliceU8 name, ZagSliceU8 dty, int32_t has_dty, Node* expr);
+static Node* mk_let(ZagSliceU8 name, ZagSliceU8 dty, int32_t has_dty, int32_t has_init, Node* expr);
 static Node* mk_ret(int32_t has_expr, Node* expr);
 static Node* mk_if(Node* cond, ArrayList_pNode then_body, ArrayList_pNode els_body, int32_t has_els);
 static Node* mk_while(Node* cond, ArrayList_pNode body);
@@ -3570,8 +3570,8 @@ static Node* mk_estmt(Node* e) {
 static Node* mk_assign(Node* t, Node* e) {
     return ({ Node* __n = (Node*)malloc(sizeof(Node)); *__n = (Node){ .tag = Node_assign, .u = { .assign = (Assign){ .target = t, .expr = e } } }; __n; });
 }
-static Node* mk_let(ZagSliceU8 name, ZagSliceU8 dty, int32_t has_dty, Node* expr) {
-    return ({ Node* __n = (Node*)malloc(sizeof(Node)); *__n = (Node){ .tag = Node_let_, .u = { .let_ = (Let){ .name = name, .dty = dty, .has_dty = has_dty, .expr = expr, .eff = (ZagSliceU8){(const uint8_t*)"", 0}, .calign = 0 } } }; __n; });
+static Node* mk_let(ZagSliceU8 name, ZagSliceU8 dty, int32_t has_dty, int32_t has_init, Node* expr) {
+    return ({ Node* __n = (Node*)malloc(sizeof(Node)); *__n = (Node){ .tag = Node_let_, .u = { .let_ = (Let){ .name = name, .dty = dty, .has_dty = has_dty, .has_init = has_init, .expr = expr, .eff = (ZagSliceU8){(const uint8_t*)"", 0}, .calign = 0 } } }; __n; });
 }
 static Node* mk_ret(int32_t has_expr, Node* expr) {
     return ({ Node* __n = (Node*)malloc(sizeof(Node)); *__n = (Node){ .tag = Node_ret, .u = { .ret = (Return){ .has_expr = has_expr, .expr = expr } } }; __n; });
@@ -4386,10 +4386,15 @@ static Node* parse_stmt(Parser* p) {
     leff = (*p).fn_eff;
     has_dty = 1;
     }
+    int32_t has_init = 0;
+    Node* e = mk_ident((ZagSliceU8){(const uint8_t*)"", 0});
+    if (at_op(p, (ZagSliceU8){(const uint8_t*)"=", 1})) {
     Token _eq = adv(p);
-    Node* e = parse_expr(p);
+    e = parse_expr(p);
+    has_init = 1;
+    }
     eat_semi(p);
-    return ({ Node* __n = (Node*)malloc(sizeof(Node)); *__n = (Node){ .tag = Node_let_, .u = { .let_ = (Let){ .name = name, .dty = dty, .has_dty = has_dty, .expr = e, .eff = leff, .calign = calign } } }; __n; });
+    return ({ Node* __n = (Node*)malloc(sizeof(Node)); *__n = (Node){ .tag = Node_let_, .u = { .let_ = (Let){ .name = name, .dty = dty, .has_dty = has_dty, .has_init = has_init, .expr = e, .eff = leff, .calign = calign } } }; __n; });
     }
     if (at_k(p, Tk_KwReturn)) {
     Token _t = adv(p);
@@ -4896,7 +4901,7 @@ static void q_rewrite_stmt(Node* n, ArrayList__u8 names, ZagSliceU8 qual) {
     {
         __auto_type l = __sw.u.let_;
     q_rewrite_expr(l.expr, names, qual);
-    (*n) = (Node){ .tag = Node_let_, .u = { .let_ = (Let){ .name = l.name, .dty = q_subst_type(l.dty, names, qual), .has_dty = l.has_dty, .expr = l.expr, .eff = l.eff, .calign = l.calign } } };
+    (*n) = (Node){ .tag = Node_let_, .u = { .let_ = (Let){ .name = l.name, .dty = q_subst_type(l.dty, names, qual), .has_dty = l.has_dty, .has_init = l.has_init, .expr = l.expr, .eff = l.eff, .calign = l.calign } } };
         break;
     }
     case Node_ret:
@@ -6208,7 +6213,7 @@ static SwitchArm cg_clone_arm(SwitchArm a, ArrayList__u8 tp, ArrayList__u8 ta) {
     return (SwitchArm){ .tags = a.tags, .cap = a.cap, .has_cap = a.has_cap, .body = cg_clone_block(a.body, tp, ta) };
 }
 static Node* cg_clone_stmt(Node* n, ArrayList__u8 tp, ArrayList__u8 ta) {
-    return ({ __auto_type __sw = (*n); (__sw.tag == Node_let_) ? ({ __auto_type l = __sw.u.let_; (mk_let(l.name, cg_subst_type(l.dty, tp, ta), l.has_dty, cg_clone_expr(l.expr, tp, ta))); }) : (__sw.tag == Node_ret) ? ({ __auto_type r = __sw.u.ret; (mk_ret(r.has_expr, cg_clone_expr(r.expr, tp, ta))); }) : (__sw.tag == Node_if_) ? ({ __auto_type x = __sw.u.if_; (({ Node* __n = (Node*)malloc(sizeof(Node)); *__n = (Node){ .tag = Node_if_, .u = { .if_ = (If){ .cond = cg_clone_expr(x.cond, tp, ta), .then_body = cg_clone_block(x.then_body, tp, ta), .els_body = cg_clone_block(x.els_body, tp, ta), .has_els = x.has_els, .cap = x.cap, .has_cap = x.has_cap } } }; __n; })); }) : (__sw.tag == Node_while_) ? ({ __auto_type w = __sw.u.while_; (({ Node* __n = (Node*)malloc(sizeof(Node)); *__n = (Node){ .tag = Node_while_, .u = { .while_ = (While){ .cond = cg_clone_expr(w.cond, tp, ta), .body = cg_clone_block(w.body, tp, ta), .cap = w.cap, .has_cap = w.has_cap } } }; __n; })); }) : (__sw.tag == Node_assign) ? ({ __auto_type a = __sw.u.assign; (mk_assign(cg_clone_expr(a.target, tp, ta), cg_clone_expr(a.expr, tp, ta))); }) : (__sw.tag == Node_estmt) ? ({ __auto_type e = __sw.u.estmt; (mk_estmt(cg_clone_expr(e.expr, tp, ta))); }) : (__sw.tag == Node_switch_) ? ({ __auto_type sw = __sw.u.switch_; (cg_clone_switch(sw, tp, ta)); }) : (n); });
+    return ({ __auto_type __sw = (*n); (__sw.tag == Node_let_) ? ({ __auto_type l = __sw.u.let_; (mk_let(l.name, cg_subst_type(l.dty, tp, ta), l.has_dty, l.has_init, cg_clone_expr(l.expr, tp, ta))); }) : (__sw.tag == Node_ret) ? ({ __auto_type r = __sw.u.ret; (mk_ret(r.has_expr, cg_clone_expr(r.expr, tp, ta))); }) : (__sw.tag == Node_if_) ? ({ __auto_type x = __sw.u.if_; (({ Node* __n = (Node*)malloc(sizeof(Node)); *__n = (Node){ .tag = Node_if_, .u = { .if_ = (If){ .cond = cg_clone_expr(x.cond, tp, ta), .then_body = cg_clone_block(x.then_body, tp, ta), .els_body = cg_clone_block(x.els_body, tp, ta), .has_els = x.has_els, .cap = x.cap, .has_cap = x.has_cap } } }; __n; })); }) : (__sw.tag == Node_while_) ? ({ __auto_type w = __sw.u.while_; (({ Node* __n = (Node*)malloc(sizeof(Node)); *__n = (Node){ .tag = Node_while_, .u = { .while_ = (While){ .cond = cg_clone_expr(w.cond, tp, ta), .body = cg_clone_block(w.body, tp, ta), .cap = w.cap, .has_cap = w.has_cap } } }; __n; })); }) : (__sw.tag == Node_assign) ? ({ __auto_type a = __sw.u.assign; (mk_assign(cg_clone_expr(a.target, tp, ta), cg_clone_expr(a.expr, tp, ta))); }) : (__sw.tag == Node_estmt) ? ({ __auto_type e = __sw.u.estmt; (mk_estmt(cg_clone_expr(e.expr, tp, ta))); }) : (__sw.tag == Node_switch_) ? ({ __auto_type sw = __sw.u.switch_; (cg_clone_switch(sw, tp, ta)); }) : (n); });
 }
 static Node* cg_clone_switch(Switch sw, ArrayList__u8 tp, ArrayList__u8 ta) {
     ArrayList_SwitchArm arms = make_SwitchArm(4);
@@ -10807,12 +10812,16 @@ static void cg_lower_stmt(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     }
     }
     } else {
+    if ((l.has_init == 0)) {
+    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    } else {
     cg_lower_expr(out, l.expr, env, syms, cg);
     push_Instr(out, i_pop(R_RAX()));
     if ((cg_is_float_ty(lty) == 1)) {
     if ((cg_is_float_ty(cg_expr_type(l.expr, env, syms, cg)) == 0)) {
     push_Instr(out, i_fsi2sd(R_XMM0(), R_RAX()));
     push_Instr(out, i_fmovq_xg(R_RAX(), R_XMM0()));
+    }
     }
     }
     int32_t disp = cg_slot_alloc_typed(env, l.name, lty, 1);
