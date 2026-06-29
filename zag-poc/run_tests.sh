@@ -45,7 +45,7 @@ g strings
 echo "── enums/patterns (expr switch, multi-pattern, exhaustiveness, int-literal) ──"
 g patterns
 echo "── modules (@import flat merge + qualified as name) ──"
-g modules; g modules_struct
+g modules; g modules_struct; g modules_generic
 echo "── optionals (?T, null, orelse, if-let, force-unwrap) ──"
 g optionals
 echo "── heterogeneous: embedded (sat_i16, u11, fixed_8_8, @realtime) ──"
