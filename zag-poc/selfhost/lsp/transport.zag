@@ -1,0 +1,148 @@
+// selfhost/lsp/transport.zag — LSP JSON-RPC framing over stdin/stdout.
+//
+// LSP uses the Language Server Protocol base protocol:
+//
+//   Content-Length: N\r\n
+//   \r\n
+//   <N bytes of JSON>
+//
+// We read messages from stdin (fd=0) via a byte-at-a-time loop,
+// accumulate the header, parse Content-Length, then read the body.
+// Responses are written to stdout (fd=1) using _zag_print.
+
+@import("../../std/list.zag")
+@import("../../std/rt.zag")
+@import("json.zag")
+
+// ── stdin byte reader ─────────────────────────────────────────────────────────
+// Read a single byte from stdin.
+// Returns the byte value (0..255) or -1 on EOF/error.
+fn lsp_read_byte() i32 {
+    let buf: ArrayList[u8] = make[u8](1);
+    let n: i32 = _zag_read_fd(0, buf.data as *i8, 1);
+    if (n <= 0) { return 0 - 1; }
+    return buf.data[0] as i32;
+}
+
+// ── Content-Length parser ─────────────────────────────────────────────────────
+// Given the header block (bytes accumulated before the blank line),
+// extract the Content-Length: N value. Returns -1 if not found.
+fn parse_content_length(hdr: []u8) i32 {
+    let prefix: []u8 = "Content-Length: ";
+    let plen: i32 = prefix.len;
+    let i: i32 = 0;
+    while (i + plen <= hdr.len) {
+        let match_: i32 = 1;
+        let ci: i32 = 0;
+        while (ci < plen) {
+            if (hdr[i + ci] != prefix[ci]) { match_ = 0; }
+            ci = ci + 1;
+        }
+        if (match_ == 1) {
+            let j: i32 = i + plen;
+            let v: i32 = 0;
+            let found: i32 = 0;
+            while (j < hdr.len) {
+                let c: u8 = hdr[j];
+                if (c >= 48 && c <= 57) {
+                    v = v * 10 + (c as i32 - 48);
+                    found = 1;
+                    j = j + 1;
+                } else {
+                    j = hdr.len;
+                }
+            }
+            if (found == 1) { return v; }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// ── message reader ─────────────────────────────────────────────────────────────
+// Read one complete LSP message from stdin.
+// Returns the JSON body as []u8, or "" on EOF/error.
+fn lsp_read_msg() []u8 {
+    // Accumulate header bytes until we see \r\n\r\n.
+    let hdr: ArrayList[u8] = make[u8](256);
+    let seq: i32 = 0;   // state machine: counts matching bytes of \r\n\r\n
+    let done: i32 = 0;
+    while (done == 0) {
+        let c: i32 = lsp_read_byte();
+        if (c < 0) { return ""; }
+        push[u8](&hdr, c as u8);
+        // Match \r\n\r\n  (13 10 13 10)
+        if (seq == 0 && c == 13) { seq = 1; }
+        else if (seq == 1 && c == 10) { seq = 2; }
+        else if (seq == 2 && c == 13) { seq = 3; }
+        else if (seq == 3 && c == 10) { done = 1; }
+        else if (c == 13) { seq = 1; }
+        else { seq = 0; }
+    }
+
+    let hdr_str: []u8 = hdr.data[0..hdr.len];
+    let content_len: i32 = parse_content_length(hdr_str);
+    if (content_len <= 0) { return ""; }
+
+    // Read exactly content_len bytes for the body, byte by byte.
+    let body: ArrayList[u8] = make[u8](content_len + 1);
+    let remaining: i32 = content_len;
+    while (remaining > 0) {
+        let c: i32 = lsp_read_byte();
+        if (c < 0) { return body.data[0..body.len]; }
+        push[u8](&body, c as u8);
+        remaining = remaining - 1;
+    }
+    return body.data[0..body.len];
+}
+
+// ── message writer ─────────────────────────────────────────────────────────────
+// Write a complete LSP message (Content-Length header + body) to stdout.
+fn lsp_send_msg(body: []u8) void {
+    let len_str: []u8 = _zag_i64_to_str(body.len as i64);
+    let hdr: ArrayList[u8] = make[u8](64);
+    str_append(&hdr, "Content-Length: ");
+    str_append(&hdr, len_str);
+    str_append(&hdr, "\r\n\r\n");
+    _zag_print(hdr.data[0..hdr.len]);
+    _zag_print(body);
+    _zag_flush();
+}
+
+// ── response/notification helpers ─────────────────────────────────────────────
+
+// Send a JSON-RPC success response: {"jsonrpc":"2.0","id":N,"result":...}
+fn lsp_send_response(id: i32, result: []u8) void {
+    let out: ArrayList[u8] = make[u8](256);
+    str_append(&out, "{\"jsonrpc\":\"2.0\",\"id\":");
+    str_append(&out, i32_to_str(id));
+    str_append(&out, ",\"result\":");
+    str_append(&out, result);
+    push[u8](&out, 125);
+    lsp_send_msg(out.data[0..out.len]);
+}
+
+// Send a JSON-RPC notification (no id):
+//   {"jsonrpc":"2.0","method":"...","params":{...}}
+fn lsp_send_notification(method: []u8, params: []u8) void {
+    let out: ArrayList[u8] = make[u8](256);
+    str_append(&out, "{\"jsonrpc\":\"2.0\",\"method\":");
+    str_append(&out, json_str(method));
+    str_append(&out, ",\"params\":");
+    str_append(&out, params);
+    push[u8](&out, 125);
+    lsp_send_msg(out.data[0..out.len]);
+}
+
+// Send a JSON-RPC error response.
+fn lsp_send_error(id: i32, code: i32, msg: []u8) void {
+    let out: ArrayList[u8] = make[u8](256);
+    str_append(&out, "{\"jsonrpc\":\"2.0\",\"id\":");
+    str_append(&out, i32_to_str(id));
+    str_append(&out, ",\"error\":{\"code\":");
+    str_append(&out, i32_to_str(code));
+    str_append(&out, ",\"message\":");
+    str_append(&out, json_str(msg));
+    str_append(&out, "}}");
+    lsp_send_msg(out.data[0..out.len]);
+}

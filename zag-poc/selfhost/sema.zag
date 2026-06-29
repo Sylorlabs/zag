@@ -6,7 +6,9 @@
 // fixpoint iteration over the call graph, then checks every constrained
 // function against its forbidden set.
 //
-// Effects are an i32 bitmask:  Alloc=1, Panic=2, IO=4, Lock=8.
+// Effects are an i32 bitmask:  Alloc=1, Panic=2, IO=4, Lock=8, Raises=16.
+// Raises (16): function returns !T (error union) — can propagate an error to
+// its caller.  Functions using `try` inside a non-!T body are a violation.
 // (Bitwise OR is written `bor(a,b)` because `|` lexes as the capture delimiter,
 //  not a binary operator; `a + b - (a & b)` is the OR of two masks.)
 
@@ -14,6 +16,85 @@
 @import("../std/map.zag") as map
 
 fn bor(a: i32, b: i32) i32 { return a + b - (a & b); }
+
+// ── Raises (bit 16): error-union helpers ─────────────────────────────────────
+// Returns 1 if `ret` is an error-union return type (starts with '!').
+fn is_eu_ret(ret: []u8) i32 {
+    if (ret.len > 0 && ret[0] == '!') { return 1; }
+    return 0;
+}
+// Does this expression tree contain a `try` operator anywhere?
+fn expr_uses_try(n: *Node) i32 {
+    switch (n.*) {
+        .un    => |u| { if (@strEq(u.op, "try")) { return 1; } return expr_uses_try(u.e); }
+        .bin   => |b| { if (expr_uses_try(b.l) == 1) { return 1; } return expr_uses_try(b.r); }
+        .call  => |c| {
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) {
+                if (expr_uses_try(get[*Node](c.args, i)) == 1) { return 1; }
+                i = i + 1;
+            }
+            return 0;
+        }
+        .idx   => |x| { if (expr_uses_try(x.base) == 1) { return 1; } return expr_uses_try(x.idx); }
+        .fld   => |f| { return expr_uses_try(f.base); }
+        .slit_ => |s| {
+            let i: i32 = 0;
+            while (i < len[FieldInit](s.fields)) {
+                if (expr_uses_try(get[FieldInit](s.fields, i).val) == 1) { return 1; }
+                i = i + 1;
+            }
+            return 0;
+        }
+        .slice_ => |s| {
+            if (expr_uses_try(s.base) == 1) { return 1; }
+            if (expr_uses_try(s.lo) == 1) { return 1; }
+            return expr_uses_try(s.hi);
+        }
+        .cast_  => |c| { return expr_uses_try(c.expr); }
+        else    => { return 0; }
+    }
+}
+fn stmts_use_try(body: ArrayList[*Node]) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        if (stmt_uses_try(get[*Node](body, i)) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn stmt_uses_try(n: *Node) i32 {
+    switch (n.*) {
+        .let_   => |l| { if (l.has_init == 1) { return expr_uses_try(l.expr); } return 0; }
+        .ret    => |r| { if (r.has_expr == 1) { return expr_uses_try(r.expr); } return 0; }
+        .if_    => |x| {
+            if (expr_uses_try(x.cond) == 1) { return 1; }
+            if (stmts_use_try(x.then_body) == 1) { return 1; }
+            if (x.has_els == 1) { return stmts_use_try(x.els_body); }
+            return 0;
+        }
+        .while_ => |w| {
+            if (expr_uses_try(w.cond) == 1) { return 1; }
+            return stmts_use_try(w.body);
+        }
+        .assign => |a| {
+            if (expr_uses_try(a.target) == 1) { return 1; }
+            return expr_uses_try(a.expr);
+        }
+        .switch_ => |sw| {
+            if (expr_uses_try(sw.subject) == 1) { return 1; }
+            let i: i32 = 0;
+            while (i < len[SwitchArm](sw.arms)) {
+                if (stmts_use_try(get[SwitchArm](sw.arms, i).body) == 1) { return 1; }
+                i = i + 1;
+            }
+            if (sw.has_els == 1) { return stmts_use_try(sw.els_body); }
+            return 0;
+        }
+        .estmt  => |e| { return expr_uses_try(e.expr); }
+        else    => { return 0; }
+    }
+}
 
 // ── effect sources ──────────────────────────────────────────────────────────
 fn builtin_eff(name: []u8) i32 {
@@ -449,6 +530,9 @@ fn recompute_fn(f: FnDecl, eff: *map.StringMap[i32]) bool {
     if (f.is_extern == 1) { return false; }
     let old: i32 = map.get[i32](eff.*, f.name) orelse 0;
     let ne: i32 = bor(old, body_eff(f.body, eff.*));
+    // Functions returning !T carry the Raises effect (bit 16) as a declarative
+    // property — they can propagate an error to their caller.
+    if (is_eu_ret(f.ret) == 1) { ne = bor(ne, 16); }
     // If this fn is @total and the path-sensitive prover discharges all divisions,
     // clear the Panic bit now so that callers don't inherit spurious Panic.
     if ((ne & 2) != 0 && has_annot(f.annots, "@total") == 1 && fn_total_safe(f, eff.*) == 1) {
@@ -729,9 +813,17 @@ fn fn_violation_mask(f: FnDecl, decls: ArrayList[*Node], eff: map.StringMap[i32]
 }
 fn report_fn(f: FnDecl, decls: ArrayList[*Node], eff: map.StringMap[i32]) i32 {
     if (f.is_extern == 1) { return 0; }
-    if (len[[]u8](f.annots) == 0) { return 0; }
-    let myeff: i32 = fn_violation_mask(f, decls, eff);
     let count: i32 = 0;
+    // Raises check: `try` may only appear inside a function that returns !T.
+    // If a non-!T function body uses `try`, report a Raises violation.
+    if (is_eu_ret(f.ret) == 0 && stmts_use_try(f.body) == 1) {
+        _zag_print("zag: VIOLATION in ");
+        _zag_print(f.name);
+        _zag_println(" @raises (try used in a function that does not return !T)");
+        count = count + 1;
+    }
+    if (len[[]u8](f.annots) == 0) { return count; }
+    let myeff: i32 = fn_violation_mask(f, decls, eff);
     let i: i32 = 0;
     while (i < len[[]u8](f.annots)) {
         let a: []u8 = get[[]u8](f.annots, i);

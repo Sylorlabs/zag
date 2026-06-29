@@ -224,5 +224,92 @@ nts(){  # nts <label> <file> <expect-stdout>
 }
 nts "interfaces Square report=75 Rect report=36" examples/interfaces.zag "$(printf '75\n36')"
 
+echo "── error unions (!T, try, catch) ──"
+# Basic catch success: safe_div(10,2)=5 returned as !i32, catch -1 → 5 (exit).
+nt  "error union catch success" 'error { Err } fn sdiv(a: i32, b: i32) !i32 { if (b == 0) { return error.Err; } return a / b; } fn main() i32 { return sdiv(10, 2) catch -1; }' 5
+# Basic catch on error path: safe_div(5,0)→error, catch -1 → exit 255 (i.e. -1 as u8).
+nt  "error union catch error"   'error { Err } fn sdiv(a: i32, b: i32) !i32 { if (b == 0) { return error.Err; } return a / b; } fn main() i32 { return sdiv(5, 0) catch 7; }' 7
+# try propagation: compute(10,2)→5*2=10; catch -1 → 10.
+nt  "error union try propagate ok" 'error { Err } fn sdiv(a: i32, b: i32) !i32 { if (b == 0) { return error.Err; } return a / b; } fn calc(a: i32, b: i32) !i32 { let q: i32 = try sdiv(a, b); return q * 2; } fn main() i32 { return calc(10, 2) catch -1; }' 10
+# try propagation with error: compute(10,0)→error, catch 99 → 99.
+nt  "error union try propagate err" 'error { Err } fn sdiv(a: i32, b: i32) !i32 { if (b == 0) { return error.Err; } return a / b; } fn calc(a: i32, b: i32) !i32 { let q: i32 = try sdiv(a, b); return q * 2; } fn main() i32 { return calc(10, 0) catch 99; }' 99
+# catch with error code binding: code is nonzero on error.
+nt  "error union catch |e| code>0" 'error { Err } fn sdiv(a: i32, b: i32) !i32 { if (b == 0) { return error.Err; } return a / b; } fn main() i32 { let c: i32 = sdiv(7, 0) catch |e| e; if (c > 0) { return 42; } return 0; }' 42
+# Multiple error tags in the error set; distinct codes.
+nt  "error union distinct codes" 'error { NotFound, OutOfRange } fn get_err(x: i32) !i32 { if (x == 0) { return error.NotFound; } if (x == 1) { return error.OutOfRange; } return x; } fn main() i32 { let a: i32 = get_err(0) catch |e| e; let b: i32 = get_err(1) catch |e| e; if (a != b && a > 0 && b > 0) { return 42; } return 0; }' 42
+# Sema rejects try in non-!T function (Raises violation).
+rm -f /tmp/nt_bin
+printf 'error { Err } fn maybe() !i32 { return error.Err; } fn bad() i32 { return try maybe(); } fn main() i32 { return 0; }' > nt_src.zag
+"$ZNC" nt_src.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
+if grep -q 'VIOLATION' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
+    echo "  ok  rejects try in non-!T function (Raises violation)"; pass=$((pass+1))
+else
+    echo "  XX  should reject try in non-!T function"; fail=$((fail+1))
+fi
+rm -f /tmp/nt_bin nt_src.zag
+# Run the full error-propagation integration test.
+"$ZNC" tests/error_propagation.zag -o /tmp/nt_ep >/tmp/nt_ep_out 2>&1
+if [ -x /tmp/nt_ep ]; then
+    ep_out=$(/tmp/nt_ep); ep_ec=$?
+    if [ "$ep_ec" = "0" ] && echo "$ep_out" | grep -q "ALL PASS"; then
+        echo "  ok  error_propagation.zag: all 12 cases pass"; pass=$((pass+1))
+    else
+        echo "  XX  error_propagation.zag: failed (exit=$ep_ec)"; fail=$((fail+1))
+        echo "$ep_out" | grep FAIL | head -5
+    fi
+else
+    echo "  XX  error_propagation.zag: compile failed"; fail=$((fail+1))
+    sed -n '1,6p' /tmp/nt_ep_out
+fi
+rm -f /tmp/nt_ep
+
+# ── module system: pub/private, circular imports, zag.mod dep validation ──────
+echo "── module system: pub/private · circular detection · zag.mod deps ──"
+
+# 1. Qualified import: pub fn is accessible, prints correct result.
+rm -f /tmp/nt_bin
+"$ZNC" tests/module_system/main.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
+if [ -x /tmp/nt_bin ]; then
+    got=$(/tmp/nt_bin)
+    if [ "$got" = "7" ]; then
+        echo "  ok  module pub fn: utils.add(3,4)=7"; pass=$((pass+1))
+    else
+        echo "  XX  module pub fn: got '$got', want '7'"; fail=$((fail+1))
+    fi
+else
+    echo "  XX  module pub fn: compile failed"; sed -n '1,6p' /tmp/nt_out; fail=$((fail+1))
+fi
+rm -f /tmp/nt_bin
+
+# 2. Private symbol access via qualified import must fail (not accessible).
+rm -f /tmp/nt_bin
+"$ZNC" tests/module_system/private_access.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
+if [ ! -x /tmp/nt_bin ]; then
+    echo "  ok  module private symbol inaccessible (compile rejected)"; pass=$((pass+1))
+else
+    echo "  XX  module private symbol should be inaccessible"; fail=$((fail+1))
+fi
+rm -f /tmp/nt_bin
+
+# 3. Circular imports must be detected loudly with an error and no binary.
+rm -f /tmp/nt_bin
+"$ZNC" tests/module_system/circ_main.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
+if grep -q 'circular import' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
+    echo "  ok  circular import detected loudly"; pass=$((pass+1))
+else
+    echo "  XX  circular import not detected"; cat /tmp/nt_out; fail=$((fail+1))
+fi
+rm -f /tmp/nt_bin
+
+# 4. zag.mod missing dep must be detected loudly.
+rm -f /tmp/nt_bin
+"$ZNC" tests/module_system/missing_dep/main.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
+if grep -q "dep '.*' declared in zag.mod" /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
+    echo "  ok  zag.mod missing dep detected loudly"; pass=$((pass+1))
+else
+    echo "  XX  zag.mod missing dep not detected"; cat /tmp/nt_out; fail=$((fail+1))
+fi
+rm -f /tmp/nt_bin
+
 echo "════ native pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]

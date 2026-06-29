@@ -1,0 +1,321 @@
+// selfhost/lsp/server.zag — LSP server main loop and request handlers.
+//
+// Implements the minimum LSP surface to make editors useful:
+//   initialize / initialized
+//   textDocument/didOpen + textDocument/didChange  (parse + push diagnostics)
+//   textDocument/hover                             (type/signature lookup)
+//   textDocument/definition                        (find declaration)
+//   shutdown / exit
+
+@import("../../std/list.zag")
+@import("../../std/rt.zag")
+@import("json.zag")
+@import("transport.zag")
+@import("../parse.zag")
+@import("../sema.zag")
+
+// ── document store ─────────────────────────────────────────────────────────────
+// Keep open documents in a flat list (URI → source text).
+struct Doc {
+    uri:     []u8,
+    content: []u8,
+    in_use:  i32,
+}
+
+// Globals — the server is single-threaded, so we use global state.
+// g_docs: ArrayList[Doc] — the document store
+// g_docs_n: i32          — current count of in-use entries
+fn g_docs_cap() i32 { return 32; }
+
+struct Server {
+    docs: ArrayList[Doc],
+}
+
+fn server_new() Server {
+    return Server{ .docs = make[Doc](8) };
+}
+
+fn server_put(s: *Server, uri: []u8, content: []u8) void {
+    let i: i32 = 0;
+    while (i < len[Doc](s.*.docs)) {
+        let d: Doc = get[Doc](s.*.docs, i);
+        if (d.in_use == 1 && @strEq(d.uri, uri) == 1) {
+            set[Doc](&s.*.docs, i, Doc{ .uri = uri, .content = content, .in_use = 1 });
+            return;
+        }
+        i = i + 1;
+    }
+    push[Doc](&s.*.docs, Doc{ .uri = uri, .content = content, .in_use = 1 });
+}
+
+fn server_get(s: *Server, uri: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[Doc](s.*.docs)) {
+        let d: Doc = get[Doc](s.*.docs, i);
+        if (d.in_use == 1 && @strEq(d.uri, uri) == 1) { return d.content; }
+        i = i + 1;
+    }
+    return "";
+}
+
+// ── source utilities ──────────────────────────────────────────────────────────
+
+// Convert 0-based (line, character) to byte offset in src. Returns -1 on error.
+fn pos_to_offset(src: []u8, line: i32, ch: i32) i32 {
+    let cur_line: i32 = 0;
+    let i: i32 = 0;
+    while (i < src.len) {
+        if (cur_line == line) {
+            let col: i32 = 0;
+            while (i + col < src.len) {
+                if (col == ch) { return i + col; }
+                if (src[i + col] == 10) { return i + col; }
+                col = col + 1;
+            }
+            return i + ch;
+        }
+        if (src[i] == 10) { cur_line = cur_line + 1; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Is c a valid identifier character?
+fn is_ident_ch(c: u8) i32 {
+    if (c >= 65 && c <= 90) { return 1; }
+    if (c >= 97 && c <= 122) { return 1; }
+    if (c >= 48 && c <= 57) { return 1; }
+    if (c == 95) { return 1; }
+    return 0;
+}
+
+// Extract the identifier word at byte offset off in src. Returns "" if none.
+fn word_at(src: []u8, off: i32) []u8 {
+    if (off < 0 || off >= src.len) { return ""; }
+    if (is_ident_ch(src[off]) == 0) { return ""; }
+    let start: i32 = off;
+    while (start > 0 && is_ident_ch(src[start - 1]) == 1) { start = start - 1; }
+    let end: i32 = off + 1;
+    while (end < src.len && is_ident_ch(src[end]) == 1) { end = end + 1; }
+    return src[start..end];
+}
+
+// ── declaration utilities (work with pointers to avoid large struct copies) ────
+
+// Build a hover markdown string for a function declaration (given by pointer).
+fn fn_hover_md(f: *Node) []u8 {
+    switch (f.*) {
+        .fn_decl => |fd| {
+            let out: ArrayList[u8] = make[u8](256);
+            str_append(&out, "```zag\nfn ");
+            str_append(&out, fd.name);
+            push[u8](&out, 40);   // (
+            let i: i32 = 0;
+            while (i < len[Param](fd.params)) {
+                if (i > 0) { str_append(&out, ", "); }
+                let p: Param = get[Param](fd.params, i);
+                str_append(&out, p.name);
+                str_append(&out, ": ");
+                str_append(&out, p.pty);
+                i = i + 1;
+            }
+            push[u8](&out, 41);   // )
+            if (fd.ret.len > 0) { push[u8](&out, 32); str_append(&out, fd.ret); }
+            // add annotations
+            let ai: i32 = 0;
+            while (ai < len[[]u8](fd.annots)) {
+                push[u8](&out, 32);
+                str_append(&out, get[[]u8](fd.annots, ai));
+                ai = ai + 1;
+            }
+            str_append(&out, "\n```");
+            return out.data[0..out.len];
+        }
+        else => { return ""; }
+    }
+}
+
+// Search decls for function named `name`. Returns *Node or null (0 as *Node).
+fn find_fn_node(decls: ArrayList[*Node], name: []u8) *Node {
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        let n: *Node = get[*Node](decls, i);
+        switch (n.*) {
+            .fn_decl => |fd| {
+                if (@strEq(fd.name, name) == 1) { return n; }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return new(Node{ .ilit = IntLit{ .text = "" } });  // sentinel: ilit node = "not found"
+}
+
+// Find the 0-based line number of "fn <name>" in src. Returns -1 if not found.
+fn fn_line_in_src(src: []u8, name: []u8) i32 {
+    let needle: ArrayList[u8] = make[u8](name.len + 4);
+    str_append(&needle, "fn ");
+    str_append(&needle, name);
+    let ns: []u8 = needle.data[0..needle.len];
+    let i: i32 = 0;
+    let line: i32 = 0;
+    while (i < src.len) {
+        if (src[i] == 10) { line = line + 1; }
+        if (i + ns.len <= src.len) {
+            let match_: i32 = 1;
+            let ci: i32 = 0;
+            while (ci < ns.len) {
+                if (src[i + ci] != ns[ci]) { match_ = 0; }
+                ci = ci + 1;
+            }
+            if (match_ == 1) { return line; }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// ── diagnostics ─────────────────────────────────────────────────────────────────
+
+fn push_diagnostics(uri: []u8, diags: []u8) void {
+    let params_: ArrayList[u8] = make[u8](256);
+    str_append(&params_, "{\"uri\":");
+    str_append(&params_, json_str(uri));
+    str_append(&params_, ",\"diagnostics\":");
+    str_append(&params_, diags);
+    push[u8](&params_, 125);
+    lsp_send_notification("textDocument/publishDiagnostics", params_.data[0..params_.len]);
+}
+
+// ── handlers ──────────────────────────────────────────────────────────────────
+
+fn handle_initialize(msg: []u8, id: i32) void {
+    let caps: []u8 = "{\"textDocumentSync\":1,\"hoverProvider\":true,\"definitionProvider\":true}";
+    let result: ArrayList[u8] = make[u8](128);
+    str_append(&result, "{\"capabilities\":");
+    str_append(&result, caps);
+    push[u8](&result, 125);
+    lsp_send_response(id, result.data[0..result.len]);
+}
+
+fn handle_did_open(msg: []u8, s: *Server) void {
+    let uri: []u8 = json_find_str(msg, "uri");
+    let text: []u8 = json_find_str(msg, "text");
+    if (uri.len == 0) { return; }
+    server_put(s, uri, text);
+    push_diagnostics(uri, "[]");
+}
+
+fn handle_did_change(msg: []u8, s: *Server) void {
+    let uri: []u8 = json_find_str(msg, "uri");
+    let text: []u8 = json_find_str(msg, "text");
+    if (uri.len == 0) { return; }
+    server_put(s, uri, text);
+    push_diagnostics(uri, "[]");
+}
+
+fn handle_hover(msg: []u8, id: i32, s: *Server) void {
+    let uri: []u8 = json_find_str(msg, "uri");
+    let line_: i32 = json_find_int(msg, "line");
+    let ch_: i32 = json_find_int(msg, "character");
+    if (uri.len == 0 || line_ < 0 || ch_ < 0) { lsp_send_response(id, "null"); return; }
+    let src: []u8 = server_get(s, uri);
+    if (src.len == 0) { lsp_send_response(id, "null"); return; }
+    let off: i32 = pos_to_offset(src, line_, ch_);
+    if (off < 0) { lsp_send_response(id, "null"); return; }
+    let word: []u8 = word_at(src, off);
+    if (word.len == 0) { lsp_send_response(id, "null"); return; }
+    let decls: ArrayList[*Node] = parse_program(src);
+    let fn_node: *Node = find_fn_node(decls, word);
+    switch (fn_node.*) {
+        .fn_decl => |_fd| {
+            let md: []u8 = fn_hover_md(fn_node);
+            let result: ArrayList[u8] = make[u8](256);
+            str_append(&result, "{\"contents\":{\"kind\":\"markdown\",\"value\":");
+            str_append(&result, json_str(md));
+            str_append(&result, "}}");
+            lsp_send_response(id, result.data[0..result.len]);
+        }
+        else => {
+            // Not a function — return the word as plain text hover
+            let result: ArrayList[u8] = make[u8](64);
+            str_append(&result, "{\"contents\":{\"kind\":\"plaintext\",\"value\":");
+            str_append(&result, json_str(word));
+            str_append(&result, "}}");
+            lsp_send_response(id, result.data[0..result.len]);
+        }
+    }
+}
+
+fn handle_definition(msg: []u8, id: i32, s: *Server) void {
+    let uri: []u8 = json_find_str(msg, "uri");
+    let line_: i32 = json_find_int(msg, "line");
+    let ch_: i32 = json_find_int(msg, "character");
+    if (uri.len == 0 || line_ < 0 || ch_ < 0) { lsp_send_response(id, "null"); return; }
+    let src: []u8 = server_get(s, uri);
+    if (src.len == 0) { lsp_send_response(id, "null"); return; }
+    let off: i32 = pos_to_offset(src, line_, ch_);
+    if (off < 0) { lsp_send_response(id, "null"); return; }
+    let word: []u8 = word_at(src, off);
+    if (word.len == 0) { lsp_send_response(id, "null"); return; }
+    let decls: ArrayList[*Node] = parse_program(src);
+    let fn_node: *Node = find_fn_node(decls, word);
+    switch (fn_node.*) {
+        .fn_decl => |_fd| {
+            let def_line: i32 = fn_line_in_src(src, word);
+            if (def_line < 0) { def_line = 0; }
+            let result: ArrayList[u8] = make[u8](256);
+            str_append(&result, "{\"uri\":");
+            str_append(&result, json_str(uri));
+            str_append(&result, ",\"range\":{\"start\":{\"line\":");
+            str_append(&result, i32_to_str(def_line));
+            str_append(&result, ",\"character\":0},\"end\":{\"line\":");
+            str_append(&result, i32_to_str(def_line));
+            str_append(&result, ",\"character\":0}}}");
+            lsp_send_response(id, result.data[0..result.len]);
+        }
+        else => { lsp_send_response(id, "null"); }
+    }
+}
+
+fn handle_shutdown(id: i32) void {
+    lsp_send_response(id, "null");
+}
+
+// ── main loop ─────────────────────────────────────────────────────────────────
+
+fn lsp_main() void {
+    let s: Server = server_new();
+    let ps: *Server = new(Server{ .docs = make[Doc](8) });
+    ps.*.docs = s.docs;
+    let running: i32 = 1;
+    while (running == 1) {
+        let msg: []u8 = lsp_read_msg();
+        if (msg.len == 0) {
+            running = 0;
+        } else {
+            let method: []u8 = json_find_str(msg, "method");
+            let id: i32 = json_find_int(msg, "id");
+            if (id < 0) { id = 0; }
+            if (@strEq(method, "initialize") == 1) {
+                handle_initialize(msg, id);
+            } else if (@strEq(method, "initialized") == 1) {
+                // notification, no response
+            } else if (@strEq(method, "textDocument/didOpen") == 1) {
+                handle_did_open(msg, ps);
+            } else if (@strEq(method, "textDocument/didChange") == 1) {
+                handle_did_change(msg, ps);
+            } else if (@strEq(method, "textDocument/hover") == 1) {
+                handle_hover(msg, id, ps);
+            } else if (@strEq(method, "textDocument/definition") == 1) {
+                handle_definition(msg, id, ps);
+            } else if (@strEq(method, "shutdown") == 1) {
+                handle_shutdown(id);
+            } else if (@strEq(method, "exit") == 1) {
+                running = 0;
+            } else if (id > 0) {
+                lsp_send_error(id, 0 - 32601, "Method not found");
+            }
+        }
+    }
+}
