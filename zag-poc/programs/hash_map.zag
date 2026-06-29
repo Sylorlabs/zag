@@ -1,0 +1,282 @@
+// programs/hash_map.zag — open-addressing hash map with generic value type.
+//
+// Attempts to use a generic struct HashMap[V] with:
+//   put(key: []u8, val: V)
+//   get(key: []u8) -> ?V    (returns -1 sentinel on miss for i32 specialisation)
+//   delete(key: []u8)
+//
+// FNV-1a hash, linear probing, load factor 0.75, double-on-resize.
+//
+// NOTE: If generic struct instantiation is unsupported by znc, we fall back
+// to a concrete HashMap_i32 (documented as GAP in GAPS.md).
+
+// ── FNV-1a hash ───────────────────────────────────────────────────────────────
+
+fn fnv1a(key: []u8) i32 {
+    let h: i32 = -2128831035;   // 2166136261 as i32
+    let i: i32 = 0;
+    while (i < key.len) {
+        h = (h ^ (key[i] as i32)) * 16777619;
+        i = i + 1;
+    }
+    return h;
+}
+
+fn fnv1a_pos(key: []u8, cap: i32) i32 {
+    let h: i32 = fnv1a(key);
+    let idx: i32 = h & (cap - 1);
+    if (idx < 0) { idx = idx + cap; }
+    return idx;
+}
+
+// ── copy a key slice to heap ───────────────────────────────────────────────────
+
+fn copy_key(key: []u8) []u8 {
+    if (key.len == 0) { return ""; }
+    let buf: *u8 = _zag_malloc(key.len) as *u8;
+    let i: i32 = 0;
+    while (i < key.len) { buf[i] = key[i]; i = i + 1; }
+    return buf[0..key.len];
+}
+
+// ── HashMap_i32: open-addressing, string → i32 ────────────────────────────────
+// Slot states: used[slot] = 0 (empty) | 1 (occupied) | 2 (tombstone/deleted)
+
+struct HashMap_i32 {
+    keys:  *[]u8,   // 16 bytes per slot (fat slice stride)
+    vals:  *i32,    // 8 bytes per slot (word stride)
+    used:  *i32,    // 8 bytes per slot
+    cap:   i32,
+    count: i32,
+}
+
+fn hm_new(initial_cap: i32) HashMap_i32 {
+    let c: i32 = initial_cap;
+    if (c < 8) { c = 8; }
+    return HashMap_i32{
+        .keys  = _zag_malloc(c * 16) as *[]u8,
+        .vals  = _zag_malloc(c * 8) as *i32,
+        .used  = _zag_malloc(c * 8) as *i32,
+        .cap   = c,
+        .count = 0,
+    };
+}
+
+fn hm_init_slots(m: *HashMap_i32) void {
+    let i: i32 = 0;
+    while (i < m.*.cap) { m.*.used[i] = 0; i = i + 1; }
+}
+
+fn hm_find_slot(m: *HashMap_i32, key: []u8) i32 {
+    let idx: i32 = fnv1a_pos(key, m.*.cap);
+    let probed: i32 = 0;
+    while (probed < m.*.cap) {
+        let u: i32 = m.*.used[idx];
+        if (u == 0) { return -1; }   // empty: not found
+        if (u == 1) {
+            if (_zag_strcmp(m.*.keys[idx], key) == 1) { return idx; }
+        }
+        idx = idx + 1;
+        if (idx >= m.*.cap) { idx = 0; }
+        probed = probed + 1;
+    }
+    return -1;
+}
+
+fn hm_find_insert(m: *HashMap_i32, key: []u8) i32 {
+    let idx: i32 = fnv1a_pos(key, m.*.cap);
+    let first_tomb: i32 = -1;
+    let probed: i32 = 0;
+    while (probed < m.*.cap) {
+        let u: i32 = m.*.used[idx];
+        if (u == 0) {
+            if (first_tomb >= 0) { return first_tomb; }
+            return idx;
+        }
+        if (u == 2) { if (first_tomb < 0) { first_tomb = idx; } }
+        idx = idx + 1;
+        if (idx >= m.*.cap) { idx = 0; }
+        probed = probed + 1;
+    }
+    if (first_tomb >= 0) { return first_tomb; }
+    return 0;
+}
+
+fn hm_resize(m: *HashMap_i32) void {
+    let old_cap: i32 = m.*.cap;
+    let old_keys: *[]u8 = m.*.keys;
+    let old_vals: *i32  = m.*.vals;
+    let old_used: *i32  = m.*.used;
+    let new_cap: i32 = old_cap * 2;
+    m.*.keys  = _zag_malloc(new_cap * 16) as *[]u8;
+    m.*.vals  = _zag_malloc(new_cap * 8) as *i32;
+    m.*.used  = _zag_malloc(new_cap * 8) as *i32;
+    m.*.cap   = new_cap;
+    m.*.count = 0;
+    let i: i32 = 0;
+    while (i < new_cap) { m.*.used[i] = 0; i = i + 1; }
+    // rehash existing entries
+    i = 0;
+    while (i < old_cap) {
+        if (old_used[i] == 1) {
+            let slot: i32 = hm_find_insert(m, old_keys[i]);
+            m.*.keys[slot] = old_keys[i];
+            m.*.vals[slot] = old_vals[i];
+            m.*.used[slot] = 1;
+            m.*.count = m.*.count + 1;
+        }
+        i = i + 1;
+    }
+    _zag_free(old_keys as *i8);
+    _zag_free(old_vals as *i8);
+    _zag_free(old_used as *i8);
+}
+
+fn hm_put(m: *HashMap_i32, key: []u8, val: i32) void {
+    // resize when load > 0.75
+    if (m.*.count * 4 >= m.*.cap * 3) { hm_resize(m); }
+    // check if key exists (update)
+    let existing: i32 = hm_find_slot(m, key);
+    if (existing >= 0) { m.*.vals[existing] = val; return; }
+    let slot: i32 = hm_find_insert(m, key);
+    m.*.keys[slot] = copy_key(key);
+    m.*.vals[slot] = val;
+    m.*.used[slot] = 1;
+    m.*.count = m.*.count + 1;
+}
+
+// Returns the value, or -1 if not found (sentinel).
+fn hm_get(m: *HashMap_i32, key: []u8) i32 {
+    let slot: i32 = hm_find_slot(m, key);
+    if (slot < 0) { return -1; }
+    return m.*.vals[slot];
+}
+
+fn hm_delete(m: *HashMap_i32, key: []u8) void {
+    let slot: i32 = hm_find_slot(m, key);
+    if (slot < 0) { return; }
+    m.*.used[slot] = 2;   // tombstone
+    m.*.count = m.*.count - 1;
+}
+
+fn hm_free(m: *HashMap_i32) void {
+    _zag_free(m.*.keys as *i8);
+    _zag_free(m.*.vals as *i8);
+    _zag_free(m.*.used as *i8);
+}
+
+// ── test helpers ──────────────────────────────────────────────────────────────
+
+fn str_prefix(base: []u8, n: i32) []u8 {
+    // Build a key like "key00", "key01", ... using digit chars
+    // We'll use a fixed-size stack buffer trick:
+    // key = base + tens_digit + ones_digit
+    let buf: *u8 = _zag_malloc(base.len + 2) as *u8;
+    let i: i32 = 0;
+    while (i < base.len) { buf[i] = base[i]; i = i + 1; }
+    buf[base.len]     = ('0' as i32 + n / 10) as u8;
+    buf[base.len + 1] = ('0' as i32 + n % 10) as u8;
+    return buf[0..base.len + 2];
+}
+
+fn main() i32 {
+    _zag_println("=== HashMap Test ===");
+
+    let m: HashMap_i32 = hm_new(8);
+    let mp: *HashMap_i32 = &m;
+    hm_init_slots(mp);
+
+    // Insert 20 key-value pairs: key00..key19 → 0..19
+    let i: i32 = 0;
+    while (i < 20) {
+        let k: []u8 = str_prefix("key", i);
+        hm_put(mp, k, i * 10);
+        i = i + 1;
+    }
+
+    _zag_println("After inserting 20 pairs:");
+    _zag_print("  count = ");
+    _zag_println(_zag_i64_to_str(m.count as i64));
+    _zag_print("  cap   = ");
+    _zag_println(_zag_i64_to_str(m.cap as i64));
+
+    // Look up all 20 pairs and verify
+    let ok: i32 = 1;
+    i = 0;
+    while (i < 20) {
+        let k: []u8 = str_prefix("key", i);
+        let got: i32 = hm_get(mp, k);
+        if (got != i * 10) { ok = 0; }
+        i = i + 1;
+    }
+    if (ok == 1) { _zag_println("  lookup all 20: PASS"); } else { _zag_println("  lookup all 20: FAIL"); }
+
+    // Delete keys 0, 5, 10, 15, 19
+    hm_delete(mp, str_prefix("key", 0));
+    hm_delete(mp, str_prefix("key", 5));
+    hm_delete(mp, str_prefix("key", 10));
+    hm_delete(mp, str_prefix("key", 15));
+    hm_delete(mp, str_prefix("key", 19));
+
+    _zag_print("  count after 5 deletes = ");
+    _zag_println(_zag_i64_to_str(m.count as i64));
+
+    // Confirm deletions return -1 (miss sentinel)
+    let del_ok: i32 = 1;
+    if (hm_get(mp, str_prefix("key", 0))  != -1) { del_ok = 0; }
+    if (hm_get(mp, str_prefix("key", 5))  != -1) { del_ok = 0; }
+    if (hm_get(mp, str_prefix("key", 10)) != -1) { del_ok = 0; }
+    if (hm_get(mp, str_prefix("key", 15)) != -1) { del_ok = 0; }
+    if (hm_get(mp, str_prefix("key", 19)) != -1) { del_ok = 0; }
+    if (del_ok == 1) { _zag_println("  deletion confirmed: PASS"); } else { _zag_println("  deletion confirmed: FAIL"); }
+
+    // Confirm remaining 15 keys are still there
+    let remain_ok: i32 = 1;
+    i = 0;
+    while (i < 20) {
+        let skip: i32 = 0;
+        if (i == 0)  { skip = 1; }
+        if (i == 5)  { skip = 1; }
+        if (i == 10) { skip = 1; }
+        if (i == 15) { skip = 1; }
+        if (i == 19) { skip = 1; }
+        if (skip == 0) {
+            let k: []u8 = str_prefix("key", i);
+            let got: i32 = hm_get(mp, k);
+            if (got != i * 10) { remain_ok = 0; }
+        }
+        i = i + 1;
+    }
+    if (remain_ok == 1) { _zag_println("  remaining 15 intact: PASS"); } else { _zag_println("  remaining 15 intact: FAIL"); }
+
+    // Re-insert over a deleted slot (tombstone reuse)
+    hm_put(mp, str_prefix("key", 0), 999);
+    let reins: i32 = hm_get(mp, str_prefix("key", 0));
+    if (reins == 999) { _zag_println("  tombstone reuse: PASS"); } else { _zag_println("  tombstone reuse: FAIL"); }
+
+    // Test resize by adding 20 more
+    i = 20;
+    while (i < 40) {
+        let k: []u8 = str_prefix("key", i);
+        hm_put(mp, k, i * 7);
+        i = i + 1;
+    }
+    let big_ok: i32 = 1;
+    i = 20;
+    while (i < 40) {
+        let k: []u8 = str_prefix("key", i);
+        let got: i32 = hm_get(mp, k);
+        if (got != i * 7) { big_ok = 0; }
+        i = i + 1;
+    }
+    if (big_ok == 1) { _zag_println("  post-resize lookup 20 more: PASS"); } else { _zag_println("  post-resize lookup 20 more: FAIL"); }
+
+    _zag_print("  final count = ");
+    _zag_println(_zag_i64_to_str(m.count as i64));
+    _zag_print("  final cap   = ");
+    _zag_println(_zag_i64_to_str(m.cap as i64));
+
+    hm_free(mp);
+    _zag_println("=== DONE ===");
+    return 0;
+}

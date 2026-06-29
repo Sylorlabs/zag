@@ -47,23 +47,26 @@ zig build                              # builds the bootstrap → ./zagc
 git checkout -                         # back to the latest, Zig-free tree
 ```
 
-## Building today — no Zig, no cc
+## Supported v1 bootstrap — native only
 
-The committed **seed binaries** (`./zagc`, `./znc`) are the trusted bootstrap.
-`bootstrap.sh` rebuilds the whole toolchain from them with zero external tools:
+The committed `./znc` binary is the trusted bootstrap seed. `bootstrap.sh`
+rebuilds the supported compiler directly from Zag source:
 
 ```sh
 ./bootstrap.sh
-#   ./znc selfhost/zagc.zag           -> ./zagc   (native, full-language C backend)
-#   ./znc selfhost/native/znc.zag     -> ./znc    (native compiler, Zag → ELF)
-# strace shows only ./znc execs — no cc / as / ld / sh.
+#   ./znc selfhost/native/znc.zag -o znc.new
+#   znc.new -> ./znc
 ```
 
-- `./zagc` — the full-language compiler (C backend; shells out to `cc` only when
-  you *use* it to compile a program).
-- `./znc` — the native x86-64 compiler: `Zag → ELF` directly, **never** touches
-  `cc`/`as`/`ld`/`libc`. It self-hosts at a **byte-identical fixpoint**
-  (`znc` compiling `znc.zag` reproduces itself exactly).
+`./znc` is the only supported v1 compiler. It performs lexing, parsing, semantic
+analysis, optimization, x86-64 encoding, and ELF writing in Zag. Its generated
+programs use Linux syscalls and have no dynamic loader or libc dependency.
+
+`./zagc` and `selfhost/codegen.zag` remain in the repository as historical
+bootstrap material and a differential oracle. They are not a supported build
+path, are not an acceptable bootstrap fallback, and must not be required by a
+release gate. C interoperability, when intentionally added later, is an optional
+boundary rather than an implementation dependency.
 
 ## The one permanent caveat
 
@@ -74,12 +77,13 @@ build; you bootstrap from the committed seed, and the original Zig bootstrap
 stays preserved in history at `v0.0-zig-bootstrap` as the reproducibility
 safety net.
 
-## Tests (all run with zero Zig in the tree)
+## Supported release gates
 
 ```sh
-./run_tests.sh            # 46/46 — full language, the C backend
-./tests/run_selfhost.sh   # 28/28 — incl. the byte-identical C3 self-compile fixpoint
-./tests/run_native.sh     # native backend, no libc — integers, structs, generics,
-                          #   unions, optionals, floats, register alloc, and the
-                          #   full numeric system (posits/quire/sat/RNS/bignum)
+./tests/run_native_authority.sh  # poison host C tools; self-rebuild and smoke test
+./tests/run_native.sh            # native language/backend behavior suite
 ```
+
+The older `run_tests.sh` and `tests/run_selfhost.sh` suites exercise the legacy
+C emitter. They remain useful for differential testing but do not define v1
+support or release readiness.

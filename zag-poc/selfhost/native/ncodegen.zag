@@ -1886,6 +1886,7 @@ struct Env {
     types:       ArrayList[[]u8],
     byref:       ArrayList[i32],
     count:       i32,    // number of named locals
+    scope_base:  i32,    // first binding introduced in the current lexical block
     frame_words: i32,    // next free 8-byte word index
     epilogue:    i32,
     sret_disp:   i32,    // rbp disp of the saved sret pointer (cg_not_found if none)
@@ -1900,6 +1901,7 @@ fn cg_env_new(epilogue: i32) Env {
         .types = make[[]u8](8),
         .byref = make[i32](8),
         .count = 0,
+        .scope_base = 0,
         .frame_words = 0,
         .epilogue = epilogue,
         .sret_disp = 0 - 2147483647,
@@ -1908,22 +1910,44 @@ fn cg_env_new(epilogue: i32) Env {
     };
 }
 
+struct CgScopeMark { count: i32, scope_base: i32 }
+
+fn cg_scope_begin(env: *Env) CgScopeMark {
+    let mark: CgScopeMark = CgScopeMark{
+        .count = len[[]u8](env.*.names),
+        .scope_base = env.*.scope_base,
+    };
+    env.*.scope_base = mark.count;
+    return mark;
+}
+
+fn cg_scope_end(env: *Env, mark: CgScopeMark) void {
+    while (len[[]u8](env.*.names) > mark.count) {
+        let _n: []u8 = pop[[]u8](&env.*.names);
+        let _d: i32 = pop[i32](&env.*.disps);
+        let _t: []u8 = pop[[]u8](&env.*.types);
+        let _b: i32 = pop[i32](&env.*.byref);
+    }
+    env.*.count = mark.count;
+    env.*.scope_base = mark.scope_base;
+}
+
 // Is the named local a BY-REF aggregate (its slot holds a pointer to the block)?
 fn cg_slot_byref(env: Env, name: []u8) i32 {
-    let i: i32 = 0;
-    while (i < len[[]u8](env.names)) {
+    let i: i32 = len[[]u8](env.names) - 1;
+    while (i >= 0) {
         if (@strEq(get[[]u8](env.names, i), name)) { return get[i32](env.byref, i); }
-        i = i + 1;
+        i = i - 1;
     }
     return 0;
 }
 
 // Type string recorded for a local (empty if none / unknown).
 fn cg_slot_type(env: Env, name: []u8) []u8 {
-    let i: i32 = 0;
-    while (i < len[[]u8](env.names)) {
+    let i: i32 = len[[]u8](env.names) - 1;
+    while (i >= 0) {
         if (@strEq(get[[]u8](env.names, i), name)) { return get[[]u8](env.types, i); }
-        i = i + 1;
+        i = i - 1;
     }
     return "";
 }
@@ -1937,7 +1961,7 @@ fn cg_slot_type(env: Env, name: []u8) []u8 {
 // our struct field offsets being POSITIVE (base + 8*idx), field accesses stay
 // inside the block.
 fn cg_slot_alloc_br(env: *Env, name: []u8, ty: []u8, words: i32, byref: i32) i32 {
-    let i: i32 = 0;
+    let i: i32 = env.*.scope_base;
     while (i < len[[]u8](env.*.names)) {
         if (@strEq(get[[]u8](env.*.names, i), name)) {
             set[[]u8](&env.*.types, i, ty);
@@ -1991,10 +2015,10 @@ fn cg_slot_alloc(env: *Env, name: []u8) i32 {
 // Look up an existing local's displacement; returns 1 (mod via has-flag) packed
 // as: returns the disp, and -2147483647 sentinel means "not found".
 fn cg_slot_find(env: Env, name: []u8) i32 {
-    let i: i32 = 0;
-    while (i < len[[]u8](env.names)) {
+    let i: i32 = len[[]u8](env.names) - 1;
+    while (i >= 0) {
         if (@strEq(get[[]u8](env.names, i), name)) { return get[i32](env.disps, i); }
-        i = i + 1;
+        i = i - 1;
     }
     return 0 - 2147483647;   // sentinel: undefined name
 }
@@ -2004,15 +2028,15 @@ fn cg_slot_find(env: Env, name: []u8) i32 {
 // that a reused capture name (e.g. `x catch |e| ...  ...  y catch |e| ...`)
 // always maps to the CURRENT catch's error slot.
 fn cg_slot_rebind(env: *Env, name: []u8, disp: i32, ty: []u8, byref: i32) void {
-    let i: i32 = 0;
-    while (i < len[[]u8](env.*.names)) {
+    let i: i32 = len[[]u8](env.*.names) - 1;
+    while (i >= 0) {
         if (@strEq(get[[]u8](env.*.names, i), name)) {
             set[i32](&env.*.disps, i, disp);
             set[[]u8](&env.*.types, i, ty);
             set[i32](&env.*.byref, i, byref);
             return;
         }
-        i = i + 1;
+        i = i - 1;
     }
     push[[]u8](&env.*.names, name);
     push[i32](&env.*.disps, disp);
@@ -2506,9 +2530,13 @@ fn cg_scan_body(cg: *Cg, sc: *ScanCtx, body: ArrayList[*Node]) void {
                 // fn-typed let → fat_fn (same normalization as fn-typed params).
                 if (cg_is_fn_type(lty) == 1) { lty = "fat_fn"; }
                 cg_scan_rectype(sc, l.name, lty);
-                if (cg_scan_seen(sc.*.seen, l.name) == 0) {
-                    sc.*.words.* = sc.*.words.* + cg_type_words(cg, lty);
-                }
+                // Reserve storage for every declaration. Same-name bindings in
+                // nested blocks occupy distinct slots so the outer value can be
+                // restored when the inner lexical scope ends. This may
+                // conservatively over-reserve for a same-block re-let, but never
+                // under-reserves the frame.
+                let _seen_local: i32 = cg_scan_seen(sc.*.seen, l.name);
+                sc.*.words.* = sc.*.words.* + cg_type_words(cg, lty);
                 // an aggregate/optional let materializes via a pslot (1 word).
                 if (cg_type_is_agg(cg, lty) == 1) { sc.*.words.* = sc.*.words.* + 1; }
                 // ROUND 3: `let x: rns_3 = <int>` LOWERS to a synthesized
@@ -2677,6 +2705,7 @@ fn cg_native_rt_ret(name: []u8) []u8 {
     if (@strEq(name, "_zag_exit"))            { return ""; }
     if (@strEq(name, "_zag_memcpy"))          { return ""; }
     if (@strEq(name, "_zag_read_fd"))         { return "i64"; }
+    if (@strEq(name, "_zag_clock_monotonic_ms")) { return "i64"; }
     return "";
 }
 
@@ -2710,6 +2739,7 @@ fn cg_is_native_rt(name: []u8) i32 {
     if (@strEq(name, "_zag_exit"))            { return 1; }
     if (@strEq(name, "_zag_memcpy"))          { return 1; }
     if (@strEq(name, "_zag_read_fd"))         { return 1; }
+    if (@strEq(name, "_zag_clock_monotonic_ms")) { return 1; }
     return 0;
 }
 
@@ -2943,6 +2973,38 @@ fn cg_expr_type(n: *Node, env: *Env, syms: ArrayList[FnSym], cg: *Cg) []u8 {
         }
         else => { return ""; }
     }
+}
+
+// Conservative assignment compatibility for types the native backend can
+// identify. An empty actual type is an untyped integer literal or an expression
+// whose scalar type is not yet recoverable, so it remains accepted. Known
+// aggregate/scalar, pointer, optional, and named-aggregate mismatches are hard
+// errors instead of being lowered as unrelated machine-word representations.
+fn cg_types_compatible(expected0: []u8, actual0: []u8, cg: *Cg) i32 {
+    let expected: []u8 = cg_norm_type(expected0);
+    let actual: []u8 = cg_norm_type(actual0);
+    if (expected.len == 0 || actual.len == 0) { return 1; }
+    if (@strEq(expected, actual)) { return 1; }
+    if (cg_is_fn_type(expected) == 1 && @strEq(actual, "fat_fn")) { return 1; }
+    if (@strEq(expected, "fat_fn") && cg_is_fn_type(actual) == 1) { return 1; }
+    // T may initialize ?T; ?T itself was handled by exact equality above.
+    if (expected.len > 1 && expected[0] == '?') {
+        if (@strEq(cg_norm_type(expected[1..]), actual)) { return 1; }
+        return 0;
+    }
+    let ea: i32 = cg_type_is_agg(cg, expected);
+    let aa: i32 = cg_type_is_agg(cg, actual);
+    if (ea != aa) { return 0; }
+    if (ea == 1) { return 0; } // different named aggregate/slice types
+    let ep: i32 = 0;
+    let ap: i32 = 0;
+    if (expected.len > 0) { if (expected[0] == '*') { ep = 1; } }
+    if (actual.len > 0) { if (actual[0] == '*') { ap = 1; } }
+    if (ep != ap) { return 0; }
+    if (ep == 1) { return 0; } // different pointee types
+    // Known scalar numeric types retain the backend's existing widening and
+    // narrowing behavior. Cast requirements can be tightened in a later edition.
+    return 1;
 }
 
 // ── lvalue ADDRESS lowering (struct-aware, complex lvalues) ──────────────────
@@ -3344,7 +3406,7 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                     push[Instr](out, i_push(R_RAX()));
                     return;
                 }
-                cg_err(cg, "native: unknown identifier in expression");
+                cg_err(cg, _zag_str_concat("native: unknown identifier in expression: ", x.name));
                 // emit a recognizable 0 so the program still assembles loudly
                 push[Instr](out, i_mov_imm(R_RAX(), 0));
                 push[Instr](out, i_push(R_RAX()));
@@ -5055,6 +5117,36 @@ fn cg_lower_native_rt(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, s
         return 1;
     }
 
+    // ── monotonic milliseconds via clock_gettime(CLOCK_MONOTONIC) ───────────
+    // Linux x86-64 syscall 228 writes { i64 sec, i64 nsec } to the timespec.
+    // Convert it to sec*1000 + nsec/1_000_000 without libc.
+    if (@strEq(fname, "_zag_clock_monotonic_ms")) {
+        if (nargs != 0) { cg_err(cg, "native: _zag_clock_monotonic_ms expects no arguments"); push[Instr](out, i_mov_imm(R_RAX(), 0 - 1)); push[Instr](out, i_push(R_RAX())); return 1; }
+        let failed: i32 = cg_fresh(cg);
+        let done: i32 = cg_fresh(cg);
+        push[Instr](out, i_sub_imm(R_RSP(), 16));
+        push[Instr](out, i_mov_imm(R_RAX(), 228));     // sys_clock_gettime
+        push[Instr](out, i_mov_imm(R_RDI(), 1));       // CLOCK_MONOTONIC
+        push[Instr](out, i_mov_rr(R_RSI(), R_RSP()));  // struct timespec*
+        push[Instr](out, i_syscall());
+        push[Instr](out, i_cmp_imm(R_RAX(), 0));
+        push[Instr](out, i_jl(failed));
+        push[Instr](out, i_load(R_R10(), R_RSP(), 0)); // seconds
+        push[Instr](out, i_mov_imm(R_RCX(), 1000));
+        push[Instr](out, i_imul(R_R10(), R_RCX()));
+        push[Instr](out, i_load(R_RAX(), R_RSP(), 8)); // nanoseconds
+        push[Instr](out, i_mov_imm(R_RCX(), 1000000));
+        push[Instr](out, i_idiv(R_RCX()));
+        push[Instr](out, i_add(R_RAX(), R_R10()));
+        push[Instr](out, i_jmp(done));
+        push[Instr](out, i_label(failed));
+        push[Instr](out, i_mov_imm(R_RAX(), 0 - 1));
+        push[Instr](out, i_label(done));
+        push[Instr](out, i_add_imm(R_RSP(), 16));
+        push[Instr](out, i_push(R_RAX()));
+        return 1;
+    }
+
     // ── the routine-backed runtime fns (RT_* index, expected arg count) ──────
     let idx: i32 = 0 - 1; let want: i32 = 0; let found: i32 = 0;
     if (@strEq(fname, "_zag_str_concat"))       { idx = RT_CONCAT();  want = 2; found = 1; }
@@ -5721,17 +5813,19 @@ fn cg_lower_switch_stmt(out: *ArrayList[Instr], sw: Switch, env: *Env, syms: Arr
         push[Instr](out, i_jmp(next_lbl));        // no tag matched → next arm
         // body
         push[Instr](out, i_label(body_lbl));
+        let arm_scope: CgScopeMark = cg_scope_begin(env);
         if (kind == 2 && arm.has_cap == 1) {
             let payty: []u8 = cg_union_payload_type(cg, uname, get[[]u8](arm.tags, 0));
             cg_bind_capture(out, arm.cap, payty, blk, env, cg);
         }
         cg_lower_block(out, arm.body, env, syms, cg);
+        cg_scope_end(env, arm_scope);
         push[Instr](out, i_jmp(end_lbl));
         push[Instr](out, i_label(next_lbl));
         ai = ai + 1;
     }
     if (sw.has_els == 1) {
-        cg_lower_block(out, sw.els_body, env, syms, cg);
+        cg_lower_scoped_block(out, sw.els_body, env, syms, cg);
     }
     push[Instr](out, i_label(end_lbl));
 }
@@ -5761,11 +5855,13 @@ fn cg_lower_switch_expr(out: *ArrayList[Instr], sw: Switch, env: *Env, syms: Arr
         }
         push[Instr](out, i_jmp(next_lbl));
         push[Instr](out, i_label(body_lbl));
+        let arm_scope: CgScopeMark = cg_scope_begin(env);
         if (kind == 2 && arm.has_cap == 1) {
             let payty: []u8 = cg_union_payload_type(cg, uname, get[[]u8](arm.tags, 0));
             cg_bind_capture(out, arm.cap, payty, blk, env, cg);
         }
         cg_lower_arm_value(out, arm.body, env, syms, cg);   // pushes arm value
+        cg_scope_end(env, arm_scope);
         push[Instr](out, i_pop(R_RAX()));
         push[Instr](out, i_store(R_RBP(), res, R_RAX()));
         push[Instr](out, i_jmp(end_lbl));
@@ -5813,6 +5909,13 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
             else { lty = cg_expr_type(l.expr, env, syms, cg); }
             // fn-typed let → fat_fn (same normalization as fn-typed params).
             if (cg_is_fn_type(lty) == 1) { lty = "fat_fn"; }
+
+            if (l.has_dty == 1 && l.has_init == 1) {
+                let ity: []u8 = cg_expr_type(l.expr, env, syms, cg);
+                if (cg_types_compatible(lty, ity, cg) == 0) {
+                    cg_err(cg, "native: let initializer type mismatch");
+                }
+            }
 
             if (cg_type_is_opt(cg, lty) == 1) {
                 // OPTIONAL-typed let `let o: ?T = <null | value | optional>`.
@@ -6101,6 +6204,7 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
             let else_lbl: i32 = cg_fresh(cg);
             let end_lbl: i32 = cg_fresh(cg);
             if (iff.has_cap == 1) {
+                let capture_scope: CgScopeMark = cg_scope_begin(env);
                 // if-let: `if (opt) |cap| { ... }`
                 // Materialize opt into a scratch block, check has, bind cap = val.
                 // Scalar T: cap = T (value loaded from blk+8).
@@ -6139,19 +6243,20 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                     push[Instr](out, i_store(R_RBP(), cdisp, R_RAX()));
                 }
                 cg_lower_block(out, iff.then_body, env, syms, cg);
+                cg_scope_end(env, capture_scope);
                 push[Instr](out, i_jmp(end_lbl));
                 push[Instr](out, i_label(else_lbl));
-                if (iff.has_els == 1) { cg_lower_block(out, iff.els_body, env, syms, cg); }
+                if (iff.has_els == 1) { cg_lower_scoped_block(out, iff.els_body, env, syms, cg); }
                 push[Instr](out, i_label(end_lbl));
             } else {
                 cg_lower_expr(out, iff.cond, env, syms, cg);
                 push[Instr](out, i_pop(R_RAX()));
                 push[Instr](out, i_cmp_imm(R_RAX(), 0));
                 push[Instr](out, i_je(else_lbl));
-                cg_lower_block(out, iff.then_body, env, syms, cg);
+                cg_lower_scoped_block(out, iff.then_body, env, syms, cg);
                 push[Instr](out, i_jmp(end_lbl));
                 push[Instr](out, i_label(else_lbl));
-                if (iff.has_els == 1) { cg_lower_block(out, iff.els_body, env, syms, cg); }
+                if (iff.has_els == 1) { cg_lower_scoped_block(out, iff.els_body, env, syms, cg); }
                 push[Instr](out, i_label(end_lbl));
             }
         }
@@ -6159,6 +6264,7 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
             let top: i32 = cg_fresh(cg);
             let end: i32 = cg_fresh(cg);
             if (w.has_cap == 1) {
+                let capture_scope: CgScopeMark = cg_scope_begin(env);
                 // while-let: `while (opt) |cap| { body }` — loop while optional has value
                 let aty: []u8 = cg_expr_type(w.cond, env, syms, cg);
                 let onf: i32 = 2;
@@ -6198,6 +6304,7 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                     push[Instr](out, i_store(R_RBP(), cdisp, R_RAX()));
                 }
                 cg_lower_block(out, w.body, env, syms, cg);
+                cg_scope_end(env, capture_scope);
                 push[Instr](out, i_jmp(top));
                 push[Instr](out, i_label(end));
             } else {
@@ -6206,7 +6313,7 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                 push[Instr](out, i_pop(R_RAX()));
                 push[Instr](out, i_cmp_imm(R_RAX(), 0));
                 push[Instr](out, i_je(end));
-                cg_lower_block(out, w.body, env, syms, cg);
+                cg_lower_scoped_block(out, w.body, env, syms, cg);
                 push[Instr](out, i_jmp(top));
                 push[Instr](out, i_label(end));
             }
@@ -6230,6 +6337,16 @@ fn cg_lower_block(out: *ArrayList[Instr], body: ArrayList[*Node], env: *Env, sym
         cg_lower_stmt(out, get[*Node](body, i), env, syms, cg);
         i = i + 1;
     }
+}
+
+// Lower a nested lexical block with its own binding layer. Frame slots remain
+// allocated (frame_words is monotonic), but names introduced in the block are
+// removed from lookup when control leaves it, revealing any outer binding with
+// the same name again.
+fn cg_lower_scoped_block(out: *ArrayList[Instr], body: ArrayList[*Node], env: *Env, syms: ArrayList[FnSym], cg: *Cg) void {
+    let mark: CgScopeMark = cg_scope_begin(env);
+    cg_lower_block(out, body, env, syms, cg);
+    cg_scope_end(env, mark);
 }
 
 // ── per-function lowering ────────────────────────────────────────────────────

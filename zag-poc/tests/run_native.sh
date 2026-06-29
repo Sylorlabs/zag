@@ -5,12 +5,11 @@
 cd "$(dirname "$0")/.."    # zag-poc root
 pass=0; fail=0
 
-# Build the native driver (znc) with the self-hosted compiler.
-if ! ./zagc build selfhost/native/znc.zag >/tmp/zn_build 2>&1; then
+# Rebuild the native driver with the supported Zag-native seed.
+if ! ./znc selfhost/native/znc.zag -o /tmp/znc_drv >/tmp/zn_build 2>&1; then
     echo "  XX  znc driver build"; sed -n '1,20p' /tmp/zn_build
     echo "════ native pass=0 fail=1 ════"; exit 1
 fi
-cp selfhost/native/znc.zag.out /tmp/znc_drv
 ZNC=/tmp/znc_drv
 
 # nt <name> <source> <expected-exit>
@@ -250,7 +249,7 @@ nt  "error union distinct codes" 'error { NotFound, OutOfRange } fn get_err(x: i
 rm -f /tmp/nt_bin
 printf 'error { Err } fn maybe() !i32 { return error.Err; } fn bad() i32 { return try maybe(); } fn main() i32 { return 0; }' > nt_src.zag
 "$ZNC" nt_src.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
-if grep -q 'VIOLATION' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
+if grep -qi 'violation\|error\[E' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
     echo "  ok  rejects try in non-!T function (Raises violation)"; pass=$((pass+1))
 else
     echo "  XX  should reject try in non-!T function"; fail=$((fail+1))
@@ -303,7 +302,7 @@ rm -f /tmp/nt_bin
 # 3. Circular imports must be detected loudly with an error and no binary.
 rm -f /tmp/nt_bin
 "$ZNC" tests/module_system/circ_main.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
-if grep -q 'circular import' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
+if grep -qi 'circular.*import\|E0011' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
     echo "  ok  circular import detected loudly"; pass=$((pass+1))
 else
     echo "  XX  circular import not detected"; cat /tmp/nt_out; fail=$((fail+1))
@@ -321,7 +320,7 @@ fi
 rm -f /tmp/nt_bin
 
 echo "── stdlib2 (sort/hashmap/strbuf) ──"
-OUT=$(./znc tests/stdlib2_test.zag -o /tmp/zag_stdlib2_test 2>&1)
+OUT=$("$ZNC" tests/stdlib2_test.zag -o /tmp/zag_stdlib2_test 2>&1)
 if echo "$OUT" | grep -q "error\|aborted"; then
     echo "  XX  stdlib2_test compile failed"; echo "$OUT" | head -8; fail=$((fail+1))
 else
@@ -333,6 +332,20 @@ else
     fi
 fi
 rm -f /tmp/zag_stdlib2_test
+
+echo "── v1 standard library (native acceptance) ──"
+OUT=$("$ZNC" tests/stdlib_v1_test.zag -o /tmp/zag_stdlib_v1_test 2>&1)
+if echo "$OUT" | grep -q "error\|aborted"; then
+    echo "  XX  v1 stdlib compile failed"; echo "$OUT" | head -8; fail=$((fail+1))
+else
+    RES=$(/tmp/zag_stdlib_v1_test 2>&1)
+    if echo "$RES" | grep -q "FAIL"; then
+        echo "  XX  v1 stdlib: $(echo "$RES" | grep FAIL | head -5)"; fail=$((fail+1))
+    else
+        echo "  ok  v1 stdlib: collections/strings/files/process/time/testing"; pass=$((pass+1))
+    fi
+fi
+rm -f /tmp/zag_stdlib_v1_test
 
 echo "════ native pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]

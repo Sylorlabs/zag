@@ -1,0 +1,288 @@
+// selfhost/native/ar.zag — GNU ar (Unix static archive) parser.
+//
+// Parses the BSD/GNU ".a" archive format to extract object files and symbol
+// tables. Used by the native static linker to pull in library members that
+// define symbols referenced by the main object.
+//
+// Format recap:
+//   byte  0..7   : magic "!<arch>\n"  (33 60 97 114 99 104 62 10)
+//   then repeated entries, each:
+//     bytes +0 ..+15 : name  [16]  (ASCII, padded with spaces)
+//     bytes +16..+27 : date  [12]  (decimal ASCII, spaces)
+//     bytes +28..+33 : uid   [ 6]  (decimal ASCII, spaces)
+//     bytes +34..+39 : gid   [ 6]  (decimal ASCII, spaces)
+//     bytes +40..+47 : mode  [ 8]  (octal ASCII,  spaces)
+//     bytes +48..+57 : size  [10]  (decimal ASCII, spaces)  — data byte count
+//     bytes +58..+59 : fmag  [ 2]  = 0x60 0x0A
+//     bytes +60..    : data  (size bytes, padded to even total)
+//
+// GNU extensions:
+//   "/"  entry  : GNU symbol table (skip — use ar_symbol_table() instead)
+//   "//" entry  : GNU extended-name table (long filenames, '\n'-delimited)
+//   "/NNN" name : long name at byte offset NNN in the "//" table
+//
+// LANGUAGE SUBSET NOTE (self-hosted compiler):
+//   No `<<`/`>>`, no `|` as bitwise-or (use arithmetic), no break/continue.
+//   Use `go: i32 = 1` flag instead of break.  Deref pointer fields as `p.*.field`.
+
+@import("../../std/list.zag")
+@import("../../std/rt.zag")
+
+// ── data types ────────────────────────────────────────────────────────────────
+
+// A parsed archive member: its name and a slice of its raw data bytes inside
+// the original archive buffer (zero-copy — the slice points into `buf`).
+struct ArEntry { name: []u8, data: []u8 }
+
+// One entry from the GNU symbol table: a symbol name and the byte offset of
+// the archive member header that defines it.
+struct ArSymbol { name: []u8, entry_offset: i64 }
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+// Parse an unsigned decimal integer from buf[lo..hi).
+// Stops at the first byte that is not an ASCII digit (space, null, etc.).
+// Returns 0 on an empty or all-space field.
+fn ar_parse_dec(buf: []u8, lo: i32, hi: i32) i64 {
+    let val: i64 = 0;
+    let i: i32 = lo;
+    let go: i32 = 1;
+    while (go == 1 && i < hi) {
+        let c: i32 = buf[i] as i32;
+        if (c < 48 || c > 57) {
+            // not '0'..'9' (48..57) — stop
+            go = 0;
+        } else {
+            val = val * 10 + ((buf[i] as i64) - 48);
+            i = i + 1;
+        }
+    }
+    return val;
+}
+
+// Read a 4-byte big-endian unsigned integer from buf[off..off+4].
+// Computed with arithmetic only — no `<<` available in the subset.
+// Formula: ((a*256+b)*256+c)*256+d
+fn ar_read_be32(buf: []u8, off: i32) i64 {
+    let a: i64 = buf[off]     as i64;
+    let b: i64 = buf[off + 1] as i64;
+    let c: i64 = buf[off + 2] as i64;
+    let d: i64 = buf[off + 3] as i64;
+    return ((a * 256 + b) * 256 + c) * 256 + d;
+}
+
+// Decode the 16-byte name field that starts at buf[hdr_off].
+//
+// Special cases (checked in order):
+//   byte[0]=='/' and byte[1]=='/'        →  return "//"
+//   byte[0]=='/' and byte[1]==' '        →  return "/"  (GNU symbol table)
+//   byte[0]=='/' and byte[1] is a digit  →  long name: parse decimal offset
+//       into ext_names and return the name stored there (up to '/' or '\n')
+//   otherwise: normal short name — slice buf[hdr_off..end] where end is the
+//       first '/', ' ', or NUL within the 16-byte field.
+//
+// ext_names must be the data bytes of the "//" entry (or an empty slice if
+// no "//" entry has been seen yet — long-name lookups return "" in that case).
+fn ar_get_name(buf: []u8, hdr_off: i32, ext_names: []u8) []u8 {
+    let b0: i32 = buf[hdr_off]     as i32;
+    let b1: i32 = buf[hdr_off + 1] as i32;
+
+    // '/' = 47
+    if (b0 == 47) {
+        // byte[1] == '/' ?  → extended-names table header pseudo-entry
+        if (b1 == 47) {
+            return "//";
+        }
+        // byte[1] == ' '(32) or '\n'(10) or '\r'(13) ?  → GNU symbol table header
+        else if (b1 == 32 || b1 == 10 || b1 == 13) {
+            return "/";
+        }
+        // byte[1] is '0'..'9' ?  → long-name reference "/NNN"
+        else if (b1 >= 48 && b1 <= 57) {
+            // Parse the decimal offset (field bytes hdr_off+1 .. hdr_off+16).
+            let xoff: i64 = ar_parse_dec(buf, hdr_off + 1, hdr_off + 16);
+            let start: i32 = xoff as i32;
+            // Guard against a bad or missing ext_names.
+            if (start >= ext_names.len) { return ""; }
+            // Walk ext_names[start..] until '\n'(10) or '/'(47).
+            let end: i32 = start;
+            let go: i32 = 1;
+            while (go == 1 && end < ext_names.len) {
+                let c: i32 = ext_names[end] as i32;
+                if (c == 10 || c == 47) { go = 0; }
+                else { end = end + 1; }
+            }
+            return ext_names[start..end];
+        }
+        // Some other byte after '/': fall through to normal name parse.
+        else { }
+    }
+
+    // Normal short name: walk buf[hdr_off..hdr_off+16] up to '/'(47), ' '(32), or NUL(0).
+    let end: i32 = hdr_off;
+    let go2: i32 = 1;
+    while (go2 == 1 && end < hdr_off + 16) {
+        let c: i32 = buf[end] as i32;
+        if (c == 47 || c == 32 || c == 0) { go2 = 0; }
+        else { end = end + 1; }
+    }
+    return buf[hdr_off..end];
+}
+
+// ── main parsers ──────────────────────────────────────────────────────────────
+
+// Parse all object-file members from the archive in `buf`.
+// Returns a list of ArEntry values (name + data slice into buf).
+// The "/" (GNU symbol table) and "//" (extended names) pseudo-entries are
+// consumed internally and NOT included in the result.
+//
+// Single linear pass — GNU ar guarantees "//" precedes any "/NNN" entries.
+fn ar_parse(buf: []u8) ArrayList[ArEntry] {
+    let result: ArrayList[ArEntry] = make[ArEntry](8);
+
+    // Verify the 8-byte archive magic: "!<arch>\n"
+    //   '!'=33  '<'=60  'a'=97  'r'=114  'c'=99  'h'=104  '>'=62  '\n'=10
+    if (buf.len < 8) { return result; }
+    if (buf[0] != 33 || buf[1] != 60 || buf[2] != 97 || buf[3] != 114) { return result; }
+    if (buf[4] != 99 || buf[5] != 104 || buf[6] != 62 || buf[7] != 10)  { return result; }
+
+    // ext_names starts empty; filled when we encounter the "//" entry.
+    let ext_names: []u8 = "";
+
+    let off: i32 = 8;   // first entry header begins right after the 8-byte magic
+    let go: i32 = 1;
+    while (go == 1 && off + 60 <= buf.len) {
+        // Read the size field at header bytes +48..+58.
+        let sz: i64 = ar_parse_dec(buf, off + 48, off + 58);
+
+        // Decode the name (may consult ext_names for "/NNN" entries).
+        let name: []u8 = ar_get_name(buf, off, ext_names);
+
+        if (@strEq(name, "//")) {
+            // GNU extended-names table — capture it for future "/NNN" lookups.
+            let data_end: i32 = off + 60 + (sz as i32);
+            if (data_end <= buf.len) {
+                ext_names = buf[off + 60..data_end];
+            }
+        } else if (@strEq(name, "/")) {
+            // GNU symbol table — skip here; use ar_symbol_table() to read it.
+        } else {
+            // Regular object-file member.
+            let data_end: i32 = off + 60 + (sz as i32);
+            if (data_end > buf.len) { data_end = buf.len; }
+            let data: []u8 = buf[off + 60..data_end];
+            push[ArEntry](&result, ArEntry{ .name = name, .data = data });
+        }
+
+        // Advance to the next entry.  Each member is padded to an even size.
+        let raw_next: i32 = off + 60 + (sz as i32);
+        let pad: i32 = (sz as i32) % 2;   // 0 if even, 1 if odd
+        let next: i32 = raw_next + pad;
+        // Safety: guard against infinite loop on corrupt data.
+        if (next <= off) { go = 0; }
+        else { off = next; }
+    }
+
+    return result;
+}
+
+// Parse the GNU symbol table ("/") entry from the archive in `buf`.
+// Returns a list of ArSymbol{ name, entry_offset } pairs where entry_offset
+// is the byte offset of the *header* of the member that defines the symbol.
+// Returns an empty list if no "/" entry is present.
+//
+// GNU symbol-table data layout (immediately following the 60-byte header):
+//   4 bytes  big-endian  : N  (number of symbols)
+//   N * 4 bytes BE       : file offsets, one per symbol
+//   N null-terminated    : symbol name strings (contiguous)
+fn ar_symbol_table(buf: []u8) ArrayList[ArSymbol] {
+    let result: ArrayList[ArSymbol] = make[ArSymbol](16);
+
+    // Verify magic.
+    if (buf.len < 8) { return result; }
+    if (buf[0] != 33 || buf[1] != 60) { return result; }
+
+    // Find the "/" entry (normally the very first entry at offset 8).
+    let off: i32 = 8;
+    let found: i32 = 0;
+    let sym_data: []u8 = "";
+    let go: i32 = 1;
+    while (go == 1 && off + 60 <= buf.len) {
+        let sz: i64 = ar_parse_dec(buf, off + 48, off + 58);
+        let b0: i32 = buf[off]     as i32;
+        let b1: i32 = buf[off + 1] as i32;
+        // '/' = 47, ' ' = 32, '\n' = 10, '\r' = 13
+        if (b0 == 47 && (b1 == 32 || b1 == 10 || b1 == 13)) {
+            // This is the GNU symbol table entry.
+            let data_end: i32 = off + 60 + (sz as i32);
+            if (data_end <= buf.len) {
+                sym_data = buf[off + 60..data_end];
+            }
+            found = 1;
+            go = 0;
+        } else {
+            let raw_next: i32 = off + 60 + (sz as i32);
+            let pad: i32 = (sz as i32) % 2;
+            let next: i32 = raw_next + pad;
+            if (next <= off) { go = 0; }
+            else { off = next; }
+        }
+    }
+
+    if (found == 0) { return result; }
+    if (sym_data.len < 4) { return result; }
+
+    // Decode the count N (4-byte big-endian at offset 0).
+    let n: i64 = ar_read_be32(sym_data, 0);
+    let ni: i32 = n as i32;
+
+    // Minimum size: 4 (count) + ni*4 (offsets) must fit in sym_data.
+    if (sym_data.len < 4 + ni * 4) { return result; }
+
+    // String table begins immediately after the N 4-byte offsets.
+    let str_base: i32 = 4 + ni * 4;
+    let str_off: i32 = 0;   // running offset within the string table
+
+    let idx: i32 = 0;
+    let go2: i32 = 1;
+    while (go2 == 1 && idx < ni) {
+        // Read this symbol's archive-member file offset.
+        let foff: i64 = ar_read_be32(sym_data, 4 + idx * 4);
+
+        // Locate the symbol name (null-terminated) in the string table.
+        let name_start: i32 = str_base + str_off;
+        if (name_start >= sym_data.len) {
+            // Ran off the end — stop early.
+            go2 = 0;
+        } else {
+            // Find the terminating NUL byte.
+            let name_end: i32 = name_start;
+            let go3: i32 = 1;
+            while (go3 == 1 && name_end < sym_data.len) {
+                if (sym_data[name_end] == 0) { go3 = 0; }
+                else { name_end = name_end + 1; }
+            }
+            let sym_name: []u8 = sym_data[name_start..name_end];
+            push[ArSymbol](&result, ArSymbol{ .name = sym_name, .entry_offset = foff });
+            // Advance past the NUL terminator.
+            str_off = str_off + (name_end - name_start) + 1;
+            idx = idx + 1;
+        }
+    }
+
+    return result;
+}
+
+// Return the raw data bytes of the archive member whose *header* starts at
+// byte offset `file_off` in `buf`.
+// The header is always 60 bytes; data follows immediately after.
+// Clamps to buf.len to avoid over-run on truncated archives.
+fn ar_entry_data(buf: []u8, file_off: i64) []u8 {
+    let hdr: i32 = file_off as i32;
+    if (hdr + 60 > buf.len) { return ""; }
+    let sz: i64 = ar_parse_dec(buf, hdr + 48, hdr + 58);
+    let data_start: i32 = hdr + 60;
+    let data_end: i32 = data_start + (sz as i32);
+    if (data_end > buf.len) { data_end = buf.len; }
+    return buf[data_start..data_end];
+}

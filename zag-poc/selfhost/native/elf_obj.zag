@@ -1,0 +1,461 @@
+// selfhost/native/elf_obj.zag — ELF relocatable object reader + static merger.
+//
+// Reads ELF64 .o files (ET_REL, EM_X86_64, little-endian) and merges their
+// .text sections into a single flat code blob for static linking.  Applied as
+// the back-half of the native linker: after ar.zag locates the right archive
+// members, this module extracts symbols, relocations, and code, and applies the
+// PC-relative relocations so the merged library blob is self-consistent.
+//
+// ELF64 layout constants used here (all byte offsets, little-endian fields):
+//
+//   ELF header (64 bytes total):
+//     e_ident   [0..16]  — {0x7F,'E','L','F',2,1,1,...}
+//     e_shoff    u64 @40 — section header table file offset
+//     e_shnum    u16 @60 — number of section headers
+//     e_shstrndx u16 @62 — section-name string-table index
+//
+//   Section header (64 bytes each):
+//     sh_name    u32 @0   — offset into .shstrtab
+//     sh_type    u32 @4   — 0=NULL, 1=PROGBITS, 2=SYMTAB, 3=STRTAB, 4=RELA
+//     sh_offset  u64 @24  — file offset of section data
+//     sh_size    u64 @32  — section data byte count
+//     sh_link    u32 @40  — for SYMTAB: linked strtab section index
+//     sh_info    u32 @44  — for RELA:   target section index
+//     sh_entsize u64 @56  — entry size (24 for SYMTAB and RELA)
+//
+//   Symbol entry (24 bytes):
+//     st_name   u32 @0   — offset into linked .strtab
+//     st_info    u8 @4   — (bind<<4)|type; STB_GLOBAL bind=1
+//     st_shndx  u16 @6   — defining section index; 0=SHN_UNDEF
+//     st_value  u64 @8   — offset within section
+//
+//   RELA entry (24 bytes):
+//     r_offset  u64 @0   — byte offset within target section to patch
+//     r_info    u64 @8   — (sym_idx * 4294967296) + type
+//     r_addend  i64 @16  — signed addend
+//
+// Relocation types:
+//   R_X86_64_64    = 1  — 8-byte absolute:  write sym_addr + addend
+//   R_X86_64_PC32  = 2  — 4-byte PC-rel:    write (sym_addr + addend - (site+4)) as i32
+//   R_X86_64_PLT32 = 4  — same as PC32 for static linking
+//   R_X86_64_32S   = 11 — 4-byte sign-extended absolute
+//
+// LANGUAGE SUBSET NOTE (self-hosted compiler):
+//   No `<<`/`>>` — use multiply/divide for bit manipulation.
+//   No `|` as bitwise-or — use bor(a,b)=a+b-(a&b) when needed.
+//   No break/continue — use `go: i32 = 1` flag.
+//   Deref pointer fields as `p.*.field`.
+
+@import("../../std/list.zag")
+@import("../../std/rt.zag")
+
+// ── data types ────────────────────────────────────────────────────────────────
+
+// One symbol from an ELF .o file.
+struct ObjSym {
+    name:       []u8,
+    sec_idx:    i32,   // ELF section index (0 = SHN_UNDEF)
+    offset:     i64,   // st_value: byte offset within its section
+    is_global:  i32,   // 1 if STB_GLOBAL, else 0
+    is_defined: i32,   // 1 if sec_idx != SHN_UNDEF, else 0
+}
+
+// One RELA relocation entry.
+struct ObjReloc {
+    sec_idx:  i32,   // target section index (sh_info from the RELA section header)
+    offset:   i64,   // byte offset within the target section to patch
+    sym_idx:  i32,   // index of the symbol in ObjFile.syms whose address to use
+    type_:    i32,   // relocation type (R_X86_64_* constant)
+    addend:   i64,   // signed addend
+}
+
+// One section from an ELF .o file.
+struct ObjSec {
+    name:   []u8,   // section name (e.g. ".text", ".rela.text")
+    data:   []u8,   // slice of the raw section bytes inside the original buffer
+    type_:  i32,    // sh_type (1=PROGBITS, 2=SYMTAB, 3=STRTAB, 4=RELA, ...)
+}
+
+// Parsed ELF relocatable object.
+struct ObjFile {
+    secs:   ArrayList[ObjSec],
+    syms:   ArrayList[ObjSym],
+    relocs: ArrayList[ObjReloc],
+}
+
+// A resolved symbol address: name -> virtual address in the final binary.
+struct SymAddr { name: []u8, addr: i64 }
+
+// A relocation that needs to be applied after all objects are merged.
+struct PendingReloc {
+    patch_off: i64,   // byte offset in MergedLib.text to patch
+    type_:     i32,   // R_X86_64_* relocation type
+    sym_name:  []u8,  // name of the symbol whose address to substitute
+    addend:    i64,   // signed addend
+}
+
+// Accumulated library code + symbol table + pending relocations.
+struct MergedLib {
+    text:      ArrayList[u8],
+    sym_addrs: ArrayList[SymAddr],
+    relocs:    ArrayList[PendingReloc],
+    text_base: i64,   // virtual address where text[0] is mapped
+}
+
+// ── little-endian byte readers ────────────────────────────────────────────────
+// All use arithmetic (no `<<`/`>>`) so they work in the self-hosted subset.
+
+fn elf_obj_u8at(buf: []u8, off: i64) i64 {
+    return buf[off as i32] as i64;
+}
+
+fn elf_obj_u16le(buf: []u8, off: i64) i64 {
+    return elf_obj_u8at(buf, off) + elf_obj_u8at(buf, off + 1) * 256;
+}
+
+fn elf_obj_u32le(buf: []u8, off: i64) i64 {
+    return elf_obj_u16le(buf, off) + elf_obj_u16le(buf, off + 2) * 65536;
+}
+
+// 64-bit read — correct when high 32 bits are 0 (always true for .o offsets).
+fn elf_obj_u64le(buf: []u8, off: i64) i64 {
+    return elf_obj_u32le(buf, off) + elf_obj_u32le(buf, off + 4) * 4294967296;
+}
+
+// Signed 64-bit read — sign-extends the high 32 bits (for RELA addends).
+fn elf_obj_i64le(buf: []u8, off: i64) i64 {
+    let lo: i64 = elf_obj_u32le(buf, off);
+    let hi: i64 = elf_obj_u32le(buf, off + 4);
+    if (hi >= 2147483648) { hi = hi - 4294967296; }
+    return lo + hi * 4294967296;
+}
+
+// ── string-table helper ────────────────────────────────────────────────────────
+
+// Read a null-terminated C string from buf starting at byte offset `off`.
+// Returns a sub-slice of buf — no allocation.
+fn elf_obj_cstr(buf: []u8, off: i32) []u8 {
+    if (off < 0 || off >= buf.len) { return ""; }
+    let end: i32 = off;
+    let go: i32 = 1;
+    while (go == 1 && end < buf.len) {
+        if (buf[end] == 0) { go = 0; }
+        else { end = end + 1; }
+    }
+    return buf[off..end];
+}
+
+// ── ELF object parser ─────────────────────────────────────────────────────────
+
+fn elf_obj_parse(buf: []u8) ObjFile {
+    let obj: ObjFile = ObjFile{
+        .secs   = make[ObjSec](8),
+        .syms   = make[ObjSym](16),
+        .relocs = make[ObjReloc](16),
+    };
+
+    // Need at least 64 bytes for the ELF header.
+    if (buf.len < 64) { return obj; }
+
+    // Verify ELF magic: 0x7F 'E' 'L' 'F'  (127 69 76 70).
+    if ((buf[0] as i32) != 127) { return obj; }
+    if ((buf[1] as i32) != 69)  { return obj; }
+    if ((buf[2] as i32) != 76)  { return obj; }
+    if ((buf[3] as i32) != 70)  { return obj; }
+
+    // Read section-header table location and dimensions.
+    let shoff:    i64 = elf_obj_u64le(buf, 40);  // e_shoff
+    let shnum:    i64 = elf_obj_u16le(buf, 60);  // e_shnum
+    let shstrndx: i64 = elf_obj_u16le(buf, 62);  // e_shstrndx
+
+    if (shoff == 0 || shnum == 0) { return obj; }
+
+    // ── Read the section-name string table (.shstrtab) ────────────────────────
+    let shstrtab: []u8 = "";
+    if (shstrndx > 0 && shstrndx < shnum) {
+        let ss_base: i64 = shoff + shstrndx * 64;
+        let ss_off:  i64 = elf_obj_u64le(buf, ss_base + 24);
+        let ss_sz:   i64 = elf_obj_u64le(buf, ss_base + 32);
+        let ss_s: i32 = ss_off as i32;
+        let ss_e: i32 = (ss_off + ss_sz) as i32;
+        if (ss_s >= 0 && ss_e <= buf.len) {
+            shstrtab = buf[ss_s..ss_e];
+        }
+    }
+
+    // ── Pass 1: read all sections into obj.secs ───────────────────────────────
+    // Push one ObjSec per ELF section index so index i == ELF section index i.
+    let si: i64 = 0;
+    while (si < shnum) {
+        let sh_base: i64 = shoff + si * 64;
+        let sh_name: i64 = elf_obj_u32le(buf, sh_base);
+        let sh_type: i64 = elf_obj_u32le(buf, sh_base + 4);
+        let sh_off:  i64 = elf_obj_u64le(buf, sh_base + 24);
+        let sh_sz:   i64 = elf_obj_u64le(buf, sh_base + 32);
+
+        let sec_name: []u8 = elf_obj_cstr(shstrtab, sh_name as i32);
+        let sec_s: i32 = sh_off as i32;
+        let sec_e: i32 = (sh_off + sh_sz) as i32;
+        let sec_data: []u8 = "";
+        if (sec_s >= 0 && sec_e <= buf.len && sec_e >= sec_s) {
+            sec_data = buf[sec_s..sec_e];
+        }
+        push[ObjSec](&obj.secs, ObjSec{
+            .name  = sec_name,
+            .data  = sec_data,
+            .type_ = sh_type as i32,
+        });
+        si = si + 1;
+    }
+
+    // ── Pass 2: find SYMTAB and read symbols ──────────────────────────────────
+    let symtab_idx:  i64 = 0 - 1;
+    let symtab_link: i64 = 0;
+    let si2: i64 = 0;
+    while (si2 < shnum) {
+        let sh_base2: i64 = shoff + si2 * 64;
+        let sh_type2: i64 = elf_obj_u32le(buf, sh_base2 + 4);
+        if (sh_type2 == 2) {
+            symtab_idx  = si2;
+            symtab_link = elf_obj_u32le(buf, sh_base2 + 40);
+        }
+        si2 = si2 + 1;
+    }
+
+    // Read the STRTAB for symbol names (linked from the SYMTAB).
+    let sym_strtab: []u8 = "";
+    if (symtab_link > 0 && symtab_link < shnum) {
+        let st_base: i64 = shoff + symtab_link * 64;
+        let st_off:  i64 = elf_obj_u64le(buf, st_base + 24);
+        let st_sz:   i64 = elf_obj_u64le(buf, st_base + 32);
+        let st_s: i32 = st_off as i32;
+        let st_e: i32 = (st_off + st_sz) as i32;
+        if (st_s >= 0 && st_e <= buf.len) {
+            sym_strtab = buf[st_s..st_e];
+        }
+    }
+
+    // Read all symbols from the SYMTAB section.
+    if (symtab_idx >= 0) {
+        let sym_sh_base: i64 = shoff + symtab_idx * 64;
+        let sym_sh_off:  i64 = elf_obj_u64le(buf, sym_sh_base + 24);
+        let sym_sh_sz:   i64 = elf_obj_u64le(buf, sym_sh_base + 32);
+        let sym_entsize: i64 = elf_obj_u64le(buf, sym_sh_base + 56);
+        if (sym_entsize <= 0) { sym_entsize = 24; }
+
+        let nsyms: i64 = sym_sh_sz / sym_entsize;
+        let symi: i64 = 0;
+        while (symi < nsyms) {
+            let sym_base: i64 = sym_sh_off + symi * sym_entsize;
+            let st_name:  i64 = elf_obj_u32le(buf, sym_base);
+            let st_info:  i64 = elf_obj_u8at(buf,  sym_base + 4);
+            let st_shndx: i64 = elf_obj_u16le(buf, sym_base + 6);
+            let st_value: i64 = elf_obj_u64le(buf, sym_base + 8);
+
+            // STB_GLOBAL = 1 (high nibble of st_info)
+            let st_bind: i64 = st_info / 16;
+            let is_global: i32 = 0;
+            if (st_bind == 1) { is_global = 1; }
+
+            // SHN_UNDEF = 0; SHN_ABS/COMMON >= 0xff00 (65280)
+            let is_defined: i32 = 0;
+            if (st_shndx > 0 && st_shndx < 65280) { is_defined = 1; }
+
+            let sym_name: []u8 = elf_obj_cstr(sym_strtab, st_name as i32);
+            push[ObjSym](&obj.syms, ObjSym{
+                .name       = sym_name,
+                .sec_idx    = st_shndx as i32,
+                .offset     = st_value,
+                .is_global  = is_global,
+                .is_defined = is_defined,
+            });
+            symi = symi + 1;
+        }
+    }
+
+    // ── Pass 3: find all RELA sections and read relocations ───────────────────
+    let si3: i64 = 0;
+    while (si3 < shnum) {
+        let sh_base3: i64 = shoff + si3 * 64;
+        let sh_type3: i64 = elf_obj_u32le(buf, sh_base3 + 4);
+        if (sh_type3 == 4) {
+            let sh_off3:     i64 = elf_obj_u64le(buf, sh_base3 + 24);
+            let sh_sz3:      i64 = elf_obj_u64le(buf, sh_base3 + 32);
+            let sh_info3:    i64 = elf_obj_u32le(buf, sh_base3 + 44);
+            let sh_entsize3: i64 = elf_obj_u64le(buf, sh_base3 + 56);
+            if (sh_entsize3 <= 0) { sh_entsize3 = 24; }
+
+            let nrelocs: i64 = sh_sz3 / sh_entsize3;
+            let ri: i64 = 0;
+            while (ri < nrelocs) {
+                let r_base:   i64 = sh_off3 + ri * sh_entsize3;
+                let r_offset: i64 = elf_obj_u64le(buf, r_base);
+                let r_info:   i64 = elf_obj_u64le(buf, r_base + 8);
+                let r_addend: i64 = elf_obj_i64le(buf, r_base + 16);
+
+                // r_info high 32 bits = symbol index, low 32 bits = type
+                let r_sym:  i64 = r_info / 4294967296;
+                let r_type: i64 = r_info % 4294967296;
+
+                push[ObjReloc](&obj.relocs, ObjReloc{
+                    .sec_idx = sh_info3 as i32,
+                    .offset  = r_offset,
+                    .sym_idx = r_sym as i32,
+                    .type_   = r_type as i32,
+                    .addend  = r_addend,
+                });
+                ri = ri + 1;
+            }
+        }
+        si3 = si3 + 1;
+    }
+
+    return obj;
+}
+
+// ── patch helpers ─────────────────────────────────────────────────────────────
+
+// Write a little-endian i32 into ml.text at byte offset `off`.
+fn obj_patch_i32(ml: *MergedLib, off: i64, val: i64) void {
+    let off4: i32 = off as i32;
+    let x: i64 = val;
+    let k: i32 = 0;
+    while (k < 4) {
+        let b: i64 = x & 255;
+        set[u8](&ml.*.text, off4 + k, b as u8);
+        x = (x - b) / 256;
+        k = k + 1;
+    }
+}
+
+// Write a little-endian i64 into ml.text at byte offset `off`.
+fn obj_patch_i64(ml: *MergedLib, off: i64, val: i64) void {
+    let off4: i32 = off as i32;
+    let x: i64 = val;
+    let k: i32 = 0;
+    while (k < 8) {
+        let b: i64 = x & 255;
+        set[u8](&ml.*.text, off4 + k, b as u8);
+        x = (x - b) / 256;
+        k = k + 1;
+    }
+}
+
+// ── merge + apply ─────────────────────────────────────────────────────────────
+
+// Append the .text section of `obj` to `ml.text`.
+// Records the virtual addresses of globally-defined symbols in that section.
+// Records pending relocations (to be applied later by apply_relocs).
+//
+// text_base — the virtual address where ml.text[0] is mapped in the final binary.
+fn merge_obj(ml: *MergedLib, obj: ObjFile, text_base: i64) void {
+    // Find the .text section (SHT_PROGBITS = 1, name = ".text").
+    let text_sec_idx: i32 = 0 - 1;
+    let i: i32 = 0;
+    while (i < len[ObjSec](obj.secs)) {
+        let sec: ObjSec = get[ObjSec](obj.secs, i);
+        if (@strEq(sec.name, ".text") && sec.type_ == 1) {
+            text_sec_idx = i;
+        }
+        i = i + 1;
+    }
+    if (text_sec_idx < 0) { return; }
+
+    let sec: ObjSec = get[ObjSec](obj.secs, text_sec_idx);
+    // Byte offset within ml.text where this object's code starts.
+    let sec_start: i64 = ml.*.text.len as i64;
+
+    // Append this object's .text bytes to the merged blob.
+    let di: i32 = 0;
+    while (di < sec.data.len) {
+        push[u8](&ml.*.text, sec.data[di]);
+        di = di + 1;
+    }
+
+    // Record global defined symbols that live in this .text section.
+    let si: i32 = 0;
+    while (si < len[ObjSym](obj.syms)) {
+        let sym: ObjSym = get[ObjSym](obj.syms, si);
+        if (sym.is_global == 1 && sym.is_defined == 1 && sym.sec_idx == text_sec_idx) {
+            let addr: i64 = text_base + sec_start + sym.offset;
+            push[SymAddr](&ml.*.sym_addrs, SymAddr{ .name = sym.name, .addr = addr });
+        }
+        si = si + 1;
+    }
+
+    // Record pending relocations that target this .text section.
+    let ri: i32 = 0;
+    while (ri < len[ObjReloc](obj.relocs)) {
+        let reloc: ObjReloc = get[ObjReloc](obj.relocs, ri);
+        if (reloc.sec_idx == text_sec_idx) {
+            let patch_off: i64 = sec_start + reloc.offset;
+            let sym_name: []u8 = "";
+            if (reloc.sym_idx >= 0 && reloc.sym_idx < len[ObjSym](obj.syms)) {
+                sym_name = get[ObjSym](obj.syms, reloc.sym_idx).name;
+            }
+            push[PendingReloc](&ml.*.relocs, PendingReloc{
+                .patch_off = patch_off,
+                .type_     = reloc.type_,
+                .sym_name  = sym_name,
+                .addend    = reloc.addend,
+            });
+        }
+        ri = ri + 1;
+    }
+}
+
+// Apply all pending relocations in ml.relocs.
+// Symbols are looked up first in ml.sym_addrs (library-internal), then
+// in extern_addrs (symbols provided by the main binary).
+//
+// Relocation types handled:
+//   R_X86_64_64   (1):  8-byte absolute   = sym_addr + addend
+//   R_X86_64_PC32 (2):  4-byte PC-rel     = sym_addr + addend - (site_vaddr + 4)
+//   R_X86_64_PLT32(4):  same as PC32 for static linking
+//   R_X86_64_32S  (11): 4-byte sign-ext   = sym_addr + addend (low 32 bits)
+fn apply_relocs(ml: *MergedLib, extern_addrs: ArrayList[SymAddr]) void {
+    let text_base: i64 = ml.*.text_base;
+    let i: i32 = 0;
+    while (i < len[PendingReloc](ml.*.relocs)) {
+        let r: PendingReloc = get[PendingReloc](ml.*.relocs, i);
+
+        // Resolve symbol address (library-internal first, then external).
+        let sym_addr: i64 = 0;
+        let found: i32 = 0;
+
+        let j: i32 = 0;
+        while (j < len[SymAddr](ml.*.sym_addrs)) {
+            let sa: SymAddr = get[SymAddr](ml.*.sym_addrs, j);
+            if (@strEq(sa.name, r.sym_name)) { sym_addr = sa.addr; found = 1; }
+            j = j + 1;
+        }
+        if (found == 0) {
+            let k: i32 = 0;
+            while (k < len[SymAddr](extern_addrs)) {
+                let ea: SymAddr = get[SymAddr](extern_addrs, k);
+                if (@strEq(ea.name, r.sym_name)) { sym_addr = ea.addr; found = 1; }
+                k = k + 1;
+            }
+        }
+
+        if (found == 1) {
+            let patch_off: i64 = r.patch_off;
+            let type_: i32 = r.type_;
+            if (type_ == 2 || type_ == 4) {
+                // R_X86_64_PC32 or R_X86_64_PLT32
+                let site_vaddr: i64 = text_base + patch_off;
+                let val: i64 = sym_addr + r.addend - site_vaddr - 4;
+                obj_patch_i32(ml, patch_off, val);
+            } else if (type_ == 1) {
+                // R_X86_64_64
+                let val: i64 = sym_addr + r.addend;
+                obj_patch_i64(ml, patch_off, val);
+            } else if (type_ == 11) {
+                // R_X86_64_32S
+                let val: i64 = sym_addr + r.addend;
+                obj_patch_i32(ml, patch_off, val);
+            }
+        }
+        i = i + 1;
+    }
+}

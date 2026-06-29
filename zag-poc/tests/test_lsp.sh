@@ -66,6 +66,13 @@ RESULT=$(lsp_exchange "$INIT" "$OPEN" "$EXIT_MSG")
 check "didOpen pushes diagnostics" "$RESULT" '"method":"textDocument/publishDiagnostics"'
 check "diagnostics are for the opened URI" "$RESULT" '"uri":"file:///add.zag"'
 
+# ── Test 3b: semantic effect violation is published ──────────────────────────
+BAD_SRC='extern fn do_io() void @io; fn bad() void @pure { do_io(); }'
+BAD_OPEN='{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///bad.zag","languageId":"zag","version":1,"text":"'"$BAD_SRC"'"}}}'
+RESULT=$(lsp_exchange "$INIT" "$BAD_OPEN" "$EXIT_MSG")
+check "effect violation becomes an LSP diagnostic" "$RESULT" 'effect violation: I/O not allowed'
+check "effect diagnostic has Zag source" "$RESULT" '"source":"zag"'
+
 # ── Test 4: hover over function name ──────────────────────────────────────────
 # Position 3 = 'a' in 'add' (fn |a|dd...)
 HOVER='{"jsonrpc":"2.0","id":3,"method":"textDocument/hover","params":{"textDocument":{"uri":"file:///add.zag"},"position":{"line":0,"character":3}}}'

@@ -1,4 +1,34 @@
-# zag-poc — Zag bootstrap compiler (Phase 0)
+# Zag
+
+> **Supported v1 path:** `./znc` compiles Zag directly to static x86-64 ELF.
+> It does not invoke C, `cc`, `as`, `ld`, libc, Zig, or LLVM. Run
+> `./bootstrap.sh` to self-rebuild and `./tests/run_native_authority.sh` to
+> verify that boundary. See [BOOTSTRAP.md](BOOTSTRAP.md).
+
+The C-emitting `./zagc` path documented below is retained as historical POC and
+differential-oracle material. It is not the supported compiler, bootstrap
+fallback, or release authority.
+
+```sh
+./znc examples/numeric.zag -o numeric
+./numeric
+```
+
+Current native tooling:
+
+```sh
+./znc version
+./znc init
+./znc fmt --in-place source.zag
+./znc source.zag -o program --debug
+make test
+```
+
+The self-hosted LSP lives under `selfhost/lsp/`; the VS Code client is under
+`../editors/vscode/`. Six larger native programs and their observed language
+gaps are documented in `programs/GAPS.md`.
+
+## Historical Phase 0 record
 
 A real, from-scratch compiler for a subset of **Zag**, proving the one feature that
 justifies the language: **the compiler proves capability claims** (`@realtime`,

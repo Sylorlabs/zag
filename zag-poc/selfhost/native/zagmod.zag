@@ -1,0 +1,264 @@
+// selfhost/native/zagmod.zag — zag.mod manifest parser.
+//
+// Parses the INI-like "zag.mod" file format used to describe a Zag package
+// and its dependencies, e.g.:
+//
+//   [package]
+//   name    = "my_lib"
+//   version = "0.1.0"
+//
+//   [deps]
+//   libm = { link = "m" }
+//   myext = { path = "/home/user/myext" }
+//
+// Sections are introduced by "[section-name]" lines.
+// Key-value pairs use "key = value" where value is either:
+//   - A quoted string: "some text"
+//   - An inline table:  { link = "m", path = "/..." }
+//
+// LANGUAGE SUBSET NOTE (self-hosted compiler):
+//   No `<<`/`>>`, no `|` as bitwise-or, no break/continue.
+//   Use `go: i32 = 1` flag instead of break.  Deref pointer fields via `p.*.field`.
+//
+// ASCII codes used throughout:
+//   '[' = 91   ']' = 93   '=' = 61   '#' = 35   '"' = 34
+//   '{' = 123  '}' = 125  '\n' = 10  '\r' = 13  ' ' = 32  '\t' = 9
+
+@import("../../std/list.zag")
+@import("../../std/rt.zag")
+
+// ── data types ────────────────────────────────────────────────────────────────
+
+// A single dependency declared in the [deps] section.
+//   name  — the local identifier (left-hand side of the key = ... line)
+//   link  — value of `link` field, e.g. "m" for -lm  (empty if absent)
+//   path  — value of `path` field, a filesystem path    (empty if absent)
+struct ZagDep { name: []u8, link: []u8, path: []u8 }
+
+// The parsed contents of a zag.mod file.
+//   pkg_name — value of `name` in [package]
+//   deps     — all entries from [deps]
+struct ZagMod { pkg_name: []u8, deps: ArrayList[ZagDep] }
+
+// ── string helpers ────────────────────────────────────────────────────────────
+
+// Return s with leading and trailing ASCII spaces (32) and tabs (9) removed.
+// Returns a sub-slice of s — no allocation.
+fn zagmod_trim(s: []u8) []u8 {
+    // Skip leading whitespace.
+    let lo: i32 = 0;
+    let go: i32 = 1;
+    while (go == 1 && lo < s.len) {
+        let c: i32 = s[lo] as i32;
+        if (c == 32 || c == 9) { lo = lo + 1; }
+        else { go = 0; }
+    }
+    // Skip trailing whitespace.
+    let hi: i32 = s.len;
+    let go2: i32 = 1;
+    while (go2 == 1 && hi > lo) {
+        let c: i32 = s[hi - 1] as i32;
+        if (c == 32 || c == 9) { hi = hi - 1; }
+        else { go2 = 0; }
+    }
+    if (lo >= hi) { return ""; }
+    return s[lo..hi];
+}
+
+// Trim s then, if it starts and ends with '"' (34), strip those quotes.
+// Otherwise return the trimmed value as-is.
+fn zagmod_unquote(s: []u8) []u8 {
+    let t: []u8 = zagmod_trim(s);
+    if (t.len >= 2) {
+        if ((t[0] as i32) == 34 && (t[t.len - 1] as i32) == 34) {
+            return t[1..t.len - 1];
+        }
+    }
+    return t;
+}
+
+// Search the inline-table string `s` (e.g. '{ link = "m", path = "/x" }')
+// for a field named `field` and return its unquoted value.
+// Returns an empty slice if the field is not present.
+//
+// Strategy: scan for occurrences of `field` followed (after optional spaces)
+// by '=' (61), then capture the value up to the next ',' (44) or '}' (125).
+fn zagmod_extract_field(s: []u8, field: []u8) []u8 {
+    let flen: i32 = field.len;
+    let slen: i32 = s.len;
+    let i: i32 = 0;
+    let result: []u8 = "";
+    let go: i32 = 1;
+
+    while (go == 1 && i + flen <= slen) {
+        // Check if field starts at position i.
+        let match_: i32 = 1;
+        let j: i32 = 0;
+        while (j < flen && match_ == 1) {
+            if (s[i + j] != field[j]) { match_ = 0; }
+            j = j + 1;
+        }
+
+        if (match_ == 1) {
+            // Verify that what follows the field name is optional spaces then '='.
+            let k: i32 = i + flen;
+            // Skip spaces/tabs.
+            let go2: i32 = 1;
+            while (go2 == 1 && k < slen) {
+                let c: i32 = s[k] as i32;
+                if (c == 32 || c == 9) { k = k + 1; }
+                else { go2 = 0; }
+            }
+            if (k < slen && (s[k] as i32) == 61) {
+                // '=' found — value starts after it.
+                k = k + 1;
+                // Skip spaces/tabs after '='.
+                let go3: i32 = 1;
+                while (go3 == 1 && k < slen) {
+                    let c: i32 = s[k] as i32;
+                    if (c == 32 || c == 9) { k = k + 1; }
+                    else { go3 = 0; }
+                }
+                // Collect value up to ',' (44) or '}' (125).
+                let val_start: i32 = k;
+                let go4: i32 = 1;
+                while (go4 == 1 && k < slen) {
+                    let c: i32 = s[k] as i32;
+                    if (c == 44 || c == 125) { go4 = 0; }
+                    else { k = k + 1; }
+                }
+                result = zagmod_unquote(s[val_start..k]);
+                go = 0;
+            } else {
+                // Not a real match (field name is a prefix of something else).
+                i = i + 1;
+            }
+        } else {
+            i = i + 1;
+        }
+    }
+
+    return result;
+}
+
+// ── line splitter ─────────────────────────────────────────────────────────────
+
+// Find the index of the next '\n' (10) at or after position `start` in `src`.
+// Returns src.len if no '\n' is found.
+fn zagmod_next_newline(src: []u8, start: i32) i32 {
+    let i: i32 = start;
+    let go: i32 = 1;
+    while (go == 1 && i < src.len) {
+        if ((src[i] as i32) == 10) { go = 0; }
+        else { i = i + 1; }
+    }
+    return i;
+}
+
+// ── parser ────────────────────────────────────────────────────────────────────
+
+// Parse a zag.mod source string and return a ZagMod.
+//
+// Line-by-line approach:
+//   1. Trim each line.
+//   2. Empty or '#'-prefixed lines → skip.
+//   3. Starts with '[' → new section; extract name between '[' and ']'.
+//   4. Contains '=' → key/value pair:
+//        [package]  key "name"    → pkg_name
+//        [package]  key "version" → ignored (no field for it in ZagMod)
+//        [deps]     key = value   → append ZagDep
+//
+// Values for [deps] may be inline tables ({ link = "m" }) or quoted strings.
+// A plain quoted string is treated as `link` with that value (common shorthand).
+fn zagmod_parse(src: []u8) ZagMod {
+    let mod_: ZagMod = ZagMod{
+        .pkg_name = "",
+        .deps = make[ZagDep](4),
+    };
+
+    // Current section: 0 = none, 1 = [package], 2 = [deps]
+    let section: i32 = 0;
+
+    let pos: i32 = 0;
+    let go: i32 = 1;
+    while (go == 1 && pos <= src.len) {
+        // Find the end of the current line.
+        let nl: i32 = zagmod_next_newline(src, pos);
+        // Extract the raw line (without the '\n').
+        let raw_line: []u8 = src[pos..nl];
+        // Strip optional '\r' at the end (Windows line endings).
+        let line_end: i32 = raw_line.len;
+        if (line_end > 0 && (raw_line[line_end - 1] as i32) == 13) {
+            raw_line = raw_line[0..line_end - 1];
+        }
+        let line: []u8 = zagmod_trim(raw_line);
+
+        // Move to the next line.
+        if (nl >= src.len) { go = 0; }
+        else { pos = nl + 1; }
+
+        // Skip empty lines and comments.
+        if (line.len == 0) { }
+        else if ((line[0] as i32) == 35) { }   // '#' = 35
+        else if ((line[0] as i32) == 91) {
+            // '[' = 91 — section header.  Find the matching ']' (93).
+            let rb: i32 = 1;
+            let go2: i32 = 1;
+            while (go2 == 1 && rb < line.len) {
+                if ((line[rb] as i32) == 93) { go2 = 0; }
+                else { rb = rb + 1; }
+            }
+            let sec_name: []u8 = zagmod_trim(line[1..rb]);
+            if (@strEq(sec_name, "package")) { section = 1; }
+            else if (@strEq(sec_name, "deps")) { section = 2; }
+            else { section = 0; }
+        } else {
+            // Look for '=' (61) — key = value pair.
+            let eq: i32 = 0;
+            let found_eq: i32 = 0;
+            let go3: i32 = 1;
+            while (go3 == 1 && eq < line.len) {
+                if ((line[eq] as i32) == 61) { found_eq = 1; go3 = 0; }
+                else { eq = eq + 1; }
+            }
+            if (found_eq == 1) {
+                let key: []u8 = zagmod_trim(line[0..eq]);
+                let val_raw: []u8 = zagmod_trim(line[eq + 1..line.len]);
+
+                if (section == 1) {
+                    // [package] section.
+                    if (@strEq(key, "name")) {
+                        mod_.pkg_name = zagmod_unquote(val_raw);
+                    }
+                    // "version" and others: recognized but not stored.
+                } else if (section == 2) {
+                    // [deps] section.  key is the dep identifier.
+                    let dep_name: []u8 = key;
+                    let dep_link: []u8 = "";
+                    let dep_path: []u8 = "";
+
+                    // Is the value an inline table? ( starts with '{' = 123 )
+                    let trimmed_val: []u8 = zagmod_trim(val_raw);
+                    if (trimmed_val.len > 0 && (trimmed_val[0] as i32) == 123) {
+                        // Extract fields from the inline table.
+                        dep_link = zagmod_extract_field(trimmed_val, "link");
+                        dep_path = zagmod_extract_field(trimmed_val, "path");
+                    } else {
+                        // Plain quoted string — treat as the link value.
+                        dep_link = zagmod_unquote(trimmed_val);
+                    }
+
+                    push[ZagDep](&mod_.deps, ZagDep{
+                        .name = dep_name,
+                        .link = dep_link,
+                        .path = dep_path,
+                    });
+                }
+                // section == 0: unknown section, ignore.
+            }
+            // No '=' on the line and not a section header: ignore.
+        }
+    }
+
+    return mod_;
+}

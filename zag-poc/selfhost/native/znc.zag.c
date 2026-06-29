@@ -411,6 +411,33 @@ static uint64_t zag_p64_div(uint64_t a,uint64_t b){
     if(a==0x8000000000000000ULL||b==0x8000000000000000ULL||!b)return 0x8000000000000000ULL;
     if(!a)return 0ULL;
     return zag_ld_to_p64(zag_p64_to_ld(a)/zag_p64_to_ld(b)); }
+
+/* ── VSA binary hypervector: vsa_b<N> ───────────────────────────────────────
+   Vector Symbolic Architecture N-bit binary hypervector, stored as
+   ceil(N/32) uint32_t words (same packing used by the GPU's MLIR vector<Nxi1>).
+   Operations:
+     bind(a,b)   = a ^ b  (XOR  — creates a dissimilar composite vector)
+     bundle(a,b) = a | b  (OR   — approximates majority/superposition)
+     mask(a,b)   = a & b  (AND  — project onto a subset of dimensions)
+   ZAG_VSA_DEFINE(N, NWORDS) instantiates the struct + ops for dimension N.
+   The C backend emits ZAG_VSA_DEFINE for every vsa_b<N> encountered.
+   On GPU (--target gpu-*), mlir.zag maps vsa_b<N> to vector<Nxi1> and
+   lowers ^ / | / & directly to arith.xori / arith.ori / arith.andi. */
+#define ZAG_VSA_DEFINE(N, NWORDS) \
+typedef struct { uint32_t w[NWORDS]; } ZagVsa_##N; \
+static ZagVsa_##N zag_vsa_xor_##N(ZagVsa_##N a, ZagVsa_##N b) { \
+    ZagVsa_##N r; int _i; \
+    for (_i = 0; _i < NWORDS; _i++) r.w[_i] = a.w[_i] ^ b.w[_i]; \
+    return r; } \
+static ZagVsa_##N zag_vsa_or_##N(ZagVsa_##N a, ZagVsa_##N b) { \
+    ZagVsa_##N r; int _i; \
+    for (_i = 0; _i < NWORDS; _i++) r.w[_i] = a.w[_i] | b.w[_i]; \
+    return r; } \
+static ZagVsa_##N zag_vsa_and_##N(ZagVsa_##N a, ZagVsa_##N b) { \
+    ZagVsa_##N r; int _i; \
+    for (_i = 0; _i < NWORDS; _i++) r.w[_i] = a.w[_i] & b.w[_i]; \
+    return r; }
+
 typedef struct Instr_s Instr;
 typedef struct Param_s Param;
 typedef struct FieldInit_s FieldInit;
@@ -442,11 +469,14 @@ enum { Node_fn_decl, Node_let_, Node_ret, Node_if_, Node_while_, Node_assign, No
 typedef struct Node_s Node;
 typedef enum { Tk_Eof, Tk_Ident, Tk_Annot, Tk_Op, Tk_Str, Tk_Int, Tk_Float, Tk_KwFn, Tk_KwExtern, Tk_KwLet, Tk_KwReturn, Tk_KwIf, Tk_KwElse, Tk_KwWhile, Tk_KwTrue, Tk_KwFalse, Tk_KwStruct, Tk_KwEnum, Tk_KwUnion, Tk_KwSwitch, Tk_KwError, Tk_KwTry, Tk_KwCatch, Tk_KwNull, Tk_KwOrelse, Tk_KwPub, Tk_Lp, Tk_Rp, Tk_Lbrace, Tk_Rbrace, Tk_Lbracket, Tk_Rbracket, Tk_Comma, Tk_Semi, Tk_Colon, Tk_Dot, Tk_Pipe, Tk_DotDot } Tk;
 typedef struct Token_s Token;
+typedef struct Span_s Span;
+typedef struct Diag_s Diag;
 typedef struct Parser_s Parser;
 typedef struct Exp_s Exp;
 typedef struct Cg_s Cg;
 typedef struct FnSym_s FnSym;
 typedef struct Env_s Env;
+typedef struct CgScopeMark_s CgScopeMark;
 typedef struct ScanCtx_s ScanCtx;
 typedef struct ArEntry_s ArEntry;
 typedef struct ArSymbol_s ArSymbol;
@@ -459,6 +489,9 @@ typedef struct PendingReloc_s PendingReloc;
 typedef struct MergedLib_s MergedLib;
 typedef struct ZagDep_s ZagDep;
 typedef struct ZagMod_s ZagMod;
+typedef struct DwarfBuilder_s DwarfBuilder;
+typedef struct DwarfSections_s DwarfSections;
+typedef struct FmtFile_s FmtFile;
 typedef struct LoEnv_s LoEnv;
 typedef struct ArrayList_i32_s ArrayList_i32;
 typedef struct ArrayList_u8_s ArrayList_u8;
@@ -532,12 +565,15 @@ struct Cast_s { Node* expr; ZagSliceU8 target; };
 struct Slice_s { Node* base; Node* lo; Node* hi; int32_t has_hi; int32_t ptr_base; };
 struct LinkDir_s { ZagSliceU8 lib; };
 struct Node_s { int32_t tag; union { FnDecl fn_decl; Let let_; Return ret; If if_; While while_; Assign assign; ExprStmt estmt; Switch switch_; IntLit ilit; StrLit slit; Ident id; Bin bin; Un un; Call call; Index idx; Field fld; StructLit slit_; Cast cast_; Slice slice_; StructDecl struct_; EnumDecl enum_; UnionDecl union_; LinkDir link_dir; } u; };
-struct Token_s { Tk kind; ZagSliceU8 val; int32_t line; };
+struct Token_s { Tk kind; ZagSliceU8 val; int32_t line; int32_t col; };
+struct Span_s { ZagSliceU8 file; int32_t line; int32_t col; int32_t len; };
+struct Diag_s { ZagSliceU8 code; ZagSliceU8 msg; Span span; ZagSliceU8 note; ZagSliceU8 hint; };
 struct Parser_s { ArrayList_Token toks; int32_t i; ArrayList_pNode closures; int32_t cctr; ZagSliceU8 fn_eff; };
 struct Exp_s { ArrayList_pNode decls; ArrayList__u8 seen; };
 struct Cg_s { int32_t next; int32_t err; ArrayList_u8* data; ArrayList_pNode decls; int32_t pi_lbl; int32_t ps_lbl; int32_t al_lbl; int32_t se_lbl; int32_t ml_lbl; int32_t rl_lbl; int32_t pf_lbl; int32_t use_pi; int32_t use_pf; int32_t use_ps; int32_t use_al; int32_t use_se; int32_t use_ml; int32_t use_rl; int32_t rt_base; ArrayList_i32* rt_used; ZagSliceU8 cur_fn; int32_t cur_fn_line; ZagSliceU8 cur_cap_names; };
 struct FnSym_s { ZagSliceU8 name; int32_t lbl; ZagSliceU8 ret; int32_t nparams; };
-struct Env_s { ArrayList__u8 names; ArrayList_i32 disps; ArrayList__u8 types; ArrayList_i32 byref; int32_t count; int32_t frame_words; int32_t epilogue; int32_t sret_disp; int32_t sret_words; ZagSliceU8 sret_type; };
+struct Env_s { ArrayList__u8 names; ArrayList_i32 disps; ArrayList__u8 types; ArrayList_i32 byref; int32_t count; int32_t scope_base; int32_t frame_words; int32_t epilogue; int32_t sret_disp; int32_t sret_words; ZagSliceU8 sret_type; };
+struct CgScopeMark_s { int32_t count; int32_t scope_base; };
 struct ScanCtx_s { ArrayList__u8* seen; int32_t* words; ArrayList__u8 names; ArrayList__u8 types; ArrayList__u8 fnames; ArrayList__u8 frets; };
 struct ArEntry_s { ZagSliceU8 name; ZagSliceU8 data; };
 struct ArSymbol_s { ZagSliceU8 name; int64_t entry_offset; };
@@ -550,6 +586,9 @@ struct PendingReloc_s { int64_t patch_off; int32_t type_; ZagSliceU8 sym_name; i
 struct MergedLib_s { ArrayList_u8 text; ArrayList_SymAddr sym_addrs; ArrayList_PendingReloc relocs; int64_t text_base; };
 struct ZagDep_s { ZagSliceU8 name; ZagSliceU8 link; ZagSliceU8 path; };
 struct ZagMod_s { ZagSliceU8 pkg_name; ArrayList_ZagDep deps; };
+struct DwarfBuilder_s { ArrayList_u8 abbrev; ArrayList_u8 info; ArrayList_u8 line_; ZagSliceU8 fname; int32_t nfuncs; };
+struct DwarfSections_s { ArrayList_u8 abbrev; ArrayList_u8 info; ArrayList_u8 line_; };
+struct FmtFile_s { ArrayList__u8 headers; ArrayList_pNode decls; };
 struct LoEnv_s { ZagSliceU8 name; ZagSliceU8 ty; };
 typedef struct { int32_t _has; int32_t _val; } ZagOpt_i32;
 static void push_u8(ArrayList_u8* xs, uint8_t val);
@@ -883,10 +922,17 @@ static int32_t is_alpha(int32_t c);
 static int32_t is_alnum(int32_t c);
 static int32_t is_space(int32_t c);
 static Tk kw_kind(ZagSliceU8 w);
-static Token mk(Tk kind, ZagSliceU8 val, int32_t line);
+static Token mk(Tk kind, ZagSliceU8 val, int32_t line, int32_t col);
 static int32_t is_two_op(ZagSliceU8 src, int32_t i, int32_t n);
 static Tk punct_kind(int32_t c);
 static ArrayList_Token lex(ZagSliceU8 src);
+static int32_t diag_line_start(ZagSliceU8 src, int32_t line);
+static int32_t diag_line_end(ZagSliceU8 src, int32_t start);
+static void diag_print_int(int32_t n);
+static void diag_print(Diag* d, ZagSliceU8 src);
+static void diag_emit(ZagSliceU8 code, ZagSliceU8 msg, ZagSliceU8 file, int32_t line, int32_t col, int32_t tlen, ZagSliceU8 note, ZagSliceU8 hint, ZagSliceU8 src);
+static ZagSliceU8 annot_note(ZagSliceU8 a);
+static ZagSliceU8 annot_hint(ZagSliceU8 a);
 static Token cur(Parser* p);
 static int32_t cur_code(Parser* p);
 static int32_t at_k(Parser* p, Tk k);
@@ -1079,6 +1125,8 @@ static int32_t cg_enum_member_index(Cg* cg, ZagSliceU8 ename, ZagSliceU8 member)
 static ZagSliceU8 cg_enum_name_for_member(Cg* cg, ZagSliceU8 m);
 static int32_t cg_find_fn(ArrayList_FnSym syms, ZagSliceU8 name);
 static Env cg_env_new(int32_t epilogue);
+static CgScopeMark cg_scope_begin(Env* env);
+static void cg_scope_end(Env* env, CgScopeMark mark);
 static int32_t cg_slot_byref(Env env, ZagSliceU8 name);
 static ZagSliceU8 cg_slot_type(Env env, ZagSliceU8 name);
 static int32_t cg_slot_alloc_br(Env* env, ZagSliceU8 name, ZagSliceU8 ty, int32_t words, int32_t byref);
@@ -1104,6 +1152,7 @@ static ZagSliceU8 cg_native_rt_ret(ZagSliceU8 name);
 static int32_t cg_is_native_rt(ZagSliceU8 name);
 static ZagSliceU8 cg_fn_ret(ArrayList_FnSym syms, ZagSliceU8 name);
 static ZagSliceU8 cg_expr_type(Node* n, Env* env, ArrayList_FnSym syms, Cg* cg);
+static int32_t cg_types_compatible(ZagSliceU8 expected0, ZagSliceU8 actual0, Cg* cg);
 static void cg_push_agg_base(ArrayList_Instr* out, Env* env, ZagSliceU8 name, int32_t disp);
 static int32_t cg_is_lvalue(Node* n);
 static void cg_push_base_addr(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnSym syms, Cg* cg);
@@ -1154,6 +1203,7 @@ static void cg_lower_switch_expr(ArrayList_Instr* out, Switch sw, Env* env, Arra
 static void cg_lower_arm_value(ArrayList_Instr* out, ArrayList_pNode body, Env* env, ArrayList_FnSym syms, Cg* cg);
 static void cg_lower_stmt(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnSym syms, Cg* cg);
 static void cg_lower_block(ArrayList_Instr* out, ArrayList_pNode body, Env* env, ArrayList_FnSym syms, Cg* cg);
+static void cg_lower_scoped_block(ArrayList_Instr* out, ArrayList_pNode body, Env* env, ArrayList_FnSym syms, Cg* cg);
 static void cg_lower_fn(ArrayList_Instr* out, FnDecl f, int32_t lbl, ArrayList_FnSym syms, Cg* cg);
 static void cg_emit_print_str(ArrayList_Instr* out, int32_t lbl);
 static void cg_emit_print_int(ArrayList_Instr* out, int32_t lbl, Cg* cg);
@@ -1269,27 +1319,32 @@ static int32_t call_user_fn(Node* dn, Call c, map__StringMap_i32* env, ArrayList
 static int32_t fn_has_fnparam(FnDecl f);
 static int32_t call_user_fn2(FnDecl f, Call c, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff, int32_t depth);
 static int32_t fn_violation_mask(FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff);
-static int32_t report_fn(FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff);
+static int32_t report_fn(FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file);
 static ZagSliceU8 struct_field_eff(ArrayList_pNode decls, ZagSliceU8 sname, ZagSliceU8 fname);
 static ZagSliceU8 sfeff(Node* dn, ZagSliceU8 fname);
 static ZagSliceU8 sfeff_scan(ArrayList_Param fields, ZagSliceU8 fname);
-static int32_t contract_check(ZagSliceU8 where, int32_t forb, int32_t veff);
-static int32_t store_fn(FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff);
-static int32_t store_body(ArrayList_pNode body, map__StringMap_i32* env, FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff);
-static int32_t store_stmt(Node* n, map__StringMap_i32* env, FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff);
-static int32_t store_switch(Switch sw, map__StringMap_i32* env, FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff);
-static int32_t store_let(Let l, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff);
-static int32_t store_ret(Return r, map__StringMap_i32* env, FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff);
+static int32_t contract_check(ZagSliceU8 where, int32_t forb, int32_t veff, ZagSliceU8 src, ZagSliceU8 file);
+static int32_t store_fn(FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file);
+static int32_t store_body(ArrayList_pNode body, map__StringMap_i32* env, FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file);
+static int32_t store_stmt(Node* n, map__StringMap_i32* env, FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file);
+static int32_t store_switch(Switch sw, map__StringMap_i32* env, FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file);
+static int32_t store_let(Let l, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file);
+static int32_t store_ret(Return r, map__StringMap_i32* env, FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file);
 static int32_t ret_escapes_capturing(Node* n, ArrayList_pNode decls);
 static int32_t id_caps(ZagSliceU8 nm, ArrayList_pNode decls);
-static int32_t store_expr(Node* n, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff);
-static int32_t store_call(Call c, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff);
-static int32_t store_call_params(Node* dn, Call c, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff);
-static int32_t store_call_params2(FnDecl f, Call c, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff);
-static int32_t store_slit(StructLit s, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff);
-static int32_t report_violations(ArrayList_pNode decls, map__StringMap_i32 eff);
-static int32_t report_decl(Node* d, ArrayList_pNode decls, map__StringMap_i32 eff);
-static int32_t store_decl(Node* d, ArrayList_pNode decls, map__StringMap_i32 eff);
+static int32_t store_expr(Node* n, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file);
+static int32_t store_call(Call c, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file);
+static int32_t store_call_params(Node* dn, Call c, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file);
+static int32_t store_call_params2(FnDecl f, Call c, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file);
+static int32_t store_slit(StructLit s, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file);
+static ZagSliceU8 eu_bare_callee(Node* n, map__StringMap_i32 eff);
+static int32_t check_eu_stmts(ZagSliceU8 fn_name, ArrayList_pNode body, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file);
+static int32_t check_eu_stmt(ZagSliceU8 fn_name, Node* n, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file);
+static int32_t check_eu_fn(FnDecl f, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file);
+static int32_t check_eu_decl(Node* d, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file);
+static int32_t report_violations(ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file);
+static int32_t report_decl(Node* d, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file);
+static int32_t store_decl(Node* d, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file);
 static int64_t ar_parse_dec(ZagSliceU8 buf, int32_t lo, int32_t hi);
 static int64_t ar_read_be32(ZagSliceU8 buf, int32_t off);
 static ZagSliceU8 ar_get_name(ZagSliceU8 buf, int32_t hdr_off, ZagSliceU8 ext_names);
@@ -1312,6 +1367,49 @@ static ZagSliceU8 zagmod_unquote(ZagSliceU8 s);
 static ZagSliceU8 zagmod_extract_field(ZagSliceU8 s, ZagSliceU8 field);
 static int32_t zagmod_next_newline(ZagSliceU8 src, int32_t start);
 static ZagMod zagmod_parse(ZagSliceU8 src);
+static int32_t DW_TAG_compile_unit(void);
+static int32_t DW_TAG_subprogram(void);
+static int32_t DW_CHILDREN_yes(void);
+static int32_t DW_CHILDREN_no(void);
+static int32_t DW_AT_producer(void);
+static int32_t DW_AT_language(void);
+static int32_t DW_AT_name(void);
+static int32_t DW_AT_comp_dir(void);
+static int32_t DW_AT_decl_file(void);
+static int32_t DW_AT_decl_line(void);
+static int32_t DW_FORM_string(void);
+static int32_t DW_FORM_data1(void);
+static int32_t DW_FORM_data2(void);
+static int32_t DW_FORM_data4(void);
+static int32_t DW_LANG_C99(void);
+static int32_t DW_LNE_end_sequence(void);
+static void db_eb(ArrayList_u8* buf, int32_t b);
+static void db_le(ArrayList_u8* buf, int64_t v, int32_t n);
+static void db_cstr(ArrayList_u8* buf, ZagSliceU8 s);
+static DwarfBuilder dwarf_new(ZagSliceU8 fname);
+static void dwarf_build_abbrev(DwarfBuilder* db);
+static void dwarf_emit_compile_unit(DwarfBuilder* db);
+static void dwarf_emit_function(DwarfBuilder* db, ZagSliceU8 name, int32_t line);
+static void dwarf_finish(DwarfBuilder* db);
+static void dwarf_emit_line_program(DwarfBuilder* db);
+static void dw_shdr(ArrayList_u8* buf, int32_t sh_name, int32_t sh_type, int64_t sh_flags, int64_t sh_addr, int64_t sh_offset, int64_t sh_size, int32_t sh_link, int32_t sh_info, int64_t sh_addralign, int64_t sh_entsize);
+static DwarfSections dwarf_build(DwarfBuilder* db);
+static void dwarf_patch_elf(ArrayList_u8* elf_buf, DwarfSections ds);
+static void fmt_ch(ArrayList_u8* out, int32_t c);
+static void fmt_app(ArrayList_u8* out, ZagSliceU8 s);
+static void fmt_indent(ArrayList_u8* out, int32_t depth);
+static void fmt_str_literal(ArrayList_u8* out, ZagSliceU8 text);
+static int32_t fmt_is_bin(Node* n);
+static void fmt_expr_parens(ArrayList_u8* out, Node* n, int32_t depth);
+static void fmt_expr(ArrayList_u8* out, Node* n, int32_t depth);
+static void fmt_block_body(ArrayList_u8* out, ArrayList_pNode body, int32_t depth);
+static void fmt_stmt(ArrayList_u8* out, Node* n, int32_t depth);
+static void fmt_stmt_inline(ArrayList_u8* out, Node* n, int32_t depth);
+static void fmt_decl(ArrayList_u8* out, Node* n);
+static FmtFile fmt_scan_file(ZagSliceU8 src);
+static ArrayList_u8 fmt_program(ZagSliceU8 src);
+static ZagSliceU8 zag_version(void);
+static ZagSliceU8 zag_edition(void);
 static ZagSliceU8 lo_env_get(ArrayList_LoEnv env, ZagSliceU8 name);
 static ZagSliceU8 lo_id_ty(Node* n, ArrayList_LoEnv env, ArrayList_pNode dl);
 static Node* lo_mk_call2(ZagSliceU8 fname, Node* a, Node* b);
@@ -1331,6 +1429,8 @@ static int32_t has_flag(ZagSliceU8 name);
 static ZagSliceU8 src_arg(void);
 static ZagSliceU8 out_flag(void);
 static ZagSliceU8 default_out(ZagSliceU8 path);
+static int32_t znc_fmt(ZagSliceU8 fpath, int32_t in_place);
+static int32_t znc_init(void);
 static void push_u8(ArrayList_u8* xs, uint8_t val) {
     if (((*xs).len >= (*xs).cap)) {
     int32_t nc = ((*xs).cap * 2);
@@ -4314,8 +4414,8 @@ static Tk kw_kind(ZagSliceU8 w) {
     }
     return Tk_Ident;
 }
-static Token mk(Tk kind, ZagSliceU8 val, int32_t line) {
-    return (Token){ .kind = kind, .val = val, .line = line };
+static Token mk(Tk kind, ZagSliceU8 val, int32_t line, int32_t col) {
+    return (Token){ .kind = kind, .val = val, .line = line, .col = col };
 }
 static int32_t is_two_op(ZagSliceU8 src, int32_t i, int32_t n) {
     if (((i + 1) >= n)) {
@@ -4387,11 +4487,13 @@ static ArrayList_Token lex(ZagSliceU8 src) {
     int32_t n = src.len;
     int32_t i = 0;
     int32_t line = 1;
+    int32_t line_start = 0;
     while ((i < n)) {
     int32_t c = ch(src, i);
     if ((c == 10)) {
     line = (line + 1);
     i = (i + 1);
+    line_start = i;
     } else {
     if (is_space(c)) {
     i = (i + 1);
@@ -4407,7 +4509,7 @@ static ArrayList_Token lex(ZagSliceU8 src) {
     while (((i < n) && is_alnum(ch(src, i)))) {
     i = (i + 1);
     }
-    push_Token((&toks), mk(Tk_Annot, (ZagSliceU8){ (src).ptr + (start), (i) - (start) }, line));
+    push_Token((&toks), mk(Tk_Annot, (ZagSliceU8){ (src).ptr + (start), (i) - (start) }, line, ((start - line_start) + 1)));
     } else {
     if (is_alpha(c)) {
     int32_t start = i;
@@ -4416,7 +4518,7 @@ static ArrayList_Token lex(ZagSliceU8 src) {
     i = (i + 1);
     }
     ZagSliceU8 word = (ZagSliceU8){ (src).ptr + (start), (i) - (start) };
-    push_Token((&toks), mk(kw_kind(word), word, line));
+    push_Token((&toks), mk(kw_kind(word), word, line, ((start - line_start) + 1)));
     } else {
     if (is_digit(c)) {
     int32_t start = i;
@@ -4440,7 +4542,7 @@ static ArrayList_Token lex(ZagSliceU8 src) {
     if (is_float) {
     k = Tk_Float;
     }
-    push_Token((&toks), mk(k, (ZagSliceU8){ (src).ptr + (start), (i) - (start) }, line));
+    push_Token((&toks), mk(k, (ZagSliceU8){ (src).ptr + (start), (i) - (start) }, line, ((start - line_start) + 1)));
     } else {
     if ((c == 34)) {
     int32_t start = i;
@@ -4453,9 +4555,10 @@ static ArrayList_Token lex(ZagSliceU8 src) {
     }
     }
     i = (i + 1);
-    push_Token((&toks), mk(Tk_Str, (ZagSliceU8){ (src).ptr + (start), (i) - (start) }, line));
+    push_Token((&toks), mk(Tk_Str, (ZagSliceU8){ (src).ptr + (start), (i) - (start) }, line, ((start - line_start) + 1)));
     } else {
     if ((c == 39)) {
+    int32_t char_start = i;
     i = (i + 1);
     int32_t cv = 0;
     if (((ch(src, i) == 92) && ((i + 1) < n))) {
@@ -4486,17 +4589,17 @@ static ArrayList_Token lex(ZagSliceU8 src) {
     if (((i < n) && (ch(src, i) == 39))) {
     i = (i + 1);
     }
-    push_Token((&toks), mk(Tk_Int, _zag_i64_to_str(((int64_t)(cv))), line));
+    push_Token((&toks), mk(Tk_Int, _zag_i64_to_str(((int64_t)(cv))), line, ((char_start - line_start) + 1)));
     } else {
     if ((((c == 46) && ((i + 1) < n)) && (ch(src, (i + 1)) == 46))) {
-    push_Token((&toks), mk(Tk_DotDot, (ZagSliceU8){ (src).ptr + (i), ((i + 2)) - (i) }, line));
+    push_Token((&toks), mk(Tk_DotDot, (ZagSliceU8){ (src).ptr + (i), ((i + 2)) - (i) }, line, ((i - line_start) + 1)));
     i = (i + 2);
     } else {
     if (is_two_op(src, i, n)) {
-    push_Token((&toks), mk(Tk_Op, (ZagSliceU8){ (src).ptr + (i), ((i + 2)) - (i) }, line));
+    push_Token((&toks), mk(Tk_Op, (ZagSliceU8){ (src).ptr + (i), ((i + 2)) - (i) }, line, ((i - line_start) + 1)));
     i = (i + 2);
     } else {
-    push_Token((&toks), mk(punct_kind(c), (ZagSliceU8){ (src).ptr + (i), ((i + 1)) - (i) }, line));
+    push_Token((&toks), mk(punct_kind(c), (ZagSliceU8){ (src).ptr + (i), ((i + 1)) - (i) }, line, ((i - line_start) + 1)));
     i = (i + 1);
     }
     }
@@ -4509,8 +4612,114 @@ static ArrayList_Token lex(ZagSliceU8 src) {
     }
     }
     }
-    push_Token((&toks), mk(Tk_Eof, (ZagSliceU8){ (src).ptr + (0), (0) - (0) }, line));
+    push_Token((&toks), mk(Tk_Eof, (ZagSliceU8){ (src).ptr + (0), (0) - (0) }, line, 0));
     return toks;
+}
+static int32_t diag_line_start(ZagSliceU8 src, int32_t line) {
+    int32_t cur = 1;
+    int32_t i = 0;
+    while (((i < src.len) && (cur < line))) {
+    if ((((int32_t)((src).ptr[i])) == 10)) {
+    cur = (cur + 1);
+    }
+    i = (i + 1);
+    }
+    return i;
+}
+static int32_t diag_line_end(ZagSliceU8 src, int32_t start) {
+    int32_t i = start;
+    while (((i < src.len) && (((int32_t)((src).ptr[i])) != 10))) {
+    i = (i + 1);
+    }
+    return i;
+}
+static void diag_print_int(int32_t n) {
+    _zag_print(_zag_i64_to_str(((int64_t)(n))));
+}
+static void diag_print(Diag* d, ZagSliceU8 src) {
+    _zag_print((ZagSliceU8){(const uint8_t*)"error[", 6});
+    _zag_print((*d).code);
+    _zag_print((ZagSliceU8){(const uint8_t*)"]: ", 3});
+    _zag_println((*d).msg);
+    if (((*d).span.file.len > 0)) {
+    _zag_print((ZagSliceU8){(const uint8_t*)"  --> ", 6});
+    _zag_print((*d).span.file);
+    _zag_print((ZagSliceU8){(const uint8_t*)":", 1});
+    diag_print_int((*d).span.line);
+    _zag_print((ZagSliceU8){(const uint8_t*)":", 1});
+    diag_print_int((*d).span.col);
+    _zag_println((ZagSliceU8){(const uint8_t*)"", 0});
+    }
+    if (((src.len > 0) && ((*d).span.line > 0))) {
+    int32_t ls = diag_line_start(src, (*d).span.line);
+    int32_t le = diag_line_end(src, ls);
+    _zag_println((ZagSliceU8){(const uint8_t*)"   |", 4});
+    diag_print_int((*d).span.line);
+    _zag_print((ZagSliceU8){(const uint8_t*)" | ", 3});
+    _zag_println((ZagSliceU8){ (src).ptr + (ls), (le) - (ls) });
+    _zag_print((ZagSliceU8){(const uint8_t*)"   | ", 5});
+    int32_t spaces = (*d).span.col;
+    if ((spaces > 0)) {
+    spaces = (spaces - 1);
+    }
+    int32_t si = 0;
+    while ((si < spaces)) {
+    _zag_print((ZagSliceU8){(const uint8_t*)" ", 1});
+    si = (si + 1);
+    }
+    int32_t ui = 0;
+    int32_t ulen = (*d).span.len;
+    if ((ulen < 1)) {
+    ulen = 1;
+    }
+    while ((ui < ulen)) {
+    _zag_print((ZagSliceU8){(const uint8_t*)"^", 1});
+    ui = (ui + 1);
+    }
+    _zag_println((ZagSliceU8){(const uint8_t*)" effect occurs here", 19});
+    }
+    if (((*d).note.len > 0)) {
+    _zag_print((ZagSliceU8){(const uint8_t*)"   = note: ", 11});
+    _zag_println((*d).note);
+    }
+    if (((*d).hint.len > 0)) {
+    _zag_print((ZagSliceU8){(const uint8_t*)"   = hint: ", 11});
+    _zag_println((*d).hint);
+    }
+}
+static void diag_emit(ZagSliceU8 code, ZagSliceU8 msg, ZagSliceU8 file, int32_t line, int32_t col, int32_t tlen, ZagSliceU8 note, ZagSliceU8 hint, ZagSliceU8 src) {
+    Diag d = (Diag){ .code = code, .msg = msg, .span = (Span){ .file = file, .line = line, .col = col, .len = tlen }, .note = note, .hint = hint };
+    diag_print((&d), src);
+}
+static ZagSliceU8 annot_note(ZagSliceU8 a) {
+    if (_zag_str_eq(a, (ZagSliceU8){(const uint8_t*)"@realtime", 9})) {
+    return (ZagSliceU8){(const uint8_t*)"@realtime functions must not perform heap allocation, IO, or lock acquisition", 77};
+    }
+    if (_zag_str_eq(a, (ZagSliceU8){(const uint8_t*)"@pure", 5})) {
+    return (ZagSliceU8){(const uint8_t*)"@pure functions must not perform heap allocation, IO, or lock acquisition", 73};
+    }
+    if (_zag_str_eq(a, (ZagSliceU8){(const uint8_t*)"@noalloc", 8})) {
+    return (ZagSliceU8){(const uint8_t*)"@noalloc functions must not perform heap allocation (zalloc/zfree/new)", 70};
+    }
+    if (_zag_str_eq(a, (ZagSliceU8){(const uint8_t*)"@total", 6})) {
+    return (ZagSliceU8){(const uint8_t*)"@total functions must not panic — guard all integer divisions at runtime", 74};
+    }
+    return (ZagSliceU8){(const uint8_t*)"capability constraint violated", 30};
+}
+static ZagSliceU8 annot_hint(ZagSliceU8 a) {
+    if (_zag_str_eq(a, (ZagSliceU8){(const uint8_t*)"@realtime", 9})) {
+    return (ZagSliceU8){(const uint8_t*)"remove the allocation/IO/lock, or remove the @realtime annotation", 65};
+    }
+    if (_zag_str_eq(a, (ZagSliceU8){(const uint8_t*)"@pure", 5})) {
+    return (ZagSliceU8){(const uint8_t*)"remove the allocation/IO/lock, or remove the @pure annotation", 61};
+    }
+    if (_zag_str_eq(a, (ZagSliceU8){(const uint8_t*)"@noalloc", 8})) {
+    return (ZagSliceU8){(const uint8_t*)"remove the heap allocation, or remove the @noalloc annotation", 61};
+    }
+    if (_zag_str_eq(a, (ZagSliceU8){(const uint8_t*)"@total", 6})) {
+    return (ZagSliceU8){(const uint8_t*)"guard all divisions (e.g. `if (d != 0)`) or remove the @total annotation", 72};
+    }
+    return (ZagSliceU8){(const uint8_t*)"remove the forbidden effect or the capability annotation", 56};
 }
 static Token cur(Parser* p) {
     return get_Token((*p).toks, (*p).i);
@@ -4833,11 +5042,21 @@ static Node* parse_closure(Parser* p) {
     ZagSliceU8 capnames = (ZagSliceU8){(const uint8_t*)"", 0};
     while ((!at_k(p, Tk_Rbracket))) {
     if ((!at_k(p, Tk_Comma))) {
+    if (_zag_str_eq(cur(p).val, (ZagSliceU8){(const uint8_t*)"&", 1})) {
+    Token _amp = adv(p);
+    if ((ncaps > 0)) {
+    capnames = _zag_str_concat(capnames, (ZagSliceU8){(const uint8_t*)",", 1});
+    }
+    capnames = _zag_str_concat(capnames, (ZagSliceU8){(const uint8_t*)"*", 1});
+    capnames = _zag_str_concat(capnames, cur(p).val);
+    ncaps = (ncaps + 1);
+    } else {
     if ((ncaps > 0)) {
     capnames = _zag_str_concat(capnames, (ZagSliceU8){(const uint8_t*)",", 1});
     }
     capnames = _zag_str_concat(capnames, cur(p).val);
     ncaps = (ncaps + 1);
+    }
     }
     Token _c = adv(p);
     }
@@ -4859,9 +5078,7 @@ static Node* parse_closure(Parser* p) {
     ZagSliceU8 ret = parse_type(p);
     ZagSliceU8 reff = (*p).fn_eff;
     if (at_k(p, Tk_Annot)) {
-    _zag_print((ZagSliceU8){(const uint8_t*)"zag: error: effect annotation '", 31});
-    _zag_print(cur(p).val);
-    _zag_println((ZagSliceU8){(const uint8_t*)"' on closure literal is not supported; annotate the enclosing named function instead", 84});
+    diag_emit((ZagSliceU8){(const uint8_t*)"E0012", 5}, _zag_str_concat((ZagSliceU8){(const uint8_t*)"effect annotation `", 19}, _zag_str_concat(cur(p).val, (ZagSliceU8){(const uint8_t*)"` on closure literal is not supported; annotate the enclosing named function instead", 84})), (ZagSliceU8){(const uint8_t*)"", 0}, cur(p).line, cur(p).col, cur(p).val.len, (ZagSliceU8){(const uint8_t*)"closure literals inherit effects from the enclosing named function", 66}, (ZagSliceU8){(const uint8_t*)"move the annotation to the enclosing `fn` declaration", 53}, (ZagSliceU8){(const uint8_t*)"", 0});
     _zag_exit(1);
     }
     ArrayList_pNode body = parse_block(p);
@@ -6088,8 +6305,7 @@ static ZagSliceU8 resolve_import_path(ZagSliceU8 relpath, ZagSliceU8 base_dir) {
 }
 static void load_module(ZagSliceU8 path, ZagSliceU8 qual, int32_t has_qual, ArrayList__u8* seen, ArrayList_pNode* out, ArrayList__u8* cfiles, ArrayList__u8* aliases, ArrayList__u8* loading) {
     if (seen_has((*loading), path)) {
-    _zag_print((ZagSliceU8){(const uint8_t*)"zag: error: circular import detected: ", 38});
-    _zag_println(path);
+    diag_emit((ZagSliceU8){(const uint8_t*)"E0011", 5}, _zag_str_concat((ZagSliceU8){(const uint8_t*)"circular @import detected: `", 28}, _zag_str_concat(path, (ZagSliceU8){(const uint8_t*)"`", 1})), path, 1, 1, 1, (ZagSliceU8){(const uint8_t*)"this file is already being parsed — it is part of its own import chain", 72}, (ZagSliceU8){(const uint8_t*)"break the cycle by extracting shared types into a separate module", 65}, (ZagSliceU8){(const uint8_t*)"", 0});
     _zag_exit(1);
     return;
     }
@@ -6239,9 +6455,7 @@ static void resolve_src(ZagSliceU8 src, ZagSliceU8 base_dir, ArrayList__u8* seen
     if ((((at_k((&p), Tk_Annot) || at_k((&p), Tk_Ident)) || at_k((&p), Tk_KwExtern)) || at_k((&p), Tk_KwFn))) {
     push_pNode(out, parse_fn((&p), 0));
     } else {
-    _zag_print((ZagSliceU8){(const uint8_t*)"zag: error: unexpected token at top level: '", 44});
-    _zag_print(cur((&p)).val);
-    _zag_println((ZagSliceU8){(const uint8_t*)"'", 1});
+    diag_emit((ZagSliceU8){(const uint8_t*)"E0010", 5}, _zag_str_concat((ZagSliceU8){(const uint8_t*)"unexpected token at top level: `", 32}, _zag_str_concat(cur((&p)).val, (ZagSliceU8){(const uint8_t*)"`", 1})), (ZagSliceU8){(const uint8_t*)"", 0}, cur((&p)).line, cur((&p)).col, cur((&p)).val.len, (ZagSliceU8){(const uint8_t*)"only `fn`, `struct`, `enum`, `union`, `error`, `operator`, `interface`, and `@import` are valid at top level", 108}, (ZagSliceU8){(const uint8_t*)"check for mismatched braces or a stray token", 44}, src);
     _zag_exit(1);
     }
     }
@@ -8659,30 +8873,45 @@ static int32_t cg_find_fn(ArrayList_FnSym syms, ZagSliceU8 name) {
     return (0 - 1);
 }
 static Env cg_env_new(int32_t epilogue) {
-    return (Env){ .names = make__u8(8), .disps = make_i32(8), .types = make__u8(8), .byref = make_i32(8), .count = 0, .frame_words = 0, .epilogue = epilogue, .sret_disp = (0 - 2147483647), .sret_words = 0, .sret_type = (ZagSliceU8){(const uint8_t*)"", 0} };
+    return (Env){ .names = make__u8(8), .disps = make_i32(8), .types = make__u8(8), .byref = make_i32(8), .count = 0, .scope_base = 0, .frame_words = 0, .epilogue = epilogue, .sret_disp = (0 - 2147483647), .sret_words = 0, .sret_type = (ZagSliceU8){(const uint8_t*)"", 0} };
+}
+static CgScopeMark cg_scope_begin(Env* env) {
+    CgScopeMark mark = (CgScopeMark){ .count = len__u8((*env).names), .scope_base = (*env).scope_base };
+    (*env).scope_base = mark.count;
+    return mark;
+}
+static void cg_scope_end(Env* env, CgScopeMark mark) {
+    while ((len__u8((*env).names) > mark.count)) {
+    ZagSliceU8 _n = pop__u8((&(*env).names));
+    int32_t _d = pop_i32((&(*env).disps));
+    ZagSliceU8 _t = pop__u8((&(*env).types));
+    int32_t _b = pop_i32((&(*env).byref));
+    }
+    (*env).count = mark.count;
+    (*env).scope_base = mark.scope_base;
 }
 static int32_t cg_slot_byref(Env env, ZagSliceU8 name) {
-    int32_t i = 0;
-    while ((i < len__u8(env.names))) {
+    int32_t i = (len__u8(env.names) - 1);
+    while ((i >= 0)) {
     if (_zag_str_eq(get__u8(env.names, i), name)) {
     return get_i32(env.byref, i);
     }
-    i = (i + 1);
+    i = (i - 1);
     }
     return 0;
 }
 static ZagSliceU8 cg_slot_type(Env env, ZagSliceU8 name) {
-    int32_t i = 0;
-    while ((i < len__u8(env.names))) {
+    int32_t i = (len__u8(env.names) - 1);
+    while ((i >= 0)) {
     if (_zag_str_eq(get__u8(env.names, i), name)) {
     return get__u8(env.types, i);
     }
-    i = (i + 1);
+    i = (i - 1);
     }
     return (ZagSliceU8){(const uint8_t*)"", 0};
 }
 static int32_t cg_slot_alloc_br(Env* env, ZagSliceU8 name, ZagSliceU8 ty, int32_t words, int32_t byref) {
-    int32_t i = 0;
+    int32_t i = (*env).scope_base;
     while ((i < len__u8((*env).names))) {
     if (_zag_str_eq(get__u8((*env).names, i), name)) {
     set__u8((&(*env).types), i, ty);
@@ -8720,25 +8949,25 @@ static int32_t cg_slot_alloc(Env* env, ZagSliceU8 name) {
     return cg_slot_alloc_typed(env, name, (ZagSliceU8){(const uint8_t*)"", 0}, 1);
 }
 static int32_t cg_slot_find(Env env, ZagSliceU8 name) {
-    int32_t i = 0;
-    while ((i < len__u8(env.names))) {
+    int32_t i = (len__u8(env.names) - 1);
+    while ((i >= 0)) {
     if (_zag_str_eq(get__u8(env.names, i), name)) {
     return get_i32(env.disps, i);
     }
-    i = (i + 1);
+    i = (i - 1);
     }
     return (0 - 2147483647);
 }
 static void cg_slot_rebind(Env* env, ZagSliceU8 name, int32_t disp, ZagSliceU8 ty, int32_t byref) {
-    int32_t i = 0;
-    while ((i < len__u8((*env).names))) {
+    int32_t i = (len__u8((*env).names) - 1);
+    while ((i >= 0)) {
     if (_zag_str_eq(get__u8((*env).names, i), name)) {
     set_i32((&(*env).disps), i, disp);
     set__u8((&(*env).types), i, ty);
     set_i32((&(*env).byref), i, byref);
     return;
     }
-    i = (i + 1);
+    i = (i - 1);
     }
     push__u8((&(*env).names), name);
     push_i32((&(*env).disps), disp);
@@ -8827,6 +9056,9 @@ static ZagSliceU8 cg_scan_typeof(ScanCtx* sc, Cg* cg, Node* n) {
     {
         __auto_type sl = __sw.u.slice_;
     ZagSliceU8 bt = cg_scan_typeof(sc, cg, sl.base);
+    if ((cg_slice_is_word(bt) == 1)) {
+    return bt;
+    }
     if ((cg_type_is_slice(cg, bt) == 1)) {
     return (ZagSliceU8){(const uint8_t*)"[]u8", 4};
     }
@@ -8855,6 +9087,9 @@ static ZagSliceU8 cg_scan_typeof(ScanCtx* sc, Cg* cg, Node* n) {
     {
         __auto_type ix = __sw.u.idx;
     ZagSliceU8 bt = cg_scan_typeof(sc, cg, ix.base);
+    if ((cg_slice_is_word(bt) == 1)) {
+    return cg_slice_elem(bt);
+    }
     if ((cg_type_is_slice(cg, bt) == 1)) {
     return (ZagSliceU8){(const uint8_t*)"u8", 2};
     }
@@ -9361,9 +9596,8 @@ static void cg_scan_body(Cg* cg, ScanCtx* sc, ArrayList_pNode body) {
     lty = (ZagSliceU8){(const uint8_t*)"fat_fn", 6};
     }
     cg_scan_rectype(sc, l.name, lty);
-    if ((cg_scan_seen((*sc).seen, l.name) == 0)) {
+    int32_t _seen_local = cg_scan_seen((*sc).seen, l.name);
     (*(*sc).words) = ((*(*sc).words) + cg_type_words(cg, lty));
-    }
     if ((cg_type_is_agg(cg, lty) == 1)) {
     (*(*sc).words) = ((*(*sc).words) + 1);
     }
@@ -9620,6 +9854,9 @@ static ZagSliceU8 cg_native_rt_ret(ZagSliceU8 name) {
     if (_zag_str_eq(name, (ZagSliceU8){(const uint8_t*)"_zag_read_fd", 12})) {
     return (ZagSliceU8){(const uint8_t*)"i64", 3};
     }
+    if (_zag_str_eq(name, (ZagSliceU8){(const uint8_t*)"_zag_clock_monotonic_ms", 23})) {
+    return (ZagSliceU8){(const uint8_t*)"i64", 3};
+    }
     return (ZagSliceU8){(const uint8_t*)"", 0};
 }
 static int32_t cg_is_native_rt(ZagSliceU8 name) {
@@ -9699,6 +9936,9 @@ static int32_t cg_is_native_rt(ZagSliceU8 name) {
     return 1;
     }
     if (_zag_str_eq(name, (ZagSliceU8){(const uint8_t*)"_zag_read_fd", 12})) {
+    return 1;
+    }
+    if (_zag_str_eq(name, (ZagSliceU8){(const uint8_t*)"_zag_clock_monotonic_ms", 23})) {
     return 1;
     }
     return 0;
@@ -9960,6 +10200,9 @@ static ZagSliceU8 cg_expr_type(Node* n, Env* env, ArrayList_FnSym syms, Cg* cg) 
     {
         __auto_type sl = __sw.u.slice_;
     ZagSliceU8 bt = cg_expr_type(sl.base, env, syms, cg);
+    if ((cg_slice_is_word(bt) == 1)) {
+    return bt;
+    }
     if ((cg_type_is_slice(cg, bt) == 1)) {
     return (ZagSliceU8){(const uint8_t*)"[]u8", 4};
     }
@@ -10054,6 +10297,55 @@ static ZagSliceU8 cg_expr_type(Node* n, Env* env, ArrayList_FnSym syms, Cg* cg) 
     }
     }
     }
+}
+static int32_t cg_types_compatible(ZagSliceU8 expected0, ZagSliceU8 actual0, Cg* cg) {
+    ZagSliceU8 expected = cg_norm_type(expected0);
+    ZagSliceU8 actual = cg_norm_type(actual0);
+    if (((expected.len == 0) || (actual.len == 0))) {
+    return 1;
+    }
+    if (_zag_str_eq(expected, actual)) {
+    return 1;
+    }
+    if (((cg_is_fn_type(expected) == 1) && _zag_str_eq(actual, (ZagSliceU8){(const uint8_t*)"fat_fn", 6}))) {
+    return 1;
+    }
+    if ((_zag_str_eq(expected, (ZagSliceU8){(const uint8_t*)"fat_fn", 6}) && (cg_is_fn_type(actual) == 1))) {
+    return 1;
+    }
+    if (((expected.len > 1) && ((expected).ptr[0] == 63))) {
+    if (_zag_str_eq(cg_norm_type((ZagSliceU8){ (expected).ptr + (1), ((expected).len) - (1) }), actual)) {
+    return 1;
+    }
+    return 0;
+    }
+    int32_t ea = cg_type_is_agg(cg, expected);
+    int32_t aa = cg_type_is_agg(cg, actual);
+    if ((ea != aa)) {
+    return 0;
+    }
+    if ((ea == 1)) {
+    return 0;
+    }
+    int32_t ep = 0;
+    int32_t ap = 0;
+    if ((expected.len > 0)) {
+    if (((expected).ptr[0] == 42)) {
+    ep = 1;
+    }
+    }
+    if ((actual.len > 0)) {
+    if (((actual).ptr[0] == 42)) {
+    ap = 1;
+    }
+    }
+    if ((ep != ap)) {
+    return 0;
+    }
+    if ((ep == 1)) {
+    return 0;
+    }
+    return 1;
 }
 static void cg_push_agg_base(ArrayList_Instr* out, Env* env, ZagSliceU8 name, int32_t disp) {
     if ((cg_slot_byref((*env), name) == 1)) {
@@ -10331,7 +10623,13 @@ static void cg_lower_expr(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     if ((ti > 0)) {
     tys = _zag_str_concat(tys, (ZagSliceU8){(const uint8_t*)",", 1});
     }
+    if (((cn.len > 0) && ((cn).ptr[0] == 42))) {
+    ZagSliceU8 real_cn = (ZagSliceU8){ (cn).ptr + (1), (cn.len) - (1) };
+    ZagSliceU8 base_ty = cg_slot_type((*env), real_cn);
+    tys = _zag_str_concat(tys, _zag_str_concat((ZagSliceU8){(const uint8_t*)"*", 1}, base_ty));
+    } else {
     tys = _zag_str_concat(tys, cg_slot_type((*env), cn));
+    }
     ti = (ti + 1);
     }
     int32_t di2 = 0;
@@ -10367,11 +10665,22 @@ static void cg_lower_expr(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     int32_t ci = 0;
     while ((ci < len__u8(cnames))) {
     ZagSliceU8 cname = get__u8(cnames, ci);
-    int32_t cdisp = cg_slot_find((*env), cname);
+    int32_t is_ptr_cap = 0;
+    ZagSliceU8 real_cname = cname;
+    if (((cname.len > 0) && ((cname).ptr[0] == 42))) {
+    is_ptr_cap = 1;
+    real_cname = (ZagSliceU8){ (cname).ptr + (1), (cname.len) - (1) };
+    }
+    int32_t cdisp = cg_slot_find((*env), real_cname);
     if ((cdisp != cg_not_found())) {
-    ZagSliceU8 cty = cg_slot_type((*env), cname);
+    if ((is_ptr_cap == 1)) {
+    push_Instr(out, i_load(R_RSI(), R_RBP(), save_rsi_slot));
+    push_Instr(out, i_lea(R_RAX(), R_RBP(), cdisp));
+    push_Instr(out, i_store(R_RSI(), (8 * ci), R_RAX()));
+    } else {
+    ZagSliceU8 cty = cg_slot_type((*env), real_cname);
     int32_t is_inline_agg = 0;
-    if (((cg_type_is_agg(cg, cty) == 1) && (cg_slot_byref((*env), cname) == 0))) {
+    if (((cg_type_is_agg(cg, cty) == 1) && (cg_slot_byref((*env), real_cname) == 0))) {
     is_inline_agg = 1;
     }
     if ((is_inline_agg == 1)) {
@@ -10389,6 +10698,7 @@ static void cg_lower_expr(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     } else {
     push_Instr(out, i_load(R_RAX(), R_RBP(), cdisp));
     push_Instr(out, i_store(R_RSI(), (8 * ci), R_RAX()));
+    }
     }
     }
     ci = (ci + 1);
@@ -10413,7 +10723,7 @@ static void cg_lower_expr(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     push_Instr(out, i_push(R_RAX()));
     return;
     }
-    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: unknown identifier in expression", 40});
+    cg_err(cg, _zag_str_concat((ZagSliceU8){(const uint8_t*)"native: unknown identifier in expression: ", 42}, x.name));
     push_Instr(out, i_mov_imm(R_RAX(), 0));
     push_Instr(out, i_push(R_RAX()));
     } else {
@@ -10809,8 +11119,36 @@ static void cg_lower_slice(ArrayList_Instr* out, Slice sl, Env* env, ArrayList_F
     if ((handled == 0)) {
     ZagSliceU8 bt = cg_expr_type(sl.base, env, syms, cg);
     if ((cg_slice_is_word(bt) == 1)) {
-    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: sub-slicing a numeric-element slice is not supported (index it instead)", 79});
-    push_Instr(out, i_mov_imm(R_RAX(), 0));
+    cg_lower_expr(out, sl.base, env, syms, cg);
+    push_Instr(out, i_pop(R_RSI()));
+    push_Instr(out, i_load(R_RAX(), R_RSI(), 0));
+    push_Instr(out, i_store(R_RBP(), (src + 0), R_RAX()));
+    push_Instr(out, i_load(R_RAX(), R_RSI(), 8));
+    push_Instr(out, i_store(R_RBP(), (src + 8), R_RAX()));
+    int32_t loslot_w = cg_slot_scratch(env);
+    cg_lower_expr(out, sl.lo, env, syms, cg);
+    push_Instr(out, i_pop(R_RAX()));
+    push_Instr(out, i_store(R_RBP(), loslot_w, R_RAX()));
+    int32_t hislot_w = cg_slot_scratch(env);
+    if ((sl.has_hi == 1)) {
+    cg_lower_expr(out, sl.hi, env, syms, cg);
+    push_Instr(out, i_pop(R_RAX()));
+    } else {
+    push_Instr(out, i_load(R_RAX(), R_RBP(), (src + 8)));
+    }
+    push_Instr(out, i_store(R_RBP(), hislot_w, R_RAX()));
+    int32_t res_w = cg_slot_scratch_n(env, 2);
+    push_Instr(out, i_load(R_RAX(), R_RBP(), (src + 0)));
+    push_Instr(out, i_load(R_RCX(), R_RBP(), loslot_w));
+    push_Instr(out, i_mov_imm(R_RDX(), 8));
+    push_Instr(out, i_imul(R_RCX(), R_RDX()));
+    push_Instr(out, i_add(R_RAX(), R_RCX()));
+    push_Instr(out, i_store(R_RBP(), (res_w + 0), R_RAX()));
+    push_Instr(out, i_load(R_RAX(), R_RBP(), hislot_w));
+    push_Instr(out, i_load(R_RCX(), R_RBP(), loslot_w));
+    push_Instr(out, i_sub(R_RAX(), R_RCX()));
+    push_Instr(out, i_store(R_RBP(), (res_w + 8), R_RAX()));
+    push_Instr(out, i_lea(R_RAX(), R_RBP(), res_w));
     push_Instr(out, i_push(R_RAX()));
     return;
     }
@@ -12065,6 +12403,37 @@ static int32_t cg_lower_native_rt(ArrayList_Instr* out, ZagSliceU8 fname, Call c
     push_Instr(out, i_push(R_RAX()));
     return 1;
     }
+    if (_zag_str_eq(fname, (ZagSliceU8){(const uint8_t*)"_zag_clock_monotonic_ms", 23})) {
+    if ((nargs != 0)) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: _zag_clock_monotonic_ms expects no arguments", 52});
+    push_Instr(out, i_mov_imm(R_RAX(), (0 - 1)));
+    push_Instr(out, i_push(R_RAX()));
+    return 1;
+    }
+    int32_t failed = cg_fresh(cg);
+    int32_t done = cg_fresh(cg);
+    push_Instr(out, i_sub_imm(R_RSP(), 16));
+    push_Instr(out, i_mov_imm(R_RAX(), 228));
+    push_Instr(out, i_mov_imm(R_RDI(), 1));
+    push_Instr(out, i_mov_rr(R_RSI(), R_RSP()));
+    push_Instr(out, i_syscall());
+    push_Instr(out, i_cmp_imm(R_RAX(), 0));
+    push_Instr(out, i_jl(failed));
+    push_Instr(out, i_load(R_R10(), R_RSP(), 0));
+    push_Instr(out, i_mov_imm(R_RCX(), 1000));
+    push_Instr(out, i_imul(R_R10(), R_RCX()));
+    push_Instr(out, i_load(R_RAX(), R_RSP(), 8));
+    push_Instr(out, i_mov_imm(R_RCX(), 1000000));
+    push_Instr(out, i_idiv(R_RCX()));
+    push_Instr(out, i_add(R_RAX(), R_R10()));
+    push_Instr(out, i_jmp(done));
+    push_Instr(out, i_label(failed));
+    push_Instr(out, i_mov_imm(R_RAX(), (0 - 1)));
+    push_Instr(out, i_label(done));
+    push_Instr(out, i_add_imm(R_RSP(), 16));
+    push_Instr(out, i_push(R_RAX()));
+    return 1;
+    }
     int32_t idx = (0 - 1);
     int32_t want = 0;
     int32_t found = 0;
@@ -12763,17 +13132,19 @@ static void cg_lower_switch_stmt(ArrayList_Instr* out, Switch sw, Env* env, Arra
     }
     push_Instr(out, i_jmp(next_lbl));
     push_Instr(out, i_label(body_lbl));
+    CgScopeMark arm_scope = cg_scope_begin(env);
     if (((kind == 2) && (arm.has_cap == 1))) {
     ZagSliceU8 payty = cg_union_payload_type(cg, uname, get__u8(arm.tags, 0));
     cg_bind_capture(out, arm.cap, payty, blk, env, cg);
     }
     cg_lower_block(out, arm.body, env, syms, cg);
+    cg_scope_end(env, arm_scope);
     push_Instr(out, i_jmp(end_lbl));
     push_Instr(out, i_label(next_lbl));
     ai = (ai + 1);
     }
     if ((sw.has_els == 1)) {
-    cg_lower_block(out, sw.els_body, env, syms, cg);
+    cg_lower_scoped_block(out, sw.els_body, env, syms, cg);
     }
     push_Instr(out, i_label(end_lbl));
 }
@@ -12799,11 +13170,13 @@ static void cg_lower_switch_expr(ArrayList_Instr* out, Switch sw, Env* env, Arra
     }
     push_Instr(out, i_jmp(next_lbl));
     push_Instr(out, i_label(body_lbl));
+    CgScopeMark arm_scope = cg_scope_begin(env);
     if (((kind == 2) && (arm.has_cap == 1))) {
     ZagSliceU8 payty = cg_union_payload_type(cg, uname, get__u8(arm.tags, 0));
     cg_bind_capture(out, arm.cap, payty, blk, env, cg);
     }
     cg_lower_arm_value(out, arm.body, env, syms, cg);
+    cg_scope_end(env, arm_scope);
     push_Instr(out, i_pop(R_RAX()));
     push_Instr(out, i_store(R_RBP(), res, R_RAX()));
     push_Instr(out, i_jmp(end_lbl));
@@ -12861,6 +13234,12 @@ static void cg_lower_stmt(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     }
     if ((cg_is_fn_type(lty) == 1)) {
     lty = (ZagSliceU8){(const uint8_t*)"fat_fn", 6};
+    }
+    if (((l.has_dty == 1) && (l.has_init == 1))) {
+    ZagSliceU8 ity = cg_expr_type(l.expr, env, syms, cg);
+    if ((cg_types_compatible(lty, ity, cg) == 0)) {
+    cg_err(cg, (ZagSliceU8){(const uint8_t*)"native: let initializer type mismatch", 37});
+    }
     }
     if ((cg_type_is_opt(cg, lty) == 1)) {
     int32_t onf = cg_agg_words(cg, lty);
@@ -13193,6 +13572,7 @@ static void cg_lower_stmt(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     int32_t else_lbl = cg_fresh(cg);
     int32_t end_lbl = cg_fresh(cg);
     if ((iff.has_cap == 1)) {
+    CgScopeMark capture_scope = cg_scope_begin(env);
     ZagSliceU8 aty = cg_expr_type(iff.cond, env, syms, cg);
     int32_t onf = 2;
     if ((aty.len > 1)) {
@@ -13231,10 +13611,11 @@ static void cg_lower_stmt(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     push_Instr(out, i_store(R_RBP(), cdisp, R_RAX()));
     }
     cg_lower_block(out, iff.then_body, env, syms, cg);
+    cg_scope_end(env, capture_scope);
     push_Instr(out, i_jmp(end_lbl));
     push_Instr(out, i_label(else_lbl));
     if ((iff.has_els == 1)) {
-    cg_lower_block(out, iff.els_body, env, syms, cg);
+    cg_lower_scoped_block(out, iff.els_body, env, syms, cg);
     }
     push_Instr(out, i_label(end_lbl));
     } else {
@@ -13242,11 +13623,11 @@ static void cg_lower_stmt(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     push_Instr(out, i_pop(R_RAX()));
     push_Instr(out, i_cmp_imm(R_RAX(), 0));
     push_Instr(out, i_je(else_lbl));
-    cg_lower_block(out, iff.then_body, env, syms, cg);
+    cg_lower_scoped_block(out, iff.then_body, env, syms, cg);
     push_Instr(out, i_jmp(end_lbl));
     push_Instr(out, i_label(else_lbl));
     if ((iff.has_els == 1)) {
-    cg_lower_block(out, iff.els_body, env, syms, cg);
+    cg_lower_scoped_block(out, iff.els_body, env, syms, cg);
     }
     push_Instr(out, i_label(end_lbl));
     }
@@ -13258,6 +13639,7 @@ static void cg_lower_stmt(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     int32_t top = cg_fresh(cg);
     int32_t end = cg_fresh(cg);
     if ((w.has_cap == 1)) {
+    CgScopeMark capture_scope = cg_scope_begin(env);
     ZagSliceU8 aty = cg_expr_type(w.cond, env, syms, cg);
     int32_t onf = 2;
     if ((aty.len > 1)) {
@@ -13301,6 +13683,7 @@ static void cg_lower_stmt(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     push_Instr(out, i_store(R_RBP(), cdisp, R_RAX()));
     }
     cg_lower_block(out, w.body, env, syms, cg);
+    cg_scope_end(env, capture_scope);
     push_Instr(out, i_jmp(top));
     push_Instr(out, i_label(end));
     } else {
@@ -13309,7 +13692,7 @@ static void cg_lower_stmt(ArrayList_Instr* out, Node* n, Env* env, ArrayList_FnS
     push_Instr(out, i_pop(R_RAX()));
     push_Instr(out, i_cmp_imm(R_RAX(), 0));
     push_Instr(out, i_je(end));
-    cg_lower_block(out, w.body, env, syms, cg);
+    cg_lower_scoped_block(out, w.body, env, syms, cg);
     push_Instr(out, i_jmp(top));
     push_Instr(out, i_label(end));
     }
@@ -13342,6 +13725,11 @@ static void cg_lower_block(ArrayList_Instr* out, ArrayList_pNode body, Env* env,
     cg_lower_stmt(out, get_pNode(body, i), env, syms, cg);
     i = (i + 1);
     }
+}
+static void cg_lower_scoped_block(ArrayList_Instr* out, ArrayList_pNode body, Env* env, ArrayList_FnSym syms, Cg* cg) {
+    CgScopeMark mark = cg_scope_begin(env);
+    cg_lower_block(out, body, env, syms, cg);
+    cg_scope_end(env, mark);
 }
 static void cg_lower_fn(ArrayList_Instr* out, FnDecl f, int32_t lbl, ArrayList_FnSym syms, Cg* cg) {
     (*cg).cur_fn = f.name;
@@ -13432,7 +13820,16 @@ static void cg_lower_fn(ArrayList_Instr* out, FnDecl f, int32_t lbl, ArrayList_F
     if ((ci < len__u8(ctypes))) {
     cty = get__u8(ctypes, ci);
     }
+    int32_t is_ptr_cap = 0;
+    ZagSliceU8 real_cname = cname;
+    if (((cname.len > 0) && ((cname).ptr[0] == 42))) {
+    is_ptr_cap = 1;
+    real_cname = (ZagSliceU8){ (cname).ptr + (1), (cname.len) - (1) };
+    }
     int32_t cdisp = 0;
+    if ((is_ptr_cap == 1)) {
+    cdisp = cg_slot_alloc_typed((&env), real_cname, cty, 1);
+    } else {
     if (((cty.len > 0) && (cg_type_is_agg(cg, cg_norm_type(cty)) == 1))) {
     cdisp = cg_slot_alloc_br((&env), cname, cg_norm_type(cty), 1, 1);
     } else {
@@ -13440,6 +13837,7 @@ static void cg_lower_fn(ArrayList_Instr* out, FnDecl f, int32_t lbl, ArrayList_F
     cdisp = cg_slot_alloc_typed((&env), cname, cty, 1);
     } else {
     cdisp = cg_slot_alloc((&env), cname);
+    }
     }
     }
     push_Instr(out, i_load(R_RAX(), R_RDI(), (8 * ci)));
@@ -17467,15 +17865,13 @@ static int32_t fn_violation_mask(FnDecl f, ArrayList_pNode decls, map__StringMap
     map__StringMap_i32 env = map__make_i32(16);
     return fn_latent(f, (&env), decls, eff, 0);
 }
-static int32_t report_fn(FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff) {
+static int32_t report_fn(FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file) {
     if ((f.is_extern == 1)) {
     return 0;
     }
     int32_t count = 0;
     if (((is_eu_ret(f.ret) == 0) && (stmts_use_try(f.body) == 1))) {
-    _zag_print((ZagSliceU8){(const uint8_t*)"zag: VIOLATION in ", 18});
-    _zag_print(f.name);
-    _zag_println((ZagSliceU8){(const uint8_t*)" @raises (try used in a function that does not return !T)", 57});
+    diag_emit((ZagSliceU8){(const uint8_t*)"E0003", 5}, _zag_str_concat((ZagSliceU8){(const uint8_t*)"`try` used in function `", 24}, _zag_str_concat(f.name, (ZagSliceU8){(const uint8_t*)"` which does not return !T", 26})), file, f.line, 1, f.name.len, (ZagSliceU8){(const uint8_t*)"`try` propagates errors to the caller, but this function's return type is not !T", 80}, (ZagSliceU8){(const uint8_t*)"change the return type to !T or handle the error with `catch`", 61}, src);
     count = (count + 1);
     }
     if ((len__u8(f.annots) == 0)) {
@@ -17491,15 +17887,7 @@ static int32_t report_fn(FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff
     if ((_zag_str_eq(a, (ZagSliceU8){(const uint8_t*)"@total", 6}) && (fn_total_safe(f, eff) == 1))) {
     i = (i + 1);
     } else {
-    _zag_print((ZagSliceU8){(const uint8_t*)"zag: VIOLATION in ", 18});
-    _zag_print(f.name);
-    if ((f.line > 0)) {
-    _zag_print((ZagSliceU8){(const uint8_t*)" (line ", 7});
-    _zag_print(_zag_i64_to_str(((int64_t)(f.line))));
-    _zag_print((ZagSliceU8){(const uint8_t*)")", 1});
-    }
-    _zag_print((ZagSliceU8){(const uint8_t*)" ", 1});
-    _zag_println(a);
+    diag_emit((ZagSliceU8){(const uint8_t*)"E0002", 5}, _zag_str_concat((ZagSliceU8){(const uint8_t*)"capability violation — `", 26}, _zag_str_concat(a, _zag_str_concat((ZagSliceU8){(const uint8_t*)"` constraint broken in function `", 33}, _zag_str_concat(f.name, (ZagSliceU8){(const uint8_t*)"`", 1})))), file, f.line, 1, f.name.len, annot_note(a), annot_hint(a), src);
     count = (count + 1);
     i = (i + 1);
     }
@@ -17533,53 +17921,52 @@ static ZagSliceU8 sfeff_scan(ArrayList_Param fields, ZagSliceU8 fname) {
     }
     return (ZagSliceU8){(const uint8_t*)"", 0};
 }
-static int32_t contract_check(ZagSliceU8 where, int32_t forb, int32_t veff) {
+static int32_t contract_check(ZagSliceU8 where, int32_t forb, int32_t veff, ZagSliceU8 src, ZagSliceU8 file) {
     int32_t bad = (veff & forb);
     if ((bad != 0)) {
-    _zag_print((ZagSliceU8){(const uint8_t*)"zag: VIOLATION ", 15});
-    _zag_println(where);
+    diag_emit((ZagSliceU8){(const uint8_t*)"E0007", 5}, _zag_str_concat((ZagSliceU8){(const uint8_t*)"capability violation — ", 25}, where), file, 0, 0, 1, (ZagSliceU8){(const uint8_t*)"a function value violates the effect contract of the type it is stored into", 75}, (ZagSliceU8){(const uint8_t*)"use a function that satisfies the declared effect bound", 55}, src);
     return 1;
     }
     return 0;
 }
-static int32_t store_fn(FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff) {
+static int32_t store_fn(FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file) {
     if ((f.is_extern == 1)) {
     return 0;
     }
     map__StringMap_i32 env = map__make_i32(16);
     seed_params(f, (&env));
-    return store_body(f.body, (&env), f, decls, eff);
+    return store_body(f.body, (&env), f, decls, eff, src, file);
 }
-static int32_t store_body(ArrayList_pNode body, map__StringMap_i32* env, FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff) {
+static int32_t store_body(ArrayList_pNode body, map__StringMap_i32* env, FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file) {
     int32_t acc = 0;
     int32_t i = 0;
     while ((i < len_pNode(body))) {
-    acc = (acc + store_stmt(get_pNode(body, i), env, f, decls, eff));
+    acc = (acc + store_stmt(get_pNode(body, i), env, f, decls, eff, src, file));
     i = (i + 1);
     }
     return acc;
 }
-static int32_t store_stmt(Node* n, map__StringMap_i32* env, FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff) {
-    return ({ __auto_type __sw = (*n); (__sw.tag == Node_let_) ? ({ __auto_type l = __sw.u.let_; (store_let(l, env, decls, eff)); }) : (__sw.tag == Node_ret) ? ({ __auto_type r = __sw.u.ret; (store_ret(r, env, f, decls, eff)); }) : (__sw.tag == Node_assign) ? ({ __auto_type a = __sw.u.assign; (store_expr(a.expr, env, decls, eff)); }) : (__sw.tag == Node_estmt) ? ({ __auto_type e = __sw.u.estmt; (store_expr(e.expr, env, decls, eff)); }) : (__sw.tag == Node_if_) ? ({ __auto_type x = __sw.u.if_; ((store_body(x.then_body, env, f, decls, eff) + store_body(x.els_body, env, f, decls, eff))); }) : (__sw.tag == Node_while_) ? ({ __auto_type w = __sw.u.while_; (store_body(w.body, env, f, decls, eff)); }) : (__sw.tag == Node_switch_) ? ({ __auto_type sw = __sw.u.switch_; (store_switch(sw, env, f, decls, eff)); }) : (0); });
+static int32_t store_stmt(Node* n, map__StringMap_i32* env, FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file) {
+    return ({ __auto_type __sw = (*n); (__sw.tag == Node_let_) ? ({ __auto_type l = __sw.u.let_; (store_let(l, env, decls, eff, src, file)); }) : (__sw.tag == Node_ret) ? ({ __auto_type r = __sw.u.ret; (store_ret(r, env, f, decls, eff, src, file)); }) : (__sw.tag == Node_assign) ? ({ __auto_type a = __sw.u.assign; (store_expr(a.expr, env, decls, eff, src, file)); }) : (__sw.tag == Node_estmt) ? ({ __auto_type e = __sw.u.estmt; (store_expr(e.expr, env, decls, eff, src, file)); }) : (__sw.tag == Node_if_) ? ({ __auto_type x = __sw.u.if_; ((store_body(x.then_body, env, f, decls, eff, src, file) + store_body(x.els_body, env, f, decls, eff, src, file))); }) : (__sw.tag == Node_while_) ? ({ __auto_type w = __sw.u.while_; (store_body(w.body, env, f, decls, eff, src, file)); }) : (__sw.tag == Node_switch_) ? ({ __auto_type sw = __sw.u.switch_; (store_switch(sw, env, f, decls, eff, src, file)); }) : (0); });
 }
-static int32_t store_switch(Switch sw, map__StringMap_i32* env, FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff) {
+static int32_t store_switch(Switch sw, map__StringMap_i32* env, FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file) {
     int32_t acc = 0;
     int32_t i = 0;
     while ((i < len_SwitchArm(sw.arms))) {
-    acc = (acc + store_body(get_SwitchArm(sw.arms, i).body, env, f, decls, eff));
+    acc = (acc + store_body(get_SwitchArm(sw.arms, i).body, env, f, decls, eff, src, file));
     i = (i + 1);
     }
     if ((sw.has_els == 1)) {
-    acc = (acc + store_body(sw.els_body, env, f, decls, eff));
+    acc = (acc + store_body(sw.els_body, env, f, decls, eff, src, file));
     }
     return acc;
 }
-static int32_t store_let(Let l, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff) {
-    int32_t acc = store_expr(l.expr, env, decls, eff);
+static int32_t store_let(Let l, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file) {
+    int32_t acc = store_expr(l.expr, env, decls, eff, src, file);
     if ((is_fn_pty(l.dty) == 1)) {
     int32_t forb = row_forbidden(l.eff);
     if ((forb != 0)) {
-    acc = (acc + contract_check(_zag_str_concat((ZagSliceU8){(const uint8_t*)"storing into typed local '", 26}, _zag_str_concat(l.name, (ZagSliceU8){(const uint8_t*)"' breaks its effect contract", 28})), forb, val_eff(l.expr, env, decls, eff)));
+    acc = (acc + contract_check(_zag_str_concat((ZagSliceU8){(const uint8_t*)"storing into typed local `", 26}, _zag_str_concat(l.name, (ZagSliceU8){(const uint8_t*)"` breaks its effect contract", 28})), forb, val_eff(l.expr, env, decls, eff), src, file));
     }
     if ((l.eff.len > 0)) {
     map__put_i32(env, l.name, row_default_call(l.eff));
@@ -17589,20 +17976,18 @@ static int32_t store_let(Let l, map__StringMap_i32* env, ArrayList_pNode decls, 
     }
     return acc;
 }
-static int32_t store_ret(Return r, map__StringMap_i32* env, FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff) {
+static int32_t store_ret(Return r, map__StringMap_i32* env, FnDecl f, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file) {
     if ((r.has_expr == 0)) {
     return 0;
     }
-    int32_t acc = store_expr(r.expr, env, decls, eff);
+    int32_t acc = store_expr(r.expr, env, decls, eff, src, file);
     if ((ret_escapes_capturing(r.expr, decls) == 1)) {
-    _zag_print((ZagSliceU8){(const uint8_t*)"zag: VIOLATION in ", 18});
-    _zag_print(f.name);
-    _zag_println((ZagSliceU8){(const uint8_t*)": capturing closure escapes (stack-env would dangle) — heap closures are Phase-1 work", 87});
+    diag_emit((ZagSliceU8){(const uint8_t*)"E0006", 5}, _zag_str_concat((ZagSliceU8){(const uint8_t*)"capturing closure escapes function `", 36}, _zag_str_concat(f.name, (ZagSliceU8){(const uint8_t*)"`", 1})), file, f.line, 1, f.name.len, (ZagSliceU8){(const uint8_t*)"the captured environment lives on the stack; returning the closure causes a dangling reference", 94}, (ZagSliceU8){(const uint8_t*)"heap closures (Phase-1) are not yet supported — restructure to avoid returning the closure", 92}, src);
     acc = (acc + 1);
     }
     int32_t forb = row_forbidden(f.ret_eff);
     if ((forb != 0)) {
-    acc = (acc + contract_check(_zag_str_concat((ZagSliceU8){(const uint8_t*)"in ", 3}, _zag_str_concat(f.name, (ZagSliceU8){(const uint8_t*)": returned value breaks the return-type effect contract", 55})), forb, val_eff(r.expr, env, decls, eff)));
+    acc = (acc + contract_check(_zag_str_concat((ZagSliceU8){(const uint8_t*)"in `", 4}, _zag_str_concat(f.name, (ZagSliceU8){(const uint8_t*)"`: returned value breaks the return-type effect contract", 56})), forb, val_eff(r.expr, env, decls, eff), src, file));
     }
     return acc;
 }
@@ -17619,26 +18004,26 @@ static int32_t id_caps(ZagSliceU8 nm, ArrayList_pNode decls) {
     }
     return 0;
 }
-static int32_t store_expr(Node* n, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff) {
-    return ({ __auto_type __sw = (*n); (__sw.tag == Node_call) ? ({ __auto_type c = __sw.u.call; (store_call(c, env, decls, eff)); }) : (__sw.tag == Node_slit_) ? ({ __auto_type s = __sw.u.slit_; (store_slit(s, env, decls, eff)); }) : (__sw.tag == Node_bin) ? ({ __auto_type b = __sw.u.bin; ((store_expr(b.l, env, decls, eff) + store_expr(b.r, env, decls, eff))); }) : (__sw.tag == Node_un) ? ({ __auto_type u = __sw.u.un; (store_expr(u.e, env, decls, eff)); }) : (__sw.tag == Node_idx) ? ({ __auto_type x = __sw.u.idx; ((store_expr(x.base, env, decls, eff) + store_expr(x.idx, env, decls, eff))); }) : (__sw.tag == Node_fld) ? ({ __auto_type fexpr = __sw.u.fld; (store_expr(fexpr.base, env, decls, eff)); }) : (0); });
+static int32_t store_expr(Node* n, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file) {
+    return ({ __auto_type __sw = (*n); (__sw.tag == Node_call) ? ({ __auto_type c = __sw.u.call; (store_call(c, env, decls, eff, src, file)); }) : (__sw.tag == Node_slit_) ? ({ __auto_type s = __sw.u.slit_; (store_slit(s, env, decls, eff, src, file)); }) : (__sw.tag == Node_bin) ? ({ __auto_type b = __sw.u.bin; ((store_expr(b.l, env, decls, eff, src, file) + store_expr(b.r, env, decls, eff, src, file))); }) : (__sw.tag == Node_un) ? ({ __auto_type u = __sw.u.un; (store_expr(u.e, env, decls, eff, src, file)); }) : (__sw.tag == Node_idx) ? ({ __auto_type x = __sw.u.idx; ((store_expr(x.base, env, decls, eff, src, file) + store_expr(x.idx, env, decls, eff, src, file))); }) : (__sw.tag == Node_fld) ? ({ __auto_type fexpr = __sw.u.fld; (store_expr(fexpr.base, env, decls, eff, src, file)); }) : (0); });
 }
-static int32_t store_call(Call c, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff) {
+static int32_t store_call(Call c, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file) {
     int32_t acc = 0;
     int32_t k = 0;
     while ((k < len_pNode(c.args))) {
-    acc = (acc + store_expr(get_pNode(c.args, k), env, decls, eff));
+    acc = (acc + store_expr(get_pNode(c.args, k), env, decls, eff, src, file));
     k = (k + 1);
     }
     int32_t fi = find_fn(decls, callee_name(c.callee));
     if ((fi >= 0)) {
-    acc = (acc + store_call_params(get_pNode(decls, fi), c, env, decls, eff));
+    acc = (acc + store_call_params(get_pNode(decls, fi), c, env, decls, eff, src, file));
     }
     return acc;
 }
-static int32_t store_call_params(Node* dn, Call c, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff) {
-    return ({ __auto_type __sw = (*dn); (__sw.tag == Node_fn_decl) ? ({ __auto_type f = __sw.u.fn_decl; (store_call_params2(f, c, env, decls, eff)); }) : (0); });
+static int32_t store_call_params(Node* dn, Call c, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file) {
+    return ({ __auto_type __sw = (*dn); (__sw.tag == Node_fn_decl) ? ({ __auto_type f = __sw.u.fn_decl; (store_call_params2(f, c, env, decls, eff, src, file)); }) : (0); });
 }
-static int32_t store_call_params2(FnDecl f, Call c, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff) {
+static int32_t store_call_params2(FnDecl f, Call c, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file) {
     int32_t acc = 0;
     int32_t i = 0;
     while ((i < len_Param(f.params))) {
@@ -17647,7 +18032,7 @@ static int32_t store_call_params2(FnDecl f, Call c, map__StringMap_i32* env, Arr
     int32_t forb = row_forbidden(p.eff);
     if ((forb != 0)) {
     if ((i < len_pNode(c.args))) {
-    acc = (acc + contract_check(_zag_str_concat((ZagSliceU8){(const uint8_t*)"callback passed to '", 20}, _zag_str_concat(f.name, _zag_str_concat((ZagSliceU8){(const uint8_t*)"' param '", 9}, _zag_str_concat(p.name, (ZagSliceU8){(const uint8_t*)"' breaks its effect bound", 25})))), forb, val_eff(get_pNode(c.args, i), env, decls, eff)));
+    acc = (acc + contract_check(_zag_str_concat((ZagSliceU8){(const uint8_t*)"callback passed to `", 20}, _zag_str_concat(f.name, _zag_str_concat((ZagSliceU8){(const uint8_t*)"` param `", 9}, _zag_str_concat(p.name, (ZagSliceU8){(const uint8_t*)"` breaks its effect bound", 25})))), forb, val_eff(get_pNode(c.args, i), env, decls, eff), src, file));
     }
     }
     }
@@ -17655,37 +18040,135 @@ static int32_t store_call_params2(FnDecl f, Call c, map__StringMap_i32* env, Arr
     }
     return acc;
 }
-static int32_t store_slit(StructLit s, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff) {
+static int32_t store_slit(StructLit s, map__StringMap_i32* env, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file) {
     int32_t acc = 0;
     int32_t i = 0;
     while ((i < len_FieldInit(s.fields))) {
     FieldInit fi = get_FieldInit(s.fields, i);
-    acc = (acc + store_expr(fi.val, env, decls, eff));
+    acc = (acc + store_expr(fi.val, env, decls, eff, src, file));
     ZagSliceU8 feff = struct_field_eff(decls, s.sname, fi.name);
     int32_t forb = row_forbidden(feff);
     if ((forb != 0)) {
-    acc = (acc + contract_check(_zag_str_concat((ZagSliceU8){(const uint8_t*)"field '", 7}, _zag_str_concat(s.sname, _zag_str_concat((ZagSliceU8){(const uint8_t*)".", 1}, _zag_str_concat(fi.name, (ZagSliceU8){(const uint8_t*)"' stores a value that breaks its effect contract", 48})))), forb, val_eff(fi.val, env, decls, eff)));
+    acc = (acc + contract_check(_zag_str_concat((ZagSliceU8){(const uint8_t*)"field `", 7}, _zag_str_concat(s.sname, _zag_str_concat((ZagSliceU8){(const uint8_t*)".", 1}, _zag_str_concat(fi.name, (ZagSliceU8){(const uint8_t*)"` stores a value that breaks its effect contract", 48})))), forb, val_eff(fi.val, env, decls, eff), src, file));
     }
     i = (i + 1);
     }
     return acc;
 }
-static int32_t report_violations(ArrayList_pNode decls, map__StringMap_i32 eff) {
+static ZagSliceU8 eu_bare_callee(Node* n, map__StringMap_i32 eff) {
+    {
+    Node __sw = (*n);
+    switch (__sw.tag) {
+    case Node_call:
+    {
+        __auto_type c = __sw.u.call;
+    ZagSliceU8 cn = callee_name(c.callee);
+    if (((({ __auto_type __o = map__get_i32(eff, cn); __o._has ? __o._val : (0); }) & 16) != 0)) {
+    return cn;
+    }
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+        break;
+    }
+    default:
+    {
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+        break;
+    }
+    }
+    }
+}
+static int32_t check_eu_stmts(ZagSliceU8 fn_name, ArrayList_pNode body, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file) {
+    int32_t acc = 0;
+    int32_t i = 0;
+    while ((i < len_pNode(body))) {
+    acc = (acc + check_eu_stmt(fn_name, get_pNode(body, i), eff, src, file));
+    i = (i + 1);
+    }
+    return acc;
+}
+static int32_t check_eu_stmt(ZagSliceU8 fn_name, Node* n, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file) {
+    {
+    Node __sw = (*n);
+    switch (__sw.tag) {
+    case Node_let_:
+    {
+        __auto_type l = __sw.u.let_;
+    if ((l.has_init == 0)) {
+    return 0;
+    }
+    if (((l.has_dty == 1) && (is_eu_ret(l.dty) == 0))) {
+    ZagSliceU8 callee = eu_bare_callee(l.expr, eff);
+    if ((callee.len > 0)) {
+    diag_emit((ZagSliceU8){(const uint8_t*)"E0008", 5}, _zag_str_concat((ZagSliceU8){(const uint8_t*)"`", 1}, _zag_str_concat(callee, _zag_str_concat((ZagSliceU8){(const uint8_t*)"` returns `!T` but result assigned to `", 39}, _zag_str_concat(l.name, _zag_str_concat((ZagSliceU8){(const uint8_t*)": ", 2}, _zag_str_concat(l.dty, (ZagSliceU8){(const uint8_t*)"` without `catch`", 17})))))), file, 0, 0, 1, (ZagSliceU8){(const uint8_t*)"a fallible function was called without handling the error case", 62}, _zag_str_concat((ZagSliceU8){(const uint8_t*)"wrap with `try` or handle with `catch`: `let ", 45}, _zag_str_concat(l.name, _zag_str_concat((ZagSliceU8){(const uint8_t*)" = try ", 7}, _zag_str_concat(callee, (ZagSliceU8){(const uint8_t*)"(...)`", 6})))), src);
+    return 1;
+    }
+    }
+    return 0;
+        break;
+    }
+    case Node_if_:
+    {
+        __auto_type x = __sw.u.if_;
+    int32_t a = check_eu_stmts(fn_name, x.then_body, eff, src, file);
+    int32_t b = check_eu_stmts(fn_name, x.els_body, eff, src, file);
+    return (a + b);
+        break;
+    }
+    case Node_while_:
+    {
+        __auto_type w = __sw.u.while_;
+    return check_eu_stmts(fn_name, w.body, eff, src, file);
+        break;
+    }
+    case Node_switch_:
+    {
+        __auto_type sw = __sw.u.switch_;
+    int32_t acc = 0;
+    int32_t si = 0;
+    while ((si < len_SwitchArm(sw.arms))) {
+    acc = (acc + check_eu_stmts(fn_name, get_SwitchArm(sw.arms, si).body, eff, src, file));
+    si = (si + 1);
+    }
+    if ((sw.has_els == 1)) {
+    acc = (acc + check_eu_stmts(fn_name, sw.els_body, eff, src, file));
+    }
+    return acc;
+        break;
+    }
+    default:
+    {
+    return 0;
+        break;
+    }
+    }
+    }
+}
+static int32_t check_eu_fn(FnDecl f, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file) {
+    if ((f.is_extern == 1)) {
+    return 0;
+    }
+    return check_eu_stmts(f.name, f.body, eff, src, file);
+}
+static int32_t check_eu_decl(Node* d, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file) {
+    return ({ __auto_type __sw = (*d); (__sw.tag == Node_fn_decl) ? ({ __auto_type f = __sw.u.fn_decl; (check_eu_fn(f, eff, src, file)); }) : (0); });
+}
+static int32_t report_violations(ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file) {
     int32_t total = 0;
     int32_t i = 0;
     while ((i < len_pNode(decls))) {
     Node* d = get_pNode(decls, i);
-    total = (total + report_decl(d, decls, eff));
-    total = (total + store_decl(d, decls, eff));
+    total = (total + report_decl(d, decls, eff, src, file));
+    total = (total + store_decl(d, decls, eff, src, file));
+    total = (total + check_eu_decl(d, eff, src, file));
     i = (i + 1);
     }
     return total;
 }
-static int32_t report_decl(Node* d, ArrayList_pNode decls, map__StringMap_i32 eff) {
-    return ({ __auto_type __sw = (*d); (__sw.tag == Node_fn_decl) ? ({ __auto_type f = __sw.u.fn_decl; (report_fn(f, decls, eff)); }) : (0); });
+static int32_t report_decl(Node* d, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file) {
+    return ({ __auto_type __sw = (*d); (__sw.tag == Node_fn_decl) ? ({ __auto_type f = __sw.u.fn_decl; (report_fn(f, decls, eff, src, file)); }) : (0); });
 }
-static int32_t store_decl(Node* d, ArrayList_pNode decls, map__StringMap_i32 eff) {
-    return ({ __auto_type __sw = (*d); (__sw.tag == Node_fn_decl) ? ({ __auto_type f = __sw.u.fn_decl; (store_fn(f, decls, eff)); }) : (0); });
+static int32_t store_decl(Node* d, ArrayList_pNode decls, map__StringMap_i32 eff, ZagSliceU8 src, ZagSliceU8 file) {
+    return ({ __auto_type __sw = (*d); (__sw.tag == Node_fn_decl) ? ({ __auto_type f = __sw.u.fn_decl; (store_fn(f, decls, eff, src, file)); }) : (0); });
 }
 static int64_t ar_parse_dec(ZagSliceU8 buf, int32_t lo, int32_t hi) {
     int64_t val = 0;
@@ -18352,6 +18835,1134 @@ static ZagMod zagmod_parse(ZagSliceU8 src) {
     }
     return mod_;
 }
+static int32_t DW_TAG_compile_unit(void) {
+    return 17;
+}
+static int32_t DW_TAG_subprogram(void) {
+    return 46;
+}
+static int32_t DW_CHILDREN_yes(void) {
+    return 1;
+}
+static int32_t DW_CHILDREN_no(void) {
+    return 0;
+}
+static int32_t DW_AT_producer(void) {
+    return 37;
+}
+static int32_t DW_AT_language(void) {
+    return 19;
+}
+static int32_t DW_AT_name(void) {
+    return 3;
+}
+static int32_t DW_AT_comp_dir(void) {
+    return 27;
+}
+static int32_t DW_AT_decl_file(void) {
+    return 58;
+}
+static int32_t DW_AT_decl_line(void) {
+    return 59;
+}
+static int32_t DW_FORM_string(void) {
+    return 8;
+}
+static int32_t DW_FORM_data1(void) {
+    return 8;
+}
+static int32_t DW_FORM_data2(void) {
+    return 5;
+}
+static int32_t DW_FORM_data4(void) {
+    return 6;
+}
+static int32_t DW_LANG_C99(void) {
+    return 12;
+}
+static int32_t DW_LNE_end_sequence(void) {
+    return 1;
+}
+static void db_eb(ArrayList_u8* buf, int32_t b) {
+    push_u8(buf, ((uint8_t)((b % 256))));
+}
+static void db_le(ArrayList_u8* buf, int64_t v, int32_t n) {
+    int64_t x = v;
+    int32_t k = 0;
+    while ((k < n)) {
+    int64_t b = (x & 255);
+    db_eb(buf, ((int32_t)(b)));
+    x = ((x - b) / 256);
+    k = (k + 1);
+    }
+}
+static void db_cstr(ArrayList_u8* buf, ZagSliceU8 s) {
+    int32_t i = 0;
+    while ((i < s.len)) {
+    push_u8(buf, (s).ptr[i]);
+    i = (i + 1);
+    }
+    push_u8(buf, 0);
+}
+static DwarfBuilder dwarf_new(ZagSliceU8 fname) {
+    return (DwarfBuilder){ .abbrev = make_u8(64), .info = make_u8(128), .line_ = make_u8(64), .fname = fname, .nfuncs = 0 };
+}
+static void dwarf_build_abbrev(DwarfBuilder* db) {
+    ArrayList_u8* a = (&(*db).abbrev);
+    db_eb(a, 1);
+    db_eb(a, DW_TAG_compile_unit());
+    db_eb(a, DW_CHILDREN_yes());
+    db_eb(a, DW_AT_language());
+    db_eb(a, DW_FORM_data2());
+    db_eb(a, 0);
+    db_eb(a, 0);
+    db_eb(a, 2);
+    db_eb(a, DW_TAG_subprogram());
+    db_eb(a, DW_CHILDREN_no());
+    db_eb(a, DW_AT_name());
+    db_eb(a, DW_FORM_string());
+    db_eb(a, DW_AT_decl_line());
+    db_eb(a, DW_FORM_data4());
+    db_eb(a, 0);
+    db_eb(a, 0);
+    db_eb(a, 0);
+}
+static void dwarf_emit_compile_unit(DwarfBuilder* db) {
+    ArrayList_u8* info = (&(*db).info);
+    db_le(info, 0, 4);
+    db_le(info, 4, 2);
+    db_le(info, 0, 4);
+    db_eb(info, 8);
+    db_eb(info, 1);
+    db_le(info, ((int64_t)(DW_LANG_C99())), 2);
+}
+static void dwarf_emit_function(DwarfBuilder* db, ZagSliceU8 name, int32_t line) {
+    ArrayList_u8* info = (&(*db).info);
+    db_eb(info, 2);
+    db_cstr(info, name);
+    db_le(info, ((int64_t)(line)), 4);
+    (*db).nfuncs = ((*db).nfuncs + 1);
+}
+static void dwarf_finish(DwarfBuilder* db) {
+    ArrayList_u8* info = (&(*db).info);
+    db_eb(info, 0);
+    int64_t unit_len = ((int64_t)(((*info).len - 4)));
+    int32_t b0 = ((int32_t)((unit_len & 255)));
+    int32_t b1 = ((int32_t)(((unit_len / 256) & 255)));
+    int32_t b2 = ((int32_t)(((unit_len / 65536) & 255)));
+    int32_t b3 = ((int32_t)(((unit_len / 16777216) & 255)));
+    set_u8(info, 0, ((uint8_t)(b0)));
+    set_u8(info, 1, ((uint8_t)(b1)));
+    set_u8(info, 2, ((uint8_t)(b2)));
+    set_u8(info, 3, ((uint8_t)(b3)));
+}
+static void dwarf_emit_line_program(DwarfBuilder* db) {
+    ArrayList_u8* ln = (&(*db).line_);
+    int32_t len_pos = (*ln).len;
+    db_le(ln, 0, 4);
+    db_le(ln, 4, 2);
+    int32_t hdrlen_pos = (*ln).len;
+    db_le(ln, 0, 4);
+    int32_t hdr_body_start = (*ln).len;
+    db_eb(ln, 1);
+    db_eb(ln, 1);
+    db_eb(ln, 1);
+    db_eb(ln, 251);
+    db_eb(ln, 14);
+    db_eb(ln, 13);
+    db_eb(ln, 0);
+    db_eb(ln, 1);
+    db_eb(ln, 1);
+    db_eb(ln, 1);
+    db_eb(ln, 1);
+    db_eb(ln, 0);
+    db_eb(ln, 0);
+    db_eb(ln, 0);
+    db_eb(ln, 1);
+    db_eb(ln, 0);
+    db_eb(ln, 0);
+    db_eb(ln, 1);
+    db_eb(ln, 0);
+    db_cstr(ln, (*db).fname);
+    db_eb(ln, 0);
+    db_eb(ln, 0);
+    db_eb(ln, 0);
+    db_eb(ln, 0);
+    int32_t hdr_body_end = (*ln).len;
+    int64_t hdr_len_val = ((int64_t)((hdr_body_end - hdr_body_start)));
+    int32_t hb0 = ((int32_t)((hdr_len_val & 255)));
+    int32_t hb1 = ((int32_t)(((hdr_len_val / 256) & 255)));
+    int32_t hb2 = ((int32_t)(((hdr_len_val / 65536) & 255)));
+    int32_t hb3 = ((int32_t)(((hdr_len_val / 16777216) & 255)));
+    set_u8(ln, hdrlen_pos, ((uint8_t)(hb0)));
+    set_u8(ln, (hdrlen_pos + 1), ((uint8_t)(hb1)));
+    set_u8(ln, (hdrlen_pos + 2), ((uint8_t)(hb2)));
+    set_u8(ln, (hdrlen_pos + 3), ((uint8_t)(hb3)));
+    db_eb(ln, 0);
+    db_eb(ln, 1);
+    db_eb(ln, DW_LNE_end_sequence());
+    int64_t total_len_val = ((int64_t)((((*ln).len - len_pos) - 4)));
+    int32_t tb0 = ((int32_t)((total_len_val & 255)));
+    int32_t tb1 = ((int32_t)(((total_len_val / 256) & 255)));
+    int32_t tb2 = ((int32_t)(((total_len_val / 65536) & 255)));
+    int32_t tb3 = ((int32_t)(((total_len_val / 16777216) & 255)));
+    set_u8(ln, len_pos, ((uint8_t)(tb0)));
+    set_u8(ln, (len_pos + 1), ((uint8_t)(tb1)));
+    set_u8(ln, (len_pos + 2), ((uint8_t)(tb2)));
+    set_u8(ln, (len_pos + 3), ((uint8_t)(tb3)));
+}
+static void dw_shdr(ArrayList_u8* buf, int32_t sh_name, int32_t sh_type, int64_t sh_flags, int64_t sh_addr, int64_t sh_offset, int64_t sh_size, int32_t sh_link, int32_t sh_info, int64_t sh_addralign, int64_t sh_entsize) {
+    db_le(buf, ((int64_t)(sh_name)), 4);
+    db_le(buf, ((int64_t)(sh_type)), 4);
+    db_le(buf, sh_flags, 8);
+    db_le(buf, sh_addr, 8);
+    db_le(buf, sh_offset, 8);
+    db_le(buf, sh_size, 8);
+    db_le(buf, ((int64_t)(sh_link)), 4);
+    db_le(buf, ((int64_t)(sh_info)), 4);
+    db_le(buf, sh_addralign, 8);
+    db_le(buf, sh_entsize, 8);
+}
+static DwarfSections dwarf_build(DwarfBuilder* db) {
+    return (DwarfSections){ .abbrev = (*db).abbrev, .info = (*db).info, .line_ = (*db).line_ };
+}
+static void dwarf_patch_elf(ArrayList_u8* elf_buf, DwarfSections ds) {
+    ArrayList_u8 shstrtab = make_u8(64);
+    db_eb((&shstrtab), 0);
+    int32_t nm_abbrev = shstrtab.len;
+    db_cstr((&shstrtab), (ZagSliceU8){(const uint8_t*)".debug_abbrev", 13});
+    int32_t nm_info = shstrtab.len;
+    db_cstr((&shstrtab), (ZagSliceU8){(const uint8_t*)".debug_info", 11});
+    int32_t nm_line = shstrtab.len;
+    db_cstr((&shstrtab), (ZagSliceU8){(const uint8_t*)".debug_line", 11});
+    int32_t nm_shstrtab = shstrtab.len;
+    db_cstr((&shstrtab), (ZagSliceU8){(const uint8_t*)".shstrtab", 9});
+    int64_t base = ((int64_t)((*elf_buf).len));
+    int64_t off_shstrtab = base;
+    int64_t off_abbrev = (off_shstrtab + ((int64_t)(shstrtab.len)));
+    int64_t off_info = (off_abbrev + ((int64_t)(ds.abbrev.len)));
+    int64_t off_line = (off_info + ((int64_t)(ds.info.len)));
+    int64_t off_shdrs = (off_line + ((int64_t)(ds.line_.len)));
+    int32_t i = 0;
+    while ((i < shstrtab.len)) {
+    push_u8(elf_buf, get_u8(shstrtab, i));
+    i = (i + 1);
+    }
+    i = 0;
+    while ((i < ds.abbrev.len)) {
+    push_u8(elf_buf, get_u8(ds.abbrev, i));
+    i = (i + 1);
+    }
+    i = 0;
+    while ((i < ds.info.len)) {
+    push_u8(elf_buf, get_u8(ds.info, i));
+    i = (i + 1);
+    }
+    i = 0;
+    while ((i < ds.line_.len)) {
+    push_u8(elf_buf, get_u8(ds.line_, i));
+    i = (i + 1);
+    }
+    dw_shdr(elf_buf, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+    dw_shdr(elf_buf, nm_abbrev, 1, 0, 0, off_abbrev, ((int64_t)(ds.abbrev.len)), 0, 0, 1, 0);
+    dw_shdr(elf_buf, nm_info, 1, 0, 0, off_info, ((int64_t)(ds.info.len)), 0, 0, 1, 0);
+    dw_shdr(elf_buf, nm_line, 1, 0, 0, off_line, ((int64_t)(ds.line_.len)), 0, 0, 1, 0);
+    dw_shdr(elf_buf, nm_shstrtab, 3, 0, 0, off_shstrtab, ((int64_t)(shstrtab.len)), 0, 0, 1, 0);
+    int64_t sh = off_shdrs;
+    int32_t k = 0;
+    while ((k < 8)) {
+    int64_t b = (sh & 255);
+    set_u8(elf_buf, (40 + k), ((uint8_t)(b)));
+    sh = ((sh - b) / 256);
+    k = (k + 1);
+    }
+    set_u8(elf_buf, 58, ((uint8_t)(64)));
+    set_u8(elf_buf, 59, ((uint8_t)(0)));
+    set_u8(elf_buf, 60, ((uint8_t)(5)));
+    set_u8(elf_buf, 61, ((uint8_t)(0)));
+    set_u8(elf_buf, 62, ((uint8_t)(4)));
+    set_u8(elf_buf, 63, ((uint8_t)(0)));
+}
+static void fmt_ch(ArrayList_u8* out, int32_t c) {
+    push_u8(out, ((uint8_t)(c)));
+}
+static void fmt_app(ArrayList_u8* out, ZagSliceU8 s) {
+    int32_t i = 0;
+    while ((i < s.len)) {
+    push_u8(out, (s).ptr[i]);
+    i = (i + 1);
+    }
+}
+static void fmt_indent(ArrayList_u8* out, int32_t depth) {
+    int32_t i = 0;
+    while ((i < (depth * 4))) {
+    push_u8(out, 32);
+    i = (i + 1);
+    }
+}
+static void fmt_str_literal(ArrayList_u8* out, ZagSliceU8 text) {
+    fmt_ch(out, 34);
+    int32_t i = 0;
+    while ((i < text.len)) {
+    uint8_t c = (text).ptr[i];
+    if ((c == 92)) {
+    fmt_ch(out, 92);
+    fmt_ch(out, 92);
+    } else {
+    if ((c == 34)) {
+    fmt_ch(out, 92);
+    fmt_ch(out, 34);
+    } else {
+    push_u8(out, c);
+    }
+    }
+    i = (i + 1);
+    }
+    fmt_ch(out, 34);
+}
+static int32_t fmt_is_bin(Node* n) {
+    {
+    Node __sw = (*n);
+    switch (__sw.tag) {
+    case Node_bin:
+    {
+        __auto_type _ = __sw.u.bin;
+    return 1;
+        break;
+    }
+    default:
+    {
+    return 0;
+        break;
+    }
+    }
+    }
+}
+static void fmt_expr_parens(ArrayList_u8* out, Node* n, int32_t depth) {
+    if ((fmt_is_bin(n) == 1)) {
+    fmt_ch(out, 40);
+    fmt_expr(out, n, depth);
+    fmt_ch(out, 41);
+    } else {
+    fmt_expr(out, n, depth);
+    }
+}
+static void fmt_expr(ArrayList_u8* out, Node* n, int32_t depth) {
+    {
+    Node __sw = (*n);
+    switch (__sw.tag) {
+    case Node_ilit:
+    {
+        __auto_type x = __sw.u.ilit;
+    fmt_app(out, x.text);
+        break;
+    }
+    case Node_slit:
+    {
+        __auto_type x = __sw.u.slit;
+    fmt_str_literal(out, x.text);
+        break;
+    }
+    case Node_id:
+    {
+        __auto_type x = __sw.u.id;
+    fmt_app(out, x.name);
+        break;
+    }
+    case Node_bin:
+    {
+        __auto_type b = __sw.u.bin;
+    fmt_expr_parens(out, b.l, depth);
+    fmt_ch(out, 32);
+    fmt_app(out, b.op);
+    fmt_ch(out, 32);
+    fmt_expr_parens(out, b.r, depth);
+        break;
+    }
+    case Node_un:
+    {
+        __auto_type u = __sw.u.un;
+    if (_zag_str_eq(u.op, (ZagSliceU8){(const uint8_t*)"try", 3})) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"try ", 4});
+    fmt_expr(out, u.e, depth);
+    } else {
+    fmt_app(out, u.op);
+    fmt_expr(out, u.e, depth);
+    }
+        break;
+    }
+    case Node_call:
+    {
+        __auto_type c = __sw.u.call;
+    int32_t is_special = 0;
+    {
+    Node __sw = (*c.callee);
+    switch (__sw.tag) {
+    case Node_id:
+    {
+        __auto_type ci = __sw.u.id;
+    if ((_zag_str_eq(ci.name, (ZagSliceU8){(const uint8_t*)"__catch", 7}) == 1)) {
+    if ((len_pNode(c.args) >= 2)) {
+    is_special = 1;
+    fmt_expr_parens(out, get_pNode(c.args, 0), depth);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)" catch ", 7});
+    fmt_expr_parens(out, get_pNode(c.args, 1), depth);
+    }
+    } else {
+    if ((_zag_str_eq(ci.name, (ZagSliceU8){(const uint8_t*)"__catchc", 8}) == 1)) {
+    if ((len_pNode(c.args) >= 3)) {
+    is_special = 1;
+    fmt_expr_parens(out, get_pNode(c.args, 0), depth);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)" catch |", 8});
+    fmt_expr(out, get_pNode(c.args, 1), depth);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"| ", 2});
+    fmt_expr_parens(out, get_pNode(c.args, 2), depth);
+    }
+    }
+    }
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+    if ((is_special == 0)) {
+    fmt_expr(out, c.callee, depth);
+    if ((len__u8(c.targs) > 0)) {
+    fmt_ch(out, 91);
+    int32_t ti = 0;
+    while ((ti < len__u8(c.targs))) {
+    if ((ti > 0)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)", ", 2});
+    }
+    fmt_app(out, get__u8(c.targs, ti));
+    ti = (ti + 1);
+    }
+    fmt_ch(out, 93);
+    }
+    fmt_ch(out, 40);
+    int32_t i = 0;
+    while ((i < len_pNode(c.args))) {
+    if ((i > 0)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)", ", 2});
+    }
+    fmt_expr(out, get_pNode(c.args, i), depth);
+    i = (i + 1);
+    }
+    fmt_ch(out, 41);
+    }
+        break;
+    }
+    case Node_idx:
+    {
+        __auto_type x = __sw.u.idx;
+    fmt_expr(out, x.base, depth);
+    fmt_ch(out, 91);
+    fmt_expr(out, x.idx, depth);
+    fmt_ch(out, 93);
+        break;
+    }
+    case Node_fld:
+    {
+        __auto_type f = __sw.u.fld;
+    fmt_expr(out, f.base, depth);
+    fmt_ch(out, 46);
+    fmt_app(out, f.fname);
+        break;
+    }
+    case Node_slit_:
+    {
+        __auto_type s = __sw.u.slit_;
+    fmt_app(out, s.sname);
+    if ((len__u8(s.targs) > 0)) {
+    fmt_ch(out, 91);
+    int32_t ti = 0;
+    while ((ti < len__u8(s.targs))) {
+    if ((ti > 0)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)", ", 2});
+    }
+    fmt_app(out, get__u8(s.targs, ti));
+    ti = (ti + 1);
+    }
+    fmt_ch(out, 93);
+    }
+    fmt_ch(out, 123);
+    int32_t i = 0;
+    while ((i < len_FieldInit(s.fields))) {
+    FieldInit fi = get_FieldInit(s.fields, i);
+    if ((i == 0)) {
+    fmt_ch(out, 32);
+    } else {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)", ", 2});
+    }
+    fmt_ch(out, 46);
+    fmt_app(out, fi.name);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)" = ", 3});
+    fmt_expr(out, fi.val, depth);
+    i = (i + 1);
+    }
+    if ((len_FieldInit(s.fields) > 0)) {
+    fmt_ch(out, 32);
+    }
+    fmt_ch(out, 125);
+        break;
+    }
+    case Node_cast_:
+    {
+        __auto_type c = __sw.u.cast_;
+    fmt_expr_parens(out, c.expr, depth);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)" as ", 4});
+    fmt_app(out, c.target);
+        break;
+    }
+    case Node_slice_:
+    {
+        __auto_type s = __sw.u.slice_;
+    fmt_expr(out, s.base, depth);
+    fmt_ch(out, 91);
+    fmt_expr(out, s.lo, depth);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"..", 2});
+    if ((s.has_hi == 1)) {
+    fmt_expr(out, s.hi, depth);
+    }
+    fmt_ch(out, 93);
+        break;
+    }
+    case Node_switch_:
+    {
+        __auto_type sw = __sw.u.switch_;
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"switch (", 8});
+    fmt_expr(out, sw.subject, depth);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)") {\n", 4});
+    int32_t ai = 0;
+    while ((ai < len_SwitchArm(sw.arms))) {
+    SwitchArm arm = get_SwitchArm(sw.arms, ai);
+    fmt_indent(out, (depth + 1));
+    int32_t ti = 0;
+    while ((ti < len__u8(arm.tags))) {
+    if ((ti > 0)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)", ", 2});
+    }
+    fmt_ch(out, 46);
+    fmt_app(out, get__u8(arm.tags, ti));
+    ti = (ti + 1);
+    }
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)" => ", 4});
+    if ((arm.has_cap == 1)) {
+    fmt_ch(out, 124);
+    fmt_app(out, arm.cap);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"| ", 2});
+    }
+    if ((len_pNode(arm.body) == 1)) {
+    {
+    Node __sw = (*get_pNode(arm.body, 0));
+    switch (__sw.tag) {
+    case Node_estmt:
+    {
+        __auto_type es = __sw.u.estmt;
+    fmt_expr(out, es.expr, (depth + 1));
+    fmt_ch(out, 44);
+        break;
+    }
+    default:
+    {
+    fmt_block_body(out, arm.body, (depth + 1));
+        break;
+    }
+    }
+    }
+    } else {
+    fmt_block_body(out, arm.body, (depth + 1));
+    }
+    fmt_ch(out, 10);
+    ai = (ai + 1);
+    }
+    if ((sw.has_els == 1)) {
+    fmt_indent(out, (depth + 1));
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"else => ", 8});
+    fmt_block_body(out, sw.els_body, (depth + 1));
+    fmt_ch(out, 10);
+    }
+    fmt_indent(out, depth);
+    fmt_ch(out, 125);
+        break;
+    }
+    default:
+    {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"???", 3});
+        break;
+    }
+    }
+    }
+}
+static void fmt_block_body(ArrayList_u8* out, ArrayList_pNode body, int32_t depth) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"{\n", 2});
+    int32_t i = 0;
+    while ((i < len_pNode(body))) {
+    fmt_stmt(out, get_pNode(body, i), (depth + 1));
+    i = (i + 1);
+    }
+    fmt_indent(out, depth);
+    fmt_ch(out, 125);
+}
+static void fmt_stmt(ArrayList_u8* out, Node* n, int32_t depth) {
+    {
+    Node __sw = (*n);
+    switch (__sw.tag) {
+    case Node_let_:
+    {
+        __auto_type l = __sw.u.let_;
+    fmt_indent(out, depth);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"let ", 4});
+    fmt_app(out, l.name);
+    if ((l.has_dty == 1)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)": ", 2});
+    fmt_app(out, l.dty);
+    }
+    if ((l.has_init == 1)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)" = ", 3});
+    fmt_expr(out, l.expr, depth);
+    }
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)";\n", 2});
+        break;
+    }
+    case Node_ret:
+    {
+        __auto_type r = __sw.u.ret;
+    fmt_indent(out, depth);
+    if ((r.has_expr == 1)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"return ", 7});
+    fmt_expr(out, r.expr, depth);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)";\n", 2});
+    } else {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"return;\n", 8});
+    }
+        break;
+    }
+    case Node_if_:
+    {
+        __auto_type x = __sw.u.if_;
+    fmt_indent(out, depth);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"if (", 4});
+    fmt_expr(out, x.cond, depth);
+    fmt_ch(out, 41);
+    if ((x.has_cap == 1)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)" |", 2});
+    fmt_app(out, x.cap);
+    fmt_ch(out, 124);
+    }
+    fmt_ch(out, 32);
+    fmt_block_body(out, x.then_body, depth);
+    if ((x.has_els == 1)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)" else ", 6});
+    if ((len_pNode(x.els_body) == 1)) {
+    {
+    Node __sw = (*get_pNode(x.els_body, 0));
+    switch (__sw.tag) {
+    case Node_if_:
+    {
+        __auto_type _inner = __sw.u.if_;
+    fmt_stmt_inline(out, get_pNode(x.els_body, 0), depth);
+    return;
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+    }
+    fmt_block_body(out, x.els_body, depth);
+    }
+    fmt_ch(out, 10);
+        break;
+    }
+    case Node_while_:
+    {
+        __auto_type w = __sw.u.while_;
+    fmt_indent(out, depth);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"while (", 7});
+    fmt_expr(out, w.cond, depth);
+    fmt_ch(out, 41);
+    if ((w.has_cap == 1)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)" |", 2});
+    fmt_app(out, w.cap);
+    fmt_ch(out, 124);
+    }
+    fmt_ch(out, 32);
+    fmt_block_body(out, w.body, depth);
+    fmt_ch(out, 10);
+        break;
+    }
+    case Node_assign:
+    {
+        __auto_type a = __sw.u.assign;
+    fmt_indent(out, depth);
+    fmt_expr(out, a.target, depth);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)" = ", 3});
+    fmt_expr(out, a.expr, depth);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)";\n", 2});
+        break;
+    }
+    case Node_estmt:
+    {
+        __auto_type e = __sw.u.estmt;
+    fmt_indent(out, depth);
+    fmt_expr(out, e.expr, depth);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)";\n", 2});
+        break;
+    }
+    case Node_switch_:
+    {
+        __auto_type sw = __sw.u.switch_;
+    fmt_indent(out, depth);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"switch (", 8});
+    fmt_expr(out, sw.subject, depth);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)") {\n", 4});
+    int32_t ai = 0;
+    while ((ai < len_SwitchArm(sw.arms))) {
+    SwitchArm arm = get_SwitchArm(sw.arms, ai);
+    fmt_indent(out, (depth + 1));
+    int32_t ti = 0;
+    while ((ti < len__u8(arm.tags))) {
+    if ((ti > 0)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)", ", 2});
+    }
+    fmt_ch(out, 46);
+    fmt_app(out, get__u8(arm.tags, ti));
+    ti = (ti + 1);
+    }
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)" => ", 4});
+    if ((arm.has_cap == 1)) {
+    fmt_ch(out, 124);
+    fmt_app(out, arm.cap);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"| ", 2});
+    }
+    fmt_block_body(out, arm.body, (depth + 1));
+    fmt_ch(out, 10);
+    ai = (ai + 1);
+    }
+    if ((sw.has_els == 1)) {
+    fmt_indent(out, (depth + 1));
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"else => ", 8});
+    fmt_block_body(out, sw.els_body, (depth + 1));
+    fmt_ch(out, 10);
+    }
+    fmt_indent(out, depth);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+        break;
+    }
+    default:
+    {
+    fmt_indent(out, depth);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"/* unsupported stmt */\n", 23});
+        break;
+    }
+    }
+    }
+}
+static void fmt_stmt_inline(ArrayList_u8* out, Node* n, int32_t depth) {
+    {
+    Node __sw = (*n);
+    switch (__sw.tag) {
+    case Node_if_:
+    {
+        __auto_type x = __sw.u.if_;
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"if (", 4});
+    fmt_expr(out, x.cond, depth);
+    fmt_ch(out, 41);
+    if ((x.has_cap == 1)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)" |", 2});
+    fmt_app(out, x.cap);
+    fmt_ch(out, 124);
+    }
+    fmt_ch(out, 32);
+    fmt_block_body(out, x.then_body, depth);
+    if ((x.has_els == 1)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)" else ", 6});
+    if ((len_pNode(x.els_body) == 1)) {
+    {
+    Node __sw = (*get_pNode(x.els_body, 0));
+    switch (__sw.tag) {
+    case Node_if_:
+    {
+        __auto_type _inner = __sw.u.if_;
+    fmt_stmt_inline(out, get_pNode(x.els_body, 0), depth);
+    return;
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+    }
+    fmt_block_body(out, x.els_body, depth);
+    }
+    fmt_ch(out, 10);
+        break;
+    }
+    default:
+    {
+    fmt_stmt(out, n, depth);
+        break;
+    }
+    }
+    }
+}
+static void fmt_decl(ArrayList_u8* out, Node* n) {
+    {
+    Node __sw = (*n);
+    switch (__sw.tag) {
+    case Node_fn_decl:
+    {
+        __auto_type f = __sw.u.fn_decl;
+    int32_t is_op = 0;
+    if ((f.name.len >= 5)) {
+    if (((((((f.name).ptr[0] == 95) && ((f.name).ptr[1] == 95)) && ((f.name).ptr[2] == 111)) && ((f.name).ptr[3] == 112)) && ((f.name).ptr[4] == 95))) {
+    is_op = 1;
+    }
+    }
+    int32_t is_iface = 0;
+    if ((f.name.len >= 8)) {
+    if ((((((((((f.name).ptr[0] == 95) && ((f.name).ptr[1] == 95)) && ((f.name).ptr[2] == 105)) && ((f.name).ptr[3] == 102)) && ((f.name).ptr[4] == 97)) && ((f.name).ptr[5] == 99)) && ((f.name).ptr[6] == 101)) && ((f.name).ptr[7] == 95))) {
+    is_iface = 1;
+    }
+    }
+    if ((is_op == 1)) {
+    ZagSliceU8 tname = (ZagSliceU8){ (f.name).ptr + (5), (f.name.len) - (5) };
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"operator ", 9});
+    fmt_app(out, tname);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)" {\n", 3});
+    int32_t i = 0;
+    while ((i < len_Param(f.params))) {
+    Param p = get_Param(f.params, i);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"    ", 4});
+    fmt_app(out, p.name);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)" => ", 4});
+    fmt_app(out, p.pty);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)",\n", 2});
+    i = (i + 1);
+    }
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    } else {
+    if ((is_iface == 1)) {
+    ZagSliceU8 iname = (ZagSliceU8){ (f.name).ptr + (8), (f.name.len) - (8) };
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"interface ", 10});
+    fmt_app(out, iname);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)" {\n", 3});
+    int32_t i = 0;
+    while ((i < len_Param(f.params))) {
+    Param mp = get_Param(f.params, i);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"    fn ", 7});
+    fmt_app(out, mp.name);
+    fmt_ch(out, 40);
+    ZagSliceU8 ptys = mp.eff;
+    int32_t pcount = 0;
+    int32_t pstart = 0;
+    int32_t go = 1;
+    while (((go == 1) && (pstart <= ptys.len))) {
+    int32_t ci = pstart;
+    int32_t found = 0;
+    while (((ci < ptys.len) && (found == 0))) {
+    if (((ptys).ptr[ci] == 44)) {
+    found = 1;
+    } else {
+    ci = (ci + 1);
+    }
+    }
+    ZagSliceU8 seg = (ZagSliceU8){(const uint8_t*)"", 0};
+    if ((found == 1)) {
+    seg = (ZagSliceU8){ (ptys).ptr + (pstart), (ci) - (pstart) };
+    } else {
+    if ((pstart < ptys.len)) {
+    seg = (ZagSliceU8){ (ptys).ptr + (pstart), (ptys.len) - (pstart) };
+    }
+    go = 0;
+    }
+    if ((seg.len > 0)) {
+    if ((pcount > 0)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)", ", 2});
+    }
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"p", 1});
+    fmt_app(out, _zag_i64_to_str(((int64_t)(pcount))));
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)": ", 2});
+    fmt_app(out, seg);
+    pcount = (pcount + 1);
+    }
+    if ((found == 1)) {
+    pstart = (ci + 1);
+    } else {
+    go = 0;
+    }
+    }
+    fmt_ch(out, 41);
+    fmt_ch(out, 32);
+    fmt_app(out, mp.pty);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)";\n", 2});
+    i = (i + 1);
+    }
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+    } else {
+    if ((f.is_pub == 1)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"pub ", 4});
+    }
+    if ((f.is_extern == 1)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"extern ", 7});
+    }
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"fn ", 3});
+    fmt_app(out, f.name);
+    if ((len__u8(f.tparams) > 0)) {
+    fmt_ch(out, 91);
+    int32_t ti = 0;
+    while ((ti < len__u8(f.tparams))) {
+    if ((ti > 0)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)", ", 2});
+    }
+    fmt_app(out, get__u8(f.tparams, ti));
+    ti = (ti + 1);
+    }
+    fmt_ch(out, 93);
+    }
+    fmt_ch(out, 40);
+    int32_t i = 0;
+    while ((i < len_Param(f.params))) {
+    if ((i > 0)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)", ", 2});
+    }
+    Param p = get_Param(f.params, i);
+    fmt_app(out, p.name);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)": ", 2});
+    fmt_app(out, p.pty);
+    i = (i + 1);
+    }
+    fmt_ch(out, 41);
+    fmt_ch(out, 32);
+    fmt_app(out, f.ret);
+    int32_t ai = 0;
+    while ((ai < len__u8(f.annots))) {
+    fmt_ch(out, 32);
+    fmt_app(out, get__u8(f.annots, ai));
+    ai = (ai + 1);
+    }
+    if ((f.is_extern == 1)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)";\n", 2});
+    } else {
+    fmt_ch(out, 32);
+    fmt_block_body(out, f.body, 0);
+    fmt_ch(out, 10);
+    }
+    }
+    }
+        break;
+    }
+    case Node_struct_:
+    {
+        __auto_type s = __sw.u.struct_;
+    if ((s.is_pub == 1)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"pub ", 4});
+    }
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"struct ", 7});
+    fmt_app(out, s.name);
+    if ((len__u8(s.tparams) > 0)) {
+    fmt_ch(out, 91);
+    int32_t ti = 0;
+    while ((ti < len__u8(s.tparams))) {
+    if ((ti > 0)) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)", ", 2});
+    }
+    fmt_app(out, get__u8(s.tparams, ti));
+    ti = (ti + 1);
+    }
+    fmt_ch(out, 93);
+    }
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)" {\n", 3});
+    int32_t i = 0;
+    while ((i < len_Param(s.fields))) {
+    Param p = get_Param(s.fields, i);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"    ", 4});
+    fmt_app(out, p.name);
+    if ((!_zag_str_eq(p.pty, (ZagSliceU8){(const uint8_t*)"void", 4}))) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)": ", 2});
+    fmt_app(out, p.pty);
+    }
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)",\n", 2});
+    i = (i + 1);
+    }
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+        break;
+    }
+    case Node_union_:
+    {
+        __auto_type u = __sw.u.union_;
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"union ", 6});
+    fmt_app(out, u.name);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)" {\n", 3});
+    int32_t i = 0;
+    while ((i < len_Param(u.fields))) {
+    Param p = get_Param(u.fields, i);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"    ", 4});
+    fmt_app(out, p.name);
+    if ((!_zag_str_eq(p.pty, (ZagSliceU8){(const uint8_t*)"void", 4}))) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)": ", 2});
+    fmt_app(out, p.pty);
+    }
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)",\n", 2});
+    i = (i + 1);
+    }
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+        break;
+    }
+    case Node_enum_:
+    {
+        __auto_type e = __sw.u.enum_;
+    if (_zag_str_eq(e.name, (ZagSliceU8){(const uint8_t*)"__zag_errors", 12})) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"error {\n", 8});
+    } else {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"enum ", 5});
+    fmt_app(out, e.name);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)" {\n", 3});
+    }
+    int32_t i = 0;
+    while ((i < len__u8(e.members))) {
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"    ", 4});
+    fmt_app(out, get__u8(e.members, i));
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)",\n", 2});
+    i = (i + 1);
+    }
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"}\n", 2});
+        break;
+    }
+    case Node_link_dir:
+    {
+        __auto_type ld = __sw.u.link_dir;
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"@link(\"", 7});
+    fmt_app(out, ld.lib);
+    fmt_app(out, (ZagSliceU8){(const uint8_t*)"\");\n", 4});
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+}
+static FmtFile fmt_scan_file(ZagSliceU8 src) {
+    ArrayList_Token toks = lex(src);
+    Parser p = (Parser){ .toks = toks, .i = 0, .closures = make_pNode(2), .cctr = 0, .fn_eff = (ZagSliceU8){(const uint8_t*)"", 0} };
+    ArrayList__u8 headers = make__u8(8);
+    ArrayList_pNode decls = make_pNode(16);
+    while ((!at_k((&p), Tk_Eof))) {
+    if ((at_k((&p), Tk_Annot) && _zag_str_eq(cur((&p)).val, (ZagSliceU8){(const uint8_t*)"@import", 7}))) {
+    Token _imp = adv((&p));
+    Token _lp = adv((&p));
+    Token pathtok = adv((&p));
+    Token _rp = adv((&p));
+    ZagSliceU8 hdr = _zag_str_concat((ZagSliceU8){(const uint8_t*)"@import(", 8}, _zag_str_concat(pathtok.val, (ZagSliceU8){(const uint8_t*)")", 1}));
+    if ((at_k((&p), Tk_Ident) && _zag_str_eq(cur((&p)).val, (ZagSliceU8){(const uint8_t*)"as", 2}))) {
+    Token _as = adv((&p));
+    ZagSliceU8 alias = adv((&p)).val;
+    hdr = _zag_str_concat(hdr, _zag_str_concat((ZagSliceU8){(const uint8_t*)" as ", 4}, alias));
+    }
+    push__u8((&headers), hdr);
+    } else {
+    if ((at_k((&p), Tk_Annot) && _zag_str_eq(cur((&p)).val, (ZagSliceU8){(const uint8_t*)"@link", 5}))) {
+    Token _lnk = adv((&p));
+    Token _lp = adv((&p));
+    Token libtok = adv((&p));
+    Token _rp = adv((&p));
+    eat_semi((&p));
+    push__u8((&headers), _zag_str_concat((ZagSliceU8){(const uint8_t*)"@link(", 6}, _zag_str_concat(libtok.val, (ZagSliceU8){(const uint8_t*)")", 1})));
+    } else {
+    if (at_k((&p), Tk_KwPub)) {
+    Token _pub = adv((&p));
+    if (at_k((&p), Tk_KwStruct)) {
+    push_pNode((&decls), parse_struct((&p), 1));
+    } else {
+    if (at_k((&p), Tk_KwUnion)) {
+    push_pNode((&decls), parse_union((&p)));
+    } else {
+    if (at_k((&p), Tk_KwEnum)) {
+    push_pNode((&decls), parse_enum((&p)));
+    } else {
+    push_pNode((&decls), parse_fn((&p), 1));
+    }
+    }
+    }
+    } else {
+    if (at_k((&p), Tk_KwStruct)) {
+    push_pNode((&decls), parse_struct((&p), 0));
+    } else {
+    if (at_k((&p), Tk_KwUnion)) {
+    push_pNode((&decls), parse_union((&p)));
+    } else {
+    if (at_k((&p), Tk_KwEnum)) {
+    push_pNode((&decls), parse_enum((&p)));
+    } else {
+    if (at_k((&p), Tk_KwError)) {
+    push_pNode((&decls), parse_error_decl((&p)));
+    } else {
+    if ((at_k((&p), Tk_Ident) && _zag_str_eq(cur((&p)).val, (ZagSliceU8){(const uint8_t*)"operator", 8}))) {
+    push_pNode((&decls), parse_operator((&p)));
+    } else {
+    if ((at_k((&p), Tk_Ident) && _zag_str_eq(cur((&p)).val, (ZagSliceU8){(const uint8_t*)"interface", 9}))) {
+    push_pNode((&decls), parse_interface((&p)));
+    } else {
+    if ((((at_k((&p), Tk_Annot) || at_k((&p), Tk_Ident)) || at_k((&p), Tk_KwExtern)) || at_k((&p), Tk_KwFn))) {
+    push_pNode((&decls), parse_fn((&p), 0));
+    } else {
+    Token _tok = adv((&p));
+    }
+    }
+    }
+    }
+    }
+    }
+    }
+    }
+    }
+    }
+    }
+    int32_t ci = 0;
+    while ((ci < len_pNode(p.closures))) {
+    push_pNode((&decls), get_pNode(p.closures, ci));
+    ci = (ci + 1);
+    }
+    return (FmtFile){ .headers = headers, .decls = decls };
+}
+static ArrayList_u8 fmt_program(ZagSliceU8 src) {
+    FmtFile ff = fmt_scan_file(src);
+    ArrayList_u8 out = make_u8((src.len + 64));
+    int32_t hi = 0;
+    while ((hi < len__u8(ff.headers))) {
+    fmt_app((&out), get__u8(ff.headers, hi));
+    fmt_ch((&out), 10);
+    hi = (hi + 1);
+    }
+    if (((len__u8(ff.headers) > 0) && (len_pNode(ff.decls) > 0))) {
+    fmt_ch((&out), 10);
+    }
+    int32_t di = 0;
+    while ((di < len_pNode(ff.decls))) {
+    if ((di > 0)) {
+    fmt_ch((&out), 10);
+    }
+    fmt_decl((&out), get_pNode(ff.decls, di));
+    di = (di + 1);
+    }
+    return out;
+}
+static ZagSliceU8 zag_version(void) {
+    return (ZagSliceU8){(const uint8_t*)"2026.06.0-dev", 13};
+}
+static ZagSliceU8 zag_edition(void) {
+    return (ZagSliceU8){(const uint8_t*)"2026", 4};
+}
 static ZagSliceU8 lo_env_get(ArrayList_LoEnv env, ZagSliceU8 name) {
     int32_t i = 0;
     while ((i < len_LoEnv(env))) {
@@ -18837,11 +20448,82 @@ static ZagSliceU8 default_out(ZagSliceU8 path) {
     }
     return _zag_str_concat(path, (ZagSliceU8){(const uint8_t*)".out", 4});
 }
+static int32_t znc_fmt(ZagSliceU8 fpath, int32_t in_place) {
+    if ((fpath.len == 0)) {
+    _zag_println((ZagSliceU8){(const uint8_t*)"znc fmt: no source file", 23});
+    return 1;
+    }
+    ZagSliceU8 src = _zag_read_file(fpath);
+    if ((src.len < 0)) {
+    _zag_print((ZagSliceU8){(const uint8_t*)"znc fmt: cannot read ", 21});
+    _zag_println(fpath);
+    return 1;
+    }
+    ArrayList_u8 formatted = fmt_program(src);
+    if ((in_place == 1)) {
+    int32_t wrc = _zag_write_file(fpath, (ZagSliceU8){ (formatted.data) + (0), (formatted.len) - (0) });
+    if ((wrc != 0)) {
+    _zag_println((ZagSliceU8){(const uint8_t*)"znc fmt: write failed", 21});
+    return 1;
+    }
+    _zag_print((ZagSliceU8){(const uint8_t*)"znc fmt: formatted ", 19});
+    _zag_println(fpath);
+    } else {
+    _zag_print((ZagSliceU8){ (formatted.data) + (0), (formatted.len) - (0) });
+    }
+    return 0;
+}
+static int32_t znc_init(void) {
+    ZagSliceU8 modpath = (ZagSliceU8){(const uint8_t*)"zag.mod", 7};
+    if ((_zag_file_exists(modpath) != 0)) {
+    _zag_println((ZagSliceU8){(const uint8_t*)"znc init: zag.mod already exists", 32});
+    return 1;
+    }
+    ZagSliceU8 content = (ZagSliceU8){(const uint8_t*)"name = \"myproject\"\nversion = \"2026.06.0-dev\"\nedition = \"2026\"\n", 62};
+    int32_t wrc = _zag_write_file(modpath, content);
+    if ((wrc != 0)) {
+    _zag_println((ZagSliceU8){(const uint8_t*)"znc init: failed to write zag.mod", 33});
+    return 1;
+    }
+    _zag_println((ZagSliceU8){(const uint8_t*)"znc init: created zag.mod", 25});
+    return 0;
+}
 int main(void) {
     if ((_zag_argc() < 2)) {
-    _zag_println((ZagSliceU8){(const uint8_t*)"usage: znc <source.zag> [-o out] [-l lib] [-L path] [--run]", 59});
+    _zag_println((ZagSliceU8){(const uint8_t*)"usage: znc <source.zag> [-o out] [-l lib] [-L path] [--run] [--debug]", 69});
+    _zag_println((ZagSliceU8){(const uint8_t*)"       znc fmt [--in-place] <source.zag>", 40});
+    _zag_println((ZagSliceU8){(const uint8_t*)"       znc init", 15});
+    _zag_println((ZagSliceU8){(const uint8_t*)"       znc version", 18});
     _zag_println((ZagSliceU8){(const uint8_t*)"  compiles Zag to a native x86-64 ELF — no cc/as/ld/libc", 58});
     return 1;
+    }
+    ZagSliceU8 cmd = _zag_arg(1);
+    if (((_zag_str_eq(cmd, (ZagSliceU8){(const uint8_t*)"version", 7}) || _zag_str_eq(cmd, (ZagSliceU8){(const uint8_t*)"--version", 9})) || _zag_str_eq(cmd, (ZagSliceU8){(const uint8_t*)"-v", 2}))) {
+    _zag_print((ZagSliceU8){(const uint8_t*)"znc ", 4});
+    _zag_print(zag_version());
+    _zag_print((ZagSliceU8){(const uint8_t*)" (edition ", 10});
+    _zag_print(zag_edition());
+    _zag_println((ZagSliceU8){(const uint8_t*)")", 1});
+    return 0;
+    }
+    if (_zag_str_eq(cmd, (ZagSliceU8){(const uint8_t*)"fmt", 3})) {
+    int32_t in_place = has_flag((ZagSliceU8){(const uint8_t*)"--in-place", 10});
+    ZagSliceU8 fpath = (ZagSliceU8){(const uint8_t*)"", 0};
+    int32_t fi = 2;
+    int32_t finding = 1;
+    while (((finding == 1) && (fi < _zag_argc()))) {
+    ZagSliceU8 arg = _zag_arg(fi);
+    if (((arg.len > 0) && ((arg).ptr[0] != 45))) {
+    fpath = arg;
+    finding = 0;
+    } else {
+    fi = (fi + 1);
+    }
+    }
+    return znc_fmt(fpath, in_place);
+    }
+    if (_zag_str_eq(cmd, (ZagSliceU8){(const uint8_t*)"init", 4})) {
+    return znc_init();
     }
     ZagSliceU8 path = src_arg();
     if ((path.len == 0)) {
@@ -18857,7 +20539,7 @@ int main(void) {
     ArrayList_pNode decls = parse_program_dir(src, dir_of(path));
     lo_operators(decls);
     map__StringMap_i32 eff = analyze(decls);
-    int32_t viols = report_violations(decls, eff);
+    int32_t viols = report_violations(decls, eff, src, path);
     if ((viols > 0)) {
     _zag_println((ZagSliceU8){(const uint8_t*)"znc: capability check FAILED", 28});
     return 1;
@@ -18887,6 +20569,44 @@ int main(void) {
     out = default_out(path);
     }
     int32_t rc = write_elf_exec_data_lib(out, code, 0, data, ml.text);
+    if (((rc == 0) && (has_flag((ZagSliceU8){(const uint8_t*)"--debug", 7}) == 1))) {
+    ZagSliceU8 elf_bytes = _zag_read_file(out);
+    if ((elf_bytes.len > 0)) {
+    ArrayList_u8 elf_buf = make_u8((elf_bytes.len + 512));
+    int32_t ci = 0;
+    while ((ci < elf_bytes.len)) {
+    push_u8((&elf_buf), (elf_bytes).ptr[ci]);
+    ci = (ci + 1);
+    }
+    DwarfBuilder dbuilder = dwarf_new(path);
+    dwarf_build_abbrev((&dbuilder));
+    dwarf_emit_compile_unit((&dbuilder));
+    int32_t di = 0;
+    while ((di < len_pNode(code_decls))) {
+    {
+    Node __sw = (*get_pNode(code_decls, di));
+    switch (__sw.tag) {
+    case Node_fn_decl:
+    {
+        __auto_type f = __sw.u.fn_decl;
+    dwarf_emit_function((&dbuilder), f.name, f.line);
+        break;
+    }
+    default:
+    {
+        break;
+    }
+    }
+    }
+    di = (di + 1);
+    }
+    dwarf_finish((&dbuilder));
+    dwarf_emit_line_program((&dbuilder));
+    DwarfSections sections = dwarf_build((&dbuilder));
+    dwarf_patch_elf((&elf_buf), sections);
+    rc = _zag_write_file(out, (ZagSliceU8){ (elf_buf.data) + (0), (elf_buf.len) - (0) });
+    }
+    }
     if ((rc != 0)) {
     _zag_println((ZagSliceU8){(const uint8_t*)"znc: failed to write executable", 31});
     return 1;
