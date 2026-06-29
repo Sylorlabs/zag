@@ -12,12 +12,15 @@
 // binary is statically linked, has no interpreter, and exits via a raw syscall.
 
 @import("x86.zag")        // encode(ArrayList[Instr]) -> ArrayList[u8]
-@import("elf.zag")        // write_elf_exec_data(path, code, entry_off, data) -> i32
+@import("elf.zag")        // write_elf_exec_data / write_elf_exec_data_lib
 @import("regalloc.zag")   // regalloc(ArrayList[Instr]) -> ArrayList[Instr] (register promotion)
 @import("optimize.zag")   // optimize(ArrayList[Instr]) -> ArrayList[Instr] (fold/stack-elim/DCE)
 @import("peephole.zag")   // peephole(ArrayList[Instr]) -> ArrayList[Instr] (optimizer)
 @import("ncodegen.zag")   // lower_program(decls, *errcount, *databuf) -> ArrayList[Instr]
 @import("../sema.zag")    // analyze(decls)->eff  report_violations(decls,eff)->i32
+@import("ar.zag")         // ar_symbol_table, ar_entry_data (GNU ar reader)
+@import("elf_obj.zag")    // elf_obj_parse, merge_obj, apply_relocs, MergedLib
+@import("zagmod.zag")     // zagmod_parse, ZagMod (zag.mod manifest reader)
 
 // ── operator-contract lowering (pre-sema) ────────────────────────────────────
 // Rewrites binary ops on user types to their decode fn calls BEFORE sema runs,
@@ -33,9 +36,31 @@ fn lo_env_get(env: ArrayList[LoEnv], name: []u8) []u8 {
     }
     return "";
 }
-fn lo_id_ty(n: *Node, env: ArrayList[LoEnv]) []u8 {
+fn lo_id_ty(n: *Node, env: ArrayList[LoEnv], dl: ArrayList[*Node]) []u8 {
     switch (n.*) {
-        .id => |x| { return lo_env_get(env, x.name); }
+        .id  => |x| { return lo_env_get(env, x.name); }
+        .fld => |f| {
+            let base_ty: []u8 = lo_id_ty(f.base, env, dl);
+            if (base_ty.len == 0) { return ""; }
+            let si: i32 = 0;
+            while (si < len[*Node](dl)) {
+                switch (get[*Node](dl, si).*) {
+                    .struct_ => |s| {
+                        if (@strEq(s.name, base_ty)) {
+                            let fi: i32 = 0;
+                            while (fi < len[Param](s.fields)) {
+                                let fp: Param = get[Param](s.fields, fi);
+                                if (@strEq(fp.name, f.fname)) { return fp.pty; }
+                                fi = fi + 1;
+                            }
+                        }
+                    }
+                    else => { }
+                }
+                si = si + 1;
+            }
+            return "";
+        }
         else => { return ""; }
     }
 }
@@ -51,7 +76,7 @@ fn lo_expr(n: *Node, env: ArrayList[LoEnv], dl: ArrayList[*Node]) void {
             lo_expr(b.l, env, dl);
             lo_expr(b.r, env, dl);
             if (@strEq(b.op, "+") || @strEq(b.op, "-") || @strEq(b.op, "*") || @strEq(b.op, "/")) {
-                let lt: []u8 = lo_id_ty(b.l, env);
+                let lt: []u8 = lo_id_ty(b.l, env, dl);
                 if (lt.len > 0) {
                     let decode: []u8 = op_contract_fn(dl, lt, b.op);
                     if (decode.len > 0) {
@@ -135,6 +160,188 @@ fn lo_operators(decls: ArrayList[*Node]) void {
     }
 }
 
+// ── library linking helpers ───────────────────────────────────────────────────
+
+// Walk `decls`, collect any `.link_dir` node's `.lib` name into `link_libs`,
+// and return a new list with all `.link_dir` nodes removed.
+// ncodegen.zag's pass-1 switch would abort on unknown top-level nodes, so we
+// must filter them out before calling lower_program.
+fn znc_collect_links(decls: ArrayList[*Node], link_libs: *ArrayList[[]u8]) ArrayList[*Node] {
+    let filtered: ArrayList[*Node] = make[*Node](len[*Node](decls));
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        let n: *Node = get[*Node](decls, i);
+        switch (n.*) {
+            .link_dir => |ld| { push[[]u8](link_libs, ld.lib); }
+            else => { push[*Node](&filtered, n); }
+        }
+        i = i + 1;
+    }
+    return filtered;
+}
+
+// Append any `-lNAME` or `-l NAME` library names from argv into `link_libs`.
+fn znc_argv_links(link_libs: *ArrayList[[]u8]) void {
+    let i: i32 = 1;
+    while (i < _zag_argc()) {
+        let a: []u8 = _zag_arg(i);
+        if (a.len > 2) {
+            // "-lNAME" form
+            if ((a[0] as i32) == 45 && (a[1] as i32) == 108) {
+                push[[]u8](link_libs, a[2..a.len]);
+            }
+        }
+        if (@strEq(a, "-l")) {
+            if (i + 1 < _zag_argc()) {
+                push[[]u8](link_libs, _zag_arg(i + 1));
+                i = i + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// Append any `-LPATH` or `-L PATH` search directories from argv into `lib_paths`.
+fn znc_argv_paths(lib_paths: *ArrayList[[]u8]) void {
+    let i: i32 = 1;
+    while (i < _zag_argc()) {
+        let a: []u8 = _zag_arg(i);
+        if (a.len > 2) {
+            // "-LPATH" form
+            if ((a[0] as i32) == 45 && (a[1] as i32) == 76) {
+                push[[]u8](lib_paths, a[2..a.len]);
+            }
+        }
+        if (@strEq(a, "-L")) {
+            if (i + 1 < _zag_argc()) {
+                push[[]u8](lib_paths, _zag_arg(i + 1));
+                i = i + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// Read a `zag.mod` from `dir` and add any `link` and `path` fields from
+// [deps] into `link_libs` and `lib_paths` respectively.
+fn znc_load_zagmod(dir: []u8, link_libs: *ArrayList[[]u8], lib_paths: *ArrayList[[]u8]) void {
+    let modpath: []u8 = join_path(dir, "zag.mod");
+    if (_zag_file_exists(modpath) == 0) { return; }
+    let src: []u8 = _zag_read_file(modpath);
+    if (src.len < 0) { return; }
+    let mod_: ZagMod = zagmod_parse(src);
+    let i: i32 = 0;
+    while (i < len[ZagDep](mod_.deps)) {
+        let dep: ZagDep = get[ZagDep](mod_.deps, i);
+        if (dep.link.len > 0) { push[[]u8](link_libs, dep.link); }
+        if (dep.path.len > 0) { push[[]u8](lib_paths, dep.path); }
+        i = i + 1;
+    }
+}
+
+// Scan the filtered decls list for `extern fn` declarations and return their names.
+// These are the symbols we need to pull in from static libraries.
+fn collect_extern_syms(decls: ArrayList[*Node]) ArrayList[[]u8] {
+    let syms: ArrayList[[]u8] = make[[]u8](8);
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .fn_decl => |f| {
+                if (f.is_extern == 1) { push[[]u8](&syms, f.name); }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return syms;
+}
+
+// Search for `lib{libname}.a` in the user-supplied paths then in standard
+// system library directories.  Returns the full path on success, "" on failure.
+fn find_library(libname: []u8, paths: ArrayList[[]u8]) []u8 {
+    let fname: []u8 = _zag_str_concat("lib", _zag_str_concat(libname, ".a"));
+    let i: i32 = 0;
+    while (i < len[[]u8](paths)) {
+        let full: []u8 = join_path(get[[]u8](paths, i), fname);
+        if (_zag_file_exists(full) != 0) { return full; }
+        i = i + 1;
+    }
+    // Fallback: standard Linux multiarch and legacy paths.
+    let syspaths: ArrayList[[]u8] = make[[]u8](4);
+    push[[]u8](&syspaths, "/usr/lib/x86_64-linux-gnu");
+    push[[]u8](&syspaths, "/usr/lib");
+    push[[]u8](&syspaths, "/lib/x86_64-linux-gnu");
+    push[[]u8](&syspaths, "/lib");
+    let j: i32 = 0;
+    while (j < len[[]u8](syspaths)) {
+        let full: []u8 = join_path(get[[]u8](syspaths, j), fname);
+        if (_zag_file_exists(full) != 0) { return full; }
+        j = j + 1;
+    }
+    return "";
+}
+
+// For each library in `libs`, find it, parse it as a GNU ar archive,
+// and merge the object-file members that define symbols in `needed_syms`
+// into a single MergedLib.  Then apply intra-library relocations.
+//
+// `text_base` — the virtual address where the merged library code will be
+// placed (immediately after the main program code in the ELF text segment).
+fn link_libraries(libs: ArrayList[[]u8], paths: ArrayList[[]u8], needed_syms: ArrayList[[]u8], text_base: i64) MergedLib {
+    let ml: MergedLib = MergedLib{
+        .text      = make[u8](256),
+        .sym_addrs = make[SymAddr](8),
+        .relocs    = make[PendingReloc](16),
+        .text_base = text_base,
+    };
+
+    let i: i32 = 0;
+    while (i < len[[]u8](libs)) {
+        let libname: []u8 = get[[]u8](libs, i);
+        let libpath: []u8 = find_library(libname, paths);
+        if (libpath.len == 0) {
+            _zag_print("znc: error: @link library '");
+            _zag_print(libname);
+            _zag_println("' not found in search paths (set ZAG_LIB_PATH or place library adjacent to source)");
+            _zag_exit(1);
+        }
+        if (libpath.len > 0) {
+            let buf: []u8 = _zag_read_file(libpath);
+            if (buf.len > 0) {
+                // Parse the GNU symbol table so we can look up which archive
+                // member contains each needed symbol.
+                let ar_syms: ArrayList[ArSymbol] = ar_symbol_table(buf);
+                let ni: i32 = 0;
+                while (ni < len[[]u8](needed_syms)) {
+                    let sym: []u8 = get[[]u8](needed_syms, ni);
+                    let file_off: i64 = 0 - 1;
+                    let si2: i32 = 0;
+                    while (si2 < len[ArSymbol](ar_syms)) {
+                        let as_: ArSymbol = get[ArSymbol](ar_syms, si2);
+                        if (@strEq(as_.name, sym)) { file_off = as_.entry_offset; }
+                        si2 = si2 + 1;
+                    }
+                    if (file_off >= 0) {
+                        let obj_data: []u8 = ar_entry_data(buf, file_off);
+                        if (obj_data.len > 0) {
+                            let obj: ObjFile = elf_obj_parse(obj_data);
+                            merge_obj(&ml, obj, text_base);
+                        }
+                    }
+                    ni = ni + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    // Apply intra-library relocations now that all sym_addrs are known.
+    let empty_extern: ArrayList[SymAddr] = make[SymAddr](1);
+    apply_relocs(&ml, empty_extern);
+
+    return ml;
+}
+
 // Is `name` present anywhere in argv?
 fn has_flag(name: []u8) i32 {
     let i: i32 = 0;
@@ -185,7 +392,7 @@ fn default_out(path: []u8) []u8 {
 
 fn main() i32 {
     if (_zag_argc() < 2) {
-        _zag_println("usage: znc <source.zag> [-o out] [--run]");
+        _zag_println("usage: znc <source.zag> [-o out] [-l lib] [-L path] [--run]");
         _zag_println("  compiles Zag to a native x86-64 ELF — no cc/as/ld/libc");
         return 1;
     }
@@ -213,32 +420,55 @@ fn main() i32 {
         return 1;
     }
 
+    // Collect @link directives and strip them from decls before codegen.
+    // (ncodegen pass-1 aborts on unknown top-level node kinds.)
+    let link_libs: ArrayList[[]u8] = make[[]u8](4);
+    let lib_paths: ArrayList[[]u8] = make[[]u8](4);
+    let code_decls: ArrayList[*Node] = znc_collect_links(decls, &link_libs);
+
+    // Also accept -l/-L flags and zag.mod deps.
+    znc_argv_links(&link_libs);
+    znc_argv_paths(&lib_paths);
+    znc_load_zagmod(dir_of(path), &link_libs, &lib_paths);
+
+    // Collect `extern fn` names — the symbols we need from static libraries.
+    let extern_syms: ArrayList[[]u8] = collect_extern_syms(code_decls);
+
     let nerr: i32 = 0;
     let data: ArrayList[u8] = make[u8](16);
-    let prog:  ArrayList[Instr] = lower_program(decls, &nerr, &data);
+    let prog:  ArrayList[Instr] = lower_program(code_decls, &nerr, &data);
     if (nerr > 0) {
         _zag_println("znc: build aborted — unsupported constructs (see messages above)");
         return 1;
     }
-    // register promotion (keep eligible scalar locals in callee-saved regs),
-    // then the local optimizer (constant-stack elimination + folding + immediate
-    // form + dead-write removal), then peephole to clean up the residue (the
-    // now-adjacent push/pop, mov r,r and store-to-load pairs).
+    // register promotion, optimizer, peephole, encode
     let prog2: ArrayList[Instr] = regalloc(prog);
     let prog3: ArrayList[Instr] = optimize(prog2);
     let opt:   ArrayList[Instr] = peephole(prog3);
     let code:  ArrayList[u8]    = encode(opt);
 
+    // Static-link any requested libraries.
+    // Library code goes right after the main program code in the text segment,
+    // so text_base = VBASE() + HDRS2() + code.len.
+    let text_base_i64: i64 = (VBASE() + HDRS2() + code.len) as i64;
+    let ml: MergedLib = link_libraries(link_libs, lib_paths, extern_syms, text_base_i64);
+
     let out: []u8 = out_flag();
     if (out.len == 0) { out = default_out(path); }
 
-    let rc: i32 = write_elf_exec_data(out, code, 0, data);
+    let rc: i32 = write_elf_exec_data_lib(out, code, 0, data, ml.text);
     if (rc != 0) { _zag_println("znc: failed to write executable"); return 1; }
     _zag_print("znc: wrote native binary ");
     _zag_print(out);
     _zag_print(" (");
     _zag_print(_zag_i64_to_str(code.len as i64));
-    _zag_println(" bytes of machine code, 0 external tools)");
+    _zag_print(" bytes main");
+    if (ml.text.len > 0) {
+        _zag_print(" + ");
+        _zag_print(_zag_i64_to_str(ml.text.len as i64));
+        _zag_print(" bytes libs");
+    }
+    _zag_println(", 0 external tools)");
 
     if (has_flag("--run") == 1) {
         let runcmd: []u8 = out;

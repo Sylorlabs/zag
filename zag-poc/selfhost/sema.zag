@@ -191,22 +191,41 @@ fn nz_div_safe(r: *Node, nz: ArrayList[[]u8]) i32 {
     return 0;
 }
 // Extract nonzero var bindings from a condition into nz.
-//   Handles: v != 0,  0 != v,  c1 && c2 (recursively).
+//   Handles: v != 0, 0 != v, v > 0, 0 < v, v >= 1, 1 <= v, c1 && c2.
 fn extract_nz(cond: *Node, nz: *ArrayList[[]u8]) void {
     switch (cond.*) {
         .bin => |b| {
+            // v != 0  or  0 != v
             if (@strEq(b.op, "!=")) {
                 if (is_zero_lit(b.r) == 1) {
-                    switch (b.l.*) {
-                        .id => |x| { push[[]u8](nz, x.name); }
-                        else => { }
-                    }
+                    switch (b.l.*) { .id => |x| { push[[]u8](nz, x.name); } else => { } }
                 }
                 if (is_zero_lit(b.l) == 1) {
-                    switch (b.r.*) {
-                        .id => |x| { push[[]u8](nz, x.name); }
-                        else => { }
-                    }
+                    switch (b.r.*) { .id => |x| { push[[]u8](nz, x.name); } else => { } }
+                }
+            }
+            // v > 0  →  v nonzero
+            if (@strEq(b.op, ">")) {
+                if (is_zero_lit(b.r) == 1) {
+                    switch (b.l.*) { .id => |x| { push[[]u8](nz, x.name); } else => { } }
+                }
+            }
+            // 0 < v  →  v nonzero
+            if (@strEq(b.op, "<")) {
+                if (is_zero_lit(b.l) == 1) {
+                    switch (b.r.*) { .id => |x| { push[[]u8](nz, x.name); } else => { } }
+                }
+            }
+            // v >= 1  →  v nonzero
+            if (@strEq(b.op, ">=")) {
+                if (is_pos_lit(b.r) == 1) {
+                    switch (b.l.*) { .id => |x| { push[[]u8](nz, x.name); } else => { } }
+                }
+            }
+            // 1 <= v  →  v nonzero
+            if (@strEq(b.op, "<=")) {
+                if (is_pos_lit(b.l) == 1) {
+                    switch (b.r.*) { .id => |x| { push[[]u8](nz, x.name); } else => { } }
                 }
             }
             if (@strEq(b.op, "&&")) {
@@ -218,32 +237,38 @@ fn extract_nz(cond: *Node, nz: *ArrayList[[]u8]) void {
     }
 }
 // Count unguarded divisions in expr given nz. Returns > 0 if unsafe.
-fn total_unsafe_expr(n: *Node, nz: ArrayList[[]u8]) i32 {
+// `eff` is threaded through so that calls to functions with Panic bit set are
+// counted as unsafe (inter-procedural @total checking).
+fn total_unsafe_expr(n: *Node, nz: ArrayList[[]u8], eff: map.StringMap[i32]) i32 {
     switch (n.*) {
         .bin => |b| {
-            let sub: i32 = total_unsafe_expr(b.l, nz) + total_unsafe_expr(b.r, nz);
+            let sub: i32 = total_unsafe_expr(b.l, nz, eff) + total_unsafe_expr(b.r, nz, eff);
             if (@strEq(b.op, "/") || @strEq(b.op, "%")) {
                 if (nz_div_safe(b.r, nz) == 0) { return sub + 1; }
             }
             return sub;
         }
-        .un    => |u| { return total_unsafe_expr(u.e, nz); }
+        .un    => |u| { return total_unsafe_expr(u.e, nz, eff); }
         .call  => |c| {
             let acc: i32 = 0;
             let i: i32 = 0;
             while (i < len[*Node](c.args)) {
-                acc = acc + total_unsafe_expr(get[*Node](c.args, i), nz);
+                acc = acc + total_unsafe_expr(get[*Node](c.args, i), nz, eff);
                 i = i + 1;
             }
+            // If the callee has Panic bit in the effect map it is not proven safe.
+            let cn: []u8 = callee_name(c.callee);
+            if ((map.get[i32](eff, cn) orelse 0) & 2 != 0) { acc = acc + 1; }
             return acc;
         }
-        .idx   => |x| { return total_unsafe_expr(x.base, nz) + total_unsafe_expr(x.idx, nz); }
-        .fld   => |f| { return total_unsafe_expr(f.base, nz); }
+        .cast_ => |c| { return total_unsafe_expr(c.expr, nz, eff); }
+        .idx   => |x| { return total_unsafe_expr(x.base, nz, eff) + total_unsafe_expr(x.idx, nz, eff); }
+        .fld   => |f| { return total_unsafe_expr(f.base, nz, eff); }
         .slit_ => |s| {
             let acc: i32 = 0;
             let i: i32 = 0;
             while (i < len[FieldInit](s.fields)) {
-                acc = acc + total_unsafe_expr(get[FieldInit](s.fields, i).val, nz);
+                acc = acc + total_unsafe_expr(get[FieldInit](s.fields, i).val, nz, eff);
                 i = i + 1;
             }
             return acc;
@@ -251,60 +276,65 @@ fn total_unsafe_expr(n: *Node, nz: ArrayList[[]u8]) i32 {
         else   => { return 0; }
     }
 }
-fn total_unsafe_body(body: ArrayList[*Node], nz: *ArrayList[[]u8]) i32 {
+fn total_unsafe_body(body: ArrayList[*Node], nz: *ArrayList[[]u8], eff: map.StringMap[i32]) i32 {
     let acc: i32 = 0;
     let i: i32 = 0;
     while (i < len[*Node](body)) {
-        acc = acc + total_unsafe_stmt(get[*Node](body, i), nz);
+        acc = acc + total_unsafe_stmt(get[*Node](body, i), nz, eff);
         i = i + 1;
     }
     return acc;
 }
-fn total_unsafe_stmt(n: *Node, nz: *ArrayList[[]u8]) i32 {
+fn total_unsafe_stmt(n: *Node, nz: *ArrayList[[]u8], eff: map.StringMap[i32]) i32 {
     switch (n.*) {
         .let_ => |l| {
-            let e: i32 = total_unsafe_expr(l.expr, nz.*);
-            // If let x = <always-positive expr>, record x as nonzero for scope.
+            let e: i32 = total_unsafe_expr(l.expr, nz.*, eff);
             if (expr_always_pos(l.expr) == 1) { push[[]u8](nz, l.name); }
             return e;
         }
         .ret  => |r| {
-            if (r.has_expr == 1) { return total_unsafe_expr(r.expr, nz.*); }
+            if (r.has_expr == 1) { return total_unsafe_expr(r.expr, nz.*, eff); }
             return 0;
         }
         .if_  => |x| {
-            let cu: i32 = total_unsafe_expr(x.cond, nz.*);
+            let cu: i32 = total_unsafe_expr(x.cond, nz.*, eff);
             let prev: i32 = len[[]u8](nz.*);
             extract_nz(x.cond, nz);
-            let tu: i32 = total_unsafe_body(x.then_body, nz);
+            let tu: i32 = total_unsafe_body(x.then_body, nz, eff);
             while (len[[]u8](nz.*) > prev) { let _ignored: []u8 = pop[[]u8](nz); }
-            let eu: i32 = total_unsafe_body(x.els_body, nz);
+            let eu: i32 = total_unsafe_body(x.els_body, nz, eff);
             return cu + tu + eu;
         }
         .while_ => |w| {
-            return total_unsafe_expr(w.cond, nz.*) + total_unsafe_body(w.body, nz);
+            let cu: i32 = total_unsafe_expr(w.cond, nz.*, eff);
+            let prev2: i32 = len[[]u8](nz.*);
+            extract_nz(w.cond, nz);
+            let wu: i32 = total_unsafe_body(w.body, nz, eff);
+            while (len[[]u8](nz.*) > prev2) { let _ignored: []u8 = pop[[]u8](nz); }
+            return cu + wu;
         }
         .assign => |a| {
-            return total_unsafe_expr(a.target, nz.*) + total_unsafe_expr(a.expr, nz.*);
+            return total_unsafe_expr(a.target, nz.*, eff) + total_unsafe_expr(a.expr, nz.*, eff);
         }
         .switch_ => |sw| {
-            let acc: i32 = total_unsafe_expr(sw.subject, nz.*);
+            let acc: i32 = total_unsafe_expr(sw.subject, nz.*, eff);
             let i: i32 = 0;
             while (i < len[SwitchArm](sw.arms)) {
-                acc = acc + total_unsafe_body(get[SwitchArm](sw.arms, i).body, nz);
+                acc = acc + total_unsafe_body(get[SwitchArm](sw.arms, i).body, nz, eff);
                 i = i + 1;
             }
-            if (sw.has_els == 1) { acc = acc + total_unsafe_body(sw.els_body, nz); }
+            if (sw.has_els == 1) { acc = acc + total_unsafe_body(sw.els_body, nz, eff); }
             return acc;
         }
-        .estmt => |e| { return total_unsafe_expr(e.expr, nz.*); }
+        .estmt => |e| { return total_unsafe_expr(e.expr, nz.*, eff); }
         else   => { return 0; }
     }
 }
-// Returns 1 if every integer division in f's body is provably safe.
-fn fn_total_safe(f: FnDecl) i32 {
+// Returns 1 if every integer division/modulo in f's body is provably safe,
+// including transitive calls (callee must have Panic=0 in the eff map).
+fn fn_total_safe(f: FnDecl, eff: map.StringMap[i32]) i32 {
     let nz: ArrayList[[]u8] = make[[]u8](8);
-    let bad: i32 = total_unsafe_body(f.body, &nz);
+    let bad: i32 = total_unsafe_body(f.body, &nz, eff);
     return (bad == 0) as i32;
 }
 
@@ -347,6 +377,7 @@ fn expr_eff(n: *Node, eff: map.StringMap[i32]) i32 {
         .fld   => |f| expr_eff(f.base, eff),
         .slit_ => |s| flds_eff(s.fields, eff),
         .slice_ => |s| bor(bor(expr_eff(s.base, eff), expr_eff(s.lo, eff)), expr_eff(s.hi, eff)),
+        .cast_  => |c| expr_eff(c.expr, eff),
         else   => 0,
     };
 }
@@ -405,10 +436,24 @@ fn recompute(d: *Node, eff: *map.StringMap[i32]) bool {
     };
 }
 
+fn has_annot(annots: ArrayList[[]u8], a: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[[]u8](annots)) {
+        if (@strEq(get[[]u8](annots, i), a)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn recompute_fn(f: FnDecl, eff: *map.StringMap[i32]) bool {
     if (f.is_extern == 1) { return false; }
     let old: i32 = map.get[i32](eff.*, f.name) orelse 0;
     let ne: i32 = bor(old, body_eff(f.body, eff.*));
+    // If this fn is @total and the path-sensitive prover discharges all divisions,
+    // clear the Panic bit now so that callers don't inherit spurious Panic.
+    if ((ne & 2) != 0 && has_annot(f.annots, "@total") == 1 && fn_total_safe(f, eff.*) == 1) {
+        ne = ne - 2;
+    }
     if (ne != old) {
         map.put[i32](eff, f.name, ne);
         return true;
@@ -697,11 +742,16 @@ fn report_fn(f: FnDecl, decls: ArrayList[*Node], eff: map.StringMap[i32]) i32 {
                 // before reporting. It can discharge guards like `if (d != 0)`
                 // and algebraic invariants like `n*n + 1` that the coarse fixpoint
                 // conservatively flags as Panic.
-                if (@strEq(a, "@total") && fn_total_safe(f) == 1) {
+                if (@strEq(a, "@total") && fn_total_safe(f, eff) == 1) {
                     i = i + 1;
                 } else {
                     _zag_print("zag: VIOLATION in ");
                     _zag_print(f.name);
+                    if (f.line > 0) {
+                        _zag_print(" (line ");
+                        _zag_print(_zag_i64_to_str(f.line as i64));
+                        _zag_print(")");
+                    }
                     _zag_print(" ");
                     _zag_println(a);
                     count = count + 1;
@@ -800,6 +850,13 @@ fn store_let(l: Let, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map
 fn store_ret(r: Return, env: *map.StringMap[i32], f: FnDecl, decls: ArrayList[*Node], eff: map.StringMap[i32]) i32 {
     if (r.has_expr == 0) { return 0; }
     let acc: i32 = store_expr(r.expr, env, decls, eff);
+    // Escape check: returning a capturing closure would dangle (env lives on the stack).
+    if (ret_escapes_capturing(r.expr, decls) == 1) {
+        _zag_print("zag: VIOLATION in ");
+        _zag_print(f.name);
+        _zag_println(": capturing closure escapes (stack-env would dangle) — heap closures are Phase-1 work");
+        acc = acc + 1;
+    }
     // return-type fn contract: the returned value must satisfy the declared row
     let forb: i32 = row_forbidden(f.ret_eff);
     if (forb != 0) {

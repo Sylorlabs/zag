@@ -213,5 +213,16 @@ else
 fi
 rm -f /tmp/nt_bin nt_src.zag
 
+echo "── structural interfaces (native vtable dispatch + coercion) ──"
+nts(){  # nts <label> <file> <expect-stdout>
+    "$ZNC" "$2" -o /tmp/nt_bin >/tmp/nt_out 2>&1
+    local got
+    if [ ! -x /tmp/nt_bin ]; then echo "  XX  $1 (compile failed)"; sed -n '1,8p' /tmp/nt_out; fail=$((fail+1)); return; fi
+    got=$(/tmp/nt_bin 2>/dev/null); rm -f /tmp/nt_bin
+    if [ "$got" = "$3" ]; then echo "  ok  $1 (stdout='$got')"; pass=$((pass+1))
+    else echo "  XX  $1 (got '$got', want '$3')"; fail=$((fail+1)); fi
+}
+nts "interfaces Square report=75 Rect report=36" examples/interfaces.zag "$(printf '75\n36')"
+
 echo "════ native pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]
