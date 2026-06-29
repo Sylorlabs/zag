@@ -127,6 +127,30 @@ fn is_arb_int_ty(t: []u8) i32 {
 fn arb_int_bits(t: []u8) i64 { return cg_parse_uint(t, 1, t.len); }
 fn arb_int_signed(t: []u8) i32 { if ((t[0] as i32) == 'i') { return 1; } return 0; }
 
+// VSA binary hypervector: vsa_b<N> (N-dimensional, packed as ceil(N/32) uint32_t words).
+// Examples: vsa_b<10000>, vsa_b<4096>.  Corresponds to MLIR vector<Nxi1>.
+// C backend stores it as a tagged struct ZagVsa_N with a uint32_t word array.
+fn is_vsa_ty(t: []u8) i32 {
+    // Must start with "vsa_b<" (6 chars) and end with ">"
+    if (t.len < 8) { return 0; }
+    if ((t[0] as i32) != 'v') { return 0; }
+    if ((t[1] as i32) != 's') { return 0; }
+    if ((t[2] as i32) != 'a') { return 0; }
+    if ((t[3] as i32) != '_') { return 0; }
+    if ((t[4] as i32) != 'b') { return 0; }
+    if ((t[5] as i32) != '<') { return 0; }
+    if ((t[t.len - 1] as i32) != '>') { return 0; }
+    // The dimension must be all digits
+    if (cg_all_digits(t, 6, t.len - 1) == 0) { return 0; }
+    return 1;
+}
+
+// "vsa_b<10000>" → "10000"
+fn vsa_dim(t: []u8) []u8 { return t[6..t.len - 1]; }
+
+// ceil(N / 32) — number of uint32_t words needed to store N bits.
+fn vsa_nwords(dim: i64) i64 { return (dim + 31) / 32; }
+
 // 1 iff t is any heterogeneous numeric type that needs the numeric runtime / a
 // special slice typedef.
 fn is_numeric_ty(t: []u8) i32 {
@@ -137,6 +161,7 @@ fn is_numeric_ty(t: []u8) i32 {
     if (is_fixed_ty(t) == 1) { return 1; }
     if (is_arb_int_ty(t) == 1) { return 1; }
     if (is_bignum_ty(t) == 1) { return 1; }
+    if (is_vsa_ty(t) == 1) { return 1; }
     return 0;
 }
 
@@ -173,6 +198,7 @@ fn ctype(t: []u8) []u8 {
     }
     if (is_rns_ty(t) == 1)   { return "ZagRns"; }
     if (is_fixed_ty(t) == 1) { return "int32_t"; }   // fixed_I_F stored as int32_t (Q-format)
+    if (is_vsa_ty(t) == 1)   { return _zag_str_concat("ZagVsa_", vsa_dim(t)); }
     if (is_arb_int_ty(t) == 1) {
         let n: i64 = arb_int_bits(t);
         let is_sgn: i32 = arb_int_signed(t);
@@ -1797,6 +1823,18 @@ fn lower_numeric_bin(b: Bin, bt: []u8) *Node {
         }
     }
 
+    // vsa_b<N>: bind = XOR, bundle = OR; both lower to a runtime call.
+    // C backend: zag_vsa_xor_<dim>(a, b) / zag_vsa_or_<dim>(a, b)
+    // MLIR backend: arith.xori / arith.ori on vector<Nxi1> (handled in mlir.zag).
+    if (is_vsa_ty(bt) == 1) {
+        let dim: []u8 = vsa_dim(bt);
+        let nm: []u8 = "";
+        if (@strEq(b.op, "^"))      { nm = _zag_str_concat("zag_vsa_xor_", dim); }
+        else if (@strEq(b.op, "|")) { nm = _zag_str_concat("zag_vsa_or_",  dim); }
+        else if (@strEq(b.op, "&")) { nm = _zag_str_concat("zag_vsa_and_", dim); }
+        if (nm.len > 0) { return cg_call2(nm, b.l, b.r); }
+    }
+
     // bignum u_any/i_any and everything else: native C operator.
     return mk_bin(b.op, b.l, b.r);
 }
@@ -3223,6 +3261,98 @@ fn emit_numeric_runtime(buf: *ArrayList[u8]) void {
     emit(buf, "    if(a==0x8000000000000000ULL||b==0x8000000000000000ULL||!b)return 0x8000000000000000ULL;\n");
     emit(buf, "    if(!a)return 0ULL;\n");
     emit(buf, "    return zag_ld_to_p64(zag_p64_to_ld(a)/zag_p64_to_ld(b)); }\n");
+    emit(buf, "\n");
+    emit(buf, "/* ── VSA binary hypervector: vsa_b<N> ───────────────────────────────────────\n");
+    emit(buf, "   Vector Symbolic Architecture N-bit binary hypervector, stored as\n");
+    emit(buf, "   ceil(N/32) uint32_t words (same packing used by the GPU's MLIR vector<Nxi1>).\n");
+    emit(buf, "   Operations:\n");
+    emit(buf, "     bind(a,b)   = a ^ b  (XOR  — creates a dissimilar composite vector)\n");
+    emit(buf, "     bundle(a,b) = a | b  (OR   — approximates majority/superposition)\n");
+    emit(buf, "     mask(a,b)   = a & b  (AND  — project onto a subset of dimensions)\n");
+    emit(buf, "   ZAG_VSA_DEFINE(N, NWORDS) instantiates the struct + ops for dimension N.\n");
+    emit(buf, "   The C backend emits ZAG_VSA_DEFINE for every vsa_b<N> encountered.\n");
+    emit(buf, "   On GPU (--target gpu-*), mlir.zag maps vsa_b<N> to vector<Nxi1> and\n");
+    emit(buf, "   lowers ^ / | / & directly to arith.xori / arith.ori / arith.andi. */\n");
+    emit(buf, "#define ZAG_VSA_DEFINE(N, NWORDS) \\\n");
+    emit(buf, "typedef struct { uint32_t w[NWORDS]; } ZagVsa_##N; \\\n");
+    emit(buf, "static ZagVsa_##N zag_vsa_xor_##N(ZagVsa_##N a, ZagVsa_##N b) { \\\n");
+    emit(buf, "    ZagVsa_##N r; int _i; \\\n");
+    emit(buf, "    for (_i = 0; _i < NWORDS; _i++) r.w[_i] = a.w[_i] ^ b.w[_i]; \\\n");
+    emit(buf, "    return r; } \\\n");
+    emit(buf, "static ZagVsa_##N zag_vsa_or_##N(ZagVsa_##N a, ZagVsa_##N b) { \\\n");
+    emit(buf, "    ZagVsa_##N r; int _i; \\\n");
+    emit(buf, "    for (_i = 0; _i < NWORDS; _i++) r.w[_i] = a.w[_i] | b.w[_i]; \\\n");
+    emit(buf, "    return r; } \\\n");
+    emit(buf, "static ZagVsa_##N zag_vsa_and_##N(ZagVsa_##N a, ZagVsa_##N b) { \\\n");
+    emit(buf, "    ZagVsa_##N r; int _i; \\\n");
+    emit(buf, "    for (_i = 0; _i < NWORDS; _i++) r.w[_i] = a.w[_i] & b.w[_i]; \\\n");
+    emit(buf, "    return r; }\n");
+    emit(buf, "\n");
+}
+
+// ── VSA-define scan: emit ZAG_VSA_DEFINE(N, NWORDS) for every vsa_b<N> ──────
+// Uses C preprocessor arithmetic so we never need to parse the dim string here.
+fn vsa_seen_has(seen: ArrayList[[]u8], dim: []u8) bool {
+    let i: i32 = 0;
+    while (i < len[[]u8](seen)) {
+        if (@strEq(get[[]u8](seen, i), dim)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn emit_one_vsa_define(buf: *ArrayList[u8], t: []u8, seen: *ArrayList[[]u8]) void {
+    if (is_vsa_ty(t) == 0) { return; }
+    let dim: []u8 = vsa_dim(t);
+    if (vsa_seen_has(seen.*, dim)) { return; }
+    push[[]u8](seen, dim);
+    emit(buf, "ZAG_VSA_DEFINE(");
+    emit(buf, dim);
+    emit(buf, ", (((");
+    emit(buf, dim);
+    emit(buf, ")+31)/32))\n");
+}
+
+fn emit_vsa_defines_block(buf: *ArrayList[u8], body: ArrayList[*Node], seen: *ArrayList[[]u8]) void {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        switch (get[*Node](body, i).*) {
+            .let_   => |l| { if (l.has_dty == 1) { emit_one_vsa_define(buf, l.dty, seen); } }
+            .if_    => |x| { emit_vsa_defines_block(buf, x.then_body, seen); if (x.has_els == 1) { emit_vsa_defines_block(buf, x.els_body, seen); } }
+            .while_ => |w| { emit_vsa_defines_block(buf, w.body, seen); }
+            .switch_ => |sw| {
+                let ai: i32 = 0;
+                while (ai < len[SwitchArm](sw.arms)) { emit_vsa_defines_block(buf, get[SwitchArm](sw.arms, ai).body, seen); ai = ai + 1; }
+                if (sw.has_els == 1) { emit_vsa_defines_block(buf, sw.els_body, seen); }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+}
+
+fn emit_vsa_defines_decl(buf: *ArrayList[u8], d: *Node, seen: *ArrayList[[]u8]) void {
+    switch (d.*) {
+        .fn_decl => |f| {
+            if (len[[]u8](f.tparams) > 0) { return; }
+            let pj: i32 = 0;
+            while (pj < len[Param](f.params)) {
+                emit_one_vsa_define(buf, get[Param](f.params, pj).pty, seen);
+                pj = pj + 1;
+            }
+            emit_one_vsa_define(buf, f.ret, seen);
+            if (f.is_extern == 0) { emit_vsa_defines_block(buf, f.body, seen); }
+        }
+        .struct_ => |s| {
+            if (len[[]u8](s.tparams) > 0) { return; }
+            let fj: i32 = 0;
+            while (fj < len[Param](s.fields)) {
+                emit_one_vsa_define(buf, get[Param](s.fields, fj).pty, seen);
+                fj = fj + 1;
+            }
+        }
+        else => { }
+    }
 }
 
 // ── special slice typedefs ───────────────────────────────────────────────────
@@ -4044,6 +4174,13 @@ fn codegen_decls_t(decls: ArrayList[*Node], ppu32: i32) ArrayList[u8] {
     while (sli < len[*Node](decls)) {
         emit_slice_typedefs_decl(&buf, get[*Node](decls, sli), &slice_seen);
         sli = sli + 1;
+    }
+    // VSA defines: ZAG_VSA_DEFINE(N, NWORDS) for every vsa_b<N> dimension used.
+    let vsa_seen: ArrayList[[]u8] = make[[]u8](2);
+    let vsai: i32 = 0;
+    while (vsai < len[*Node](decls)) {
+        emit_vsa_defines_decl(&buf, get[*Node](decls, vsai), &vsa_seen);
+        vsai = vsai + 1;
     }
     // function-pointer typedefs (fn-type params / lets / struct fields)
     let fn_seen: ArrayList[[]u8] = make[[]u8](4);
