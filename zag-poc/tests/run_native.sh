@@ -152,6 +152,15 @@ nto "u11 mask (2100&0x7FF)" 'fn main() i32 { let a: u11 = 2000; let b: u11 = 100
 nto "i12 signed native"     'fn main() i32 { let a: i12 = 0 - 100; let b: i12 = 50; let c: i12 = a - b; print_i32(c); return 0; }' "-150" 0
 # []sat_i16 slice indexing must compile (word-stride element load).
 nto "[]sat_i16 index compiles" 'fn pick(s: []sat_i16) sat_i16 { return s[0] + s[1]; } fn main() i32 { print_int(7); return 0; }' "7" 0
+# Word-stride numeric sub-slicing: []i32 base, bounded lo..hi → correct len.
+# xs = [10,20,30,40,50] allocated via zalloc_i(5); sub = xs[1..4] → len=3.
+nt  "[]i32 sub-slice len"    'fn main() i32 { let xs: []i32 = zalloc_i(5); xs[0] = 10; xs[1] = 20; xs[2] = 30; xs[3] = 40; xs[4] = 50; let sub: []i32 = xs[1..4]; return sub.len; }' 3
+# Sub-slice element access: sub[0]=xs[1]=20, sub[1]=xs[2]=30, sub[2]=xs[3]=40.
+nt  "[]i32 sub-slice elem"   'fn main() i32 { let xs: []i32 = zalloc_i(5); xs[0] = 10; xs[1] = 20; xs[2] = 30; xs[3] = 40; xs[4] = 50; let sub: []i32 = xs[2..5]; return sub[0] + sub[1] + sub[2]; }' 120
+# Open-ended sub-slice xs[lo..]: len = base.len - lo.
+nt  "[]i32 sub-slice open"   'fn main() i32 { let xs: []i32 = zalloc_i(5); xs[0] = 1; xs[1] = 2; xs[2] = 3; xs[3] = 4; xs[4] = 5; let sub: []i32 = xs[3..]; return sub.len; }' 2
+# []sat_i16 sub-slice compiles and produces correct len (code-path test).
+nt  "[]sat_i16 sub-slice len" 'fn sublen(s: []sat_i16) i32 { let t: []sat_i16 = s[1..3]; return t.len; } fn main() i32 { return 2; }' 2
 # A sat/fixed-free program must NOT pull in the rt2 runtime (no extra fns).
 nto "no-satfixed unaffected" 'fn main() i32 { let x: u32 = 7; print_int(x as i32); return 0; }' "7" 0
 

@@ -2113,6 +2113,7 @@ fn cg_scan_typeof(sc: *ScanCtx, cg: *Cg, n: *Node) []u8 {
         .cast_ => |c2| { return cg_norm_type(c2.target); }
         .slice_ => |sl| {
             let bt: []u8 = cg_scan_typeof(sc, cg, sl.base);
+            if (cg_slice_is_word(bt) == 1) { return bt; }   // []i32, []sat_i16, etc.
             if (cg_type_is_slice(cg, bt) == 1) { return "[]u8"; }
             switch (sl.base.*) { .slit => |_s| { return "[]u8"; } else => { } }
             if (@strEq(bt, "*u8") || @strEq(bt, "*i8")) { return "[]u8"; }
@@ -2120,6 +2121,9 @@ fn cg_scan_typeof(sc: *ScanCtx, cg: *Cg, n: *Node) []u8 {
         }
         .idx => |ix| {
             let bt: []u8 = cg_scan_typeof(sc, cg, ix.base);
+            // A word-stride numeric slice ([]i32, []sat_i16, etc.) yields its element
+            // type; a byte slice ([]u8/[]i8) yields "u8".
+            if (cg_slice_is_word(bt) == 1) { return cg_slice_elem(bt); }
             if (cg_type_is_slice(cg, bt) == 1) { return "u8"; }
             if (bt.len > 1) { if (bt[0] == '*') { return bt[1..]; } }
             return "";
@@ -2887,11 +2891,11 @@ fn cg_expr_type(n: *Node, env: *Env, syms: ArrayList[FnSym], cg: *Cg) []u8 {
         .cast_ => |cst| { return cg_norm_type(cst.target); }
         .slit  => |_s| { return "[]u8"; }   // a string literal is a []u8 slice value
         .slice_ => |sl| {
-            // base[lo..hi] : a sub-slice. A []u8 base (or a string literal, which
-            // is a []u8 value) yields a []u8. A *u8 pointer base (e.g. an
-            // ArrayList[u8]'s `.data` field) yields []u8 = {data+lo, hi-lo}. We
-            // only model []u8; other element widths report "" (rejected at lowering).
+            // base[lo..hi] : a sub-slice. A []u8 base (or a string literal) yields
+            // []u8. A *u8 pointer base (e.g. ArrayList[u8].data) yields []u8.
+            // A word-stride numeric slice []E yields []E (same element type).
             let bt: []u8 = cg_expr_type(sl.base, env, syms, cg);
+            if (cg_slice_is_word(bt) == 1) { return bt; }   // []i32, []sat_i16, etc.
             if (cg_type_is_slice(cg, bt) == 1) { return "[]u8"; }
             switch (sl.base.*) { .slit => |_s| { return "[]u8"; } else => { } }
             if (@strEq(bt, "*u8") || @strEq(bt, "*i8")) { return "[]u8"; }
@@ -3711,12 +3715,47 @@ fn cg_lower_slice(out: *ArrayList[Instr], sl: Slice, env: *Env, syms: ArrayList[
     }
     if (handled == 0) {
         let bt: []u8 = cg_expr_type(sl.base, env, syms, cg);
-        // Sub-slicing a WORD-stride numeric slice ([]sat_i16 etc.) would need
-        // 8-byte element arithmetic for the new ptr/len; not yet supported — the
-        // examples only index such slices, never re-slice them. Reject loudly.
         if (cg_slice_is_word(bt) == 1) {
-            cg_err(cg, "native: sub-slicing a numeric-element slice is not supported (index it instead)");
-            push[Instr](out, i_mov_imm(R_RAX(), 0));
+            // WORD-stride numeric slice ([]sat_i16, []fixed_I_F, []posit32, etc.).
+            // Each element occupies 8 bytes in memory.  The new sub-slice is:
+            //   ptr = base.ptr + lo * 8
+            //   len = hi - lo
+            // We load the base {ptr,len} block, compute lo/hi, then build the
+            // result block exactly like the []u8 path below but multiply lo by 8
+            // before adding it to the base pointer.
+            cg_lower_expr(out, sl.base, env, syms, cg);        // pushes block base
+            push[Instr](out, i_pop(R_RSI()));                  // rsi = src block base
+            push[Instr](out, i_load(R_RAX(), R_RSI(), 0));     // rax = base ptr
+            push[Instr](out, i_store(R_RBP(), src + 0, R_RAX()));
+            push[Instr](out, i_load(R_RAX(), R_RSI(), 8));     // rax = base len
+            push[Instr](out, i_store(R_RBP(), src + 8, R_RAX()));
+            // lo
+            let loslot_w: i32 = cg_slot_scratch(env);
+            cg_lower_expr(out, sl.lo, env, syms, cg);
+            push[Instr](out, i_pop(R_RAX()));
+            push[Instr](out, i_store(R_RBP(), loslot_w, R_RAX()));
+            // hi
+            let hislot_w: i32 = cg_slot_scratch(env);
+            if (sl.has_hi == 1) {
+                cg_lower_expr(out, sl.hi, env, syms, cg);
+                push[Instr](out, i_pop(R_RAX()));
+            } else {
+                push[Instr](out, i_load(R_RAX(), R_RBP(), src + 8));   // hi = base len
+            }
+            push[Instr](out, i_store(R_RBP(), hislot_w, R_RAX()));
+            // Build result: ptr = base_ptr + lo*8, len = hi - lo
+            let res_w: i32 = cg_slot_scratch_n(env, 2);
+            push[Instr](out, i_load(R_RAX(), R_RBP(), src + 0));   // base ptr
+            push[Instr](out, i_load(R_RCX(), R_RBP(), loslot_w));  // lo
+            push[Instr](out, i_mov_imm(R_RDX(), 8));
+            push[Instr](out, i_imul(R_RCX(), R_RDX()));             // rcx = lo * 8
+            push[Instr](out, i_add(R_RAX(), R_RCX()));              // rax = ptr + lo*8
+            push[Instr](out, i_store(R_RBP(), res_w + 0, R_RAX()));
+            push[Instr](out, i_load(R_RAX(), R_RBP(), hislot_w));   // hi
+            push[Instr](out, i_load(R_RCX(), R_RBP(), loslot_w));   // lo
+            push[Instr](out, i_sub(R_RAX(), R_RCX()));              // hi - lo = len
+            push[Instr](out, i_store(R_RBP(), res_w + 8, R_RAX()));
+            push[Instr](out, i_lea(R_RAX(), R_RBP(), res_w));
             push[Instr](out, i_push(R_RAX()));
             return;
         }
