@@ -311,5 +311,19 @@ else
 fi
 rm -f /tmp/nt_bin
 
+echo "── stdlib2 (sort/hashmap/strbuf) ──"
+OUT=$(./znc tests/stdlib2_test.zag -o /tmp/zag_stdlib2_test 2>&1)
+if echo "$OUT" | grep -q "error\|aborted"; then
+    echo "  XX  stdlib2_test compile failed"; echo "$OUT" | head -8; fail=$((fail+1))
+else
+    RES=$(/tmp/zag_stdlib2_test 2>&1)
+    if echo "$RES" | grep -q "FAIL"; then
+        echo "  XX  stdlib2_test: $(echo "$RES" | grep FAIL | head -5)"; fail=$((fail+1))
+    else
+        echo "  ok  stdlib2: sort/hashmap/strbuf all pass"; pass=$((pass+1))
+    fi
+fi
+rm -f /tmp/zag_stdlib2_test
+
 echo "════ native pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]
