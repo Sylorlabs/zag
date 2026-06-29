@@ -1,0 +1,155 @@
+// selfhost/native/signal_rt.zag — OS signal handling runtime for the Zag native backend.
+//
+// Provides signal installation, blocking, raising, and restore-to-default.
+// All syscalls go through _zag_raw_syscall, a ncodegen-intercepted extern that
+// maps directly to the Linux x86-64 SYSCALL instruction:
+//   rax = num, rdi = a1, rsi = a2, rdx = a3, r10 = a4, r8 = a5, r9 = a6
+//
+// STRUCT LAYOUTS (must match kernel ABI exactly):
+//   struct kernel_sigaction { handler: i64, flags: i64, restorer: i64, mask: i64 }
+//   struct sigset_t { bits: i64 }   (just the low 64 bits, _NSIG=64 on x86-64)
+//
+// SUBSET DISCIPLINE (same as numeric_rt.zag):
+//   • NO `<<` / `>>`     → use * p2(k) / / p2(k) or helper
+//   • NO `|` / `||`      → use + for disjoint-bit OR; `&` for masking
+//   • NO break/continue  → loop-done flag
+//   • i64 for all bit/address arithmetic; booleans as i32 (0/1)
+//
+// COMMON SIGNAL NUMBERS:
+//   SIGHUP=1  SIGINT=2  SIGQUIT=3  SIGILL=4  SIGTRAP=5  SIGABRT=6
+//   SIGFPE=8  SIGKILL=9 SIGSEGV=11 SIGPIPE=13 SIGALRM=14 SIGTERM=15
+//   SIGUSR1=10 SIGUSR2=12 SIGCHLD=17 SIGCONT=18 SIGSTOP=19 SIGTSTP=20
+
+// ── raw syscall intrinsic ─────────────────────────────────────────────────────
+// ncodegen intercepts this name and emits a direct SYSCALL instruction.
+// Pointer arguments must be passed as i64 (their raw address).
+extern fn _zag_raw_syscall(num: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) i64
+
+// ── signal-related constants ──────────────────────────────────────────────────
+fn SIG_DFL() i64 { return 0; }        // default action
+fn SIG_IGN() i64 { return 1; }        // ignore
+
+// sa_flags bits (SA_RESTART | SA_SIGINFO — both needed for a real handler)
+fn SA_SIGINFO()  i64 { return 4; }          // handler receives siginfo_t
+fn SA_RESTART()  i64 { return 268435456; }  // 0x10000000 — restart syscalls on signal
+fn SA_FLAGS_HANDLER() i64 { return 268435460; }  // SA_RESTART + SA_SIGINFO (combined with +)
+
+// sigprocmask how values
+fn SIG_BLOCK()   i64 { return 0; }
+fn SIG_UNBLOCK() i64 { return 1; }
+fn SIG_SETMASK() i64 { return 2; }
+
+// ── user-facing structs ───────────────────────────────────────────────────────
+// SigAction: the Zag-level representation; handler is a function pointer value.
+struct SigAction { handler: i64, flags: i64, mask: i64 }
+
+// SigInfo: filled in by the kernel when SA_SIGINFO is set (first 4 words only).
+struct SigInfo { signo: i64, errno: i64, code: i64, pid: i64 }
+
+// ── kernel struct layout (must be passed to sigaction(2)) ────────────────────
+// The kernel sigaction struct for x86-64 is exactly 4 * 8 = 32 bytes:
+//   { sa_handler/sa_sigaction: i64, sa_flags: i64, sa_restorer: i64, sa_mask: i64 }
+// We build it as 4 consecutive i64 fields on the (Zag) stack frame.
+struct KernelSigAction { handler: i64, flags: i64, restorer: i64, mask: i64 }
+
+// ── signal bit manipulation ───────────────────────────────────────────────────
+// Build a sigset_t with only `signum` set (1-based; bit signum-1 of the word).
+fn sig_p2(k: i64) i64 {
+    let r: i64 = 1;
+    let i: i64 = 0;
+    while (i < k) { r = r * 2; i = i + 1; }
+    return r;
+}
+
+fn sig_make_set(signum: i64) i64 {
+    if (signum < 1) { return 0; }
+    if (signum > 64) { return 0; }
+    return sig_p2(signum - 1);
+}
+
+// ── signal_install ────────────────────────────────────────────────────────────
+// Install a signal handler using sigaction(2) (syscall #13).
+// handler_addr is the address of the user's void(i64) function (already a raw fn ptr).
+// Returns 1 on success, 0 on error.
+fn signal_install(signum: i64, handler_addr: i64) i32 {
+    let kact: KernelSigAction = KernelSigAction{
+        .handler  = handler_addr,
+        .flags    = SA_FLAGS_HANDLER(),
+        .restorer = 0,
+        .mask     = 0
+    };
+    // &kact as the address — ncodegen maps a local struct's address to an i64.
+    let act_ptr: i64 = &kact as i64;
+    let rc: i64 = _zag_raw_syscall(13, signum, act_ptr, 0, 0, 0, 0);
+    if (rc == 0) { return 1; }
+    return 0;
+}
+
+// ── signal_ignore ─────────────────────────────────────────────────────────────
+// Install SIG_IGN for signum.
+fn signal_ignore(signum: i64) void {
+    let kact: KernelSigAction = KernelSigAction{
+        .handler  = SIG_IGN(),
+        .flags    = 0,
+        .restorer = 0,
+        .mask     = 0
+    };
+    let act_ptr: i64 = &kact as i64;
+    let _rc: i64 = _zag_raw_syscall(13, signum, act_ptr, 0, 0, 0, 0);
+}
+
+// ── signal_default ────────────────────────────────────────────────────────────
+// Restore the default action for signum.
+fn signal_default(signum: i64) void {
+    let kact: KernelSigAction = KernelSigAction{
+        .handler  = SIG_DFL(),
+        .flags    = 0,
+        .restorer = 0,
+        .mask     = 0
+    };
+    let act_ptr: i64 = &kact as i64;
+    let _rc: i64 = _zag_raw_syscall(13, signum, act_ptr, 0, 0, 0, 0);
+}
+
+// ── signal_raise ──────────────────────────────────────────────────────────────
+// Send signum to the calling process via kill(getpid(), signum).
+// getpid = syscall #39; kill = syscall #62.
+fn signal_raise(signum: i64) void {
+    let pid: i64 = _zag_raw_syscall(39, 0, 0, 0, 0, 0, 0);   // getpid()
+    let _rc: i64 = _zag_raw_syscall(62, pid, signum, 0, 0, 0, 0);  // kill(pid, sig)
+}
+
+// ── signal_block ──────────────────────────────────────────────────────────────
+// Add signum to the process's signal mask (SIG_BLOCK via sigprocmask #14).
+// sigprocmask(how, *set, *oldset, sigsetsize=8)
+fn signal_block(signum: i64) void {
+    let mask: i64 = sig_make_set(signum);
+    let mask_ptr: i64 = &mask as i64;
+    let _rc: i64 = _zag_raw_syscall(14, SIG_BLOCK(), mask_ptr, 0, 8, 0, 0);
+}
+
+// ── signal_unblock ────────────────────────────────────────────────────────────
+// Remove signum from the process's signal mask (SIG_UNBLOCK via sigprocmask #14).
+fn signal_unblock(signum: i64) void {
+    let mask: i64 = sig_make_set(signum);
+    let mask_ptr: i64 = &mask as i64;
+    let _rc: i64 = _zag_raw_syscall(14, SIG_UNBLOCK(), mask_ptr, 0, 8, 0, 0);
+}
+
+// ── signal_getpid ─────────────────────────────────────────────────────────────
+// Return the PID of the calling process (syscall #39).
+fn signal_getpid() i64 {
+    return _zag_raw_syscall(39, 0, 0, 0, 0, 0, 0);
+}
+
+// ── common signal numbers (accessor fns so callers need no magic numbers) ────
+fn SIGINT()  i64 { return 2; }
+fn SIGTERM() i64 { return 15; }
+fn SIGSEGV() i64 { return 11; }
+fn SIGUSR1() i64 { return 10; }
+fn SIGUSR2() i64 { return 12; }
+fn SIGCHLD() i64 { return 17; }
+fn SIGHUP()  i64 { return 1; }
+fn SIGKILL() i64 { return 9; }
+fn SIGPIPE() i64 { return 13; }
+fn SIGALRM() i64 { return 14; }

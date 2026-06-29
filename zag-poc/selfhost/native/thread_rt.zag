@@ -1,0 +1,247 @@
+// selfhost/native/thread_rt.zag — POSIX-style threading via Linux clone(2).
+//
+// Threads are created with clone(2) syscall #56 sharing VM, files, signal handlers,
+// and the futex-based TID mechanism for join. Mutexes use futex(2) syscall #202.
+// Stack memory is allocated with mmap(2) syscall #9 and freed with munmap(2) #11.
+//
+// CLONE flags used for thread creation:
+//   CLONE_VM           = 0x0100   share address space
+//   CLONE_FS           = 0x0200   share filesystem root/cwd/umask
+//   CLONE_FILES        = 0x0400   share file descriptor table
+//   CLONE_SIGHAND      = 0x0800   share signal handlers
+//   CLONE_THREAD       = 0x10000  same thread group (TGID)
+//   CLONE_SYSVSEM      = 0x20000  share SysV semaphore undo list
+//   CLONE_SETTLS       = 0x80000  (not used here — no TLS)
+//   CLONE_PARENT_SETTID= 0x100000 write child TID to *parent_tidptr
+//   CLONE_CHILD_CLEARTID= 0x200000 clear child TID on exit (enables futex-based join)
+//   CLONE_CHILD_SETTID = 0x1000000 write child TID to *child_tidptr
+//
+// Effective flag word for a joinable thread (all of the above minus SETTLS):
+//   0x3D0F00 — documented in task spec.
+// We also add CLONE_PARENT_SETTID (0x100000) and CLONE_CHILD_CLEARTID (0x200000)
+// and CLONE_CHILD_SETTID (0x1000000) so the kernel writes the TID into our Thread
+// struct and clears it to 0 on exit (allowing futex WAIT for join).
+// Full flags = 0x3D0F00 + 0x100000 + 0x200000 + 0x1000000 = 0x1F30F00
+// = 32440064 decimal.
+//
+// FUTEX constants:
+//   FUTEX_WAIT = 0, FUTEX_WAKE = 1
+//
+// SUBSET DISCIPLINE (same as numeric_rt.zag):
+//   • NO `<<` / `>>`    → use * p2(k) / p2(k) for powers-of-two arithmetic
+//   • NO `|` / `||`     → + for disjoint-bit OR, & for masking
+//   • NO break/continue → done-flag loops
+//   • i64 for addresses; bool as i32 (0/1)
+
+// ── raw syscall intrinsic ─────────────────────────────────────────────────────
+extern fn _zag_raw_syscall(num: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) i64
+
+// ── threading constants ───────────────────────────────────────────────────────
+fn THR_CLONE_FLAGS() i64 { return 32440064; }   // see file header comment
+fn THR_STACK_GUARD() i64 { return 4096; }        // one-page guard zone at bottom of stack
+
+// mmap prot/flags for stacks:
+fn PROT_READ()        i64 { return 1; }
+fn PROT_WRITE()       i64 { return 2; }
+fn PROT_RW()          i64 { return 3; }   // READ + WRITE (use + since they are disjoint)
+fn MAP_PRIVATE()      i64 { return 2; }
+fn MAP_ANONYMOUS()    i64 { return 32; }   // 0x20
+fn MAP_PRIVATE_ANON() i64 { return 34; }   // MAP_PRIVATE + MAP_ANONYMOUS
+
+// futex op codes
+fn FUTEX_WAIT() i64 { return 0; }
+fn FUTEX_WAKE() i64 { return 1; }
+
+// mutex states
+fn MUTEX_UNLOCKED()   i64 { return 0; }
+fn MUTEX_LOCKED()     i64 { return 1; }
+fn MUTEX_CONTENDED()  i64 { return 2; }
+
+// ── user-facing structs ───────────────────────────────────────────────────────
+// Thread: handle returned by thread_spawn.
+//   tid        = the kernel thread ID (clone result in parent); set to 0 by kernel on exit.
+//   stack_base = base of the mmap'd stack region (for munmap on cleanup).
+//   stack_size = total size of the mmap'd region (including guard page).
+struct Thread { tid: i64, stack_base: i64, stack_size: i64 }
+
+// Mutex: a futex-based mutual exclusion lock.
+//   state = 0 (unlocked), 1 (locked, no waiters), 2 (locked, waiters present)
+struct Mutex { state: i64 }
+
+// ── internal: power-of-two helper ────────────────────────────────────────────
+fn thr_p2(k: i64) i64 {
+    let r: i64 = 1;
+    let i: i64 = 0;
+    while (i < k) { r = r * 2; i = i + 1; }
+    return r;
+}
+
+// ── mmap / munmap helpers ─────────────────────────────────────────────────────
+// Allocate `size` bytes with mmap(NULL, size, PROT_RW, MAP_PRIVATE|MAP_ANON, -1, 0).
+// Returns the mapped address on success, 0 on error (kernel returns small neg errno).
+fn thr_mmap(size: i64) i64 {
+    // mmap syscall #9: (addr=0, length, prot, flags, fd=-1, offset=0)
+    let ptr: i64 = _zag_raw_syscall(9, 0, size, PROT_RW(), MAP_PRIVATE_ANON(), 0 - 1, 0);
+    // mmap returns -errno (a small negative value) on failure.
+    if (ptr < 0) { return 0; }
+    return ptr;
+}
+
+// Unmap `size` bytes starting at `addr`.
+fn thr_munmap(addr: i64, size: i64) void {
+    let _rc: i64 = _zag_raw_syscall(11, addr, size, 0, 0, 0, 0);
+}
+
+// ── thread_spawn ──────────────────────────────────────────────────────────────
+// Allocate a stack, then clone a child thread that calls fn_ptr(arg).
+//
+// The child thread is set up by the kernel so that after clone(2) the child
+// starts execution at fn_ptr (passed as the `stack` argument to clone on x86-64,
+// the top-of-stack word at entry is the function pointer). We push fn_ptr and arg
+// to the TOP of the stack before calling clone so the child's start sequence is:
+//
+//   [stack top - 0*8] = arg  (passed in rdi for the child's fn_ptr call)
+//   [stack top - 1*8] = fn_ptr  (child RIP at entry, via the ABI ret-from-clone)
+//
+// On Linux x86-64 the clone syscall uses:
+//   rdi = flags, rsi = child_stack (top of stack), rdx = *parent_tid, r10 = *child_tid
+//   r8 = 0 (no TLS), rax = 56
+//
+// After clone returns in the parent, rax = child TID.
+// After clone returns in the child, rax = 0; the child then executes from the
+// address pointed to by [rsp] (the return address we pushed above).
+//
+// We store &t.tid as both parent_tidptr and child_tidptr so the kernel:
+//   • writes the TID there on creation (CLONE_PARENT_SETTID)
+//   • clears it to 0 on child exit (CLONE_CHILD_CLEARTID) — enables futex join
+//
+// Returns a Thread handle.  tid == 0 on allocation failure.
+fn thread_spawn(fn_ptr: i64, arg: i64, stack_size: i64) Thread {
+    let total: i64 = stack_size + THR_STACK_GUARD();
+    let base: i64 = thr_mmap(total);
+    if (base == 0) {
+        return Thread{ .tid = 0, .stack_base = 0, .stack_size = 0 };
+    }
+    // Stack grows DOWN. The usable region starts at base + GUARD and the top
+    // (initial rsp) is base + total. We push two 8-byte words below the top:
+    //   [top - 8]  = arg       (child will pop into rdi before calling fn_ptr)
+    //   [top - 16] = fn_ptr    (the "return address" that the child jumps to)
+    // child_rsp = base + total - 16
+    let top: i64 = base + total;
+    // Write fn_ptr and arg into the child stack — these are at fixed offsets
+    // relative to `base`. We use pointer arithmetic via i64.
+    // We need to store values at addresses (top-16) and (top-8).
+    // ncodegen must support writing an i64 through a raw address stored in a
+    // variable; we use the _zag_raw_syscall trick to write via a zero-byte write
+    // ... actually, direct Zag lets us do: let p: *i64 = (top - 16) as *i64; p.* = fn_ptr;
+    // which ncodegen lowers to a native store instruction.
+    let p_fn: *i64 = (top - 16) as *i64;
+    let p_arg: *i64 = (top - 8) as *i64;
+    p_fn.* = fn_ptr;
+    p_arg.* = arg;
+    let child_rsp: i64 = top - 16;
+    // Allocate a Thread on the stack so we can pass &t.tid to clone.
+    let t: Thread = Thread{ .tid = 0, .stack_base = base, .stack_size = total };
+    let tid_ptr: i64 = &t.tid as i64;
+    // clone(flags, child_stack, parent_tid, child_tid, tls=0)
+    let flags: i64 = THR_CLONE_FLAGS();
+    let child_tid: i64 = _zag_raw_syscall(56, flags, child_rsp, tid_ptr, tid_ptr, 0, 0);
+    if (child_tid < 0) {
+        // clone failed; release the stack.
+        thr_munmap(base, total);
+        return Thread{ .tid = 0, .stack_base = 0, .stack_size = 0 };
+    }
+    // In the parent, clone returns the child TID.
+    // (CLONE_PARENT_SETTID also wrote it to t.tid already, but set it explicitly.)
+    t.tid = child_tid;
+    return t;
+}
+
+// ── thread_join ───────────────────────────────────────────────────────────────
+// Wait until the thread `t` has exited. The kernel clears t.tid to 0 and wakes
+// all futex waiters on &t.tid when the thread calls exit_group internally.
+// We use FUTEX_WAIT to block until t.tid == 0.
+// futex(addr, FUTEX_WAIT, val, *timeout=0, ...) — waits if *addr == val.
+fn thread_join(t: *Thread) void {
+    let done: i32 = 0;
+    while (done == 0) {
+        let tid_now: i64 = t.*.tid;
+        if (tid_now == 0) {
+            done = 1;
+        } else {
+            // futex(addr, FUTEX_WAIT, expected, timeout_ptr=0, ...)
+            // If *addr != expected, futex returns immediately (EAGAIN); loop again.
+            let tid_ptr: i64 = &t.*.tid as i64;
+            let _rc: i64 = _zag_raw_syscall(202, tid_ptr, FUTEX_WAIT(), tid_now, 0, 0, 0);
+            // rc = 0 (woken) or -EAGAIN (already changed) or -EINTR; retry either way.
+        }
+    }
+    // Stack cleanup after join.
+    if (t.*.stack_base != 0) {
+        thr_munmap(t.*.stack_base, t.*.stack_size);
+        t.*.stack_base = 0;
+    }
+}
+
+// ── mutex_new ─────────────────────────────────────────────────────────────────
+fn mutex_new() Mutex {
+    return Mutex{ .state = MUTEX_UNLOCKED() };
+}
+
+// ── mutex_lock ────────────────────────────────────────────────────────────────
+// Spin-and-futex lock:
+//   1. Try CAS 0→1 (unlocked→locked). If it succeeds, done.
+//   2. If state was already ≥1, CAS to set it to 2 (contended), then futex WAIT.
+//   3. Retry from (1) after wakeup.
+//
+// In pure Zag without inline asm, we use _zag_raw_syscall #1000 as the ncodegen
+// hook for a LOCK CMPXCHG: _zag_raw_syscall(1000, addr, expected, desired, 0, 0, 0)
+// returns the OLD value at addr (if old == expected, swap succeeded).
+// ncodegen maps syscall num 1000 → inline LOCK CMPXCHG64 instruction.
+fn mutex_lock(m: *Mutex) void {
+    let done: i32 = 0;
+    while (done == 0) {
+        let state_ptr: i64 = &m.*.state as i64;
+        // Attempt CAS 0 → 1 (try to acquire unlocked mutex)
+        let old: i64 = _zag_raw_syscall(1000, state_ptr, MUTEX_UNLOCKED(), MUTEX_LOCKED(), 0, 0, 0);
+        if (old == MUTEX_UNLOCKED()) {
+            // We acquired the lock cleanly.
+            done = 1;
+        } else {
+            // Mutex is already locked; ensure state is CONTENDED so unlock wakes us.
+            let _old2: i64 = _zag_raw_syscall(1000, state_ptr, MUTEX_LOCKED(), MUTEX_CONTENDED(), 0, 0, 0);
+            // futex WAIT: block if state is still CONTENDED
+            let s: i64 = m.*.state;
+            if (s == MUTEX_CONTENDED()) {
+                let _fw: i64 = _zag_raw_syscall(202, state_ptr, FUTEX_WAIT(), MUTEX_CONTENDED(), 0, 0, 0);
+            }
+            // After wakeup, retry the outer loop (CAS 0→1 again).
+        }
+    }
+}
+
+// ── mutex_unlock ──────────────────────────────────────────────────────────────
+// Atomically set state to 0; if the old state was CONTENDED, wake one waiter.
+// ncodegen maps syscall 1001 → LOCK XCHG (atomic exchange):
+//   _zag_raw_syscall(1001, addr, newval, 0, ...) returns old value.
+fn mutex_unlock(m: *Mutex) void {
+    let state_ptr: i64 = &m.*.state as i64;
+    let old: i64 = _zag_raw_syscall(1001, state_ptr, MUTEX_UNLOCKED(), 0, 0, 0, 0);
+    if (old == MUTEX_CONTENDED()) {
+        // Wake one waiter.
+        let _fw: i64 = _zag_raw_syscall(202, state_ptr, FUTEX_WAKE(), 1, 0, 0, 0);
+    }
+}
+
+// ── thread_self_exit ──────────────────────────────────────────────────────────
+// Terminate the calling thread (NOT the whole process).
+// Uses exit syscall #60 with code 0; the kernel clears the TID and wakes joiners.
+fn thread_self_exit() void {
+    let _rc: i64 = _zag_raw_syscall(60, 0, 0, 0, 0, 0, 0);
+}
+
+// ── sched_yield ───────────────────────────────────────────────────────────────
+// Yield the CPU to another runnable thread/process (sched_yield syscall #24).
+fn sched_yield() void {
+    let _rc: i64 = _zag_raw_syscall(24, 0, 0, 0, 0, 0, 0);
+}

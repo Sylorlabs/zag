@@ -1,0 +1,198 @@
+// selfhost/native/net_rt.zag — Network syscall wrappers for the Zag native backend.
+//
+// All networking goes through Linux x86-64 syscalls, invoked via the
+// _zag_raw_syscall intrinsic intercepted by ncodegen. No libc, no C.
+//
+// SYSCALL NUMBERS (Linux x86-64):
+//   close       =  3
+//   socket      = 41
+//   connect     = 42
+//   accept      = 43
+//   sendto      = 44
+//   recvfrom    = 45
+//   bind        = 49
+//   listen      = 50
+//   setsockopt  = 54
+//
+// SUBSET DISCIPLINE (same as numeric_rt.zag):
+//   • NO `<<` / `>>`    → use * 256 / / 256 etc. for byte swaps
+//   • NO `|` / `||`     → use + for disjoint-bit OR
+//   • NO break/continue → done-flag loops
+//   • i64 for addresses and raw values; bool as i32
+
+// ── raw syscall intrinsic ─────────────────────────────────────────────────────
+extern fn _zag_raw_syscall(num: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) i64
+
+// ── socket constants ──────────────────────────────────────────────────────────
+fn AF_INET()      i64 { return 2; }
+fn SOCK_STREAM()  i64 { return 1; }
+fn SOCK_DGRAM()   i64 { return 2; }
+fn SOL_SOCKET()   i64 { return 1; }
+fn SO_REUSEADDR() i64 { return 2; }
+
+// ── SockAddrIn (sockaddr_in, network byte order) ──────────────────────────────
+// Layout must match the kernel's sockaddr_in exactly (16 bytes total):
+//   sin_family (2 bytes) | sin_port (2 bytes) | sin_addr (4 bytes) | pad (8 bytes)
+// We pack family+port into one i64 field and addr+pad into a second, so the
+// compiler's field-layout machinery can handle them without special alignment code.
+// However, for clarity of use we expose them as separate fields in the Zag struct
+// and provide net_pack_addr to write them into a raw 16-byte slot for the syscall.
+struct SockAddrIn {
+    family: i64,   // AF_INET = 2, stored as 16-bit in kernel struct
+    port:   i64,   // host byte order; call htons before passing to kernel
+    addr:   i64,   // IPv4 address, host byte order; call htonl before passing
+    pad0:   i64,   // padding word (bytes 8..15 of sockaddr_in)
+}
+
+// ── KernelSockAddr: the raw 16-byte sockaddr_in the kernel sees ───────────────
+// We build it as two 8-byte words:
+//   word0 = (family & 0xFFFF) | ((port_net & 0xFFFF) << 16) | ((addr_net) << 32)
+//   word1 = pad (zeroes)
+// Since we can't use << we build word0 with multiplications.
+struct KernelSockAddr { w0: i64, w1: i64 }
+
+// ── byte-order helpers ────────────────────────────────────────────────────────
+// net_low16(x): the low 16 bits of x as an i64.
+fn net_low16(x: i64) i64 {
+    return x - ((x / 65536) * 65536);
+}
+
+// net_low8(x): the low 8 bits of x.
+fn net_low8(x: i64) i64 {
+    return x - ((x / 256) * 256);
+}
+
+// net_byte(x, n): byte n (0=LSB) of x.
+fn net_byte(x: i64, n: i64) i64 {
+    let s: i64 = 1;
+    let i: i64 = 0;
+    while (i < n) { s = s * 256; i = i + 1; }
+    return net_low8(x / s);
+}
+
+// htons: swap bytes of a 16-bit port value (host to network byte order).
+fn htons(port: i64) i64 {
+    let lo: i64 = net_low8(port);
+    let hi: i64 = net_low8(port / 256);
+    return lo * 256 + hi;
+}
+
+// htonl: swap bytes of a 32-bit address value (host to network byte order).
+fn htonl(addr: i64) i64 {
+    let b0: i64 = net_byte(addr, 0);
+    let b1: i64 = net_byte(addr, 1);
+    let b2: i64 = net_byte(addr, 2);
+    let b3: i64 = net_byte(addr, 3);
+    return b0 * 16777216 + b1 * 65536 + b2 * 256 + b3;
+}
+
+// ── net_make_addr: build a KernelSockAddr from family, port (host), addr (host) ──
+// The kernel sockaddr_in layout in memory (little-endian host):
+//   bytes [0..1] = family (little-endian 16-bit)
+//   bytes [2..3] = port   (big-endian / network 16-bit)
+//   bytes [4..7] = addr   (big-endian / network 32-bit)
+//   bytes [8..15] = 0
+//
+// We build the first 8 bytes as a single i64 word0 (little-endian layout):
+//   word0 = family_le16 + (port_be16 * 65536) + (addr_be32 * 4294967296)
+// Note: 65536 = 2^16, 4294967296 = 2^32.
+fn net_make_addr(family: i64, port_host: i64, addr_host: i64) KernelSockAddr {
+    let fam16: i64 = net_low16(family);
+    let port_net: i64 = htons(port_host);
+    let addr_net: i64 = htonl(addr_host);
+    // pack into the first 8-byte word
+    let w0: i64 = fam16 + port_net * 65536 + addr_net * 4294967296;
+    return KernelSockAddr{ .w0 = w0, .w1 = 0 };
+}
+
+// IPv4 address helpers
+fn net_addr_loopback() i64 { return 2130706433; }  // 127.0.0.1 = 0x7F000001
+fn net_addr_any()      i64 { return 0; }            // 0.0.0.0   = INADDR_ANY
+
+// ── syscall wrappers ──────────────────────────────────────────────────────────
+
+// net_socket: create a socket. Returns fd on success, negative errno on error.
+fn net_socket(domain: i64, type_: i64, proto: i64) i64 {
+    return _zag_raw_syscall(41, domain, type_, proto, 0, 0, 0);
+}
+
+// net_bind: bind socket fd to address addr (built via net_make_addr).
+// Returns 0 on success, negative errno on error.
+fn net_bind(fd: i64, kaddr: *KernelSockAddr, addrlen: i64) i64 {
+    let p: i64 = kaddr as i64;
+    return _zag_raw_syscall(49, fd, p, addrlen, 0, 0, 0);
+}
+
+// net_listen: mark socket as passive (accepting). backlog = max pending connections.
+fn net_listen(fd: i64, backlog: i64) i64 {
+    return _zag_raw_syscall(50, fd, backlog, 0, 0, 0, 0);
+}
+
+// net_accept: accept an incoming connection. addr_out and addrlen_out may be 0
+// if the caller does not need the peer address.
+// Returns new fd on success, negative errno on error.
+fn net_accept(fd: i64, addr_out: i64, addrlen_out: i64) i64 {
+    return _zag_raw_syscall(43, fd, addr_out, addrlen_out, 0, 0, 0);
+}
+
+// net_connect: initiate a connection to addr.
+// Returns 0 on success, negative errno on error.
+fn net_connect(fd: i64, kaddr: *KernelSockAddr, addrlen: i64) i64 {
+    let p: i64 = kaddr as i64;
+    return _zag_raw_syscall(42, fd, p, addrlen, 0, 0, 0);
+}
+
+// net_send: send len bytes from buf.ptr (sendto with flags, no dest addr).
+// Returns bytes sent on success, negative errno on error.
+fn net_send(fd: i64, buf_ptr: i64, buf_len: i64, flags: i64) i64 {
+    return _zag_raw_syscall(44, fd, buf_ptr, buf_len, flags, 0, 0);
+}
+
+// net_recv: receive up to buf_len bytes into buf_ptr (recvfrom, no src addr).
+// Returns bytes received, 0 on EOF, negative errno on error.
+fn net_recv(fd: i64, buf_ptr: i64, buf_len: i64, flags: i64) i64 {
+    return _zag_raw_syscall(45, fd, buf_ptr, buf_len, flags, 0, 0);
+}
+
+// net_close: close a file descriptor (syscall #3).
+fn net_close(fd: i64) void {
+    let _rc: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+}
+
+// net_setsockopt: set a socket option. optval_ptr is raw address of the option value.
+fn net_setsockopt(fd: i64, level: i64, optname: i64, optval_ptr: i64, optlen: i64) i64 {
+    return _zag_raw_syscall(54, fd, level, optname, optval_ptr, optlen, 0);
+}
+
+// ── convenience: set SO_REUSEADDR ────────────────────────────────────────────
+fn net_set_reuseaddr(fd: i64) i64 {
+    let one: i64 = 1;
+    let ptr: i64 = &one as i64;
+    return net_setsockopt(fd, SOL_SOCKET(), SO_REUSEADDR(), ptr, 4);
+}
+
+// ── convenience: open a TCP listener on a given port ─────────────────────────
+// Returns the listening fd, or a negative value on error.
+fn net_tcp_listen(port: i64, backlog: i64) i64 {
+    let fd: i64 = net_socket(AF_INET(), SOCK_STREAM(), 0);
+    if (fd < 0) { return fd; }
+    let _reuserc: i64 = net_set_reuseaddr(fd);
+    let kaddr: KernelSockAddr = net_make_addr(AF_INET(), port, net_addr_any());
+    let brc: i64 = net_bind(fd, &kaddr, 16);
+    if (brc < 0) { net_close(fd); return brc; }
+    let lrc: i64 = net_listen(fd, backlog);
+    if (lrc < 0) { net_close(fd); return lrc; }
+    return fd;
+}
+
+// ── convenience: connect to a TCP server ──────────────────────────────────────
+// addr_host is the IPv4 address in host byte order (use net_addr_loopback() etc.)
+// Returns the connected fd, or a negative value on error.
+fn net_tcp_connect(addr_host: i64, port: i64) i64 {
+    let fd: i64 = net_socket(AF_INET(), SOCK_STREAM(), 0);
+    if (fd < 0) { return fd; }
+    let kaddr: KernelSockAddr = net_make_addr(AF_INET(), port, addr_host);
+    let crc: i64 = net_connect(fd, &kaddr, 16);
+    if (crc < 0) { net_close(fd); return crc; }
+    return fd;
+}

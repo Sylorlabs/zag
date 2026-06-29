@@ -1,0 +1,241 @@
+// selfhost/native/runtime_test.zag — Integration tests for signal_rt, net_rt, thread_rt.
+//
+// Three test scenarios:
+//   1. SIGNAL TEST: install a SIGUSR1 handler, raise SIGUSR1, verify the handler fires.
+//   2. NETWORK TEST: open a TCP listener on 127.0.0.1:19876, connect to it, send a byte.
+//   3. THREAD TEST: spawn 2 threads that each increment a shared counter under a mutex,
+//                   join both threads, verify the counter equals 2000 (1000 per thread).
+//
+// Build with:
+//   znc selfhost/native/runtime_test.zag -o runtime_test && ./runtime_test
+//
+// All test output goes to stdout via _zag_println.  A non-zero exit means FAIL.
+
+// ── stdlib (included by znc automatically) ───────────────────────────────────
+// We rely on _zag_println, _zag_i64_to_str, _zag_exit being available as the
+// standard set of ncodegen intrinsics (no explicit import needed).
+
+// ── include the runtime modules (znc --include or direct compilation) ─────────
+// In practice znc auto-includes rt files; for clarity we list the dependencies:
+//   signal_rt.zag → SigAction, signal_install, signal_raise, SIGUSR1, ...
+//   net_rt.zag    → net_tcp_listen, net_tcp_connect, net_send, net_recv, net_close
+//   thread_rt.zag → Thread, Mutex, thread_spawn, thread_join, mutex_*, ...
+//
+// (The actual include mechanism is handled by the build system; symbols are available
+// when all four files are compiled together.)
+
+// ── raw syscall intrinsic (re-declared here so this file compiles standalone) ─
+extern fn _zag_raw_syscall(num: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) i64
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TEST 1: SIGNAL
+// ══════════════════════════════════════════════════════════════════════════════
+
+// A global that the signal handler writes to so we can detect it was called.
+// (Implemented as a module-level mutable variable: Zag supports let at top-level.)
+let g_signal_fired: i64 = 0;
+
+// The handler: called by the kernel when SIGUSR1 arrives.
+// Sets g_signal_fired = 1 to prove execution.
+fn test_sigusr1_handler(signum: i64) void {
+    g_signal_fired = 1;
+}
+
+fn test_signal() i32 {
+    _zag_println("TEST 1: signal handler");
+
+    // signal_install takes the function ADDRESS as an i64.
+    // We pass it as a fn-pointer cast: &test_sigusr1_handler as i64.
+    let handler_addr: i64 = &test_sigusr1_handler as i64;
+
+    // Build and install the sigaction struct (from signal_rt).
+    let kact: KernelSigAction = KernelSigAction{
+        .handler  = handler_addr,
+        .flags    = SA_FLAGS_HANDLER(),
+        .restorer = 0,
+        .mask     = 0
+    };
+    let act_ptr: i64 = &kact as i64;
+    let rc_install: i64 = _zag_raw_syscall(13, SIGUSR1(), act_ptr, 0, 0, 0, 0);
+    if (rc_install != 0) {
+        _zag_println("FAIL: sigaction returned error");
+        return 1;
+    }
+
+    // Raise SIGUSR1 via kill(getpid(), SIGUSR1).
+    let pid: i64 = _zag_raw_syscall(39, 0, 0, 0, 0, 0, 0);
+    let _rc_kill: i64 = _zag_raw_syscall(62, pid, SIGUSR1(), 0, 0, 0, 0);
+
+    // After the synchronous signal, g_signal_fired should be 1.
+    if (g_signal_fired != 1) {
+        _zag_println("FAIL: signal handler did not fire");
+        return 1;
+    }
+
+    _zag_println("PASS: signal handler fired correctly");
+    return 0;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TEST 2: NETWORKING
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Test port — chosen to be unlikely to collide with system services.
+fn TEST_PORT() i64 { return 19876; }
+
+fn test_network() i32 {
+    _zag_println("TEST 2: network socket connect/send/recv");
+
+    // Create a listening TCP socket on loopback.
+    let listen_fd: i64 = net_tcp_listen(TEST_PORT(), 5);
+    if (listen_fd < 0) {
+        _zag_println("FAIL: could not create TCP listener");
+        return 1;
+    }
+
+    // Connect from a client socket (same process; non-blocking accept works because
+    // the kernel buffers the SYN before accept is called).
+    let client_fd: i64 = net_tcp_connect(net_addr_loopback(), TEST_PORT());
+    if (client_fd < 0) {
+        _zag_println("FAIL: TCP connect failed");
+        net_close(listen_fd);
+        return 1;
+    }
+
+    // Accept the connection on the server side.
+    let server_fd: i64 = net_accept(listen_fd, 0, 0);
+    if (server_fd < 0) {
+        _zag_println("FAIL: TCP accept failed");
+        net_close(client_fd);
+        net_close(listen_fd);
+        return 1;
+    }
+
+    // Send one byte from client to server.
+    let send_buf: i64 = 42;   // use the address of a local i64 as the send buffer
+    let send_ptr: i64 = &send_buf as i64;
+    let nsent: i64 = net_send(client_fd, send_ptr, 1, 0);
+    if (nsent != 1) {
+        _zag_println("FAIL: TCP send returned wrong byte count");
+        net_close(server_fd);
+        net_close(client_fd);
+        net_close(listen_fd);
+        return 1;
+    }
+
+    // Receive it on the server side.
+    let recv_buf: i64 = 0;
+    let recv_ptr: i64 = &recv_buf as i64;
+    let nrecv: i64 = net_recv(server_fd, recv_ptr, 1, 0);
+    if (nrecv != 1) {
+        _zag_println("FAIL: TCP recv returned wrong byte count");
+        net_close(server_fd);
+        net_close(client_fd);
+        net_close(listen_fd);
+        return 1;
+    }
+
+    // Verify the byte was transmitted correctly.
+    // recv_buf's lowest byte should be 42.
+    let received_byte: i64 = recv_buf - ((recv_buf / 256) * 256);
+    if (received_byte != 42) {
+        _zag_println("FAIL: received wrong byte value");
+        net_close(server_fd);
+        net_close(client_fd);
+        net_close(listen_fd);
+        return 1;
+    }
+
+    net_close(server_fd);
+    net_close(client_fd);
+    net_close(listen_fd);
+
+    _zag_println("PASS: network send/recv worked correctly");
+    return 0;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// TEST 3: THREADING + MUTEX
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Shared state accessed by two threads.
+let g_counter: i64 = 0;
+let g_mutex: Mutex = Mutex{ .state = 0 };
+let ITERS_PER_THREAD: i64 = 1000;
+
+// Thread body: increment g_counter ITERS_PER_THREAD times under the mutex.
+fn thread_increment_fn() void {
+    let i: i64 = 0;
+    while (i < ITERS_PER_THREAD) {
+        mutex_lock(&g_mutex);
+        g_counter = g_counter + 1;
+        mutex_unlock(&g_mutex);
+        i = i + 1;
+    }
+    thread_self_exit();
+}
+
+fn test_threads() i32 {
+    _zag_println("TEST 3: threaded counter under mutex");
+
+    g_counter = 0;
+    g_mutex = mutex_new();
+
+    let fn_addr: i64 = &thread_increment_fn as i64;
+    let stack_sz: i64 = 65536;   // 64 KiB per thread
+
+    // Spawn two threads.
+    let t1: Thread = thread_spawn(fn_addr, 0, stack_sz);
+    if (t1.tid == 0) {
+        _zag_println("FAIL: thread_spawn #1 failed");
+        return 1;
+    }
+    let t2: Thread = thread_spawn(fn_addr, 0, stack_sz);
+    if (t2.tid == 0) {
+        _zag_println("FAIL: thread_spawn #2 failed");
+        thread_join(&t1);
+        return 1;
+    }
+
+    // Join both threads (blocks until each exits).
+    thread_join(&t1);
+    thread_join(&t2);
+
+    // Verify the counter.
+    let expected: i64 = ITERS_PER_THREAD * 2;
+    if (g_counter != expected) {
+        _zag_print("FAIL: counter = ");
+        _zag_println(_zag_i64_to_str(g_counter));
+        _zag_print("      expected = ");
+        _zag_println(_zag_i64_to_str(expected));
+        return 1;
+    }
+
+    _zag_println("PASS: threaded counter correct");
+    return 0;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MAIN
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn main() i32 {
+    let failures: i32 = 0;
+
+    let r1: i32 = test_signal();
+    if (r1 != 0) { failures = failures + 1; }
+
+    let r2: i32 = test_network();
+    if (r2 != 0) { failures = failures + 1; }
+
+    let r3: i32 = test_threads();
+    if (r3 != 0) { failures = failures + 1; }
+
+    if (failures == 0) {
+        _zag_println("ALL TESTS PASSED");
+        return 0;
+    }
+    _zag_print("FAILED: ");
+    _zag_println(_zag_i64_to_str(failures as i64));
+    return 1;
+}
