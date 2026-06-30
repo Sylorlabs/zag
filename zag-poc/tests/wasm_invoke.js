@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Minimal WASM host harness when wasmtime is unavailable.
+// Node.js WASM host fallback when wasmtime/cargo host is unavailable.
+// Prefer: tests/wasmtime_run.sh (wasmtime + env::print_* stubs).
 // Usage: node wasm_invoke.js <file.wasm> <expected-i32-return>
 'use strict';
 const fs = require('fs');
