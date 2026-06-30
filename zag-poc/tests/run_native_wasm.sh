@@ -5,6 +5,7 @@ cd "$(dirname "$0")/.."
 pass=0; fail=0
 SCRIPT_DIR="$(dirname "$0")"
 WASM_HOST_JS="$SCRIPT_DIR/wasm_invoke.js"
+WASMTIME_RUN="$SCRIPT_DIR/wasmtime_run.sh"
 
 if [ ! -x ./znc ]; then
     echo "  XX  ./znc missing — run ./bootstrap.sh first"
@@ -54,23 +55,24 @@ wasm_build(){ local src="$1" out="$2"
 }
 
 # Harsh runtime verification: invoke exported main() and check i32 return.
-# Prefer wasmtime; fall back to tests/wasm_invoke.js (env import stubs).
+# Prefer wasmtime + tests/wasmtime_run.sh (env::print_* host stubs);
+# fall back to tests/wasm_invoke.js when wasmtime/cargo unavailable.
 # SKIP only when neither runner exists; FAIL if a runner is present but breaks.
 wasm_runtime_expect(){ local wf="$1" expect="$2" label="$3"
-    if command -v wasmtime >/dev/null 2>&1; then
-        local got
-        if ! got=$(wasmtime run --invoke main "$wf" 2>/tmp/wasm_rt_err); then
-            echo "  XX  runtime $label (wasmtime invoke failed)" >&2
+    if [ -x "$WASMTIME_RUN" ]; then
+        local rt=0
+        "$WASMTIME_RUN" "$wf" "$expect" >/tmp/wasm_rt_out 2>/tmp/wasm_rt_err || rt=$?
+        if [ "$rt" -eq 0 ]; then
+            echo "  ok  runtime $label (wasmtime main() → $expect)"
+            return 0
+        fi
+        if [ "$rt" -eq 127 ]; then
+            : # wasmtime/cargo missing — try node below
+        else
+            echo "  XX  runtime $label (wasmtime host failed)" >&2
             sed -n '1,5p' /tmp/wasm_rt_err >&2
             return 1
         fi
-        got=$(echo "$got" | tr -d '[:space:]')
-        if [ "$got" = "$expect" ]; then
-            echo "  ok  runtime $label (wasmtime main() → $got)"
-            return 0
-        fi
-        echo "  XX  runtime $label (wasmtime main() → '$got', want '$expect')"
-        return 1
     fi
     if command -v node >/dev/null 2>&1 && [ -f "$WASM_HOST_JS" ]; then
         if node "$WASM_HOST_JS" "$wf" "$expect" >/tmp/wasm_rt_out 2>/tmp/wasm_rt_err; then
@@ -81,7 +83,7 @@ wasm_runtime_expect(){ local wf="$1" expect="$2" label="$3"
         sed -n '1,5p' /tmp/wasm_rt_err
         return 1
     fi
-    echo "  --  SKIP runtime $label (no wasmtime or node)"
+    echo "  --  SKIP runtime $label (no wasmtime/cargo or node; install: curl -sSf https://wasmtime.dev/install.sh | bash)"
     return 2
 }
 
@@ -176,6 +178,29 @@ if [ "$(echo "$r" | tail -1)" = "1" ]; then
     echo "  ok  numeric.zag → .wasm"; pass=$((pass+1))
 else
     echo "  XX  numeric.zag → .wasm"; echo "$r"; fail=$((fail+1))
+fi
+
+wasm_build examples/wasm_float.zag /tmp/wasm_float.wasm
+r=$(wasm_validate /tmp/wasm_float.wasm)
+if [ "$(echo "$r" | tail -1)" = "1" ]; then
+    echo "  ok  wasm_float.zag (f32/f64 locals + add/mul)"; pass=$((pass+1))
+else
+    echo "  XX  wasm_float.zag"; echo "$r"; fail=$((fail+1))
+fi
+set +e
+wasm_runtime_expect /tmp/wasm_float.wasm 8 "f32/f64 (1.5+2.5)*2"; rt=$?
+set -e
+case "$rt" in
+    0) pass=$((pass+1)) ;;
+    1) fail=$((fail+1)) ;;
+    2) : ;;
+esac
+
+# Union switch (examples/wasm_op.zag) is not yet lowered by wasm.zag — tracked skip.
+if wasm_build examples/wasm_op.zag /tmp/wasm_op.wasm 2>/tmp/wasm_op_skip; then
+    echo "  XX  wasm_op.zag unexpectedly compiled (union switch should be unsupported)"; fail=$((fail+1))
+else
+    echo "  ok  wasm_op.zag skip (union switch not in wasm backend yet)"; pass=$((pass+1))
 fi
 
 echo "════ native-wasm pass=$pass fail=$fail ════"
