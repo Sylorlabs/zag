@@ -2478,7 +2478,12 @@ fn cg_scan_expr(cg: *Cg, sc: *ScanCtx, n: *Node) void {
                     sc.*.words.* = sc.*.words.* + 1;
                     if (sw_kind2 == 2 && len[[]u8](arm.tags) > 0) {
                         let payty2: []u8 = cg_union_payload_type(cg, sw_uname2, get[[]u8](arm.tags, 0));
-                        cg_scan_rectype(sc, arm.cap, _zag_str_concat("*", cg_norm_type(payty2)));
+                        let norm2: []u8 = cg_norm_type(payty2);
+                        if (cg_type_is_agg(cg, norm2) == 1) {
+                            cg_scan_rectype(sc, arm.cap, _zag_str_concat("*", norm2));
+                        } else {
+                            cg_scan_rectype(sc, arm.cap, norm2);
+                        }
                     }
                 }
                 cg_scan_body(cg, sc, arm.body);
@@ -2607,14 +2612,14 @@ fn cg_scan_body(cg: *Cg, sc: *ScanCtx, body: ArrayList[*Node]) void {
             .switch_ => |sw| {
                 // A switch lowers the subject to a scratch block sized to the
                 // subject (a UNION subject is its FULL {tag, inline payload} block;
-                // a scalar/enum fits one word), plus ONE capture-pointer word per
+                // a scalar/enum fits one word), plus ONE capture word per
                 // capturing arm. Reserve those, then walk subject + arm bodies. For
                 // a UNION arm with a `|cap|` capture we RECORD the capture's type
-                // (`*<payload-type>`) in the scan's name map — exactly as
-                // cg_bind_capture types it at lowering — so an aggregate field of
-                // the capture (e.g. `len(f.*.params)` where params is an ArrayList)
-                // is correctly sized as an aggregate arg. Without this the scan
-                // under-reserves the arg-copy and the frame overruns.
+                // in the scan's name map — exactly as cg_bind_capture types it at
+                // lowering: scalar payloads bind as T (value), aggregate payloads as
+                // *T (pointer to blk+8) so `cap.*.field` reaches inline struct/slice
+                // fields. Without this the scan under-reserves arg-copy blocks and
+                // the frame overruns.
                 let sw_uname: []u8 = "";
                 let sw_kind: i32 = cg_switch_kind(cg, sw, &sw_uname);
                 sc.*.words.* = sc.*.words.* + cg_scan_switch_subject_words(cg, sw);
@@ -2626,7 +2631,12 @@ fn cg_scan_body(cg: *Cg, sc: *ScanCtx, body: ArrayList[*Node]) void {
                         sc.*.words.* = sc.*.words.* + 1;
                         if (sw_kind == 2 && len[[]u8](arm.tags) > 0) {
                             let payty: []u8 = cg_union_payload_type(cg, sw_uname, get[[]u8](arm.tags, 0));
-                            cg_scan_rectype(sc, arm.cap, _zag_str_concat("*", cg_norm_type(payty)));
+                            let norm: []u8 = cg_norm_type(payty);
+                            if (cg_type_is_agg(cg, norm) == 1) {
+                                cg_scan_rectype(sc, arm.cap, _zag_str_concat("*", norm));
+                            } else {
+                                cg_scan_rectype(sc, arm.cap, norm);
+                            }
                         }
                     }
                     cg_scan_body(cg, sc, arm.body);
@@ -5700,8 +5710,8 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
 //
 // A switch dispatches on a DISCRIMINANT integer:
 //   • UNION subject  → the tag word at [block+0] (the active variant's index).
-//                      A `|cap|` capture binds cap = pointer to the payload at
-//                      [block+8], typed as that variant's declared payload type.
+//                      A `|cap|` capture binds cap to the payload at [block+8]:
+//                      scalar T → cap : T (value); aggregate T → cap : *T.
 //   • ENUM subject   → the member-index integer value.
 //   • plain VALUE    → the integer value itself (arms match integer literals).
 //
@@ -5775,17 +5785,21 @@ fn cg_switch_materialize(out: *ArrayList[Instr], sw: Switch, kind: i32, uname: [
     return blk;
 }
 
-// Bind a union arm's `|cap|` capture: store a POINTER to the payload (blk+8) into
-// a fresh local slot named `cap`, typed as the variant's declared payload type
-// reachable via deref. We type the capture slot as a POINTER-to-payload so that
-// `cap.*` / `cap.*.field` work; if the payload is itself a struct/union, the
-// capture is a pointer to its block. Returns nothing.
+// Bind a union arm's `|cap|` capture into a fresh local slot named `cap`.
+// Scalar payload T: cap = T (value loaded from blk+8) — matches zagc semantics.
+// Aggregate payload T: cap = *T (pointer to blk+8) — use cap.* / cap.*.field.
 fn cg_bind_capture(out: *ArrayList[Instr], cap: []u8, payty: []u8, blk: i32, env: *Env, cg: *Cg) void {
-    // capture holds &payload; its type is *<payload-type> so deref reads it.
-    let capty: []u8 = _zag_str_concat("*", cg_norm_type(payty));
-    let cdisp: i32 = cg_slot_alloc_typed(env, cap, capty, 1);
-    push[Instr](out, i_lea(R_RAX(), R_RBP(), blk + 8));   // rax = &payload
-    push[Instr](out, i_store(R_RBP(), cdisp, R_RAX()));   // cap = &payload
+    let norm: []u8 = cg_norm_type(payty);
+    if (cg_type_is_agg(cg, norm) == 1) {
+        let capty: []u8 = _zag_str_concat("*", norm);
+        let cdisp: i32 = cg_slot_alloc_typed(env, cap, capty, 1);
+        push[Instr](out, i_lea(R_RAX(), R_RBP(), blk + 8));   // rax = &payload
+        push[Instr](out, i_store(R_RBP(), cdisp, R_RAX()));   // cap = &payload
+    } else {
+        let cdisp: i32 = cg_slot_alloc_typed(env, cap, norm, 1);
+        push[Instr](out, i_load(R_RAX(), R_RBP(), blk + 8));   // rax = payload value
+        push[Instr](out, i_store(R_RBP(), cdisp, R_RAX()));    // cap = payload
+    }
 }
 
 // Lower a switch STATEMENT: dispatch to per-arm bodies, with an else fallback.
@@ -9060,9 +9074,25 @@ fn lower_program(decls0in: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u
                     // unknown function". So a mere extern decl is harmless.
                 } else if (cg_starts_with(f.name, "__iface_") == 1) {
                     // interface pseudo-decl: metadata only, no code emitted.
+                } else if (len[*Node](f.body) == 0) {
+                    // forward declaration (`fn foo() T;`): no code until the definition.
                 } else {
-                    push[FnSym](&syms, FnSym{ .name = f.name, .lbl = next_id, .ret = cg_norm_type(f.ret), .nparams = len[Param](f.params) });
-                    next_id = next_id + 1;
+                    // A later definition of the same name replaces an earlier symbol
+                    // (mutual recursion: `fn bar() i32;` then `fn bar() i32 { ... }`).
+                    let si: i32 = 0;
+                    let found: i32 = 0;
+                    while (si < len[FnSym](syms)) {
+                        if (@strEq(get[FnSym](syms, si).name, f.name)) {
+                            get[FnSym](syms, si).ret = cg_norm_type(f.ret);
+                            get[FnSym](syms, si).nparams = len[Param](f.params);
+                            found = 1;
+                        }
+                        si = si + 1;
+                    }
+                    if (found == 0) {
+                        push[FnSym](&syms, FnSym{ .name = f.name, .lbl = next_id, .ret = cg_norm_type(f.ret), .nparams = len[Param](f.params) });
+                        next_id = next_id + 1;
+                    }
                 }
             }
             .struct_ => |_s| { }   // type decl: no code; consulted for layout.
@@ -9151,7 +9181,7 @@ fn lower_program(decls0in: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u
         let d2: *Node = get[*Node](decls, di);
         switch (d2.*) {
             .fn_decl => |f| {
-                if (f.is_extern == 0 && len[[]u8](f.tparams) == 0) {
+                if (f.is_extern == 0 && len[[]u8](f.tparams) == 0 && len[*Node](f.body) > 0) {
                     if (cg_starts_with(f.name, "__iface_") == 1) {
                         // interface pseudo-decl: metadata only, skip body emission.
                     } else {

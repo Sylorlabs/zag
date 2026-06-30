@@ -27,6 +27,8 @@ echo "── native backend: Zag → x86-64 ELF (no cc/as/ld/libc) ──"
 nt "return literal"  'fn main() i32 { return 42; }' 42
 nt "arithmetic"      'fn main() i32 { let a: i32 = 8; let b: i32 = 5; return a * b - 2; }' 38
 nt "function call"   'fn add(a: i32, b: i32) i32 { return a + b; } fn main() i32 { return add(40, 2); }' 42
+nt "forward decl"    'fn foo() i32; fn main() i32 { return 0; }' 0
+nt "fwd mutual rec"  'fn bar() i32; fn foo() i32 { return bar(); } fn bar() i32 { return 42; } fn main() i32 { return foo(); }' 42
 nt "recursion (fib)" 'fn fib(n: i32) i32 { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); } fn main() i32 { return fib(10); }' 55
 nt "while loop"      'fn main() i32 { let s: i32 = 0; let i: i32 = 1; while (i <= 10) { s = s + i; i = i + 1; } return s; }' 55
 nt "factorial"       'fn fact(n: i32) i32 { if (n < 2) { return 1; } return n * fact(n - 1); } fn main() i32 { return fact(5); }' 120
@@ -73,7 +75,8 @@ nt  "@strEq differ"    'fn main() i32 { if (@strEq("hi", "ho")) { return 1; } re
 nt  "generic id[T]"    'fn id[T](x: T) T { return x; } fn main() i32 { return id[i32](42); }' 42
 nt  "ArrayList[i32]"   '@import("std/list.zag") fn main() i32 { let xs: ArrayList[i32] = make[i32](4); push[i32](&xs, 30); push[i32](&xs, 12); return get[i32](xs, 0) + get[i32](xs, 1); }' 42
 nt  "ArrayList realloc" '@import("std/list.zag") fn main() i32 { let xs: ArrayList[i32] = make[i32](2); push[i32](&xs, 1); push[i32](&xs, 2); push[i32](&xs, 3); push[i32](&xs, 4); push[i32](&xs, 5); return len[i32](xs); }' 5
-nt  "union switch"     'union U { a: i32, b: i32 } fn main() i32 { let u: U = U{ .b = 42 }; return switch (u) { .a => |x| 0, .b => |x| x.* }; }' 42
+nt  "union switch"     'union U { a: i32, b: i32 } fn main() i32 { let u: U = U{ .b = 42 }; return switch (u) { .a => |x| 0, .b => |x| x }; }' 42
+nt  "union capture val" 'union Expr { num: i32, neg: i32 } fn eval(e: Expr) i32 { return switch (e) { .num => |v| v, .neg => |v| 0 - v }; } fn main() i32 { let e1: Expr = Expr{ .num = 42 }; let e2: Expr = Expr{ .neg = 5 }; return eval(e1) + eval(e2); }' 37
 nt  "enum switch"      'enum Color { Red, Green, Blue } fn main() i32 { let c: Color = Color.Green; return switch (c) { .Red => 1, .Green => 42, .Blue => 3 }; }' 42
 echo "── variable layout · nested literals · &expr · optionals (round 2) ──"
 nt  "@sizeOf slice field" 'struct S { a: i32, b: []u8, c: i32 } fn main() i32 { return @sizeOf[S](); }' 32
