@@ -51,6 +51,8 @@ Larger programs under `programs/` are documented in [programs/GAPS.md](programs/
 Release gates (these must pass before a release):
 
 ```sh
+make test                              # full v1 release gates (includes programs)
+bash tests/run_programs.sh             # programs/*.zag integration gate only
 bash tests/run_native_authority.sh
 bash tests/run_semantics.sh
 bash tests/run_diag.sh
