@@ -10,8 +10,8 @@
 #   make clean     — remove generated artifacts (keeps seed binaries zagc + znc)
 
 .PHONY: all bootstrap znc zagc test test-authority test-bootstrap test-semantics \
-        test-diagnostics test-tooling test-programs test-native test-differential \
-        test-selfhost clean install
+        test-diagnostics test-tooling test-programs test-native test-abi-layout \
+        test-differential test-selfhost clean install
 
 # ── Primary target ────────────────────────────────────────────────────────────
 all: znc
@@ -62,6 +62,11 @@ test-programs:
 test-native:
 	@echo "── native backend suite ──"
 	bash tests/run_native.sh
+
+# ABI/layout edge-case regression (informational — documents CURRENT behavior).
+test-abi-layout:
+	@echo "── ABI/layout regression suite ──"
+	bash tests/run_abi_layout.sh
 
 # Differential tests against the C backend (not a release gate).
 test-differential:

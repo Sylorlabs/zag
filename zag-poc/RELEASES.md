@@ -94,7 +94,12 @@ parser or sema bugs that affect both backends.
 ./run_tests.sh
 ./tests/run_selfhost.sh
 ./tests/run_stdlib.sh
+./tests/run_abi_layout.sh
 ```
+
+ABI/layout hardening (`tests/run_abi_layout.sh`) documents **current** struct,
+slice, union, `fat_fn`, and `!T` sizing per `COMPATIBILITY.md`. It is an
+informational regression gate — language v1 does **not** freeze binary layout.
 
 ### 6. Verify byte-identical self-hosting fixpoint — BLOCKING
 
