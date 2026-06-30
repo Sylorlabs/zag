@@ -12,13 +12,6 @@ if [ ! -x ./znc ]; then
     echo "════ native-wasm pass=0 fail=1 ════"; exit 1
 fi
 ZNC=./znc
-if [ ! -x ./znc-target ]; then
-    if ! "$ZNC" selfhost/native/znc_target.zag -o ./znc-target >/tmp/znc_tgt_build 2>&1; then
-        echo "  XX  znc-target build"; sed -n '1,20p' /tmp/znc_tgt_build
-        echo "════ native-wasm pass=0 fail=1 ════"; exit 1
-    fi
-fi
-ZNC_TARGET=./znc-target
 
 wasm_validate(){ local wf="$1"
     local ok=1
@@ -51,7 +44,7 @@ wasm_validate(){ local wf="$1"
 }
 
 wasm_build(){ local src="$1" out="$2"
-    "$ZNC_TARGET" wasm "$src" -o "$out" >/tmp/znc_wasm_out 2>&1
+    "$ZNC" "$src" --target wasm -o "$out" >/tmp/znc_wasm_out 2>&1
 }
 
 # Harsh runtime verification: invoke exported main() and check i32 return.

@@ -318,9 +318,9 @@ Zag v1 is a self-hosted native compiler (`./znc`) that boots from a committed se
 | Witness chains, effect polymorphism, closures | Yes | Yes |
 | Posits, quire, saturating ints, `u11`, fixed-point, RNS | Yes | Yes |
 | Native stdlib, LSP, formatter, DWARF | Yes | Partial |
-| `@total` SMT proofs via ghost_engine | Gated (`run_native_total.sh`) | Yes |
-| GPU / MLIR | Via `./znc-target`; gated (`run_native_gpu.sh`) | Yes |
-| WebAssembly | Via `./znc-target`; gated (`run_native_wasm.sh`) | Yes |
+| `@total` SMT proofs (in-process solver) | Gated (`run_native_total.sh`) | Yes |
+| GPU / MLIR | Yes (`--target gpu-*`; `run_native_gpu.sh`) | Yes |
+| WebAssembly | Yes (`--target wasm`; `run_native_wasm.sh`) | Yes |
 | multi-arch CPU (arm64, riscv, …) | No | Yes |
 
 Release gates:

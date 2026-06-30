@@ -9,19 +9,12 @@ if [ ! -x ./znc ]; then
     echo "════ native-gpu pass=0 fail=1 ════"; exit 1
 fi
 ZNC=./znc
-if [ ! -x ./znc-target ]; then
-    if ! "$ZNC" selfhost/native/znc_target.zag -o ./znc-target >/tmp/znc_tgt_build 2>&1; then
-        echo "  XX  znc-target build"; sed -n '1,20p' /tmp/znc_tgt_build
-        echo "════ native-gpu pass=0 fail=1 ════"; exit 1
-    fi
-fi
 
 mkdir -p /tmp/zag_gpu
 cp examples/gpu_matmul_mx.zag /tmp/zag_gpu/gpu_matmul_mx.zag
 cp examples/gpu_vsa_hd.zag    /tmp/zag_gpu/gpu_vsa_hd.zag
-cp -f ./znc-target /tmp/zag_gpu/znc-target
 cp -f "$ZNC" /tmp/zag_gpu/znc
-chmod +x /tmp/zag_gpu/znc-target /tmp/zag_gpu/znc
+chmod +x /tmp/zag_gpu/znc
 NOSTUB='unsupported|unimplemented|stub|TODO|unhandled|= //|// closure|// unknown|<kernel>'
 
 gpu_check(){ local stem="$1"; shift

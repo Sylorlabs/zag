@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # bootstrap.sh — rebuild the supported Zag v1 compiler seeds from source.
 #
-# Produces two release artifacts:
-#   ./znc         — lean native x86-64 compiler (selfhost/native/znc.zag)
-#   ./znc-target  — GPU MLIR + WASM helper (selfhost/native/znc_target.zag)
+# Produces one release artifact:
+#   ./znc — native x86-64 compiler with GPU MLIR + WASM backends
+#           (selfhost/native/znc.zag; mlir.zag is lean, no codegen.zag)
 #
-# ./znc reads Zag and writes a static x86-64 ELF directly. For --target gpu-*
-# and --target wasm it shells to ./znc-target. Neither binary invokes cc, as,
+# ./znc reads Zag and writes a static x86-64 ELF, GPU MLIR, or WASM directly.
+# Neither path invokes cc, as,
 # ld, or libc. The historical C emitter (`./zagc`, `selfhost/codegen.zag`) is
 # not part of this workflow.
 #
@@ -26,10 +26,5 @@ echo "== native bootstrap: Zag -> x86-64 ELF (no cc/as/ld/libc) =="
 mv -f znc.new znc
 echo "   ./znc rebuilt itself from selfhost/native/znc.zag"
 
-echo "== GPU/WASM helper: znc-target (mlir + wasm backends) =="
-./znc selfhost/native/znc_target.zag -o znc-target.new
-mv -f znc-target.new znc-target
-echo "   ./znc-target built from selfhost/native/znc_target.zag"
-
-echo "== done. Supported compiler: ./znc (+ ./znc-target for gpu/wasm) =="
+echo "== done. Supported compiler: ./znc (native + gpu + wasm) =="
 echo "   see BOOTSTRAP.md for the legacy C differential oracle."

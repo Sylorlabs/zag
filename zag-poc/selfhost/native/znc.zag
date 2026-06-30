@@ -25,6 +25,8 @@
 @import("../fmt.zag")     // native Zag source formatter
 @import("../version.zag") // zag_version / zag_edition
 @import("../smt.zag")     // @total SMT discharge (kept out of sema.zag for lean bootstrap)
+@import("../mlir.zag")    // GPU MLIR emitter (lean — no codegen.zag dependency)
+@import("wasm.zag")       // WASM binary emitter
 
 // ── operator-contract lowering (pre-sema) ────────────────────────────────────
 // Rewrites binary ops on user types to their decode fn calls BEFORE sema runs,
@@ -346,9 +348,9 @@ fn link_libraries(libs: ArrayList[[]u8], paths: ArrayList[[]u8], needed_syms: Ar
     return ml;
 }
 
-// ── gpu / wasm target delegation (→ ./znc-target) ─────────────────────────────
-// mlir.zag + wasm.zag live in znc_target.zag so this driver stays small enough
-// to self-host.  `--target gpu-*` and `--target wasm` exec the sibling binary.
+// ── gpu / wasm targets (mlir.zag + wasm.zag, linked above) ───────────────────
+// mlir.zag is decoupled from codegen.zag so this driver can host GPU/WASM
+// backends without blowing the self-hosting fixpoint budget.
 
 fn starts_with(s: []u8, p: []u8) i32 {
     if (s.len < p.len) { return 0; }
@@ -392,36 +394,74 @@ fn wasm_target() i32 {
     return 0;
 }
 
-fn znc_target_path() []u8 {
-    if (_zag_file_exists("./znc-target") != 0) { return "./znc-target"; }
-    return "";
+fn stem_of(path: []u8) []u8 {
+    let slash: i32 = 0 - 1;
+    let i: i32 = 0;
+    while (i < path.len) {
+        if (path[i] == '/') { slash = i; }
+        i = i + 1;
+    }
+    let base: []u8 = path;
+    if (slash >= 0) { base = path[slash + 1..]; }
+    let dot: i32 = 0 - 1;
+    let j: i32 = 0;
+    while (j < base.len) {
+        if (base[j] == '.') { dot = j; }
+        j = j + 1;
+    }
+    if (dot > 0) { return base[0..dot]; }
+    return base;
 }
 
-fn delegate_gpu(path: []u8, subtarget: []u8) i32 {
-    let tgt: []u8 = znc_target_path();
-    if (tgt.len == 0) {
-        _zag_println("znc: ./znc-target missing — run ./bootstrap.sh to build the GPU/WASM helper");
+fn znc_check_src(path: []u8, src: []u8) i32 {
+    let decls: ArrayList[*Node] = parse_program_dir(src, dir_of(path));
+    lo_operators(decls);
+    let eff: map__StringMap[i32] = analyze(decls);
+    let viols: i32 = report_violations(decls, eff, src, path);
+    if (viols > 0) {
+        _zag_println("znc: capability check FAILED");
         return 1;
     }
-    let cmd: []u8 = _zag_str_concat(tgt, _zag_str_concat(" gpu ", _zag_str_concat(path, _zag_str_concat(" ", subtarget))));
-    return _zag_exec_cmd(cmd);
+    return 0;
 }
 
-fn delegate_wasm(path: []u8) i32 {
-    let tgt: []u8 = znc_target_path();
-    if (tgt.len == 0) {
-        _zag_println("znc: ./znc-target missing — run ./bootstrap.sh to build the GPU/WASM helper");
+fn build_gpu(path: []u8, target: []u8) i32 {
+    let src: []u8 = _zag_read_file(path);
+    if (src.len < 0) { _zag_print("znc: cannot read "); _zag_println(path); return 1; }
+    if (znc_check_src(path, src) != 0) { return 1; }
+    let mbuf: ArrayList[u8] = emit_mlir_dir(src, dir_of(path), target);
+    let mpath: []u8 = _zag_str_concat(stem_of(path), ".mlir");
+    if (_zag_write_file(mpath, mbuf.data[0..mbuf.len]) != 0) {
+        _zag_println("znc: failed to write MLIR");
         return 1;
     }
-    let cmd: []u8 = _zag_str_concat(tgt, _zag_str_concat(" wasm ", path));
+    _zag_print("znc: [gpu-");
+    _zag_print(target);
+    _zag_print("] wrote MLIR ");
+    _zag_println(mpath);
+    return 0;
+}
+
+fn build_wasm(path: []u8) i32 {
+    let src: []u8 = _zag_read_file(path);
+    if (src.len < 0) { _zag_print("znc: cannot read "); _zag_println(path); return 1; }
+    if (znc_check_src(path, src) != 0) { return 1; }
+    let wbuf: ArrayList[u8] = emit_wasm_dir(src, dir_of(path));
     let out: []u8 = out_flag();
-    if (out.len > 0) {
-        cmd = _zag_str_concat(cmd, _zag_str_concat(" -o ", out));
+    if (out.len == 0) { out = _zag_str_concat(stem_of(path), ".wasm"); }
+    if (_zag_write_file(out, wbuf.data[0..wbuf.len]) != 0) {
+        _zag_println("znc: failed to write WASM");
+        return 1;
     }
+    _zag_print("znc: [wasm] wrote WASM ");
+    _zag_println(out);
     if (has_flag("--run") == 1) {
-        cmd = _zag_str_concat(cmd, " --run");
+        let runcmd: []u8 = _zag_str_concat("wasmtime ", out);
+        let ec: i32 = _zag_exec_cmd(runcmd);
+        _zag_print("znc: wasmtime exited ");
+        _zag_println(_zag_i64_to_str(ec as i64));
     }
-    return _zag_exec_cmd(cmd);
+    return 0;
 }
 
 // Is `name` present anywhere in argv?
@@ -584,8 +624,8 @@ fn main() i32 {
     if (path.len == 0) { _zag_println("znc: no source file"); return 1; }
 
     let gtarget: []u8 = gpu_target();
-    if (gtarget.len > 0) { return delegate_gpu(path, gtarget); }
-    if (wasm_target() == 1) { return delegate_wasm(path); }
+    if (gtarget.len > 0) { return build_gpu(path, gtarget); }
+    if (wasm_target() == 1) { return build_wasm(path); }
 
     let src: []u8 = _zag_read_file(path);
     if (src.len < 0) {
