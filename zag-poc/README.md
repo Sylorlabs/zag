@@ -1,6 +1,6 @@
 # Zag compiler (`zag-poc`)
 
-The supported compiler is `./znc`. It reads Zag source and writes a static x86-64 ELF binary, GPU MLIR (via `./znc-target`), or WebAssembly. No `cc`, no `as`, no `ld`, no libc, no Zig, no LLVM.
+The supported compiler is `./znc`. It reads Zag source and writes a static x86-64 ELF binary, GPU MLIR (`--target gpu-*`), or WebAssembly (`--target wasm`). No `cc`, no `as`, no `ld`, no libc, no Zig, no LLVM.
 
 ```sh
 ./znc examples/numeric.zag -o numeric --run

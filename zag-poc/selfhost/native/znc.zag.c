@@ -1425,11 +1425,18 @@ static void znc_load_zagmod(ZagSliceU8 dir, ArrayList__u8* link_libs, ArrayList_
 static ArrayList__u8 collect_extern_syms(ArrayList_pNode decls);
 static ZagSliceU8 find_library(ZagSliceU8 libname, ArrayList__u8 paths);
 static MergedLib link_libraries(ArrayList__u8 libs, ArrayList__u8 paths, ArrayList__u8 needed_syms, int64_t text_base);
+static int32_t starts_with(ZagSliceU8 s, ZagSliceU8 p);
+static ZagSliceU8 gpu_target(void);
+static int32_t wasm_target(void);
+static ZagSliceU8 znc_target_path(void);
+static int32_t delegate_gpu(ZagSliceU8 path, ZagSliceU8 subtarget);
+static int32_t delegate_wasm(ZagSliceU8 path);
 static int32_t has_flag(ZagSliceU8 name);
 static ZagSliceU8 src_arg(void);
 static ZagSliceU8 out_flag(void);
 static ZagSliceU8 default_out(ZagSliceU8 path);
 static int32_t znc_fmt(ZagSliceU8 fpath, int32_t in_place);
+static int32_t znc_check(ZagSliceU8 path);
 static int32_t znc_init(void);
 static void push_u8(ArrayList_u8* xs, uint8_t val) {
     if (((*xs).len >= (*xs).cap)) {
@@ -20399,6 +20406,87 @@ static MergedLib link_libraries(ArrayList__u8 libs, ArrayList__u8 paths, ArrayLi
     apply_relocs((&ml), empty_extern);
     return ml;
 }
+static int32_t starts_with(ZagSliceU8 s, ZagSliceU8 p) {
+    if ((s.len < p.len)) {
+    return 0;
+    }
+    int32_t i = 0;
+    while ((i < p.len)) {
+    if (((s).ptr[i] != (p).ptr[i])) {
+    return 0;
+    }
+    i = (i + 1);
+    }
+    return 1;
+}
+static ZagSliceU8 gpu_target(void) {
+    int32_t i = 0;
+    while ((i < _zag_argc())) {
+    ZagSliceU8 a = _zag_arg(i);
+    if (_zag_str_eq(a, (ZagSliceU8){(const uint8_t*)"--target", 8})) {
+    if (((i + 1) < _zag_argc())) {
+    ZagSliceU8 v = _zag_arg((i + 1));
+    if ((starts_with(v, (ZagSliceU8){(const uint8_t*)"gpu-", 4}) == 1)) {
+    return (ZagSliceU8){ (v).ptr + (4), ((v).len) - (4) };
+    }
+    }
+    }
+    if ((starts_with(a, (ZagSliceU8){(const uint8_t*)"--target=gpu-", 13}) == 1)) {
+    return (ZagSliceU8){ (a).ptr + (13), ((a).len) - (13) };
+    }
+    i = (i + 1);
+    }
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+}
+static int32_t wasm_target(void) {
+    int32_t i = 0;
+    while ((i < _zag_argc())) {
+    ZagSliceU8 a = _zag_arg(i);
+    if (_zag_str_eq(a, (ZagSliceU8){(const uint8_t*)"--target", 8})) {
+    if (((i + 1) < _zag_argc())) {
+    if (_zag_str_eq(_zag_arg((i + 1)), (ZagSliceU8){(const uint8_t*)"wasm", 4})) {
+    return 1;
+    }
+    }
+    }
+    if (_zag_str_eq(a, (ZagSliceU8){(const uint8_t*)"--target=wasm", 13})) {
+    return 1;
+    }
+    i = (i + 1);
+    }
+    return 0;
+}
+static ZagSliceU8 znc_target_path(void) {
+    if ((_zag_file_exists((ZagSliceU8){(const uint8_t*)"./znc-target", 12}) != 0)) {
+    return (ZagSliceU8){(const uint8_t*)"./znc-target", 12};
+    }
+    return (ZagSliceU8){(const uint8_t*)"", 0};
+}
+static int32_t delegate_gpu(ZagSliceU8 path, ZagSliceU8 subtarget) {
+    ZagSliceU8 tgt = znc_target_path();
+    if ((tgt.len == 0)) {
+    _zag_println((ZagSliceU8){(const uint8_t*)"znc: ./znc-target missing — run ./bootstrap.sh to build the GPU/WASM helper", 77});
+    return 1;
+    }
+    ZagSliceU8 cmd = _zag_str_concat(tgt, _zag_str_concat((ZagSliceU8){(const uint8_t*)" gpu ", 5}, _zag_str_concat(path, _zag_str_concat((ZagSliceU8){(const uint8_t*)" ", 1}, subtarget))));
+    return _zag_exec_cmd(cmd);
+}
+static int32_t delegate_wasm(ZagSliceU8 path) {
+    ZagSliceU8 tgt = znc_target_path();
+    if ((tgt.len == 0)) {
+    _zag_println((ZagSliceU8){(const uint8_t*)"znc: ./znc-target missing — run ./bootstrap.sh to build the GPU/WASM helper", 77});
+    return 1;
+    }
+    ZagSliceU8 cmd = _zag_str_concat(tgt, _zag_str_concat((ZagSliceU8){(const uint8_t*)" wasm ", 6}, path));
+    ZagSliceU8 out = out_flag();
+    if ((out.len > 0)) {
+    cmd = _zag_str_concat(cmd, _zag_str_concat((ZagSliceU8){(const uint8_t*)" -o ", 4}, out));
+    }
+    if ((has_flag((ZagSliceU8){(const uint8_t*)"--run", 5}) == 1)) {
+    cmd = _zag_str_concat(cmd, (ZagSliceU8){(const uint8_t*)" --run", 6});
+    }
+    return _zag_exec_cmd(cmd);
+}
 static int32_t has_flag(ZagSliceU8 name) {
     int32_t i = 0;
     while ((i < _zag_argc())) {
@@ -20473,6 +20561,28 @@ static int32_t znc_fmt(ZagSliceU8 fpath, int32_t in_place) {
     }
     return 0;
 }
+static int32_t znc_check(ZagSliceU8 path) {
+    if ((path.len == 0)) {
+    _zag_println((ZagSliceU8){(const uint8_t*)"znc: no source file", 19});
+    return 1;
+    }
+    ZagSliceU8 src = _zag_read_file(path);
+    if ((src.len < 0)) {
+    _zag_print((ZagSliceU8){(const uint8_t*)"znc: cannot read ", 17});
+    _zag_println(path);
+    return 1;
+    }
+    ArrayList_pNode decls = parse_program_dir(src, dir_of(path));
+    lo_operators(decls);
+    map__StringMap_i32 eff = analyze(decls);
+    int32_t viols = report_violations(decls, eff, src, path);
+    if ((viols > 0)) {
+    _zag_println((ZagSliceU8){(const uint8_t*)"znc: capability check FAILED", 28});
+    return 1;
+    }
+    _zag_println((ZagSliceU8){(const uint8_t*)"znc: OK — all capability claims proven", 40});
+    return 0;
+}
 static int32_t znc_init(void) {
     ZagSliceU8 modpath = (ZagSliceU8){(const uint8_t*)"zag.mod", 7};
     if ((_zag_file_exists(modpath) != 0)) {
@@ -20491,6 +20601,9 @@ static int32_t znc_init(void) {
 int main(void) {
     if ((_zag_argc() < 2)) {
     _zag_println((ZagSliceU8){(const uint8_t*)"usage: znc <source.zag> [-o out] [-l lib] [-L path] [--run] [--debug]", 69});
+    _zag_println((ZagSliceU8){(const uint8_t*)"       znc <source.zag> --target gpu-nvidia|gpu-amd|gpu-vulkan", 62});
+    _zag_println((ZagSliceU8){(const uint8_t*)"       znc <source.zag> --target wasm [-o out.wasm] [--run]", 59});
+    _zag_println((ZagSliceU8){(const uint8_t*)"       znc check <source.zag>", 29});
     _zag_println((ZagSliceU8){(const uint8_t*)"       znc fmt [--in-place] <source.zag>", 40});
     _zag_println((ZagSliceU8){(const uint8_t*)"       znc init", 15});
     _zag_println((ZagSliceU8){(const uint8_t*)"       znc version", 18});
@@ -20525,10 +20638,24 @@ int main(void) {
     if (_zag_str_eq(cmd, (ZagSliceU8){(const uint8_t*)"init", 4})) {
     return znc_init();
     }
+    if (_zag_str_eq(cmd, (ZagSliceU8){(const uint8_t*)"check", 5})) {
+    ZagSliceU8 cpath = (ZagSliceU8){(const uint8_t*)"", 0};
+    if ((_zag_argc() >= 3)) {
+    cpath = _zag_arg(2);
+    }
+    return znc_check(cpath);
+    }
     ZagSliceU8 path = src_arg();
     if ((path.len == 0)) {
     _zag_println((ZagSliceU8){(const uint8_t*)"znc: no source file", 19});
     return 1;
+    }
+    ZagSliceU8 gtarget = gpu_target();
+    if ((gtarget.len > 0)) {
+    return delegate_gpu(path, gtarget);
+    }
+    if ((wasm_target() == 1)) {
+    return delegate_wasm(path);
     }
     ZagSliceU8 src = _zag_read_file(path);
     if ((src.len < 0)) {

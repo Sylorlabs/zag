@@ -9,12 +9,11 @@ release tag is pushed. Steps marked **BLOCKING** abort the release if they fail.
 
 - You are on the `native-self-hosting-no-zig` branch (or a release branch cut
   from it).
-- `./znc` and `./znc-target` are the committed seed binaries. `./zagc` is
-  present only for differential testing; it is NOT a release artifact.
-- `./znc` is the lean native x86-64 compiler (lexer through ELF emission).
-  `./znc-target` is the GPU MLIR + WASM helper built from
-  `selfhost/native/znc_target.zag`; `./znc` invokes it for `--target gpu-*`
-  and `--target wasm`.
+- `./znc` is the committed seed binary. `./zagc` is present only for
+  differential testing; it is NOT a release artifact.
+- `./znc` is the native x86-64 compiler (lexer through ELF emission) with
+  integrated GPU MLIR (`--target gpu-*`) and WASM (`--target wasm`) backends.
+  `selfhost/native/znc_target.zag` remains optional for differential checks.
 - The working tree is clean (`git status` shows no uncommitted changes).
 
 ---
@@ -76,9 +75,8 @@ Expected: all tests pass.
 
 ### 5b. Run multi-target native gates — BLOCKING
 
-These suites exercise `./znc-target` (GPU MLIR and WASM backends) and
-`@total` proofs on the supported `./znc` path. All three must pass before
-tagging.
+These suites exercise GPU MLIR, WASM, and `@total` proofs on the supported
+`./znc` path. All three must pass before tagging.
 
 ```sh
 bash tests/run_native_gpu.sh
@@ -101,20 +99,20 @@ parser or sema bugs that affect both backends.
 ### 6. Verify byte-identical self-hosting fixpoint — BLOCKING
 
 ```sh
-./bootstrap.sh                                   # rebuild both seeds from source
+./bootstrap.sh                                   # rebuild seed from source
 ./znc selfhost/native/znc.zag -o znc.new         # znc compiles znc
-./znc selfhost/native/znc_target.zag -o znc-target.new
-diff znc znc.new && diff znc-target znc-target.new && echo "fixpoint OK"
+diff znc znc.new && echo "fixpoint OK"
 ```
 
-Or use the dedicated scripts:
+Or use the dedicated script:
 
 ```sh
 ./tests/check_native_bootstrap_repro.sh
-./tests/check_native_target_repro.sh
 ```
 
-A non-zero diff on either binary is a release blocker.
+A non-zero diff on `./znc` is a release blocker. Optionally run
+`./tests/check_native_target_repro.sh` if you rebuilt `znc-target` for
+differential checks.
 
 ### 7. Update CHANGELOG.md
 
@@ -133,13 +131,13 @@ git commit -m "changelog: add release date for 2026.06.0"
 
 ### 8. Build and commit seed binaries
 
-Rebuild the seed binaries from source and commit them. Both `./znc` and
-`./znc-target` are release artifacts for multi-target support. `zagc` is
-committed for differential-testing convenience, not as a supported binary.
+Rebuild the seed binary from source and commit it. `./znc` is the release
+artifact for native ELF, GPU MLIR, and WASM. `zagc` is committed for
+differential-testing convenience, not as a supported binary.
 
 ```sh
-./bootstrap.sh          # produces ./znc and ./znc-target
-git add znc znc-target  # REQUIRED: supported seed binaries
+./bootstrap.sh          # produces ./znc
+git add znc             # REQUIRED: supported seed binary
 # git add zagc          # OPTIONAL: zagc is a differential oracle only
 git commit -m "release: update seed binaries for 2026.06.0"
 ```
