@@ -63,9 +63,9 @@ test-native:
 	@echo "── native backend suite ──"
 	bash tests/run_native.sh
 
-# ABI/layout edge-case regression (informational — documents CURRENT behavior).
+# ABI/layout edge-case regression (release-blocking — documents CURRENT behavior).
 test-abi-layout:
-	@echo "── ABI/layout regression suite ──"
+	@echo "── ABI/layout regression suite (release gate) ──"
 	bash tests/run_abi_layout.sh
 
 # Differential tests against the C backend (not a release gate).
@@ -79,7 +79,7 @@ test-selfhost:
 	bash tests/run_selfhost.sh
 
 # Default `make test`: runs the v1 release gates.
-test: znc test-authority test-bootstrap test-semantics test-diagnostics test-tooling test-programs test-native
+test: znc test-authority test-bootstrap test-semantics test-diagnostics test-tooling test-programs test-native test-abi-layout
 	@echo "════ all v1 release gates passed ════"
 
 # ── Install ───────────────────────────────────────────────────────────────────

@@ -80,5 +80,15 @@ else
     fail=$((fail + 1))
 fi
 
+echo "── native authority: ABI/layout release gate ──"
+if ZNC="$tmp/znc-stage2" bash tests/run_abi_layout.sh >"$tmp/abi.log" 2>&1; then
+    echo "  ok  ABI/layout suite passed on stage-2 compiler"
+    pass=$((pass + 1))
+else
+    echo "  XX  ABI/layout suite failed on stage-2 compiler"
+    sed -n '1,30p' "$tmp/abi.log"
+    fail=$((fail + 1))
+fi
+
 echo "════ native-authority pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]

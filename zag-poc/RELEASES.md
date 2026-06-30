@@ -75,14 +75,20 @@ Expected: all tests pass.
 
 ### 5b. Run multi-target native gates — BLOCKING
 
-These suites exercise GPU MLIR, WASM, and `@total` proofs on the supported
-`./znc` path. All three must pass before tagging.
+These suites exercise GPU MLIR, WASM, `@total` proofs, and ABI/layout
+hardening on the supported `./znc` path. All four must pass before tagging.
 
 ```sh
 bash tests/run_native_gpu.sh
 bash tests/run_native_wasm.sh
 bash tests/run_native_total.sh
+bash tests/run_abi_layout.sh
 ```
+
+ABI/layout hardening (`tests/run_abi_layout.sh`) documents **current** struct,
+slice, union, `fat_fn`, and `!T` sizing per `COMPATIBILITY.md`. Failure is a
+release blocker — language v1 does **not** freeze binary layout; the suite
+captures documented-current behavior only.
 
 ### 5c. Run the differential test suites (informational)
 
@@ -94,12 +100,7 @@ parser or sema bugs that affect both backends.
 ./run_tests.sh
 ./tests/run_selfhost.sh
 ./tests/run_stdlib.sh
-./tests/run_abi_layout.sh
 ```
-
-ABI/layout hardening (`tests/run_abi_layout.sh`) documents **current** struct,
-slice, union, `fat_fn`, and `!T` sizing per `COMPATIBILITY.md`. It is an
-informational regression gate — language v1 does **not** freeze binary layout.
 
 ### 6. Verify byte-identical self-hosting fixpoint — BLOCKING
 
