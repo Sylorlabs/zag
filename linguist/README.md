@@ -32,7 +32,22 @@ Grammar repository: https://github.com/Sylorlabs/zag-grammar
 5. Run `script/update-ids` and open a PR linking GitHub code search for `extension:zag`.
 
 Linguist requires broad public usage (~2000 indexed `.zag` files). The upstream
-PR may sit open until that threshold is met. The root `.gitattributes` already
-declares `linguist-language=Zag`; GitHub will honor the name, blue color, and
-grammar only after PR #8041 merges and GitHub ships a new Linguist release
-(typically days to weeks after merge).
+PR may sit open until that threshold is met. Until it merges, the root
+`.gitattributes` maps `*.zag` to **Zig** on github.com so files highlight
+correctly — see the README “GitHub syntax highlighting” note.
+
+## After merge
+
+Change `.gitattributes` from:
+
+```gitattributes
+*.zag linguist-language=Zig linguist-detectable
+```
+
+to:
+
+```gitattributes
+*.zag linguist-language=Zag linguist-detectable
+```
+
+GitHub refreshes linguist on its own release cadence (days to weeks after merge).

@@ -77,6 +77,15 @@ Without a prover, `./znc` still proves all call-graph effects (`@realtime`, `@no
 apt install mlir-tools llvm-18
 ```
 
+### GitHub syntax highlighting
+
+On github.com, `.zag` files are temporarily classified as **Zig** (via `.gitattributes`)
+so they get syntax highlighting and show up sensibly in the repo language bar. Zag is not
+Zig — this is a stand-in until [GitHub Linguist accepts Zag](https://github.com/github-linguist/linguist/pull/8041).
+After that PR merges, we will switch the attribute to `linguist-language=Zag` and the
+site will show the Zag name and blue color. Local editors use the Zag grammar in
+`editors/vscode/` regardless.
+
 ---
 
 ## Quick start
