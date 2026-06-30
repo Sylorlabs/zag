@@ -189,12 +189,21 @@ case "$rt" in
     2) : ;;
 esac
 
-# Union switch (examples/wasm_op.zag) is not yet lowered by wasm.zag — tracked skip.
-if wasm_build examples/wasm_op.zag /tmp/wasm_op.wasm 2>/tmp/wasm_op_skip; then
-    echo "  XX  wasm_op.zag unexpectedly compiled (union switch should be unsupported)"; fail=$((fail+1))
+wasm_build examples/wasm_op.zag /tmp/wasm_op.wasm
+r=$(wasm_validate /tmp/wasm_op.wasm)
+if [ "$(echo "$r" | tail -1)" = "1" ]; then
+    echo "  ok  wasm_op.zag (enum + union switch)"; pass=$((pass+1))
 else
-    echo "  ok  wasm_op.zag skip (union switch not in wasm backend yet)"; pass=$((pass+1))
+    echo "  XX  wasm_op.zag"; echo "$r"; fail=$((fail+1))
 fi
+set +e
+wasm_runtime_expect /tmp/wasm_op.wasm 0 "wasm_op enum/union switch"; rt=$?
+set -e
+case "$rt" in
+    0) pass=$((pass+1)) ;;
+    1) fail=$((fail+1)) ;;
+    2) : ;;
+esac
 
 echo "════ native-wasm pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]
