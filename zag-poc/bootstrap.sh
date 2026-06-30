@@ -22,4 +22,4 @@ mv -f znc.new znc
 echo "   ./znc rebuilt itself from selfhost/native/znc.zag"
 
 echo "== done. Supported compiler: ./znc =="
-echo "   legacy ./zagc is retained for historical differential testing only."
+echo "   see BOOTSTRAP.md for the legacy C differential oracle."

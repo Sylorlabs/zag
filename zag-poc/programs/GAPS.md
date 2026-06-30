@@ -123,16 +123,20 @@ define callees before callers (dependency-first ordering).
 
 ---
 
-## Gap 3 — @pure / @noalloc capability annotations not enforced by znc
+## Gap 3: @pure / @noalloc not enforced for `_zag_*` runtime calls
 
 **Severity: MAJOR**
 
 ### Symptom
 
-The effect/capability checker (`sema.zag`) is supposed to reject functions
-annotated `@pure` or `@noalloc` that transitively perform forbidden effects
-(Alloc, IO, Lock).  In practice, znc compiles such violations silently and
-the emitted binary runs them.
+The effect checker in `sema.zag` rejects obvious violations for names it knows
+about (`zalloc`, `print_i32`, and similar). Call-graph proofs for `@realtime`
+with `zalloc` work correctly on `znc`.
+
+Functions annotated `@pure` or `@noalloc` that call `_zag_malloc`, `_zag_println`,
+or other `_zag_*` runtime helpers are not caught today because those names are
+missing from the builtin effect table. `znc` compiles them and the binary runs
+the forbidden effects.
 
 ### Repro
 

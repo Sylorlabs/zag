@@ -34,7 +34,7 @@ Grammar repository: https://github.com/Sylorlabs/zag-grammar
 Linguist requires broad public usage (~2000 indexed `.zag` files). The upstream
 PR may sit open until that threshold is met. Until it merges, the root
 `.gitattributes` maps `*.zag` to **Zig** on github.com so files highlight
-correctly — see the README “GitHub syntax highlighting” note.
+correctly. See the README "GitHub syntax highlighting" note.
 
 ## After merge
 
