@@ -13,7 +13,13 @@ after **Zag** is registered in [github-linguist/linguist](https://github.com/git
 | Grammar | `editors/vscode/syntaxes/zag.tmLanguage.json` |
 | Scope | `source.zag` |
 
-## Submit / track the upstream PR
+## Upstream PR
+
+Tracking PR: https://github.com/github-linguist/linguist/pulls?q=is%3Apr+zag
+
+Grammar repository: https://github.com/Sylorlabs/zag-grammar
+
+## Submit / update the upstream PR
 
 1. Fork `github-linguist/linguist`.
 2. Add the `languages.yml` snippet from `languages.yml.snippet`.
