@@ -205,5 +205,95 @@ case "$rt" in
     2) : ;;
 esac
 
+# union literal as call argument (expression position, not let binding)
+printf 'enum OpClass { Numeric, Control, Memory } union WasmOp { local_get: i32, i32_const: i64, i32_add: bool } fn classify(op: WasmOp) OpClass { let cls: OpClass = OpClass.Control; switch (op) { .local_get => |_idx| { cls = OpClass.Memory; } .i32_const => |_v| { cls = OpClass.Numeric; } .i32_add => |_x| { cls = OpClass.Numeric; } } return cls; } fn code(c: OpClass) i32 { let r: i32 = 0; switch (c) { .Numeric => { r = 1; } .Control => { r = 2; } .Memory => { r = 3; } } return r; } fn main() i32 { return code(classify(WasmOp{ .i32_const = 42 })); }' > /tmp/wasm_union_lit_arg.zag
+wasm_build /tmp/wasm_union_lit_arg.zag /tmp/wasm_union_lit_arg.wasm
+r=$(wasm_validate /tmp/wasm_union_lit_arg.wasm)
+if [ "$(echo "$r" | tail -1)" = "1" ]; then
+    echo "  ok  wasm union literal as call arg"; pass=$((pass+1))
+else
+    echo "  XX  wasm union literal as call arg"; echo "$r"; fail=$((fail+1))
+fi
+set +e
+wasm_runtime_expect /tmp/wasm_union_lit_arg.wasm 1 "union literal call arg"; rt=$?
+set -e
+case "$rt" in
+    0) pass=$((pass+1)) ;;
+    1) fail=$((fail+1)) ;;
+    2) : ;;
+esac
+
+# nested union switch (outer capture feeds inner union literal payload)
+printf 'enum OpClass { Numeric, Control, Memory } union WasmOp { local_get: i32, i32_const: i64, i32_add: bool } fn classify(op: WasmOp) OpClass { let cls: OpClass = OpClass.Control; switch (op) { .local_get => |_idx| { cls = OpClass.Memory; } .i32_const => |_v| { cls = OpClass.Numeric; } .i32_add => |_x| { cls = OpClass.Numeric; } } return cls; } fn code(c: OpClass) i32 { let r: i32 = 0; switch (c) { .Numeric => { r = 1; } .Control => { r = 2; } .Memory => { r = 3; } } return r; } fn main() i32 { let r: i32 = 0; switch (WasmOp{ .local_get = 7 }) { .local_get => |idx| { switch (WasmOp{ .i32_const = idx }) { .i32_const => |_v| { r = code(classify(WasmOp{ .i32_const = 99 })); } .local_get => |_i| { r = 0; } .i32_add => |_x| { r = 0; } } } .i32_const => |_v| { r = 0; } .i32_add => |_x| { r = 0; } } return r; }' > /tmp/wasm_nested_union_sw.zag
+wasm_build /tmp/wasm_nested_union_sw.zag /tmp/wasm_nested_union_sw.wasm
+r=$(wasm_validate /tmp/wasm_nested_union_sw.wasm)
+if [ "$(echo "$r" | tail -1)" = "1" ]; then
+    echo "  ok  wasm nested union switch + literal subject"; pass=$((pass+1))
+else
+    echo "  XX  wasm nested union switch"; echo "$r"; fail=$((fail+1))
+fi
+set +e
+wasm_runtime_expect /tmp/wasm_nested_union_sw.wasm 1 "nested union switch"; rt=$?
+set -e
+case "$rt" in
+    0) pass=$((pass+1)) ;;
+    1) fail=$((fail+1)) ;;
+    2) : ;;
+esac
+
+# enum + union combo with struct literal call arg
+printf 'enum Kind { A, B } union U { a: i32, b: Kind } struct P { x: i32, y: i32 } fn tag(u: U) i32 { let r: i32 = 0; switch (u) { .a => |v| { r = v; } .b => |k| { switch (k) { .A => { r = 10; } .B => { r = 20; } } } } return r; } fn add(p: P) i32 { return p.x + p.y; } fn main() i32 { return tag(U{ .b = Kind.B }) + add(P{ .x = 3, .y = 4 }); }' > /tmp/wasm_enum_union_combo.zag
+wasm_build /tmp/wasm_enum_union_combo.zag /tmp/wasm_enum_union_combo.wasm
+r=$(wasm_validate /tmp/wasm_enum_union_combo.wasm)
+if [ "$(echo "$r" | tail -1)" = "1" ]; then
+    echo "  ok  wasm enum+union combo + struct literal arg"; pass=$((pass+1))
+else
+    echo "  XX  wasm enum+union combo"; echo "$r"; fail=$((fail+1))
+fi
+set +e
+wasm_runtime_expect /tmp/wasm_enum_union_combo.wasm 27 "enum+union combo"; rt=$?
+set -e
+case "$rt" in
+    0) pass=$((pass+1)) ;;
+    1) fail=$((fail+1)) ;;
+    2) : ;;
+esac
+
+# empty-payload union variant (bool placeholder) via expression-position literal
+printf 'union W { noop: bool, val: i32 } fn pick(w: W) i32 { switch (w) { .noop => |_x| { return 0; } .val => |v| { return v; } } return -1; } fn main() i32 { return pick(W{ .noop = true }) + pick(W{ .val = 11 }); }' > /tmp/wasm_union_empty.zag
+wasm_build /tmp/wasm_union_empty.zag /tmp/wasm_union_empty.wasm
+r=$(wasm_validate /tmp/wasm_union_empty.wasm)
+if [ "$(echo "$r" | tail -1)" = "1" ]; then
+    echo "  ok  wasm empty-payload union variant literal"; pass=$((pass+1))
+else
+    echo "  XX  wasm empty-payload union variant"; echo "$r"; fail=$((fail+1))
+fi
+set +e
+wasm_runtime_expect /tmp/wasm_union_empty.wasm 11 "empty payload union"; rt=$?
+set -e
+case "$rt" in
+    0) pass=$((pass+1)) ;;
+    1) fail=$((fail+1)) ;;
+    2) : ;;
+esac
+
+# f32/f64 edge cases: f32 add, f32→f64 cast, f64 mul, trunc to i32
+printf 'fn main() i32 { let a: f32 = 1.5; let b: f32 = 2.5; let c: f32 = a + b; let d: f64 = c as f64; let e: f64 = d * 1.75; return e as i32; }' > /tmp/wasm_float_edge.zag
+wasm_build /tmp/wasm_float_edge.zag /tmp/wasm_float_edge.wasm
+r=$(wasm_validate /tmp/wasm_float_edge.wasm)
+if [ "$(echo "$r" | tail -1)" = "1" ]; then
+    echo "  ok  wasm f32/f64 edge (cast + mul + trunc)"; pass=$((pass+1))
+else
+    echo "  XX  wasm f32/f64 edge"; echo "$r"; fail=$((fail+1))
+fi
+set +e
+wasm_runtime_expect /tmp/wasm_float_edge.wasm 7 "f32/f64 edge"; rt=$?
+set -e
+case "$rt" in
+    0) pass=$((pass+1)) ;;
+    1) fail=$((fail+1)) ;;
+    2) : ;;
+esac
+
 echo "════ native-wasm pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]
