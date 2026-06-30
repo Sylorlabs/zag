@@ -85,7 +85,7 @@ nt  "union switch"     'union U { a: i32, b: i32 } fn main() i32 { let u: U = U{
 nt  "union capture val" 'union Expr { num: i32, neg: i32 } fn eval(e: Expr) i32 { return switch (e) { .num => |v| v, .neg => |v| 0 - v }; } fn main() i32 { let e1: Expr = Expr{ .num = 42 }; let e2: Expr = Expr{ .neg = 5 }; return eval(e1) + eval(e2); }' 37
 # Union-arm capture of a []u8 payload binds as *[]u8 (aggregate); print_str must
 # accept the pointer-typed capture without an explicit sp.* deref.
-nto "print_str union capture" 'union MaybeStr { yes: []u8, no: i32 } fn main() i32 { let v: MaybeStr = MaybeStr{ .yes = "world\n" }; switch (v) { .yes => |s| { print_str(s); }, .no => |_| { print_i32(0); } } return 0; }' "world" 0
+nto "print_str union capture" 'union MaybeStr { yes: []u8, no: i32 } fn main() i32 { let v: MaybeStr = MaybeStr{ .yes = "world\n" }; switch (v) { .yes => |s| { print_str(s); } .no => |_| { print_i32(0); } } return 0; }' "world" 0
 nt  "enum switch"      'enum Color { Red, Green, Blue } fn main() i32 { let c: Color = Color.Green; return switch (c) { .Red => 1, .Green => 42, .Blue => 3 }; }' 42
 echo "── variable layout · nested literals · &expr · optionals (round 2) ──"
 nt  "@sizeOf slice field" 'struct S { a: i32, b: []u8, c: i32 } fn main() i32 { return @sizeOf[S](); }' 32
