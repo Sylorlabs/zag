@@ -1,0 +1,469 @@
+// selfhost/smt_solve.zag — in-process QF_LIA/QF_NIA discharge for @total VCs.
+//
+// Port of ghost_engine/src/zag_verify.zig embedded solver (no exec, no Z3).
+// Parses the restricted SMT-LIB2 scripts smt_build_vc emits and returns:
+//   rc 0 — proven (UNSAT)
+//   rc 1 — unsafe (SAT, counterexample in cex)
+//   rc 2 — unknown
+
+@import("../std/list.zag")
+@import("../std/map.zag") as map
+@import("../std/rt.zag")
+
+struct SmtLit { text: []u8 }
+struct SmtEq { l: *SmtExpr, r: *SmtExpr }
+struct SmtAdd { l: *SmtExpr, r: *SmtExpr }
+struct SmtMul { l: *SmtExpr, r: *SmtExpr }
+struct SmtAnd { parts: ArrayList[*SmtExpr] }
+
+union SmtExpr {
+    e_int: SmtLit,
+    e_ident: []u8,
+    e_not: *SmtExpr,
+    e_and: SmtAnd,
+    e_eq: SmtEq,
+    e_add: SmtAdd,
+    e_mul: SmtMul,
+}
+
+struct SmtParse {
+    src: []u8,
+    i: i32,
+    vars: ArrayList[[]u8],
+}
+
+struct SmtSolveOut { rc: i32, cex: []u8 }
+
+fn smt_skip_ws(p: *SmtParse) void {
+    let looping: i32 = 1;
+    while (looping == 1 && p.*.i < p.*.src.len) {
+        let c: u8 = p.*.src[p.*.i];
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            p.*.i = p.*.i + 1;
+        } else if (c == ';') {
+            while (p.*.i < p.*.src.len && p.*.src[p.*.i] != '\n') {
+                p.*.i = p.*.i + 1;
+            }
+        } else {
+            looping = 0;
+        }
+    }
+}
+
+fn smt_peek(p: *SmtParse) u8 {
+    smt_skip_ws(p);
+    if (p.*.i >= p.*.src.len) { return 0; }
+    return p.*.src[p.*.i];
+}
+
+fn smt_eat(p: *SmtParse, lit: []u8) i32 {
+    smt_skip_ws(p);
+    if (p.*.i + lit.len > p.*.src.len) { return 0; }
+    let i: i32 = 0;
+    while (i < lit.len) {
+        if (p.*.src[p.*.i + i] != lit[i]) { return 0; }
+        i = i + 1;
+    }
+    p.*.i = p.*.i + lit.len;
+    return 1;
+}
+
+fn smt_is_sym_char(c: u8) i32 {
+    if (c >= 'a' && c <= 'z') { return 1; }
+    if (c >= 'A' && c <= 'Z') { return 1; }
+    if (c >= '0' && c <= '9') { return 1; }
+    if (c == '_' || c == '.' || c == '-') { return 1; }
+    return 0;
+}
+
+fn smt_parse_sym(p: *SmtParse) []u8 {
+    smt_skip_ws(p);
+    let start: i32 = p.*.i;
+    while (p.*.i < p.*.src.len && smt_is_sym_char(p.*.src[p.*.i]) == 1) {
+        p.*.i = p.*.i + 1;
+    }
+    if (p.*.i == start) { return ""; }
+    return p.*.src[start..p.*.i];
+}
+
+fn smt_parse_int_lit(p: *SmtParse) []u8 {
+    smt_skip_ws(p);
+    let start: i32 = p.*.i;
+    if (smt_peek(p) == '-') {
+        p.*.i = p.*.i + 1;
+    }
+    while (p.*.i < p.*.src.len && p.*.src[p.*.i] >= '0' && p.*.src[p.*.i] <= '9') {
+        p.*.i = p.*.i + 1;
+    }
+    if (p.*.i == start) { return "0"; }
+    return p.*.src[start..p.*.i];
+}
+
+fn smt_int_val(text: []u8) i32 {
+    return (_zag_str_to_i64(text) as i32);
+}
+
+fn smt_parse_expr(p: *SmtParse) *SmtExpr {
+    smt_skip_ws(p);
+    if (smt_peek(p) == '(') {
+        p.*.i = p.*.i + 1;
+        let op: []u8 = "";
+        let ch: u8 = smt_peek(p);
+        if (ch == '=' || ch == '+' || ch == '-' || ch == '*' || ch == '<' || ch == '>') {
+            p.*.i = p.*.i + 1;
+            if ((ch == '<' || ch == '>') && p.*.i < p.*.src.len && p.*.src[p.*.i] == '=') {
+                op = p.*.src[p.*.i - 1..p.*.i + 1];
+                p.*.i = p.*.i + 1;
+            } else {
+                op = p.*.src[p.*.i - 1..p.*.i];
+            }
+        } else {
+            op = smt_parse_sym(p);
+        }
+        if (@strEq(op, "not")) {
+            let sub: *SmtExpr = smt_parse_expr(p);
+            let _rp: i32 = smt_eat(p, ")");
+            return new(SmtExpr{ .e_not = sub });
+        }
+        if (@strEq(op, "and")) {
+            let parts: ArrayList[*SmtExpr] = make[*SmtExpr](2);
+            while (smt_peek(p) != ')') {
+                push[*SmtExpr](&parts, smt_parse_expr(p));
+            }
+            let _rp: i32 = smt_eat(p, ")");
+            return new(SmtExpr{ .e_and = SmtAnd{ .parts = parts } });
+        }
+        if (@strEq(op, "=")) {
+            let l: *SmtExpr = smt_parse_expr(p);
+            let r: *SmtExpr = smt_parse_expr(p);
+            let _rp: i32 = smt_eat(p, ")");
+            return new(SmtExpr{ .e_eq = SmtEq{ .l = l, .r = r } });
+        }
+        if (@strEq(op, "+")) {
+            let l: *SmtExpr = smt_parse_expr(p);
+            let r: *SmtExpr = smt_parse_expr(p);
+            let _rp: i32 = smt_eat(p, ")");
+            return new(SmtExpr{ .e_add = SmtAdd{ .l = l, .r = r } });
+        }
+        if (@strEq(op, "*")) {
+            let l: *SmtExpr = smt_parse_expr(p);
+            let r: *SmtExpr = smt_parse_expr(p);
+            let _rp: i32 = smt_eat(p, ")");
+            return new(SmtExpr{ .e_mul = SmtMul{ .l = l, .r = r } });
+        }
+        return new(SmtExpr{ .e_int = SmtLit{ .text = "0" } });
+    }
+    let ch2: u8 = smt_peek(p);
+    if ((ch2 >= '0' && ch2 <= '9') || ch2 == '-') {
+        let v: []u8 = smt_parse_int_lit(p);
+        return new(SmtExpr{ .e_int = SmtLit{ .text = v } });
+    }
+    let name: []u8 = smt_parse_sym(p);
+    return new(SmtExpr{ .e_ident = name });
+}
+
+fn smt_parse_top(p: *SmtParse) *SmtExpr {
+    smt_skip_ws(p);
+    if (p.*.i >= p.*.src.len) { return new(SmtExpr{ .e_int = SmtLit{ .text = "0" } }); }
+    if (smt_peek(p) == '(') {
+        p.*.i = p.*.i + 1;
+        let kw: []u8 = smt_parse_sym(p);
+        if (@strEq(kw, "declare-const")) {
+            let name: []u8 = smt_parse_sym(p);
+            let _ty: []u8 = smt_parse_sym(p);
+            let _rp: i32 = smt_eat(p, ")");
+            push[[]u8](&p.*.vars, name);
+            return smt_parse_top(p);
+        }
+        if (@strEq(kw, "assert")) {
+            let e: *SmtExpr = smt_parse_expr(p);
+            let _rp: i32 = smt_eat(p, ")");
+            return e;
+        }
+        if (@strEq(kw, "check-sat") || @strEq(kw, "get-model")) {
+            let _rp: i32 = smt_eat(p, ")");
+            return smt_parse_top(p);
+        }
+        if (@strEq(kw, "set-logic")) {
+            let _lg: []u8 = smt_parse_sym(p);
+            let _rp: i32 = smt_eat(p, ")");
+            return smt_parse_top(p);
+        }
+        return new(SmtExpr{ .e_int = SmtLit{ .text = "0" } });
+    }
+    let kw2: []u8 = smt_parse_sym(p);
+    if (@strEq(kw2, "set-logic")) {
+        let _lg: []u8 = smt_parse_sym(p);
+        return smt_parse_top(p);
+    }
+    return new(SmtExpr{ .e_int = SmtLit{ .text = "0" } });
+}
+
+fn smt_eval_int(e: *SmtExpr, env: map.StringMap[i32]) i32 {
+    switch (e.*) {
+        .e_int => |lit| { return smt_int_val(lit.text); }
+        .e_ident => |n| { return map.get[i32](env, n) orelse 0; }
+        .e_add => |p| { return smt_eval_int(p.l, env) + smt_eval_int(p.r, env); }
+        .e_mul => |p| { return smt_eval_int(p.l, env) * smt_eval_int(p.r, env); }
+        else => { return 0; }
+    }
+}
+
+fn smt_eval_bool(e: *SmtExpr, env: map.StringMap[i32]) i32 {
+    switch (e.*) {
+        .e_int => |lit| { if (smt_int_val(lit.text) != 0) { return 1; } return 0; }
+        .e_ident => |n| { if ((map.get[i32](env, n) orelse 0) != 0) { return 1; } return 0; }
+        .e_not => |x| { if (smt_eval_bool(x, env) == 1) { return 0; } return 1; }
+        .e_and => |a| {
+            let i: i32 = 0;
+            while (i < len[*SmtExpr](a.parts)) {
+                if (smt_eval_bool(get[*SmtExpr](a.parts, i), env) == 0) { return 0; }
+                i = i + 1;
+            }
+            return 1;
+        }
+        .e_eq => |p| { if (smt_eval_int(p.l, env) == smt_eval_int(p.r, env)) { return 1; } return 0; }
+        .e_add => |p| { if (smt_eval_int(p.l, env) + smt_eval_int(p.r, env) != 0) { return 1; } return 0; }
+        .e_mul => |p| { if (smt_eval_int(p.l, env) * smt_eval_int(p.r, env) != 0) { return 1; } return 0; }
+    }
+}
+
+fn smt_is_square_same(l: *SmtExpr, r: *SmtExpr) i32 {
+    switch (l.*) {
+        .e_mul => |lm| {
+            switch (r.*) {
+                .e_mul => |rm| {
+                    switch (lm.l.*) {
+                        .e_ident => |ln| {
+                            switch (lm.r.*) {
+                                .e_ident => |lr| {
+                                    if (!@strEq(ln, lr)) { return 0; }
+                                    switch (rm.l.*) {
+                                        .e_ident => |rn| {
+                                            switch (rm.r.*) {
+                                                .e_ident => |rr| {
+                                                    if (@strEq(ln, rn) && @strEq(ln, rr)) { return 1; }
+                                                }
+                                                else => { }
+                                            }
+                                        }
+                                        else => { }
+                                    }
+                                }
+                                else => { }
+                            }
+                        }
+                        else => { }
+                    }
+                }
+                else => { }
+            }
+        }
+        else => { }
+    }
+    return 0;
+}
+
+fn smt_is_pos_lit(e: *SmtExpr) i32 {
+    switch (e.*) {
+        .e_int => |lit| { if (smt_int_val(lit.text) > 0) { return 1; } return 0; }
+        else => { return 0; }
+    }
+}
+
+fn smt_is_zero_lit(e: *SmtExpr) i32 {
+    switch (e.*) {
+        .e_int => |lit| { if (@strEq(lit.text, "0")) { return 1; } return 0; }
+        else => { return 0; }
+    }
+}
+
+fn smt_min_int(e: *SmtExpr) i32 {
+    switch (e.*) {
+        .e_int => |lit| { return smt_int_val(lit.text); }
+        .e_add => |p| { return smt_min_int(p.l) + smt_min_int(p.r); }
+        .e_mul => |p| {
+            if (smt_is_square_same(p.l, p.r) == 1) { return 0; }
+            return smt_min_int(p.l) * smt_min_int(p.r);
+        }
+        else => { return 0; }
+    }
+}
+
+fn smt_is_eq_zero(e: *SmtExpr) i32 {
+    switch (e.*) {
+        .e_eq => |p| {
+            if (smt_is_zero_lit(p.l) == 1 || smt_is_zero_lit(p.r) == 1) { return 1; }
+        }
+        else => { }
+    }
+    return 0;
+}
+
+fn smt_eq_var_zero(e: *SmtExpr) []u8 {
+    switch (e.*) {
+        .e_eq => |p| {
+            switch (p.l.*) {
+                .e_ident => |n| {
+                    if (smt_is_zero_lit(p.r) == 1) { return n; }
+                }
+                else => { }
+            }
+            switch (p.r.*) {
+                .e_ident => |n| {
+                    if (smt_is_zero_lit(p.l) == 1) { return n; }
+                }
+                else => { }
+            }
+        }
+        else => { }
+    }
+    return "";
+}
+
+fn smt_is_not_eq(e: *SmtExpr) i32 {
+    let found: i32 = 0;
+    switch (e.*) {
+        .e_not => |x| {
+            switch (x.*) {
+                .e_eq => |_p| { found = 1; }
+                else => { }
+            }
+        }
+        else => { }
+    }
+    return found;
+}
+
+fn smt_not_eq_child(ne: *SmtExpr) *SmtExpr {
+    let out: *SmtExpr = new(SmtExpr{ .e_int = SmtLit{ .text = "0" } });
+    switch (ne.*) {
+        .e_not => |x| { out = x; }
+        else => { }
+    }
+    return out;
+}
+
+fn smt_is_eq_same_var(ne: *SmtExpr, eq: *SmtExpr) i32 {
+    if (smt_is_not_eq(ne) == 0) { return 0; }
+    let nv: []u8 = smt_eq_var_zero(smt_not_eq_child(ne));
+    let ev: []u8 = smt_eq_var_zero(eq);
+    if (nv.len == 0 || ev.len == 0) { return 0; }
+    if (@strEq(nv, ev)) { return 1; }
+    return 0;
+}
+
+fn smt_is_always_positive(e: *SmtExpr) i32 {
+    switch (e.*) {
+        .e_eq => |p| {
+            if (smt_is_zero_lit(p.l) == 1 && smt_min_int(p.r) >= 1) { return 1; }
+            if (smt_is_zero_lit(p.r) == 1 && smt_min_int(p.l) >= 1) { return 1; }
+        }
+        else => { }
+    }
+    return 0;
+}
+
+fn smt_constraints_contradict(a: *SmtExpr, b: *SmtExpr) i32 {
+    if (smt_is_not_eq(a) == 1 && smt_is_eq_same_var(a, b) == 1) { return 1; }
+    if (smt_is_not_eq(b) == 1 && smt_is_eq_same_var(b, a) == 1) { return 1; }
+    if (smt_is_eq_zero(a) == 1 && smt_is_always_positive(b) == 1) { return 1; }
+    if (smt_is_eq_zero(b) == 1 && smt_is_always_positive(a) == 1) { return 1; }
+    return 0;
+}
+
+fn smt_is_contradiction(e: *SmtExpr) i32 {
+    switch (e.*) {
+        .e_and => |a| {
+            let i: i32 = 0;
+            while (i < len[*SmtExpr](a.parts)) {
+                let j: i32 = i + 1;
+                while (j < len[*SmtExpr](a.parts)) {
+                    if (smt_constraints_contradict(get[*SmtExpr](a.parts, i), get[*SmtExpr](a.parts, j)) == 1) {
+                        return 1;
+                    }
+                    j = j + 1;
+                }
+                i = i + 1;
+            }
+            return 0;
+        }
+        .e_eq => |_p| {
+            if (smt_is_eq_zero(e) == 1 && smt_is_always_positive(e) == 1) { return 1; }
+            return 0;
+        }
+        else => { return 0; }
+    }
+}
+
+struct SmtSatResult { found: i32, env: map.StringMap[i32] }
+
+fn smt_brute_sat(formula: *SmtExpr, names: ArrayList[[]u8]) SmtSatResult {
+    let empty: map.StringMap[i32] = map.make[i32](4);
+    let n: i32 = len[[]u8](names);
+    if (n == 0) {
+        if (smt_eval_bool(formula, empty) == 1) {
+            return SmtSatResult{ .found = 1, .env = empty };
+        }
+        return SmtSatResult{ .found = 0, .env = empty };
+    }
+    let limit: i32 = 64;
+    let idx: *i32 = _zag_malloc(n * @sizeOf[i32]()) as *i32;
+    let i: i32 = 0;
+    while (i < n) {
+        idx[i] = 0 - limit;
+        i = i + 1;
+    }
+    let done: i32 = 0;
+    while (done == 0) {
+        let env: map.StringMap[i32] = map.make[i32](n * 2 + 4);
+        let k: i32 = 0;
+        while (k < n) {
+            map.put[i32](&env, get[[]u8](names, k), idx[k]);
+            k = k + 1;
+        }
+        if (smt_eval_bool(formula, env) == 1) {
+            return SmtSatResult{ .found = 1, .env = env };
+        }
+        let carry: i32 = 0;
+        let advanced: i32 = 0;
+        while (carry < n && advanced == 0) {
+            idx[carry] = idx[carry] + 1;
+            if (idx[carry] <= limit) {
+                advanced = 1;
+            } else {
+                idx[carry] = 0 - limit;
+                carry = carry + 1;
+            }
+        }
+        if (carry == n) { done = 1; }
+    }
+    return SmtSatResult{ .found = 0, .env = empty };
+}
+
+fn smt_fmt_cex(env: map.StringMap[i32], names: ArrayList[[]u8]) []u8 {
+    let acc: []u8 = "counterexample:";
+    let i: i32 = 0;
+    while (i < len[[]u8](names)) {
+        let name: []u8 = get[[]u8](names, i);
+        let v: i32 = map.get[i32](env, name) orelse 0;
+        acc = _zag_str_concat(acc, _zag_str_concat(" ", _zag_str_concat(name, _zag_str_concat("=", _zag_i64_to_str(v as i64)))));
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn smt_solve_discharge(smt: []u8) SmtSolveOut {
+    if (smt.len == 0) { return SmtSolveOut{ .rc = 2, .cex = "" }; }
+    let p: SmtParse = SmtParse{ .src = smt, .i = 0, .vars = make[[]u8](4) };
+    let formula: *SmtExpr = smt_parse_top(&p);
+    if (smt_is_contradiction(formula) == 1) {
+        return SmtSolveOut{ .rc = 0, .cex = "" };
+    }
+    let sat: SmtSatResult = smt_brute_sat(formula, p.vars);
+    if (sat.found == 1) {
+        let cex: []u8 = smt_fmt_cex(sat.env, p.vars);
+        return SmtSolveOut{ .rc = 1, .cex = cex };
+    }
+    return SmtSolveOut{ .rc = 2, .cex = "" };
+}
