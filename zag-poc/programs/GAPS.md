@@ -1,18 +1,31 @@
 # Zag Native Backend (znc) — Gap Report
 
 **Compiler under test:** `./znc` (native x86-64 ELF backend, `selfhost/native/`)
-**Date:** 2026-06-29
-**Method:** Six nontrivial programs (50–200 lines each) compiled and run via `znc`.
-Additional targeted micro-repros for each gap below.
+**Original report date:** 2026-06-29
+**Last updated:** 2026-06-30 (release `2026.06.0`)
 
-All programs compiled and ran with correct output.  Each gap was confirmed
-to produce the described failure on the actual `znc` binary.
+Six nontrivial programs (50–200 lines each) were compiled and run via `znc`.
+Targeted micro-repros below originally confirmed each gap on the pre-release
+binary.  Gaps 1–6 are **fixed** in `2026.06.0`; gaps 7–8 unchanged.
+
+| Gap | Title | Severity | Status |
+|-----|-------|----------|--------|
+| 1 | Union scalar capture semantics | BLOCKER | **Fixed** (`3a118ed`) |
+| 2 | Forward declarations SIGSEGV | BLOCKER | **Fixed** (`9fdb2b2`) |
+| 3 | `@pure`/`@noalloc` vs `_zag_*` | MAJOR | **Fixed** (`3e25c27`) |
+| 4 | Nested generic `ArrayList[ArrayList[T]]` | MAJOR | **Fixed** (`7433e50`) |
+| 5 | `print_str` on union slice capture | MAJOR | **Fixed** (`2b580ec`) |
+| 6 | i32 arithmetic truncation | MAJOR | **Fixed** (`2b580ec`) |
+| 7 | No `@alloc` surface syntax | MINOR | Open (by design) |
+| 8 | Simple generic structs | INFO | OK |
+
+Tests: `tests/run_native.sh` (111 cases) covers repros for gaps 1–6.
 
 ---
 
 ## Gap 1 — Union arm capture binds pointer-to-payload, not value
 
-**Severity: BLOCKER**
+**Severity: BLOCKER** · **Status: FIXED in 2026.06.0** (`3a118ed`)
 
 ### Symptom
 
@@ -83,7 +96,7 @@ This is a **semantic incompatibility** between the two backends.
 
 ## Gap 2 — Forward function declarations crash znc (SIGSEGV)
 
-**Severity: BLOCKER**
+**Severity: BLOCKER** · **Status: FIXED in 2026.06.0** (`9fdb2b2`)
 
 ### Symptom
 
@@ -125,7 +138,7 @@ define callees before callers (dependency-first ordering).
 
 ## Gap 3: @pure / @noalloc not enforced for `_zag_*` runtime calls
 
-**Severity: MAJOR**
+**Severity: MAJOR** · **Status: FIXED in 2026.06.0** (`3e25c27`)
 
 ### Symptom
 
@@ -179,7 +192,7 @@ names evaluate to 0.
 
 ## Gap 4 — Nested generic instantiation not supported
 
-**Severity: MAJOR**
+**Severity: MAJOR** · **Status: FIXED in 2026.06.0** (`7433e50`, one level deep)
 
 ### Symptom
 
@@ -218,7 +231,7 @@ row-stride indexing (as done in `programs/csv_parser.zag`).
 
 ## Gap 5 — `print_str` fails when argument is a union-arm capture
 
-**Severity: MAJOR**
+**Severity: MAJOR** · **Status: FIXED in 2026.06.0** (`2b580ec`)
 
 ### Symptom
 
@@ -259,7 +272,7 @@ or use `_zag_println(sp.*)` which tolerates the pointer-typed argument.
 
 ## Gap 6 — i32 arithmetic does not truncate to 32 bits in local variables
 
-**Severity: MAJOR**
+**Severity: MAJOR** · **Status: FIXED in 2026.06.0** (`2b580ec`)
 
 ### Symptom
 
@@ -357,14 +370,14 @@ as a type argument to another generic).
 | Sort Bench | programs/sort_bench.zag | 150 | yes | yes (64-bit semantics noted) |
 | State Machine | programs/state_machine.zag | 185 | yes | yes |
 
-### Key workarounds applied
+### Key workarounds applied (original report; several gaps now fixed)
 
-- **json_parser.zag**: Used `struct JsonValue` with kind discriminant instead of `union JsonValue` with slice variants, avoiding Gap 1 and Gap 5.
-- **hash_map.zag**: Implemented concrete `HashMap_i32` (string→i32) rather than `HashMap[V]` generic struct, because nested generics as struct fields were not tested; also avoided documenting a gap for generic-struct value types since simple generics do work (Gap 8).
-- **arena.zag**: No `@Alloc` annotation (Gap 7); used comment to document allocation intent. Pointer arithmetic via `as i64` cast for address computation.
-- **csv_parser.zag**: Used flat `*[]u8` array with `row * max_cols + col` indexing instead of `ArrayList[ArrayList[[]u8]]` (Gap 4).
-- **sort_bench.zag**: Annotated sorts `@pure` even though they call `_zag_malloc` for the explicit stack, relying on Gap 3 (unenforced) — noted in the code.
-- **state_machine.zag**: Used concrete `struct FSM` (not `struct FSM[S, I]`); used `i32` for states/inputs since enum→i32 cast is needed for array indexing anyway.
+- **json_parser.zag**: Used `struct JsonValue` with kind discriminant instead of `union JsonValue` with slice variants (Gaps 1/5 now fixed — union form would work today).
+- **hash_map.zag**: Concrete `HashMap_i32` rather than `HashMap[V]` generic struct (Gap 8 confirms simple generics work).
+- **arena.zag**: No `@Alloc` annotation (Gap 7 — still open); comment documents allocation intent.
+- **csv_parser.zag**: Flat `*[]u8` grid indexing instead of `ArrayList[ArrayList[[]u8]]` (Gap 4 fixed for `ArrayList[ArrayList[T]]`; nested slices untested).
+- **sort_bench.zag**: `quicksort` no longer carries incorrect `@pure` after Gap 3 fix; i32 LCG now wraps correctly after Gap 6 fix.
+- **state_machine.zag**: Concrete `struct FSM` (not `struct FSM[S, I]`); `i32` for states/inputs for array indexing.
 
 ### Actual compiler output for each program
 

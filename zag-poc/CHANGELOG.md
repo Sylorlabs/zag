@@ -6,11 +6,19 @@ Pacific Time. Tags are listed in chronological order; all tags preceded
 
 ---
 
-## [Unreleased] — 2026-06-29
+## [2026.06.0] — 2026-06-30
 
-Work on the `native-self-hosting-no-zig` branch after `v0.4-numerics-native`.
+First formal CalVer release. `./znc` is the sole supported compiler: native
+x86-64 ELF, GPU MLIR (`--target gpu-*`), WebAssembly (`--target wasm`), and
+in-process `@total` SMT proofs — all from one seed binary.
 
 ### Added
+- **GPU MLIR and WASM on `./znc`**: lean `mlir.zag` (no `codegen.zag` import)
+  and `wasm.zag` merged into `znc.zag`; single `./bootstrap.sh` fixpoint.
+- **In-process SMT solver** (`smt_solve.zag`): QF_LIA/QF_NIA discharge for
+  `@total` without shelling out to external tools on the normal path.
+- **WASM runtime harness**: `tests/wasm_invoke_host/` + `wasmtime_run.sh`.
+- **WASM tagged-union/enum switch** lowering (`examples/wasm_op.zag`).
 - **vsa_b\<N\> bitwidth vector operators**: XOR, OR, AND on `vsa_b<N>` types;
   per-program dimension scan so `ZAG_VSA_DEFINE` macros are emitted once per
   unique width.
@@ -54,6 +62,14 @@ Work on the `native-self-hosting-no-zig` branch after `v0.4-numerics-native`.
 - `zagc` is now labelled "historical bootstrap material and differential oracle"
   in `BOOTSTRAP.md`; it is not a release artifact.
 - `bootstrap.sh` is the only supported rebuild path; it uses `znc` exclusively.
+
+### Fixed (native backend gaps, see `programs/GAPS.md`)
+- Union scalar capture `|v| v` binds payload values, not pointers.
+- Forward function declarations (`fn foo() T;`) parse without SIGSEGV.
+- `@pure` / `@noalloc` enforced for `_zag_malloc`, `_zag_println`, and peers.
+- Nested `ArrayList[ArrayList[T]]` monomorphization (one level deep).
+- `print_str` accepts `*[]u8` union-arm captures.
+- `i32`/`u32` arithmetic truncates to 32 bits on store and widen.
 
 ---
 
