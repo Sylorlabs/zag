@@ -53,18 +53,26 @@ git checkout -                         # back to the latest, Zig-free tree
 
 ## Supported v1 bootstrap — native only
 
-The committed `./znc` binary is the trusted bootstrap seed. `bootstrap.sh`
-rebuilds the supported compiler directly from Zag source:
+The committed `./znc` and `./znc-target` binaries are the trusted bootstrap
+seeds. `bootstrap.sh` rebuilds both directly from Zag source:
 
 ```sh
 ./bootstrap.sh
 #   ./znc selfhost/native/znc.zag -o znc.new
 #   znc.new -> ./znc
+#   ./znc selfhost/native/znc_target.zag -o znc-target.new
+#   znc-target.new -> ./znc-target
 ```
 
-`./znc` is the only supported v1 compiler. It performs lexing, parsing, semantic
-analysis, optimization, x86-64 encoding, and ELF writing in Zag. Its generated
-programs use Linux syscalls and have no dynamic loader or libc dependency.
+### Two-binary split
+
+| Binary | Source | Role |
+|--------|--------|------|
+| `./znc` | `selfhost/native/znc.zag` | Lean native x86-64 compiler: lexing, parsing, semantic analysis, optimization, x86-64 encoding, and ELF writing. Default for `./znc file.zag -o program`. |
+| `./znc-target` | `selfhost/native/znc_target.zag` | GPU MLIR + WASM helper. Built by `bootstrap.sh` and invoked by `./znc` for `--target gpu-*` and `--target wasm`. Keeps the self-hosted `znc.zag` small enough to reach a byte-identical fixpoint. |
+
+Both are release artifacts. Generated x86-64 programs use Linux syscalls and have
+no dynamic loader or libc dependency.
 
 `./zagc` and `selfhost/codegen.zag` remain in the repository as historical
 bootstrap material and a differential oracle. They are not a supported build
@@ -84,8 +92,13 @@ safety net.
 ## Supported release gates
 
 ```sh
-./tests/run_native_authority.sh  # poison host C tools; self-rebuild and smoke test
-./tests/run_native.sh            # native language/backend behavior suite
+./tests/run_native_authority.sh       # poison host C tools; self-rebuild and smoke test
+./tests/run_native.sh                 # native language/backend behavior suite
+bash tests/run_native_gpu.sh          # GPU MLIR via ./znc-target
+bash tests/run_native_wasm.sh         # WASM binary emission via ./znc-target
+bash tests/run_native_total.sh        # @total proofs on ./znc
+./tests/check_native_bootstrap_repro.sh  # byte-identical ./znc fixpoint
+./tests/check_native_target_repro.sh     # byte-identical ./znc-target fixpoint
 ```
 
 The older `run_tests.sh` and `tests/run_selfhost.sh` suites exercise the legacy

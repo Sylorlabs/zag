@@ -9,8 +9,12 @@ release tag is pushed. Steps marked **BLOCKING** abort the release if they fail.
 
 - You are on the `native-self-hosting-no-zig` branch (or a release branch cut
   from it).
-- `./znc` is the committed seed binary. `./zagc` is present only for
-  differential testing; it is NOT a release artifact.
+- `./znc` and `./znc-target` are the committed seed binaries. `./zagc` is
+  present only for differential testing; it is NOT a release artifact.
+- `./znc` is the lean native x86-64 compiler (lexer through ELF emission).
+  `./znc-target` is the GPU MLIR + WASM helper built from
+  `selfhost/native/znc_target.zag`; `./znc` invokes it for `--target gpu-*`
+  and `--target wasm`.
 - The working tree is clean (`git status` shows no uncommitted changes).
 
 ---
@@ -70,7 +74,19 @@ Expected: all tests pass.
 ./tests/run_diag.sh
 ```
 
-### 5b. Run the differential test suites (informational)
+### 5b. Run multi-target native gates — BLOCKING
+
+These suites exercise `./znc-target` (GPU MLIR and WASM backends) and
+`@total` proofs on the supported `./znc` path. All three must pass before
+tagging.
+
+```sh
+bash tests/run_native_gpu.sh
+bash tests/run_native_wasm.sh
+bash tests/run_native_total.sh
+```
+
+### 5c. Run the differential test suites (informational)
 
 These suites test the legacy C-emitting backend (`zagc`) and the self-hosted
 semantic checker. They are not release gates but regressions here indicate
@@ -85,18 +101,20 @@ parser or sema bugs that affect both backends.
 ### 6. Verify byte-identical self-hosting fixpoint — BLOCKING
 
 ```sh
-./bootstrap.sh                                   # rebuild znc from seed
+./bootstrap.sh                                   # rebuild both seeds from source
 ./znc selfhost/native/znc.zag -o znc.new         # znc compiles znc
-diff znc znc.new && echo "fixpoint OK"
+./znc selfhost/native/znc_target.zag -o znc-target.new
+diff znc znc.new && diff znc-target znc-target.new && echo "fixpoint OK"
 ```
 
-Or use the dedicated script:
+Or use the dedicated scripts:
 
 ```sh
 ./tests/check_native_bootstrap_repro.sh
+./tests/check_native_target_repro.sh
 ```
 
-A non-zero diff is a release blocker.
+A non-zero diff on either binary is a release blocker.
 
 ### 7. Update CHANGELOG.md
 
@@ -115,13 +133,13 @@ git commit -m "changelog: add release date for 2026.06.0"
 
 ### 8. Build and commit seed binaries
 
-Rebuild the seed binaries from source and commit them. Only `znc` is a release
-artifact. `zagc` is committed for differential-testing convenience, not as a
-supported binary.
+Rebuild the seed binaries from source and commit them. Both `./znc` and
+`./znc-target` are release artifacts for multi-target support. `zagc` is
+committed for differential-testing convenience, not as a supported binary.
 
 ```sh
-./bootstrap.sh          # produces ./znc only
-git add znc             # REQUIRED: znc is the supported seed binary
+./bootstrap.sh          # produces ./znc and ./znc-target
+git add znc znc-target  # REQUIRED: supported seed binaries
 # git add zagc          # OPTIONAL: zagc is a differential oracle only
 git commit -m "release: update seed binaries for 2026.06.0"
 ```
@@ -142,7 +160,7 @@ Assemble the release tarball. Only include the supported artifacts.
 ```sh
 VERSION=2026.06.0
 mkdir -p dist/zag-$VERSION
-cp znc bootstrap.sh run_tests.sh dist/zag-$VERSION/
+cp znc znc-target bootstrap.sh run_tests.sh dist/zag-$VERSION/
 cp -r selfhost/ examples/ std/ dist/zag-$VERSION/
 cp README.md BOOTSTRAP.md VERSIONING.md CHANGELOG.md \
    COMPATIBILITY.md RELEASES.md dist/zag-$VERSION/

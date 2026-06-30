@@ -1,0 +1,806 @@
+// selfhost/native/wasm.zag — Zag → WebAssembly binary emitter (no wasm-ld/llvm).
+//
+// Lowers a parsed Zag program to a valid WASM module (magic \0asm, version 1).
+// Supports i32/i64/u32/u64/bool arithmetic, locals, calls, if/else, while,
+// struct literals/field access, and host imports for print_i32/print_u64/print_i64.
+
+@import("../parse.zag")
+
+// ── output helpers ───────────────────────────────────────────────────────────
+fn wb_push(buf: *ArrayList[u8], b: u8) void {
+    push[u8](buf, b);
+}
+
+fn wb_append(buf: *ArrayList[u8], src: []u8) void {
+    let i: i32 = 0;
+    while (i < src.len) { push[u8](buf, src[i]); i = i + 1; }
+}
+
+fn wb_append_list(buf: *ArrayList[u8], src: ArrayList[u8]) void {
+    let i: i32 = 0;
+    while (i < src.len) { push[u8](buf, get[u8](src, i)); i = i + 1; }
+}
+
+// ── LEB128 encoders (no >> or | — Zag subset) ────────────────────────────────
+fn leb_u32(v: u32) ArrayList[u8] {
+    let out: ArrayList[u8] = make[u8](5);
+    let x: u32 = v;
+    while (1 == 1) {
+        let low: u32 = x % 128;
+        let b: u8 = low as u8;
+        x = (x - low) / 128;
+        if (x == 0) {
+            push[u8](&out, b);
+            return out;
+        }
+        push[u8](&out, (b + 128) as u8);
+    }
+    return out;
+}
+
+fn leb_i32(v: i32) ArrayList[u8] {
+    let out: ArrayList[u8] = make[u8](5);
+    let x: i64 = v as i64;
+    let more: i32 = 1;
+    while (more == 1) {
+        let low: i64 = x % 128;
+        if (low < 0) { low = low + 128; }
+        let b: u8 = low as u8;
+        let xnext: i64 = (x - low) / 128;
+        let sign: i32 = (b as i32) / 64 % 2;
+        if ((xnext == 0 && sign == 0) || (xnext == -1 && sign == 1)) { more = 0; }
+        else { push[u8](&out, (b + 128) as u8); x = xnext; }
+        if (more == 0) { push[u8](&out, b); }
+    }
+    return out;
+}
+
+fn leb_i64(v: i64) ArrayList[u8] {
+    let out: ArrayList[u8] = make[u8](10);
+    let x: i64 = v;
+    let more: i32 = 1;
+    while (more == 1) {
+        let low: i64 = x % 128;
+        if (low < 0) { low = low + 128; }
+        let b: u8 = low as u8;
+        let xnext: i64 = (x - low) / 128;
+        let sign: i32 = (b as i32) / 64 % 2;
+        if ((xnext == 0 && sign == 0) || (xnext == -1 && sign == 1)) { more = 0; }
+        else { push[u8](&out, (b + 128) as u8); x = xnext; }
+        if (more == 0) { push[u8](&out, b); }
+    }
+    return out;
+}
+
+// WASM value types: 127=i32, 126=i64
+fn wasm_val_ty(t: []u8) u8 {
+    if (@strEq(t, "i64")) { return 126; }
+    if (@strEq(t, "u64")) { return 126; }
+    if (@strEq(t, "i32")) { return 127; }
+    if (@strEq(t, "u32")) { return 127; }
+    if (@strEq(t, "bool")) { return 127; }
+    return 127;
+}
+
+fn is_i64_ty(t: []u8) i32 {
+    if (@strEq(t, "i64")) { return 1; }
+    if (@strEq(t, "u64")) { return 1; }
+    return 0;
+}
+
+fn is_cmp_op(op: []u8) i32 {
+    if (@strEq(op, "==")) { return 1; }
+    if (@strEq(op, "!=")) { return 1; }
+    if (@strEq(op, "<"))  { return 1; }
+    if (@strEq(op, ">"))  { return 1; }
+    if (@strEq(op, "<=")) { return 1; }
+    if (@strEq(op, ">=")) { return 1; }
+    return 0;
+}
+
+// ── type inference (minimal, mirrors mlir.zag) ───────────────────────────────
+struct WBinding { name: []u8, ty: []u8 }
+
+fn w_env_lookup(env: ArrayList[WBinding], name: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[WBinding](env)) {
+        if (@strEq(get[WBinding](env, i).name, name)) { return get[WBinding](env, i).ty; }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn w_ilit_type(text: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < text.len) { if (text[i] == '.') { return "f32"; } i = i + 1; }
+    return "i32";
+}
+
+fn w_fn_ret(dl: ArrayList[*Node], name: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[*Node](dl)) {
+        switch (get[*Node](dl, i).*) {
+            .fn_decl => |f| { if (@strEq(f.name, name)) { return f.ret; } }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn w_struct_field_type(dl: ArrayList[*Node], sname: []u8, fname: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[*Node](dl)) {
+        switch (get[*Node](dl, i).*) {
+            .struct_ => |s| {
+                if (@strEq(s.name, sname)) {
+                    let j: i32 = 0;
+                    while (j < len[Param](s.fields)) {
+                        if (@strEq(get[Param](s.fields, j).name, fname)) {
+                            return get[Param](s.fields, j).pty;
+                        }
+                        j = j + 1;
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn w_type_of(n: *Node, env: ArrayList[WBinding], dl: ArrayList[*Node]) []u8 {
+    switch (n.*) {
+        .ilit => |x| { return w_ilit_type(x.text); }
+        .id   => |x| { return w_env_lookup(env, x.name); }
+        .bin  => |b| {
+            if (is_cmp_op(b.op) == 1) { return "bool"; }
+            let lt: []u8 = w_type_of(b.l, env, dl);
+            if (lt.len > 0) { return lt; }
+            return w_type_of(b.r, env, dl);
+        }
+        .un   => |u| { return w_type_of(u.e, env, dl); }
+        .fld  => |f| {
+            if (@strEq(f.fname, "len")) { return "i32"; }
+            let bt: []u8 = w_type_of(f.base, env, dl);
+            return w_struct_field_type(dl, bt, f.fname);
+        }
+        .call => |c| {
+            let cn: []u8 = "";
+            switch (c.callee.*) {
+                .id => |d| { cn = d.name; }
+                else => { }
+            }
+            if (@strEq(cn, "print_i32"))  { return "void"; }
+            if (@strEq(cn, "print_u64"))  { return "void"; }
+            if (@strEq(cn, "print_i64"))  { return "void"; }
+            if (@strEq(cn, "print_int"))  { return "void"; }
+            return w_fn_ret(dl, cn);
+        }
+        .slit_ => |s| { return s.sname; }
+        else => { return ""; }
+    }
+}
+
+fn w_parse_i64(s: []u8) i64 {
+    let i: i32 = 0;
+    let neg: i32 = 0;
+    if (s.len > 0) {
+        if (s[0] == '-') { neg = 1; i = 1; }
+        else if (s[0] == '+') { i = 1; }
+    }
+    let acc: i64 = 0;
+    while (i < s.len) {
+        let c: u8 = s[i];
+        if (c != '_') {
+            let d: i64 = (c as i64) - 48;
+            if (d >= 0 && d <= 9) { acc = acc * 10 + d; }
+        }
+        i = i + 1;
+    }
+    if (neg == 1) { return 0 - acc; }
+    return acc;
+}
+
+// ── local slot table ─────────────────────────────────────────────────────────
+struct WSlot { name: []u8, ty: []u8, idx: i32 }
+
+struct WLocals {
+    slots: ArrayList[WSlot]
+    next: i32
+}
+
+fn wl_find(loc: *WLocals, name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[WSlot](loc.*.slots)) {
+        if (@strEq(get[WSlot](loc.*.slots, i).name, name)) { return get[WSlot](loc.*.slots, i).idx; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn wl_add(loc: *WLocals, name: []u8, ty: []u8) i32 {
+    let idx: i32 = loc.*.next;
+    push[WSlot](&loc.*.slots, WSlot{ .name = name, .ty = ty, .idx = idx });
+    loc.*.next = loc.*.next + 1;
+    return idx;
+}
+
+fn wl_ty(loc: WLocals, name: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[WSlot](loc.slots)) {
+        if (@strEq(get[WSlot](loc.slots, i).name, name)) { return get[WSlot](loc.slots, i).ty; }
+        i = i + 1;
+    }
+    return "";
+}
+
+// ── function index table ─────────────────────────────────────────────────────
+struct WFnSym { name: []u8, idx: i32, type_idx: i32, is_import: i32 }
+
+struct WMod {
+    decls: ArrayList[*Node]
+    syms: ArrayList[WFnSym]
+    types: ArrayList[u8]       // encoded type entries (each starts with 0x60)
+    type_count: i32
+    import_count: i32
+    code_fns: ArrayList[ArrayList[u8]]
+    err: i32
+}
+
+fn wm_err(m: *WMod, msg: []u8) void {
+    _zag_eprintln(_zag_str_concat("znc: wasm codegen error: ", msg));
+    m.*.err = m.*.err + 1;
+}
+
+fn wm_add_type(m: *WMod, params: ArrayList[[]u8], ret: []u8) i32 {
+    let idx: i32 = m.*.type_count;
+    push[u8](&m.*.types, 96);
+    push[u8](&m.*.types, len[[]u8](params) as u8);
+    let pi: i32 = 0;
+    while (pi < len[[]u8](params)) {
+        push[u8](&m.*.types, wasm_val_ty(get[[]u8](params, pi)));
+        pi = pi + 1;
+    }
+    if (ret.len > 0 && @strEq(ret, "void") == 0) {
+        push[u8](&m.*.types, 1);
+        push[u8](&m.*.types, wasm_val_ty(ret));
+    } else {
+        push[u8](&m.*.types, 0);
+    }
+    m.*.type_count = m.*.type_count + 1;
+    return idx;
+}
+
+fn wm_find_sym(m: *WMod, name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[WFnSym](m.*.syms)) {
+        if (@strEq(get[WFnSym](m.*.syms, i).name, name)) { return get[WFnSym](m.*.syms, i).idx; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn wm_register_import(m: *WMod, name: []u8, params: ArrayList[[]u8], ret: []u8) i32 {
+    let existing: i32 = wm_find_sym(m, name);
+    if (existing >= 0) { return existing; }
+    let tidx: i32 = wm_add_type(m, params, ret);
+    let fidx: i32 = m.*.import_count;
+    push[WFnSym](&m.*.syms, WFnSym{ .name = name, .idx = fidx, .type_idx = tidx, .is_import = 1 });
+    m.*.import_count = m.*.import_count + 1;
+    return fidx;
+}
+
+fn wm_register_fn(m: *WMod, name: []u8, params: ArrayList[[]u8], ret: []u8) i32 {
+    let existing: i32 = wm_find_sym(m, name);
+    if (existing >= 0) { return existing; }
+    let tidx: i32 = wm_add_type(m, params, ret);
+    let fidx: i32 = m.*.import_count + len[ArrayList[u8]](m.*.code_fns);
+    push[WFnSym](&m.*.syms, WFnSym{ .name = name, .idx = fidx, .type_idx = tidx, .is_import = 0 });
+    let empty: ArrayList[u8] = make[u8](64);
+    push[ArrayList[u8]](&m.*.code_fns, empty);
+    return fidx;
+}
+
+fn wm_fn_type_idx(m: *WMod, name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[WFnSym](m.*.syms)) {
+        if (@strEq(get[WFnSym](m.*.syms, i).name, name)) { return get[WFnSym](m.*.syms, i).type_idx; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ── WASM opcode emission ─────────────────────────────────────────────────────
+fn wo_i32_const(buf: *ArrayList[u8], v: i32) void {
+    wb_push(buf, 65);
+    wb_append_list(buf, leb_i32(v));
+}
+
+fn wo_i64_const(buf: *ArrayList[u8], v: i64) void {
+    wb_push(buf, 66);
+    wb_append_list(buf, leb_i64(v));
+}
+
+fn wo_local_get(buf: *ArrayList[u8], idx: i32) void {
+    wb_push(buf, 32);
+    wb_append_list(buf, leb_u32(idx as u32));
+}
+
+fn wo_local_set(buf: *ArrayList[u8], idx: i32) void {
+    wb_push(buf, 33);
+    wb_append_list(buf, leb_u32(idx as u32));
+}
+
+fn wo_call(buf: *ArrayList[u8], fidx: i32) void {
+    wb_push(buf, 16);
+    wb_append_list(buf, leb_u32(fidx as u32));
+}
+
+fn wo_drop(buf: *ArrayList[u8]) void {
+    wb_push(buf, 26);
+}
+
+fn wo_return(buf: *ArrayList[u8]) void {
+    wb_push(buf, 15);
+}
+
+fn wo_end(buf: *ArrayList[u8]) void {
+    wb_push(buf, 11);
+}
+
+fn wo_bin_i32(buf: *ArrayList[u8], op: []u8) void {
+    if (@strEq(op, "+")) { wb_push(buf, 106); return; }
+    if (@strEq(op, "-")) { wb_push(buf, 107); return; }
+    if (@strEq(op, "*")) { wb_push(buf, 108); return; }
+    if (@strEq(op, "/")) { wb_push(buf, 109); return; }
+    if (@strEq(op, "%")) { wb_push(buf, 111); return; }
+    if (@strEq(op, "==")) { wb_push(buf, 70); return; }
+    if (@strEq(op, "!=")) { wb_push(buf, 71); return; }
+    if (@strEq(op, "<"))  { wb_push(buf, 72); return; }
+    if (@strEq(op, ">"))  { wb_push(buf, 74); return; }
+    if (@strEq(op, "<=")) { wb_push(buf, 76); return; }
+    if (@strEq(op, ">=")) { wb_push(buf, 78); return; }
+    wb_push(buf, 106);
+}
+
+fn wo_bin_i64(buf: *ArrayList[u8], op: []u8) void {
+    if (@strEq(op, "+")) { wb_push(buf, 124); return; }
+    if (@strEq(op, "-")) { wb_push(buf, 125); return; }
+    if (@strEq(op, "*")) { wb_push(buf, 126); return; }
+    if (@strEq(op, "/")) { wb_push(buf, 127); return; }
+    if (@strEq(op, "%")) { wb_push(buf, 129); return; }
+    if (@strEq(op, "==")) { wb_push(buf, 83); return; }
+    if (@strEq(op, "!=")) { wb_push(buf, 84); return; }
+    if (@strEq(op, "<"))  { wb_push(buf, 85); return; }
+    if (@strEq(op, ">"))  { wb_push(buf, 87); return; }
+    if (@strEq(op, "<=")) { wb_push(buf, 89); return; }
+    if (@strEq(op, ">=")) { wb_push(buf, 91); return; }
+    wb_push(buf, 124);
+}
+
+fn wo_un_i32(buf: *ArrayList[u8], op: []u8) void {
+    if (@strEq(op, "-")) { wo_i32_const(buf, 0); wb_push(buf, 107); return; }
+    if (@strEq(op, "!")) { wb_push(buf, 69); return; }
+}
+
+fn wo_un_i64(buf: *ArrayList[u8], op: []u8) void {
+    if (@strEq(op, "-")) { wo_i64_const(buf, 0); wb_push(buf, 125); return; }
+}
+
+fn wo_i32_to_i64(buf: *ArrayList[u8]) void {
+    wb_push(buf, 172);
+}
+
+fn wo_promote_to(buf: *ArrayList[u8], ty: []u8) void {
+    if (is_i64_ty(ty) == 1) { wo_i32_to_i64(buf); }
+}
+
+// ── expression / statement lowering ──────────────────────────────────────────
+fn w_lower_expr(buf: *ArrayList[u8], n: *Node, env: ArrayList[WBinding], loc: *WLocals, m: *WMod) []u8 {
+    switch (n.*) {
+        .ilit => |x| {
+            let ty: []u8 = w_ilit_type(x.text);
+            if (is_i64_ty(ty) == 1) {
+                wo_i64_const(buf, w_parse_i64(x.text));
+                return ty;
+            }
+            wo_i32_const(buf, w_parse_i64(x.text) as i32);
+            return "i32";
+        }
+        .id => |x| {
+            let idx: i32 = wl_find(loc, x.name);
+            if (idx < 0) { wm_err(m, "unknown variable"); wo_i32_const(buf, 0); return "i32"; }
+            let ty: []u8 = wl_ty(loc.*, x.name);
+            wo_local_get(buf, idx);
+            return ty;
+        }
+        .bin => |b| {
+            let lty: []u8 = w_type_of(b.l, env, m.*.decls);
+            let rty0: []u8 = w_type_of(b.r, env, m.*.decls);
+            let use64: i32 = 0;
+            if (is_i64_ty(lty) == 1 || is_i64_ty(rty0) == 1) { use64 = 1; }
+            let lt: []u8 = w_lower_expr(buf, b.l, env, loc, m);
+            if (use64 == 1 && is_i64_ty(lt) == 0) { wo_i32_to_i64(buf); }
+            let rt: []u8 = w_lower_expr(buf, b.r, env, loc, m);
+            if (use64 == 1 && is_i64_ty(rt) == 0) { wo_i32_to_i64(buf); }
+            if (use64 == 1) {
+                wo_bin_i64(buf, b.op);
+                if (is_cmp_op(b.op) == 1) { return "bool"; }
+                return "u64";
+            }
+            wo_bin_i32(buf, b.op);
+            if (is_cmp_op(b.op) == 1) { return "bool"; }
+            return "i32";
+        }
+        .un => |u| {
+            let et: []u8 = w_lower_expr(buf, u.e, env, loc, m);
+            if (is_i64_ty(et) == 1) { wo_un_i64(buf, u.op); return "i64"; }
+            wo_un_i32(buf, u.op);
+            return "i32";
+        }
+        .call => |c| {
+            let cn: []u8 = "";
+            switch (c.callee.*) {
+                .id => |d| { cn = d.name; }
+                else => { }
+            }
+            let ai: i32 = 0;
+            while (ai < len[*Node](c.args)) {
+                w_lower_expr(buf, get[*Node](c.args, ai), env, loc, m);
+                ai = ai + 1;
+            }
+            if (@strEq(cn, "print_i32") || @strEq(cn, "print_int")) {
+                let p32: ArrayList[[]u8] = make[[]u8](1);
+                push[[]u8](&p32, "i32");
+                let fidx: i32 = wm_register_import(m, "print_i32", p32, "void");
+                wo_call(buf, fidx);
+                return "void";
+            }
+            if (@strEq(cn, "print_u64")) {
+                let p: ArrayList[[]u8] = make[[]u8](1);
+                push[[]u8](&p, "u64");
+                let fidx: i32 = wm_register_import(m, "print_u64", p, "void");
+                wo_call(buf, fidx);
+                return "void";
+            }
+            if (@strEq(cn, "print_i64")) {
+                let p: ArrayList[[]u8] = make[[]u8](1);
+                push[[]u8](&p, "i64");
+                let fidx: i32 = wm_register_import(m, "print_i64", p, "void");
+                wo_call(buf, fidx);
+                return "void";
+            }
+            let fidx2: i32 = wm_find_sym(m, cn);
+            if (fidx2 < 0) { wm_err(m, "call to unknown function"); wo_i32_const(buf, 0); return "i32"; }
+            wo_call(buf, fidx2);
+            return w_fn_ret(m.*.decls, cn);
+        }
+        .fld => |f| {
+            if (@strEq(f.fname, "len")) {
+                wo_i32_const(buf, 0);
+                return "i32";
+            }
+            switch (f.base.*) {
+                .id => |x| {
+                    let fname: []u8 = _zag_str_concat(_zag_str_concat(x.name, "."), f.fname);
+                    let idx: i32 = wl_find(loc, fname);
+                    if (idx >= 0) {
+                        wo_local_get(buf, idx);
+                        return wl_ty(loc.*, fname);
+                    }
+                }
+                else => { }
+            }
+            wo_i32_const(buf, 0);
+            return "i32";
+        }
+        .slit_ => |s| {
+            let fi: i32 = 0;
+            while (fi < len[FieldInit](s.fields)) {
+                w_lower_expr(buf, get[FieldInit](s.fields, fi).val, env, loc, m);
+                wo_drop(buf);
+                fi = fi + 1;
+            }
+            wo_i32_const(buf, 0);
+            return s.sname;
+        }
+        else => {
+            wo_i32_const(buf, 0);
+            return "i32";
+        }
+    }
+}
+
+fn w_lower_block(buf: *ArrayList[u8], body: ArrayList[*Node], env: *ArrayList[WBinding], loc: *WLocals, m: *WMod) void {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        w_lower_stmt(buf, get[*Node](body, i), env, loc, m);
+        i = i + 1;
+    }
+}
+
+fn w_lower_stmt(buf: *ArrayList[u8], n: *Node, env: *ArrayList[WBinding], loc: *WLocals, m: *WMod) void {
+    switch (n.*) {
+        .let_ => |l| {
+            let ty: []u8 = l.dty;
+            if (ty.len == 0) { ty = w_type_of(l.expr, env.*, m.*.decls); }
+            if (ty.len == 0) { ty = "i32"; }
+            switch (l.expr.*) {
+                .slit_ => |s| {
+                    let fi: i32 = 0;
+                    while (fi < len[FieldInit](s.fields)) {
+                        let fin: FieldInit = get[FieldInit](s.fields, fi);
+                        w_lower_expr(buf, fin.val, env.*, loc, m);
+                        let fty: []u8 = w_struct_field_type(m.*.decls, s.sname, fin.name);
+                        if (fty.len == 0) { fty = "i32"; }
+                        if (is_i64_ty(fty) == 1) {
+                            let et: []u8 = w_type_of(fin.val, env.*, m.*.decls);
+                            if (is_i64_ty(et) == 0) { wo_i32_to_i64(buf); }
+                        }
+                        let slot: []u8 = _zag_str_concat(_zag_str_concat(l.name, "."), fin.name);
+                        let idx: i32 = wl_add(loc, slot, fty);
+                        wo_local_set(buf, idx);
+                        push[WBinding](env, WBinding{ .name = slot, .ty = fty });
+                        fi = fi + 1;
+                    }
+                    push[WBinding](env, WBinding{ .name = l.name, .ty = ty });
+                }
+                else => {
+                    w_lower_expr(buf, l.expr, env.*, loc, m);
+                    if (is_i64_ty(ty) == 1) {
+                        let et: []u8 = w_type_of(l.expr, env.*, m.*.decls);
+                        if (is_i64_ty(et) == 0) { wo_i32_to_i64(buf); }
+                    }
+                    let idx: i32 = wl_add(loc, l.name, ty);
+                    wo_local_set(buf, idx);
+                    push[WBinding](env, WBinding{ .name = l.name, .ty = ty });
+                }
+            }
+        }
+        .ret => |r| {
+            if (r.has_expr == 1) {
+                w_lower_expr(buf, r.expr, env.*, loc, m);
+            }
+            wo_return(buf);
+        }
+        .if_ => |x| {
+            w_lower_expr(buf, x.cond, env.*, loc, m);
+            wb_push(buf, 4);
+            wb_push(buf, 64);
+            w_lower_block(buf, x.then_body, env, loc, m);
+            if (x.has_els == 1) {
+                wb_push(buf, 5);
+                w_lower_block(buf, x.els_body, env, loc, m);
+            }
+            wo_end(buf);
+        }
+        .while_ => |w| {
+            wb_push(buf, 2);
+            wb_push(buf, 64);
+            wb_push(buf, 3);
+            wb_push(buf, 64);
+            w_lower_expr(buf, w.cond, env.*, loc, m);
+            wb_push(buf, 69);
+            wb_push(buf, 13);
+            wb_append_list(buf, leb_u32(1));
+            w_lower_block(buf, w.body, env, loc, m);
+            wb_push(buf, 12);
+            wb_append_list(buf, leb_u32(0));
+            wo_end(buf);
+            wo_end(buf);
+        }
+        .assign => |a| {
+            w_lower_expr(buf, a.expr, env.*, loc, m);
+            switch (a.target.*) {
+                .id => |x| {
+                    let idx: i32 = wl_find(loc, x.name);
+                    if (idx >= 0) { wo_local_set(buf, idx); }
+                    else { wm_err(m, "assign to unknown variable"); wo_drop(buf); }
+                }
+                else => { wo_drop(buf); }
+            }
+        }
+        .estmt => |e| {
+            let ty: []u8 = w_lower_expr(buf, e.expr, env.*, loc, m);
+            if (@strEq(ty, "void") == 0) { wo_drop(buf); }
+        }
+        else => { }
+    }
+}
+
+fn w_lower_fn(m: *WMod, f: FnDecl) void {
+    let fidx: i32 = wm_find_sym(m, f.name);
+    if (fidx < 0) { return; }
+    let code_idx: i32 = fidx - m.*.import_count;
+    if (code_idx < 0) { return; }
+
+    let loc: WLocals = WLocals{ .slots = make[WSlot](8), .next = 0 };
+    let env: ArrayList[WBinding] = make[WBinding](8);
+    let pi: i32 = 0;
+    while (pi < len[Param](f.params)) {
+        let p: Param = get[Param](f.params, pi);
+        wl_add(&loc, p.name, p.pty);
+        push[WBinding](&env, WBinding{ .name = p.name, .ty = p.pty });
+        pi = pi + 1;
+    }
+
+    let body: ArrayList[u8] = make[u8](256);
+    w_lower_block(&body, f.body, &env, &loc, m);
+    wo_end(&body);
+
+    let locals_decl: ArrayList[u8] = make[u8](16);
+    let extra: i32 = loc.next - len[Param](f.params);
+    if (extra > 0) {
+        wb_append_list(&locals_decl, leb_u32(extra as u32));
+        let li: i32 = len[Param](f.params);
+        while (li < loc.next) {
+            let ty: []u8 = get[WSlot](loc.slots, li).ty;
+            wb_append_list(&locals_decl, leb_u32(1));
+            push[u8](&locals_decl, wasm_val_ty(ty));
+            li = li + 1;
+        }
+    } else {
+        wb_append_list(&locals_decl, leb_u32(0));
+    }
+
+    let fn_code: ArrayList[u8] = make[u8](body.len + 32);
+    let size_bytes: ArrayList[u8] = make[u8](8);
+    wb_append_list(&fn_code, locals_decl);
+    wb_append_list(&fn_code, body);
+    set[ArrayList[u8]](&m.*.code_fns, code_idx, fn_code);
+}
+
+// ── module assembly ────────────────────────────────────────────────────────────
+fn wm_collect_fns(m: *WMod) void {
+    // Register host imports used by print builtins.
+    let pi: ArrayList[[]u8] = make[[]u8](1);
+    push[[]u8](&pi, "i32");
+    wm_register_import(m, "print_i32", pi, "void");
+    let pu: ArrayList[[]u8] = make[[]u8](1);
+    push[[]u8](&pu, "i64");
+    wm_register_import(m, "print_u64", pu, "void");
+    wm_register_import(m, "print_i64", pu, "void");
+
+    let i: i32 = 0;
+    while (i < len[*Node](m.*.decls)) {
+        switch (get[*Node](m.*.decls, i).*) {
+            .fn_decl => |f| {
+                if (f.is_extern == 0 && len[[]u8](f.tparams) == 0) {
+                    let ps: ArrayList[[]u8] = make[[]u8](len[Param](f.params));
+                    let pj: i32 = 0;
+                    while (pj < len[Param](f.params)) {
+                        push[[]u8](&ps, get[Param](f.params, pj).pty);
+                        pj = pj + 1;
+                    }
+                    wm_register_fn(m, f.name, ps, f.ret);
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+
+    let j: i32 = 0;
+    while (j < len[*Node](m.*.decls)) {
+        switch (get[*Node](m.*.decls, j).*) {
+            .fn_decl => |f| {
+                if (f.is_extern == 0 && len[[]u8](f.tparams) == 0) {
+                    w_lower_fn(m, f);
+                }
+            }
+            else => { }
+        }
+        j = j + 1;
+    }
+}
+
+fn wm_section(buf: *ArrayList[u8], id: u8, payload: ArrayList[u8]) void {
+    wb_push(buf, id);
+    wb_append_list(buf, leb_u32(payload.len as u32));
+    wb_append_list(buf, payload);
+}
+
+fn wm_encode_module(m: *WMod) ArrayList[u8] {
+    let out: ArrayList[u8] = make[u8](4096);
+    wb_push(&out, 0);
+    wb_push(&out, 97);
+    wb_push(&out, 115);
+    wb_push(&out, 109);
+    wb_push(&out, 1);
+    wb_push(&out, 0);
+    wb_push(&out, 0);
+    wb_push(&out, 0);
+
+    // Type section
+    let typesec: ArrayList[u8] = make[u8](m.*.types.len + 4);
+    wb_append_list(&typesec, leb_u32(m.*.type_count as u32));
+    wb_append_list(&typesec, m.*.types);
+    wm_section(&out, 1, typesec);
+
+    // Import section
+    let impsec: ArrayList[u8] = make[u8](128);
+    wb_append_list(&impsec, leb_u32(m.*.import_count as u32));
+    let ii: i32 = 0;
+    while (ii < len[WFnSym](m.*.syms)) {
+        let s: WFnSym = get[WFnSym](m.*.syms, ii);
+        if (s.is_import == 1) {
+            let modname: []u8 = "env";
+            wb_append_list(&impsec, leb_u32(modname.len as u32));
+            wb_append(&impsec, modname);
+            wb_append_list(&impsec, leb_u32(s.name.len as u32));
+            wb_append(&impsec, s.name);
+            wb_push(&impsec, 0);
+            wb_append_list(&impsec, leb_u32(s.type_idx as u32));
+        }
+        ii = ii + 1;
+    }
+    if (m.*.import_count > 0) { wm_section(&out, 2, impsec); }
+
+    // Function section
+    let fnsec: ArrayList[u8] = make[u8](64);
+    wb_append_list(&fnsec, leb_u32(len[ArrayList[u8]](m.*.code_fns) as u32));
+    let fi: i32 = 0;
+    while (fi < len[ArrayList[u8]](m.*.code_fns)) {
+        let fname: []u8 = "";
+        let si: i32 = 0;
+        while (si < len[WFnSym](m.*.syms)) {
+            let s2: WFnSym = get[WFnSym](m.*.syms, si);
+            if (s2.is_import == 0 && s2.idx == m.*.import_count + fi) { fname = s2.name; }
+            si = si + 1;
+        }
+        let tidx: i32 = wm_fn_type_idx(m, fname);
+        wb_append_list(&fnsec, leb_u32(tidx as u32));
+        fi = fi + 1;
+    }
+    wm_section(&out, 3, fnsec);
+
+    // Export section — export "main"
+    let expsec: ArrayList[u8] = make[u8](32);
+    let main_idx: i32 = wm_find_sym(m, "main");
+    if (main_idx >= 0) {
+        wb_append_list(&expsec, leb_u32(1));
+        let en: []u8 = "main";
+        wb_append_list(&expsec, leb_u32(en.len as u32));
+        wb_append(&expsec, en);
+        wb_push(&expsec, 0);
+        wb_append_list(&expsec, leb_u32(main_idx as u32));
+        wm_section(&out, 7, expsec);
+    }
+
+    // Code section
+    let codesec: ArrayList[u8] = make[u8](4096);
+    wb_append_list(&codesec, leb_u32(len[ArrayList[u8]](m.*.code_fns) as u32));
+    let ci: i32 = 0;
+    while (ci < len[ArrayList[u8]](m.*.code_fns)) {
+        let fnbody: ArrayList[u8] = get[ArrayList[u8]](m.*.code_fns, ci);
+        let wrapped: ArrayList[u8] = make[u8](fnbody.len + 8);
+        wb_append_list(&wrapped, fnbody);
+        wb_append_list(&codesec, leb_u32(wrapped.len as u32));
+        wb_append_list(&codesec, wrapped);
+        ci = ci + 1;
+    }
+    wm_section(&out, 10, codesec);
+
+    return out;
+}
+
+// ── public entry ─────────────────────────────────────────────────────────────
+fn emit_wasm_dir(src: []u8, base_dir: []u8) ArrayList[u8] {
+    let decls: ArrayList[*Node] = parse_program_dir(src, base_dir);
+    let m: WMod = WMod{
+        .decls = decls,
+        .syms = make[WFnSym](8),
+        .types = make[u8](64),
+        .type_count = 0,
+        .import_count = 0,
+        .code_fns = make[ArrayList[u8]](4),
+        .err = 0,
+    };
+    wm_collect_fns(&m);
+    if (m.err > 0) {
+        _zag_exit(1);
+    }
+    return wm_encode_module(&m);
+}

@@ -1,0 +1,263 @@
+// selfhost/native/znc_target.zag — GPU/MLIR + WASM backends for ./znc.
+//
+// Built as ./znc-target (sibling of ./znc). Invoked by the lean znc driver for
+// `--target gpu-*` and `--target wasm` so the self-hosted znc.zag stays small
+// enough to rebuild itself (mlir.zag pulls in codegen.zag).
+
+@import("../mlir.zag")
+@import("wasm.zag")
+@import("../sema.zag")
+
+struct LoEnv { name: []u8, ty: []u8 }
+
+fn lo_env_get(env: ArrayList[LoEnv], name: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[LoEnv](env)) {
+        if (@strEq(get[LoEnv](env, i).name, name)) { return get[LoEnv](env, i).ty; }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn lo_id_ty(n: *Node, env: ArrayList[LoEnv], dl: ArrayList[*Node]) []u8 {
+    switch (n.*) {
+        .id  => |x| { return lo_env_get(env, x.name); }
+        .fld => |f| {
+            let base_ty: []u8 = lo_id_ty(f.base, env, dl);
+            if (base_ty.len == 0) { return ""; }
+            let si: i32 = 0;
+            while (si < len[*Node](dl)) {
+                switch (get[*Node](dl, si).*) {
+                    .struct_ => |s| {
+                        if (@strEq(s.name, base_ty)) {
+                            let fi: i32 = 0;
+                            while (fi < len[Param](s.fields)) {
+                                let fp: Param = get[Param](s.fields, fi);
+                                if (@strEq(fp.name, f.fname)) { return fp.pty; }
+                                fi = fi + 1;
+                            }
+                        }
+                    }
+                    else => { }
+                }
+                si = si + 1;
+            }
+            return "";
+        }
+        else => { return ""; }
+    }
+}
+
+fn lo_mk_call2(fname: []u8, a: *Node, b: *Node) *Node {
+    let args: ArrayList[*Node] = make[*Node](2);
+    push[*Node](&args, a);
+    push[*Node](&args, b);
+    return mk_call(mk_ident(fname), args);
+}
+
+fn lo_expr(n: *Node, env: ArrayList[LoEnv], dl: ArrayList[*Node]) void {
+    switch (n.*) {
+        .bin => |b| {
+            lo_expr(b.l, env, dl);
+            lo_expr(b.r, env, dl);
+            if (@strEq(b.op, "+") || @strEq(b.op, "-") || @strEq(b.op, "*") || @strEq(b.op, "/")) {
+                let lt: []u8 = lo_id_ty(b.l, env, dl);
+                if (lt.len > 0) {
+                    let decode: []u8 = op_contract_fn(dl, lt, b.op);
+                    if (decode.len > 0) { n.* = lo_mk_call2(decode, b.l, b.r).*; }
+                }
+            }
+        }
+        .un    => |u| { lo_expr(u.e, env, dl); }
+        .call  => |c| {
+            lo_expr(c.callee, env, dl);
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) { lo_expr(get[*Node](c.args, i), env, dl); i = i + 1; }
+        }
+        .idx   => |x| { lo_expr(x.base, env, dl); lo_expr(x.idx, env, dl); }
+        .fld   => |f| { lo_expr(f.base, env, dl); }
+        .slit_ => |s| {
+            let i: i32 = 0;
+            while (i < len[FieldInit](s.fields)) { lo_expr(get[FieldInit](s.fields, i).val, env, dl); i = i + 1; }
+        }
+        else => { }
+    }
+}
+
+fn lo_block(body: ArrayList[*Node], env: *ArrayList[LoEnv], dl: ArrayList[*Node]) void {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) { lo_stmt(get[*Node](body, i), env, dl); i = i + 1; }
+}
+
+fn lo_stmt(n: *Node, env: *ArrayList[LoEnv], dl: ArrayList[*Node]) void {
+    switch (n.*) {
+        .let_   => |l| {
+            lo_expr(l.expr, env.*, dl);
+            if (l.has_dty == 1 && l.dty.len > 0) {
+                push[LoEnv](env, LoEnv{ .name = l.name, .ty = l.dty });
+            }
+        }
+        .ret    => |r| { if (r.has_expr == 1) { lo_expr(r.expr, env.*, dl); } }
+        .if_    => |x| { lo_expr(x.cond, env.*, dl); lo_block(x.then_body, env, dl); lo_block(x.els_body, env, dl); }
+        .while_ => |w| { lo_expr(w.cond, env.*, dl); lo_block(w.body, env, dl); }
+        .assign => |a| { lo_expr(a.target, env.*, dl); lo_expr(a.expr, env.*, dl); }
+        .switch_ => |sw| {
+            lo_expr(sw.subject, env.*, dl);
+            let i: i32 = 0;
+            while (i < len[SwitchArm](sw.arms)) { lo_block(get[SwitchArm](sw.arms, i).body, env, dl); i = i + 1; }
+            if (sw.has_els == 1) { lo_block(sw.els_body, env, dl); }
+        }
+        .estmt  => |e| { lo_expr(e.expr, env.*, dl); }
+        else    => { }
+    }
+}
+
+fn lo_build_env(params: ArrayList[Param]) ArrayList[LoEnv] {
+    let env: ArrayList[LoEnv] = make[LoEnv](8);
+    let i: i32 = 0;
+    while (i < len[Param](params)) {
+        let p: Param = get[Param](params, i);
+        push[LoEnv](&env, LoEnv{ .name = p.name, .ty = p.pty });
+        i = i + 1;
+    }
+    return env;
+}
+
+fn lo_operators(decls: ArrayList[*Node]) void {
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .fn_decl => |f| {
+                if (f.is_extern == 0 && len[[]u8](f.tparams) == 0) {
+                    let is_op: i32 = 0;
+                    if (f.name.len >= 5) {
+                        if (f.name[0] == '_' && f.name[1] == '_' && f.name[2] == 'o' && f.name[3] == 'p' && f.name[4] == '_') { is_op = 1; }
+                    }
+                    if (is_op == 0) {
+                        let lenv: ArrayList[LoEnv] = lo_build_env(f.params);
+                        lo_block(f.body, &lenv, decls);
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+}
+
+fn starts_with(s: []u8, p: []u8) i32 {
+    if (s.len < p.len) { return 0; }
+    let i: i32 = 0;
+    while (i < p.len) {
+        if (s[i] != p[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn stem_of(path: []u8) []u8 {
+    let slash: i32 = 0 - 1;
+    let i: i32 = 0;
+    while (i < path.len) {
+        if (path[i] == '/') { slash = i; }
+        i = i + 1;
+    }
+    let base: []u8 = path;
+    if (slash >= 0) { base = path[slash + 1..]; }
+    let dot: i32 = 0 - 1;
+    let j: i32 = 0;
+    while (j < base.len) {
+        if (base[j] == '.') { dot = j; }
+        j = j + 1;
+    }
+    if (dot > 0) { return base[0..dot]; }
+    return base;
+}
+
+fn out_flag() []u8 {
+    let i: i32 = 2;
+    while (i < _zag_argc()) {
+        if (@strEq(_zag_arg(i), "-o")) {
+            if (i + 1 < _zag_argc()) { return _zag_arg(i + 1); }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn has_flag(name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < _zag_argc()) {
+        if (@strEq(_zag_arg(i), name)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn check_sema(path: []u8, src: []u8) i32 {
+    let decls: ArrayList[*Node] = parse_program_dir(src, dir_of(path));
+    lo_operators(decls);
+    let eff: map__StringMap[i32] = analyze(decls);
+    let viols: i32 = report_violations(decls, eff, src, path);
+    if (viols > 0) {
+        _zag_println("znc: capability check FAILED");
+        return 1;
+    }
+    return 0;
+}
+
+fn build_gpu(path: []u8, target: []u8) i32 {
+    let src: []u8 = _zag_read_file(path);
+    if (src.len < 0) { _zag_println("znc-target: cannot read source"); return 1; }
+    if (check_sema(path, src) != 0) { return 1; }
+    let mbuf: ArrayList[u8] = emit_mlir_dir(src, dir_of(path), target);
+    let mpath: []u8 = _zag_str_concat(stem_of(path), ".mlir");
+    if (_zag_write_file(mpath, mbuf.data[0..mbuf.len]) != 0) {
+        _zag_println("znc-target: failed to write MLIR");
+        return 1;
+    }
+    _zag_print("znc: [gpu-");
+    _zag_print(target);
+    _zag_print("] wrote MLIR ");
+    _zag_println(mpath);
+    return 0;
+}
+
+fn build_wasm(path: []u8) i32 {
+    let src: []u8 = _zag_read_file(path);
+    if (src.len < 0) { _zag_println("znc-target: cannot read source"); return 1; }
+    if (check_sema(path, src) != 0) { return 1; }
+    let wbuf: ArrayList[u8] = emit_wasm_dir(src, dir_of(path));
+    let out: []u8 = out_flag();
+    if (out.len == 0) { out = _zag_str_concat(stem_of(path), ".wasm"); }
+    if (_zag_write_file(out, wbuf.data[0..wbuf.len]) != 0) {
+        _zag_println("znc-target: failed to write WASM");
+        return 1;
+    }
+    _zag_print("znc: [wasm] wrote WASM ");
+    _zag_println(out);
+    if (has_flag("--run") == 1) {
+        let runcmd: []u8 = _zag_str_concat("wasmtime ", out);
+        let ec: i32 = _zag_exec_cmd(runcmd);
+        _zag_print("znc: wasmtime exited ");
+        _zag_println(_zag_i64_to_str(ec as i64));
+    }
+    return 0;
+}
+
+fn main() i32 {
+    if (_zag_argc() < 3) {
+        _zag_println("usage: znc-target gpu <file.zag> <nvidia|amd|vulkan>");
+        _zag_println("       znc-target wasm <file.zag> [-o out.wasm] [--run]");
+        return 1;
+    }
+    let mode: []u8 = _zag_arg(1);
+    let path: []u8 = _zag_arg(2);
+    if (@strEq(mode, "gpu")) {
+        if (_zag_argc() < 4) { _zag_println("znc-target: missing gpu sub-target"); return 1; }
+        return build_gpu(path, _zag_arg(3));
+    }
+    if (@strEq(mode, "wasm")) { return build_wasm(path); }
+    _zag_println("znc-target: unknown mode");
+    return 1;
+}

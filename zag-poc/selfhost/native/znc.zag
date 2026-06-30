@@ -24,6 +24,7 @@
 @import("dwarf.zag")      // optional DWARF sections for --debug builds
 @import("../fmt.zag")     // native Zag source formatter
 @import("../version.zag") // zag_version / zag_edition
+@import("../smt.zag")     // @total SMT discharge (kept out of sema.zag for lean bootstrap)
 
 // ── operator-contract lowering (pre-sema) ────────────────────────────────────
 // Rewrites binary ops on user types to their decode fn calls BEFORE sema runs,
@@ -345,6 +346,84 @@ fn link_libraries(libs: ArrayList[[]u8], paths: ArrayList[[]u8], needed_syms: Ar
     return ml;
 }
 
+// ── gpu / wasm target delegation (→ ./znc-target) ─────────────────────────────
+// mlir.zag + wasm.zag live in znc_target.zag so this driver stays small enough
+// to self-host.  `--target gpu-*` and `--target wasm` exec the sibling binary.
+
+fn starts_with(s: []u8, p: []u8) i32 {
+    if (s.len < p.len) { return 0; }
+    let i: i32 = 0;
+    while (i < p.len) {
+        if (s[i] != p[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// "nvidia" / "amd" / "vulkan" when `--target gpu-*` is present, else "".
+fn gpu_target() []u8 {
+    let i: i32 = 0;
+    while (i < _zag_argc()) {
+        let a: []u8 = _zag_arg(i);
+        if (@strEq(a, "--target")) {
+            if (i + 1 < _zag_argc()) {
+                let v: []u8 = _zag_arg(i + 1);
+                if (starts_with(v, "gpu-") == 1) { return v[4..]; }
+            }
+        }
+        if (starts_with(a, "--target=gpu-") == 1) { return a[13..]; }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn wasm_target() i32 {
+    let i: i32 = 0;
+    while (i < _zag_argc()) {
+        let a: []u8 = _zag_arg(i);
+        if (@strEq(a, "--target")) {
+            if (i + 1 < _zag_argc()) {
+                if (@strEq(_zag_arg(i + 1), "wasm")) { return 1; }
+            }
+        }
+        if (@strEq(a, "--target=wasm")) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn znc_target_path() []u8 {
+    if (_zag_file_exists("./znc-target") != 0) { return "./znc-target"; }
+    return "";
+}
+
+fn delegate_gpu(path: []u8, subtarget: []u8) i32 {
+    let tgt: []u8 = znc_target_path();
+    if (tgt.len == 0) {
+        _zag_println("znc: ./znc-target missing — run ./bootstrap.sh to build the GPU/WASM helper");
+        return 1;
+    }
+    let cmd: []u8 = _zag_str_concat(tgt, _zag_str_concat(" gpu ", _zag_str_concat(path, _zag_str_concat(" ", subtarget))));
+    return _zag_exec_cmd(cmd);
+}
+
+fn delegate_wasm(path: []u8) i32 {
+    let tgt: []u8 = znc_target_path();
+    if (tgt.len == 0) {
+        _zag_println("znc: ./znc-target missing — run ./bootstrap.sh to build the GPU/WASM helper");
+        return 1;
+    }
+    let cmd: []u8 = _zag_str_concat(tgt, _zag_str_concat(" wasm ", path));
+    let out: []u8 = out_flag();
+    if (out.len > 0) {
+        cmd = _zag_str_concat(cmd, _zag_str_concat(" -o ", out));
+    }
+    if (has_flag("--run") == 1) {
+        cmd = _zag_str_concat(cmd, " --run");
+    }
+    return _zag_exec_cmd(cmd);
+}
+
 // Is `name` present anywhere in argv?
 fn has_flag(name: []u8) i32 {
     let i: i32 = 0;
@@ -413,6 +492,40 @@ fn znc_fmt(fpath: []u8, in_place: i32) i32 {
     return 0;
 }
 
+fn znc_emit_total_cex(decls: ArrayList[*Node], eff: map__StringMap[i32]) void {
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .fn_decl => |f| {
+                if (f.is_extern == 0 && has_annot(f.annots, "@total") == 1 && fn_total_safe(f, eff) == 0) {
+                    let tout: SmtOutcome = smt_prove_fn(f);
+                    if (tout.rc == 1 && tout.cex.len > 0) { _zag_println(tout.cex); }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+}
+
+fn znc_check(path: []u8) i32 {
+    if (path.len == 0) { _zag_println("znc: no source file"); return 1; }
+    let src: []u8 = _zag_read_file(path);
+    if (src.len < 0) { _zag_print("znc: cannot read "); _zag_println(path); return 1; }
+    let decls: ArrayList[*Node] = parse_program_dir(src, dir_of(path));
+    lo_operators(decls);
+    let eff: map__StringMap[i32] = analyze(decls);
+    let viols: i32 = report_violations(decls, eff, src, path);
+    if (viols > 0) {
+        znc_emit_total_cex(decls, eff);
+        _zag_println("znc: capability check FAILED");
+        return 1;
+    }
+    smt_report_proofs(decls, eff);
+    _zag_println("znc: OK — all capability claims proven");
+    return 0;
+}
+
 fn znc_init() i32 {
     let modpath: []u8 = "zag.mod";
     if (_zag_file_exists(modpath) != 0) {
@@ -429,6 +542,9 @@ fn znc_init() i32 {
 fn main() i32 {
     if (_zag_argc() < 2) {
         _zag_println("usage: znc <source.zag> [-o out] [-l lib] [-L path] [--run] [--debug]");
+        _zag_println("       znc <source.zag> --target gpu-nvidia|gpu-amd|gpu-vulkan");
+        _zag_println("       znc <source.zag> --target wasm [-o out.wasm] [--run]");
+        _zag_println("       znc check <source.zag>");
         _zag_println("       znc fmt [--in-place] <source.zag>");
         _zag_println("       znc init");
         _zag_println("       znc version");
@@ -458,9 +574,18 @@ fn main() i32 {
         return znc_fmt(fpath, in_place);
     }
     if (@strEq(cmd, "init")) { return znc_init(); }
+    if (@strEq(cmd, "check")) {
+        let cpath: []u8 = "";
+        if (_zag_argc() >= 3) { cpath = _zag_arg(2); }
+        return znc_check(cpath);
+    }
 
     let path: []u8 = src_arg();
     if (path.len == 0) { _zag_println("znc: no source file"); return 1; }
+
+    let gtarget: []u8 = gpu_target();
+    if (gtarget.len > 0) { return delegate_gpu(path, gtarget); }
+    if (wasm_target() == 1) { return delegate_wasm(path); }
 
     let src: []u8 = _zag_read_file(path);
     if (src.len < 0) {
@@ -479,9 +604,11 @@ fn main() i32 {
     let eff: map__StringMap[i32] = analyze(decls);
     let viols: i32 = report_violations(decls, eff, src, path);
     if (viols > 0) {
+        znc_emit_total_cex(decls, eff);
         _zag_println("znc: capability check FAILED");
         return 1;
     }
+    smt_report_proofs(decls, eff);
 
     // Collect @link directives and strip them from decls before codegen.
     // (ncodegen pass-1 aborts on unknown top-level node kinds.)
