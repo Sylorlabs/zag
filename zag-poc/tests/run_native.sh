@@ -33,6 +33,10 @@ nt "recursion (fib)" 'fn fib(n: i32) i32 { if (n < 2) { return n; } return fib(n
 nt "while loop"      'fn main() i32 { let s: i32 = 0; let i: i32 = 1; while (i <= 10) { s = s + i; i = i + 1; } return s; }' 55
 nt "factorial"       'fn fact(n: i32) i32 { if (n < 2) { return 1; } return n * fact(n - 1); } fn main() i32 { return fact(5); }' 120
 nt "div and mod"     'fn main() i32 { return (100 / 7) + (100 % 7); }' 16
+# Gap 6: i32 overflow must wrap at 32 bits — `x as i64` sign-extends the low
+# dword (LCG step from GAPS.md). Before the fix, x as i64 read the full 64-bit
+# product and printed 205497925614448 instead of 920370032.
+nto "i32 overflow wrap" 'fn main() i32 { let x: i32 = 123456789; x = x * 1664525 + 1013904223; _zag_println(_zag_i64_to_str(x as i64)); return 0; }' "920370032" 0
 nt "unary minus"     'fn main() i32 { let a: i32 = 50; return 0 - a + 57; }' 7
 nt "nested if/else"  'fn main() i32 { let x: i32 = 7; if (x < 5) { return 1; } else if (x < 10) { return 99; } else { return 2; } }' 99
 
@@ -75,8 +79,13 @@ nt  "@strEq differ"    'fn main() i32 { if (@strEq("hi", "ho")) { return 1; } re
 nt  "generic id[T]"    'fn id[T](x: T) T { return x; } fn main() i32 { return id[i32](42); }' 42
 nt  "ArrayList[i32]"   '@import("std/list.zag") fn main() i32 { let xs: ArrayList[i32] = make[i32](4); push[i32](&xs, 30); push[i32](&xs, 12); return get[i32](xs, 0) + get[i32](xs, 1); }' 42
 nt  "ArrayList realloc" '@import("std/list.zag") fn main() i32 { let xs: ArrayList[i32] = make[i32](2); push[i32](&xs, 1); push[i32](&xs, 2); push[i32](&xs, 3); push[i32](&xs, 4); push[i32](&xs, 5); return len[i32](xs); }' 5
+# Gap 4: nested generic type-args (ArrayList[ArrayList[T]]) must monomorphize.
+nt  "ArrayList nested"  '@import("std/list.zag") fn main() i32 { let outer: ArrayList[ArrayList[i32]] = make[ArrayList[i32]](4); let inner: ArrayList[i32] = make[i32](3); push[i32](&inner, 10); push[i32](&inner, 20); push[ArrayList[i32]](&outer, inner); let row: ArrayList[i32] = get[ArrayList[i32]](outer, 0); return get[i32](row, 0) + get[i32](row, 1); }' 30
 nt  "union switch"     'union U { a: i32, b: i32 } fn main() i32 { let u: U = U{ .b = 42 }; return switch (u) { .a => |x| 0, .b => |x| x }; }' 42
 nt  "union capture val" 'union Expr { num: i32, neg: i32 } fn eval(e: Expr) i32 { return switch (e) { .num => |v| v, .neg => |v| 0 - v }; } fn main() i32 { let e1: Expr = Expr{ .num = 42 }; let e2: Expr = Expr{ .neg = 5 }; return eval(e1) + eval(e2); }' 37
+# Union-arm capture of a []u8 payload binds as *[]u8 (aggregate); print_str must
+# accept the pointer-typed capture without an explicit sp.* deref.
+nto "print_str union capture" 'union MaybeStr { yes: []u8, no: i32 } fn main() i32 { let v: MaybeStr = MaybeStr{ .yes = "world\n" }; switch (v) { .yes => |s| { print_str(s); }, .no => |_| { print_i32(0); } } return 0; }' "world" 0
 nt  "enum switch"      'enum Color { Red, Green, Blue } fn main() i32 { let c: Color = Color.Green; return switch (c) { .Red => 1, .Green => 42, .Blue => 3 }; }' 42
 echo "── variable layout · nested literals · &expr · optionals (round 2) ──"
 nt  "@sizeOf slice field" 'struct S { a: i32, b: []u8, c: i32 } fn main() i32 { return @sizeOf[S](); }' 32
