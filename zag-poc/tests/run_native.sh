@@ -72,6 +72,8 @@ nto "print slice var"     'fn main() i32 { let s: []u8 = "hello\n"; print_str(s)
 nto "println slice newline" 'fn main() i32 { let s: []u8 = "AB"; _zag_println(s); _zag_println("CD"); return 0; }' "$(printf 'AB\nCD')" 0
 nt  "new heap (mmap)"     'struct P { x: i32, y: i32 } fn main() i32 { let p: *P = new(P{ .x = 40, .y = 2 }); return p.*.x + p.*.y; }' 42
 nt  "new x3 (frame)"      'struct P { x: i32 } fn main() i32 { let a: *P = new(P{ .x = 10 }); let b: *P = new(P{ .x = 20 }); let c: *P = new(P{ .x = 12 }); return a.*.x + b.*.x + c.*.x; }' 42
+nt  "new+delete pair"     'struct P { x: i32 } fn main() i32 { let p: *P = new(P{ .x = 42 }); let v: i32 = p.*.x; delete(p); return v; }' 42
+nt  "delete after use"    'struct P { x: i32, y: i32 } fn main() i32 { let p: *P = new(P{ .x = 10, .y = 32 }); let s: i32 = p.*.x + p.*.y; delete(p); return s; }' 42
 echo "── generics · unions · @-builtins (native self-hosting round 1) ──"
 nt  "@sizeOf struct"   'struct P { a: i32, b: i32, c: i32 } fn main() i32 { return @sizeOf[P](); }' 24
 nt  "@strEq equal"     'fn main() i32 { if (@strEq("hi", "hi")) { return 1; } return 0; }' 1

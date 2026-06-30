@@ -68,6 +68,9 @@ reject "reject @pure + IO" \
 reject "reject @noalloc + zalloc" \
     'fn bad(n: i32) void @noalloc { let p: []i32 = zalloc_i(n); } fn main() i32 { return 0; }' \
     'E0002|violation|aborted'
+reject "reject @noalloc + delete" \
+    'struct P { x: i32 } fn bad() void @noalloc { let p: *P = new(P{ .x = 1 }); delete(p); } fn main() i32 { return 0; }' \
+    'E0002|violation|aborted'
 reject "reject @realtime + IO" \
     'fn bad() void @realtime { print_str("x"); } fn main() i32 { return 0; }' \
     'E0002|violation|aborted'
