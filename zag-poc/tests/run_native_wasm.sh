@@ -295,5 +295,59 @@ case "$rt" in
     2) : ;;
 esac
 
+# negative f32 literal (unary minus on float)
+printf 'fn main() i32 { let a: f32 = -1.5; return a as i32; }' > /tmp/wasm_neg_f32_lit.zag
+wasm_build /tmp/wasm_neg_f32_lit.zag /tmp/wasm_neg_f32_lit.wasm
+r=$(wasm_validate /tmp/wasm_neg_f32_lit.wasm)
+if [ "$(echo "$r" | tail -1)" = "1" ]; then
+    echo "  ok  wasm negative f32 literal"; pass=$((pass+1))
+else
+    echo "  XX  wasm negative f32 literal"; echo "$r"; fail=$((fail+1))
+fi
+set +e
+wasm_runtime_expect /tmp/wasm_neg_f32_lit.wasm -1 "negative f32 literal"; rt=$?
+set -e
+case "$rt" in
+    0) pass=$((pass+1)) ;;
+    1) fail=$((fail+1)) ;;
+    2) : ;;
+esac
+
+# f64 literal call args (f32 + f64 parameters)
+printf 'fn scale(x: f32, y: f64) f64 { return x as f64 * y; } fn main() i32 { let r: f64 = scale(1.25, 2.75); return r as i32; }' > /tmp/wasm_f64_call_lit.zag
+wasm_build /tmp/wasm_f64_call_lit.zag /tmp/wasm_f64_call_lit.wasm
+r=$(wasm_validate /tmp/wasm_f64_call_lit.wasm)
+if [ "$(echo "$r" | tail -1)" = "1" ]; then
+    echo "  ok  wasm f64 literal call args"; pass=$((pass+1))
+else
+    echo "  XX  wasm f64 literal call args"; echo "$r"; fail=$((fail+1))
+fi
+set +e
+wasm_runtime_expect /tmp/wasm_f64_call_lit.wasm 3 "f64 literal call args (1.25*2.75)"; rt=$?
+set -e
+case "$rt" in
+    0) pass=$((pass+1)) ;;
+    1) fail=$((fail+1)) ;;
+    2) : ;;
+esac
+
+# mixed f32/f64 promotion in calls (f32 arg + f64 literal → f64 param)
+printf 'fn mix(a: f32, b: f64) f64 { return a as f64 + b; } fn main() i32 { let x: f32 = 2.0; return mix(x, 3.5) as i32; }' > /tmp/wasm_f32_f64_call.zag
+wasm_build /tmp/wasm_f32_f64_call.zag /tmp/wasm_f32_f64_call.wasm
+r=$(wasm_validate /tmp/wasm_f32_f64_call.wasm)
+if [ "$(echo "$r" | tail -1)" = "1" ]; then
+    echo "  ok  wasm mixed f32/f64 call promotion"; pass=$((pass+1))
+else
+    echo "  XX  wasm mixed f32/f64 call promotion"; echo "$r"; fail=$((fail+1))
+fi
+set +e
+wasm_runtime_expect /tmp/wasm_f32_f64_call.wasm 5 "mixed f32/f64 call"; rt=$?
+set -e
+case "$rt" in
+    0) pass=$((pass+1)) ;;
+    1) fail=$((fail+1)) ;;
+    2) : ;;
+esac
+
 echo "════ native-wasm pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]
