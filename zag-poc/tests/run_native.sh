@@ -81,6 +81,14 @@ nt  "ArrayList[i32]"   '@import("std/list.zag") fn main() i32 { let xs: ArrayLis
 nt  "ArrayList realloc" '@import("std/list.zag") fn main() i32 { let xs: ArrayList[i32] = make[i32](2); push[i32](&xs, 1); push[i32](&xs, 2); push[i32](&xs, 3); push[i32](&xs, 4); push[i32](&xs, 5); return len[i32](xs); }' 5
 # Gap 4: nested generic type-args (ArrayList[ArrayList[T]]) must monomorphize.
 nt  "ArrayList nested"  '@import("std/list.zag") fn main() i32 { let outer: ArrayList[ArrayList[i32]] = make[ArrayList[i32]](4); let inner: ArrayList[i32] = make[i32](3); push[i32](&inner, 10); push[i32](&inner, 20); push[ArrayList[i32]](&outer, inner); let row: ArrayList[i32] = get[ArrayList[i32]](outer, 0); return get[i32](row, 0) + get[i32](row, 1); }' 30
+# 3-deep nested generics: compound type-args monomorphize transitively.
+nt  "ArrayList nested 3" '@import("std/list.zag") fn main() i32 { let outer: ArrayList[ArrayList[ArrayList[i32]]] = make[ArrayList[ArrayList[i32]]](2); let mid: ArrayList[ArrayList[i32]] = make[ArrayList[i32]](2); let inner: ArrayList[i32] = make[i32](2); push[i32](&inner, 10); push[i32](&inner, 20); push[ArrayList[i32]](&mid, inner); push[ArrayList[ArrayList[i32]]](&outer, mid); let row: ArrayList[ArrayList[i32]] = get[ArrayList[ArrayList[i32]]](outer, 0); let col: ArrayList[i32] = get[ArrayList[i32]](row, 0); return get[i32](col, 0) + get[i32](col, 1); }' 30
+# push[ArrayList[i32]] inference from val type (no explicit targs).
+nt  "ArrayList nested push infer" '@import("std/list.zag") fn main() i32 { let outer: ArrayList[ArrayList[i32]] = make[ArrayList[i32]](4); let inner: ArrayList[i32] = make[i32](3); push[i32](&inner, 10); push[i32](&inner, 20); push(&outer, inner); let row: ArrayList[i32] = get[ArrayList[i32]](outer, 0); return get[i32](row, 0) + get[i32](row, 1); }' 30
+# Chained get inference through nested ArrayList layers (untyped lets).
+nt  "ArrayList nested get infer" '@import("std/list.zag") fn main() i32 { let outer: ArrayList[ArrayList[ArrayList[i32]]] = make[ArrayList[ArrayList[i32]]](2); let mid: ArrayList[ArrayList[i32]] = make[ArrayList[i32]](2); let inner: ArrayList[i32] = make[i32](2); push[i32](&inner, 7); push[i32](&inner, 8); push[ArrayList[i32]](&mid, inner); push[ArrayList[ArrayList[i32]]](&outer, mid); let row = get(outer, 0); let col = get(row, 0); return get(col, 0) + get(col, 1); }' 15
+# set[i32] on inner row visible through nested get (shared data pointer).
+nt  "ArrayList nested set" '@import("std/list.zag") fn main() i32 { let outer: ArrayList[ArrayList[i32]] = make[ArrayList[i32]](2); let inner: ArrayList[i32] = make[i32](2); push[i32](&inner, 5); push[ArrayList[i32]](&outer, inner); set(&inner, 0, 100); let row = get(outer, 0); return get(row, 0); }' 100
 nt  "union switch"     'union U { a: i32, b: i32 } fn main() i32 { let u: U = U{ .b = 42 }; return switch (u) { .a => |x| 0, .b => |x| x }; }' 42
 nt  "union capture val" 'union Expr { num: i32, neg: i32 } fn eval(e: Expr) i32 { return switch (e) { .num => |v| v, .neg => |v| 0 - v }; } fn main() i32 { let e1: Expr = Expr{ .num = 42 }; let e2: Expr = Expr{ .neg = 5 }; return eval(e1) + eval(e2); }' 37
 # Union-arm capture of a []u8 payload binds as *[]u8 (aggregate); print_str must
@@ -230,6 +238,20 @@ if grep -q 'build aborted' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
     echo "  ok  rejects mixed rns/non-rns arithmetic loudly"; pass=$((pass+1))
 else
     echo "  XX  mixed rns/non-rns not rejected loudly"; fail=$((fail+1))
+fi
+rm -f /tmp/nt_bin nt_src.zag
+
+echo "── Gap 7: user @alloc/@io effect declarations ──"
+# Pass: user fn may declare @alloc (same semantics as extern @alloc).
+nt "user @alloc compiles" 'fn arena_alloc(n: i32) *i8 @alloc { return _zag_malloc(n) as *i8; } fn main() i32 { let p: *i8 = arena_alloc(8); _zag_free(p); return 0; }' 0
+# Reject: @alloc declared on a body with no heap ops still forbids @noalloc callers.
+rm -f /tmp/nt_bin
+printf 'fn declares_alloc() *i8 @alloc { return 0 as *i8; }\nfn bad() void @noalloc { let p: *i8 = declares_alloc(); }\nfn main() i32 { return 0; }\n' > nt_src.zag
+"$ZNC" nt_src.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
+if grep -qi 'E0002\|@noalloc' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
+    echo "  ok  @noalloc rejects caller of user @alloc fn"; pass=$((pass+1))
+else
+    echo "  XX  @noalloc should reject caller of user @alloc fn"; sed -n '1,8p' /tmp/nt_out; fail=$((fail+1))
 fi
 rm -f /tmp/nt_bin nt_src.zag
 
