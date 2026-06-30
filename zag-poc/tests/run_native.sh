@@ -381,5 +381,12 @@ else
 fi
 rm -f /tmp/zag_stdlib_v1_test
 
+echo "── native edge-case battery (run_native_edge.sh) ──"
+if ! ZNC="$ZNC" bash tests/run_native_edge.sh; then
+    echo "  XX  native edge-case battery failed"; fail=$((fail+1))
+else
+    echo "  ok  native edge-case battery (all edge cases pass)"; pass=$((pass+1))
+fi
+
 echo "════ native pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]
