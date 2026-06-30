@@ -50,31 +50,32 @@ let poly:   rns_3     = coefficient;   // parallel mod-arithmetic over 3 coprime
 
 ## Install
 
-**Requirements:** Python 3.10+, a C compiler (`cc` or `gcc`).
+**Requirements:** x86-64 Linux only. No Python, Zig, `cc`, LLVM, or libc build chain.
 
 ```bash
 git clone https://github.com/Sylorlabs/zag.git
 cd zag/zag-poc
-zagc
+chmod +x znc bootstrap.sh
+./bootstrap.sh    # optional: self-rebuild ./znc from the committed seed
+./znc examples/numeric.zag -o numeric --run
 ```
 
-That's it. The bootstrap compiler has no Python dependencies. It lexes, parses, type-checks, proves capabilities, and emits C — all in one file. The system C compiler turns that into a native binary.
+`./znc` is the supported v1 compiler: it lexes, parses, type-checks, proves capabilities,
+optimizes, and emits a static x86-64 ELF with no external tools. See
+[`zag-poc/INSTALL.md`](zag-poc/INSTALL.md) and [`zag-poc/BOOTSTRAP.md`](zag-poc/BOOTSTRAP.md).
 
-**Optional — Z3 prover (for `@total` division-by-zero proofs):**
+**Optional — ghost_engine / Z3 (for `@total` division-by-zero proofs on the legacy `./zagc` differential path):**
 ```bash
-pip install z3-solver
+( cd ../ghost_engine && zig build zag-verify )   # if ghost_engine is available
+bash prove.sh
 ```
-Without Z3, the compiler still proves all call-graph effects (`@realtime`, `@noalloc`, `@pure`). Z3 is only needed for arithmetic proofs inside `@total` functions.
+Without a prover, `./znc` still proves all call-graph effects (`@realtime`, `@noalloc`, `@pure`).
 
-**Optional — MLIR toolchain (for GPU targets):**
+**Optional — MLIR toolchain (GPU targets via `selfhost/mlir.zag` on the legacy `./zagc` path):**
 ```bash
 # Ubuntu / Debian
 apt install mlir-tools llvm-18
-
-# macOS
-brew install llvm    # mlir-opt lives in $(brew --prefix llvm)/bin/
 ```
-Without `mlir-opt`, `zagc` still writes the `.mlir` file for manual lowering.
 
 ---
 
@@ -84,22 +85,18 @@ Without `mlir-opt`, `zagc` still writes the `.mlir` file for manual lowering.
 cd zag/zag-poc
 
 # Prove this function's effects are clean, build it, and run it
-zagc build examples/audio_render.zag --run
+./znc examples/audio_render.zag -o audio_render --run
 
 # Watch the prover reject an allocation buried 3 calls deep inside @realtime
-zagc check examples/audio_render_bad.zag
-
-# See the C that was generated instead of compiling it
-zagc build examples/audio_render.zag --emit-c
+./znc examples/audio_render_bad.zag -o /tmp/bad   # exits non-zero with witness chain
 
 # Try the heterogeneous numeric types
-zagc build examples/embedded_sensor.zag --run   # u11 + sat_i16 + fixed_8_8
-zagc build examples/hpc_rns.zag --run           # rns_3 residue arithmetic
-zagc build examples/safe_bignum.zag --run       # u_any overflow-safe sums
+./znc examples/embedded_sensor.zag -o embedded_sensor --run   # u11 + sat_i16 + fixed_8_8
+./znc examples/hpc_rns.zag -o hpc_rns --run                   # rns_3 residue arithmetic
+./znc examples/safe_bignum.zag -o safe_bignum --run           # u_any overflow-safe sums
 
-# Run the full test suite
-bash run_tests.sh
-# ════ pass=35 fail=0 ════
+# Run the v1 release gate
+bash tests/run_native_authority.sh
 ```
 
 **What the bad-program check output looks like:**
@@ -135,10 +132,13 @@ The compiler found the chain — `gain` calls `reverbScratch` which calls `zallo
     │
     ├── GPU targets ──► MLIR emitter → mlir-opt → PTX / GCN / SPIR-V
     │
-    └── CPU targets ──► C codegen → cc → native binary
+    └── CPU targets ──► native x86-64 codegen → static ELF (./znc)
 ```
 
-The compiler is a from-scratch **Zig** program (`zag-poc/src/`, ~8,400 lines; entry `src/main.zig`, build with `zig build` → `zig-out/bin/zagc`). This is the Phase-0 bootstrap; the original Python prototype has been retired. Phase 1 is a self-hosting Zag compiler written in Zag (`zag-poc/selfhost/`), in progress.
+The supported compiler is a self-hosted Zag program (`zag-poc/selfhost/native/`, entry
+`znc.zag`). The retired Python prototype (`zagc.py`) and Zig bootstrap (`src/*.zig`) live only
+in git history (`v0.0-zig-bootstrap`). The legacy C-emitting `./zagc` remains as a differential
+oracle, not a supported build path.
 
 ### The effect system
 
@@ -373,16 +373,14 @@ Test suite: **pass=35 fail=0** (`bash run_tests.sh`).
 README.md               this file
 ZAG_DESIGN.md           full language design document with implementation notes
 zag-poc/
-  src/                  bootstrap compiler in Zig (~8,400 lines; entry main.zig)
-  selfhost/             self-hosting compiler written in Zag (in progress)
-  build.zig             `zig build` → zig-out/bin/zagc
-  run_tests.sh          full test suite (35 programs)
-  prove.sh              Z3 / ghost_engine integration demo
-  examples/             35 .zag programs (good ones that run + bad ones that are rejected)
-  gpu/
-    mlir_emitter.py     Zag AST → MLIR textual IR
-    lowering.py         mlir-opt pass pipeline driver (nvidia / amd / vulkan)
-    types.py            GPU type mappings (Zag type → MLIR type string)
+  znc                   committed native seed compiler (self-rebuild via bootstrap.sh)
+  bootstrap.sh          rebuild ./znc from selfhost/native/znc.zag
+  selfhost/             self-hosted compiler in Zag (lexer, parser, sema, native codegen, LSP)
+  tests/                v1 release gates (native authority, semantics, diagnostics, programs)
+  run_tests.sh          legacy ./zagc differential suite (informational)
+  prove.sh              ghost_engine @total proof demo (legacy ./zagc path)
+  examples/             Zag programs (good ones that run + bad ones that are rejected)
+  programs/             larger native acceptance programs + GAPS.md
 ```
 
 ---

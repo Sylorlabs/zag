@@ -13,10 +13,14 @@ journey so anyone can walk it — **including recovering the original bootstrap.
 ## The chain, in one line
 
 ```
-Python (zagc.py)  →  Zig bootstrap (src/*.zig)  →  self-hosted C-backend (selfhost/*.zag)
-                                                →  native backend (selfhost/native/*.zag)
-                                                →  Zig DELETED  →  numeric system in native code
+Python (zagc.py, removed)  →  Zig bootstrap (src/*.zig, removed at v0.1)
+                          →  self-hosted C-backend (selfhost/*.zag, differential oracle)
+                          →  native backend (selfhost/native/*.zag)
+                          →  Zig DELETED  →  numeric system in native code
 ```
+
+The Python prototype (`zagc.py`) and `gpu/*.py` middlemen are no longer in the tree.
+Recover them from git history (`git show v0.0-zig-bootstrap:zag-poc/zagc.py`) if needed.
 
 ## Walk the history by tag
 

@@ -173,10 +173,10 @@ bash prove.sh
 ```
 You'll see `total_guarded` (`if (d!=0) a/d`) and `total_nonzero` (`x/(n*n+1)`, no guard) **proven
 by ghost_engine** (`🔒 ghost_engine proved …`), and `total_bad` rejected with a concrete
-counterexample (`a=0, d=0`). Prover selection is automatic (`Sema.prover_name()` →
-`ghost_engine` | `z3-python` | `none`); `GHOST_ENGINE`/`GHOST_VERIFY` override the path. With no
-prover the compiler degrades to the conservative rule, so `run_tests.sh` (24 prover-independent
-programs) still passes under plain `python3`.
+counterexample (`a=0, d=0`). Prover selection is automatic (`ghost_engine` | `z3` | `none`);
+`GHOST_ENGINE`/`GHOST_VERIFY` override the path. With no prover the legacy `./zagc` differential
+path degrades to the conservative rule, so `run_tests.sh` (prover-independent programs) still
+passes without an external prover.
 
 ### Effect polymorphism + effect variables (verified)
 A capability system is a toy unless it composes. Working here:

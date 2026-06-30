@@ -9,7 +9,13 @@
 #   cd ../../ghost_engine && zig build zag-verify
 cd "$(dirname "$0")"
 
-echo "prover detected: $(python3 -c 'import zagc; print(zagc.Sema([]).prover_name())')"
+if [ -n "${GHOST_ENGINE:-}" ] && [ -x "${GHOST_ENGINE}" ]; then
+    echo "prover detected: ghost_engine (${GHOST_ENGINE})"
+elif command -v zag_verify >/dev/null 2>&1; then
+    echo "prover detected: ghost_engine (zag_verify in PATH)"
+else
+    echo "prover detected: none (conservative @total checking; legacy ./zagc differential path)"
+fi
 echo
 
 echo "════════ WITHOUT a prover (forced) — conservative ════════"
