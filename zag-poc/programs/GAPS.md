@@ -6,7 +6,7 @@
 
 Six nontrivial programs (50–200 lines each) were compiled and run via `znc`.
 Targeted micro-repros below originally confirmed each gap on the pre-release
-binary.  Gaps 1–6 are **fixed** in `2026.06.0`; gaps 7–8 unchanged.
+binary.  Gaps 1–7 are **fixed**; gap 8 was informational (OK).
 
 | Gap | Title | Severity | Status |
 |-----|-------|----------|--------|
@@ -16,7 +16,7 @@ binary.  Gaps 1–6 are **fixed** in `2026.06.0`; gaps 7–8 unchanged.
 | 4 | Nested generic `ArrayList[ArrayList[T]]` | MAJOR | **Fixed** (`7433e50`) |
 | 5 | `print_str` on union slice capture | MAJOR | **Fixed** (`2b580ec`) |
 | 6 | i32 arithmetic truncation | MAJOR | **Fixed** (`2b580ec`) |
-| 7 | No `@alloc` surface syntax | MINOR | Open (by design) |
+| 7 | `@alloc`/`@io` declaration on user fns | MINOR | **Fixed** (`8d8dd2b`) |
 | 8 | Simple generic structs | INFO | OK |
 
 Tests: `tests/run_native.sh` (111 cases) covers repros for gaps 1–6.
@@ -321,7 +321,7 @@ Explicit masking `x & 0x7FFFFFFF` or using i64 throughout avoids the issue.
 
 ## Gap 7 — No explicit Alloc effect annotation syntax for user functions
 
-**Severity: MINOR**
+**Severity: MINOR** · **Status: FIXED in 2026.07.0-dev** (`8d8dd2b`)
 
 ### Symptom
 
@@ -374,7 +374,7 @@ as a type argument to another generic).
 
 - **json_parser.zag**: Used `struct JsonValue` with kind discriminant instead of `union JsonValue` with slice variants (Gaps 1/5 now fixed — union form would work today).
 - **hash_map.zag**: Concrete `HashMap_i32` rather than `HashMap[V]` generic struct (Gap 8 confirms simple generics work).
-- **arena.zag**: No `@Alloc` annotation (Gap 7 — still open); comment documents allocation intent.
+- **arena.zag**: `arena_new` uses `@alloc`; bump-only `arena_alloc` documents no latent alloc.
 - **csv_parser.zag**: Flat `*[]u8` grid indexing instead of `ArrayList[ArrayList[[]u8]]` (Gap 4 fixed for `ArrayList[ArrayList[T]]`; nested slices untested).
 - **sort_bench.zag**: `quicksort` no longer carries incorrect `@pure` after Gap 3 fix; i32 LCG now wraps correctly after Gap 6 fix.
 - **state_machine.zag**: Concrete `struct FSM` (not `struct FSM[S, I]`); `i32` for states/inputs for array indexing.
