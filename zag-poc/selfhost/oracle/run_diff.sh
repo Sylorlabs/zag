@@ -74,6 +74,11 @@ PRINT_STR_SRC='fn main() i32 { print_str("hello, world"); return 0; }'
 # conversion in `print_i32(r1)`.
 STREQ_SRC='fn main() i32 { let a: []u8 = "abc"; let b: []u8 = "abc"; let c: []u8 = "xyz"; print_i32(@strEq(a, b)); print_i32(@strEq(a, c)); return 0; }'
 
+# A thirteenth test: f32 arithmetic + print_f32. Exercises the
+# interpreter's f32 parsing, f32 binary ops, and printf '%g' output
+# (which must match the C backend's %g format exactly).
+F32_ARITH_SRC='fn main() i32 { let x: f32 = 1.5; let y: f32 = 2.5; let z: f32 = x + y; print_f32(z); return 0; }'
+
 # (print_str of a string literal is deferred — see interp.zag's emit_str_ln
 # comment. Adding a new native-runtime symbol requires hand-tuning in
 # selfhost/native/ncodegen.zag's RT_* dispatch table, which is a separate
@@ -148,6 +153,7 @@ run_test "sum_bytes" "$SUM_BYTES_SRC"
 run_test "len_field" "$LEN_FIELD_SRC"
 run_test "print_str" "$PRINT_STR_SRC"
 run_test "streq"     "$STREQ_SRC"
+run_test "f32_arith" "$F32_ARITH_SRC"
 
 echo "============================================"
 echo "differential oracle: $PASS passed, $FAIL failed"
