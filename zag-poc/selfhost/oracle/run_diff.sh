@@ -84,6 +84,15 @@ F32_ARITH_SRC='fn main() i32 { let x: f32 = 1.5; let y: f32 = 2.5; let z: f32 = 
 # value, f32 multiplication, and the return-propagation through exec_block.
 F32_FN_SRC='fn softclip(x: f32) f32 { return x * 0.8; } fn main() i32 { let r: f32 = softclip(1.0); print_f32(r); return 0; }'
 
+# A fifteenth test: f32 unary minus. Exercises the .un handler for
+# VT_F32 values (separate from the integer path).
+F32_NEG_SRC='fn main() i32 { let x: f32 = -(1.5); print_f32(x); return 0; }'
+
+# A sixteenth test: f32 in a while loop. Iterates over integer indices
+# but uses f32 in the body to verify f32/i32 coexistence in a single
+# function. Combines f32 add, f32 print, and integer while/arithmetic.
+F32_WHILE_SRC='fn main() i32 { let s: f32 = 0.0; let i: i32 = 0; while (i < 5) { s = s + 0.5; i = i + 1; } print_f32(s); return 0; }'
+
 # (print_str of a string literal is deferred — see interp.zag's emit_str_ln
 # comment. Adding a new native-runtime symbol requires hand-tuning in
 # selfhost/native/ncodegen.zag's RT_* dispatch table, which is a separate
@@ -160,6 +169,8 @@ run_test "print_str" "$PRINT_STR_SRC"
 run_test "streq"     "$STREQ_SRC"
 run_test "f32_arith" "$F32_ARITH_SRC"
 run_test "f32_fn"    "$F32_FN_SRC"
+run_test "f32_neg"   "$F32_NEG_SRC"
+run_test "f32_while" "$F32_WHILE_SRC"
 
 echo "============================================"
 echo "differential oracle: $PASS passed, $FAIL failed"
