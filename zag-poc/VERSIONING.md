@@ -107,8 +107,8 @@ The two-release rule applies from the first `2026.06.x` release onward.
 
 | Platform        | Status          | Notes                                           |
 |-----------------|-----------------|-------------------------------------------------|
-| x86-64 Linux    | **Supported**   | Only current target; native ELF, no libc        |
-| ARM64 Linux     | Planned         | Requires AArch64 ISA + ELF backend             |
+| x86-64 Linux    | **Supported**   | Primary target; native ELF, no libc             |
+| ARM64 Linux     | **Experimental** | `--target arm64`; static AArch64 ELF, no libc. Structs/slices/enums/unions/optionals/generics; the 6 example programs are byte-identical to x86 (tests/run_native_arm64.sh, via qemu-user). Not yet: floats, error unions, closures, sat/fixed/posit numerics. |
 | RISC-V Linux    | Planned         | Requires RV64GC ISA + ELF backend              |
 | macOS (any)     | Not planned yet | Requires Mach-O backend                         |
 | Windows         | Not planned     | Requires PE/COFF backend                        |

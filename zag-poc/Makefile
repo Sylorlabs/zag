@@ -10,7 +10,7 @@
 #   make clean     — remove generated artifacts (keeps seed binaries zagc + znc)
 
 .PHONY: all bootstrap znc zagc test test-authority test-bootstrap test-semantics \
-        test-diagnostics test-tooling test-programs test-native test-abi-layout \
+        test-diagnostics test-tooling test-programs test-native test-abi-layout test-arm64 \
         test-differential test-selfhost clean install
 
 # ── Primary target ────────────────────────────────────────────────────────────
@@ -68,6 +68,11 @@ test-abi-layout:
 	@echo "── ABI/layout regression suite (release gate) ──"
 	bash tests/run_abi_layout.sh
 
+# AArch64 Linux backend (runs via qemu-user; requires qemu-aarch64-static).
+test-arm64:
+	@echo "── arm64 backend suite (qemu-user) ──"
+	bash tests/run_native_arm64.sh
+
 # Differential tests against the C backend (not a release gate).
 test-differential:
 	@echo "── differential suite via zagc (informational only) ──"
@@ -79,7 +84,7 @@ test-selfhost:
 	bash tests/run_selfhost.sh
 
 # Default `make test`: runs the v1 release gates.
-test: znc test-authority test-bootstrap test-semantics test-diagnostics test-tooling test-programs test-native test-abi-layout
+test: znc test-authority test-bootstrap test-semantics test-diagnostics test-tooling test-programs test-native test-abi-layout test-arm64
 	@echo "════ all v1 release gates passed ════"
 
 # ── Install ───────────────────────────────────────────────────────────────────

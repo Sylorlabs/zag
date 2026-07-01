@@ -108,6 +108,26 @@ nt "nested generics" '@import("std/list.zag") fn main() i32 { let m: ArrayList[A
 nt "struct elems+pop" '@import("std/list.zag") struct Pt { x: i32, y: i32 } fn main() i32 { let ps: ArrayList[Pt] = make[Pt](1); push[Pt](&ps, Pt{ .x = 30, .y = 8 }); push[Pt](&ps, Pt{ .x = 1, .y = 2 }); let p: Pt = pop[Pt](&ps); return p.x + p.y + get[Pt](ps, 0).x + get[Pt](ps, 0).y + len[Pt](ps); }' 42
 nt "strEq/strLen"    'fn main() i32 { let s: []u8 = "hello"; let c: i32 = 0; if (@strEq(s, "hello")) { c = c + 1; } if (!@strEq(s, "world")) { c = c + 1; } if (@strLen(s) == 5) { c = c + 40; } return c; }' 42
 
+echo "── real programs (output must be byte-identical to x86) ──"
+for prog in arena hash_map sort_bench state_machine csv_parser json_parser; do
+    if ! "$ZNC" "programs/$prog.zag" -o /tmp/np_x86 >/dev/null 2>&1; then
+        echo "  XX  $prog (x86 compile failed)"; fail=$((fail+1)); continue
+    fi
+    /tmp/np_x86 > /tmp/np_x86_out 2>&1; x86_ec=$?
+    if ! "$ZNC" "programs/$prog.zag" --target arm64 -o /tmp/np_arm >/dev/null 2>&1; then
+        echo "  XX  $prog (arm64 compile failed)"; fail=$((fail+1)); continue
+    fi
+    "$QEMU" /tmp/np_arm > /tmp/np_arm_out 2>&1; arm_ec=$?
+    if [ "$x86_ec" = "$arm_ec" ] && diff -q /tmp/np_x86_out /tmp/np_arm_out >/dev/null 2>&1; then
+        echo "  ok  $prog (byte-identical output, exit $arm_ec)"; pass=$((pass+1))
+    else
+        echo "  XX  $prog (output differs from x86: x86=$x86_ec arm=$arm_ec)"
+        diff /tmp/np_x86_out /tmp/np_arm_out 2>/dev/null | head -4
+        fail=$((fail+1))
+    fi
+    rm -f /tmp/np_x86 /tmp/np_arm /tmp/np_x86_out /tmp/np_arm_out
+done
+
 # static ELF, no interpreter
 printf 'fn main() i32 { return 0; }' > nt_src.zag
 "$ZNC" nt_src.zag --target arm64 -o /tmp/nt_elf >/dev/null 2>&1
