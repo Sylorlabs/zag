@@ -48,6 +48,16 @@ LEN_SRC='fn main() void { let s: []u8 = "abcde"; print_i32(@len(s)); }'
 # verified by the other tests but haven't been tested together.
 I64_WHILE_SRC='fn main() void { let s: i64 = 0; let i: i64 = 1; while (i <= 10) { s = s + i; i = i + 1; } print_i64(s); }'
 
+# An eighth test: slice indexing. Reads the 3rd byte of a string literal as
+# an i32. The C backend lowers `s[2]` to `s.ptr[2]` for slice bases; the
+# interpreter reads from its heap-allocated string buffer.
+IDX_SRC='fn main() void { let s: []u8 = "abcde"; print_i32(s[2] as i32); }'
+
+# A ninth test: combination — while loop summing the bytes of a string.
+# Exercises idx + while + add in one program, all of which are independently
+# verified by the other tests but haven't been tested together.
+SUM_BYTES_SRC='fn main() i32 { let s: []u8 = "abc"; let total: i32 = 0; let i: i32 = 0; while (i < @len(s)) { total = total + s[i] as i32; i = i + 1; } print_i32(total); return 0; }'
+
 # (print_str of a string literal is deferred — see interp.zag's emit_str_ln
 # comment. Adding a new native-runtime symbol requires hand-tuning in
 # selfhost/native/ncodegen.zag's RT_* dispatch table, which is a separate
@@ -117,6 +127,8 @@ run_test "while"     "$WHILE_SRC"
 run_test "i64"       "$I64_SRC"
 run_test "len"       "$LEN_SRC"
 run_test "i64_while" "$I64_WHILE_SRC"
+run_test "idx"       "$IDX_SRC"
+run_test "sum_bytes" "$SUM_BYTES_SRC"
 
 echo "============================================"
 echo "differential oracle: $PASS passed, $FAIL failed"
