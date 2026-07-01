@@ -58,6 +58,11 @@ IDX_SRC='fn main() void { let s: []u8 = "abcde"; print_i32(s[2] as i32); }'
 # verified by the other tests but haven't been tested together.
 SUM_BYTES_SRC='fn main() i32 { let s: []u8 = "abc"; let total: i32 = 0; let i: i32 = 0; while (i < @len(s)) { total = total + s[i] as i32; i = i + 1; } print_i32(total); return 0; }'
 
+# A tenth test: .len field access (vs @len builtin). Both should give the
+# same result; verifying both forms keeps the slice value representation
+# consistent with the C backend's struct-literal lowering.
+LEN_FIELD_SRC='fn main() i32 { let s: []u8 = "abcde"; print_i32(s.len); return 0; }'
+
 # (print_str of a string literal is deferred — see interp.zag's emit_str_ln
 # comment. Adding a new native-runtime symbol requires hand-tuning in
 # selfhost/native/ncodegen.zag's RT_* dispatch table, which is a separate
@@ -129,6 +134,7 @@ run_test "len"       "$LEN_SRC"
 run_test "i64_while" "$I64_WHILE_SRC"
 run_test "idx"       "$IDX_SRC"
 run_test "sum_bytes" "$SUM_BYTES_SRC"
+run_test "len_field" "$LEN_FIELD_SRC"
 
 echo "============================================"
 echo "differential oracle: $PASS passed, $FAIL failed"
