@@ -88,6 +88,17 @@ nt "enum switch"     'enum Color { red, green, blue } fn main() i32 { let c: Col
 nto "print_str var"  'fn main() i32 { let s: []u8 = "dyn\n"; print_str(s); return 0; }' "dyn" 0
 nto "println var"    'fn main() i32 { let s: []u8 = "dyn2"; _zag_println(s); return 0; }' "dyn2" 0
 
+echo "── unions, optionals, scoping ──"
+nt "union tag switch" 'union V { a: i32, b: i32 } fn main() i32 { let v: V = V{ .b = 40 }; switch (v) { .a => |x| { return 1; } .b => |x| { return x + 2; } } return 0; }' 42
+nt "union agg payload" 'struct P { x: i32, y: i32 } union V { p: P, n: i32 } fn main() i32 { let v: V = V{ .p = P{ .x = 40, .y = 2 } }; switch (v) { .p => |c| { return c.*.x + c.*.y; } .n => |m| { return m; } } return 0; }' 42
+nt "opt some"        'fn main() i32 { let o: ?i32 = 42; if (o) |v| { return v; } return 1; }' 42
+nt "opt null"        'fn main() i32 { let o: ?i32 = null; if (o) |v| { return 1; } return 42; }' 42
+nt "opt reassign"    'fn main() i32 { let o: ?i32 = null; o = 21; if (o) |v| { return v * 2; } return 1; }' 42
+nt "opt orelse"      'fn main() i32 { let o: ?i32 = null; let a: i32 = o orelse 40; o = 10; let b: i32 = o orelse 99; return a + b / 5; }' 42
+nt "opt fn return"   'fn find(k: i32) ?i32 { if (k > 0) { return k * 2; } return null; } fn main() i32 { let a: i32 = find(21) orelse 0; let b: i32 = find(0 - 1) orelse 100; return a - b + 100; }' 42
+nt "while-let"       'fn main() i32 { let o: ?i32 = 3; let s: i32 = 0; while (o) |v| { s = s + v; if (v == 1) { o = null; } else { o = v - 1; } } return s * 7; }' 42
+nt "scoped shadow"   'fn main() i32 { let x: i32 = 40; if (x > 0) { let x: i32 = 2; if (x != 2) { return 1; } } return x + 2; }' 42
+
 # static ELF, no interpreter
 printf 'fn main() i32 { return 0; }' > nt_src.zag
 "$ZNC" nt_src.zag --target arm64 -o /tmp/nt_elf >/dev/null 2>&1
