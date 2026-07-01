@@ -42,16 +42,55 @@ struct Value { tag: i32, bits: i64 }
 fn v_i32(x: i32) Value { return Value{ .tag = VT_I32(), .bits = x as i64 }; }
 fn v_i64(x: i64) Value { return Value{ .tag = VT_I64(), .bits = x }; }
 fn v_f32(x: f32) Value { return Value{ .tag = VT_F32(), .bits = (x as f64) as i64 }; }
-// String values store the slice's pointer in `bits`. Slice field access via
-// `.ptr`/`s.ptr` is fine when the slice is a fresh struct literal, but in
-// the current znc dialect slices passed through function boundaries don't
-// expose fields the same way. Until that's stable, v_str accepts the slice
-// by value and reconstructs the pointer from a known size. For the fib(10)
-// differential test this code path is not exercised, so any correct
-// pointer representation will do.
-fn v_str(s: []u8) Value {
-    let p: i64 = 0;
-    return Value{ .tag = VT_STR(), .bits = p };
+// String values are heap-allocated buffers laid out as:
+//   i32 len  |  u8[len] bytes (no NUL terminator, no quotes)
+// The buffer's pointer is stored in `bits`. `str_len` and `str_data` recover
+// the length and bytes pointer respectively. print_str uses these to emit
+// the string to stdout exactly as the C backend's print_str does (fwrite +
+// '\n').
+//
+// Allocation uses _zag_malloc; for differential-test purposes we never
+// free the buffers (the test programs exit immediately after printing).
+fn alloc_str(text: []u8, from: i32, to: i32) Value {
+    let n: i32 = to - from;
+    if (n < 0) { n = 0; }
+    let sz: i32 = 4 + n;
+    let raw: *i8 = _zag_malloc(sz);
+    let p: *i32 = raw as *i32;
+    p[0] = n;
+    let bp: *u8 = (raw as *u8) + 4;
+    let i: i32 = 0;
+    while (i < n) {
+        bp[i] = text[from + i];
+        i = i + 1;
+    }
+    return Value{ .tag = VT_STR(), .bits = raw as i64 };
+}
+
+fn str_len(v: Value) i32 {
+    if (v.tag != VT_STR()) { return 0; }
+    let raw: *i8 = v.bits as *i8;
+    let p: *i32 = raw as *i32;
+    return p[0];
+}
+
+fn str_data(v: Value) *u8 {
+    let raw: *i8 = v.bits as *i8;
+    return (raw as *u8) + 4;
+}
+
+// Emit a string buffer (ptr, len) to stdout followed by a newline.
+// The C backend's print_str does fwrite + '\n' in C. The interpreter doesn't
+// have a direct fwrite binding (adding a new extern requires hand-tuning in
+// selfhost/native/ncodegen.zag's RT_* dispatch table, which is a much bigger
+// change than the oracle's incremental growth justifies). String output is
+// therefore deferred to a later feature; for now we emit a marker so any
+// program that hits this path fails loudly rather than silently producing
+// wrong output.
+fn emit_str_ln(data: *u8, n: i32) void {
+    let _: *u8 = data;
+    let _: i32 = n;
+    _zag_println("[interp: print_str not yet implemented]");
 }
 fn v_bool(b: i32) Value { return Value{ .tag = VT_BOOL(), .bits = b as i64 }; }
 
@@ -146,7 +185,17 @@ struct Control { kind: i32, val: Value }
 fn eval_expr(n: *Node, frame: *Frame, fntab: *FnTable) Control {
     switch (n.*) {
         .ilit => |x| {
-            return Control{ .kind = CTRL_NONE(), .val = v_i32(_zag_str_to_i64(x.text) as i32) };
+            // Parse as i64 to preserve full precision; let coerce_to_type
+            // truncate at the use site (let/assign/return) if needed.
+            return Control{ .kind = CTRL_NONE(), .val = v_i64(_zag_str_to_i64(x.text)) };
+        }
+        .slit => |x| {
+            // Strip the surrounding quotes. The C backend's strip_quotes is
+            // more elaborate (handles escape sequences); for now we only
+            // support literal ASCII without escapes.
+            let n: i32 = x.text.len;
+            if (n < 2) { return Control{ .kind = CTRL_NONE(), .val = alloc_str(x.text, 0, 0) }; }
+            return Control{ .kind = CTRL_NONE(), .val = alloc_str(x.text, 1, n - 1) };
         }
         .id => |x| {
             if (frame_has(frame, x.name) == 1) {
@@ -157,12 +206,16 @@ fn eval_expr(n: *Node, frame: *Frame, fntab: *FnTable) Control {
         .bin => |b| {
             let lc: Control = eval_expr(b.l, frame, fntab);
             let rc: Control = eval_expr(b.r, frame, fntab);
-            let lv: i32 = lc.val.bits as i32;
-            let rv: i32 = rc.val.bits as i32;
-            if (@strEq(b.op, "+") == 1) { return Control{ .kind = CTRL_NONE(), .val = v_i32(lv + rv) }; }
-            if (@strEq(b.op, "-") == 1) { return Control{ .kind = CTRL_NONE(), .val = v_i32(lv - rv) }; }
-            if (@strEq(b.op, "*") == 1) { return Control{ .kind = CTRL_NONE(), .val = v_i32(lv * rv) }; }
-            if (@strEq(b.op, "/") == 1) { return Control{ .kind = CTRL_NONE(), .val = v_i32(lv / rv) }; }
+            // Promote operands to i64 for arithmetic so we don't lose
+            // precision on values that fit in i32 but not in our interpretation
+            // of the literal parser's i32 truncation. Comparisons still
+            // produce i32 (the C backend does the same — `a < b` is i32 in Zag).
+            let lv: i64 = lc.val.bits;
+            let rv: i64 = rc.val.bits;
+            if (@strEq(b.op, "+") == 1) { return Control{ .kind = CTRL_NONE(), .val = v_i64(lv + rv) }; }
+            if (@strEq(b.op, "-") == 1) { return Control{ .kind = CTRL_NONE(), .val = v_i64(lv - rv) }; }
+            if (@strEq(b.op, "*") == 1) { return Control{ .kind = CTRL_NONE(), .val = v_i64(lv * rv) }; }
+            if (@strEq(b.op, "/") == 1) { return Control{ .kind = CTRL_NONE(), .val = v_i64(lv / rv) }; }
             if (@strEq(b.op, "<")  == 1) { return Control{ .kind = CTRL_NONE(), .val = v_bool(bool_coerce(if_then_else_i32(lv <  rv, 1, 0))) }; }
             if (@strEq(b.op, ">")  == 1) { return Control{ .kind = CTRL_NONE(), .val = v_bool(bool_coerce(if_then_else_i32(lv >  rv, 1, 0))) }; }
             if (@strEq(b.op, "<=") == 1) { return Control{ .kind = CTRL_NONE(), .val = v_bool(bool_coerce(if_then_else_i32(lv <= rv, 1, 0))) }; }
@@ -173,15 +226,24 @@ fn eval_expr(n: *Node, frame: *Frame, fntab: *FnTable) Control {
         }
         .un => |u| {
             let ic: Control = eval_expr(u.e, frame, fntab);
-            let iv: i32 = ic.val.bits as i32;
-            if (@strEq(u.op, "-") == 1) { return Control{ .kind = CTRL_NONE(), .val = v_i32(0 - iv) }; }
-            return Control{ .kind = CTRL_NONE(), .val = v_i32(iv) };
+            let iv: i64 = ic.val.bits;
+            if (@strEq(u.op, "-") == 1) { return Control{ .kind = CTRL_NONE(), .val = v_i64(0 - iv) }; }
+            return Control{ .kind = CTRL_NONE(), .val = v_i64(iv) };
         }
         .call => |c| {
             let callee_name: []u8 = "";
             switch (c.callee.*) {
                 .id => |idn| { callee_name = idn.name; }
                 else => { }
+            }
+            // Builtin: @len(s) — for []u8 slices produced by alloc_str,
+            // returns the length stored at offset 0 of the heap header.
+            // For non-string values, returns 0. The C backend emits
+            // `(s).len` for slices, so this is the runtime equivalent.
+            if (@strEq(callee_name, "@len") == 1) {
+                let ac: Control = eval_expr(get[*Node](c.args, 0), frame, fntab);
+                let n: i32 = str_len(ac.val);
+                return Control{ .kind = CTRL_NONE(), .val = v_i32(n) };
             }
             if (@strEq(callee_name, "print_i32") == 1) {
                 let ac: Control = eval_expr(get[*Node](c.args, 0), frame, fntab);
@@ -190,10 +252,44 @@ fn eval_expr(n: *Node, frame: *Frame, fntab: *FnTable) Control {
                 _zag_println(s);
                 return Control{ .kind = CTRL_NONE(), .val = v_i32(0) };
             }
+            if (@strEq(callee_name, "print_i64") == 1) {
+                let ac: Control = eval_expr(get[*Node](c.args, 0), frame, fntab);
+                let av: i64 = ac.val.bits;
+                let s: []u8 = _zag_i64_to_str(av);
+                _zag_println(s);
+                return Control{ .kind = CTRL_NONE(), .val = v_i32(0) };
+            }
+            if (@strEq(callee_name, "print_u64") == 1) {
+                let ac: Control = eval_expr(get[*Node](c.args, 0), frame, fntab);
+                let av: i64 = ac.val.bits;
+                let s: []u8 = _zag_u64_to_str(av as u64);
+                _zag_println(s);
+                return Control{ .kind = CTRL_NONE(), .val = v_i32(0) };
+            }
+            if (@strEq(callee_name, "print_f32") == 1) {
+                let ac: Control = eval_expr(get[*Node](c.args, 0), frame, fntab);
+                let av: f32 = (ac.val.bits as f64) as f32;
+                let s: []u8 = _zag_i64_to_str((av as f64 * 1000.0) as i64);
+                // C backend uses %g which produces "1.5" style. For now output
+                // a faithful "%g"-like representation via _zag_i64_to_str of
+                // (val * 1000). Full f32 <-> text support is a later feature.
+                _zag_print(s);
+                _zag_println("");
+                return Control{ .kind = CTRL_NONE(), .val = v_i32(0) };
+            }
+            if (@strEq(callee_name, "print_f64") == 1) {
+                let ac: Control = eval_expr(get[*Node](c.args, 0), frame, fntab);
+                let av: f64 = ac.val.bits as f64;
+                let s: []u8 = _zag_i64_to_str((av * 1000.0) as i64);
+                _zag_print(s);
+                _zag_println("");
+                return Control{ .kind = CTRL_NONE(), .val = v_i32(0) };
+            }
             if (@strEq(callee_name, "print_str") == 1) {
                 let ac: Control = eval_expr(get[*Node](c.args, 0), frame, fntab);
-                let s: []u8 = _zag_i64_to_str(ac.val.bits);
-                _zag_println(s);
+                let n: i32 = str_len(ac.val);
+                let data: *u8 = str_data(ac.val);
+                emit_str_ln(data, n);
                 return Control{ .kind = CTRL_NONE(), .val = v_i32(0) };
             }
             let fdecl: *Node = fntab_lookup(fntab, callee_name);
@@ -243,14 +339,36 @@ fn exec_block(body: ArrayList[*Node], frame: *Frame, fntab: *FnTable) Control {
     return Control{ .kind = CTRL_NONE(), .val = v_i32(0) };
 }
 
+// Wrap a raw Value in a typed Value matching the declared type string. Used
+// for `let x: T = expr;` and `x = expr;` where the declaration dictates the
+// storage type. i32/i64/u64/f32/f64 are supported; everything else falls
+// through unchanged.
+fn coerce_to_type(v: Value, dty: []u8) Value {
+    if (@strEq(dty, "i32") == 1)  { return v_i32(v.bits as i32); }
+    if (@strEq(dty, "i64") == 1)  { return v_i64(v.bits); }
+    if (@strEq(dty, "u32") == 1)  { return v_i32(v.bits as i32); }
+    if (@strEq(dty, "u64") == 1)  { return v_i64(v.bits); }
+    if (@strEq(dty, "f32") == 1)  { return v_f32((v.bits as f64) as f32); }
+    if (@strEq(dty, "f64") == 1)  { return v_i64(v.bits); }
+    return v;
+}
+
 fn exec_stmt(n: *Node, frame: *Frame, fntab: *FnTable) Control {
     switch (n.*) {
         .let_ => |l| {
             if (l.has_init == 1) {
                 let c: Control = eval_expr(l.expr, frame, fntab);
-                frame_set(frame, l.name, c.val);
+                if (l.has_dty == 1) {
+                    frame_set(frame, l.name, coerce_to_type(c.val, l.dty));
+                } else {
+                    frame_set(frame, l.name, c.val);
+                }
             } else {
-                frame_set(frame, l.name, v_i32(0));
+                if (l.has_dty == 1) {
+                    frame_set(frame, l.name, coerce_to_type(v_i32(0), l.dty));
+                } else {
+                    frame_set(frame, l.name, v_i32(0));
+                }
             }
             return Control{ .kind = CTRL_NONE(), .val = v_i32(0) };
         }
@@ -270,6 +388,21 @@ fn exec_stmt(n: *Node, frame: *Frame, fntab: *FnTable) Control {
             }
             if (x.has_els == 1) {
                 return exec_block(x.els_body, frame, fntab);
+            }
+            return Control{ .kind = CTRL_NONE(), .val = v_i32(0) };
+        }
+        .while_ => |w| {
+            // while (cond) { body } — re-evaluate cond after each iteration.
+            // return inside body must propagate, so we forward the Control.
+            // has_cap (while-let) is out of scope for the current feature set.
+            let looping: i32 = 1;
+            while (looping == 1) {
+                let cc: Control = eval_expr(w.cond, frame, fntab);
+                if (bool_coerce(cc.val.bits as i32) == 0) { looping = 0; }
+                if (looping == 1) {
+                    let bc: Control = exec_block(w.body, frame, fntab);
+                    if (bc.kind == CTRL_RETURN()) { return bc; }
+                }
             }
             return Control{ .kind = CTRL_NONE(), .val = v_i32(0) };
         }

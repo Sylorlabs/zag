@@ -30,6 +30,29 @@ LET_SRC='fn main() void { let x: i32 = 7; let y: i32 = 3; let z: i32 = x * y + 1
 # A third test: if/else, to exercise the has_els path.
 IFELSE_SRC='fn pick(n: i32) i32 { if (n > 0) { return 1; } else { return 0 - 1; } } fn main() void { print_i32(pick(5)); print_i32(pick(0 - 3)); }'
 
+# A fourth test: while loop, to exercise the while_ path. sum_to_n(10) = 55
+# (same answer as fib(10), but the path is iterative not recursive).
+WHILE_SRC='fn sum_to_n(n: i32) i32 { let s: i32 = 0; let i: i32 = 1; while (i <= n) { s = s + i; i = i + 1; } return s; } fn main() void { print_i32(sum_to_n(10)); }'
+
+# A fifth test: i64 type, to exercise type promotion in let. The literal
+# `4000000000` is too big for i32; declared as i64, it must round-trip.
+I64_SRC='fn main() void { let big: i64 = 4000000000; print_i64(big); }'
+
+# A sixth test: @len on a string literal. Exercises the @len builtin dispatch
+# in the interpreter's call handler, plus the heap-allocated string buffer
+# the interpreter uses to represent []u8 values.
+LEN_SRC='fn main() void { let s: []u8 = "abcde"; print_i32(@len(s)); }'
+
+# A seventh test: while loop with i64 accumulator. Exercises the combination
+# of i64 promotion + while + arithmetic, all of which are independently
+# verified by the other tests but haven't been tested together.
+I64_WHILE_SRC='fn main() void { let s: i64 = 0; let i: i64 = 1; while (i <= 10) { s = s + i; i = i + 1; } print_i64(s); }'
+
+# (print_str of a string literal is deferred — see interp.zag's emit_str_ln
+# comment. Adding a new native-runtime symbol requires hand-tuning in
+# selfhost/native/ncodegen.zag's RT_* dispatch table, which is a separate
+# piece of work from growing the interpreter.)
+
 PASS=0
 FAIL=0
 FAILED_TESTS=""
@@ -90,6 +113,10 @@ run_test() {
 run_test "fib"      "$FIB_SRC"
 run_test "let_arith" "$LET_SRC"
 run_test "ifelse"    "$IFELSE_SRC"
+run_test "while"     "$WHILE_SRC"
+run_test "i64"       "$I64_SRC"
+run_test "len"       "$LEN_SRC"
+run_test "i64_while" "$I64_WHILE_SRC"
 
 echo "============================================"
 echo "differential oracle: $PASS passed, $FAIL failed"
