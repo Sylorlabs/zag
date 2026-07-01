@@ -45,10 +45,24 @@ nt "arithmetic"      'fn main() i32 { let a: i32 = 8; let b: i32 = 5; return a *
 nt "function call"   'fn add(a: i32, b: i32) i32 { return a + b; } fn main() i32 { return add(40, 2); }' 42
 nt "while loop"      'fn main() i32 { let s: i32 = 0; let i: i32 = 1; while (i <= 10) { s = s + i; i = i + 1; } return s; }' 55
 nt "if/else"         'fn main() i32 { let x: i32 = 7; if (x < 5) { return 1; } else { return 99; } }' 99
+nt "recursion (fib)" 'fn fib(n: i32) i32 { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); } fn main() i32 { return fib(10); }' 55
+nt "factorial"       'fn fact(n: i32) i32 { if (n < 2) { return 1; } return n * fact(n - 1); } fn main() i32 { return fact(5); }' 120
+nt "div and mod"     'fn main() i32 { return (100 / 7) + (100 % 7); }' 16
+nt "unary minus"     'fn main() i32 { let a: i32 = 50; return 0 - a + 57; }' 7
+nt "nested if/else"  'fn main() i32 { let x: i32 = 7; if (x < 5) { return 1; } else if (x < 10) { return 99; } else { return 2; } }' 99
+nt "fwd mutual rec"  'fn bar() i32; fn foo() i32 { return bar(); } fn bar() i32 { return 42; } fn main() i32 { return foo(); }' 42
+nt "logical ops"     'fn main() i32 { let a: i32 = 1; let b: i32 = 0; if (a == 1 && b == 0) { if (a == 0 || b == 0) { return 33; } } return 1; }' 33
+nt "not op"          'fn main() i32 { let a: i32 = 0; if (!a) { return 21; } return 1; }' 21
+nt "many args"       'fn s6(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32) i32 { return a + b + c + d + e + f; } fn main() i32 { return s6(1, 2, 3, 4, 5, 6); }' 21
+nt "nested calls"    'fn add(a: i32, b: i32) i32 { return a + b; } fn main() i32 { return add(add(10, 20), add(5, 7)); }' 42
 
 echo "── output (write syscall) ──"
 nto "print_i32"      'fn main() i32 { print_i32(12345); return 0; }' "12345" 0
 nto "print_int"      'fn main() i32 { print_int(42); return 0; }' "42" 0
+nto "print_int zero" 'fn main() i32 { print_int(0); return 0; }' "0" 0
+nto "print_int neg"  'fn main() i32 { print_i32(0 - 42); return 0; }' "-42" 0
+nto "print computed" 'fn main() i32 { let s: i32 = 0; let i: i32 = 1; while (i <= 10) { s = s + i; i = i + 1; } print_int(s); return 0; }' "55" 0
+nto "print big i64"  'fn main() i32 { print_int(123456789012); return 0; }' "123456789012" 0
 nto "print_str"      'fn main() i32 { print_str("hello\n"); return 0; }' "hello" 0
 nto "println str"    'fn main() i32 { _zag_println("world\n"); return 0; }' "world" 0
 
