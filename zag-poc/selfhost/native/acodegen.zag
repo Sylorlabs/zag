@@ -1,7 +1,17 @@
-// selfhost/native/acodegen.zag — lean AArch64 codegen (MVP subset).
+// selfhost/native/acodegen.zag — AArch64 codegen (Phase-2 subset).
 //
-// Supports: i32 arithmetic, return, let, fn call, while, if/else,
-// print_int/print_i32/_zag_println/print_str via Linux write syscall (64).
+// Mirrors the x86 backend's data model (see ncodegen.zag):
+//   • uniform 8-byte fields; aggregates evaluate to their block ADDRESS
+//   • locals: INLINE (slot block, lea) or BY-REF (slot holds pointer)
+//   • slices are {ptr@0, len@8}; []u8 data is byte-packed
+//   • aggregate args are caller-copied, passed by address
+//   • aggregate returns via hidden sret pointer in x8 (AAPCS64)
+//   • heap = one mmap per allocation (syscall 222), no free
+//
+// Supports: i32/i64/u8 arithmetic, control flow, fn calls (≤8 args),
+// structs, pointers (& / .* / new / delete), []u8 + word slices (len,
+// index, subslice), enums (member consts, ==, switch without captures),
+// print_int/print_i32/print_str/_zag_print/_zag_println.
 
 @import("aisa.zag")
 @import("../parse.zag")
@@ -43,6 +53,23 @@ fn ac_is_int_text(s: []u8) i32 {
     return 1;
 }
 
+// 'x' / '\n' single-char literal → value, or -1 if not a char literal.
+fn ac_char_lit_val(s: []u8) i64 {
+    if (s.len < 3) { return 0 - 1; }
+    if (s[0] != 39) { return 0 - 1; }
+    if (s[1] == 92 && s.len >= 4) {
+        let e: u8 = s[2];
+        if (e == 'n') { return 10; }
+        if (e == 't') { return 9; }
+        if (e == 'r') { return 13; }
+        if (e == '0') { return 0; }
+        if (e == 92) { return 92; }
+        if (e == 39) { return 39; }
+        return e as i64;
+    }
+    return s[1] as i64;
+}
+
 fn ac_decode_str(text: []u8, out: *ArrayList[u8]) void {
     let n: i32 = text.len;
     let i: i32 = 0;
@@ -74,14 +101,17 @@ fn ac_decoded_len(text: []u8) i32 {
     return len[u8](tmp);
 }
 
-struct AFnSym { name: []u8, lbl: i32, nparams: i32 }
+struct AFnSym { name: []u8, lbl: i32, nparams: i32, ret: []u8 }
 
-fn AC_EXPR_WORDS() i32 { return 32; }
+fn AC_EXPR_WORDS() i32 { return 48; }
 
-struct ASlots {
+// Locals: INLINE aggregates own `words` contiguous slots; BY-REF locals own
+// one word holding a pointer to a block elsewhere (aggregate params).
+struct AEnv {
     names: ArrayList[[]u8],
     disps: ArrayList[i32],
-    count: i32,
+    types: ArrayList[[]u8],
+    byref: ArrayList[i32],
 }
 
 struct ACg {
@@ -90,10 +120,16 @@ struct ACg {
     data: *ArrayList[u8],
     pi_lbl: i32,
     ps_lbl: i32,
+    al_lbl: i32,
     use_pi: i32,
     use_ps: i32,
+    use_al: i32,
     frame_words: i32,
     epilogue: i32,
+    sret_disp: i32,     // frame disp of the saved x8 sret pointer (0 = none)
+    sret_words: i32,    // words of the aggregate being returned (0 = scalar)
+    nl_off: i32,        // data offset of the interned "\n" (-1 = not yet)
+    decls: ArrayList[*Node],
 }
 
 fn ac_fresh(cg: *ACg) i32 {
@@ -113,18 +149,192 @@ fn ac_align16(n: i32) i32 {
     return n + (16 - r);
 }
 
-fn ac_slots_new() ASlots {
-    return ASlots{ .names = make[[]u8](8), .disps = make[i32](8), .count = 0 };
+fn ac_round8(n: i32) i32 {
+    let r: i32 = n % 8;
+    if (r == 0) { return n; }
+    return n + (8 - r);
 }
 
-fn ac_slot_alloc(slots: *ASlots, cg: *ACg, name: []u8) i32 {
+fn ac_env_new() AEnv {
+    return AEnv{
+        .names = make[[]u8](8),
+        .disps = make[i32](8),
+        .types = make[[]u8](8),
+        .byref = make[i32](8),
+    };
+}
+
+// ── type registry ────────────────────────────────────────────────────────────
+
+fn ac_find_struct(cg: *ACg, name: []u8, out: *StructDecl) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](cg.*.decls)) {
+        switch (get[*Node](cg.*.decls, i).*) {
+            .struct_ => |sd| {
+                if (@strEq(sd.name, name)) { out.* = sd; return 1; }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn ac_find_union(cg: *ACg, name: []u8, out: *UnionDecl) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](cg.*.decls)) {
+        switch (get[*Node](cg.*.decls, i).*) {
+            .union_ => |ud| {
+                if (@strEq(ud.name, name)) { out.* = ud; return 1; }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Index of member `m` in enum `ename`, or -1 (also -1 if no such enum).
+fn ac_enum_member(cg: *ACg, ename: []u8, m: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](cg.*.decls)) {
+        switch (get[*Node](cg.*.decls, i).*) {
+            .enum_ => |ed| {
+                if (@strEq(ed.name, ename)) {
+                    let j: i32 = 0;
+                    while (j < len[[]u8](ed.members)) {
+                        if (@strEq(get[[]u8](ed.members, j), m)) { return j; }
+                        j = j + 1;
+                    }
+                    return 0 - 1;
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn ac_is_enum(cg: *ACg, name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](cg.*.decls)) {
+        switch (get[*Node](cg.*.decls, i).*) {
+            .enum_ => |ed| { if (@strEq(ed.name, name)) { return 1; } }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn ac_type_is_slice(ty: []u8) i32 {
+    if (ty.len < 3) { return 0; }
+    if (ty[0] == 91 && ty[1] == 93) { return 1; }   // "[]"
+    return 0;
+}
+
+fn ac_slice_elem(ty: []u8) []u8 {
+    if (ac_type_is_slice(ty) == 0) { return ""; }
+    return ty[2..];
+}
+
+fn ac_elem_is_byte(ty: []u8) i32 {
+    if (@strEq(ty, "u8")) { return 1; }
+    if (@strEq(ty, "i8")) { return 1; }
+    return 0;
+}
+
+fn ac_type_size(cg: *ACg, ty: []u8) i32 {
+    if (ty.len == 0) { return 8; }
+    if (ty[0] == '*') { return 8; }
+    if (ac_type_is_slice(ty) == 1) { return 16; }
+    if (ty[0] == '?') { return 8 + ac_round8(ac_type_size(cg, ty[1..])); }
+    let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1), .tparams = make[[]u8](1), .is_pub = 0 };
+    if (ac_find_struct(cg, ty, &sd) == 1) {
+        let total: i32 = 0;
+        let i: i32 = 0;
+        while (i < len[Param](sd.fields)) {
+            total = total + ac_round8(ac_type_size(cg, get[Param](sd.fields, i).pty));
+            i = i + 1;
+        }
+        if (total == 0) { return 8; }
+        return total;
+    }
+    let ud: UnionDecl = UnionDecl{ .name = "", .fields = make[Param](1) };
+    if (ac_find_union(cg, ty, &ud) == 1) {
+        let maxp: i32 = 0;
+        let j: i32 = 0;
+        while (j < len[Param](ud.fields)) {
+            let ps: i32 = ac_round8(ac_type_size(cg, get[Param](ud.fields, j).pty));
+            if (ps > maxp) { maxp = ps; }
+            j = j + 1;
+        }
+        if (maxp == 0) { maxp = 8; }
+        return 8 + maxp;
+    }
+    return 8;
+}
+
+fn ac_type_words(cg: *ACg, ty: []u8) i32 {
+    return ac_round8(ac_type_size(cg, ty)) / 8;
+}
+
+fn ac_elem_stride(cg: *ACg, ty: []u8) i32 {
+    if (ac_elem_is_byte(ty) == 1) { return 1; }
+    return ac_round8(ac_type_size(cg, ty));
+}
+
+fn ac_is_aggregate(cg: *ACg, ty: []u8) i32 {
+    if (ty.len == 0) { return 0; }
+    if (ty[0] == '*') { return 0; }
+    if (ac_type_is_slice(ty) == 1) { return 1; }
+    if (ty[0] == '?') { return 1; }
+    let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1), .tparams = make[[]u8](1), .is_pub = 0 };
+    if (ac_find_struct(cg, ty, &sd) == 1) { return 1; }
+    let ud: UnionDecl = UnionDecl{ .name = "", .fields = make[Param](1) };
+    if (ac_find_union(cg, ty, &ud) == 1) { return 1; }
+    return 0;
+}
+
+// Byte offset of `fname` in struct `sname`, or -1.
+fn ac_field_offset(cg: *ACg, sname: []u8, fname: []u8) i32 {
+    let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1), .tparams = make[[]u8](1), .is_pub = 0 };
+    if (ac_find_struct(cg, sname, &sd) == 0) { return 0 - 1; }
+    let off: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[Param](sd.fields)) {
+        let p: Param = get[Param](sd.fields, i);
+        if (@strEq(p.name, fname)) { return off; }
+        off = off + ac_round8(ac_type_size(cg, p.pty));
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn ac_field_type(cg: *ACg, sname: []u8, fname: []u8) []u8 {
+    let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1), .tparams = make[[]u8](1), .is_pub = 0 };
+    if (ac_find_struct(cg, sname, &sd) == 0) { return ""; }
+    let i: i32 = 0;
+    while (i < len[Param](sd.fields)) {
+        let p: Param = get[Param](sd.fields, i);
+        if (@strEq(p.name, fname)) { return p.pty; }
+        i = i + 1;
+    }
+    return "";
+}
+
+// ── slots ────────────────────────────────────────────────────────────────────
+
+fn ac_slot_alloc_br(env: *AEnv, cg: *ACg, name: []u8, ty: []u8, words: i32, byref: i32) i32 {
     let first: i32 = cg.*.frame_words;
-    let d: i32 = 0 - (8 * (first + 1));
-    push[[]u8](&slots.*.names, name);
-    push[i32](&slots.*.disps, d);
-    cg.*.frame_words = cg.*.frame_words + 1;
-    slots.*.count = slots.*.count + 1;
-    return d;
+    let disp: i32 = 0 - (8 * (first + words));
+    push[[]u8](&env.*.names, name);
+    push[i32](&env.*.disps, disp);
+    push[[]u8](&env.*.types, ty);
+    push[i32](&env.*.byref, byref);
+    cg.*.frame_words = cg.*.frame_words + words;
+    return disp;
 }
 
 fn ac_slot_scratch(cg: *ACg, words: i32) i32 {
@@ -136,11 +346,33 @@ fn ac_slot_scratch(cg: *ACg, words: i32) i32 {
 
 // Returns the (negative) frame displacement, or 0 when not found — slot
 // displacements start at -8, so 0 is the only safe "miss" sentinel.
-fn ac_slot_find(slots: *ASlots, slot_n: *i32, name: []u8) i32 {
-    let i: i32 = slot_n.* - 1;
+fn ac_slot_find(env: *AEnv, name: []u8) i32 {
+    let i: i32 = len[[]u8](env.*.names) - 1;
     while (i >= 0) {
-        if (@strEq(get[[]u8](slots.*.names, i), name)) {
-            return get[i32](slots.*.disps, i);
+        if (@strEq(get[[]u8](env.*.names, i), name)) {
+            return get[i32](env.*.disps, i);
+        }
+        i = i - 1;
+    }
+    return 0;
+}
+
+fn ac_slot_type(env: *AEnv, name: []u8) []u8 {
+    let i: i32 = len[[]u8](env.*.names) - 1;
+    while (i >= 0) {
+        if (@strEq(get[[]u8](env.*.names, i), name)) {
+            return get[[]u8](env.*.types, i);
+        }
+        i = i - 1;
+    }
+    return "";
+}
+
+fn ac_slot_byref(env: *AEnv, name: []u8) i32 {
+    let i: i32 = len[[]u8](env.*.names) - 1;
+    while (i >= 0) {
+        if (@strEq(get[[]u8](env.*.names, i), name)) {
+            return get[i32](env.*.byref, i);
         }
         i = i - 1;
     }
@@ -154,6 +386,14 @@ fn ac_intern_str(cg: *ACg, text: []u8, add_nl: i32) i32 {
     return off;
 }
 
+fn ac_intern_nl(cg: *ACg) i32 {
+    if (cg.*.nl_off >= 0) { return cg.*.nl_off; }
+    let off: i32 = len[u8](cg.*.data.*);
+    push[u8](cg.*.data, 10);
+    cg.*.nl_off = off;
+    return off;
+}
+
 fn ac_find_fn(syms: ArrayList[AFnSym], name: []u8) i32 {
     let i: i32 = 0;
     while (i < len[AFnSym](syms)) {
@@ -163,18 +403,206 @@ fn ac_find_fn(syms: ArrayList[AFnSym], name: []u8) i32 {
     return 0 - 1;
 }
 
+fn ac_find_fn_ret(syms: ArrayList[AFnSym], name: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[AFnSym](syms)) {
+        if (@strEq(get[AFnSym](syms, i).name, name)) { return get[AFnSym](syms, i).ret; }
+        i = i + 1;
+    }
+    return "";
+}
 
+// ── small emit helpers ───────────────────────────────────────────────────────
 
-fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, slots: *ASlots, slot_n: *i32, syms: ArrayList[AFnSym], cg: *ACg) void {
+// dst = x29 + disp
+fn ac_emit_lea(out: *ArrayList[AInstr], dst: i32, disp: i32) void {
+    push[AInstr](out, ai_mov_rr(dst, A_X29()));
+    if (disp < 0) { push[AInstr](out, ai_sub_imm(dst, (0 - disp) as i64)); }
+    else if (disp > 0) { push[AInstr](out, ai_add_imm(dst, disp as i64)); }
+}
+
+// copy `words` 8-byte words from [x11] to [x10] (clobbers x9)
+fn ac_emit_copy(out: *ArrayList[AInstr], words: i32) void {
+    let k: i32 = 0;
+    while (k < words) {
+        push[AInstr](out, ai_load(A_X9(), A_X11(), 8 * k));
+        push[AInstr](out, ai_store(A_X10(), 8 * k, A_X9()));
+        k = k + 1;
+    }
+}
+
+// ── expression type inference (best-effort; "" = unknown scalar) ────────────
+
+fn ac_expr_type(n: *Node, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) []u8 {
+    switch (n.*) {
+        .ilit => |_x| { return "i64"; }
+        .slit => |_x| { return "[]u8"; }
+        .id => |x| {
+            if (@strEq(x.name, "true") || @strEq(x.name, "false")) { return "bool"; }
+            return ac_slot_type(env, x.name);
+        }
+        .bin => |b| {
+            if (@strEq(b.op, "==") || @strEq(b.op, "!=") || @strEq(b.op, "<") ||
+                @strEq(b.op, ">") || @strEq(b.op, "<=") || @strEq(b.op, ">=") ||
+                @strEq(b.op, "&&") || @strEq(b.op, "||")) { return "bool"; }
+            let lt: []u8 = ac_expr_type(b.l, env, syms, cg);
+            if (lt.len > 0) { return lt; }
+            return ac_expr_type(b.r, env, syms, cg);
+        }
+        .un => |u| {
+            if (@strEq(u.op, "!")) { return "bool"; }
+            if (@strEq(u.op, "&")) {
+                return _zag_str_concat("*", ac_expr_type(u.e, env, syms, cg));
+            }
+            return ac_expr_type(u.e, env, syms, cg);
+        }
+        .call => |c| {
+            switch (c.callee.*) {
+                .id => |fnid| {
+                    if (@strEq(fnid.name, "new")) {
+                        if (len[*Node](c.args) == 1) {
+                            return _zag_str_concat("*", ac_expr_type(get[*Node](c.args, 0), env, syms, cg));
+                        }
+                        return "*u8";
+                    }
+                    if (@strEq(fnid.name, "_zag_malloc")) { return "*u8"; }
+                    return ac_find_fn_ret(syms, fnid.name);
+                }
+                else => { return ""; }
+            }
+        }
+        .fld => |f| {
+            // enum member constant: Color.red
+            switch (f.base.*) {
+                .id => |bid| {
+                    if (ac_slot_find(env, bid.name) == 0 && ac_is_enum(cg, bid.name) == 1) {
+                        return bid.name;
+                    }
+                }
+                else => { }
+            }
+            let bt: []u8 = ac_expr_type(f.base, env, syms, cg);
+            if (@strEq(f.fname, "*")) {
+                if (bt.len > 1 && bt[0] == '*') { return bt[1..]; }
+                return "";
+            }
+            if (ac_type_is_slice(bt) == 1 && @strEq(f.fname, "len")) { return "i64"; }
+            let sname: []u8 = bt;
+            if (bt.len > 1 && bt[0] == '*') { sname = bt[1..]; }
+            return ac_field_type(cg, sname, f.fname);
+        }
+        .idx => |ix| {
+            let bt: []u8 = ac_expr_type(ix.base, env, syms, cg);
+            if (ac_type_is_slice(bt) == 1) { return ac_slice_elem(bt); }
+            if (bt.len > 1 && bt[0] == '*') { return bt[1..]; }
+            return "";
+        }
+        .cast_ => |cst| { return cst.target; }
+        .slit_ => |sl| { return sl.sname; }
+        .slice_ => |sc| { return ac_expr_type(sc.base, env, syms, cg); }
+        else => { return ""; }
+    }
+}
+
+// ── lvalue address ───────────────────────────────────────────────────────────
+// Pushes the ADDRESS of the lvalue onto the expression stack.
+
+fn ac_lower_addr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) void {
+    switch (n.*) {
+        .id => |x| {
+            let disp: i32 = ac_slot_find(env, x.name);
+            if (disp == 0) {
+                ac_err(cg, _zag_str_concat("arm64: address of unknown identifier: ", x.name));
+                push[AInstr](out, ai_mov_imm(A_X0(), 0));
+                push[AInstr](out, ai_push(A_X0()));
+                return;
+            }
+            if (ac_slot_byref(env, x.name) == 1) {
+                push[AInstr](out, ai_load(A_X0(), A_X29(), disp));
+            } else {
+                ac_emit_lea(out, A_X0(), disp);
+            }
+            push[AInstr](out, ai_push(A_X0()));
+        }
+        .fld => |f| {
+            let bt: []u8 = ac_expr_type(f.base, env, syms, cg);
+            if (@strEq(f.fname, "*")) {
+                // address of p.* is the pointer value itself
+                ac_lower_expr(out, f.base, env, syms, cg);
+                return;
+            }
+            if (ac_type_is_slice(bt) == 1 && @strEq(f.fname, "len")) {
+                ac_lower_expr(out, f.base, env, syms, cg);
+                push[AInstr](out, ai_pop(A_X0()));
+                push[AInstr](out, ai_add_imm(A_X0(), 8));
+                push[AInstr](out, ai_push(A_X0()));
+                return;
+            }
+            let sname: []u8 = bt;
+            if (bt.len > 1 && bt[0] == '*') { sname = bt[1..]; }
+            let off: i32 = ac_field_offset(cg, sname, f.fname);
+            if (off < 0) {
+                ac_err(cg, _zag_str_concat("arm64: unknown field: ", f.fname));
+                push[AInstr](out, ai_mov_imm(A_X0(), 0));
+                push[AInstr](out, ai_push(A_X0()));
+                return;
+            }
+            ac_lower_expr(out, f.base, env, syms, cg);   // base address / ptr value
+            push[AInstr](out, ai_pop(A_X0()));
+            if (off > 0) { push[AInstr](out, ai_add_imm(A_X0(), off as i64)); }
+            push[AInstr](out, ai_push(A_X0()));
+        }
+        .idx => |ix| {
+            let bt: []u8 = ac_expr_type(ix.base, env, syms, cg);
+            let elem: []u8 = "";
+            let is_slice: i32 = 0;
+            if (ac_type_is_slice(bt) == 1) { elem = ac_slice_elem(bt); is_slice = 1; }
+            else if (bt.len > 1 && bt[0] == '*') { elem = bt[1..]; }
+            else { ac_err(cg, "arm64: indexing a non-slice/pointer value"); }
+            let stride: i32 = ac_elem_stride(cg, elem);
+            ac_lower_expr(out, ix.base, env, syms, cg);
+            if (is_slice == 1) {
+                // slice block address → load data ptr
+                push[AInstr](out, ai_pop(A_X0()));
+                push[AInstr](out, ai_load(A_X0(), A_X0(), 0));
+                push[AInstr](out, ai_push(A_X0()));
+            }
+            ac_lower_expr(out, ix.idx, env, syms, cg);
+            push[AInstr](out, ai_pop(A_X1()));
+            push[AInstr](out, ai_pop(A_X0()));
+            if (stride != 1) {
+                push[AInstr](out, ai_mov_imm(A_X9(), stride as i64));
+                push[AInstr](out, ai_mul(A_X1(), A_X1(), A_X9()));
+            }
+            push[AInstr](out, ai_add(A_X0(), A_X1()));
+            push[AInstr](out, ai_push(A_X0()));
+        }
+        else => {
+            ac_err(cg, "arm64: unsupported lvalue");
+            push[AInstr](out, ai_mov_imm(A_X0(), 0));
+            push[AInstr](out, ai_push(A_X0()));
+        }
+    }
+}
+
+// ── expressions ──────────────────────────────────────────────────────────────
+
+fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) void {
     switch (n.*) {
         .ilit => |x| {
             if (ac_is_int_text(x.text) == 1) {
                 push[AInstr](out, ai_mov_imm(A_X0(), ac_parse_i64(x.text)));
                 push[AInstr](out, ai_push(A_X0()));
             } else {
-                ac_err(cg, "arm64: unsupported numeric literal");
-                push[AInstr](out, ai_mov_imm(A_X0(), 0));
-                push[AInstr](out, ai_push(A_X0()));
+                let cv: i64 = ac_char_lit_val(x.text);
+                if (cv >= 0) {
+                    push[AInstr](out, ai_mov_imm(A_X0(), cv));
+                    push[AInstr](out, ai_push(A_X0()));
+                } else {
+                    ac_err(cg, "arm64: unsupported numeric literal");
+                    push[AInstr](out, ai_mov_imm(A_X0(), 0));
+                    push[AInstr](out, ai_push(A_X0()));
+                }
             }
         }
         .id => |x| {
@@ -188,10 +616,20 @@ fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, slots: *ASlots, slot_n: *i32
                 push[AInstr](out, ai_push(A_X0()));
                 return;
             }
-            let disp: i32 = ac_slot_find(slots, slot_n, x.name);
+            let disp: i32 = ac_slot_find(env, x.name);
             if (disp == 0) {
                 ac_err(cg, _zag_str_concat("arm64: unknown identifier: ", x.name));
                 push[AInstr](out, ai_mov_imm(A_X0(), 0));
+                push[AInstr](out, ai_push(A_X0()));
+                return;
+            }
+            let ty: []u8 = ac_slot_type(env, x.name);
+            if (ac_is_aggregate(cg, ty) == 1) {
+                if (ac_slot_byref(env, x.name) == 1) {
+                    push[AInstr](out, ai_load(A_X0(), A_X29(), disp));
+                } else {
+                    ac_emit_lea(out, A_X0(), disp);
+                }
                 push[AInstr](out, ai_push(A_X0()));
             } else {
                 push[AInstr](out, ai_load(A_X0(), A_X29(), disp));
@@ -200,12 +638,12 @@ fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, slots: *ASlots, slot_n: *i32
         }
         .un => |u| {
             if (@strEq(u.op, "-")) {
-                ac_lower_expr(out, u.e, slots, slot_n, syms, cg);
+                ac_lower_expr(out, u.e, env, syms, cg);
                 push[AInstr](out, ai_pop(A_X0()));
                 push[AInstr](out, ai_neg(A_X0(), A_X0()));
                 push[AInstr](out, ai_push(A_X0()));
             } else if (@strEq(u.op, "!")) {
-                ac_lower_expr(out, u.e, slots, slot_n, syms, cg);
+                ac_lower_expr(out, u.e, env, syms, cg);
                 push[AInstr](out, ai_pop(A_X0()));
                 push[AInstr](out, ai_cmp_imm(A_X0(), 0));
                 let l0: i32 = ac_fresh(cg);
@@ -217,11 +655,17 @@ fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, slots: *ASlots, slot_n: *i32
                 push[AInstr](out, ai_mov_imm(A_X0(), 1));
                 push[AInstr](out, ai_label(l1));
                 push[AInstr](out, ai_push(A_X0()));
+            } else if (@strEq(u.op, "&")) {
+                ac_lower_addr(out, u.e, env, syms, cg);
+            } else {
+                ac_err(cg, "arm64: unsupported unary operator");
+                push[AInstr](out, ai_mov_imm(A_X0(), 0));
+                push[AInstr](out, ai_push(A_X0()));
             }
         }
         .bin => |b| {
-            ac_lower_expr(out, b.l, slots, slot_n, syms, cg);
-            ac_lower_expr(out, b.r, slots, slot_n, syms, cg);
+            ac_lower_expr(out, b.l, env, syms, cg);
+            ac_lower_expr(out, b.r, env, syms, cg);
             push[AInstr](out, ai_pop(A_X1()));
             push[AInstr](out, ai_pop(A_X0()));
             if (@strEq(b.op, "+")) {
@@ -236,61 +680,11 @@ fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, slots: *ASlots, slot_n: *i32
                 push[AInstr](out, ai_sdiv(A_X9(), A_X0(), A_X1()));
                 push[AInstr](out, ai_mul(A_X9(), A_X9(), A_X1()));
                 push[AInstr](out, ai_sub(A_X0(), A_X9()));
-            } else if (@strEq(b.op, "==")) {
+            } else if (ac_cmp_cc(b.op) >= 0) {
                 push[AInstr](out, ai_cmp(A_X0(), A_X1()));
                 let l0: i32 = ac_fresh(cg);
                 let l1: i32 = ac_fresh(cg);
-                push[AInstr](out, ai_jne(l0));
-                push[AInstr](out, ai_mov_imm(A_X0(), 1));
-                push[AInstr](out, ai_jmp(l1));
-                push[AInstr](out, ai_label(l0));
-                push[AInstr](out, ai_mov_imm(A_X0(), 0));
-                push[AInstr](out, ai_label(l1));
-            } else if (@strEq(b.op, "!=")) {
-                push[AInstr](out, ai_cmp(A_X0(), A_X1()));
-                let l0: i32 = ac_fresh(cg);
-                let l1: i32 = ac_fresh(cg);
-                push[AInstr](out, ai_je(l0));
-                push[AInstr](out, ai_mov_imm(A_X0(), 1));
-                push[AInstr](out, ai_jmp(l1));
-                push[AInstr](out, ai_label(l0));
-                push[AInstr](out, ai_mov_imm(A_X0(), 0));
-                push[AInstr](out, ai_label(l1));
-            } else if (@strEq(b.op, "<")) {
-                push[AInstr](out, ai_cmp(A_X0(), A_X1()));
-                let l0: i32 = ac_fresh(cg);
-                let l1: i32 = ac_fresh(cg);
-                push[AInstr](out, ai_jge(l0));
-                push[AInstr](out, ai_mov_imm(A_X0(), 1));
-                push[AInstr](out, ai_jmp(l1));
-                push[AInstr](out, ai_label(l0));
-                push[AInstr](out, ai_mov_imm(A_X0(), 0));
-                push[AInstr](out, ai_label(l1));
-            } else if (@strEq(b.op, ">")) {
-                push[AInstr](out, ai_cmp(A_X0(), A_X1()));
-                let l0: i32 = ac_fresh(cg);
-                let l1: i32 = ac_fresh(cg);
-                push[AInstr](out, ai_jle(l0));
-                push[AInstr](out, ai_mov_imm(A_X0(), 1));
-                push[AInstr](out, ai_jmp(l1));
-                push[AInstr](out, ai_label(l0));
-                push[AInstr](out, ai_mov_imm(A_X0(), 0));
-                push[AInstr](out, ai_label(l1));
-            } else if (@strEq(b.op, "<=")) {
-                push[AInstr](out, ai_cmp(A_X0(), A_X1()));
-                let l0: i32 = ac_fresh(cg);
-                let l1: i32 = ac_fresh(cg);
-                push[AInstr](out, ai_jg(l0));
-                push[AInstr](out, ai_mov_imm(A_X0(), 1));
-                push[AInstr](out, ai_jmp(l1));
-                push[AInstr](out, ai_label(l0));
-                push[AInstr](out, ai_mov_imm(A_X0(), 0));
-                push[AInstr](out, ai_label(l1));
-            } else if (@strEq(b.op, ">=")) {
-                push[AInstr](out, ai_cmp(A_X0(), A_X1()));
-                let l0: i32 = ac_fresh(cg);
-                let l1: i32 = ac_fresh(cg);
-                push[AInstr](out, ai_jl(l0));
+                ac_push_jcc_false(out, b.op, l0);
                 push[AInstr](out, ai_mov_imm(A_X0(), 1));
                 push[AInstr](out, ai_jmp(l1));
                 push[AInstr](out, ai_label(l0));
@@ -327,36 +721,7 @@ fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, slots: *ASlots, slot_n: *i32
             push[AInstr](out, ai_push(A_X0()));
         }
         .call => |c| {
-            switch (c.callee.*) {
-                .id => |fnid| {
-                    if (ac_lower_print(out, fnid.name, c, slots, slot_n, syms, cg) == 1) { return; }
-                    let lbl: i32 = ac_find_fn(syms, fnid.name);
-                    if (lbl < 0) {
-                        ac_err(cg, _zag_str_concat("arm64: unknown function: ", fnid.name));
-                        push[AInstr](out, ai_mov_imm(A_X0(), 0));
-                        push[AInstr](out, ai_push(A_X0()));
-                        return;
-                    }
-                    let ai: i32 = 0;
-                    while (ai < len[*Node](c.args)) {
-                        ac_lower_expr(out, get[*Node](c.args, ai), slots, slot_n, syms, cg);
-                        ai = ai + 1;
-                    }
-                    let aj: i32 = len[*Node](c.args) - 1;
-                    while (aj >= 0) {
-                        let reg: i32 = a_arg_reg(aj);
-                        push[AInstr](out, ai_pop(reg));
-                        aj = aj - 1;
-                    }
-                    push[AInstr](out, ai_call(lbl));
-                    push[AInstr](out, ai_push(A_X0()));
-                }
-                else => {
-                    ac_err(cg, "arm64: unsupported call form");
-                    push[AInstr](out, ai_mov_imm(A_X0(), 0));
-                    push[AInstr](out, ai_push(A_X0()));
-                }
-            }
+            ac_lower_call(out, c, env, syms, cg);
         }
         .slit => |sl| {
             let off: i32 = ac_intern_str(cg, sl.text, 0);
@@ -366,13 +731,228 @@ fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, slots: *ASlots, slot_n: *i32
             push[AInstr](out, ai_store(A_X29(), base + 0, A_X0()));
             push[AInstr](out, ai_mov_imm(A_X0(), dlen as i64));
             push[AInstr](out, ai_store(A_X29(), base + 8, A_X0()));
-            push[AInstr](out, ai_mov_rr(A_X0(), A_X29()));
-            if (base < 0) { push[AInstr](out, ai_sub_imm(A_X0(), (0 - base) as i64)); }
-            else { push[AInstr](out, ai_add_imm(A_X0(), base as i64)); }
+            ac_emit_lea(out, A_X0(), base);
             push[AInstr](out, ai_push(A_X0()));
+        }
+        .slit_ => |sl| {
+            // struct literal → fill a scratch block, push its address
+            let w: i32 = ac_type_words(cg, sl.sname);
+            let base: i32 = ac_slot_scratch(cg, w);
+            let i: i32 = 0;
+            while (i < len[FieldInit](sl.fields)) {
+                let fi: FieldInit = get[FieldInit](sl.fields, i);
+                let off: i32 = ac_field_offset(cg, sl.sname, fi.name);
+                if (off < 0) {
+                    ac_err(cg, _zag_str_concat("arm64: unknown struct field: ", fi.name));
+                } else {
+                    let fty: []u8 = ac_field_type(cg, sl.sname, fi.name);
+                    ac_lower_expr(out, fi.val, env, syms, cg);
+                    if (ac_is_aggregate(cg, fty) == 1) {
+                        push[AInstr](out, ai_pop(A_X11()));
+                        ac_emit_lea(out, A_X10(), base + off);
+                        ac_emit_copy(out, ac_type_words(cg, fty));
+                    } else {
+                        push[AInstr](out, ai_pop(A_X0()));
+                        push[AInstr](out, ai_store(A_X29(), base + off, A_X0()));
+                    }
+                }
+                i = i + 1;
+            }
+            ac_emit_lea(out, A_X0(), base);
+            push[AInstr](out, ai_push(A_X0()));
+        }
+        .fld => |f| {
+            // enum member constant
+            switch (f.base.*) {
+                .id => |bid| {
+                    if (ac_slot_find(env, bid.name) == 0 && ac_is_enum(cg, bid.name) == 1) {
+                        let mv: i32 = ac_enum_member(cg, bid.name, f.fname);
+                        if (mv < 0) { ac_err(cg, _zag_str_concat("arm64: unknown enum member: ", f.fname)); mv = 0; }
+                        push[AInstr](out, ai_mov_imm(A_X0(), mv as i64));
+                        push[AInstr](out, ai_push(A_X0()));
+                        return;
+                    }
+                }
+                else => { }
+            }
+            let bt: []u8 = ac_expr_type(f.base, env, syms, cg);
+            if (@strEq(f.fname, "*")) {
+                let elem: []u8 = "";
+                if (bt.len > 1 && bt[0] == '*') { elem = bt[1..]; }
+                ac_lower_expr(out, f.base, env, syms, cg);   // pointer value
+                if (ac_is_aggregate(cg, elem) == 1) { return; }  // address IS the value
+                push[AInstr](out, ai_pop(A_X10()));
+                push[AInstr](out, ai_load(A_X0(), A_X10(), 0));
+                push[AInstr](out, ai_push(A_X0()));
+                return;
+            }
+            if (ac_type_is_slice(bt) == 1 && @strEq(f.fname, "len")) {
+                ac_lower_expr(out, f.base, env, syms, cg);
+                push[AInstr](out, ai_pop(A_X10()));
+                push[AInstr](out, ai_load(A_X0(), A_X10(), 8));
+                push[AInstr](out, ai_push(A_X0()));
+                return;
+            }
+            let sname: []u8 = bt;
+            if (bt.len > 1 && bt[0] == '*') { sname = bt[1..]; }
+            let off: i32 = ac_field_offset(cg, sname, f.fname);
+            if (off < 0) {
+                ac_err(cg, _zag_str_concat("arm64: unknown field: ", f.fname));
+                push[AInstr](out, ai_mov_imm(A_X0(), 0));
+                push[AInstr](out, ai_push(A_X0()));
+                return;
+            }
+            let fty: []u8 = ac_field_type(cg, sname, f.fname);
+            ac_lower_expr(out, f.base, env, syms, cg);
+            push[AInstr](out, ai_pop(A_X10()));
+            if (ac_is_aggregate(cg, fty) == 1) {
+                if (off > 0) { push[AInstr](out, ai_add_imm(A_X10(), off as i64)); }
+                push[AInstr](out, ai_push(A_X10()));
+            } else {
+                push[AInstr](out, ai_load(A_X0(), A_X10(), off));
+                push[AInstr](out, ai_push(A_X0()));
+            }
+        }
+        .idx => |ix| {
+            let bt: []u8 = ac_expr_type(ix.base, env, syms, cg);
+            let elem: []u8 = "";
+            if (ac_type_is_slice(bt) == 1) { elem = ac_slice_elem(bt); }
+            else if (bt.len > 1 && bt[0] == '*') { elem = bt[1..]; }
+            ac_lower_addr(out, n, env, syms, cg);
+            push[AInstr](out, ai_pop(A_X10()));
+            if (ac_is_aggregate(cg, elem) == 1) {
+                push[AInstr](out, ai_push(A_X10()));
+            } else if (ac_elem_is_byte(elem) == 1) {
+                push[AInstr](out, ai_loadb(A_X0(), A_X10(), 0));
+                push[AInstr](out, ai_push(A_X0()));
+            } else {
+                push[AInstr](out, ai_load(A_X0(), A_X10(), 0));
+                push[AInstr](out, ai_push(A_X0()));
+            }
+        }
+        .slice_ => |sc| {
+            let bt: []u8 = ac_expr_type(sc.base, env, syms, cg);
+            if (ac_type_is_slice(bt) == 0) {
+                ac_err(cg, "arm64: slicing a non-slice value");
+                push[AInstr](out, ai_mov_imm(A_X0(), 0));
+                push[AInstr](out, ai_push(A_X0()));
+                return;
+            }
+            let stride: i32 = ac_elem_stride(cg, ac_slice_elem(bt));
+            ac_lower_expr(out, sc.base, env, syms, cg);
+            ac_lower_expr(out, sc.lo, env, syms, cg);
+            if (sc.has_hi == 1) { ac_lower_expr(out, sc.hi, env, syms, cg); }
+            if (sc.has_hi == 1) { push[AInstr](out, ai_pop(A_X13())); }
+            push[AInstr](out, ai_pop(A_X12()));
+            push[AInstr](out, ai_pop(A_X10()));
+            push[AInstr](out, ai_load(A_X0(), A_X10(), 0));    // data ptr
+            push[AInstr](out, ai_load(A_X1(), A_X10(), 8));    // len
+            if (sc.has_hi == 0) { push[AInstr](out, ai_mov_rr(A_X13(), A_X1())); }
+            // new ptr = ptr + lo*stride ; new len = hi - lo
+            push[AInstr](out, ai_mov_imm(A_X9(), stride as i64));
+            push[AInstr](out, ai_mul(A_X11(), A_X12(), A_X9()));
+            push[AInstr](out, ai_add(A_X0(), A_X11()));
+            push[AInstr](out, ai_sub(A_X13(), A_X12()));
+            let base: i32 = ac_slot_scratch(cg, 2);
+            push[AInstr](out, ai_store(A_X29(), base + 0, A_X0()));
+            push[AInstr](out, ai_store(A_X29(), base + 8, A_X13()));
+            ac_emit_lea(out, A_X0(), base);
+            push[AInstr](out, ai_push(A_X0()));
+        }
+        .cast_ => |cst| {
+            ac_lower_expr(out, cst.expr, env, syms, cg);
+            if (@strEq(cst.target, "u8") || @strEq(cst.target, "i8")) {
+                push[AInstr](out, ai_pop(A_X0()));
+                push[AInstr](out, ai_and_imm(A_X0(), 255));
+                push[AInstr](out, ai_push(A_X0()));
+            } else if (@strEq(cst.target, "i32")) {
+                push[AInstr](out, ai_pop(A_X0()));
+                push[AInstr](out, ai_sxtw(A_X0(), A_X0()));
+                push[AInstr](out, ai_push(A_X0()));
+            }
+            // i64/u64/usize/pointers: value already 64-bit — no-op
         }
         else => {
             ac_err(cg, "arm64: unsupported expression");
+            push[AInstr](out, ai_mov_imm(A_X0(), 0));
+            push[AInstr](out, ai_push(A_X0()));
+        }
+    }
+}
+
+fn ac_cmp_cc(op: []u8) i32 {
+    if (@strEq(op, "==")) { return 0; }
+    if (@strEq(op, "!=")) { return 1; }
+    if (@strEq(op, "<"))  { return 2; }
+    if (@strEq(op, "<=")) { return 3; }
+    if (@strEq(op, ">"))  { return 4; }
+    if (@strEq(op, ">=")) { return 5; }
+    return 0 - 1;
+}
+
+// branch to `lbl` when the comparison `op` is FALSE (flags already set)
+fn ac_push_jcc_false(out: *ArrayList[AInstr], op: []u8, lbl: i32) void {
+    if (@strEq(op, "=="))      { push[AInstr](out, ai_jne(lbl)); }
+    else if (@strEq(op, "!=")) { push[AInstr](out, ai_je(lbl)); }
+    else if (@strEq(op, "<"))  { push[AInstr](out, ai_jge(lbl)); }
+    else if (@strEq(op, "<=")) { push[AInstr](out, ai_jg(lbl)); }
+    else if (@strEq(op, ">"))  { push[AInstr](out, ai_jle(lbl)); }
+    else                       { push[AInstr](out, ai_jl(lbl)); }
+}
+
+// ── calls ────────────────────────────────────────────────────────────────────
+
+fn ac_lower_call(out: *ArrayList[AInstr], c: Call, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) void {
+    switch (c.callee.*) {
+        .id => |fnid| {
+            if (ac_lower_builtin(out, fnid.name, c, env, syms, cg) == 1) { return; }
+            let lbl: i32 = ac_find_fn(syms, fnid.name);
+            if (lbl < 0) {
+                ac_err(cg, _zag_str_concat("arm64: unknown function: ", fnid.name));
+                push[AInstr](out, ai_mov_imm(A_X0(), 0));
+                push[AInstr](out, ai_push(A_X0()));
+                return;
+            }
+            let nargs: i32 = len[*Node](c.args);
+            if (nargs > 8) {
+                ac_err(cg, "arm64: more than 8 arguments not supported");
+                push[AInstr](out, ai_mov_imm(A_X0(), 0));
+                push[AInstr](out, ai_push(A_X0()));
+                return;
+            }
+            let ai: i32 = 0;
+            while (ai < nargs) {
+                let a: *Node = get[*Node](c.args, ai);
+                let aty: []u8 = ac_expr_type(a, env, syms, cg);
+                ac_lower_expr(out, a, env, syms, cg);
+                if (ac_is_aggregate(cg, aty) == 1) {
+                    // by-value semantics: copy to a fresh block, pass its address
+                    let w: i32 = ac_type_words(cg, aty);
+                    let base: i32 = ac_slot_scratch(cg, w);
+                    push[AInstr](out, ai_pop(A_X11()));
+                    ac_emit_lea(out, A_X10(), base);
+                    ac_emit_copy(out, w);
+                    ac_emit_lea(out, A_X0(), base);
+                    push[AInstr](out, ai_push(A_X0()));
+                }
+                ai = ai + 1;
+            }
+            let aj: i32 = nargs - 1;
+            while (aj >= 0) {
+                push[AInstr](out, ai_pop(a_arg_reg(aj)));
+                aj = aj - 1;
+            }
+            let rty: []u8 = ac_find_fn_ret(syms, fnid.name);
+            if (ac_is_aggregate(cg, rty) == 1) {
+                let rw: i32 = ac_type_words(cg, rty);
+                let rbase: i32 = ac_slot_scratch(cg, rw);
+                ac_emit_lea(out, A_X8(), rbase);
+            }
+            push[AInstr](out, ai_call(lbl));
+            push[AInstr](out, ai_push(A_X0()));
+        }
+        else => {
+            ac_err(cg, "arm64: unsupported call form");
             push[AInstr](out, ai_mov_imm(A_X0(), 0));
             push[AInstr](out, ai_push(A_X0()));
         }
@@ -392,16 +972,12 @@ fn ac_is_print_str(name: []u8) i32 {
     return 0;
 }
 
-fn ac_is_println(name: []u8) i32 {
-    if (@strEq(name, "_zag_println")) { return 1; }
-    return 0;
-}
-
-fn ac_lower_print(out: *ArrayList[AInstr], fname: []u8, c: Call, slots: *ASlots, slot_n: *i32, syms: ArrayList[AFnSym], cg: *ACg) i32 {
+// Returns 1 if `fname` was handled as a builtin (result pushed).
+fn ac_lower_builtin(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) i32 {
     let nargs: i32 = len[*Node](c.args);
     if (ac_is_print_int(fname) == 1) {
         if (nargs != 1) { ac_err(cg, "arm64: print_i32 expects one argument"); return 1; }
-        ac_lower_expr(out, get[*Node](c.args, 0), slots, slot_n, syms, cg);
+        ac_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
         push[AInstr](out, ai_pop(A_X0()));
         if (@strEq(fname, "print_i32")) {
             push[AInstr](out, ai_sxtw(A_X0(), A_X0()));
@@ -412,63 +988,136 @@ fn ac_lower_print(out: *ArrayList[AInstr], fname: []u8, c: Call, slots: *ASlots,
         push[AInstr](out, ai_push(A_X0()));
         return 1;
     }
-    if (ac_is_print_str(fname) == 1 || ac_is_println(fname) == 1) {
+    if (ac_is_print_str(fname) == 1 || @strEq(fname, "_zag_println")) {
         if (nargs != 1) { ac_err(cg, "arm64: print_str expects one argument"); return 1; }
         let arg: *Node = get[*Node](c.args, 0);
-        switch (arg.*) {
-            .slit => |sl| {
-                let add_nl: i32 = 0;
-                if (ac_is_println(fname) == 1) { add_nl = 1; }
-                let total: i32 = ac_decoded_len(sl.text) + add_nl;
-                let off: i32 = ac_intern_str(cg, sl.text, add_nl);
-                push[AInstr](out, ai_mov_imm(A_X1(), A_DATA_VBASE() + (off as i64)));
-                push[AInstr](out, ai_mov_imm(A_X2(), total as i64));
-                cg.*.use_ps = 1;
-                push[AInstr](out, ai_call(cg.*.ps_lbl));
-            }
-            else => {
-                ac_err(cg, "arm64: print_str argument must be a string literal");
-            }
+        let aty: []u8 = ac_expr_type(arg, env, syms, cg);
+        if (ac_type_is_slice(aty) == 0) {
+            ac_err(cg, "arm64: print_str argument must be a []u8 slice");
+            push[AInstr](out, ai_mov_imm(A_X0(), 0));
+            push[AInstr](out, ai_push(A_X0()));
+            return 1;
+        }
+        ac_lower_expr(out, arg, env, syms, cg);
+        push[AInstr](out, ai_pop(A_X10()));
+        push[AInstr](out, ai_load(A_X1(), A_X10(), 0));
+        push[AInstr](out, ai_load(A_X2(), A_X10(), 8));
+        cg.*.use_ps = 1;
+        push[AInstr](out, ai_call(cg.*.ps_lbl));
+        if (@strEq(fname, "_zag_println")) {
+            let nl: i32 = ac_intern_nl(cg);
+            push[AInstr](out, ai_mov_imm(A_X1(), A_DATA_VBASE() + (nl as i64)));
+            push[AInstr](out, ai_mov_imm(A_X2(), 1));
+            push[AInstr](out, ai_call(cg.*.ps_lbl));
         }
         push[AInstr](out, ai_mov_imm(A_X0(), 0));
+        push[AInstr](out, ai_push(A_X0()));
+        return 1;
+    }
+    if (@strEq(fname, "new")) {
+        if (nargs != 1) { ac_err(cg, "arm64: new expects one argument"); return 1; }
+        let a: *Node = get[*Node](c.args, 0);
+        let aty: []u8 = ac_expr_type(a, env, syms, cg);
+        let sz: i32 = ac_round8(ac_type_size(cg, aty));
+        ac_lower_expr(out, a, env, syms, cg);
+        push[AInstr](out, ai_mov_imm(A_X0(), sz as i64));
+        cg.*.use_al = 1;
+        push[AInstr](out, ai_call(cg.*.al_lbl));
+        if (ac_is_aggregate(cg, aty) == 1) {
+            push[AInstr](out, ai_mov_rr(A_X10(), A_X0()));
+            push[AInstr](out, ai_pop(A_X11()));
+            ac_emit_copy(out, sz / 8);
+            push[AInstr](out, ai_push(A_X10()));
+        } else {
+            push[AInstr](out, ai_mov_rr(A_X10(), A_X0()));
+            push[AInstr](out, ai_pop(A_X11()));
+            push[AInstr](out, ai_store(A_X10(), 0, A_X11()));
+            push[AInstr](out, ai_push(A_X10()));
+        }
+        return 1;
+    }
+    if (@strEq(fname, "delete") || @strEq(fname, "_zag_free")) {
+        // mmap regions are not freed incrementally (same model as x86)
+        if (nargs == 1) {
+            ac_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+            push[AInstr](out, ai_pop(A_X0()));
+        }
+        push[AInstr](out, ai_mov_imm(A_X0(), 0));
+        push[AInstr](out, ai_push(A_X0()));
+        return 1;
+    }
+    if (@strEq(fname, "_zag_malloc")) {
+        if (nargs != 1) { ac_err(cg, "arm64: _zag_malloc expects one argument"); return 1; }
+        ac_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+        push[AInstr](out, ai_pop(A_X0()));
+        cg.*.use_al = 1;
+        push[AInstr](out, ai_call(cg.*.al_lbl));
         push[AInstr](out, ai_push(A_X0()));
         return 1;
     }
     return 0;
 }
 
-fn ac_cond_branch(out: *ArrayList[AInstr], cond: *Node, slots: *ASlots, slot_n: *i32, syms: ArrayList[AFnSym], cg: *ACg, lbl: i32) void {
-    ac_lower_expr(out, cond, slots, slot_n, syms, cg);
+// ── statements ───────────────────────────────────────────────────────────────
+
+fn ac_cond_branch(out: *ArrayList[AInstr], cond: *Node, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg, lbl: i32) void {
+    ac_lower_expr(out, cond, env, syms, cg);
     push[AInstr](out, ai_pop(A_X0()));
     push[AInstr](out, ai_cmp_imm(A_X0(), 0));
     push[AInstr](out, ai_je(lbl));
 }
 
-fn ac_lower_stmt(out: *ArrayList[AInstr], n: *Node, slots: *ASlots, slot_n: *i32, syms: ArrayList[AFnSym], cg: *ACg) void {
+fn ac_lower_stmt(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) void {
     switch (n.*) {
         .let_ => |l| {
-            ac_lower_expr(out, l.expr, slots, slot_n, syms, cg);
-            push[AInstr](out, ai_pop(A_X0()));
-            let disp: i32 = ac_slot_find(slots, slot_n, l.name);
-            if (disp == 0) { disp = ac_slot_alloc(slots, cg, l.name); }
-            push[AInstr](out, ai_store(A_X29(), disp, A_X0()));
+            let ty: []u8 = "";
+            if (l.has_dty == 1) { ty = l.dty; }
+            else if (l.has_init == 1) { ty = ac_expr_type(l.expr, env, syms, cg); }
+            let w: i32 = ac_type_words(cg, ty);
+            let disp: i32 = ac_slot_alloc_br(env, cg, l.name, ty, w, 0);
+            if (l.has_init == 1) {
+                ac_lower_expr(out, l.expr, env, syms, cg);
+                if (ac_is_aggregate(cg, ty) == 1) {
+                    push[AInstr](out, ai_pop(A_X11()));
+                    ac_emit_lea(out, A_X10(), disp);
+                    ac_emit_copy(out, w);
+                } else {
+                    push[AInstr](out, ai_pop(A_X0()));
+                    push[AInstr](out, ai_store(A_X29(), disp, A_X0()));
+                }
+            }
         }
         .assign => |a| {
-            ac_lower_expr(out, a.expr, slots, slot_n, syms, cg);
-            push[AInstr](out, ai_pop(A_X0()));
+            let tty: []u8 = ac_expr_type(a.target, env, syms, cg);
+            let is_byte: i32 = 0;
             switch (a.target.*) {
-                .id => |x| {
-                    let disp: i32 = ac_slot_find(slots, slot_n, x.name);
-                    if (disp == 0) { ac_err(cg, "arm64: assign to unknown variable"); }
-                    else { push[AInstr](out, ai_store(A_X29(), disp, A_X0())); }
-                }
-                else => { ac_err(cg, "arm64: unsupported assign target"); }
+                .idx => |_ix| { if (ac_elem_is_byte(tty) == 1) { is_byte = 1; } }
+                else => { }
+            }
+            ac_lower_addr(out, a.target, env, syms, cg);
+            ac_lower_expr(out, a.expr, env, syms, cg);
+            if (ac_is_aggregate(cg, tty) == 1) {
+                push[AInstr](out, ai_pop(A_X11()));
+                push[AInstr](out, ai_pop(A_X10()));
+                ac_emit_copy(out, ac_type_words(cg, tty));
+            } else {
+                push[AInstr](out, ai_pop(A_X0()));
+                push[AInstr](out, ai_pop(A_X10()));
+                if (is_byte == 1) { push[AInstr](out, ai_storeb(A_X10(), 0, A_X0())); }
+                else { push[AInstr](out, ai_store(A_X10(), 0, A_X0())); }
             }
         }
         .ret => |r| {
             if (r.has_expr == 1) {
-                ac_lower_expr(out, r.expr, slots, slot_n, syms, cg);
-                push[AInstr](out, ai_pop(A_X0()));
+                ac_lower_expr(out, r.expr, env, syms, cg);
+                if (cg.*.sret_words > 0) {
+                    push[AInstr](out, ai_pop(A_X11()));
+                    push[AInstr](out, ai_load(A_X10(), A_X29(), cg.*.sret_disp));
+                    ac_emit_copy(out, cg.*.sret_words);
+                    push[AInstr](out, ai_mov_rr(A_X0(), A_X10()));
+                } else {
+                    push[AInstr](out, ai_pop(A_X0()));
+                }
             } else {
                 push[AInstr](out, ai_mov_imm(A_X0(), 0));
             }
@@ -477,88 +1126,93 @@ fn ac_lower_stmt(out: *ArrayList[AInstr], n: *Node, slots: *ASlots, slot_n: *i32
         .if_ => |x| {
             let l_else: i32 = ac_fresh(cg);
             let l_end: i32 = ac_fresh(cg);
-            ac_cond_branch(out, x.cond, slots, slot_n, syms, cg, l_else);
-            ac_lower_block(out, x.then_body, slots, slot_n, syms, cg);
+            ac_cond_branch(out, x.cond, env, syms, cg, l_else);
+            ac_lower_block(out, x.then_body, env, syms, cg);
             push[AInstr](out, ai_jmp(l_end));
             push[AInstr](out, ai_label(l_else));
-            ac_lower_block(out, x.els_body, slots, slot_n, syms, cg);
+            ac_lower_block(out, x.els_body, env, syms, cg);
             push[AInstr](out, ai_label(l_end));
         }
         .while_ => |w| {
             let l_top: i32 = ac_fresh(cg);
             let l_end: i32 = ac_fresh(cg);
             push[AInstr](out, ai_label(l_top));
-            ac_cond_branch(out, w.cond, slots, slot_n, syms, cg, l_end);
-            ac_lower_block(out, w.body, slots, slot_n, syms, cg);
+            ac_cond_branch(out, w.cond, env, syms, cg, l_end);
+            ac_lower_block(out, w.body, env, syms, cg);
             push[AInstr](out, ai_jmp(l_top));
             push[AInstr](out, ai_label(l_end));
         }
+        .switch_ => |sw| {
+            ac_lower_switch(out, sw, env, syms, cg);
+        }
         .estmt => |e| {
-            ac_lower_expr(out, e.expr, slots, slot_n, syms, cg);
+            ac_lower_expr(out, e.expr, env, syms, cg);
             push[AInstr](out, ai_pop(A_X0()));
         }
         else => { ac_err(cg, "arm64: unsupported statement"); }
     }
 }
 
-fn ac_lower_block(out: *ArrayList[AInstr], body: ArrayList[*Node], slots: *ASlots, slot_n: *i32, syms: ArrayList[AFnSym], cg: *ACg) void {
+// switch on a scalar (enum value / integer). Captures are not yet supported.
+fn ac_lower_switch(out: *ArrayList[AInstr], sw: Switch, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) void {
+    let sty: []u8 = ac_expr_type(sw.subject, env, syms, cg);
+    if (ac_is_aggregate(cg, sty) == 1) {
+        ac_err(cg, "arm64: switch on aggregates (unions) not yet supported");
+        return;
+    }
+    let l_end: i32 = ac_fresh(cg);
+    let l_els: i32 = ac_fresh(cg);
+    let narms: i32 = len[SwitchArm](sw.arms);
+    let arm_lbls: ArrayList[i32] = make[i32](narms + 1);
+    let k: i32 = 0;
+    while (k < narms) { push[i32](&arm_lbls, ac_fresh(cg)); k = k + 1; }
+
+    ac_lower_expr(out, sw.subject, env, syms, cg);
+    push[AInstr](out, ai_pop(A_X0()));
+    let i: i32 = 0;
+    while (i < narms) {
+        let arm: SwitchArm = get[SwitchArm](sw.arms, i);
+        if (arm.has_cap == 1) {
+            ac_err(cg, "arm64: switch captures not yet supported");
+        }
+        let t: i32 = 0;
+        while (t < len[[]u8](arm.tags)) {
+            let tag: []u8 = get[[]u8](arm.tags, t);
+            let v: i32 = 0 - 1;
+            if (sty.len > 0) { v = ac_enum_member(cg, sty, tag); }
+            if (v < 0 && ac_is_int_text(tag) == 1) { v = ac_parse_i64(tag) as i32; }
+            if (v < 0) { ac_err(cg, _zag_str_concat("arm64: unknown switch tag: ", tag)); v = 0; }
+            push[AInstr](out, ai_cmp_imm(A_X0(), v as i64));
+            push[AInstr](out, ai_je(get[i32](arm_lbls, i)));
+            t = t + 1;
+        }
+        i = i + 1;
+    }
+    push[AInstr](out, ai_jmp(l_els));
+    i = 0;
+    while (i < narms) {
+        let arm2: SwitchArm = get[SwitchArm](sw.arms, i);
+        push[AInstr](out, ai_label(get[i32](arm_lbls, i)));
+        ac_lower_block(out, arm2.body, env, syms, cg);
+        push[AInstr](out, ai_jmp(l_end));
+        i = i + 1;
+    }
+    push[AInstr](out, ai_label(l_els));
+    if (sw.has_els == 1) { ac_lower_block(out, sw.els_body, env, syms, cg); }
+    push[AInstr](out, ai_label(l_end));
+}
+
+fn ac_lower_block(out: *ArrayList[AInstr], body: ArrayList[*Node], env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) void {
     let i: i32 = 0;
     while (i < len[*Node](body)) {
-        ac_lower_stmt(out, get[*Node](body, i), slots, slot_n, syms, cg);
+        ac_lower_stmt(out, get[*Node](body, i), env, syms, cg);
         i = i + 1;
     }
 }
 
-fn ac_scan_locals(body: ArrayList[*Node], words: *i32) void {
-    let i: i32 = 0;
-    while (i < len[*Node](body)) {
-        switch (get[*Node](body, i).*) {
-            .let_ => |_| { words.* = words.* + 1; }
-            .if_ => |x| {
-                ac_scan_locals(x.then_body, words);
-                ac_scan_locals(x.els_body, words);
-            }
-            .while_ => |w| { ac_scan_locals(w.body, words); }
-            else => { }
-        }
-        i = i + 1;
-    }
-}
+// ── functions ────────────────────────────────────────────────────────────────
 
-fn ac_fn_bind_slots(slots: *ASlots, slot_n: *i32, cg: *ACg, decls: ArrayList[*Node], di: i32) void {
-    slots.* = ac_slots_new();
-    cg.*.frame_words = 0;
-    switch (get[*Node](decls, di).*) {
-        .fn_decl => |f| {
-            let pk: i32 = 0;
-            while (pk < len[Param](f.params)) {
-                ac_slot_alloc(slots, cg, get[Param](f.params, pk).name);
-                pk = pk + 1;
-            }
-            ac_bind_locals(f.body, slots, cg);
-        }
-        else => { }
-    }
-    slot_n.* = slots.*.count;
-}
-
-fn ac_bind_locals(body: ArrayList[*Node], slots: *ASlots, cg: *ACg) void {
-    let i: i32 = 0;
-    while (i < len[*Node](body)) {
-        switch (get[*Node](body, i).*) {
-            .let_ => |l| { ac_slot_alloc(slots, cg, l.name); }
-            .if_ => |x| {
-                ac_bind_locals(x.then_body, slots, cg);
-                ac_bind_locals(x.els_body, slots, cg);
-            }
-            .while_ => |w| { ac_bind_locals(w.body, slots, cg); }
-            else => { }
-        }
-        i = i + 1;
-    }
-}
-
-fn ac_lower_fn(out: *ArrayList[AInstr], params: ArrayList[Param], body: ArrayList[*Node], lbl: i32, slots: *ASlots, slot_n: *i32, syms: ArrayList[AFnSym], cg: *ACg) void {
+fn ac_lower_fn(out: *ArrayList[AInstr], params: ArrayList[Param], ret: []u8, body: ArrayList[*Node], lbl: i32, syms: ArrayList[AFnSym], cg: *ACg) void {
     if (len[*Node](body) == 0) {
         ac_err(cg, "arm64: empty fn body in lower_fn");
         return;
@@ -566,11 +1220,32 @@ fn ac_lower_fn(out: *ArrayList[AInstr], params: ArrayList[Param], body: ArrayLis
 
     let epi: i32 = ac_fresh(cg);
     cg.*.epilogue = epi;
+    cg.*.frame_words = 0;
+    cg.*.sret_disp = 0;
+    cg.*.sret_words = 0;
+
+    let env: AEnv = ac_env_new();
+
+    // bind params: scalars inline, aggregates by-ref (caller passed a copy's address)
+    let pi: i32 = 0;
+    while (pi < len[Param](params)) {
+        let p: Param = get[Param](params, pi);
+        if (ac_is_aggregate(cg, p.pty) == 1) {
+            let _d1: i32 = ac_slot_alloc_br(&env, cg, p.name, p.pty, 1, 1);
+        } else {
+            let _d2: i32 = ac_slot_alloc_br(&env, cg, p.name, p.pty, 1, 0);
+        }
+        pi = pi + 1;
+    }
+    if (ac_is_aggregate(cg, ret) == 1) {
+        cg.*.sret_words = ac_type_words(cg, ret);
+        cg.*.sret_disp = ac_slot_scratch(cg, 1);
+    }
 
     // Lower the body into a scratch list first so cg.frame_words includes
     // every scratch slot (string literals etc.) before the frame is sized.
     let bodyins: ArrayList[AInstr] = make[AInstr](64);
-    ac_lower_block(&bodyins, body, slots, slot_n, syms, cg);
+    ac_lower_block(&bodyins, body, &env, syms, cg);
 
     // Frame: [SP .. SP+expr) expression stack, [X29-8*words .. X29) slots.
     let frame: i32 = ac_align16(8 * cg.*.frame_words) + ac_align16(8 * AC_EXPR_WORDS());
@@ -586,15 +1261,18 @@ fn ac_lower_fn(out: *ArrayList[AInstr], params: ArrayList[Param], body: ArrayLis
     push[AInstr](out, ai_sub_imm(A_SP(), frame as i64));
     push[AInstr](out, ai_mov_rr(A_X28(), A_SP()));
 
-    let pi: i32 = 0;
-    while (pi < len[Param](params)) {
-        let pname: []u8 = get[Param](params, pi).name;
-        let pdisp: i32 = ac_slot_find(slots, slot_n, pname);
-        let reg: i32 = a_arg_reg(pi);
+    let pj: i32 = 0;
+    while (pj < len[Param](params)) {
+        let pname: []u8 = get[Param](params, pj).name;
+        let pdisp: i32 = ac_slot_find(&env, pname);
+        let reg: i32 = a_arg_reg(pj);
         if (reg >= 0) {
             push[AInstr](out, ai_store(A_X29(), pdisp, reg));
         }
-        pi = pi + 1;
+        pj = pj + 1;
+    }
+    if (cg.*.sret_words > 0) {
+        push[AInstr](out, ai_store(A_X29(), cg.*.sret_disp, A_X8()));
     }
 
     let bi: i32 = 0;
@@ -710,6 +1388,21 @@ fn ac_emit_print_str(out: *ArrayList[AInstr], lbl: i32) void {
     push[AInstr](out, ai_ret());
 }
 
+// __alloc(x0=size): mmap(NULL, size, RW, PRIVATE|ANON, -1, 0) → x0
+// AArch64 Linux: mmap = 222; PROT_READ|PROT_WRITE = 3; MAP_PRIVATE|MAP_ANON = 34.
+fn ac_emit_alloc(out: *ArrayList[AInstr], lbl: i32) void {
+    push[AInstr](out, ai_label(lbl));
+    push[AInstr](out, ai_mov_rr(A_X1(), A_X0()));
+    push[AInstr](out, ai_mov_imm(A_X0(), 0));
+    push[AInstr](out, ai_mov_imm(A_X2(), 3));
+    push[AInstr](out, ai_mov_imm(A_X3(), 34));
+    push[AInstr](out, ai_mov_imm(A_X4(), 0 - 1));
+    push[AInstr](out, ai_mov_imm(A_X5(), 0));
+    push[AInstr](out, ai_mov_imm(A_X8(), 222));
+    push[AInstr](out, ai_svc());
+    push[AInstr](out, ai_ret());
+}
+
 fn aload_program(decls: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8]) ArrayList[AInstr] {
     let out: ArrayList[AInstr] = make[AInstr](128);
     let top_err: i32 = 0;
@@ -731,14 +1424,14 @@ fn aload_program(decls: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8])
                         si = si + 1;
                     }
                     if (found == 0) {
-                        push[AFnSym](&syms, AFnSym{ .name = f.name, .lbl = next_id, .nparams = len[Param](f.params) });
+                        push[AFnSym](&syms, AFnSym{ .name = f.name, .lbl = next_id, .nparams = len[Param](f.params), .ret = f.ret });
                         next_id = next_id + 1;
                     }
                 }
             }
-            .struct_ => |_| { }
-            .enum_ => |_| { }
-            .union_ => |_| { }
+            .struct_ => |_s| { }
+            .enum_ => |_e| { }
+            .union_ => |_u| { }
             else => {
                 _zag_eprintln("arm64: skipping unsupported top-level decl");
                 top_err = top_err + 1;
@@ -749,16 +1442,23 @@ fn aload_program(decls: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8])
 
     let pi_lbl: i32 = next_id;
     let ps_lbl: i32 = next_id + 1;
+    let al_lbl: i32 = next_id + 2;
     let cg: ACg = ACg{
-        .next = next_id + 2,
+        .next = next_id + 3,
         .err = top_err,
         .data = dataout,
         .pi_lbl = pi_lbl,
         .ps_lbl = ps_lbl,
+        .al_lbl = al_lbl,
         .use_pi = 0,
         .use_ps = 0,
+        .use_al = 0,
         .frame_words = 0,
         .epilogue = 0,
+        .sret_disp = 0,
+        .sret_words = 0,
+        .nl_off = 0 - 1,
+        .decls = decls,
     };
 
     let main_lbl: i32 = ac_find_fn(syms, "main");
@@ -784,10 +1484,7 @@ fn aload_program(decls: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8])
             .fn_decl => |f| {
                 if (f.is_extern == 0 && len[[]u8](f.tparams) == 0 && len[*Node](f.body) > 0) {
                     let lbl: i32 = ac_find_fn(syms, f.name);
-                    let slots: ASlots = ac_slots_new();
-                    let slot_n: i32 = 0;
-                    ac_fn_bind_slots(&slots, &slot_n, &cg, decls, di);
-                    ac_lower_fn(&out, f.params, f.body, lbl, &slots, &slot_n, syms, &cg);
+                    ac_lower_fn(&out, f.params, f.ret, f.body, lbl, syms, &cg);
                 }
             }
             else => { }
@@ -797,6 +1494,7 @@ fn aload_program(decls: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8])
 
     if (cg.use_pi == 1) { ac_emit_print_int(&out, cg.pi_lbl, &cg); }
     if (cg.use_ps == 1) { ac_emit_print_str(&out, cg.ps_lbl); }
+    if (cg.use_al == 1) { ac_emit_alloc(&out, cg.al_lbl); }
 
     errout.* = cg.err;
     return out;

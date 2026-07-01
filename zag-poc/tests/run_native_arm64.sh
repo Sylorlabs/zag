@@ -66,6 +66,28 @@ nto "print big i64"  'fn main() i32 { print_int(123456789012); return 0; }' "123
 nto "print_str"      'fn main() i32 { print_str("hello\n"); return 0; }' "hello" 0
 nto "println str"    'fn main() i32 { _zag_println("world\n"); return 0; }' "world" 0
 
+echo "── data model: structs, pointers, heap, slices, enums ──"
+nt "struct fields"   'struct P { x: i32, y: i32 } fn main() i32 { let p: P = P{ .x = 40, .y = 2 }; return p.x + p.y; }' 42
+nt "struct field set" 'struct P { x: i32, y: i32 } fn main() i32 { let p: P = P{ .x = 8, .y = 1 }; p.y = 5; return p.x * p.y; }' 40
+nt "nested struct"   'struct In { v: i32 } struct Out { a: In, b: i32 } fn main() i32 { let o: Out = Out{ .a = In{ .v = 40 }, .b = 2 }; return o.a.v + o.b; }' 42
+nt "struct byval arg" 'struct P { x: i32, y: i32 } fn zap(p: P) i32 { p.x = 0; return p.x; } fn main() i32 { let p: P = P{ .x = 40, .y = 2 }; let z: i32 = zap(p); return p.x + z; }' 40
+nt "struct return"   'struct P { x: i32, y: i32 } fn mk(x: i32, y: i32) P { return P{ .x = x, .y = y }; } fn main() i32 { let p: P = mk(40, 2); return p.x + p.y; }' 42
+nt "ptr to scalar"   'fn main() i32 { let a: i32 = 1; let pa: *i32 = &a; pa.* = 42; return a; }' 42
+nt "ptr to struct"   'struct P { x: i32, y: i32 } fn main() i32 { let p: P = P{ .x = 1, .y = 2 }; let q: *P = &p; q.*.x = 40; return p.x + p.y; }' 42
+nt "ptr arg mutate"  'struct P { x: i32, y: i32 } fn bump(q: *P) i32 { q.*.x = q.*.x + 1; return 0; } fn main() i32 { let p: P = P{ .x = 41, .y = 0 }; let z: i32 = bump(&p); return p.x + z; }' 42
+nt "new + deref"     'struct P { x: i32, y: i32 } fn main() i32 { let q: *P = new(P{ .x = 40, .y = 2 }); let r: i32 = q.*.x + q.*.y; delete(q); return r; }' 42
+nt "new scalar"      'fn main() i32 { let q: *i32 = new(42); return q.*; }' 42
+nt "malloc bytes"    'fn main() i32 { let b: *u8 = _zag_malloc(8); b[0] = 65; b[1] = 66; return (b[0] as i32) + (b[1] as i32) - 89; }' 42
+nt "slice len"       'fn main() i32 { let s: []u8 = "hello"; return s.len; }' 5
+nt "slice index"     'fn main() i32 { let s: []u8 = "hello"; return s[1] as i32; }' 101
+nt "subslice"        'fn main() i32 { let s: []u8 = "hello"; let t: []u8 = s[1..3]; return t.len + (t[0] as i32) - 60; }' 43
+nt "subslice open"   'fn main() i32 { let s: []u8 = "hello"; let t: []u8 = s[2..]; return t.len; }' 3
+nt "slice byval arg" 'fn first(s: []u8) i32 { return s[0] as i32; } fn main() i32 { return first("*hi") - 2; }' 40
+nt "enum compare"    'enum Color { red, green, blue } fn main() i32 { let c: Color = Color.green; if (c == Color.green) { return 11; } return 0; }' 11
+nt "enum switch"     'enum Color { red, green, blue } fn main() i32 { let c: Color = Color.blue; switch (c) { .red => { return 1; } .green => { return 2; } .blue => { return 42; } } return 0; }' 42
+nto "print_str var"  'fn main() i32 { let s: []u8 = "dyn\n"; print_str(s); return 0; }' "dyn" 0
+nto "println var"    'fn main() i32 { let s: []u8 = "dyn2"; _zag_println(s); return 0; }' "dyn2" 0
+
 # static ELF, no interpreter
 printf 'fn main() i32 { return 0; }' > nt_src.zag
 "$ZNC" nt_src.zag --target arm64 -o /tmp/nt_elf >/dev/null 2>&1
