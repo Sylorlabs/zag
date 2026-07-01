@@ -24,7 +24,7 @@ check() {
     fi
 }
 
-check_version() { "$ZNC" version | grep -q '^znc 2026\.06\.0-dev (edition 2026)$'; }
+check_version() { "$ZNC" version | grep -q '^znc 2026\.07\.0-dev (edition 2026)$'; }
 
 check_format() {
     printf 'fn main() i32{let x:i32=40+2;return x;}\n' >"$tmp/input.zag"
