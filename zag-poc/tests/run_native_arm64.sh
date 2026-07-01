@@ -116,6 +116,16 @@ nt "try propagate"   'error { Err } fn sdiv(a: i32, b: i32) !i32 { if (b == 0) {
 nt "try success"     'error { Err } fn sdiv(a: i32, b: i32) !i32 { if (b == 0) { return error.Err; } return a / b; } fn calc(a: i32, b: i32) !i32 { let q: i32 = try sdiv(a, b); return q * 2; } fn main() i32 { return calc(10, 2) catch 0 - 1; }' 10
 nt "catch capture"   'error { NotFound, OutOfRange } fn ge(x: i32) !i32 { if (x == 0) { return error.NotFound; } if (x == 1) { return error.OutOfRange; } return x; } fn main() i32 { let a: i32 = ge(0) catch |e| e; let b: i32 = ge(1) catch |e| e; if (a != b && a > 0 && b > 0) { return 42; } return 0; }' 42
 
+echo "── floats (f64/f32 held as doubles) ──"
+nt "f64 add cmp"     'fn main() i32 { let x: f64 = 1.5; let y: f64 = 2.5; if (x + y == 4.0) { return 42; } return 1; }' 42
+nt "f64 div as i32"  'fn main() i32 { let x: f64 = 7.0; let y: f64 = 2.0; return (x / y) as i32; }' 3
+nt "int to f64 back" 'fn main() i32 { let n: i32 = 7; let f: f64 = n as f64; return f as i32; }' 7
+nt "f64 mul sub"     'fn main() i32 { let a: f64 = 6.5; let b: f64 = 8.0; return (a * b - 10.0) as i32; }' 42
+nt "f64 neg"         'fn main() i32 { let a: f64 = -3.5; let b: f64 = 0.0 - a; return (b * 12.0) as i32; }' 42
+nt "f64 compare lt"  'fn main() i32 { let a: f64 = 1.25; let b: f64 = 1.5; if (a < b && b > a && a <= a && b >= b && a != b) { return 42; } return 1; }' 42
+nt "f32 via f64"     'fn main() i32 { let a: f32 = 10.5; let b: f32 = 4.0; return (a * b) as i32; }' 42
+nt "f64 fn arg ret"  'fn half(x: f64) f64 { return x / 2.0; } fn main() i32 { return half(84.0) as i32; }' 42
+
 echo "── real programs (output must be byte-identical to x86) ──"
 for prog in arena hash_map sort_bench state_machine csv_parser json_parser; do
     if ! "$ZNC" "programs/$prog.zag" -o /tmp/np_x86 >/dev/null 2>&1; then
