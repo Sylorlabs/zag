@@ -257,6 +257,7 @@ fn ac_type_size(cg: *ACg, ty0: []u8) i32 {
     if (ty.len == 0) { return 8; }
     if (ty[0] == '*') { return 8; }
     if (ac_type_is_slice(ty) == 1) { return 16; }
+    if (ty[0] == '!') { return 16; }               // !T error union = {err_code, val}
     if (ty[0] == '?') { return 8 + ac_round8(ac_type_size(cg, ty[1..])); }
     let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1), .tparams = make[[]u8](1), .is_pub = 0 };
     if (ac_find_struct(cg, ty, &sd) == 1) {
@@ -298,6 +299,7 @@ fn ac_is_aggregate(cg: *ACg, ty0: []u8) i32 {
     if (ty.len == 0) { return 0; }
     if (ty[0] == '*') { return 0; }
     if (ac_type_is_slice(ty) == 1) { return 1; }
+    if (ty[0] == '!') { return 1; }
     if (ty[0] == '?') { return 1; }
     let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1), .tparams = make[[]u8](1), .is_pub = 0 };
     if (ac_find_struct(cg, ty, &sd) == 1) { return 1; }
@@ -522,6 +524,11 @@ fn ac_expr_type(n: *Node, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) []u8 {
             if (@strEq(u.op, "&")) {
                 return _zag_str_concat("*", ac_expr_type(u.e, env, syms, cg));
             }
+            if (@strEq(u.op, "try")) {
+                let ety: []u8 = ac_expr_type(u.e, env, syms, cg);
+                if (ety.len > 1 && ety[0] == '!') { return ety[1..]; }
+                return ety;
+            }
             return ac_expr_type(u.e, env, syms, cg);
         }
         .call => |c| {
@@ -536,6 +543,11 @@ fn ac_expr_type(n: *Node, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) []u8 {
                     if (@strEq(fnid.name, "_zag_malloc") || @strEq(fnid.name, "_zag_realloc")) { return "*u8"; }
                     if (@strEq(fnid.name, "_zag_i64_to_str")) { return "[]u8"; }
                     if (@strEq(fnid.name, "_zag_strcmp")) { return "i32"; }
+                    if (@strEq(fnid.name, "__catch") || @strEq(fnid.name, "__catchc")) {
+                        let cty0: []u8 = ac_expr_type(get[*Node](c.args, 0), env, syms, cg);
+                        if (cty0.len > 1 && cty0[0] == '!') { return cty0[1..]; }
+                        return cty0;
+                    }
                     if (fnid.name.len > 0 && fnid.name[0] == '@') { return ""; }
                     if (len[[]u8](c.targs) > 0) {
                         return ac_find_fn_ret(syms, cg_mangle_generic_norm(fnid.name, c.targs));
@@ -546,9 +558,10 @@ fn ac_expr_type(n: *Node, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) []u8 {
             }
         }
         .fld => |f| {
-            // enum member constant: Color.red
+            // enum member constant: Color.red ; error.X → i32 code
             switch (f.base.*) {
                 .id => |bid| {
+                    if (@strEq(bid.name, "error")) { return "i32"; }
                     if (ac_slot_find(env, bid.name) == 0 && ac_is_enum(cg, bid.name) == 1) {
                         return bid.name;
                     }
@@ -739,6 +752,27 @@ fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
                 push[AInstr](out, ai_push(A_X0()));
             } else if (@strEq(u.op, "&")) {
                 ac_lower_addr(out, u.e, env, syms, cg);
+            } else if (@strEq(u.op, "try")) {
+                // try expr — expr is !T {err@0,val@8}; err==0 → val, else propagate.
+                let l_ok: i32 = ac_fresh(cg);
+                ac_lower_expr(out, u.e, env, syms, cg);   // pushes &{err,val}
+                push[AInstr](out, ai_pop(A_X10()));
+                push[AInstr](out, ai_load(A_X0(), A_X10(), 0));
+                push[AInstr](out, ai_cmp_imm(A_X0(), 0));
+                push[AInstr](out, ai_je(l_ok));
+                if (cg.*.ret_ty.len > 1 && cg.*.ret_ty[0] == '!') {
+                    push[AInstr](out, ai_load(A_X11(), A_X29(), cg.*.sret_disp));
+                    push[AInstr](out, ai_store(A_X11(), 0, A_X0()));
+                    push[AInstr](out, ai_mov_imm(A_X9(), 0));
+                    push[AInstr](out, ai_store(A_X11(), 8, A_X9()));
+                    push[AInstr](out, ai_mov_rr(A_X0(), A_X11()));
+                } else {
+                    ac_err(cg, "arm64: try in a fn that does not return !T");
+                }
+                push[AInstr](out, ai_jmp(cg.*.epilogue));
+                push[AInstr](out, ai_label(l_ok));
+                push[AInstr](out, ai_load(A_X0(), A_X10(), 8));
+                push[AInstr](out, ai_push(A_X0()));
             } else {
                 ac_err(cg, "arm64: unsupported unary operator");
                 push[AInstr](out, ai_mov_imm(A_X0(), 0));
@@ -922,9 +956,16 @@ fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
             push[AInstr](out, ai_push(A_X0()));
         }
         .fld => |f| {
-            // enum member constant
+            // enum member constant / error.X code (index+1 in __zag_errors)
             switch (f.base.*) {
                 .id => |bid| {
+                    if (@strEq(bid.name, "error")) {
+                        let ecv: i32 = ac_enum_member(cg, "__zag_errors", f.fname);
+                        if (ecv < 0) { ac_err(cg, _zag_str_concat("arm64: unknown error: ", f.fname)); ecv = 0 - 1; }
+                        push[AInstr](out, ai_mov_imm(A_X0(), (ecv + 1) as i64));
+                        push[AInstr](out, ai_push(A_X0()));
+                        return;
+                    }
                     if (ac_slot_find(env, bid.name) == 0 && ac_is_enum(cg, bid.name) == 1) {
                         let mv: i32 = ac_enum_member(cg, bid.name, f.fname);
                         if (mv < 0) { ac_err(cg, _zag_str_concat("arm64: unknown enum member: ", f.fname)); mv = 0; }
@@ -1266,6 +1307,46 @@ fn ac_lower_builtin(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv, s
         push[AInstr](out, ai_push(A_X0()));
         return 1;
     }
+    if (@strEq(fname, "__catch")) {
+        let l_ok: i32 = ac_fresh(cg);
+        let l_done: i32 = ac_fresh(cg);
+        ac_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);   // &{err,val}
+        push[AInstr](out, ai_pop(A_X10()));
+        push[AInstr](out, ai_load(A_X0(), A_X10(), 0));
+        push[AInstr](out, ai_cmp_imm(A_X0(), 0));
+        push[AInstr](out, ai_je(l_ok));
+        ac_lower_expr(out, get[*Node](c.args, 1), env, syms, cg);   // fallback
+        push[AInstr](out, ai_jmp(l_done));
+        push[AInstr](out, ai_label(l_ok));
+        push[AInstr](out, ai_load(A_X0(), A_X10(), 8));
+        push[AInstr](out, ai_push(A_X0()));
+        push[AInstr](out, ai_label(l_done));
+        return 1;
+    }
+    if (@strEq(fname, "__catchc")) {
+        let l_ok: i32 = ac_fresh(cg);
+        let l_done: i32 = ac_fresh(cg);
+        ac_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+        push[AInstr](out, ai_pop(A_X10()));
+        push[AInstr](out, ai_load(A_X0(), A_X10(), 0));
+        push[AInstr](out, ai_cmp_imm(A_X0(), 0));
+        push[AInstr](out, ai_je(l_ok));
+        // bind |err| to the code, then evaluate the fallback
+        switch (get[*Node](c.args, 1).*) {
+            .id => |eid| {
+                let ed: i32 = ac_slot_alloc_br(env, cg, eid.name, "i32", 1, 0);
+                push[AInstr](out, ai_store(A_X29(), ed, A_X0()));
+            }
+            else => { ac_err(cg, "arm64: catch capture must be an identifier"); }
+        }
+        ac_lower_expr(out, get[*Node](c.args, 2), env, syms, cg);
+        push[AInstr](out, ai_jmp(l_done));
+        push[AInstr](out, ai_label(l_ok));
+        push[AInstr](out, ai_load(A_X0(), A_X10(), 8));
+        push[AInstr](out, ai_push(A_X0()));
+        push[AInstr](out, ai_label(l_done));
+        return 1;
+    }
     if (@strEq(fname, "_zag_strcmp")) {
         if (nargs != 2) { ac_err(cg, "arm64: _zag_strcmp expects two arguments"); return 1; }
         ac_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
@@ -1471,6 +1552,34 @@ fn ac_lower_stmt(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
         }
         .ret => |r| {
             if (r.has_expr == 1) {
+                if (cg.*.sret_words > 0 && cg.*.ret_ty.len > 1 && cg.*.ret_ty[0] == '!') {
+                    // !T error-union return: `return error.X` → {code, 0};
+                    // `return val` → {0, val}. Scalar payloads only (as on x86).
+                    let is_err_ret: i32 = 0;
+                    switch (r.expr.*) {
+                        .fld => |ef| {
+                            switch (ef.base.*) {
+                                .id => |eid2| { if (@strEq(eid2.name, "error")) { is_err_ret = 1; } }
+                                else => { }
+                            }
+                        }
+                        else => { }
+                    }
+                    ac_lower_expr(out, r.expr, env, syms, cg);
+                    push[AInstr](out, ai_pop(A_X0()));
+                    push[AInstr](out, ai_load(A_X10(), A_X29(), cg.*.sret_disp));
+                    push[AInstr](out, ai_mov_imm(A_X9(), 0));
+                    if (is_err_ret == 1) {
+                        push[AInstr](out, ai_store(A_X10(), 0, A_X0()));
+                        push[AInstr](out, ai_store(A_X10(), 8, A_X9()));
+                    } else {
+                        push[AInstr](out, ai_store(A_X10(), 8, A_X0()));
+                        push[AInstr](out, ai_store(A_X10(), 0, A_X9()));
+                    }
+                    push[AInstr](out, ai_mov_rr(A_X0(), A_X10()));
+                    push[AInstr](out, ai_jmp(cg.*.epilogue));
+                    return;
+                }
                 if (cg.*.sret_words > 0 && ac_is_optional(cg.*.ret_ty) == 1 && ac_is_null_node(r.expr) == 1) {
                     push[AInstr](out, ai_load(A_X10(), A_X29(), cg.*.sret_disp));
                     push[AInstr](out, ai_mov_imm(A_X9(), 0));

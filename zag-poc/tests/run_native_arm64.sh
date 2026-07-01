@@ -108,6 +108,14 @@ nt "nested generics" '@import("std/list.zag") fn main() i32 { let m: ArrayList[A
 nt "struct elems+pop" '@import("std/list.zag") struct Pt { x: i32, y: i32 } fn main() i32 { let ps: ArrayList[Pt] = make[Pt](1); push[Pt](&ps, Pt{ .x = 30, .y = 8 }); push[Pt](&ps, Pt{ .x = 1, .y = 2 }); let p: Pt = pop[Pt](&ps); return p.x + p.y + get[Pt](ps, 0).x + get[Pt](ps, 0).y + len[Pt](ps); }' 42
 nt "strEq/strLen"    'fn main() i32 { let s: []u8 = "hello"; let c: i32 = 0; if (@strEq(s, "hello")) { c = c + 1; } if (!@strEq(s, "world")) { c = c + 1; } if (@strLen(s) == 5) { c = c + 40; } return c; }' 42
 
+echo "── error unions (!T, try, catch) ──"
+nt "catch ok"        'error { Err } fn sdiv(a: i32, b: i32) !i32 { if (b == 0) { return error.Err; } return a / b; } fn main() i32 { return sdiv(84, 2) catch 0; }' 42
+nt "catch fallback"  'error { Err } fn sdiv(a: i32, b: i32) !i32 { if (b == 0) { return error.Err; } return a / b; } fn main() i32 { return sdiv(5, 0) catch 7; }' 7
+nt "catch success"   'error { Err } fn sdiv(a: i32, b: i32) !i32 { if (b == 0) { return error.Err; } return a / b; } fn main() i32 { return sdiv(10, 2) catch 0 - 1; }' 5
+nt "try propagate"   'error { Err } fn sdiv(a: i32, b: i32) !i32 { if (b == 0) { return error.Err; } return a / b; } fn calc(a: i32, b: i32) !i32 { let q: i32 = try sdiv(a, b); return q * 2; } fn main() i32 { return calc(10, 0) catch 99; }' 99
+nt "try success"     'error { Err } fn sdiv(a: i32, b: i32) !i32 { if (b == 0) { return error.Err; } return a / b; } fn calc(a: i32, b: i32) !i32 { let q: i32 = try sdiv(a, b); return q * 2; } fn main() i32 { return calc(10, 2) catch 0 - 1; }' 10
+nt "catch capture"   'error { NotFound, OutOfRange } fn ge(x: i32) !i32 { if (x == 0) { return error.NotFound; } if (x == 1) { return error.OutOfRange; } return x; } fn main() i32 { let a: i32 = ge(0) catch |e| e; let b: i32 = ge(1) catch |e| e; if (a != b && a > 0 && b > 0) { return 42; } return 0; }' 42
+
 echo "── real programs (output must be byte-identical to x86) ──"
 for prog in arena hash_map sort_bench state_machine csv_parser json_parser; do
     if ! "$ZNC" "programs/$prog.zag" -o /tmp/np_x86 >/dev/null 2>&1; then
