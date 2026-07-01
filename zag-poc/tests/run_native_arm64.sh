@@ -99,6 +99,15 @@ nt "opt fn return"   'fn find(k: i32) ?i32 { if (k > 0) { return k * 2; } return
 nt "while-let"       'fn main() i32 { let o: ?i32 = 3; let s: i32 = 0; while (o) |v| { s = s + v; if (v == 1) { o = null; } else { o = v - 1; } } return s * 7; }' 42
 nt "scoped shadow"   'fn main() i32 { let x: i32 = 40; if (x > 0) { let x: i32 = 2; if (x != 2) { return 1; } } return x + 2; }' 42
 
+echo "── generics (monomorphization) + string builtins ──"
+nt "generic identity" 'fn id[T](x: T) T { return x; } fn main() i32 { return id[i32](42); }' 42
+nt "generic infer"   'fn id[T](x: T) T { return x; } fn main() i32 { return id(42); }' 42
+nt "arraylist sum"   '@import("std/list.zag") fn main() i32 { let xs: ArrayList[i32] = make[i32](2); let i: i32 = 0; while (i < 10) { push[i32](&xs, i); i = i + 1; } let s: i32 = 0; let j: i32 = 0; while (j < len[i32](xs)) { s = s + get[i32](xs, j); j = j + 1; } return s; }' 45
+nt "arraylist grow"  '@import("std/list.zag") fn main() i32 { let xs: ArrayList[u8] = make[u8](1); let i: i32 = 0; while (i < 100) { push[u8](&xs, (i % 7) as u8); i = i + 1; } return (get[u8](xs, 99) as i32) + len[u8](xs) - 59; }' 42
+nt "nested generics" '@import("std/list.zag") fn main() i32 { let m: ArrayList[ArrayList[i32]] = make[ArrayList[i32]](2); let r: ArrayList[i32] = make[i32](2); push[i32](&r, 20); push[i32](&r, 22); push[ArrayList[i32]](&m, r); let row: ArrayList[i32] = get[ArrayList[i32]](m, 0); return get[i32](row, 0) + get[i32](row, 1); }' 42
+nt "struct elems+pop" '@import("std/list.zag") struct Pt { x: i32, y: i32 } fn main() i32 { let ps: ArrayList[Pt] = make[Pt](1); push[Pt](&ps, Pt{ .x = 30, .y = 8 }); push[Pt](&ps, Pt{ .x = 1, .y = 2 }); let p: Pt = pop[Pt](&ps); return p.x + p.y + get[Pt](ps, 0).x + get[Pt](ps, 0).y + len[Pt](ps); }' 42
+nt "strEq/strLen"    'fn main() i32 { let s: []u8 = "hello"; let c: i32 = 0; if (@strEq(s, "hello")) { c = c + 1; } if (!@strEq(s, "world")) { c = c + 1; } if (@strLen(s) == 5) { c = c + 40; } return c; }' 42
+
 # static ELF, no interpreter
 printf 'fn main() i32 { return 0; }' > nt_src.zag
 "$ZNC" nt_src.zag --target arm64 -o /tmp/nt_elf >/dev/null 2>&1
