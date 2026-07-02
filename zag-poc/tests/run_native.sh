@@ -291,6 +291,20 @@ else
     echo "  XX  should reject try in non-!T function"; fail=$((fail+1))
 fi
 rm -f /tmp/nt_bin nt_src.zag
+# Arity check: wrong argument count is a compile error; correct count passes.
+rm -f /tmp/nt_bin
+printf 'fn add(a: i32, b: i32) i32 { return a + b; } fn main() i32 { return add(1); }' > nt_src.zag
+"$ZNC" nt_src.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
+if grep -q 'arity check FAILED' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
+    echo "  ok  rejects call with wrong argument count"; pass=$((pass+1))
+else
+    echo "  XX  should reject call with wrong argument count"; sed -n '1,4p' /tmp/nt_out; fail=$((fail+1))
+fi
+rm -f /tmp/nt_bin nt_src.zag
+
+# Exponent float literals: 1e3 / 2.5e-9 lex as floats and round-trip via %g.
+nto "exponent float literals" 'fn main() i32 { print_f64(2.5e-9); print_f64(1e3); return 0; }' "$(printf '2.5e-09\n1000')" 0
+
 # Run the full error-propagation integration test.
 "$ZNC" tests/error_propagation.zag -o /tmp/nt_ep >/tmp/nt_ep_out 2>&1
 if [ -x /tmp/nt_ep ]; then

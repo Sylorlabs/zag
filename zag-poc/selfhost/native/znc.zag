@@ -432,9 +432,209 @@ fn stem_of(path: []u8) []u8 {
     return base;
 }
 
+// ── call-arity check ─────────────────────────────────────────────────────────
+// Static pass: every call through a PLAIN top-level fn name must pass exactly
+// as many arguments as the decl has params. Skips builtins, @-intrinsics,
+// runtime externs, method sugar, and names shadowed by locals/params/captures
+// (those are fn-values whose arity is not statically known here).
+
+fn znc_arity_exempt(nm: []u8) i32 {
+    if (nm.len == 0) { return 1; }
+    if (nm[0] == '@') { return 1; }
+    if (cg_starts_with(nm, "_zag_") == 1) { return 1; }
+    if (cg_starts_with(nm, "__") == 1) { return 1; }
+    if (@strEq(nm, "new") || @strEq(nm, "delete")) { return 1; }
+    if (@strEq(nm, "print_int") || @strEq(nm, "print_i32") || @strEq(nm, "print_str")) { return 1; }
+    if (@strEq(nm, "print_f64") || @strEq(nm, "print_f32") || @strEq(nm, "print_u64") || @strEq(nm, "print_i64")) { return 1; }
+    if (@strEq(nm, "zalloc") || @strEq(nm, "zfree")) { return 1; }
+    if (@strEq(nm, "sinf") || @strEq(nm, "cosf") || @strEq(nm, "sqrtf")) { return 1; }
+    if (@strEq(nm, "sin") || @strEq(nm, "cos") || @strEq(nm, "sqrt")) { return 1; }
+    return 0;
+}
+
+fn znc_arity_in(names: ArrayList[[]u8], nm: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[[]u8](names)) {
+        if (@strEq(get[[]u8](names, i), nm)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn znc_arity_locals(body: ArrayList[*Node], outn: *ArrayList[[]u8]) void {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        switch (get[*Node](body, i).*) {
+            .let_ => |l| { push[[]u8](outn, l.name); }
+            .if_ => |x| {
+                if (x.has_cap == 1) { push[[]u8](outn, x.cap); }
+                znc_arity_locals(x.then_body, outn);
+                znc_arity_locals(x.els_body, outn);
+            }
+            .while_ => |w| {
+                if (w.has_cap == 1) { push[[]u8](outn, w.cap); }
+                znc_arity_locals(w.body, outn);
+            }
+            .switch_ => |sw| {
+                let ai: i32 = 0;
+                while (ai < len[SwitchArm](sw.arms)) {
+                    let arm: SwitchArm = get[SwitchArm](sw.arms, ai);
+                    if (arm.has_cap == 1) { push[[]u8](outn, arm.cap); }
+                    znc_arity_locals(arm.body, outn);
+                    ai = ai + 1;
+                }
+                if (sw.has_els == 1) { znc_arity_locals(sw.els_body, outn); }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+}
+
+fn znc_arity_find(decls: ArrayList[*Node], nm: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .fn_decl => |f| {
+                if (@strEq(f.name, nm) && f.is_extern == 0) { return len[Param](f.params); }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn znc_arity_expr(n: *Node, fname: []u8, locals: ArrayList[[]u8], decls: ArrayList[*Node], errs: *i32) void {
+    switch (n.*) {
+        .call => |c| {
+            switch (c.callee.*) {
+                .id => |fnid| {
+                    if (znc_arity_exempt(fnid.name) == 0 && znc_arity_in(locals, fnid.name) == 0) {
+                        let want: i32 = znc_arity_find(decls, fnid.name);
+                        if (want >= 0 && want != len[*Node](c.args)) {
+                            _zag_eprintln(_zag_str_concat("znc: error: call to '", _zag_str_concat(fnid.name,
+                                _zag_str_concat("' passes ", _zag_str_concat(_zag_i64_to_str(len[*Node](c.args) as i64),
+                                _zag_str_concat(" argument(s), expected ", _zag_str_concat(_zag_i64_to_str(want as i64),
+                                _zag_str_concat(" (in fn '", _zag_str_concat(fname, "')")))))))));
+                            errs.* = errs.* + 1;
+                        }
+                    }
+                }
+                .fld => |mf| { znc_arity_expr(mf.base, fname, locals, decls, errs); }
+                else => { }
+            }
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) {
+                znc_arity_expr(get[*Node](c.args, i), fname, locals, decls, errs);
+                i = i + 1;
+            }
+        }
+        .bin => |b| {
+            znc_arity_expr(b.l, fname, locals, decls, errs);
+            znc_arity_expr(b.r, fname, locals, decls, errs);
+        }
+        .un => |u| { znc_arity_expr(u.e, fname, locals, decls, errs); }
+        .idx => |ix| {
+            znc_arity_expr(ix.base, fname, locals, decls, errs);
+            znc_arity_expr(ix.idx, fname, locals, decls, errs);
+        }
+        .fld => |f| { znc_arity_expr(f.base, fname, locals, decls, errs); }
+        .cast_ => |cst| { znc_arity_expr(cst.expr, fname, locals, decls, errs); }
+        .slit_ => |sl| {
+            let i2: i32 = 0;
+            while (i2 < len[FieldInit](sl.fields)) {
+                znc_arity_expr(get[FieldInit](sl.fields, i2).val, fname, locals, decls, errs);
+                i2 = i2 + 1;
+            }
+        }
+        .slice_ => |sc| {
+            znc_arity_expr(sc.base, fname, locals, decls, errs);
+            znc_arity_expr(sc.lo, fname, locals, decls, errs);
+            if (sc.has_hi == 1) { znc_arity_expr(sc.hi, fname, locals, decls, errs); }
+        }
+        else => { }
+    }
+}
+
+fn znc_arity_block(body: ArrayList[*Node], fname: []u8, locals: ArrayList[[]u8], decls: ArrayList[*Node], errs: *i32) void {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        switch (get[*Node](body, i).*) {
+            .let_ => |l| { if (l.has_init == 1) { znc_arity_expr(l.expr, fname, locals, decls, errs); } }
+            .assign => |a| {
+                znc_arity_expr(a.target, fname, locals, decls, errs);
+                znc_arity_expr(a.expr, fname, locals, decls, errs);
+            }
+            .ret => |r| { if (r.has_expr == 1) { znc_arity_expr(r.expr, fname, locals, decls, errs); } }
+            .if_ => |x| {
+                znc_arity_expr(x.cond, fname, locals, decls, errs);
+                znc_arity_block(x.then_body, fname, locals, decls, errs);
+                znc_arity_block(x.els_body, fname, locals, decls, errs);
+            }
+            .while_ => |w| {
+                znc_arity_expr(w.cond, fname, locals, decls, errs);
+                znc_arity_block(w.body, fname, locals, decls, errs);
+            }
+            .switch_ => |sw| {
+                znc_arity_expr(sw.subject, fname, locals, decls, errs);
+                let ai: i32 = 0;
+                while (ai < len[SwitchArm](sw.arms)) {
+                    znc_arity_block(get[SwitchArm](sw.arms, ai).body, fname, locals, decls, errs);
+                    ai = ai + 1;
+                }
+                if (sw.has_els == 1) { znc_arity_block(sw.els_body, fname, locals, decls, errs); }
+            }
+            .estmt => |e| { znc_arity_expr(e.expr, fname, locals, decls, errs); }
+            else => { }
+        }
+        i = i + 1;
+    }
+}
+
+fn znc_check_arity(decls: ArrayList[*Node]) i32 {
+    let errs: i32 = 0;
+    let di: i32 = 0;
+    while (di < len[*Node](decls)) {
+        switch (get[*Node](decls, di).*) {
+            .fn_decl => |f| {
+                if (f.is_extern == 0 && len[*Node](f.body) > 0 && cg_starts_with(f.name, "__iface_") == 0) {
+                    let locals: ArrayList[[]u8] = make[[]u8](8);
+                    let pi: i32 = 0;
+                    while (pi < len[Param](f.params)) {
+                        push[[]u8](&locals, get[Param](f.params, pi).name);
+                        pi = pi + 1;
+                    }
+                    // closure captures are locals too (may hold fn-values)
+                    if (f.cap_names.len > 0) {
+                        let cns: ArrayList[[]u8] = split_args(f.cap_names);
+                        let ci: i32 = 0;
+                        while (ci < len[[]u8](cns)) {
+                            let cn: []u8 = get[[]u8](cns, ci);
+                            if (cn.len > 0 && cn[0] == '*') { push[[]u8](&locals, cn[1..]); }
+                            else { push[[]u8](&locals, cn); }
+                            ci = ci + 1;
+                        }
+                    }
+                    znc_arity_locals(f.body, &locals);
+                    znc_arity_block(f.body, f.name, locals, decls, &errs);
+                }
+            }
+            else => { }
+        }
+        di = di + 1;
+    }
+    return errs;
+}
+
 fn znc_check_src(path: []u8, src: []u8) i32 {
     let decls: ArrayList[*Node] = parse_program_dir(src, dir_of(path));
     lo_operators(decls);
+    let aerrs: i32 = znc_check_arity(decls);
+    if (aerrs > 0) {
+        _zag_println("znc: arity check FAILED");
+        return 1;
+    }
     let eff: map__StringMap[i32] = analyze(decls);
     let viols: i32 = report_violations(decls, eff, src, path);
     if (viols > 0) {
@@ -700,6 +900,13 @@ fn main() i32 {
 
     // Lower operator contracts (x + y → big_add(x, y)) so sema sees the real calls.
     lo_operators(decls);
+
+    // Static call-arity check (also runs for arm64/wasm/gpu via znc_check_src).
+    let aerrs: i32 = znc_check_arity(decls);
+    if (aerrs > 0) {
+        _zag_println("znc: arity check FAILED");
+        return 1;
+    }
 
     // Effect/capability check (sema.zag): reject @total/@realtime/@noalloc violations.
     let eff: map__StringMap[i32] = analyze(decls);
