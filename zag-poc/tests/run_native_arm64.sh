@@ -137,6 +137,8 @@ nt "fn as value"     'fn add1(x: i32) i32 { return x + 1; } fn apply(f: fn(i32) 
 nt "closure capture" 'fn main() i32 { let g: i32 = 3; let f: fn(i32) i32 = fn[g](x: i32) i32 { return x * g; }; return f(14); }' 42
 nt "closure as arg"  'fn apply(f: fn(i32) i32, x: i32) i32 { return f(x); } fn main() i32 { let g: i32 = 2; let f: fn(i32) i32 = fn[g](x: i32) i32 { return x * g; }; return apply(f, 21); }' 42
 nt "two captures"    'fn main() i32 { let a: i32 = 40; let b: i32 = 2; let f: fn() i32 = fn[a, b]() i32 { return a + b; }; return f(); }' 42
+nt "capless closure" 'fn main() i32 { let f: fn(i32) i32 = fn[](x: i32) i32 { return x + 40; }; return f(2); }' 42
+nt "clos shadows fn" 'fn add(a: i32, b: i32) i32 { return a + b; } fn main() i32 { let add: fn(i32) i32 = fn[](x: i32) i32 { return x; }; return add(1) + 41; }' 42
 nt "ptr capture"     'fn main() i32 { let v: i32 = 10; let bump: fn() i32 = fn[&v]() i32 { v.* = v.* + 1; return 0; }; let z: i32 = bump(); let z2: i32 = bump(); return v + z + z2 + 30; }' 42
 
 echo "── structural interfaces (vtable dispatch + coercion) ──"

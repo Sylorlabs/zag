@@ -305,6 +305,12 @@ rm -f /tmp/nt_bin nt_src.zag
 # Exponent float literals: 1e3 / 2.5e-9 lex as floats and round-trip via %g.
 nto "exponent float literals" 'fn main() i32 { print_f64(2.5e-9); print_f64(1e3); return 0; }' "$(printf '2.5e-09\n1000')" 0
 
+# Capture-less closures use the STANDARD call ABI (env==0) — the callee must
+# not shift its params expecting a hidden env arg (regression: arg read as 0).
+nt "capture-less closure"  'fn main() i32 { let f: fn(i32) i32 = fn[](x: i32) i32 { return x + 40; }; return f(2); }' 42
+nt "closure shadows fn"    'fn add(a: i32, b: i32) i32 { return a + b; } fn main() i32 { let add: fn(i32) i32 = fn[](x: i32) i32 { return x; }; return add(1) + 41; }' 42
+nt "capturing closure"     'fn main() i32 { let g: i32 = 3; let f: fn(i32) i32 = fn[g](x: i32) i32 { return x * g; }; return f(14); }' 42
+
 # Run the full error-propagation integration test.
 "$ZNC" tests/error_propagation.zag -o /tmp/nt_ep >/tmp/nt_ep_out 2>&1
 if [ -x /tmp/nt_ep ]; then
