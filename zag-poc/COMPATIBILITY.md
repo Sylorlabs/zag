@@ -175,3 +175,13 @@ diff znc znc.new && echo "fixpoint OK"
 This is the primary regression gate. The fixpoint is verified by
 `tests/check_native_bootstrap_repro.sh`. Any change that breaks the fixpoint
 is a blocker, regardless of which test suite it appears in.
+
+## Integer division semantics (defined on every target)
+
+- `x / 0` and `x % 0` PANIC at runtime: `panic: division by zero` on stderr,
+  exit code 134. Both native backends emit an explicit divisor check (the SMT
+  `@total` checker can prove divisions safe at compile time; unproven code
+  still gets defined behavior instead of a hardware trap / silent zero).
+- `i64::MIN / -1` wraps to `i64::MIN`; `i64::MIN % -1` is `0` (AArch64 SDIV
+  hardware semantics; the x86 backend special-cases `-1` to match instead of
+  faulting in `idiv`).
