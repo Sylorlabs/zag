@@ -108,7 +108,7 @@ The two-release rule applies from the first `2026.06.x` release onward.
 | Platform        | Status          | Notes                                           |
 |-----------------|-----------------|-------------------------------------------------|
 | x86-64 Linux    | **Supported**   | Primary target; native ELF, no libc             |
-| ARM64 Linux     | **Experimental** | `--target arm64`; static AArch64 ELF, no libc. Structs/slices/enums/unions/optionals/generics/error-unions/f32+f64; the 6 example programs are byte-identical to x86 (tests/run_native_arm64.sh, via qemu-user). Not yet: float printing, closures, interfaces, sat/fixed/posit numerics, DWARF. |
+| ARM64 Linux     | **Experimental** | `--target arm64`; static AArch64 ELF, no libc. Full core-language parity: structs/slices/enums/unions/optionals/generics/error-unions/f32+f64 (incl. %g printing)/closures/structural interfaces; the 6 example programs are byte-identical to x86 (tests/run_native_arm64.sh, via qemu-user). Not yet: sat/fixed/posit/RNS numerics, DWARF, >8-arg calls. |
 | RISC-V Linux    | Planned         | Requires RV64GC ISA + ELF backend              |
 | macOS (any)     | Not planned yet | Requires Mach-O backend                         |
 | Windows         | Not planned     | Requires PE/COFF backend                        |
