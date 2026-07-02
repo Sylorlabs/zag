@@ -259,6 +259,8 @@ fn ac_type_size(cg: *ACg, ty0: []u8) i32 {
     if (ty.len == 0) { return 8; }
     if (ty[0] == '*') { return 8; }
     if (ac_type_is_slice(ty) == 1) { return 16; }
+    if (@strEq(ty, "fat_fn")) { return 16; }        // {code_ptr, env_ptr}
+    if (cg_is_fn_type(ty) == 1) { return 16; }
     if (ty[0] == '!') { return 16; }               // !T error union = {err_code, val}
     if (ty[0] == '?') { return 8 + ac_round8(ac_type_size(cg, ty[1..])); }
     let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1), .tparams = make[[]u8](1), .is_pub = 0 };
@@ -301,6 +303,8 @@ fn ac_is_aggregate(cg: *ACg, ty0: []u8) i32 {
     if (ty.len == 0) { return 0; }
     if (ty[0] == '*') { return 0; }
     if (ac_type_is_slice(ty) == 1) { return 1; }
+    if (@strEq(ty, "fat_fn")) { return 1; }
+    if (cg_is_fn_type(ty) == 1) { return 1; }
     if (ty[0] == '!') { return 1; }
     if (ty[0] == '?') { return 1; }
     let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1), .tparams = make[[]u8](1), .is_pub = 0 };
@@ -515,7 +519,12 @@ fn ac_expr_type(n: *Node, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) []u8 {
         .slit => |_x| { return "[]u8"; }
         .id => |x| {
             if (@strEq(x.name, "true") || @strEq(x.name, "false")) { return "bool"; }
-            return ac_slot_type(env, x.name);
+            let sty: []u8 = ac_slot_type(env, x.name);
+            if (sty.len == 0 && ac_slot_find(env, x.name) == 0) {
+                if (cg_is_clos_name(x.name) == 1) { return "fat_fn"; }
+                if (ac_find_fn(syms, x.name) >= 0) { return "fat_fn"; }
+            }
+            return sty;
         }
         .bin => |b| {
             if (@strEq(b.op, "==") || @strEq(b.op, "!=") || @strEq(b.op, "<") ||
@@ -607,6 +616,110 @@ fn ac_expr_type(n: *Node, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) []u8 {
         }
         else => { return ""; }
     }
+}
+
+// Build a fat_fn {code_ptr, env_ptr} block for a fn used as a value and push
+// its address. Closures (__clos_N) malloc an env holding the captures:
+// scalars by value, aggregates as heap copies, '*name' captures by address.
+fn ac_materialize_fat_fn(out: *ArrayList[AInstr], name: []u8, lbl: i32, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) void {
+    let fb: i32 = ac_slot_scratch(cg, 2);
+    push[AInstr](out, ai_lea_lbl(A_X0(), lbl));
+    push[AInstr](out, ai_store(A_X29(), fb, A_X0()));
+    let caps: []u8 = "";
+    let di: i32 = 0;
+    while (di < len[*Node](cg.*.decls)) {
+        switch (get[*Node](cg.*.decls, di).*) {
+            .fn_decl => |fd| { if (@strEq(fd.name, name)) { caps = fd.cap_names; } }
+            else => { }
+        }
+        di = di + 1;
+    }
+    if (caps.len == 0) {
+        push[AInstr](out, ai_mov_imm(A_X0(), 0));
+        push[AInstr](out, ai_store(A_X29(), fb + 8, A_X0()));
+        ac_emit_lea(out, A_X0(), fb);
+        push[AInstr](out, ai_push(A_X0()));
+        return;
+    }
+    // record capture types on the decl so the closure body can bind them
+    let cnames0: ArrayList[[]u8] = split_args(caps);
+    let tys: []u8 = "";
+    let ti: i32 = 0;
+    while (ti < len[[]u8](cnames0)) {
+        let cn: []u8 = get[[]u8](cnames0, ti);
+        if (ti > 0) { tys = _zag_str_concat(tys, ","); }
+        if (cn.len > 0 && cn[0] == '*') {
+            tys = _zag_str_concat(tys, _zag_str_concat("*", ac_slot_type(env, cn[1..])));
+        } else {
+            tys = _zag_str_concat(tys, ac_slot_type(env, cn));
+        }
+        ti = ti + 1;
+    }
+    let di2: i32 = 0;
+    while (di2 < len[*Node](cg.*.decls)) {
+        let dn: *Node = get[*Node](cg.*.decls, di2);
+        switch (dn.*) {
+            .fn_decl => |fd2| {
+                if (@strEq(fd2.name, name) && fd2.cap_types.len == 0) {
+                    dn.* = Node{ .fn_decl = FnDecl{
+                        .name = fd2.name, .tparams = fd2.tparams,
+                        .params = fd2.params, .ret = fd2.ret,
+                        .annots = fd2.annots, .body = fd2.body,
+                        .is_extern = fd2.is_extern, .ret_eff = fd2.ret_eff,
+                        .caps = fd2.caps, .cap_names = fd2.cap_names,
+                        .cap_types = tys, .line = fd2.line, .is_pub = fd2.is_pub } };
+                }
+            }
+            else => { }
+        }
+        di2 = di2 + 1;
+    }
+    // env = __malloc(ncaps * 8); fill the capture slots
+    let ncaps: i32 = cg_count_caps(caps);
+    let env_save: i32 = ac_slot_scratch(cg, 1);
+    push[AInstr](out, ai_mov_imm(A_X0(), (ncaps * 8) as i64));
+    cg.*.use_al = 1;
+    push[AInstr](out, ai_call(cg.*.al_lbl));
+    push[AInstr](out, ai_store(A_X29(), env_save, A_X0()));
+    let ci: i32 = 0;
+    while (ci < len[[]u8](cnames0)) {
+        let cname: []u8 = get[[]u8](cnames0, ci);
+        let is_ptr_cap: i32 = 0;
+        let real_cn: []u8 = cname;
+        if (cname.len > 0 && cname[0] == '*') { is_ptr_cap = 1; real_cn = cname[1..]; }
+        let cdisp: i32 = ac_slot_find(env, real_cn);
+        if (cdisp != 0) {
+            if (is_ptr_cap == 1) {
+                ac_emit_lea(out, A_X0(), cdisp);
+                push[AInstr](out, ai_load(A_X10(), A_X29(), env_save));
+                push[AInstr](out, ai_store(A_X10(), 8 * ci, A_X0()));
+            } else {
+                let cty: []u8 = ac_slot_type(env, real_cn);
+                if (ac_is_aggregate(cg, cty) == 1 && ac_slot_byref(env, real_cn) == 0) {
+                    // heap-copy the inline aggregate; env slot holds the copy's addr
+                    let nw: i32 = ac_type_words(cg, cty);
+                    push[AInstr](out, ai_mov_imm(A_X0(), (nw * 8) as i64));
+                    push[AInstr](out, ai_call(cg.*.al_lbl));
+                    push[AInstr](out, ai_mov_rr(A_X10(), A_X0()));
+                    ac_emit_lea(out, A_X11(), cdisp);
+                    ac_emit_copy(out, nw);
+                    push[AInstr](out, ai_load(A_X9(), A_X29(), env_save));
+                    push[AInstr](out, ai_store(A_X9(), 8 * ci, A_X10()));
+                } else {
+                    push[AInstr](out, ai_load(A_X0(), A_X29(), cdisp));
+                    push[AInstr](out, ai_load(A_X10(), A_X29(), env_save));
+                    push[AInstr](out, ai_store(A_X10(), 8 * ci, A_X0()));
+                }
+            }
+        } else {
+            ac_err(cg, _zag_str_concat("arm64: capture of unknown variable: ", real_cn));
+        }
+        ci = ci + 1;
+    }
+    push[AInstr](out, ai_load(A_X0(), A_X29(), env_save));
+    push[AInstr](out, ai_store(A_X29(), fb + 8, A_X0()));
+    ac_emit_lea(out, A_X0(), fb);
+    push[AInstr](out, ai_push(A_X0()));
 }
 
 // ── lvalue address ───────────────────────────────────────────────────────────
@@ -729,6 +842,11 @@ fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
             }
             let disp: i32 = ac_slot_find(env, x.name);
             if (disp == 0) {
+                let flbl: i32 = ac_find_fn(syms, x.name);
+                if (flbl >= 0) {
+                    ac_materialize_fat_fn(out, x.name, flbl, env, syms, cg);
+                    return;
+                }
                 ac_err(cg, _zag_str_concat("arm64: unknown identifier: ", x.name));
                 push[AInstr](out, ai_mov_imm(A_X0(), 0));
                 push[AInstr](out, ai_push(A_X0()));
@@ -1222,6 +1340,80 @@ fn ac_push_jcc_false(out: *ArrayList[AInstr], op: []u8, lbl: i32) void {
 
 // ── calls ────────────────────────────────────────────────────────────────────
 
+// Call through a fat_fn variable: runtime env check picks the ABI —
+// env==0: x0=arg0, x1=arg1, ... ; env!=0: x0=env, x1=arg0, ...
+fn ac_lower_indirect_call(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) void {
+    let nargs: i32 = len[*Node](c.args);
+    if (nargs > 7) {
+        ac_err(cg, "arm64: more than 7 arguments to a fn-value call");
+        push[AInstr](out, ai_mov_imm(A_X0(), 0));
+        push[AInstr](out, ai_push(A_X0()));
+        return;
+    }
+    let fdisp: i32 = ac_slot_find(env, fname);
+    let is_byref: i32 = ac_slot_byref(env, fname);
+    let code_slot: i32 = ac_slot_scratch(cg, 1);
+    let env_slot: i32 = ac_slot_scratch(cg, 1);
+    if (is_byref == 1) {
+        push[AInstr](out, ai_load(A_X10(), A_X29(), fdisp));
+        push[AInstr](out, ai_load(A_X0(), A_X10(), 0));
+        push[AInstr](out, ai_load(A_X9(), A_X10(), 8));
+    } else {
+        push[AInstr](out, ai_load(A_X0(), A_X29(), fdisp));
+        push[AInstr](out, ai_load(A_X9(), A_X29(), fdisp + 8));
+    }
+    push[AInstr](out, ai_store(A_X29(), code_slot, A_X0()));
+    push[AInstr](out, ai_store(A_X29(), env_slot, A_X9()));
+    // spill user args into scratch slots (aggregates: caller copy, pass addr)
+    let aslot: ArrayList[i32] = make[i32](nargs + 1);
+    let ui: i32 = 0;
+    while (ui < nargs) {
+        let a: *Node = get[*Node](c.args, ui);
+        let aty: []u8 = ac_expr_type(a, env, syms, cg);
+        let sl: i32 = ac_slot_scratch(cg, 1);
+        push[i32](&aslot, sl);
+        ac_lower_expr(out, a, env, syms, cg);
+        if (ac_is_aggregate(cg, aty) == 1) {
+            let w: i32 = ac_type_words(cg, aty);
+            let cpy: i32 = ac_slot_scratch(cg, w);
+            push[AInstr](out, ai_pop(A_X11()));
+            ac_emit_lea(out, A_X10(), cpy);
+            ac_emit_copy(out, w);
+            ac_emit_lea(out, A_X0(), cpy);
+        } else {
+            push[AInstr](out, ai_pop(A_X0()));
+        }
+        push[AInstr](out, ai_store(A_X29(), sl, A_X0()));
+        ui = ui + 1;
+    }
+    let l_env: i32 = ac_fresh(cg);
+    let l_done: i32 = ac_fresh(cg);
+    push[AInstr](out, ai_load(A_X9(), A_X29(), env_slot));
+    push[AInstr](out, ai_cmp_imm(A_X9(), 0));
+    push[AInstr](out, ai_jne(l_env));
+    // standard ABI
+    let si: i32 = 0;
+    while (si < nargs) {
+        push[AInstr](out, ai_load(a_arg_reg(si), A_X29(), get[i32](aslot, si)));
+        si = si + 1;
+    }
+    push[AInstr](out, ai_load(A_X10(), A_X29(), code_slot));
+    push[AInstr](out, ai_call_reg(A_X10()));
+    push[AInstr](out, ai_jmp(l_done));
+    // env-first ABI
+    push[AInstr](out, ai_label(l_env));
+    let ai2: i32 = 0;
+    while (ai2 < nargs) {
+        push[AInstr](out, ai_load(a_arg_reg(ai2 + 1), A_X29(), get[i32](aslot, ai2)));
+        ai2 = ai2 + 1;
+    }
+    push[AInstr](out, ai_load(A_X0(), A_X29(), env_slot));
+    push[AInstr](out, ai_load(A_X10(), A_X29(), code_slot));
+    push[AInstr](out, ai_call_reg(A_X10()));
+    push[AInstr](out, ai_label(l_done));
+    push[AInstr](out, ai_push(A_X0()));
+}
+
 fn ac_lower_call(out: *ArrayList[AInstr], c: Call, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) void {
     switch (c.callee.*) {
         .id => |fnid| {
@@ -1232,6 +1424,10 @@ fn ac_lower_call(out: *ArrayList[AInstr], c: Call, env: *AEnv, syms: ArrayList[A
             let cname: []u8 = fnid.name;
             if (len[[]u8](c.targs) > 0) { cname = cg_mangle_generic_norm(fnid.name, c.targs); }
             if (ac_lower_builtin(out, cname, c, env, syms, cg) == 1) { return; }
+            if (ac_slot_find(env, cname) != 0 && @strEq(ac_slot_type(env, cname), "fat_fn")) {
+                ac_lower_indirect_call(out, cname, c, env, syms, cg);
+                return;
+            }
             let lbl: i32 = ac_find_fn(syms, cname);
             if (lbl < 0) {
                 ac_err(cg, _zag_str_concat("arm64: unknown function: ", cname));
@@ -1552,6 +1748,7 @@ fn ac_lower_stmt(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
             let ty: []u8 = "";
             if (l.has_dty == 1) { ty = l.dty; }
             else if (l.has_init == 1) { ty = ac_expr_type(l.expr, env, syms, cg); }
+            if (cg_is_fn_type(cg_norm_type(ty)) == 1) { ty = "fat_fn"; }
             let w: i32 = ac_type_words(cg, ty);
             let disp: i32 = ac_slot_alloc_br(env, cg, l.name, ty, w, 0);
             if (l.has_init == 1) {
@@ -1854,7 +2051,10 @@ fn ac_lower_block(out: *ArrayList[AInstr], body: ArrayList[*Node], env: *AEnv, s
 
 // ── functions ────────────────────────────────────────────────────────────────
 
-fn ac_lower_fn(out: *ArrayList[AInstr], params: ArrayList[Param], ret: []u8, body: ArrayList[*Node], lbl: i32, syms: ArrayList[AFnSym], cg: *ACg) void {
+fn ac_lower_fn(out: *ArrayList[AInstr], f: FnDecl, lbl: i32, syms: ArrayList[AFnSym], cg: *ACg) void {
+    let params: ArrayList[Param] = f.params;
+    let ret: []u8 = f.ret;
+    let body: ArrayList[*Node] = f.body;
     if (len[*Node](body) == 0) {
         ac_err(cg, "arm64: empty fn body in lower_fn");
         return;
@@ -1869,20 +2069,58 @@ fn ac_lower_fn(out: *ArrayList[AInstr], params: ArrayList[Param], ret: []u8, bod
 
     let env: AEnv = ac_env_new();
 
+    // capturing closure: hidden env ptr arrives FIRST (x0); user args shift by 1
+    let is_clos: i32 = 0;
+    if (cg_is_clos_name(f.name) == 1 && f.cap_names.len > 0) { is_clos = 1; }
+    let shift: i32 = 0;
+    let zenv_disp: i32 = 0;
+    if (is_clos == 1) {
+        shift = 1;
+        zenv_disp = ac_slot_scratch(cg, 1);
+    }
+
     // bind params: scalars inline, aggregates by-ref (caller passed a copy's address)
     let pi: i32 = 0;
     while (pi < len[Param](params)) {
         let p: Param = get[Param](params, pi);
-        if (ac_is_aggregate(cg, p.pty) == 1) {
-            let _d1: i32 = ac_slot_alloc_br(&env, cg, p.name, p.pty, 1, 1);
+        let pty: []u8 = p.pty;
+        if (cg_is_fn_type(cg_norm_type(pty)) == 1) { pty = "fat_fn"; }
+        if (ac_is_aggregate(cg, pty) == 1) {
+            let _d1: i32 = ac_slot_alloc_br(&env, cg, p.name, pty, 1, 1);
         } else {
-            let _d2: i32 = ac_slot_alloc_br(&env, cg, p.name, p.pty, 1, 0);
+            let _d2: i32 = ac_slot_alloc_br(&env, cg, p.name, pty, 1, 0);
         }
         pi = pi + 1;
     }
     if (ac_is_aggregate(cg, ret) == 1) {
         cg.*.sret_words = ac_type_words(cg, ret);
         cg.*.sret_disp = ac_slot_scratch(cg, 1);
+    }
+
+    // closure captures: bind each capture to a frame slot NOW (the prologue
+    // loads them from the env block after the params are stored).
+    let cap_disps: ArrayList[i32] = make[i32](4);
+    if (is_clos == 1) {
+        let cnames: ArrayList[[]u8] = split_args(f.cap_names);
+        let ctypes: ArrayList[[]u8] = split_args(f.cap_types);
+        let ci: i32 = 0;
+        while (ci < len[[]u8](cnames)) {
+            let cname: []u8 = get[[]u8](cnames, ci);
+            let cty: []u8 = "";
+            if (ci < len[[]u8](ctypes)) { cty = get[[]u8](ctypes, ci); }
+            let real_cn: []u8 = cname;
+            if (cname.len > 0 && cname[0] == '*') { real_cn = cname[1..]; }
+            let cd: i32 = 0;
+            if (cname.len > 0 && cname[0] == '*') {
+                cd = ac_slot_alloc_br(&env, cg, real_cn, cty, 1, 0);
+            } else if (cty.len > 0 && ac_is_aggregate(cg, cty) == 1) {
+                cd = ac_slot_alloc_br(&env, cg, cname, cty, 1, 1);
+            } else {
+                cd = ac_slot_alloc_br(&env, cg, cname, cty, 1, 0);
+            }
+            push[i32](&cap_disps, cd);
+            ci = ci + 1;
+        }
     }
 
     // Lower the body into a scratch list first so cg.frame_words includes
@@ -1908,11 +2146,21 @@ fn ac_lower_fn(out: *ArrayList[AInstr], params: ArrayList[Param], ret: []u8, bod
     while (pj < len[Param](params)) {
         let pname: []u8 = get[Param](params, pj).name;
         let pdisp: i32 = ac_slot_find(&env, pname);
-        let reg: i32 = a_arg_reg(pj);
+        let reg: i32 = a_arg_reg(pj + shift);
         if (reg >= 0) {
             push[AInstr](out, ai_store(A_X29(), pdisp, reg));
         }
         pj = pj + 1;
+    }
+    if (is_clos == 1) {
+        push[AInstr](out, ai_store(A_X29(), zenv_disp, A_X0()));
+        push[AInstr](out, ai_load(A_X10(), A_X29(), zenv_disp));
+        let ck: i32 = 0;
+        while (ck < len[i32](cap_disps)) {
+            push[AInstr](out, ai_load(A_X9(), A_X10(), 8 * ck));
+            push[AInstr](out, ai_store(A_X29(), get[i32](cap_disps, ck), A_X9()));
+            ck = ck + 1;
+        }
     }
     if (cg.*.sret_words > 0) {
         push[AInstr](out, ai_store(A_X29(), cg.*.sret_disp, A_X8()));
@@ -2007,6 +2255,11 @@ fn ac_emit_print_int(out: *ArrayList[AInstr], lbl: i32, cg: *ACg) void {
     push[AInstr](out, ai_sub_imm(A_X12(), 1));
     push[AInstr](out, ai_jmp(l_wtop));
     push[AInstr](out, ai_label(l_wdone));
+
+    // trailing newline (same contract as the x86 __print_int)
+    push[AInstr](out, ai_mov_imm(A_X13(), 10));
+    push[AInstr](out, ai_storeb(A_X1(), 0, A_X13()));
+    push[AInstr](out, ai_add_imm(A_X11(), 1));
 
     push[AInstr](out, ai_mov_imm(A_X8(), 64));
     push[AInstr](out, ai_mov_imm(A_X0(), 1));
@@ -2598,7 +2851,7 @@ fn aload_program(decls0: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8]
             .fn_decl => |f| {
                 if (f.is_extern == 0 && len[[]u8](f.tparams) == 0 && len[*Node](f.body) > 0) {
                     let lbl: i32 = ac_find_fn(syms, f.name);
-                    ac_lower_fn(&out, f.params, f.ret, f.body, lbl, syms, &cg);
+                    ac_lower_fn(&out, f, lbl, syms, &cg);
                 }
             }
             else => { }
