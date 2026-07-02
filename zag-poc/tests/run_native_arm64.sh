@@ -126,6 +126,12 @@ nt "f64 compare lt"  'fn main() i32 { let a: f64 = 1.25; let b: f64 = 1.5; if (a
 nt "f32 via f64"     'fn main() i32 { let a: f32 = 10.5; let b: f32 = 4.0; return (a * b) as i32; }' 42
 nt "f64 fn arg ret"  'fn half(x: f64) f64 { return x / 2.0; } fn main() i32 { return half(84.0) as i32; }' 42
 
+nto "print_f64"      'fn main() i32 { print_f64(3.14159); return 0; }' "3.14159" 0
+nto "print_f64 neg"  'fn main() i32 { print_f64(0.0 - 1.5); return 0; }' "-1.5" 0
+nto "print_f64 sci"  'fn main() i32 { let m: f64 = 1000000.0; print_f64(1.23457 * m); return 0; }' "1.23457e+06" 0
+nto "print_f64 tiny" 'fn main() i32 { print_f64(0.000012345); return 0; }' "1.2345e-05" 0
+nto "print_f32"      'fn main() i32 { print_f32(10.5); return 0; }' "10.5" 0
+
 echo "── real programs (output must be byte-identical to x86) ──"
 for prog in arena hash_map sort_bench state_machine csv_parser json_parser; do
     if ! "$ZNC" "programs/$prog.zag" -o /tmp/np_x86 >/dev/null 2>&1; then
