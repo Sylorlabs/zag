@@ -73,6 +73,11 @@ test-arm64:
 	@echo "── arm64 backend suite (qemu-user) ──"
 	bash tests/run_native_arm64.sh
 
+# Cross-backend differential gate: identical output on x86-64 and arm64.
+test-differential-backends:
+	@echo "── differential x86/arm64 gate ──"
+	bash tests/run_differential.sh
+
 # Differential tests against the C backend (not a release gate).
 test-differential:
 	@echo "── differential suite via zagc (informational only) ──"
@@ -84,7 +89,7 @@ test-selfhost:
 	bash tests/run_selfhost.sh
 
 # Default `make test`: runs the v1 release gates.
-test: znc test-authority test-bootstrap test-semantics test-diagnostics test-tooling test-programs test-native test-abi-layout test-arm64
+test: znc test-authority test-bootstrap test-semantics test-diagnostics test-tooling test-programs test-native test-abi-layout test-arm64 test-differential-backends
 	@echo "════ all v1 release gates passed ════"
 
 # ── Install ───────────────────────────────────────────────────────────────────
