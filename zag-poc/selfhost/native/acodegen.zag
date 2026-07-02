@@ -286,6 +286,9 @@ fn ac_type_size(cg: *ACg, ty0: []u8) i32 {
         if (maxp == 0) { maxp = 8; }
         return 8 + maxp;
     }
+    // interface: M fn-ptr slots + 1 data-ptr slot
+    let iM: i32 = iface_method_count(cg.*.decls, ty);
+    if (iM > 0) { return (iM + 1) * 8; }
     return 8;
 }
 
@@ -311,6 +314,7 @@ fn ac_is_aggregate(cg: *ACg, ty0: []u8) i32 {
     if (ac_find_struct(cg, ty, &sd) == 1) { return 1; }
     let ud: UnionDecl = UnionDecl{ .name = "", .fields = make[Param](1) };
     if (ac_find_union(cg, ty, &ud) == 1) { return 1; }
+    if (iface_method_count(cg.*.decls, ty) > 0) { return 1; }
     return 0;
 }
 
@@ -489,6 +493,34 @@ fn ac_find_fn_ret(syms: ArrayList[AFnSym], name: []u8) []u8 {
     return "";
 }
 
+fn ac_fn_param_type(cg: *ACg, fname: []u8, idx: i32) []u8 {
+    let di: i32 = 0;
+    while (di < len[*Node](cg.*.decls)) {
+        switch (get[*Node](cg.*.decls, di).*) {
+            .fn_decl => |f| {
+                if (@strEq(f.name, fname) && idx < len[Param](f.params)) {
+                    return get[Param](f.params, idx).pty;
+                }
+            }
+            else => { }
+        }
+        di = di + 1;
+    }
+    return "";
+}
+
+fn ac_iface_mret(cg: *ACg, iname: []u8, mname: []u8) []u8 {
+    let M: i32 = iface_method_count(cg.*.decls, iname);
+    let mi: i32 = 0;
+    while (mi < M) {
+        if (@strEq(iface_method_name(cg.*.decls, iname, mi), mname)) {
+            return iface_method_ret(cg.*.decls, iname, mi);
+        }
+        mi = mi + 1;
+    }
+    return "";
+}
+
 // ── small emit helpers ───────────────────────────────────────────────────────
 
 // dst = x29 + disp
@@ -552,6 +584,19 @@ fn ac_expr_type(n: *Node, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) []u8 {
         }
         .call => |c| {
             switch (c.callee.*) {
+                .fld => |mf| {
+                    if (!@strEq(mf.fname, "*") && !@strEq(mf.fname, "?") && !@strEq(mf.fname, "has") && !@strEq(mf.fname, "val")) {
+                        let rty0: []u8 = ac_expr_type(mf.base, env, syms, cg);
+                        if (rty0.len > 1 && rty0[0] == '*') { rty0 = rty0[1..]; }
+                        if (iface_method_count(cg.*.decls, rty0) > 0) {
+                            return ac_iface_mret(cg, rty0, mf.fname);
+                        }
+                        if (rty0.len > 0) {
+                            return ac_find_fn_ret(syms, _zag_str_concat(_zag_str_concat(rty0, "_"), mf.fname));
+                        }
+                    }
+                    return "";
+                }
                 .id => |fnid| {
                     if (@strEq(fnid.name, "new")) {
                         if (len[*Node](c.args) == 1) {
@@ -1340,6 +1385,85 @@ fn ac_push_jcc_false(out: *ArrayList[AInstr], op: []u8, lbl: i32) void {
 
 // ── calls ────────────────────────────────────────────────────────────────────
 
+// Coerce a concrete lvalue to interface `iname`: build the (M+1)-word fat
+// block [fn0..fnM-1, data_ptr] in the frame; returns its displacement.
+fn ac_iface_coerce(out: *ArrayList[AInstr], arg: *Node, concrete_ty: []u8, iname: []u8, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) i32 {
+    let M: i32 = iface_method_count(cg.*.decls, iname);
+    let fat: i32 = ac_slot_scratch(cg, M + 1);
+    let mi: i32 = 0;
+    while (mi < M) {
+        let meth: []u8 = iface_method_name(cg.*.decls, iname, mi);
+        let fn_name: []u8 = _zag_str_concat(_zag_str_concat(concrete_ty, "_"), meth);
+        let fn_lbl: i32 = ac_find_fn(syms, fn_name);
+        if (fn_lbl < 0) {
+            ac_err(cg, _zag_str_concat("arm64: interface impl method not found: ", fn_name));
+            push[AInstr](out, ai_mov_imm(A_X0(), 0));
+        } else {
+            push[AInstr](out, ai_lea_lbl(A_X0(), fn_lbl));
+        }
+        push[AInstr](out, ai_store(A_X29(), fat + mi * 8, A_X0()));
+        mi = mi + 1;
+    }
+    ac_lower_addr(out, arg, env, syms, cg);
+    push[AInstr](out, ai_pop(A_X0()));
+    push[AInstr](out, ai_store(A_X29(), fat + M * 8, A_X0()));
+    return fat;
+}
+
+// Interface method dispatch: recv is interface-typed; fat block holds the
+// vtable. Calls fn[midx] with x0 = data ptr, x1.. = extra args.
+fn ac_lower_iface_dispatch(out: *ArrayList[AInstr], recv: *Node, mname: []u8, extra_args: ArrayList[*Node], env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) void {
+    let iname: []u8 = ac_expr_type(recv, env, syms, cg);
+    if (iname.len > 1 && iname[0] == '*') { iname = iname[1..]; }
+    let M: i32 = iface_method_count(cg.*.decls, iname);
+    let midx: i32 = 0 - 1;
+    let mi: i32 = 0;
+    while (mi < M) {
+        if (@strEq(iface_method_name(cg.*.decls, iname, mi), mname)) { midx = mi; }
+        mi = mi + 1;
+    }
+    if (midx < 0) {
+        ac_err(cg, _zag_str_concat("arm64: interface method not found: ", mname));
+        push[AInstr](out, ai_mov_imm(A_X0(), 0));
+        push[AInstr](out, ai_push(A_X0()));
+        return;
+    }
+    ac_lower_expr(out, recv, env, syms, cg);          // fat block address
+    push[AInstr](out, ai_pop(A_X10()));
+    let fn_slot: i32 = ac_slot_scratch(cg, 1);
+    let data_slot: i32 = ac_slot_scratch(cg, 1);
+    push[AInstr](out, ai_load(A_X0(), A_X10(), midx * 8));
+    push[AInstr](out, ai_store(A_X29(), fn_slot, A_X0()));
+    push[AInstr](out, ai_load(A_X0(), A_X10(), M * 8));
+    push[AInstr](out, ai_store(A_X29(), data_slot, A_X0()));
+    let nex: i32 = len[*Node](extra_args);
+    if (nex > 7) {
+        ac_err(cg, "arm64: more than 7 args to an interface method");
+        push[AInstr](out, ai_mov_imm(A_X0(), 0));
+        push[AInstr](out, ai_push(A_X0()));
+        return;
+    }
+    let arg_slots: ArrayList[i32] = make[i32](nex + 1);
+    let ei: i32 = 0;
+    while (ei < nex) {
+        let asl: i32 = ac_slot_scratch(cg, 1);
+        push[i32](&arg_slots, asl);
+        ac_lower_expr(out, get[*Node](extra_args, ei), env, syms, cg);
+        push[AInstr](out, ai_pop(A_X0()));
+        push[AInstr](out, ai_store(A_X29(), asl, A_X0()));
+        ei = ei + 1;
+    }
+    push[AInstr](out, ai_load(A_X0(), A_X29(), data_slot));
+    let ei2: i32 = 0;
+    while (ei2 < nex) {
+        push[AInstr](out, ai_load(a_arg_reg(ei2 + 1), A_X29(), get[i32](arg_slots, ei2)));
+        ei2 = ei2 + 1;
+    }
+    push[AInstr](out, ai_load(A_X10(), A_X29(), fn_slot));
+    push[AInstr](out, ai_call_reg(A_X10()));
+    push[AInstr](out, ai_push(A_X0()));
+}
+
 // Call through a fat_fn variable: runtime env check picks the ABI —
 // env==0: x0=arg0, x1=arg1, ... ; env!=0: x0=env, x1=arg0, ...
 fn ac_lower_indirect_call(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) void {
@@ -1416,6 +1540,37 @@ fn ac_lower_indirect_call(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *A
 
 fn ac_lower_call(out: *ArrayList[AInstr], c: Call, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) void {
     switch (c.callee.*) {
+        .fld => |mf| {
+            // method call: recv.m(args) → iface dispatch or RecvType_m(recv, args)
+            if (@strEq(mf.fname, "*") || @strEq(mf.fname, "?") || @strEq(mf.fname, "has") || @strEq(mf.fname, "val")) {
+                ac_err(cg, "arm64: unsupported call form");
+                push[AInstr](out, ai_mov_imm(A_X0(), 0));
+                push[AInstr](out, ai_push(A_X0()));
+                return;
+            }
+            let rty: []u8 = ac_expr_type(mf.base, env, syms, cg);
+            if (rty.len > 1 && rty[0] == '*') { rty = rty[1..]; }
+            if (iface_method_count(cg.*.decls, rty) > 0) {
+                ac_lower_iface_dispatch(out, mf.base, mf.fname, c.args, env, syms, cg);
+                return;
+            }
+            let mn: []u8 = _zag_str_concat(_zag_str_concat(rty, "_"), mf.fname);
+            if (rty.len > 0 && ac_find_fn(syms, mn) >= 0) {
+                let margs: ArrayList[*Node] = make[*Node](len[*Node](c.args) + 1);
+                push[*Node](&margs, mf.base);
+                let mk: i32 = 0;
+                while (mk < len[*Node](c.args)) {
+                    push[*Node](&margs, get[*Node](c.args, mk));
+                    mk = mk + 1;
+                }
+                ac_lower_call(out, Call{ .callee = mk_ident(mn), .args = margs, .targs = make[[]u8](1) }, env, syms, cg);
+                return;
+            }
+            ac_err(cg, _zag_str_concat("arm64: unknown method: ", mf.fname));
+            push[AInstr](out, ai_mov_imm(A_X0(), 0));
+            push[AInstr](out, ai_push(A_X0()));
+            return;
+        }
         .id => |fnid| {
             if (fnid.name.len > 0 && fnid.name[0] == '@') {
                 ac_lower_at_builtin(out, fnid.name, c, env, syms, cg);
@@ -1446,16 +1601,24 @@ fn ac_lower_call(out: *ArrayList[AInstr], c: Call, env: *AEnv, syms: ArrayList[A
             while (ai < nargs) {
                 let a: *Node = get[*Node](c.args, ai);
                 let aty: []u8 = ac_expr_type(a, env, syms, cg);
-                ac_lower_expr(out, a, env, syms, cg);
-                if (ac_is_aggregate(cg, aty) == 1) {
-                    // by-value semantics: copy to a fresh block, pass its address
-                    let w: i32 = ac_type_words(cg, aty);
-                    let base: i32 = ac_slot_scratch(cg, w);
-                    push[AInstr](out, ai_pop(A_X11()));
-                    ac_emit_lea(out, A_X10(), base);
-                    ac_emit_copy(out, w);
-                    ac_emit_lea(out, A_X0(), base);
+                let pt: []u8 = ac_fn_param_type(cg, cname, ai);
+                if (iface_method_count(cg.*.decls, pt) > 0 && iface_method_count(cg.*.decls, aty) == 0) {
+                    // concrete value → interface param: build fat vtable block
+                    let fat: i32 = ac_iface_coerce(out, a, aty, pt, env, syms, cg);
+                    ac_emit_lea(out, A_X0(), fat);
                     push[AInstr](out, ai_push(A_X0()));
+                } else {
+                    ac_lower_expr(out, a, env, syms, cg);
+                    if (ac_is_aggregate(cg, aty) == 1) {
+                        // by-value semantics: copy to a fresh block, pass its address
+                        let w: i32 = ac_type_words(cg, aty);
+                        let base: i32 = ac_slot_scratch(cg, w);
+                        push[AInstr](out, ai_pop(A_X11()));
+                        ac_emit_lea(out, A_X10(), base);
+                        ac_emit_copy(out, w);
+                        ac_emit_lea(out, A_X0(), base);
+                        push[AInstr](out, ai_push(A_X0()));
+                    }
                 }
                 ai = ai + 1;
             }

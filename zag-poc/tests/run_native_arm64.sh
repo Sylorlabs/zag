@@ -139,6 +139,20 @@ nt "closure as arg"  'fn apply(f: fn(i32) i32, x: i32) i32 { return f(x); } fn m
 nt "two captures"    'fn main() i32 { let a: i32 = 40; let b: i32 = 2; let f: fn() i32 = fn[a, b]() i32 { return a + b; }; return f(); }' 42
 nt "ptr capture"     'fn main() i32 { let v: i32 = 10; let bump: fn() i32 = fn[&v]() i32 { v.* = v.* + 1; return 0; }; let z: i32 = bump(); let z2: i32 = bump(); return v + z + z2 + 30; }' 42
 
+echo "── structural interfaces (vtable dispatch + coercion) ──"
+nt "method call"     'struct P { x: i32 } fn (self: P) twice() i32 { return self.x * 2; } fn main() i32 { let p: P = P{ .x = 21 }; return p.twice(); }' 42
+nt "iface dispatch"  'interface Shape { fn area(self) i32; } struct Sq { s: i32 } fn (self: Sq) area() i32 { return self.s * self.s; } struct Rc { w: i32, h: i32 } fn (self: Rc) area() i32 { return self.w * self.h; } fn go(s: Shape) i32 { return s.area(); } fn main() i32 { let a: Sq = Sq{ .s = 5 }; let b: Rc = Rc{ .w = 3, .h = 4 }; return go(a) + go(b) + 5; }' 42
+nt "iface multi-meth" 'interface Shape { fn area(self) i32; fn scaled(self, k: i32) i32; } struct Sq { s: i32 } fn (self: Sq) area() i32 { return self.s * self.s; } fn (self: Sq) scaled(k: i32) i32 { return self.s * self.s * k; } fn rep(s: Shape) i32 { return s.area() + s.scaled(2); } fn main() i32 { let a: Sq = Sq{ .s = 3 }; return rep(a) + 15; }' 42
+
+# interfaces example must match the x86 expected output exactly
+"$ZNC" examples/interfaces.zag --target arm64 -o /tmp/nt_if >/tmp/nt_out 2>&1
+if [ -x /tmp/nt_if ] && [ "$("$QEMU" /tmp/nt_if 2>/dev/null)" = "$(printf '75\n36')" ]; then
+    echo "  ok  examples/interfaces.zag (75/36)"; pass=$((pass+1))
+else
+    echo "  XX  examples/interfaces.zag"; sed -n '1,6p' /tmp/nt_out; fail=$((fail+1))
+fi
+rm -f /tmp/nt_if
+
 echo "── real programs (output must be byte-identical to x86) ──"
 for prog in arena hash_map sort_bench state_machine csv_parser json_parser; do
     if ! "$ZNC" "programs/$prog.zag" -o /tmp/np_x86 >/dev/null 2>&1; then
