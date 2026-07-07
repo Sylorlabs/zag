@@ -39,12 +39,40 @@
 // extern decl omits. The lexer hands us unsigned magnitudes; a leading '-' is a
 // separate Un("-") node, but we tolerate one here for robustness. Underscores in
 // numeric literals (e.g. 1_000) are skipped.
+// True when s (past an optional sign) begins with a 0x / 0X hex prefix.
+fn cg_is_hex_text(s: []u8) i32 {
+    let i: i32 = 0;
+    if (s.len > 0 && (s[0] == '-' || s[0] == '+')) { i = 1; }
+    if (i + 1 < s.len && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) { return 1; }
+    return 0;
+}
+
 fn cg_parse_i64(s: []u8) i64 {
     let i: i32 = 0;
     let neg: i32 = 0;
     if (s.len > 0) {
         if (s[0] == '-') { neg = 1; i = 1; }
         else if (s[0] == '+') { i = 1; }
+    }
+    // hex: consume the 0x prefix, accumulate base 16.
+    if (i + 1 < s.len && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
+        i = i + 2;
+        let hacc: i64 = 0;
+        while (i < s.len) {
+            let hc: u8 = s[i];
+            if (hc == '_') {
+                i = i + 1;
+            } else {
+                let hv: i64 = 0 - 1;
+                if (hc >= '0' && hc <= '9') { hv = (hc as i64) - 48; }
+                else if (hc >= 'a' && hc <= 'f') { hv = (hc as i64) - 87; }   // 'a'=97 → 10
+                else if (hc >= 'A' && hc <= 'F') { hv = (hc as i64) - 55; }   // 'A'=65 → 10
+                if (hv >= 0) { hacc = hacc * 16 + hv; }
+                i = i + 1;
+            }
+        }
+        if (neg == 1) { return 0 - hacc; }
+        return hacc;
     }
     let acc: i64 = 0;
     while (i < s.len) {
@@ -73,6 +101,18 @@ fn cg_is_int_text(s: []u8) i32 {
         else if (s[0] == '+') { i = 1; }
     }
     if (i >= s.len) { return 0; }
+    // hex literal: 0x followed by at least one hex digit / '_'
+    if (i + 1 < s.len && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X')) {
+        let h: i32 = i + 2;
+        if (h >= s.len) { return 0; }
+        while (h < s.len) {
+            let c: u8 = s[h];
+            let ok: bool = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == '_';
+            if (!ok) { return 0; }
+            h = h + 1;
+        }
+        return 1;
+    }
     while (i < s.len) {
         let c: u8 = s[i];
         if (c == '_') { i = i + 1; }
@@ -766,6 +806,7 @@ fn cg_clone_stmt(n: *Node, tp: ArrayList[[]u8], ta: ArrayList[[]u8]) *Node {
         .ret     => |r| mk_ret(r.has_expr, cg_clone_expr(r.expr, tp, ta)),
         .if_     => |x| new(Node{ .if_ = If{ .cond = cg_clone_expr(x.cond, tp, ta), .then_body = cg_clone_block(x.then_body, tp, ta), .els_body = cg_clone_block(x.els_body, tp, ta), .has_els = x.has_els, .cap = x.cap, .has_cap = x.has_cap } }),
         .while_  => |w| new(Node{ .while_ = While{ .cond = cg_clone_expr(w.cond, tp, ta), .body = cg_clone_block(w.body, tp, ta), .cap = w.cap, .has_cap = w.has_cap } }),
+        .break_  => |_b| mk_break(),
         .assign  => |a| mk_assign(cg_clone_expr(a.target, tp, ta), cg_clone_expr(a.expr, tp, ta)),
         .estmt   => |e| mk_estmt(cg_clone_expr(e.expr, tp, ta)),
         .switch_ => |sw| cg_clone_switch(sw, tp, ta),
@@ -1387,6 +1428,7 @@ struct Cg {
     ml_lbl: i32,    // label of the __malloc support routine (_zag_malloc)
     dz_lbl: i32,    // label of the __div0 panic routine (division by zero)
     rl_lbl: i32,    // label of the __realloc support routine (_zag_realloc)
+    fr_lbl: i32,    // label of the __free support routine (_zag_free / delete)
     pf_lbl: i32,    // label of the __print_f64 support routine (print_f64/print_f32)
     use_pi: i32,    // 1 if __print_int is referenced
     use_pf: i32,    // 1 if __print_f64 is referenced
@@ -1396,6 +1438,7 @@ struct Cg {
     use_ml: i32,    // 1 if __malloc is referenced
     use_dz: i32,    // 1 if __div0 is referenced
     use_rl: i32,    // 1 if __realloc is referenced
+    use_fr: i32,    // 1 if __free is referenced
     // ── NATIVE SYSCALL RUNTIME (the `_zag_*` externs) ────────────────────────
     // A contiguous block of `RT_COUNT()` labels minted at `rt_base`; routine k
     // has label rt_base+k (see the RT_* index constants). `rt_used[k] == 1` iff
@@ -1979,6 +2022,7 @@ struct Env {
     sret_disp:   i32,    // rbp disp of the saved sret pointer (cg_not_found if none)
     sret_words:  i32,    // word count of the returned aggregate (0 if not sret)
     sret_type:   []u8,   // the aggregate return type string ("" if not sret)
+    break_lbls:  ArrayList[i32],   // innermost loop exit labels (for `break`)
 }
 
 fn cg_env_new(epilogue: i32) Env {
@@ -1993,6 +2037,7 @@ fn cg_env_new(epilogue: i32) Env {
         .epilogue = epilogue,
         .sret_disp = 0 - 2147483647,
         .sret_words = 0,
+        .break_lbls = make[i32](4),
         .sret_type = "",
     };
 }
@@ -2017,6 +2062,21 @@ fn cg_scope_end(env: *Env, mark: CgScopeMark) void {
     }
     env.*.count = mark.count;
     env.*.scope_base = mark.scope_base;
+}
+
+fn cg_break_push(env: *Env, lbl: i32) void {
+    push[i32](&env.*.break_lbls, lbl);
+}
+
+fn cg_break_pop(env: *Env) void {
+    if (env.*.break_lbls.len > 0) {
+        env.*.break_lbls.len = env.*.break_lbls.len - 1;
+    }
+}
+
+fn cg_break_top(env: *Env) i32 {
+    if (env.*.break_lbls.len == 0) { return 0 - 1; }
+    return get[i32](env.*.break_lbls, env.*.break_lbls.len - 1);
 }
 
 // Is the named local a BY-REF aggregate (its slot holds a pointer to the block)?
@@ -2300,6 +2360,26 @@ fn cg_scan_typeof(sc: *ScanCtx, cg: *Cg, n: *Node) []u8 {
                     }
                     return "";
                 }
+                .fld => |mf| {
+                    // method call: recv.method(args) → RecvType_method return type.
+                    // Mirrors cg_expr_type's method case so the pre-scan sizes
+                    // aggregate method RESULTS (sret blocks, agg-arg copies,
+                    // agg `let` storage) exactly like lowering will.
+                    if (!@strEq(mf.fname, "*") && !@strEq(mf.fname, "?") && !@strEq(mf.fname, "has") && !@strEq(mf.fname, "val")) {
+                        let mrty: []u8 = cg_scan_typeof(sc, cg, mf.base);
+                        if (mrty.len > 1 && mrty[0] == '*') { mrty = mrty[1..]; }
+                        if (mrty.len > 0) {
+                            let mmname: []u8 = _zag_str_concat(_zag_str_concat(mrty, "_"), mf.fname);
+                            if (len[[]u8](c.targs) > 0) { mmname = cg_mangle_generic_norm(mmname, c.targs); }
+                            let mi: i32 = 0;
+                            while (mi < len[[]u8](sc.*.fnames)) {
+                                if (@strEq(get[[]u8](sc.*.fnames, mi), mmname)) { return get[[]u8](sc.*.frets, mi); }
+                                mi = mi + 1;
+                            }
+                        }
+                    }
+                    return "";
+                }
                 else => { return ""; }
             }
         }
@@ -2343,6 +2423,33 @@ fn cg_scan_call(cg: *Cg, sc: *ScanCtx, c: Call) void {
                         // fn-field call: reserve fb3(2) + env_slot(1) + per-arg slot(1 each)
                         sc.*.words.* = sc.*.words.* + 3 + len[*Node](c.args);
                     }
+                    // TRUE METHOD: lowering rewrites recv.method(a..) into
+                    // RecvType_method(recv, a..), PREPENDING the receiver as
+                    // arg 0. The receiver therefore needs the same scratch a
+                    // normal argument gets — one 8-byte spill slot, plus an
+                    // agg_words copy block when the receiver is an aggregate
+                    // passed by value. Missing this under-reserved the frame
+                    // and every later cg_slot_scratch_n write landed BELOW
+                    // rsp (clobbered by the next call/push → segfaults in
+                    // struct-returning fns that call methods).
+                    let mn2: []u8 = mname2;
+                    if (len[[]u8](c.targs) > 0) { mn2 = cg_mangle_generic_norm(mname2, c.targs); }
+                    let is_meth: i32 = 0;
+                    let mfi: i32 = 0;
+                    while (mfi < len[[]u8](sc.*.fnames)) {
+                        if (@strEq(get[[]u8](sc.*.fnames, mfi), mn2)) { is_meth = 1; }
+                        mfi = mfi + 1;
+                    }
+                    if (is_meth == 1) {
+                        sc.*.words.* = sc.*.words.* + 1;   // receiver arg spill slot
+                        if (cg_type_is_agg(cg, rty2) == 1) {
+                            sc.*.words.* = sc.*.words.* + cg_agg_words(cg, rty2);
+                        }
+                    }
+                    // The receiver expression itself is evaluated by lowering
+                    // (as arg 0 / fn-field base / iface recv) — walk it so any
+                    // scratch IT needs (nested calls, literals, …) is reserved.
+                    cg_scan_expr(cg, sc, f.base);
                     fname = mname2;
                 }
             }
@@ -2528,7 +2635,19 @@ fn cg_scan_expr(cg: *Cg, sc: *ScanCtx, n: *Node) void {
         }
         .bin  => |b| {
             // `orelse` materializes the optional into a scratch block + pslot.
-            if (@strEq(b.op, "orelse")) { sc.*.words.* = sc.*.words.* + 4; }
+            // Size to the optional (floor 4): aggregate inners are rejected at
+            // lowering, but nested ?? optionals still exceed the old fixed 4.
+            if (@strEq(b.op, "orelse")) {
+                let olt: []u8 = cg_scan_typeof(sc, cg, b.l);
+                let ow2: i32 = 4;
+                if (olt.len > 1) {
+                    if (olt[0] == '?') {
+                        let cw2: i32 = cg_agg_words(cg, olt) + 1;
+                        if (cw2 > ow2) { ow2 = cw2; }
+                    }
+                }
+                sc.*.words.* = sc.*.words.* + ow2;
+            }
             // ROUND 3: an rns_3 op lowers to a znrt_rns_<op>(l,r) CALL (lowering),
             // which needs sret + 2 by-value arg copies + 2 aslot spill words. The
             // pre-scan never sees that synthesized call, so reserve its worst case
@@ -2543,8 +2662,20 @@ fn cg_scan_expr(cg: *Cg, sc: *ScanCtx, n: *Node) void {
         }
         .un   => |u| { cg_scan_expr(cg, sc, u.e); }
         .fld  => |f| {
-            // force-unwrap `.?` materializes the optional into a scratch block + pslot.
-            if (@strEq(f.fname, "?")) { sc.*.words.* = sc.*.words.* + 4; }
+            // force-unwrap `.?` materializes the optional into a scratch block +
+            // pslot — sized to the optional (floor 4); a *?T base peels to ?T.
+            if (@strEq(f.fname, "?")) {
+                let obt: []u8 = cg_scan_typeof(sc, cg, f.base);
+                if (obt.len > 1) { if (obt[0] == '*') { obt = obt[1..]; } }
+                let ow3: i32 = 4;
+                if (obt.len > 1) {
+                    if (obt[0] == '?') {
+                        let cw3: i32 = cg_agg_words(cg, obt) + 1;
+                        if (cw3 > ow3) { ow3 = cw3; }
+                    }
+                }
+                sc.*.words.* = sc.*.words.* + ow3;
+            }
             cg_scan_expr(cg, sc, f.base);
         }
         .idx  => |x| { cg_scan_expr(cg, sc, x.base); cg_scan_expr(cg, sc, x.idx); }
@@ -2665,10 +2796,20 @@ fn cg_scan_body(cg: *Cg, sc: *ScanCtx, body: ArrayList[*Node]) void {
             .if_    => |iff| {
                 cg_scan_expr(cg, sc, iff.cond);
                 if (iff.has_cap == 1) {
-                    // if-let: scratch optional block + capture slot.
-                    sc.*.words.* = sc.*.words.* + 4;  // scratch optional block (conservative)
-                    sc.*.words.* = sc.*.words.* + 1;  // capture slot (scalar value or pointer)
+                    // if-let: scratch optional block (sized to the optional — a big
+                    // ?Struct block is 1+agg_words(T) words; floor at the old 4-word
+                    // minimum) + pslot + capture slot. The emitter consumes exactly
+                    // onf (cg_slot_scratch_n) + 1 (cg_pslot_for_frame) + 1 (capture).
                     let ct: []u8 = cg_scan_typeof(sc, cg, iff.cond);
+                    let ow: i32 = 4;
+                    if (ct.len > 1) {
+                        if (ct[0] == '?') {
+                            let cw: i32 = cg_agg_words(cg, ct);
+                            if (cw > ow) { ow = cw; }
+                        }
+                    }
+                    sc.*.words.* = sc.*.words.* + ow + 1;  // scratch optional block + pslot
+                    sc.*.words.* = sc.*.words.* + 1;  // capture slot (scalar value or pointer)
                     if (ct.len > 1) {
                         if (ct[0] == '?') {
                             let inner: []u8 = ct[1..];
@@ -2686,10 +2827,18 @@ fn cg_scan_body(cg: *Cg, sc: *ScanCtx, body: ArrayList[*Node]) void {
             .while_ => |w2| {
                 cg_scan_expr(cg, sc, w2.cond);
                 if (w2.has_cap == 1) {
-                    // while-let: scratch optional block + capture slot.
-                    sc.*.words.* = sc.*.words.* + 4;  // scratch optional block (conservative)
-                    sc.*.words.* = sc.*.words.* + 1;  // capture slot
+                    // while-let: scratch optional block (sized like if-let) + pslot
+                    // + capture slot.
                     let ct: []u8 = cg_scan_typeof(sc, cg, w2.cond);
+                    let ow: i32 = 4;
+                    if (ct.len > 1) {
+                        if (ct[0] == '?') {
+                            let cw: i32 = cg_agg_words(cg, ct);
+                            if (cw > ow) { ow = cw; }
+                        }
+                    }
+                    sc.*.words.* = sc.*.words.* + ow + 1;  // scratch optional block + pslot
+                    sc.*.words.* = sc.*.words.* + 1;  // capture slot
                     if (ct.len > 1) {
                         if (ct[0] == '?') {
                             let inner: []u8 = ct[1..];
@@ -2810,7 +2959,9 @@ fn cg_native_rt_ret(name: []u8) []u8 {
     if (@strEq(name, "_zag_exit"))            { return ""; }
     if (@strEq(name, "_zag_memcpy"))          { return ""; }
     if (@strEq(name, "_zag_read_fd"))         { return "i64"; }
+    if (@strEq(name, "_zag_slice_ptr"))       { return "*i8"; }
     if (@strEq(name, "_zag_clock_monotonic_ms")) { return "i64"; }
+    if (@strEq(name, "_zag_raw_syscall"))     { return "i64"; }
     return "";
 }
 
@@ -2845,7 +2996,9 @@ fn cg_is_native_rt(name: []u8) i32 {
     if (@strEq(name, "_zag_exit"))            { return 1; }
     if (@strEq(name, "_zag_memcpy"))          { return 1; }
     if (@strEq(name, "_zag_read_fd"))         { return 1; }
+    if (@strEq(name, "_zag_slice_ptr"))       { return 1; }
     if (@strEq(name, "_zag_clock_monotonic_ms")) { return 1; }
+    if (@strEq(name, "_zag_raw_syscall"))     { return 1; }
     return 0;
 }
 
@@ -5014,10 +5167,11 @@ fn cg_lower_new(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnSy
             if (cg_type_is_agg(cg, sn) == 0) {
                 cg_err(cg, "native: new(...) on unknown struct/union type");
             }
-            // rdi = sizeof(T) ; call __alloc → rax = ptr.
+            // rdi = sizeof(T) ; call __malloc → rax = header'd ptr (so
+            // delete()/_zag_free can reclaim it).
             push[Instr](out, i_mov_imm(R_RDI(), sz as i64));
-            cg.*.use_al = 1;
-            push[Instr](out, i_call(cg.*.al_lbl));
+            cg.*.use_ml = 1;
+            push[Instr](out, i_call(cg.*.ml_lbl));
             // Stash ptr in a scratch pslot so field-value expressions can't
             // clobber it; the materializer reloads it per store.
             let pslot: i32 = cg_slot_scratch(env);
@@ -5265,10 +5419,28 @@ fn cg_lower_runtime(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
         return 1;
     }
     if (@strEq(fname, "_zag_free")) {
-        // evaluate the argument for side effects, then discard; no unmap.
+        // real deallocation: __free returns the block to its class free list
+        // (or munmaps a large block).
         if (nargs == 1) {
             cg_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
-            push[Instr](out, i_pop(R_RAX()));
+            push[Instr](out, i_pop(R_RDI()));
+            cg.*.use_fr = 1;
+            push[Instr](out, i_call(cg.*.fr_lbl));
+        }
+        push[Instr](out, i_mov_imm(R_RAX(), 0));
+        push[Instr](out, i_push(R_RAX()));
+        return 1;
+    }
+    if (@strEq(fname, "_zag_str_free")) {
+        // free a heap string's DATA buffer (from _zag_strdup/_zag_str_concat/
+        // _zag_i64_to_str/...). The 16-byte {ptr,len} block is not touched —
+        // it may live on the stack or be shared by value copies.
+        if (nargs == 1) {
+            cg_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+            push[Instr](out, i_pop(R_RDI()));                // rdi = &{ptr,len}
+            push[Instr](out, i_load(R_RDI(), R_RDI(), 0));   // rdi = data ptr
+            cg.*.use_fr = 1;
+            push[Instr](out, i_call(cg.*.fr_lbl));
         }
         push[Instr](out, i_mov_imm(R_RAX(), 0));
         push[Instr](out, i_push(R_RAX()));
@@ -5359,6 +5531,41 @@ fn cg_lower_native_rt(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, s
         if (nargs != 3) { cg_err(cg, "native: _zag_read_fd expects 3 arguments"); push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return 1; }
         cg_rt_lower_args(out, c, env, syms, cg);   // rdi=fd, rsi=buf, rdx=count
         push[Instr](out, i_mov_imm(R_RAX(), 0));    // sys_read
+        push[Instr](out, i_syscall());
+        push[Instr](out, i_push(R_RAX()));
+        return 1;
+    }
+
+    // ── _zag_slice_ptr(rdi=&[]u8) -> rax = data pointer ───────────────────────
+    if (@strEq(fname, "_zag_slice_ptr")) {
+        if (nargs != 1) { cg_err(cg, "native: _zag_slice_ptr expects one []u8 argument"); push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return 1; }
+        cg_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+        push[Instr](out, i_pop(R_RDI()));
+        push[Instr](out, i_load(R_RAX(), R_RDI(), 0));
+        push[Instr](out, i_push(R_RAX()));
+        return 1;
+    }
+
+    // ── _zag_raw_syscall(num, a1..a6) → rax ──────────────────────────────────
+    // The raw Linux syscall escape hatch net_rt/thread_rt/signal_rt were
+    // written against. Linux x86-64 convention: number in rax, args in
+    // rdi, rsi, rdx, r10, r8, r9 (NOT rcx — the syscall insn clobbers
+    // rcx/r11). Args are evaluated left-to-right onto the CPU stack, then
+    // popped in reverse so nested calls inside arguments stay balanced.
+    if (@strEq(fname, "_zag_raw_syscall")) {
+        if (nargs != 7) { cg_err(cg, "native: _zag_raw_syscall expects 7 arguments (num, a1..a6)"); push[Instr](out, i_mov_imm(R_RAX(), 0 - 1)); push[Instr](out, i_push(R_RAX())); return 1; }
+        let ai: i32 = 0;
+        while (ai < 7) {
+            cg_lower_expr(out, get[*Node](c.args, ai), env, syms, cg);
+            ai = ai + 1;
+        }
+        push[Instr](out, i_pop(R_R9()));    // a6
+        push[Instr](out, i_pop(R_R8()));    // a5
+        push[Instr](out, i_pop(R_R10()));   // a4
+        push[Instr](out, i_pop(R_RDX()));   // a3
+        push[Instr](out, i_pop(R_RSI()));   // a2
+        push[Instr](out, i_pop(R_RDI()));   // a1
+        push[Instr](out, i_pop(R_RAX()));   // syscall number
         push[Instr](out, i_syscall());
         push[Instr](out, i_push(R_RAX()));
         return 1;
@@ -6629,7 +6836,9 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                     push[Instr](out, i_load(R_RAX(), R_RBP(), blk + 8));
                     push[Instr](out, i_store(R_RBP(), cdisp, R_RAX()));
                 }
+                cg_break_push(env, end);
                 cg_lower_block(out, w.body, env, syms, cg);
+                cg_break_pop(env);
                 cg_scope_end(env, capture_scope);
                 push[Instr](out, i_jmp(top));
                 push[Instr](out, i_label(end));
@@ -6639,9 +6848,19 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                 push[Instr](out, i_pop(R_RAX()));
                 push[Instr](out, i_cmp_imm(R_RAX(), 0));
                 push[Instr](out, i_je(end));
+                cg_break_push(env, end);
                 cg_lower_scoped_block(out, w.body, env, syms, cg);
+                cg_break_pop(env);
                 push[Instr](out, i_jmp(top));
                 push[Instr](out, i_label(end));
+            }
+        }
+        .break_ => |_b| {
+            let tgt: i32 = cg_break_top(env);
+            if (tgt < 0) {
+                cg_err(cg, "native: break outside loop");
+            } else {
+                push[Instr](out, i_jmp(tgt));
             }
         }
         .estmt => |e| {
@@ -7375,22 +7594,149 @@ fn cg_emit_panic(out: *ArrayList[Instr], msg: []u8, lbl_past: i32, cg: *Cg) void
     push[Instr](out, i_label(lbl_past));   // unreachable, but keeps structure
 }
 
+// ── the REAL allocator ────────────────────────────────────────────────────────
+// Segregated free lists over mmap'd arenas, with the same 8-byte size header
+// the old bump design used (size at [ptr-8]) so __realloc keeps working.
+//
+// BSS layout (writable PT_LOAD at BSS_VBASE, zero-filled by the loader):
+//   +0   arena cursor (next carve address; 0 until the first arena mmap)
+//   +8   arena end
+//   +16  free-list heads[0..15]; class c serves user sizes ≤ 16<<c (16..512K)
+//
+// Small (n ≤ 512K): round to the class size; pop the class free list, else
+// carve [header|block] off the current 1 MiB arena (mmap a fresh arena when
+// exhausted). The header holds the CLASS size, so __free reclasses exactly.
+// Large: dedicated mmap of n+8; __free munmaps it.
+// NOT yet thread-safe: the free lists are unlocked (single-threaded programs
+// only — same constraint as the rest of the native runtime today).
+fn BSS_VBASE() i64 { return 134217728; }        // 0x8000000 (elf.zag BSS_VADDR)
+fn ALLOC_HEADS() i64 { return BSS_VBASE() + 16; }
+fn ALLOC_MAX_SMALL() i64 { return 524288; }     // 16 << 15
+fn ALLOC_ARENA() i64 { return 1048576; }        // 1 MiB arenas
+
 fn cg_emit_malloc(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
+    let l_class: i32 = cg_fresh(cg);
+    let l_found: i32 = cg_fresh(cg);
+    let l_carve: i32 = cg_fresh(cg);
+    let l_have:  i32 = cg_fresh(cg);
+
     push[Instr](out, i_label(lbl));
+    // class search: rsi = candidate size (16,32,..), rcx = class index
+    push[Instr](out, i_mov_imm(R_RSI(), 16));
+    push[Instr](out, i_mov_imm(R_RCX(), 0));
+    push[Instr](out, i_label(l_class));
+    push[Instr](out, i_cmp(R_RSI(), R_RDI()));
+    push[Instr](out, i_jge(l_found));                // class size >= n
+    push[Instr](out, i_add(R_RSI(), R_RSI()));
+    push[Instr](out, i_add_imm(R_RCX(), 1));
+    push[Instr](out, i_cmp_imm(R_RCX(), 16));
+    push[Instr](out, i_jl(l_class));
+    // large path: dedicated mmap of n+8; header = exact n
     push[Instr](out, i_push(R_RDI()));               // save n
-    push[Instr](out, i_add_imm(R_RDI(), 8));         // request n + 8 (header)
+    push[Instr](out, i_add_imm(R_RDI(), 8));
     push[Instr](out, i_call(cg.*.al_lbl));           // rax = mmap base
-    push[Instr](out, i_pop(R_RCX()));                // rcx = n
+    push[Instr](out, i_pop(R_RCX()));
     push[Instr](out, i_store(R_RAX(), 0, R_RCX()));  // [base] = n
-    push[Instr](out, i_add_imm(R_RAX(), 8));         // ptr = base + 8
+    push[Instr](out, i_add_imm(R_RAX(), 8));
+    push[Instr](out, i_ret());
+
+    push[Instr](out, i_label(l_found));
+    // rsi = class size, rcx = class index; r8 = &heads[rcx]
+    push[Instr](out, i_mov_rr(R_R8(), R_RCX()));
+    push[Instr](out, i_mov_imm(R_R9(), 8));
+    push[Instr](out, i_imul(R_R8(), R_R9()));
+    push[Instr](out, i_mov_imm(R_R9(), ALLOC_HEADS()));
+    push[Instr](out, i_add(R_R8(), R_R9()));
+    push[Instr](out, i_load(R_RAX(), R_R8(), 0));    // rax = head
+    push[Instr](out, i_cmp_imm(R_RAX(), 0));
+    push[Instr](out, i_je(l_carve));
+    // pop: heads[c] = [head]; header already carries the class size
+    push[Instr](out, i_load(R_R9(), R_RAX(), 0));
+    push[Instr](out, i_store(R_R8(), 0, R_R9()));
+    push[Instr](out, i_ret());
+
+    push[Instr](out, i_label(l_carve));
+    // carve [header(8) | class size] off the arena; refill arena if short
+    push[Instr](out, i_mov_imm(R_R10(), BSS_VBASE()));
+    push[Instr](out, i_load(R_RDX(), R_R10(), 0));   // rdx = cur
+    push[Instr](out, i_load(R_R9(),  R_R10(), 8));   // r9  = end
+    push[Instr](out, i_mov_rr(R_RAX(), R_RDX()));
+    push[Instr](out, i_add(R_RAX(), R_RSI()));
+    push[Instr](out, i_add_imm(R_RAX(), 8));         // rax = cur + need
+    push[Instr](out, i_cmp(R_RAX(), R_R9()));
+    push[Instr](out, i_jle(l_have));
+    // mmap a fresh arena (class+8 ≤ 512K+8 always fits in 1 MiB)
+    push[Instr](out, i_push(R_RSI()));               // save class size
+    push[Instr](out, i_mov_imm(R_RDI(), ALLOC_ARENA()));
+    push[Instr](out, i_call(cg.*.al_lbl));           // rax = arena base
+    push[Instr](out, i_pop(R_RSI()));
+    push[Instr](out, i_mov_imm(R_R10(), BSS_VBASE()));
+    push[Instr](out, i_store(R_R10(), 0, R_RAX()));  // cur = base
+    push[Instr](out, i_mov_rr(R_R9(), R_RAX()));
+    push[Instr](out, i_add_imm(R_R9(), ALLOC_ARENA()));
+    push[Instr](out, i_store(R_R10(), 8, R_R9()));   // end = base + arena
+    push[Instr](out, i_load(R_RDX(), R_R10(), 0));   // rdx = cur (fresh base)
+    push[Instr](out, i_mov_rr(R_RAX(), R_RDX()));
+    push[Instr](out, i_add(R_RAX(), R_RSI()));
+    push[Instr](out, i_add_imm(R_RAX(), 8));
+    push[Instr](out, i_label(l_have));
+    push[Instr](out, i_store(R_R10(), 0, R_RAX()));  // commit new cursor
+    push[Instr](out, i_store(R_RDX(), 0, R_RSI()));  // header = class size
+    push[Instr](out, i_mov_rr(R_RAX(), R_RDX()));
+    push[Instr](out, i_add_imm(R_RAX(), 8));         // ptr = block + 8
+    push[Instr](out, i_ret());
+}
+
+// ── support routine: __free(rdi=ptr) ──────────────────────────────────────────
+// NULL is ignored. Reads the size header: large blocks munmap; small blocks
+// push onto their class free list (the freed block's first word becomes the
+// next-pointer).
+fn cg_emit_free(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
+    let l_ret:   i32 = cg_fresh(cg);
+    let l_big:   i32 = cg_fresh(cg);
+    let l_class: i32 = cg_fresh(cg);
+    let l_found: i32 = cg_fresh(cg);
+
+    push[Instr](out, i_label(lbl));
+    push[Instr](out, i_cmp_imm(R_RDI(), 0));
+    push[Instr](out, i_je(l_ret));
+    push[Instr](out, i_load(R_RSI(), R_RDI(), 0 - 8));   // rsi = size header
+    push[Instr](out, i_cmp_imm(R_RSI(), ALLOC_MAX_SMALL()));
+    push[Instr](out, i_jg(l_big));
+    // class index from the (exact) class size: rcx = idx, rdx = 16,32,..
+    push[Instr](out, i_mov_imm(R_RCX(), 0));
+    push[Instr](out, i_mov_imm(R_RDX(), 16));
+    push[Instr](out, i_label(l_class));
+    push[Instr](out, i_cmp(R_RDX(), R_RSI()));
+    push[Instr](out, i_jge(l_found));
+    push[Instr](out, i_add(R_RDX(), R_RDX()));
+    push[Instr](out, i_add_imm(R_RCX(), 1));
+    push[Instr](out, i_jmp(l_class));
+    push[Instr](out, i_label(l_found));
+    push[Instr](out, i_mov_rr(R_R8(), R_RCX()));
+    push[Instr](out, i_mov_imm(R_R9(), 8));
+    push[Instr](out, i_imul(R_R8(), R_R9()));
+    push[Instr](out, i_mov_imm(R_R9(), ALLOC_HEADS()));
+    push[Instr](out, i_add(R_R8(), R_R9()));             // r8 = &heads[c]
+    push[Instr](out, i_load(R_R9(), R_R8(), 0));
+    push[Instr](out, i_store(R_RDI(), 0, R_R9()));       // [ptr] = old head
+    push[Instr](out, i_store(R_R8(), 0, R_RDI()));       // head = ptr
+    push[Instr](out, i_label(l_ret));
+    push[Instr](out, i_ret());
+    push[Instr](out, i_label(l_big));
+    // munmap(ptr-8, size+8) — syscall 11 (kernel page-rounds the length)
+    push[Instr](out, i_sub_imm(R_RDI(), 8));
+    push[Instr](out, i_add_imm(R_RSI(), 8));
+    push[Instr](out, i_mov_imm(R_RAX(), 11));
+    push[Instr](out, i_syscall());
     push[Instr](out, i_ret());
 }
 
 // ── support routine: __realloc(rdi=oldptr, rsi=newsize) -> rax = newptr ───────
-// Allocate a fresh header'd region of `newsize`, copy min(oldsize, newsize)
-// bytes (rounded UP to 8-byte words; both regions are page-rounded mmaps so the
-// ≤7-byte over-copy stays in-bounds), and return the new user pointer. The old
-// region is left mapped (no unmap — documented small leak). oldsize is read from
+// __malloc a fresh block (its header = class size ≥ newsize), copy
+// min(oldsize, newsize) bytes (rounded UP to 8-byte words; both blocks'
+// capacities are multiples of 8, so the ≤7-byte over-copy stays in-bounds),
+// __free the old block, and return the new user pointer. oldsize is read from
 // the header at [oldptr-8].
 fn cg_emit_realloc(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     let l_min:  i32 = cg_fresh(cg);
@@ -7401,11 +7747,8 @@ fn cg_emit_realloc(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     push[Instr](out, i_push(R_RDI()));               // save oldptr
     push[Instr](out, i_push(R_RSI()));               // save newsize
     push[Instr](out, i_mov_rr(R_RDI(), R_RSI()));    // rdi = newsize
-    push[Instr](out, i_add_imm(R_RDI(), 8));         // + header
-    push[Instr](out, i_call(cg.*.al_lbl));           // rax = new mmap base
+    push[Instr](out, i_call(cg.*.ml_lbl));           // rax = newptr (header'd)
     push[Instr](out, i_pop(R_RSI()));                // rsi = newsize
-    push[Instr](out, i_store(R_RAX(), 0, R_RSI()));  // [newbase] = newsize
-    push[Instr](out, i_add_imm(R_RAX(), 8));         // rax = newptr (past header)
     push[Instr](out, i_pop(R_RDI()));                // rdi = oldptr
     push[Instr](out, i_load(R_R8(), R_RDI(), 0 - 8));// r8 = oldsize = [oldptr-8]
     // rcx = min(oldsize, newsize)
@@ -7430,6 +7773,10 @@ fn cg_emit_realloc(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     push[Instr](out, i_add_imm(R_R9(), 8));          // next word
     push[Instr](out, i_jmp(l_loop));
     push[Instr](out, i_label(l_done));
+    // release the old block (rdi still = oldptr); keep newptr across the call
+    push[Instr](out, i_push(R_RAX()));
+    push[Instr](out, i_call(cg.*.fr_lbl));
+    push[Instr](out, i_pop(R_RAX()));
     push[Instr](out, i_ret());                        // rax = newptr
 }
 
@@ -7452,11 +7799,12 @@ fn cg_emit_realloc(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
 // [block+0] and rdx=len at [block+8], leaving the block address in rax. Helper
 // emitted inline by the routines that build a []u8 result. Clobbers rdi.
 fn cg_rt_emit_make_slice(out: *ArrayList[Instr], cg: *Cg) void {
-    // caller has the desired ptr in rsi and len in rdx; preserve across __alloc.
+    // caller has the desired ptr in rsi and len in rdx; preserve across __malloc
+    // (arena-carved 16-byte class — a raw mmap here wasted a page per slice).
     push[Instr](out, i_push(R_RSI()));
     push[Instr](out, i_push(R_RDX()));
     push[Instr](out, i_mov_imm(R_RDI(), 16));
-    push[Instr](out, i_call(cg.*.al_lbl));       // rax = 16-byte block
+    push[Instr](out, i_call(cg.*.ml_lbl));       // rax = 16-byte block
     push[Instr](out, i_pop(R_RDX()));            // rdx = len
     push[Instr](out, i_pop(R_RSI()));            // rsi = ptr
     push[Instr](out, i_store(R_RAX(), 0, R_RSI()));   // [block+0] = ptr
@@ -8216,12 +8564,33 @@ fn cg_emit_rt_idxbyte(out: *ArrayList[Instr], cg: *Cg) void {
 }
 
 // ── _zag_memcpy(rdi=dst, rsi=src, rdx=n) -> void ─────────────────────────────
+// Word-at-a-time forward copy with a byte tail: the old one-byte-per-loop
+// version (with a push/pop-heavy store_byte call per byte) made memcpy the
+// bottleneck of anything blit-shaped.
 fn cg_emit_rt_memcpy(out: *ArrayList[Instr], cg: *Cg) void {
-    let l_top: i32 = cg_fresh(cg);
-    let l_end: i32 = cg_fresh(cg);
+    let l_words: i32 = cg_fresh(cg);
+    let l_bytes: i32 = cg_fresh(cg);
+    let l_btop:  i32 = cg_fresh(cg);
+    let l_end:   i32 = cg_fresh(cg);
     push[Instr](out, i_label(cg_rt_lbl(cg, RT_MEMCPY())));
     push[Instr](out, i_mov_imm(R_R8(), 0));          // i
-    push[Instr](out, i_label(l_top));
+    // 8-byte words while i+8 <= n
+    push[Instr](out, i_label(l_words));
+    push[Instr](out, i_mov_rr(R_RAX(), R_R8()));
+    push[Instr](out, i_add_imm(R_RAX(), 8));
+    push[Instr](out, i_cmp(R_RAX(), R_RDX()));
+    push[Instr](out, i_jg(l_bytes));                 // i+8 > n → byte tail
+    push[Instr](out, i_mov_rr(R_RAX(), R_RSI()));
+    push[Instr](out, i_add(R_RAX(), R_R8()));
+    push[Instr](out, i_load(R_RAX(), R_RAX(), 0));   // rax = 8 src bytes
+    push[Instr](out, i_mov_rr(R_RCX(), R_RDI()));
+    push[Instr](out, i_add(R_RCX(), R_R8()));
+    push[Instr](out, i_store(R_RCX(), 0, R_RAX()));
+    push[Instr](out, i_add_imm(R_R8(), 8));
+    push[Instr](out, i_jmp(l_words));
+    // byte tail
+    push[Instr](out, i_label(l_bytes));
+    push[Instr](out, i_label(l_btop));
     push[Instr](out, i_cmp(R_R8(), R_RDX()));
     push[Instr](out, i_jge(l_end));
     push[Instr](out, i_mov_rr(R_RAX(), R_RSI()));
@@ -8237,7 +8606,7 @@ fn cg_emit_rt_memcpy(out: *ArrayList[Instr], cg: *Cg) void {
     push[Instr](out, i_pop(R_RSI()));
     push[Instr](out, i_pop(R_RDI()));               // restore dst ptr
     push[Instr](out, i_add_imm(R_R8(), 1));
-    push[Instr](out, i_jmp(l_top));
+    push[Instr](out, i_jmp(l_btop));
     push[Instr](out, i_label(l_end));
     push[Instr](out, i_mov_imm(R_RAX(), 0));
     push[Instr](out, i_ret());
@@ -8348,19 +8717,20 @@ fn cg_rt_close_deps(cg: *Cg) void {
     if (cg_rt_is_used(cg, RT_U2S()) == 1)     { cg.*.use_ml = 1; }
     if (cg_rt_is_used(cg, RT_STRDUP()) == 1)  { cg.*.use_ml = 1; }
     if (cg_rt_is_used(cg, RT_READF()) == 1)   { cg.*.use_ml = 1; cg.*.use_rl = 1; set[i32](cg.*.rt_used, RT_PATHBUF(), 1); }
-    if (cg_rt_is_used(cg, RT_ARG()) == 1)     { cg.*.use_al = 1; }
+    if (cg_rt_is_used(cg, RT_ARG()) == 1)     { cg.*.use_ml = 1; }
+    if (cg_rt_is_used(cg, RT_GETENV()) == 1)  { cg.*.use_ml = 1; }
     if (cg_rt_is_used(cg, RT_WRITELN()) == 1) { }  // no alloc
     if (cg_rt_is_used(cg, RT_WRITEF()) == 1)  { cg.*.use_ml = 1; set[i32](cg.*.rt_used, RT_PATHBUF(), 1); }
     if (cg_rt_is_used(cg, RT_WRITEX()) == 1)  { cg.*.use_ml = 1; set[i32](cg.*.rt_used, RT_PATHBUF(), 1); }
     if (cg_rt_is_used(cg, RT_FEXISTS()) == 1) { cg.*.use_ml = 1; set[i32](cg.*.rt_used, RT_PATHBUF(), 1); }
     if (cg_rt_is_used(cg, RT_EXEC()) == 1)    { cg.*.use_ml = 1; set[i32](cg.*.rt_used, RT_PATHBUF(), 1); }
     if (cg_rt_is_used(cg, RT_PATHBUF()) == 1) { cg.*.use_ml = 1; }
-    // make_slice uses __alloc; any []u8-returning routine needs it.
-    if (cg_rt_is_used(cg, RT_CONCAT()) == 1)  { cg.*.use_al = 1; }
-    if (cg_rt_is_used(cg, RT_I2S()) == 1)     { cg.*.use_al = 1; }
-    if (cg_rt_is_used(cg, RT_U2S()) == 1)     { cg.*.use_al = 1; }
-    if (cg_rt_is_used(cg, RT_STRDUP()) == 1)  { cg.*.use_al = 1; }
-    if (cg_rt_is_used(cg, RT_READF()) == 1)   { cg.*.use_al = 1; }
+    // make_slice allocates via __malloc; any []u8-returning routine needs it.
+    if (cg_rt_is_used(cg, RT_CONCAT()) == 1)  { cg.*.use_ml = 1; }
+    if (cg_rt_is_used(cg, RT_I2S()) == 1)     { cg.*.use_ml = 1; }
+    if (cg_rt_is_used(cg, RT_U2S()) == 1)     { cg.*.use_ml = 1; }
+    if (cg_rt_is_used(cg, RT_STRDUP()) == 1)  { cg.*.use_ml = 1; }
+    if (cg_rt_is_used(cg, RT_READF()) == 1)   { cg.*.use_ml = 1; }
 }
 
 // Emit every referenced native-runtime routine body (after the heap/print/streq
@@ -9542,10 +9912,11 @@ fn lower_program(decls0in: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u
     let rl_lbl: i32 = next_id + 5;
     let pf_lbl: i32 = next_id + 6;
     let dz_lbl: i32 = next_id + 7;
+    let fr_lbl: i32 = next_id + 8;
     // NATIVE SYSCALL RUNTIME: a contiguous block of RT_COUNT() labels for the
     // `_zag_*` routines, minted above the heap/print/streq routine labels. Their
     // `rt_used` flags (one per routine, init 0) gate body emission like use_*.
-    let rt_base: i32 = next_id + 8;
+    let rt_base: i32 = next_id + 9;
     let rt_used: ArrayList[i32] = make[i32](RT_COUNT() + 1);
     let rti: i32 = 0;
     while (rti < RT_COUNT()) { push[i32](&rt_used, 0); rti = rti + 1; }
@@ -9561,6 +9932,7 @@ fn lower_program(decls0in: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u
         .ml_lbl = ml_lbl,
         .dz_lbl = dz_lbl,
         .rl_lbl = rl_lbl,
+        .fr_lbl = fr_lbl,
         .pf_lbl = pf_lbl,
         .use_pi = 0,
         .use_pf = 0,
@@ -9570,6 +9942,7 @@ fn lower_program(decls0in: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u
         .use_ml = 0,
         .use_dz = 0,
         .use_rl = 0,
+        .use_fr = 0,
         .rt_base = rt_base,
         .rt_used = &rt_used,
         .cur_fn = "",
@@ -9634,14 +10007,15 @@ fn lower_program(decls0in: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u
     // the transitive `use_*` / rt_used flags here so every called routine has a
     // body. (Order doesn't matter — emission below is gated on the final flags.)
     cg_rt_close_deps(&cg);
+    if (cg.use_rl == 1) { cg.use_ml = 1; cg.use_fr = 1; }   // realloc = malloc+copy+free
     if (cg.use_ml == 1) { cg.use_al = 1; }
-    if (cg.use_rl == 1) { cg.use_al = 1; }
     if (cg.use_pi == 1) { cg_emit_print_int(&out, cg.pi_lbl, &cg); }
     if (cg.use_pf == 1) { cg_emit_print_f64(&out, cg.pf_lbl, &cg); }
     if (cg.use_ps == 1) { cg_emit_print_str(&out, cg.ps_lbl); }
     if (cg.use_al == 1) { cg_emit_alloc(&out, cg.al_lbl); }
     if (cg.use_se == 1) { cg_emit_streq(&out, cg.se_lbl, &cg); }
     if (cg.use_ml == 1) { cg_emit_malloc(&out, cg.ml_lbl, &cg); }
+    if (cg.use_fr == 1) { cg_emit_free(&out, cg.fr_lbl, &cg); }
     if (cg.use_dz == 1) { cg_emit_div0(&out, cg.dz_lbl, &cg); }
     if (cg.use_rl == 1) { cg_emit_realloc(&out, cg.rl_lbl, &cg); }
     cg_emit_native_rt(&out, &cg);

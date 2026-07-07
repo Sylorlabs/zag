@@ -23,6 +23,17 @@ nt(){
     rm -f /tmp/nt_bin
 }
 
+# nto <name> <source> <expected-stdout> <expected-exit>
+nto(){
+    printf '%s' "$2" > nt_src.zag
+    "$ZNC" nt_src.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
+    if [ ! -x /tmp/nt_bin ]; then echo "  XX  $1 (compile failed)"; sed -n '1,6p' /tmp/nt_out; fail=$((fail+1)); return; fi
+    local got; got=$(/tmp/nt_bin); local ec=$?
+    if [ "$got" = "$3" ] && [ "$ec" = "$4" ]; then echo "  ok  $1 (stdout='$got' exit=$ec)"; pass=$((pass+1));
+    else echo "  XX  $1 (got stdout='$got' exit=$ec, want '$3'/$4)"; fail=$((fail+1)); fi
+    rm -f /tmp/nt_bin
+}
+
 echo "── native backend: Zag → x86-64 ELF (no cc/as/ld/libc) ──"
 nt "return literal"  'fn main() i32 { return 42; }' 42
 nt "arithmetic"      'fn main() i32 { let a: i32 = 8; let b: i32 = 5; return a * b - 2; }' 38
@@ -40,16 +51,6 @@ nto "i32 overflow wrap" 'fn main() i32 { let x: i32 = 123456789; x = x * 1664525
 nt "unary minus"     'fn main() i32 { let a: i32 = 50; return 0 - a + 57; }' 7
 nt "nested if/else"  'fn main() i32 { let x: i32 = 7; if (x < 5) { return 1; } else if (x < 10) { return 99; } else { return 2; } }' 99
 
-# nto <name> <source> <expected-stdout> <expected-exit> — for output-producing programs
-nto(){
-    printf '%s' "$2" > nt_src.zag
-    "$ZNC" nt_src.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
-    if [ ! -x /tmp/nt_bin ]; then echo "  XX  $1 (compile failed)"; sed -n '1,6p' /tmp/nt_out; fail=$((fail+1)); return; fi
-    local got; got=$(/tmp/nt_bin); local ec=$?
-    if [ "$got" = "$3" ] && [ "$ec" = "$4" ]; then echo "  ok  $1 (stdout='$got' exit=$ec)"; pass=$((pass+1));
-    else echo "  XX  $1 (got stdout='$got' exit=$ec, want '$3'/$4)"; fail=$((fail+1)); fi
-    rm -f /tmp/nt_bin
-}
 echo "── output (print via write syscall) + structs ──"
 nto "print_int"      'fn main() i32 { print_int(12345); return 0; }' "12345" 0
 nto "print_int zero" 'fn main() i32 { print_int(0); return 0; }' "0" 0
@@ -209,15 +210,16 @@ else
 fi
 rm -f /tmp/nt_elf nt_src.zag
 
-# Hardening: an unsupported construct must ABORT the build, never miscompile.
-# (Float literals are now SUPPORTED; a hex literal is still rejected loudly.)
+# Hex integer literals are supported (0x / 0X, digits + a-f/A-F + '_'):
+# 0xff == 255 and 0x2a == 42, so the program must compile and exit 42.
 rm -f /tmp/nt_bin
-printf 'fn main() i32 { let x: i32 = 0xff; return 0; }' > nt_src.zag
+printf 'fn main() i32 { let x: i32 = 0xff; if (x != 255) { return 1; } return 0x2a; }' > nt_src.zag
 "$ZNC" nt_src.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
-if grep -q 'build aborted' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
-    echo "  ok  rejects hex literal loudly (aborts, emits no binary)"; pass=$((pass+1))
+/tmp/nt_bin >/dev/null 2>&1
+if [ "$?" -eq 42 ]; then
+    echo "  ok  hex literal compiles and evaluates (0xff==255, 0x2a==42)"; pass=$((pass+1))
 else
-    echo "  XX  hex literal not rejected loudly"; fail=$((fail+1))
+    echo "  XX  hex literal miscompiled"; fail=$((fail+1))
 fi
 rm -f /tmp/nt_bin nt_src.zag
 

@@ -58,7 +58,7 @@ echo "-- v1 core: required rejection --"
 reject unknown-name reject_unknown_name.zag
 reject try-outside-error-function reject_try_non_error.zag
 reject mixed-posit-arithmetic reject_mixed_posit.zag
-reject hexadecimal-literal reject_hex_literal.zag
+ok hexadecimal-literal accept_hex_literal.zag 42
 reject escaping-capturing-closure reject_closure_escape.zag
 reject general-type-mismatch reject_type_mismatch.zag
 
