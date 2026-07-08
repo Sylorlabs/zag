@@ -59,15 +59,24 @@ bash tests/run_diag.sh
 bash tests/run_native.sh
 ```
 
-Informational differential suites that still use the legacy C emitter:
+Native cross-target and self-hosting gates:
 
 ```sh
-bash run_tests.sh
-bash tests/run_selfhost.sh
+bash tests/run_native.sh
+bash tests/run_native_arm64.sh
+bash tests/run_arm64_selfhost.sh
 ```
 
-## Legacy `./zagc` path
+## Retired C-emitting compiler
 
-`./zagc` emits C and shells out to the host compiler. It remains in the tree as a differential oracle only. It is not rebuilt by `bootstrap.sh` and it is not a supported build path. Multi-target builds (wasm, GPU, arm64, and the rest) live on that legacy path if you need them for comparison.
+The old `zagc` C-emitting compiler, its runtime, generated C files, and its
+oracle suites are intentionally absent from this tree. They must not be
+restored as a fallback. Use Git history if you need to study them:
 
-`prove.sh` exercises `@total` proofs through ghost_engine on the legacy path.
+```sh
+git log --all -- zag-poc/selfhost/zagc.zag zag-poc/selfhost/codegen.zag
+git show <commit>:zag-poc/selfhost/codegen.zag
+```
+
+The supported compiler is self-hosted `./znc`; x86-64 and ARM64 machine code,
+WASM, and GPU MLIR are emitted by Zag sources without Python, C, or Zig.

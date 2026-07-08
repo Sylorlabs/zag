@@ -1,11 +1,16 @@
 #!/usr/bin/env bash
-# AArch64 Linux backend suite: compile Zag to static EM_AARCH64 ELF, run via qemu-user.
+# AArch64 Linux backend suite: compile Zag to static EM_AARCH64 ELF, run via
+# qemu-user — or natively when the host is already aarch64 (real-hardware CI).
 cd "$(dirname "$0")/.."    # zag-poc root
 pass=0; fail=0
 
-QEMU="${QEMU:-qemu-aarch64-static}"
-if ! command -v "$QEMU" >/dev/null 2>&1; then
-    echo "  XX  $QEMU not found (apt install qemu-user-static)"; exit 1
+if [ "$(uname -m)" = "aarch64" ]; then
+    QEMU=""     # native execution: "$QEMU" prog expands to prog
+else
+    QEMU="${QEMU:-qemu-aarch64-static}"
+    if ! command -v "$QEMU" >/dev/null 2>&1; then
+        echo "  XX  $QEMU not found (apt install qemu-user-static)"; exit 1
+    fi
 fi
 
 if [ -z "${ZNC:-}" ]; then
@@ -23,7 +28,7 @@ nt(){
     if ! file /tmp/nt_arm | grep -q 'ARM aarch64'; then
         echo "  XX  $1 (not aarch64 ELF)"; fail=$((fail+1)); return
     fi
-    "$QEMU" /tmp/nt_arm; local got=$?
+    $QEMU /tmp/nt_arm; local got=$?
     if [ "$got" = "$3" ]; then echo "  ok  $1 (exit $got)"; pass=$((pass+1));
     else echo "  XX  $1 (got $got, want $3)"; fail=$((fail+1)); fi
     rm -f /tmp/nt_arm
@@ -33,7 +38,7 @@ nto(){
     printf '%s' "$2" > nt_src.zag
     "$ZNC" nt_src.zag --target arm64 -o /tmp/nt_arm >/tmp/nt_out 2>&1
     if [ ! -x /tmp/nt_arm ]; then echo "  XX  $1 (compile failed)"; sed -n '1,8p' /tmp/nt_out; fail=$((fail+1)); return; fi
-    local got; got=$("$QEMU" /tmp/nt_arm); local ec=$?
+    local got; got=$($QEMU /tmp/nt_arm); local ec=$?
     if [ "$got" = "$3" ] && [ "$ec" = "$4" ]; then echo "  ok  $1 (stdout='$got' exit=$ec)"; pass=$((pass+1));
     else echo "  XX  $1 (got stdout='$got' exit=$ec, want '$3'/$4)"; fail=$((fail+1)); fi
     rm -f /tmp/nt_arm
@@ -148,7 +153,7 @@ nt "iface multi-meth" 'interface Shape { fn area(self) i32; fn scaled(self, k: i
 
 # interfaces example must match the x86 expected output exactly
 "$ZNC" examples/interfaces.zag --target arm64 -o /tmp/nt_if >/tmp/nt_out 2>&1
-if [ -x /tmp/nt_if ] && [ "$("$QEMU" /tmp/nt_if 2>/dev/null)" = "$(printf '75\n36')" ]; then
+if [ -x /tmp/nt_if ] && [ "$($QEMU /tmp/nt_if 2>/dev/null)" = "$(printf '75\n36')" ]; then
     echo "  ok  examples/interfaces.zag (75/36)"; pass=$((pass+1))
 else
     echo "  XX  examples/interfaces.zag"; sed -n '1,6p' /tmp/nt_out; fail=$((fail+1))
@@ -164,7 +169,7 @@ for prog in arena hash_map sort_bench state_machine csv_parser json_parser; do
     if ! "$ZNC" "programs/$prog.zag" --target arm64 -o /tmp/np_arm >/dev/null 2>&1; then
         echo "  XX  $prog (arm64 compile failed)"; fail=$((fail+1)); continue
     fi
-    "$QEMU" /tmp/np_arm > /tmp/np_arm_out 2>&1; arm_ec=$?
+    $QEMU /tmp/np_arm > /tmp/np_arm_out 2>&1; arm_ec=$?
     if [ "$x86_ec" = "$arm_ec" ] && diff -q /tmp/np_x86_out /tmp/np_arm_out >/dev/null 2>&1; then
         echo "  ok  $prog (byte-identical output, exit $arm_ec)"; pass=$((pass+1))
     else

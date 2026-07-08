@@ -2,8 +2,8 @@
 
 ## Prerequisites
 
-- **x86-64 Linux** — the native backend emits x86-64 ELF; ARM and 32-bit are
-  not yet supported
+- **x86-64 Linux or ARM64 Linux** — native ELF is supported on both targets;
+  x86-64 can cross-compile ARM64 and verify it through qemu-user
 - **No other build tools required** — no `cc`, no `zig`, no `llvm`, no `make`
 - Tested on: Ubuntu 22.04, Ubuntu 24.04, Fedora 40, Arch Linux (rolling)
 
@@ -41,7 +41,6 @@ binary.  No host C compiler or assembler is invoked.
 ```sh
 ./bootstrap.sh
 # Rebuilds: ./znc (from selfhost/native/znc.zag)
-# The legacy ./zagc is NOT rebuilt by bootstrap.sh — it is not a supported path.
 ```
 
 After bootstrap, verify the fixpoint (znc compiling itself produces an
@@ -69,19 +68,16 @@ bash tests/run_native.sh
 
 All four gates above must be green before shipping a release.
 
-### Additional / informational
+### Cross-target native gates
 
 ```sh
-# Self-hosted compiler pipeline tests (28 tests, differential):
-bash tests/run_selfhost.sh
-
-# Language behaviour suite via the C-backend oracle (46 tests, differential):
-bash run_tests.sh
+bash tests/run_native_arm64.sh
+bash tests/run_differential.sh
+bash tests/run_arm64_selfhost.sh
 ```
 
-These use `./zagc` (C backend) and are informational. A release does not invoke
-them; the native authority, bootstrap, semantic, diagnostic, and backend gates
-define release readiness.
+On x86-64 these use qemu-user only to execute ARM64 output. The compiler remains
+pure Zag and does not use Python, C, or Zig.
 
 ---
 
@@ -105,23 +101,12 @@ znc myprogram.zag -o myprogram
 ./myprogram
 ```
 
-### Optional: install the C-backend oracle
-
-`./zagc` is available for differential testing but is **not supported for
-production use**.
-
-```sh
-sudo install -m755 zagc /usr/local/bin/zagc
-```
-
----
-
 ## Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
 | `Permission denied: ./znc` | `chmod +x znc` |
-| `cannot execute binary file: Exec format error` | You are on ARM or 32-bit; the native backend is x86-64 only |
+| `cannot execute binary file: Exec format error` | The compiler binary does not match the host architecture; use the matching release seed |
 | `bootstrap: native seed ./znc is missing` | Restore from git: `git checkout HEAD -- znc` |
 | bootstrap fixpoint mismatch | Release blocker: rebuild the seed to convergence and rerun the dedicated check |
 | `run_native_authority.sh: strace unavailable` | Install strace: `sudo apt install strace`; authority test still passes via PATH poisoning alone |

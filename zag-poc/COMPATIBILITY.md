@@ -12,9 +12,8 @@ The only **supported** Zag compiler is `./znc` (the native backend,
 `selfhost/native/znc.zag`). It emits x86-64 ELF executables with no `cc`, `as`,
 `ld`, `libc`, `Zig`, or `LLVM` involvement.
 
-`./zagc` (the C-emitting backend, `selfhost/codegen.zag`) is a **differential-
-testing oracle**. It is not a release artifact, not a supported build path, and
-carries no ABI, CLI, or language-compatibility guarantees.
+The retired C-emitting compiler is available only through Git history. It is
+absent from the supported tree and cannot be used as a bootstrap fallback.
 
 ---
 
@@ -150,10 +149,7 @@ release without notice.
 | Artifact | Status |
 |----------|--------|
 | ZIR format (`selfhost/zir.zag` output) | Internal; no compatibility guarantee |
-| `zagc` C-backend output format | Historical oracle; not a stable format |
-| `--emit-c` C output from `zagc` | Unstable; do not depend on it |
 | AST JSON format (`zag ast`) | Unstable; fields may be renamed or added |
-| `zagc` CLI flags | Unstable (oracle, not production) |
 | `selfhost/native/isa.zag` `Instr` enum variants | Compiler-internal |
 | `ncodegen.zag` internal helpers (`cg_*`) | Compiler-internal |
 | `zir.zag` IR node variants | Compiler-internal |

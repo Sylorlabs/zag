@@ -1,17 +1,16 @@
 # Zag compiler Makefile
 #
 # Primary compiler: ./znc  (native x86-64 ELF, zero cc/as/ld/libc)
-# Legacy oracle:    ./zagc (C-backend differential oracle; not a supported build path)
 #
 # Supported workflow:
 #   make           — rebuild znc from seed (= bootstrap)
 #   make test      — run the authoritative v1 test suite
 #   make install   — install znc to /usr/local/bin
-#   make clean     — remove generated artifacts (keeps seed binaries zagc + znc)
+#   make clean     — remove generated artifacts (keeps the znc seed)
 
-.PHONY: all bootstrap znc zagc test test-authority test-bootstrap test-semantics \
+.PHONY: all bootstrap znc test test-pure-tree test-authority test-bootstrap test-semantics \
         test-diagnostics test-tooling test-programs test-native test-abi-layout test-arm64 \
-        test-differential test-selfhost clean install
+        test-differential-backends test-arm64-selfhost clean install
 
 # ── Primary target ────────────────────────────────────────────────────────────
 all: znc
@@ -26,16 +25,10 @@ znc: selfhost/native/znc.zag
 bootstrap: znc
 	@echo "Bootstrap complete — seed: ./znc"
 
-# ── Legacy C-backend oracle (not a supported build path) ─────────────────────
-# zagc is retained for historical differential testing only.  It is NOT a
-# release artifact and NOT an acceptable bootstrap fallback.
-zagc: selfhost/zagc.zag
-	@echo "── rebuilding zagc via znc (differential oracle only) ──"
-	./znc selfhost/zagc.zag -o zagc.new
-	mv -f zagc.new zagc
-	@echo "   ./zagc rebuilt (differential oracle; not for release)"
-
 # ── Test targets ─────────────────────────────────────────────────────────────
+
+test-pure-tree:
+	bash tests/check_pure_zag_tree.sh
 
 # THE authoritative release gate: poisons host C tools, self-rebuilds znc, smoke tests.
 test-authority:
@@ -78,41 +71,29 @@ test-differential-backends:
 	@echo "── differential x86/arm64 gate ──"
 	bash tests/run_differential.sh
 
-# Differential tests against the C backend (not a release gate).
-test-differential:
-	@echo "── differential suite via zagc (informational only) ──"
-	bash run_tests.sh
-
-# Selfhost compiler-pipeline tests (informational).
-test-selfhost:
-	@echo "── self-hosted pipeline tests ──"
-	bash tests/run_selfhost.sh
+test-arm64-selfhost:
+	@echo "── arm64 self-hosting fixpoint ──"
+	bash tests/run_arm64_selfhost.sh
 
 # Default `make test`: runs the v1 release gates.
-test: znc test-authority test-bootstrap test-semantics test-diagnostics test-tooling test-programs test-native test-abi-layout test-arm64 test-differential-backends
+test: znc test-pure-tree test-authority test-bootstrap test-semantics test-diagnostics test-tooling test-programs test-native test-abi-layout test-arm64 test-differential-backends test-arm64-selfhost
 	@echo "════ all v1 release gates passed ════"
 
 # ── Install ───────────────────────────────────────────────────────────────────
 install: znc
 	install -m755 znc /usr/local/bin/znc
 	@echo "Installed znc → /usr/local/bin/znc"
-	@echo "Optional (differential oracle):"
-	@echo "  sudo install -m755 zagc /usr/local/bin/zagc"
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
-# Removes all generated artifacts.  Does NOT remove seed binaries zagc and znc.
+# Removes generated artifacts. Does NOT remove the znc seed binary.
 clean:
-	@echo "── removing generated C intermediates and ELF outputs ──"
-	find . \( -name '*.zag.c' -o -name '*.zag.out' -o -name '*.zag.zir.c' \) \
-	    ! -path './selfhost/native/znc.zag.c' \
-	    ! -path './selfhost/native/znc.zag.out' \
-	    -delete 2>/dev/null || true
+	@echo "── removing generated outputs ──"
+	find . -name '*.zag.out' -delete 2>/dev/null || true
 	rm -f nt_src.zag
 	@echo "── removing scratch and test build binaries ──"
-	rm -f zagc_new zagc_new2 zagc_new3 zagc_test2
 	rm -f znc_fp znc_fp2 znc_new znc_new2 znc_new3 znc_test
 	rm -f znc.fp2 znc.fp3 znc.new2
-	rm -f _pt.zag.c _pt.zag.out _sl2.zag.c
+	rm -f _pt.zag.out
 	rm -f test_escape_debug test_escape_debug.zag test_escape_debug.zag.out
 	rm -f test_infer test_infer.zag test_infer.zag.out
 	rm -f test_let test_let.zag test_let.zag.out
@@ -136,4 +117,4 @@ clean:
 	rm -f examples/total_guarded examples/total_nonzero
 	rm -f examples/interfaces examples/hot_demo
 	rm -f examples/*.mlir
-	@echo "clean done (seed binaries zagc + znc preserved)"
+	@echo "clean done (znc seed preserved)"

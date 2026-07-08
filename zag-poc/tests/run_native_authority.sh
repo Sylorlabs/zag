@@ -11,6 +11,8 @@ tmp="${TMPDIR:-/tmp}/zag-native-authority.$$"
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 mkdir -p "$tmp/bin"
 
+bash tests/check_pure_zag_tree.sh
+
 for tool in cc gcc clang as ld; do
     printf '#!/bin/sh\necho "forbidden host tool invoked: %s" >&2\nexit 97\n' "$tool" > "$tmp/bin/$tool"
     chmod +x "$tmp/bin/$tool"

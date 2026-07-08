@@ -555,6 +555,11 @@ fn parse_stmt(p: *Parser) *Node {
         }
         return new(Node{ .if_ = If{ .cond = cond, .then_body = then_body, .els_body = els_body, .has_els = has_els, .cap = cap, .has_cap = has_cap } });
     }
+    if (at_k(p, Tk.KwBreak)) {
+        let _b: Token = adv(p);
+        eat_semi(p);
+        return mk_break();
+    }
     if (at_k(p, Tk.KwWhile)) {
         let _t: Token = adv(p);
         let _o: Token = adv(p);  // (
@@ -915,8 +920,8 @@ fn seen_has(seen: ArrayList[[]u8], p: []u8) bool {
 //
 // We rename the imported module's own (non-extern) decls to `qual__name`,
 // rewrite internal references to them, and on the importing side collapse
-// `alias.member` access to `alias__member`. extern fns keep their literal FFI
-// names so linkage to runtime.c is preserved.
+// `alias.member` access to `alias__member`. extern fns keep their literal
+// native runtime symbol names.
 //
 // Generic type applications Base[args] are fully supported: q_subst_type
 // descends into the argument list so that module-local names nested inside
@@ -993,19 +998,43 @@ fn q_subst_type(t: []u8, names: ArrayList[[]u8], qual: []u8) []u8 {
 }
 
 // Mutating walk: prefix references to the module's own decls inside an expr.
-fn q_rewrite_expr(n: *Node, names: ArrayList[[]u8], qual: []u8) void {
+// `locals` is the current lexical binding stack (params, `let`s, captures).
+// A locally-bound name SHADOWS a module-level decl and is not rewritten
+// (v1 spec: "A local binding shadows an imported declaration with the same
+// name"); previously a param or let named like a module fn (e.g. `cap`) was
+// wrongly renamed to `qual__cap` and failed to resolve.
+fn q_rewrite_expr(n: *Node, names: ArrayList[[]u8], qual: []u8, locals: *ArrayList[[]u8]) void {
     switch (n.*) {
         .id => |x| {
+            if (seen_has(locals.*, x.name)) { return; }
             if (seen_has(names, x.name)) {
                 n.* = Node{ .id = Ident{ .name = qpref(qual, x.name) } };
             }
         }
-        .bin => |b| { q_rewrite_expr(b.l, names, qual); q_rewrite_expr(b.r, names, qual); }
-        .un  => |u| { q_rewrite_expr(u.e, names, qual); }
+        .bin => |b| { q_rewrite_expr(b.l, names, qual, locals); q_rewrite_expr(b.r, names, qual, locals); }
+        .un  => |u| { q_rewrite_expr(u.e, names, qual, locals); }
         .call => |c| {
-            q_rewrite_expr(c.callee, names, qual);
-            let i: i32 = 0;
-            while (i < len[*Node](c.args)) { q_rewrite_expr(get[*Node](c.args, i), names, qual); i = i + 1; }
+            // `e catch |err| fb` parses to __catchc(e, err, fb): arg 1 IS the
+            // binding occurrence (not a reference — never rewrite it), and it
+            // shadows module decls inside fb (arg 2).
+            let is_catchc: i32 = 0;
+            switch (c.callee.*) {
+                .id => |ci| { if (@strEq(ci.name, "__catchc")) { is_catchc = 1; } }
+                else => { }
+            }
+            if (is_catchc == 1 && len[*Node](c.args) == 3) {
+                q_rewrite_expr(get[*Node](c.args, 0), names, qual, locals);
+                let capn: []u8 = "";
+                switch (get[*Node](c.args, 1).*) { .id => |cx| { capn = cx.name; } else => { } }
+                let save_c: i32 = len[[]u8](locals.*);
+                if (capn.len > 0) { push[[]u8](locals, capn); }
+                q_rewrite_expr(get[*Node](c.args, 2), names, qual, locals);
+                locals.*.len = save_c;
+            } else {
+                q_rewrite_expr(c.callee, names, qual, locals);
+                let i: i32 = 0;
+                while (i < len[*Node](c.args)) { q_rewrite_expr(get[*Node](c.args, i), names, qual, locals); i = i + 1; }
+            }
             // substitute type-args (e.g. @sizeOf[MapEntry[V]] → @sizeOf[qual__MapEntry[V]])
             if (len[[]u8](c.targs) > 0) {
                 let nt: ArrayList[[]u8] = make[[]u8](2);
@@ -1017,16 +1046,16 @@ fn q_rewrite_expr(n: *Node, names: ArrayList[[]u8], qual: []u8) void {
                 n.* = Node{ .call = Call{ .callee = c.callee, .args = c.args, .targs = nt } };
             }
         }
-        .fld => |f| { q_rewrite_expr(f.base, names, qual); }
-        .idx => |x| { q_rewrite_expr(x.base, names, qual); q_rewrite_expr(x.idx, names, qual); }
+        .fld => |f| { q_rewrite_expr(f.base, names, qual, locals); }
+        .idx => |x| { q_rewrite_expr(x.base, names, qual, locals); q_rewrite_expr(x.idx, names, qual, locals); }
         .cast_ => |c| {
-            q_rewrite_expr(c.expr, names, qual);
+            q_rewrite_expr(c.expr, names, qual, locals);
             n.* = Node{ .cast_ = Cast{ .expr = c.expr, .target = q_subst_type(c.target, names, qual) } };
         }
-        .slice_ => |s| { q_rewrite_expr(s.base, names, qual); q_rewrite_expr(s.lo, names, qual); q_rewrite_expr(s.hi, names, qual); }
+        .slice_ => |s| { q_rewrite_expr(s.base, names, qual, locals); q_rewrite_expr(s.lo, names, qual, locals); q_rewrite_expr(s.hi, names, qual, locals); }
         .slit_ => |s| {
             let i: i32 = 0;
-            while (i < len[FieldInit](s.fields)) { q_rewrite_expr(get[FieldInit](s.fields, i).val, names, qual); i = i + 1; }
+            while (i < len[FieldInit](s.fields)) { q_rewrite_expr(get[FieldInit](s.fields, i).val, names, qual, locals); i = i + 1; }
             let nm: []u8 = s.sname;
             if (seen_has(names, s.sname)) { nm = qpref(qual, s.sname); }
             let nt: ArrayList[[]u8] = make[[]u8](2);
@@ -1037,36 +1066,73 @@ fn q_rewrite_expr(n: *Node, names: ArrayList[[]u8], qual: []u8) void {
             }
             n.* = Node{ .slit_ = StructLit{ .sname = nm, .fields = s.fields, .targs = nt } };
         }
+        .switch_ => |sw| {
+            // expression-position switch (switch as a value): walk subject and
+            // arm bodies like the statement form, honoring |cap| shadowing.
+            // (Previously not walked at all: module refs inside expression
+            // switches in a qualified module were silently left unrenamed.)
+            q_rewrite_expr(sw.subject, names, qual, locals);
+            let ai: i32 = 0;
+            while (ai < len[SwitchArm](sw.arms)) {
+                let arm: SwitchArm = get[SwitchArm](sw.arms, ai);
+                let save_a: i32 = len[[]u8](locals.*);
+                if (arm.has_cap == 1) { push[[]u8](locals, arm.cap); }
+                q_rewrite_block(arm.body, names, qual, locals);
+                locals.*.len = save_a;
+                ai = ai + 1;
+            }
+            if (sw.has_els == 1) { q_rewrite_block(sw.els_body, names, qual, locals); }
+        }
         else => { }
     }
 }
 
-fn q_rewrite_block(body: ArrayList[*Node], names: ArrayList[[]u8], qual: []u8) void {
+fn q_rewrite_block(body: ArrayList[*Node], names: ArrayList[[]u8], qual: []u8, locals: *ArrayList[[]u8]) void {
+    let save: i32 = len[[]u8](locals.*);
     let i: i32 = 0;
-    while (i < len[*Node](body)) { q_rewrite_stmt(get[*Node](body, i), names, qual); i = i + 1; }
+    while (i < len[*Node](body)) { q_rewrite_stmt(get[*Node](body, i), names, qual, locals); i = i + 1; }
+    locals.*.len = save;   // bindings introduced in this block go out of scope
 }
 
-fn q_rewrite_stmt(n: *Node, names: ArrayList[[]u8], qual: []u8) void {
+fn q_rewrite_stmt(n: *Node, names: ArrayList[[]u8], qual: []u8, locals: *ArrayList[[]u8]) void {
     switch (n.*) {
         .let_ => |l| {
-            q_rewrite_expr(l.expr, names, qual);
+            // the initializer sees the OUTER scope; the binding starts after it.
+            q_rewrite_expr(l.expr, names, qual, locals);
             n.* = Node{ .let_ = Let{ .name = l.name, .dty = q_subst_type(l.dty, names, qual), .has_dty = l.has_dty, .has_init = l.has_init, .expr = l.expr, .eff = l.eff, .calign = l.calign } };
+            push[[]u8](locals, l.name);
         }
-        .ret => |r| { if (r.has_expr == 1) { q_rewrite_expr(r.expr, names, qual); } }
+        .ret => |r| { if (r.has_expr == 1) { q_rewrite_expr(r.expr, names, qual, locals); } }
         .if_ => |x| {
-            q_rewrite_expr(x.cond, names, qual);
-            q_rewrite_block(x.then_body, names, qual);
-            if (x.has_els == 1) { q_rewrite_block(x.els_body, names, qual); }
+            q_rewrite_expr(x.cond, names, qual, locals);
+            let save_i: i32 = len[[]u8](locals.*);
+            if (x.has_cap == 1) { push[[]u8](locals, x.cap); }   // if (opt) |cap|
+            q_rewrite_block(x.then_body, names, qual, locals);
+            locals.*.len = save_i;
+            if (x.has_els == 1) { q_rewrite_block(x.els_body, names, qual, locals); }
         }
-        .while_ => |w| { q_rewrite_expr(w.cond, names, qual); q_rewrite_block(w.body, names, qual); }
-        .assign => |a| { q_rewrite_expr(a.target, names, qual); q_rewrite_expr(a.expr, names, qual); }
+        .while_ => |w| {
+            q_rewrite_expr(w.cond, names, qual, locals);
+            let save_w: i32 = len[[]u8](locals.*);
+            if (w.has_cap == 1) { push[[]u8](locals, w.cap); }   // while (opt) |cap|
+            q_rewrite_block(w.body, names, qual, locals);
+            locals.*.len = save_w;
+        }
+        .assign => |a| { q_rewrite_expr(a.target, names, qual, locals); q_rewrite_expr(a.expr, names, qual, locals); }
         .switch_ => |sw| {
-            q_rewrite_expr(sw.subject, names, qual);
+            q_rewrite_expr(sw.subject, names, qual, locals);
             let ai: i32 = 0;
-            while (ai < len[SwitchArm](sw.arms)) { q_rewrite_block(get[SwitchArm](sw.arms, ai).body, names, qual); ai = ai + 1; }
-            if (sw.has_els == 1) { q_rewrite_block(sw.els_body, names, qual); }
+            while (ai < len[SwitchArm](sw.arms)) {
+                let arm: SwitchArm = get[SwitchArm](sw.arms, ai);
+                let save_s: i32 = len[[]u8](locals.*);
+                if (arm.has_cap == 1) { push[[]u8](locals, arm.cap); }
+                q_rewrite_block(arm.body, names, qual, locals);
+                locals.*.len = save_s;
+                ai = ai + 1;
+            }
+            if (sw.has_els == 1) { q_rewrite_block(sw.els_body, names, qual, locals); }
         }
-        .estmt => |e| { q_rewrite_expr(e.expr, names, qual); }
+        .estmt => |e| { q_rewrite_expr(e.expr, names, qual, locals); }
         else => { }
     }
 }
@@ -1106,7 +1172,27 @@ fn qualify_decl(d: *Node, names: ArrayList[[]u8], qual: []u8) *Node {
     switch (d.*) {
         .fn_decl => |f| {
             if (f.is_extern == 1) { return d; }   // keep literal FFI name + signature
-            q_rewrite_block(f.body, names, qual);
+            // Seed the lexical scope with the fn's own bindings: params and
+            // (for hoisted capturing closures) the comma-joined capture names.
+            // These shadow same-named module decls inside the body.
+            let locals: ArrayList[[]u8] = make[[]u8](8);
+            let qpi: i32 = 0;
+            while (qpi < len[Param](f.params)) {
+                push[[]u8](&locals, get[Param](f.params, qpi).name);
+                qpi = qpi + 1;
+            }
+            if (f.cap_names.len > 0) {
+                let cs: i32 = 0;
+                let ci2: i32 = 0;
+                while (ci2 <= f.cap_names.len) {
+                    if (ci2 == f.cap_names.len || (f.cap_names[ci2] as i32) == ',') {
+                        if (ci2 > cs) { push[[]u8](&locals, f.cap_names[cs..ci2]); }
+                        cs = ci2 + 1;
+                    }
+                    ci2 = ci2 + 1;
+                }
+            }
+            q_rewrite_block(f.body, names, qual, &locals);
             return new(Node{ .fn_decl = FnDecl{
                 .name = qpref(qual, f.name),
                 .tparams = f.tparams,
@@ -1269,15 +1355,6 @@ fn rewrite_decls(decls: ArrayList[*Node], aliases: ArrayList[[]u8]) void {
     }
 }
 
-// Record the sibling `runtime.c` next to an imported module (if present) so the
-// driver can hand it to cc. Deduped against cfiles.
-fn collect_cfile(mod_dir: []u8, cfiles: *ArrayList[[]u8]) void {
-    let cpath: []u8 = join_path(mod_dir, "runtime.c");
-    if (_zag_file_exists(cpath) == 0) { return; }
-    if (seen_has(cfiles.*, cpath)) { return; }
-    push[[]u8](cfiles, cpath);
-}
-
 // Resolve an @import path: try relative to base_dir first, then lib/ sibling.
 // Returns the first path that exists, or the relative path as a fallback.
 fn resolve_import_path(relpath: []u8, base_dir: []u8) []u8 {
@@ -1343,7 +1420,7 @@ fn canon_path(p: []u8) []u8 {
 // (when has_qual==1) prefixes every decl with `qual__` and substitutes type
 // references, so a module imported `as name` lives in its own namespace.
 // `loading` tracks the current import stack for circular dependency detection.
-fn load_module(path0: []u8, qual: []u8, has_qual: i32, seen: *ArrayList[[]u8], out: *ArrayList[*Node], cfiles: *ArrayList[[]u8], aliases: *ArrayList[[]u8], loading: *ArrayList[[]u8]) void {
+fn load_module(path0: []u8, qual: []u8, has_qual: i32, seen: *ArrayList[[]u8], out: *ArrayList[*Node], aliases: *ArrayList[[]u8], loading: *ArrayList[[]u8]) void {
     let path: []u8 = canon_path(path0);
     // Circular import detection must come first (before seen dedup).
     // If path is on the loading stack it is currently being parsed — that is a cycle.
@@ -1370,14 +1447,13 @@ fn load_module(path0: []u8, qual: []u8, has_qual: i32, seen: *ArrayList[[]u8], o
         _zag_exit(1);
     }
     let mod_dir: []u8 = dir_of(path);
-    collect_cfile(mod_dir, cfiles);
     if (has_qual == 1) {
         // Qualified: resolve into a private list, then prefix + splice.
         let inner: ArrayList[*Node] = make[*Node](8);
-        resolve_src(src, mod_dir, seen, &inner, cfiles, aliases, loading);
+        resolve_src(src, mod_dir, seen, &inner, aliases, loading);
         qualify_into(inner, qual, out);
     } else {
-        resolve_src(src, mod_dir, seen, out, cfiles, aliases, loading);
+        resolve_src(src, mod_dir, seen, out, aliases, loading);
     }
     let _dropped: []u8 = pop[[]u8](loading);   // pop from in-progress stack
 }
@@ -1432,11 +1508,10 @@ fn check_zag_mod(base_dir: []u8) void {
 
 // Parse the top-level decls of one source string, resolving its @imports
 // relative to `base_dir`, appending decls to `out`. Module aliases (`as name`)
-// are accumulated GLOBALLY in `aliases` — the bootstrap propagates an alias
-// through flat re-imports (e.g. zagc.zag uses `map.` via flat-imported sema.zag),
-// so `alias.member` rewriting is applied once over all decls afterward.
+// are accumulated GLOBALLY in `aliases`, so `alias.member` rewriting is
+// applied once over all declarations afterward.
 // `loading` is the current in-progress import stack for circular detection.
-fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayList[*Node], cfiles: *ArrayList[[]u8], aliases: *ArrayList[[]u8], loading: *ArrayList[[]u8]) void {
+fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayList[*Node], aliases: *ArrayList[[]u8], loading: *ArrayList[[]u8]) void {
     let toks: ArrayList[Token] = lex(src);
     let p: Parser = Parser{ .toks = toks, .i = 0, .closures = make[*Node](2), .cctr = 0, .fn_eff = "" };
     while (!at_k(&p, Tk.Eof)) {
@@ -1455,7 +1530,7 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
                 if (!seen_has(aliases.*, qual)) { push[[]u8](aliases, qual); }
             }
             let resolved: []u8 = resolve_import_path(relpath, base_dir);
-            load_module(resolved, qual, has_qual, seen, out, cfiles, aliases, loading);
+            load_module(resolved, qual, has_qual, seen, out, aliases, loading);
         } else if (at_k(&p, Tk.Annot) && @strEq(cur(&p).val, "@link")) {
             let _lnk: Token = adv(&p);       // @link
             let _lp2: Token = adv(&p);        // (
@@ -1507,26 +1582,19 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
     }
 }
 
-// Parse a whole program, resolving @imports relative to `base_dir`, also
-// collecting sibling runtime.c paths into `cfiles` for the driver to link.
-fn parse_program_collect(src: []u8, base_dir: []u8, cfiles: *ArrayList[[]u8]) ArrayList[*Node] {
+// Parse a whole program, resolving @imports relative to `base_dir`.
+fn parse_program_dir(src: []u8, base_dir: []u8) ArrayList[*Node] {
     let seen: ArrayList[[]u8] = make[[]u8](8);
     let decls: ArrayList[*Node] = make[*Node](8);
     let aliases: ArrayList[[]u8] = make[[]u8](4);
     let loading: ArrayList[[]u8] = make[[]u8](8);
     // Validate zag.mod deps before compiling
     check_zag_mod(base_dir);
-    resolve_src(src, base_dir, &seen, &decls, cfiles, &aliases, &loading);
+    resolve_src(src, base_dir, &seen, &decls, &aliases, &loading);
     // Global alias pass: collapse every `alias.member` → `alias__member` across
     // all decls (aliases propagate through flat re-imports).
     rewrite_decls(decls, aliases);
     return decls;
-}
-
-// Parse a whole program, resolving @imports relative to `base_dir`.
-fn parse_program_dir(src: []u8, base_dir: []u8) ArrayList[*Node] {
-    let cfiles: ArrayList[[]u8] = make[[]u8](2);
-    return parse_program_collect(src, base_dir, &cfiles);
 }
 
 // Parse a whole program (decls: struct / enum / union / fn / extern fn).

@@ -12,7 +12,7 @@
 #   6. Commits + tags the release
 #   7. Builds a release tarball: zag-<version>-x86_64-linux.tar.gz
 #
-# NOTE: ./zagc is NOT a release artifact.  ./znc is the only supported compiler.
+# ./znc is the only compiler. Retired implementations live only in Git history.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -23,6 +23,8 @@ if [ -z "$VERSION" ]; then
 fi
 
 echo "════════════════════════════════════════════════════════════════"
+
+bash tests/check_pure_zag_tree.sh
 echo "  Zag release: $VERSION"
 echo "════════════════════════════════════════════════════════════════"
 
@@ -108,10 +110,7 @@ mkdir -p "$STAGING"
 
 # Primary release artifact: znc (the only supported compiler)
 cp znc "$STAGING/"
-cp bootstrap.sh run_tests.sh "$STAGING/"
-
-# NOTE: zagc is NOT a release artifact — it is retained in the repository for
-# differential testing only.  It is not copied to the release tarball.
+cp bootstrap.sh "$STAGING/"
 
 # Source and tests
 cp -r examples "$STAGING/" 2>/dev/null || true
@@ -124,7 +123,7 @@ for f in README.md BOOTSTRAP.md INSTALL.md CHANGELOG.md; do
     [ -f "$f" ] && cp "$f" "$STAGING/" || true
 done
 
-# Strip generated artifacts from the tarball
+# Strip generated artifacts from the tarball and reject forbidden source types.
 find "$STAGING" \( \
     -name '*.zag.c' -o \
     -name '*.zag.out' -o \

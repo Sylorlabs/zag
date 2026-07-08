@@ -3,21 +3,19 @@
 #
 # Produces one release artifact:
 #   ./znc — native x86-64 compiler with GPU MLIR + WASM backends
-#           (selfhost/native/znc.zag; mlir.zag is lean, no codegen.zag)
+#           (selfhost/native/znc.zag)
 #
 # ./znc reads Zag and writes a static x86-64 ELF, GPU MLIR, or WASM directly.
-# Neither path invokes cc, as,
-# ld, or libc. The historical C emitter (`./zagc`, `selfhost/codegen.zag`) is
-# not part of this workflow.
+# No path invokes Python, C, Zig, cc, as, ld, or libc.
 #
-# Like every self-hosted language (Rust/Go/Zig), you bootstrap from trusted
+# Like every self-hosted language, you bootstrap from trusted
 # seed binaries — you cannot compile from absolutely nothing.
 set -e
 cd "$(dirname "$0")"
 
 if [ ! -x ./znc ]; then
     echo "bootstrap: native seed ./znc is missing; restore the committed seed." >&2
-    echo "bootstrap: the legacy C backend is intentionally not an accepted fallback." >&2
+    echo "bootstrap: no non-Zag fallback exists; restore the committed znc seed." >&2
     exit 1
 fi
 
@@ -27,4 +25,4 @@ mv -f znc.new znc
 echo "   ./znc rebuilt itself from selfhost/native/znc.zag"
 
 echo "== done. Supported compiler: ./znc (native + gpu + wasm) =="
-echo "   see BOOTSTRAP.md for the legacy C differential oracle."
+echo "   retired bootstrap implementations are available only through Git history."

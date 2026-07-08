@@ -60,8 +60,8 @@ production build path.
 **additive-only**. Flags documented in that release will not be renamed or
 removed within edition `2026`. New flags may be added in any release.
 
-`zagc` is a **differential-testing oracle** (the legacy C-emitting compiler).
-Its CLI carries **no stability guarantees** and it is not a supported build path.
+The retired C-emitting compiler has no current CLI surface. Consult Git history
+for historical behavior; it must not be restored as a supported path.
 
 ### 4. Stdlib Tier (`std/` module interfaces)
 
