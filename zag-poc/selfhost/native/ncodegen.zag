@@ -1478,7 +1478,8 @@ fn RT_MEMCMP()   i32 { return 14; }  // _zag_memcmp(rdi=a, rsi=b, rdx=n) -> memc
 fn RT_STR2I()    i32 { return 15; }  // _zag_str_to_i64(rdi=&s) -> i64
 fn RT_PATHBUF()  i32 { return 16; }  // helper: __rt_pathbuf(rdi=&slice) -> rax=cstr (mmap'd, NUL-term)
 fn RT_GETENV()   i32 { return 17; }  // _zag_getenv(rdi=&name) -> &{ptr,len} ({0,0} if unset)
-fn RT_COUNT()    i32 { return 18; }  // number of runtime routines
+fn RT_EXECCAP()  i32 { return 18; }  // _zag_exec_capture(rdi=&cmd) -> &{ptr,len} (child stdout)
+fn RT_COUNT()    i32 { return 19; }  // number of runtime routines
 
 // Record an unsupported-construct error: warn loudly AND bump the count so the
 // driver ABORTS the build instead of ever emitting a silently-wrong binary.
@@ -2965,6 +2966,7 @@ fn cg_native_rt_ret(name: []u8) []u8 {
     if (@strEq(name, "_zag_read_file"))       { return "[]u8"; }
     if (@strEq(name, "_zag_arg"))             { return "[]u8"; }
     if (@strEq(name, "_zag_getenv"))          { return "[]u8"; }
+    if (@strEq(name, "_zag_exec_capture"))    { return "[]u8"; }
     // scalar-returning (i32/i64 in rax).
     if (@strEq(name, "_zag_strlen"))          { return "i32"; }
     if (@strEq(name, "_zag_str_len"))         { return "i32"; }
@@ -3003,6 +3005,7 @@ fn cg_is_native_rt(name: []u8) i32 {
     if (@strEq(name, "_zag_read_file"))       { return 1; }
     if (@strEq(name, "_zag_arg"))             { return 1; }
     if (@strEq(name, "_zag_getenv"))          { return 1; }
+    if (@strEq(name, "_zag_exec_capture"))    { return 1; }
     if (@strEq(name, "_zag_strlen"))          { return 1; }
     if (@strEq(name, "_zag_str_len"))         { return 1; }
     if (@strEq(name, "_zag_strcmp"))          { return 1; }
@@ -5644,6 +5647,7 @@ fn cg_lower_native_rt(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, s
     if (@strEq(fname, "_zag_arg"))              { idx = RT_ARG();     want = 1; found = 1; }
     if (@strEq(fname, "_zag_getenv"))           { idx = RT_GETENV();  want = 1; found = 1; }
     if (@strEq(fname, "_zag_exec_cmd"))         { idx = RT_EXEC();    want = 1; found = 1; }
+    if (@strEq(fname, "_zag_exec_capture"))     { idx = RT_EXECCAP(); want = 1; found = 1; }
     if (@strEq(fname, "_zag_strcmp_ord"))       { idx = RT_STRCMPO(); want = 2; found = 1; }
     if (@strEq(fname, "_zag_str_index_of_byte")){ idx = RT_IDXBYTE(); want = 2; found = 1; }
     if (@strEq(fname, "_zag_memcpy"))           { idx = RT_MEMCPY();  want = 3; found = 1; }
@@ -6527,7 +6531,20 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                         initexpr = mk_call(mk_ident("znrt_rns_from_i64"), fargs);
                     }
                     let rt: []u8 = cg_expr_type(initexpr, env, syms, cg);
-                    if (cg_type_is_agg(cg, rt) == 0) {
+                    let rt_agg: i32 = cg_type_is_agg(cg, rt);
+                    // A generic call (e.g. `new[Note]()`, `list.push[T](..)` results) or a
+                    // `try f()` whose aggregate return type cg_expr_type can't resolve here:
+                    // the DECLARED type `lty` IS a known aggregate and the callee returns it
+                    // via sret, so trust `lty` and copy `nf` (= lty) words. This unblocks
+                    // generic containers `let xs: ArrayList[T] = new[T]()` and `let x: S = try f()`.
+                    if (rt_agg == 0) {
+                        switch (initexpr.*) {
+                            .call => |_c| { rt_agg = 1; }
+                            .un   => |u| { if (@strEq(u.op, "try")) { rt_agg = 1; } }
+                            else => { }
+                        }
+                    }
+                    if (rt_agg == 0) {
                         cg_err(cg, "native: aggregate let needs an aggregate initializer");
                     } else {
                         cg_lower_expr(out, initexpr, env, syms, cg);   // pushes src base
@@ -8490,6 +8507,155 @@ fn cg_emit_rt_exec(out: *ArrayList[Instr], cg: *Cg) void {
     push[Instr](out, i_syscall());
 }
 
+// ── _zag_exec_capture(rdi=&cmd) -> rax = &{ptr,len}  (child's stdout bytes) ──
+// pipe2(p); fork(); child: dup2(p[1],1), close both, execve("/bin/sh","-c",cmd);
+// parent: close p[1], read p[0] into a grow buffer until EOF, wait4, return the
+// captured bytes as a heap slice. This is _zag_exec_cmd fused with the
+// _zag_read_file read loop, differing only in the fd source (pipe vs open()).
+fn cg_emit_rt_execcap(out: *ArrayList[Instr], cg: *Cg) void {
+    let l_child: i32 = cg_fresh(cg);
+    let l_rtop:  i32 = cg_fresh(cg);
+    let l_haveroom: i32 = cg_fresh(cg);
+    let l_rdone: i32 = cg_fresh(cg);
+    // constant argv strings in DATA.
+    let sh_off: i32 = len[u8](cg.*.data.*);
+    cg_rt_push_cstr(cg, "/bin/sh");
+    let dashc_off: i32 = len[u8](cg.*.data.*);
+    cg_rt_push_cstr(cg, "-c");
+
+    push[Instr](out, i_label(cg_rt_lbl(cg, RT_EXECCAP())));
+    push[Instr](out, i_push(R_RBP()));
+    push[Instr](out, i_mov_rr(R_RBP(), R_RSP()));
+    push[Instr](out, i_sub_imm(R_RSP(), 160));
+    // frame: [rbp-8]=cmd cstr [rbp-16]=readfd [rbp-24]=writefd [rbp-32]=buf
+    //        [rbp-40]=cap [rbp-48]=total [rbp-56]=pid [rbp-64]=status
+    //        [rbp-96..-72]=argv[0..3]  [rbp-112]=pipefd pair (8 bytes)
+    push[Instr](out, i_call(cg_rt_lbl(cg, RT_PATHBUF())));   // rax = cmd cstr (rdi=&cmd)
+    push[Instr](out, i_store(R_RBP(), 0 - 8, R_RAX()));
+    // argv[0]="/bin/sh" argv[1]="-c" argv[2]=cmd argv[3]=NULL (ascending addrs)
+    push[Instr](out, i_mov_imm(R_RAX(), DATA_VBASE() + (sh_off as i64)));
+    push[Instr](out, i_store(R_RBP(), 0 - 96, R_RAX()));
+    push[Instr](out, i_mov_imm(R_RAX(), DATA_VBASE() + (dashc_off as i64)));
+    push[Instr](out, i_store(R_RBP(), 0 - 88, R_RAX()));
+    push[Instr](out, i_load(R_RAX(), R_RBP(), 0 - 8));
+    push[Instr](out, i_store(R_RBP(), 0 - 80, R_RAX()));
+    push[Instr](out, i_mov_imm(R_RAX(), 0));
+    push[Instr](out, i_store(R_RBP(), 0 - 72, R_RAX()));
+    // pipe2(&pair, 0)
+    push[Instr](out, i_lea(R_RDI(), R_RBP(), 0 - 112));
+    push[Instr](out, i_mov_imm(R_RSI(), 0));
+    push[Instr](out, i_mov_imm(R_RAX(), 293));        // sys_pipe2
+    push[Instr](out, i_syscall());
+    // pair = writefd<<32 | readfd ; split via 32-bit shifts (fds are small +ve)
+    push[Instr](out, i_load(R_RAX(), R_RBP(), 0 - 112));
+    push[Instr](out, i_mov_imm(R_RCX(), 32));
+    push[Instr](out, i_mov_rr(R_R8(), R_RAX()));
+    push[Instr](out, i_sar_cl(R_RAX()));              // rax = writefd
+    push[Instr](out, i_store(R_RBP(), 0 - 24, R_RAX()));
+    push[Instr](out, i_mov_rr(R_RAX(), R_R8()));
+    push[Instr](out, i_shl_cl(R_RAX()));             // readfd -> high half
+    push[Instr](out, i_sar_cl(R_RAX()));             // rax = readfd (sign-safe)
+    push[Instr](out, i_store(R_RBP(), 0 - 16, R_RAX()));
+    // fork()
+    push[Instr](out, i_mov_imm(R_RAX(), 57));
+    push[Instr](out, i_syscall());
+    push[Instr](out, i_cmp_imm(R_RAX(), 0));
+    push[Instr](out, i_je(l_child));
+    // ── parent ──
+    push[Instr](out, i_store(R_RBP(), 0 - 56, R_RAX()));   // pid
+    // close(writefd) so EOF arrives when the child exits
+    push[Instr](out, i_mov_imm(R_RAX(), 3));
+    push[Instr](out, i_load(R_RDI(), R_RBP(), 0 - 24));
+    push[Instr](out, i_syscall());
+    // buf = malloc(65536); cap=65536; total=0
+    push[Instr](out, i_mov_imm(R_RDI(), 65536));
+    push[Instr](out, i_call(cg.*.ml_lbl));
+    push[Instr](out, i_store(R_RBP(), 0 - 32, R_RAX()));
+    push[Instr](out, i_mov_imm(R_RAX(), 65536));
+    push[Instr](out, i_store(R_RBP(), 0 - 40, R_RAX()));
+    push[Instr](out, i_mov_imm(R_RAX(), 0));
+    push[Instr](out, i_store(R_RBP(), 0 - 48, R_RAX()));
+    // read loop
+    push[Instr](out, i_label(l_rtop));
+    push[Instr](out, i_load(R_R8(), R_RBP(), 0 - 40));    // cap
+    push[Instr](out, i_load(R_R9(), R_RBP(), 0 - 48));    // total
+    push[Instr](out, i_mov_rr(R_RAX(), R_R8()));
+    push[Instr](out, i_sub(R_RAX(), R_R9()));             // room
+    push[Instr](out, i_cmp_imm(R_RAX(), 0));
+    push[Instr](out, i_jg(l_haveroom));
+    // grow: cap*=2; buf = realloc(buf, cap)
+    push[Instr](out, i_load(R_RDI(), R_RBP(), 0 - 32));
+    push[Instr](out, i_load(R_RSI(), R_RBP(), 0 - 40));
+    push[Instr](out, i_add(R_RSI(), R_RSI()));
+    push[Instr](out, i_store(R_RBP(), 0 - 40, R_RSI()));
+    push[Instr](out, i_call(cg.*.rl_lbl));
+    push[Instr](out, i_store(R_RBP(), 0 - 32, R_RAX()));
+    push[Instr](out, i_label(l_haveroom));
+    // read(readfd, buf+total, cap-total)
+    push[Instr](out, i_mov_imm(R_RAX(), 0));
+    push[Instr](out, i_load(R_RDI(), R_RBP(), 0 - 16));
+    push[Instr](out, i_load(R_RSI(), R_RBP(), 0 - 32));
+    push[Instr](out, i_load(R_R8(), R_RBP(), 0 - 48));
+    push[Instr](out, i_add(R_RSI(), R_R8()));
+    push[Instr](out, i_load(R_RDX(), R_RBP(), 0 - 40));
+    push[Instr](out, i_sub(R_RDX(), R_R8()));
+    push[Instr](out, i_syscall());
+    push[Instr](out, i_cmp_imm(R_RAX(), 0));
+    push[Instr](out, i_jle(l_rdone));
+    push[Instr](out, i_load(R_R8(), R_RBP(), 0 - 48));
+    push[Instr](out, i_add(R_R8(), R_RAX()));
+    push[Instr](out, i_store(R_RBP(), 0 - 48, R_R8()));
+    push[Instr](out, i_jmp(l_rtop));
+    push[Instr](out, i_label(l_rdone));
+    // close(readfd)
+    push[Instr](out, i_mov_imm(R_RAX(), 3));
+    push[Instr](out, i_load(R_RDI(), R_RBP(), 0 - 16));
+    push[Instr](out, i_syscall());
+    // wait4(pid, &status, 0, 0) — reap the child
+    push[Instr](out, i_mov_imm(R_RAX(), 61));
+    push[Instr](out, i_load(R_RDI(), R_RBP(), 0 - 56));
+    push[Instr](out, i_lea(R_RSI(), R_RBP(), 0 - 64));
+    push[Instr](out, i_mov_imm(R_RDX(), 0));
+    push[Instr](out, i_mov_imm(R_R10(), 0));
+    push[Instr](out, i_syscall());
+    // return {buf, total}
+    push[Instr](out, i_load(R_RSI(), R_RBP(), 0 - 32));
+    push[Instr](out, i_load(R_RDX(), R_RBP(), 0 - 48));
+    cg_rt_emit_make_slice(out, cg);
+    push[Instr](out, i_mov_rr(R_RSP(), R_RBP()));
+    push[Instr](out, i_pop(R_RBP()));
+    push[Instr](out, i_ret());
+    // ── child ──
+    push[Instr](out, i_label(l_child));
+    // dup2(writefd, 1)
+    push[Instr](out, i_mov_imm(R_RAX(), 33));
+    push[Instr](out, i_load(R_RDI(), R_RBP(), 0 - 24));
+    push[Instr](out, i_mov_imm(R_RSI(), 1));
+    push[Instr](out, i_syscall());
+    // close(readfd); close(writefd) — stdout now holds the pipe
+    push[Instr](out, i_mov_imm(R_RAX(), 3));
+    push[Instr](out, i_load(R_RDI(), R_RBP(), 0 - 16));
+    push[Instr](out, i_syscall());
+    push[Instr](out, i_mov_imm(R_RAX(), 3));
+    push[Instr](out, i_load(R_RDI(), R_RBP(), 0 - 24));
+    push[Instr](out, i_syscall());
+    // execve("/bin/sh", argv, envp) — envp = r15 + 16 + 8*argc (see cg_emit_rt_exec)
+    push[Instr](out, i_mov_imm(R_RAX(), 59));
+    push[Instr](out, i_mov_imm(R_RDI(), DATA_VBASE() + (sh_off as i64)));
+    push[Instr](out, i_lea(R_RSI(), R_RBP(), 0 - 96));
+    push[Instr](out, i_load(R_RDX(), 15, 0));
+    push[Instr](out, i_mov_imm(R_RCX(), 8));
+    push[Instr](out, i_imul(R_RDX(), R_RCX()));
+    push[Instr](out, i_add_imm(R_RDX(), 16));
+    push[Instr](out, i_mov_rr(R_RCX(), 15));
+    push[Instr](out, i_add(R_RDX(), R_RCX()));
+    push[Instr](out, i_syscall());
+    // execve failed → exit(127)
+    push[Instr](out, i_mov_imm(R_RAX(), 60));
+    push[Instr](out, i_mov_imm(R_RDI(), 127));
+    push[Instr](out, i_syscall());
+}
+
 // Append a NUL-terminated copy of `s` (decoded — it is a plain literal, no
 // escapes) to the DATA blob.
 fn cg_rt_push_cstr(cg: *Cg, s: []u8) void {
@@ -8771,6 +8937,7 @@ fn cg_rt_close_deps(cg: *Cg) void {
     if (cg_rt_is_used(cg, RT_WRITEX()) == 1)  { cg.*.use_ml = 1; set[i32](cg.*.rt_used, RT_PATHBUF(), 1); }
     if (cg_rt_is_used(cg, RT_FEXISTS()) == 1) { cg.*.use_ml = 1; set[i32](cg.*.rt_used, RT_PATHBUF(), 1); }
     if (cg_rt_is_used(cg, RT_EXEC()) == 1)    { cg.*.use_ml = 1; set[i32](cg.*.rt_used, RT_PATHBUF(), 1); }
+    if (cg_rt_is_used(cg, RT_EXECCAP()) == 1) { cg.*.use_ml = 1; cg.*.use_rl = 1; set[i32](cg.*.rt_used, RT_PATHBUF(), 1); }
     if (cg_rt_is_used(cg, RT_PATHBUF()) == 1) { cg.*.use_ml = 1; }
     // make_slice allocates via __malloc; any []u8-returning routine needs it.
     if (cg_rt_is_used(cg, RT_CONCAT()) == 1)  { cg.*.use_ml = 1; }
@@ -8795,6 +8962,7 @@ fn cg_emit_native_rt(out: *ArrayList[Instr], cg: *Cg) void {
     if (cg_rt_is_used(cg, RT_ARG()) == 1)     { cg_emit_rt_arg(out, cg); }
     if (cg_rt_is_used(cg, RT_GETENV()) == 1)  { cg_emit_rt_getenv(out, cg); }
     if (cg_rt_is_used(cg, RT_EXEC()) == 1)    { cg_emit_rt_exec(out, cg); }
+    if (cg_rt_is_used(cg, RT_EXECCAP()) == 1) { cg_emit_rt_execcap(out, cg); }
     if (cg_rt_is_used(cg, RT_STRDUP()) == 1)  { cg_emit_rt_strdup(out, cg); }
     if (cg_rt_is_used(cg, RT_STRCMPO()) == 1) { cg_emit_rt_strcmp_ord(out, cg); }
     if (cg_rt_is_used(cg, RT_IDXBYTE()) == 1) { cg_emit_rt_idxbyte(out, cg); }
