@@ -1429,52 +1429,97 @@ fn id_name_or_empty(n: *Node) []u8 {
     };
 }
 
-fn rewrite_expr(n: *Node, aliases: ArrayList[[]u8]) void {
+// `locals` tracks in-scope binding names (params + let bindings + captures). A base name that
+// is BOTH a known import alias AND a live local must NOT be rewritten to `alias__member` — the
+// local shadows the module. Without this, a fn param like `proj: *Project` (in some module) is
+// hijacked by another file's `@import(...) as proj` and `proj.tracks` mis-compiles to the
+// non-existent `proj__tracks`. Import aliases are accumulated globally, so this shadowing check
+// is what keeps them from leaking across module boundaries. (Mirror of q_rewrite_*'s handling.)
+fn rewrite_expr(n: *Node, aliases: ArrayList[[]u8], locals: *ArrayList[[]u8]) void {
     switch (n.*) {
         .fld => |f| {
-            rewrite_expr(f.base, aliases);
+            rewrite_expr(f.base, aliases, locals);
             let bn: []u8 = id_name_or_empty(f.base);
-            if (bn.len > 0 && seen_has(aliases, bn)) {
+            if (bn.len > 0 && seen_has(aliases, bn) && seen_has(locals.*, bn) == 0) {
                 n.* = Node{ .id = Ident{ .name = qpref(bn, f.fname) } };
             }
         }
-        .bin => |b| { rewrite_expr(b.l, aliases); rewrite_expr(b.r, aliases); }
-        .un  => |u| { rewrite_expr(u.e, aliases); }
+        .bin => |b| { rewrite_expr(b.l, aliases, locals); rewrite_expr(b.r, aliases, locals); }
+        .un  => |u| { rewrite_expr(u.e, aliases, locals); }
         .call => |c| {
-            rewrite_expr(c.callee, aliases);
-            let i: i32 = 0;
-            while (i < len[*Node](c.args)) { rewrite_expr(get[*Node](c.args, i), aliases); i = i + 1; }
+            // `e catch |err| fb` → __catchc(e, err, fb): arg1 is the binding, and it shadows
+            // module aliases inside fb (arg2). Bind it before descending into fb.
+            let is_catchc: i32 = 0;
+            switch (c.callee.*) {
+                .id => |ci| { if (@strEq(ci.name, "__catchc")) { is_catchc = 1; } }
+                else => { }
+            }
+            if (is_catchc == 1 && len[*Node](c.args) == 3) {
+                rewrite_expr(get[*Node](c.args, 0), aliases, locals);
+                let capn: []u8 = "";
+                switch (get[*Node](c.args, 1).*) { .id => |cx| { capn = cx.name; } else => { } }
+                let save_c: i32 = len[[]u8](locals.*);
+                if (capn.len > 0) { push[[]u8](locals, capn); }
+                rewrite_expr(get[*Node](c.args, 2), aliases, locals);
+                locals.*.len = save_c;
+            } else {
+                rewrite_expr(c.callee, aliases, locals);
+                let i: i32 = 0;
+                while (i < len[*Node](c.args)) { rewrite_expr(get[*Node](c.args, i), aliases, locals); i = i + 1; }
+            }
         }
-        .idx => |x| { rewrite_expr(x.base, aliases); rewrite_expr(x.idx, aliases); }
-        .cast_ => |c| { rewrite_expr(c.expr, aliases); }
-        .slice_ => |s| { rewrite_expr(s.base, aliases); rewrite_expr(s.lo, aliases); rewrite_expr(s.hi, aliases); }
+        .idx => |x| { rewrite_expr(x.base, aliases, locals); rewrite_expr(x.idx, aliases, locals); }
+        .cast_ => |c| { rewrite_expr(c.expr, aliases, locals); }
+        .slice_ => |s| { rewrite_expr(s.base, aliases, locals); rewrite_expr(s.lo, aliases, locals); rewrite_expr(s.hi, aliases, locals); }
         .slit_ => |s| {
             let i: i32 = 0;
-            while (i < len[FieldInit](s.fields)) { rewrite_expr(get[FieldInit](s.fields, i).val, aliases); i = i + 1; }
+            while (i < len[FieldInit](s.fields)) { rewrite_expr(get[FieldInit](s.fields, i).val, aliases, locals); i = i + 1; }
         }
         else => { }
     }
 }
 
-fn rewrite_block(body: ArrayList[*Node], aliases: ArrayList[[]u8]) void {
+fn rewrite_block(body: ArrayList[*Node], aliases: ArrayList[[]u8], locals: *ArrayList[[]u8]) void {
+    let save: i32 = len[[]u8](locals.*);
     let i: i32 = 0;
-    while (i < len[*Node](body)) { rewrite_stmt(get[*Node](body, i), aliases); i = i + 1; }
+    while (i < len[*Node](body)) { rewrite_stmt(get[*Node](body, i), aliases, locals); i = i + 1; }
+    locals.*.len = save;   // bindings introduced in this block go out of scope
 }
 
-fn rewrite_stmt(n: *Node, aliases: ArrayList[[]u8]) void {
+fn rewrite_stmt(n: *Node, aliases: ArrayList[[]u8], locals: *ArrayList[[]u8]) void {
     switch (n.*) {
-        .let_ => |l| { rewrite_expr(l.expr, aliases); }
-        .ret  => |r| { if (r.has_expr == 1) { rewrite_expr(r.expr, aliases); } }
-        .if_  => |x| { rewrite_expr(x.cond, aliases); rewrite_block(x.then_body, aliases); if (x.has_els == 1) { rewrite_block(x.els_body, aliases); } }
-        .while_ => |w| { rewrite_expr(w.cond, aliases); rewrite_block(w.body, aliases); }
-        .assign => |a| { rewrite_expr(a.target, aliases); rewrite_expr(a.expr, aliases); }
-        .switch_ => |sw| {
-            rewrite_expr(sw.subject, aliases);
-            let ai: i32 = 0;
-            while (ai < len[SwitchArm](sw.arms)) { rewrite_block(get[SwitchArm](sw.arms, ai).body, aliases); ai = ai + 1; }
-            if (sw.has_els == 1) { rewrite_block(sw.els_body, aliases); }
+        .let_ => |l| { rewrite_expr(l.expr, aliases, locals); push[[]u8](locals, l.name); }
+        .ret  => |r| { if (r.has_expr == 1) { rewrite_expr(r.expr, aliases, locals); } }
+        .if_  => |x| {
+            rewrite_expr(x.cond, aliases, locals);
+            let save_i: i32 = len[[]u8](locals.*);
+            if (x.has_cap == 1) { push[[]u8](locals, x.cap); }
+            rewrite_block(x.then_body, aliases, locals);
+            locals.*.len = save_i;
+            if (x.has_els == 1) { rewrite_block(x.els_body, aliases, locals); }
         }
-        .estmt => |e| { rewrite_expr(e.expr, aliases); }
+        .while_ => |w| {
+            rewrite_expr(w.cond, aliases, locals);
+            let save_w: i32 = len[[]u8](locals.*);
+            if (w.has_cap == 1) { push[[]u8](locals, w.cap); }
+            rewrite_block(w.body, aliases, locals);
+            locals.*.len = save_w;
+        }
+        .assign => |a| { rewrite_expr(a.target, aliases, locals); rewrite_expr(a.expr, aliases, locals); }
+        .switch_ => |sw| {
+            rewrite_expr(sw.subject, aliases, locals);
+            let ai: i32 = 0;
+            while (ai < len[SwitchArm](sw.arms)) {
+                let arm: SwitchArm = get[SwitchArm](sw.arms, ai);
+                let save_s: i32 = len[[]u8](locals.*);
+                if (arm.has_cap == 1) { push[[]u8](locals, arm.cap); }
+                rewrite_block(arm.body, aliases, locals);
+                locals.*.len = save_s;
+                ai = ai + 1;
+            }
+            if (sw.has_els == 1) { rewrite_block(sw.els_body, aliases, locals); }
+        }
+        .estmt => |e| { rewrite_expr(e.expr, aliases, locals); }
         else => { }
     }
 }
@@ -1486,7 +1531,14 @@ fn rewrite_decls(decls: ArrayList[*Node], aliases: ArrayList[[]u8]) void {
     while (i < len[*Node](decls)) {
         let d: *Node = get[*Node](decls, i);
         switch (d.*) {
-            .fn_decl => |f| { rewrite_block(f.body, aliases); }
+            .fn_decl => |f| {
+                // seed the function's parameters as locals so a param named like an import
+                // alias (e.g. `proj`) shadows the module inside this body.
+                let locals: ArrayList[[]u8] = make[[]u8](8);
+                let pi: i32 = 0;
+                while (pi < len[Param](f.params)) { push[[]u8](&locals, get[Param](f.params, pi).name); pi = pi + 1; }
+                rewrite_block(f.body, aliases, &locals);
+            }
             else => { }
         }
         i = i + 1;
