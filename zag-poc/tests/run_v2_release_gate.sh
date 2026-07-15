@@ -31,6 +31,7 @@ run_gate "v1 semantic compatibility" bash tests/run_semantics.sh
 run_gate "v1 native execution" bash tests/run_native.sh
 run_gate "v2 edition boundary" bash tests/run_v2_edition.sh
 run_gate "malformed-input crash corpus" bash tests/run_crash_corpus.sh
+run_gate "deterministic fuzz smoke" bash tests/run_fuzz_smoke.sh
 run_gate "WASM regression" bash tests/run_native_wasm.sh
 run_gate "GPU frontend validation (not execution)" bash tests/run_native_gpu.sh
 
@@ -43,7 +44,7 @@ unsupported "C ABI and dynamic linking" "no bidirectional C ABI/shared-library e
 unsupported "CPU intrinsics/SIMD/inline assembly" "no v2 operand/clobber checked asm interface"
 unsupported "effect adversarial suite" "no Unsafe/Atomic/FFI/GPU effect propagation"
 unsupported "physical GPU execution" "no runtime enumerate/allocate/dispatch/readback path"
-unsupported "sanitizers and fuzzing" "crash corpus exists, but no structured fuzz targets or sanitizer modes"
+unsupported "sanitizers" "crash corpus and deterministic fuzz smoke exist, but no sanitizer modes"
 unsupported "documentation verification map" "verification matrix exists but records incomplete required capabilities"
 
 echo "════ v2-release pass=$pass fail=$fail ════"
