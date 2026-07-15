@@ -10,6 +10,12 @@ The authoritative command is `bash tests/run_v2_release_gate.sh`.  At the
 time this matrix was written it must fail: it records the unimplemented v2
 surface rather than granting a premature green release.
 
+Latest isolated working-copy run (2026-07-14): **8 passing categories, 11
+failing required categories, exit 1**.  Passing categories were bootstrap,
+v1 semantic/native compatibility, the v2 edition gate, malformed-input corpus,
+deterministic fuzz smoke, WASM regression, and GPU frontend validation.  Every
+failure below is intentional fail-closed release evidence, not a skipped test.
+
 | Capability | Specification | Implementation evidence | Positive evidence | Negative evidence | Runtime evidence | Status |
 |---|---|---|---|---|---|---|
 | Edition boundary | `V2_LANGUAGE_SPEC.md` §1 | `selfhost/v2_edition.zag`; `native/znc.zag` | `tests/run_v2_edition.sh`: v1 sources continue to compile | same test rejects v2 words in edition 2026 and edition 2027 words fail closed | native compiler exits nonzero and does not compile the rejected source | IMPLEMENTED (gate only) |
