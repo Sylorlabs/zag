@@ -123,7 +123,7 @@ No maintained malformed-input fuzz corpus was found at baseline.  The v2 work
 now adds `tests/run_crash_corpus.sh` with minimized malformed sources.  It
 initially exposed signal termination for `missing_block_end.zag` and
 `unterminated_string.zag`; the lexer and parser EOF guard were fixed and the
-current corpus rejects all five inputs without an artifact.  This is a small
+current corpus rejects all ten inputs without an artifact.  This is a small
 regression corpus, not evidence of broad robustness: no systematic parser,
 sema, codegen, object-writer, or GPU-emitter fuzz target exists.
 

@@ -27,7 +27,7 @@ surface rather than granting a premature green release.
 | GPU address spaces and kernel effects | `V2_GPU_MODEL.md`, `V2_EFFECT_MODEL.md` | MLIR/gfx bundle emitters do not have a v2 typed authority | `tests/run_native_gpu.sh` checks emitted output | no address-space/effect rejection tests | none | FRONTEND ONLY |
 | GPU target binary and physical dispatch | `V2_GPU_MODEL.md` | none: no device enumeration/context/buffer/dispatch/readback path | none | no OOB/effect rejection at runtime | none | UNSUPPORTED |
 | Sanitizers and debug allocator | `V2_MEMORY_MODEL.md` | none | none | none | none | UNSUPPORTED |
-| Fuzzing and malformed-input corpus | `V2_IMPLEMENTATION_PLAN.md` | `tests/run_crash_corpus.sh`; `tests/crash_corpus/` | crash corpus rejects five minimized malformed sources | same suite asserts nonzero exit, timeout failure, no artifact, and no signal termination | compiler invocation only | PARTIAL / corpus passes; no structured fuzzing |
+| Fuzzing and malformed-input corpus | `V2_IMPLEMENTATION_PLAN.md` | `tests/run_crash_corpus.sh`; `tests/crash_corpus/` | crash corpus rejects ten minimized malformed sources | same suite asserts nonzero exit, timeout failure, no artifact, and no signal termination | compiler invocation only | PARTIAL / corpus passes; no structured fuzzing |
 | Differential and performance evidence | `V2_IMPLEMENTATION_PLAN.md` | legacy differential scripts exist | `tests/run_differential.sh` is v1 evidence | no v2 semantic differential suite | no v2 benchmarks | PARTIAL / not v2 support |
 
 ## Verified v1 regression evidence, not v2 completion
