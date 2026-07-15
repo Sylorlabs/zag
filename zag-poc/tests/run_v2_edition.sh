@@ -30,6 +30,19 @@ reject() {
 
 reject "v1 rejects v2 unsafe syntax" 2026 E0200
 reject "v2 rejects unimplemented unsafe syntax" 2027 E0201
+# A source may live under a project directory.  The nearest ancestor manifest
+# controls its edition; only consulting the source directory would silently
+# turn a v2 project back into v1.
+mkdir -p "$tmp/nested/src"
+printf 'name = "nested"\nversion = "0"\nedition = "2027"\n' >"$tmp/nested/zag.mod"
+printf 'fn main() i32 { unsafe { return 42; } }\n' >"$tmp/nested/src/main.zag"
+if (cd "$tmp/nested" && "$ZNC" src/main.zag -o out) >"$tmp/nested/log" 2>&1 || [ -e "$tmp/nested/out" ]; then
+  echo "  XX  nested source inherits project edition"; sed -n '1,8p' "$tmp/nested/log"; fail=$((fail + 1))
+elif grep -q E0201 "$tmp/nested/log"; then
+  echo "  ok  nested source inherits project edition"; pass=$((pass + 1))
+else
+  echo "  XX  nested source inherits project edition (missing diagnostic)"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v1-asm"
 printf 'name = "v1asm"\nversion = "0"\nedition = "2026"\n' >"$tmp/v1-asm/zag.mod"
 printf 'fn main() i32 { asm { } return 0; }\n' >"$tmp/v1-asm/main.zag"
