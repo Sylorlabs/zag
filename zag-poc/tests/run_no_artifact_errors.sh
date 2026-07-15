@@ -38,5 +38,24 @@ fn main() i32 { return 2; }'
 check missing_main 'fn helper() i32 { return 1; }'
 check unknown_identifier 'fn main() i32 { return does_not_exist; }'
 
+# An existing output belongs to the caller.  A failed compile must neither
+# replace it with a partial executable nor delete it; successful output should
+# eventually be written atomically by the driver.
+printf 'caller-owned sentinel\n' >"$tmp/existing.out"
+printf '%s\n' 'fn main() i32 { return does_not_exist; }' >"$tmp/existing.zag"
+set +e
+timeout 5 "$ZNC" "$tmp/existing.zag" -o "$tmp/existing.out" >"$tmp/existing.log" 2>&1
+status=$?
+set -e
+if [ "$status" -ne 0 ] && [ "$status" -ne 124 ] && [ "$status" -lt 128 ] && \
+   [ "$(cat "$tmp/existing.out")" = 'caller-owned sentinel' ]; then
+  echo "  ok  existing output survives hard error"
+  pass=$((pass + 1))
+else
+  echo "  XX  existing output survives hard error (status=$status)"
+  sed -n '1,10p' "$tmp/existing.log"
+  fail=$((fail + 1))
+fi
+
 echo "════ no-artifact-errors pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]
