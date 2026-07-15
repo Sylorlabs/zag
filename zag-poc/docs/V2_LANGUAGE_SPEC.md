@@ -38,3 +38,34 @@ artifact.  Checked operations trap with a specified message/code where a static
 rejection is impossible.  Unsafe operations are either defined, checked/trap,
 or explicitly undefined by their owning specification; there is no ambient C
 undefined behavior.
+
+## Integer and conversion semantics
+
+Fixed-width signed and unsigned integer arithmetic is checked by default.
+Overflow, invalid shift count, and division by zero are compile-time errors when
+constant and otherwise specified traps in checked and release builds.  Explicit
+`wrapping_*`, `saturating_*`, and `checked_*` operations state the desired
+alternative: wrapping is modulo 2^N, saturating clamps to the destination
+range, and checked returns an error/optional result.  The optimizer may replace
+a check only when it preserves the same value-or-trap behavior.
+
+Narrowing conversion is checked; bit reinterpretation is a named, unsafe
+operation when it can expose invalid representation or target byte order.
+Signed values use two's-complement representation.  Floating-point operations
+retain the target's specified IEEE behavior where implemented, while conversion
+to an integer checks range and NaN unless an explicit unsafe/wrapping operation
+is selected.
+
+## Target selection and diagnostics
+
+Target extensions are selected explicitly by target triple, CPU feature set, or
+GPU backend name.  Selecting a feature does not promise runtime availability:
+feature detection or an explicit deployment contract is required before use.
+An unsupported target, instruction, ABI form, or device operation is a hard
+diagnostic with its source span and target name; emitting comments, a placeholder
+binary, or a syntactically valid but unexecuted intermediate file is not support.
+
+Diagnostics include the source location, relevant type/operation, violated
+rule, and a smallest intentional alternative where one exists (for example,
+`unsafe`, `wrapping_add`, or a checked slice operation).  Capability diagnostics
+also include their complete effect witness chain.
