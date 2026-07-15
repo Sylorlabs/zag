@@ -31,7 +31,7 @@ gpu_check(){ local stem="$1"; shift
 echo "── znc GPU/MLIR backend (selfhost/mlir.zag) ──"
 r1=$(gpu_check gpu_matmul_mx 'gpu.module @zag_kernels' 'gpu.func @matmulMxKernel' ' kernel {' 'f8E4M3FN' 'gpu.thread_id' 'gpu.block_id' 'func.func @tileSize' 'gpu.return' 'gpu.launch_func @zag_kernels::@matmulMxKernel')
 if [ "$(echo "$r1" | tail -1)" = "1" ]; then
-    echo "  ok  gpu mlir matmul (kernels/dialects, real launch_func, no stubs)"; pass=$((pass+1))
+    echo "  ok  gpu mlir matmul (frontend structure only; no runtime launch)"; pass=$((pass+1))
 else
     echo "  XX  gpu mlir matmul"; echo "$r1"; fail=$((fail+1))
 fi

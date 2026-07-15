@@ -51,12 +51,12 @@ complete feature.
 
 ## 3. Documented claims that are not completed implementations
 
-1. Root README calls the GPU path a "GPU backend" and some GPU test labels say
-   "real launch_func".  The audit found `build_gpu` only writes `.mlir`; the
-   gfx1010 path only writes a bundle.  Neither path enumerates a device,
-   creates a context, allocates device memory, dispatches, waits, reads output,
-   or validates results.  This is frontend emission, not an operational GPU
-   backend.
+1. At baseline the root README called the GPU path a "GPU backend" and a GPU
+   test label said "real launch_func".  The audit found `build_gpu` only writes
+   `.mlir`; the gfx1010 path only writes a bundle.  Neither path enumerates a
+   device, creates a context, allocates device memory, dispatches, waits, reads
+   output, or validates results.  The README and test label now identify this
+   truthfully as frontend emission, not an operational GPU backend.
 2. `thread_rt.zag` contains Linux clone/futex-oriented code, but v1 explicitly
    excludes language-level threads, atomics, and a concurrency memory model.
    No public grammar, semantic model, codegen integration, or execution gate
