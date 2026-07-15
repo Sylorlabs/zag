@@ -43,7 +43,7 @@ unsupported "CPU intrinsics/SIMD/inline assembly" "no v2 operand/clobber checked
 unsupported "effect adversarial suite" "no Unsafe/Atomic/FFI/GPU effect propagation"
 unsupported "physical GPU execution" "no runtime enumerate/allocate/dispatch/readback path"
 unsupported "sanitizers and fuzzing" "no maintained v2 fuzz corpus or sanitizer modes"
-unsupported "documentation verification map" "docs/V2_FINAL_VERIFICATION.md absent"
+unsupported "documentation verification map" "verification matrix exists but records incomplete required capabilities"
 
 echo "════ v2-release pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]
