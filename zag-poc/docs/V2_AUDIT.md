@@ -119,9 +119,13 @@ and FFI calls have no defined language semantics.
 
 ## 7. Crash, silent-miscompile, and weak-test audit
 
-No maintained malformed-input fuzz corpus was found.  Existing semantic and
-diagnostic tests cover selected rejection cases, but no systematic parser,
-sema, codegen, object-writer, or GPU-emitter fuzz target exists.
+No maintained malformed-input fuzz corpus was found at baseline.  The v2 work
+now adds `tests/run_crash_corpus.sh` with minimized malformed sources; it
+currently demonstrates signal termination for `missing_block_end.zag` and
+`unterminated_string.zag`, so it is intentionally a failing regression gate,
+not evidence of robustness.  Existing semantic and diagnostic tests cover
+selected rejection cases, but no systematic parser, sema, codegen,
+object-writer, or GPU-emitter fuzz target exists.
 
 Native codegen deliberately records many unsupported forms through `cg_err`
 and the driver aborts on a nonzero lowering error.  That is the correct
