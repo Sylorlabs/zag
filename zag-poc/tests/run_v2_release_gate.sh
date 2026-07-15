@@ -30,6 +30,7 @@ run_gate "bootstrap/rebuild" ./bootstrap.sh
 run_gate "v1 semantic compatibility" bash tests/run_semantics.sh
 run_gate "v1 native execution" bash tests/run_native.sh
 run_gate "v2 edition boundary" bash tests/run_v2_edition.sh
+run_gate "v2 option rejection" bash tests/run_v2_option_rejection.sh
 run_gate "malformed-input crash corpus" bash tests/run_crash_corpus.sh
 run_gate "deterministic fuzz smoke" bash tests/run_fuzz_smoke.sh
 run_gate "hard errors leave no artifact" bash tests/run_no_artifact_errors.sh
