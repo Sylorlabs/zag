@@ -4,7 +4,7 @@
 
 In Zig, when someone annotates a function `// no allocations`, you trust them. In Zag, `@realtime` is a *compiler-verified capability*. The compiler walks the entire call graph and either produces a proof that no allocation, lock, or IO can reach your audio thread, or it rejects the program and shows you exactly which call three levels deep introduced the violation.
 
-That's the single idea that justifies this language's existence. Everything else (the heterogeneous numeric types, the GPU backend, the bignum overflow safety) is the same idea applied further.
+That's the single idea that justifies this language's existence. Everything else (the heterogeneous numeric types, GPU frontend emission, the bignum overflow safety) is the same idea applied further.
 
 ---
 
@@ -20,7 +20,7 @@ Zig's philosophy is "no hidden allocations, no hidden control flow." It enforces
 | Integer overflow | Wraps (undefined) or traps | `sat_i16` never wraps, `u_any` never overflows |
 | 11-bit ADC value | `u16` + manual `& 0x7FF` everywhere | `u11`, compiler inserts the mask |
 | Audio DSP sample | `i16` that silently wraps on spike | `sat_i16`, clamps to ±32767, proven |
-| GPU kernel correctness | No guarantee | `@kernel`, same effect proof as `@realtime` |
+| GPU kernel correctness | No guarantee | Not established: current GPU work emits frontend artifacts only |
 | Integer types | `u8`, `u16`, `u32`, `u64`, `i8`… | All of those **plus** any width from `u1` to `u127` |
 
 ### The three tiers Zig never touches
@@ -44,7 +44,9 @@ let budget: u_any     = items * price; // can't overflow; grows as needed; Alloc
 let poly:   rns_3     = coefficient;   // parallel mod-arithmetic over 3 coprime channels
 ```
 
-**Tier 3: GPU as another target (legacy path).** `@kernel` uses the same effect rules as `@realtime`. MLIR emission lives on the legacy `./zagc` differential path today, not on `./znc`.
+**Tier 3: GPU frontend emission (legacy path).** MLIR emission for `@kernel`
+sources exists on a legacy differential path.  It has no verified GPU runtime,
+dispatch, readback, or kernel-effect proof and is not a GPU backend.
 
 ---
 
@@ -255,9 +257,12 @@ Types that map to hardware that Vulkan SPIR-V cannot represent:
 | `mx_fp4` | MX Microscaling FP4 E2M1 | `f4E2M1FN` | Extreme-density speculative decoding |
 | `vsa_b<N>` | N-dimensional binary hypervector | `vector<Nxi1>` | GPU bitwise SIMD |
 
-### GPU (legacy path)
+### GPU frontend emission (legacy path)
 
-MLIR emission for `@kernel` functions is implemented in `selfhost/mlir.zag` and exercised through the legacy `./zagc` differential path. `./znc` does not ship GPU targets today.
+MLIR emission for `@kernel` functions is implemented in `selfhost/mlir.zag` and
+exercised through a legacy differential path.  This is not physical GPU
+execution: no device is enumerated, no context/buffer is created, and no result
+is read back or checked. `./znc` does not ship an operational GPU target.
 
 ---
 
@@ -284,7 +289,9 @@ The supported v1 compiler emits **x86-64 Linux ELF only**:
 ./znc file.zag -o program --debug
 ```
 
-Multi-arch CPU targets, wasm, RISC-V posit hardware, and GPU backends exist on the legacy `./zagc` differential path. See `zag-poc/README.md` if you need those for comparison work.
+Multi-arch CPU targets, wasm, RISC-V posit hardware, and GPU frontend emission
+exist on legacy/differential paths.  No GPU backend is claimed. See
+`zag-poc/README.md` if you need those for comparison work.
 
 ---
 
@@ -319,7 +326,7 @@ Zag v1 is a self-hosted native compiler (`./znc`) that boots from a committed se
 | Posits, quire, saturating ints, `u11`, fixed-point, RNS | Yes | Yes |
 | Native stdlib, LSP, formatter, DWARF | Yes | Partial |
 | `@total` SMT proofs (in-process solver) | Gated (`run_native_total.sh`) | Yes |
-| GPU / MLIR | Yes (`--target gpu-*`; `run_native_gpu.sh`) | Yes |
+| GPU frontend / MLIR emission | Yes (`--target gpu-*`; `run_native_gpu.sh`) | Yes |
 | WebAssembly | Yes (`--target wasm`; `run_native_wasm.sh`) | Yes |
 | multi-arch CPU (arm64, riscv, …) | No | Yes |
 

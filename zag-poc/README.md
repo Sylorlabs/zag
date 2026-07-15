@@ -1,6 +1,9 @@
 # Zag compiler (`zag-poc`)
 
-The supported compiler is `./znc`. It reads Zag source and writes a static x86-64 ELF binary, GPU MLIR (`--target gpu-*`), or WebAssembly (`--target wasm`). No `cc`, no `as`, no `ld`, no libc, no Zig, no LLVM.
+The supported compiler is `./znc`. It writes a static x86-64 ELF binary,
+WebAssembly (`--target wasm`), or GPU MLIR frontend output (`--target gpu-*`).
+GPU MLIR output is not a GPU executable or dispatch runtime. No `cc`, no `as`,
+no `ld`, no libc, no Zig, no LLVM.
 
 ```sh
 ./znc examples/numeric.zag -o numeric --run
@@ -79,4 +82,5 @@ git show <commit>:zag-poc/selfhost/codegen.zag
 ```
 
 The supported compiler is self-hosted `./znc`; x86-64 and ARM64 machine code,
-WASM, and GPU MLIR are emitted by Zag sources without Python, C, or Zig.
+WASM, and GPU MLIR frontend output are emitted by Zag sources without Python,
+C, or Zig.  GPU MLIR is not physical GPU execution.
