@@ -34,6 +34,7 @@ run_gate "v2 option rejection" bash tests/run_v2_option_rejection.sh
 run_gate "malformed-input crash corpus" bash tests/run_crash_corpus.sh
 run_gate "deterministic fuzz smoke" bash tests/run_fuzz_smoke.sh
 run_gate "hard errors leave no artifact" bash tests/run_no_artifact_errors.sh
+run_gate "documentation consistency" bash tests/run_docs_consistency.sh
 run_gate "WASM regression" bash tests/run_native_wasm.sh
 run_gate "GPU frontend validation (not execution)" bash tests/run_native_gpu.sh
 
