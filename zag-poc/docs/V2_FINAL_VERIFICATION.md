@@ -23,6 +23,7 @@ failure below is intentional fail-closed release evidence, not a skipped test.
 | Unsafe lexical boundary | `V2_UNSAFE_MODEL.md` | none | none | edition gate rejects/blocks spelling only | none | UNSUPPORTED |
 | Raw pointers, provenance, alignment, aliasing | `V2_MEMORY_MODEL.md` | v1 `*T` lowering in `native/ncodegen.zag` is not a v2 model | existing v1 pointer tests only | none for v2 rules | none | UNSUPPORTED |
 | Checked and unchecked slices | `V2_MEMORY_MODEL.md` | v1 native slice lowering | `tests/run_native.sh` covers v1 checked paths | no v2 unchecked boundary test | v1 native execution only | PARTIAL / not v2 support |
+| Integer overflow and conversions | `V2_LANGUAGE_SPEC.md` §5 | distributed v1 numeric lowering | selected v1 numeric tests | no v2 checked/wrapping/saturating contract suite | v1 native execution only | PARTIAL / not v2 support |
 | Allocation, resize, free, custom allocators | `V2_MEMORY_MODEL.md` | `_zag_malloc`, `_zag_realloc`, `_zag_free` lowering | existing v1 native tests exercise selected paths | no allocation-failure, invalid-free, or effect tests | mmap-backed native paths only | PARTIAL / not v2 support |
 | Layout and ABI representations | `V2_MEMORY_MODEL.md`, `V2_ABI.md` | native size/layout code | existing native aggregate tests | no C layout differential test | no bidirectional C execution | UNSUPPORTED |
 | Volatile and MMIO | `V2_MEMORY_MODEL.md` | none | none | none | none | UNSUPPORTED |
