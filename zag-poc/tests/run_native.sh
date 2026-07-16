@@ -377,6 +377,22 @@ else
 fi
 rm -f /tmp/nt_bin
 
+# 5. Qualified generic calls reached through a mixed alias/flat import diamond
+# must retain the substituted generic struct layout during monomorphization.
+"$ZNC" tests/module_alias_generic/main.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
+if [ -x /tmp/nt_bin ]; then
+    /tmp/nt_bin
+    got=$?
+    if [ "$got" = "42" ]; then
+        echo "  ok  qualified generic signature registers struct layout"; pass=$((pass+1))
+    else
+        echo "  XX  qualified generic signature: got exit $got, want 42"; fail=$((fail+1))
+    fi
+else
+    echo "  XX  qualified generic signature: compile failed"; sed -n '1,8p' /tmp/nt_out; fail=$((fail+1))
+fi
+rm -f /tmp/nt_bin
+
 echo "── stdlib2 (sort/hashmap/strbuf) ──"
 OUT=$("$ZNC" tests/stdlib2_test.zag -o /tmp/zag_stdlib2_test 2>&1)
 if echo "$OUT" | grep -q "error\|aborted"; then
