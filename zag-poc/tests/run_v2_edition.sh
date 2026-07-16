@@ -174,6 +174,16 @@ elif grep -q 'cannot write through' "$tmp/v2-const-write/log"; then
 else
   echo "  XX  const raw pointer mutation rejection missing diagnostic"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-double-free"
+printf 'name = "v2doublefree"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-double-free/zag.mod"
+printf 'fn main() i32 { unsafe { let p: *mut i32 = new(42) as *mut i32; delete(p); delete(p); } return 0; }\n' >"$tmp/v2-double-free/main.zag"
+if (cd "$tmp/v2-double-free" && "$ZNC" main.zag -o out) >"$tmp/v2-double-free/log" 2>&1 || [ -e "$tmp/v2-double-free/out" ]; then
+  echo "  XX  statically evident double free rejects without artifact"; sed -n '1,8p' "$tmp/v2-double-free/log"; fail=$((fail + 1))
+elif grep -q 'double free of named allocation' "$tmp/v2-double-free/log"; then
+  echo "  ok  statically evident double free rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  double-free rejection missing diagnostic"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-nullable-deref"
 printf 'name = "v2nullablederef"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-nullable-deref/zag.mod"
 printf 'unsafe fn load(p: ?*const i32) i32 { return p.*; } fn main() i32 { return 0; }\n' >"$tmp/v2-nullable-deref/main.zag"

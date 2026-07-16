@@ -35,8 +35,10 @@ This is a v2 (`edition = "2027"`) contract, not a description of current v1
 types, requires explicit optional unwrapping before nullable dereference,
 rejects casts between distinct generic/host/device/workgroup address spaces,
 executes bounded native dereference cases, rejects dereference outside unsafe,
-and rejects writes through `*const`. Provenance identity, dynamic bounds,
-alignment instrumentation, allocator handles, and most operations below remain
+rejects writes through `*const`, and rejects a statically evident second
+`delete`/`_zag_free` of the same named allocation in edition 2027. Provenance
+identity, dynamic bounds, aliasing, use-after-free, alignment instrumentation,
+allocator handles, and most operations below remain
 unimplemented; v1 pointer indexing and `new`/`delete` extensions are not
 evidence that those rules already hold.
 
