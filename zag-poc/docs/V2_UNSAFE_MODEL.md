@@ -25,11 +25,13 @@ direct call sites, and propagates the `Unsafe` effect into `@pure` and
 Native x86-64 executes the positive cases; AArch64, WASM, and GPU MLIR have
 compile/lowering regression coverage.
 
-This is not the complete model. The compiler does not yet retain the required
-per-operation source-span audit records, propagate unsafe contracts through
-indirect function values, closures, callbacks, generics, or FFI, or implement
-the full unsafe-operation inventory. Pointer provenance, bounds, alignment,
-aliasing, and lifetime enforcement also remain incomplete.
+This is not the complete model. Until function types carry an `Unsafe`
+contract, converting an `unsafe fn` to a function value is rejected rather
+than silently permitting an unsafe indirect call. The compiler does not yet
+retain the required per-operation source-span audit records, propagate unsafe
+contracts through indirect function values, closures, callbacks, generics, or
+FFI, or implement the full unsafe-operation inventory. Pointer provenance,
+bounds, alignment, aliasing, and lifetime enforcement also remain incomplete.
 
 ## Call boundary and auditability
 

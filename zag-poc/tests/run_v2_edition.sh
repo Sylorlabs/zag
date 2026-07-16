@@ -65,6 +65,16 @@ elif grep -q 'call to unsafe function requires unsafe' "$tmp/v2-safe-call/log"; 
 else
   echo "  XX  unsafe call rejection missing diagnostic"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-unsafe-value"
+printf 'name = "v2unsafevalue"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-unsafe-value/zag.mod"
+printf 'unsafe fn raw() i32 { return 42; } fn main() i32 { let f: fn() i32 = raw; return f(); }\n' >"$tmp/v2-unsafe-value/main.zag"
+if (cd "$tmp/v2-unsafe-value" && "$ZNC" main.zag -o out) >"$tmp/v2-unsafe-value/log" 2>&1 || [ -e "$tmp/v2-unsafe-value/out" ]; then
+  echo "  XX  unsafe function value rejects without artifact"; sed -n '1,8p' "$tmp/v2-unsafe-value/log"; fail=$((fail + 1))
+elif grep -q 'unsafe function values are not implemented' "$tmp/v2-unsafe-value/log"; then
+  echo "  ok  unsafe function value rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  unsafe function value rejection missing diagnostic"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-pure-unsafe"
 printf 'name = "v2pureunsafe"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-pure-unsafe/zag.mod"
 printf 'unsafe fn raw() i32 { return 42; } fn bad() i32 @pure { unsafe { return raw(); } } fn main() i32 { return 0; }\n' >"$tmp/v2-pure-unsafe/main.zag"
