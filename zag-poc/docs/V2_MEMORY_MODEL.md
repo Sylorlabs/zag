@@ -31,10 +31,14 @@ is used and its operation is proven nonblocking.
 ## Status and edition boundary
 
 This is a v2 (`edition = "2027"`) contract, not a description of current v1
-`*T` lowering.  No spelling in this document is accepted until the typed v2
-frontend, effect checker, and target lowering implement it.  In particular,
-v1 pointer indexing and `new`/`delete` extensions must not be used as evidence
-that these rules already hold.
+`*T` lowering. The compiler now accepts qualified and nullable raw-pointer
+types, requires explicit optional unwrapping before nullable dereference,
+rejects casts between distinct generic/host/device/workgroup address spaces,
+executes bounded native dereference cases, rejects dereference outside unsafe,
+and rejects writes through `*const`. Provenance identity, dynamic bounds,
+alignment instrumentation, allocator handles, and most operations below remain
+unimplemented; v1 pointer indexing and `new`/`delete` extensions are not
+evidence that those rules already hold.
 
 ## Pointer categories and lifetime
 

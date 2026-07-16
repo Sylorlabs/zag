@@ -17,3 +17,33 @@
 Each step requires specification mapping, positive and negative compile tests,
 runtime tests where relevant, and an honest unsupported status before the next
 step is claimed complete.
+
+## Sequencing and exit evidence
+
+| Milestone | Entry condition | Exit evidence | Current status |
+|---|---|---|---|
+| 0. Audit/baseline | dirty-tree-safe snapshot and all named v1 gates | audit, preserved logs, contradiction inventory | COMPLETE as a forensic baseline only |
+| 1. Edition/spec boundary | frozen v1 preserved | v1 rejects v2 syntax/options; v2 unsupported syntax fails closed; normative drafts | PARTIAL: gate and drafts exist |
+| 2. Typed semantic authority | edition boundary | one typed IR consumed by effects and every backend; no skip/comment lowering | PARTIAL: shared declaration and conservative expression-category checks gate every target; complete expression typing and backend lowering still use local string inference |
+| 3. Unsafe/pointer vertical slice | typed authority | lexical unsafe, pointer categories/provenance, positive driver case and safe negative cases | PARTIAL: dedicated unsafe AST nodes, unsafe functions/direct-call checks, the `Unsafe` effect, cross-target lowering, qualified/nullable pointer categories, explicit nullable unwrapping, and address-space cast separation are implemented; safe dereference and const mutation fail closed; source-span auditing, indirect-call propagation, provenance identity, bounds, and alignment instrumentation remain |
+| 4. Memory/allocator/volatile | pointer slice | layout goldens, allocation/reclamation execution, debug checks, MMIO codegen checks | NOT STARTED |
+| 5. Atomics/concurrency | memory rules | lowering inspection, litmus/stress tests with timeouts, realtime rejections | NOT STARTED |
+| 6. ABI/linking | fixed layouts | C-to-Zag and Zag-to-C executable suite, object/shared/dynamic tests | NOT STARTED |
+| 7. CPU control | unsafe/target model | asm operand/clobber validation and machine-code tests | NOT STARTED |
+| 8. GPU runtime | typed device semantics | bounded physical dispatch, readback, CPU comparison, cleanup and timeout test | NOT STARTED |
+| 9. Hardening/release | all prior milestones | fuzz/differential/sanitizers/benchmarks and zero required release failures | NOT STARTED |
+
+The current release gate and generated support matrix are control-plane
+infrastructure, not substitutes for any milestone's implementation evidence.
+
+## Non-negotiable implementation constraints
+
+- A v2 parser/lowering change must be edition-gated before it can alter v1.
+- A capability is not marked supported until a negative test proves misuse is
+  rejected and a runtime test proves the supported target behavior where
+  execution is claimed.
+- GPU compilation, validation, target-binary production, runtime loading,
+  dispatch, result validation, and synchronization are separate milestones.
+- Optional C/Vulkan/toolchain modes may use external tooling only when selected;
+  `./bootstrap.sh` and default static x86-64 native output retain no such
+  dependency.

@@ -7,11 +7,11 @@ SCRIPT_DIR="$(dirname "$0")"
 WASM_HOST_JS="$SCRIPT_DIR/wasm_invoke.js"
 WASMTIME_RUN="$SCRIPT_DIR/wasmtime_run.sh"
 
-if [ ! -x ./znc ]; then
-    echo "  XX  ./znc missing — run ./bootstrap.sh first"
+ZNC="${ZNC:-./znc}"
+if [ ! -x "$ZNC" ]; then
+    echo "  XX  $ZNC missing — run ./bootstrap.sh first or set ZNC"
     echo "════ native-wasm pass=0 fail=1 ════"; exit 1
 fi
-ZNC=./znc
 
 wasm_validate(){ local wf="$1"
     local ok=1

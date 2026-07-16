@@ -37,5 +37,54 @@ else
   bad "GPU status disagrees between audit and verification matrix"
 fi
 
+if [ -f docs/V2_SAFETY_TOOLING.md ] && \
+   rg -q 'rejects the proposed v2' docs/V2_SAFETY_TOOLING.md && \
+   rg -q 'Current status remains unsupported' docs/V2_SAFETY_TOOLING.md; then
+  ok "safety-tooling document is explicit about unsupported status"
+else
+  bad "safety-tooling document is missing or overclaims implementation"
+fi
+
+if [ -f docs/V2_SUPPORT_MATRIX.generated.md ] && \
+   rg -q 'REQUIRED FAILURE: UNSUPPORTED' docs/V2_SUPPORT_MATRIX.generated.md; then
+  ok "generated support matrix retains required unsupported failures"
+else
+  bad "generated support matrix is missing or masks unsupported requirements"
+fi
+
+if [ -f docs/V2_MIGRATION.md ] && \
+   rg -q 'v1 is frozen' docs/V2_MIGRATION.md && \
+   rg -q 'intentionally blocked by E0201' docs/V2_MIGRATION.md; then
+  ok "migration guide preserves frozen-v1 and fail-closed boundary"
+else
+  bad "migration guide is missing or permits an unsupported v2 migration"
+fi
+
+if [ -f docs/V2_FFI_GUIDE.md ] && [ -f docs/V2_CONCURRENCY_GUIDE.md ] && \
+   [ -f docs/V2_ALLOCATOR_GUIDE.md ] && \
+   rg -q 'not implemented' docs/V2_FFI_GUIDE.md && \
+   rg -q 'not implemented' docs/V2_CONCURRENCY_GUIDE.md && \
+   rg -q 'not implemented' docs/V2_ALLOCATOR_GUIDE.md; then
+  ok "low-level guides exist without claiming unimplemented APIs"
+else
+  bad "low-level guides are missing or overclaim implementation"
+fi
+
+if [ -f docs/V2_GPU_GUIDE.md ] && [ -f docs/V2_CPU_CONTROL_GUIDE.md ] && \
+   rg -q 'does not currently execute a GPU kernel' docs/V2_GPU_GUIDE.md && \
+   rg -q 'not implemented in v2' docs/V2_CPU_CONTROL_GUIDE.md; then
+  ok "GPU and CPU-control guides distinguish plans from implementation"
+else
+  bad "GPU or CPU-control guide is missing or overclaims support"
+fi
+
+if [ -f docs/V2_TARGET_SUPPORT.md ] && \
+   rg -q 'not a GPU execution backend' docs/V2_TARGET_SUPPORT.md && \
+   rg -q '| Vulkan compute | no runtime implementation | unsupported |' docs/V2_TARGET_SUPPORT.md; then
+  ok "target support matrix marks GPU runtime targets unsupported"
+else
+  bad "target support matrix is missing or overclaims GPU runtime support"
+fi
+
 echo "════ docs-consistency pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]

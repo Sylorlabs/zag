@@ -3,6 +3,10 @@
 # qemu-user — or natively when the host is already aarch64 (real-hardware CI).
 cd "$(dirname "$0")/.."    # zag-poc root
 pass=0; fail=0
+WORK="/tmp/zag_native_arm64_$$"
+SRC="nt_src_arm64_$$.zag"
+mkdir -p "$WORK"
+trap 'rm -rf "$WORK"; rm -f "$SRC"' EXIT
 
 if [ "$(uname -m)" = "aarch64" ]; then
     QEMU=""     # native execution: "$QEMU" prog expands to prog
@@ -14,41 +18,44 @@ else
 fi
 
 if [ -z "${ZNC:-}" ]; then
-    if ! ./znc selfhost/native/znc.zag -o /tmp/znc_drv >/tmp/zn_build 2>&1; then
-        echo "  XX  znc driver build"; sed -n '1,20p' /tmp/zn_build
+    if ! ./znc selfhost/native/znc.zag -o "$WORK/znc_drv" >"$WORK/zn_build" 2>&1; then
+        echo "  XX  znc driver build"; sed -n '1,20p' "$WORK/zn_build"
         echo "════ arm64 pass=0 fail=1 ════"; exit 1
     fi
-    ZNC=/tmp/znc_drv
+    ZNC="$WORK/znc_drv"
 fi
 
 nt(){
-    printf '%s' "$2" > nt_src.zag
-    "$ZNC" nt_src.zag --target arm64 -o /tmp/nt_arm >/tmp/nt_out 2>&1
-    if [ ! -x /tmp/nt_arm ]; then echo "  XX  $1 (compile failed)"; sed -n '1,8p' /tmp/nt_out; fail=$((fail+1)); return; fi
-    if ! file /tmp/nt_arm | grep -q 'ARM aarch64'; then
+    printf '%s' "$2" > "$SRC"
+    "$ZNC" "$SRC" --target arm64 -o "$WORK/nt_arm" >"$WORK/nt_out" 2>&1
+    if [ ! -x "$WORK/nt_arm" ]; then echo "  XX  $1 (compile failed)"; sed -n '1,8p' "$WORK/nt_out"; fail=$((fail+1)); return; fi
+    if ! file "$WORK/nt_arm" | grep -q 'ARM aarch64'; then
         echo "  XX  $1 (not aarch64 ELF)"; fail=$((fail+1)); return
     fi
-    $QEMU /tmp/nt_arm; local got=$?
+    $QEMU "$WORK/nt_arm"; local got=$?
     if [ "$got" = "$3" ]; then echo "  ok  $1 (exit $got)"; pass=$((pass+1));
     else echo "  XX  $1 (got $got, want $3)"; fail=$((fail+1)); fi
-    rm -f /tmp/nt_arm
+    rm -f "$WORK/nt_arm"
 }
 
 nto(){
-    printf '%s' "$2" > nt_src.zag
-    "$ZNC" nt_src.zag --target arm64 -o /tmp/nt_arm >/tmp/nt_out 2>&1
-    if [ ! -x /tmp/nt_arm ]; then echo "  XX  $1 (compile failed)"; sed -n '1,8p' /tmp/nt_out; fail=$((fail+1)); return; fi
-    local got; got=$($QEMU /tmp/nt_arm); local ec=$?
+    printf '%s' "$2" > "$SRC"
+    "$ZNC" "$SRC" --target arm64 -o "$WORK/nt_arm" >"$WORK/nt_out" 2>&1
+    if [ ! -x "$WORK/nt_arm" ]; then echo "  XX  $1 (compile failed)"; sed -n '1,8p' "$WORK/nt_out"; fail=$((fail+1)); return; fi
+    local got; got=$($QEMU "$WORK/nt_arm"); local ec=$?
     if [ "$got" = "$3" ] && [ "$ec" = "$4" ]; then echo "  ok  $1 (stdout='$got' exit=$ec)"; pass=$((pass+1));
     else echo "  XX  $1 (got stdout='$got' exit=$ec, want '$3'/$4)"; fail=$((fail+1)); fi
-    rm -f /tmp/nt_arm
+    rm -f "$WORK/nt_arm"
 }
 
 echo "── arm64 backend: Zag → AArch64 ELF (qemu-user) ──"
 nt "return literal"  'fn main() i32 { return 42; }' 42
 nt "arithmetic"      'fn main() i32 { let a: i32 = 8; let b: i32 = 5; return a * b - 2; }' 38
+nt "portable memory fence" 'fn main() i32 { let a:i32 = 20; @memoryFence(); return a + 22; }' 42
 nt "function call"   'fn add(a: i32, b: i32) i32 { return a + b; } fn main() i32 { return add(40, 2); }' 42
 nt "while loop"      'fn main() i32 { let s: i32 = 0; let i: i32 = 1; while (i <= 10) { s = s + i; i = i + 1; } return s; }' 55
+nt "continue nested" 'fn main() i32 { let i: i32 = 0; let s: i32 = 0; while (i < 8) { i = i + 1; if (i % 2 == 0) { continue; } let j: i32 = 0; while (j < 3) { j = j + 1; if (j == 2) { continue; } s = s + 1; } } return s; }' 8
+nt "break nested"    'fn main() i32 { let i: i32 = 0; let s:i32 = 0; while (i < 5) { i = i + 1; let j:i32 = 0; while (j < 5) { j = j + 1; if (j == 3) { break; } s = s + 1; } } return s; }' 10
 nt "if/else"         'fn main() i32 { let x: i32 = 7; if (x < 5) { return 1; } else { return 99; } }' 99
 nt "recursion (fib)" 'fn fib(n: i32) i32 { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); } fn main() i32 { return fib(10); }' 55
 nt "factorial"       'fn fact(n: i32) i32 { if (n < 2) { return 1; } return n * fact(n - 1); } fn main() i32 { return fact(5); }' 120
@@ -152,43 +159,43 @@ nt "iface dispatch"  'interface Shape { fn area(self) i32; } struct Sq { s: i32 
 nt "iface multi-meth" 'interface Shape { fn area(self) i32; fn scaled(self, k: i32) i32; } struct Sq { s: i32 } fn (self: Sq) area() i32 { return self.s * self.s; } fn (self: Sq) scaled(k: i32) i32 { return self.s * self.s * k; } fn rep(s: Shape) i32 { return s.area() + s.scaled(2); } fn main() i32 { let a: Sq = Sq{ .s = 3 }; return rep(a) + 15; }' 42
 
 # interfaces example must match the x86 expected output exactly
-"$ZNC" examples/interfaces.zag --target arm64 -o /tmp/nt_if >/tmp/nt_out 2>&1
-if [ -x /tmp/nt_if ] && [ "$($QEMU /tmp/nt_if 2>/dev/null)" = "$(printf '75\n36')" ]; then
+"$ZNC" examples/interfaces.zag --target arm64 -o $WORK/nt_if >$WORK/nt_out 2>&1
+if [ -x $WORK/nt_if ] && [ "$($QEMU $WORK/nt_if 2>/dev/null)" = "$(printf '75\n36')" ]; then
     echo "  ok  examples/interfaces.zag (75/36)"; pass=$((pass+1))
 else
-    echo "  XX  examples/interfaces.zag"; sed -n '1,6p' /tmp/nt_out; fail=$((fail+1))
+    echo "  XX  examples/interfaces.zag"; sed -n '1,6p' $WORK/nt_out; fail=$((fail+1))
 fi
-rm -f /tmp/nt_if
+rm -f $WORK/nt_if
 
 echo "── real programs (output must be byte-identical to x86) ──"
 for prog in arena hash_map sort_bench state_machine csv_parser json_parser; do
-    if ! "$ZNC" "programs/$prog.zag" -o /tmp/np_x86 >/dev/null 2>&1; then
+    if ! "$ZNC" "programs/$prog.zag" -o $WORK/np_x86 >/dev/null 2>&1; then
         echo "  XX  $prog (x86 compile failed)"; fail=$((fail+1)); continue
     fi
-    /tmp/np_x86 > /tmp/np_x86_out 2>&1; x86_ec=$?
-    if ! "$ZNC" "programs/$prog.zag" --target arm64 -o /tmp/np_arm >/dev/null 2>&1; then
+    $WORK/np_x86 > $WORK/np_x86_out 2>&1; x86_ec=$?
+    if ! "$ZNC" "programs/$prog.zag" --target arm64 -o $WORK/np_arm >/dev/null 2>&1; then
         echo "  XX  $prog (arm64 compile failed)"; fail=$((fail+1)); continue
     fi
-    $QEMU /tmp/np_arm > /tmp/np_arm_out 2>&1; arm_ec=$?
-    if [ "$x86_ec" = "$arm_ec" ] && diff -q /tmp/np_x86_out /tmp/np_arm_out >/dev/null 2>&1; then
+    $QEMU $WORK/np_arm > $WORK/np_arm_out 2>&1; arm_ec=$?
+    if [ "$x86_ec" = "$arm_ec" ] && diff -q $WORK/np_x86_out $WORK/np_arm_out >/dev/null 2>&1; then
         echo "  ok  $prog (byte-identical output, exit $arm_ec)"; pass=$((pass+1))
     else
         echo "  XX  $prog (output differs from x86: x86=$x86_ec arm=$arm_ec)"
-        diff /tmp/np_x86_out /tmp/np_arm_out 2>/dev/null | head -4
+        diff $WORK/np_x86_out $WORK/np_arm_out 2>/dev/null | head -4
         fail=$((fail+1))
     fi
-    rm -f /tmp/np_x86 /tmp/np_arm /tmp/np_x86_out /tmp/np_arm_out
+    rm -f $WORK/np_x86 $WORK/np_arm $WORK/np_x86_out $WORK/np_arm_out
 done
 
 # static ELF, no interpreter
-printf 'fn main() i32 { return 0; }' > nt_src.zag
-"$ZNC" nt_src.zag --target arm64 -o /tmp/nt_elf >/dev/null 2>&1
-if file /tmp/nt_elf | grep -q 'statically linked' && ! readelf -l /tmp/nt_elf 2>/dev/null | grep -q 'INTERP'; then
+printf 'fn main() i32 { return 0; }' > $SRC
+"$ZNC" $SRC --target arm64 -o $WORK/nt_elf >/dev/null 2>&1
+if file $WORK/nt_elf | grep -q 'statically linked' && ! readelf -l $WORK/nt_elf 2>/dev/null | grep -q 'INTERP'; then
     echo "  ok  emitted ELF is static, no interpreter"; pass=$((pass+1))
 else
     echo "  XX  emitted ELF static/no-interp check"; fail=$((fail+1))
 fi
-rm -f /tmp/nt_elf nt_src.zag
+rm -f $WORK/nt_elf $SRC
 
 echo "════ arm64 pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]

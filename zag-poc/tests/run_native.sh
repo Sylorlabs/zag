@@ -4,34 +4,38 @@
 # (parse → ncodegen → x86 encode → ELF) is Zag (selfhost/native/*.zag).
 cd "$(dirname "$0")/.."    # zag-poc root
 pass=0; fail=0
+WORK="/tmp/zag_native_x86_$$"
+SRC="nt_src_x86_$$.zag"
+mkdir -p "$WORK"
+trap 'rm -rf "$WORK"; rm -f "$SRC"' EXIT
 
 # Rebuild the native driver with the supported Zag-native seed.
-if ! ./znc selfhost/native/znc.zag -o /tmp/znc_drv >/tmp/zn_build 2>&1; then
-    echo "  XX  znc driver build"; sed -n '1,20p' /tmp/zn_build
+if ! ./znc selfhost/native/znc.zag -o "$WORK/znc_drv" >"$WORK/zn_build" 2>&1; then
+    echo "  XX  znc driver build"; sed -n '1,20p' "$WORK/zn_build"
     echo "════ native pass=0 fail=1 ════"; exit 1
 fi
-ZNC=/tmp/znc_drv
+ZNC="$WORK/znc_drv"
 
 # nt <name> <source> <expected-exit>
 nt(){
-    printf '%s' "$2" > nt_src.zag
-    "$ZNC" nt_src.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
-    if [ ! -x /tmp/nt_bin ]; then echo "  XX  $1 (compile failed)"; sed -n '1,8p' /tmp/nt_out; fail=$((fail+1)); return; fi
-    /tmp/nt_bin; local got=$?
+    printf '%s' "$2" > "$SRC"
+    "$ZNC" "$SRC" -o "$WORK/nt_bin" >"$WORK/nt_out" 2>&1
+    if [ ! -x "$WORK/nt_bin" ]; then echo "  XX  $1 (compile failed)"; sed -n '1,8p' "$WORK/nt_out"; fail=$((fail+1)); return; fi
+    "$WORK/nt_bin"; local got=$?
     if [ "$got" = "$3" ]; then echo "  ok  $1 (exit $got)"; pass=$((pass+1));
     else echo "  XX  $1 (got $got, want $3)"; fail=$((fail+1)); fi
-    rm -f /tmp/nt_bin
+    rm -f "$WORK/nt_bin"
 }
 
 # nto <name> <source> <expected-stdout> <expected-exit>
 nto(){
-    printf '%s' "$2" > nt_src.zag
-    "$ZNC" nt_src.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
-    if [ ! -x /tmp/nt_bin ]; then echo "  XX  $1 (compile failed)"; sed -n '1,6p' /tmp/nt_out; fail=$((fail+1)); return; fi
-    local got; got=$(/tmp/nt_bin); local ec=$?
+    printf '%s' "$2" > "$SRC"
+    "$ZNC" "$SRC" -o "$WORK/nt_bin" >"$WORK/nt_out" 2>&1
+    if [ ! -x "$WORK/nt_bin" ]; then echo "  XX  $1 (compile failed)"; sed -n '1,6p' "$WORK/nt_out"; fail=$((fail+1)); return; fi
+    local got; got=$("$WORK/nt_bin"); local ec=$?
     if [ "$got" = "$3" ] && [ "$ec" = "$4" ]; then echo "  ok  $1 (stdout='$got' exit=$ec)"; pass=$((pass+1));
     else echo "  XX  $1 (got stdout='$got' exit=$ec, want '$3'/$4)"; fail=$((fail+1)); fi
-    rm -f /tmp/nt_bin
+    rm -f "$WORK/nt_bin"
 }
 
 echo "── native backend: Zag → x86-64 ELF (no cc/as/ld/libc) ──"
@@ -42,6 +46,7 @@ nt "forward decl"    'fn foo() i32; fn main() i32 { return 0; }' 0
 nt "fwd mutual rec"  'fn bar() i32; fn foo() i32 { return bar(); } fn bar() i32 { return 42; } fn main() i32 { return foo(); }' 42
 nt "recursion (fib)" 'fn fib(n: i32) i32 { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); } fn main() i32 { return fib(10); }' 55
 nt "while loop"      'fn main() i32 { let s: i32 = 0; let i: i32 = 1; while (i <= 10) { s = s + i; i = i + 1; } return s; }' 55
+nt "continue nested" 'fn main() i32 { let i: i32 = 0; let s: i32 = 0; while (i < 8) { i = i + 1; if (i % 2 == 0) { continue; } let j: i32 = 0; while (j < 3) { j = j + 1; if (j == 2) { continue; } s = s + 1; } } return s; }' 8
 nt "factorial"       'fn fact(n: i32) i32 { if (n < 2) { return 1; } return n * fact(n - 1); } fn main() i32 { return fact(5); }' 120
 nt "div and mod"     'fn main() i32 { return (100 / 7) + (100 % 7); }' 16
 # Gap 6: i32 overflow must wrap at 32 bits — `x as i64` sign-extends the low
@@ -73,6 +78,16 @@ nto "print slice var"     'fn main() i32 { let s: []u8 = "hello\n"; print_str(s)
 nto "println slice newline" 'fn main() i32 { let s: []u8 = "AB"; _zag_println(s); _zag_println("CD"); return 0; }' "$(printf 'AB\nCD')" 0
 nt  "new heap (mmap)"     'struct P { x: i32, y: i32 } fn main() i32 { let p: *P = new(P{ .x = 40, .y = 2 }); return p.*.x + p.*.y; }' 42
 nt  "new x3 (frame)"      'struct P { x: i32 } fn main() i32 { let a: *P = new(P{ .x = 10 }); let b: *P = new(P{ .x = 20 }); let c: *P = new(P{ .x = 12 }); return a.*.x + b.*.x + c.*.x; }' 42
+# A scanner miss must resolve to the lowering pass's larger, aligned high-water
+# mark; an overestimate remains untouched. This guards the prologue patch that
+# prevents a future omitted scratch/capture scan from becoming stack corruption.
+nt  "frame high-water repairs scan miss" '@import("selfhost/native/ncodegen.zag") fn main() i32 { if (cg_resolve_frame_size(16, 9) != 80) { return 1; } if (cg_resolve_frame_size(96, 9) != 96) { return 2; } return 0; }' 0
+# Put the final byte of a dedicated mmap directly before a PROT_NONE guard page.
+# A byte access must touch exactly one byte; the former 8-byte load/RMW-store
+# crossed the boundary and deterministically SIGSEGVed here.
+nt  "byte access stops at mapping boundary" '@import("std/list.zag") fn main() i32 { let n:i32 = 528376; let xs:ArrayList[u8] = make[u8](n); let end:i64 = (xs.data as i64) + (n as i64); let guard:i64 = _zag_raw_syscall(10,end,4096,0,0,0,0); if (guard != 0) { return 3; } xs.data[n-1] = 42; return xs.data[n-1]; }' 42
+nt  "gfx1010 named encoder decoder golden" '@import("selfhost/gfx1010.zag") fn main() i32 { let code:ArrayList[u8] = gfx_emit_fill_code(); let depth:ArrayList[u8]=gfx_emit_depth_code(); let blend:ArrayList[u8]=gfx_emit_blend_code(); if (!gfx1010_validate_code(code)||!gfx1010_validate_depth_code(depth)||!gfx1010_validate_blend_code(blend)) { return 1; } if (code.len!=28||depth.len!=60||blend.len!=236||gfx_code_u32(code,0) != 0x7E020203 || gfx_code_u32(code,1) != 0x34040282 || gfx_code_u32(code,4) != 0x00000302 || gfx_code_u32(depth,2)!=0xDC308000 || gfx_code_u32(depth,6)!=0xBF860007 || gfx_code_u32(blend,8)!=0xBF860031 || gfx_code_u32(blend,52)!=0xDC708000) { return 2; } if (gfx_enc_v_mov_b32(256,0) != 0 || gfx_enc_v_lshlrev_b32(0,65,0) != 0 || gfx_enc_global_store_dword_1(0,256,0) != 0 || gfx_enc_global_load_dword_1(0,0,3)!=0) { return 3; } code.data[0] = (code.data[0] + 1) as u8; depth.data[8]=(depth.data[8]+1) as u8; blend.data[32]=(blend.data[32]+1) as u8; if (gfx1010_validate_code(code)||gfx1010_validate_depth_code(depth)||gfx1010_validate_blend_code(blend)) { return 4; } return 42; }' 42
+nt  "portable memory fence" 'fn main() i32 { let before:i32 = 20; @memoryFence(); let after:i32 = 22; return before + after; }' 42
 nt  "new+delete pair"     'struct P { x: i32 } fn main() i32 { let p: *P = new(P{ .x = 42 }); let v: i32 = p.*.x; delete(p); return v; }' 42
 nt  "delete after use"    'struct P { x: i32, y: i32 } fn main() i32 { let p: *P = new(P{ .x = 10, .y = 32 }); let s: i32 = p.*.x + p.*.y; delete(p); return s; }' 42
 echo "── generics · unions · @-builtins (native self-hosting round 1) ──"
@@ -98,6 +113,7 @@ nt  "union capture val" 'union Expr { num: i32, neg: i32 } fn eval(e: Expr) i32 
 # accept the pointer-typed capture without an explicit sp.* deref.
 nto "print_str union capture" 'union MaybeStr { yes: []u8, no: i32 } fn main() i32 { let v: MaybeStr = MaybeStr{ .yes = "world\n" }; switch (v) { .yes => |s| { print_str(s); } .no => |_| { print_i32(0); } } return 0; }' "world" 0
 nt  "enum switch"      'enum Color { Red, Green, Blue } fn main() i32 { let c: Color = Color.Green; return switch (c) { .Red => 1, .Green => 42, .Blue => 3 }; }' 42
+nt  "switch expression block guard" 'union U { n: i32, bad: i32 } fn eval(u: U) i32 { return switch (u) { .n => |x| { if (x < 0) { return 1; } return x + 2; } .bad => |_| 0 }; } fn main() i32 { return eval(U{ .n = 40 }); }' 42
 echo "── variable layout · nested literals · &expr · optionals (round 2) ──"
 nt  "@sizeOf slice field" 'struct S { a: i32, b: []u8, c: i32 } fn main() i32 { return @sizeOf[S](); }' 32
 nt  "var-layout fields"   'struct S { a: i32, b: []u8, c: i32 } fn main() i32 { let s: S = S{ .a = 40, .b = "x", .c = 2 }; return s.a + s.c; }' 42
@@ -202,69 +218,69 @@ nto "quire cancellation=1" 'fn main() i32 { let one: p32 = @intToPosit(1); let b
 nto "no-rns unaffected" 'fn main() i32 { print_int(7); return 0; }' "7" 0
 
 # The emitted artifact must be a real static ELF with no interpreter (no libc).
-"$ZNC" nt_src.zag -o /tmp/nt_elf >/dev/null 2>&1
-if file /tmp/nt_elf | grep -q 'statically linked' && ! readelf -l /tmp/nt_elf 2>/dev/null | grep -q 'INTERP'; then
+"$ZNC" $SRC -o $WORK/nt_elf >/dev/null 2>&1
+if file $WORK/nt_elf | grep -q 'statically linked' && ! readelf -l $WORK/nt_elf 2>/dev/null | grep -q 'INTERP'; then
     echo "  ok  emitted ELF is static, no interpreter (no libc)"; pass=$((pass+1))
 else
     echo "  XX  emitted ELF static/no-interp check"; fail=$((fail+1))
 fi
-rm -f /tmp/nt_elf nt_src.zag
+rm -f $WORK/nt_elf $SRC
 
 # Hex integer literals are supported (0x / 0X, digits + a-f/A-F + '_'):
 # 0xff == 255 and 0x2a == 42, so the program must compile and exit 42.
-rm -f /tmp/nt_bin
-printf 'fn main() i32 { let x: i32 = 0xff; if (x != 255) { return 1; } return 0x2a; }' > nt_src.zag
-"$ZNC" nt_src.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
-/tmp/nt_bin >/dev/null 2>&1
+rm -f $WORK/nt_bin
+printf 'fn main() i32 { let x: i32 = 0xff; if (x != 255) { return 1; } return 0x2a; }' > $SRC
+"$ZNC" $SRC -o $WORK/nt_bin >$WORK/nt_out 2>&1
+$WORK/nt_bin >/dev/null 2>&1
 if [ "$?" -eq 42 ]; then
     echo "  ok  hex literal compiles and evaluates (0xff==255, 0x2a==42)"; pass=$((pass+1))
 else
     echo "  XX  hex literal miscompiled"; fail=$((fail+1))
 fi
-rm -f /tmp/nt_bin nt_src.zag
+rm -f $WORK/nt_bin $SRC
 
 # Hardening: mixing a posit and a non-posit operand must ABORT, never miscompile.
-rm -f /tmp/nt_bin
-printf 'fn main() i32 { let p: p32 = @intToPosit(1); let q: i32 = 2; let r: p32 = p + q; return 0; }' > nt_src.zag
-"$ZNC" nt_src.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
-if grep -q 'build aborted' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
+rm -f $WORK/nt_bin
+printf 'fn main() i32 { let p: p32 = @intToPosit(1); let q: i32 = 2; let r: p32 = p + q; return 0; }' > $SRC
+"$ZNC" $SRC -o $WORK/nt_bin >$WORK/nt_out 2>&1
+if grep -q 'build aborted' $WORK/nt_out && [ ! -x $WORK/nt_bin ]; then
     echo "  ok  rejects mixed posit/non-posit arithmetic loudly"; pass=$((pass+1))
 else
     echo "  XX  mixed posit/non-posit not rejected loudly"; fail=$((fail+1))
 fi
-rm -f /tmp/nt_bin nt_src.zag
+rm -f $WORK/nt_bin $SRC
 
 # Hardening: mixing an rns_3 and a non-rns operand must ABORT, never miscompile.
-rm -f /tmp/nt_bin
-printf 'fn main() i32 { let x: rns_3 = 5; let y: i32 = 2; let z: rns_3 = x + y; return 0; }' > nt_src.zag
-"$ZNC" nt_src.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
-if grep -q 'build aborted' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
+rm -f $WORK/nt_bin
+printf 'fn main() i32 { let x: rns_3 = 5; let y: i32 = 2; let z: rns_3 = x + y; return 0; }' > $SRC
+"$ZNC" $SRC -o $WORK/nt_bin >$WORK/nt_out 2>&1
+if grep -q 'build aborted' $WORK/nt_out && [ ! -x $WORK/nt_bin ]; then
     echo "  ok  rejects mixed rns/non-rns arithmetic loudly"; pass=$((pass+1))
 else
     echo "  XX  mixed rns/non-rns not rejected loudly"; fail=$((fail+1))
 fi
-rm -f /tmp/nt_bin nt_src.zag
+rm -f $WORK/nt_bin $SRC
 
 echo "── Gap 7: user @alloc/@io effect declarations ──"
 # Pass: user fn may declare @alloc (same semantics as extern @alloc).
 nt "user @alloc compiles" 'fn arena_alloc(n: i32) *i8 @alloc { return _zag_malloc(n) as *i8; } fn main() i32 { let p: *i8 = arena_alloc(8); _zag_free(p); return 0; }' 0
 # Reject: @alloc declared on a body with no heap ops still forbids @noalloc callers.
-rm -f /tmp/nt_bin
-printf 'fn declares_alloc() *i8 @alloc { return 0 as *i8; }\nfn bad() void @noalloc { let p: *i8 = declares_alloc(); }\nfn main() i32 { return 0; }\n' > nt_src.zag
-"$ZNC" nt_src.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
-if grep -qi 'E0002\|@noalloc' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
+rm -f $WORK/nt_bin
+printf 'fn declares_alloc() *i8 @alloc { return 0 as *i8; }\nfn bad() void @noalloc { let p: *i8 = declares_alloc(); }\nfn main() i32 { return 0; }\n' > $SRC
+"$ZNC" $SRC -o $WORK/nt_bin >$WORK/nt_out 2>&1
+if grep -qi 'E0002\|@noalloc' $WORK/nt_out && [ ! -x $WORK/nt_bin ]; then
     echo "  ok  @noalloc rejects caller of user @alloc fn"; pass=$((pass+1))
 else
-    echo "  XX  @noalloc should reject caller of user @alloc fn"; sed -n '1,8p' /tmp/nt_out; fail=$((fail+1))
+    echo "  XX  @noalloc should reject caller of user @alloc fn"; sed -n '1,8p' $WORK/nt_out; fail=$((fail+1))
 fi
-rm -f /tmp/nt_bin nt_src.zag
+rm -f $WORK/nt_bin $SRC
 
 echo "── structural interfaces (native vtable dispatch + coercion) ──"
 nts(){  # nts <label> <file> <expect-stdout>
-    "$ZNC" "$2" -o /tmp/nt_bin >/tmp/nt_out 2>&1
+    "$ZNC" "$2" -o $WORK/nt_bin >$WORK/nt_out 2>&1
     local got
-    if [ ! -x /tmp/nt_bin ]; then echo "  XX  $1 (compile failed)"; sed -n '1,8p' /tmp/nt_out; fail=$((fail+1)); return; fi
-    got=$(/tmp/nt_bin 2>/dev/null); rm -f /tmp/nt_bin
+    if [ ! -x $WORK/nt_bin ]; then echo "  XX  $1 (compile failed)"; sed -n '1,8p' $WORK/nt_out; fail=$((fail+1)); return; fi
+    got=$($WORK/nt_bin 2>/dev/null); rm -f $WORK/nt_bin
     if [ "$got" = "$3" ]; then echo "  ok  $1 (stdout='$got')"; pass=$((pass+1))
     else echo "  XX  $1 (got '$got', want '$3')"; fail=$((fail+1)); fi
 }
@@ -284,25 +300,25 @@ nt  "error union catch |e| code>0" 'error { Err } fn sdiv(a: i32, b: i32) !i32 {
 # Multiple error tags in the error set; distinct codes.
 nt  "error union distinct codes" 'error { NotFound, OutOfRange } fn get_err(x: i32) !i32 { if (x == 0) { return error.NotFound; } if (x == 1) { return error.OutOfRange; } return x; } fn main() i32 { let a: i32 = get_err(0) catch |e| e; let b: i32 = get_err(1) catch |e| e; if (a != b && a > 0 && b > 0) { return 42; } return 0; }' 42
 # Sema rejects try in non-!T function (Raises violation).
-rm -f /tmp/nt_bin
-printf 'error { Err } fn maybe() !i32 { return error.Err; } fn bad() i32 { return try maybe(); } fn main() i32 { return 0; }' > nt_src.zag
-"$ZNC" nt_src.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
-if grep -qi 'violation\|error\[E' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
+rm -f $WORK/nt_bin
+printf 'error { Err } fn maybe() !i32 { return error.Err; } fn bad() i32 { return try maybe(); } fn main() i32 { return 0; }' > $SRC
+"$ZNC" $SRC -o $WORK/nt_bin >$WORK/nt_out 2>&1
+if grep -qi 'violation\|error\[E' $WORK/nt_out && [ ! -x $WORK/nt_bin ]; then
     echo "  ok  rejects try in non-!T function (Raises violation)"; pass=$((pass+1))
 else
     echo "  XX  should reject try in non-!T function"; fail=$((fail+1))
 fi
-rm -f /tmp/nt_bin nt_src.zag
+rm -f $WORK/nt_bin $SRC
 # Arity check: wrong argument count is a compile error; correct count passes.
-rm -f /tmp/nt_bin
-printf 'fn add(a: i32, b: i32) i32 { return a + b; } fn main() i32 { return add(1); }' > nt_src.zag
-"$ZNC" nt_src.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
-if grep -q 'arity check FAILED' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
+rm -f $WORK/nt_bin
+printf 'fn add(a: i32, b: i32) i32 { return a + b; } fn main() i32 { return add(1); }' > $SRC
+"$ZNC" $SRC -o $WORK/nt_bin >$WORK/nt_out 2>&1
+if grep -q 'arity check FAILED' $WORK/nt_out && [ ! -x $WORK/nt_bin ]; then
     echo "  ok  rejects call with wrong argument count"; pass=$((pass+1))
 else
-    echo "  XX  should reject call with wrong argument count"; sed -n '1,4p' /tmp/nt_out; fail=$((fail+1))
+    echo "  XX  should reject call with wrong argument count"; sed -n '1,4p' $WORK/nt_out; fail=$((fail+1))
 fi
-rm -f /tmp/nt_bin nt_src.zag
+rm -f $WORK/nt_bin $SRC
 
 # Exponent float literals: 1e3 / 2.5e-9 lex as floats and round-trip via %g.
 nto "exponent float literals" 'fn main() i32 { print_f64(2.5e-9); print_f64(1e3); return 0; }' "$(printf '2.5e-09\n1000')" 0
@@ -314,9 +330,9 @@ nt "closure shadows fn"    'fn add(a: i32, b: i32) i32 { return a + b; } fn main
 nt "capturing closure"     'fn main() i32 { let g: i32 = 3; let f: fn(i32) i32 = fn[g](x: i32) i32 { return x * g; }; return f(14); }' 42
 
 # Run the full error-propagation integration test.
-"$ZNC" tests/error_propagation.zag -o /tmp/nt_ep >/tmp/nt_ep_out 2>&1
-if [ -x /tmp/nt_ep ]; then
-    ep_out=$(/tmp/nt_ep); ep_ec=$?
+"$ZNC" tests/error_propagation.zag -o $WORK/nt_ep >$WORK/nt_ep_out 2>&1
+if [ -x $WORK/nt_ep ]; then
+    ep_out=$($WORK/nt_ep); ep_ec=$?
     if [ "$ep_ec" = "0" ] && echo "$ep_out" | grep -q "ALL PASS"; then
         echo "  ok  error_propagation.zag: all 12 cases pass"; pass=$((pass+1))
     else
@@ -325,63 +341,65 @@ if [ -x /tmp/nt_ep ]; then
     fi
 else
     echo "  XX  error_propagation.zag: compile failed"; fail=$((fail+1))
-    sed -n '1,6p' /tmp/nt_ep_out
+    sed -n '1,6p' $WORK/nt_ep_out
 fi
-rm -f /tmp/nt_ep
+rm -f $WORK/nt_ep
 
 # ── module system: pub/private, circular imports, zag.mod dep validation ──────
 echo "── module system: pub/private · circular detection · zag.mod deps ──"
 
 # 1. Qualified import: pub fn is accessible, prints correct result.
-rm -f /tmp/nt_bin
-"$ZNC" tests/module_system/main.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
-if [ -x /tmp/nt_bin ]; then
-    got=$(/tmp/nt_bin)
+rm -f $WORK/nt_bin
+"$ZNC" tests/module_system/main.zag -o $WORK/nt_bin >$WORK/nt_out 2>&1
+if [ -x $WORK/nt_bin ]; then
+    got=$($WORK/nt_bin)
     if [ "$got" = "7" ]; then
         echo "  ok  module pub fn: utils.add(3,4)=7"; pass=$((pass+1))
     else
         echo "  XX  module pub fn: got '$got', want '7'"; fail=$((fail+1))
     fi
 else
-    echo "  XX  module pub fn: compile failed"; sed -n '1,6p' /tmp/nt_out; fail=$((fail+1))
+    echo "  XX  module pub fn: compile failed"; sed -n '1,6p' $WORK/nt_out; fail=$((fail+1))
 fi
-rm -f /tmp/nt_bin
+rm -f $WORK/nt_bin
 
 # 2. Private symbol access via qualified import must fail (not accessible).
-rm -f /tmp/nt_bin
-"$ZNC" tests/module_system/private_access.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
-if [ ! -x /tmp/nt_bin ]; then
+rm -f $WORK/nt_bin
+"$ZNC" tests/module_system/private_access.zag -o $WORK/nt_bin >$WORK/nt_out 2>&1
+if [ ! -x $WORK/nt_bin ]; then
     echo "  ok  module private symbol inaccessible (compile rejected)"; pass=$((pass+1))
 else
     echo "  XX  module private symbol should be inaccessible"; fail=$((fail+1))
 fi
-rm -f /tmp/nt_bin
+rm -f $WORK/nt_bin
 
 # 3. Circular imports must be detected loudly with an error and no binary.
-rm -f /tmp/nt_bin
-"$ZNC" tests/module_system/circ_main.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
-if grep -qi 'circular.*import\|E0011' /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
+rm -f $WORK/nt_bin
+"$ZNC" tests/module_system/circ_main.zag -o $WORK/nt_bin >$WORK/nt_out 2>&1
+if grep -qi 'circular.*import\|E0011' $WORK/nt_out && [ ! -x $WORK/nt_bin ]; then
     echo "  ok  circular import detected loudly"; pass=$((pass+1))
 else
-    echo "  XX  circular import not detected"; cat /tmp/nt_out; fail=$((fail+1))
+    echo "  XX  circular import not detected"; cat $WORK/nt_out; fail=$((fail+1))
 fi
-rm -f /tmp/nt_bin
+rm -f $WORK/nt_bin
 
 # 4. zag.mod missing dep must be detected loudly.
-rm -f /tmp/nt_bin
-"$ZNC" tests/module_system/missing_dep/main.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
-if grep -q "dep '.*' declared in zag.mod" /tmp/nt_out && [ ! -x /tmp/nt_bin ]; then
+rm -f $WORK/nt_bin
+"$ZNC" tests/module_system/missing_dep/main.zag -o $WORK/nt_bin >$WORK/nt_out 2>&1
+if grep -q "dep '.*' declared in zag.mod" $WORK/nt_out && [ ! -x $WORK/nt_bin ]; then
     echo "  ok  zag.mod missing dep detected loudly"; pass=$((pass+1))
 else
-    echo "  XX  zag.mod missing dep not detected"; cat /tmp/nt_out; fail=$((fail+1))
+    echo "  XX  zag.mod missing dep not detected"; cat $WORK/nt_out; fail=$((fail+1))
 fi
-rm -f /tmp/nt_bin
+rm -f $WORK/nt_bin
 
-# 5. Qualified generic calls reached through a mixed alias/flat import diamond
-# must retain the substituted generic struct layout during monomorphization.
-"$ZNC" tests/module_alias_generic/main.zag -o /tmp/nt_bin >/tmp/nt_out 2>&1
-if [ -x /tmp/nt_bin ]; then
-    /tmp/nt_bin
+# 5. A qualified generic function may be the only owner of its parameter's
+# generic struct instance. The mono pass must register that layout before
+# normalizing the signature, including through a qualified/flat diamond.
+rm -f $WORK/nt_bin
+"$ZNC" tests/module_alias_generic/main.zag -o $WORK/nt_bin >$WORK/nt_out 2>&1
+if [ -x $WORK/nt_bin ]; then
+    $WORK/nt_bin
     got=$?
     if [ "$got" = "42" ]; then
         echo "  ok  qualified generic signature registers struct layout"; pass=$((pass+1))
@@ -389,37 +407,37 @@ if [ -x /tmp/nt_bin ]; then
         echo "  XX  qualified generic signature: got exit $got, want 42"; fail=$((fail+1))
     fi
 else
-    echo "  XX  qualified generic signature: compile failed"; sed -n '1,8p' /tmp/nt_out; fail=$((fail+1))
+    echo "  XX  qualified generic signature: compile failed"; sed -n '1,8p' $WORK/nt_out; fail=$((fail+1))
 fi
-rm -f /tmp/nt_bin
+rm -f $WORK/nt_bin
 
 echo "── stdlib2 (sort/hashmap/strbuf) ──"
-OUT=$("$ZNC" tests/stdlib2_test.zag -o /tmp/zag_stdlib2_test 2>&1)
+OUT=$("$ZNC" tests/stdlib2_test.zag -o $WORK/zag_stdlib2_test 2>&1)
 if echo "$OUT" | grep -q "error\|aborted"; then
     echo "  XX  stdlib2_test compile failed"; echo "$OUT" | head -8; fail=$((fail+1))
 else
-    RES=$(/tmp/zag_stdlib2_test 2>&1)
+    RES=$($WORK/zag_stdlib2_test 2>&1)
     if echo "$RES" | grep -q "FAIL"; then
         echo "  XX  stdlib2_test: $(echo "$RES" | grep FAIL | head -5)"; fail=$((fail+1))
     else
         echo "  ok  stdlib2: sort/hashmap/strbuf all pass"; pass=$((pass+1))
     fi
 fi
-rm -f /tmp/zag_stdlib2_test
+rm -f $WORK/zag_stdlib2_test
 
 echo "── v1 standard library (native acceptance) ──"
-OUT=$("$ZNC" tests/stdlib_v1_test.zag -o /tmp/zag_stdlib_v1_test 2>&1)
+OUT=$("$ZNC" tests/stdlib_v1_test.zag -o $WORK/zag_stdlib_v1_test 2>&1)
 if echo "$OUT" | grep -q "error\|aborted"; then
     echo "  XX  v1 stdlib compile failed"; echo "$OUT" | head -8; fail=$((fail+1))
 else
-    RES=$(/tmp/zag_stdlib_v1_test 2>&1)
+    RES=$($WORK/zag_stdlib_v1_test 2>&1)
     if echo "$RES" | grep -q "FAIL"; then
         echo "  XX  v1 stdlib: $(echo "$RES" | grep FAIL | head -5)"; fail=$((fail+1))
     else
         echo "  ok  v1 stdlib: collections/strings/files/process/time/testing"; pass=$((pass+1))
     fi
 fi
-rm -f /tmp/zag_stdlib_v1_test
+rm -f $WORK/zag_stdlib_v1_test
 
 echo "── native edge-case battery (run_native_edge.sh) ──"
 if ! ZNC="$ZNC" bash tests/run_native_edge.sh; then

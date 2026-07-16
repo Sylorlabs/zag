@@ -18,7 +18,9 @@
 @import("peephole.zag")   // peephole(ArrayList[Instr]) -> ArrayList[Instr] (optimizer)
 @import("ncodegen.zag")   // lower_program(decls, *errcount, *databuf) -> ArrayList[Instr]
 @import("../sema.zag")    // analyze(decls)->eff  report_violations(decls,eff)->i32
+@import("../typed.zag")   // shared declared-type authority for every target
 @import("../v2_edition.zag") // edition-gated v2 syntax rejection before parse
+@import("../analyze.zag") // run_analysis(decls, file, pedantic)->i32  leak + efficiency lints
 @import("ar.zag")         // ar_symbol_table, ar_entry_data (GNU ar reader)
 @import("elf_obj.zag")    // elf_obj_parse, merge_obj, apply_relocs, MergedLib
 @import("zagmod.zag")     // zagmod_parse, ZagMod (zag.mod manifest reader)
@@ -27,6 +29,7 @@
 @import("../version.zag") // zag_version / zag_edition
 @import("../smt.zag")     // @total SMT discharge (kept out of sema.zag for lean bootstrap)
 @import("../mlir.zag")    // GPU MLIR emitter (lean — no codegen.zag dependency)
+@import("../gfx1010.zag") // deterministic validated RDNA1 kernel bundles
 @import("wasm.zag")       // WASM binary emitter
 @import("acodegen.zag")   // AArch64 lean codegen (--target arm64 only)
 @import("aarch64.zag")   // AArch64 instruction encoder
@@ -126,6 +129,7 @@ fn lo_stmt(n: *Node, env: *ArrayList[LoEnv], dl: ArrayList[*Node]) void {
         .ret    => |r| { if (r.has_expr == 1) { lo_expr(r.expr, env.*, dl); } }
         .if_    => |x| { lo_expr(x.cond, env.*, dl); lo_block(x.then_body, env, dl); lo_block(x.els_body, env, dl); }
         .while_ => |w| { lo_expr(w.cond, env.*, dl); lo_block(w.body, env, dl); }
+        .unsafe_ => |u| { lo_block(u.body, env, dl); }
         .assign => |a| { lo_expr(a.target, env.*, dl); lo_expr(a.expr, env.*, dl); }
         .switch_ => |sw| {
             lo_expr(sw.subject, env.*, dl);
@@ -383,6 +387,18 @@ fn gpu_target() []u8 {
     return "";
 }
 
+fn gfx1010_target() i32 {
+    let i: i32 = 0;
+    while (i < _zag_argc()) {
+        let a: []u8 = _zag_arg(i);
+        if (@strEq(a, "--target") && i + 1 < _zag_argc() &&
+            @strEq(_zag_arg(i + 1), "amdgpu-gfx1010")) { return 1; }
+        if (@strEq(a, "--target=amdgpu-gfx1010")) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn wasm_target() i32 {
     let i: i32 = 0;
     while (i < _zag_argc()) {
@@ -476,6 +492,7 @@ fn znc_arity_locals(body: ArrayList[*Node], outn: *ArrayList[[]u8]) void {
                 if (w.has_cap == 1) { push[[]u8](outn, w.cap); }
                 znc_arity_locals(w.body, outn);
             }
+            .unsafe_ => |u| { znc_arity_locals(u.body, outn); }
             .switch_ => |sw| {
                 let ai: i32 = 0;
                 while (ai < len[SwitchArm](sw.arms)) {
@@ -577,6 +594,7 @@ fn znc_arity_block(body: ArrayList[*Node], fname: []u8, locals: ArrayList[[]u8],
                 znc_arity_expr(w.cond, fname, locals, decls, errs);
                 znc_arity_block(w.body, fname, locals, decls, errs);
             }
+            .unsafe_ => |u| { znc_arity_block(u.body, fname, locals, decls, errs); }
             .switch_ => |sw| {
                 znc_arity_expr(sw.subject, fname, locals, decls, errs);
                 let ai: i32 = 0;
@@ -722,12 +740,14 @@ fn znc_check_src(path: []u8, src: []u8) i32 {
         _zag_println("znc: duplicate-definition check FAILED");
         return 1;
     }
+    if (typed_check_program(decls, path) > 0) { return 1; }
     let eff: map__StringMap[i32] = analyze(decls);
     let viols: i32 = report_violations(decls, eff, src, path);
     if (viols > 0) {
         _zag_println("znc: capability check FAILED");
         return 1;
     }
+    if (run_analyzer(decls, path) != 0) { return 1; }
     return 0;
 }
 
@@ -745,6 +765,23 @@ fn build_gpu(path: []u8, target: []u8) i32 {
     _zag_print(target);
     _zag_print("] wrote MLIR ");
     _zag_println(mpath);
+    return 0;
+}
+
+fn build_gfx1010(path: []u8) i32 {
+    let src: []u8 = _zag_read_file(path);
+    if (src.len < 0) { _zag_print("znc: cannot read "); _zag_println(path); return 1; }
+    if (znc_check_src(path, src) != 0) { return 1; }
+    let errors: i32 = 0;
+    let bundle: ArrayList[u8] = emit_gfx1010_bundle(src, dir_of(path), &errors);
+    if (errors != 0) { return 1; }
+    let out: []u8 = out_flag();
+    if (out.len == 0) { out = _zag_str_concat(stem_of(path), ".zgk"); }
+    if (_zag_write_file(out, bundle.data[0..bundle.len]) != 0) {
+        _zag_println("znc: failed to write gfx1010 kernel bundle"); return 1;
+    }
+    _zag_print("znc: [amdgpu-gfx1010] wrote validated kernel bundle ");
+    _zag_println(out);
     return 0;
 }
 
@@ -812,6 +849,33 @@ fn build_wasm(path: []u8) i32 {
     return 0;
 }
 
+// ── static analyzer (analyze.zag) driver glue ────────────────────────────────
+// The leak + efficiency analyzer runs by default on every build/check.
+//   --no-analyze       turn the analyzer off entirely
+//   --analyze-strict   treat findings as errors (fail the build)
+//   --analyze-pedantic also emit strength-reduction hints (E0103)
+fn analysis_enabled() i32 {
+    if (has_flag("--no-analyze") == 1) { return 0; }
+    return 1;
+}
+fn analysis_pedantic() i32 { return has_flag("--analyze-pedantic"); }
+
+// Run the analyzer (if enabled) and print a one-line summary. Returns 1 only
+// when findings exist AND --analyze-strict was passed (so the caller aborts).
+fn run_analyzer(decls: ArrayList[*Node], path: []u8) i32 {
+    if (analysis_enabled() == 0) { return 0; }
+    let issues: i32 = run_analysis(decls, path, analysis_pedantic());
+    if (issues > 0) {
+        let n: []u8 = _zag_i64_to_str(issues as i64);
+        if (has_flag("--analyze-strict") == 1) {
+            _zag_eprintln(_zag_str_concat("znc: analyzer found ", _zag_str_concat(n, " issue(s) — build FAILED (--analyze-strict)")));
+            return 1;
+        }
+        _zag_eprintln(_zag_str_concat("znc: analyzer found ", _zag_str_concat(n, " issue(s) (warnings above; use --analyze-strict to fail the build, --no-analyze to silence)")));
+    }
+    return 0;
+}
+
 // Is `name` present anywhere in argv?
 fn has_flag(name: []u8) i32 {
     let i: i32 = 0;
@@ -822,13 +886,14 @@ fn has_flag(name: []u8) i32 {
     return 0;
 }
 
-// First non-flag argument (the source path).
+// First non-flag argument (the source path). Skips the optional `build`
+// subcommand word so both `znc foo.zag` and `znc build --hot foo.zag` work.
 fn src_arg() []u8 {
     let i: i32 = 1;
     while (i < _zag_argc()) {
         let a: []u8 = _zag_arg(i);
         if (a.len > 0) {
-            if (a[0] != '-') { return a; }
+            if (a[0] != '-' && @strEq(a, "build") == 0) { return a; }
         }
         i = i + 1;
     }
@@ -900,6 +965,7 @@ fn znc_check(path: []u8) i32 {
     if (path.len == 0) { _zag_println("znc: no source file"); return 1; }
     let src: []u8 = _zag_read_file(path);
     if (src.len < 0) { _zag_print("znc: cannot read "); _zag_println(path); return 1; }
+    if (v2_validate_source(path, src) != 0) { return 1; }
     let decls: ArrayList[*Node] = parse_program_dir(src, dir_of(path));
     lo_operators(decls);
     let eff: map__StringMap[i32] = analyze(decls);
@@ -910,6 +976,7 @@ fn znc_check(path: []u8) i32 {
         return 1;
     }
     smt_report_proofs(decls, eff);
+    if (run_analyzer(decls, path) != 0) { return 1; }
     _zag_println("znc: OK — all capability claims proven");
     return 0;
 }
@@ -927,16 +994,87 @@ fn znc_init() i32 {
     return 0;
 }
 
+// First non-flag argv entry at or after `start` ("" if none).
+fn first_nonflag_from(start: i32) []u8 {
+    let i: i32 = start;
+    while (i < _zag_argc()) {
+        let a: []u8 = _zag_arg(i);
+        if (a.len > 0 && a[0] != '-') { return a; }
+        i = i + 1;
+    }
+    return "";
+}
+
+// --hot build: record the code/data sizes for the hot-patch layout guard.
+fn znc_write_hotlen(clen: i32, dlen: i32) void {
+    let _a: i32 = _zag_write_file(".zag_hotlen", _zag_i64_to_str(clen as i64));
+    let _b: i32 = _zag_write_file(".zag_hotdlen", _zag_i64_to_str(dlen as i64));
+    _zag_println("znc: [--hot] recorded layout in .zag_hotlen — after edits run `znc hot-patch <src>`; the running program swaps it in live");
+}
+
+// `znc hot-patch <src>`: re-assemble the (edited) program and, if it keeps the
+// same code+data layout as the --hot build, stage the new `.text` bytes in
+// `.zag_hotpatch` for the running process to memcpy over its live code.
+fn znc_hot_patch(path: []u8) i32 {
+    if (path.len == 0) { _zag_println("znc hot-patch: no source file"); return 1; }
+    let src: []u8 = _zag_read_file(path);
+    if (src.len < 0) { _zag_print("znc hot-patch: cannot read "); _zag_println(path); return 1; }
+
+    // Same front-end + codegen pipeline as the build path so that every
+    // unchanged function assembles to byte-identical code at the same offset.
+    let decls: ArrayList[*Node] = parse_program_dir(src, dir_of(path));
+    lo_operators(decls);
+    let link_libs: ArrayList[[]u8] = make[[]u8](4);
+    let code_decls: ArrayList[*Node] = znc_collect_links(decls, &link_libs);
+    let nerr: i32 = 0;
+    let data: ArrayList[u8] = make[u8](16);
+    let prog: ArrayList[Instr] = lower_program(code_decls, &nerr, &data);
+    if (nerr > 0) { _zag_println("znc hot-patch: build failed — unsupported constructs (see messages above)"); return 1; }
+    let code: ArrayList[u8] = encode(peephole(optimize(regalloc(prog))));
+
+    // Layout guard: an in-place swap is only safe if the code (and the absolute-
+    // addressed data blob) kept the same size as the running image.
+    let want_c: []u8 = _zag_read_file(".zag_hotlen");
+    if (want_c.len <= 0) {
+        _zag_println("znc hot-patch: no .zag_hotlen found — build the program with `--hot` first");
+        return 1;
+    }
+    let got_c: []u8 = _zag_i64_to_str(code.len as i64);
+    if (@strEq(want_c, got_c) == 0) {
+        _zag_println("znc hot-patch: edit changed the compiled code size — rebuild required (hot-patch only applies layout-preserving edits, e.g. changing a constant)");
+        return 1;
+    }
+    let want_d: []u8 = _zag_read_file(".zag_hotdlen");
+    let got_d: []u8 = _zag_i64_to_str(data.len as i64);
+    if (want_d.len > 0 && @strEq(want_d, got_d) == 0) {
+        _zag_println("znc hot-patch: edit changed the data/string layout — rebuild required");
+        return 1;
+    }
+
+    let wrc: i32 = _zag_write_file(".zag_hotpatch", code.data[0..code.len]);
+    if (wrc != 0) { _zag_println("znc hot-patch: failed to write .zag_hotpatch"); return 1; }
+    _zag_print("znc hot-patch: staged ");
+    _zag_print(got_c);
+    _zag_println(" bytes → .zag_hotpatch (the running process swaps it in on its next zag_hot_wait())");
+    return 0;
+}
+
 fn main() i32 {
     if (_zag_argc() < 2) {
         _zag_println("usage: znc <source.zag> [-o out] [-l lib] [-L path] [--run] [--debug]");
-        _zag_println("       znc <source.zag> --target gpu-nvidia|gpu-amd|gpu-vulkan");
+        _zag_println("       znc <source.zag> --target gpu-nvidia|gpu-amd|gpu-vulkan|amdgpu-gfx1010");
         _zag_println("       znc <source.zag> --target wasm [-o out.wasm] [--run]");
         _zag_println("       znc <source.zag> --target arm64 [-o out] [--run]");
         _zag_println("       znc check <source.zag>");
+        _zag_println("       znc [build] --hot <source.zag> [-o out]   (hot-reloadable build)");
+        _zag_println("       znc hot-patch <source.zag>                (stage a live code patch)");
         _zag_println("       znc fmt [--in-place] <source.zag>");
         _zag_println("       znc init");
         _zag_println("       znc version");
+        _zag_println("  analyzer (leak + efficiency lints) runs by default:");
+        _zag_println("    --no-analyze        disable the analyzer");
+        _zag_println("    --analyze-strict    treat analyzer findings as errors");
+        _zag_println("    --analyze-pedantic  also emit strength-reduction hints");
         _zag_println("  compiles Zag to a native x86-64 ELF — no cc/as/ld/libc");
         return 1;
     }
@@ -963,7 +1101,9 @@ fn main() i32 {
         return znc_fmt(fpath, in_place);
     }
     if (@strEq(cmd, "init")) { return znc_init(); }
+    if (@strEq(cmd, "hot-patch")) { return znc_hot_patch(first_nonflag_from(2)); }
     if (@strEq(cmd, "check")) {
+        if (v2_validate_options() != 0) { return 1; }
         let cpath: []u8 = "";
         if (_zag_argc() >= 3) { cpath = _zag_arg(2); }
         return znc_check(cpath);
@@ -976,6 +1116,7 @@ fn main() i32 {
 
     let gtarget: []u8 = gpu_target();
     if (gtarget.len > 0) { return build_gpu(path, gtarget); }
+    if (gfx1010_target() == 1) { return build_gfx1010(path); }
     if (wasm_target() == 1) { return build_wasm(path); }
     if (arm64_target() == 1) { return build_arm64(path); }
 
@@ -1006,6 +1147,10 @@ fn main() i32 {
         return 1;
     }
 
+    // Native uses the same declared-type authority as ARM64, WASM, and GPU.
+    // Reject before any backend can invent a layout for an unknown name.
+    if (typed_check_program(decls, path) > 0) { return 1; }
+
     // Effect/capability check (sema.zag): reject @total/@realtime/@noalloc violations.
     let eff: map__StringMap[i32] = analyze(decls);
     let viols: i32 = report_violations(decls, eff, src, path);
@@ -1015,6 +1160,9 @@ fn main() i32 {
         return 1;
     }
     smt_report_proofs(decls, eff);
+
+    // Leak + efficiency analysis (analyze.zag). On by default; --no-analyze to skip.
+    if (run_analyzer(decls, path) != 0) { return 1; }
 
     // Collect @link directives and strip them from decls before codegen.
     // (ncodegen pass-1 aborts on unknown top-level node kinds.)
@@ -1089,6 +1237,10 @@ fn main() i32 {
         _zag_print(" bytes libs");
     }
     _zag_println(", 0 external tools)");
+
+    // --hot: record the code/data sizes so `znc hot-patch` can verify a later
+    // patch keeps the same layout (see hot_rt.zag).
+    if (has_flag("--hot") == 1) { znc_write_hotlen(code.len, data.len); }
 
     if (has_flag("--run") == 1) {
         let runcmd: []u8 = out;

@@ -9,20 +9,25 @@ produced, not that a target executes them.
 The authoritative command is `bash tests/run_v2_release_gate.sh`.  At the
 time this matrix was written it must fail: it records the unimplemented v2
 surface rather than granting a premature green release.
+`docs/V2_SUPPORT_MATRIX.generated.md` is separately generated from that gate's
+inventory; it cannot turn an unsupported category into a release pass.
 
-Latest isolated working-copy run (2026-07-14): **8 passing categories, 11
-failing required categories, exit 1**.  Passing categories were bootstrap,
-v1 semantic/native compatibility, the v2 edition gate, malformed-input corpus,
-deterministic fuzz smoke, WASM regression, and GPU frontend validation.  Every
-failure below is intentional fail-closed release evidence, not a skipped test.
+Latest isolated working-copy run (2026-07-15): **14 passing categories, 10
+failing required categories, exit 1**. Passing categories include bootstrap,
+v1 semantic/native compatibility, shared declared-type authority, the v2
+edition/option gates, hard-error handling, malformed-input and deterministic
+fuzz smoke, documentation/matrix checks, WASM regression, and GPU frontend
+validation. Every failure below is intentional fail-closed release evidence,
+not a skipped test.
 
 | Capability | Specification | Implementation evidence | Positive evidence | Negative evidence | Runtime evidence | Status |
 |---|---|---|---|---|---|---|
-| Edition boundary | `V2_LANGUAGE_SPEC.md` §1 | `selfhost/v2_edition.zag`; `native/znc.zag` | `tests/run_v2_edition.sh`: v1 sources continue to compile | same test rejects v2 words in edition 2026 and edition 2027 words fail closed | native compiler exits nonzero and does not compile the rejected source | IMPLEMENTED (gate only) |
+| Edition boundary | `V2_LANGUAGE_SPEC.md` §1 | `selfhost/v2_edition.zag`; `native/znc.zag` | `tests/run_v2_edition.sh`: v1 sources continue to compile; `check` also applies the gate | same test rejects v2 words in edition 2026 and edition 2027 words fail closed | native compiler exits nonzero and does not compile/check the rejected source | IMPLEMENTED (gate only) |
 | Unimplemented v2 driver options | `V2_LANGUAGE_SPEC.md` §6 | `selfhost/v2_edition.zag`; `native/znc.zag` | `tests/run_v2_option_rejection.sh` | rejects safety, sanitizer, target-feature, GPU-runtime, and CLI edition options rather than ignoring them | asserts nonzero status and no artifact | IMPLEMENTED (fail-closed gate only) |
 | Hard-error artifact suppression | `V2_LANGUAGE_SPEC.md` §4 | native driver error returns | `tests/run_no_artifact_errors.sh` | same test covers arity, duplicate definition, missing main, unknown identifier, and a caller-owned output sentinel | asserts nonzero status, no fresh artifact, and no overwrite/delete of an existing output | PARTIAL / representative errors only |
-| Unsafe lexical boundary | `V2_UNSAFE_MODEL.md` | none | none | edition gate rejects/blocks spelling only | none | UNSUPPORTED |
-| Raw pointers, provenance, alignment, aliasing | `V2_MEMORY_MODEL.md` | v1 `*T` lowering in `native/ncodegen.zag` is not a v2 model | existing v1 pointer tests only | none for v2 rules | none | UNSUPPORTED |
+| Shared typed authority | `V2_LANGUAGE_SPEC.md` §2 | `selfhost/typed.zag`; invoked by `native/znc.zag` before every target | `tests/run_typed_authority.sh` accepts named/generic types and runs the native result | rejects unknown signature/local types on every target with E0202 and representation-category return/call/assignment/operator mismatches with E0203, all without artifacts | native positive executes; rejection runs through every target driver | PARTIAL / declarations and conservative expressions; complete numeric/generic expression types and backend IR remain duplicated |
+| Unsafe lexical boundary | `V2_UNSAFE_MODEL.md` | dedicated `UnsafeBlock` AST in `selfhost/ast.zag`; `selfhost/v2_edition.zag`, `parse.zag`, `typed.zag`, and `sema.zag` preserve lexical scope, unsafe functions, direct-call safety, and the `Unsafe` effect | `tests/run_v2_edition.sh` executes native unsafe blocks/functions and checks formatting plus AArch64, WASM, and GPU lowering | rejects safe calls to unsafe functions, safe-scope raw dereference, const-pointer mutation, ordinary type errors inside unsafe, and `Unsafe` reaching `@pure`, without artifacts | native x86-64 execution; AArch64/WASM/GPU compile evidence only | PARTIAL / direct unsafe blocks and functions implemented; source-span audit records, indirect calls/function values/generics/FFI propagation, and the complete unsafe-operation inventory remain |
+| Raw pointers, provenance, alignment, aliasing | `V2_MEMORY_MODEL.md` | typed qualifier recognition and pre-lowering machine-control checks in `selfhost/typed.zag`; native pointer lowering | `tests/run_v2_edition.sh` executes `*const` construction/dereference and explicitly unwrapped nullable dereference | edition 2026 rejection, direct nullable dereference, cross-address-space casts, safe-scope dereference, and const mutation reject without artifacts | native x86-64 execution | PARTIAL / pointer categories, nullability, address-space cast separation, and lexical rules; provenance identity, bounds, aliasing, lifetime, and alignment instrumentation remain |
 | Checked and unchecked slices | `V2_MEMORY_MODEL.md` | v1 native slice lowering | `tests/run_native.sh` covers v1 checked paths | no v2 unchecked boundary test | v1 native execution only | PARTIAL / not v2 support |
 | Integer overflow and conversions | `V2_LANGUAGE_SPEC.md` §5 | distributed v1 numeric lowering | selected v1 numeric tests | no v2 checked/wrapping/saturating contract suite | v1 native execution only | PARTIAL / not v2 support |
 | Allocation, resize, free, custom allocators | `V2_MEMORY_MODEL.md` | `_zag_malloc`, `_zag_realloc`, `_zag_free` lowering | existing v1 native tests exercise selected paths | no allocation-failure, invalid-free, or effect tests | mmap-backed native paths only | PARTIAL / not v2 support |
@@ -30,12 +35,12 @@ failure below is intentional fail-closed release evidence, not a skipped test.
 | Volatile and MMIO | `V2_MEMORY_MODEL.md` | none | none | none | none | UNSUPPORTED |
 | Atomics, fences, memory orders | `V2_CONCURRENCY_MODEL.md` | isolated legacy fence lowering is not a public API | none for v2 atomics | no ordering/alignment rejection tests | no litmus execution | UNSUPPORTED |
 | Threads and blocking semantics | `V2_CONCURRENCY_MODEL.md` | `native/thread_rt.zag` is runtime-oriented only | none for public v2 syntax | no realtime/effect rejection suite | no v2 spawn/join stress suite | UNSUPPORTED |
-| Effect propagation | `V2_EFFECT_MODEL.md` | `selfhost/sema.zag` has v1 bitmask inference | `tests/run_semantics.sh` | lacks Unsafe/Atomic/FFI/GPU adversarial witnesses | semantic check only | PARTIAL / not v2 support |
+| Effect propagation | `V2_EFFECT_MODEL.md` | `selfhost/sema.zag` infers the `Unsafe` effect from unsafe blocks and direct unsafe calls | `tests/run_semantics.sh`; `tests/run_v2_edition.sh` accepts ordinary unsafe use | rejects the `Unsafe` effect in `@pure` and `@realtime` functions | semantic check only | PARTIAL / Unsafe direct-call slice only; Atomic/FFI/GPU and indirect-call propagation remain |
 | C ABI, static objects, dynamic libraries | `V2_ABI.md` | v1 `extern` parsing and native call lowering | selected native extern tests | no invalid-v2-ABI suite | no C-to-Zag/Zag-to-C/shared-object suite | UNSUPPORTED |
 | CPU intrinsics, SIMD, inline assembly | `V2_LANGUAGE_SPEC.md`, `V2_UNSAFE_MODEL.md` | none | none | none | no machine-code assertions | UNSUPPORTED |
 | GPU address spaces and kernel effects | `V2_GPU_MODEL.md`, `V2_EFFECT_MODEL.md` | MLIR/gfx bundle emitters do not have a v2 typed authority | `tests/run_native_gpu.sh` checks emitted output | no address-space/effect rejection tests | none | FRONTEND ONLY |
 | GPU target binary and physical dispatch | `V2_GPU_MODEL.md` | none: no device enumeration/context/buffer/dispatch/readback path | none | no OOB/effect rejection at runtime | none | UNSUPPORTED |
-| Sanitizers and debug allocator | `V2_MEMORY_MODEL.md` | none | none | none | none | UNSUPPORTED |
+| Sanitizers and debug allocator | `V2_SAFETY_TOOLING.md` | none | none | none | none | UNSUPPORTED |
 | Fuzzing and malformed-input corpus | `V2_IMPLEMENTATION_PLAN.md` | `tests/run_crash_corpus.sh`, `tests/run_fuzz_smoke.sh`; `tests/crash_corpus/` | crash corpus rejects ten minimized malformed sources; deterministic byte smoke has seven cases | both suites assert nonzero exit, timeout failure, no artifact, and no signal termination | compiler invocation only | PARTIAL / no coverage-guided fuzzing or sanitizers |
 | Differential and performance evidence | `V2_IMPLEMENTATION_PLAN.md` | legacy differential scripts exist | `tests/run_differential.sh` is v1 evidence | no v2 semantic differential suite | no v2 benchmarks | PARTIAL / not v2 support |
 

@@ -16,6 +16,7 @@ struct Parser {
     cctr:     i32,                // unique-name counter for hoisted closures
     fn_eff:   []u8,               // effect row of the most recently parsed fn type ("" if none/non-fn)
     consts:   ArrayList[[]u8],    // top-level `const` names → desugared to nullary fns; bare refs auto-call
+    unsafe_next: i32,              // top-level `unsafe fn` marker consumed by parse_fn
 }
 
 // ── cursor helpers ──────────────────────────────────────────────────────────
@@ -121,7 +122,20 @@ fn parse_fn_type(p: *Parser) []u8 {
 // ── types (returns the type as a []u8 string) ───────────────────────────────
 fn parse_type(p: *Parser) []u8 {
     if (at_k(p, Tk.KwFn)) { return parse_fn_type(p); }
-    if (at_op(p, "*")) { let _t: Token = adv(p); return _zag_str_concat("*", parse_type(p)); }
+    if (at_op(p, "*")) {
+        let _t: Token = adv(p);
+        if (at_k(p, Tk.Ident) && (@strEq(cur(p).val, "const") || @strEq(cur(p).val, "mut") ||
+            @strEq(cur(p).val, "device") || @strEq(cur(p).val, "workgroup") ||
+            @strEq(cur(p).val, "host"))) {
+            let qual: []u8 = adv(p).val;
+            return _zag_str_concat(_zag_str_concat("*", _zag_str_concat(qual, " ")), parse_type(p));
+        }
+        if (at_k(p, Tk.Ident) && @strEq(cur(p).val, "opaque")) {
+            let _q: Token = adv(p);
+            return "*opaque";
+        }
+        return _zag_str_concat("*", parse_type(p));
+    }
     if (at_op(p, "?")) { let _t: Token = adv(p); return _zag_str_concat("?", parse_type(p)); }
     if (at_op(p, "!")) { let _t: Token = adv(p); return _zag_str_concat("!", parse_type(p)); }
     if (at_k(p, Tk.Lbracket)) {
@@ -135,6 +149,20 @@ fn parse_type(p: *Parser) []u8 {
     if (at_k(p, Tk.Dot)) {
         let _d: Token = adv(p);
         nm = _zag_str_concat(_zag_str_concat(nm, "__"), adv(p).val);
+    }
+    // Dimensioned hardware type application: vsa_b<10000>. This is distinct
+    // from generic type arguments because the payload is a compile-time
+    // integer dimension, not a type. Preserve one canonical spelling so every
+    // semantic/backend path sees the same type instead of stray `<`, integer,
+    // and `>` tokens leaking into following parameters.
+    if (at_op(p, "<")) {
+        let _lt: Token = adv(p);
+        let s: []u8 = _zag_str_concat(nm, "<");
+        while (!at_op(p, ">")) {
+            s = _zag_str_concat(s, adv(p).val);
+        }
+        let _gt: Token = adv(p);
+        return _zag_str_concat(s, ">");
     }
     // generic type application: Base[T1,T2]
     if (at_k(p, Tk.Lbracket)) {
@@ -608,6 +636,13 @@ fn parse_switch(p: *Parser) *Node {
 
 fn parse_stmt(p: *Parser) *Node {
     if (at_k(p, Tk.KwSwitch)) { return parse_switch(p); }
+    // V2 lexical unsafe block. Keep the boundary explicit so every semantic
+    // and lowering consumer must intentionally preserve or reject it.
+    if (at_k(p, Tk.Ident) && @strEq(cur(p).val, "unsafe")) {
+        let _u: Token = adv(p);
+        let body: ArrayList[*Node] = parse_block(p);
+        return mk_unsafe(body);
+    }
     // `@cacheAlign(N) let x: T = ...` — pin a hot local to its own cache line.
     let calign: i32 = cache_align_opt(p);
     if (at_k(p, Tk.KwLet)) {
@@ -677,6 +712,11 @@ fn parse_stmt(p: *Parser) *Node {
         let _b: Token = adv(p);
         eat_semi(p);
         return mk_break();
+    }
+    if (at_k(p, Tk.KwContinue)) {
+        let _c: Token = adv(p);
+        eat_semi(p);
+        return mk_continue();
     }
     if (at_k(p, Tk.KwWhile)) {
         let _t: Token = adv(p);
@@ -753,6 +793,10 @@ fn parse_fn(p: *Parser, is_pub: i32) *Node {
     let reff: []u8 = p.*.fn_eff;
     let annots: ArrayList[[]u8] = make[[]u8](2);
     while (at_k(p, Tk.Annot)) { push[[]u8](&annots, adv(p).val); }
+    if (p.*.unsafe_next == 1) {
+        push[[]u8](&annots, "@unsafe");
+        p.*.unsafe_next = 0;
+    }
     let body: ArrayList[*Node] = make[*Node](8);
     if (is_extern == 1) {
         eat_semi(p);
@@ -763,6 +807,12 @@ fn parse_fn(p: *Parser, is_pub: i32) *Node {
         body = parse_block(p);
     }
     return new(Node{ .fn_decl = FnDecl{ .name = name, .tparams = tparams, .params = params, .ret = ret, .annots = annots, .body = body, .is_extern = is_extern, .ret_eff = reff, .caps = 0, .cap_names = "", .cap_types = "", .line = _fn.line, .is_pub = is_pub } });
+}
+
+fn parse_unsafe_fn(p: *Parser, is_pub: i32) *Node {
+    let _unsafe: Token = adv(p);
+    p.*.unsafe_next = 1;
+    return parse_fn(p, is_pub);
 }
 
 // Optional `@cacheAlign(N)` prefix → N (a positive integer), else 0. Consumes
@@ -1236,6 +1286,7 @@ fn q_rewrite_stmt(n: *Node, names: ArrayList[[]u8], qual: []u8, locals: *ArrayLi
             q_rewrite_block(w.body, names, qual, locals);
             locals.*.len = save_w;
         }
+        .unsafe_ => |u| { q_rewrite_block(u.body, names, qual, locals); }
         .assign => |a| { q_rewrite_expr(a.target, names, qual, locals); q_rewrite_expr(a.expr, names, qual, locals); }
         .switch_ => |sw| {
             q_rewrite_expr(sw.subject, names, qual, locals);
@@ -1518,6 +1569,7 @@ fn rewrite_stmt(n: *Node, aliases: ArrayList[[]u8], locals: *ArrayList[[]u8]) vo
             rewrite_block(w.body, aliases, locals);
             locals.*.len = save_w;
         }
+        .unsafe_ => |u| { rewrite_block(u.body, aliases, locals); }
         .assign => |a| { rewrite_expr(a.target, aliases, locals); rewrite_expr(a.expr, aliases, locals); }
         .switch_ => |sw| {
             rewrite_expr(sw.subject, aliases, locals);
@@ -1558,9 +1610,40 @@ fn rewrite_decls(decls: ArrayList[*Node], aliases: ArrayList[[]u8]) void {
     }
 }
 
-// Resolve an @import path: try relative to base_dir first, then lib/ sibling.
+fn std_import_name(relpath: []u8) []u8 {
+    if (relpath.len <= 4 || relpath[0] != 's' || relpath[1] != 't' ||
+        relpath[2] != 'd' || relpath[3] != ':') { return ""; }
+    let name: []u8 = relpath[4..];
+    let i: i32 = 0;
+    while (i < name.len) {
+        let c: u8 = name[i];
+        let safe: bool = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '/';
+        if (!safe || (c == '/' && (i == 0 || i + 1 == name.len))) { return ""; }
+        i = i + 1;
+    }
+    return _zag_str_concat(name, ".zag");
+}
+
+// Resolve an @import path. `std:name` is compiler-owned and cannot be shadowed
+// by the project: repository builds resolve beside znc, installed builds use
+// /usr/local/lib/zag/std. Ordinary paths remain source-relative with lib/
+// fallback for compatibility.
 // Returns the first path that exists, or the relative path as a fallback.
 fn resolve_import_path(relpath: []u8, base_dir: []u8) []u8 {
+    let std_name: []u8 = std_import_name(relpath);
+    if (std_name.len > 0) {
+        let exe_dir: []u8 = dir_of(_zag_arg(0));
+        let bundled: []u8 = join_path(join_path(exe_dir,"std"),std_name);
+        if (_zag_file_exists(bundled) == 1) { return bundled; }
+        let installed: []u8 = join_path("/usr/local/lib/zag/std",std_name);
+        if (_zag_file_exists(installed) == 1) { return installed; }
+        return bundled;
+    }
+    if (relpath.len >= 4 && relpath[0] == 's' && relpath[1] == 't' &&
+        relpath[2] == 'd' && relpath[3] == ':') {
+        return "/__zag_invalid_std_import__";
+    }
     let p1: []u8 = join_path(base_dir, relpath);
     if (_zag_file_exists(p1) == 1) { return p1; }
     // Try lib/ sibling of base_dir's parent
@@ -1722,7 +1805,7 @@ fn check_zag_mod(base_dir: []u8) void {
 // `loading` is the current in-progress import stack for circular detection.
 fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayList[*Node], aliases: *ArrayList[[]u8], loading: *ArrayList[[]u8]) void {
     let toks: ArrayList[Token] = lex(src);
-    let p: Parser = Parser{ .toks = toks, .i = 0, .closures = make[*Node](2), .cctr = 0, .fn_eff = "", .consts = make[[]u8](4) };
+    let p: Parser = Parser{ .toks = toks, .i = 0, .closures = make[*Node](2), .cctr = 0, .fn_eff = "", .consts = make[[]u8](4), .unsafe_next = 0 };
     while (!at_k(&p, Tk.Eof)) {
         if (at_k(&p, Tk.Annot) && @strEq(cur(&p).val, "@import")) {
             let _imp: Token = adv(&p);     // @import
@@ -1750,7 +1833,9 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
         } else if (at_k(&p, Tk.KwPub)) {
             // `pub` keyword — marks the next decl as part of the public API
             let _pub: Token = adv(&p);   // pub
-            if (at_k(&p, Tk.KwStruct)) {
+            if (at_k(&p, Tk.Ident) && @strEq(cur(&p).val, "unsafe")) {
+                push[*Node](out, parse_unsafe_fn(&p, 1));
+            } else if (at_k(&p, Tk.KwStruct)) {
                 push[*Node](out, parse_struct(&p, 1));
             } else if (at_k(&p, Tk.KwUnion)) {
                 push[*Node](out, parse_union(&p));
@@ -1759,6 +1844,8 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
             } else {
                 push[*Node](out, parse_fn(&p, 1));
             }
+        } else if (at_k(&p, Tk.Ident) && @strEq(cur(&p).val, "unsafe")) {
+            push[*Node](out, parse_unsafe_fn(&p, 0));
         } else if (at_k(&p, Tk.KwStruct)) {
             push[*Node](out, parse_struct(&p, 0));
         } else if (at_k(&p, Tk.KwUnion)) {
