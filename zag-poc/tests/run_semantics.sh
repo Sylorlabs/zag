@@ -31,6 +31,26 @@ ok() {
     fi
 }
 
+ok_strict() {
+    local name=$1 source=$2 expected=$3 binary="$TMP/$1"
+    if ! "$ZNC" "$ROOT/tests/semantic/$source" -o "$binary" --analyze-strict >"$TMP/$name.compile" 2>&1; then
+        echo "  XX  $name (strict compile failed)"
+        sed -n '1,12p' "$TMP/$name.compile"
+        fail=$((fail + 1))
+        return
+    fi
+    "$binary" >"$TMP/$name.run" 2>&1
+    local actual=$?
+    if [ "$actual" -eq "$expected" ]; then
+        echo "  ok  $name (strict exit $actual)"
+        pass=$((pass + 1))
+    else
+        echo "  XX  $name (exit $actual, expected $expected)"
+        sed -n '1,12p' "$TMP/$name.run"
+        fail=$((fail + 1))
+    fi
+}
+
 reject() {
     local name=$1 source=$2 binary="$TMP/$1"
     rm -f "$binary"
@@ -53,6 +73,8 @@ ok error-propagation errors_propagation.zag 42
 ok generic-monomorphization generics_monomorphization.zag 42
 ok memory-value-pointer memory_value_pointer.zag 42
 ok edge-control-values edge_control_values.zag 42
+ok_strict imported-const-flat import_const_flat.zag 42
+ok_strict imported-const-qualified import_const_qualified.zag 42
 
 echo "-- v1 core: required rejection --"
 reject unknown-name reject_unknown_name.zag
