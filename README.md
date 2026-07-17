@@ -281,17 +281,20 @@ is read back or checked. `./znc` does not ship an operational GPU target.
 
 ## Build targets
 
-The supported v1 compiler emits **x86-64 Linux ELF only**:
+The supported v1 compiler emits **x86-64 Linux ELF** as its primary target and
+can cross-compile **experimental ARM64 Linux ELF**:
 
 ```bash
 ./znc file.zag -o program
 ./znc file.zag -o program --run
 ./znc file.zag -o program --debug
+./znc file.zag --target arm64 -o program
 ```
 
-Multi-arch CPU targets, wasm, RISC-V posit hardware, and GPU frontend emission
-exist on legacy/differential paths.  No GPU backend is claimed. See
-`zag-poc/README.md` if you need those for comparison work.
+ARM64 output is static and can be verified through qemu-user on x86-64.
+RISC-V is planned, not implemented. WebAssembly and GPU frontend emission are
+available through their respective targets; no GPU backend is claimed. See
+`zag-poc/README.md` for comparison work.
 
 ---
 
@@ -328,7 +331,7 @@ Zag v1 is a self-hosted native compiler (`./znc`) that boots from a committed se
 | `@total` SMT proofs (in-process solver) | Gated (`run_native_total.sh`) | Yes |
 | GPU frontend / MLIR emission | Yes (`--target gpu-*`; `run_native_gpu.sh`) | Yes |
 | WebAssembly | Yes (`--target wasm`; `run_native_wasm.sh`) | Yes |
-| multi-arch CPU (arm64, riscv, …) | No | Yes |
+| multi-arch CPU | ARM64: Yes, experimental; RISC-V: No | Yes |
 
 Release gates:
 
