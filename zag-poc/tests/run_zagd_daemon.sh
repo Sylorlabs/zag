@@ -10,6 +10,9 @@ trap 'if [ -n "${daemon_pid:-}" ]; then kill "$daemon_pid" 2>/dev/null || true; 
 ./znc selfhost/zagd_daemon.zag -o "$tmp/zagd" --no-analyze >/dev/null
 
 mkdir "$tmp/project"
+printf '999999999\n' > "$tmp/project/.zagd.lock"
+"$tmp/zagd" --root "$tmp/project" --mode off
+test ! -e "$tmp/project/.zagd.lock"
 "$tmp/zagd" --root "$tmp/project" --mode light &
 daemon_pid=$!
 
