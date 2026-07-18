@@ -34,8 +34,8 @@ if ! "$ZNC" tests/x86_profile_abi.zag --cpu=unknown -o "$tmp/badcpu" --no-analyz
 else bad "unknown CPU profile rejection"; fi
 
 if ! "$ZNC" tests/x86_profile_abi.zag --target i686 -o "$tmp/i686" --no-analyze >"$tmp/i686.log" 2>&1 &&
-   grep -q "i686 is not implemented" "$tmp/i686.log" && [ ! -e "$tmp/i686" ]; then
-    ok "i686 is explicitly rejected instead of silently emitting ELF64"
+   grep -q "unsupported construct" "$tmp/i686.log" && [ ! -e "$tmp/i686" ]; then
+    ok "i686 milestone rejects unsupported ABI constructs instead of emitting ELF64"
 else bad "i686 fail-closed rejection"; fi
 
 if "$ZNC" tests/x86_profile_abi.zag --target linux-x86_64 -o "$tmp/explicit" --no-analyze >/dev/null &&
