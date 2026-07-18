@@ -153,7 +153,7 @@ for _ in $(seq 1 100); do
 done
 grep -q '^singleton=true$' "$tmp/project/.zagd.status"
 grep -q '^cache_reused=false$' "$tmp/project/.zagd.status"
-printf 'adaptive state\n' > "$tmp/project/reuse.zag"
+printf 'pub fn api(x:i32) i32 { return x; }\n' > "$tmp/project/reuse.zag"
 for _ in $(seq 1 100); do
     grep -q 'last_file=.*/reuse.zag$' "$tmp/project/.zagd.status" 2>/dev/null && break
     sleep 0.01
@@ -172,6 +172,31 @@ for _ in $(seq 1 100); do
     sleep 0.01
 done
 grep -q '^cache_reused=true$' "$tmp/project/.zagd.status"
+before_restart=$(grep '^events=' "$tmp/project/.zagd.status")
+printf 'pub fn api(x:i32) i32 { return x; }\n' > "$tmp/project/reuse.zag"
+sleep 0.15
+test "$(grep '^events=' "$tmp/project/.zagd.status")" = "$before_restart"
+printf 'pub fn api(x:i64) i64 { return x; }\n' > "$tmp/project/reuse.zag"
+for _ in $(seq 1 100); do
+    grep -q '^last_change=public-shape$' "$tmp/project/.zagd.status" 2>/dev/null && break
+    sleep 0.01
+done
+grep -q '^last_change=public-shape$' "$tmp/project/.zagd.status"
+printf stop > "$tmp/project/.zagd.stop"
+for _ in $(seq 1 100); do
+    grep -q '^state=stopped$' "$tmp/project/.zagd.status" 2>/dev/null && break
+    sleep 0.01
+done
+
+# A file changed while the daemon was stopped invalidates the restored index.
+printf 'pub fn api(x:i64) i64 { return x + 1; }\n' > "$tmp/project/reuse.zag"
+child_pid=$("$tmp/zagd" --root "$tmp/project" --mode adaptive --window-ms 20 --daemonize)
+test "$child_pid" -gt 1
+for _ in $(seq 1 100); do
+    grep -q '^state=idle$' "$tmp/project/.zagd.status" 2>/dev/null && break
+    sleep 0.01
+done
+grep -q '^cache_reused=false$' "$tmp/project/.zagd.status"
 printf stop > "$tmp/project/.zagd.stop"
 for _ in $(seq 1 100); do
     grep -q '^state=stopped$' "$tmp/project/.zagd.status" 2>/dev/null && break
