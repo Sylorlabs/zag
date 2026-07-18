@@ -77,14 +77,16 @@ or memory constraints.
 
 ## i686 milestone
 
-i686 is a separate future target, not part of the first Zag Script release and
-not implied by x86-64 support. Completion requires ELF32, a specified i386
+i686 remains a separate target, not part of the first Zag Script release and
+not implied by x86-64 support. A first isolated milestone emits and executes an
+ELF32 `EM_386` process containing only a literal-return `main` and the 32-bit
+Linux exit syscall. Every pointer, `usize`, call, local, import, expression, and
+Script construct is rejected. General completion still requires a specified i386
 calling convention, 32-bit pointers/`usize`, smaller-register-set allocation,
 32-bit Linux syscalls, explicit rejection of 64-bit assumptions, target-specific
 runtime tests and execution on real or emulated 32-bit Linux. Until those gates
 pass, public documentation must say Linux x86-64, not full x86-family support.
-The CLI rejects i686 requests before output rather than silently emitting an
-ELF64 binary.
+The CLI never aliases i686 requests to ELF64.
 
 ## Release evidence
 

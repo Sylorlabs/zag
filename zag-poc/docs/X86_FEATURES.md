@@ -18,7 +18,7 @@ in the encoder.
 | AVX, AVX2, FMA, BMI1, BMI2, AVX-512 | not advertised |
 | `native` | resolved with raw CPUID and OSXSAVE/XGETBV gating; permitted set is currently SSE2 |
 | runtime multiversioning | not implemented |
-| i686 / ELF32 | not implemented |
+| i686 / ELF32 | minimal literal-return milestone only |
 
 Native resolution executes CPUID directly. AVX usability requires the CPU AVX
 bit, OSXSAVE, and XGETBV confirmation that XCR0 enables both XMM and YMM state;
@@ -36,5 +36,7 @@ byte-identical output while both profiles permit the same SSE2 feature set.
 Linux x86-64 support must not be described as full x86-family support until the
 separate i686 milestone passes.
 
-`--target i686`, `--target x86`, and `--target linux-i686` are explicitly
-rejected before artifact output. They do not alias to x86-64.
+`--target i686`, `--target x86`, and `--target linux-i686` select an isolated
+ELF32 milestone backend. It accepts only `fn main() i32 { return <0..255>; }`,
+emits `EM_386` with Linux `int 0x80` exit, and rejects every other construct
+before output. This is execution proof, not general i686 language support.
