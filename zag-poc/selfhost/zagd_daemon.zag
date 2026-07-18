@@ -1,0 +1,299 @@
+// zagd daemon entry. Build with:
+//   ./znc selfhost/zagd_daemon.zag -o zagd
+// Run foreground for supervision/tests, or pass --daemonize for auto-start.
+
+@import("zagd.zag")
+@import("zagd_linux.zag")
+
+extern fn _zag_read_file(path: []u8) []u8
+extern fn _zag_write_file(path: []u8, content: []u8) i32
+extern fn _zag_file_exists(path: []u8) i32
+
+struct ZagdWatch { wd: i64, path: []u8 }
+struct ZagdFileState { path: []u8, hash: ZagdHash, exists: i32 }
+
+fn zagd_parse_pid(value: []u8) i64 {
+    let result: i64 = 0;
+    let i: i32 = 0;
+    while (i < value.len && value[i] >= '0' && value[i] <= '9') {
+        result = result * 10 + ((value[i] as i64) - 48);
+        i = i + 1;
+    }
+    return result;
+}
+
+fn zagd_claim_singleton(lock_path: []u8) i64 {
+    let fd: i64 = zagd_open_lock(lock_path);
+    if (fd >= 0) { return fd; }
+    let prior: i64 = zagd_parse_pid(_zag_read_file(lock_path));
+    if (prior < 2) { return 0 - 1; }
+    if (zagd_pid_alive(prior) == 1) { return 0 - 1; }
+    zagd_unlink(lock_path);
+    return zagd_open_lock(lock_path);
+}
+
+fn zagd_watch_path(fd: i64, path: []u8, watches: *ArrayList[ZagdWatch]) i32 {
+    let i: i32 = 0;
+    while (i < watches.*.len) {
+        if (@strEq(watches.*.data[i].path, path)) { return 1; }
+        i = i + 1;
+    }
+    if (watches.*.len >= 4096) { return 0; }
+    let wd: i64 = zagd_inotify_watch(fd, path);
+    if (wd < 0) { return 0; }
+    push[ZagdWatch](watches, ZagdWatch{ .wd = wd, .path = path });
+    return 1;
+}
+
+fn zagd_scan_directories(fd: i64, root: []u8, watches: *ArrayList[ZagdWatch]) void {
+    if (zagd_watch_path(fd, root, watches) == 0) { return; }
+    let dirfd: i64 = zagd_open_directory(root);
+    if (dirfd < 0) { return; }
+    let entries: ArrayList[u8] = make[u8](4096);
+    let scanning: i32 = 1;
+    while (scanning == 1) {
+        let nread: i64 = zagd_getdents(dirfd, &entries);
+        if (nread <= 0) { scanning = 0; }
+        else {
+            let off: i32 = 0;
+            while (off + 19 <= nread) {
+                let reclen: i32 = zagd_u16_at(entries.data[0..nread as i32], off + 16);
+                if (reclen < 19 || off + reclen > nread) { off = nread as i32; }
+                else {
+                    let dtype: i32 = entries.data[off + 18] as i32;
+                    let name: []u8 = zagd_event_name(entries.data[0..nread as i32], off + 19, reclen - 19);
+                    if (dtype == 4 && @strEq(name, ".") == 0 && @strEq(name, "..") == 0 && zagd_ignored_name(name) == 0) {
+                        zagd_scan_directories(fd, zagd_join_path(root, name), watches);
+                    }
+                    off = off + reclen;
+                }
+            }
+        }
+    }
+    zagd_close(dirfd);
+}
+
+fn zagd_watch_base(watches: *ArrayList[ZagdWatch], wd: i64) []u8 {
+    let i: i32 = 0;
+    while (i < watches.*.len) {
+        if (watches.*.data[i].wd == wd) { return watches.*.data[i].path; }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn zagd_record_changed(records: *ArrayList[ZagdFileState], path: []u8,
+        hash: ZagdHash, exists: i32) i32 {
+    let i: i32 = 0;
+    while (i < records.*.len) {
+        if (@strEq(records.*.data[i].path, path)) {
+            if (records.*.data[i].exists == exists && zagd_hash_equal(records.*.data[i].hash, hash) == 1) { return 0; }
+            records.*.data[i].hash = hash;
+            records.*.data[i].exists = exists;
+            return 1;
+        }
+        i = i + 1;
+    }
+    push[ZagdFileState](records, ZagdFileState{ .path = path, .hash = hash, .exists = exists });
+    return 1;
+}
+
+fn zagd_mode_name(mode: i32) []u8 {
+    if (mode == zagd_mode_off()) { return "off"; }
+    if (mode == zagd_mode_adaptive()) { return "adaptive"; }
+    if (mode == zagd_mode_deep()) { return "deep"; }
+    return "light";
+}
+
+fn zagd_parse_mode(value: []u8) i32 {
+    if (@strEq(value, "off")) { return zagd_mode_off(); }
+    if (@strEq(value, "adaptive")) { return zagd_mode_adaptive(); }
+    if (@strEq(value, "deep")) { return zagd_mode_deep(); }
+    if (@strEq(value, "light")) { return zagd_mode_light(); }
+    return 0 - 1;
+}
+
+fn zagd_parse_window(value: []u8) i64 {
+    if (value.len == 0) { return 0 - 1; }
+    let result: i64 = 0;
+    let i: i32 = 0;
+    while (i < value.len) {
+        let c: u8 = value[i];
+        if (c < '0' || c > '9') { return 0 - 1; }
+        result = result * 10 + ((c as i64) - 48);
+        if (result > 60000) { return 0 - 1; }
+        i = i + 1;
+    }
+    if (result < 1) { return 0 - 1; }
+    return result;
+}
+
+fn zagd_status_text(pid: i64, mode: i32, state: []u8, file: []u8,
+        hash: ZagdHash, events: i64) []u8 {
+    let out: []u8 = "version=1\n";
+    out = _zag_str_concat(out, _zag_str_concat("pid=", _zag_str_concat(_zag_i64_to_str(pid), "\n")));
+    out = _zag_str_concat(out, _zag_str_concat("mode=", _zag_str_concat(zagd_mode_name(mode), "\n")));
+    out = _zag_str_concat(out, _zag_str_concat("state=", _zag_str_concat(state, "\n")));
+    out = _zag_str_concat(out, "singleton=true\nnetwork=false\ngpu_background=false\n");
+    out = _zag_str_concat(out, _zag_str_concat("events=", _zag_str_concat(_zag_i64_to_str(events), "\n")));
+    out = _zag_str_concat(out, _zag_str_concat("last_file=", _zag_str_concat(file, "\n")));
+    out = _zag_str_concat(out, _zag_str_concat("content_hash_first=", _zag_str_concat(_zag_i64_to_str(hash.first), "\n")));
+    out = _zag_str_concat(out, _zag_str_concat("content_hash_second=", _zag_str_concat(_zag_i64_to_str(hash.second), "\n")));
+    return out;
+}
+
+fn zagd_write_status(path: []u8, pid: i64, mode: i32, state: []u8,
+        file: []u8, hash: ZagdHash, events: i64) i32 {
+    return _zag_write_file(path, zagd_status_text(pid, mode, state, file, hash, events));
+}
+
+fn zagd_run(root: []u8, mode: i32, window_ms: i64) i32 {
+    let status_path: []u8 = zagd_join_path(root, ".zagd.status");
+    let stop_path: []u8 = zagd_join_path(root, ".zagd.stop");
+    let lock_path: []u8 = zagd_join_path(root, ".zagd.lock");
+    let pid: i64 = zagd_pid();
+    let empty: ZagdHash = zagd_content_hash("");
+
+    if (mode == zagd_mode_off()) {
+        if (_zag_file_exists(lock_path) == 1) {
+            let _stop_write: i32 = _zag_write_file(stop_path, "stop\n");
+            let waits: i32 = 0;
+            while (waits < 2000 && _zag_file_exists(lock_path) == 1) {
+                zagd_sleep_ms(1);
+                waits = waits + 1;
+            }
+            if (_zag_file_exists(lock_path) == 1) {
+                _zag_eprintln("zagd: active daemon did not stop before timeout");
+                return 7;
+            }
+        }
+        let _wr: i32 = zagd_write_status(status_path, pid, mode, "stopped", "", empty, 0);
+        return 0;
+    }
+
+    zagd_unlink(stop_path);
+
+    let lock_fd: i64 = zagd_claim_singleton(lock_path);
+    if (lock_fd < 0) {
+        _zag_eprintln("zagd: project already has an active or starting daemon");
+        return 6;
+    }
+    let _lock_write: i32 = _zag_write_file(lock_path, _zag_i64_to_str(pid));
+
+    let fd: i64 = zagd_inotify_open();
+    if (fd < 0) {
+        zagd_close(lock_fd); zagd_unlink(lock_path);
+        let _wr: i32 = zagd_write_status(status_path, pid, mode, "error-inotify-init", "", empty, 0);
+        return 2;
+    }
+    let watches: ArrayList[ZagdWatch] = make[ZagdWatch](16);
+    zagd_scan_directories(fd, root, &watches);
+    if (watches.len == 0) {
+        zagd_close(fd);
+        zagd_close(lock_fd); zagd_unlink(lock_path);
+        let _wr: i32 = zagd_write_status(status_path, pid, mode, "error-inotify-watch", "", empty, 0);
+        return 3;
+    }
+
+    let _wr0: i32 = zagd_write_status(status_path, pid, mode, "idle", "", empty, 0);
+    let buffer: ArrayList[u8] = make[u8](4096);
+    let records: ArrayList[ZagdFileState] = make[ZagdFileState](32);
+    let running: i32 = 1;
+    let event_count: i64 = 0;
+    while (running == 1) {
+        // Blocking inotify read: unchanged projects consume no polling CPU.
+        let nread: i64 = zagd_read_events(fd, &buffer);
+        if (nread < 0) {
+            running = 0;
+        } else {
+            let off: i32 = 0;
+            while (off + 16 <= nread) {
+                let event_wd: i64 = zagd_u32_at(buffer.data[0..nread as i32], off);
+                let mask: i64 = zagd_u32_at(buffer.data[0..nread as i32], off + 4);
+                let name_len: i32 = zagd_u32_at(buffer.data[0..nread as i32], off + 12) as i32;
+                if (off + 16 + name_len > nread) {
+                    off = nread as i32;
+                } else {
+                    let name: []u8 = zagd_event_name(buffer.data[0..nread as i32], off + 16, name_len);
+                    if (@strEq(name, ".zagd.stop")) {
+                        running = 0;
+                    } else if (zagd_ignored_name(name) == 0) {
+                        let base: []u8 = zagd_watch_base(&watches, event_wd);
+                        let full: []u8 = zagd_join_path(base, name);
+                        if (zagd_mask_has(mask, zagd_in_isdir()) == 1 &&
+                            (zagd_mask_has(mask, zagd_in_create()) == 1 || zagd_mask_has(mask, zagd_in_moved_to()) == 1)) {
+                            zagd_scan_directories(fd, full, &watches);
+                        }
+                        // Events are hints. Wait, then read the complete file and
+                        // derive identity from bytes rather than metadata.
+                        zagd_sleep_ms(window_ms);
+                        let exists: i32 = _zag_file_exists(full);
+                        let hash: ZagdHash = empty;
+                        if (exists == 1) {
+                            let bytes: []u8 = _zag_read_file(full);
+                            if (bytes.len >= 0) { hash = zagd_content_hash(bytes); }
+                        }
+                        if (zagd_record_changed(&records, full, hash, exists) == 1) {
+                            event_count = event_count + 1;
+                            let _wr: i32 = zagd_write_status(status_path, pid, mode,
+                                "idle", full, hash, event_count);
+                        }
+                    }
+                    off = off + 16 + name_len;
+                }
+            }
+        }
+    }
+    zagd_close(fd);
+    zagd_close(lock_fd);
+    zagd_unlink(lock_path);
+    zagd_unlink(stop_path);
+    let _wr1: i32 = zagd_write_status(status_path, pid, mode, "stopped", "", empty, event_count);
+    return 0;
+}
+
+fn main() i32 {
+    let root: []u8 = ".";
+    let mode: i32 = zagd_mode_light();
+    let window_ms: i64 = 75;
+    let daemonize: i32 = 0;
+    let i: i32 = 1;
+    while (i < _zag_argc()) {
+        let arg: []u8 = _zag_arg(i);
+        if (@strEq(arg, "--daemonize")) { daemonize = 1; }
+        else if (@strEq(arg, "--root") && i + 1 < _zag_argc()) { i = i + 1; root = _zag_arg(i); }
+        else if (@strEq(arg, "--mode") && i + 1 < _zag_argc()) {
+            i = i + 1;
+            mode = zagd_parse_mode(_zag_arg(i));
+            if (mode < 0) { _zag_eprintln("zagd: mode must be off, light, adaptive, or deep"); return 4; }
+        }
+        else if (@strEq(arg, "--window-ms") && i + 1 < _zag_argc()) {
+            i = i + 1;
+            window_ms = zagd_parse_window(_zag_arg(i));
+            if (window_ms < 0) { _zag_eprintln("zagd: --window-ms must be 1..60000"); return 4; }
+        }
+        i = i + 1;
+    }
+    if (daemonize == 1) {
+        let child: i64 = zagd_fork();
+        if (child < 0) { _zag_eprintln("zagd: fork failed"); return 5; }
+        if (child > 0) {
+            // Do not report successful auto-start until the child owns the
+            // project lock. O_EXCL in the child arbitrates concurrent starters.
+            let lock_path: []u8 = zagd_join_path(root, ".zagd.lock");
+            let tries: i32 = 0;
+            while (tries < 100 && _zag_file_exists(lock_path) == 0) {
+                zagd_sleep_ms(1);
+                tries = tries + 1;
+            }
+            if (_zag_file_exists(lock_path) == 0) {
+                _zag_eprintln("zagd: child did not acquire project singleton");
+                return 6;
+            }
+            _zag_println(_zag_i64_to_str(child));
+            return 0;
+        }
+        zagd_close(0); zagd_close(1); zagd_close(2);
+    }
+    return zagd_run(root, mode, window_ms);
+}
