@@ -44,4 +44,6 @@ grep -q 'root script top-level execution' "$tmp_dir/uncaught.err"
 test "$("$tmp_dir/prelude")" = 'prelude:file-data'
 "$znc_bin" tests/script_frontend/prelude_override.zag -o "$tmp_dir/prelude-override" --no-analyze --no-zagd >/dev/null
 test "$("$tmp_dir/prelude-override")" = 'override:yes'
+"$znc_bin" tests/script_frontend/args_strings.zag -o "$tmp_dir/args-strings" --no-analyze --no-zagd >/dev/null
+test "$("$tmp_dir/args-strings" value)" = 'arg:value'
 echo "script runtime integration: PASS"

@@ -41,9 +41,11 @@ return 0;
 ## Prelude
 
 The intentionally small implemented prelude is `print`, `println`, `read_file`,
-`write_file`, `script_alloc`, and `script_alloc_used`. The ordinary strict-Zag
+`write_file`, `args_len`, `arg`, `string_concat`, `script_alloc`, and
+`script_alloc_used`. The ordinary strict-Zag
 mappings are `_zag_print`, `_zag_println`, `_zag_read_file`, `_zag_write_file`,
-and the explicit script-context allocation runtime calls. Prelude bindings occur
+`_zag_argc`, `_zag_arg`, `_zag_str_concat`, and the explicit script-context
+allocation runtime calls. Prelude bindings occur
 only in executable statements of the selected script root. An ordinary user
 function with the same name wins independently.
 
@@ -60,8 +62,8 @@ not a general memory-safety guarantee or the eventual typed error API.
 - A `.zag` suffix alone does not activate the profile.
 - A source file without `script;` keeps regular Zag semantics.
 
-Process execution with timeout, JSON, typed-list convenience syntax, an `args`
-view, and automatic allocator/capability expansion are not implemented. Use
+Process execution with timeout, JSON, typed-list convenience syntax, a materialized
+`args` collection, and automatic allocator/capability expansion are not implemented. Use
 ordinary explicit Zag APIs where available; the compiler does not pretend those
 APIs are script defaults.
 

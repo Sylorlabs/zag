@@ -60,9 +60,10 @@ negative tests.
 
 The implicit prelude is a small allowlist. Each name resolves to an ordinary,
 documented Zag declaration with an explicit strict-Zag equivalent. The implemented
-allowlist is `print`, `println`, `read_file`, `write_file`, `script_alloc`, and
-`script_alloc_used`. Arguments, typed collections, string building, bounded
-process execution, and basic JSON remain candidates, added only
+allowlist is `print`, `println`, `read_file`, `write_file`, `args_len`, `arg`,
+`string_concat`, `script_alloc`, and `script_alloc_used`. A materialized argument
+collection, typed collections, a growable string builder, bounded process
+execution, and basic JSON remain candidates, added only
 when their type, effect, allocation, error and limit behavior are implemented.
 
 Collections remain statically typed. The compiler may infer one element type
