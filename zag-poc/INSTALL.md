@@ -40,7 +40,7 @@ binary.  No host C compiler or assembler is invoked.
 
 ```sh
 ./bootstrap.sh
-# Rebuilds: ./znc (from selfhost/native/znc.zag)
+# Rebuilds: ./znc and builds sibling ./zagd in pure Zag
 ```
 
 After bootstrap, verify the fixpoint (znc compiling itself produces an
@@ -85,13 +85,13 @@ pure Zag and does not use Python, C, or Zig.
 
 ```sh
 sudo make install
-# Installs znc → /usr/local/bin/znc
+# Installs znc and zagd → /usr/local/bin
 ```
 
 Or manually:
 
 ```sh
-sudo install -m755 znc /usr/local/bin/znc
+sudo install -m755 znc zagd /usr/local/bin/
 ```
 
 After installing, you can compile Zag programs from anywhere:
@@ -100,6 +100,16 @@ After installing, you can compile Zag programs from anywhere:
 znc myprogram.zag -o myprogram
 ./myprogram
 ```
+
+Ordinary source commands attempt to start one `zagd` per project. Planner
+failure only emits a warning and never blocks foreground correctness. Control it
+explicitly with `znc watch --mode light|adaptive|deep|off`, `znc status`,
+`znc suggest`, and `znc shutdown`. A project may set `mode=off` (or another
+mode) in `.zagd.conf`. The daemon never rewrites source and regular Zag
+suggestions are advisory.
+Use `--no-zagd` on an individual foreground command when a hermetic invocation
+must not start or contact the background service; this never changes project
+configuration.
 
 ## Troubleshooting
 

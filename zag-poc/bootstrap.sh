@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # bootstrap.sh — rebuild the supported Zag v1 compiler seeds from source.
 #
-# Produces one release artifact:
+# Produces the compiler and its automatic, correctness-independent planner:
 #   ./znc — native x86-64 compiler with GPU MLIR + WASM backends
 #           (selfhost/native/znc.zag)
 #
@@ -24,5 +24,10 @@ echo "== native bootstrap: Zag -> x86-64 ELF (no cc/as/ld/libc) =="
 mv -f znc.new znc
 echo "   ./znc rebuilt itself from selfhost/native/znc.zag"
 
-echo "== done. Supported compiler: ./znc (native + gpu + wasm) =="
+./znc selfhost/zagd_daemon.zag -o zagd.new --no-analyze --no-zagd
+chmod +x zagd.new
+mv -f zagd.new zagd
+echo "   ./zagd built from selfhost/zagd_daemon.zag"
+
+echo "== done. Supported compiler: ./znc; automatic planner: ./zagd =="
 echo "   retired bootstrap implementations are available only through Git history."

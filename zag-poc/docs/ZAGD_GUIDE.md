@@ -1,11 +1,17 @@
 # `zagd` guide
 
-Status: reusable correctness core only, 2026-07-18.
+Status: Linux daemon lifecycle and content tracking implemented, 2026-07-18.
 
-`zagd` is intended to be an optional, editor-independent continuous analysis and
-planning service. No daemon process, Linux watcher, `znc watch`, `status`, or
-`suggest` command is implemented yet. Foreground builds neither require nor
-consult a daemon.
+`zagd` is an automatic, editor-independent continuous analysis service whose
+availability is correctness-independent. `znc` starts its sibling daemon for ordinary source commands and exposes `watch`,
+`status`, `shutdown`, and advisory `suggest`. Startup failure warns but never
+changes foreground compiler correctness.
+
+Use `.zagd.conf` with `mode=off`, `mode=light`, `mode=adaptive`, or `mode=deep`
+to select automatic startup behavior. A subsequent source command applies a
+mode change, including stopping an existing daemon for `mode=off`. The
+`stability_window_ms` setting controls the daemon's stable-read delay. Adaptive and deep currently select
+lifecycle modes only; broader planning engines remain future work.
 
 The implemented pure-Zag core in `selfhost/zagd.zag` provides:
 
@@ -44,4 +50,3 @@ The test compiles and executes the core using `./znc`. It covers stable identity
 path-sensitive snapshots, stability timing, all change classes, successful cache
 acceptance, partial-record rejection, stale-snapshot rejection, and tampered
 payload rejection.
-

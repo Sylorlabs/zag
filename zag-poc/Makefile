@@ -8,12 +8,12 @@
 #   make install   — install znc to /usr/local/bin
 #   make clean     — remove generated artifacts (keeps the znc seed)
 
-.PHONY: all bootstrap znc test test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-analyzer test-hot-reload test-dynamic-abi test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-std-namespace \
+.PHONY: all bootstrap znc zagd test test-zagd-product test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-analyzer test-hot-reload test-dynamic-abi test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-std-namespace \
         test-diagnostics test-tooling test-programs test-native test-abi-layout test-arm64 \
         test-differential-backends test-arm64-selfhost clean install
 
 # ── Primary target ────────────────────────────────────────────────────────────
-all: znc
+all: znc zagd
 
 # ── Build the native compiler from seed ──────────────────────────────────────
 znc: selfhost/native/znc.zag
@@ -22,8 +22,14 @@ znc: selfhost/native/znc.zag
 	mv -f znc.new znc
 	@echo "   ./znc rebuilt"
 
-bootstrap: znc
+bootstrap: znc zagd
 	@echo "Bootstrap complete — seed: ./znc"
+
+zagd: selfhost/zagd_daemon.zag znc
+	@echo "── building zagd (pure Zag, no libc) ──"
+	./znc selfhost/zagd_daemon.zag -o zagd.new --no-analyze --no-zagd
+	chmod +x zagd.new
+	mv -f zagd.new zagd
 
 # ── Test targets ─────────────────────────────────────────────────────────────
 
@@ -87,6 +93,9 @@ test-std-namespace:
 test-programs:
 	bash tests/run_programs.sh
 
+test-zagd-product: znc zagd
+	bash tests/run_zagd_product.sh
+
 # Full native backend suite, Zag → ELF, no cc/as/ld/libc.
 test-native:
 	@echo "── native backend suite ──"
@@ -120,11 +129,12 @@ test: znc test-pure-tree test-authority test-bootstrap test-semantics test-typed
 	@echo "════ all v1 release gates passed ════"
 
 # ── Install ───────────────────────────────────────────────────────────────────
-install: znc
+install: znc zagd
 	install -m755 znc /usr/local/bin/znc
+	install -m755 zagd /usr/local/bin/zagd
 	install -d /usr/local/lib/zag/std
 	install -m644 std/*.zag /usr/local/lib/zag/std/
-	@echo "Installed znc → /usr/local/bin/znc and std → /usr/local/lib/zag/std"
+	@echo "Installed znc + zagd → /usr/local/bin and std → /usr/local/lib/zag/std"
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 # Removes generated artifacts. Does NOT remove the znc seed binary.

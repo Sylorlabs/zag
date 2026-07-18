@@ -33,7 +33,7 @@ check_static_elf() {
 }
 
 echo "── native authority: poison cc/gcc/clang/as/ld ──"
-if PATH="$tmp/bin:$PATH" ./znc selfhost/native/znc.zag -o "$tmp/znc-stage2" >"$tmp/rebuild.log" 2>&1; then
+if PATH="$tmp/bin:$PATH" ./znc selfhost/native/znc.zag -o "$tmp/znc-stage2" --no-zagd >"$tmp/rebuild.log" 2>&1; then
     echo "  ok  native seed rebuilt znc without a host C toolchain"
     pass=$((pass + 1))
     check_static_elf "$tmp/znc-stage2" "stage-2 compiler"
@@ -45,7 +45,7 @@ fi
 
 if command -v strace >/dev/null 2>&1; then
     if PATH="$tmp/bin:$PATH" strace -f -e trace=execve -o "$tmp/exec.log" \
-       ./znc selfhost/native/znc.zag -o "$tmp/znc-traced" >"$tmp/traced.log" 2>&1 && \
+       ./znc selfhost/native/znc.zag -o "$tmp/znc-traced" --no-zagd >"$tmp/traced.log" 2>&1 && \
        [ "$(grep -c 'execve(' "$tmp/exec.log")" -eq 1 ]; then
         echo "  ok  syscall trace shows no child tool execution"
         pass=$((pass + 1))

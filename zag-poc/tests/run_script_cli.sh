@@ -19,7 +19,8 @@ test "$markerless_status" -eq 5
 
 "$znc_bin" explain tests/script_frontend/basic.zag --format json >"$tmp_dir/explain.json"
 grep -q '"profile":{"value":"script","basis":"proven"}' "$tmp_dir/explain.json"
-grep -q '"allocator":{"value":"unimplemented","basis":"unknown"}' "$tmp_dir/explain.json"
+grep -q '"allocator":{"value":"script_process_arena","basis":"derived"}' "$tmp_dir/explain.json"
+grep -q '"script_memory_bytes":{"value":67108864,"basis":"derived"}' "$tmp_dir/explain.json"
 
 if "$znc_bin" explain tests/script_frontend/basic.zag --format yaml >/dev/null 2>&1; then
     echo "invalid explain format unexpectedly succeeded" >&2
