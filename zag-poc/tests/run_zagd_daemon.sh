@@ -8,8 +8,12 @@ trap 'if [ -n "${daemon_pid:-}" ]; then kill "$daemon_pid" 2>/dev/null || true; 
 ./znc tests/zagd_linux_test.zag -o "$tmp/linux-test" --no-analyze >/dev/null
 "$tmp/linux-test"
 ./znc selfhost/zagd_daemon.zag -o "$tmp/zagd" --no-analyze >/dev/null
+./znc tests/zagd_semantic_fixture.zag -o "$tmp/semantic-fixture" --no-analyze >/dev/null
 
 mkdir "$tmp/project"
+mkdir -p "$tmp/project/.zag-cache/zagd"
+printf 'pub fn api(x:i32) i32 { return x; }\n' > "$tmp/project/app.zag"
+"$tmp/semantic-fixture" "$tmp/project/app.zag" "$tmp/project/.zag-cache/zagd/semantic.record"
 printf '999999999\n' > "$tmp/project/.zagd.lock"
 "$tmp/zagd" --root "$tmp/project" --mode off
 test ! -e "$tmp/project/.zagd.lock"
@@ -24,6 +28,7 @@ grep -q '^state=idle$' "$tmp/project/.zagd.status"
 grep -q '^mode=light$' "$tmp/project/.zagd.status"
 grep -q '^network=false$' "$tmp/project/.zagd.status"
 grep -q '^gpu_background=false$' "$tmp/project/.zagd.status"
+grep -q '^semantic_manifest=true$' "$tmp/project/.zagd.status"
 
 printf 'one\n' > "$tmp/project/app.zag"
 for _ in $(seq 1 100); do
@@ -31,6 +36,7 @@ for _ in $(seq 1 100); do
     sleep 0.01
 done
 grep -q 'last_file=.*/app.zag$' "$tmp/project/.zagd.status"
+grep -q '^semantic_manifest=false$' "$tmp/project/.zagd.status"
 first=$(grep '^content_hash_first=' "$tmp/project/.zagd.status")
 
 printf 'two\n' > "$tmp/project/app.zag"
