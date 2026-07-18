@@ -1800,6 +1800,63 @@ fn check_zag_mod(base_dir: []u8) void {
     check_zag_mod_deps(mod_src, base_dir);
 }
 
+// Bind the deliberately small script allocation convenience to this script's
+// hidden context. This walk is applied only to root executable statements;
+// imported strict declarations and explicit allocator calls are untouched.
+fn script_bind_expr(n: *Node) void {
+    switch (n.*) {
+        .call => |c| {
+            let bind: i32 = 0;
+            switch (c.callee.*) { .id => |id| {
+                if (@strEq(id.name, "script_alloc")) { bind = 1; }
+                if (@strEq(id.name, "script_alloc_used")) { bind = 2; }
+            } else => { } }
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) { script_bind_expr(get[*Node](c.args, i)); i = i + 1; }
+            if (bind > 0) {
+                let args: ArrayList[*Node] = make[*Node](len[*Node](c.args) + 1);
+                push[*Node](&args, mk_ident("__zag_script_context"));
+                let j: i32 = 0; while (j < len[*Node](c.args)) { push[*Node](&args, get[*Node](c.args, j)); j = j + 1; }
+                if (bind == 1) { n.* = mk_call(mk_ident("_zag_script_alloc"), args).*; }
+                else { n.* = mk_call(mk_ident("_zag_script_alloc_used"), args).*; }
+            } else { script_bind_expr(c.callee); }
+        }
+        .bin => |b| { script_bind_expr(b.l); script_bind_expr(b.r); }
+        .un => |u| { script_bind_expr(u.e); }
+        .fld => |f| { script_bind_expr(f.base); }
+        .idx => |x| { script_bind_expr(x.base); script_bind_expr(x.idx); }
+        .cast_ => |c| { script_bind_expr(c.expr); }
+        .slice_ => |s| { script_bind_expr(s.base); script_bind_expr(s.lo); script_bind_expr(s.hi); }
+        .slit_ => |s| { let i: i32 = 0; while (i < len[FieldInit](s.fields)) { script_bind_expr(get[FieldInit](s.fields, i).val); i = i + 1; } }
+        .switch_ => |sw| {
+            script_bind_expr(sw.subject);
+            let i: i32 = 0; while (i < len[SwitchArm](sw.arms)) { script_bind_block(get[SwitchArm](sw.arms, i).body); i = i + 1; }
+            script_bind_block(sw.els_body);
+        }
+        else => { }
+    }
+}
+fn script_bind_stmt(n: *Node) void {
+    switch (n.*) {
+        .let_ => |l| { if (l.has_init == 1) { script_bind_expr(l.expr); } }
+        .ret => |r| { if (r.has_expr == 1) { script_bind_expr(r.expr); } }
+        .estmt => |e| { script_bind_expr(e.expr); }
+        .assign => |a| { script_bind_expr(a.target); script_bind_expr(a.expr); }
+        .if_ => |x| { script_bind_expr(x.cond); script_bind_block(x.then_body); script_bind_block(x.els_body); }
+        .while_ => |w| { script_bind_expr(w.cond); script_bind_block(w.body); }
+        .unsafe_ => |u| { script_bind_block(u.body); }
+        .switch_ => |sw| {
+            script_bind_expr(sw.subject);
+            let i: i32 = 0; while (i < len[SwitchArm](sw.arms)) { script_bind_block(get[SwitchArm](sw.arms, i).body); i = i + 1; }
+            script_bind_block(sw.els_body);
+        }
+        else => { }
+    }
+}
+fn script_bind_block(body: ArrayList[*Node]) void {
+    let i: i32 = 0; while (i < len[*Node](body)) { script_bind_stmt(get[*Node](body, i)); i = i + 1; }
+}
+
 // Parse the top-level decls of one source string, resolving its @imports
 // relative to `base_dir`, appending decls to `out`. Module aliases (`as name`)
 // are accumulated GLOBALLY in `aliases`, so `alias.member` rewriting is
@@ -1908,19 +1965,27 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
     }
     if (is_root == 1 && script_seen == 1) {
         let di: i32 = 0;
+        let user_script_alloc: i32 = 0;
         while (di < len[*Node](out.*)) {
             switch (get[*Node](out.*, di).*) {
                 .fn_decl => |f| {
+                    if (@strEq(f.name, "script_alloc")) { user_script_alloc = 1; }
                     if (@strEq(f.name, "main")) {
                         diag_emit("E0015", "script module conflicts with user-defined `main`", "", f.line, 1, 4, "the script profile generates the process entry point", "remove `main` or remove `script;`", src);
                         _zag_exit(1);
                     }
                     if (@strEq(f.name, "__zag_compiler_script_body_7f3a") ||
+                        @strEq(f.name, "__zag_compiler_script_uncaught_7f3a") ||
                         @strEq(f.name, "_zag_script_context_init") ||
                         @strEq(f.name, "_zag_script_context_shutdown")) {
                         diag_emit("E0016", "declaration conflicts with a compiler-owned script symbol", "", f.line, 1, f.name.len,
                             "generated script runtime symbols are reserved and are not user APIs",
                             "rename this declaration", src);
+                        _zag_exit(1);
+                    }
+                    if (@strEq(f.name, "_zag_script_alloc") || @strEq(f.name, "_zag_script_alloc_used")) {
+                        diag_emit("E0016", "declaration conflicts with a compiler-owned script symbol", "", f.line, 1, f.name.len,
+                            "generated script runtime symbols are reserved and are not user APIs", "rename this declaration", src);
                         _zag_exit(1);
                     }
                 }
@@ -1931,7 +1996,28 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
         // Keep user top-level control flow inside a hidden function. This makes
         // every return flow back through the process wrapper, so deterministic
         // shutdown cannot be bypassed by a top-level `return`.
+        // An explicit user declaration wins over the prelude convenience.
+        if (user_script_alloc == 0) { script_bind_block(script_body); }
         push[*Node](&script_body, mk_ret(1, mk_int("0")));
+        let report_params: ArrayList[Param] = make[Param](1);
+        push[Param](&report_params, Param{ .name = "code", .pty = "i32", .eff = "", .calign = 0 });
+        let report_body: ArrayList[*Node] = make[*Node](3);
+        let code_args: ArrayList[*Node] = make[*Node](1); push[*Node](&code_args, mk_ident("code"));
+        let concat_args: ArrayList[*Node] = make[*Node](2);
+        push[*Node](&concat_args, mk_str("uncaught Zag Script error code "));
+        push[*Node](&concat_args, mk_call(mk_ident("_zag_i64_to_str"), code_args));
+        let print_args: ArrayList[*Node] = make[*Node](1);
+        push[*Node](&print_args, mk_call(mk_ident("_zag_str_concat"), concat_args));
+        push[*Node](&report_body, mk_estmt(mk_call(mk_ident("_zag_eprintln"), print_args)));
+        let where_args: ArrayList[*Node] = make[*Node](1);
+        push[*Node](&where_args, mk_str("operation: root script top-level execution (exact source witness unavailable)"));
+        push[*Node](&report_body, mk_estmt(mk_call(mk_ident("_zag_eprintln"), where_args)));
+        push[*Node](&report_body, mk_ret(1, mk_int("1")));
+        push[*Node](out, new(Node{ .fn_decl = FnDecl{
+            .name = "__zag_compiler_script_uncaught_7f3a", .tparams = make[[]u8](1), .params = report_params,
+            .ret = "i32", .annots = make[[]u8](1), .body = report_body,
+            .is_extern = 0, .ret_eff = "", .caps = 0, .cap_names = "",
+            .cap_types = "", .line = 0, .is_pub = 0 } }));
         let hidden_params: ArrayList[Param] = make[Param](1);
         push[Param](&hidden_params, Param{ .name = "__zag_script_context", .pty = "*opaque", .eff = "", .calign = 0 });
         push[*Node](out, new(Node{ .fn_decl = FnDecl{
@@ -1947,14 +2033,14 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
             mk_call(mk_ident("_zag_script_context_init"), init_args)));
         let body_args: ArrayList[*Node] = make[*Node](1);
         push[*Node](&body_args, mk_ident("__zag_script_context"));
-        let caught_args: ArrayList[*Node] = make[*Node](2);
+        let caught_args: ArrayList[*Node] = make[*Node](3);
         push[*Node](&caught_args, mk_call(mk_ident("__zag_compiler_script_body_7f3a"), body_args));
-        // Until error-name/source witnesses are available to generated AST,
-        // preserve the required nonzero process status without inventing a
-        // diagnostic that the compiler cannot substantiate.
-        push[*Node](&caught_args, mk_int("1"));
+        push[*Node](&caught_args, mk_ident("__zag_script_error_code"));
+        let report_args: ArrayList[*Node] = make[*Node](1);
+        push[*Node](&report_args, mk_ident("__zag_script_error_code"));
+        push[*Node](&caught_args, mk_call(mk_ident("__zag_compiler_script_uncaught_7f3a"), report_args));
         push[*Node](&wrapper, mk_let("__zag_script_status", "i32", 1, 1,
-            mk_call(mk_ident("__catch"), caught_args)));
+            mk_call(mk_ident("__catchc"), caught_args)));
         let shutdown_args: ArrayList[*Node] = make[*Node](1);
         push[*Node](&shutdown_args, mk_ident("__zag_script_context"));
         push[*Node](&wrapper, mk_estmt(mk_call(mk_ident("_zag_script_context_shutdown"), shutdown_args)));
