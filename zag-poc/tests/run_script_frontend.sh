@@ -12,6 +12,25 @@ basic_status=$?
 set -e
 test "$basic_status" -eq 7
 
+# A top-level return exits only the hidden body; the generated wrapper still
+# owns deterministic shutdown and preserves the requested process status.
+"$znc_bin" tests/script_frontend/top_level_return.zag -o "$tmp_dir/top-return" --no-analyze >/dev/null
+set +e
+"$tmp_dir/top-return"
+return_status=$?
+set -e
+test "$return_status" -eq 23
+
+# An uncaught top-level error is caught by the generated process wrapper and
+# becomes a deterministic nonzero status. Error-name witnesses are not yet
+# available here, so the compiler deliberately does not fabricate one.
+"$znc_bin" tests/script_frontend/uncaught_error.zag -o "$tmp_dir/uncaught" --no-analyze >/dev/null
+set +e
+"$tmp_dir/uncaught"
+uncaught_status=$?
+set -e
+test "$uncaught_status" -eq 1
+
 "$znc_bin" tests/script_frontend/import_root.zag -o "$tmp_dir/import-root" --no-analyze >/dev/null
 set +e
 "$tmp_dir/import-root"
@@ -30,5 +49,11 @@ if "$znc_bin" tests/script_frontend/conflicting_main.zag -o "$tmp_dir/conflict" 
     exit 1
 fi
 grep -q 'conflicts with user-defined `main`' "$tmp_dir/conflict.out"
+
+if "$znc_bin" tests/script_frontend/reserved_symbol.zag -o "$tmp_dir/reserved" --no-analyze >"$tmp_dir/reserved.out" 2>&1; then
+    echo "compiler-owned script symbol unexpectedly accepted" >&2
+    exit 1
+fi
+grep -q 'compiler-owned script symbol' "$tmp_dir/reserved.out"
 
 echo "script frontend: PASS"
