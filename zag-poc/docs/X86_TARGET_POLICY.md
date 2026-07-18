@@ -32,12 +32,11 @@ metadata and keys all target-dependent cache entries by it.
 
 ## Feature discovery
 
-Native discovery currently uses Linux `/proc/cpuinfo`, whose exposed feature
-flags describe execution state made available by both CPU and kernel. It
-requires the `lm` and `sse2` baseline and fails closed if flags are unavailable.
-This deliberately avoids treating raw hardware CPUID as sufficient for AVX.
-Direct CPUID/XGETBV discovery may later replace this Linux interface, but must
-preserve the same separation between detection and emission permission.
+Native discovery executes CPUID leaves directly. AVX-family usability also
+requires OSXSAVE and XGETBV confirmation that XCR0 enables XMM/YMM state.
+AVX2 additionally requires its leaf-7 feature bit. This avoids treating raw
+hardware CPUID as sufficient and preserves the separation between detection
+and emission permission.
 
 Features may be detected but not advertised for code generation until their
 instruction encoding, register/state handling, ABI interaction, fallback and

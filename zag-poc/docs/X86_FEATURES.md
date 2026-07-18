@@ -16,16 +16,16 @@ in the encoder.
 | SSE2 | advertised by the generic profile |
 | SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT | not advertised |
 | AVX, AVX2, FMA, BMI1, BMI2, AVX-512 | not advertised |
-| `native` | resolved from Linux `/proc/cpuinfo`; permitted set is currently SSE2 |
+| `native` | resolved with raw CPUID and OSXSAVE/XGETBV gating; permitted set is currently SSE2 |
 | runtime multiversioning | not implemented |
 | i686 / ELF32 | not implemented |
 
-Native resolution reads Linux's execution-visible feature flags from
-`/proc/cpuinfo` and fails closed if the required `lm` and `sse2` baseline is not
-reported. Linux suppresses AVX-family flags when the kernel cannot manage the
-required extended register state, so this is an OS-qualified report, not an
-unqualified raw CPUID guess. The compiler then intersects detected features
-with its independently tested encoder permission set. That permitted set is
+Native resolution executes CPUID directly. AVX usability requires the CPU AVX
+bit, OSXSAVE, and XGETBV confirmation that XCR0 enables both XMM and YMM state;
+AVX2 additionally requires its leaf-7 bit. Deterministic negative tests prove
+that hardware AVX alone and OSXSAVE without YMM state remain disabled. The
+compiler then intersects detected features with its independently tested
+encoder permission set. That permitted set is
 currently SSE2 only; detecting AVX, AVX2, FMA, BMI or AVX-512 never enables
 their emission.
 
