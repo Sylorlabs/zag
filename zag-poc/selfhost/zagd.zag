@@ -1,0 +1,183 @@
+// selfhost/zagd.zag -- pure core primitives for the file-driven Zag planner.
+//
+// This module intentionally performs no filesystem I/O and starts no worker.
+// Watchers are platform adapters; this core turns their fully-read contents and
+// timestamps into deterministic identities and conservative invalidation/cache
+// decisions.  Keeping correctness here independent of a daemon ensures a
+// foreground build never needs zagd.
+
+struct ZagdHash { first: i64, second: i64, bytes: i64 }
+
+struct ZagdConfig {
+    mode: i32,
+    max_workers: i32,
+    max_memory_bytes: i64,
+    max_cache_bytes: i64,
+    stability_window_ms: i64,
+    gpu_background: i32,
+    network_access: i32,
+}
+
+struct ZagdSnapshot {
+    identity: ZagdHash,
+    parent: ZagdHash,
+    root: ZagdHash,
+    file_count: i32,
+    valid: i32,
+}
+
+struct ZagdStableDecision {
+    stable: i32,
+    content_changed: i32,
+    wait_ms: i64,
+}
+
+struct ZagdCacheRecord {
+    format_version: i32,
+    compiler_identity: ZagdHash,
+    snapshot_identity: ZagdHash,
+    target_identity: ZagdHash,
+    payload_identity: ZagdHash,
+    payload_bytes: i64,
+    complete: i32,
+}
+
+// Planner modes. Functions avoid enums so configuration decoding can reject
+// unknown integers instead of accidentally accepting a new enum representation.
+fn zagd_mode_off() i32 { return 0; }
+fn zagd_mode_light() i32 { return 1; }
+fn zagd_mode_adaptive() i32 { return 2; }
+fn zagd_mode_deep() i32 { return 3; }
+
+// Invalidation classes, ordered from least to most expensive.
+fn zagd_change_none() i32 { return 0; }
+fn zagd_change_nonsemantic() i32 { return 1; }
+fn zagd_change_private_body() i32 { return 2; }
+fn zagd_change_public_shape() i32 { return 3; }
+fn zagd_change_root_profile() i32 { return 4; }
+fn zagd_change_target_profile() i32 { return 5; }
+fn zagd_change_unknown() i32 { return 6; }
+
+fn zagd_cache_format_version() i32 { return 1; }
+
+fn zagd_default_config() ZagdConfig {
+    return ZagdConfig{
+        .mode = zagd_mode_light(),
+        .max_workers = 1,
+        .max_memory_bytes = 268435456,
+        .max_cache_bytes = 2147483648,
+        .stability_window_ms = 75,
+        .gpu_background = 0,
+        .network_access = 0,
+    };
+}
+
+fn zagd_config_valid(c: ZagdConfig) i32 {
+    if (c.mode < zagd_mode_off() || c.mode > zagd_mode_deep()) { return 0; }
+    if (c.max_workers < 1 || c.max_workers > 64) { return 0; }
+    if (c.max_memory_bytes < 1048576 || c.max_memory_bytes > 68719476736) { return 0; }
+    if (c.max_cache_bytes < 0 || c.max_cache_bytes > 274877906944) { return 0; }
+    if (c.stability_window_ms < 1 || c.stability_window_ms > 60000) { return 0; }
+    if (c.gpu_background != 0 && c.gpu_background != 1) { return 0; }
+    if (c.network_access != 0) { return 0; }
+    return 1;
+}
+
+fn zagd_hash_empty() ZagdHash {
+    return ZagdHash{ .first = 216613626, .second = 131542391, .bytes = 0 };
+}
+
+// Two independent modular rolling hashes make identity deterministic on every
+// supported target without relying on integer overflow semantics. This is a
+// cache identity, not a cryptographic authenticity primitive; cache hits are
+// still validated against all correctness inputs below.
+fn zagd_hash_extend(seed: ZagdHash, data: []u8) ZagdHash {
+    let a: i64 = seed.first;
+    let b: i64 = seed.second;
+    let i: i32 = 0;
+    while (i < data.len) {
+        let byte: i64 = data[i] as i64;
+        a = (a * 257 + byte + 1) % 1000000007;
+        b = (b * 263 + byte + 1) % 1000000009;
+        i = i + 1;
+    }
+    return ZagdHash{ .first = a, .second = b, .bytes = seed.bytes + data.len };
+}
+
+fn zagd_content_hash(data: []u8) ZagdHash {
+    return zagd_hash_extend(zagd_hash_empty(), data);
+}
+
+fn zagd_hash_equal(a: ZagdHash, b: ZagdHash) i32 {
+    if (a.first != b.first) { return 0; }
+    if (a.second != b.second) { return 0; }
+    if (a.bytes != b.bytes) { return 0; }
+    return 1;
+}
+
+// Compose identities with explicit separators and lengths. Callers must supply
+// files in canonical project-relative path order; watcher event order is never
+// a snapshot input.
+fn zagd_snapshot_begin(root: ZagdHash) ZagdHash {
+    let h: ZagdHash = zagd_hash_extend(zagd_hash_empty(), "zagd-snapshot-v1");
+    h.first = (h.first * 257 + root.first) % 1000000007;
+    h.second = (h.second * 263 + root.second) % 1000000009;
+    h.bytes = h.bytes + root.bytes;
+    return h;
+}
+
+fn zagd_snapshot_add(prior: ZagdHash, path: []u8, content: ZagdHash) ZagdHash {
+    let h: ZagdHash = zagd_hash_extend(prior, path);
+    h.first = (h.first * 257 + content.first + path.len) % 1000000007;
+    h.second = (h.second * 263 + content.second + content.bytes) % 1000000009;
+    h.bytes = h.bytes + content.bytes + 1;
+    return h;
+}
+
+fn zagd_make_snapshot(identity: ZagdHash, parent: ZagdHash, root: ZagdHash, file_count: i32, valid: i32) ZagdSnapshot {
+    return ZagdSnapshot{ .identity = identity, .parent = parent, .root = root,
+        .file_count = file_count, .valid = valid };
+}
+
+// event_ms is the last observed write/rename/delete event. A negative or
+// backwards clock is treated as unstable rather than guessed safe.
+fn zagd_stability(previous: ZagdHash, current: ZagdHash, event_ms: i64, now_ms: i64, window_ms: i64) ZagdStableDecision {
+    let changed: i32 = 1 - zagd_hash_equal(previous, current);
+    if (window_ms < 1 || event_ms < 0 || now_ms < event_ms) {
+        return ZagdStableDecision{ .stable = 0, .content_changed = changed, .wait_ms = window_ms };
+    }
+    let age: i64 = now_ms - event_ms;
+    if (age < window_ms) {
+        return ZagdStableDecision{ .stable = 0, .content_changed = changed, .wait_ms = window_ms - age };
+    }
+    return ZagdStableDecision{ .stable = 1, .content_changed = changed, .wait_ms = 0 };
+}
+
+fn zagd_classify_change(content_changed: i32, semantic_changed: i32,
+        public_shape_changed: i32, root_profile_changed: i32,
+        target_profile_changed: i32, analysis_complete: i32) i32 {
+    if (content_changed == 0) { return zagd_change_none(); }
+    if (analysis_complete == 0) { return zagd_change_unknown(); }
+    if (target_profile_changed != 0) { return zagd_change_target_profile(); }
+    if (root_profile_changed != 0) { return zagd_change_root_profile(); }
+    if (public_shape_changed != 0) { return zagd_change_public_shape(); }
+    if (semantic_changed != 0) { return zagd_change_private_body(); }
+    return zagd_change_nonsemantic();
+}
+
+// Cache acceptance is fail-closed. Corrupt, partial, oversized, stale compiler,
+// stale target, or stale snapshot records are misses and can never authorize an
+// executable. The payload hash must be recomputed from bytes before this call.
+fn zagd_cache_accept(record: ZagdCacheRecord, compiler: ZagdHash,
+        snapshot: ZagdHash, target: ZagdHash, actual_payload: ZagdHash,
+        max_cache_bytes: i64) i32 {
+    if (record.format_version != zagd_cache_format_version()) { return 0; }
+    if (record.complete != 1) { return 0; }
+    if (record.payload_bytes < 0 || record.payload_bytes > max_cache_bytes) { return 0; }
+    if (record.payload_bytes != actual_payload.bytes) { return 0; }
+    if (zagd_hash_equal(record.compiler_identity, compiler) == 0) { return 0; }
+    if (zagd_hash_equal(record.snapshot_identity, snapshot) == 0) { return 0; }
+    if (zagd_hash_equal(record.target_identity, target) == 0) { return 0; }
+    if (zagd_hash_equal(record.payload_identity, actual_payload) == 0) { return 0; }
+    return 1;
+}
