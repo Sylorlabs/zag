@@ -1,13 +1,16 @@
 # `zagd` architecture
 
-Status: Phase 0 design, 2026-07-18. No daemon, watcher, snapshot cache, or
-planner command is implemented yet.
+Status: Linux light-mode implementation with bounded advisory-planner
+foundations, 2026-07-18. Recursive inotify watching, stable content hashing,
+transactional advisory snapshots, restart validation, status, suggestion,
+shutdown, and source-command auto-start are implemented. Complete semantic
+dependency reconstruction, daemon-fed adaptive facts, and deep search are not.
 
 ## Purpose and correctness boundary
 
-`zagd` is an optional project-level analysis and planning service driven by
-filesystem state. `znc watch` may initially host it. Editors are not part of the
-protocol. A foreground `znc` build always remains authoritative and must work
+`zagd` is an automatically started, correctness-independent project-level
+analysis and planning service driven by filesystem state. Editors are not part
+of the protocol. A foreground `znc` build always remains authoritative and works
 when the daemon is absent, stopped, stale, or has a corrupt cache.
 
 The daemon never rewrites source. Regular Zag receives facts and suggestions.
@@ -99,7 +102,9 @@ defaults and produce a diagnostic.
 
 ## Commands and protocol
 
-`znc watch` owns or connects to the project daemon. `status` reports PID or
+`znc watch` owns or connects to the project daemon. Ordinary source commands
+ensure the configured singleton is running unless `mode=off` or the one-shot
+`--no-zagd` override is present. `status` reports PID or
 equivalent instance identity, mode, current snapshot, validity, queued/running
 work, budgets and cache health. `suggest` emits snapshot-bound advisory facts in
 text or JSON. Shutdown is explicit and graceful. The transport is local-only,
@@ -127,3 +132,22 @@ snapshots, conservative module invalidation, transactional bounded cache,
 status/shutdown, then light analysis. Adaptive and deep planning begin only
 after stale-cache and rapid-update stress tests prove the correctness boundary.
 
+## Current incremental-index boundary
+
+The implemented advisory snapshot record persists canonical project-relative
+paths plus content, comment-insensitive semantic, public-declaration-shape and
+root-profile fingerprints. Restart reuse requires a valid checksum, the current
+compiler version, target and exact planner mode. It restores the per-file index,
+so identical rewrites remain non-invalidating after restart and a later public
+shape edit remains distinguishable from a private body edit. Unsafe paths,
+truncation, corruption, stale configuration or an inconsistent file count make
+the whole index a cache miss; they never authorize generated code.
+
+This is not yet a semantic dependency graph. In particular, the watcher does
+not claim that lexical `@import` discovery models merged modules, conditional
+resolution or declaration-level callers. Until the compiler exposes its
+resolved module/declaration graph to the daemon, public-shape changes are
+classified correctly but dependent declarations are conservatively treated as
+unknown rather than under-invalidated. Adaptive advice likewise remains a
+bounded core API and is not published from invented watcher facts. Deep mode is
+a lifecycle selection only, not a completed deep optimizer.

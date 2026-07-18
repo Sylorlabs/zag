@@ -1,8 +1,8 @@
 # Zag Script implementation audit
 
-Status: Phase 0 architecture record, 2026-07-18. Zag Script and `zagd` are not
-implemented at the time of this audit. Statements below distinguish current
-behavior from required changes.
+Status: architecture record updated through the first working Zag Script and
+Linux `zagd` implementation, 2026-07-18. The sections retain the pre-change
+evidence and distinguish it from later implemented behavior and remaining gaps.
 
 ## Pre-change baseline
 
@@ -176,3 +176,21 @@ effect rules, ABI, native lowering, and CLI build form. It receives no generated
 entry point, implicit prelude, source rewrite, hidden long-lived script runtime,
 automatic concurrency, or daemon dependency. Explicit choices always outrank
 planner advice. Existing passing gates remain release requirements.
+
+## Implementation delta
+
+Items 1 through 4 and the initial parts of 5 through 8 now exist in the ordinary
+self-hosted path: explicit Script profile metadata, root statements, generated
+managed entry point, bounded `script_alloc`, root-only overrideable prelude,
+error boundary, `explain`, focused strict checks, conservative hardening,
+inotify snapshots and fail-closed advisory cache records. Regular Zag retains
+the invariants above and planner output remains advisory.
+
+The remaining safety boundary is explicit. The Script allocation budget counts
+`script_alloc` payloads, not every `make`/`new` allocation or allocator metadata.
+There is no ownership/borrowing proof, complete reclamation, named error/source
+witness path, bounded process-capture API, typed variadic collection literal,
+or general JSON prelude yet. Restart reuse validates snapshot metadata but does
+not yet restore a complete semantic dependency index. Adaptive candidates exist
+as a bounded API but are not fed synthetic facts by the daemon; deep search is
+not implemented.
