@@ -1,8 +1,8 @@
 # Linux x86 target policy
 
-Status: Phase 0 policy, 2026-07-18. The supported native x86 target today is
-Linux ELF64 x86-64. `--cpu` profiles, CPUID/XGETBV discovery, multiversioning,
-and i686 are not yet implemented as a complete tested feature.
+Status: target-permission foundation, 2026-07-18. The supported native x86
+target today is Linux ELF64 x86-64. Generic and native CPU profiles are
+implemented; optional SIMD lowering, multiversioning, and i686 are not.
 
 ## Current target
 
@@ -32,10 +32,12 @@ metadata and keys all target-dependent cache entries by it.
 
 ## Feature discovery
 
-Native discovery uses CPUID leaves with availability checks. AVX-family enablement
-also requires OSXSAVE and XGETBV confirmation that the operating system saves
-the required XMM/YMM state; AVX-512 additionally requires the relevant opmask
-and ZMM state. Hardware CPUID alone is insufficient.
+Native discovery currently uses Linux `/proc/cpuinfo`, whose exposed feature
+flags describe execution state made available by both CPU and kernel. It
+requires the `lm` and `sse2` baseline and fails closed if flags are unavailable.
+This deliberately avoids treating raw hardware CPUID as sufficient for AVX.
+Direct CPUID/XGETBV discovery may later replace this Linux interface, but must
+preserve the same separation between detection and emission permission.
 
 Features may be detected but not advertised for code generation until their
 instruction encoding, register/state handling, ABI interaction, fallback and
@@ -82,6 +84,8 @@ calling convention, 32-bit pointers/`usize`, smaller-register-set allocation,
 32-bit Linux syscalls, explicit rejection of 64-bit assumptions, target-specific
 runtime tests and execution on real or emulated 32-bit Linux. Until those gates
 pass, public documentation must say Linux x86-64, not full x86-family support.
+The CLI rejects i686 requests before output rather than silently emitting an
+ELF64 binary.
 
 ## Release evidence
 

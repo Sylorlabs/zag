@@ -1,6 +1,6 @@
 # Linux x86-64 features
 
-Status: deterministic baseline profile foundation, 2026-07-18.
+Status: implemented target-permission foundation, 2026-07-18.
 
 The native target is Linux ELF64 x86-64. The implemented profile resolver
 defines `generic`, `x86-64`, and `x86-64-v1` as aliases for one canonical
@@ -16,19 +16,25 @@ in the encoder.
 | SSE2 | advertised by the generic profile |
 | SSE3, SSSE3, SSE4.1, SSE4.2, POPCNT | not advertised |
 | AVX, AVX2, FMA, BMI1, BMI2, AVX-512 | not advertised |
-| `native` | recognized but fails closed |
+| `native` | resolved from Linux `/proc/cpuinfo`; permitted set is currently SSE2 |
 | runtime multiversioning | not implemented |
 | i686 / ELF32 | not implemented |
 
-Native resolution intentionally reports that self-hosted CPUID,
-OSXSAVE/XGETBV discovery is unavailable and directs callers to `generic`.
-Hardware support is never guessed from the compiler host. AVX-family features
-must remain unavailable until both CPU and operating-system state support can be
-proven and corresponding encoder, ABI, fallback, and execution tests pass.
+Native resolution reads Linux's execution-visible feature flags from
+`/proc/cpuinfo` and fails closed if the required `lm` and `sse2` baseline is not
+reported. Linux suppresses AVX-family flags when the kernel cannot manage the
+required extended register state, so this is an OS-qualified report, not an
+unqualified raw CPUID guess. The compiler then intersects detected features
+with its independently tested encoder permission set. That permitted set is
+currently SSE2 only; detecting AVX, AVX2, FMA, BMI or AVX-512 never enables
+their emission.
 
 The profile module emits a stable JSON report and a target-qualified cache key.
-At this foundation stage the resolver is tested directly; complete `znc --cpu`
-CLI integration and generic/native differential execution are not claimed here.
+`znc --cpu generic` and `znc --cpu native` are CLI-integrated. The target-policy
+gate executes integer and floating ABI paths under each and requires
+byte-identical output while both profiles permit the same SSE2 feature set.
 Linux x86-64 support must not be described as full x86-family support until the
 separate i686 milestone passes.
 
+`--target i686`, `--target x86`, and `--target linux-i686` are explicitly
+rejected before artifact output. They do not alias to x86-64.
