@@ -41,6 +41,25 @@ for _ in $(seq 1 100); do
 done
 test "$(grep '^content_hash_first=' "$tmp/project/.zagd.status")" != "$first"
 
+printf '// comment only\ntwo\n' > "$tmp/project/app.zag"
+for _ in $(seq 1 100); do
+    grep -q '^last_change=nonsemantic$' "$tmp/project/.zagd.status" 2>/dev/null && break
+    sleep 0.01
+done
+grep -q '^last_change=nonsemantic$' "$tmp/project/.zagd.status"
+
+printf 'fn local() i32 { return 1; }\n' > "$tmp/project/classify.zag"
+for _ in $(seq 1 100); do
+    grep -q 'last_file=.*/classify.zag$' "$tmp/project/.zagd.status" 2>/dev/null && break
+    sleep 0.01
+done
+printf 'fn local() i32 { return 2; }\n' > "$tmp/project/classify.zag"
+for _ in $(seq 1 100); do
+    grep -q '^last_change=private-body$' "$tmp/project/.zagd.status" 2>/dev/null && break
+    sleep 0.01
+done
+grep -q '^last_change=private-body$' "$tmp/project/.zagd.status"
+
 "$tmp/zagd" --root "$tmp/project" --mode off
 wait "$daemon_pid"
 daemon_pid=
