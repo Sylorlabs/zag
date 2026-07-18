@@ -1,6 +1,6 @@
 # Zag Script bounded-process boundary
 
-Status: blocked primitive, 2026-07-18.
+Status: supervisor blocked; stable result ABI implemented, 2026-07-18.
 
 Zag Script does not expose `process_run_timeout`. The existing native
 `_zag_exec_capture(command)` is deliberately not used as its implementation.
@@ -29,8 +29,15 @@ The smallest correct Linux x86-64 primitive must implement all of these together
    timeout/overflow state, and a runtime-error code.
 
 The backend currently has fragments of this (`pipe2`, `fork`, `execve`, blocking
-read, and `wait4`) but no nonblocking supervision state machine or aggregate
-result ABI for a runtime intrinsic. Adding only a timer around the current call,
+read, and `wait4`) but no nonblocking supervision state machine.
+
+The result boundary is implemented independently: `ProcessResult` contains a
+compiler-owned opaque handle. Typed ordinary-Zag getters expose status, state,
+and captured output. The handle layout is fixed at four 64-bit words (status,
+state, output pointer, output length), so module name prefixing cannot change the
+runtime ABI. The native supervisor will construct this handle directly.
+
+Adding only a timer around the current call,
 killing only the shell PID, or returning partial output as success would be an
 incorrect implementation.
 
