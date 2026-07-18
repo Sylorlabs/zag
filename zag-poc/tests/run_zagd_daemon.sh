@@ -87,6 +87,7 @@ for _ in $(seq 1 100); do
 done
 grep -q '^state=idle$' "$tmp/project/.zagd.status"
 grep -q '^mode=adaptive$' "$tmp/project/.zagd.status"
+grep -q '^cache_reused=false$' "$tmp/project/.zagd.status"
 printf stop > "$tmp/project/.zagd.stop"
 for _ in $(seq 1 100); do
     grep -q '^state=stopped$' "$tmp/project/.zagd.status" 2>/dev/null && break
@@ -151,11 +152,45 @@ for _ in $(seq 1 100); do
     sleep 0.01
 done
 grep -q '^singleton=true$' "$tmp/project/.zagd.status"
+grep -q '^cache_reused=false$' "$tmp/project/.zagd.status"
+printf 'adaptive state\n' > "$tmp/project/reuse.zag"
+for _ in $(seq 1 100); do
+    grep -q 'last_file=.*/reuse.zag$' "$tmp/project/.zagd.status" 2>/dev/null && break
+    sleep 0.01
+done
 printf stop > "$tmp/project/.zagd.stop"
 for _ in $(seq 1 100); do
     grep -q '^state=stopped$' "$tmp/project/.zagd.status" 2>/dev/null && break
     sleep 0.01
 done
 grep -q '^state=stopped$' "$tmp/project/.zagd.status"
+
+child_pid=$("$tmp/zagd" --root "$tmp/project" --mode adaptive --window-ms 20 --daemonize)
+test "$child_pid" -gt 1
+for _ in $(seq 1 100); do
+    grep -q '^state=idle$' "$tmp/project/.zagd.status" 2>/dev/null && break
+    sleep 0.01
+done
+grep -q '^cache_reused=true$' "$tmp/project/.zagd.status"
+printf stop > "$tmp/project/.zagd.stop"
+for _ in $(seq 1 100); do
+    grep -q '^state=stopped$' "$tmp/project/.zagd.status" 2>/dev/null && break
+    sleep 0.01
+done
+
+# Corrupt advisory state is a cache miss, never a startup or correctness error.
+printf 'corrupt\n' > "$tmp/project/.zag-cache/zagd/snapshot.record"
+child_pid=$("$tmp/zagd" --root "$tmp/project" --mode adaptive --window-ms 20 --daemonize)
+test "$child_pid" -gt 1
+for _ in $(seq 1 100); do
+    grep -q '^state=idle$' "$tmp/project/.zagd.status" 2>/dev/null && break
+    sleep 0.01
+done
+grep -q '^cache_reused=false$' "$tmp/project/.zagd.status"
+printf stop > "$tmp/project/.zagd.stop"
+for _ in $(seq 1 100); do
+    grep -q '^state=stopped$' "$tmp/project/.zagd.status" 2>/dev/null && break
+    sleep 0.01
+done
 
 echo "zagd daemon: pass"
