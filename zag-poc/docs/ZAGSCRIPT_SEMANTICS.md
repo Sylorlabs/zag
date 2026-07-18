@@ -1,8 +1,10 @@
 # Zag Script semantics
 
-Status: design contract, 2026-07-18. This document specifies intended behavior;
-the profile is not yet implemented. Until its tests pass, examples here are not
-claims of compiler support.
+Status: semantics contract with an implemented foundation, 2026-07-18. Profile
+activation, root lowering, managed shutdown, requested-payload limits, the small
+documented prelude, explain, conservative hardening, and strict rejection have
+focused tests. Statements describing arguments, typed collections, process,
+JSON, ownership, or full allocation accounting remain design requirements.
 
 ## Profile activation
 
@@ -37,14 +39,15 @@ reclaims safely reclaimable script resources, and exits deterministically.
 
 ## Script context and allocation
 
-The internal context contains only capabilities that exist in the implementation:
-allocator state and limit, process arguments, environment access policy,
-capability policy, resource limits, and error-reporting state. It is not a
-dynamic object environment.
+The current internal context contains allocator accounting and its limit. Process
+arguments, environment/capability views, and richer error-reporting state remain
+future fields; they are not fabricated as empty APIs. It is not a dynamic object
+environment.
 
-The initial default may be a process-lifetime arena. If selected, memory remains
-retained until script exit. The configured limit is a hard runtime boundary;
-an allocation beyond it produces a named error and a nonzero exit. Imported
+The initial default is process-lifetime accounting. `script_alloc` payload remains
+retained until script exit. The configured limit is a hard boundary for that
+requested payload; ordinary make/new, file reads, and allocator metadata are
+outside it. An allocation beyond it returns null for the caller to handle. Imported
 strict code receives no implicit allocator. An explicit allocator or resource
 policy in source wins over the script default.
 
@@ -56,9 +59,10 @@ negative tests.
 ## Prelude
 
 The implicit prelude is a small allowlist. Each name resolves to an ordinary,
-documented Zag declaration with an explicit strict-Zag equivalent. Initial
-candidates are output, arguments, path/file helpers, typed collections, string
-building, bounded process execution, and basic JSON. Features are added only
+documented Zag declaration with an explicit strict-Zag equivalent. The implemented
+allowlist is `print`, `println`, `read_file`, `write_file`, `script_alloc`, and
+`script_alloc_used`. Arguments, typed collections, string building, bounded
+process execution, and basic JSON remain candidates, added only
 when their type, effect, allocation, error and limit behavior are implemented.
 
 Collections remain statically typed. The compiler may infer one element type
@@ -111,4 +115,3 @@ without an accepted explicit transformation and equivalence evidence.
 Without profile activation, all existing Zag rules remain unchanged. `zagd` is
 never required for parsing, checking, compiling or running. Cache state and
 planner availability cannot affect program correctness.
-

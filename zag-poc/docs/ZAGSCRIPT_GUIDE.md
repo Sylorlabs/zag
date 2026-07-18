@@ -13,11 +13,9 @@ A script module imported by a strict root contributes declarations without
 running its script body. Duplicate profile declarations and a script containing
 a user `main` are diagnosed.
 
-This is not yet the complete product described by
-`ZAGSCRIPT_SEMANTICS.md`. In particular, the script prelude, `ScriptContext`,
-bounded arena, uncaught-error wrapper, `znc script`, `explain`, `harden`, and
-`check --strict` are not implemented. The normal direct build form is the
-currently supported entry:
+The implemented profile includes a managed context, requested-payload allocation
+limit, uncaught-error wrapper, `znc script`, `explain`, conservative `harden`,
+and `check --strict`. Both activation forms are supported:
 
 ```sh
 ./znc examples/script_hello.zag -o /tmp/script_hello
@@ -34,13 +32,24 @@ of the supported path.
 ```zag
 script;
 
-_zag_println("Hello from Zag Script");
+println("Hello from Zag Script");
 return 0;
 ```
 
-`return` supplies the generated process entry point's status. There is not yet a
-script prelude, so this example uses the existing native output primitive. It is
-an implementation example, not the intended final ergonomic API.
+`return` supplies the generated process entry point's status.
+
+## Prelude
+
+The intentionally small implemented prelude is `print`, `println`, `read_file`,
+`write_file`, `script_alloc`, and `script_alloc_used`. The ordinary strict-Zag
+mappings are `_zag_print`, `_zag_println`, `_zag_read_file`, `_zag_write_file`,
+and the explicit script-context allocation runtime calls. Prelude bindings occur
+only in executable statements of the selected script root. An ordinary user
+function with the same name wins independently.
+
+`read_file` currently allocates outside the requested-payload script budget and
+reports failure using a slice with negative length. This is documented behavior,
+not a general memory-safety guarantee or the eventual typed error API.
 
 ## Profile rules currently enforced
 
@@ -51,18 +60,14 @@ an implementation example, not the intended final ergonomic API.
 - A `.zag` suffix alone does not activate the profile.
 - A source file without `script;` keeps regular Zag semantics.
 
-## Unsupported examples
-
-The requested `script_files.zag`, `script_process.zag`,
-`script_collections.zag`, and `script_harden.zag` examples are intentionally not
-present yet. Publishing them now would imply nonexistent prelude, allocator,
-process-timeout, typed-list, or hardening behavior. Existing strict Zag standard
-library examples remain valid demonstrations of those ordinary APIs, but they
-are not evidence of implicit Zag Script conveniences.
+Process execution with timeout, JSON, typed-list convenience syntax, an `args`
+view, and automatic allocator/capability expansion are not implemented. Use
+ordinary explicit Zag APIs where available; the compiler does not pretend those
+APIs are script defaults.
 
 ## Safety boundary
 
-The current profile lowering does not establish ownership, borrowing, automatic
-reclamation, or general memory safety. It also does not yet enforce a script
-memory limit. Normal Zag effects and runtime behavior remain authoritative.
-
+The profile lowering does not establish ownership, borrowing, automatic
+reclamation, or general memory safety. `script_alloc` enforces a configurable
+requested-payload limit, but ordinary allocation and file-read buffers are not
+charged to it. Normal Zag effects and runtime behavior remain authoritative.

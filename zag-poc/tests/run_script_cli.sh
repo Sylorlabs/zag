@@ -30,18 +30,20 @@ if "$znc_bin" check tests/script_frontend/basic.zag --strict >/dev/null 2>&1; th
     echo "strict script check unexpectedly succeeded" >&2
     exit 1
 fi
-if "$znc_bin" --cpu native tests/script_frontend/basic.zag -o "$tmp_dir/native" >/dev/null 2>&1; then
-    echo "unimplemented native CPU discovery unexpectedly succeeded" >&2
-    exit 1
-fi
+"$znc_bin" --cpu native tests/script_frontend/basic.zag -o "$tmp_dir/native" --no-analyze --no-zagd >/dev/null
 
 "$znc_bin" harden tests/script_frontend/basic.zag >"$tmp_dir/harden.txt"
-grep -q 'status: unsupported for automatic conversion' "$tmp_dir/harden.txt"
-if "$znc_bin" harden tests/script_frontend/basic.zag \
-    --output "$tmp_dir/hardened.zag" >/dev/null 2>&1; then
-    echo "unsupported harden output unexpectedly succeeded" >&2
-    exit 1
-fi
-test ! -e "$tmp_dir/hardened.zag"
+grep -q 'fn main() i32' "$tmp_dir/harden.txt"
+grep -q 'harden report: conservative statement-only expansion' "$tmp_dir/harden.txt"
+"$znc_bin" harden tests/script_frontend/basic.zag \
+    --output "$tmp_dir/hardened.zag" >"$tmp_dir/harden-report.txt"
+test -e "$tmp_dir/hardened.zag"
+grep -q 'fn main() i32' "$tmp_dir/hardened.zag"
+"$znc_bin" "$tmp_dir/hardened.zag" -o "$tmp_dir/hardened" --no-analyze --no-zagd >/dev/null
+set +e
+"$tmp_dir/hardened"
+hardened_status=$?
+set -e
+test "$hardened_status" -eq 7
 
 echo "script CLI: PASS"

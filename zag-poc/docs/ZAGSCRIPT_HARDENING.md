@@ -1,11 +1,11 @@
 # Zag Script hardening
 
-Status: contract and current limitation, 2026-07-18.
+Status: conservative statement-only preview, 2026-07-18.
 
 Hardening is the planned path from concise Zag Script to reviewable explicit
-Zag. It is not a rewrite into another language. The current compiler does not
-implement the `znc harden` command, generated candidate files, patches, or apply
-mode.
+Zag. It is not a rewrite into another language. `znc harden` can currently
+expand a statement-only script into an explicit `fn main() i32`. With `--output`
+it writes a separate candidate and never overwrites the source.
 
 ## Required hardening output
 
@@ -20,15 +20,14 @@ equivalent.
 overwritten by default. A future `--apply` requires a clean source snapshot,
 rollback material, and successful configured parity tests.
 
-## What can be done today
+## Current boundary
 
-Developers can manually replace root statements with an explicit `fn main`,
-remove `script;`, retain source order, and use ordinary explicit APIs. This is a
-manual refactor, not compiler-verified hardening. There is currently no report
-proving behavioral parity, no automatic capability expansion, and no strict
-promotion gate.
+Imports and declarations mixed with executable top-level statements are rejected
+by automatic hardening because placement cannot yet be preserved safely. The
+candidate deliberately retains ordinary native primitive calls selected by the
+script prelude; allocator and capability policy synthesis remain explicit
+unsupported report items. The report lists parity tests still required.
 
-Do not use `--analyze-strict` as a substitute for the planned `check --strict`.
-The former controls the existing analyzer; it does not resolve or reject the
-full Zag Script convenience set.
-
+`check --strict` rejects the generated entry point and implicit allocator, and
+adds focused filesystem and script-context allocation diagnostics when present.
+`--analyze-strict` is separate and only controls analyzer findings.

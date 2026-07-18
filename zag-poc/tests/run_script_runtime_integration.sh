@@ -2,14 +2,15 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+znc_bin=${ZNC:-./znc}
 tmp_dir=$(mktemp -d /tmp/zag-script-runtime.XXXXXX)
 trap 'rm -rf "$tmp_dir" /tmp/zag_script_top_return /tmp/zag_script_uncaught /tmp/zag_script_alloc_limit /tmp/zag_script_explicit_alloc /tmp/zag_script_custom_limit' EXIT
 
-./znc selfhost/native/script_lowering_native_test.zag \
+"$znc_bin" selfhost/native/script_lowering_native_test.zag \
     -o "$tmp_dir/generator" --no-analyze >/dev/null
 "$tmp_dir/generator"
 
-./znc selfhost/script_parser_probe.zag \
+"$znc_bin" selfhost/script_parser_probe.zag \
     -o "$tmp_dir/parser-probe" --no-analyze >/dev/null
 if "$tmp_dir/parser-probe" tests/script_frontend/reserved_symbol.zag \
     >"$tmp_dir/reserved.out" 2>&1; then
@@ -38,4 +39,9 @@ test "$explicit_status" -eq 19
 test "$custom_limit_status" -eq 0
 grep -q 'uncaught Zag Script error code 1' "$tmp_dir/uncaught.err"
 grep -q 'root script top-level execution' "$tmp_dir/uncaught.err"
+
+"$znc_bin" tests/script_frontend/prelude.zag -o "$tmp_dir/prelude" --no-analyze --no-zagd >/dev/null
+test "$("$tmp_dir/prelude")" = 'prelude:file-data'
+"$znc_bin" tests/script_frontend/prelude_override.zag -o "$tmp_dir/prelude-override" --no-analyze --no-zagd >/dev/null
+test "$("$tmp_dir/prelude-override")" = 'override:yes'
 echo "script runtime integration: PASS"
