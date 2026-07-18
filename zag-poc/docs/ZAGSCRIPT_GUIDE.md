@@ -62,10 +62,26 @@ not a general memory-safety guarantee or the eventual typed error API.
 - A `.zag` suffix alone does not activate the profile.
 - A source file without `script;` keeps regular Zag semantics.
 
-Process execution with timeout, JSON, typed-list convenience syntax, a materialized
-`args` collection, and automatic allocator/capability expansion are not implemented. Use
+Process execution with timeout, implicit JSON bindings, typed-list convenience
+syntax, a materialized `args` collection, and automatic allocator/capability expansion are not implemented. Use
 ordinary explicit Zag APIs where available; the compiler does not pretend those
 APIs are script defaults.
+
+Basic JSON scalar support is available as the ordinary `std:json` module. It
+stringifies and parses strings, signed integers, and booleans with statically
+typed parse results containing `ok` and `value`. Parse failure is explicit.
+Objects, arrays, floats, null, and Unicode `\\u` decoding remain unsupported.
+Zag Script uses the same inspectable API as strict Zag:
+
+```zag
+@import("std:json") as json
+let result: json.JsonIntResult = json.json_parse_int("42");
+```
+
+The existing shell execution runtime is intentionally not a Script convenience:
+its capture pipe blocks and therefore cannot enforce a deadline. A future bounded
+API must use nonblocking observation, kill the child on timeout, reap it, and cap
+captured output before it can be exposed.
 
 ## Safety boundary
 
