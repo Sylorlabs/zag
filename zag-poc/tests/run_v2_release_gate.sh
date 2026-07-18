@@ -38,7 +38,7 @@ run_gate "deterministic fuzz smoke" bash tests/run_fuzz_smoke.sh
 run_gate "hard errors leave no artifact" bash tests/run_no_artifact_errors.sh
 run_gate "documentation consistency" bash tests/run_docs_consistency.sh
 run_gate "generated support matrix" bash tests/run_v2_support_matrix.sh
-run_gate "WASM regression" bash tests/run_native_wasm.sh
+run_gate "WASM emission regression (no runtime)" bash tests/run_native_wasm.sh
 run_gate "GPU frontend validation (not execution)" bash tests/run_native_gpu.sh
 
 unsupported "pointer and memory model" "raw pointer categories and lexical checks exist, but provenance/alignment/lifetime instrumentation is incomplete"

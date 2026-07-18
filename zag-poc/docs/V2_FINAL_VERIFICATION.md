@@ -16,7 +16,7 @@ Latest isolated working-copy run (2026-07-15): **14 passing categories, 10
 failing required categories, exit 1**. Passing categories include bootstrap,
 v1 semantic/native compatibility, shared declared-type authority, the v2
 edition/option gates, hard-error handling, malformed-input and deterministic
-fuzz smoke, documentation/matrix checks, WASM regression, and GPU frontend
+fuzz smoke, documentation/matrix checks, WASM emission regression, and GPU frontend
 validation. Every failure below is intentional fail-closed release evidence,
 not a skipped test.
 
@@ -52,7 +52,8 @@ compiler.  They do not discharge a v2 row above: `./bootstrap.sh`,
 `bash tests/run_native_authority.sh`, `bash tests/run_native_wasm.sh`, and
 `bash tests/run_native_gpu.sh`.  The GPU command validates emitted MLIR and a
 restricted bundle only; it must never be cited as a physical GPU execution
-test.
+test. The WASM command validates pure-Zag emission and structure only; runtime
+execution remains unsupported until its runtime is implemented in Zag.
 
 ## Release decision
 

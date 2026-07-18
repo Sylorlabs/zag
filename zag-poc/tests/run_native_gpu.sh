@@ -69,7 +69,7 @@ ZAG
 if ( cd /tmp/zag_gpu && ./znc fill.zag --target amdgpu-gfx1010 -o fill-a.zgk >/dev/null ) && \
    ( cd /tmp/zag_gpu && ./znc fill.zag --target amdgpu-gfx1010 -o fill-b.zgk >/dev/null ) && \
    cmp -s /tmp/zag_gpu/fill-a.zgk /tmp/zag_gpu/fill-b.zgk && \
-   [ "$(wc -c </tmp/zag_gpu/fill-a.zgk)" -eq 100 ] && \
+   [ "$(wc -c </tmp/zag_gpu/fill-a.zgk)" -eq 108 ] && \
    [ "$(od -An -tu4 -j8 -N4 /tmp/zag_gpu/fill-a.zgk | tr -d ' ')" = 1010 ] && \
    [ "$(od -An -tu4 -j68 -N4 /tmp/zag_gpu/fill-a.zgk | tr -d ' ')" = 3356428357 ]; then
     echo "  ok  gfx1010 bundle is deterministic with validated metadata and code hash"; pass=$((pass+1))

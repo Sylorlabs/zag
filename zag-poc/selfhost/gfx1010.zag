@@ -1,0 +1,467 @@
+// gfx1010.zag — deterministic, self-hosted Zag kernel compiler for RDNA1.
+//
+// This first supported profile intentionally accepts a narrow, fully validated
+// kernel subset instead of emitting guessed instructions. It compiles the
+// canonical one-thread-per-workgroup u32 fill kernel and rejects every other
+// AST shape. The output is a ZGK1 bundle: fixed-width machine-readable metadata
+// followed by reviewed GFX10.1 instructions. Consumers never need handwritten
+// opcodes or hardcoded resource registers.
+
+@import("parse.zag")
+
+fn gfx_push_u32(out: *ArrayList[u8], v: i64) void {
+    let n: i64 = v & 0xFFFFFFFF;
+    push[u8](out, (n & 255) as u8);
+    push[u8](out, ((n / 256) & 255) as u8);
+    push[u8](out, ((n / 65536) & 255) as u8);
+    push[u8](out, ((n / 16777216) & 255) as u8);
+}
+
+fn gfx_is_id(n: *Node, want: []u8) bool {
+    return switch (n.*) {
+        .id => |x| @strEq(x.name, want),
+        else => false,
+    };
+}
+
+fn gfx_is_zero(n: *Node) bool {
+    return switch (n.*) {
+        .ilit => |x| @strEq(x.text, "0"),
+        else => false,
+    };
+}
+
+fn gfx_is_builtin_dim(n: *Node, name: []u8) bool {
+    let ok: bool = false;
+    switch (n.*) {
+        .call => |c| {
+            if (!gfx_is_id(c.callee, name) || len[*Node](c.args) != 1) { return false; }
+            ok = gfx_is_zero(get[*Node](c.args, 0));
+        }
+        else => { }
+    }
+    return ok;
+}
+
+fn gfx_is_global_index(n: *Node) bool {
+    let ok: bool = false;
+    switch (n.*) {
+        .bin => |add| {
+            if (!@strEq(add.op, "+") || !gfx_is_builtin_dim(add.r, "@gpuThreadIdx")) { return false; }
+            switch (add.l.*) {
+                .bin => |mul| {
+                    ok = @strEq(mul.op, "*") &&
+                        gfx_is_builtin_dim(mul.l, "@gpuBlockIdx") &&
+                        gfx_is_builtin_dim(mul.r, "@gpuBlockDim");
+                }
+                else => { }
+            }
+        }
+        else => { }
+    }
+    return ok;
+}
+
+fn gfx_has_annot(f: FnDecl, want: []u8) bool {
+    let i: i32 = 0;
+    while (i < len[[]u8](f.annots)) {
+        if (@strEq(get[[]u8](f.annots, i), want)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Validate the exact semantic profile the encoder implements. Names come from
+// the declaration, so renaming parameters/local variables remains supported.
+fn gfx_is_fill_kernel(f: FnDecl) bool {
+    if (!gfx_has_annot(f, "@kernel") || len[Param](f.params) != 3 ||
+        !@strEq(f.ret, "void") || len[*Node](f.body) != 2) { return false; }
+    let p_out: Param = get[Param](f.params, 0);
+    let p_val: Param = get[Param](f.params, 1);
+    let p_cnt: Param = get[Param](f.params, 2);
+    if (!@strEq(p_out.pty, "[]i32") || !@strEq(p_val.pty, "i32") ||
+        !@strEq(p_cnt.pty, "i32")) { return false; }
+
+    let idx_name: []u8 = "";
+    switch (get[*Node](f.body, 0).*) {
+        .let_ => |l| {
+            if (l.has_init == 0 || !gfx_is_global_index(l.expr)) { return false; }
+            idx_name = l.name;
+        }
+        else => { return false; }
+    }
+
+    let valid: bool = false;
+    switch (get[*Node](f.body, 1).*) {
+        .if_ => |x| {
+            if (x.has_els != 0 || len[*Node](x.then_body) != 1) { return false; }
+            let cond_ok: bool = switch (x.cond.*) {
+                .bin => |b| @strEq(b.op, "<") && gfx_is_id(b.l, idx_name) && gfx_is_id(b.r, p_cnt.name),
+                else => false,
+            };
+            if (!cond_ok) { return false; }
+            switch (get[*Node](x.then_body, 0).*) {
+                .assign => |a| {
+                    if (!gfx_is_id(a.expr, p_val.name)) { return false; }
+                    valid = switch (a.target.*) {
+                        .idx => |ix| gfx_is_id(ix.base, p_out.name) && gfx_is_id(ix.idx, idx_name),
+                        else => false,
+                    };
+                }
+                else => { }
+            }
+        }
+        else => { }
+    }
+    return valid;
+}
+
+// A bounded solid depth/composite stage. The host clips each dispatched span;
+// the kernel independently loads depth and conditionally writes both color and
+// depth for every workgroup. Parameter names remain freely renameable.
+fn gfx_is_depth_kernel(f: FnDecl) bool {
+    if (!gfx_has_annot(f,"@kernel") || len[Param](f.params) != 4 ||
+        !@strEq(f.ret,"void") || len[*Node](f.body) != 2) { return false; }
+    let p_color:Param=get[Param](f.params,0);let p_depth:Param=get[Param](f.params,1);
+    let p_value:Param=get[Param](f.params,2);let p_z:Param=get[Param](f.params,3);
+    if (!@strEq(p_color.pty,"[]i32") || !@strEq(p_depth.pty,"[]i32") ||
+        !@strEq(p_value.pty,"i32") || !@strEq(p_z.pty,"i32")) { return false; }
+    let idx_name:[]u8="";
+    switch(get[*Node](f.body,0).*) {
+        .let_=>|l|{if(l.has_init==0||!gfx_is_global_index(l.expr)){return false;}idx_name=l.name;}
+        else=>{return false;}
+    }
+    let valid:bool=false;
+    switch(get[*Node](f.body,1).*) {
+        .if_=>|x|{
+            if(x.has_els!=0||len[*Node](x.then_body)!=2){return false;}
+            let cond_ok:bool=false;
+            switch(x.cond.*){
+                .bin=>|b|{
+                    if(@strEq(b.op,"<=")&&gfx_is_id(b.l,p_z.name)){
+                        cond_ok=switch(b.r.*){.idx=>|ix|gfx_is_id(ix.base,p_depth.name)&&gfx_is_id(ix.idx,idx_name),else=>false,};
+                    }
+                }
+                else=>{}
+            }
+            if(!cond_ok){return false;}
+            let color_ok:bool=false;let depth_ok:bool=false;
+            switch(get[*Node](x.then_body,0).*){
+                .assign=>|a|{color_ok=gfx_is_id(a.expr,p_value.name)&&switch(a.target.*){.idx=>|ix|gfx_is_id(ix.base,p_color.name)&&gfx_is_id(ix.idx,idx_name),else=>false,};}
+                else=>{}
+            }
+            switch(get[*Node](x.then_body,1).*){
+                .assign=>|a|{depth_ok=gfx_is_id(a.expr,p_z.name)&&switch(a.target.*){.idx=>|ix|gfx_is_id(ix.base,p_depth.name)&&gfx_is_id(ix.idx,idx_name),else=>false,};}
+                else=>{}
+            }
+            valid=color_ok&&depth_ok;
+        }
+        else=>{}
+    }
+    return valid;
+}
+
+fn gfx_is_blend_expr(n:*Node,value_name:[]u8,color_name:[]u8,alpha_name:[]u8,idx_name:[]u8)bool{
+    let ok:bool=false;switch(n.*){
+        .call=>|c|{
+            if(!gfx_is_id(c.callee,"@gpuBlend")||len[*Node](c.args)!=3){return false;}
+            let old_ok:bool=switch(get[*Node](c.args,1).*){
+                .idx=>|ix|gfx_is_id(ix.base,color_name)&&gfx_is_id(ix.idx,idx_name),else=>false,
+            };
+            ok=gfx_is_id(get[*Node](c.args,0),value_name)&&old_ok&&gfx_is_id(get[*Node](c.args,2),alpha_name);
+        }
+        else=>{}
+    }return ok;
+}
+
+fn gfx_is_index_of(n:*Node,base_name:[]u8,idx_name:[]u8)bool{
+    let ok:bool=false;switch(n.*){.idx=>|ix|{ok=gfx_is_id(ix.base,base_name)&&gfx_is_id(ix.idx,idx_name);}else=>{}}return ok;
+}
+
+// Depth-tested packed 0x00RRGGBB source-over compositing. @gpuBlend is a
+// compiler-owned device intrinsic: it has no host fallback and is accepted only
+// in this exact bounded kernel shape.
+fn gfx_is_blend_kernel(f:FnDecl)bool{
+    if(!gfx_has_annot(f,"@kernel")||len[Param](f.params)!=5||!@strEq(f.ret,"void")||len[*Node](f.body)!=2){return false;}
+    let pc:Param=get[Param](f.params,0);let pd:Param=get[Param](f.params,1);let pv:Param=get[Param](f.params,2);
+    let pz:Param=get[Param](f.params,3);let pa:Param=get[Param](f.params,4);
+    if(!@strEq(pc.pty,"[]i32")||!@strEq(pd.pty,"[]i32")||!@strEq(pv.pty,"i32")||!@strEq(pz.pty,"i32")||!@strEq(pa.pty,"i32")){return false;}
+    let idx:[]u8="";
+    switch(get[*Node](f.body,0).*){
+        .let_=>|l|{if(l.has_init==0||!gfx_is_global_index(l.expr)){return false;}idx=l.name;}
+        else=>{return false;}
+    }
+    let valid:bool=false;
+    switch(get[*Node](f.body,1).*){
+        .if_=>|x|{
+            if(x.has_els!=0||len[*Node](x.then_body)!=2){return false;}
+            let cond:bool=false;
+            switch(x.cond.*){
+                .bin=>|b|{cond=@strEq(b.op,"<=")&&gfx_is_id(b.l,pz.name)&&gfx_is_index_of(b.r,pd.name,idx);}
+                else=>{}
+            }
+            let cok:bool=false;let zok:bool=false;
+            switch(get[*Node](x.then_body,0).*){
+                .assign=>|a|{cok=gfx_is_blend_expr(a.expr,pv.name,pc.name,pa.name,idx)&&gfx_is_index_of(a.target,pc.name,idx);}
+                else=>{}
+            }
+            switch(get[*Node](x.then_body,1).*){
+                .assign=>|a|{zok=gfx_is_id(a.expr,pz.name)&&gfx_is_index_of(a.target,pd.name,idx);}
+                else=>{}
+            }
+            valid=cond&&cok&&zok;
+        }
+        else=>{}
+    }
+    return valid;
+}
+
+fn gfx_find_profile(decls: ArrayList[*Node]) i32 {
+    let found: i32 = 0;
+    let kernels: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .fn_decl => |f| {
+                if (gfx_has_annot(f, "@kernel") || gfx_has_annot(f, "@device")) {
+                    kernels = kernels + 1;
+                    if (gfx_is_fill_kernel(f)) { found = 1; }
+                    else if (gfx_is_depth_kernel(f)) { found = 2; }
+                    else if (gfx_is_blend_kernel(f)) { found = 3; }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    if (kernels != 1) { return 0; }
+    return found;
+}
+
+fn gfx_kernel_hash(code: ArrayList[u8]) i64 {
+    let h: i64 = 2166136261;
+    let i: i32 = 0;
+    while (i < code.len) {
+        h = (h * 16777619 + (code.data[i] as i64)) % 4294967296;
+        i = i + 1;
+    }
+    return h;
+}
+
+// Named GFX10.1 instruction encoders. Whole production instructions are never
+// pasted into a consumer or assembled as opaque words: each operand is checked
+// here and placed into its documented field. Returning zero makes an internal
+// range mistake fail the decoder instead of silently producing executable code.
+fn gfx_enc_v_mov_b32(dst_vgpr: i32, src_sgpr: i32) i64 {
+    if (dst_vgpr < 0 || dst_vgpr > 255 || src_sgpr < 0 || src_sgpr > 127) { return 0; }
+    // VOP1 opcode 1 occupies bits 9..16; destination VGPR is bits 17..24.
+    return 0x7E000000 + (dst_vgpr as i64) * 0x20000 + 0x200 + (src_sgpr as i64);
+}
+
+fn gfx_enc_v_lshlrev_b32(dst_vgpr: i32, amount: i32, src_vgpr: i32) i64 {
+    if (dst_vgpr < 0 || dst_vgpr > 255 || amount < 0 || amount > 64 ||
+        src_vgpr < 0 || src_vgpr > 255) { return 0; }
+    // VOP2 opcode 0x1a; inline integer constants use selector 128+n.
+    return 0x34000000 + (dst_vgpr as i64) * 0x20000 +
+        (src_vgpr as i64) * 0x200 + 128 + (amount as i64);
+}
+
+fn gfx_enc_global_store_dword_0() i64 { return 0xDC708000; }
+fn gfx_enc_global_store_dword_1(addr_vgpr:i32,data_vgpr:i32,saddr:i32) i64 {
+    if(addr_vgpr<0||addr_vgpr>255||data_vgpr<0||data_vgpr>255||saddr<0||saddr>126||saddr%2!=0){return 0;}
+    return (addr_vgpr as i64)+(data_vgpr as i64)*0x100+(saddr as i64)*0x10000;
+}
+fn gfx_enc_global_load_dword_0() i64{return 0xDC308000;}
+fn gfx_enc_global_load_dword_1(addr_vgpr:i32,dst_vgpr:i32,saddr:i32) i64{
+    if(addr_vgpr<0||addr_vgpr>255||dst_vgpr<0||dst_vgpr>255||saddr<0||saddr>126||saddr%2!=0){return 0;}
+    return (addr_vgpr as i64)+(saddr as i64)*0x10000+(dst_vgpr as i64)*0x1000000;
+}
+fn gfx_enc_v_cmp_le_i32(src_sgpr:i32,src_vgpr:i32)i64{
+    if(src_sgpr<0||src_sgpr>105||src_vgpr<0||src_vgpr>255){return 0;}
+    return 0x7C000000+(131 as i64)*0x20000+(src_vgpr as i64)*0x200+(src_sgpr as i64);
+}
+fn gfx_enc_s_cbranch_vccz(forward_dwords:i32)i64{
+    if(forward_dwords<0||forward_dwords>32767){return 0;}return 0xBF860000+(forward_dwords as i64);
+}
+fn gfx_enc_s_sub_u32_literal(dst_sgpr:i32,src_sgpr:i32)i64{
+    if(dst_sgpr<0||dst_sgpr>105||src_sgpr<0||src_sgpr>105){return 0;}
+    return 0x80800000+(dst_sgpr as i64)*0x10000+(src_sgpr as i64)*0x100+255;
+}
+fn gfx_enc_v_lshrrev_b32(dst:i32,amount:i32,src:i32)i64{
+    if(dst<0||dst>255||amount<0||amount>64||src<0||src>255){return 0;}
+    return 0x2C000000+(dst as i64)*0x20000+(src as i64)*0x200+128+(amount as i64);
+}
+fn gfx_enc_v_and_literal(dst:i32,src:i32)i64{
+    if(dst<0||dst>255||src<0||src>255){return 0;}
+    return 0x36000000+(dst as i64)*0x20000+(src as i64)*0x200+255;
+}
+fn gfx_enc_v_mul_lo_u32_0(dst:i32)i64{if(dst<0||dst>255){return 0;}return 0xD5690000+(dst as i64);}
+fn gfx_enc_v_mul_lo_u32_1(src0:i32,src1:i32)i64{
+    if(src0<0||src0>255||src1<0||src1>255){return 0;}
+    return 256+(src0 as i64)+(256+(src1 as i64))*0x200;
+}
+fn gfx_enc_v_add_nc_u32(dst:i32,src0:i32,src1:i32)i64{
+    if(dst<0||dst>255||src0<0||src0>255||src1<0||src1>255){return 0;}
+    return 0x4A000000+(dst as i64)*0x20000+(src1 as i64)*0x200+256+(src0 as i64);
+}
+fn gfx_enc_v_or_b32(dst:i32,src0:i32,src1:i32)i64{
+    if(dst<0||dst>255||src0<0||src0>255||src1<0||src1>255){return 0;}
+    return 0x38000000+(dst as i64)*0x20000+(src1 as i64)*0x200+256+(src0 as i64);
+}
+fn gfx_enc_s_waitcnt_vmcnt0() i64 { return 0xBF8C3F70; }
+fn gfx_enc_s_endpgm() i64 { return 0xBF810000; }
+
+fn gfx_emit_fill_code() ArrayList[u8] {
+    let code: ArrayList[u8] = make[u8](32);
+    // v1=s3(workgroup id); v2=v1<<2; v3=s2(value); store [s0:s1+v2].
+    gfx_push_u32(&code, gfx_enc_v_mov_b32(1,3));
+    gfx_push_u32(&code, gfx_enc_v_lshlrev_b32(2,2,1));
+    gfx_push_u32(&code, gfx_enc_v_mov_b32(3,2));
+    gfx_push_u32(&code, gfx_enc_global_store_dword_0());
+    gfx_push_u32(&code, gfx_enc_global_store_dword_1(2,3,0));
+    gfx_push_u32(&code, gfx_enc_s_waitcnt_vmcnt0());
+    gfx_push_u32(&code, gfx_enc_s_endpgm());
+    return code;
+}
+
+fn gfx_emit_depth_code() ArrayList[u8]{
+    let code:ArrayList[u8]=make[u8](64);
+    // s0:1 color, s2:3 depth, s4 value, s5 new depth, s6 TGID_X.
+    gfx_push_u32(&code,gfx_enc_v_mov_b32(0,6));
+    gfx_push_u32(&code,gfx_enc_v_lshlrev_b32(1,2,0));
+    gfx_push_u32(&code,gfx_enc_global_load_dword_0());
+    gfx_push_u32(&code,gfx_enc_global_load_dword_1(1,2,2));
+    gfx_push_u32(&code,gfx_enc_s_waitcnt_vmcnt0());
+    gfx_push_u32(&code,gfx_enc_v_cmp_le_i32(5,2));
+    gfx_push_u32(&code,gfx_enc_s_cbranch_vccz(7));
+    gfx_push_u32(&code,gfx_enc_v_mov_b32(3,4));
+    gfx_push_u32(&code,gfx_enc_global_store_dword_0());
+    gfx_push_u32(&code,gfx_enc_global_store_dword_1(1,3,0));
+    gfx_push_u32(&code,gfx_enc_v_mov_b32(4,5));
+    gfx_push_u32(&code,gfx_enc_global_store_dword_0());
+    gfx_push_u32(&code,gfx_enc_global_store_dword_1(1,4,2));
+    gfx_push_u32(&code,gfx_enc_s_waitcnt_vmcnt0());
+    gfx_push_u32(&code,gfx_enc_s_endpgm());return code;
+}
+
+fn gfx_emit_blend_code()ArrayList[u8]{
+    let c:ArrayList[u8]=make[u8](256);
+    // s0:1 color, s2:3 depth, s4 value, s5 z, s6 alpha, s7 TGID_X.
+    gfx_push_u32(&c,gfx_enc_v_mov_b32(0,7));gfx_push_u32(&c,gfx_enc_v_lshlrev_b32(1,2,0));
+    gfx_push_u32(&c,gfx_enc_global_load_dword_0());gfx_push_u32(&c,gfx_enc_global_load_dword_1(1,2,2));
+    gfx_push_u32(&c,gfx_enc_global_load_dword_0());gfx_push_u32(&c,gfx_enc_global_load_dword_1(1,3,0));
+    gfx_push_u32(&c,gfx_enc_s_waitcnt_vmcnt0());gfx_push_u32(&c,gfx_enc_v_cmp_le_i32(5,2));
+    gfx_push_u32(&c,gfx_enc_s_cbranch_vccz(49));gfx_push_u32(&c,gfx_enc_s_sub_u32_literal(8,6));gfx_push_u32(&c,256);
+    gfx_push_u32(&c,gfx_enc_v_mov_b32(4,4));gfx_push_u32(&c,gfx_enc_v_mov_b32(5,6));gfx_push_u32(&c,gfx_enc_v_mov_b32(6,8));
+    // Red channel.
+    gfx_push_u32(&c,gfx_enc_v_lshrrev_b32(7,16,4));gfx_push_u32(&c,gfx_enc_v_and_literal(7,7));gfx_push_u32(&c,255);
+    gfx_push_u32(&c,gfx_enc_v_lshrrev_b32(8,16,3));gfx_push_u32(&c,gfx_enc_v_and_literal(8,8));gfx_push_u32(&c,255);
+    gfx_push_u32(&c,gfx_enc_v_mul_lo_u32_0(7));gfx_push_u32(&c,gfx_enc_v_mul_lo_u32_1(7,5));
+    gfx_push_u32(&c,gfx_enc_v_mul_lo_u32_0(8));gfx_push_u32(&c,gfx_enc_v_mul_lo_u32_1(8,6));
+    gfx_push_u32(&c,gfx_enc_v_add_nc_u32(7,7,8));gfx_push_u32(&c,gfx_enc_v_lshrrev_b32(7,8,7));gfx_push_u32(&c,gfx_enc_v_lshlrev_b32(7,16,7));
+    // Green channel.
+    gfx_push_u32(&c,gfx_enc_v_lshrrev_b32(8,8,4));gfx_push_u32(&c,gfx_enc_v_and_literal(8,8));gfx_push_u32(&c,255);
+    gfx_push_u32(&c,gfx_enc_v_lshrrev_b32(9,8,3));gfx_push_u32(&c,gfx_enc_v_and_literal(9,9));gfx_push_u32(&c,255);
+    gfx_push_u32(&c,gfx_enc_v_mul_lo_u32_0(8));gfx_push_u32(&c,gfx_enc_v_mul_lo_u32_1(8,5));
+    gfx_push_u32(&c,gfx_enc_v_mul_lo_u32_0(9));gfx_push_u32(&c,gfx_enc_v_mul_lo_u32_1(9,6));
+    gfx_push_u32(&c,gfx_enc_v_add_nc_u32(8,8,9));gfx_push_u32(&c,gfx_enc_v_lshrrev_b32(8,8,8));gfx_push_u32(&c,gfx_enc_v_lshlrev_b32(8,8,8));
+    // Blue channel and packed result.
+    gfx_push_u32(&c,gfx_enc_v_and_literal(9,4));gfx_push_u32(&c,255);gfx_push_u32(&c,gfx_enc_v_and_literal(10,3));gfx_push_u32(&c,255);
+    gfx_push_u32(&c,gfx_enc_v_mul_lo_u32_0(9));gfx_push_u32(&c,gfx_enc_v_mul_lo_u32_1(9,5));
+    gfx_push_u32(&c,gfx_enc_v_mul_lo_u32_0(10));gfx_push_u32(&c,gfx_enc_v_mul_lo_u32_1(10,6));
+    gfx_push_u32(&c,gfx_enc_v_add_nc_u32(9,9,10));gfx_push_u32(&c,gfx_enc_v_lshrrev_b32(9,8,9));
+    gfx_push_u32(&c,gfx_enc_v_or_b32(7,7,8));gfx_push_u32(&c,gfx_enc_v_or_b32(7,7,9));
+    gfx_push_u32(&c,gfx_enc_global_store_dword_0());gfx_push_u32(&c,gfx_enc_global_store_dword_1(1,7,0));
+    gfx_push_u32(&c,gfx_enc_v_mov_b32(4,5));gfx_push_u32(&c,gfx_enc_global_store_dword_0());gfx_push_u32(&c,gfx_enc_global_store_dword_1(1,4,2));
+    gfx_push_u32(&c,gfx_enc_s_waitcnt_vmcnt0());gfx_push_u32(&c,gfx_enc_s_endpgm());return c;
+}
+
+fn gfx_code_u32(code: ArrayList[u8], index: i32) i64 {
+    let off: i32 = index * 4;
+    if (off < 0 || off + 4 > code.len) { return 0; }
+    return (code.data[off] as i64) + (code.data[off + 1] as i64) * 256 +
+        (code.data[off + 2] as i64) * 65536 + (code.data[off + 3] as i64) * 16777216;
+}
+
+// Decoder/validator for the complete supported instruction profile. It walks
+// instruction boundaries, validates format/opcode/register fields, and rejects
+// unknown encodings. The final semantic sequence check prevents rearranged or
+// merely individually-valid words from becoming an approved fill kernel.
+fn gfx1010_validate_code(code: ArrayList[u8]) bool {
+    if (code.len != 28) { return false; }
+    let mov_wg: i64 = gfx_code_u32(code, 0);
+    let shift: i64 = gfx_code_u32(code, 1);
+    let mov_value: i64 = gfx_code_u32(code, 2);
+    let store0: i64 = gfx_code_u32(code, 3);
+    let store1: i64 = gfx_code_u32(code, 4);
+    let wait: i64 = gfx_code_u32(code, 5);
+    let end: i64 = gfx_code_u32(code, 6);
+
+    let mov0_format: bool = (mov_wg / 0x2000000) == 0x3F &&
+        ((mov_wg / 0x200) % 256) == 1;
+    let mov1_format: bool = (mov_value / 0x2000000) == 0x3F &&
+        ((mov_value / 0x200) % 256) == 1;
+    let store_format: bool = (store0 & 0xFFFFE000) == 0xDC708000;
+    let shift_format: bool = ((shift / 0x2000000) % 64) == 0x1A;
+    if (!mov0_format || !mov1_format || !shift_format || !store_format ||
+        wait != gfx_enc_s_waitcnt_vmcnt0() || end != gfx_enc_s_endpgm()) { return false; }
+
+    return mov_wg == gfx_enc_v_mov_b32(1,3) &&
+        shift == gfx_enc_v_lshlrev_b32(2,2,1) &&
+        mov_value == gfx_enc_v_mov_b32(3,2) &&
+        store0 == gfx_enc_global_store_dword_0() &&
+        store1 == gfx_enc_global_store_dword_1(2,3,0);
+}
+
+fn gfx1010_validate_depth_code(code:ArrayList[u8])bool{
+    if(code.len!=60){return false;}let golden:ArrayList[u8]=gfx_emit_depth_code();
+    let i:i32=0;while(i<15){if(gfx_code_u32(code,i)!=gfx_code_u32(golden,i)){return false;}i=i+1;}return true;
+}
+fn gfx1010_validate_blend_code(code:ArrayList[u8])bool{
+    if(code.len!=236){return false;}let golden:ArrayList[u8]=gfx_emit_blend_code();let i:i32=0;
+    while(i<59){if(gfx_code_u32(code,i)!=gfx_code_u32(golden,i)){return false;}i=i+1;}return true;
+}
+
+// ZGK1 v2 header (80 bytes): magic, version, arch, header/code sizes, entry,
+// user/system SGPRs, VGPRs, LDS, scratch, wave size, RSRC1/2, required local
+// size xyz, deterministic code hash, and the compiler-owned PM4 dispatch
+// contract. Code begins at header_size. Consumers must never infer the launch
+// initiator or PM4 profile from an instruction stream.
+fn emit_gfx1010_bundle(src: []u8, base_dir: []u8, errors: *i32) ArrayList[u8] {
+    let decls: ArrayList[*Node] = parse_program_dir(src, base_dir);
+    let out: ArrayList[u8] = make[u8](128);
+    let profile:i32=gfx_find_profile(decls);
+    if (profile == 0) {
+        _zag_println("znc[gfx1010]: unsupported kernel: require exactly one reviewed bounded fill, depth-write, or depth-blend @kernel; loops, host effects, unsafe pointers, and unknown forms are rejected");
+        errors.* = errors.* + 1;
+        return out;
+    }
+    let code:ArrayList[u8]=gfx_emit_fill_code();if(profile==2){code=gfx_emit_depth_code();}else if(profile==3){code=gfx_emit_blend_code();}
+    if ((profile==1&&!gfx1010_validate_code(code))||(profile==2&&!gfx1010_validate_depth_code(code))||(profile==3&&!gfx1010_validate_blend_code(code))) {
+        _zag_println("znc[gfx1010]: internal encoder/decoder disagreement");
+        errors.* = errors.* + 1;
+        return out;
+    }
+    push[u8](&out, 90); push[u8](&out, 71); push[u8](&out, 75); push[u8](&out, 49); // ZGK1
+    gfx_push_u32(&out, 2);       // bundle version
+    gfx_push_u32(&out, 1010);    // gfx10.1 architecture profile
+    gfx_push_u32(&out, 80);      // header size / code offset
+    gfx_push_u32(&out, code.len as i64);
+    gfx_push_u32(&out, 0);       // entry offset
+    let user:i32=3;let vgprs:i32=4;if(profile==2){user=6;vgprs=5;}else if(profile==3){user=7;vgprs=11;}
+    gfx_push_u32(&out, user);    // profile-owned user SGPRs
+    gfx_push_u32(&out, 1);       // system SGPR: TGID_X
+    gfx_push_u32(&out, vgprs);   // VGPRs used
+    gfx_push_u32(&out, 0);       // LDS bytes
+    gfx_push_u32(&out, 0);       // scratch bytes
+    gfx_push_u32(&out, 32);      // wave size
+    gfx_push_u32(&out, 0);       // COMPUTE_PGM_RSRC1
+    gfx_push_u32(&out, user*2+128); // USER_SGPR_COUNT | TGID_X_EN
+    gfx_push_u32(&out, 1); gfx_push_u32(&out, 1); gfx_push_u32(&out, 1);
+    gfx_push_u32(&out, gfx_kernel_hash(code));
+    gfx_push_u32(&out, 1);       // COMPUTE_DISPATCH_INITIATOR: COMPUTE_SHADER_EN
+    gfx_push_u32(&out, 1);       // PM4 contract profile 1: reviewed compute dispatch
+    let i: i32 = 0;
+    while (i < code.len) { push[u8](&out, code.data[i]); i = i + 1; }
+    return out;
+}

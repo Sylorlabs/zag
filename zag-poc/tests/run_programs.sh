@@ -27,8 +27,12 @@ run_prog() {
     fi
 
     local out ec
-    out=$("$tmp/$name" 2>&1) || true
+    # Capture the program status itself. `... || true; ec=$?` records `true`'s
+    # status and could silently promote a crashing example to success.
+    set +e
+    out=$("$tmp/$name" 2>&1)
     ec=$?
+    set -e
 
     if [ "$ec" != "$want_exit" ]; then
         echo "  XX  $name (exit $ec, want $want_exit)"

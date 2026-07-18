@@ -46,7 +46,7 @@ complete feature.
 | Checked slice indexing | native `cg_lower_expr` emits an OOB panic path | Existing execution tests cover ordinary slices; trap policy is not a complete target-independent memory model. |
 | Current effects | `sema.zag` bitmask: Alloc, Panic, IO, Lock, Raises | Transitive direct-call analysis exists; no formal v2 lattice for unsafe, volatile, atomics, FFI, threads, or GPU runtime actions. |
 | ARM64 | `acodegen.zag`, `aarch64.zag`, separate tests | Experimental only; source contains explicit unsupported lowering cases. |
-| WASM | `native/wasm.zag`, `tests/run_native_wasm.sh` | Binary emission and runtime invocation tests exist. |
+| WASM | `native/wasm.zag`, `tests/run_native_wasm.sh` | Pure-Zag binary emission exists; runtime execution is unsupported until implemented in Zag. |
 | GPU frontend | `mlir.zag`, `gfx1010.zag`, `tests/run_native_gpu.sh` | MLIR text and a deterministic restricted bundle are emitted.  No physical GPU execution was performed or implemented. |
 
 ## 3. Documented claims that are not completed implementations
@@ -136,8 +136,8 @@ MLIR has comment-emission paths for unsupported constructs.  These are
 potential silent-miscompile risks until every path is made a hard diagnostic.
 
 Weak tests identified: GPU gate string matching/brace counting/fixed bytes;
-WASM structural string/section inspection (supplemented by Node/wasmtime
-execution where available); and selected source grep checks in authority.
+WASM structural string/section inspection without runtime execution; and
+selected source grep checks in authority.
 They remain useful subchecks but cannot be release evidence for hardware or
 semantic behavior.
 
@@ -152,7 +152,7 @@ All logs are preserved in repository-root `artifacts/baseline/`.
 | `bash tests/run_native.sh` | PASS, 132 pass / 0 fail. |
 | `bash tests/run_semantics.sh` | PASS, 14 pass / 0 fail, 0 known gaps. |
 | `bash tests/run_native_gpu.sh` | PASS, 5 pass / 0 fail; compilation/format validation only. |
-| `bash tests/run_native_wasm.sh` | PASS, 31 pass / 0 fail. |
+| `bash tests/run_native_wasm.sh` | Historical external-runtime result removed; current gate proves emission only and marks pure-Zag runtime execution unsupported. |
 | `bash tests/run_native_total.sh` | PASS, 8 pass / 0 fail. |
 | `bash run_tests.sh` | Not run: file is absent.  Recorded as explicit unsupported, not pass. |
 

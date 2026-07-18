@@ -28,6 +28,29 @@ else
     sed -n '1,12p' "$tmp/good.log"
 fi
 
+cat >"$tmp/generic-optional.zag" <<'ZAG'
+fn present[V](value: V) ?V { return value; }
+fn main() i32 {
+    let got: ?i32 = present[i32](42);
+    return got orelse 1;
+}
+ZAG
+if "$ZNC" "$tmp/generic-optional.zag" -o "$tmp/generic-optional" >"$tmp/generic-optional.log" 2>&1 &&
+   [ -x "$tmp/generic-optional" ]; then
+    set +e
+    "$tmp/generic-optional"
+    generic_optional_rc=$?
+    set -e
+    if [ "$generic_optional_rc" -eq 42 ]; then
+        ok "explicit generic arguments substitute through optional results"
+    else
+        bad "generic optional program exit=$generic_optional_rc"
+    fi
+else
+    bad "generic optional result substitution"
+    sed -n '1,12p' "$tmp/generic-optional.log"
+fi
+
 cat >"$tmp/bad.zag" <<'ZAG'
 fn ghost(x: Missing) Missing { return x; }
 fn main() i32 { return 0; }

@@ -260,9 +260,17 @@ Types that map to hardware that Vulkan SPIR-V cannot represent:
 ### GPU frontend emission (legacy path)
 
 MLIR emission for `@kernel` functions is implemented in `selfhost/mlir.zag` and
-exercised through a legacy differential path.  This is not physical GPU
-execution: no device is enumerated, no context/buffer is created, and no result
-is read back or checked. `./znc` does not ship an operational GPU target.
+exercised through a legacy differential path. It is not a production backend:
+no device is enumerated, no context/buffer is created, and no result is read
+back or checked.
+
+The supported self-hosted compiler ships the custom Zag-native
+`amdgpu-gfx1010` target. It emits validated ZGK1 RDNA1 bundles without LLVM or
+MLIR. Pure-Zag userspace runtimes consume them through the existing Linux
+AMDGPU driver UAPI. Future portable targets use custom Zag SPIR-V or PTX
+generators over installed Vulkan/CUDA drivers; Zag does not rewrite privileged
+kernel drivers or firmware. The executable contract is `std:gpu_platform`; see
+`zag-poc/docs/GPU_COMPILER_DRIVER_BOUNDARY.md`.
 
 ---
 
@@ -292,9 +300,9 @@ can cross-compile **experimental ARM64 Linux ELF**:
 ```
 
 ARM64 output is static and can be verified through qemu-user on x86-64.
-RISC-V is planned, not implemented. WebAssembly and GPU frontend emission are
-available through their respective targets; no GPU backend is claimed. See
-`zag-poc/README.md` for comparison work.
+RISC-V is planned, not implemented. WebAssembly, the custom Zag-native GFX10.1
+backend, and legacy GPU MLIR frontends are available through their respective
+targets. Other physical GPU families remain planned and fail closed.
 
 ---
 
