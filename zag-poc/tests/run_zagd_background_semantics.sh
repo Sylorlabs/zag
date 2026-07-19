@@ -5,6 +5,7 @@ cd "$(dirname "$0")/.."
 tmp=$(mktemp -d /tmp/zagd-background-sema.XXXXXX)
 trap 'if [ -d "$tmp/project" ]; then printf stop > "$tmp/project/.zagd.stop" 2>/dev/null || true; fi; rm -rf "$tmp"' EXIT
 compiler=${ZNC:-"$(pwd)/znc"}
+compiler=$(realpath "$compiler")
 
 "$compiler" selfhost/zagd_daemon.zag -o "$tmp/zagd" --no-zagd --no-analyze >/dev/null
 ln -s "$compiler" "$tmp/znc"
