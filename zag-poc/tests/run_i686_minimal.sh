@@ -17,6 +17,15 @@ if [ "$shnum" = 6 ]; then ok "ELF32 section table is present"; else bad "ELF32 s
 if command -v readelf >/dev/null 2>&1; then
   if readelf -S -s "$tmp/a.out" 2>/dev/null | grep -q '\.debug_line' && readelf -s "$tmp/a.out" 2>/dev/null | grep -q ' main$'; then ok "reference reader sees text symbols and debug line"; else bad "readelf metadata"; fi
 fi
+if "$ZNC" tests/i686_literal.zag --target i686 --emit-obj -o "$tmp/main.o" --no-analyze >/dev/null; then
+  etype=$(od -An -tu1 -j16 -N1 "$tmp/main.o" | tr -d ' ')
+  if [ "$etype" = 1 ]; then ok "ELF32 ET_REL object emits"; else bad "ELF32 relocatable type"; fi
+  if command -v readelf >/dev/null 2>&1 && readelf -r "$tmp/main.o" 2>/dev/null | grep -q 'R_386_PC32.*main'; then ok "R_386_PC32 startup relocation is published"; else bad "ELF32 relocation metadata"; fi
+  if command -v ld >/dev/null 2>&1 && ld -m elf_i386 -o "$tmp/linked" "$tmp/main.o" >/dev/null 2>&1; then
+    set +e; "$tmp/linked"; linked_rc=$?; set -e
+    if [ "$linked_rc" -eq 42 ]; then ok "reference linker resolves relocatable object"; else bad "linked object status=$linked_rc"; fi
+  fi
+else bad "ELF32 object emits"; fi
 set +e
 "$tmp/a.out"; rc=$?
 set -e
