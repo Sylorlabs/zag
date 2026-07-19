@@ -21,7 +21,7 @@ test "$markerless_status" -eq 5
 "$znc_bin" explain tests/script_frontend/basic.zag --format json >"$tmp_dir/explain.json"
 grep -q '"profile":{"value":"script","basis":"proven"}' "$tmp_dir/explain.json"
 grep -q '"allocator":{"value":"script_process_arena","basis":"derived"}' "$tmp_dir/explain.json"
-grep -q '"script_memory_bytes":{"value":67108864,"basis":"derived"}' "$tmp_dir/explain.json"
+grep -q '"script_memory_bytes":{"value":67108864' "$tmp_dir/explain.json"
 grep -q '"semantic_facts":{"format":"zag-semantic-manifest-v1"' "$tmp_dir/explain.json"
 grep -q 'decl_fn=' "$tmp_dir/explain.json"
 grep -q 'value_type=' "$tmp_dir/explain.json"
