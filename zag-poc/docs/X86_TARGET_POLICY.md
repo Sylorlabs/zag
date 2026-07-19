@@ -85,15 +85,21 @@ loads/stores, addition, subtraction, assignment, and return. It emits a real
 i386 stack frame and an ELF32 `EM_386` process using the 32-bit Linux exit
 syscall. Signed comparisons, `if`/`else`, `while`, `break`, and `continue` use
 explicit IR labels with checked relative-branch patching. Multiple non-generic
-`i32` functions use a cdecl-like boundary: arguments are pushed right-to-left,
-the caller removes arguments, and results return in EAX. EBP, EBX, ESI, and EDI
+`i32` functions use the SysV i386 boundary: arguments are pushed right-to-left,
+the caller removes arguments, and results return in EAX. Scalar `f64` occupies
+two naturally ordered stack words, uses x87 arithmetic, and returns in ST(0).
+The target guarantees the psABI baseline 4-byte stack alignment; the optional
+16-byte preferred boundary used by some SSE toolchains is not promised. EBP,
+EBX, ESI, and EDI
 are callee-saved; current generated bodies use only EAX, ECX, EBP, and the stack.
 `usize` is one 32-bit word. `*i32` and `*usize` use 32-bit addresses and support
 addressing initialized frame locals, indirect loads/stores, and scalar argument
 passing. Uninitialized pointers, unsupported pointer element types, imports,
-and Script constructs fail before artifact creation. General completion still requires broader i386
+and Script constructs fail before artifact creation. `i64`, `u64`, and `f32`
+signatures reject explicitly rather than acquiring host-sized layouts. General
+completion still requires broader i386
 aggregate calling conventions, pointer arithmetic, smaller-register-set allocation,
-32-bit Linux syscalls, explicit rejection of 64-bit assumptions, target-specific
+32-bit Linux syscalls, target-specific
 runtime tests and execution on real or emulated 32-bit Linux. Until those gates
 pass, public documentation must say Linux x86-64, not full x86-family support.
 The CLI never aliases i686 requests to ELF64.

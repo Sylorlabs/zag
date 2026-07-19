@@ -54,7 +54,13 @@ if "$ZNC" tests/i686_calls.zag --target i686 -o "$tmp/calls" --no-analyze >/dev/
   if [ "$call_rc" -eq 42 ]; then ok "cdecl-like i32 arguments returns and caller cleanup execute"; else bad "call ABI execution status=$call_rc"; fi
 else bad "multiple i32 functions emit"; fi
 if ! "$ZNC" tests/i686_reject_abi.zag --target i686 -o "$tmp/badabi" --no-analyze >"$tmp/badabi.log" 2>&1 &&
-   grep -q "not a supported 32-bit scalar" "$tmp/badabi.log" && [ ! -e "$tmp/badabi" ]; then ok "unsupported floating ABI rejects before output"; else bad "unsupported ABI rejection"; fi
+   grep -q "not a supported i386 scalar" "$tmp/badabi.log" && [ ! -e "$tmp/badabi" ]; then ok "unsupported f32 ABI rejects before output"; else bad "unsupported ABI rejection"; fi
+if ! "$ZNC" tests/i686_reject_i64.zag --target i686 -o "$tmp/badi64" --no-analyze >"$tmp/badi64.log" 2>&1 &&
+   grep -Eq "return i32|supported i386 scalar" "$tmp/badi64.log" && [ ! -e "$tmp/badi64" ]; then ok "64-bit scalar assumptions reject before output"; else bad "i64 ABI rejection"; fi
+if "$ZNC" tests/i686_float.zag --target i686 -o "$tmp/float" --no-analyze >/dev/null; then
+  set +e; "$tmp/float"; float_rc=$?; set -e
+  if [ "$float_rc" -eq 42 ]; then ok "SysV i386 f64 stack arguments x87 return and arithmetic execute"; else bad "f64 ABI status=$float_rc"; fi
+else bad "f64 ABI program emits"; fi
 if "$ZNC" tests/i686_pointer.zag --target i686 -o "$tmp/pointer" --no-analyze >/dev/null; then
   set +e; "$tmp/pointer"; ptr_rc=$?; set -e
   if [ "$ptr_rc" -eq 42 ]; then ok "32-bit usize pointer address dereference and store execute"; else bad "pointer execution status=$ptr_rc"; fi
