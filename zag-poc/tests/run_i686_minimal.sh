@@ -30,5 +30,11 @@ if "$ZNC" tests/i686_control_flow.zag --target i686 -o "$tmp/cf" --no-analyze >/
   set +e; "$tmp/cf"; cf_rc=$?; set -e
   if [ "$cf_rc" -eq 42 ]; then ok "comparisons if while break continue execute"; else bad "control-flow execution status=$cf_rc"; fi
 else bad "control-flow IR emits"; fi
+if "$ZNC" tests/i686_calls.zag --target i686 -o "$tmp/calls" --no-analyze >/dev/null; then
+  set +e; "$tmp/calls"; call_rc=$?; set -e
+  if [ "$call_rc" -eq 42 ]; then ok "cdecl-like i32 arguments returns and caller cleanup execute"; else bad "call ABI execution status=$call_rc"; fi
+else bad "multiple i32 functions emit"; fi
+if ! "$ZNC" tests/i686_reject_abi.zag --target i686 -o "$tmp/badabi" --no-analyze >"$tmp/badabi.log" 2>&1 &&
+   grep -q "pointers and usize are rejected" "$tmp/badabi.log" && [ ! -e "$tmp/badabi" ]; then ok "unsupported ABI types reject before output"; else bad "unsupported ABI rejection"; fi
 echo "i686 minimal: pass=$pass fail=$fail"
 test "$fail" -eq 0

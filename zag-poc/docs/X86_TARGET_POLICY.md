@@ -82,8 +82,13 @@ not implied by x86-64 support. The isolated backend now lowers the normal parsed
 AST through a target-neutral integer IR for `i32` constants, initialized locals,
 loads/stores, addition, subtraction, assignment, and return. It emits a real
 i386 stack frame and an ELF32 `EM_386` process using the 32-bit Linux exit
-syscall. Pointers, `usize`, calls, imports, control flow, additional functions,
-and Script constructs fail before artifact creation. General completion still requires a specified i386
+syscall. Signed comparisons, `if`/`else`, `while`, `break`, and `continue` use
+explicit IR labels with checked relative-branch patching. Multiple non-generic
+`i32` functions use a cdecl-like boundary: arguments are pushed right-to-left,
+the caller removes arguments, and results return in EAX. EBP, EBX, ESI, and EDI
+are callee-saved; current generated bodies use only EAX, ECX, EBP, and the stack.
+Pointers, `usize`, imports, and Script constructs fail before artifact creation.
+General completion still requires broader i386
 calling convention, 32-bit pointers/`usize`, smaller-register-set allocation,
 32-bit Linux syscalls, explicit rejection of 64-bit assumptions, target-specific
 runtime tests and execution on real or emulated 32-bit Linux. Until those gates

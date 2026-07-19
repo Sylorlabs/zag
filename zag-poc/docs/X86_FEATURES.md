@@ -38,7 +38,9 @@ separate i686 milestone passes.
 
 `--target i686`, `--target x86`, and `--target linux-i686` select an isolated
 ELF32 milestone backend. It accepts a non-generic `i32 main` with initialized
-`i32` locals, assignment, integer constants, `+`, `-`, and return. These nodes
-lower through a validated integer IR into an i386 frame; Linux startup exits
-through `int 0x80`. Unsupported types and AST nodes reject before output. This
+`i32` locals and parameters, assignment, integer constants, arithmetic,
+comparisons, structured branches/loops, and non-generic `i32` calls. These nodes
+lower through a validated integer IR into i386 frames with caller-cleaned stack
+arguments and EAX returns; Linux startup exits through `int 0x80`. Unsupported
+types and AST nodes reject before output. This
 is executable integer-backend proof, not general i686 language support.
