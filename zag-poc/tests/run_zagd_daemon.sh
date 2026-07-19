@@ -114,6 +114,9 @@ for _ in $(seq 1 100); do
     grep -q '^mode=deep$' "$tmp/project/.zagd.status" 2>/dev/null && break
     sleep 0.01
 done
+grep -q '^planner_budget=256$' "$tmp/project/.zagd.status"
+grep -q '^planner_suggestions=0$' "$tmp/project/.zagd.status"
+grep -q '^planner_state=complete$' "$tmp/project/.zagd.status"
 if "$tmp/zagd" --root "$tmp/project" --mode light >/dev/null 2>&1; then
     echo "duplicate daemon unexpectedly started" >&2; exit 1
 fi
