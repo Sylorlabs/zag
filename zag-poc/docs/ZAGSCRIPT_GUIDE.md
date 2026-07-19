@@ -116,9 +116,11 @@ sequences copy linear total data. Superseded arena buffers remain until Script
 shutdown and count toward `script_alloc_used()`.
 
 Basic JSON scalar support is available as the ordinary `std:json` module. It
-stringifies and parses strings, signed integers, and booleans with statically
-typed parse results containing `ok` and `value`. Parse failure is explicit.
-Objects, arrays, floats, null, and Unicode `\\u` decoding remain unsupported.
+stringifies and parses strings, signed integers, and booleans, parses finite
+JSON floating-point syntax, and parses/stringifies null. Statically typed parse
+results contain `ok` and, where applicable, `value`; parse failure is explicit.
+Objects, arrays, float stringification, and Unicode `\\u` decoding remain
+unsupported.
 Zag Script uses the same inspectable API as strict Zag:
 
 ```zag
