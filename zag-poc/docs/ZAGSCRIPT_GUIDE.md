@@ -18,10 +18,13 @@ limit, uncaught-error wrapper, `znc script`, `explain`, conservative `harden`,
 and `check --strict`. Both activation forms are supported:
 
 The JSON form of `explain` embeds the compiler's checksummed semantic manifest,
-including declaration signatures, layouts, call edges, derived function effect
-masks, and proven value-type witnesses for explicit declarations and exact
-literal/cast/struct-literal cases. Other expression types remain explicitly
-unknown rather than guessed.
+including declaration signatures, layouts, call edges, function effects, and
+per-expression `expr_fact` witnesses. Types come from the shared typed frontend;
+effects come from sema's context-sensitive expression walk. Calls, binary and
+unary forms, casts, slice indexing/slicing, supported struct fields, assignments,
+returns, and nested control-flow conditions are recursively reported. A form
+outside typed authority is tagged `type_basis=unknown`, never guessed. Text and
+JSON expose the same checksummed manifest.
 
 ```sh
 ./znc examples/script_hello.zag -o /tmp/script_hello
