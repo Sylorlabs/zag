@@ -79,8 +79,10 @@ Background checks use `--no-zagd`, so they cannot recursively start a daemon.
 Failed checks mark the snapshot invalid and cannot authorize an executable. The
 semantic artifact index persists stable declaration, public/effect, layout,
 compiler, target, and source identities with conservative invalidation. It does
-not substitute cached machine bytes into foreground output; executable
-authority remains with the current compiler invocation.
+not authorize executable reuse. The separate foreground compiler cache may skip
+backend lowering only after exact compiler/source graph/target/ABI/config and
+code/data checksum validation; executable authority remains with the current
+compiler invocation.
 
 ## Correctness boundary
 

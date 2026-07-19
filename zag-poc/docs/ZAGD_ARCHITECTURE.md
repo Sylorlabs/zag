@@ -184,8 +184,11 @@ target, exact semantic source hash, and the record checksum must all validate.
 A mismatch is a cache miss and foreground compilation proceeds normally.
 Private body changes invalidate the declaration and its transitive callers;
 public layout changes invalidate layout/codegen dependents; comment-only edits
-record zero codegen invalidation. The index records these decisions but does not
-yet substitute cached machine-code bytes into the foreground linker.
+record zero codegen invalidation. The daemon index never authorizes executable
+reuse. Independently, the foreground compiler consumes a whole-program cache
+before backend lowering only after exact compiler executable, root/import
+content, target, ABI/profile, configuration, and code/data checksum validation.
+Any missing, stale, truncated, or corrupt component falls back to codegen.
 the daemon accepts them only for matching content and otherwise launches a
 stable-source foreground-equivalent check. Uncertain dependents remain
 conservative rather than under-invalidated. Adaptive/deep runs use hard
