@@ -226,3 +226,13 @@ boolean is not accepted as equivalence. This is a resource supervisor for compil
 reviewed finalists, not a sandbox for hostile executables: the no-network/GPU/
 mutation rule is planner authority enforced before execution, not a Linux
 seccomp claim. Only equivalent output witnesses may become measured plan facts.
+
+The daemon integration uses `.zagd.deep-reference` and `.zagd.deep-finalist` as
+the explicit execution checkpoint. For one stable source/target candidate it
+runs three bounded reference/finalist pairs, checks the semantic source hash
+before and between executions, observes the stop file between runs, and
+transactionally persists a measured record only after exact witness equality
+for every pair. A stale, cancelled, mismatched, timed-out, or overflowing run
+removes any prior measurement and publishes no replacement. These control files
+authorize only compiler-produced reviewed executables; they add no filesystem
+namespace, seccomp, network isolation, or hostile-code sandbox.

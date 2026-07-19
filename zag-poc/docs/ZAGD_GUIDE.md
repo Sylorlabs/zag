@@ -36,6 +36,16 @@ stopping a running project daemon. No second opt-out setting is required.
 and deep run deterministic bounded planner budgets; they are not a complete
 whole-program optimizer or an unbounded idle-time search.
 
+Deep finalist execution is separately explicit. Put the reviewed executable
+paths in `.zagd.deep-reference` and `.zagd.deep-finalist` (one relative-to-root
+or absolute path per file), then select deep mode. The daemon runs three bounded
+reference/finalist pairs only for the current valid semantic snapshot and writes
+`.zag-cache/zagd/deep-measurement.record` only when every pair has identical
+stdout, stderr, exit status, terminating signal, and success state. A stop
+request or source change between executions prevents persistence. Removing
+either control file disables execution; adaptive and light modes never execute
+them.
+
 Regular Zag consumes the service as warnings and suggestions only. Zag Script
 may apply the supported allocator/CPU/device/layout defaults when source and CLI
 leave them unspecified. Explicit command-line choices always win, and changing
