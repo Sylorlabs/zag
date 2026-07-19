@@ -1,0 +1,221 @@
+// x86_cpu_profile.zag -- deterministic Linux x86-64 target policy foundation.
+//
+// This module deliberately separates a requested profile from a resolved
+// profile.  `native` is valid syntax, but resolution fails closed until the
+// self-hosted runtime obtains raw CPUID facts and qualifies AVX-family state
+// with OSXSAVE + XGETBV. Detection and code-generation permission remain separate:
+// today the encoder permission set is deliberately SSE2-only.
+
+struct X86Features {
+    sse2: i32,
+    sse3: i32,
+    ssse3: i32,
+    sse41: i32,
+    sse42: i32,
+    popcnt: i32,
+    avx: i32,
+    avx2: i32,
+    fma: i32,
+    bmi1: i32,
+    bmi2: i32,
+    avx512: i32,
+}
+
+struct X86CpuProfile {
+    valid: i32,
+    request_kind: i32, // 1 generic, 2 native, 3 named, 0 invalid
+    requested: []u8,
+    canonical: []u8,
+    detection: []u8,
+    cache_key: []u8,
+    diagnostic: []u8,
+    features: X86Features,
+}
+
+struct X86Detection {
+    available: i32,
+    cpu_avx: i32,
+    osxsave: i32,
+    xmm_ymm_state: i32,
+    avx_usable: i32,
+    avx2_usable: i32,
+}
+
+fn x86_bit(v: i64, bit: i32) i32 {
+    if ((v & (1 << bit)) != 0) { return 1; }
+    return 0;
+}
+
+fn x86_gate_avx(ecx1: i64, xcr0: i64, ebx7: i64) X86Detection {
+    let cpu_avx: i32 = x86_bit(ecx1, 28);
+    let osxsave: i32 = x86_bit(ecx1, 27);
+    let state: i32 = 0;
+    if ((xcr0 & 6) == 6) { state = 1; }
+    let avx_ok: i32 = cpu_avx * osxsave * state;
+    let avx2_ok: i32 = x86_bit(ebx7, 5) * avx_ok;
+    return X86Detection{.available=1,.cpu_avx=cpu_avx,.osxsave=osxsave,
+        .xmm_ymm_state=state,.avx_usable=avx_ok,.avx2_usable=avx2_ok};
+}
+
+fn x86_detect_raw() X86Detection {
+    let max_leaf: i64 = _zag_x86_cpuid_eax(0, 0);
+    if (max_leaf < 1) { return X86Detection{.available=0,.cpu_avx=0,.osxsave=0,.xmm_ymm_state=0,.avx_usable=0,.avx2_usable=0}; }
+    let ecx1: i64 = _zag_x86_cpuid_ecx(1, 0);
+    let xcr0: i64 = 0;
+    if (x86_bit(ecx1, 28) == 1 && x86_bit(ecx1, 27) == 1) { xcr0 = _zag_x86_xgetbv(0); }
+    let ebx7: i64 = 0;
+    if (max_leaf >= 7) { ebx7 = _zag_x86_cpuid_ebx(7, 0); }
+    return x86_gate_avx(ecx1, xcr0, ebx7);
+}
+
+fn x86_no_features() X86Features {
+    return X86Features{ .sse2 = 0, .sse3 = 0, .ssse3 = 0,
+        .sse41 = 0, .sse42 = 0, .popcnt = 0, .avx = 0, .avx2 = 0,
+        .fma = 0, .bmi1 = 0, .bmi2 = 0, .avx512 = 0 };
+}
+
+// The current x86 encoder implements the integer x86-64 baseline and scalar
+// SSE2 floating-point instructions.  No optional feature is advertised merely
+// because a host CPU might have it.
+fn x86_generic_features() X86Features {
+    let f: X86Features = x86_no_features();
+    f.sse2 = 1;
+    return f;
+}
+
+fn x86_cpu_value(raw: []u8) []u8 {
+    if (raw.len > 6 && raw[0] == '-' && raw[1] == '-' && raw[2] == 'c' &&
+        raw[3] == 'p' && raw[4] == 'u' && raw[5] == '=') {
+        return raw[6..];
+    }
+    return raw;
+}
+
+fn x86_profile_error(requested: []u8, kind: i32, message: []u8) X86CpuProfile {
+    return X86CpuProfile{ .valid = 0, .request_kind = kind,
+        .requested = requested, .canonical = "unresolved",
+        .detection = "unavailable", .cache_key = "",
+        .diagnostic = message, .features = x86_no_features() };
+}
+
+fn x86_generic_profile(requested: []u8, kind: i32) X86CpuProfile {
+    return X86CpuProfile{ .valid = 1, .request_kind = kind,
+        .requested = requested, .canonical = "x86-64-v1",
+        .detection = "defined", .cache_key = "linux-x86_64|x86-64-v1|sse2",
+        .diagnostic = "", .features = x86_generic_features() };
+}
+
+fn x86_runtime_profile(requested: []u8) X86CpuProfile {
+    let f:X86Features=x86_generic_features();
+    f.popcnt=2;
+    return X86CpuProfile{.valid=1,.request_kind=4,.requested=requested,
+        .canonical="x86-64-runtime-popcnt",.detection="runtime-cpuid",
+        .cache_key="linux-x86_64|runtime-dispatch|sse2,popcnt",
+        .diagnostic="",.features=f};
+}
+
+fn x86_ascii_space(c: u8) i32 {
+    if (c == 32 || c == 9 || c == 10 || c == 13) { return 1; }
+    return 0;
+}
+
+// Match a complete whitespace-delimited token.  This avoids substring bugs
+// such as treating "avx2" as proof of "avx" or a model name as a feature.
+fn x86_has_token(text: []u8, token: []u8) i32 {
+    if (token.len == 0 || text.len < token.len) { return 0; }
+    let i: i32 = 0;
+    while (i + token.len <= text.len) {
+        let left_ok: i32 = 0;
+        if (i == 0) { left_ok = 1; } else { left_ok = x86_ascii_space(text[i - 1]); }
+        let j: i32 = 0;
+        while (j < token.len && text[i + j] == token[j]) { j = j + 1; }
+        let right_ok: i32 = 0;
+        if (i + token.len == text.len) { right_ok = 1; }
+        else { right_ok = x86_ascii_space(text[i + token.len]); }
+        if (left_ok == 1 && j == token.len && right_ok == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn x86_cpuinfo_flags(cpuinfo: []u8) []u8 {
+    let i: i32 = 0;
+    while (i + 7 < cpuinfo.len) {
+        let line_start: i32 = i;
+        while (i < cpuinfo.len && cpuinfo[i] != 10) { i = i + 1; }
+        let line: []u8 = cpuinfo[line_start..i];
+        if (line.len >= 5 && line[0] == 'f' && line[1] == 'l' &&
+            line[2] == 'a' && line[3] == 'g' && line[4] == 's') {
+            let colon: i32 = 5;
+            while (colon < line.len && line[colon] != ':') { colon = colon + 1; }
+            if (colon < line.len) { return line[colon + 1..]; }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn x86_native_profile_from_cpuinfo(requested: []u8, cpuinfo: []u8) X86CpuProfile {
+    let flags: []u8 = x86_cpuinfo_flags(cpuinfo);
+    if (flags.len == 0) {
+        return x86_profile_error(requested, 2,
+            "x86 cpu profile 'native' unavailable: Linux did not provide /proc/cpuinfo flags; use --cpu=generic");
+    }
+    if (x86_has_token(flags, "lm") == 0 || x86_has_token(flags, "sse2") == 0) {
+        return x86_profile_error(requested, 2,
+            "x86 cpu profile 'native' rejected: host does not report the required x86-64/SSE2 baseline");
+    }
+    return X86CpuProfile{ .valid = 1, .request_kind = 2,
+        .requested = requested, .canonical = "native-sse2",
+        .detection = "linux-proc-cpuinfo",
+        .cache_key = "linux-x86_64|native|permitted=sse2",
+        .diagnostic = "", .features = x86_generic_features() };
+}
+
+fn x86_native_profile(requested: []u8) X86CpuProfile {
+    let detected: X86Detection = x86_detect_raw();
+    if (detected.available == 0) {
+        return x86_profile_error(requested, 2, "x86 cpu profile 'native' unavailable: CPUID leaf 1 is unavailable");
+    }
+    let features:X86Features=x86_generic_features();let ecx1:i64=_zag_x86_cpuid_ecx(1,0);features.popcnt=x86_bit(ecx1,23);
+    let canonical:[]u8="native-sse2";let key:[]u8="linux-x86_64|native|permitted=sse2";if(features.popcnt==1){canonical="native-sse2-popcnt";key="linux-x86_64|native|permitted=sse2,popcnt";}
+    return X86CpuProfile{ .valid = 1, .request_kind = 2,
+        .requested = requested, .canonical = canonical,
+        .detection = "cpuid-xgetbv", .cache_key = key,
+        .diagnostic = "", .features = features };
+}
+
+// Accepted values: generic, native, x86-64, and x86-64-v1.  Named aliases
+// canonicalize to one cache identity so spelling cannot fragment plan caches.
+fn parse_x86_cpu_profile(raw: []u8) X86CpuProfile {
+    let name: []u8 = x86_cpu_value(raw);
+    if (@strEq(name, "generic")) { return x86_generic_profile(name, 1); }
+    if (@strEq(name, "x86-64") || @strEq(name, "x86-64-v1")) {
+        return x86_generic_profile(name, 3);
+    }
+    if (@strEq(name, "native")) {
+        return x86_native_profile(name);
+    }
+    if (@strEq(name, "runtime")) { return x86_runtime_profile(name); }
+    return x86_profile_error(name, 0,
+        "unknown x86 cpu profile; supported profiles: generic, native, runtime, x86-64-v1");
+}
+
+// Stable machine-readable data.  Its field order and feature order are part of
+// the cache/report contract; callers need not inspect host-dependent state.
+fn x86_profile_report_json(p: X86CpuProfile) []u8 {
+    if (p.valid == 1 && p.request_kind == 4) {
+        return "{\"target\":\"linux-x86_64\",\"profile\":\"x86-64-runtime-popcnt\",\"detection\":\"runtime-cpuid\",\"features\":[\"sse2\",\"popcnt\"],\"cache_key\":\"linux-x86_64|runtime-dispatch|sse2,popcnt\"}";
+    }
+    if (p.valid == 1 && p.request_kind == 2) {
+        if(p.features.popcnt==1){return "{\"target\":\"linux-x86_64\",\"profile\":\"native-sse2-popcnt\",\"resolved\":true,\"detection\":\"cpuid-xgetbv\",\"permitted_features\":[\"sse2\",\"popcnt\"],\"cache_key\":\"linux-x86_64|native|permitted=sse2,popcnt\"}";}
+        return "{\"target\":\"linux-x86_64\",\"profile\":\"native-sse2\",\"resolved\":true,\"detection\":\"cpuid-xgetbv\",\"permitted_features\":[\"sse2\"],\"cache_key\":\"linux-x86_64|native|permitted=sse2\"}";
+    }
+    if (p.valid == 1) {
+        return "{\"target\":\"linux-x86_64\",\"profile\":\"x86-64-v1\",\"detection\":\"defined\",\"features\":[\"sse2\"],\"cache_key\":\"linux-x86_64|x86-64-v1|sse2\"}";
+    }
+    if (p.request_kind == 2) {
+        return "{\"target\":\"linux-x86_64\",\"profile\":\"native\",\"resolved\":false,\"detection\":\"unavailable\"}";
+    }
+    return "{\"target\":\"linux-x86_64\",\"profile\":\"invalid\",\"resolved\":false}";
+}

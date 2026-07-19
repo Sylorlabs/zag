@@ -4,6 +4,29 @@
 // do not link libc. `process_run_shell` intentionally invokes /bin/sh and
 // returns its exit status; use it only when shell interpretation is wanted.
 
+@import("std:list")
+
+// Opaque stable ABI for the future bounded supervisor. Module-prefixing may
+// rename ProcessResult, but cannot change the compiler-owned handle layout.
+struct ProcessResult { handle: *opaque }
+
+fn process_state_exited() i32 { return 0; }
+fn process_state_timed_out() i32 { return 1; }
+fn process_state_output_limit() i32 { return 2; }
+fn process_state_runtime_error() i32 { return 3; }
+
+fn process_result_status(result: ProcessResult) i32 {
+    return _zag_process_result_status(result.handle);
+}
+
+fn process_result_state(result: ProcessResult) i32 {
+    return _zag_process_result_state(result.handle);
+}
+
+fn process_result_output(result: ProcessResult) []u8 {
+    return _zag_process_result_output(result.handle);
+}
+
 fn process_arg_count() i32 {
     return _zag_argc();
 }
@@ -14,6 +37,113 @@ fn process_arg(index: i32) []u8 {
 
 fn process_run_shell(command: []u8) i32 {
     return _zag_exec_cmd(command);
+}
+
+fn process_alloc(context: *opaque, scripted: i32, bytes: i64) *i8 {
+    if (scripted == 1) { return _zag_script_alloc(context, bytes); }
+    return _zag_malloc(bytes as i32);
+}
+
+fn process_result_new(context: *opaque, scripted: i32, status: i32, state: i32, output: []u8) *opaque {
+    if (scripted == 1) {
+        return _zag_script_process_result_abi_new(context, status, state, output);
+    }
+    return _zag_process_result_abi_new(status, state, output);
+}
+
+// Run `/bin/sh -c command` with a monotonic deadline and a hard stdout cap.
+// Linux x86-64 raw syscalls only; no libc, linker, polling thread, or external
+// timeout program. State 0=exited, 1=timed out, 2=output cap, 3=runtime error.
+fn process_run_bounded_internal(context: *opaque, scripted: i32, command: []u8, timeout_ms: i64, max_output: i64) ProcessResult {
+    if (timeout_ms < 1 || max_output < 1 || max_output > 1048576) {
+        return ProcessResult{ .handle = process_result_new(context, scripted, 0 - 1, process_state_runtime_error(), "") };
+    }
+    let pair: *i64 = process_alloc(context, scripted, 8) as *i64;
+    if (pair == null as *i64) { _zag_eprintln("Zag Script memory limit exceeded by process setup"); return ProcessResult{ .handle = null as *opaque }; }
+    if (_zag_raw_syscall(293, pair as i64, 2048, 0, 0, 0, 0) < 0) { // pipe2 O_NONBLOCK
+        return ProcessResult{ .handle = process_result_new(context, scripted, 0 - 1, process_state_runtime_error(), "") };
+    }
+    let packed: i64 = pair[0];
+    let read_fd: i64 = packed & 4294967295;
+    let write_fd: i64 = packed >> 32;
+    let cmd_memory: *i8 = process_alloc(context, scripted, (command.len + 1) as i64);
+    let argv: **i8 = process_alloc(context, scripted, 32) as **i8;
+    if (cmd_memory == null as *i8 || argv == null as **i8) { _zag_eprintln("Zag Script memory limit exceeded by process command"); return ProcessResult{ .handle = null as *opaque }; }
+    let command_i: i32 = 0;
+    while (command_i < command.len) { cmd_memory[command_i] = command[command_i]; command_i = command_i + 1; }
+    cmd_memory[command.len] = 0;
+    argv[0] = _zag_slice_ptr("/bin/sh\0"); argv[1] = _zag_slice_ptr("-c\0");
+    argv[2] = cmd_memory; argv[3] = null as *i8;
+    let pid: i64 = _zag_raw_syscall(57, 0, 0, 0, 0, 0, 0);
+    if (pid == 0) {
+        let _group: i64 = _zag_raw_syscall(109, 0, 0, 0, 0, 0, 0); // setpgid(0,0)
+        let _dup: i64 = _zag_raw_syscall(33, write_fd, 1, 0, 0, 0, 0);
+        let _cr: i64 = _zag_raw_syscall(3, read_fd, 0, 0, 0, 0, 0);
+        let _cw: i64 = _zag_raw_syscall(3, write_fd, 0, 0, 0, 0, 0);
+        let _exec: i64 = _zag_raw_syscall(59, _zag_slice_ptr("/bin/sh\0") as i64,
+            argv as i64, 0, 0, 0, 0);
+        _zag_exit(127);
+    }
+    if (pid < 0) {
+        let _a: i64 = _zag_raw_syscall(3, read_fd, 0, 0, 0, 0, 0);
+        let _b: i64 = _zag_raw_syscall(3, write_fd, 0, 0, 0, 0, 0);
+        return ProcessResult{ .handle = process_result_new(context, scripted, 0 - 1, process_state_runtime_error(), "") };
+    }
+    // Parent-side setpgid closes the fork/exec race; EACCES means child won it.
+    let _pg: i64 = _zag_raw_syscall(109, pid, pid, 0, 0, 0, 0);
+    let _closew: i64 = _zag_raw_syscall(3, write_fd, 0, 0, 0, 0, 0);
+    let buffer: *i8 = process_alloc(context, scripted, max_output + 1);
+    let statusp: *i64 = process_alloc(context, scripted, 8) as *i64;
+    let sleep_ts: *i64 = process_alloc(context, scripted, 16) as *i64;
+    if (buffer == null as *i8 || statusp == null as *i64 || sleep_ts == null as *i64) {
+        _zag_eprintln("Zag Script memory limit exceeded by process capture");
+        let _kill_alloc: i64 = _zag_raw_syscall(62, 0 - pid, 9, 0, 0, 0, 0);
+        let _reap_alloc: i64 = _zag_raw_syscall(61, pid, 0, 0, 0, 0, 0);
+        return ProcessResult{ .handle = null as *opaque };
+    }
+    sleep_ts[0] = 0; sleep_ts[1] = 1000000; // 1ms
+    let start: i64 = _zag_clock_monotonic_ms();
+    let total: i64 = 0;
+    let state: i32 = process_state_exited();
+    let done: i32 = 0;
+    let eof: i32 = 0;
+    let reaped: i32 = 0;
+    while (done == 0) {
+        if (total > max_output) { state = process_state_output_limit(); total = max_output; done = 1; }
+        else if (eof == 0) {
+            let nr: i64 = _zag_raw_syscall(0, read_fd, (buffer as i64) + total,
+                (max_output + 1) - total, 0, 0, 0);
+            if (nr > 0) { total = total + nr; }
+            else if (nr == 0) { eof = 1; }
+            else if (nr != 0 - 11 && nr != 0 - 4) { state = process_state_runtime_error(); done = 1; }
+        }
+        if (done == 0 && reaped == 0) {
+            let waited: i64 = _zag_raw_syscall(61, pid, statusp as i64, 1, 0, 0, 0); // WNOHANG
+            if (waited == pid) { reaped = 1; }
+            else if (waited < 0 && waited != 0 - 4) { state = process_state_runtime_error(); done = 1; }
+        }
+        if (done == 0 && eof == 1 && reaped == 1) { done = 1; }
+        let now: i64 = _zag_clock_monotonic_ms();
+        if (done == 0 && (now < 0 || now - start >= timeout_ms)) { state = process_state_timed_out(); done = 1; }
+        if (done == 0) { let _nap: i64 = _zag_raw_syscall(35, sleep_ts as i64, 0, 0, 0, 0, 0); }
+    }
+    if (state != process_state_exited()) {
+        let _kill: i64 = _zag_raw_syscall(62, 0 - pid, 9, 0, 0, 0, 0); // whole process group
+    }
+    if (reaped == 0) { let _reap: i64 = _zag_raw_syscall(61, pid, statusp as i64, 0, 0, 0, 0); }
+    let _closer: i64 = _zag_raw_syscall(3, read_fd, 0, 0, 0, 0, 0);
+    let exit_status: i32 = ((statusp[0] >> 8) & 255) as i32;
+    return ProcessResult{ .handle = process_result_new(context, scripted, exit_status, state, buffer[0..total as i32]) };
+}
+
+fn process_run_bounded(command: []u8, timeout_ms: i64, max_output: i64) ProcessResult {
+    unsafe {
+        return process_run_bounded_internal(null as *opaque, 0, command, timeout_ms, max_output);
+    }
+}
+
+fn process_run_bounded_script(context: *opaque, command: []u8, timeout_ms: i64, max_output: i64) ProcessResult {
+    return process_run_bounded_internal(context, 1, command, timeout_ms, max_output);
 }
 
 fn process_exit(code: i32) void {

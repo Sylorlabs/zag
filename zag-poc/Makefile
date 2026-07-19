@@ -8,12 +8,12 @@
 #   make install   — install znc to /usr/local/bin
 #   make clean     — remove generated artifacts (keeps the znc seed)
 
-.PHONY: all bootstrap znc test test-pure-tree test-authority test-bootstrap test-semantics \
+.PHONY: all bootstrap znc zagd test test-zagd-product test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-analyzer test-hot-reload test-dynamic-abi test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-std-namespace \
         test-diagnostics test-tooling test-programs test-native test-abi-layout test-arm64 \
         test-differential-backends test-arm64-selfhost clean install
 
 # ── Primary target ────────────────────────────────────────────────────────────
-all: znc
+all: znc zagd
 
 # ── Build the native compiler from seed ──────────────────────────────────────
 znc: selfhost/native/znc.zag
@@ -22,8 +22,14 @@ znc: selfhost/native/znc.zag
 	mv -f znc.new znc
 	@echo "   ./znc rebuilt"
 
-bootstrap: znc
+bootstrap: znc zagd
 	@echo "Bootstrap complete — seed: ./znc"
+
+zagd: selfhost/zagd_daemon.zag znc
+	@echo "── building zagd (pure Zag, no libc) ──"
+	./znc selfhost/zagd_daemon.zag -o zagd.new --no-analyze --no-zagd
+	chmod +x zagd.new
+	mv -f zagd.new zagd
 
 # ── Test targets ─────────────────────────────────────────────────────────────
 
@@ -42,14 +48,53 @@ test-bootstrap:
 test-semantics:
 	bash tests/run_semantics.sh
 
+test-typed-authority:
+	bash tests/run_typed_authority.sh
+
 test-diagnostics:
 	bash tests/run_diag.sh
 
 test-tooling:
 	bash tests/run_tooling.sh
 
+# Static analyzer (analyze.zag): leak (L00xx) + efficiency (E01xx) lints.
+test-analyzer:
+	@echo "── static analyzer suite ──"
+	bash tests/run_analyzer.sh
+
+# Live code hot-reload (hot_rt.zag + `znc hot-patch`): end-to-end swap test.
+test-hot-reload:
+	@echo "── hot-reload suite ──"
+	bash tests/run_hot_reload.sh
+
+# Fail-closed Linux GPU reset/fault-domain classification.
+test-gpu-isolation:
+	@echo "── GPU isolation classification suite ──"
+	bash tests/run_gpu_isolation.sh
+
+# Strict ZGK1 instruction and PM4 virtual command processor.
+test-gfx1010-vm:
+	@echo "── virtual GFX10.1 command processor suite ──"
+	bash tests/run_gfx1010_vm.sh
+
+test-gpu-std:
+	@echo "── evidence-first GPU standard library suite ──"
+	bash tests/run_gpu_std.sh
+
+test-gpu-platform:
+	@echo "── GPU compiler/runtime/driver boundary suite ──"
+	bash tests/run_gpu_platform.sh
+
+# Compiler-owned, non-shadowable standard-library import namespace.
+test-std-namespace:
+	@echo "── std namespace suite ──"
+	bash tests/run_std_namespace.sh
+
 test-programs:
 	bash tests/run_programs.sh
+
+test-zagd-product: znc zagd
+	bash tests/run_zagd_product.sh
 
 # Full native backend suite, Zag → ELF, no cc/as/ld/libc.
 test-native:
@@ -75,14 +120,25 @@ test-arm64-selfhost:
 	@echo "── arm64 self-hosting fixpoint ──"
 	bash tests/run_arm64_selfhost.sh
 
+test-dynamic-abi:
+	@echo "── explicit dynamic system ABI gate ──"
+	bash tests/run_dynamic_abi.sh
+
 # Default `make test`: runs the v1 release gates.
-test: znc test-pure-tree test-authority test-bootstrap test-semantics test-diagnostics test-tooling test-programs test-native test-abi-layout test-arm64 test-differential-backends test-arm64-selfhost
+test: znc test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-diagnostics test-tooling test-analyzer test-hot-reload test-dynamic-abi test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-std-namespace test-programs test-native test-abi-layout test-arm64 test-differential-backends test-arm64-selfhost
 	@echo "════ all v1 release gates passed ════"
 
 # ── Install ───────────────────────────────────────────────────────────────────
-install: znc
+install: znc zagd
 	install -m755 znc /usr/local/bin/znc
-	@echo "Installed znc → /usr/local/bin/znc"
+	install -m755 zagd /usr/local/bin/zagd
+	install -d /usr/local/lib/zag/std
+	install -m644 std/*.zag /usr/local/lib/zag/std/
+	install -m644 selfhost/std/process.zag /usr/local/lib/zag/std/process.zag
+	install -m644 selfhost/std/script_string_builder.zag /usr/local/lib/zag/std/script_string_builder.zag
+	install -m644 selfhost/std/script_list.zag /usr/local/lib/zag/std/script_list.zag
+	install -m644 selfhost/std/script_string.zag /usr/local/lib/zag/std/script_string.zag
+	@echo "Installed znc + zagd → /usr/local/bin and std → /usr/local/lib/zag/std"
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 # Removes generated artifacts. Does NOT remove the znc seed binary.

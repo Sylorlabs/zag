@@ -4,14 +4,12 @@ set -eu
 cd "$(dirname "$0")/.."
 pass=0; fail=0
 SCRIPT_DIR="$(dirname "$0")"
-WASM_HOST_JS="$SCRIPT_DIR/wasm_invoke.js"
-WASMTIME_RUN="$SCRIPT_DIR/wasmtime_run.sh"
 
-if [ ! -x ./znc ]; then
-    echo "  XX  ./znc missing — run ./bootstrap.sh first"
+ZNC="${ZNC:-./znc}"
+if [ ! -x "$ZNC" ]; then
+    echo "  XX  $ZNC missing — run ./bootstrap.sh first or set ZNC"
     echo "════ native-wasm pass=0 fail=1 ════"; exit 1
 fi
-ZNC=./znc
 
 wasm_validate(){ local wf="$1"
     local ok=1
@@ -34,7 +32,7 @@ wasm_validate(){ local wf="$1"
     od -An -tx1 "$wf" | grep -q ' 03 ' || { ok=0; echo "      missing function section"; }
     od -An -tx1 "$wf" | grep -q ' 07 ' || { ok=0; echo "      missing export section"; }
     od -An -tx1 "$wf" | grep -q ' 0a ' || { ok=0; echo "      missing code section"; }
-    # exported symbol name for wasmtime --invoke
+    # exported symbol name for a future pure-Zag runtime
     strings "$wf" 2>/dev/null | grep -qx 'main' || { ok=0; echo "      missing exported main"; }
     # no stub markers in binary (strings)
     if strings "$wf" 2>/dev/null | grep -qE 'unsupported|unimplemented|stub|TODO'; then
@@ -47,36 +45,12 @@ wasm_build(){ local src="$1" out="$2"
     "$ZNC" "$src" --target wasm -o "$out" >/tmp/znc_wasm_out 2>&1
 }
 
-# Harsh runtime verification: invoke exported main() and check i32 return.
-# Prefer wasmtime + tests/wasmtime_run.sh (env::print_* host stubs);
-# fall back to tests/wasm_invoke.js when wasmtime/cargo unavailable.
-# SKIP only when neither runner exists; FAIL if a runner is present but breaks.
+# Runtime execution must be implemented in Zag. External engines are not a
+# shipping path, fallback, or test oracle. Until the pure-Zag runtime exists,
+# emission is checked structurally and runtime evidence remains unsupported.
 wasm_runtime_expect(){ local wf="$1" expect="$2" label="$3"
-    if [ -x "$WASMTIME_RUN" ]; then
-        local rt=0
-        "$WASMTIME_RUN" "$wf" "$expect" >/tmp/wasm_rt_out 2>/tmp/wasm_rt_err || rt=$?
-        if [ "$rt" -eq 0 ]; then
-            echo "  ok  runtime $label (wasmtime main() → $expect)"
-            return 0
-        fi
-        if [ "$rt" -eq 127 ]; then
-            : # wasmtime/cargo missing — try node below
-        else
-            echo "  XX  runtime $label (wasmtime host failed)" >&2
-            sed -n '1,5p' /tmp/wasm_rt_err >&2
-            return 1
-        fi
-    fi
-    if command -v node >/dev/null 2>&1 && [ -f "$WASM_HOST_JS" ]; then
-        if node "$WASM_HOST_JS" "$wf" "$expect" >/tmp/wasm_rt_out 2>/tmp/wasm_rt_err; then
-            echo "  ok  runtime $label (node host main() → $expect)"
-            return 0
-        fi
-        echo "  XX  runtime $label (node host failed)"
-        sed -n '1,5p' /tmp/wasm_rt_err
-        return 1
-    fi
-    echo "  --  SKIP runtime $label (no wasmtime/cargo or node; install: curl -sSf https://wasmtime.dev/install.sh | bash)"
+    : "$wf" "$expect"
+    echo "  --  UNSUPPORTED runtime $label (pure-Zag WASM runtime not implemented)"
     return 2
 }
 
@@ -348,6 +322,22 @@ case "$rt" in
     1) fail=$((fail+1)) ;;
     2) : ;;
 esac
+
+# The compiler must never fall back to Wasmtime, Cargo, Node, or another host
+# implementation. `--run` is a stable hard error until Zag owns the runtime.
+if "$ZNC" examples/wasm_ret42.zag --target wasm -o /tmp/wasm_no_external_run.wasm --run \
+    >/tmp/wasm_no_external_run.log 2>&1; then
+    echo "  XX  wasm --run must fail closed without a pure-Zag runtime"
+    fail=$((fail+1))
+elif grep -q 'E0800: WASM execution requires a pure-Zag runtime' /tmp/wasm_no_external_run.log &&
+     ! grep -Eqi 'wasmtime|cargo|node' /tmp/wasm_no_external_run.log; then
+    echo "  ok  wasm --run fails closed without invoking another language/runtime"
+    pass=$((pass+1))
+else
+    echo "  XX  wasm --run missing pure-Zag fail-closed diagnostic"
+    sed -n '1,8p' /tmp/wasm_no_external_run.log
+    fail=$((fail+1))
+fi
 
 echo "════ native-wasm pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]

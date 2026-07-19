@@ -39,5 +39,24 @@ for source in tests/crash_corpus/*.zag; do
   fi
 done
 
+# Literal terminators are diagnosed by the lexer rather than becoming a parser
+# out-of-bounds path.  Keep this explicit so a future recovery change does not
+# regress to a crash or silently accept the malformed literal.
+for source in unterminated_string unterminated_char; do
+  out="$tmp/$source.literal.out"
+  set +e
+  "$ZNC" "tests/crash_corpus/$source.zag" -o "$out" >"$tmp/$source.literal.log" 2>&1
+  status=$?
+  set -e
+  if [ "$status" -ne 0 ] && [ ! -e "$out" ] && rg -q 'E0002: unterminated' "$tmp/$source.literal.log"; then
+    echo "  ok  $source has lexical diagnostic"
+    pass=$((pass + 1))
+  else
+    echo "  XX  $source lacks lexical E0002 diagnostic"
+    sed -n '1,12p' "$tmp/$source.literal.log"
+    fail=$((fail + 1))
+  fi
+done
+
 echo "════ crash-corpus pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]

@@ -29,24 +29,25 @@ echo "── Zag v2 release gate ──"
 run_gate "bootstrap/rebuild" ./bootstrap.sh
 run_gate "v1 semantic compatibility" bash tests/run_semantics.sh
 run_gate "v1 native execution" bash tests/run_native.sh
+run_gate "shared declared-type authority" bash tests/run_typed_authority.sh
 run_gate "v2 edition boundary" bash tests/run_v2_edition.sh
+run_gate "unsafe lexical and raw-pointer boundary" bash tests/run_v2_edition.sh
 run_gate "v2 option rejection" bash tests/run_v2_option_rejection.sh
 run_gate "malformed-input crash corpus" bash tests/run_crash_corpus.sh
 run_gate "deterministic fuzz smoke" bash tests/run_fuzz_smoke.sh
 run_gate "hard errors leave no artifact" bash tests/run_no_artifact_errors.sh
 run_gate "documentation consistency" bash tests/run_docs_consistency.sh
 run_gate "generated support matrix" bash tests/run_v2_support_matrix.sh
-run_gate "WASM regression" bash tests/run_native_wasm.sh
+run_gate "WASM emission regression (no runtime)" bash tests/run_native_wasm.sh
 run_gate "GPU frontend validation (not execution)" bash tests/run_native_gpu.sh
 
-unsupported "unsafe boundaries" "no v2 unsafe AST, type rules, or lowering"
-unsupported "pointer and memory model" "no v2 provenance/alignment/lifetime implementation"
+unsupported "pointer and memory model" "raw pointer categories and lexical checks exist, but provenance/alignment/lifetime instrumentation is incomplete"
 unsupported "allocator and reclamation" "no specified v2 allocator API or debug allocator"
 unsupported "volatile/MMIO" "no language-level volatile operations"
 unsupported "atomics and concurrency" "no public atomic API or v2 memory model implementation"
 unsupported "C ABI and dynamic linking" "no bidirectional C ABI/shared-library execution suite"
 unsupported "CPU intrinsics/SIMD/inline assembly" "no v2 operand/clobber checked asm interface"
-unsupported "effect adversarial suite" "no Unsafe/Atomic/FFI/GPU effect propagation"
+unsupported "effect adversarial suite" "direct Unsafe propagation is tested, but indirect calls and Atomic/FFI/GPU effects are incomplete"
 unsupported "physical GPU execution" "no runtime enumerate/allocate/dispatch/readback path"
 unsupported "sanitizers" "crash corpus and deterministic fuzz smoke exist, but no sanitizer modes"
 unsupported "documentation verification map" "verification matrix exists but records incomplete required capabilities"

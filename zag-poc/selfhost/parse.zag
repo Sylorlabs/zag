@@ -16,6 +16,7 @@ struct Parser {
     cctr:     i32,                // unique-name counter for hoisted closures
     fn_eff:   []u8,               // effect row of the most recently parsed fn type ("" if none/non-fn)
     consts:   ArrayList[[]u8],    // top-level `const` names → desugared to nullary fns; bare refs auto-call
+    unsafe_next: i32,              // top-level `unsafe fn` marker consumed by parse_fn
 }
 
 // ── cursor helpers ──────────────────────────────────────────────────────────
@@ -121,7 +122,20 @@ fn parse_fn_type(p: *Parser) []u8 {
 // ── types (returns the type as a []u8 string) ───────────────────────────────
 fn parse_type(p: *Parser) []u8 {
     if (at_k(p, Tk.KwFn)) { return parse_fn_type(p); }
-    if (at_op(p, "*")) { let _t: Token = adv(p); return _zag_str_concat("*", parse_type(p)); }
+    if (at_op(p, "*")) {
+        let _t: Token = adv(p);
+        if (at_k(p, Tk.Ident) && (@strEq(cur(p).val, "const") || @strEq(cur(p).val, "mut") ||
+            @strEq(cur(p).val, "device") || @strEq(cur(p).val, "workgroup") ||
+            @strEq(cur(p).val, "host"))) {
+            let qual: []u8 = adv(p).val;
+            return _zag_str_concat(_zag_str_concat("*", _zag_str_concat(qual, " ")), parse_type(p));
+        }
+        if (at_k(p, Tk.Ident) && @strEq(cur(p).val, "opaque")) {
+            let _q: Token = adv(p);
+            return "*opaque";
+        }
+        return _zag_str_concat("*", parse_type(p));
+    }
     if (at_op(p, "?")) { let _t: Token = adv(p); return _zag_str_concat("?", parse_type(p)); }
     if (at_op(p, "!")) { let _t: Token = adv(p); return _zag_str_concat("!", parse_type(p)); }
     if (at_k(p, Tk.Lbracket)) {
@@ -135,6 +149,20 @@ fn parse_type(p: *Parser) []u8 {
     if (at_k(p, Tk.Dot)) {
         let _d: Token = adv(p);
         nm = _zag_str_concat(_zag_str_concat(nm, "__"), adv(p).val);
+    }
+    // Dimensioned hardware type application: vsa_b<10000>. This is distinct
+    // from generic type arguments because the payload is a compile-time
+    // integer dimension, not a type. Preserve one canonical spelling so every
+    // semantic/backend path sees the same type instead of stray `<`, integer,
+    // and `>` tokens leaking into following parameters.
+    if (at_op(p, "<")) {
+        let _lt: Token = adv(p);
+        let s: []u8 = _zag_str_concat(nm, "<");
+        while (!at_op(p, ">")) {
+            s = _zag_str_concat(s, adv(p).val);
+        }
+        let _gt: Token = adv(p);
+        return _zag_str_concat(s, ">");
     }
     // generic type application: Base[T1,T2]
     if (at_k(p, Tk.Lbracket)) {
@@ -608,6 +636,13 @@ fn parse_switch(p: *Parser) *Node {
 
 fn parse_stmt(p: *Parser) *Node {
     if (at_k(p, Tk.KwSwitch)) { return parse_switch(p); }
+    // V2 lexical unsafe block. Keep the boundary explicit so every semantic
+    // and lowering consumer must intentionally preserve or reject it.
+    if (at_k(p, Tk.Ident) && @strEq(cur(p).val, "unsafe")) {
+        let _u: Token = adv(p);
+        let body: ArrayList[*Node] = parse_block(p);
+        return mk_unsafe(body);
+    }
     // `@cacheAlign(N) let x: T = ...` — pin a hot local to its own cache line.
     let calign: i32 = cache_align_opt(p);
     if (at_k(p, Tk.KwLet)) {
@@ -677,6 +712,11 @@ fn parse_stmt(p: *Parser) *Node {
         let _b: Token = adv(p);
         eat_semi(p);
         return mk_break();
+    }
+    if (at_k(p, Tk.KwContinue)) {
+        let _c: Token = adv(p);
+        eat_semi(p);
+        return mk_continue();
     }
     if (at_k(p, Tk.KwWhile)) {
         let _t: Token = adv(p);
@@ -753,6 +793,10 @@ fn parse_fn(p: *Parser, is_pub: i32) *Node {
     let reff: []u8 = p.*.fn_eff;
     let annots: ArrayList[[]u8] = make[[]u8](2);
     while (at_k(p, Tk.Annot)) { push[[]u8](&annots, adv(p).val); }
+    if (p.*.unsafe_next == 1) {
+        push[[]u8](&annots, "@unsafe");
+        p.*.unsafe_next = 0;
+    }
     let body: ArrayList[*Node] = make[*Node](8);
     if (is_extern == 1) {
         eat_semi(p);
@@ -763,6 +807,12 @@ fn parse_fn(p: *Parser, is_pub: i32) *Node {
         body = parse_block(p);
     }
     return new(Node{ .fn_decl = FnDecl{ .name = name, .tparams = tparams, .params = params, .ret = ret, .annots = annots, .body = body, .is_extern = is_extern, .ret_eff = reff, .caps = 0, .cap_names = "", .cap_types = "", .line = _fn.line, .is_pub = is_pub } });
+}
+
+fn parse_unsafe_fn(p: *Parser, is_pub: i32) *Node {
+    let _unsafe: Token = adv(p);
+    p.*.unsafe_next = 1;
+    return parse_fn(p, is_pub);
 }
 
 // Optional `@cacheAlign(N)` prefix → N (a positive integer), else 0. Consumes
@@ -1236,6 +1286,7 @@ fn q_rewrite_stmt(n: *Node, names: ArrayList[[]u8], qual: []u8, locals: *ArrayLi
             q_rewrite_block(w.body, names, qual, locals);
             locals.*.len = save_w;
         }
+        .unsafe_ => |u| { q_rewrite_block(u.body, names, qual, locals); }
         .assign => |a| { q_rewrite_expr(a.target, names, qual, locals); q_rewrite_expr(a.expr, names, qual, locals); }
         .switch_ => |sw| {
             q_rewrite_expr(sw.subject, names, qual, locals);
@@ -1518,6 +1569,7 @@ fn rewrite_stmt(n: *Node, aliases: ArrayList[[]u8], locals: *ArrayList[[]u8]) vo
             rewrite_block(w.body, aliases, locals);
             locals.*.len = save_w;
         }
+        .unsafe_ => |u| { rewrite_block(u.body, aliases, locals); }
         .assign => |a| { rewrite_expr(a.target, aliases, locals); rewrite_expr(a.expr, aliases, locals); }
         .switch_ => |sw| {
             rewrite_expr(sw.subject, aliases, locals);
@@ -1558,9 +1610,49 @@ fn rewrite_decls(decls: ArrayList[*Node], aliases: ArrayList[[]u8]) void {
     }
 }
 
-// Resolve an @import path: try relative to base_dir first, then lib/ sibling.
+fn std_import_name(relpath: []u8) []u8 {
+    if (relpath.len <= 4 || relpath[0] != 's' || relpath[1] != 't' ||
+        relpath[2] != 'd' || relpath[3] != ':') { return ""; }
+    let name: []u8 = relpath[4..];
+    let i: i32 = 0;
+    while (i < name.len) {
+        let c: u8 = name[i];
+        let safe: bool = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '/';
+        if (!safe || (c == '/' && (i == 0 || i + 1 == name.len))) { return ""; }
+        i = i + 1;
+    }
+    return _zag_str_concat(name, ".zag");
+}
+
+// Resolve an @import path. `std:name` is compiler-owned and cannot be shadowed
+// by the project: repository builds resolve beside znc, installed builds use
+// /usr/local/lib/zag/std. Ordinary paths remain source-relative with lib/
+// fallback for compatibility.
 // Returns the first path that exists, or the relative path as a fallback.
 fn resolve_import_path(relpath: []u8, base_dir: []u8) []u8 {
+    let std_name: []u8 = std_import_name(relpath);
+    if (std_name.len > 0) {
+        let exe_dir: []u8 = dir_of(_zag_arg(0));
+        let bundled: []u8 = join_path(join_path(exe_dir,"std"),std_name);
+        if (_zag_file_exists(bundled) == 1) { return bundled; }
+        let source_tree: []u8 = join_path("std", std_name);
+        if (_zag_file_exists(source_tree) == 1) { return source_tree; }
+        if (@strEq(std_name, "process.zag") || @strEq(std_name, "script_io.zag") || @strEq(std_name, "script_string_builder.zag") ||
+            @strEq(std_name, "script_list.zag") || @strEq(std_name, "script_string.zag") || @strEq(std_name, "script_path.zag")) {
+            let selfhost_module: []u8 = join_path(join_path(exe_dir, "selfhost/std"), std_name);
+            if (_zag_file_exists(selfhost_module) == 1) { return selfhost_module; }
+            let source_module: []u8 = join_path("selfhost/std", std_name);
+            if (_zag_file_exists(source_module) == 1) { return source_module; }
+        }
+        let installed: []u8 = join_path("/usr/local/lib/zag/std",std_name);
+        if (_zag_file_exists(installed) == 1) { return installed; }
+        return bundled;
+    }
+    if (relpath.len >= 4 && relpath[0] == 's' && relpath[1] == 't' &&
+        relpath[2] == 'd' && relpath[3] == ':') {
+        return "/__zag_invalid_std_import__";
+    }
     let p1: []u8 = join_path(base_dir, relpath);
     if (_zag_file_exists(p1) == 1) { return p1; }
     // Try lib/ sibling of base_dir's parent
@@ -1623,7 +1715,8 @@ fn canon_path(p: []u8) []u8 {
 // (when has_qual==1) prefixes every decl with `qual__` and substitutes type
 // references, so a module imported `as name` lives in its own namespace.
 // `loading` tracks the current import stack for circular dependency detection.
-fn load_module(path0: []u8, qual: []u8, has_qual: i32, seen: *ArrayList[[]u8], out: *ArrayList[*Node], aliases: *ArrayList[[]u8], loading: *ArrayList[[]u8]) void {
+fn resolved_module_has(modules:ArrayList[ResolvedModule],path:[]u8)i32{let i:i32=0;while(i<len[ResolvedModule](modules)){if(@strEq(get[ResolvedModule](modules,i).path,path)){return 1;}i=i+1;}return 0;}
+fn load_module(path0: []u8, qual: []u8, has_qual: i32, seen: *ArrayList[[]u8], out: *ArrayList[*Node], aliases: *ArrayList[[]u8], loading: *ArrayList[[]u8], modules:*ArrayList[ResolvedModule], imports:*ArrayList[ResolvedImport]) void {
     let path: []u8 = canon_path(path0);
     // Circular import detection must come first (before seen dedup).
     // If path is on the loading stack it is currently being parsed — that is a cycle.
@@ -1655,14 +1748,17 @@ fn load_module(path0: []u8, qual: []u8, has_qual: i32, seen: *ArrayList[[]u8], o
         let _dropped: []u8 = pop[[]u8](loading);
         _zag_exit(1);
     }
+    if(resolved_module_has(modules.*,path)==0){push[ResolvedModule](modules,ResolvedModule{.path=path,.source=src});}
     let mod_dir: []u8 = dir_of(path);
     if (has_qual == 1) {
         // Qualified: resolve into a private list, then prefix + splice.
         let inner: ArrayList[*Node] = make[*Node](8);
-        resolve_src(src, mod_dir, seen, &inner, aliases, loading);
+        let imported_profile: i32 = 0;
+        resolve_src(src, mod_dir, seen, &inner, aliases, loading, 0, &imported_profile,path,modules,imports);
         qualify_into(inner, qual, out);
     } else {
-        resolve_src(src, mod_dir, seen, out, aliases, loading);
+        let imported_profile: i32 = 0;
+        resolve_src(src, mod_dir, seen, out, aliases, loading, 0, &imported_profile,path,modules,imports);
     }
     let _dropped: []u8 = pop[[]u8](loading);   // pop from in-progress stack
 }
@@ -1715,16 +1811,172 @@ fn check_zag_mod(base_dir: []u8) void {
     check_zag_mod_deps(mod_src, base_dir);
 }
 
+// Bind the deliberately small script allocation convenience to this script's
+// hidden context. This walk is applied only to root executable statements;
+// imported strict declarations and explicit allocator calls are untouched.
+fn script_has_user_fn(decls: ArrayList[*Node], name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .fn_decl => |f| { if (@strEq(f.name, name)) { return 1; } }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn script_list_literal_class(node: *Node) i32 {
+    let result: i32 = switch (node.*) {
+        .ilit => |_value| 1,
+        .slit => |_value| 2,
+        .id => |_value| 0,
+        else => 0,
+    };
+    switch (node.*) {
+        .id => |value| {
+            if (@strEq(value.name, "true") || @strEq(value.name, "false")) { result = 3; }
+        }
+        else => { }
+    }
+    return result;
+}
+
+fn script_bind_expr(n: *Node, decls: ArrayList[*Node]) void {
+    switch (n.*) {
+        .call => |c| {
+            let bind: i32 = 0;
+            switch (c.callee.*) { .id => |id| {
+                if (@strEq(id.name, "script_alloc")) { bind = 1; }
+                if (@strEq(id.name, "script_alloc_used")) { bind = 2; }
+                if (@strEq(id.name, "print")) { bind = 3; }
+                if (@strEq(id.name, "println")) { bind = 4; }
+                if (@strEq(id.name, "read_file")) { bind = 5; }
+                if (@strEq(id.name, "write_file")) { bind = 6; }
+                if (@strEq(id.name, "args_len")) { bind = 7; }
+                if (@strEq(id.name, "arg")) { bind = 8; }
+                if (@strEq(id.name, "string_concat")) { bind = 9; }
+                if (@strEq(id.name, "process_run_timeout")) { bind = 10; }
+                if (@strEq(id.name, "string_builder")) { bind = 11; }
+                if (@strEq(id.name, "list")) { bind = 12; }
+                if (@strEq(id.name, "new")) { bind = 13; }
+                if (@strEq(id.name, "args")) { bind = 14; }
+                if (@strEq(id.name, "path_join")) { bind = 15; }
+                if (@strEq(id.name, "path_basename")) { bind = 16; }
+                if (@strEq(id.name, "path_dirname")) { bind = 17; }
+                if (@strEq(id.name, "path_extension")) { bind = 18; }
+                if (bind > 0 && script_has_user_fn(decls, id.name) == 1) { bind = 0; }
+            } else => { } }
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) { script_bind_expr(get[*Node](c.args, i), decls); i = i + 1; }
+            if (bind > 0) {
+                let args: ArrayList[*Node] = make[*Node](len[*Node](c.args) + 1);
+                push[*Node](&args, mk_ident("__zag_script_context"));
+                let j: i32 = 0; while (j < len[*Node](c.args)) { push[*Node](&args, get[*Node](c.args, j)); j = j + 1; }
+                if (bind == 1) { n.* = mk_call(mk_ident("_zag_script_alloc"), args).*; }
+                else if (bind == 2) { n.* = mk_call(mk_ident("_zag_script_alloc_used"), args).*; }
+                else if (bind == 3) { n.* = mk_call(mk_ident("_zag_print"), c.args).*; }
+                else if (bind == 4) { n.* = mk_call(mk_ident("_zag_println"), c.args).*; }
+                else if (bind == 5) { n.* = mk_call(mk_ident("script_read_file"), args).*; }
+                else if (bind == 6) { n.* = mk_call(mk_ident("_zag_write_file"), c.args).*; }
+                else if (bind == 7) { n.* = mk_call(mk_ident("_zag_argc"), c.args).*; }
+                else if (bind == 8) { n.* = mk_call(mk_ident("_zag_arg"), c.args).*; }
+                else if (bind == 9) { n.* = mk_call(mk_ident("script_string_concat"), args).*; }
+                else if (bind == 10) { n.* = mk_call(mk_ident("process_run_bounded_script"), args).*; }
+                else if (bind == 11) { n.* = mk_call(mk_ident("script_string_builder_new"), args).*; }
+                else if (bind == 13) { n.* = mk_call(mk_ident("_zag_script_new"), args).*; }
+                else if (bind == 14) { n.* = mk_call(mk_ident("script_args"), args).*; }
+                else if (bind == 15) { n.* = mk_call(mk_ident("script_path_join"), args).*; }
+                else if (bind == 16) { n.* = mk_call(mk_ident("script_path_basename"), args).*; }
+                else if (bind == 17) { n.* = mk_call(mk_ident("script_path_dirname"), args).*; }
+                else if (bind == 18) { n.* = mk_call(mk_ident("script_path_extension"), args).*; }
+                else {
+                    let list_arity: i32 = len[*Node](c.args);
+                    if (list_arity < 1 || list_arity > 4) {
+                        _zag_eprintln("Zag Script list expects one to four initial values");
+                        _zag_exit(1);
+                    }
+                    let literal_class: i32 = script_list_literal_class(get[*Node](c.args, 0));
+                    let list_i: i32 = 1;
+                    while (list_i < list_arity) {
+                        let next_class: i32 = script_list_literal_class(get[*Node](c.args, list_i));
+                        if (literal_class != 0 && next_class != 0 && literal_class != next_class) {
+                            _zag_eprintln("Zag Script list elements have incompatible literal types");
+                            _zag_exit(1);
+                        }
+                        list_i = list_i + 1;
+                    }
+                    let constructor: []u8 = _zag_str_concat("script_list", _zag_i64_to_str(list_arity as i64));
+                    n.* = mk_call(mk_ident(constructor), args).*;
+                }
+            } else { script_bind_expr(c.callee, decls); }
+        }
+        .bin => |b| { script_bind_expr(b.l, decls); script_bind_expr(b.r, decls); }
+        .un => |u| { script_bind_expr(u.e, decls); }
+        .fld => |f| { script_bind_expr(f.base, decls); }
+        .idx => |x| { script_bind_expr(x.base, decls); script_bind_expr(x.idx, decls); }
+        .cast_ => |c| { script_bind_expr(c.expr, decls); }
+        .slice_ => |s| { script_bind_expr(s.base, decls); script_bind_expr(s.lo, decls); script_bind_expr(s.hi, decls); }
+        .slit_ => |s| { let i: i32 = 0; while (i < len[FieldInit](s.fields)) { script_bind_expr(get[FieldInit](s.fields, i).val, decls); i = i + 1; } }
+        .switch_ => |sw| {
+            script_bind_expr(sw.subject, decls);
+            let i: i32 = 0; while (i < len[SwitchArm](sw.arms)) { script_bind_block(get[SwitchArm](sw.arms, i).body, decls); i = i + 1; }
+            script_bind_block(sw.els_body, decls);
+        }
+        else => { }
+    }
+}
+fn script_bind_stmt(n: *Node, decls: ArrayList[*Node]) void {
+    switch (n.*) {
+        .let_ => |l| { if (l.has_init == 1) { script_bind_expr(l.expr, decls); } }
+        .ret => |r| { if (r.has_expr == 1) { script_bind_expr(r.expr, decls); } }
+        .estmt => |e| { script_bind_expr(e.expr, decls); }
+        .assign => |a| { script_bind_expr(a.target, decls); script_bind_expr(a.expr, decls); }
+        .if_ => |x| { script_bind_expr(x.cond, decls); script_bind_block(x.then_body, decls); script_bind_block(x.els_body, decls); }
+        .while_ => |w| { script_bind_expr(w.cond, decls); script_bind_block(w.body, decls); }
+        .unsafe_ => |u| { script_bind_block(u.body, decls); }
+        .switch_ => |sw| {
+            script_bind_expr(sw.subject, decls);
+            let i: i32 = 0; while (i < len[SwitchArm](sw.arms)) { script_bind_block(get[SwitchArm](sw.arms, i).body, decls); i = i + 1; }
+            script_bind_block(sw.els_body, decls);
+        }
+        else => { }
+    }
+}
+fn script_bind_block(body: ArrayList[*Node], decls: ArrayList[*Node]) void {
+    let i: i32 = 0; while (i < len[*Node](body)) { script_bind_stmt(get[*Node](body, i), decls); i = i + 1; }
+}
+
 // Parse the top-level decls of one source string, resolving its @imports
 // relative to `base_dir`, appending decls to `out`. Module aliases (`as name`)
 // are accumulated GLOBALLY in `aliases`, so `alias.member` rewriting is
 // applied once over all declarations afterward.
 // `loading` is the current in-progress import stack for circular detection.
-fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayList[*Node], aliases: *ArrayList[[]u8], loading: *ArrayList[[]u8]) void {
+fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayList[*Node], aliases: *ArrayList[[]u8], loading: *ArrayList[[]u8], is_root: i32, root_profile: *i32, current_path:[]u8, modules:*ArrayList[ResolvedModule], imports:*ArrayList[ResolvedImport]) void {
     let toks: ArrayList[Token] = lex(src);
-    let p: Parser = Parser{ .toks = toks, .i = 0, .closures = make[*Node](2), .cctr = 0, .fn_eff = "", .consts = make[[]u8](4) };
+    let p: Parser = Parser{ .toks = toks, .i = 0, .closures = make[*Node](2), .cctr = 0, .fn_eff = "", .consts = make[[]u8](4), .unsafe_next = 0 };
+    let script_seen: i32 = 0;
+    let executable_seen: i32 = 0;
+    let script_body: ArrayList[*Node] = make[*Node](8);
     while (!at_k(&p, Tk.Eof)) {
-        if (at_k(&p, Tk.Annot) && @strEq(cur(&p).val, "@import")) {
+        if (at_k(&p, Tk.Ident) && @strEq(cur(&p).val, "script")) {
+            let st: Token = adv(&p);
+            if (!at_k(&p, Tk.Semi)) {
+                diag_emit("E0012", "script profile declaration must be `script;`", "", st.line, st.col, 6, "the script declaration is a file-level marker", "add `;` after `script`", src);
+                _zag_exit(1);
+            }
+            let _semi: Token = adv(&p);
+            if (script_seen == 1) {
+                diag_emit("E0013", "duplicate `script;` declaration", "", st.line, st.col, 6, "a module has exactly one compilation profile", "remove the duplicate declaration", src);
+                _zag_exit(1);
+            }
+            if (executable_seen == 1) {
+                diag_emit("E0014", "`script;` must appear before executable top-level statements", "", st.line, st.col, 6, "profile selection must precede script execution", "move `script;` to the beginning of the file", src);
+                _zag_exit(1);
+            }
+            script_seen = 1;
+            if (is_root == 1) { root_profile.* = 1; }
+        } else if (at_k(&p, Tk.Annot) && @strEq(cur(&p).val, "@import")) {
             let _imp: Token = adv(&p);     // @import
             let _lp: Token = adv(&p);      // (
             let pathtok: Token = adv(&p);  // "path"
@@ -1739,7 +1991,8 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
                 if (!seen_has(aliases.*, qual)) { push[[]u8](aliases, qual); }
             }
             let resolved: []u8 = resolve_import_path(relpath, base_dir);
-            load_module(resolved, qual, has_qual, seen, out, aliases, loading);
+            let canonical:[]u8=canon_path(resolved);push[ResolvedImport](imports,ResolvedImport{.importer=current_path,.imported=canonical});
+            load_module(canonical, qual, has_qual, seen, out, aliases, loading,modules,imports);
         } else if (at_k(&p, Tk.Annot) && @strEq(cur(&p).val, "@link")) {
             let _lnk: Token = adv(&p);       // @link
             let _lp2: Token = adv(&p);        // (
@@ -1750,7 +2003,9 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
         } else if (at_k(&p, Tk.KwPub)) {
             // `pub` keyword — marks the next decl as part of the public API
             let _pub: Token = adv(&p);   // pub
-            if (at_k(&p, Tk.KwStruct)) {
+            if (at_k(&p, Tk.Ident) && @strEq(cur(&p).val, "unsafe")) {
+                push[*Node](out, parse_unsafe_fn(&p, 1));
+            } else if (at_k(&p, Tk.KwStruct)) {
                 push[*Node](out, parse_struct(&p, 1));
             } else if (at_k(&p, Tk.KwUnion)) {
                 push[*Node](out, parse_union(&p));
@@ -1759,6 +2014,8 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
             } else {
                 push[*Node](out, parse_fn(&p, 1));
             }
+        } else if (at_k(&p, Tk.Ident) && @strEq(cur(&p).val, "unsafe")) {
+            push[*Node](out, parse_unsafe_fn(&p, 0));
         } else if (at_k(&p, Tk.KwStruct)) {
             push[*Node](out, parse_struct(&p, 0));
         } else if (at_k(&p, Tk.KwUnion)) {
@@ -1773,8 +2030,14 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
             push[*Node](out, parse_interface(&p));
         } else if (at_k(&p, Tk.Ident) && @strEq(cur(&p).val, "const")) {
             push[*Node](out, parse_const(&p));
-        } else if (at_k(&p, Tk.Annot) || at_k(&p, Tk.Ident) || at_k(&p, Tk.KwExtern) || at_k(&p, Tk.KwFn)) {
+        } else if (at_k(&p, Tk.Annot) || at_k(&p, Tk.KwExtern) || at_k(&p, Tk.KwFn)) {
             push[*Node](out, parse_fn(&p, 0));
+        } else if (script_seen == 1) {
+            // Imported script modules retain their ordinary declarations but
+            // never contribute executable body statements to the root.
+            executable_seen = 1;
+            let stmt: *Node = parse_stmt(&p);
+            if (is_root == 1) { push[*Node](&script_body, stmt); }
         } else {
             diag_emit("E0010",
                 _zag_str_concat("unexpected token at top level: `", _zag_str_concat(cur(&p).val, "`")),
@@ -1791,21 +2054,308 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
         push[*Node](out, get[*Node](p.closures, ci));
         ci = ci + 1;
     }
+    if (is_root == 1 && script_seen == 1) {
+        let di: i32 = 0;
+        while (di < len[*Node](out.*)) {
+            switch (get[*Node](out.*, di).*) {
+                .fn_decl => |f| {
+                    if (@strEq(f.name, "main")) {
+                        diag_emit("E0015", "script module conflicts with user-defined `main`", "", f.line, 1, 4, "the script profile generates the process entry point", "remove `main` or remove `script;`", src);
+                        _zag_exit(1);
+                    }
+                    if (@strEq(f.name, "__zag_compiler_script_body_7f3a") ||
+                        @strEq(f.name, "__zag_compiler_script_uncaught_7f3a") ||
+                        @strEq(f.name, "_zag_script_context_init") ||
+                        @strEq(f.name, "_zag_script_context_shutdown")) {
+                        diag_emit("E0016", "declaration conflicts with a compiler-owned script symbol", "", f.line, 1, f.name.len,
+                            "generated script runtime symbols are reserved and are not user APIs",
+                            "rename this declaration", src);
+                        _zag_exit(1);
+                    }
+                    if (@strEq(f.name, "_zag_script_alloc") || @strEq(f.name, "_zag_script_alloc_used") || @strEq(f.name, "_zag_script_new")) {
+                        diag_emit("E0016", "declaration conflicts with a compiler-owned script symbol", "", f.line, 1, f.name.len,
+                            "generated script runtime symbols are reserved and are not user APIs", "rename this declaration", src);
+                        _zag_exit(1);
+                    }
+                }
+                else => { }
+            }
+            di = di + 1;
+        }
+        // Load the ordinary strict-Zag implementation only when the root uses
+        // the bounded-process convenience and has not declared its own override.
+        if (script_has_user_fn(out.*, "process_run_timeout") == 0) {
+            let wants_process: i32 = 0;
+            let si: i32 = 0;
+            let needle: []u8 = "process_run_timeout";
+            while (si + needle.len <= src.len && wants_process == 0) {
+                if (@strEq(src[si..si + needle.len], needle)) { wants_process = 1; }
+                si = si + 1;
+            }
+            if (wants_process == 1) {
+                load_module(resolve_import_path("std:process", base_dir), "", 0,
+                    seen, out, aliases, loading, modules, imports);
+            }
+        }
+        if (script_has_user_fn(out.*, "read_file") == 0) {
+            let wants_read: i32 = 0;
+            let ri: i32 = 0;
+            let read_needle: []u8 = "read_file(";
+            while (ri + read_needle.len <= src.len && wants_read == 0) {
+                if (@strEq(src[ri..ri + read_needle.len], read_needle)) { wants_read = 1; }
+                ri = ri + 1;
+            }
+            if (wants_read == 1) {
+                load_module(resolve_import_path("std:script_io", base_dir), "", 0,
+                    seen, out, aliases, loading, modules, imports);
+            }
+        }
+        if (script_has_user_fn(out.*, "string_builder") == 0) {
+            let wants_builder: i32 = 0;
+            let bi: i32 = 0;
+            let builder_needle: []u8 = "string_builder";
+            while (bi + builder_needle.len <= src.len && wants_builder == 0) {
+                if (@strEq(src[bi..bi + builder_needle.len], builder_needle)) { wants_builder = 1; }
+                bi = bi + 1;
+            }
+            if (wants_builder == 1) {
+                load_module(resolve_import_path("std:script_string_builder", base_dir), "", 0,
+                    seen, out, aliases, loading, modules, imports);
+            }
+        }
+        if (script_has_user_fn(out.*, "list") == 0) {
+            let wants_list: i32 = 0;
+            let li: i32 = 0;
+            let list_needle: []u8 = "list(";
+            while (li + list_needle.len <= src.len && wants_list == 0) {
+                if (@strEq(src[li..li + list_needle.len], list_needle)) { wants_list = 1; }
+                li = li + 1;
+            }
+            if (wants_list == 1) {
+                load_module(resolve_import_path("std:script_list", base_dir), "", 0,
+                    seen, out, aliases, loading, modules, imports);
+            }
+        }
+        if (script_has_user_fn(out.*, "args") == 0) {
+            let wants_args:i32=0;let ai:i32=0;let args_needle:[]u8="args(";
+            while(ai+args_needle.len<=src.len&&wants_args==0){if(@strEq(src[ai..ai+args_needle.len],args_needle)){wants_args=1;}ai=ai+1;}
+            if(wants_args==1){load_module(resolve_import_path("std:script_list",base_dir),"",0,seen,out,aliases,loading,modules,imports);}
+        }
+        let wants_path:i32=0;let path_i:i32=0;
+        while(path_i+5<=src.len&&wants_path==0){if(@strEq(src[path_i..path_i+5],"path_")){wants_path=1;}path_i=path_i+1;}
+        if(wants_path==1){load_module(resolve_import_path("std:script_path",base_dir),"",0,seen,out,aliases,loading,modules,imports);}
+        if (script_has_user_fn(out.*, "string_concat") == 0) {
+            let wants_concat: i32 = 0;
+            let sci: i32 = 0;
+            let concat_needle: []u8 = "string_concat(";
+            while (sci + concat_needle.len <= src.len && wants_concat == 0) {
+                if (@strEq(src[sci..sci + concat_needle.len], concat_needle)) { wants_concat = 1; }
+                sci = sci + 1;
+            }
+            if (wants_concat == 1) {
+                load_module(resolve_import_path("std:script_string", base_dir), "", 0,
+                    seen, out, aliases, loading, modules, imports);
+            }
+        }
+        // Keep user top-level control flow inside a hidden function. This makes
+        // every return flow back through the process wrapper, so deterministic
+        // shutdown cannot be bypassed by a top-level `return`.
+        // An explicit user declaration wins independently over each prelude convenience.
+        script_bind_block(script_body, out.*);
+        push[*Node](&script_body, mk_ret(1, mk_int("0")));
+        let report_params: ArrayList[Param] = make[Param](1);
+        push[Param](&report_params, Param{ .name = "code", .pty = "i32", .eff = "", .calign = 0 });
+        let report_body: ArrayList[*Node] = make[*Node](3);
+        // Error declarations are represented by the compiler-owned
+        // __zag_errors enum. Emit deterministic name witnesses before the
+        // numeric fallback so uncaught Script diagnostics preserve the user's
+        // declared error identity without a runtime reflection system.
+        let error_decl_i: i32 = 0;
+        while (error_decl_i < len[*Node](out.*)) {
+            switch (get[*Node](out.*, error_decl_i).*) {
+                .enum_ => |errors| {
+                    if (@strEq(errors.name, "__zag_errors")) {
+                        let error_i: i32 = 0;
+                        while (error_i < len[[]u8](errors.members)) {
+                            let named_args: ArrayList[*Node] = make[*Node](1);
+                            push[*Node](&named_args, mk_str(_zag_str_concat("uncaught Zag Script error name: ", get[[]u8](errors.members, error_i))));
+                            let named_body: ArrayList[*Node] = make[*Node](1);
+                            push[*Node](&named_body, mk_estmt(mk_call(mk_ident("_zag_eprintln"), named_args)));
+                            push[*Node](&report_body, mk_if(mk_bin("==", mk_ident("code"),
+                                mk_int(_zag_i64_to_str((error_i + 1) as i64))), named_body, make[*Node](1), 0));
+                            error_i = error_i + 1;
+                        }
+                    }
+                }
+                else => { }
+            }
+            error_decl_i = error_decl_i + 1;
+        }
+        let code_args: ArrayList[*Node] = make[*Node](1); push[*Node](&code_args, mk_ident("code"));
+        let concat_args: ArrayList[*Node] = make[*Node](2);
+        push[*Node](&concat_args, mk_str("uncaught Zag Script error code "));
+        push[*Node](&concat_args, mk_call(mk_ident("_zag_i64_to_str"), code_args));
+        let print_args: ArrayList[*Node] = make[*Node](1);
+        push[*Node](&print_args, mk_call(mk_ident("_zag_str_concat"), concat_args));
+        push[*Node](&report_body, mk_estmt(mk_call(mk_ident("_zag_eprintln"), print_args)));
+        let where_args: ArrayList[*Node] = make[*Node](1);
+        push[*Node](&where_args, mk_str("operation: root script top-level execution (exact source witness unavailable)"));
+        push[*Node](&report_body, mk_estmt(mk_call(mk_ident("_zag_eprintln"), where_args)));
+        push[*Node](&report_body, mk_ret(1, mk_int("1")));
+        push[*Node](out, new(Node{ .fn_decl = FnDecl{
+            .name = "__zag_compiler_script_uncaught_7f3a", .tparams = make[[]u8](1), .params = report_params,
+            .ret = "i32", .annots = make[[]u8](1), .body = report_body,
+            .is_extern = 0, .ret_eff = "", .caps = 0, .cap_names = "",
+            .cap_types = "", .line = 0, .is_pub = 0 } }));
+        let hidden_params: ArrayList[Param] = make[Param](1);
+        push[Param](&hidden_params, Param{ .name = "__zag_script_context", .pty = "*opaque", .eff = "", .calign = 0 });
+        push[*Node](out, new(Node{ .fn_decl = FnDecl{
+            .name = "__zag_compiler_script_body_7f3a", .tparams = make[[]u8](1), .params = hidden_params,
+            .ret = "!i32", .annots = make[[]u8](1), .body = script_body,
+            .is_extern = 0, .ret_eff = "", .caps = 0, .cap_names = "",
+            .cap_types = "", .line = 0, .is_pub = 0 } }));
+
+        let wrapper: ArrayList[*Node] = make[*Node](5);
+        let init_args: ArrayList[*Node] = make[*Node](1);
+        push[*Node](&init_args, mk_int("67108864"));
+        push[*Node](&wrapper, mk_let("__zag_script_context", "*opaque", 1, 1,
+            mk_call(mk_ident("_zag_script_context_init"), init_args)));
+        let body_args: ArrayList[*Node] = make[*Node](1);
+        push[*Node](&body_args, mk_ident("__zag_script_context"));
+        let caught_args: ArrayList[*Node] = make[*Node](3);
+        push[*Node](&caught_args, mk_call(mk_ident("__zag_compiler_script_body_7f3a"), body_args));
+        push[*Node](&caught_args, mk_ident("__zag_script_error_code"));
+        let report_args: ArrayList[*Node] = make[*Node](1);
+        push[*Node](&report_args, mk_ident("__zag_script_error_code"));
+        push[*Node](&caught_args, mk_call(mk_ident("__zag_compiler_script_uncaught_7f3a"), report_args));
+        push[*Node](&wrapper, mk_let("__zag_script_status", "i32", 1, 1,
+            mk_call(mk_ident("__catchc"), caught_args)));
+        let shutdown_args: ArrayList[*Node] = make[*Node](1);
+        push[*Node](&shutdown_args, mk_ident("__zag_script_context"));
+        push[*Node](&wrapper, mk_estmt(mk_call(mk_ident("_zag_script_context_shutdown"), shutdown_args)));
+        push[*Node](&wrapper, mk_ret(1, mk_ident("__zag_script_status")));
+        push[*Node](out, new(Node{ .fn_decl = FnDecl{
+            .name = "main", .tparams = make[[]u8](1), .params = make[Param](1),
+            .ret = "i32", .annots = make[[]u8](1), .body = wrapper,
+            .is_extern = 0, .ret_eff = "", .caps = 0, .cap_names = "",
+            .cap_types = "", .line = 0, .is_pub = 0 } }));
+    }
 }
 
 // Parse a whole program, resolving @imports relative to `base_dir`.
-fn parse_program_dir(src: []u8, base_dir: []u8) ArrayList[*Node] {
+fn parse_compilation_unit_dir(src: []u8, base_dir: []u8) CompilationUnit {
     let seen: ArrayList[[]u8] = make[[]u8](8);
     let decls: ArrayList[*Node] = make[*Node](8);
     let aliases: ArrayList[[]u8] = make[[]u8](4);
     let loading: ArrayList[[]u8] = make[[]u8](8);
+    let modules:ArrayList[ResolvedModule]=make[ResolvedModule](8);let imports:ArrayList[ResolvedImport]=make[ResolvedImport](8);push[ResolvedModule](&modules,ResolvedModule{.path="<root>",.source=src});
     // Validate zag.mod deps before compiling
     check_zag_mod(base_dir);
-    resolve_src(src, base_dir, &seen, &decls, &aliases, &loading);
+    let profile_code: i32 = 0;
+    resolve_src(src, base_dir, &seen, &decls, &aliases, &loading, 1, &profile_code,"<root>",&modules,&imports);
     // Global alias pass: collapse every `alias.member` → `alias__member` across
     // all decls (aliases propagate through flat re-imports).
     rewrite_decls(decls, aliases);
-    return decls;
+    let profile: ModuleProfile = ModuleProfile.strict;
+    if (profile_code == 1) { profile = ModuleProfile.script; }
+    return CompilationUnit{ .profile = profile, .decls = decls, .modules=modules, .imports=imports };
+}
+
+fn script_default_memory_limit() i64 { return 67108864; }
+fn script_min_memory_limit() i64 { return 1048576; }
+fn script_max_memory_limit() i64 { return 2147483648; }
+
+// Change only the compiler-generated root wrapper's context limit. Imported
+// modules have no wrapper and are never visited. Returns 0 on success, 1 for
+// an invalid range or malformed/non-script unit.
+fn compilation_unit_set_script_memory_limit(unit: *CompilationUnit, limit_bytes: i64) i32 {
+    if (limit_bytes < script_min_memory_limit() || limit_bytes > script_max_memory_limit()) { return 1; }
+    if (unit.*.profile != ModuleProfile.script) { return 1; }
+    let text: []u8 = _zag_i64_to_str(limit_bytes);
+    let i: i32 = 0;
+    while (i < len[*Node](unit.*.decls)) {
+        switch (get[*Node](unit.*.decls, i).*) {
+            .fn_decl => |f| {
+                if (@strEq(f.name, "main") && len[*Node](f.body) > 0) {
+                    switch (get[*Node](f.body, 0).*) {
+                        .let_ => |binding| { switch (binding.expr.*) {
+                            .call => |call| { switch (call.callee.*) {
+                                .id => |id| {
+                                    if (@strEq(id.name, "_zag_script_context_init") && len[*Node](call.args) == 1) {
+                                        let arg: *Node = get[*Node](call.args, 0);
+                                        arg.* = mk_int(text).*;
+                                        return 0;
+                                    }
+                                }
+                                else => { }
+                            } }
+                            else => { }
+                        } }
+                        else => { }
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn compilation_unit_set_script_source_label(unit: *CompilationUnit, path: []u8) i32 {
+    if (unit.*.profile != ModuleProfile.script) { return 1; }
+    let i: i32 = 0;
+    while (i < len[*Node](unit.*.decls)) {
+        switch (get[*Node](unit.*.decls, i).*) {
+            .fn_decl => |f| {
+                if (@strEq(f.name, "__zag_compiler_script_uncaught_7f3a")) {
+                    let j: i32 = 0;
+                    while (j < len[*Node](f.body)) {
+                        switch (get[*Node](f.body, j).*) {
+                            .estmt => |statement| { switch (statement.expr.*) {
+                                .call => |call| {
+                                    if (len[*Node](call.args) == 1) {
+                                        let arg: *Node = get[*Node](call.args, 0);
+                                        switch (arg.*) {
+                                            .slit => |literal| {
+                                                if (literal.text.len >= 22 && @strEq(literal.text[0..22], "operation: root script")) {
+                                                    arg.* = mk_str(_zag_str_concat("source: ", _zag_str_concat(path,
+                                                        " (root Script operation; exact expression witness unavailable)"))).*;
+                                                    return 0;
+                                                }
+                                            }
+                                            else => { }
+                                        }
+                                    }
+                                }
+                                else => { }
+                            } }
+                            else => { }
+                        }
+                        j = j + 1;
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Explicit compiler/embedding API. The supplied value is authoritative over
+// the 64 MiB default. Existing parse_compilation_unit_dir callers are unchanged.
+fn parse_compilation_unit_dir_with_script_limit(src: []u8, base_dir: []u8, limit_bytes: i64) CompilationUnit {
+    let unit: CompilationUnit = parse_compilation_unit_dir(src, base_dir);
+    if (compilation_unit_set_script_memory_limit(&unit, limit_bytes) != 0) {
+        _zag_eprintln("Zag Script memory limit must be between 1048576 and 2147483648 bytes and requires a script root");
+        _zag_exit(1);
+    }
+    return unit;
+}
+
+fn parse_program_dir(src: []u8, base_dir: []u8) ArrayList[*Node] {
+    return parse_compilation_unit_dir(src, base_dir).decls;
 }
 
 // Parse a whole program (decls: struct / enum / union / fn / extern fn).

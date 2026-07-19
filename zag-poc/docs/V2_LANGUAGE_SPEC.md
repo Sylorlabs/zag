@@ -5,10 +5,13 @@ being specified.  V2 is a new edition and does not change edition-2026/v1.
 
 ## Edition and portability
 
-`edition = "2027"` in `zag.mod` selects v2.  A source without this field stays
-edition 2026.  V2 core semantics are portable only where this specification says
-so; CPU instructions, OS APIs, linker formats, and GPU backends are target
-extensions and require an explicit target/capability declaration.
+`edition = "2027"` in the nearest ancestor `zag.mod` selects v2.  A source
+without this field stays edition 2026.  The command-line edition/safety/sanitize
+and target-feature spellings are rejected until their documented implementation
+exists; they are never silently ignored.  V2 core semantics are portable only
+where this specification says so; CPU instructions, OS APIs, linker formats,
+and GPU backends are target extensions and require an explicit target/capability
+declaration.
 
 ## Language tiers
 
@@ -29,7 +32,21 @@ explicit allocator handles, atomics, volatile operations, `extern` ABI
 declarations, target feature declarations, and kernel declarations.  Every
 addition is rejected in edition 2026 with a diagnostic naming the required
 edition.  Detailed normative rules live in the memory, unsafe, ABI,
-concurrency, GPU, and effect documents.
+concurrency, GPU, effect, and safety-tooling documents.
+
+The current vertical slice implements dedicated lexical `unsafe { ... }` AST
+nodes, direct `unsafe fn` declarations/calls, and the raw-pointer qualifier
+forms `*const`, `*mut`, `*opaque`, `*device`, `*workgroup`, and `*host`. Raw
+dereference is rejected outside unsafe, mutation through `*const` is rejected
+in every scope, and calling an unsafe function requires an unsafe call site.
+Unsafe blocks and direct calls infer the `Unsafe` effect, which `@pure` and
+`@realtime` reject. Nullable raw pointers require explicit unwrapping before
+dereference, and direct casts between generic, host, device, and workgroup
+address spaces are rejected. `volatile`, `atomic`, and `asm` remain fail-closed
+and unsupported. Pointer provenance identity, bounds and alignment
+instrumentation, source-span audit records, indirect
+function-value/callback/generic/FFI propagation, and the complete
+unsafe-operation inventory are not yet implemented.
 
 ## Error policy
 
