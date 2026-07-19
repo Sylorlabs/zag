@@ -70,7 +70,14 @@ memory-safety guarantee or the eventual typed error API.
 - A `.zag` suffix alone does not activate the profile.
 - A source file without `script;` keeps regular Zag semantics.
 
-Implicit JSON bindings and a materialized `args` collection are not implemented.
+`args()` materializes a typed `ScriptList[[]u8]`; its backing array is charged
+to the Script allocator while argument string bytes remain immutable process
+storage. `path_join`, `path_basename`, `path_dirname`, and `path_extension` are
+lexical path helpers. `path_join` allocates from the bounded Script context; the
+other helpers return input slices and never access the filesystem.
+
+Implicit JSON bindings are not implemented; JSON remains available through the
+ordinary `std:json` declarations.
 Project `.zagd.conf` defaults for allocator, CPU, device, layout, and Script
 memory budget are resolved by foreground compilation; command-line
 `--script-allocator`, `--cpu`, `--device`, and `--layout` choices win. This is

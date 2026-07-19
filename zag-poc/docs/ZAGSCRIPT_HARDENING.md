@@ -11,6 +11,11 @@ it writes a separate candidate and never overwrites the source.
 separate output, assumptions, parity tests, and unsupported transformations as
 a machine-readable report.
 
+`--apply` is fail-closed: it requires `--test-command`, verifies that the source
+still matches the analyzed snapshot, checks the generated strict candidate,
+creates `<source>.harden.bak`, and restores the original bytes automatically if
+the parity command fails. An existing rollback file is never overwritten.
+
 ## Required hardening output
 
 The current preview identifies generated entry behavior, selected defaults,
