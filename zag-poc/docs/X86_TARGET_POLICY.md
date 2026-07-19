@@ -113,8 +113,15 @@ outside this milestone.
 
 Basic local structs use declaration-order layout with each supported scalar
 field occupying one 4-byte word. Struct literals must initialize every field;
-field loads and stores use fixed frame offsets. Aggregate calls and returns are
-rejected: aggregate sharing uses explicit pointers until a by-value ABI exists.
+field loads and stores use fixed frame offsets. Aggregate returns remain
+rejected; pointer sharing remains the explicit mutation mechanism.
+
+The implemented SysV i386 aggregate-call subset passes basic structs containing
+only 32-bit scalar fields by value. The caller pushes fields in reverse order,
+the first declared field appears at the lowest argument address, and the caller
+removes the complete aggregate argument area. Basic struct parameters support
+field loads. Struct returns, nested aggregates, float aggregate fields, and
+aggregate mutation through by-value parameters reject before artifact output.
 
 `_zag_println_i32(value)` formats the complete signed 32-bit range into a
 bounded stack buffer, appends a newline, and writes it without libc. Its encoder
