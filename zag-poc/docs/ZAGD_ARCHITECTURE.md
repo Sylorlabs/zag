@@ -206,3 +206,16 @@ snapshot, validates its content and target/root keys on restart, exposes reuse
 and invalidation in `.zagd.status`, and includes it in cache-budget eviction.
 Corruption is reported as `incremental_cache_reused=false` with unknown
 invalidation; foreground compilation remains independent of the record.
+
+## Deep finalist execution audit
+
+The planner can ingest target-qualified measurements, but `zagd` does not yet
+execute finalist binaries. Its available process helper has no hard timeout,
+kill/cancellation handle, memory limit, or captured-output equivalence witness.
+Using it would violate the deep-mode resource contract. `zagd_benchmark.zag`
+therefore enforces explicit deep mode, at most three finalists, a 1–5000 ms
+budget, 1–256 MiB memory range, stable source/target identities, cancellation,
+and no network/GPU/source writes, then fails closed with
+`executor_unavailable`. Execution can be enabled only when one Zag runtime
+primitive provides all required controls together; until then no result is
+persisted or labeled measured.
