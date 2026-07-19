@@ -19,7 +19,7 @@ in the encoder.
 | AVX, AVX2, FMA, BMI1, BMI2, AVX-512 | not advertised |
 | `native` | CPUID/OS-gated SSE2 plus POPCNT when present and tested |
 | runtime multiversioning | implemented only for the `popcount(i64)` intrinsic |
-| i686 / ELF32 | executable/relocatable i32 and SysV x87 f64 subset |
+| i686 / ELF32 | executable/relocatable i32 and SysV x87 f32/f64 subset |
 
 Native resolution executes CPUID directly. AVX usability requires the CPU AVX
 bit, OSXSAVE, and XGETBV confirmation that XCR0 enables both XMM and YMM state;
@@ -44,12 +44,13 @@ separate i686 milestone passes.
 ELF32 milestone backend. It accepts a non-generic `i32 main` with initialized
 `i32` locals and parameters, assignment, integer constants, arithmetic,
 comparisons, structured branches/loops, non-generic `i32` calls, and scalar
-`f64` locals, arithmetic, comparison, stack arguments, and ST(0) returns. These nodes
+`f32`/`f64` locals, arithmetic, comparison, width-correct stack arguments, and
+ST(0) returns. These nodes
 lower through a validated integer IR into i386 frames with caller-cleaned stack
 arguments and EAX returns; Linux startup exits through `int 0x80`. Unsupported
 types and AST nodes reject before output. This
-is executable i386-backend proof, not general i686 language support; `f32` and
-64-bit integer signatures remain fail-closed.
+is executable i386-backend proof, not general i686 language support; 64-bit
+integer signatures remain fail-closed.
 
 The milestone defines `usize` and supported pointers as 32-bit ABI words.
 Address-of is restricted to initialized stack locals; dereference and indirect
