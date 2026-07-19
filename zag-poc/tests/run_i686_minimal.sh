@@ -56,5 +56,9 @@ if "$ZNC" tests/i686_struct.zag --target i686 -o "$tmp/struct" --no-analyze >/de
   set +e; "$tmp/struct"; struct_rc=$?; set -e
   if [ "$struct_rc" -eq 42 ]; then ok "basic sequential struct layout field load/store execute"; else bad "struct status=$struct_rc"; fi
 else bad "basic struct program emits"; fi
+if "$ZNC" tests/i686_print.zag --target i686 -o "$tmp/print" --no-analyze >/dev/null; then
+  set +e; print_out=$("$tmp/print"); print_rc=$?; set -e
+  if [ "$print_rc" -eq 42 ] && [ "$print_out" = "-2147483648" ]; then ok "formatted signed i32 print preserves ABI"; else bad "formatted print output=$print_out status=$print_rc"; fi
+else bad "formatted print program emits"; fi
 echo "i686 minimal: pass=$pass fail=$fail"
 test "$fail" -eq 0

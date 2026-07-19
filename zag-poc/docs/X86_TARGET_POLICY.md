@@ -107,6 +107,11 @@ field occupying one 4-byte word. Struct literals must initialize every field;
 field loads and stores use fixed frame offsets. Aggregate calls and returns are
 rejected: aggregate sharing uses explicit pointers until a by-value ABI exists.
 
+`_zag_println_i32(value)` formats the complete signed 32-bit range into a
+bounded stack buffer, appends a newline, and writes it without libc. Its encoder
+preserves EBX, ESI, and EDI and returns the raw write result. General string
+literal/data-section printing is not implied by this integer primitive.
+
 ## Release evidence
 
 Any performance report records hardware, kernel, resolved feature set, compiler
