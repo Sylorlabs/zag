@@ -29,6 +29,8 @@ grep -q '^mode=light$' "$tmp/project/.zagd.status"
 grep -q '^network=false$' "$tmp/project/.zagd.status"
 grep -q '^gpu_background=false$' "$tmp/project/.zagd.status"
 grep -q '^semantic_manifest=true$' "$tmp/project/.zagd.status"
+grep -q '^executable_authority=false$' "$tmp/project/.zag-cache/zagd/plan.record"
+grep -q '^basis=proven-manifest-facts$' "$tmp/project/.zag-cache/zagd/plan.record"
 
 printf 'one\n' > "$tmp/project/app.zag"
 for _ in $(seq 1 100); do
