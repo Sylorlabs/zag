@@ -201,6 +201,7 @@ grep -q '^incremental_cache_reused=true$' "$tmp/project/.zagd.status"
 test -f "$tmp/project/.zag-cache/zagd/incremental.record"
 grep -q '^format=zagd-incremental-v1$' "$tmp/project/.zag-cache/zagd/incremental.record"
 grep -q '^executable_authority=false$' "$tmp/project/.zag-cache/zagd/incremental.record"
+grep -q '^decl=api' "$tmp/project/.zag-cache/zagd/incremental.record"
 before_restart=$(grep '^events=' "$tmp/project/.zagd.status")
 printf 'pub fn api(x:i32) i32 { return x; }\n' > "$tmp/project/reuse.zag"
 sleep 0.15
