@@ -32,7 +32,10 @@ build_stage() {
     label=$3
     log="$tmp/$label.log"
 
-    if ! PATH="$tmp/empty-path" "$compiler" "$source_file" -o "$output" >"$log" 2>&1; then
+    # Reproducibility is a code-generation property. Keep the advisory analyzer
+    # and correctness-independent daemon out of the fixpoint measurement.
+    if ! PATH="$tmp/empty-path" "$compiler" "$source_file" -o "$output" \
+        --no-analyze --no-zagd >"$log" 2>&1; then
         echo "  XX  $label failed" >&2
         sed -n '1,40p' "$log" >&2
         exit 1
