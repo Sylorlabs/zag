@@ -22,4 +22,11 @@ if grep -qm1 -E '^flags.*(^| )popcnt( |$)' /proc/cpuinfo; then
     test "$native_rc" -eq "$generic_rc"
     LC_ALL=C grep -q $'\xf3\x48\x0f\xb8' "$tmp/native"
 fi
+"$compiler" tests/x86_popcount.zag -o "$tmp/runtime" --cpu=runtime --no-zagd --no-analyze >/dev/null
+set +e
+"$tmp/runtime"
+runtime_rc=$?
+set -e
+test "$runtime_rc" -eq "$generic_rc"
+LC_ALL=C grep -q $'\xf3\x48\x0f\xb8' "$tmp/runtime"
 echo "x86 popcount differential: pass"
