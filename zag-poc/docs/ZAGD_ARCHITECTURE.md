@@ -143,6 +143,21 @@ cancelled, non-deep, and mismatched measurements are ignored. Accepted timings
 replace estimates with measured provenance; they never authorize source
 rewrites or bypass foreground equivalence checks.
 
+Profile ingestion uses the bounded `zagd-profile-v1` record. A record is
+accepted only when its checksum and exact compiler-binary, semantic-source and
+target hashes match the current planning request. Hot-region samples are
+positive counters with canonical region names; selection is capped by a hard
+budget, sorted by descending count and then lexical name, and contains no
+random tie breaking. Stale, corrupt, oversized and mismatched profiles are
+ignored.
+
+Profile-backed backend records currently select only the optional instructions
+the native backend already implements and differentially tests: POPCNT and
+BMI1 ANDN, and only when the resolved target feature set permits them. A packed
+SIMD request is recorded as unsupported and never selected because this encoder
+does not yet implement packed SIMD. GPU and kernel tuning are not profile
+candidates in this release.
+
 Every suggestion identifies evidence, confidence, estimated benefit/cost,
 rejected alternatives and invalidation conditions. Automatic script choices
 use the same report format. Regular Zag plans remain advisory except existing

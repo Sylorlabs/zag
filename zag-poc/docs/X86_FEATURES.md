@@ -30,6 +30,12 @@ encoder permission set. That permitted set is
 currently SSE2 plus separately gated POPCNT lowering. Detecting AVX, AVX2, FMA,
 BMI or AVX-512 never enables their emission.
 
+The planner follows the same permission boundary. Exact-key profile samples may
+rank `popcount` and `andn` regions, but their backend plans are selected only
+when the resolved target permits the already implemented POPCNT or BMI1 ANDN
+lowering. `simd-packed` is an explicit unsupported record, not an instruction
+selection request; no packed SSE/AVX code is emitted from profile evidence.
+
 The profile module emits a stable JSON report and a target-qualified cache key.
 `znc --cpu generic` and `znc --cpu native` are CLI-integrated. The target-policy
 gate executes integer and floating ABI paths under each and requires
@@ -65,3 +71,8 @@ linking with strong-symbol resolution plus `R_386_32` and `R_386_PC32`.
 COMDAT, TLS, weak/common precedence, dynamic linking, a split W^X load image,
 heap ownership, and complete i386 ABI/runtime support remain outside this
 milestone.
+
+The executable i686 subset includes merged source imports, escaped byte-string
+literals, and explicit mmap2/munmap-backed `_zag_malloc`/`_zag_free` for the
+supported 32-bit pointer types. It deliberately does not infer ownership,
+reclaim leaked allocations, provide realloc, or expose a general allocator ABI.
