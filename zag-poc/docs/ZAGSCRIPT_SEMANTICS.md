@@ -57,7 +57,9 @@ or an explicit strict-Zag allocator. Allocator metadata, temporary file-reader
 staging, imported strict `make`, and imported strict `new` remain outside the
 Script budget and are never silently redirected. File-reader staging is
 released immediately after its bounded Script copy (including a copy-budget
-failure), but its transient peak remains outside the Script budget. A direct
+failure), and its temporary native path bridge is released immediately after
+`open(2)`; the staging payload's transient peak remains outside the Script
+budget. A direct
 allocation beyond the limit returns null; prelude file/process operations also
 emit an operation-specific diagnostic. Imported strict code receives no implicit
 allocator. An explicit allocator or resource policy in source wins over the

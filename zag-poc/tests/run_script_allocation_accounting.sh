@@ -23,6 +23,11 @@ printf x >>"$tmp_dir/over.bin"
 printf 'script;\nlet data:[]u8=read_file("over.bin");\nif(data.len!=0){return 1;}\nif(script_alloc_used()!=0){return 2;}\nreturn 0;\n' >"$tmp_dir/read_over.zag"
 (cd "$tmp_dir" && "$znc_bin" read_over.zag -o read_over --no-zagd >/dev/null && ./read_over 2>read_over.err && grep -q 'memory limit exceeded by read_file result' read_over.err)
 
+# A failed open must not charge the Script arena.  The native runtime also
+# releases its temporary NUL-terminated path bridge on this failure path.
+printf 'script;\nlet data:[]u8=read_file("does-not-exist");\nif(data.len>=0){return 1;}\nif(script_alloc_used()!=0){return 2;}\nreturn 0;\n' >"$tmp_dir/read_missing.zag"
+(cd "$tmp_dir" && "$znc_bin" read_missing.zag -o read_missing --no-zagd >/dev/null && ./read_missing)
+
 printf 'script;\nlet result=process_run_timeout("printf bounded",1000,1048400);\nif(process_result_state(result)!=process_state_exited()){return 1;}\nif(!@strEq(process_result_output(result),"bounded")){return 2;}\nif(script_alloc_used()!=1048512){return 3;}\nreturn 0;\n' >"$tmp_dir/process_ok.zag"
 (cd "$tmp_dir" && "$znc_bin" process_ok.zag -o process_ok --no-zagd >/dev/null && ./process_ok)
 
