@@ -174,9 +174,13 @@ symbols are hard errors naming the symbol. COMDAT/groups, TLS, dynamic
 relocations, weak/common precedence, linker scripts, and other relocation kinds
 fail closed rather than entering the supported subset accidentally.
 
-The milestone maps merged allocatable sections into one read/write/execute
-segment. Page-separated W^X text/data segments remain required before this
-linker is described as hardened against writable-code attacks.
+The milestone maps executable allocatable sections into an RX `PT_LOAD` and
+non-executable allocatable sections into a page-separated RW `PT_LOAD`.
+`R_386_32` and `R_386_PC32` are applied using the final split-image virtual
+addresses. The regression suite executes a cross-object text-to-data reference
+and, when `readelf` is available, verifies that no loadable segment is both
+writable and executable. This is W^X hardening for the supported static subset,
+not a claim of complete i686 linker parity.
 
 ## Release evidence
 

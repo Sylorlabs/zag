@@ -13,6 +13,18 @@ set +e; "$tmp/multi"; rc=$?; set -e
 test "$rc" -eq 42
 echo "  ok  cross-object PC32 call and R_386_32 data relocation execute"
 
+if command -v readelf >/dev/null 2>&1; then
+    readelf -lW "$tmp/multi" >"$tmp/phdrs"
+    grep -Eq 'LOAD[[:space:]].*R E[[:space:]]' "$tmp/phdrs"
+    grep -Eq 'LOAD[[:space:]].*RW[[:space:]]' "$tmp/phdrs"
+    if grep -Eq 'LOAD[[:space:]].*RWE' "$tmp/phdrs"; then
+        echo "  XX  linker emitted a writable executable PT_LOAD"; exit 1
+    fi
+    echo "  ok  linked image separates RX text from RW data (W^X)"
+else
+    echo "  ok  W^X program-header inspection skipped (readelf unavailable)"
+fi
+
 "$tmp/link-driver" "$tmp/archive" "$tmp/entry.o" "$tmp/libhelper.a"
 set +e; "$tmp/archive"; rc=$?; set -e
 test "$rc" -eq 42
@@ -30,4 +42,4 @@ fi
 grep -q 'undefined symbol: helper' "$tmp/missing.log"
 echo "  ok  missing definition rejects with its symbol name"
 
-echo "i686 multi-object: pass=4 fail=0"
+echo "i686 multi-object: pass=5 fail=0"
