@@ -46,7 +46,7 @@ if "$ZNC" tests/i686_write.zag --target i686 -o "$tmp/write" --no-analyze >/dev/
 else bad "raw i386 write program emits"; fi
 if "$ZNC" tests/i686_large_frame.zag --target i686 -o "$tmp/large" --no-analyze >/dev/null; then
   set +e; "$tmp/large"; large_rc=$?; set -e
-  if [ "$large_rc" -eq 42 ]; then ok "128-byte i386 frame preserves all local slots"; else bad "large-frame status=$large_rc"; fi
+  if [ "$large_rc" -eq 42 ]; then ok "256-byte i386 frame preserves all local slots"; else bad "large-frame status=$large_rc"; fi
 else bad "large-frame program emits"; fi
 if "$ZNC" tests/i686_write_error.zag --target i686 -o "$tmp/writeerr" --no-analyze >/dev/null; then
   set +e; "$tmp/writeerr"; err_rc=$?; set -e
