@@ -44,8 +44,9 @@ arguments, environment/capability views, and richer error-reporting state remain
 future fields; they are not fabricated as empty APIs. It is not a dynamic object
 environment.
 
-The initial default is process-lifetime accounting. Charged payload remains
-retained until script exit. The configured limit covers explicit `script_alloc`,
+The initial default is a bounded Script-lifetime bump arena. Charged payload
+remains retained until the generated shutdown boundary, which unmaps the whole
+arena deterministically. The configured limit covers explicit `script_alloc`,
 Script collections/builders/string concatenation, returned `read_file` data, and
 bounded-process setup, capture capacity, result handles, and compiler-owned `new`
 in root top-level statements. Ordinary `make`, allocator metadata, temporary

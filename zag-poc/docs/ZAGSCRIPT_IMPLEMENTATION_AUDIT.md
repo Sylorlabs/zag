@@ -82,10 +82,10 @@ inference. Allocation failure and bounds behavior are not yet a complete
 language-wide safety boundary.
 
 Required change: a script allocator must be explicit in runtime state, bounded,
-fail observably, and used only by script conveniences. A process-lifetime arena
-is an acceptable initial policy only if retention until exit is documented and
-the limit is enforced. It must not replace explicit allocation in imported
-strict libraries.
+fail observably, and used only by script conveniences. The implemented bounded
+bump arena retains charged payload until generated shutdown and then unmaps its
+complete mapping. It does not replace explicit allocation in imported strict
+libraries.
 
 ## 5. Runtime helpers
 

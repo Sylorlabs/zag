@@ -130,14 +130,13 @@ Error capture (`catch |e|`) and non-scalar error payloads remain unsupported.
 ELF32 executables include a non-loaded section table for `.text`, `.shstrtab`,
 `.strtab`, `.symtab`, and a minimal valid DWARF v2 `.debug_line`. Global `_start`
 and `main` function symbols are published. These inspection/debug sections do
-not alter the PT_LOAD bytes. This is executable metadata, not yet an `ET_REL`
-object format or static-library linker.
+not alter the PT_LOAD bytes.
 
 `--target i686 --emit-obj` emits a real ELF32 `ET_REL` object. Its `_start`
 stub references global `main` through `R_386_PC32`; `.rel.text`, `.symtab`,
 string tables, and `.debug_line` are self-hosted output. Reference `ld -m
 elf_i386` linking is an optional test only and is never a compiler dependency.
-Pure-Zag archive production and multi-object resolution remain separate work.
+Foreign and general multi-object resolution remain separate work.
 
 `--emit-static` wraps the deterministic Zag object in a GNU-compatible archive.
 `--link-i686` consumes either that archive or a Zag-produced object, validates
