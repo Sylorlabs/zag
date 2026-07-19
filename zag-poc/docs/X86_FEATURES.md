@@ -18,7 +18,7 @@ in the encoder.
 | POPCNT | generic fallback; native-gated opcode; cached dispatch with `--cpu=runtime` |
 | AVX, AVX2, FMA, BMI1, BMI2, AVX-512 | not advertised |
 | `native` | CPUID/OS-gated SSE2 plus POPCNT when present and tested |
-| runtime multiversioning | implemented only for the `popcount(i64)` intrinsic |
+| runtime multiversioning | `popcount(i64)` and BMI1 `andn(i64,i64)` intrinsics |
 | i686 / ELF32 | executable/relocatable i32 and SysV x87 f32/f64 subset |
 
 Native resolution executes CPUID directly. AVX usability requires the CPU AVX
@@ -36,7 +36,11 @@ gate executes integer and floating ABI paths under each and requires
 equivalent observable output. `popcount(i64)` uses a baseline software sequence
 for `generic`, a POPCNT opcode only when `native` detects and permits it, and a
 cached CPUID-selected generic/POPCNT path for `runtime`. This narrow dispatch is
-not general function multiversioning.
+not general function multiversioning. `andn(a,b)` has the exact generic fallback
+`(~a) & b`. Native emission requires CPUID leaf 7 EBX bit 3. Runtime mode caches
+that decision independently from POPCNT and never executes the VEX-encoded ANDN
+path when BMI1 is absent. BMI1 does not require extended OS register state;
+AVX-family dispatch still requires OSXSAVE and XCR0 XMM/YMM qualification.
 Linux x86-64 support must not be described as full x86-family support until the
 separate i686 milestone passes.
 

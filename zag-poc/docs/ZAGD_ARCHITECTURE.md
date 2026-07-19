@@ -129,6 +129,20 @@ are hard filters. Expected runtime is the default objective, but a faster plan
 is rejected when it exceeds memory or stability limits. Random exploration is
 not a default policy.
 
+Adaptive/deep mode generates a fixed, bounded set of concrete buffer-reuse,
+arena-temporary, compiler-owned layout, and CPU-chunk candidates from semantic
+facts. Invalid, unsupported, non-equivalent, over-memory, and strictly
+dominated candidates are removed deterministically. Records are keyed by exact
+source and target hashes and remain advisory with `source_changes=false`.
+Script candidates become automatic only for the corresponding unspecified
+allocator or device choice.
+
+Deep measurements are accepted only when explicitly supplied with at least
+three runs and exact candidate/source/target identities. Stale, malformed,
+cancelled, non-deep, and mismatched measurements are ignored. Accepted timings
+replace estimates with measured provenance; they never authorize source
+rewrites or bypass foreground equivalence checks.
+
 Every suggestion identifies evidence, confidence, estimated benefit/cost,
 rejected alternatives and invalidation conditions. Automatic script choices
 use the same report format. Regular Zag plans remain advisory except existing

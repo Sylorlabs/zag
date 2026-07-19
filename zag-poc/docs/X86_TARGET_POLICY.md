@@ -3,6 +3,8 @@
 Status: target-permission foundation, 2026-07-18. The supported native x86
 target today is Linux ELF64 x86-64. Generic, native, and runtime CPU profiles
 are implemented. Optional SIMD families and general multiversioning are not;
+the bounded POPCNT and BMI1 ANDN intrinsics have exact generic fallbacks and
+cached CPUID-qualified runtime selection.
 i686 is an isolated, explicitly limited milestone target.
 
 ## Current target

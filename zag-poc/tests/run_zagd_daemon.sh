@@ -130,6 +130,9 @@ grep -q '^format=zagd-artifact-index-v1$' "$tmp/project/.zag-cache/zagd/artifact
 grep -q '^executable_authority=false$' "$tmp/project/.zag-cache/zagd/artifact.record"
 grep -q '^compiler=' "$tmp/project/.zag-cache/zagd/artifact.record"
 grep -q '^target=linux-x86_64-generic$' "$tmp/project/.zag-cache/zagd/artifact.record"
+test -f "$tmp/project/.zag-cache/zagd/candidates.record"
+grep -q '^format=zagd-candidates-v1$' "$tmp/project/.zag-cache/zagd/candidates.record"
+grep -q '^source_changes=false$' "$tmp/project/.zag-cache/zagd/candidates.record"
 if "$tmp/zagd" --root "$tmp/project" --mode light >/dev/null 2>&1; then
     echo "duplicate daemon unexpectedly started" >&2; exit 1
 fi
