@@ -197,6 +197,10 @@ for _ in $(seq 1 100); do
     sleep 0.01
 done
 grep -q '^cache_reused=true$' "$tmp/project/.zagd.status"
+grep -q '^incremental_cache_reused=true$' "$tmp/project/.zagd.status"
+test -f "$tmp/project/.zag-cache/zagd/incremental.record"
+grep -q '^format=zagd-incremental-v1$' "$tmp/project/.zag-cache/zagd/incremental.record"
+grep -q '^executable_authority=false$' "$tmp/project/.zag-cache/zagd/incremental.record"
 before_restart=$(grep '^events=' "$tmp/project/.zagd.status")
 printf 'pub fn api(x:i32) i32 { return x; }\n' > "$tmp/project/reuse.zag"
 sleep 0.15
@@ -230,6 +234,7 @@ done
 
 # Corrupt advisory state is a cache miss, never a startup or correctness error.
 printf 'corrupt\n' > "$tmp/project/.zag-cache/zagd/snapshot.record"
+printf 'corrupt\n' > "$tmp/project/.zag-cache/zagd/incremental.record"
 child_pid=$("$tmp/zagd" --root "$tmp/project" --mode adaptive --window-ms 20 --daemonize)
 test "$child_pid" -gt 1
 for _ in $(seq 1 100); do
@@ -237,6 +242,8 @@ for _ in $(seq 1 100); do
     sleep 0.01
 done
 grep -q '^cache_reused=false$' "$tmp/project/.zagd.status"
+grep -q '^incremental_cache_reused=false$' "$tmp/project/.zagd.status"
+grep -q '^incremental_invalidation=unknown$' "$tmp/project/.zagd.status"
 printf stop > "$tmp/project/.zagd.stop"
 for _ in $(seq 1 100); do
     grep -q '^state=stopped$' "$tmp/project/.zagd.status" 2>/dev/null && break

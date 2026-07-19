@@ -201,3 +201,8 @@ body changes invalidate functions, callers, and codegen regions; public shape
 or layout changes invalidate all dependent layers. Root-profile, target, unknown,
 truncated, corrupt, or executable-authority records conservatively invalidate
 everything. These records never authorize executable reuse or source changes.
+The daemon transactionally updates `incremental.record` after each stable file
+snapshot, validates its content and target/root keys on restart, exposes reuse
+and invalidation in `.zagd.status`, and includes it in cache-budget eviction.
+Corruption is reported as `incremental_cache_reused=false` with unknown
+invalidation; foreground compilation remains independent of the record.
