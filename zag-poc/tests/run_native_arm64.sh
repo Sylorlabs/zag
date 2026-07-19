@@ -168,15 +168,29 @@ fi
 rm -f $WORK/nt_if
 
 echo "── real programs (output must be byte-identical to x86) ──"
+# On real aarch64 hardware the x86 reference binary cannot be executed (this job
+# deliberately runs without qemu). The byte-identical x86↔arm64 output check is
+# owned by the emulated x86 job that runs this same script; here we instead prove
+# each program loads through the real kernel ELF loader / syscall path and exits
+# cleanly with output.
 for prog in arena hash_map sort_bench state_machine csv_parser json_parser; do
-    if ! "$ZNC" "programs/$prog.zag" -o $WORK/np_x86 >/dev/null 2>&1; then
-        echo "  XX  $prog (x86 compile failed)"; fail=$((fail+1)); continue
-    fi
-    $WORK/np_x86 > $WORK/np_x86_out 2>&1; x86_ec=$?
     if ! "$ZNC" "programs/$prog.zag" --target arm64 -o $WORK/np_arm >/dev/null 2>&1; then
         echo "  XX  $prog (arm64 compile failed)"; fail=$((fail+1)); continue
     fi
     $QEMU $WORK/np_arm > $WORK/np_arm_out 2>&1; arm_ec=$?
+    if [ "$(uname -m)" = "aarch64" ]; then
+        if [ "$arm_ec" = "0" ] && [ -s $WORK/np_arm_out ]; then
+            echo "  ok  $prog (ran on native aarch64, exit $arm_ec)"; pass=$((pass+1))
+        else
+            echo "  XX  $prog (native run failed: exit=$arm_ec)"; sed -n '1,4p' $WORK/np_arm_out; fail=$((fail+1))
+        fi
+        rm -f $WORK/np_arm $WORK/np_arm_out
+        continue
+    fi
+    if ! "$ZNC" "programs/$prog.zag" -o $WORK/np_x86 >/dev/null 2>&1; then
+        echo "  XX  $prog (x86 compile failed)"; fail=$((fail+1)); rm -f $WORK/np_arm $WORK/np_arm_out; continue
+    fi
+    $WORK/np_x86 > $WORK/np_x86_out 2>&1; x86_ec=$?
     if [ "$x86_ec" = "$arm_ec" ] && diff -q $WORK/np_x86_out $WORK/np_arm_out >/dev/null 2>&1; then
         echo "  ok  $prog (byte-identical output, exit $arm_ec)"; pass=$((pass+1))
     else
