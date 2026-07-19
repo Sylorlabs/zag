@@ -26,5 +26,9 @@ if "$ZNC" tests/i686_i32_ir.zag --target i686 -o "$tmp/ir" --no-analyze >/dev/nu
   set +e; "$tmp/ir"; ir_rc=$?; set -e
   if [ "$ir_rc" -eq 42 ]; then ok "i32 IR locals assignment add/sub execute"; else bad "i32 IR execution status=$ir_rc"; fi
 else bad "i32 IR emits"; fi
+if "$ZNC" tests/i686_control_flow.zag --target i686 -o "$tmp/cf" --no-analyze >/dev/null; then
+  set +e; "$tmp/cf"; cf_rc=$?; set -e
+  if [ "$cf_rc" -eq 42 ]; then ok "comparisons if while break continue execute"; else bad "control-flow execution status=$cf_rc"; fi
+else bad "control-flow IR emits"; fi
 echo "i686 minimal: pass=$pass fail=$fail"
 test "$fail" -eq 0
