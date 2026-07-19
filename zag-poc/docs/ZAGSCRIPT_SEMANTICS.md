@@ -88,8 +88,12 @@ success status.
 
 Prelude operations carry the same ordinary effects as their strict declarations.
 Filesystem, process, network and device access are capabilities, not inferred
-permission. Unsupported capability policy is reported as unresolved rather
-than treated as enforced.
+permission. Project policy keys `allow_filesystem_read`,
+`allow_filesystem_write`, and `allow_process` accept `true` or `false`; the
+foreground compiler rejects a Script prelude operation when its policy is
+false, independently of whether `zagd` is running. Defaults preserve the local
+Script prelude and projects can deny each capability without source changes.
+Network access remains unavailable rather than implicitly permitted.
 
 ## Progressive explicitness
 
