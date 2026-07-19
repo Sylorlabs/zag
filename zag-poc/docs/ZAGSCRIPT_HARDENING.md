@@ -27,8 +27,9 @@ must remain an explicit unsupported item rather than generated code presented as
 equivalent.
 
 `--output` writes a separate formatted `.zag` file. Source is never
-overwritten by default. A future `--apply` requires a clean source snapshot,
-rollback material, and successful configured parity tests.
+overwritten by default. `--apply` requires an unchanged source snapshot,
+an explicit `--test-command`, and a rollback copy. The candidate is checked
+before replacement and the original is restored if the parity command fails.
 
 ## Current boundary
 

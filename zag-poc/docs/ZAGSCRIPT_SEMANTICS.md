@@ -101,8 +101,11 @@ and contains the same facts as text output.
 `harden` is non-destructive by default. Its first implementation may produce a
 preview, patch, candidate source, assumptions, required parity tests and honest
 unsupported items. It must not pretend an incomplete conversion is strict Zag.
-`--output` writes a separate file. Any future `--apply` requires a clean
-snapshot, rollback artifact and successful configured tests.
+`--output` writes a separate file. `--apply` requires an unchanged source
+snapshot, an explicit parity-test command, a rollback copy, and restores the
+original automatically when validation fails. It never silently skips the
+parity test. A clean Git worktree is still recommended but is not fabricated as
+compiler proof.
 
 `check --strict` rejects unresolved script conveniences, including implicit
 allocator or capabilities, unbounded process execution, implicit randomness,

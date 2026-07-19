@@ -186,11 +186,14 @@ error boundary, `explain`, focused strict checks, conservative hardening,
 inotify snapshots and fail-closed advisory cache records. Regular Zag retains
 the invariants above and planner output remains advisory.
 
-The remaining safety boundary is explicit. The Script allocation budget counts
+The remaining safety boundary is explicit. Compiler-owned Script payloads now
+come from one bounded mapping that is reclaimed at generated shutdown. The
+Script allocation budget counts
 Script collection/string/file-result/bounded-process payloads and root top-level
 `new`, but not ordinary `make`, imported strict allocation, allocator metadata,
 or file-reader staging.
-There is no ownership/borrowing proof, complete reclamation, general JSON
+There is no ownership/borrowing proof, reclamation for allocations outside the
+Script arena, general JSON
 object/array prelude, or complete source-to-runtime lifetime analysis. Named
 top-level errors and source paths, bounded process capture, statically typed
 Script lists, scalar JSON, project-configured supported defaults, and stable

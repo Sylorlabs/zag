@@ -18,9 +18,10 @@ limit, uncaught-error wrapper, `znc script`, `explain`, conservative `harden`,
 and `check --strict`. Both activation forms are supported:
 
 The JSON form of `explain` embeds the compiler's checksummed semantic manifest,
-including declaration signatures, layouts, call edges, and derived function
-effect masks. Per-expression inferred-type witnesses remain explicitly
-unavailable rather than guessed.
+including declaration signatures, layouts, call edges, derived function effect
+masks, and proven value-type witnesses for explicit declarations and exact
+literal/cast/struct-literal cases. Other expression types remain explicitly
+unknown rather than guessed.
 
 ```sh
 ./znc examples/script_hello.zag -o /tmp/script_hello
@@ -127,8 +128,10 @@ let result: json.JsonIntResult = json.json_parse_int("42");
 
 ## Safety boundary
 
-The profile lowering does not establish ownership, borrowing, automatic
-reclamation, or general memory safety. The configurable requested-payload limit
+The profile lowering does not establish ownership, borrowing, or general memory
+safety. Compiler-owned Script payloads use one bounded mmap-backed arena and the
+generated shutdown boundary reclaims that complete mapping deterministically.
+The configurable requested-payload limit
 covers Script collection/string-builder storage, string concatenation, returned
 file data, bounded-process storage, and compiler-owned `new` in root top-level
 statements. Ordinary `make`, allocator metadata, file-reader staging, and `new`
