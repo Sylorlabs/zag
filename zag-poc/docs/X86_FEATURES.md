@@ -13,7 +13,7 @@ in the encoder.
 | --- | --- |
 | `generic` | implemented; canonicalizes to `x86-64-v1` |
 | `x86-64`, `x86-64-v1` | implemented aliases |
-| SSE2 | advertised by the generic profile |
+| SSE2 | advertised by the generic profile; scalar floating point and baseline MOVDQU memcpy chunks |
 | SSE3, SSSE3, SSE4.1, SSE4.2 | not advertised |
 | POPCNT | generic fallback; native-gated opcode; cached dispatch with `--cpu=runtime` |
 | AVX, AVX2, FMA, BMI1, BMI2, AVX-512 | not advertised |
@@ -27,14 +27,17 @@ AVX2 additionally requires its leaf-7 bit. Deterministic negative tests prove
 that hardware AVX alone and OSXSAVE without YMM state remain disabled. The
 compiler then intersects detected features with its independently tested
 encoder permission set. That permitted set is
-currently SSE2 plus separately gated POPCNT lowering. Detecting AVX, AVX2, FMA,
+currently SSE2 (including compiler-owned unaligned MOVDQU bulk-copy chunks) plus separately gated POPCNT lowering. Detecting AVX, AVX2, FMA,
 BMI or AVX-512 never enables their emission.
 
 The planner follows the same permission boundary. Exact-key profile samples may
 rank `popcount` and `andn` regions, but their backend plans are selected only
 when the resolved target permits the already implemented POPCNT or BMI1 ANDN
 lowering. `simd-packed` is an explicit unsupported record, not an instruction
-selection request; no packed SSE/AVX code is emitted from profile evidence.
+selection request; no user-requested packed SSE/AVX code is emitted from profile
+evidence. The compiler-owned memcpy runtime does use SSE2 MOVDQU chunks, which
+is a fixed semantics-preserving baseline implementation rather than planner
+selected vectorization.
 
 The profile module emits a stable JSON report and a target-qualified cache key.
 `znc --cpu generic` and `znc --cpu native` are CLI-integrated. The target-policy
