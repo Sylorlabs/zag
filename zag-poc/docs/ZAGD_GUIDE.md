@@ -1,32 +1,47 @@
 # `zagd` guide
 
-Status: Linux daemon lifecycle and content tracking implemented, 2026-07-18.
+Status: Linux daemon lifecycle, content tracking, and bounded background semantic
+rechecking implemented, 2026-07-18.
 
 `zagd` is an automatic, editor-independent continuous analysis service whose
-availability is correctness-independent. `znc` starts its sibling daemon for ordinary source commands and exposes `watch`,
+availability is correctness-independent. `znc` starts its sibling daemon for
+ordinary source commands and exposes `watch`,
 `status`, `shutdown`, and advisory `suggest`. Startup failure warns but never
 changes foreground compiler correctness.
 
 Use `.zagd.conf` with `mode=off`, `mode=light`, `mode=adaptive`, or `mode=deep`
 to select automatic startup behavior. A subsequent source command applies a
 mode change, including stopping an existing daemon for `mode=off`. The
-`stability_window_ms` setting controls the daemon's stable-read delay. Adaptive and deep currently select
-lifecycle modes only; broader planning engines remain future work.
+`stability_window_ms` setting controls the daemon's stable-read delay. Adaptive
+and deep run deterministic bounded planner budgets; they are not a complete
+whole-program optimizer or an unbounded idle-time search.
 
-The implemented pure-Zag core in `selfhost/zagd.zag` provides:
+Regular Zag consumes the service as warnings and suggestions only. Zag Script
+may apply the supported allocator/CPU/device/layout defaults when source and CLI
+leave them unspecified. Explicit command-line choices always win, and changing
+project defaults requires only editing `.zagd.conf` and issuing the next source
+command; the daemon never rewrites source.
+
+The implemented pure-Zag core in `selfhost/zagd.zag` and Linux service in
+`selfhost/zagd_daemon.zag` provide:
 
 - deterministic content identities;
 - canonical snapshot identity composition;
 - stability-window decisions from supplied timestamps and hashes;
 - conservative change classes;
 - quiet bounded configuration defaults; and
-- fail-closed cache-record acceptance.
+- fail-closed cache-record acceptance;
+- recursive inotify observation, atomic-save handling, and ignored build/cache
+  paths;
+- transactional persistent snapshot/advisory records; and
+- stable-source semantic rechecks by the sibling self-hosted `znc` process.
 
-The core performs no filesystem I/O. A future watcher must read complete files,
-hash their contents, canonicalize path order, and pass observations into these
-primitives. No current code claims inotify support, atomic cache writes,
-persistent storage, dependency graph maintenance, incremental parsing, worker
-cancellation, or idle CPU measurements.
+The policy core itself performs no filesystem I/O; the Linux daemon supplies it.
+Events remain hints: the daemon waits for stability, reads complete content,
+hashes it, ignores identical rewrites, and rechecks the final stable source.
+Background checks use `--no-zagd`, so they cannot recursively start a daemon.
+Failed checks mark the snapshot invalid and cannot authorize an executable. The
+index is not yet a complete declaration/caller graph or machine-code cache.
 
 ## Correctness boundary
 
@@ -40,13 +55,17 @@ Cache acceptance is analysis infrastructure only. It does not authorize stale
 machine code, and deleting all cache state must affect performance rather than
 program correctness.
 
-## Testing the implemented core
+## Testing the implementation
 
 ```sh
 tests/run_zagd_core.sh
+tests/run_zagd_daemon.sh
+tests/run_zagd_background_semantics.sh
 ```
 
-The test compiles and executes the core using `./znc`. It covers stable identity,
+The tests compile and execute the implementation using `./znc`. They cover
+stable identity,
 path-sensitive snapshots, stability timing, all change classes, successful cache
 acceptance, partial-record rejection, stale-snapshot rejection, and tampered
-payload rejection.
+payload rejection, recursive and atomic-save events, restart reuse, stable-source
+background checks, invalid snapshots, and recovery after a later valid edit.

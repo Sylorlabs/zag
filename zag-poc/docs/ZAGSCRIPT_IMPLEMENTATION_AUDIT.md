@@ -190,9 +190,12 @@ The remaining safety boundary is explicit. The Script allocation budget counts
 Script collection/string/file-result/bounded-process payloads and root top-level
 `new`, but not ordinary `make`, imported strict allocation, allocator metadata,
 or file-reader staging.
-There is no ownership/borrowing proof, complete reclamation, named error/source
-witness path, bounded process-capture API, typed variadic collection literal,
-or general JSON prelude yet. Restart reuse validates snapshot metadata but does
-not yet restore a complete semantic dependency index. Adaptive candidates exist
-as a bounded API but are not fed synthetic facts by the daemon; deep search is
-not implemented.
+There is no ownership/borrowing proof, complete reclamation, general JSON
+object/array prelude, or complete source-to-runtime lifetime analysis. Named
+top-level errors and source paths, bounded process capture, statically typed
+Script lists, scalar JSON, project-configured supported defaults, and stable
+background semantic rechecks are implemented. Restart reuse validates snapshot
+metadata and declaration fingerprints but does not restore a complete semantic
+caller/layout/codegen dependency graph. Adaptive/deep candidates have bounded
+deterministic budgets and consume only checksum-bound proven facts; broad deep
+search, PGO, SIMD tuning, and microbenchmark selection are not implemented.

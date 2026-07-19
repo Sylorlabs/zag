@@ -4,7 +4,7 @@ Status: Linux light-mode implementation with bounded advisory-planner
 foundations, 2026-07-18. Recursive inotify watching, stable content hashing,
 transactional advisory snapshots, restart validation, status, suggestion,
 shutdown, and source-command auto-start are implemented. Complete semantic
-dependency reconstruction, daemon-fed adaptive facts, and deep search are not.
+dependency reconstruction and general deep search are not.
 
 ## Purpose and correctness boundary
 
@@ -66,12 +66,14 @@ matches.
 
 ## Modes and state machine
 
-`off` performs no daemon analysis. `light` maintains hashes, snapshots, imports,
-incremental parse/type/effect facts and cheap exact lifetime/dead-code facts.
-`adaptive` schedules bounded allocation, buffer reuse, layout and CPU-region
-candidates after stability. `deep` is explicit and budgeted; it may run targeted
-search, profiling or microbenchmarks and equivalence checks. Invalidated work
-transitions immediately to cancelled and its result cannot be published.
+`off` performs no daemon analysis. `light` maintains hashes and snapshots and
+runs a fresh self-hosted parse/type/effect check after stable source changes.
+This is background semantic rechecking, not an in-process incremental parser.
+`adaptive` evaluates a bounded set of allocation, buffer reuse, layout and
+CPU-region candidates after stability. `deep` is explicit and has a larger but
+still hard candidate budget. Current deep work does not run profiling,
+microbenchmarks, or broad equivalence search. Invalidated work transitions
+immediately to cancelled and its result cannot be published.
 
 The service states are starting, idle, stabilizing, analyzing-light,
 analyzing-adaptive, analyzing-deep, cancelling, recovering and stopped. At most
@@ -143,11 +145,11 @@ shape edit remains distinguishable from a private body edit. Unsafe paths,
 truncation, corruption, stale configuration or an inconsistent file count make
 the whole index a cache miss; they never authorize generated code.
 
-This is not yet a semantic dependency graph. In particular, the watcher does
-not claim that lexical `@import` discovery models merged modules, conditional
-resolution or declaration-level callers. Until the compiler exposes its
-resolved module/declaration graph to the daemon, public-shape changes are
-classified correctly but dependent declarations are conservatively treated as
-unknown rather than under-invalidated. Adaptive advice likewise remains a
-bounded core API and is not published from invented watcher facts. Deep mode is
-a lifecycle selection only, not a completed deep optimizer.
+This is not yet a complete semantic dependency graph. Lexical `@import`
+discovery does not model every merged-module or conditional-resolution case.
+The foreground compiler can publish checksum-bound semantic declaration facts;
+the daemon accepts them only for matching content and otherwise launches a
+stable-source foreground-equivalent check. Uncertain dependents remain
+conservative rather than under-invalidated. Adaptive/deep runs use hard
+deterministic budgets and accept only proven manifest facts; deep mode is not a
+completed superoptimizer, profile-guided tuner, or benchmarking engine.

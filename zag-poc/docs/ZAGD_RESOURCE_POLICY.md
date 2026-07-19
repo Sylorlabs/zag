@@ -14,13 +14,13 @@ Status: validated defaults enforced by the Linux daemon, 2026-07-18.
 | background GPU | disabled |
 | network access | disabled |
 
-Configuration validation accepts modes `off`, `light`, `adaptive`, and `deep`,
-one to 64 workers, memory from 1 MiB through 64 GiB, cache from zero through
-256 GiB, and a stability window from 1 ms through 60 seconds. Network access is
-currently always rejected. The daemon blocks in inotify while idle, uses one
-worker by default, applies the stability window, bounds persistent cache records,
-and never uses network or GPU. Memory-budget enforcement covers planner-owned
-records, not the Linux kernel's inotify accounting.
+Configuration accepts modes `off`, `light`, `adaptive`, and `deep`, a stability
+window from 1 ms through 60 seconds, and the currently supported fixed resource
+policy: one worker, a 2 GiB cache ceiling, `errors_only` notifications, no
+network, and no background GPU. Unsupported worker/cache/notification values
+are rejected instead of silently ignored. `script_memory_bytes` accepts 1 MiB
+through 2 GiB and configures the Script requested-payload budget. Memory
+accounting excludes Linux kernel inotify storage and some compiler allocations.
 
 The service blocks on operating-system events while idle, cancels snapshot-bound
 advice when invalidated, uses no GPU or network, and treats foreground builds as

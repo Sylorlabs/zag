@@ -1,8 +1,9 @@
 # Linux x86 target policy
 
 Status: target-permission foundation, 2026-07-18. The supported native x86
-target today is Linux ELF64 x86-64. Generic and native CPU profiles are
-implemented; optional SIMD lowering, multiversioning, and i686 are not.
+target today is Linux ELF64 x86-64. Generic, native, and runtime CPU profiles
+are implemented. Optional SIMD families and general multiversioning are not;
+i686 is an isolated, explicitly limited milestone target.
 
 ## Current target
 
@@ -48,10 +49,10 @@ This list is a roadmap, not a current support claim.
 
 Given compiler version, source, options and explicit profile, emitted bytes must
 be deterministic. `native` output is reproducible only for the same resolved
-feature set. Future multiversioning may emit a generic version and one or more
-qualified versions. Runtime selection checks the same required features,
-chooses deterministically and caches the selected function target. Programs are
-not required to use multiversioning.
+feature set. The implemented `--cpu=runtime` case is deliberately narrow:
+`popcount(i64)` emits generic and POPCNT bodies, checks CPUID while preserving
+callee-saved RBX, and caches one deterministic selection. No other function or
+optional SIMD family currently receives runtime multiversioning.
 
 ## ABI and ELF gate
 

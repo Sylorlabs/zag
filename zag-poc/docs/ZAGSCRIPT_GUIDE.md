@@ -65,8 +65,12 @@ memory-safety guarantee or the eventual typed error API.
 - A `.zag` suffix alone does not activate the profile.
 - A source file without `script;` keeps regular Zag semantics.
 
-Implicit JSON bindings, a materialized `args` collection, and automatic
-allocator/capability expansion are not implemented. Use
+Implicit JSON bindings and a materialized `args` collection are not implemented.
+Project `.zagd.conf` defaults for allocator, CPU, device, layout, and Script
+memory budget are resolved by foreground compilation; command-line
+`--script-allocator`, `--cpu`, `--device`, and `--layout` choices win. This is
+configuration of supported choices, not arbitrary allocator/capability
+synthesis. Use
 ordinary explicit Zag APIs where available; the compiler does not pretend those
 APIs are script defaults.
 
@@ -108,11 +112,6 @@ Zag Script uses the same inspectable API as strict Zag:
 @import("std:json") as json
 let result: json.JsonIntResult = json.json_parse_int("42");
 ```
-
-The existing shell execution runtime is intentionally not a Script convenience:
-its capture pipe blocks and therefore cannot enforce a deadline. A future bounded
-API must use nonblocking observation, kill the child on timeout, reap it, and cap
-captured output before it can be exposed.
 
 ## Safety boundary
 
