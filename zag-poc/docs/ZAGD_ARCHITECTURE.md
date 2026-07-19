@@ -155,6 +155,23 @@ the whole index a cache miss; they never authorize generated code.
 This is not yet a complete semantic dependency graph. Lexical `@import`
 discovery does not model every merged-module or conditional-resolution case.
 The foreground compiler can publish checksum-bound semantic declaration facts;
+
+## Incremental artifact index
+
+The daemon persists `.zag-cache/zagd/artifact.record` transactionally. This is
+an advisory index, never executable authority. Its identity combines the
+self-hosted compiler version, explicit target profile, public/effect/layout
+identities, and stable declaration body identities. Source line locations are
+diagnostic metadata and do not perturb an artifact identity, so comment-only
+line movement preserves codegen candidates.
+
+Reuse is fail-closed: format, completeness, advisory authority, compiler,
+target, exact semantic source hash, and the record checksum must all validate.
+A mismatch is a cache miss and foreground compilation proceeds normally.
+Private body changes invalidate the declaration and its transitive callers;
+public layout changes invalidate layout/codegen dependents; comment-only edits
+record zero codegen invalidation. The index records these decisions but does not
+yet substitute cached machine-code bytes into the foreground linker.
 the daemon accepts them only for matching content and otherwise launches a
 stable-source foreground-equivalent check. Uncertain dependents remain
 conservative rather than under-invalidated. Adaptive/deep runs use hard

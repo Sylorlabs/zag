@@ -125,6 +125,11 @@ done
 grep -q '^planner_budget=256$' "$tmp/project/.zagd.status"
 grep -q '^planner_suggestions=0$' "$tmp/project/.zagd.status"
 grep -q '^planner_state=complete$' "$tmp/project/.zagd.status"
+test -f "$tmp/project/.zag-cache/zagd/artifact.record"
+grep -q '^format=zagd-artifact-index-v1$' "$tmp/project/.zag-cache/zagd/artifact.record"
+grep -q '^executable_authority=false$' "$tmp/project/.zag-cache/zagd/artifact.record"
+grep -q '^compiler=' "$tmp/project/.zag-cache/zagd/artifact.record"
+grep -q '^target=linux-x86_64-generic$' "$tmp/project/.zag-cache/zagd/artifact.record"
 if "$tmp/zagd" --root "$tmp/project" --mode light >/dev/null 2>&1; then
     echo "duplicate daemon unexpectedly started" >&2; exit 1
 fi
