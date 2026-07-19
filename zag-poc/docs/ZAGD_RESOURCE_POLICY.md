@@ -19,12 +19,17 @@ window from 1 ms through 60 seconds, and the currently supported fixed resource
 policy: one worker, a 2 GiB cache ceiling, `errors_only` notifications, no
 network, and no background GPU. Unsupported worker/cache/notification values
 are rejected instead of silently ignored. `script_memory_bytes` accepts 1 MiB
-through 2 GiB and configures the Script requested-payload budget. Memory
+through 2 GiB and configures the Script requested-payload budget.
+`allow_filesystem_read`, `allow_filesystem_write`, and `allow_process` accept
+only `true` or `false` and are enforced by foreground Script compilation; they
+are capability policy, not daemon authority. Memory
 accounting excludes Linux kernel inotify storage and some compiler allocations.
 
 The service blocks on operating-system events while idle, cancels snapshot-bound
 advice when invalidated, uses no GPU or network, and treats foreground builds as
-authoritative. Deep mode remains opt-in but has no deep optimizer yet. Cache
+authoritative. Deep mode remains opt-in and runs only the bounded candidate and
+measurement pipeline documented in the architecture; it is not an unbounded
+whole-program optimizer. Cache
 eviction deletes cache records only, never source.
 
 Malformed or unsupported configuration must fail closed to a diagnostic or the

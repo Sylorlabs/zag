@@ -64,7 +64,10 @@ Events remain hints: the daemon waits for stability, reads complete content,
 hashes it, ignores identical rewrites, and rechecks the final stable source.
 Background checks use `--no-zagd`, so they cannot recursively start a daemon.
 Failed checks mark the snapshot invalid and cannot authorize an executable. The
-index is not yet a complete declaration/caller graph or machine-code cache.
+semantic artifact index persists stable declaration, public/effect, layout,
+compiler, target, and source identities with conservative invalidation. It does
+not substitute cached machine bytes into foreground output; executable
+authority remains with the current compiler invocation.
 
 ## Correctness boundary
 
