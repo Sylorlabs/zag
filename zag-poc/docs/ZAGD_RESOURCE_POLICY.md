@@ -35,3 +35,13 @@ eviction deletes cache records only, never source.
 Malformed or unsupported configuration must fail closed to a diagnostic or the
 documented quiet defaults. It must not silently enable workers, GPU, network, or
 deep search.
+
+Explicit deep finalist execution uses direct `execve`, never a shell. Each child
+has its own process group, CPU and address-space rlimits, a monotonic deadline,
+independent 1 MiB-or-smaller stdout/stderr caps, cancellation, group kill, and
+blocking reap. Eligibility additionally requires stable source/target hashes
+and exact post-execution comparison with the reference stdout, stderr, exit,
+signal, and state witness before timing persistence. Network, GPU, and
+source-writing finalists are rejected by planner policy; filesystem writes are
+not namespace-isolated, so this supervisor is not advertised as an untrusted
+code sandbox and only compiler-produced reviewed finalists are eligible.

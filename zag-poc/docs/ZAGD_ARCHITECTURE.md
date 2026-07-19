@@ -209,13 +209,20 @@ invalidation; foreground compilation remains independent of the record.
 
 ## Deep finalist execution audit
 
-The planner can ingest target-qualified measurements, but `zagd` does not yet
-execute finalist binaries. Its available process helper has no hard timeout,
-kill/cancellation handle, memory limit, or captured-output equivalence witness.
-Using it would violate the deep-mode resource contract. `zagd_benchmark.zag`
-therefore enforces explicit deep mode, at most three finalists, a 1–5000 ms
-budget, 1–256 MiB memory range, stable source/target identities, cancellation,
-and no network/GPU/source writes, then fails closed with
-`executor_unavailable`. Execution can be enabled only when one Zag runtime
-primitive provides all required controls together; until then no result is
-persisted or labeled measured.
+`zagd_benchmark.zag` now contains a dedicated Linux x86-64 finalist executor.
+It calls `execve` on the reviewed executable path directly (never `/bin/sh`),
+places the child in a separate process group, applies `RLIMIT_CPU` and
+`RLIMIT_AS`, observes a monotonic deadline and cancellation flag, caps stdout
+and stderr independently, kills the process group on failure, and always reaps
+the child. Its witness records stdout, stderr, normal exit status or terminating
+signal, state, and elapsed monotonic time separately.
+
+Execution remains fail closed unless the request is explicit deep mode, has at
+most three finalists and bounded time/memory, matches the current stable source
+and target hashes, and declares no network, GPU, or source mutation. After both
+executions, measured persistence requires an exact comparison of the actual
+stdout, stderr, exit, signal, and success-state witnesses; a caller-supplied
+boolean is not accepted as equivalence. This is a resource supervisor for compiler-produced,
+reviewed finalists, not a sandbox for hostile executables: the no-network/GPU/
+mutation rule is planner authority enforced before execution, not a Linux
+seccomp claim. Only equivalent output witnesses may become measured plan facts.
