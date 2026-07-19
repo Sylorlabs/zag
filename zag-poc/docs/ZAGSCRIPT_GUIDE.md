@@ -119,8 +119,9 @@ Basic JSON scalar support is available as the ordinary `std:json` module. It
 stringifies and parses strings, signed integers, and booleans, parses finite
 JSON floating-point syntax, and parses/stringifies null. Statically typed parse
 results contain `ok` and, where applicable, `value`; parse failure is explicit.
-Objects, arrays, float stringification, and Unicode `\\u` decoding remain
-unsupported.
+Objects, arrays, and float stringification remain unsupported. Unicode `\\u`
+escapes, including valid surrogate pairs, decode to UTF-8 and malformed or lone
+surrogates fail explicitly.
 Zag Script uses the same inspectable API as strict Zag:
 
 ```zag
