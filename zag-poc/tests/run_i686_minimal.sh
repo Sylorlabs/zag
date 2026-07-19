@@ -44,5 +44,13 @@ if "$ZNC" tests/i686_write.zag --target i686 -o "$tmp/write" --no-analyze >/dev/
   set +e; write_out=$("$tmp/write"); write_rc=$?; set -e
   if [ "$write_rc" -eq 42 ] && [ "$write_out" = "Z" ]; then ok "raw i386 write syscall preserves ABI and reports result"; else bad "write syscall output=$write_out status=$write_rc"; fi
 else bad "raw i386 write program emits"; fi
+if "$ZNC" tests/i686_large_frame.zag --target i686 -o "$tmp/large" --no-analyze >/dev/null; then
+  set +e; "$tmp/large"; large_rc=$?; set -e
+  if [ "$large_rc" -eq 42 ]; then ok "128-byte i386 frame preserves all local slots"; else bad "large-frame status=$large_rc"; fi
+else bad "large-frame program emits"; fi
+if "$ZNC" tests/i686_write_error.zag --target i686 -o "$tmp/writeerr" --no-analyze >/dev/null; then
+  set +e; "$tmp/writeerr"; err_rc=$?; set -e
+  if [ "$err_rc" -eq 42 ]; then ok "negative raw-syscall error path remains signed"; else bad "syscall error status=$err_rc"; fi
+else bad "syscall error program emits"; fi
 echo "i686 minimal: pass=$pass fail=$fail"
 test "$fail" -eq 0
