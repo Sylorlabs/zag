@@ -35,6 +35,8 @@ if "$znc_bin" check tests/script_frontend/basic.zag --strict >/dev/null 2>&1; th
     echo "strict script check unexpectedly succeeded" >&2
     exit 1
 fi
+strict_collection=$("$znc_bin" check tests/script_frontend/materialized_args.zag --strict --no-zagd 2>&1 || true)
+printf '%s\n' "$strict_collection" | grep -q 'temporary collection remains tied to the Script context'
 "$znc_bin" --cpu native tests/script_frontend/basic.zag -o "$tmp_dir/native" --no-analyze --no-zagd >/dev/null
 
 "$znc_bin" harden tests/script_frontend/basic.zag >"$tmp_dir/harden.txt"
