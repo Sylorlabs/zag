@@ -64,6 +64,25 @@ grep -q '"source_modified":false' "$tmp_dir/harden.json"
 grep -q '"parity_tests"' "$tmp_dir/harden.json"
 grep -q '"unsupported"' "$tmp_dir/harden.json"
 
+mkdir "$tmp_dir/apply"
+cp tests/script_frontend/basic.zag "$tmp_dir/apply/app.zag"
+(cd "$tmp_dir/apply" && "$znc_bin" harden app.zag --apply \
+    --test-command "$znc_bin app.zag -o applied --no-zagd --no-analyze" \
+    --format json --no-zagd) > "$tmp_dir/apply-report.json"
+grep -q '"status":"applied"' "$tmp_dir/apply-report.json"
+test -f "$tmp_dir/apply/app.zag.harden.bak"
+grep -q 'fn main() i32' "$tmp_dir/apply/app.zag"
+
+mkdir "$tmp_dir/rollback"
+cp tests/script_frontend/basic.zag "$tmp_dir/rollback/app.zag"
+if (cd "$tmp_dir/rollback" && "$znc_bin" harden app.zag --apply \
+    --test-command false --no-zagd >/dev/null 2>&1); then
+    echo "failing harden parity command unexpectedly applied" >&2
+    exit 1
+fi
+grep -q '^script;' "$tmp_dir/rollback/app.zag"
+cmp "$tmp_dir/rollback/app.zag" "$tmp_dir/rollback/app.zag.harden.bak"
+
 # Project Script defaults reach foreground code generation. Explicit CLI CPU
 # selection wins; regular Zag remains independent of Script defaults.
 mkdir -p "$tmp_dir/project"
