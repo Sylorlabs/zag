@@ -102,6 +102,11 @@ i386 syscall 4. It preserves EBX across the syscall and returns the kernel resul
 as a 32-bit scalar; higher-level formatting and string runtime support remain
 outside this milestone.
 
+Basic local structs use declaration-order layout with each supported scalar
+field occupying one 4-byte word. Struct literals must initialize every field;
+field loads and stores use fixed frame offsets. Aggregate calls and returns are
+rejected: aggregate sharing uses explicit pointers until a by-value ABI exists.
+
 ## Release evidence
 
 Any performance report records hardware, kernel, resolved feature set, compiler

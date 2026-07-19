@@ -52,5 +52,9 @@ if "$ZNC" tests/i686_write_error.zag --target i686 -o "$tmp/writeerr" --no-analy
   set +e; "$tmp/writeerr"; err_rc=$?; set -e
   if [ "$err_rc" -eq 42 ]; then ok "negative raw-syscall error path remains signed"; else bad "syscall error status=$err_rc"; fi
 else bad "syscall error program emits"; fi
+if "$ZNC" tests/i686_struct.zag --target i686 -o "$tmp/struct" --no-analyze >/dev/null; then
+  set +e; "$tmp/struct"; struct_rc=$?; set -e
+  if [ "$struct_rc" -eq 42 ]; then ok "basic sequential struct layout field load/store execute"; else bad "struct status=$struct_rc"; fi
+else bad "basic struct program emits"; fi
 echo "i686 minimal: pass=$pass fail=$fail"
 test "$fail" -eq 0
