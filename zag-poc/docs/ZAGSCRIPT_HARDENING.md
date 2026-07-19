@@ -7,6 +7,9 @@ Zag. It is not a rewrite into another language. `znc harden` can currently
 preserve a leading block of imports/declarations and move following executable
 statements into an explicit `fn main() i32`. With `--output`
 it writes a separate candidate and never overwrites the source.
+`--format json` emits preview status, the candidate when it is not written to a
+separate output, assumptions, parity tests, and unsupported transformations as
+a machine-readable report.
 
 ## Required hardening output
 

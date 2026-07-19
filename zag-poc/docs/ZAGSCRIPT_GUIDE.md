@@ -17,6 +17,11 @@ The implemented profile includes a managed context, requested-payload allocation
 limit, uncaught-error wrapper, `znc script`, `explain`, conservative `harden`,
 and `check --strict`. Both activation forms are supported:
 
+The JSON form of `explain` embeds the compiler's checksummed semantic manifest,
+including declaration signatures, layouts, call edges, and derived function
+effect masks. Per-expression inferred-type witnesses remain explicitly
+unavailable rather than guessed.
+
 ```sh
 ./znc examples/script_hello.zag -o /tmp/script_hello
 /tmp/script_hello
