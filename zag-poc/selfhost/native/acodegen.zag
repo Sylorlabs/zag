@@ -704,6 +704,10 @@ fn ac_expr_type(n: *Node, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) []u8 {
                     if (@strEq(fnid.name, "_zag_str_concat") || @strEq(fnid.name, "_zag_arg") || @strEq(fnid.name, "_zag_read_file")) { return "[]u8"; }
                     if (@strEq(fnid.name, "_zag_argc") || @strEq(fnid.name, "_zag_exec_cmd") || @strEq(fnid.name, "_zag_write_file") || @strEq(fnid.name, "_zag_write_exec") || @strEq(fnid.name, "_zag_file_exists")) { return "i32"; }
                     if (@strEq(fnid.name, "_zag_str_to_i64")) { return "i64"; }
+                    if (@strEq(fnid.name, "_zag_slice_ptr")) { return "*i8"; }
+                    if (@strEq(fnid.name, "_zag_raw_syscall") || @strEq(fnid.name, "_zag_x86_cpuid_eax") ||
+                        @strEq(fnid.name, "_zag_x86_cpuid_ebx") || @strEq(fnid.name, "_zag_x86_cpuid_ecx") ||
+                        @strEq(fnid.name, "_zag_x86_cpuid_edx") || @strEq(fnid.name, "_zag_x86_xgetbv")) { return "i64"; }
                     if (@strEq(fnid.name, "__catch") || @strEq(fnid.name, "__catchc")) {
                         let cty0: []u8 = ac_expr_type(get[*Node](c.args, 0), env, syms, cg);
                         if (cty0.len > 1 && cty0[0] == '!') { return cty0[1..]; }
@@ -2111,6 +2115,61 @@ fn ac_lower_builtin(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv, s
         push[AInstr](out, ai_push(A_X0()));
         return 1;
     }
+    // ── _zag_slice_ptr(&[]u8) → x0 = data pointer ────────────────────────────
+    // A []u8 value is lowered as a pointer to its {ptr,len} block; return the
+    // data pointer held at offset 0 (mirrors the x86 _zag_slice_ptr).
+    if (@strEq(fname, "_zag_slice_ptr")) {
+        if (nargs != 1) { ac_err(cg, "arm64: _zag_slice_ptr expects one []u8 argument"); push[AInstr](out, ai_mov_imm(A_X0(), 0)); push[AInstr](out, ai_push(A_X0())); return 1; }
+        ac_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+        push[AInstr](out, ai_pop(A_X10()));
+        push[AInstr](out, ai_load(A_X0(), A_X10(), 0));
+        push[AInstr](out, ai_push(A_X0()));
+        return 1;
+    }
+    // ── _zag_raw_syscall(num, a1..a6) → x0 ───────────────────────────────────
+    // AArch64 Linux convention: number in x8, args a1..a6 in x0..x5, `svc #0`,
+    // result in x0. Args are evaluated left-to-right onto the CPU stack, then
+    // popped in reverse so nested calls inside arguments stay balanced. (The
+    // syscall NUMBERS baked into the runtime escape hatch are Linux x86-64
+    // numbers; the compile path only relies on graceful degradation of the two
+    // sites it reaches — getcwd and a liveness kill-probe — both of which fall
+    // back safely when the arm64 syscall of that number returns an error.)
+    if (@strEq(fname, "_zag_raw_syscall")) {
+        if (nargs != 7) { ac_err(cg, "arm64: _zag_raw_syscall expects 7 arguments (num, a1..a6)"); push[AInstr](out, ai_mov_imm(A_X0(), 0 - 1)); push[AInstr](out, ai_push(A_X0())); return 1; }
+        let sai: i32 = 0;
+        while (sai < 7) {
+            ac_lower_expr(out, get[*Node](c.args, sai), env, syms, cg);
+            sai = sai + 1;
+        }
+        push[AInstr](out, ai_pop(A_X5()));   // a6
+        push[AInstr](out, ai_pop(A_X4()));   // a5
+        push[AInstr](out, ai_pop(A_X3()));   // a4
+        push[AInstr](out, ai_pop(A_X2()));   // a3
+        push[AInstr](out, ai_pop(A_X1()));   // a2
+        push[AInstr](out, ai_pop(A_X0()));   // a1
+        push[AInstr](out, ai_pop(A_X8()));   // syscall number
+        push[AInstr](out, ai_svc());
+        push[AInstr](out, ai_push(A_X0()));
+        return 1;
+    }
+    // ── x86 CPU feature discovery intrinsics ─────────────────────────────────
+    // CPUID/XGETBV do not exist on AArch64. Native x86 feature detection is
+    // meaningless on a non-x86 host, so these fail closed to 0 (the generic
+    // baseline). Arguments are still evaluated for stack balance and side
+    // effects, then discarded.
+    if (@strEq(fname, "_zag_x86_cpuid_eax") || @strEq(fname, "_zag_x86_cpuid_ebx") ||
+        @strEq(fname, "_zag_x86_cpuid_ecx") || @strEq(fname, "_zag_x86_cpuid_edx") ||
+        @strEq(fname, "_zag_x86_xgetbv")) {
+        let xi: i32 = 0;
+        while (xi < nargs) {
+            ac_lower_expr(out, get[*Node](c.args, xi), env, syms, cg);
+            push[AInstr](out, ai_pop(A_X0()));
+            xi = xi + 1;
+        }
+        push[AInstr](out, ai_mov_imm(A_X0(), 0));
+        push[AInstr](out, ai_push(A_X0()));
+        return 1;
+    }
     return 0;
 }
 
@@ -2533,9 +2592,25 @@ fn ac_lower_arm_value(out: *ArrayList[AInstr], body: ArrayList[*Node], env: *AEn
         push[AInstr](out, ai_push(A_X0()));
         return;
     }
+    // A block arm may perform ordinary statements before yielding its final
+    // value, and its final node may be an explicit `return` that exits the
+    // containing function (an early guard inside a switch-expression arm).
+    // Lower the prefix as real statements; for a trailing return, lower it as a
+    // statement and leave an unreachable dummy value so the branch stack shape
+    // stays well-formed. Mirrors the x86 backend's cg_lower_arm_value.
+    let i: i32 = 0;
+    while (i + 1 < len[*Node](body)) {
+        ac_lower_stmt(out, get[*Node](body, i), env, syms, cg);
+        i = i + 1;
+    }
     let last: *Node = get[*Node](body, len[*Node](body) - 1);
     switch (last.*) {
         .estmt => |e| { ac_lower_expr(out, e.expr, env, syms, cg); }
+        .ret => |_r| {
+            ac_lower_stmt(out, last, env, syms, cg);
+            push[AInstr](out, ai_mov_imm(A_X0(), 0));
+            push[AInstr](out, ai_push(A_X0()));
+        }
         else => { ac_lower_expr(out, last, env, syms, cg); }
     }
 }
@@ -2897,21 +2972,67 @@ fn ac_emit_print_str(out: *ArrayList[AInstr], lbl: i32) void {
     push[AInstr](out, ai_ret());
 }
 
-// __malloc(x0=n): mmap(NULL, n+8, RW, PRIVATE|ANON, -1, 0), store n in an
-// 8-byte header, return base+8. One mmap per allocation (same model as x86);
-// AArch64 Linux: mmap = 222; PROT_READ|PROT_WRITE = 3; MAP_PRIVATE|MAP_ANON = 34.
-fn ac_emit_alloc(out: *ArrayList[AInstr], lbl: i32) void {
+// __malloc(x0=n): arena/bump allocator. Hands out (n + 8-byte header, rounded
+// to 16) bytes from a 64 MiB arena, mmapping a fresh arena only when the
+// current one is exhausted; allocations larger than an arena get a dedicated
+// mmap. Never frees (same lifetime model as x86), but packs many small objects
+// into one mapping instead of one mmap each — the per-allocation page rounding
+// (4 KiB minimum) is what made the arm64 self-compile exceed memory under
+// qemu-user. Returns base+8 with n stored in the 8-byte header at [ret-8] so
+// __realloc can recover the old size. Two i64 globals live in the writable data
+// segment: g_cursor at A_DATA_VBASE()+0, g_end at A_DATA_VBASE()+8 (both start
+// zero, so the first call takes the grow path). AArch64 Linux: mmap = 222;
+// PROT_READ|PROT_WRITE = 3; MAP_PRIVATE|MAP_ANON = 34. The kernel preserves
+// x1-x30 across svc, so x9..x15 stay live across the mmap.
+fn ac_emit_alloc(out: *ArrayList[AInstr], lbl: i32, cg: *ACg) void {
+    let l_huge: i32 = ac_fresh(cg);
+    let l_fits: i32 = ac_fresh(cg);
     push[AInstr](out, ai_label(lbl));
-    push[AInstr](out, ai_mov_rr(A_X9(), A_X0()));      // x9 = n (kernel preserves)
-    push[AInstr](out, ai_mov_rr(A_X1(), A_X0()));
-    push[AInstr](out, ai_add_imm(A_X1(), 8));           // len = n + 8
+    // total = align16(n + 8). Do the &~15 (which clobbers x9) before x9 = n.
+    push[AInstr](out, ai_mov_rr(A_X13(), A_X0()));
+    push[AInstr](out, ai_add_imm(A_X13(), 23));         // n + header(8) + round(15)
+    push[AInstr](out, ai_and_imm(A_X13(), 0 - 16));     // & ~15
+    push[AInstr](out, ai_mov_rr(A_X9(), A_X0()));       // x9 = n (header value)
+    push[AInstr](out, ai_mov_imm(A_X10(), A_DATA_VBASE()));
+    push[AInstr](out, ai_load(A_X11(), A_X10(), 0));    // x11 = g_cursor
+    push[AInstr](out, ai_load(A_X12(), A_X10(), 8));    // x12 = g_end
+    push[AInstr](out, ai_mov_imm(A_X15(), 67108864));   // ARENA_SIZE = 64 MiB
+    push[AInstr](out, ai_cmp(A_X13(), A_X15()));
+    push[AInstr](out, ai_jg(l_huge));                   // total > arena → dedicated mmap
+    push[AInstr](out, ai_mov_rr(A_X14(), A_X11()));
+    push[AInstr](out, ai_add(A_X14(), A_X13()));        // x14 = cursor + total
+    push[AInstr](out, ai_cmp(A_X14(), A_X12()));
+    push[AInstr](out, ai_jle(l_fits));                  // fits in the current arena
+    // grow: mmap a fresh 64 MiB arena
     push[AInstr](out, ai_mov_imm(A_X0(), 0));
+    push[AInstr](out, ai_mov_rr(A_X1(), A_X15()));      // len = ARENA_SIZE
     push[AInstr](out, ai_mov_imm(A_X2(), 3));
     push[AInstr](out, ai_mov_imm(A_X3(), 34));
     push[AInstr](out, ai_mov_imm(A_X4(), 0 - 1));
     push[AInstr](out, ai_mov_imm(A_X5(), 0));
     push[AInstr](out, ai_mov_imm(A_X8(), 222));
-    push[AInstr](out, ai_svc());
+    push[AInstr](out, ai_svc());                        // x0 = arena base
+    push[AInstr](out, ai_mov_rr(A_X11(), A_X0()));      // cursor = base
+    push[AInstr](out, ai_add(A_X0(), A_X15()));         // x0 = base + ARENA_SIZE
+    push[AInstr](out, ai_store(A_X10(), 8, A_X0()));    // g_end = base + ARENA_SIZE
+    push[AInstr](out, ai_mov_rr(A_X14(), A_X11()));
+    push[AInstr](out, ai_add(A_X14(), A_X13()));        // x14 = cursor + total
+    push[AInstr](out, ai_label(l_fits));
+    push[AInstr](out, ai_store(A_X11(), 0, A_X9()));    // header = n
+    push[AInstr](out, ai_store(A_X10(), 0, A_X14()));   // g_cursor = cursor + total
+    push[AInstr](out, ai_mov_rr(A_X0(), A_X11()));
+    push[AInstr](out, ai_add_imm(A_X0(), 8));           // return cursor + 8
+    push[AInstr](out, ai_ret());
+    // dedicated mmap for a single allocation larger than one arena
+    push[AInstr](out, ai_label(l_huge));
+    push[AInstr](out, ai_mov_imm(A_X0(), 0));
+    push[AInstr](out, ai_mov_rr(A_X1(), A_X13()));      // len = total
+    push[AInstr](out, ai_mov_imm(A_X2(), 3));
+    push[AInstr](out, ai_mov_imm(A_X3(), 34));
+    push[AInstr](out, ai_mov_imm(A_X4(), 0 - 1));
+    push[AInstr](out, ai_mov_imm(A_X5(), 0));
+    push[AInstr](out, ai_mov_imm(A_X8(), 222));
+    push[AInstr](out, ai_svc());                        // x0 = base
     push[AInstr](out, ai_store(A_X0(), 0, A_X9()));     // header = n
     push[AInstr](out, ai_add_imm(A_X0(), 8));
     push[AInstr](out, ai_ret());
@@ -3778,6 +3899,15 @@ fn aload_program(decls0: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8]
     let out: ArrayList[AInstr] = make[AInstr](128);
     let top_err: i32 = 0;
 
+    // Reserve the first 16 bytes of the (writable) data segment for the arena
+    // allocator's two globals: g_cursor at ADVBASE+0 and g_end at ADVBASE+8.
+    // Both start zero (cold arena) from the file image. Reserving here — before
+    // any string is interned — shifts every interned offset up by 16 uniformly,
+    // and every reference already reads it back as A_DATA_VBASE() + off, so the
+    // layout stays self-consistent. dataout is empty at entry for both callers.
+    let grsv: i32 = 0;
+    while (grsv < 16) { push[u8](dataout, 0); grsv = grsv + 1; }
+
     // Monomorphize using the x86 backend's target-independent AST passes:
     // infer generic targs, then expand every instantiation to a concrete
     // mangled decl. The ARM lowering only ever sees concrete names.
@@ -3927,7 +4057,7 @@ fn aload_program(decls0: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8]
 
     if (cg.use_pi == 1) { ac_emit_print_int(&out, cg.pi_lbl, &cg); }
     if (cg.use_ps == 1) { ac_emit_print_str(&out, cg.ps_lbl); }
-    if (cg.use_al == 1 || cg.use_rl == 1 || cg.use_is == 1 || cg.use_ms == 1 || cg.use_pb == 1 || cg.use_cc == 1) { ac_emit_alloc(&out, cg.al_lbl); }
+    if (cg.use_al == 1 || cg.use_rl == 1 || cg.use_is == 1 || cg.use_ms == 1 || cg.use_pb == 1 || cg.use_cc == 1) { ac_emit_alloc(&out, cg.al_lbl, &cg); }
     if (cg.use_se == 1) { ac_emit_streq(&out, cg.se_lbl, &cg); }
     if (cg.use_rl == 1) { ac_emit_realloc(&out, cg.rl_lbl, &cg); }
     if (cg.use_is == 1) { ac_emit_i64s(&out, cg.is_lbl, &cg); }
