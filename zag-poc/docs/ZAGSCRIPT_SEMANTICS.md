@@ -95,6 +95,14 @@ false, independently of whether `zagd` is running. Defaults preserve the local
 Script prelude and projects can deny each capability without source changes.
 Network access remains unavailable rather than implicitly permitted.
 
+The compiler tracks values produced by compiler-owned Script allocation calls
+through root locals. It rejects obvious storage through a field, pointer, or
+nonlocal target and rejects passing those values to extern or unresolved calls.
+Known Script consumers and defined local helpers remain usable. This is a
+bounded escape check, not a whole-program ownership or borrowing proof; strict
+promotion reports ordinary root `make` allocations that remain outside Script
+accounting.
+
 ## Progressive explicitness
 
 `explain` is read-only and reports activation, generated entry behavior,
