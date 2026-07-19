@@ -40,5 +40,9 @@ if "$ZNC" tests/i686_pointer.zag --target i686 -o "$tmp/pointer" --no-analyze >/
   set +e; "$tmp/pointer"; ptr_rc=$?; set -e
   if [ "$ptr_rc" -eq 42 ]; then ok "32-bit usize pointer address dereference and store execute"; else bad "pointer execution status=$ptr_rc"; fi
 else bad "32-bit pointer program emits"; fi
+if "$ZNC" tests/i686_write.zag --target i686 -o "$tmp/write" --no-analyze >/dev/null; then
+  set +e; write_out=$("$tmp/write"); write_rc=$?; set -e
+  if [ "$write_rc" -eq 42 ] && [ "$write_out" = "Z" ]; then ok "raw i386 write syscall preserves ABI and reports result"; else bad "write syscall output=$write_out status=$write_rc"; fi
+else bad "raw i386 write program emits"; fi
 echo "i686 minimal: pass=$pass fail=$fail"
 test "$fail" -eq 0

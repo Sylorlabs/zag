@@ -91,11 +91,16 @@ are callee-saved; current generated bodies use only EAX, ECX, EBP, and the stack
 addressing initialized frame locals, indirect loads/stores, and scalar argument
 passing. Uninitialized pointers, unsupported pointer element types, imports,
 and Script constructs fail before artifact creation. General completion still requires broader i386
-calling convention, 32-bit pointers/`usize`, smaller-register-set allocation,
+aggregate calling conventions, pointer arithmetic, smaller-register-set allocation,
 32-bit Linux syscalls, explicit rejection of 64-bit assumptions, target-specific
 runtime tests and execution on real or emulated 32-bit Linux. Until those gates
 pass, public documentation must say Linux x86-64, not full x86-family support.
 The CLI never aliases i686 requests to ELF64.
+
+The compiler-owned `_zag_write(fd, pointer, count)` primitive lowers to Linux
+i386 syscall 4. It preserves EBX across the syscall and returns the kernel result
+as a 32-bit scalar; higher-level formatting and string runtime support remain
+outside this milestone.
 
 ## Release evidence
 
