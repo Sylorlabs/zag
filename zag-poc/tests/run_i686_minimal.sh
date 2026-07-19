@@ -95,7 +95,11 @@ if "$ZNC" tests/i686_struct_arg.zag --target i686 -o "$tmp/structarg" --no-analy
   set +e; "$tmp/structarg"; sa_rc=$?; set -e
   if [ "$sa_rc" -eq 42 ]; then ok "SysV i386 by-value scalar struct argument executes"; else bad "struct argument status=$sa_rc"; fi
 else bad "by-value struct argument emits"; fi
+if "$ZNC" tests/i686_struct_return.zag --target i686 -o "$tmp/structret" --no-analyze >/dev/null; then
+  set +e; "$tmp/structret"; sr_rc=$?; set -e
+  if [ "$sr_rc" -eq 42 ]; then ok "SysV i386 hidden-sret aggregate return executes"; else bad "struct return status=$sr_rc"; fi
+else bad "aggregate return emits"; fi
 if ! "$ZNC" tests/i686_reject_struct_return.zag --target i686 -o "$tmp/badstructret" --no-analyze >"$tmp/badstructret.log" 2>&1 &&
-   grep -q "return i32, !i32, f32, or f64" "$tmp/badstructret.log" && [ ! -e "$tmp/badstructret" ]; then ok "unsupported aggregate return ABI rejects before output"; else bad "aggregate return rejection"; fi
+   grep -q "aggregate returns require 32-bit scalar fields" "$tmp/badstructret.log" && [ ! -e "$tmp/badstructret" ]; then ok "unsupported aggregate return ABI rejects before output"; else bad "aggregate return rejection"; fi
 echo "i686 minimal: pass=$pass fail=$fail"
 test "$fail" -eq 0
