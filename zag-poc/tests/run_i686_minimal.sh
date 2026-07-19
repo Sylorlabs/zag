@@ -26,6 +26,11 @@ if "$ZNC" tests/i686_literal.zag --target i686 --emit-obj -o "$tmp/main.o" --no-
     if [ "$linked_rc" -eq 42 ]; then ok "reference linker resolves relocatable object"; else bad "linked object status=$linked_rc"; fi
   fi
 else bad "ELF32 object emits"; fi
+if "$ZNC" tests/i686_literal.zag --target i686 --emit-static -o "$tmp/libmain.a" --no-analyze >/dev/null &&
+   "$ZNC" "$tmp/libmain.a" --target i686 --link-i686 -o "$tmp/pure-linked" --no-analyze >/dev/null; then
+  set +e; "$tmp/pure-linked"; pure_rc=$?; set -e
+  if [ "$pure_rc" -eq 42 ]; then ok "pure Zag archive writer and ELF32 linker execute"; else bad "pure linked status=$pure_rc"; fi
+else bad "pure Zag static archive/link path"; fi
 set +e
 "$tmp/a.out"; rc=$?
 set -e

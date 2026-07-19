@@ -130,6 +130,13 @@ string tables, and `.debug_line` are self-hosted output. Reference `ld -m
 elf_i386` linking is an optional test only and is never a compiler dependency.
 Pure-Zag archive production and multi-object resolution remain separate work.
 
+`--emit-static` wraps the deterministic Zag object in a GNU-compatible archive.
+`--link-i686` consumes either that archive or a Zag-produced object, validates
+the fixed section/relocation contract, applies `R_386_PC32`, and emits a runnable
+ELF32 executable without `ld`, `ar`, a C toolchain, or another compiler. Foreign
+objects, multiple archive members, and relocation kinds beyond this contract
+fail closed rather than entering the supported subset accidentally.
+
 ## Release evidence
 
 Any performance report records hardware, kernel, resolved feature set, compiler
