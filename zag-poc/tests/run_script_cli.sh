@@ -46,4 +46,13 @@ hardened_status=$?
 set -e
 test "$hardened_status" -eq 7
 
+"$znc_bin" harden tests/script_frontend/harden_declarations.zag \
+    --output "$tmp_dir/hardened-declarations.zag" >/dev/null
+"$znc_bin" "$tmp_dir/hardened-declarations.zag" -o "$tmp_dir/hardened-declarations" --no-analyze --no-zagd >/dev/null
+set +e
+"$tmp_dir/hardened-declarations"
+declaration_status=$?
+set -e
+test "$declaration_status" -eq 42
+
 echo "script CLI: PASS"

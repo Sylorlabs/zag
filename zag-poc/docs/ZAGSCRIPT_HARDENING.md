@@ -1,10 +1,11 @@
 # Zag Script hardening
 
-Status: conservative statement-only preview, 2026-07-18.
+Status: conservative declaration-aware preview, 2026-07-18.
 
 Hardening is the planned path from concise Zag Script to reviewable explicit
 Zag. It is not a rewrite into another language. `znc harden` can currently
-expand a statement-only script into an explicit `fn main() i32`. With `--output`
+preserve a leading block of imports/declarations and move following executable
+statements into an explicit `fn main() i32`. With `--output`
 it writes a separate candidate and never overwrites the source.
 
 ## Required hardening output
@@ -22,9 +23,10 @@ rollback material, and successful configured parity tests.
 
 ## Current boundary
 
-Imports and declarations mixed with executable top-level statements are rejected
-by automatic hardening because placement cannot yet be preserved safely. The
-candidate deliberately retains ordinary native primitive calls selected by the
+Leading imports and declarations are retained at file scope. A declaration
+appearing after executable top-level statements is rejected because moving it
+could change initialization order. The candidate deliberately retains ordinary
+native primitive calls selected by the
 script prelude; allocator and capability policy synthesis remain explicit
 unsupported report items. The report lists parity tests still required.
 
