@@ -112,6 +112,12 @@ bounded stack buffer, appends a newline, and writes it without libc. Its encoder
 preserves EBX, ESI, and EDI and returns the raw write result. General string
 literal/data-section printing is not implied by this integer primitive.
 
+The scalar `!i32` subset has a two-word logical ABI carried in EDX:EAX:
+EDX is zero for success or a stable nonzero error code, and EAX is the success
+value (zero on failure). Calls materialize both IR words, plain `catch` merges
+them to one scalar, and `try` returns the same pair immediately on failure.
+Error capture (`catch |e|`) and non-scalar error payloads remain unsupported.
+
 ## Release evidence
 
 Any performance report records hardware, kernel, resolved feature set, compiler

@@ -60,5 +60,9 @@ if "$ZNC" tests/i686_print.zag --target i686 -o "$tmp/print" --no-analyze >/dev/
   set +e; print_out=$("$tmp/print"); print_rc=$?; set -e
   if [ "$print_rc" -eq 42 ] && [ "$print_out" = "-2147483648" ]; then ok "formatted signed i32 print preserves ABI"; else bad "formatted print output=$print_out status=$print_rc"; fi
 else bad "formatted print program emits"; fi
+if "$ZNC" tests/i686_error_union.zag --target i686 -o "$tmp/errorunion" --no-analyze >/dev/null; then
+  set +e; "$tmp/errorunion"; eu_rc=$?; set -e
+  if [ "$eu_rc" -eq 42 ]; then ok "two-word scalar error ABI catch and try propagation execute"; else bad "error-union status=$eu_rc"; fi
+else bad "scalar error-union program emits"; fi
 echo "i686 minimal: pass=$pass fail=$fail"
 test "$fail" -eq 0
