@@ -22,6 +22,12 @@ leave them unspecified. Explicit command-line choices always win, and changing
 project defaults requires only editing `.zagd.conf` and issuing the next source
 command; the daemon never rewrites source.
 
+`znc suggest --format text|json` accepts only a checksum-valid semantic record
+whose root source identity still matches disk. A stale or corrupt record yields
+no recommendation. JSON recommendations include `id`, `automatic`,
+`confidence`, `provenance`, `evidence`, and `action`; the envelope records
+`source_changes=false` and `checksum_bound=true` for agent-safe consumption.
+
 The implemented pure-Zag core in `selfhost/zagd.zag` and Linux service in
 `selfhost/zagd_daemon.zag` provide:
 

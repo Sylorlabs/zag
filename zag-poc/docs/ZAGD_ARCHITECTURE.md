@@ -108,8 +108,15 @@ defaults and produce a diagnostic.
 ensure the configured singleton is running unless `mode=off` or the one-shot
 `--no-zagd` override is present. `status` reports PID or
 equivalent instance identity, mode, current snapshot, validity, queued/running
-work, budgets and cache health. `suggest` emits snapshot-bound advisory facts in
-text or JSON. Shutdown is explicit and graceful. The transport is local-only,
+work, budgets and cache health. `suggest` validates the semantic-record checksum
+and current root source hash before emitting deterministic text or JSON.
+Implemented patterns include proven constant-return folding, effect-free leaf
+inline candidates, allocation-effect review, and unresolved local-type
+witnesses. Every JSON item states evidence, confidence, provenance, action, and
+whether it is an automatic Script default. Regular Zag always remains
+`automatic=false` and `source_changes=false`; Script allocator/device/layout
+defaults are automatic only where the corresponding source choice is absent.
+Shutdown is explicit and graceful. The transport is local-only,
 versioned, project-scoped and must authenticate filesystem ownership before any
 state-changing control message.
 

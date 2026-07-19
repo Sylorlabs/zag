@@ -26,7 +26,23 @@ test "$first_pid" -gt 1
 test "$(sed -n 's/^pid=//p' "$tmp/project/.zagd.status")" = "$first_pid"
 
 (cd "$tmp/project/src" && "$tmp/bin/znc" status --format json) | grep -q '"running":true'
-(cd "$tmp/project/src" && "$tmp/bin/znc" suggest --format json) | grep -q '"advisory":true'
+suggest_json=$(cd "$tmp/project/src" && "$tmp/bin/znc" suggest --format json)
+printf '%s\n' "$suggest_json" | grep -q '"advisory":true'
+printf '%s\n' "$suggest_json" | grep -q '"source_changes":false'
+printf '%s\n' "$suggest_json" | grep -q '"checksum_bound":true'
+printf '%s\n' "$suggest_json" | grep -q '"id":"constant-return-fold"'
+printf '%s\n' "$suggest_json" | grep -q '"automatic":false'
+(cd "$tmp/project/src" && "$tmp/bin/znc" suggest --format text) | grep -q 'checksum-bound=true source_changes=false'
+
+# Script snapshots report supported unspecified defaults as automatic facts;
+# they remain reports and never rewrite the source.
+printf 'script;\nprintln("planner");\n' > "$tmp/project/src/deep/main.zag"
+(cd "$tmp/project/src/deep" && "$tmp/bin/znc" check main.zag --no-analyze >/dev/null)
+script_suggest=$(cd "$tmp/project/src" && "$tmp/bin/znc" suggest --format json)
+printf '%s\n' "$script_suggest" | grep -q '"profile":"script"'
+printf '%s\n' "$script_suggest" | grep -q '"id":"script-default-allocator","automatic":true'
+printf '%s\n' "$script_suggest" | grep -q '"id":"script-default-device","automatic":true'
+test "$(cat "$tmp/project/src/deep/main.zag")" = $'script;\nprintln("planner");'
 if (cd "$tmp/project/src" && "$tmp/bin/znc" status --format yaml >/dev/null 2>&1); then
     echo "invalid status format unexpectedly accepted" >&2; exit 1
 fi
