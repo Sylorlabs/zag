@@ -128,6 +128,14 @@ and the callee pops the hidden word with `ret 4`. Nested aggregates, float
 aggregate fields, aggregate literals returned directly, and aggregate mutation
 through by-value parameters reject before artifact output.
 
+The bounded byte-slice ABI uses two 32-bit words, pointer followed by length in
+SysV stack order, and EAX/EDX for pointer/length returns. The current subset
+supports `[]u8`/`String` literals, locals, arguments, returns, `.len`, and
+`_zag_print`; literal bytes are embedded without an external linker. Slicing,
+mutation, allocation, ownership transfer, and general string-library operations
+remain rejected. Slice storage is borrowed/static and introduces no reclamation
+claim.
+
 `_zag_println_i32(value)` formats the complete signed 32-bit range into a
 bounded stack buffer, appends a newline, and writes it without libc. Its encoder
 preserves EBX, ESI, and EDI and returns the raw write result. General string

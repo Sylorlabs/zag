@@ -101,5 +101,11 @@ if "$ZNC" tests/i686_struct_return.zag --target i686 -o "$tmp/structret" --no-an
 else bad "aggregate return emits"; fi
 if ! "$ZNC" tests/i686_reject_struct_return.zag --target i686 -o "$tmp/badstructret" --no-analyze >"$tmp/badstructret.log" 2>&1 &&
    grep -q "aggregate returns require 32-bit scalar fields" "$tmp/badstructret.log" && [ ! -e "$tmp/badstructret" ]; then ok "unsupported aggregate return ABI rejects before output"; else bad "aggregate return rejection"; fi
+if "$ZNC" tests/i686_slice_abi.zag --target i686 -o "$tmp/slice" --no-analyze >/dev/null; then
+  set +e; slice_out=$("$tmp/slice"); slice_rc=$?; set -e
+  if [ "$slice_rc" -eq 42 ] && [ "$slice_out" = "Zag" ]; then ok "two-word byte-slice argument return and print ABI executes"; else bad "slice ABI output=$slice_out status=$slice_rc"; fi
+else bad "byte-slice ABI emits"; fi
+if ! "$ZNC" tests/i686_reject_slice_mutation.zag --target i686 -o "$tmp/badslice" --no-analyze >"$tmp/badslice.log" 2>&1 &&
+   grep -Eq "assignment target|byte slices expose only" "$tmp/badslice.log" && [ ! -e "$tmp/badslice" ]; then ok "unsupported byte-slice mutation rejects before output"; else bad "slice mutation rejection"; fi
 echo "i686 minimal: pass=$pass fail=$fail"
 test "$fail" -eq 0
