@@ -75,6 +75,15 @@ the shell. Its typed `ProcessResult` reports `status`, `state`, and `output`
 through the ordinary getter functions. An explicit user declaration named
 `process_run_timeout` overrides the convenience.
 
+`string_builder(capacity)` creates a fixed-capacity `ScriptStringBuilder` from
+the bounded Script allocator. `string_builder_append`, `string_builder_len`,
+`string_builder_failed`, and `string_builder_output` are ordinary Zag
+declarations. Appends never grow or reallocate the buffer: successful total copy
+work equals the number of appended bytes, overflow leaves existing contents and
+length unchanged, and marks the builder failed. Strict Zag imports
+`std:script_string_builder` and calls `string_builder_from_buffer` with explicitly
+allocated storage. This is not variadic list syntax or a dynamic value system.
+
 Basic JSON scalar support is available as the ordinary `std:json` module. It
 stringifies and parses strings, signed integers, and booleans with statically
 typed parse results containing `ok` and `value`. Parse failure is explicit.

@@ -62,7 +62,7 @@ The implicit prelude is a small allowlist. Each name resolves to an ordinary,
 documented Zag declaration with an explicit strict-Zag equivalent. The implemented
 allowlist is `print`, `println`, `read_file`, `write_file`, `args_len`, `arg`,
 `string_concat`, `script_alloc`, and `script_alloc_used`. A materialized argument
-collection, typed collections, a growable string builder, bounded process
+collection, typed collections, an automatically growing string builder, bounded process
 execution, and implicit JSON bindings remain candidates, added only
 when their type, effect, allocation, error and limit behavior are implemented.
 
