@@ -60,7 +60,8 @@ The milestone defines `usize` and supported pointers as 32-bit ABI words.
 Address-of is restricted to initialized stack locals; dereference and indirect
 store support `*i32` and `*usize`. The subset also covers basic local scalar
 structs, signed i32 output, scalar `!i32`, ELF32 symbols/debug-line metadata,
-relocatable objects, deterministic archives, and pure-Zag linking of the
-compiler-owned object/archive contract. It does not imply aggregate calls or
-returns, heap, slices, general pointer arithmetic, foreign objects, or complete
-i386 ABI/runtime support.
+relocatable objects, deterministic archives, and pure-Zag multi-object/archive
+linking with strong-symbol resolution plus `R_386_32` and `R_386_PC32`.
+COMDAT, TLS, weak/common precedence, dynamic linking, a split W^X load image,
+heap ownership, and complete i386 ABI/runtime support remain outside this
+milestone.

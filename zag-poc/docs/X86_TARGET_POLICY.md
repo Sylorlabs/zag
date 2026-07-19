@@ -156,14 +156,21 @@ not alter the PT_LOAD bytes.
 stub references global `main` through `R_386_PC32`; `.rel.text`, `.symtab`,
 string tables, and `.debug_line` are self-hosted output. Reference `ld -m
 elf_i386` linking is an optional test only and is never a compiler dependency.
-Foreign and general multi-object resolution remain separate work.
+`--link-i686` accepts multiple ELF32/i386 `ET_REL` inputs and deterministic
+Unix archives. The pure-Zag linker merges allocatable `PROGBITS`/`NOBITS`
+sections, resolves local and strong global definitions, extracts archive
+members on demand, and applies `R_386_32` and `R_386_PC32` relocations.
 
 `--emit-static` wraps the deterministic Zag object in a GNU-compatible archive.
-`--link-i686` consumes either that archive or a Zag-produced object, validates
-the fixed section/relocation contract, applies `R_386_PC32`, and emits a runnable
-ELF32 executable without `ld`, `ar`, a C toolchain, or another compiler. Foreign
-objects, multiple archive members, and relocation kinds beyond this contract
+`--link-i686` emits a runnable ELF32 executable without `ld`, `ar`, a C
+toolchain, or another compiler. Duplicate strong definitions and unresolved
+symbols are hard errors naming the symbol. COMDAT/groups, TLS, dynamic
+relocations, weak/common precedence, linker scripts, and other relocation kinds
 fail closed rather than entering the supported subset accidentally.
+
+The milestone maps merged allocatable sections into one read/write/execute
+segment. Page-separated W^X text/data segments remain required before this
+linker is described as hardened against writable-code attacks.
 
 ## Release evidence
 
