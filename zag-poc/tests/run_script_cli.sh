@@ -3,6 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 znc_bin=${ZNC:-./znc}
+case "$znc_bin" in /*) ;; *) znc_bin="$(pwd)/${znc_bin#./}" ;; esac
 tmp_dir=$(mktemp -d /tmp/zag-script-cli.XXXXXX)
 trap 'rm -rf "$tmp_dir"' EXIT
 
@@ -54,5 +55,25 @@ set +e
 declaration_status=$?
 set -e
 test "$declaration_status" -eq 42
+
+# Project Script defaults reach foreground code generation. Explicit CLI CPU
+# selection wins; regular Zag remains independent of Script defaults.
+mkdir -p "$tmp_dir/project"
+printf 'name = "planner-e2e"\n' > "$tmp_dir/project/zag.mod"
+cp tests/script_frontend/basic.zag "$tmp_dir/project/app.zag"
+printf 'mode=off\ncpu=native\nallocator=script_process_arena\ndevice=cpu\nlayout=compiler_owned\n' > "$tmp_dir/project/.zagd.conf"
+(cd "$tmp_dir/project" && "$znc_bin" explain app.zag --format text --no-zagd) > "$tmp_dir/planner-explain.txt"
+grep -q 'execution plan: cpu=native, device=cpu, layout=compiler_owned' "$tmp_dir/planner-explain.txt"
+(cd "$tmp_dir/project" && "$znc_bin" app.zag -o configured --no-analyze --no-zagd >/dev/null)
+(cd "$tmp_dir/project" && "$znc_bin" app.zag -o explicit --cpu generic --no-analyze --no-zagd >/dev/null)
+
+printf 'mode=off\nallocator=unsupported_allocator\ndevice=cpu\nlayout=compiler_owned\n' > "$tmp_dir/project/.zagd.conf"
+if (cd "$tmp_dir/project" && "$znc_bin" app.zag -o rejected --no-analyze --no-zagd >/dev/null 2>&1); then
+    echo "unsupported automatic Script default unexpectedly accepted" >&2
+    exit 1
+fi
+(cd "$tmp_dir/project" && "$znc_bin" app.zag -o overridden --script-allocator script_process_arena --device cpu --layout compiler_owned --no-analyze --no-zagd >/dev/null)
+printf 'fn main() i32 { return 0; }\n' > "$tmp_dir/project/regular.zag"
+(cd "$tmp_dir/project" && "$znc_bin" regular.zag -o regular --no-analyze --no-zagd >/dev/null)
 
 echo "script CLI: PASS"

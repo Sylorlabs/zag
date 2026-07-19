@@ -826,6 +826,7 @@ fn znc_check_src(path: []u8, src: []u8) i32 {
     if (v2_validate_source(path, src) != 0) { return 1; }
     let unit: CompilationUnit = parse_compilation_unit_dir(src, dir_of(path));
     znc_configure_script_unit(&unit, path);
+    if (znc_validate_script_defaults(path, unit) != 0) { return 1; }
     let decls: ArrayList[*Node] = unit.decls;
     lo_operators(decls);
     let aerrs: i32 = znc_check_arity(decls);
@@ -1048,6 +1049,36 @@ fn cpu_flag_value() []u8 {
     return "generic";
 }
 
+fn cpu_flag_explicit() i32 {
+    if (flag_value("--cpu").len > 0) { return 1; }
+    let i: i32 = 1;
+    while (i < _zag_argc()) {
+        let a: []u8 = _zag_arg(i);
+        if (a.len > 6 && starts_with(a, "--cpu=")) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn znc_script_explicit_choices() PlannerChoices {
+    let input:PlannerChoices=planner_empty_choices();
+    let allocator:[]u8=flag_value("--script-allocator");
+    let device:[]u8=flag_value("--device");
+    let layout:[]u8=flag_value("--layout");
+    if(allocator.len>0){input.allocator=allocator;input.allocator_explicit=1;}
+    if(device.len>0){input.device=device;input.device_explicit=1;}
+    if(layout.len>0){input.layout=layout;input.layout_explicit=1;}
+    if(cpu_flag_explicit()==1){input.cpu=cpu_flag_value();input.cpu_explicit=1;}
+    return input;
+}
+
+// Script may inherit a project CPU default. A command-line CPU request is an
+// explicit choice and always wins. Regular Zag never inherits Script defaults.
+fn znc_effective_cpu(path: []u8, script_profile: i32) []u8 {
+    if (cpu_flag_explicit() == 1 || script_profile == 0) { return cpu_flag_value(); }
+    return znc_project_config(znc_project_root(dir_of(path)), 0).default_cpu;
+}
+
 fn validate_x86_cpu_flag() i32 {
     let p: X86CpuProfile = parse_x86_cpu_profile(cpu_flag_value());
     if (p.valid == 0) {
@@ -1188,6 +1219,8 @@ fn znc_explain(path: []u8) i32 {
     let config: PlannerConfig = znc_project_config(znc_project_root(dir_of(path)), 0);
     let scripted: i32 = 0;
     if (unit.profile == ModuleProfile.script) { scripted = 1; }
+    let planner_input: PlannerChoices = znc_script_explicit_choices();
+    let resolution: PlannerResolution = planner_resolve(scripted, src, config, planner_input, 0);
     let format: []u8 = flag_value("--format");
     if (format.len > 0 && @strEq(format, "text") == 0 && @strEq(format, "json") == 0) {
         _zag_eprintln("znc explain: --format must be text or json"); return 1;
@@ -1224,7 +1257,12 @@ fn znc_explain(path: []u8) i32 {
     _zag_println("function effects: analyzed by check; per-expression type/effect witnesses unavailable [derived]");
     _zag_println("hidden allocation: root new, string_concat/list/builder/read_file results and bounded process allocations use script accounting; ordinary make remains outside [proven]");
     _zag_println("unresolved: per-expression type witnesses, ordinary make accounting, automatic reclamation [unknown]");
-    _zag_println("execution plan: generic x86-64-v1 baseline [derived]");
+    if (scripted == 1) {
+        _zag_print("execution plan: cpu="); _zag_print(resolution.choices.cpu);
+        _zag_print(", device="); _zag_print(resolution.choices.device);
+        _zag_print(", layout="); _zag_print(resolution.choices.layout);
+        _zag_println(" [derived from project config unless explicit]");
+    } else { _zag_println("execution plan: generic x86-64-v1 baseline [derived]"); }
     return 0;
 }
 
@@ -1443,8 +1481,30 @@ fn znc_configure_script_unit(unit: *CompilationUnit, path: []u8) void {
     if (unit.*.profile != ModuleProfile.script) { return; }
     let root: []u8 = znc_project_root(dir_of(path));
     let cfg: PlannerConfig = znc_project_config(root, 0);
+    let input: PlannerChoices = znc_script_explicit_choices();
+    let resolved: PlannerResolution = planner_resolve(1, "", cfg, input, 0);
+    // These are the only runtime choices implemented today. Rejecting other
+    // configured values happens in the foreground build before codegen.
     let _configured: i32 = compilation_unit_set_script_memory_limit(unit, cfg.script_memory_bytes);
     let _source_label: i32 = compilation_unit_set_script_source_label(unit, path);
+}
+
+
+fn znc_validate_script_defaults(path: []u8, unit: CompilationUnit) i32 {
+    if (unit.profile != ModuleProfile.script) { return 0; }
+    let cfg: PlannerConfig = znc_project_config(znc_project_root(dir_of(path)), 1);
+    let input: PlannerChoices = znc_script_explicit_choices();
+    let r: PlannerResolution = planner_resolve(1, "", cfg, input, 0);
+    if (r.diagnostic.len > 0) { _zag_eprintln(r.diagnostic); return 1; }
+    if (@strEq(r.choices.allocator, "script_process_arena") == 0 ||
+        @strEq(r.choices.device, "cpu") == 0 ||
+        @strEq(r.choices.layout, "compiler_owned") == 0) {
+        _zag_eprintln("znc: unsupported Zag Script planner default; supported allocator=script_process_arena, device=cpu, layout=compiler_owned");
+        return 1;
+    }
+    let p: X86CpuProfile = parse_x86_cpu_profile(r.choices.cpu);
+    if (p.valid == 0) { _zag_eprintln(_zag_str_concat("znc: ", p.diagnostic)); return 1; }
+    return 0;
 }
 
 fn znc_parse_pid(value: []u8) i64 {
@@ -1490,15 +1550,23 @@ fn znc_valid_zagd_mode(mode: []u8) i32 {
     return 0;
 }
 
-fn znc_zagd_exec(root: []u8, mode: []u8, window_ms: i64, daemonize: i32) i32 {
+fn znc_zagd_exec_config(root: []u8, mode: []u8, cfg: PlannerConfig, daemonize: i32) i32 {
     let binary: []u8 = znc_sibling_zagd();
     if (_zag_file_exists(binary) == 0) { return 127; }
-    let command: []u8 = _zag_str_concat(znc_shell_quote(binary),
-        _zag_str_concat(" --root ", _zag_str_concat(znc_shell_quote(root),
-        _zag_str_concat(" --mode ", _zag_str_concat(znc_shell_quote(mode),
-        _zag_str_concat(" --window-ms ", _zag_i64_to_str(window_ms)))))));
+    let command: []u8 = znc_shell_quote(binary);
+    command=_zag_str_concat(command,_zag_str_concat(" --root ",znc_shell_quote(root)));
+    command=_zag_str_concat(command,_zag_str_concat(" --mode ",znc_shell_quote(mode)));
+    command=_zag_str_concat(command,_zag_str_concat(" --window-ms ",_zag_i64_to_str(cfg.stability_window_ms)));
+    command=_zag_str_concat(command,_zag_str_concat(" --max-cache-bytes ",_zag_i64_to_str(cfg.max_cache_bytes)));
+    command=_zag_str_concat(command,_zag_str_concat(" --max-workers ",_zag_i64_to_str(cfg.max_workers as i64)));
+    command=_zag_str_concat(command,_zag_str_concat(" --notifications ",znc_shell_quote(cfg.notifications)));
     if (daemonize == 1) { command = _zag_str_concat(command, " --daemonize >/dev/null 2>/dev/null"); }
     return _zag_exec_cmd(command);
+}
+
+fn znc_zagd_exec(root: []u8, mode: []u8, window_ms: i64, daemonize: i32) i32 {
+    let cfg:PlannerConfig=znc_project_config(root,0);cfg.stability_window_ms=window_ms;
+    return znc_zagd_exec_config(root,mode,cfg,daemonize);
 }
 
 fn znc_zagd_lock_alive(root: []u8) i32 {
@@ -1538,7 +1606,7 @@ fn znc_zagd_ensure(root: []u8) void {
             return;
         }
     }
-    let rc: i32 = znc_zagd_exec(root, mode, config.stability_window_ms, 1);
+    let rc: i32 = znc_zagd_exec_config(root, mode, config, 1);
     if (rc != 0 && rc != 6) {
         _zag_eprintln("znc: warning: zagd unavailable; foreground compilation continues without background planning");
     }
@@ -1586,7 +1654,7 @@ fn znc_watch() i32 {
         let stopped: i32 = znc_zagd_exec(root, "off", config.stability_window_ms, 0);
         if (stopped != 0) { return stopped; }
     }
-    let rc: i32 = znc_zagd_exec(root, mode, config.stability_window_ms, 1);
+    let rc: i32 = znc_zagd_exec_config(root, mode, config, 1);
     if (rc == 127) { _zag_eprintln("znc watch: sibling zagd executable is missing; run bootstrap.sh or make zagd"); }
     return rc;
 }
@@ -1801,6 +1869,7 @@ fn main() i32 {
     // parse → apply configurable Script defaults → effect-check → lower → ELF
     let unit: CompilationUnit = parse_compilation_unit_dir(src, dir_of(path));
     znc_configure_script_unit(&unit, path);
+    if (znc_validate_script_defaults(path, unit) != 0) { return 1; }
     let decls: ArrayList[*Node] = unit.decls;
 
     // Lower operator contracts (x + y → big_add(x, y)) so sema sees the real calls.
@@ -1870,7 +1939,7 @@ fn main() i32 {
 
     let nerr: i32 = 0;
     let data: ArrayList[u8] = make[u8](16);
-    let selected_cpu:X86CpuProfile=parse_x86_cpu_profile(cpu_flag_value());
+    let selected_cpu:X86CpuProfile=parse_x86_cpu_profile(znc_effective_cpu(path, (unit.profile==ModuleProfile.script) as i32));
     let prog:  ArrayList[Instr] = lower_program_mode_cpu(code_decls, &nerr, &data, dynamic_mode,selected_cpu.features.popcnt);
     if (nerr > 0) {
         _zag_println("znc: build aborted — unsupported constructs (see messages above)");
