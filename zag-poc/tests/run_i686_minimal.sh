@@ -22,5 +22,9 @@ elif command -v qemu-i386 >/dev/null 2>&1; then
 else bad "i386 execution unavailable"; fi
 if ! "$ZNC" tests/i686_reject_pointer.zag --target i686 -o "$tmp/bad" --no-analyze >"$tmp/reject.log" 2>&1 &&
    grep -q "unsupported construct" "$tmp/reject.log" && [ ! -e "$tmp/bad" ]; then ok "pointer/local constructs reject before output"; else bad "unsupported construct rejection"; fi
+if "$ZNC" tests/i686_i32_ir.zag --target i686 -o "$tmp/ir" --no-analyze >/dev/null; then
+  set +e; "$tmp/ir"; ir_rc=$?; set -e
+  if [ "$ir_rc" -eq 42 ]; then ok "i32 IR locals assignment add/sub execute"; else bad "i32 IR execution status=$ir_rc"; fi
+else bad "i32 IR emits"; fi
 echo "i686 minimal: pass=$pass fail=$fail"
 test "$fail" -eq 0

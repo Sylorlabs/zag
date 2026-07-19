@@ -78,10 +78,12 @@ or memory constraints.
 ## i686 milestone
 
 i686 remains a separate target, not part of the first Zag Script release and
-not implied by x86-64 support. A first isolated milestone emits and executes an
-ELF32 `EM_386` process containing only a literal-return `main` and the 32-bit
-Linux exit syscall. Every pointer, `usize`, call, local, import, expression, and
-Script construct is rejected. General completion still requires a specified i386
+not implied by x86-64 support. The isolated backend now lowers the normal parsed
+AST through a target-neutral integer IR for `i32` constants, initialized locals,
+loads/stores, addition, subtraction, assignment, and return. It emits a real
+i386 stack frame and an ELF32 `EM_386` process using the 32-bit Linux exit
+syscall. Pointers, `usize`, calls, imports, control flow, additional functions,
+and Script constructs fail before artifact creation. General completion still requires a specified i386
 calling convention, 32-bit pointers/`usize`, smaller-register-set allocation,
 32-bit Linux syscalls, explicit rejection of 64-bit assumptions, target-specific
 runtime tests and execution on real or emulated 32-bit Linux. Until those gates
