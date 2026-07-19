@@ -191,3 +191,13 @@ stable-source foreground-equivalent check. Uncertain dependents remain
 conservative rather than under-invalidated. Adaptive/deep runs use hard
 deterministic budgets and accept only proven manifest facts; deep mode is not a
 completed superoptimizer, profile-guided tuner, or benchmarking engine.
+# Incremental declaration records
+
+Light mode has a versioned, checksummed `zagd-incremental-v1` advisory record
+for each analyzed file. It stores content and parse fingerprints plus explicit
+declaration-to-signature/type, layout, function body, caller, and codegen-region
+fingerprints. An unchanged parse fingerprint can reuse parsed facts. Private
+body changes invalidate functions, callers, and codegen regions; public shape
+or layout changes invalidate all dependent layers. Root-profile, target, unknown,
+truncated, corrupt, or executable-authority records conservatively invalidate
+everything. These records never authorize executable reuse or source changes.
