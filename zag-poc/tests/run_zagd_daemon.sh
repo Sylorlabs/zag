@@ -88,8 +88,12 @@ if "$tmp/zagd" --root "$tmp/project" --window-ms 0 >/dev/null 2>&1; then
     echo "invalid stability window unexpectedly accepted" >&2
     exit 1
 fi
+if "$tmp/zagd" --root "$tmp/project" --max-cache-bytes 100 >/dev/null 2>&1; then
+    echo "invalid cache limit unexpectedly accepted" >&2
+    exit 1
+fi
 
-child_pid=$("$tmp/zagd" --root "$tmp/project" --mode adaptive --window-ms 20 --daemonize)
+child_pid=$("$tmp/zagd" --root "$tmp/project" --mode adaptive --window-ms 20 --max-cache-bytes 1048576 --daemonize)
 test "$child_pid" -gt 1
 for _ in $(seq 1 100); do
     grep -q '^mode=adaptive$' "$tmp/project/.zagd.status" 2>/dev/null && break
