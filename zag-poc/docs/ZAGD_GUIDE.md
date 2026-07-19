@@ -29,6 +29,9 @@ changes foreground compiler correctness.
 Use `.zagd.conf` with `mode=off`, `mode=light`, `mode=adaptive`, or `mode=deep`
 to select automatic startup behavior. A subsequent source command applies a
 mode change, including stopping an existing daemon for `mode=off`. The
+`mode=off` setting is the persistent project opt-out for automatic background
+startup; it is already covered by product tests for fresh builds and for
+stopping a running project daemon. No second opt-out setting is required.
 `stability_window_ms` setting controls the daemon's stable-read delay. Adaptive
 and deep run deterministic bounded planner budgets; they are not a complete
 whole-program optimizer or an unbounded idle-time search.
