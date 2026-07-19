@@ -52,6 +52,7 @@ function with the same name wins independently.
 `read_file` currently allocates outside the requested-payload script budget and
 reports failure using a slice with negative length. This is documented behavior,
 not a general memory-safety guarantee or the eventual typed error API.
+`string_concat` returns Script-lifetime storage charged to that budget.
 
 ## Profile rules currently enforced
 
