@@ -87,8 +87,10 @@ explicit IR labels with checked relative-branch patching. Multiple non-generic
 `i32` functions use a cdecl-like boundary: arguments are pushed right-to-left,
 the caller removes arguments, and results return in EAX. EBP, EBX, ESI, and EDI
 are callee-saved; current generated bodies use only EAX, ECX, EBP, and the stack.
-Pointers, `usize`, imports, and Script constructs fail before artifact creation.
-General completion still requires broader i386
+`usize` is one 32-bit word. `*i32` and `*usize` use 32-bit addresses and support
+addressing initialized frame locals, indirect loads/stores, and scalar argument
+passing. Uninitialized pointers, unsupported pointer element types, imports,
+and Script constructs fail before artifact creation. General completion still requires broader i386
 calling convention, 32-bit pointers/`usize`, smaller-register-set allocation,
 32-bit Linux syscalls, explicit rejection of 64-bit assumptions, target-specific
 runtime tests and execution on real or emulated 32-bit Linux. Until those gates

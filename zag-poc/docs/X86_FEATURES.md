@@ -44,3 +44,8 @@ lower through a validated integer IR into i386 frames with caller-cleaned stack
 arguments and EAX returns; Linux startup exits through `int 0x80`. Unsupported
 types and AST nodes reject before output. This
 is executable integer-backend proof, not general i686 language support.
+
+The milestone defines `usize` and supported pointers as 32-bit ABI words.
+Address-of is restricted to initialized stack locals; dereference and indirect
+store support `*i32` and `*usize`. This does not yet imply aggregate, heap, slice,
+or general pointer-arithmetic support.

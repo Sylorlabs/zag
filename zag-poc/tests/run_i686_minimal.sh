@@ -35,6 +35,10 @@ if "$ZNC" tests/i686_calls.zag --target i686 -o "$tmp/calls" --no-analyze >/dev/
   if [ "$call_rc" -eq 42 ]; then ok "cdecl-like i32 arguments returns and caller cleanup execute"; else bad "call ABI execution status=$call_rc"; fi
 else bad "multiple i32 functions emit"; fi
 if ! "$ZNC" tests/i686_reject_abi.zag --target i686 -o "$tmp/badabi" --no-analyze >"$tmp/badabi.log" 2>&1 &&
-   grep -q "pointers and usize are rejected" "$tmp/badabi.log" && [ ! -e "$tmp/badabi" ]; then ok "unsupported ABI types reject before output"; else bad "unsupported ABI rejection"; fi
+   grep -q "not a supported 32-bit scalar" "$tmp/badabi.log" && [ ! -e "$tmp/badabi" ]; then ok "unsupported floating ABI rejects before output"; else bad "unsupported ABI rejection"; fi
+if "$ZNC" tests/i686_pointer.zag --target i686 -o "$tmp/pointer" --no-analyze >/dev/null; then
+  set +e; "$tmp/pointer"; ptr_rc=$?; set -e
+  if [ "$ptr_rc" -eq 42 ]; then ok "32-bit usize pointer address dereference and store execute"; else bad "pointer execution status=$ptr_rc"; fi
+else bad "32-bit pointer program emits"; fi
 echo "i686 minimal: pass=$pass fail=$fail"
 test "$fail" -eq 0
