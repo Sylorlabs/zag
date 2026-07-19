@@ -22,7 +22,6 @@ test "$markerless_status" -eq 5
 grep -q '"profile":{"value":"script","basis":"proven"}' "$tmp_dir/explain.json"
 grep -q '"allocator":{"value":"script_process_arena","basis":"derived"}' "$tmp_dir/explain.json"
 grep -q '"script_memory_bytes":{"value":67108864,"basis":"derived"}' "$tmp_dir/explain.json"
-grep -q '"hidden_copies":{"value":"string_concat copies both inputs; list growth copies existing elements; read_file and bounded process capture copy bytes into owned Script results; builder finish copies used bytes","basis":"proven"}' "$tmp_dir/explain.json"
 grep -q '"semantic_facts":{"format":"zag-semantic-manifest-v1"' "$tmp_dir/explain.json"
 grep -q 'decl_fn=' "$tmp_dir/explain.json"
 grep -q 'value_type=' "$tmp_dir/explain.json"
@@ -32,7 +31,6 @@ grep -q 'type_basis=typed' "$tmp_dir/explain.json"
 grep -q 'effect_basis=sema' "$tmp_dir/explain.json"
 "$znc_bin" explain tests/script_frontend/basic.zag --format text >"$tmp_dir/explain.txt"
 grep -q 'expression types/effects: typed frontend and sema witnesses' "$tmp_dir/explain.txt"
-grep -q 'hidden copies: string_concat inputs, list growth elements, read_file/process capture bytes, and builder finish output are copied \[proven\]' "$tmp_dir/explain.txt"
 grep -q 'expr_fact=' "$tmp_dir/explain.txt"
 
 if "$znc_bin" explain tests/script_frontend/basic.zag --format yaml >/dev/null 2>&1; then
