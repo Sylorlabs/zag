@@ -43,6 +43,9 @@ ExecStart=$zagd_path --root $project_root --root-source $source_path --mode $mod
 Restart=always
 RestartSec=1
 Nice=10
+MemoryMax=256M
+MemorySwapMax=0
+CPUWeight=25
 NoNewPrivileges=true
 
 [Install]
