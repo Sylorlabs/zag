@@ -5,7 +5,11 @@ tmp=$(mktemp -d /tmp/zagd-deep-integration.XXXXXX)
 daemon_pid=
 trap 'if [ -n "$daemon_pid" ]; then kill "$daemon_pid" 2>/dev/null || true; fi; find "$tmp" -depth -delete' EXIT
 mkdir -p "$tmp/bin"
-./znc selfhost/zagd_daemon.zag -o "$tmp/bin/zagd" --no-zagd --no-analyze >/dev/null
+if [ -n "${ZAGD:-}" ]; then
+    cp "$ZAGD" "$tmp/bin/zagd"
+else
+    ./znc selfhost/zagd_daemon.zag -o "$tmp/bin/zagd" --no-zagd --no-analyze >/dev/null
+fi
 cp ./znc "$tmp/bin/znc"
 ./znc tests/zagd_finalist_witness.zag -o "$tmp/reference" --no-zagd --no-analyze >/dev/null
 cp "$tmp/reference" "$tmp/equivalent"
