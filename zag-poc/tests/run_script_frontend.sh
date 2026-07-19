@@ -38,6 +38,12 @@ import_status=$?
 set -e
 test "$import_status" -eq 9
 
+"$znc_bin" tests/script_frontend/materialized_args.zag -o "$tmp_dir/materialized-args" --no-analyze >/dev/null
+"$tmp_dir/materialized-args" alpha beta
+
+"$znc_bin" tests/script_frontend/path_helpers.zag -o "$tmp_dir/path-helpers" --no-analyze >/dev/null
+"$tmp_dir/path-helpers"
+
 if "$znc_bin" tests/script_frontend/duplicate.zag -o "$tmp_dir/duplicate" --no-analyze >"$tmp_dir/dup.out" 2>&1; then
     echo "duplicate script declaration unexpectedly compiled" >&2
     exit 1
