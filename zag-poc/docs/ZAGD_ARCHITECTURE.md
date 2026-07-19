@@ -211,17 +211,17 @@ deterministic budgets and accept only proven manifest facts; deep mode is not a
 completed superoptimizer, profile-guided tuner, or benchmarking engine.
 # Incremental declaration records
 
-Light mode has a versioned, checksummed `zagd-incremental-v1` advisory record
-for each analyzed file. It stores content and parse fingerprints plus explicit
+Light mode has a versioned, checksummed `zagd-incremental-index-v1` advisory
+project index containing one record for each analyzed file. It stores content and parse fingerprints plus explicit
 declaration-to-signature/type, layout, function body, caller, and codegen-region
 fingerprints. An unchanged parse fingerprint can reuse parsed facts. Private
 body changes invalidate functions, callers, and codegen regions; public shape
 or layout changes invalidate all dependent layers. Root-profile, target, unknown,
 truncated, corrupt, or executable-authority records conservatively invalidate
 everything. These records never authorize executable reuse or source changes.
-The daemon transactionally updates `incremental.record` after each stable file
-snapshot, validates its content and target/root keys on restart, exposes reuse
-and invalidation in `.zagd.status`, and includes it in cache-budget eviction.
+The daemon transactionally updates the complete `incremental.record` index after
+each stable file snapshot, validates each reusable entry's content and target/root
+keys on restart, exposes reuse and invalidation in `.zagd.status`, and includes it in cache-budget eviction.
 Corruption is reported as `incremental_cache_reused=false` with unknown
 invalidation; foreground compilation remains independent of the record.
 
