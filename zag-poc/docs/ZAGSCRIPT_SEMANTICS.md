@@ -61,15 +61,17 @@ negative tests.
 The implicit prelude is a small allowlist. Each name resolves to an ordinary,
 documented Zag declaration with an explicit strict-Zag equivalent. The implemented
 allowlist is `print`, `println`, `read_file`, `write_file`, `args_len`, `arg`,
-`string_concat`, `script_alloc`, and `script_alloc_used`. A materialized argument
-collection, typed collections, an automatically growing string builder, bounded process
-execution, and implicit JSON bindings remain candidates, added only
-when their type, effect, allocation, error and limit behavior are implemented.
+`string_concat`, `script_alloc`, `script_alloc_used`, `process_run_timeout`,
+`string_builder`, and `list`. A materialized argument collection and implicit
+JSON bindings remain candidates rather than hidden behavior.
 
 Collections remain statically typed. The compiler may infer one element type
 when unambiguous. Mixed incompatible elements are rejected. Growth, copies and
 allocation are reportable by `explain`; implementations must avoid undocumented
 quadratic growth. No default universal `any` value is introduced.
+The implemented `ScriptList[T]` grows geometrically, charges each replacement
+buffer to the Script context, and retains superseded arena buffers until process
+shutdown. Construction accepts one to four values of a single inferred type.
 
 ## Errors and effects
 

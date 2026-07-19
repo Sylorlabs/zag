@@ -41,8 +41,8 @@ return 0;
 ## Prelude
 
 The intentionally small implemented prelude is `print`, `println`, `read_file`,
-`write_file`, `args_len`, `arg`, `string_concat`, `script_alloc`, and
-`script_alloc_used`. The ordinary strict-Zag
+`write_file`, `args_len`, `arg`, `string_concat`, `script_alloc`,
+`script_alloc_used`, `process_run_timeout`, `string_builder`, and `list`. The ordinary strict-Zag
 mappings are `_zag_print`, `_zag_println`, `_zag_read_file`, `_zag_write_file`,
 `_zag_argc`, `_zag_arg`, `_zag_str_concat`, and the explicit script-context
 allocation runtime calls. Prelude bindings occur
@@ -62,8 +62,8 @@ not a general memory-safety guarantee or the eventual typed error API.
 - A `.zag` suffix alone does not activate the profile.
 - A source file without `script;` keeps regular Zag semantics.
 
-Implicit JSON bindings, typed-list convenience syntax, a materialized `args`
-collection, and automatic allocator/capability expansion are not implemented. Use
+Implicit JSON bindings, a materialized `args` collection, and automatic
+allocator/capability expansion are not implemented. Use
 ordinary explicit Zag APIs where available; the compiler does not pretend those
 APIs are script defaults.
 
@@ -82,7 +82,14 @@ declarations. Appends never grow or reallocate the buffer: successful total copy
 work equals the number of appended bytes, overflow leaves existing contents and
 length unchanged, and marks the builder failed. Strict Zag imports
 `std:script_string_builder` and calls `string_builder_from_buffer` with explicitly
-allocated storage. This is not variadic list syntax or a dynamic value system.
+allocated storage. It is not a dynamic value system.
+
+`list(a, b, ...)` accepts one to four statically compatible initial values and
+infers one element type. `script_list_append`, `script_list_len`, and
+`script_list_get` remain typed; mixed literal types are rejected. Capacity grows
+geometrically through the bounded Script allocator, so successful append
+sequences copy linear total data. Superseded arena buffers remain until Script
+shutdown and count toward `script_alloc_used()`.
 
 Basic JSON scalar support is available as the ordinary `std:json` module. It
 stringifies and parses strings, signed integers, and booleans with statically

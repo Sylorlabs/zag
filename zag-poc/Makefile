@@ -136,6 +136,7 @@ install: znc zagd
 	install -m644 std/*.zag /usr/local/lib/zag/std/
 	install -m644 selfhost/std/process.zag /usr/local/lib/zag/std/process.zag
 	install -m644 selfhost/std/script_string_builder.zag /usr/local/lib/zag/std/script_string_builder.zag
+	install -m644 selfhost/std/script_list.zag /usr/local/lib/zag/std/script_list.zag
 	@echo "Installed znc + zagd → /usr/local/bin and std → /usr/local/lib/zag/std"
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
