@@ -60,7 +60,8 @@ function with the same name wins independently.
 
 `read_file` copies its returned value into Script-lifetime storage charged to the
 requested-payload budget. The native reader still uses temporary staging storage
-outside that accounting. Open failure uses a slice with negative length; budget
+outside that accounting, but releases it immediately after the Script copy or
+copy-budget failure. Open failure uses a slice with negative length; budget
 failure emits a diagnostic and returns an empty slice. This is not a general
 memory-safety guarantee or the eventual typed error API.
 `string_concat` returns Script-lifetime storage charged to that budget.

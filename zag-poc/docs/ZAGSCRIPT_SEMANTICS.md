@@ -55,7 +55,9 @@ in root top-level statements. Ordinary `make` in a Script root is rejected
 because it cannot be charged; use a Script collection/builder, `script_alloc`,
 or an explicit strict-Zag allocator. Allocator metadata, temporary file-reader
 staging, imported strict `make`, and imported strict `new` remain outside the
-Script budget and are never silently redirected. A direct
+Script budget and are never silently redirected. File-reader staging is
+released immediately after its bounded Script copy (including a copy-budget
+failure), but its transient peak remains outside the Script budget. A direct
 allocation beyond the limit returns null; prelude file/process operations also
 emit an operation-specific diagnostic. Imported strict code receives no implicit
 allocator. An explicit allocator or resource policy in source wins over the

@@ -93,9 +93,11 @@ Native codegen conditionally emits syscall-based helpers for stdout/stderr,
 integer and float formatting, allocation/reallocation/free, string operations,
 arguments, file existence/read/write, time, environment access, and process
 execution. `selfhost/std/io.zag`, `process.zag`, `collections.zag`, `strbuf.zag`,
-and related modules provide ordinary Zag wrappers. Process execution currently
-includes a shell-oriented wrapper; a script process API with a mandatory or
-bounded timeout is not yet present.
+and related modules provide ordinary Zag wrappers. The root-only Script
+`process_run_timeout` prelude maps to strict Zag's
+`process_run_bounded`: it uses a monotonic deadline, bounded capture, a child
+process group, and deterministic reap/cleanup. This is a Linux x86-64 syscall
+implementation, not a general cross-platform process abstraction.
 
 Required change: implement the script prelude as ordinary documented Zag
 declarations backed by these primitives. Do not implicitly expose all of std.
@@ -116,11 +118,11 @@ safety.
 There is no complete ownership, borrowing, provenance, alias, lifetime,
 automatic reclamation, concurrency memory model, exception unwinding, or
 target-complete trap specification. An arena does not establish any of these.
-Script lifetime escape checking, bounded script allocation, capability policy,
-timeout-enforced process execution, structured top-level error reporting, and
-automatic CPU/GPU placement are not implemented. Documentation and diagnostics
-must describe these gaps without converting estimates or conventions into
-proofs.
+Script lifetime escape checks, bounded Script allocation, configured capability
+policy, timeout-enforced process execution, and structured top-level error
+reporting are implemented for their documented subset. Automatic CPU/GPU
+placement remains unimplemented. Documentation and diagnostics must describe
+these gaps without converting estimates or conventions into proofs.
 
 ## 8. Native x86-64 to ELF
 
@@ -146,10 +148,12 @@ spliced into the importing program's executable body.
 
 The lexer/parser, import graph construction, shared typing, semantic/effect
 analysis, static analysis, function-level native lowering, encoded machine code,
-and final ELF assembly are separable cache candidates. Today their APIs largely
-consume mutable flat lists and process-global-style compiler state; stable
-content hashes, declaration identities, dependency edges, serialized facts,
-and target-keyed cache records do not yet form a correctness boundary.
+and final ELF assembly are separable cache candidates. The foreground compiler
+now has an exact whole-program machine-code cache boundary: compiler image,
+root/import content, target profile, ABI/profile, configuration, and code/data
+checksums must all match before backend work is skipped. `zagd` additionally
+persists advisory declaration and semantic records; those can never authorize
+an executable.
 
 Cache reuse must be validated against source hashes, compiler version, target,
 feature profile, public signatures/layouts, dependencies, and relevant options.
@@ -193,12 +197,13 @@ Script collection/string/file-result/bounded-process payloads and root top-level
 `new`, but not ordinary `make`, imported strict allocation, allocator metadata,
 or file-reader staging.
 There is no ownership/borrowing proof, reclamation for allocations outside the
-Script arena, general JSON
-object/array prelude, or complete source-to-runtime lifetime analysis. Named
-top-level errors and source paths, bounded process capture, statically typed
-Script lists, scalar JSON, project-configured supported defaults, and stable
-background semantic rechecks are implemented. Restart reuse validates snapshot
-metadata and declaration fingerprints but does not restore a complete semantic
-caller/layout/codegen dependency graph. Adaptive/deep candidates have bounded
-deterministic budgets and consume only checksum-bound proven facts; broad deep
-search, PGO, SIMD tuning, and microbenchmark selection are not implemented.
+Script arena, or complete source-to-runtime lifetime analysis. Named top-level
+errors and source paths, bounded process capture, statically typed Script lists,
+scalar JSON plus typed homogeneous arrays/string objects and Unicode escapes,
+project-configured supported defaults, and stable background semantic rechecks
+are implemented. Restart reuse validates snapshot metadata, semantic
+import/caller/layout identities, and declaration fingerprints, but uncertain
+module-resolution cases conservatively invalidate rather than reuse. Adaptive/
+deep candidates have bounded deterministic budgets and consume only
+checksum-bound proven facts; broad deep search, PGO, packed-SIMD tuning, GPU
+kernel tuning, and autonomous microbenchmark selection are not implemented.
