@@ -107,5 +107,13 @@ if "$ZNC" tests/i686_slice_abi.zag --target i686 -o "$tmp/slice" --no-analyze >/
 else bad "byte-slice ABI emits"; fi
 if ! "$ZNC" tests/i686_reject_slice_mutation.zag --target i686 -o "$tmp/badslice" --no-analyze >"$tmp/badslice.log" 2>&1 &&
    grep -Eq "assignment target|byte slices expose only" "$tmp/badslice.log" && [ ! -e "$tmp/badslice" ]; then ok "unsupported byte-slice mutation rejects before output"; else bad "slice mutation rejection"; fi
+if "$ZNC" tests/i686_import_runtime.zag --target i686 -o "$tmp/import-runtime" --no-analyze >/dev/null; then
+  set +e; import_out=$("$tmp/import-runtime"); import_rc=$?; set -e
+  if [ "$import_rc" -eq 42 ] && [ "$import_out" = "A" ]; then ok "imports escaped strings mmap allocation pointer access and munmap execute"; else bad "import/runtime output=$import_out status=$import_rc"; fi
+else bad "imported allocation runtime emits"; fi
+if "$ZNC" tests/i686_alloc_failure.zag --target i686 -o "$tmp/alloc-failure" --no-analyze >/dev/null; then
+  set +e; "$tmp/alloc-failure"; alloc_rc=$?; set -e
+  if [ "$alloc_rc" -eq 42 ]; then ok "mmap allocation failure returns a checkable null pointer"; else bad "allocation failure status=$alloc_rc"; fi
+else bad "allocation failure path emits"; fi
 echo "i686 minimal: pass=$pass fail=$fail"
 test "$fail" -eq 0

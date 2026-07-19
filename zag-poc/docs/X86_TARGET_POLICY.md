@@ -98,8 +98,13 @@ EBX, ESI, and EDI
 are callee-saved; current generated bodies use only EAX, ECX, EBP, and the stack.
 `usize` is one 32-bit word. `*i32` and `*usize` use 32-bit addresses and support
 addressing initialized frame locals, indirect loads/stores, and scalar argument
-passing. Uninitialized pointers, unsupported pointer element types, imports,
-and Script constructs fail before artifact creation. `i64` and `u64`
+passing. Merged file imports participate in the same closed-world lowering.
+The bounded runtime implements `_zag_malloc` with Linux i386 `mmap2` and
+`_zag_free` with `munmap`; allocation metadata is one private leading word,
+failure returns a checkable null pointer, and freeing null is a no-op. This is
+explicit allocation, not tracing, ownership, or automatic reclamation.
+Uninitialized pointers, unsupported pointer element types, and Script constructs
+fail before artifact creation. `i64` and `u64`
 signatures reject explicitly rather than acquiring host-sized layouts. General
 completion still requires broader i386
 aggregate calling conventions, pointer arithmetic, smaller-register-set allocation,
@@ -131,6 +136,7 @@ through by-value parameters reject before artifact output.
 The bounded byte-slice ABI uses two 32-bit words, pointer followed by length in
 SysV stack order, and EAX/EDX for pointer/length returns. The current subset
 supports `[]u8`/`String` literals, locals, arguments, returns, `.len`, and
+the standard `\\`, `\"`, `\n`, `\r`, `\t`, and `\0` byte escapes, plus
 `_zag_print`; literal bytes are embedded without an external linker. Slicing,
 mutation, allocation, ownership transfer, and general string-library operations
 remain rejected. Slice storage is borrowed/static and introduces no reclamation
