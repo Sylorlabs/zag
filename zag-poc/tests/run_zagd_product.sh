@@ -42,6 +42,10 @@ script_suggest=$(cd "$tmp/project/src" && "$tmp/bin/znc" suggest --format json)
 printf '%s\n' "$script_suggest" | grep -q '"profile":"script"'
 printf '%s\n' "$script_suggest" | grep -q '"id":"script-default-allocator","automatic":true'
 printf '%s\n' "$script_suggest" | grep -q '"id":"script-default-device","automatic":true'
+explicit_suggest=$(cd "$tmp/project/src" && "$tmp/bin/znc" suggest --format json --script-allocator custom --device gpu --layout aos)
+if printf '%s\n' "$explicit_suggest" | grep -q '"id":"script-default-'; then
+    echo "explicit Script choices did not suppress automatic defaults" >&2; exit 1
+fi
 test "$(cat "$tmp/project/src/deep/main.zag")" = $'script;\nprintln("planner");'
 if (cd "$tmp/project/src" && "$tmp/bin/znc" status --format yaml >/dev/null 2>&1); then
     echo "invalid status format unexpectedly accepted" >&2; exit 1
