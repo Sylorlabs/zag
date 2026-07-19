@@ -56,6 +56,12 @@ declaration_status=$?
 set -e
 test "$declaration_status" -eq 42
 
+"$znc_bin" harden tests/script_frontend/basic.zag --format json --no-zagd > "$tmp_dir/harden.json"
+grep -q '"status":"preview"' "$tmp_dir/harden.json"
+grep -q '"source_modified":false' "$tmp_dir/harden.json"
+grep -q '"parity_tests"' "$tmp_dir/harden.json"
+grep -q '"unsupported"' "$tmp_dir/harden.json"
+
 # Project Script defaults reach foreground code generation. Explicit CLI CPU
 # selection wins; regular Zag remains independent of Script defaults.
 mkdir -p "$tmp_dir/project"
