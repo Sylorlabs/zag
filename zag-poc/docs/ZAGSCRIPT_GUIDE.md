@@ -118,6 +118,12 @@ geometrically through the bounded Script allocator, so successful append
 sequences copy linear total data. Superseded arena buffers remain until Script
 shutdown and count toward `script_alloc_used()`.
 
+Root-level `make[T]` is intentionally rejected in Zag Script because its storage
+does not pass through `ScriptContext` and therefore cannot satisfy the configured
+memory limit. Use `list`, `string_builder`, `script_alloc`, or write an explicit
+strict-Zag function with its own allocator policy. Ordinary Zag and imported
+strict libraries retain their existing allocator semantics.
+
 Basic JSON scalar support is available as the ordinary `std:json` module. It
 stringifies and parses strings, signed integers, and booleans, parses finite
 JSON floating-point syntax, and parses/stringifies null. Statically typed parse

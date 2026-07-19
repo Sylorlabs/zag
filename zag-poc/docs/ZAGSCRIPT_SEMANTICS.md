@@ -3,8 +3,10 @@
 Status: semantics contract with an implemented foundation, 2026-07-18. Profile
 activation, root lowering, managed shutdown, requested-payload limits, the small
 documented prelude, explain, conservative hardening, and strict rejection have
-focused tests. Statements describing arguments, typed collections, process,
-JSON, ownership, or full allocation accounting remain design requirements.
+focused tests. Arguments, typed collections, bounded process capture, typed JSON,
+and the documented Script-default allocation paths are implemented. General
+ownership, borrowing, and accounting inside explicitly strict imported code
+remain outside the Script profile's guarantees.
 
 ## Profile activation
 
@@ -49,8 +51,10 @@ remains retained until the generated shutdown boundary, which unmaps the whole
 arena deterministically. The configured limit covers explicit `script_alloc`,
 Script collections/builders/string concatenation, returned `read_file` data, and
 bounded-process setup, capture capacity, result handles, and compiler-owned `new`
-in root top-level statements. Ordinary `make`, allocator metadata, temporary
-file-reader staging, and imported strict `new` remain outside it. A direct
+in root top-level statements. Ordinary `make` in a Script root is rejected
+because it cannot be charged; use a Script collection/builder, `script_alloc`,
+or an explicit strict-Zag allocator. Allocator metadata, temporary file-reader
+staging, and imported strict `new` remain outside the Script budget. A direct
 allocation beyond the limit returns null; prelude file/process operations also
 emit an operation-specific diagnostic. Imported strict code receives no implicit
 allocator. An explicit allocator or resource policy in source wins over the
@@ -60,6 +64,16 @@ This policy does not make Zag memory-safe. Pointer validity, aliasing, ownership
 and many lifetime obligations remain the programmer's responsibility. Escape
 diagnostics may claim only the specific cases the compiler checks and must have
 negative tests.
+
+The compiler computes bounded, monotone lifetime summaries for every defined
+helper reachable in the merged module graph. A summary records whether a helper
+returns a Script-lifetime value or may retain one through a field, pointer,
+nonlocal assignment, extern/unknown call, or another escaping helper. This
+covers helper chains, returned values, and imported source helpers. Recursion is
+handled by a declaration-count-bounded fixed point. Passing a Script value to
+an extern or unresolved function remains a conservative error. These summaries
+prove only those escape classes; they are not general ownership or borrow
+checking.
 
 ## Prelude
 
