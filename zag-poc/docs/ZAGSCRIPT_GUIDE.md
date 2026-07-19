@@ -49,9 +49,11 @@ allocation runtime calls. Prelude bindings occur
 only in executable statements of the selected script root. An ordinary user
 function with the same name wins independently.
 
-`read_file` currently allocates outside the requested-payload script budget and
-reports failure using a slice with negative length. This is documented behavior,
-not a general memory-safety guarantee or the eventual typed error API.
+`read_file` copies its returned value into Script-lifetime storage charged to the
+requested-payload budget. The native reader still uses temporary staging storage
+outside that accounting. Open failure uses a slice with negative length; budget
+failure emits a diagnostic and returns an empty slice. This is not a general
+memory-safety guarantee or the eventual typed error API.
 `string_concat` returns Script-lifetime storage charged to that budget.
 
 ## Profile rules currently enforced
@@ -75,6 +77,10 @@ at 1 MiB, kills the complete child process group on timeout/overflow, and reaps
 the shell. Its typed `ProcessResult` reports `status`, `state`, and `output`
 through the ordinary getter functions. An explicit user declaration named
 `process_run_timeout` overrides the convenience.
+Its command copy, descriptor/status storage, capture capacity, and result handle
+are charged to the Script budget before being exposed. The output capacity is
+reserved up front, making its maximum charged cost deterministic. Strict Zag's
+ordinary `process_run_bounded` retains its allocator behavior.
 
 `string_builder(capacity)` creates a fixed-capacity `ScriptStringBuilder` from
 the bounded Script allocator. `string_builder_append`, `string_builder_len`,
@@ -111,6 +117,9 @@ captured output before it can be exposed.
 ## Safety boundary
 
 The profile lowering does not establish ownership, borrowing, automatic
-reclamation, or general memory safety. `script_alloc` enforces a configurable
-requested-payload limit, but ordinary allocation and file-read buffers are not
-charged to it. Normal Zag effects and runtime behavior remain authoritative.
+reclamation, or general memory safety. The configurable requested-payload limit
+covers Script collection/string-builder storage, string concatenation, returned
+file data, bounded-process storage, and compiler-owned `new` in root top-level
+statements. Ordinary `make`, allocator metadata, file-reader staging, and `new`
+inside imported strict functions remain outside it. Normal Zag effects and runtime
+behavior remain authoritative.

@@ -44,12 +44,16 @@ arguments, environment/capability views, and richer error-reporting state remain
 future fields; they are not fabricated as empty APIs. It is not a dynamic object
 environment.
 
-The initial default is process-lifetime accounting. `script_alloc` payload remains
-retained until script exit. The configured limit is a hard boundary for that
-requested payload; ordinary make/new, file reads, and allocator metadata are
-outside it. An allocation beyond it returns null for the caller to handle. Imported
-strict code receives no implicit allocator. An explicit allocator or resource
-policy in source wins over the script default.
+The initial default is process-lifetime accounting. Charged payload remains
+retained until script exit. The configured limit covers explicit `script_alloc`,
+Script collections/builders/string concatenation, returned `read_file` data, and
+bounded-process setup, capture capacity, result handles, and compiler-owned `new`
+in root top-level statements. Ordinary `make`, allocator metadata, temporary
+file-reader staging, and imported strict `new` remain outside it. A direct
+allocation beyond the limit returns null; prelude file/process operations also
+emit an operation-specific diagnostic. Imported strict code receives no implicit
+allocator. An explicit allocator or resource policy in source wins over the
+script default.
 
 This policy does not make Zag memory-safe. Pointer validity, aliasing, ownership,
 and many lifetime obligations remain the programmer's responsibility. Escape

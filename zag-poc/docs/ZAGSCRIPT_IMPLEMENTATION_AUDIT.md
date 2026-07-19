@@ -187,7 +187,9 @@ inotify snapshots and fail-closed advisory cache records. Regular Zag retains
 the invariants above and planner output remains advisory.
 
 The remaining safety boundary is explicit. The Script allocation budget counts
-`script_alloc` payloads, not every `make`/`new` allocation or allocator metadata.
+Script collection/string/file-result/bounded-process payloads and root top-level
+`new`, but not ordinary `make`, imported strict allocation, allocator metadata,
+or file-reader staging.
 There is no ownership/borrowing proof, complete reclamation, named error/source
 witness path, bounded process-capture API, typed variadic collection literal,
 or general JSON prelude yet. Restart reuse validates snapshot metadata but does
