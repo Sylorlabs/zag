@@ -50,11 +50,12 @@ The initial default is a bounded Script-lifetime bump arena. Charged payload
 remains retained until the generated shutdown boundary, which unmaps the whole
 arena deterministically. The configured limit covers explicit `script_alloc`,
 Script collections/builders/string concatenation, returned `read_file` data, and
-bounded-process setup, capture capacity, result handles, and compiler-owned `new`
+bounded-process setup, capture capacity, arena-resident result handles, and compiler-owned `new`
 in root top-level statements. Ordinary `make` in a Script root is rejected
 because it cannot be charged; use a Script collection/builder, `script_alloc`,
 or an explicit strict-Zag allocator. Allocator metadata, temporary file-reader
-staging, and imported strict `new` remain outside the Script budget. A direct
+staging, imported strict `make`, and imported strict `new` remain outside the
+Script budget and are never silently redirected. A direct
 allocation beyond the limit returns null; prelude file/process operations also
 emit an operation-specific diagnostic. Imported strict code receives no implicit
 allocator. An explicit allocator or resource policy in source wins over the
@@ -99,6 +100,12 @@ body may propagate an error to its outer wrapper. An uncaught error prints its
 name, operation and best available source location or witness path, flushes
 diagnostics, and exits nonzero. Errors are not silently changed to null or a
 success status.
+
+The current statement AST retains the source file but not expression line/column
+spans. The wrapper therefore reports the exact root source path and, when the
+failing boundary is a top-level `try call(...)`, the callee name preserved by
+that AST. It explicitly says when an expression witness is unavailable and does
+not fabricate a line number or stack trace.
 
 Prelude operations carry the same ordinary effects as their strict declarations.
 Filesystem, process, network and device access are capabilities, not inferred

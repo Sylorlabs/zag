@@ -122,7 +122,10 @@ Root-level `make[T]` is intentionally rejected in Zag Script because its storage
 does not pass through `ScriptContext` and therefore cannot satisfy the configured
 memory limit. Use `list`, `string_builder`, `script_alloc`, or write an explicit
 strict-Zag function with its own allocator policy. Ordinary Zag and imported
-strict libraries retain their existing allocator semantics.
+strict libraries retain their existing allocator semantics; their allocation is
+not charged to `script_alloc_used()` and must be bounded by their explicit API
+contract. This separation prevents Script defaults from silently changing a
+library's allocator, but it does not prove that imported code is bounded.
 
 Basic JSON scalar support is available as the ordinary `std:json` module. It
 stringifies and parses strings, signed integers, and booleans, parses finite
