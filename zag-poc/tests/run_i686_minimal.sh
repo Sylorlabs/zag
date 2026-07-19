@@ -12,6 +12,11 @@ if "$ZNC" tests/i686_literal.zag --target i686 -o "$tmp/a.out" --no-analyze >/de
 class=$(od -An -tu1 -j4 -N1 "$tmp/a.out" | tr -d ' ')
 machine=$(od -An -tu1 -j18 -N2 "$tmp/a.out" | xargs)
 if [ "$class" = 1 ] && [ "$machine" = "3 0" ]; then ok "artifact is ELF32 EM_386"; else bad "ELF32 identity"; fi
+shnum=$(od -An -tu1 -j48 -N1 "$tmp/a.out" | tr -d ' ')
+if [ "$shnum" = 6 ]; then ok "ELF32 section table is present"; else bad "ELF32 section table"; fi
+if command -v readelf >/dev/null 2>&1; then
+  if readelf -S -s "$tmp/a.out" 2>/dev/null | grep -q '\.debug_line' && readelf -s "$tmp/a.out" 2>/dev/null | grep -q ' main$'; then ok "reference reader sees text symbols and debug line"; else bad "readelf metadata"; fi
+fi
 set +e
 "$tmp/a.out"; rc=$?
 set -e
