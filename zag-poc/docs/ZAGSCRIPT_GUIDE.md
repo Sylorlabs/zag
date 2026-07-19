@@ -62,10 +62,18 @@ not a general memory-safety guarantee or the eventual typed error API.
 - A `.zag` suffix alone does not activate the profile.
 - A source file without `script;` keeps regular Zag semantics.
 
-Process execution with timeout, implicit JSON bindings, typed-list convenience
-syntax, a materialized `args` collection, and automatic allocator/capability expansion are not implemented. Use
+Implicit JSON bindings, typed-list convenience syntax, a materialized `args`
+collection, and automatic allocator/capability expansion are not implemented. Use
 ordinary explicit Zag APIs where available; the compiler does not pretend those
 APIs are script defaults.
+
+`process_run_timeout(command, timeout_ms, max_output)` is the root-only Script
+name for the ordinary strict-Zag `std:process.process_run_bounded` declaration.
+It invokes `/bin/sh -c`, captures stdout, uses a monotonic deadline, caps output
+at 1 MiB, kills the complete child process group on timeout/overflow, and reaps
+the shell. Its typed `ProcessResult` reports `status`, `state`, and `output`
+through the ordinary getter functions. An explicit user declaration named
+`process_run_timeout` overrides the convenience.
 
 Basic JSON scalar support is available as the ordinary `std:json` module. It
 stringifies and parses strings, signed integers, and booleans with statically

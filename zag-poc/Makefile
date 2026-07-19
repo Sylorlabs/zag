@@ -134,6 +134,7 @@ install: znc zagd
 	install -m755 zagd /usr/local/bin/zagd
 	install -d /usr/local/lib/zag/std
 	install -m644 std/*.zag /usr/local/lib/zag/std/
+	install -m644 selfhost/std/process.zag /usr/local/lib/zag/std/process.zag
 	@echo "Installed znc + zagd → /usr/local/bin and std → /usr/local/lib/zag/std"
 
 # ── Clean ─────────────────────────────────────────────────────────────────────

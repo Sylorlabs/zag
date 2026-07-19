@@ -1,21 +1,20 @@
 # Zag Script bounded-process boundary
 
-Status: supervisor blocked; stable result ABI implemented, 2026-07-18.
+Status: native supervisor and stable result ABI implemented, 2026-07-18.
 
-Zag Script does not expose `process_run_timeout`. The existing native
-`_zag_exec_capture(command)` is deliberately not used as its implementation.
+Zag Script exposes `process_run_timeout`; strict Zag uses
+`std:process.process_run_bounded`. The existing native `_zag_exec_capture` is
+deliberately not used as its implementation.
 It creates a pipe and child shell, performs a blocking read until EOF, and only
 then waits for the child. A Zag wrapper cannot regain control while that read is
 blocked, so it cannot enforce a deadline.
 
 The executable characterization in `tests/process_timeout_blocker.zag` proves
-the current helper returns after a sleeping child, not at a requested deadline.
-`tests/process_timeout_unavailable.zag` proves the misleading convenience stays
-unavailable.
+the legacy helper returns after a sleeping child, not at a requested deadline.
 
-## Required native supervisor
+## Native supervisor
 
-The smallest correct Linux x86-64 primitive must implement all of these together:
+The Linux x86-64 implementation performs all of these together:
 
 1. Create a `pipe2` pipe with nonblocking parent observation.
 2. Fork and place the child shell in a new process group before `execve`.
@@ -28,14 +27,16 @@ The smallest correct Linux x86-64 primitive must implement all of these together
 9. Return a statically typed result containing captured bytes, exit status,
    timeout/overflow state, and a runtime-error code.
 
-The backend currently has fragments of this (`pipe2`, `fork`, `execve`, blocking
-read, and `wait4`) but no nonblocking supervision state machine.
+The state machine is ordinary self-hosted Zag over the backend's raw Linux
+syscall lowering. There is no libc, C compiler, linker, or external `timeout`
+program. A regression specifically covers a child that closes stdout and keeps
+running, so EOF cannot bypass the deadline.
 
 The result boundary is implemented independently: `ProcessResult` contains a
 compiler-owned opaque handle. Typed ordinary-Zag getters expose status, state,
 and captured output. The handle layout is fixed at four 64-bit words (status,
 state, output pointer, output length), so module name prefixing cannot change the
-runtime ABI. The native supervisor will construct this handle directly.
+runtime ABI. The supervisor constructs this handle directly.
 
 Adding only a timer around the current call,
 killing only the shell PID, or returning partial output as success would be an
