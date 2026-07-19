@@ -10,6 +10,8 @@ printf 'script;\nlet data=read_file("input.txt");\nprintln(data);\n' >"$tmp/read
 printf 'allow_filesystem_read=false\nallow_filesystem_write=true\nallow_process=true\nmode=off\n' >"$tmp/.zagd.conf"
 if "$znc_bin" "$tmp/read.zag" -o "$tmp/read" --no-zagd --no-analyze >"$tmp/out" 2>&1; then echo "denied filesystem capability unexpectedly compiled" >&2; exit 1; fi
 grep -q 'read_file denied by allow_filesystem_read=false' "$tmp/out"
+"$znc_bin" explain "$tmp/read.zag" --format json --no-zagd >"$tmp/explain.json"
+grep -q '"capability_policy":{"filesystem_read":false,"filesystem_write":true,"process":true,"network":false,"basis":"proven"}' "$tmp/explain.json"
 
 printf 'script;\nfn read_file(path:[]u8)[]u8{return "local";}\nprintln(read_file("ignored"));\n' >"$tmp/override.zag"
 "$znc_bin" "$tmp/override.zag" -o "$tmp/override" --no-zagd --no-analyze >/dev/null
