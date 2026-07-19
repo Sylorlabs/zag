@@ -1,5 +1,22 @@
 # `zagd` guide
 
+## Persistent user service
+
+Ordinary `znc` source commands automatically start the project daemon and it
+remains resident. To start it at Linux user login and restart it after an
+unexpected exit, install the optional project-specific systemd user service:
+
+```sh
+tools/zagd-user-service.sh install app.zag adaptive
+```
+
+The service runs `zagd` in the foreground under systemd with `Restart=always`,
+`Nice=10`, no elevated privileges, no network use, and the selected root source.
+The project `.zagd.conf` remains the ordinary policy location. Re-run `install`
+to change the root or service mode; use `status` or `uninstall` with the same
+root source to inspect or remove it. This optional service affects availability,
+not compiler correctness: foreground builds still work without it.
+
 Status: Linux daemon lifecycle, content tracking, and bounded background semantic
 rechecking implemented, 2026-07-18.
 
