@@ -218,6 +218,51 @@ fn emit_fcvtzs(buf: *ArrayList[u8], rd: i32, rn: i32) void {
     emit_pack(buf, a_lo3(low), a_lo3(low / 256), 120, 158);
 }
 
+// Position-independent address of a byte in the Mach-O data segment.
+// ADRP carries the signed page delta; ADD supplies the low twelve bits.
+fn emit_adrp_add(buf: *ArrayList[u8], rd: i32, pc: i64, target: i64) void {
+    let pc_page: i64 = pc - (pc % 4096);
+    let target_page: i64 = target - (target % 4096);
+    let pages: i64 = (target_page - pc_page) / 4096;
+    let enc: i64 = pages;
+    if (enc < 0) { enc = enc + 2097152; }
+    let immlo: i64 = enc % 4;
+    let immhi: i64 = (enc / 4) % 524288;
+    let word: i64 = 2415919104 + immlo * 536870912 + immhi * 32 + (rd as i64);
+    emit_pack(buf, (word % 256) as i32, ((word / 256) % 256) as i32,
+              ((word / 65536) % 256) as i32, ((word / 16777216) % 256) as i32);
+    emit_add_imm(buf, rd, rd, (target % 4096) as i32);
+}
+
+// Linux arm64 numbers are the stable target-neutral identifiers carried by
+// AK_SYSCALL. Translate them at the final Darwin encoding boundary.
+fn a_darwin_sysno(linux_num: i32) i32 {
+    if (linux_num == 93) { return 1; }    // exit
+    if (linux_num == 63) { return 3; }    // read
+    if (linux_num == 64) { return 4; }    // write
+    if (linux_num == 57) { return 6; }    // close
+    if (linux_num == 56) { return 463; }  // openat
+    if (linux_num == 53) { return 467; }  // fchmodat
+    if (linux_num == 48) { return 466; }  // faccessat
+    if (linux_num == 220) { return 2; }   // clone(SIGCHLD) profile -> fork
+    if (linux_num == 260) { return 7; }   // wait4
+    if (linux_num == 221) { return 59; }  // execve
+    if (linux_num == 222) { return 197; } // mmap
+    return 0 - 1;
+}
+
+fn emit_darwin_syscall(buf: *ArrayList[u8], linux_num: i32) void {
+    let darwin_num: i32 = a_darwin_sysno(linux_num);
+    if (darwin_num < 0) {
+        emit_mov_imm64(buf, A_X0(), 0 - 78); // ENOSYS, normalized to -errno
+        return;
+    }
+    emit_mov_imm64(buf, A_X16(), darwin_num as i64);
+    emit_pack(buf, 1, 16, 0, 212);           // svc #0x80
+    emit_bcond(buf, 3, 2);                   // b.cc +8: success skips neg
+    emit_neg(buf, A_X0(), A_X0());           // Darwin error: +errno -> -errno
+}
+
 fn emit_sxtw(buf: *ArrayList[u8], rd: i32, rn: i32) void {
     // SXTW Xd, Wn = SBFM Xd, Xn, #0, #31 = 0x93407C00 | rn<<5 | rd
     let low: i32 = 31744 + rn * 32 + rd;
@@ -387,6 +432,17 @@ fn a_encode_one(buf: *ArrayList[u8], ins: AInstr, labels: ArrayList[i32], base_o
     if (k == AK_RET()) { emit_pack(buf, 192, 3, 95, 214); return; }
     if (k == AK_SVC()) { emit_pack(buf, 1, 0, 0, 212); return; }
     if (k == AK_DMB()) { emit_pack(buf, 191, 59, 3, 213); return; } // DMB ISH
+    if (k == AK_DATA_ADDR()) { emit_mov_imm64(buf, ins.dst, A_DATA_VBASE() + ins.imm); return; }
+    if (k == AK_SYSCALL()) {
+        emit_mov_imm64(buf, A_X8(), ins.imm);
+        emit_pack(buf, 1, 0, 0, 212);         // svc #0
+        return;
+    }
+    if (k == AK_SYSCALL_REG()) {
+        emit_orr(buf, A_X8(), ins.src);
+        emit_pack(buf, 1, 0, 0, 212);
+        return;
+    }
     if (k == AK_LEA_LBL()) {
         // ADR Xd, label = 0x10000000 | immlo<<29 | immhi<<5 | rd (rel in BYTES)
         let tgt: i32 = get[i32](labels, ins.lbl);
@@ -404,6 +460,30 @@ fn a_encode_one(buf: *ArrayList[u8], ins: AInstr, labels: ArrayList[i32], base_o
         emit_pack(buf, a_lo3(low2), a_lo3(low2 / 256), 63, 214);
         return;
     }
+}
+
+fn a_encode_one_macos(buf: *ArrayList[u8], ins: AInstr, labels: ArrayList[i32],
+                      base_off: i32, code_vmaddr: i64, data_vmaddr: i64) void {
+    if (ins.kind == AK_DATA_ADDR()) {
+        emit_adrp_add(buf, ins.dst, code_vmaddr + (base_off as i64), data_vmaddr + ins.imm);
+        return;
+    }
+    if (ins.kind == AK_SYSCALL()) {
+        emit_darwin_syscall(buf, ins.imm as i32);
+        return;
+    }
+    if (ins.kind == AK_SYSCALL_REG()) {
+        // `_zag_raw_syscall` exposes Linux syscall numbers. Guessing a Darwin
+        // translation would be unsafe, so the macOS target fails closed.
+        emit_mov_imm64(buf, A_X0(), 0 - 78);
+        return;
+    }
+    if (ins.kind == AK_SVC()) {
+        // Legacy callers without an explicit syscall instruction fail closed.
+        emit_mov_imm64(buf, A_X0(), 0 - 78);
+        return;
+    }
+    a_encode_one(buf, ins, labels, base_off);
 }
 
 fn aencode(prog: ArrayList[AInstr]) ArrayList[u8] {
@@ -436,6 +516,40 @@ fn aencode(prog: ArrayList[AInstr]) ArrayList[u8] {
         let ins2: AInstr = get[AInstr](prog, i);
         let off: i32 = out.len;
         a_encode_one(&out, ins2, labels, off);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn aencode_macos(prog: ArrayList[AInstr], code_vmaddr: i64, data_vmaddr: i64) ArrayList[u8] {
+    let n: i32 = prog.len;
+    let maxlbl: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let ins: AInstr = get[AInstr](prog, i);
+        if (ins.lbl > maxlbl) { maxlbl = ins.lbl; }
+        i = i + 1;
+    }
+    let labels: ArrayList[i32] = make[i32](maxlbl + 2);
+    let j: i32 = 0;
+    while (j < maxlbl + 1) { push[i32](&labels, 0); j = j + 1; }
+
+    let scratch: ArrayList[u8] = make[u8](64);
+    i = 0;
+    while (i < n) {
+        let ins1: AInstr = get[AInstr](prog, i);
+        let here: i32 = scratch.len;
+        if (ins1.kind == AK_LABEL()) { set[i32](&labels, ins1.lbl, here); }
+        a_encode_one_macos(&scratch, ins1, labels, here, code_vmaddr, data_vmaddr);
+        i = i + 1;
+    }
+
+    let out: ArrayList[u8] = make[u8](scratch.len + 8);
+    i = 0;
+    while (i < n) {
+        let ins2: AInstr = get[AInstr](prog, i);
+        let off: i32 = out.len;
+        a_encode_one_macos(&out, ins2, labels, off, code_vmaddr, data_vmaddr);
         i = i + 1;
     }
     return out;
