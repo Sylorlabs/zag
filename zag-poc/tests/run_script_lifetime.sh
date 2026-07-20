@@ -154,4 +154,15 @@ if (cd "$tmp" && "$ZNC" check aggregate_make.zag --no-zagd --no-analyze >aggrega
     echo "unaccounted root make nested in aggregate unexpectedly accepted" >&2; exit 1
 fi
 grep -q 'root make is not charged to ScriptContext' "$tmp/aggregate_make.log"
-echo 'script lifetime: pass=16 fail=0'
+cat >"$tmp/switch_expression_escape.zag" <<'ZAG'
+script;
+extern fn retain(value: []u8) void
+let data = read_file("input.txt");
+let alias: []u8 = switch (1) { 1 => data else => "" };
+retain(alias);
+ZAG
+if (cd "$tmp" && "$ZNC" check switch_expression_escape.zag --no-zagd --no-analyze >switch_expression_escape.log 2>&1); then
+    echo "Script lifetime escape through switch expression unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'call to `retain`' "$tmp/switch_expression_escape.log"
+echo 'script lifetime: pass=17 fail=0'
