@@ -74,4 +74,23 @@ if (cd "$tmp" && "$ZNC" check ordinary_make.zag --no-zagd --no-analyze >ordinary
     echo "unaccounted root make unexpectedly accepted" >&2; exit 1
 fi
 grep -q 'root make is not charged to ScriptContext' "$tmp/ordinary_make.log"
-echo 'script lifetime: pass=8 fail=0'
+cat >"$tmp/foreign_delete.zag" <<'ZAG'
+script;
+struct Pair { value: i64 }
+let pair: *Pair = new(Pair{ .value = 7 });
+delete(pair);
+ZAG
+if (cd "$tmp" && "$ZNC" check foreign_delete.zag --no-zagd --no-analyze >foreign_delete.log 2>&1); then
+    echo "Script arena value passed to delete unexpectedly accepted" >&2; exit 1
+fi
+grep -q '`delete` cannot deallocate a Script-context value' "$tmp/foreign_delete.log"
+cat >"$tmp/foreign_raw_free.zag" <<'ZAG'
+script;
+let bytes: *i8 = script_alloc(8);
+_zag_free(bytes);
+ZAG
+if (cd "$tmp" && "$ZNC" check foreign_raw_free.zag --no-zagd --no-analyze >foreign_raw_free.log 2>&1); then
+    echo "Script arena value passed to _zag_free unexpectedly accepted" >&2; exit 1
+fi
+grep -q '`_zag_free` cannot deallocate a Script-context value' "$tmp/foreign_raw_free.log"
+echo 'script lifetime: pass=10 fail=0'

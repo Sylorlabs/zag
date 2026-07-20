@@ -65,6 +65,13 @@ emit an operation-specific diagnostic. Imported strict code receives no implicit
 allocator. An explicit allocator or resource policy in source wins over the
 script default.
 
+Values originating from the Script arena have a distinct compiler-tracked
+provenance in root Script statements. They must not be passed to `delete` or
+`_zag_free`: those are ordinary heap-deallocation paths and cannot safely free
+an arena address. The compiler rejects that boundary with a lifetime diagnostic;
+the generated Script shutdown is the sole owner of arena reclamation. This is a
+specific provenance check, not a general ownership or use-after-free system.
+
 This policy does not make Zag memory-safe. Pointer validity, aliasing, ownership,
 and many lifetime obligations remain the programmer's responsibility. Escape
 diagnostics may claim only the specific cases the compiler checks and must have
