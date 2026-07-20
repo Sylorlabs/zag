@@ -93,4 +93,31 @@ if (cd "$tmp" && "$ZNC" check foreign_raw_free.zag --no-zagd --no-analyze >forei
     echo "Script arena value passed to _zag_free unexpectedly accepted" >&2; exit 1
 fi
 grep -q '`_zag_free` cannot deallocate a Script-context value' "$tmp/foreign_raw_free.log"
-echo 'script lifetime: pass=10 fail=0'
+cat >"$tmp/switch_escape.zag" <<'ZAG'
+script;
+extern fn retain(value: []u8) void
+let data = read_file("input.txt");
+switch (1) { 1 => { retain(data); } else => {} }
+ZAG
+if (cd "$tmp" && "$ZNC" check switch_escape.zag --no-zagd --no-analyze >switch_escape.log 2>&1); then
+    echo "Script lifetime escape in switch arm unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'call to `retain`' "$tmp/switch_escape.log"
+cat >"$tmp/switch_free.zag" <<'ZAG'
+script;
+let bytes: *i8 = script_alloc(8);
+switch (1) { 1 => { _zag_free(bytes); } else => {} }
+ZAG
+if (cd "$tmp" && "$ZNC" check switch_free.zag --no-zagd --no-analyze >switch_free.log 2>&1); then
+    echo "Script foreign free in switch arm unexpectedly accepted" >&2; exit 1
+fi
+grep -q '`_zag_free` cannot deallocate a Script-context value' "$tmp/switch_free.log"
+cat >"$tmp/switch_make.zag" <<'ZAG'
+script;
+switch (1) { 1 => { let data = make[u8](16); println(data.len); } else => {} }
+ZAG
+if (cd "$tmp" && "$ZNC" check switch_make.zag --no-zagd --no-analyze >switch_make.log 2>&1); then
+    echo "unaccounted root make in switch arm unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'root make is not charged to ScriptContext' "$tmp/switch_make.log"
+echo 'script lifetime: pass=13 fail=0'
