@@ -120,4 +120,16 @@ if (cd "$tmp" && "$ZNC" check switch_make.zag --no-zagd --no-analyze >switch_mak
     echo "unaccounted root make in switch arm unexpectedly accepted" >&2; exit 1
 fi
 grep -q 'root make is not charged to ScriptContext' "$tmp/switch_make.log"
-echo 'script lifetime: pass=13 fail=0'
+cat >"$tmp/aggregate_escape.zag" <<'ZAG'
+script;
+struct Payload { bytes: []u8 }
+extern fn retain_payload(value: Payload) void
+let data = read_file("input.txt");
+let payload = Payload{ .bytes = data };
+retain_payload(payload);
+ZAG
+if (cd "$tmp" && "$ZNC" check aggregate_escape.zag --no-zagd --no-analyze >aggregate_escape.log 2>&1); then
+    echo "Script lifetime escape nested in aggregate unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'call to `retain_payload`' "$tmp/aggregate_escape.log"
+echo 'script lifetime: pass=14 fail=0'
