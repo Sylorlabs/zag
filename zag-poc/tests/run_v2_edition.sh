@@ -224,6 +224,14 @@ elif grep -q 'owned allocation `p` is neither released nor returned' "$tmp/v2-ow
 else
   echo "  XX  owned allocation leak rejection missing diagnostic"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-owned-alias-return"
+printf 'name = "v2ownedaliasreturn"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-alias-return/zag.mod"
+printf 'struct Node { value:i32 } fn allocate() *mut Node { unsafe { let p: *mut Node = new(Node{.value=42}) as *mut Node; let q: *mut Node = p; return q; } } fn main() i32 { let p: *mut Node = allocate(); unsafe { delete(p); } return 0; }\n' >"$tmp/v2-owned-alias-return/main.zag"
+if (cd "$tmp/v2-owned-alias-return" && "$ZNC" main.zag -o out) >"$tmp/v2-owned-alias-return/log" 2>&1 && [ -x "$tmp/v2-owned-alias-return/out" ]; then
+  echo "  ok  alias return transfers owned allocation"; pass=$((pass + 1))
+else
+  echo "  XX  alias return ownership transfer"; sed -n '1,8p' "$tmp/v2-owned-alias-return/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-nullable-deref"
 printf 'name = "v2nullablederef"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-nullable-deref/zag.mod"
 printf 'unsafe fn load(p: ?*const i32) i32 { return p.*; } fn main() i32 { return 0; }\n' >"$tmp/v2-nullable-deref/main.zag"
