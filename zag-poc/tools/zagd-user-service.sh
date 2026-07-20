@@ -40,8 +40,14 @@ After=default.target
 Type=simple
 WorkingDirectory=$project_root
 ExecStart=$zagd_path --root $project_root --root-source $source_path --mode $mode
-Restart=always
+Restart=on-failure
 RestartSec=1
+# A cgroup OOM is a resource-policy stop, not a reason to spin in a restart
+# loop and keep competing with the desktop. Ordinary nonzero daemon failures
+# remain restartable; znc watch or systemd can explicitly restart after the
+# user has freed resources.
+RestartPreventExitStatus=SIGKILL
+OOMPolicy=stop
 Nice=10
 MemoryMax=512M
 MemorySwapMax=0

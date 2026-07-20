@@ -8,7 +8,7 @@ Status: validated defaults enforced by the Linux daemon, 2026-07-18.
 | --- | ---: |
 | mode | light |
 | workers | 1 |
-| memory limit | 256 MiB |
+| memory limit | 512 MiB |
 | cache limit | 2 GiB |
 | stability window | 75 ms |
 | background GPU | disabled |
@@ -24,10 +24,12 @@ through 2 GiB and configures the Script requested-payload budget.
 only `true` or `false` and are enforced by foreground Script compilation; they
 are capability policy, not daemon authority. Memory
 accounting excludes Linux kernel inotify storage and some compiler allocations.
-The installed user service additionally enforces `MemoryMax=256M`, disables
-swap for the daemon, assigns a low CPU weight, and restarts after a bounded
-failure. These operating-system limits prevent advisory work from destabilizing
-foreground compilation or the desktop.
+The installed user service additionally enforces `MemoryMax=512M`, disables
+swap for the daemon, assigns a low CPU weight, and restarts ordinary daemon
+failures. An OOM kill is intentionally a quiet stop rather than a restart loop;
+after resources are available, the user or `znc watch` may restart it. These
+operating-system limits prevent advisory work from destabilizing foreground
+compilation or the desktop.
 
 The service blocks on operating-system events while idle, cancels snapshot-bound
 advice when invalidated, uses no GPU or network, and treats foreground builds as

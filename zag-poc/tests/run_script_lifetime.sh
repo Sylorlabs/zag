@@ -132,4 +132,37 @@ if (cd "$tmp" && "$ZNC" check aggregate_escape.zag --no-zagd --no-analyze >aggre
     echo "Script lifetime escape nested in aggregate unexpectedly accepted" >&2; exit 1
 fi
 grep -q 'call to `retain_payload`' "$tmp/aggregate_escape.log"
-echo 'script lifetime: pass=14 fail=0'
+cat >"$tmp/reassigned_escape.zag" <<'ZAG'
+script;
+extern fn retain(value: []u8) void
+let data = read_file("input.txt");
+let forwarded: []u8 = "";
+forwarded = data;
+retain(forwarded);
+ZAG
+if (cd "$tmp" && "$ZNC" check reassigned_escape.zag --no-zagd --no-analyze >reassigned_escape.log 2>&1); then
+    echo "Script lifetime escape after local reassignment unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'call to `retain`' "$tmp/reassigned_escape.log"
+cat >"$tmp/aggregate_make.zag" <<'ZAG'
+script;
+struct Payload { bytes: []u8 }
+let payload = Payload{ .bytes = make[u8](16) };
+println(payload.bytes.len);
+ZAG
+if (cd "$tmp" && "$ZNC" check aggregate_make.zag --no-zagd --no-analyze >aggregate_make.log 2>&1); then
+    echo "unaccounted root make nested in aggregate unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'root make is not charged to ScriptContext' "$tmp/aggregate_make.log"
+cat >"$tmp/switch_expression_escape.zag" <<'ZAG'
+script;
+extern fn retain(value: []u8) void
+let data = read_file("input.txt");
+let alias: []u8 = switch (1) { 1 => data else => "" };
+retain(alias);
+ZAG
+if (cd "$tmp" && "$ZNC" check switch_expression_escape.zag --no-zagd --no-analyze >switch_expression_escape.log 2>&1); then
+    echo "Script lifetime escape through switch expression unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'call to `retain`' "$tmp/switch_expression_escape.log"
+echo 'script lifetime: pass=17 fail=0'
