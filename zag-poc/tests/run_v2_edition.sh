@@ -232,6 +232,16 @@ if (cd "$tmp/v2-owned-alias-return" && "$ZNC" main.zag -o out) >"$tmp/v2-owned-a
 else
   echo "  XX  alias return ownership transfer"; sed -n '1,8p' "$tmp/v2-owned-alias-return/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-owned-consume"
+printf 'name = "v2ownedconsume"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-consume/zag.mod"
+printf 'struct Node { value:i32 } fn consume(p:*mut Node) void @consumes { unsafe { delete(p); } } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; consume(p); print_i64(p as i64); } return 0; }\n' >"$tmp/v2-owned-consume/main.zag"
+if (cd "$tmp/v2-owned-consume" && "$ZNC" main.zag -o out) >"$tmp/v2-owned-consume/log" 2>&1 || [ -e "$tmp/v2-owned-consume/out" ]; then
+  echo "  XX  consumed owner use rejects without artifact"; sed -n '1,8p' "$tmp/v2-owned-consume/log"; fail=$((fail + 1))
+elif grep -q 'use after free of named allocation `p`' "$tmp/v2-owned-consume/log"; then
+  echo "  ok  consumed owner use rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  consume ownership rejection missing diagnostic"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-nullable-deref"
 printf 'name = "v2nullablederef"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-nullable-deref/zag.mod"
 printf 'unsafe fn load(p: ?*const i32) i32 { return p.*; } fn main() i32 { return 0; }\n' >"$tmp/v2-nullable-deref/main.zag"
