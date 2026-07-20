@@ -214,6 +214,16 @@ elif grep -q 'use after free of named allocation `p`' "$tmp/v2-conditional-use-a
 else
   echo "  XX  conditional use-after-free rejection missing diagnostic"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-owned-leak"
+printf 'name = "v2ownedleak"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-leak/zag.mod"
+printf 'fn main() i32 { unsafe { let p: *mut i32 = new(42) as *mut i32; } return 0; }\n' >"$tmp/v2-owned-leak/main.zag"
+if (cd "$tmp/v2-owned-leak" && "$ZNC" main.zag -o out) >"$tmp/v2-owned-leak/log" 2>&1 || [ -e "$tmp/v2-owned-leak/out" ]; then
+  echo "  XX  owned allocation leak rejects without artifact"; sed -n '1,8p' "$tmp/v2-owned-leak/log"; fail=$((fail + 1))
+elif grep -q 'owned allocation `p` is neither released nor returned' "$tmp/v2-owned-leak/log"; then
+  echo "  ok  owned allocation leak rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  owned allocation leak rejection missing diagnostic"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-nullable-deref"
 printf 'name = "v2nullablederef"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-nullable-deref/zag.mod"
 printf 'unsafe fn load(p: ?*const i32) i32 { return p.*; } fn main() i32 { return 0; }\n' >"$tmp/v2-nullable-deref/main.zag"
