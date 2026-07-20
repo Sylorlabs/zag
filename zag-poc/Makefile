@@ -10,7 +10,7 @@
 
 .PHONY: all bootstrap znc zagd test test-zagd-product test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-analyzer test-hot-reload test-dynamic-abi test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-std-namespace \
         test-diagnostics test-tooling test-programs test-native test-abi-layout test-arm64 \
-        test-differential-backends test-arm64-selfhost clean install
+        test-differential-backends test-arm64-selfhost test-macos-arm64-release clean install
 
 # ── Primary target ────────────────────────────────────────────────────────────
 all: znc zagd
@@ -119,6 +119,11 @@ test-differential-backends:
 test-arm64-selfhost:
 	@echo "── arm64 self-hosting fixpoint ──"
 	bash tests/run_arm64_selfhost.sh
+
+# Native Apple-Silicon Darwin/Mach-O release gate.  Must be run on macOS arm64.
+test-macos-arm64-release:
+	@echo "── native macOS arm64 release gate ──"
+	bash tests/run_macos_arm64_release.sh
 
 test-dynamic-abi:
 	@echo "── explicit dynamic system ABI gate ──"
