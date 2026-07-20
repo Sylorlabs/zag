@@ -6,7 +6,7 @@ tmp=$(mktemp -d /tmp/zag-i686-link.XXXXXX)
 trap 'find "$tmp" -type f -delete; rmdir "$tmp"' EXIT
 
 "$ZNC" tests/i686_link_driver.zag -o "$tmp/link-driver" --no-analyze --no-zagd >/dev/null
-"$tmp/link-driver" --fixtures "$tmp/entry.o" "$tmp/helper.o" "$tmp/duplicate.o" "$tmp/libhelper.a"
+"$tmp/link-driver" --fixtures "$tmp/entry.o" "$tmp/helper.o" "$tmp/duplicate.o" "$tmp/libhelper.a" "$tmp/corrupt-metadata.o"
 
 "$tmp/link-driver" "$tmp/multi" "$tmp/entry.o" "$tmp/helper.o"
 set +e; "$tmp/multi"; rc=$?; set -e
@@ -42,4 +42,10 @@ fi
 grep -q 'undefined symbol: helper' "$tmp/missing.log"
 echo "  ok  missing definition rejects with its symbol name"
 
-echo "i686 multi-object: pass=5 fail=0"
+if "$tmp/link-driver" "$tmp/corrupt" "$tmp/corrupt-metadata.o" >"$tmp/corrupt.log" 2>&1; then
+    echo "  XX  malformed symbol metadata was accepted"; exit 1
+fi
+grep -q 'unsupported or corrupt ELF32/i386 ET_REL input' "$tmp/corrupt.log"
+echo "  ok  malformed symbol-table metadata rejects before linker traversal"
+
+echo "i686 multi-object: pass=6 fail=0"
