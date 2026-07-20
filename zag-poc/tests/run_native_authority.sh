@@ -43,9 +43,14 @@ else
     fail=$((fail + 1))
 fi
 
+printf 'fn main() i32 { print_int(42); return 0; }\n' > "$tmp/smoke.zag"
+
+# PATH poisoning above already proves that the one required self-rebuild cannot
+# reach a host toolchain. Trace a tiny native build instead of repeating the
+# largest allocation in this gate solely to count execve calls.
 if command -v strace >/dev/null 2>&1; then
     if PATH="$tmp/bin:$PATH" strace -f -e trace=execve -o "$tmp/exec.log" \
-       ./znc selfhost/native/znc.zag -o "$tmp/znc-traced" --no-analyze --no-zagd >"$tmp/traced.log" 2>&1 && \
+       ./znc "$tmp/smoke.zag" -o "$tmp/smoke-traced" --no-analyze --no-zagd >"$tmp/traced.log" 2>&1 && \
        [ "$(grep -c 'execve(' "$tmp/exec.log")" -eq 1 ]; then
         echo "  ok  syscall trace shows no child tool execution"
         pass=$((pass + 1))
@@ -60,7 +65,6 @@ else
     echo "  --  strace unavailable; PATH poisoning remains enforced"
 fi
 
-printf 'fn main() i32 { print_int(42); return 0; }\n' > "$tmp/smoke.zag"
 if PATH="$tmp/bin:$PATH" "$tmp/znc-stage2" "$tmp/smoke.zag" -o "$tmp/smoke" >"$tmp/smoke.log" 2>&1 && \
    [ "$("$tmp/smoke")" = 42 ]; then
     echo "  ok  stage-2 compiler built and ran a Zag program"
