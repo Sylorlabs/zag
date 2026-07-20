@@ -2,12 +2,14 @@
 
 ## Prerequisites
 
-- **x86-64 Linux or ARM64 Linux** — native ELF is supported on both targets;
-  x86-64 can cross-compile ARM64 and verify it through qemu-user
+- **x86-64 Linux, ARM64 Linux, or Apple Silicon macOS** — native ELF is
+  supported on Linux and signed Mach-O is supported on macOS arm64;
+  Linux x86-64 can cross-compile either ARM64 format
 - **No other build tools required** — no `cc`, no `zig`, no `llvm`, no `make`
 - Tested on: Ubuntu 22.04, Ubuntu 24.04, Fedora 40, Arch Linux (rolling)
 
-The committed `./znc` binary is the only bootstrap dependency.
+The committed `./znc` is the Linux bootstrap seed. Apple Silicon uses the
+`znc-macos-arm64` release/CI artifact as its bootstrap seed.
 
 ---
 
@@ -30,6 +32,29 @@ Build and run in one native step:
 ```sh
 ./znc examples/numeric.zag -o numeric --run
 ```
+
+### Apple Silicon macOS
+
+Download the `znc-macos-arm64` artifact, make it executable, and run it directly:
+
+```sh
+chmod +x znc-macos-arm64
+./znc-macos-arm64 examples/numeric.zag -o numeric --run
+```
+
+A macOS-hosted compiler defaults to signed `macos-arm64` output. The explicit
+spelling is useful for cross-compilation and reproducible scripts:
+
+```sh
+./znc-macos-arm64 examples/numeric.zag --target macos-arm64 -o numeric
+./numeric
+```
+
+The Mach-O writer, PIE address lowering, SHA-256 ad-hoc signer, Darwin entry ABI,
+and syscall runtime are all implemented in Zag. No Xcode, system assembler,
+linker, `codesign`, C, Python, or Zig is invoked to produce the executable.
+External library linking, `--debug`, and `--hot` are not yet available on this
+target and are rejected instead of silently producing a partial artifact.
 
 ---
 
@@ -144,7 +169,8 @@ configuration.
 
 ## What `./znc` is
 
-`znc` (Zag Native Compiler) performs the full compilation pipeline in Zag:
+`znc` (Zag Native Compiler) performs the full compilation pipeline in Zag.
+On Linux x86-64 the default path is:
 
 ```
 source.zag
@@ -157,5 +183,7 @@ source.zag
   → static ELF binary (no libc, no dynamic loader)
 ```
 
-The resulting binary uses Linux syscalls directly and has zero runtime
-dependencies beyond the kernel.
+The Linux result uses Linux syscalls directly and has no runtime dependency
+beyond the kernel. The Apple Silicon result uses the Darwin entry/syscall ABI,
+is position-independent, carries a deterministic embedded ad-hoc signature,
+and loads through macOS dyld without compiler-generated symbol imports.

@@ -7,7 +7,8 @@ v2 support unless all required v2 categories are green.
 | Target/path | Current evidence | v2 operational status |
 |---|---|---|
 | x86-64 Linux static native | v1 bootstrap/native gates execute self-hosted output | v1 supported; v2 machine-control not implemented |
-| ARM64 native | experimental lowering and separate regression tests | not a v2 supported target |
+| ARM64 Linux native | ELF lowering, qemu/native regression tests, and self-host fixpoint | v1 supported; not yet a v2 machine-control target |
+| Apple Silicon macOS native | signed PIE Mach-O, native runtime acceptance, and byte-identical self-host fixpoint | v1 supported; not yet a v2 machine-control target |
 | WebAssembly | v1 emission/execution regression gate | not a v2 supported target |
 | GPU MLIR / gfx bundle | frontend output validation only | not a GPU execution backend |
 | Vulkan compute | no runtime implementation | unsupported |
