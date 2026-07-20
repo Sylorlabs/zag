@@ -144,4 +144,14 @@ if (cd "$tmp" && "$ZNC" check reassigned_escape.zag --no-zagd --no-analyze >reas
     echo "Script lifetime escape after local reassignment unexpectedly accepted" >&2; exit 1
 fi
 grep -q 'call to `retain`' "$tmp/reassigned_escape.log"
-echo 'script lifetime: pass=15 fail=0'
+cat >"$tmp/aggregate_make.zag" <<'ZAG'
+script;
+struct Payload { bytes: []u8 }
+let payload = Payload{ .bytes = make[u8](16) };
+println(payload.bytes.len);
+ZAG
+if (cd "$tmp" && "$ZNC" check aggregate_make.zag --no-zagd --no-analyze >aggregate_make.log 2>&1); then
+    echo "unaccounted root make nested in aggregate unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'root make is not charged to ScriptContext' "$tmp/aggregate_make.log"
+echo 'script lifetime: pass=16 fail=0'
