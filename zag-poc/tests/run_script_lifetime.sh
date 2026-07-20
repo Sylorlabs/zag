@@ -186,4 +186,14 @@ if (cd "$tmp" && "$ZNC" check root_helper_new.zag --no-zagd --no-analyze >root_h
     echo "reachable root helper new unexpectedly accepted" >&2; exit 1
 fi
 grep -q 'reachable Script helper `build` uses make or new outside ScriptContext' "$tmp/root_helper_new.log"
-echo 'script lifetime: pass=19 fail=0'
+cat >"$tmp/root_helper_raw_alloc.zag" <<'ZAG'
+script;
+fn build() *i8 { return _zag_malloc(8) as *i8; }
+let bytes = build();
+println(bytes as i64);
+ZAG
+if (cd "$tmp" && "$ZNC" check root_helper_raw_alloc.zag --no-zagd --no-analyze >root_helper_raw_alloc.log 2>&1); then
+    echo "reachable root helper raw allocator unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'reachable Script helper `build` uses a raw runtime allocator outside ScriptContext' "$tmp/root_helper_raw_alloc.log"
+echo 'script lifetime: pass=20 fail=0'
