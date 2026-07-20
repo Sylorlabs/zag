@@ -194,6 +194,16 @@ elif grep -q 'use after free of named allocation `p`' "$tmp/v2-use-after-free/lo
 else
   echo "  XX  use-after-free rejection missing diagnostic"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-alias-use-after-free"
+printf 'name = "v2aliasuseafterfree"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-alias-use-after-free/zag.mod"
+printf 'fn main() i32 { unsafe { let p: *mut i32 = new(42) as *mut i32; let q: *mut i32 = p; delete(p); print_i64(q as i64); } return 0; }\n' >"$tmp/v2-alias-use-after-free/main.zag"
+if (cd "$tmp/v2-alias-use-after-free" && "$ZNC" main.zag -o out) >"$tmp/v2-alias-use-after-free/log" 2>&1 || [ -e "$tmp/v2-alias-use-after-free/out" ]; then
+  echo "  XX  local alias use after free rejects without artifact"; sed -n '1,8p' "$tmp/v2-alias-use-after-free/log"; fail=$((fail + 1))
+elif grep -q 'use after free of named allocation `p`' "$tmp/v2-alias-use-after-free/log"; then
+  echo "  ok  local alias use after free rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  alias use-after-free rejection missing diagnostic"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-nullable-deref"
 printf 'name = "v2nullablederef"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-nullable-deref/zag.mod"
 printf 'unsafe fn load(p: ?*const i32) i32 { return p.*; } fn main() i32 { return 0; }\n' >"$tmp/v2-nullable-deref/main.zag"
