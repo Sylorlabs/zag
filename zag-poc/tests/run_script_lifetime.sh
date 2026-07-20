@@ -165,4 +165,14 @@ if (cd "$tmp" && "$ZNC" check switch_expression_escape.zag --no-zagd --no-analyz
     echo "Script lifetime escape through switch expression unexpectedly accepted" >&2; exit 1
 fi
 grep -q 'call to `retain`' "$tmp/switch_expression_escape.log"
-echo 'script lifetime: pass=17 fail=0'
+cat >"$tmp/root_helper_make.zag" <<'ZAG'
+script;
+fn build() []u8 { return make[u8](16); }
+let bytes = build();
+println(bytes.len);
+ZAG
+if (cd "$tmp" && "$ZNC" check root_helper_make.zag --no-zagd --no-analyze >root_helper_make.log 2>&1); then
+    echo "reachable root helper make unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'reachable Script helper `build` uses make outside ScriptContext' "$tmp/root_helper_make.log"
+echo 'script lifetime: pass=18 fail=0'
