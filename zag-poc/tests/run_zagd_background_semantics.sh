@@ -34,6 +34,20 @@ final_bytes=$(wc -c < "$tmp/project/app.zag" | tr -d ' ')
 grep -Eq "^source=[0-9]+,[0-9]+,${final_bytes}$" "$tmp/project/.zag-cache/zagd/semantic.record"
 grep -q '^semantic_manifest=true$' "$tmp/project/.zagd.status"
 
+# The explicitly selected root is daemon authority.  A mutable compatibility
+# control file written by an unrelated foreground build must not redirect it.
+printf 'pub fn other_value() i32 { return 7; }\n' > "$tmp/project/other.zag"
+"$compiler" check "$tmp/project/other.zag" --no-analyze >/dev/null
+test ! -e "$tmp/project/.zagd.root-source"
+printf 'missing.zag\n' > "$tmp/project/.zagd.root-source"
+printf 'pub fn authority_value() i32 { return 31; }\nfn main() i32 { return authority_value(); }\n' > "$tmp/project/app.zag"
+for _ in $(seq 1 200); do
+    grep -q '^public_fn=fn authority_value->i32!' "$tmp/project/.zag-cache/zagd/semantic.record" 2>/dev/null && break
+    sleep 0.01
+done
+grep -q '^complete=true$' "$tmp/project/.zag-cache/zagd/semantic.record"
+grep -q '^public_fn=fn authority_value->i32!' "$tmp/project/.zag-cache/zagd/semantic.record"
+
 # A stable invalid source must remove, not retain, the prior valid manifest.
 printf 'pub fn incomplete( i32 {\n' > "$tmp/project/app.zag"
 for _ in $(seq 1 200); do
