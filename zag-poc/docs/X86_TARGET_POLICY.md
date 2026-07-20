@@ -53,8 +53,10 @@ Given compiler version, source, options and explicit profile, emitted bytes must
 be deterministic. `native` output is reproducible only for the same resolved
 feature set. The implemented `--cpu=runtime` case is deliberately narrow:
 `popcount(i64)` emits generic and POPCNT bodies, checks CPUID while preserving
-callee-saved RBX, and caches one deterministic selection. No other function or
-optional SIMD family currently receives runtime multiversioning.
+callee-saved RBX, and caches one deterministic selection. BMI1 `andn(i64,i64)`
+and `trailing_zeros(i64)` follow the same independent leaf-7 cache discipline;
+the latter's generic loop defines zero as 64. No optional SIMD family currently
+receives runtime multiversioning.
 
 ## ABI and ELF gate
 
