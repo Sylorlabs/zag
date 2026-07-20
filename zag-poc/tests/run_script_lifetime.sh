@@ -174,5 +174,16 @@ ZAG
 if (cd "$tmp" && "$ZNC" check root_helper_make.zag --no-zagd --no-analyze >root_helper_make.log 2>&1); then
     echo "reachable root helper make unexpectedly accepted" >&2; exit 1
 fi
-grep -q 'reachable Script helper `build` uses make outside ScriptContext' "$tmp/root_helper_make.log"
-echo 'script lifetime: pass=18 fail=0'
+grep -q 'reachable Script helper `build` uses make or new outside ScriptContext' "$tmp/root_helper_make.log"
+cat >"$tmp/root_helper_new.zag" <<'ZAG'
+script;
+struct Pair { value: i64 }
+fn build() *Pair { return new(Pair{ .value = 7 }); }
+let pair = build();
+println(pair.*.value);
+ZAG
+if (cd "$tmp" && "$ZNC" check root_helper_new.zag --no-zagd --no-analyze >root_helper_new.log 2>&1); then
+    echo "reachable root helper new unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'reachable Script helper `build` uses make or new outside ScriptContext' "$tmp/root_helper_new.log"
+echo 'script lifetime: pass=19 fail=0'
