@@ -47,6 +47,16 @@ return 0;
 
 `return` supplies the generated process entry point's status.
 
+`print` and `println` accept strings/slices and integer expressions. Script
+users do not need to manually convert a counter merely to display it:
+
+```zag
+script;
+
+let files_checked: i32 = 42;
+println(files_checked);
+```
+
 ## Prelude
 
 The intentionally small implemented prelude is `print`, `println`, `read_file`,
