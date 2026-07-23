@@ -31,11 +31,18 @@ grep -q '^gpu_background=false$' "$tmp/project/.zagd.status"
 grep -q '^watcher=inotify$' "$tmp/project/.zagd.status"
 grep -q '^watcher_health=ok$' "$tmp/project/.zagd.status"
 grep -q '^cache_bytes=[0-9][0-9]*$' "$tmp/project/.zagd.status"
+grep -q '^cache_eviction=within-limit$' "$tmp/project/.zagd.status"
+grep -q '^cache_bytes_before_trim=[0-9][0-9]*$' "$tmp/project/.zagd.status"
+grep -q '^cache_bytes_after_trim=[0-9][0-9]*$' "$tmp/project/.zagd.status"
 grep -q '^semantic_manifest=true$' "$tmp/project/.zagd.status"
+grep -q '^semantic_validation=restored$' "$tmp/project/.zagd.status"
+grep -q '^planner_cancellations=0$' "$tmp/project/.zagd.status"
 grep -q '^executable_authority=false$' "$tmp/project/.zag-cache/zagd/plan.record"
 grep -q '^basis=proven-manifest-facts$' "$tmp/project/.zag-cache/zagd/plan.record"
 grep -q '^performance_benefit=unknown$' "$tmp/project/.zag-cache/zagd/plan.record"
 grep -q '^equivalence=canonical-literal-or-bounded-integer-arithmetic-return$' "$tmp/project/.zag-cache/zagd/plan.record"
+grep -q '^cpu_profile=x86-64-v1$' "$tmp/project/.zag-cache/zagd/plan.record"
+grep -q '^target_cache_key=linux-x86_64|x86-64-v1|sse2$' "$tmp/project/.zag-cache/zagd/plan.record"
 
 printf 'one\n' > "$tmp/project/app.zag"
 for _ in $(seq 1 100); do
@@ -44,6 +51,8 @@ for _ in $(seq 1 100); do
 done
 grep -q 'last_file=.*/app.zag$' "$tmp/project/.zagd.status"
 grep -q '^semantic_manifest=false$' "$tmp/project/.zagd.status"
+grep -q '^semantic_validation=failed$' "$tmp/project/.zagd.status"
+grep -Eq '^planner_cancellations=[1-9][0-9]*$' "$tmp/project/.zagd.status"
 first=$(grep '^content_hash_first=' "$tmp/project/.zagd.status")
 
 printf 'two\n' > "$tmp/project/app.zag"
@@ -82,6 +91,26 @@ test ! -e "$tmp/project/.zagd.lock"
 "$tmp/zagd" --root "$tmp/project" --mode off
 grep -q '^mode=off$' "$tmp/project/.zagd.status"
 grep -q '^state=stopped$' "$tmp/project/.zagd.status"
+
+# The target key is planner/cache identity only.  Native discovery may select
+# already implemented POPCNT/BMI1 plans, but never changes foreground build
+# authority or permits unimplemented SIMD.
+"$tmp/zagd" --root "$tmp/project" --mode light --cpu native &
+daemon_pid=$!
+for _ in $(seq 1 100); do
+    grep -q '^cpu_detection=cpuid-xgetbv$' "$tmp/project/.zag-cache/zagd/plan.record" 2>/dev/null && break
+    sleep 0.01
+done
+grep -q '^cpu_detection=cpuid-xgetbv$' "$tmp/project/.zag-cache/zagd/plan.record"
+grep -q '^target_cache_key=linux-x86_64|native|permitted=sse2' "$tmp/project/.zag-cache/zagd/plan.record"
+"$tmp/zagd" --root "$tmp/project" --mode off
+wait "$daemon_pid"
+daemon_pid=
+
+if "$tmp/zagd" --root "$tmp/project" --cpu no-such-cpu >/dev/null 2>&1; then
+    echo "unknown CPU profile unexpectedly accepted" >&2
+    exit 1
+fi
 
 if "$tmp/zagd" --root "$tmp/project" --mode mystery >/dev/null 2>&1; then
     echo "unknown mode unexpectedly accepted" >&2

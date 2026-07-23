@@ -242,6 +242,46 @@ elif grep -q 'use after free of named allocation `p`' "$tmp/v2-owned-consume/log
 else
   echo "  XX  consume ownership rejection missing diagnostic"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-shared-borrow-write"
+printf 'name = "v2sharedborrowwrite"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-shared-borrow-write/zag.mod"
+printf 'fn inspect(p:*mut i32) *mut i32 @borrows { unsafe { p.* = 1; return p; } } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let q:*mut i32=inspect(p); delete(p); } return 0; }\n' >"$tmp/v2-shared-borrow-write/main.zag"
+if (cd "$tmp/v2-shared-borrow-write" && "$ZNC" main.zag -o out) >"$tmp/v2-shared-borrow-write/log" 2>&1 || [ -e "$tmp/v2-shared-borrow-write/out" ]; then
+  echo "  XX  shared borrow mutation rejects without artifact"; sed -n '1,8p' "$tmp/v2-shared-borrow-write/log"; fail=$((fail + 1))
+elif grep -q 'cannot mutate through a shared borrow' "$tmp/v2-shared-borrow-write/log"; then
+  echo "  ok  shared borrow mutation rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  shared borrow mutation rejection missing diagnostic"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-exclusive-borrow-active"
+printf 'name = "v2exclusiveborrowactive"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-exclusive-borrow-active/zag.mod"
+printf 'fn edit(p:*mut i32) *mut i32 @borrows_mut { unsafe { p.* = 7; return p; } } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let q:*mut i32=edit(p); print_i64(p as i64); delete(p); } return 0; }\n' >"$tmp/v2-exclusive-borrow-active/main.zag"
+if (cd "$tmp/v2-exclusive-borrow-active" && "$ZNC" main.zag -o out) >"$tmp/v2-exclusive-borrow-active/log" 2>&1 || [ -e "$tmp/v2-exclusive-borrow-active/out" ]; then
+  echo "  XX  active exclusive borrow rejects owner use without artifact"; sed -n '1,8p' "$tmp/v2-exclusive-borrow-active/log"; fail=$((fail + 1))
+elif grep -q 'exclusive mutable borrow is active' "$tmp/v2-exclusive-borrow-active/log"; then
+  echo "  ok  active exclusive borrow rejects owner use without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  active exclusive borrow rejection missing diagnostic"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-shared-blocks-exclusive"
+printf 'name = "v2sharedblocksexclusive"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-shared-blocks-exclusive/zag.mod"
+printf 'fn inspect(p:*mut i32) *mut i32 @borrows { return p; } fn edit(p:*mut i32) *mut i32 @borrows_mut { unsafe { return p; } } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let s:*mut i32=inspect(p); let m:*mut i32=edit(p); delete(p); } return 0; }\n' >"$tmp/v2-shared-blocks-exclusive/main.zag"
+if (cd "$tmp/v2-shared-blocks-exclusive" && "$ZNC" main.zag -o out) >"$tmp/v2-shared-blocks-exclusive/log" 2>&1 || [ -e "$tmp/v2-shared-blocks-exclusive/out" ]; then
+  echo "  XX  shared borrow blocks exclusive borrow without artifact"; sed -n '1,8p' "$tmp/v2-shared-blocks-exclusive/log"; fail=$((fail + 1))
+elif grep -q 'exclusive mutable borrow while a shared borrow is active' "$tmp/v2-shared-blocks-exclusive/log"; then
+  echo "  ok  shared borrow blocks exclusive borrow without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  shared/exclusive borrow rejection missing diagnostic"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-borrow-alias-consume"
+printf 'name = "v2borrowaliasconsume"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-borrow-alias-consume/zag.mod"
+printf 'struct Node { value:i32 } fn inspect(p:*mut Node) *mut Node @borrows { return p; } fn consume(p:*mut Node) void @consumes { unsafe { delete(p); } } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; let s:*mut Node=inspect(p); let alias:*mut Node=s; consume(alias); } return 0; }\n' >"$tmp/v2-borrow-alias-consume/main.zag"
+if (cd "$tmp/v2-borrow-alias-consume" && "$ZNC" main.zag -o out) >"$tmp/v2-borrow-alias-consume/log" 2>&1 || [ -e "$tmp/v2-borrow-alias-consume/out" ]; then
+  echo "  XX  borrow alias cannot be consumed without artifact"; sed -n '1,8p' "$tmp/v2-borrow-alias-consume/log"; fail=$((fail + 1))
+elif grep -q 'cannot pass a borrow to a consuming call' "$tmp/v2-borrow-alias-consume/log"; then
+  echo "  ok  borrow alias cannot be consumed without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  borrow alias consume rejection missing diagnostic"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-nullable-deref"
 printf 'name = "v2nullablederef"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-nullable-deref/zag.mod"
 printf 'unsafe fn load(p: ?*const i32) i32 { return p.*; } fn main() i32 { return 0; }\n' >"$tmp/v2-nullable-deref/main.zag"
