@@ -57,6 +57,33 @@ let files_checked: i32 = 42;
 println(files_checked);
 ```
 
+## First programs
+
+Zag Script is ordinary Zag with the low-friction profile selected by `script;`.
+For a first program, use values, `if`, `while`, functions, and the small
+prelude. You do not need `main`, allocator arguments, effects, or type
+annotations unless a program benefits from making one explicit.
+
+```zag
+script;
+
+let numbers = list(2, 3, 5);
+append(numbers, 7);
+println(length(numbers));
+println(item_at(numbers, 0));
+```
+
+`append(list, value)`, `length(list)`, and `item_at(list, index)` are Script
+root conveniences for typed lists. They lower to the ordinary explicit
+`script_list_append(&list, value)`, `script_list_len(list)`, and
+`script_list_get(list, index)` APIs. They do not introduce dynamic values or
+change strict Zag. If `append`, `length`, or `item_at` is declared by the user,
+the user declaration wins.
+
+The beginner rule is simple: values have a kind, functions do work, `if`
+chooses, loops repeat, and diagnostics explain the next small correction.
+`znc explain` is optional inspection, not required knowledge.
+
 ## Prelude
 
 The intentionally small implemented prelude is `print`, `println`, `read_file`,
