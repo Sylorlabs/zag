@@ -52,6 +52,15 @@ beyond the three contracts, and runtime use-after-free detection remain
 unimplemented. v1 pointer indexing and `new`/`delete` extensions are not
 evidence that those stronger rules already hold.
 
+The native x86-64 allocator also marks a small allocation's size header as
+freed before it links that allocation into a free list, and restores the live
+mark when reusing it. A repeated runtime `delete`/`_zag_free` of such a block
+therefore prints `zag runtime: invalid or double free` and exits nonzero rather
+than corrupting the allocator. This is allocator-integrity instrumentation,
+not general provenance or use-after-free instrumentation: arbitrary forged
+addresses and accesses through an already-freed pointer still require the
+unsafe programmer to uphold their contract.
+
 ## Pointer categories and lifetime
 
 `*const T` observes an object but does not permit mutation through that pointer;

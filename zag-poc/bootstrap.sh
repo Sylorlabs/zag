@@ -20,7 +20,7 @@ if [ ! -x ./znc ]; then
 fi
 
 echo "== native bootstrap: Zag -> x86-64 ELF (no cc/as/ld/libc) =="
-./znc selfhost/native/znc.zag -o znc.new
+./znc selfhost/native/znc.zag -o znc.new --no-foreground-cache
 mv -f znc.new znc
 echo "   ./znc rebuilt itself from selfhost/native/znc.zag"
 
