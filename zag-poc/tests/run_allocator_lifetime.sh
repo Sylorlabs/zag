@@ -31,5 +31,20 @@ else
   echo "  XX  dynamic double free program did not compile"; sed -n '1,8p' "$tmp/double_free.log"; fail=$((fail + 1))
 fi
 
+printf '%s\n' 'fn main() i32 { let p:*i8 = _zag_malloc(32) as *i8; _zag_free(p); let q:*i8 = _zag_realloc(p, 64) as *i8; return 0; }' >"$tmp/stale_realloc.zag"
+if "$ZNC" "$tmp/stale_realloc.zag" -o "$tmp/stale_realloc" --no-zagd --no-analyze --no-foreground-cache >"$tmp/stale_realloc.log" 2>&1; then
+  set +e
+  "$tmp/stale_realloc" >"$tmp/stale_realloc.out" 2>"$tmp/stale_realloc.err"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ] && grep -q 'zag runtime: realloc of invalid or freed allocation' "$tmp/stale_realloc.err"; then
+    echo "  ok  stale realloc fails closed"; pass=$((pass + 1))
+  else
+    echo "  XX  stale realloc did not fail closed (exit=$rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  stale realloc program did not compile"; sed -n '1,8p' "$tmp/stale_realloc.log"; fail=$((fail + 1))
+fi
+
 echo "════ allocator-lifetime pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]
