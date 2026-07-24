@@ -12,6 +12,8 @@ tools/zagd-user-service.sh install app.zag adaptive
 
 The service runs `zagd` in the foreground under systemd with `Restart=always`,
 `Nice=10`, no elevated privileges, no network use, and the selected root source.
+It reads `max_memory_bytes` from `.zagd.conf` during installation and applies
+the same value to both systemd's memory cgroup and `zagd`'s address-space limit.
 The project `.zagd.conf` remains the ordinary policy location. Re-run `install`
 to change the root or service mode; use `status` or `uninstall` with the same
 root source to inspect or remove it. This optional service affects availability,

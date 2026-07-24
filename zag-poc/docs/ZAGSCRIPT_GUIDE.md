@@ -17,6 +17,14 @@ The implemented profile includes a managed context, requested-payload allocation
 limit, uncaught-error wrapper, `znc script`, `explain`, conservative `harden`,
 and `check --strict`. Both activation forms are supported:
 
+- `script;` in an ordinary `.zag` file;
+- `znc script program.zag`; or
+- the optional `.zs` suffix.
+
+All three select the same `ModuleProfile.script`, parser, AST, semantic
+analysis, runtime, and native backend. `.zs` is a convenience, not a second
+language or a claim that arbitrary Python files are source-compatible.
+
 The JSON form of `explain` embeds the compiler's checksummed semantic manifest,
 including declaration signatures, layouts, call edges, function effects, and
 per-expression `expr_fact` witnesses. Types come from the shared typed frontend;
@@ -38,6 +46,18 @@ of the supported path.
 
 ## A minimal script
 
+The indentation-oriented surface is intended for first programs:
+
+```zag
+name = input("What is your name? ")
+print("Hello")
+print(name)
+```
+
+In `.zs`, a first assignment declares a statically typed local, indentation
+forms blocks, and line-ending semicolons are optional. `print` includes a
+newline. The same profile can be written in canonical Zag:
+
 ```zag
 script;
 
@@ -46,6 +66,15 @@ return 0;
 ```
 
 `return` supplies the generated process entry point's status.
+
+The implemented indentation surface includes assignment and reassignment,
+`if`/`elif`/`else`, `while`, collection and `range` loops, `def`, `return`,
+`pass`, `True`, `False`, `None`, `not`, homogeneous list literals,
+`.append`, indexing, `len`, `print`, and bounded `input`. Function parameters
+without annotations currently default to `i64`; annotations may use `int`,
+`float`, `str`, and `bool`. This is a deliberately typed Zag surface, not
+Python emulation. Classes, decorators, generators, comprehensions, arbitrary
+Python modules, and dynamic mixed-type containers are not accepted.
 
 `print` and `println` accept strings/slices and integer expressions. Script
 users do not need to manually convert a counter merely to display it:
@@ -86,7 +115,7 @@ chooses, loops repeat, and diagnostics explain the next small correction.
 
 ## Prelude
 
-The intentionally small implemented prelude is `print`, `println`, `read_file`,
+The intentionally small implemented prelude is `print`, `println`, `input`, `read_file`,
 `write_file`, `args_len`, `arg`, `string_concat`, `script_alloc`,
 `script_alloc_used`, `process_run_timeout`, `string_builder`, and `list`. The ordinary strict-Zag
 mappings are `_zag_print`, `_zag_println`, `_zag_read_file`, `_zag_write_file`,
@@ -94,6 +123,11 @@ mappings are `_zag_print`, `_zag_println`, `_zag_read_file`, `_zag_write_file`,
 allocation runtime calls. Prelude bindings occur
 only in executable statements of the selected script root. An ordinary user
 function with the same name wins independently.
+
+`input(prompt)` prints the prompt and reads at most 4096 bytes from standard
+input into Script-lifetime storage. The allocation is charged to the Script
+limit and the trailing newline is removed. It is bounded input, not an
+unbounded console buffer.
 
 `read_file` copies its returned value into Script-lifetime storage charged to the
 requested-payload budget. The native reader still uses temporary staging storage
@@ -110,7 +144,7 @@ memory-safety guarantee or the eventual typed error API.
 - Put it before executable root statements.
 - Do not also declare `main`.
 - Only the selected root's executable statements run.
-- A `.zag` suffix alone does not activate the profile.
+- A `.zag` suffix alone does not activate the profile; `.zs` does.
 - A source file without `script;` keeps regular Zag semantics.
 
 `args()` materializes a typed `ScriptList[[]u8]`; its backing array is charged

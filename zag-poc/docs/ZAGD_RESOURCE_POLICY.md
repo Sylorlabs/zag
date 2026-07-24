@@ -20,16 +20,22 @@ policy: one worker, a 2 GiB cache ceiling, `errors_only` notifications, no
 network, and no background GPU. Unsupported worker/cache/notification values
 are rejected instead of silently ignored. `script_memory_bytes` accepts 1 MiB
 through 2 GiB and configures the Script requested-payload budget.
+`max_memory_bytes` accepts 64 MiB through 2 GiB and defaults to 512 MiB. The
+daemon applies it as a Linux `RLIMIT_AS` before entering the watcher loop, so
+the limit also protects manually launched and per-project daemon instances
+that are not supervised by systemd.
 `allow_filesystem_read`, `allow_filesystem_write`, and `allow_process` accept
 only `true` or `false` and are enforced by foreground Script compilation; they
 are capability policy, not daemon authority. Memory
 accounting excludes Linux kernel inotify storage and some compiler allocations.
-The installed user service additionally enforces `MemoryMax=512M`, disables
-swap for the daemon, assigns a low CPU weight, and restarts ordinary daemon
-failures. An OOM kill is intentionally a quiet stop rather than a restart loop;
-after resources are available, the user or `znc watch` may restart it. These
-operating-system limits prevent advisory work from destabilizing foreground
-compilation or the desktop.
+The installed user service reads the same `max_memory_bytes` value while it is
+installed and applies it both as `MemoryMax` and as the daemon's `RLIMIT_AS`.
+Re-run `tools/zagd-user-service.sh install app.zag <mode>` after changing that
+setting. It disables swap for the daemon, assigns a low CPU weight, and uses
+`Restart=always` for availability. An OOM kill is intentionally a quiet stop
+rather than a restart loop; after resources are available, the user or `znc
+watch` may restart it. These operating-system limits prevent advisory work from
+destabilizing foreground compilation or the desktop.
 
 The service blocks on operating-system events while idle, cancels snapshot-bound
 advice when invalidated, uses no GPU or network, and treats foreground builds as

@@ -21,10 +21,17 @@ script;
 selection disagree, selection remains script and the compiler reports the
 redundancy in `explain`; it must not create two script bodies.
 
+The optional `.zs` suffix also selects that same profile. It may omit the
+physical `script;` marker; the compiler activates the profile in memory and
+does not rewrite the file. The indentation-oriented surface is normalized to
+ordinary Zag tokens before the existing parser. It does not introduce a second
+AST, type system, module graph, package ecosystem, or backend.
+
 `script;` may follow comments and file directives but must precede executable
 root statements. A duplicate is an error. A script root that declares a
 user-visible process `main` is rejected until an explicit, unambiguous coexistence
-rule is designed. Filename extensions do not select semantics.
+rule is designed. Except for the explicit `.zs` convenience, filenames do not
+select semantics.
 
 ## Root statements and imports
 
@@ -91,7 +98,7 @@ checking.
 
 The implicit prelude is a small allowlist. Each name resolves to an ordinary,
 documented Zag declaration with an explicit strict-Zag equivalent. The implemented
-allowlist is `print`, `println`, `read_file`, `write_file`, `args_len`, `arg`,
+allowlist is `print`, `println`, `input`, `read_file`, `write_file`, `args_len`, `arg`,
 `string_concat`, `script_alloc`, `script_alloc_used`, `process_run_timeout`,
 `string_builder`, and `list`. A materialized argument collection and implicit
 JSON bindings remain candidates rather than hidden behavior.
@@ -151,6 +158,11 @@ snapshot, an explicit parity-test command, a rollback copy, and restores the
 original automatically when validation fails. It never silently skips the
 parity test. A clean Git worktree is still recommended but is not fabricated as
 compiler proof.
+
+When Script-context prelude calls remain, the report marks the preview
+`partial` and `candidate_compilable=false`; `--apply` refuses it. This is an
+honest boundary until allocator and capability expansion can produce ordinary
+strict Zag without guessing policy.
 
 `check --strict` rejects unresolved script conveniences, including implicit
 allocator or capabilities, unbounded process execution, implicit randomness,

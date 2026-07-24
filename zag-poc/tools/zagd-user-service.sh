@@ -23,6 +23,37 @@ repo_root=$(cd "$(dirname "$0")/.." && pwd)
 zagd_path="$repo_root/zagd"
 test -x "$zagd_path" || { echo "zagd service: build $zagd_path with bootstrap.sh first" >&2; exit 1; }
 
+# Keep the systemd cgroup ceiling and the daemon's RLIMIT_AS ceiling in lock
+# step. The compiler owns the full configuration grammar; this installer only
+# reads the one decimal resource value it must put into a systemd unit.
+planner_memory_bytes=536870912
+planner_config="$project_root/.zagd.conf"
+if test -f "$planner_config"; then
+    configured_memory=$(awk -F= '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*max_memory_bytes[[:space:]]*=/ {
+            value=$2
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            print value
+            exit
+        }
+    ' "$planner_config")
+    if test -n "$configured_memory"; then
+        case "$configured_memory" in
+            *[!0-9]*|'')
+                echo "zagd service: max_memory_bytes must be a decimal value from 67108864 through 2147483648" >&2
+                exit 1
+                ;;
+        esac
+        if (( configured_memory < 67108864 || configured_memory > 2147483648 )); then
+            echo "zagd service: max_memory_bytes must be 67108864..2147483648" >&2
+            exit 1
+        fi
+        planner_memory_bytes=$configured_memory
+    fi
+fi
+
 escaped=$(systemd-escape --path "$project_root")
 unit="zagd-${escaped}.service"
 config_root=${XDG_CONFIG_HOME:-$HOME/.config}
@@ -39,8 +70,8 @@ After=default.target
 [Service]
 Type=simple
 WorkingDirectory=$project_root
-ExecStart=$zagd_path --root $project_root --root-source $source_path --mode $mode
-Restart=on-failure
+ExecStart=$zagd_path --root $project_root --root-source $source_path --mode $mode --max-memory-bytes $planner_memory_bytes
+Restart=always
 RestartSec=1
 # A cgroup OOM is a resource-policy stop, not a reason to spin in a restart
 # loop and keep competing with the desktop. Ordinary nonzero daemon failures
@@ -49,7 +80,7 @@ RestartSec=1
 RestartPreventExitStatus=SIGKILL
 OOMPolicy=stop
 Nice=10
-MemoryMax=512M
+MemoryMax=$planner_memory_bytes
 MemorySwapMax=0
 CPUWeight=25
 NoNewPrivileges=true

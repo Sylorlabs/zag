@@ -7,9 +7,9 @@ Zag. It is not a rewrite into another language. `znc harden` can currently
 preserve a leading block of imports/declarations and move following executable
 statements into an explicit `fn main() i32`. With `--output`
 it writes a separate candidate and never overwrites the source.
-`--format json` emits preview status, the candidate when it is not written to a
-separate output, assumptions, parity tests, and unsupported transformations as
-a machine-readable report.
+`--format json` emits preview status, `candidate_compilable`, the candidate when
+it is not written to a separate output, assumptions, parity tests, and
+unsupported transformations as a machine-readable report.
 
 `--apply` is fail-closed: it requires `--test-command`, verifies that the source
 still matches the analyzed snapshot, checks the generated strict candidate,
@@ -38,7 +38,9 @@ appearing after executable top-level statements is rejected because moving it
 could change initialization order. The candidate deliberately retains ordinary
 native primitive calls selected by the
 script prelude; allocator and capability policy synthesis remain explicit
-unsupported report items. The report lists parity tests still required.
+unsupported report items. A preview containing those bindings is marked
+`partial` and not strict-compilable, and `--apply` refuses it rather than
+claiming completion. The report lists parity tests still required.
 
 `check --strict` rejects the generated entry point and implicit allocator, and
 adds focused filesystem and script-context allocation diagnostics when present.
