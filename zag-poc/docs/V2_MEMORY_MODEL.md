@@ -35,12 +35,22 @@ This is a v2 (`edition = "2027"`) contract, not a description of current v1
 types, requires explicit optional unwrapping before nullable dereference,
 rejects casts between distinct generic/host/device/workgroup address spaces,
 executes bounded native dereference cases, rejects dereference outside unsafe,
-rejects writes through `*const`, and rejects a statically evident second
-`delete`/`_zag_free` of the same named allocation in edition 2027. Provenance
-identity, dynamic bounds, aliasing, use-after-free, alignment instrumentation,
-allocator handles, and most operations below remain
-unimplemented; v1 pointer indexing and `new`/`delete` extensions are not
-evidence that those rules already hold.
+rejects writes through `*const`, and performs an edition-2027 static ownership
+flow pass. That pass follows direct local aliases of compiler-recognized
+allocations, rejects double-free and use-after-free through those aliases,
+requires every discovered owner to be released or returned on every
+control-flow path, and rejects an owned value passed to an uncontracted call.
+Calls that receive an owner must explicitly declare `@borrows`,
+`@borrows_mut`, or `@consumes`; this makes ownership transfer and retention
+inspectable instead of implicit.
+
+This is still a conservative intraprocedural static analysis, not universal
+runtime memory instrumentation. Its provenance identity is a compiler-tracked
+local allocation root; dynamic bounds, arbitrary pointer arithmetic, heap-wide
+alias identity, alignment checks, allocator handles, interprocedural summaries
+beyond the three contracts, and runtime use-after-free detection remain
+unimplemented. v1 pointer indexing and `new`/`delete` extensions are not
+evidence that those stronger rules already hold.
 
 ## Pointer categories and lifetime
 

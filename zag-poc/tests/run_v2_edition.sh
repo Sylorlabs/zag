@@ -267,6 +267,34 @@ elif grep -q 'use after free of named allocation `p`' "$tmp/v2-owned-consume/log
 else
   echo "  XX  consume ownership rejection missing diagnostic"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-owned-conditional-release"
+printf 'name = "v2ownedconditionalrelease"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-conditional-release/zag.mod"
+printf 'struct Node { value:i32 } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; if (1 == 1) { delete(p); } } return 0; }\n' >"$tmp/v2-owned-conditional-release/main.zag"
+if (cd "$tmp/v2-owned-conditional-release" && "$ZNC" main.zag -o out) >"$tmp/v2-owned-conditional-release/log" 2>&1 || [ -e "$tmp/v2-owned-conditional-release/out" ]; then
+  echo "  XX  conditional release rejects without artifact"; sed -n '1,8p' "$tmp/v2-owned-conditional-release/log"; fail=$((fail + 1))
+elif grep -q 'not released or returned on every control-flow path' "$tmp/v2-owned-conditional-release/log"; then
+  echo "  ok  conditional release rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  conditional release rejection missing diagnostic"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owned-uncontracted-escape"
+printf 'name = "v2owneduncontractedescape"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-uncontracted-escape/zag.mod"
+printf 'struct Node { value:i32 } fn retain(p:*mut Node) void { } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; retain(p); delete(p); } return 0; }\n' >"$tmp/v2-owned-uncontracted-escape/main.zag"
+if (cd "$tmp/v2-owned-uncontracted-escape" && "$ZNC" main.zag -o out) >"$tmp/v2-owned-uncontracted-escape/log" 2>&1 || [ -e "$tmp/v2-owned-uncontracted-escape/out" ]; then
+  echo "  XX  uncontracted owned escape rejects without artifact"; sed -n '1,8p' "$tmp/v2-owned-uncontracted-escape/log"; fail=$((fail + 1))
+elif grep -q 'owned allocation escapes through uncontracted call `retain`' "$tmp/v2-owned-uncontracted-escape/log"; then
+  echo "  ok  uncontracted owned escape rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  uncontracted owned escape rejection missing diagnostic"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owned-borrow-contract"
+printf 'name = "v2ownedborrowcontract"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-borrow-contract/zag.mod"
+printf 'struct Node { value:i32 } fn inspect(p:*mut Node) void @borrows { } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; inspect(p); delete(p); } return 0; }\n' >"$tmp/v2-owned-borrow-contract/main.zag"
+if (cd "$tmp/v2-owned-borrow-contract" && "$ZNC" check main.zag) >"$tmp/v2-owned-borrow-contract/log" 2>&1; then
+  echo "  ok  declared borrow permits owned call"; pass=$((pass + 1))
+else
+  echo "  XX  declared borrow permits owned call"; sed -n '1,8p' "$tmp/v2-owned-borrow-contract/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-shared-borrow-write"
 printf 'name = "v2sharedborrowwrite"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-shared-borrow-write/zag.mod"
 printf 'fn inspect(p:*mut i32) *mut i32 @borrows { unsafe { p.* = 1; return p; } } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let q:*mut i32=inspect(p); delete(p); } return 0; }\n' >"$tmp/v2-shared-borrow-write/main.zag"

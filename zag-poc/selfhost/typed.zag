@@ -857,12 +857,57 @@ fn zt_check_direct_free_body(body: ArrayList[*Node], freed: *ArrayList[[]u8], al
     return errors;
 }
 
+// Ownership is intentionally tracked separately from the "may be freed" set
+// above.  The latter is used to reject a possibly-invalid later access; it is
+// not proof that every control-flow path discharged an allocation.  This
+// small flow lattice supplies that missing proof:
+//   0 live, 1 released/transferred on every path, 2 differs by path.
+// It remains intraprocedural and name-rooted, but it is real control-flow
+// analysis rather than treating a release in one arm as a release everywhere.
+fn zt_owner_terminal_state(body:ArrayList[*Node],root:[]u8,aliases:*ArrayList[ZTOwnAlias],decls:ArrayList[*Node],state:i32) i32 {
+    let out:i32=state; let i:i32=0;
+    while(i<body.len){
+        switch(body.data[i].*){
+            .let_=>|l|{if(l.has_init==1){let source:[]u8=zt_expr_direct_id(l.expr);if(source.len>0){zt_alias_set(aliases,l.name,zt_alias_root(aliases.*,source));}}}
+            .assign=>|a|{let target:[]u8=zt_expr_direct_id(a.target);let source:[]u8=zt_expr_direct_id(a.expr);if(target.len>0){if(source.len>0){zt_alias_set(aliases,target,zt_alias_root(aliases.*,source));}else if(zt_owned_acquire_name(a.expr).len>0){zt_alias_set(aliases,target,target);}else{zt_alias_set(aliases,target,"");}}}
+            .ret=>|r|{if(r.has_expr==1&&@strEq(zt_alias_root(aliases.*,zt_expr_direct_id(r.expr)),root)){out=1;}}
+            .estmt=>|e|{switch(e.expr.*){.call=>|c|{let name:[]u8=zt_direct_name(c.callee);if((@strEq(name,"delete")||@strEq(name,"_zag_free")||zt_fn_has_annot(decls,name,"@consumes")==1)&&c.args.len==1&&@strEq(zt_alias_root(aliases.*,zt_expr_direct_id(c.args.data[0])),root)){out=1;}}else=>{}}}
+            .unsafe_=>|u|{out=zt_owner_terminal_state(u.body,root,aliases,decls,out);}
+            .if_=>|x|{let ta:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);let ts:i32=zt_owner_terminal_state(x.then_body,root,&ta,decls,out);let es:i32=out;if(x.has_els==1){let ea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);es=zt_owner_terminal_state(x.els_body,root,&ea,decls,out);}if(ts==es){out=ts;}else{out=2;}}
+            .while_=>|x|{let wa:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);let ws:i32=zt_owner_terminal_state(x.body,root,&wa,decls,out);if(ws!=out){out=2;}}
+            else=>{}
+        }
+        i=i+1;
+    }
+    return out;
+}
+
+// Passing an owned root to a function with no ownership contract is an escape:
+// the caller can no longer prove whether that function retained, freed, or
+// aliased the allocation.  Edition 2027 fails closed here.  A callee must say
+// @borrows, @borrows_mut, or @consumes; ordinary values remain unaffected.
+fn zt_check_owned_call(n:*Node,owned:ArrayList[[]u8],aliases:ArrayList[ZTOwnAlias],decls:ArrayList[*Node],context:[]u8)i32{
+    switch(n.*){.call=>|c|{let name:[]u8=zt_direct_name(c.callee);let contracted:i32=((@strEq(name,"delete")||@strEq(name,"_zag_free")||zt_fn_has_annot(decls,name,"@consumes")==1||zt_borrow_mode(decls,name)>0) as i32;let ai:i32=0;while(ai<c.args.len){let arg:[]u8=zt_expr_direct_id(c.args.data[ai]);if(arg.len>0&&zt_in_names(owned,zt_alias_root(aliases,arg))==1&&contracted==0){return zt_machine_error(_zag_str_concat("owned allocation escapes through uncontracted call `",_zag_str_concat(name,"`")),context);}ai=ai+1;}}else=>{}}return 0;
+}
+fn zt_check_owned_escapes_body(body:ArrayList[*Node],owned:ArrayList[[]u8],aliases:*ArrayList[ZTOwnAlias],decls:ArrayList[*Node],context:[]u8)i32{
+    let errors:i32=0;let i:i32=0;while(i<body.len){switch(body.data[i].*){
+        .let_=>|l|{if(l.has_init==1){errors=errors+zt_check_owned_call(l.expr,owned,aliases.*,decls,context);let source:[]u8=zt_expr_direct_id(l.expr);if(source.len>0){zt_alias_set(aliases,l.name,zt_alias_root(aliases.*,source));}}}
+        .assign=>|a|{errors=errors+zt_check_owned_call(a.expr,owned,aliases.*,decls,context);let target:[]u8=zt_expr_direct_id(a.target);let source:[]u8=zt_expr_direct_id(a.expr);if(target.len>0&&source.len>0){zt_alias_set(aliases,target,zt_alias_root(aliases.*,source));}}
+        .ret=>|r|{if(r.has_expr==1){errors=errors+zt_check_owned_call(r.expr,owned,aliases.*,decls,context);}}
+        .estmt=>|e|{errors=errors+zt_check_owned_call(e.expr,owned,aliases.*,decls,context);}
+        .unsafe_=>|u|{errors=errors+zt_check_owned_escapes_body(u.body,owned,aliases,decls,context);}
+        .if_=>|x|{let ta:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);errors=errors+zt_check_owned_escapes_body(x.then_body,owned,&ta,decls,context);if(x.has_els==1){let ea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);errors=errors+zt_check_owned_escapes_body(x.els_body,owned,&ea,decls,context);}}
+        .while_=>|x|{let wa:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);errors=errors+zt_check_owned_escapes_body(x.body,owned,&wa,decls,context);}
+        else=>{}
+    }i=i+1;}return errors;
+}
+
 fn zt_check_v2_direct_frees(decls: ArrayList[*Node], file: []u8) i32 {
     if (@strEq(v2_project_edition(file), "2027") == 0) { return 0; }
     let errors: i32 = 0; let i: i32 = 0;
     while (i < len[*Node](decls)) {
         switch (get[*Node](decls, i).*) {
-            .fn_decl => |f| { let freed: ArrayList[[]u8] = make[[]u8](4);let aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);let context:[]u8=_zag_str_concat("function ",f.name); errors = errors + zt_check_direct_free_body(f.body, &freed, &aliases, decls, context);let owned:ArrayList[[]u8]=make[[]u8](4);let returned:ArrayList[[]u8]=make[[]u8](2);let transfer_aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);zt_collect_owned_body(f.body,&owned,&returned,&transfer_aliases);let oi:i32=0;while(oi<owned.len){let name:[]u8=owned.data[oi];if(zt_in_names(freed,name)==0&&zt_in_names(returned,name)==0){errors=errors+zt_machine_error(_zag_str_concat("owned allocation `",_zag_str_concat(name,"` is neither released nor returned")),context);}oi=oi+1;} }
+            .fn_decl => |f| { let freed: ArrayList[[]u8] = make[[]u8](4);let aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);let context:[]u8=_zag_str_concat("function ",f.name); errors = errors + zt_check_direct_free_body(f.body, &freed, &aliases, decls, context);let owned:ArrayList[[]u8]=make[[]u8](4);let returned:ArrayList[[]u8]=make[[]u8](2);let transfer_aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);zt_collect_owned_body(f.body,&owned,&returned,&transfer_aliases);let escape_aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);errors=errors+zt_check_owned_escapes_body(f.body,owned,&escape_aliases,decls,context);let oi:i32=0;while(oi<owned.len){let name:[]u8=owned.data[oi];let flow_aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);let terminal:i32=zt_owner_terminal_state(f.body,name,&flow_aliases,decls,0);if(terminal==0){errors=errors+zt_machine_error(_zag_str_concat("owned allocation `",_zag_str_concat(name,"` is neither released nor returned")),context);}else if(terminal==2){errors=errors+zt_machine_error(_zag_str_concat("owned allocation `",_zag_str_concat(name,"` is not released or returned on every control-flow path")),context);}oi=oi+1;} }
             else => { }
         }
         i = i + 1;
