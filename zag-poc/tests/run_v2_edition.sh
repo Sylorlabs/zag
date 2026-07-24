@@ -11,6 +11,13 @@ case "$ZNC" in
 esac
 tmp=$(mktemp -d /tmp/zag-v2-edition.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT
+# This is a foreground compiler/ownership test. Starting a project daemon for
+# every disposable test case races cleanup and can retain orphan processes;
+# daemon behavior is covered independently by run_zagd_daemon.sh.
+export ZAG_V2_TEST_ZNC="$ZNC"
+ZNC="$tmp/znc-no-zagd"
+printf '%s\n' '#!/usr/bin/env bash' 'exec "$ZAG_V2_TEST_ZNC" "$@" --no-zagd' >"$ZNC"
+chmod +x "$ZNC"
 pass=0 fail=0
 
 reject() {
@@ -231,6 +238,24 @@ if (cd "$tmp/v2-owned-alias-return" && "$ZNC" main.zag -o out) >"$tmp/v2-owned-a
   echo "  ok  alias return transfers owned allocation"; pass=$((pass + 1))
 else
   echo "  XX  alias return ownership transfer"; sed -n '1,8p' "$tmp/v2-owned-alias-return/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owned-assignment-leak"
+printf 'name = "v2ownedassignmentleak"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-assignment-leak/zag.mod"
+printf 'struct Node { value:i32 } fn main() i32 { unsafe { let p:*mut Node; p = new(Node{.value=42}) as *mut Node; } return 0; }\n' >"$tmp/v2-owned-assignment-leak/main.zag"
+if (cd "$tmp/v2-owned-assignment-leak" && "$ZNC" main.zag -o out) >"$tmp/v2-owned-assignment-leak/log" 2>&1 || [ -e "$tmp/v2-owned-assignment-leak/out" ]; then
+  echo "  XX  assignment-owned allocation leak rejects without artifact"; sed -n '1,8p' "$tmp/v2-owned-assignment-leak/log"; fail=$((fail + 1))
+elif grep -q 'owned allocation `p` is neither released nor returned' "$tmp/v2-owned-assignment-leak/log"; then
+  echo "  ok  assignment-owned allocation leak rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  assignment-owned allocation leak rejection missing diagnostic"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owned-assignment-release"
+printf 'name = "v2ownedassignmentrelease"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-assignment-release/zag.mod"
+printf 'struct Node { value:i32 } fn main() i32 { unsafe { let p:*mut Node; p = new(Node{.value=42}) as *mut Node; delete(p); } return 0; }\n' >"$tmp/v2-owned-assignment-release/main.zag"
+if (cd "$tmp/v2-owned-assignment-release" && "$ZNC" main.zag -o out) >"$tmp/v2-owned-assignment-release/log" 2>&1 && [ -x "$tmp/v2-owned-assignment-release/out" ]; then
+  echo "  ok  assignment-owned allocation release compiles"; pass=$((pass + 1))
+else
+  echo "  XX  assignment-owned allocation release"; sed -n '1,8p' "$tmp/v2-owned-assignment-release/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-owned-consume"
 printf 'name = "v2ownedconsume"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-consume/zag.mod"

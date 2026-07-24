@@ -285,4 +285,26 @@ for _ in $(seq 1 100); do
     sleep 0.01
 done
 
+# A short-lived/generated project must not leave a blocked watcher after its
+# root disappears. This is the cleanup path used by compiler test harnesses.
+mkdir "$tmp/self-delete"
+"$tmp/zagd" --root "$tmp/self-delete" --mode light --window-ms 20 &
+daemon_pid=$!
+for _ in $(seq 1 100); do
+    test -f "$tmp/self-delete/.zagd.status" && break
+    sleep 0.01
+done
+test -f "$tmp/self-delete/.zagd.status"
+rm -rf "$tmp/self-delete"
+for _ in $(seq 1 100); do
+    if ! kill -0 "$daemon_pid" 2>/dev/null; then break; fi
+    sleep 0.01
+done
+if kill -0 "$daemon_pid" 2>/dev/null; then
+    echo "daemon remained alive after watched root deletion" >&2
+    exit 1
+fi
+wait "$daemon_pid" || true
+daemon_pid=
+
 echo "zagd daemon: pass"
