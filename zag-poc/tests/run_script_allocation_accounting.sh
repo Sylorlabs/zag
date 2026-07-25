@@ -23,6 +23,15 @@ printf x >>"$tmp_dir/over.bin"
 printf 'script;\nlet data:[]u8=read_file("over.bin");\nif(data.len!=0){return 1;}\nif(script_alloc_used()!=0){return 2;}\nreturn 0;\n' >"$tmp_dir/read_over.zag"
 (cd "$tmp_dir" && "$znc_bin" read_over.zag -o read_over --no-zagd >/dev/null && ./read_over 2>read_over.err && grep -q 'memory limit exceeded by read_file result' read_over.err)
 
+# A sparse file makes the preflight boundary observable without materializing a
+# large test input. The Script allocator must reject twice before any root
+# allocation is charged; the runtime must never stage the apparent 128 MiB
+# file through the ordinary unbounded read helper.
+truncate -s 134217728 "$tmp_dir/sparse-over-limit.bin"
+printf 'script_memory_bytes=1048576\nmode=off\n' >"$tmp_dir/.zagd.conf"
+printf 'script;\nlet first:[]u8=read_file("sparse-over-limit.bin");\nlet second:[]u8=read_file("sparse-over-limit.bin");\nif(first.len!=0||second.len!=0){return 1;}\nif(script_alloc_used()!=0){return 2;}\nreturn 0;\n' >"$tmp_dir/read_sparse_over.zag"
+(cd "$tmp_dir" && "$znc_bin" read_sparse_over.zag -o read_sparse_over --no-zagd --no-foreground-cache >/dev/null && ./read_sparse_over 2>read_sparse_over.err && test "$(grep -c 'memory limit exceeded by read_file result' read_sparse_over.err)" -eq 2)
+
 # A failed open must not charge the Script arena.  The native runtime also
 # releases its temporary NUL-terminated path bridge on this failure path.
 printf 'script;\nlet data:[]u8=read_file("does-not-exist");\nif(data.len>=0){return 1;}\nif(script_alloc_used()!=0){return 2;}\nreturn 0;\n' >"$tmp_dir/read_missing.zag"

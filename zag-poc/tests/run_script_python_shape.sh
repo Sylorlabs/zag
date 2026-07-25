@@ -43,13 +43,14 @@ grep -q 'fn doubled(value:i64) i64' "$tmp/formatted.zag"
 
 "$compiler" harden "$tmp/program.zs" --output "$tmp/hardened.zag" \
     --format json --no-zagd >"$tmp/harden.json"
-grep -q '"status":"partial"' "$tmp/harden.json"
+grep -q '"status":"unsupported"' "$tmp/harden.json"
 grep -q '"candidate_compilable":false' "$tmp/harden.json"
+test ! -e "$tmp/hardened.zag"
 if "$compiler" harden "$tmp/program.zs" --apply \
     --test-command true --no-zagd >"$tmp/apply.log" 2>&1; then
-    echo "partial harden candidate unexpectedly applied" >&2
+    echo "unsupported harden candidate unexpectedly applied" >&2
     exit 1
 fi
-grep -q 'Script prelude calls still require explicit allocator' "$tmp/apply.log"
+grep -q 'apply refused: no semantics-preserving strict candidate is available' "$tmp/apply.log"
 
 echo "python-shaped Zag Script: PASS"

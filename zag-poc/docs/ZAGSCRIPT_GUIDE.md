@@ -1,8 +1,11 @@
 # Zag Script guide
 
-Zag Script is Zag's built-in low-friction profile. It provides concise defaults
-for short programs and experiments while preserving a direct path into explicit
-native Zag through inspection and hardening.
+Zag Script is Zag's built-in low-friction profile. It provides concise safe
+defaults for short programs and experiments while preserving a direct path into
+explicit native Zag through inspection and hardening. “Safe defaults” here
+means bounded, documented, and fail-closed behavior at the implemented Script
+boundary. It does not mean that Zag has a complete ownership or borrowing
+system; the exact gaps are listed below and in `ZAGSCRIPT_SEMANTICS.md`.
 
 ## Current implementation status
 
@@ -13,26 +16,53 @@ A script module imported by a strict root contributes declarations without
 running its script body. Duplicate profile declarations and a script containing
 a user `main` are diagnosed.
 
-The implemented profile includes a managed context, requested-payload allocation
-limit, uncaught-error wrapper, `znc script`, `explain`, conservative `harden`,
-and `check --strict`. Both activation forms are supported:
+The implemented profile includes a managed context, a bounded default arena,
+an explicit bounded-heap alternative, uncaught-error wrapper, `znc script`,
+`explain`, conservative `harden`, and `check --strict`. Both activation forms
+are supported:
 
 - `script;` in an ordinary `.zag` file;
 - `znc script program.zag`; or
 - the optional `.zs` suffix.
 
+`znc harden` is deliberately conservative. For a root body with no
+compiler-bound Script prelude operation and no propagated `try`, it produces a
+reviewable strict-Zag candidate with explicit memory/capability policy
+constants, context init/shutdown, and a status boundary. Other Script
+conveniences are reported as structured unsupported conversions rather than
+silently rewritten. By default hardening only prints a preview; `--output`
+uses an atomic sibling-temporary publish, while `--apply` still requires an
+explicit parity-test command and preserves a rollback copy. See
+`ZAGSCRIPT_HARDENING.md` for the exact supported boundary.
+
 All three select the same `ModuleProfile.script`, parser, AST, semantic
 analysis, runtime, and native backend. `.zs` is a convenience, not a second
 language or a claim that arbitrary Python files are source-compatible.
 
-The JSON form of `explain` embeds the compiler's checksummed semantic manifest,
-including declaration signatures, layouts, call edges, function effects, and
-per-expression `expr_fact` witnesses. Types come from the shared typed frontend;
-effects come from sema's context-sensitive expression walk. Calls, binary and
-unary forms, casts, slice indexing/slicing, supported struct fields, assignments,
-returns, and nested control-flow conditions are recursively reported. A form
-outside typed authority is tagged `type_basis=unknown`, never guessed. Text and
-JSON expose the same checksummed manifest.
+The JSON form of `explain` embeds the compiler's checksummed semantic manifest
+and its explicit `detail_level`. A full manifest includes declaration
+signatures, layouts, call edges, function effects, and per-expression
+`expr_fact` witnesses. Types come from the shared typed frontend; effects come
+from sema's context-sensitive expression walk. Calls, binary and unary forms,
+casts, slice indexing/slicing, supported struct fields, assignments, returns,
+and nested control-flow conditions are recursively reported. A form outside
+typed authority is tagged `type_basis=unknown`, never guessed.
+
+For a large merged Script/prelude unit, `detail_level=compact` preserves the
+exact checksum-bound declaration/module/call/type/layout/import graph, raw
+module hashes, and public/effect/layout identities while omitting verbose
+expression/value/copy and local buffer-lifetime witnesses. Text and JSON mark
+those witnesses unavailable; their absence is never reported as proof that no
+copy, unknown value, or reusable lifetime exists.
+
+For the compiler-bound calls in the selected root Script body, `explain` also
+has an `implicit_operations` report. It names each recognized allocation/copy
+operation, says whether allocation and copy are zero, conditional, or use the
+Script context, and separates a proven fixed byte fact from a dynamic
+`unknown`. It does not guess a source line: statement spans are not yet stored
+in the AST, so the witness explicitly says location is unavailable. The report
+is capped at 64 entries and excludes imported strict-library implementation
+details.
 
 ```sh
 ./znc examples/script_hello.zag -o /tmp/script_hello
@@ -43,6 +73,51 @@ After compiler-source changes, rebuild the self-hosted compiler through the
 documented native bootstrap before testing the new syntax. The committed `znc`
 binary is the bootstrap seed; no external compiler, assembler, or linker is part
 of the supported path.
+
+## Command reference
+
+The profile declaration and command form reach the same compilation path:
+
+```sh
+./znc script app.zag
+./znc script app.zag --run
+./znc script app.zag -o app
+./znc app.zag -o app --run
+```
+
+A source containing `script;` activates Script lowering in the direct build
+form. Inspection and promotion commands never require the daemon:
+
+```sh
+./znc explain app.zag
+./znc explain app.zag --format text
+./znc explain app.zag --format json
+./znc harden app.zag
+./znc harden app.zag --format json
+./znc harden app.zag --output app.hardened.zag
+./znc check app.zag
+./znc check app.zag --strict
+```
+
+Background planning is project-scoped and editor-independent:
+
+```sh
+./znc watch
+./znc watch --mode light
+./znc watch --mode adaptive
+./znc watch --mode deep
+./znc watch --mode off
+./znc status
+./znc suggest
+./znc suggest --format text
+./znc suggest --format json
+./znc shutdown
+```
+
+`mode=off` in `.zagd.conf` is the persistent opt-out. An explicit CLI
+allocator, CPU, device, or layout choice overrides the corresponding Script
+default without changing source. See `ZAGD_GUIDE.md` for the persistent
+systemd-user-service form and resource policy.
 
 ## A minimal script
 
@@ -115,12 +190,15 @@ chooses, loops repeat, and diagnostics explain the next small correction.
 
 ## Prelude
 
-The intentionally small implemented prelude is `print`, `println`, `input`, `read_file`,
-`write_file`, `args_len`, `arg`, `string_concat`, `script_alloc`,
-`script_alloc_used`, `process_run_timeout`, `string_builder`, and `list`. The ordinary strict-Zag
-mappings are `_zag_print`, `_zag_println`, `_zag_read_file`, `_zag_write_file`,
-`_zag_argc`, `_zag_arg`, `_zag_str_concat`, and the explicit script-context
-allocation runtime calls. Prelude bindings occur
+The intentionally small implemented prelude is `print`, `println`, `say`,
+`input`, `env`, `read_file`, `write_file`, `args_len`, `arg`, `args`,
+`path_join`, `path_basename`, `path_dirname`, `path_extension`,
+`string_concat`, `script_alloc`, `script_alloc_used`, `process_run_timeout`,
+`string_builder`, and `list`. The ordinary strict-Zag mappings are
+`_zag_print`, `_zag_println` (`say` uses `_zag_println`),
+`_zag_script_env_get`, `_zag_read_file`, `_zag_write_file`, `_zag_argc`,
+`_zag_arg`, `script_args`, the `script_path_*` helpers, `_zag_str_concat`, and
+the explicit script-context allocation runtime calls. Prelude bindings occur
 only in executable statements of the selected script root. An ordinary user
 function with the same name wins independently.
 
@@ -129,13 +207,21 @@ input into Script-lifetime storage. The allocation is charged to the Script
 limit and the trailing newline is removed. It is bounded input, not an
 unbounded console buffer.
 
-`read_file` copies its returned value into Script-lifetime storage charged to the
-requested-payload budget. The native reader still uses temporary staging storage
-outside that accounting, but releases it immediately after the Script copy or
-copy-budget failure; its temporary native path bridge is released immediately
-after `open(2)`. Open failure uses a slice with negative length; budget
-failure emits a diagnostic and returns an empty slice. This is not a general
-memory-safety guarantee or the eventual typed error API.
+`env("NAME")` reads a configured process-environment variable without copying
+it into Script storage. Put exact allowed names in `.zagd.conf`, for example
+`environment_allow=HOME,TERM`; the empty default denies all lookups. `NAME`
+must be a literal simple name, not a computed string. Unset or values longer
+than 4096 bytes return an empty value. The prelude never grants environment
+authority to an imported strict library.
+
+`read_file` size-preflights a regular file, allocates one Script-lifetime
+destination charged to the selected Script allocator, then reads directly into
+that destination while checking for growth or replacement. It never stages a
+whole file in the ordinary native allocator. The only native temporary is a
+NUL-terminated path bridge of at most 4097 bytes, released immediately after
+`open(2)`. Open failure uses a slice with negative length; budget or size-limit
+failure emits a diagnostic and returns an empty slice. A post-allocation read
+failure retains its charged Script allocation until generated shutdown.
 `string_concat` returns Script-lifetime storage charged to that budget.
 
 ## Profile rules currently enforced
@@ -163,6 +249,49 @@ synthesis. Use
 ordinary explicit Zag APIs where available; the compiler does not pretend those
 APIs are script defaults.
 
+Two native Script allocator policies are currently supported:
+
+- `script_process_arena` is the default. It reserves one mapping, charges exact
+  requested payload bytes, retains values for the Script lifetime, and unmaps
+  the mapping at generated shutdown.
+- `script_bounded_heap` is a genuinely distinct explicit option. Each
+  successful allocation owns a native block linked from `ScriptContext`; the
+  budget charges the payload plus a 16-byte ownership header, including for a
+  zero-length request. Generated shutdown frees every complete block. Native
+  size-class slack is visible in allocator telemetry but is outside
+  `script_alloc_used()`.
+
+For example:
+
+```sh
+./znc script app.zag --script-allocator script_bounded_heap --run
+```
+
+or in `.zagd.conf`:
+
+```text
+allocator=script_bounded_heap
+```
+
+The selected policy is part of the foreground machine-code cache identity.
+Changing it produces a cache miss and fresh code generation; it can never
+reuse code generated for the other allocator.
+
+The resolved choices and project filesystem/process permissions are retained as
+compiler-owned ScriptContext metadata. The context also records argument
+metadata, bounded limits, allocator state, deterministic shutdown state, and
+the uncaught-error reporting policy. `env("NAME")` is read-only and requires
+the exact literal name to appear in `.zagd.conf` as
+`environment_allow=NAME,OTHER_NAME`; the default empty list denies it. Values
+are a zero-copy process-environment view capped at 4096 bytes; unset or
+oversized values are empty. This does not create an environment API for strict
+imports. Unknown
+allocator/device/layout policy ids fail before output, and the native initializer
+also rejects malformed internal policy words rather than treating them as a new
+execution implementation. ScriptContext CPU metadata currently accepts the
+generic x86-64 baseline (including its aliases) or `native`; runtime-dispatch
+metadata is not yet part of this Script policy.
+
 `process_run_timeout(command, timeout_ms, max_output)` is the root-only Script
 name for the ordinary strict-Zag `std:process.process_run_bounded` declaration.
 It invokes `/bin/sh -c`, captures stdout, uses a monotonic deadline, caps output
@@ -172,8 +301,11 @@ through the ordinary getter functions. An explicit user declaration named
 `process_run_timeout` overrides the convenience.
 Its command copy, descriptor/status storage, capture capacity, and result handle
 are charged to the Script budget before being exposed. The output capacity is
-reserved up front, making its maximum charged cost deterministic. Strict Zag's
-ordinary `process_run_bounded` retains its allocator behavior.
+reserved up front, making its maximum charged cost deterministic. The result
+handle is 32 bytes under `script_process_arena`; `script_bounded_heap` charges
+48 bytes because its tracked native block includes the same 16-byte ownership
+header as other heap-policy allocations. Strict Zag's ordinary
+`process_run_bounded` retains its allocator behavior.
 
 `string_builder(capacity)` creates a fixed-capacity `ScriptStringBuilder` from
 the bounded Script allocator. `string_builder_append`, `string_builder_len`,
@@ -188,8 +320,8 @@ allocated storage. It is not a dynamic value system.
 infers one element type. `script_list_append`, `script_list_len`, and
 `script_list_get` remain typed; mixed literal types are rejected. Capacity grows
 geometrically through the bounded Script allocator, so successful append
-sequences copy linear total data. Superseded arena buffers remain until Script
-shutdown and count toward `script_alloc_used()`.
+sequences copy linear total data. Superseded Script buffers remain until
+shutdown and count toward `script_alloc_used()` under the selected policy.
 
 Root-level `make[T]` is intentionally rejected in Zag Script because its storage
 does not pass through `ScriptContext` and therefore cannot satisfy the configured
@@ -219,11 +351,23 @@ let result: json.JsonIntResult = json.json_parse_int("42");
 ## Safety boundary
 
 The profile lowering does not establish ownership, borrowing, or general memory
-safety. Compiler-owned Script payloads use one bounded mmap-backed arena and the
-generated shutdown boundary reclaims that complete mapping deterministically.
-The configurable requested-payload limit
-covers Script collection/string-builder storage, string concatenation, returned
-file data, bounded-process storage, and compiler-owned `new` in root top-level
-statements. Ordinary `make`, allocator metadata, file-reader staging, and `new`
-inside imported strict functions remain outside it. Normal Zag effects and runtime
-behavior remain authoritative.
+safety. The default allocator uses one bounded mmap-backed arena; the explicit
+bounded heap uses individually tracked native blocks. The generated shutdown
+boundary unmaps the arena or frees all tracked blocks, respectively. The
+configurable limit covers Script collection/string-builder storage, string
+concatenation, returned file data, bounded-process storage, and compiler-owned
+`new` in root top-level statements. The arena charges requested payload; the
+bounded heap also charges its 16-byte ownership header per allocation. Ordinary
+`make`, native allocator size-class slack, the bounded file-reader path bridge,
+and `new` inside imported strict functions remain outside it. `read_file`
+never stages whole-file contents outside the Script allocator. Normal Zag
+effects and runtime behavior remain authoritative.
+
+Native allocation diagnostics and telemetry cover the implemented allocator
+paths, including copied raw-slice descriptor double frees and failed mappings.
+They do not validate arbitrary integer-derived pointers. Edition-2027 strict
+projects may opt into the documented named-owner and explicit borrow-contract
+checks. The same edition rejects tested callee-frame addresses returned through
+named pointer-carrying aggregate aliases, but does not track mutation-aware
+container, global, or callback provenance. These checks remain a conservative
+promotion aid rather than a claim that every heap graph is proven.

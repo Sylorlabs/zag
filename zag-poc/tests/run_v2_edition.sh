@@ -295,6 +295,32 @@ if (cd "$tmp/v2-owned-borrow-contract" && "$ZNC" check main.zag) >"$tmp/v2-owned
 else
   echo "  XX  declared borrow permits owned call"; sed -n '1,8p' "$tmp/v2-owned-borrow-contract/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-owned-borrow-mut-contract"
+printf 'name = "v2ownedborrowmutcontract"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-borrow-mut-contract/zag.mod"
+printf 'struct Node { value:i32 } fn edit(p:*mut Node) void @borrows_mut { } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; edit(p); delete(p); } return 0; }\n' >"$tmp/v2-owned-borrow-mut-contract/main.zag"
+if (cd "$tmp/v2-owned-borrow-mut-contract" && "$ZNC" check main.zag) >"$tmp/v2-owned-borrow-mut-contract/log" 2>&1; then
+  echo "  ok  declared mutable borrow permits owned call"; pass=$((pass + 1))
+else
+  echo "  XX  declared mutable borrow permits owned call"; sed -n '1,8p' "$tmp/v2-owned-borrow-mut-contract/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owned-consume-contract"
+printf 'name = "v2ownedconsumecontract"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-consume-contract/zag.mod"
+printf 'struct Node { value:i32 } fn dispose(p:*mut Node) void @consumes { unsafe { delete(p); } } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; dispose(p); } return 0; }\n' >"$tmp/v2-owned-consume-contract/main.zag"
+if (cd "$tmp/v2-owned-consume-contract" && "$ZNC" check main.zag) >"$tmp/v2-owned-consume-contract/log" 2>&1; then
+  echo "  ok  declared consume permits owned transfer"; pass=$((pass + 1))
+else
+  echo "  XX  declared consume permits owned transfer"; sed -n '1,8p' "$tmp/v2-owned-consume-contract/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owned-condition-alias-escape"
+printf 'name = "v2ownedconditionaliasescape"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-condition-alias-escape/zag.mod"
+printf 'struct Node { value:i32 } fn retain(p:*mut Node) i32 { return 0; } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; let q:*mut Node=p; if (retain(q) == 0) { } delete(p); } return 0; }\n' >"$tmp/v2-owned-condition-alias-escape/main.zag"
+if (cd "$tmp/v2-owned-condition-alias-escape" && "$ZNC" check main.zag) >"$tmp/v2-owned-condition-alias-escape/log" 2>&1; then
+  echo "  XX  alias passed through conditional uncontracted call rejects"; sed -n '1,8p' "$tmp/v2-owned-condition-alias-escape/log"; fail=$((fail + 1))
+elif grep -q 'owned allocation escapes through uncontracted call `retain`' "$tmp/v2-owned-condition-alias-escape/log"; then
+  echo "  ok  alias passed through conditional uncontracted call rejects"; pass=$((pass + 1))
+else
+  echo "  XX  conditional alias ownership escape diagnostic missing"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-shared-borrow-write"
 printf 'name = "v2sharedborrowwrite"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-shared-borrow-write/zag.mod"
 printf 'fn inspect(p:*mut i32) *mut i32 @borrows { unsafe { p.* = 1; return p; } } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let q:*mut i32=inspect(p); delete(p); } return 0; }\n' >"$tmp/v2-shared-borrow-write/main.zag"
@@ -304,6 +330,34 @@ elif grep -q 'cannot mutate through a shared borrow' "$tmp/v2-shared-borrow-writ
   echo "  ok  shared borrow mutation rejects without artifact"; pass=$((pass + 1))
 else
   echo "  XX  shared borrow mutation rejection missing diagnostic"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owned-switch-release"
+printf 'name = "v2ownedswitchrelease"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-switch-release/zag.mod"
+printf 'struct Node { value:i32 } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; switch (1) { 1 => { delete(p); } else => { delete(p); } } } return 0; }\n' >"$tmp/v2-owned-switch-release/main.zag"
+if (cd "$tmp/v2-owned-switch-release" && "$ZNC" main.zag -o out) >"$tmp/v2-owned-switch-release/log" 2>&1 && [ -x "$tmp/v2-owned-switch-release/out" ]; then
+  echo "  ok  all switch paths release owner"; pass=$((pass + 1))
+else
+  echo "  XX  all switch paths release owner"; sed -n '1,8p' "$tmp/v2-owned-switch-release/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owned-switch-partial"
+printf 'name = "v2ownedswitchpartial"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-switch-partial/zag.mod"
+printf 'struct Node { value:i32 } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; switch (1) { 1 => { delete(p); } else => { } } } return 0; }\n' >"$tmp/v2-owned-switch-partial/main.zag"
+if (cd "$tmp/v2-owned-switch-partial" && "$ZNC" main.zag -o out) >"$tmp/v2-owned-switch-partial/log" 2>&1 || [ -e "$tmp/v2-owned-switch-partial/out" ]; then
+  echo "  XX  partial switch release rejects without artifact"; sed -n '1,8p' "$tmp/v2-owned-switch-partial/log"; fail=$((fail + 1))
+elif grep -q 'not released or returned on every control-flow path' "$tmp/v2-owned-switch-partial/log"; then
+  echo "  ok  partial switch release rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  partial switch release rejection missing diagnostic"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owned-switch-escape"
+printf 'name = "v2ownedswitchescape"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-switch-escape/zag.mod"
+printf 'struct Node { value:i32 } fn retain(p:*mut Node) void { } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; switch (1) { 1 => { retain(p); } else => { } } delete(p); } return 0; }\n' >"$tmp/v2-owned-switch-escape/main.zag"
+if (cd "$tmp/v2-owned-switch-escape" && "$ZNC" check main.zag) >"$tmp/v2-owned-switch-escape/log" 2>&1 || [ -e "$tmp/v2-owned-switch-escape/out" ]; then
+  echo "  XX  switch ownership escape rejects"; sed -n '1,8p' "$tmp/v2-owned-switch-escape/log"; fail=$((fail + 1))
+elif grep -q 'owned allocation escapes through uncontracted call `retain`' "$tmp/v2-owned-switch-escape/log"; then
+  echo "  ok  switch ownership escape rejects"; pass=$((pass + 1))
+else
+  echo "  XX  switch ownership escape diagnostic missing"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-exclusive-borrow-active"
 printf 'name = "v2exclusiveborrowactive"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-exclusive-borrow-active/zag.mod"
@@ -334,6 +388,106 @@ elif grep -q 'cannot pass a borrow to a consuming call' "$tmp/v2-borrow-alias-co
   echo "  ok  borrow alias cannot be consumed without artifact"; pass=$((pass + 1))
 else
   echo "  XX  borrow alias consume rejection missing diagnostic"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-consumes-body-leak"
+printf 'name = "v2consumesbodyleak"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-consumes-body-leak/zag.mod"
+printf 'struct Node { value:i32 } fn discard(p:*mut Node) void @consumes { } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; discard(p); } return 0; }\n' >"$tmp/v2-consumes-body-leak/main.zag"
+if (cd "$tmp/v2-consumes-body-leak" && "$ZNC" main.zag -o out) >"$tmp/v2-consumes-body-leak/log" 2>&1 || [ -e "$tmp/v2-consumes-body-leak/out" ]; then
+  echo "  XX  @consumes body must discharge its owner"; sed -n '1,8p' "$tmp/v2-consumes-body-leak/log"; fail=$((fail + 1))
+elif grep -q '@consumes parameter `p` is not released or transferred on every control-flow path' "$tmp/v2-consumes-body-leak/log"; then
+  echo "  ok  @consumes body must discharge its owner"; pass=$((pass + 1))
+else
+  echo "  XX  @consumes discharge diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-borrow-forward-escape"
+printf 'name = "v2borrowforwardescape"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-borrow-forward-escape/zag.mod"
+printf 'struct Node { value:i32 } fn retain(p:*mut Node) void { } fn inspect(p:*mut Node) void @borrows { retain(p); } fn main() i32 { return 0; }\n' >"$tmp/v2-borrow-forward-escape/main.zag"
+if (cd "$tmp/v2-borrow-forward-escape" && "$ZNC" check main.zag) >"$tmp/v2-borrow-forward-escape/log" 2>&1; then
+  echo "  XX  borrowed parameter forwarding must be contracted"; sed -n '1,8p' "$tmp/v2-borrow-forward-escape/log"; fail=$((fail + 1))
+elif grep -q 'borrowed value `p` escapes through uncontracted call `retain`' "$tmp/v2-borrow-forward-escape/log"; then
+  echo "  ok  borrowed parameter forwarding must be contracted"; pass=$((pass + 1))
+else
+  echo "  XX  borrowed forwarding diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owned-return-drop"
+printf 'name = "v2ownedreturndrop"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-return-drop/zag.mod"
+printf 'struct Node { value:i32 } fn allocate() *mut Node { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; return p; } } fn main() i32 { let leaked:*mut Node=allocate(); return 0; }\n' >"$tmp/v2-owned-return-drop/main.zag"
+if (cd "$tmp/v2-owned-return-drop" && "$ZNC" main.zag -o out) >"$tmp/v2-owned-return-drop/log" 2>&1 || [ -e "$tmp/v2-owned-return-drop/out" ]; then
+  echo "  XX  owned helper result must be discharged"; sed -n '1,8p' "$tmp/v2-owned-return-drop/log"; fail=$((fail + 1))
+elif grep -q 'owned allocation `leaked` is neither released nor returned' "$tmp/v2-owned-return-drop/log"; then
+  echo "  ok  owned helper result must be discharged"; pass=$((pass + 1))
+else
+  echo "  XX  owned helper result diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owned-return-mixed"
+printf 'name = "v2ownedreturnmixed"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-return-mixed/zag.mod"
+printf 'struct Node { value:i32 } fn choose(flag:i32) *mut Node { unsafe { if (flag == 1) { let p:*mut Node=new(Node{.value=42}) as *mut Node; return p; } return null as *mut Node; } } fn main() i32 { return 0; }\n' >"$tmp/v2-owned-return-mixed/main.zag"
+if (cd "$tmp/v2-owned-return-mixed" && "$ZNC" check main.zag) >"$tmp/v2-owned-return-mixed/log" 2>&1; then
+  echo "  XX  mixed owned return provenance must reject"; sed -n '1,8p' "$tmp/v2-owned-return-mixed/log"; fail=$((fail + 1))
+elif grep -q 'function `choose` mixes owned and non-owned return provenance' "$tmp/v2-owned-return-mixed/log"; then
+  echo "  ok  mixed owned return provenance must reject"; pass=$((pass + 1))
+else
+  echo "  XX  mixed owned return diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-live-owner-overwrite"
+printf 'name = "v2liveowneroverwrite"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-live-owner-overwrite/zag.mod"
+printf 'struct Node { value:i32 } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=1}) as *mut Node; p=new(Node{.value=2}) as *mut Node; delete(p); } return 0; }\n' >"$tmp/v2-live-owner-overwrite/main.zag"
+if (cd "$tmp/v2-live-owner-overwrite" && "$ZNC" main.zag -o out) >"$tmp/v2-live-owner-overwrite/log" 2>&1 || [ -e "$tmp/v2-live-owner-overwrite/out" ]; then
+  echo "  XX  live owner overwrite must reject"; sed -n '1,8p' "$tmp/v2-live-owner-overwrite/log"; fail=$((fail + 1))
+elif grep -q 'live owned allocation `p` is overwritten before release or transfer' "$tmp/v2-live-owner-overwrite/log"; then
+  echo "  ok  live owner overwrite must reject"; pass=$((pass + 1))
+else
+  echo "  XX  live owner overwrite diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owned-cast-escape"
+printf 'name = "v2ownedcastescape"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-cast-escape/zag.mod"
+printf 'struct Node { value:i32 } fn retain(p:*mut Node) void { } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; retain(p as *mut Node); delete(p); } return 0; }\n' >"$tmp/v2-owned-cast-escape/main.zag"
+if (cd "$tmp/v2-owned-cast-escape" && "$ZNC" check main.zag) >"$tmp/v2-owned-cast-escape/log" 2>&1; then
+  echo "  XX  cast cannot launder owned escape"; sed -n '1,8p' "$tmp/v2-owned-cast-escape/log"; fail=$((fail + 1))
+elif grep -q 'owned allocation escapes through uncontracted call `retain`' "$tmp/v2-owned-cast-escape/log"; then
+  echo "  ok  cast cannot launder owned escape"; pass=$((pass + 1))
+else
+  echo "  XX  cast ownership escape diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owned-aggregate-escape"
+printf 'name = "v2ownedaggregateescape"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-aggregate-escape/zag.mod"
+printf 'struct Node { value:i32 } struct Box { ptr:*mut Node } fn retain_box(value:Box) void { } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; retain_box(Box{.ptr=p}); delete(p); } return 0; }\n' >"$tmp/v2-owned-aggregate-escape/main.zag"
+if (cd "$tmp/v2-owned-aggregate-escape" && "$ZNC" check main.zag) >"$tmp/v2-owned-aggregate-escape/log" 2>&1; then
+  echo "  XX  aggregate cannot launder owned escape"; sed -n '1,8p' "$tmp/v2-owned-aggregate-escape/log"; fail=$((fail + 1))
+elif grep -q 'owned allocation escapes through uncontracted call `retain_box`' "$tmp/v2-owned-aggregate-escape/log"; then
+  echo "  ok  aggregate cannot launder owned escape"; pass=$((pass + 1))
+else
+  echo "  XX  aggregate ownership escape diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owned-nested-escape"
+printf 'name = "v2ownednestedescape"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-nested-escape/zag.mod"
+printf 'struct Node { value:i32 } fn view(p:*mut Node) *mut Node @borrows { return p; } fn retain(p:*mut Node) void { } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; retain(view(p)); delete(p); } return 0; }\n' >"$tmp/v2-owned-nested-escape/main.zag"
+if (cd "$tmp/v2-owned-nested-escape" && "$ZNC" check main.zag) >"$tmp/v2-owned-nested-escape/log" 2>&1; then
+  echo "  XX  nested call cannot launder owned escape"; sed -n '1,8p' "$tmp/v2-owned-nested-escape/log"; fail=$((fail + 1))
+elif grep -q 'owned allocation escapes through uncontracted call `retain`' "$tmp/v2-owned-nested-escape/log"; then
+  echo "  ok  nested call cannot launder owned escape"; pass=$((pass + 1))
+else
+  echo "  XX  nested ownership escape diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owned-branch-alias"
+printf 'name = "v2ownedbranchalias"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-branch-alias/zag.mod"
+printf 'struct Node { value:i32 } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; let q:*mut Node; if (1 == 1) { q=p; } else { q=p; } delete(p); print_i64(q as i64); } return 0; }\n' >"$tmp/v2-owned-branch-alias/main.zag"
+if (cd "$tmp/v2-owned-branch-alias" && "$ZNC" main.zag -o out) >"$tmp/v2-owned-branch-alias/log" 2>&1 || [ -e "$tmp/v2-owned-branch-alias/out" ]; then
+  echo "  XX  agreed branch alias use after free must reject"; sed -n '1,8p' "$tmp/v2-owned-branch-alias/log"; fail=$((fail + 1))
+elif grep -q 'use after free of named allocation `p`' "$tmp/v2-owned-branch-alias/log"; then
+  echo "  ok  agreed branch alias use after free must reject"; pass=$((pass + 1))
+else
+  echo "  XX  branch alias lifetime diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-exclusive-borrow-assignment"
+printf 'name = "v2exclusiveborrowassignment"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-exclusive-borrow-assignment/zag.mod"
+printf 'fn edit(p:*mut i32) *mut i32 @borrows_mut { unsafe { return p; } } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let q:*mut i32; q=edit(p); print_i64(p as i64); delete(p); } return 0; }\n' >"$tmp/v2-exclusive-borrow-assignment/main.zag"
+if (cd "$tmp/v2-exclusive-borrow-assignment" && "$ZNC" main.zag -o out) >"$tmp/v2-exclusive-borrow-assignment/log" 2>&1 || [ -e "$tmp/v2-exclusive-borrow-assignment/out" ]; then
+  echo "  XX  assigned exclusive borrow keeps owner unavailable"; sed -n '1,8p' "$tmp/v2-exclusive-borrow-assignment/log"; fail=$((fail + 1))
+elif grep -q 'exclusive mutable borrow is active' "$tmp/v2-exclusive-borrow-assignment/log"; then
+  echo "  ok  assigned exclusive borrow keeps owner unavailable"; pass=$((pass + 1))
+else
+  echo "  XX  assigned exclusive borrow diagnostic missing"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-nullable-deref"
 printf 'name = "v2nullablederef"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-nullable-deref/zag.mod"
@@ -370,6 +524,155 @@ elif grep -q 'cannot cast between distinct raw-pointer address spaces' "$tmp/v2-
   echo "  ok  distinct raw-pointer address spaces reject casts without artifact"; pass=$((pass + 1))
 else
   echo "  XX  address-space cast rejection missing diagnostic"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-cast-alias-use-after-free"
+printf 'name = "v2castaliasuaf"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-cast-alias-use-after-free/zag.mod"
+printf 'fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let q:*mut i32=p as *mut i32; delete(p); print_i64(q as i64); } return 0; }\n' >"$tmp/v2-cast-alias-use-after-free/main.zag"
+if (cd "$tmp/v2-cast-alias-use-after-free" && "$ZNC" main.zag -o out) >"$tmp/v2-cast-alias-use-after-free/log" 2>&1 || [ -e "$tmp/v2-cast-alias-use-after-free/out" ]; then
+  echo "  XX  cast local alias use after free rejects without artifact"; sed -n '1,8p' "$tmp/v2-cast-alias-use-after-free/log"; fail=$((fail + 1))
+elif grep -q 'use after free of named allocation `p`' "$tmp/v2-cast-alias-use-after-free/log"; then
+  echo "  ok  cast local alias use after free rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  cast alias use-after-free diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-cast-alias-double-free"
+printf 'name = "v2castaliasdoublefree"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-cast-alias-double-free/zag.mod"
+printf 'fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let q:*mut i32=p as *mut i32; delete(q); delete(p); } return 0; }\n' >"$tmp/v2-cast-alias-double-free/main.zag"
+if (cd "$tmp/v2-cast-alias-double-free" && "$ZNC" main.zag -o out) >"$tmp/v2-cast-alias-double-free/log" 2>&1 || [ -e "$tmp/v2-cast-alias-double-free/out" ]; then
+  echo "  XX  cast local alias double free rejects without artifact"; sed -n '1,8p' "$tmp/v2-cast-alias-double-free/log"; fail=$((fail + 1))
+elif grep -q 'double free of named allocation' "$tmp/v2-cast-alias-double-free/log"; then
+  echo "  ok  cast local alias double free rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  cast alias double-free diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-cast-alias-release"
+printf 'name = "v2castaliasrelease"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-cast-alias-release/zag.mod"
+printf 'fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let q:*mut i32=p as *mut i32; delete(q as *mut i32); } return 0; }\n' >"$tmp/v2-cast-alias-release/main.zag"
+if (cd "$tmp/v2-cast-alias-release" && "$ZNC" main.zag -o out) >"$tmp/v2-cast-alias-release/log" 2>&1 && [ -x "$tmp/v2-cast-alias-release/out" ]; then
+  echo "  ok  cast owner alias release is recognized"; pass=$((pass + 1))
+else
+  echo "  XX  cast owner alias release"; sed -n '1,8p' "$tmp/v2-cast-alias-release/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-cast-borrow-consume"
+printf 'name = "v2castborrowconsume"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-cast-borrow-consume/zag.mod"
+printf 'struct Node { value:i32 } fn inspect(p:*mut Node) *mut Node @borrows { return p; } fn consume(p:*mut Node) void @consumes { unsafe { delete(p); } } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; let s:*mut Node=inspect(p) as *mut Node; let alias:*mut Node=s as *mut Node; consume(alias as *mut Node); } return 0; }\n' >"$tmp/v2-cast-borrow-consume/main.zag"
+if (cd "$tmp/v2-cast-borrow-consume" && "$ZNC" main.zag -o out) >"$tmp/v2-cast-borrow-consume/log" 2>&1 || [ -e "$tmp/v2-cast-borrow-consume/out" ]; then
+  echo "  XX  cast borrow alias cannot be consumed without artifact"; sed -n '1,8p' "$tmp/v2-cast-borrow-consume/log"; fail=$((fail + 1))
+elif grep -q 'cannot pass a borrow to a consuming call' "$tmp/v2-cast-borrow-consume/log"; then
+  echo "  ok  cast borrow alias cannot be consumed without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  cast borrow consume diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-cast-borrow-release"
+printf 'name = "v2castborrowrelease"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-cast-borrow-release/zag.mod"
+printf 'struct Node { value:i32 } fn inspect(p:*mut Node) *mut Node @borrows { return p; } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; let s:*mut Node=inspect(p) as *mut Node; let alias:*mut Node=s as *mut Node; delete(alias as *mut Node); } return 0; }\n' >"$tmp/v2-cast-borrow-release/main.zag"
+if (cd "$tmp/v2-cast-borrow-release" && "$ZNC" main.zag -o out) >"$tmp/v2-cast-borrow-release/log" 2>&1 || [ -e "$tmp/v2-cast-borrow-release/out" ]; then
+  echo "  XX  cast borrow alias cannot be released without artifact"; sed -n '1,8p' "$tmp/v2-cast-borrow-release/log"; fail=$((fail + 1))
+elif grep -q 'cannot pass a borrow to a consuming call' "$tmp/v2-cast-borrow-release/log"; then
+  echo "  ok  cast borrow alias cannot be released without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  cast borrow release diagnostic missing"; fail=$((fail + 1))
+fi
+# This is deliberately a bounded lifetime rule: a raw pointer may be returned
+# when it comes from a parameter, but an address taken from a callee-local frame
+# must never cross that return boundary. The two negative cases cover the direct
+# spelling and a direct local alias through a raw-pointer cast.
+mkdir -p "$tmp/v2-return-local-address"
+printf 'name = "v2returnlocaladdress"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-return-local-address/zag.mod"
+printf 'fn bad() *const i32 { let x:i32=42; unsafe { return (&x) as *const i32; } } fn main() i32 { return 0; }\n' >"$tmp/v2-return-local-address/main.zag"
+if (cd "$tmp/v2-return-local-address" && "$ZNC" main.zag -o out) >"$tmp/v2-return-local-address/log" 2>&1 || [ -e "$tmp/v2-return-local-address/out" ]; then
+  echo "  XX  direct local address return rejects without artifact"; sed -n '1,8p' "$tmp/v2-return-local-address/log"; fail=$((fail + 1))
+elif grep -q 'address of local `x` escapes through return' "$tmp/v2-return-local-address/log"; then
+  echo "  ok  direct local address return rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  direct local address return diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-return-local-address-alias"
+printf 'name = "v2returnlocaladdressalias"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-return-local-address-alias/zag.mod"
+printf 'fn bad() *const i32 { let x:i32=42; unsafe { let p:*const i32=(&x) as *const i32; return p; } } fn main() i32 { return 0; }\n' >"$tmp/v2-return-local-address-alias/main.zag"
+if (cd "$tmp/v2-return-local-address-alias" && "$ZNC" main.zag -o out) >"$tmp/v2-return-local-address-alias/log" 2>&1 || [ -e "$tmp/v2-return-local-address-alias/out" ]; then
+  echo "  XX  direct local-address alias return rejects without artifact"; sed -n '1,8p' "$tmp/v2-return-local-address-alias/log"; fail=$((fail + 1))
+elif grep -q 'address of local `x` escapes through return' "$tmp/v2-return-local-address-alias/log"; then
+  echo "  ok  direct local-address alias return rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  direct local-address alias return diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-return-parameter-pointer"
+printf 'name = "v2returnparameterpointer"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-return-parameter-pointer/zag.mod"
+printf 'fn keep(p:*const i32) *const i32 { return p; } fn main() i32 { let x:i32=42; unsafe { let p:*const i32=keep((&x) as *const i32); return p.*; } }\n' >"$tmp/v2-return-parameter-pointer/main.zag"
+if (cd "$tmp/v2-return-parameter-pointer" && "$ZNC" main.zag -o out) >"$tmp/v2-return-parameter-pointer/log" 2>&1 &&
+   [ -x "$tmp/v2-return-parameter-pointer/out" ]; then
+  set +e
+  "$tmp/v2-return-parameter-pointer/out"
+  return_parameter_ec=$?
+  set -e
+  if [ "$return_parameter_ec" -eq 42 ]; then
+    echo "  ok  parameter pointer return remains valid"; pass=$((pass + 1))
+  else
+    echo "  XX  parameter pointer return (exit=$return_parameter_ec)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  parameter pointer return"; sed -n '1,8p' "$tmp/v2-return-parameter-pointer/log"; fail=$((fail + 1))
+fi
+# Aggregate values can carry a frame address just as a raw pointer can. The
+# first two cases cover a direct struct literal and a local aggregate alias;
+# the field case proves that taking the address of stack-owned substorage is
+# included. A pointer inherited from a caller remains a valid positive case.
+mkdir -p "$tmp/v2-return-local-address-aggregate"
+printf 'name = "v2returnlocaladdressaggregate"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-return-local-address-aggregate/zag.mod"
+printf 'struct Box { ptr:*const i32 } fn bad() Box { let x:i32=42; unsafe { return Box{.ptr=(&x) as *const i32}; } } fn main() i32 { return 0; }\n' >"$tmp/v2-return-local-address-aggregate/main.zag"
+if (cd "$tmp/v2-return-local-address-aggregate" && "$ZNC" main.zag -o out) >"$tmp/v2-return-local-address-aggregate/log" 2>&1 || [ -e "$tmp/v2-return-local-address-aggregate/out" ]; then
+  echo "  XX  aggregate local-address return rejects without artifact"; sed -n '1,8p' "$tmp/v2-return-local-address-aggregate/log"; fail=$((fail + 1))
+elif grep -q 'address of local `x` escapes through return' "$tmp/v2-return-local-address-aggregate/log"; then
+  echo "  ok  aggregate local-address return rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  aggregate local-address return diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-return-local-address-union"
+printf 'name = "v2returnlocaladdressunion"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-return-local-address-union/zag.mod"
+printf 'union Choice { ptr:*const i32, value:i32 } fn bad() Choice { let x:i32=42; unsafe { return Choice{.ptr=(&x) as *const i32}; } } fn main() i32 { return 0; }\n' >"$tmp/v2-return-local-address-union/main.zag"
+if (cd "$tmp/v2-return-local-address-union" && "$ZNC" main.zag -o out) >"$tmp/v2-return-local-address-union/log" 2>&1 || [ -e "$tmp/v2-return-local-address-union/out" ]; then
+  echo "  XX  union local-address return rejects without artifact"; sed -n '1,8p' "$tmp/v2-return-local-address-union/log"; fail=$((fail + 1))
+elif grep -q 'address of local `x` escapes through return' "$tmp/v2-return-local-address-union/log"; then
+  echo "  ok  union local-address return rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  union local-address return diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-return-local-address-aggregate-alias"
+printf 'name = "v2returnlocaladdressaggregatealias"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-return-local-address-aggregate-alias/zag.mod"
+printf 'struct Box { ptr:*const i32 } fn bad() Box { let x:i32=42; unsafe { let box:Box=Box{.ptr=(&x) as *const i32}; return box; } } fn main() i32 { return 0; }\n' >"$tmp/v2-return-local-address-aggregate-alias/main.zag"
+if (cd "$tmp/v2-return-local-address-aggregate-alias" && "$ZNC" main.zag -o out) >"$tmp/v2-return-local-address-aggregate-alias/log" 2>&1 || [ -e "$tmp/v2-return-local-address-aggregate-alias/out" ]; then
+  echo "  XX  aggregate alias local-address return rejects without artifact"; sed -n '1,8p' "$tmp/v2-return-local-address-aggregate-alias/log"; fail=$((fail + 1))
+elif grep -q 'address of local `x` escapes through return' "$tmp/v2-return-local-address-aggregate-alias/log"; then
+  echo "  ok  aggregate alias local-address return rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  aggregate alias local-address diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-return-local-field-address"
+printf 'name = "v2returnlocalfieldaddress"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-return-local-field-address/zag.mod"
+printf 'struct Pair { value:i32 } struct Box { ptr:*const i32 } fn bad() Box { let pair:Pair=Pair{.value=42}; unsafe { return Box{.ptr=(&pair.value) as *const i32}; } } fn main() i32 { return 0; }\n' >"$tmp/v2-return-local-field-address/main.zag"
+if (cd "$tmp/v2-return-local-field-address" && "$ZNC" main.zag -o out) >"$tmp/v2-return-local-field-address/log" 2>&1 || [ -e "$tmp/v2-return-local-field-address/out" ]; then
+  echo "  XX  local field-address return rejects without artifact"; sed -n '1,8p' "$tmp/v2-return-local-field-address/log"; fail=$((fail + 1))
+elif grep -q 'address of local `pair` escapes through return' "$tmp/v2-return-local-field-address/log"; then
+  echo "  ok  local field-address return rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  local field-address return diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-return-parameter-aggregate"
+printf 'name = "v2returnparameteraggregate"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-return-parameter-aggregate/zag.mod"
+printf 'struct Box { ptr:*const i32 } fn wrap(p:*const i32) Box { return Box{.ptr=p}; } fn main() i32 { return 0; }\n' >"$tmp/v2-return-parameter-aggregate/main.zag"
+if (cd "$tmp/v2-return-parameter-aggregate" && "$ZNC" check main.zag) >"$tmp/v2-return-parameter-aggregate/log" 2>&1; then
+  echo "  ok  caller-provided pointer may cross an aggregate return"; pass=$((pass + 1))
+else
+  echo "  XX  caller-provided aggregate pointer return"; sed -n '1,8p' "$tmp/v2-return-parameter-aggregate/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v1-return-local-address-aggregate"
+printf 'name = "v1returnlocaladdressaggregate"\nversion = "0"\nedition = "2026"\n' >"$tmp/v1-return-local-address-aggregate/zag.mod"
+printf 'struct Box { ptr:*i32 } fn legacy() Box { let x:i32=42; return Box{.ptr=&x}; } fn main() i32 { return 0; }\n' >"$tmp/v1-return-local-address-aggregate/main.zag"
+if (cd "$tmp/v1-return-local-address-aggregate" && "$ZNC" check main.zag) >"$tmp/v1-return-local-address-aggregate/log" 2>&1; then
+  echo "  ok  edition-2026 aggregate semantics remain unchanged"; pass=$((pass + 1))
+else
+  echo "  XX  edition-2026 aggregate compatibility"; sed -n '1,8p' "$tmp/v1-return-local-address-aggregate/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v1-pointer"
 printf 'name = "v1pointer"\nversion = "0"\nedition = "2026"\n' >"$tmp/v1-pointer/zag.mod"

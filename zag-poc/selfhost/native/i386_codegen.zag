@@ -2,13 +2,26 @@
 // This deliberately consumes the normal Zag AST. Unsupported types and nodes
 // fail before an ELF is written; the source text is never pattern matched.
 @import("../parse.zag")
+@import("elf_i686.zag")
 
-enum I32IROp { enter, const_, str_const, f32_const, f64_const, load, pair_load, f32_load, f64_load, store, pair_store, f32_store, f64_store, addr, deref, store_ind, malloc, free_, add, sub, f32add, f32sub, f32mul, f32div, fadd, fsub, fmul, fdiv, eq, ne, lt, le, gt, ge, f32eq, f32ne, f32lt, f32le, f32gt, f32ge, feq, fne, flt, fle, fgt, fge, label, jz, jmp, call, call_pair, call_sret, f32call, fcall, call_err, err_jnz, try_, write, write_slice, print_i32, ret, ret_pair, ret_sret, f32ret, fret, ret_ok, ret_err }
+enum I32IROp { enter, const_, str_const, f32_const, f64_const, load, pair_load, wide_load, f32_load, f64_load, store, pair_store, wide_store, f32_store, f64_store, normalize, widen_signed, widen_unsigned, truncate_wide, wide_bool, addr, deref, store_ind, ptr_index, ptr_store_index, slice_index, malloc, free_, add, sub, mul, div_, mod_, udiv_, umod_, wide_add, wide_sub, wide_mul, wide_div, wide_mod, wide_udiv, wide_umod, wide_and, wide_or, wide_xor, wide_shl, wide_shr, wide_sar, wide_neg, wide_eq, wide_ne, wide_lt, wide_le, wide_gt, wide_ge, wide_ult, wide_ule, wide_ugt, wide_uge, f32add, f32sub, f32mul, f32div, fadd, fsub, fmul, fdiv, eq, ne, lt, le, gt, ge, ult, ule, ugt, uge, f32eq, f32ne, f32lt, f32le, f32gt, f32ge, feq, fne, flt, fle, fgt, fge, label, jz, jmp, call, call_pair, call_sret, f32call, fcall, call_err, err_jnz, try_, write, write_slice, print_i32, ret, ret_pair, ret_sret, f32ret, fret, ret_ok, ret_err }
 struct I32IR { op: I32IROp, value: i64 }
 struct I386Local { name: []u8, slot: i32, ty: []u8 }
-struct I386Fn { name: []u8, label: i32, params: i32, param_words: i32, param_types: ArrayList[[]u8], ret_ty: []u8, returns_error: i32 }
-struct I386Lower { ir: ArrayList[I32IR], locals: ArrayList[I386Local], funcs: ArrayList[I386Fn], structs: ArrayList[StructDecl], strings:ArrayList[[]u8], failed: i32, next_label: i32, next_slot: i32, break_label: i32, continue_label: i32, current_error_fn: i32, expected_ty: []u8, current_ret_ty: []u8, sret_target: i32 }
+struct I386Fn { name: []u8, label: i32, params: i32, param_words: i32, param_types: ArrayList[[]u8], ret_ty: []u8, returns_error: i32, defined:i32, exported:i32, offset:i32 }
+struct I386Lower { ir: ArrayList[I32IR], locals: ArrayList[I386Local], funcs: ArrayList[I386Fn], structs: ArrayList[StructDecl], strings:ArrayList[[]u8], object_relocs:ArrayList[I686CodeReloc], failed: i32, next_label: i32, next_slot: i32, break_label: i32, continue_label: i32, current_error_fn: i32, expected_ty: []u8, current_ret_ty: []u8, sret_target: i32, object_mode:i32 }
 struct I386Patch { pos: i32, label: i32 }
+struct I386ValueRef { local: i32, word_offset: i32, ty: []u8, valid: i32 }
+struct I386WideLiteral { lo: i64, hi: i64, valid: i32 }
+
+// i386 has only three caller-clobbered general registers available to this
+// backend (EAX, ECX, EDX).  The lowering therefore deliberately uses a
+// stack-spill discipline for every expression temporary and reserves EBP for
+// the frame.  Keep the compiler-owned frame bounded before byte emission: a
+// malformed/generated source file must not turn an i32 multiplication into an
+// arbitrary frame-size wrap.  This is a backend resource limit, not a claim
+// that all i386 programs have a general register allocator.
+fn I386_MAX_FRAME_WORDS() i32 { return 262144; } // 1 MiB of local spill slots
+fn I386_MAX_CALL_WORDS() i32 { return 16384; }  // 64 KiB of pushed arguments
 
 fn i386_fail(c: *I386Lower, msg: []u8) void {
     if (c.*.failed == 0) { _zag_eprintln(_zag_str_concat("znc i686: unsupported construct: ", msg)); }
@@ -27,73 +40,445 @@ fn i386_emit_ir(c: *I386Lower, op: I32IROp, value: i64) void {
 }
 fn i386_new_label(c: *I386Lower) i32 { let n:i32=c.*.next_label;c.*.next_label=n+1;return n; }
 fn i386_fn(c:*I386Lower,name:[]u8) i32 { let i:i32=0;while(i<c.*.funcs.len){if(@strEq(c.*.funcs.data[i].name,name)){return i;}i=i+1;}return -1; }
-fn i386_word_ty(ty:[]u8) i32 { if(@strEq(ty,"i32")||@strEq(ty,"usize")||@strEq(ty,"*i32")||@strEq(ty,"*usize")){return 1;}return 0; }
+fn i386_pointer_ty(ty:[]u8)i32{if(ty.len<2||ty[0]!='*'){return 0;}let elem:[]u8=ty[1..];return (@strEq(elem,"i32")||@strEq(elem,"usize")||@strEq(elem,"u8")) as i32;}
+fn i386_pointer_elem(ty:[]u8)[]u8{if(i386_pointer_ty(ty)==1){return ty[1..];}return "";}
+fn i386_slice_ty(ty:[]u8)i32{if(@strEq(ty,"String")){return 1;}if(ty.len<3||ty[0]!='['||ty[1]!=']'){return 0;}let elem:[]u8=ty[2..];return (@strEq(elem,"u8")||@strEq(elem,"i32")||@strEq(elem,"usize")) as i32;}
+fn i386_slice_elem(ty:[]u8)[]u8{if(@strEq(ty,"String")){return "u8";}if(i386_slice_ty(ty)==1){return ty[2..];}return "";}
+fn i386_elem_size(ty:[]u8)i32{if(@strEq(ty,"u8")){return 1;}if(@strEq(ty,"i32")||@strEq(ty,"usize")){return 4;}return 0;}
+fn i386_narrow_scalar_ty(ty:[]u8)i32{return (@strEq(ty,"i8")||@strEq(ty,"u8")||@strEq(ty,"i16")||@strEq(ty,"u16")||@strEq(ty,"bool")) as i32;}
+fn i386_word_ty(ty:[]u8) i32 { if(@strEq(ty,"i32")||@strEq(ty,"usize")||i386_narrow_scalar_ty(ty)==1||i386_pointer_ty(ty)==1){return 1;}return 0; }
+fn i386_wide_integer_ty(ty:[]u8)i32{return (@strEq(ty,"i64")||@strEq(ty,"u64")) as i32;}
+fn i386_integer_ty(ty:[]u8)i32{return (@strEq(ty,"i32")||@strEq(ty,"usize")||@strEq(ty,"i8")||@strEq(ty,"u8")||@strEq(ty,"i16")||@strEq(ty,"u16")||i386_wide_integer_ty(ty)==1) as i32;}
+fn i386_unsigned_ty(ty:[]u8)i32{return (@strEq(ty,"usize")||@strEq(ty,"u8")||@strEq(ty,"u16")||@strEq(ty,"u64")) as i32;}
+fn i386_signed_narrow_ty(ty:[]u8)i32{return (@strEq(ty,"i8")||@strEq(ty,"i16")) as i32;}
+fn i386_signed_integer_ty(ty:[]u8)i32{return (@strEq(ty,"i8")||@strEq(ty,"i16")||@strEq(ty,"i32")||@strEq(ty,"i64")) as i32;}
+// Narrow values occupy one four-byte cdecl argument/local word, but their
+// observable value is normalized at every ABI and storage boundary.  The code
+// is consumed by I32IROp.normalize:
+//   1=i8 sign-extend, 2=u8 zero-extend, 3=i16 sign-extend,
+//   4=u16 zero-extend, 5=bool canonicalize to zero or one.
+fn i386_narrow_code(ty:[]u8)i32{if(@strEq(ty,"i8")){return 1;}if(@strEq(ty,"u8")){return 2;}if(@strEq(ty,"i16")){return 3;}if(@strEq(ty,"u16")){return 4;}if(@strEq(ty,"bool")){return 5;}return 0;}
+fn i386_emit_normalize(c:*I386Lower,ty:[]u8)void{let code:i32=i386_narrow_code(ty);if(code!=0){i386_emit_ir(c,I32IROp.normalize,code);}}
 fn i386_float_ty(ty:[]u8) i32 { if(@strEq(ty,"f64")){return 1;}if(@strEq(ty,"f32")){return 2;}return 0; }
-fn i386_slice_ty(ty:[]u8)i32{if(@strEq(ty,"[]u8")||@strEq(ty,"String")){return 1;}return 0;}
-fn i386_ty_words(ty:[]u8) i32 { if(@strEq(ty,"f64")||i386_slice_ty(ty)==1){return 2;}return 1; }
+fn i386_ty_words(ty:[]u8) i32 { if(@strEq(ty,"f64")||i386_slice_ty(ty)==1||i386_wide_integer_ty(ty)==1){return 2;}return 1; }
+fn i386_error_payload_ty(ty:[]u8)[]u8{if(@strEq(ty,"!i32")){return "i32";}return "";}
+fn i386_hex_literal_text(text:[]u8)i32{return (text.len>1&&text[0]=='0'&&(text[1]=='x'||text[1]=='X')) as i32;}
+fn i386_int_literal(n:*Node)i32{switch(n.*){.ilit=>|x|{if(i386_hex_literal_text(x.text)==1){return 1;}let i:i32=0;while(i<x.text.len){if(x.text[i]=='.'||x.text[i]=='e'||x.text[i]=='E'){return 0;}i=i+1;}return 1;}else=>{}}return 0;}
+fn i386_number_literal(n:*Node)i32{switch(n.*){.ilit=>|_x|{return 1;}else=>{}}return 0;}
+fn i386_negative_int_literal(n:*Node)i32{switch(n.*){.un=>|x|{return (@strEq(x.op,"-")&&i386_int_literal(x.e)==1) as i32;}else=>{}}return 0;}
+fn i386_null_literal(n:*Node)i32{switch(n.*){.id=>|x|{return @strEq(x.name,"null") as i32;}else=>{}}return 0;}
 fn i386_expr_ty(c:*I386Lower,n:*Node) []u8 {
     switch(n.*) {
-        .ilit=>|x|{let i:i32=0;while(i<x.text.len){if(x.text[i]=='.'||x.text[i]=='e'||x.text[i]=='E'){if(@strEq(c.*.expected_ty,"f32")){return "f32";}return "f64";}i=i+1;}return "i32";}
+        .ilit=>|x|{let i:i32=0;if(i386_hex_literal_text(x.text)==0){while(i<x.text.len){if(x.text[i]=='.'||x.text[i]=='e'||x.text[i]=='E'){if(@strEq(c.*.expected_ty,"f32")){return "f32";}return "f64";}i=i+1;}}if(i386_integer_ty(c.*.expected_ty)==1){return c.*.expected_ty;}return "i32";}
         .slit=>|_x|{return "[]u8";}
-        .id=>|x|{let li:i32=i386_local_index(c,x.name);if(li>=0){return c.*.locals.data[li].ty;}return "";}
-        .bin=>|x|{let lt:[]u8=i386_expr_ty(c,x.l);let rt:[]u8=i386_expr_ty(c,x.r);if(i386_float_ty(lt)>0||i386_float_ty(rt)>0){if(@strEq(x.op,"==")||@strEq(x.op,"!=")||@strEq(x.op,"<")||@strEq(x.op,"<=")||@strEq(x.op,">")||@strEq(x.op,">=")){return "i32";}if(i386_float_ty(lt)>0){return lt;}return rt;}return "i32";}
-        .un=>|x|{return i386_expr_ty(c,x.e);}
-        .call=>|x|{let name:[]u8="";switch(x.callee.*){.id=>|id|{name=id.name;}else=>{}}let fi:i32=i386_fn(c,name);if(fi>=0){return c.*.funcs.data[fi].ret_ty;}return "i32";}
+        .id=>|x|{if(@strEq(x.name,"true")||@strEq(x.name,"false")){return "bool";}if(@strEq(x.name,"null")){if(i386_pointer_ty(c.*.expected_ty)==1){return c.*.expected_ty;}return "*i32";}let li:i32=i386_local_index(c,x.name);if(li>=0){return c.*.locals.data[li].ty;}return "";}
+        .bin=>|x|{let lt:[]u8=i386_expr_ty(c,x.l);let rt:[]u8=i386_expr_ty(c,x.r);if(i386_int_literal(x.l)==1&&i386_integer_ty(rt)==1){lt=rt;}if(i386_int_literal(x.r)==1&&i386_integer_ty(lt)==1){rt=lt;}if(i386_negative_int_literal(x.l)==1&&i386_signed_integer_ty(rt)==1){lt=rt;}if(i386_negative_int_literal(x.r)==1&&i386_signed_integer_ty(lt)==1){rt=lt;}if(@strEq(x.op,"==")||@strEq(x.op,"!=")||@strEq(x.op,"<")||@strEq(x.op,"<=")||@strEq(x.op,">")||@strEq(x.op,">=")){return "bool";}if(@strEq(x.op,"<<")||@strEq(x.op,">>")){return lt;}if(i386_pointer_ty(lt)==1){return lt;}if(i386_float_ty(lt)>0){return lt;}if(i386_float_ty(rt)>0){return rt;}if(@strEq(lt,rt)&&(i386_narrow_scalar_ty(lt)==1||i386_wide_integer_ty(lt)==1)){return lt;}if(@strEq(lt,"usize")||@strEq(rt,"usize")){return "usize";}return "i32";}
+        .un=>|x|{if(@strEq(x.op,"&")){let et:[]u8=i386_expr_ty(c,x.e);if(et.len>0){return _zag_str_concat("*",et);}}if(@strEq(x.op,"try")){return i386_error_payload_ty(i386_expr_ty(c,x.e));}return i386_expr_ty(c,x.e);}
+        .fld=>|x|{if(@strEq(x.fname,"*")){return i386_pointer_elem(i386_expr_ty(c,x.base));}let bt:[]u8=i386_expr_ty(c,x.base);if(i386_slice_ty(bt)==1&&@strEq(x.fname,"len")){return "usize";}let ref:I386ValueRef=i386_value_ref(c,n);if(ref.valid==1){return ref.ty;}return "";}
+        .idx=>|x|{let bt:[]u8=i386_expr_ty(c,x.base);if(i386_slice_ty(bt)==1){return i386_slice_elem(bt);}return i386_pointer_elem(bt);}
+        .slice_=>|x|{let bt:[]u8=i386_expr_ty(c,x.base);if(i386_slice_ty(bt)==1){return bt;}let elem:[]u8=i386_pointer_elem(bt);if(elem.len>0){return _zag_str_concat("[]",elem);}return "";}
+        .cast_=>|x|{return x.target;}
+        .call=>|x|{let name:[]u8="";switch(x.callee.*){.id=>|id|{name=id.name;}else=>{}}if(@strEq(name,"__catch")&&x.args.len>0){return i386_error_payload_ty(i386_expr_ty(c,x.args.data[0]));}if(@strEq(name,"_zag_malloc")){if(i386_pointer_ty(c.*.expected_ty)==1){return c.*.expected_ty;}return "*i32";}if(@strEq(name,"_zag_free")||@strEq(name,"_zag_write")||@strEq(name,"_zag_print")||@strEq(name,"_zag_println_i32")){return "i32";}let fi:i32=i386_fn(c,name);if(fi>=0){return c.*.funcs.data[fi].ret_ty;}return "i32";}
         else=>{return "i32";}
     }
 }
 fn i386_struct(c:*I386Lower,name:[]u8) i32 { let i:i32=0;while(i<c.*.structs.len){if(@strEq(c.*.structs.data[i].name,name)){return i;}i=i+1;}return -1; }
 fn i386_local_index(c:*I386Lower,name:[]u8) i32 { let i:i32=0;while(i<c.*.locals.len){if(@strEq(c.*.locals.data[i].name,name)){return i;}i=i+1;}return -1; }
 fn i386_field(c:*I386Lower,ty:[]u8,name:[]u8) i32 { let si:i32=i386_struct(c,ty);if(si<0){return -1;}let i:i32=0;while(i<c.*.structs.data[si].fields.len){if(@strEq(c.*.structs.data[si].fields.data[i].name,name)){return i;}i=i+1;}return -1; }
-fn i386_param_words(c:*I386Lower,ty:[]u8) i32 { let si:i32=i386_struct(c,ty);if(si>=0){return c.*.structs.data[si].fields.len;}return i386_ty_words(ty); }
-fn i386_field_slot(l:I386Local,field:i32) i32 { return l.slot-field; }
+fn i386_struct_field_supported(c:*I386Lower,ty:[]u8)i32{return (i386_word_ty(ty)==1||i386_wide_integer_ty(ty)==1||i386_float_ty(ty)>0||i386_struct(c,ty)>=0) as i32;}
+fn i386_struct_field_words_depth(c:*I386Lower,si:i32,field:i32,depth:i32)i32{
+    let ty:[]u8=c.*.structs.data[si].fields.data[field].pty;
+    if(i386_word_ty(ty)==1||i386_wide_integer_ty(ty)==1||i386_float_ty(ty)>0){return i386_ty_words(ty);}
+    let child:i32=i386_struct(c,ty);if(child>=0){return i386_struct_words_depth(c,child,depth+1);}
+    return -1;
+}
+fn i386_struct_words_depth(c:*I386Lower,si:i32,depth:i32)i32{
+    // Any acyclic path contains at most one instance of every declaration.
+    // Exceeding that bound proves a direct or mutual by-value cycle.
+    if(si<0||depth>c.*.structs.len||c.*.structs.data[si].fields.len==0){return -1;}
+    let words:i32=0;let i:i32=0;
+    while(i<c.*.structs.data[si].fields.len){let n:i32=i386_struct_field_words_depth(c,si,i,depth);if(n<0||words>I386_MAX_FRAME_WORDS()-n){return -1;}words=words+n;i=i+1;}
+    return words;
+}
+fn i386_struct_field_words(c:*I386Lower,si:i32,field:i32)i32{
+    if(si<0){return -1;}
+    let ty:[]u8=c.*.structs.data[si].fields.data[field].pty;
+    if(i386_struct_field_supported(c,ty)==0){return -1;}
+    let child:i32=i386_struct(c,ty);if(child>=0){return i386_struct_words_depth(c,child,1);}
+    return i386_ty_words(ty);
+}
+fn i386_struct_field_word_offset(c:*I386Lower,si:i32,field:i32)i32{
+    let words:i32=0;let i:i32=0;
+    while(i<field){let n:i32=i386_struct_field_words(c,si,i);if(n<0||words>I386_MAX_FRAME_WORDS()-n){return -1;}words=words+n;i=i+1;}
+    return words;
+}
+fn i386_struct_words(c:*I386Lower,si:i32)i32{
+    return i386_struct_words_depth(c,si,0);
+}
+fn i386_param_words(c:*I386Lower,ty:[]u8) i32 { let si:i32=i386_struct(c,ty);if(si>=0){return i386_struct_words(c,si);}return i386_ty_words(ty); }
+fn i386_value_ref(c:*I386Lower,n:*Node)I386ValueRef{
+    switch(n.*){
+        .id=>|id|{let li:i32=i386_local_index(c,id.name);if(li>=0){return I386ValueRef{.local=li,.word_offset=0,.ty=c.*.locals.data[li].ty,.valid=1};}}
+        .fld=>|f|{
+            if(@strEq(f.fname,"*")){return I386ValueRef{.local=-1,.word_offset=0,.ty="",.valid=0};}
+            let base:I386ValueRef=i386_value_ref(c,f.base);if(base.valid==1){let si:i32=i386_struct(c,base.ty);let fi:i32=i386_field(c,base.ty,f.fname);if(si>=0&&fi>=0){let off:i32=i386_struct_field_word_offset(c,si,fi);if(off>=0){return I386ValueRef{.local=base.local,.word_offset=base.word_offset+off,.ty=c.*.structs.data[si].fields.data[fi].pty,.valid=1};}}}
+        }
+        else=>{}
+    }
+    return I386ValueRef{.local=-1,.word_offset=0,.ty="",.valid=0};
+}
+// SysV i386 aligns every supported sequential aggregate field to four bytes.
+// Scalar/f32 leaves occupy one word; i64/u64/f64 occupy two adjacent
+// little-endian words; acyclic nested structs recursively inline that layout.
+// Narrow leaves retain their declared value semantics at every boundary.
+fn i386_emit_value_load(c:*I386Lower,ty:[]u8,slot:i32)void{
+    let ft:i32=i386_float_ty(ty);
+    if(ft==1||i386_wide_integer_ty(ty)==1){i386_emit_ir(c,I32IROp.load,slot-1);i386_emit_ir(c,I32IROp.load,slot);}
+    else if(ft==2){i386_emit_ir(c,I32IROp.f32_load,slot);}
+    else{i386_emit_ir(c,I32IROp.load,slot);i386_emit_normalize(c,ty);}
+}
+fn i386_emit_value_store(c:*I386Lower,ty:[]u8,slot:i32)void{
+    let ft:i32=i386_float_ty(ty);
+    if(ft==1||i386_wide_integer_ty(ty)==1){i386_emit_ir(c,I32IROp.store,slot);i386_emit_ir(c,I32IROp.store,slot-1);}
+    else if(ft==2){i386_emit_ir(c,I32IROp.f32_store,slot);}
+    else{i386_emit_normalize(c,ty);i386_emit_ir(c,I32IROp.store,slot);}
+}
+fn i386_emit_struct_copy(c:*I386Lower,dest_base:i32,source_base:i32,si:i32,depth:i32)void{
+    if(depth>c.*.structs.len){i386_fail(c,"recursive by-value struct layout is unsupported");return;}
+    let field:i32=0;while(field<c.*.structs.data[si].fields.len){
+        let off:i32=i386_struct_field_word_offset(c,si,field);let ty:[]u8=c.*.structs.data[si].fields.data[field].pty;let child:i32=i386_struct(c,ty);
+        if(off<0){i386_fail(c,"struct layout overflow or recursive by-value field");return;}
+        if(child>=0){i386_emit_struct_copy(c,dest_base-off,source_base-off,child,depth+1);}
+        else{i386_emit_value_load(c,ty,source_base-off);i386_emit_value_store(c,ty,dest_base-off);}
+        field=field+1;
+    }
+}
+fn i386_emit_struct_argument(c:*I386Lower,source_base:i32,si:i32,depth:i32)void{
+    if(depth>c.*.structs.len){i386_fail(c,"recursive by-value struct layout is unsupported");return;}
+    let field:i32=c.*.structs.data[si].fields.len-1;while(field>=0){
+        let off:i32=i386_struct_field_word_offset(c,si,field);let ty:[]u8=c.*.structs.data[si].fields.data[field].pty;let child:i32=i386_struct(c,ty);
+        if(off<0){i386_fail(c,"struct layout overflow or recursive by-value field");return;}
+        if(child>=0){i386_emit_struct_argument(c,source_base-off,child,depth+1);}
+        else{i386_emit_value_load(c,ty,source_base-off);}
+        field=field-1;
+    }
+}
+fn i386_emit_sret_address(c:*I386Lower,word_off:i32)void{
+    i386_emit_ir(c,I32IROp.load,-1);
+    if(word_off>0){i386_emit_ir(c,I32IROp.const_,word_off*4);i386_emit_ir(c,I32IROp.add,0);}
+}
+fn i386_emit_struct_sret(c:*I386Lower,source_base:i32,si:i32,dest_word_off:i32,depth:i32)void{
+    if(depth>c.*.structs.len){i386_fail(c,"recursive by-value struct layout is unsupported");return;}
+    let field:i32=0;while(field<c.*.structs.data[si].fields.len){
+        let off:i32=i386_struct_field_word_offset(c,si,field);let ty:[]u8=c.*.structs.data[si].fields.data[field].pty;let child:i32=i386_struct(c,ty);
+        if(off<0){i386_fail(c,"aggregate returns require checked non-recursive sequential fields");return;}
+        if(child>=0){i386_emit_struct_sret(c,source_base-off,child,dest_word_off+off,depth+1);}
+        else if(i386_float_ty(ty)==1||i386_wide_integer_ty(ty)==1){let rw:i32=0;while(rw<2){i386_emit_sret_address(c,dest_word_off+off+rw);i386_emit_ir(c,I32IROp.load,source_base-off-rw);i386_emit_ir(c,I32IROp.store_ind,0);rw=rw+1;}}
+        else{i386_emit_sret_address(c,dest_word_off+off);i386_emit_value_load(c,ty,source_base-off);i386_emit_ir(c,I32IROp.store_ind,0);}
+        field=field+1;
+    }
+}
 fn i386_error_code(name:[]u8) i64 { let h:i64=1;let i:i32=0;while(i<name.len){h=((h*33)+(name[i] as i64))&2147483647;i=i+1;}if(h==0){return 1;}return h; }
 fn i386_add_string(c:*I386Lower,s:[]u8)i32{if(c.*.strings.len>=c.*.strings.cap){let grown:ArrayList[[]u8]=make[[]u8](c.*.strings.cap*2);let i:i32=0;while(i<c.*.strings.len){grown.data[i]=c.*.strings.data[i];i=i+1;}grown.len=c.*.strings.len;c.*.strings=grown;}let at:i32=c.*.strings.len;c.*.strings.data[at]=s;c.*.strings.len=at+1;return at;}
+// Prove that every path through the currently supported structured control-flow
+// subset reaches a return.  A loop is deliberately not treated as terminal:
+// proving that it cannot exit requires a stronger termination/constant analysis.
+// Sequential statements after a terminal statement are unreachable, so the
+// first statement that is terminal proves the complete body terminal.
+fn i386_body_always_returns(body:ArrayList[*Node]) i32 {
+    let i:i32=0;
+    while(i<body.len) {
+        switch(body.data[i].*) {
+            .ret => |_r| { return 1; }
+            .if_ => |x| {
+                if(x.has_els==1 && i386_body_always_returns(x.then_body)==1 &&
+                   i386_body_always_returns(x.els_body)==1) { return 1; }
+            }
+            .unsafe_ => |x| {
+                if(i386_body_always_returns(x.body)==1) { return 1; }
+            }
+            .switch_ => |x| {
+                if(x.has_els==1) {
+                    let all:i32=i386_body_always_returns(x.els_body);
+                    let ai:i32=0;
+                    while(ai<x.arms.len) {
+                        if(i386_body_always_returns(x.arms.data[ai].body)==0){all=0;}
+                        ai=ai+1;
+                    }
+                    if(all==1){return 1;}
+                }
+            }
+            else => { }
+        }
+        i=i+1;
+    }
+    return 0;
+}
+fn i386_value_types_match(expected:[]u8,actual:[]u8)i32{
+    if(expected.len==0||actual.len==0||@strEq(expected,actual)){return 1;}
+    return 0;
+}
+fn i386_uncontextual_ty(c:*I386Lower,n:*Node)[]u8{let old:[]u8=c.*.expected_ty;c.*.expected_ty="";let ty:[]u8=i386_expr_ty(c,n);c.*.expected_ty=old;return ty;}
+fn i386_effective_ty(c:*I386Lower,n:*Node,expected:[]u8)[]u8{
+    let actual:[]u8=i386_uncontextual_ty(c,n);
+    if(i386_int_literal(n)==1&&i386_integer_ty(expected)==1){return expected;}
+    if(i386_negative_int_literal(n)==1&&i386_signed_integer_ty(expected)==1){return expected;}
+    if(i386_negative_int_literal(n)==1&&i386_unsigned_ty(expected)==1){return expected;}
+    if(i386_integer_ty(expected)==1){
+        switch(n.*){
+            .bin=>|x|{
+                let comparison:i32=(@strEq(x.op,"==")||@strEq(x.op,"!=")||@strEq(x.op,"<")||@strEq(x.op,"<=")||@strEq(x.op,">")||@strEq(x.op,">=")) as i32;
+                if(comparison==0){
+                    let left:[]u8=i386_effective_ty(c,x.l,expected);
+                    if(@strEq(x.op,"<<")||@strEq(x.op,">>")){
+                        let right:[]u8=i386_uncontextual_ty(c,x.r);
+                        if(i386_int_literal(x.r)==1){right="i32";}
+                        if(@strEq(left,expected)&&i386_integer_ty(right)==1&&i386_wide_integer_ty(right)==0){return expected;}
+                    }else{
+                        let right:[]u8=i386_effective_ty(c,x.r,expected);
+                        if(@strEq(left,expected)&&@strEq(right,expected)){return expected;}
+                    }
+                }
+            }
+            else=>{}
+        }
+    }
+    if(i386_number_literal(n)==1&&i386_float_ty(expected)>0){return expected;}
+    if(i386_null_literal(n)==1&&i386_pointer_ty(expected)==1){return expected;}
+    if(i386_pointer_ty(expected)==1){switch(n.*){.call=>|call|{let name:[]u8="";switch(call.callee.*){.id=>|id|{name=id.name;}else=>{}}if(@strEq(name,"_zag_malloc")){return expected;}}else=>{}}}
+    return actual;
+}
+fn i386_cast_allowed(source:[]u8,target:[]u8)i32{
+    if(@strEq(source,target)){return 1;}
+    if(i386_integer_ty(source)==1&&i386_integer_ty(target)==1){return 1;}
+    if((@strEq(source,"bool")&&i386_integer_ty(target)==1)||(i386_integer_ty(source)==1&&@strEq(target,"bool"))){return 1;}
+    if(i386_pointer_ty(source)==1&&i386_pointer_ty(target)==1){return 1;}
+    return 0;
+}
+fn i386_expr_expected(c:*I386Lower,n:*Node,expected:[]u8)void{
+    let old:[]u8=c.*.expected_ty;c.*.expected_ty=expected;i386_expr(c,n);c.*.expected_ty=old;
+}
+// Parse an unsigned decimal or hexadecimal literal as two base-2^32 limbs.
+// Each intermediate is bounded below 2^36, so the self-host compiler's signed
+// i64 arithmetic cannot overflow while accepting the complete u64 range.
+fn i386_parse_wide_literal(text:[]u8)I386WideLiteral{
+    let out:I386WideLiteral=I386WideLiteral{.lo=0,.hi=0,.valid=0};
+    let i:i32=0;let base:i64=10;
+    if(text.len>1&&text[0]=='0'&&(text[1]=='x'||text[1]=='X')){base=16;i=2;}
+    let digits:i32=0;
+    while(i<text.len){
+        let ch:u8=text[i];
+        if(ch=='_'){i=i+1;}
+        else{
+            let digit:i64=-1;
+            if(ch>='0'&&ch<='9'){digit=(ch as i64)-48;}
+            else if(base==16&&ch>='a'&&ch<='f'){digit=(ch as i64)-87;}
+            else if(base==16&&ch>='A'&&ch<='F'){digit=(ch as i64)-55;}
+            if(digit<0||digit>=base){return out;}
+            let scaled_lo:i64=out.lo*base+digit;
+            let carry:i64=scaled_lo/4294967296;
+            out.lo=scaled_lo-(carry*4294967296);
+            let scaled_hi:i64=out.hi*base+carry;
+            if(scaled_hi>4294967295){return out;}
+            out.hi=scaled_hi;digits=digits+1;i=i+1;
+        }
+    }
+    if(digits>0){out.valid=1;}
+    return out;
+}
+fn i386_emit_wide_words(c:*I386Lower,hi:i64,lo:i64)void{
+    i386_emit_ir(c,I32IROp.const_,hi);i386_emit_ir(c,I32IROp.const_,lo);
+}
+fn i386_emit_int_literal(c:*I386Lower,text:[]u8)void{
+    if(i386_wide_integer_ty(c.*.expected_ty)==1){
+        let wide:I386WideLiteral=i386_parse_wide_literal(text);
+        if(wide.valid==0){i386_fail(c,"64-bit integer literal exceeds the unsigned i686 target range");return;}
+        if(@strEq(c.*.expected_ty,"i64")&&wide.hi>2147483647){i386_fail(c,"i64 literal exceeds the signed 64-bit target range");return;}
+        i386_emit_wide_words(c,wide.hi,wide.lo);
+        return;
+    }
+    let value:i64=_zag_str_to_i64(text);
+    if(value<0){i386_fail(c,"invalid integer literal for the i686 target");return;}
+    if(@strEq(c.*.expected_ty,"usize")){
+        if(value>4294967295){i386_fail(c,"usize literal exceeds the 32-bit target range");return;}
+    }else if(@strEq(c.*.expected_ty,"i8")){
+        if(value>127){i386_fail(c,"i8 literal exceeds the signed 8-bit target range; use an explicit cast for wrapping conversion");return;}
+    }else if(@strEq(c.*.expected_ty,"u8")){
+        if(value>255){i386_fail(c,"u8 literal exceeds the unsigned 8-bit target range; use an explicit cast for wrapping conversion");return;}
+    }else if(@strEq(c.*.expected_ty,"i16")){
+        if(value>32767){i386_fail(c,"i16 literal exceeds the signed 16-bit target range; use an explicit cast for wrapping conversion");return;}
+    }else if(@strEq(c.*.expected_ty,"u16")){
+        if(value>65535){i386_fail(c,"u16 literal exceeds the unsigned 16-bit target range; use an explicit cast for wrapping conversion");return;}
+    }else if(value>2147483647){
+        i386_fail(c,"i32 literal exceeds the signed 32-bit target range; use an explicit `as usize` conversion for an unsigned value");
+        return;
+    }
+    i386_emit_ir(c,I32IROp.const_,value);
+}
 fn i386_expr(c: *I386Lower, n: *Node) void {
     switch(n.*) {
-        .ilit => |x| { let ft:i32=i386_float_ty(i386_expr_ty(c,n));if(ft>0){let ef:i32=0;let bits:i64=zf64_bits_core(x.text,&ef);if(ef!=0){i386_fail(c,"invalid float literal");}else if(ft==2){i386_emit_ir(c,I32IROp.f32_const,w_f64_to_f32_bits(bits));}else{i386_emit_ir(c,I32IROp.f64_const,bits);}}else{i386_emit_ir(c,I32IROp.const_,_zag_str_to_i64(x.text));} }
+        .ilit => |x| { let ft:i32=i386_float_ty(i386_expr_ty(c,n));if(ft>0){let ef:i32=0;let bits:i64=zf64_bits_core(x.text,&ef);if(ef!=0){i386_fail(c,"invalid float literal");}else if(ft==2){i386_emit_ir(c,I32IROp.f32_const,w_f64_to_f32_bits(bits));}else{i386_emit_ir(c,I32IROp.f64_const,bits);}}else{i386_emit_int_literal(c,x.text);} }
         .slit => |x| { if(x.text.len<2){i386_fail(c,"invalid byte-string literal");return;}let decoded:ArrayList[u8]=make[u8](x.text.len);let qi:i32=1;while(qi<x.text.len-1){let ch:u8=x.text[qi];if(ch=='\\'){qi=qi+1;if(qi>=x.text.len-1){i386_fail(c,"unterminated byte-string escape");return;}let esc:u8=x.text[qi];if(esc=='n'){ch='\n';}else if(esc=='r'){ch='\r';}else if(esc=='t'){ch='\t';}else if(esc=='0'){ch=0;}else if(esc=='\\'){ch='\\';}else if(esc=='"'){ch='"';}else{i386_fail(c,"unsupported byte-string escape");return;}}decoded.data[decoded.len]=ch;decoded.len=decoded.len+1;qi=qi+1;}let si:i32=i386_add_string(c,decoded.data[0..decoded.len]);i386_emit_ir(c,I32IROp.str_const,si); }
         .id => |x| {
+            if(@strEq(x.name,"true")){i386_emit_ir(c,I32IROp.const_,1);return;}
+            if(@strEq(x.name,"false")){i386_emit_ir(c,I32IROp.const_,0);return;}
             if(@strEq(x.name,"null")){i386_emit_ir(c,I32IROp.const_,0);return;}
             let slot:i32=i386_local(c,x.name);
             if(slot==-1000000) { i386_fail(c,_zag_str_concat("unknown or uninitialized i32 local `",_zag_str_concat(x.name,"`"))); }
-            else { let li:i32=i386_local_index(c,x.name);let ft:i32=0;if(li>=0){ft=i386_float_ty(c.*.locals.data[li].ty);if(i386_slice_ty(c.*.locals.data[li].ty)==1){i386_emit_ir(c,I32IROp.pair_load,slot);return;}}if(ft==1){i386_emit_ir(c,I32IROp.f64_load,slot as i64);}else if(ft==2){i386_emit_ir(c,I32IROp.f32_load,slot);}else{i386_emit_ir(c,I32IROp.load,slot as i64);} }
+            else { let li:i32=i386_local_index(c,x.name);let ft:i32=0;let lty:[]u8="";if(li>=0){lty=c.*.locals.data[li].ty;if(i386_struct(c,lty)>=0){i386_fail(c,"aggregate value requires a matching struct destination, field access, argument, or return");return;}ft=i386_float_ty(lty);if(i386_slice_ty(lty)==1){i386_emit_ir(c,I32IROp.pair_load,slot);return;}}if(i386_wide_integer_ty(lty)==1){i386_emit_ir(c,I32IROp.wide_load,slot);}else if(ft==1){i386_emit_ir(c,I32IROp.f64_load,slot as i64);}else if(ft==2){i386_emit_ir(c,I32IROp.f32_load,slot);}else{i386_emit_ir(c,I32IROp.load,slot as i64);i386_emit_normalize(c,lty);} }
         }
         .bin => |x| {
-            if(!@strEq(x.op,"+") && !@strEq(x.op,"-") && !@strEq(x.op,"*") && !@strEq(x.op,"/") && !@strEq(x.op,"==") && !@strEq(x.op,"!=") &&
-               !@strEq(x.op,"<") && !@strEq(x.op,"<=") && !@strEq(x.op,">") && !@strEq(x.op,">=")) { i386_fail(c,"integer expression requires arithmetic or comparison"); }
+            if(!@strEq(x.op,"+") && !@strEq(x.op,"-") && !@strEq(x.op,"*") && !@strEq(x.op,"/") && !@strEq(x.op,"%") && !@strEq(x.op,"&") && !@strEq(x.op,"|") &&
+               !@strEq(x.op,"^") && !@strEq(x.op,"<<") && !@strEq(x.op,">>") && !@strEq(x.op,"==") && !@strEq(x.op,"!=") && !@strEq(x.op,"<") &&
+               !@strEq(x.op,"<=") && !@strEq(x.op,">") && !@strEq(x.op,">=")) { i386_fail(c,"integer expression requires arithmetic, bitwise, shift, or comparison"); }
             else {
-                let ft:i32=i386_float_ty(i386_expr_ty(c,x.l));let rft:i32=i386_float_ty(i386_expr_ty(c,x.r));if(ft!=rft){let rlit:i32=0;switch(x.r.*){.ilit=>|_q|{rlit=1;}else=>{}}if(ft==2&&rlit==1){c.*.expected_ty="f32";rft=2;}else{i386_fail(c,_zag_str_concat("mixed-width arithmetic requires an explicit cast: ",_zag_str_concat(x.op,_zag_str_concat(" left=",_zag_str_concat(_zag_i64_to_str(ft),_zag_str_concat(" right=",_zag_i64_to_str(rft)))))));return;}}
-                i386_expr(c,x.l); i386_expr(c,x.r);
-                if(ft>0){let base:i32=0;if(ft==2){base=1;}if(@strEq(x.op,"+")){if(base==1){i386_emit_ir(c,I32IROp.f32add,0);}else{i386_emit_ir(c,I32IROp.fadd,0);}}else if(@strEq(x.op,"-")){if(base==1){i386_emit_ir(c,I32IROp.f32sub,0);}else{i386_emit_ir(c,I32IROp.fsub,0);}}else if(@strEq(x.op,"*")){if(base==1){i386_emit_ir(c,I32IROp.f32mul,0);}else{i386_emit_ir(c,I32IROp.fmul,0);}}else if(@strEq(x.op,"/")){if(base==1){i386_emit_ir(c,I32IROp.f32div,0);}else{i386_emit_ir(c,I32IROp.fdiv,0);}}else if(@strEq(x.op,"==")){if(base==1){i386_emit_ir(c,I32IROp.f32eq,0);}else{i386_emit_ir(c,I32IROp.feq,0);}}else if(@strEq(x.op,"!=")){if(base==1){i386_emit_ir(c,I32IROp.f32ne,0);}else{i386_emit_ir(c,I32IROp.fne,0);}}else if(@strEq(x.op,"<")){if(base==1){i386_emit_ir(c,I32IROp.f32lt,0);}else{i386_emit_ir(c,I32IROp.flt,0);}}else if(@strEq(x.op,"<=")){if(base==1){i386_emit_ir(c,I32IROp.f32le,0);}else{i386_emit_ir(c,I32IROp.fle,0);}}else if(@strEq(x.op,">")){if(base==1){i386_emit_ir(c,I32IROp.f32gt,0);}else{i386_emit_ir(c,I32IROp.fgt,0);}}else{if(base==1){i386_emit_ir(c,I32IROp.f32ge,0);}else{i386_emit_ir(c,I32IROp.fge,0);}}return;}
+                let lt:[]u8=i386_expr_ty(c,x.l);let rt:[]u8=i386_expr_ty(c,x.r);
+                let shift:i32=(@strEq(x.op,"<<")||@strEq(x.op,">>")) as i32;
+                if(shift==1){
+                    rt=i386_uncontextual_ty(c,x.r);if(i386_int_literal(x.r)==1){rt="i32";}
+                    if(i386_wide_integer_ty(lt)==0){i386_fail(c,"i686 shift lowering currently requires an i64 or u64 left operand");return;}
+                    if(i386_integer_ty(rt)==0||i386_wide_integer_ty(rt)==1){i386_fail(c,"i64/u64 shift count must be a supported 32-bit integer");return;}
+                    i386_expr_expected(c,x.l,lt);i386_expr_expected(c,x.r,rt);
+                    if(@strEq(x.op,"<<")){i386_emit_ir(c,I32IROp.wide_shl,0);}
+                    else if(i386_unsigned_ty(lt)==1){i386_emit_ir(c,I32IROp.wide_shr,0);}
+                    else{i386_emit_ir(c,I32IROp.wide_sar,0);}
+                    return;
+                }
+                if(i386_int_literal(x.l)==1&&i386_integer_ty(rt)==1){lt=rt;}
+                if(i386_int_literal(x.r)==1&&i386_integer_ty(lt)==1){rt=lt;}
+                if(i386_negative_int_literal(x.l)==1&&i386_signed_integer_ty(rt)==1){lt=rt;}
+                if(i386_negative_int_literal(x.r)==1&&i386_signed_integer_ty(lt)==1){rt=lt;}
+                if(i386_null_literal(x.l)==1&&i386_pointer_ty(rt)==1){lt=rt;}
+                if(i386_null_literal(x.r)==1&&i386_pointer_ty(lt)==1){rt=lt;}
+                let ft:i32=i386_float_ty(lt);let rft:i32=i386_float_ty(rt);
+                if(ft!=rft){let rlit:i32=i386_number_literal(x.r);if(ft==2&&rlit==1){rt="f32";rft=2;}else{i386_fail(c,_zag_str_concat("mixed-width arithmetic requires an explicit cast: ",_zag_str_concat(x.op,_zag_str_concat(" left=",_zag_str_concat(lt,_zag_str_concat(" right=",rt))))));return;}}
+                if(i386_pointer_ty(lt)==1||i386_pointer_ty(rt)==1){
+                    if((@strEq(x.op,"==")||@strEq(x.op,"!="))&&@strEq(lt,rt)){i386_expr_expected(c,x.l,lt);i386_expr_expected(c,x.r,rt);if(@strEq(x.op,"==")){i386_emit_ir(c,I32IROp.eq,0);}else{i386_emit_ir(c,I32IROp.ne,0);}return;}
+                    i386_fail(c,"general pointer arithmetic is unsupported; use a bounded slice or explicit pointer indexing");
+                    return;
+                }
+                let bool_cmp:i32=(@strEq(lt,"bool")&&@strEq(rt,"bool")&&(@strEq(x.op,"==")||@strEq(x.op,"!="))) as i32;
+                if(ft==0&&rft==0&&bool_cmp==0&&(!@strEq(lt,rt)||i386_integer_ty(lt)==0)){
+                    if((@strEq(lt,"i32")&&@strEq(rt,"usize"))||(@strEq(lt,"usize")&&@strEq(rt,"i32"))){i386_fail(c,_zag_str_concat("mixed i32/usize arithmetic requires an explicit cast: ",_zag_str_concat("left=",_zag_str_concat(lt,_zag_str_concat(" right=",rt)))));}
+                    else{i386_fail(c,_zag_str_concat("mixed integer arithmetic requires an explicit cast: ",_zag_str_concat("left=",_zag_str_concat(lt,_zag_str_concat(" right=",rt)))));}
+                    return;
+                }
+                let bitwise:i32=(@strEq(x.op,"&")||@strEq(x.op,"|")||@strEq(x.op,"^")) as i32;
+                if(bitwise==1&&i386_wide_integer_ty(lt)==0){i386_fail(c,"bitwise lowering in the i686 subset currently requires i64 or u64 operands");return;}
+                i386_expr_expected(c,x.l,lt); i386_expr_expected(c,x.r,rt);
+                if(ft>0){if(@strEq(x.op,"%")){i386_fail(c,"floating-point remainder is not implemented");return;}let base:i32=0;if(ft==2){base=1;}if(@strEq(x.op,"+")){if(base==1){i386_emit_ir(c,I32IROp.f32add,0);}else{i386_emit_ir(c,I32IROp.fadd,0);}}else if(@strEq(x.op,"-")){if(base==1){i386_emit_ir(c,I32IROp.f32sub,0);}else{i386_emit_ir(c,I32IROp.fsub,0);}}else if(@strEq(x.op,"*")){if(base==1){i386_emit_ir(c,I32IROp.f32mul,0);}else{i386_emit_ir(c,I32IROp.fmul,0);}}else if(@strEq(x.op,"/")){if(base==1){i386_emit_ir(c,I32IROp.f32div,0);}else{i386_emit_ir(c,I32IROp.fdiv,0);}}else if(@strEq(x.op,"==")){if(base==1){i386_emit_ir(c,I32IROp.f32eq,0);}else{i386_emit_ir(c,I32IROp.feq,0);}}else if(@strEq(x.op,"!=")){if(base==1){i386_emit_ir(c,I32IROp.f32ne,0);}else{i386_emit_ir(c,I32IROp.fne,0);}}else if(@strEq(x.op,"<")){if(base==1){i386_emit_ir(c,I32IROp.f32lt,0);}else{i386_emit_ir(c,I32IROp.flt,0);}}else if(@strEq(x.op,"<=")){if(base==1){i386_emit_ir(c,I32IROp.f32le,0);}else{i386_emit_ir(c,I32IROp.fle,0);}}else if(@strEq(x.op,">")){if(base==1){i386_emit_ir(c,I32IROp.f32gt,0);}else{i386_emit_ir(c,I32IROp.fgt,0);}}else{if(base==1){i386_emit_ir(c,I32IROp.f32ge,0);}else{i386_emit_ir(c,I32IROp.fge,0);}}return;}
+                let unsigned:i32=i386_unsigned_ty(lt);
+                if(i386_wide_integer_ty(lt)==1){
+                    if(@strEq(x.op,"+")){i386_emit_ir(c,I32IROp.wide_add,0);}
+                    else if(@strEq(x.op,"-")){i386_emit_ir(c,I32IROp.wide_sub,0);}
+                    else if(@strEq(x.op,"*")){i386_emit_ir(c,I32IROp.wide_mul,0);}
+                    else if(@strEq(x.op,"/")){if(unsigned==1){i386_emit_ir(c,I32IROp.wide_udiv,0);}else{i386_emit_ir(c,I32IROp.wide_div,0);}}
+                    else if(@strEq(x.op,"%")){if(unsigned==1){i386_emit_ir(c,I32IROp.wide_umod,0);}else{i386_emit_ir(c,I32IROp.wide_mod,0);}}
+                    else if(@strEq(x.op,"&")){i386_emit_ir(c,I32IROp.wide_and,0);}
+                    else if(@strEq(x.op,"|")){i386_emit_ir(c,I32IROp.wide_or,0);}
+                    else if(@strEq(x.op,"^")){i386_emit_ir(c,I32IROp.wide_xor,0);}
+                    else if(@strEq(x.op,"==")){i386_emit_ir(c,I32IROp.wide_eq,0);}
+                    else if(@strEq(x.op,"!=")){i386_emit_ir(c,I32IROp.wide_ne,0);}
+                    else if(@strEq(x.op,"<")){if(unsigned==1){i386_emit_ir(c,I32IROp.wide_ult,0);}else{i386_emit_ir(c,I32IROp.wide_lt,0);}}
+                    else if(@strEq(x.op,"<=")){if(unsigned==1){i386_emit_ir(c,I32IROp.wide_ule,0);}else{i386_emit_ir(c,I32IROp.wide_le,0);}}
+                    else if(@strEq(x.op,">")){if(unsigned==1){i386_emit_ir(c,I32IROp.wide_ugt,0);}else{i386_emit_ir(c,I32IROp.wide_gt,0);}}
+                    else{if(unsigned==1){i386_emit_ir(c,I32IROp.wide_uge,0);}else{i386_emit_ir(c,I32IROp.wide_ge,0);}}
+                    return;
+                }
                 if(@strEq(x.op,"+")) { i386_emit_ir(c,I32IROp.add,0); }
                 else if(@strEq(x.op,"-")) { i386_emit_ir(c,I32IROp.sub,0); }
-                else if(@strEq(x.op,"*")||@strEq(x.op,"/")){i386_fail(c,"integer multiply/divide remain outside the i686 subset");}
+                else if(@strEq(x.op,"*")) { i386_emit_ir(c,I32IROp.mul,0); }
+                else if(@strEq(x.op,"/")) { if(unsigned==1){i386_emit_ir(c,I32IROp.udiv_,0);}else{i386_emit_ir(c,I32IROp.div_,0);} }
+                else if(@strEq(x.op,"%")) { if(unsigned==1){i386_emit_ir(c,I32IROp.umod_,0);}else{i386_emit_ir(c,I32IROp.mod_,0);} }
                 else if(@strEq(x.op,"==")) { i386_emit_ir(c,I32IROp.eq,0); }
                 else if(@strEq(x.op,"!=")) { i386_emit_ir(c,I32IROp.ne,0); }
-                else if(@strEq(x.op,"<")) { i386_emit_ir(c,I32IROp.lt,0); }
-                else if(@strEq(x.op,"<=")) { i386_emit_ir(c,I32IROp.le,0); }
-                else if(@strEq(x.op,">")) { i386_emit_ir(c,I32IROp.gt,0); }
-                else { i386_emit_ir(c,I32IROp.ge,0); }
+                else if(@strEq(x.op,"<")) { if(unsigned==1){i386_emit_ir(c,I32IROp.ult,0);}else{i386_emit_ir(c,I32IROp.lt,0);} }
+                else if(@strEq(x.op,"<=")) { if(unsigned==1){i386_emit_ir(c,I32IROp.ule,0);}else{i386_emit_ir(c,I32IROp.le,0);} }
+                else if(@strEq(x.op,">")) { if(unsigned==1){i386_emit_ir(c,I32IROp.ugt,0);}else{i386_emit_ir(c,I32IROp.gt,0);} }
+                else { if(unsigned==1){i386_emit_ir(c,I32IROp.uge,0);}else{i386_emit_ir(c,I32IROp.ge,0);} }
+                if(!@strEq(x.op,"==")&&!@strEq(x.op,"!=")&&!@strEq(x.op,"<")&&!@strEq(x.op,"<=")&&!@strEq(x.op,">")&&!@strEq(x.op,">=")){i386_emit_normalize(c,lt);}
             }
         }
         .un => |x| {
-            if(@strEq(x.op,"-")) { if(i386_float_ty(i386_expr_ty(c,x.e))==1){i386_fail(c,"unary f64 negation is not implemented");}else{i386_emit_ir(c,I32IROp.const_,0);i386_expr(c,x.e);i386_emit_ir(c,I32IROp.sub,0);} }
+            if(@strEq(x.op,"-")) {
+                if(i386_unsigned_ty(c.*.expected_ty)==1||@strEq(c.*.expected_ty,"bool")||i386_unsigned_ty(i386_expr_ty(c,x.e))==1){i386_fail(c,"negative values do not implicitly convert to usize or another unsigned scalar on i686");return;}
+                if(i386_float_ty(i386_expr_ty(c,x.e))==1){i386_fail(c,"unary f64 negation is not implemented");return;}
+                let unary_ty:[]u8=i386_expr_ty(c,x.e);
+                if(i386_wide_integer_ty(unary_ty)==1){
+                    switch(x.e.*){
+                        .ilit=>|lit|{
+                            let wide:I386WideLiteral=i386_parse_wide_literal(lit.text);
+                            if(wide.valid==0||wide.hi>2147483648||(wide.hi==2147483648&&wide.lo!=0)){i386_fail(c,"negative integer literal exceeds the signed 64-bit i686 target range");return;}
+                            let nlo:i64=0;let nhi:i64=0;
+                            if(wide.lo==0){nhi=4294967296-wide.hi;}
+                            else{nlo=4294967296-wide.lo;nhi=4294967295-wide.hi;}
+                            i386_emit_wide_words(c,nhi,nlo);
+                        }
+                        else=>{i386_expr_expected(c,x.e,unary_ty);i386_emit_ir(c,I32IROp.wide_neg,0);}
+                    }
+                    return;
+                }
+                let direct:i32=0;switch(x.e.*){.ilit=>|lit|{let value:i64=_zag_str_to_i64(lit.text);let limit:i64=2147483648;if(@strEq(c.*.expected_ty,"i8")){limit=128;}else if(@strEq(c.*.expected_ty,"i16")){limit=32768;}if(value>limit){i386_fail(c,"negative integer literal exceeds its signed i686 target range");return;}if(value==2147483648){i386_emit_ir(c,I32IROp.const_,-2147483648);direct=1;}}else=>{}}
+                if(direct==0){i386_emit_ir(c,I32IROp.const_,0);i386_expr_expected(c,x.e,"i32");i386_emit_ir(c,I32IROp.sub,0);}
+                i386_emit_normalize(c,c.*.expected_ty);
+            }
             else if(@strEq(x.op,"&")) { let slot:i32=-1000000;switch(x.e.*){.id=>|id|{slot=i386_local(c,id.name);}else=>{}}if(slot<0){i386_fail(c,"address-of requires a stack local");}else{i386_emit_ir(c,I32IROp.addr,slot);} }
-            else if(@strEq(x.op,"try")) { if(c.*.current_error_fn==0){i386_fail(c,"try requires an !i32 function");}else{i386_expr(c,x.e);i386_emit_ir(c,I32IROp.try_,0);} }
+            else if(@strEq(x.op,"try")) {
+                let union_ty:[]u8=i386_expr_ty(c,x.e);
+                if(c.*.current_error_fn==0){i386_fail(c,"try requires an !i32 function");}
+                else if(i386_error_payload_ty(union_ty).len==0){i386_fail(c,"try operand must be !i32");}
+                else{i386_expr_expected(c,x.e,union_ty);i386_emit_ir(c,I32IROp.try_,0);}
+            }
             else { i386_fail(c,"unsupported unary expression"); }
         }
         .fld => |x| {
             let is_error:i32=0;switch(x.base.*){.id=>|id|{if(@strEq(id.name,"error")){is_error=1;}}else=>{}}
             if(is_error==1){i386_emit_ir(c,I32IROp.const_,i386_error_code(x.fname));}
             else if(@strEq(x.fname,"*")){i386_expr(c,x.base);i386_emit_ir(c,I32IROp.deref,0);}
-            else { let li:i32=-1;switch(x.base.*){.id=>|id|{li=i386_local_index(c,id.name);}else=>{}}if(li<0){i386_fail(c,"field base must be a local struct or byte slice");return;}if(i386_slice_ty(c.*.locals.data[li].ty)==1){if(@strEq(x.fname,"len")){i386_emit_ir(c,I32IROp.load,c.*.locals.data[li].slot-1);}else{i386_fail(c,"byte slices expose only .len in the i686 subset");}return;}let fi:i32=i386_field(c,c.*.locals.data[li].ty,x.fname);if(fi<0){i386_fail(c,"unknown or unsupported struct field");}else{i386_emit_ir(c,I32IROp.load,i386_field_slot(c.*.locals.data[li],fi) as i64);} }
+            else { let base_ref:I386ValueRef=i386_value_ref(c,x.base);if(base_ref.valid==1&&i386_slice_ty(base_ref.ty)==1){if(@strEq(x.fname,"len")){i386_emit_ir(c,I32IROp.load,c.*.locals.data[base_ref.local].slot-base_ref.word_offset-1);}else{i386_fail(c,"slices expose only .len in the i686 subset");}return;}let ref:I386ValueRef=i386_value_ref(c,n);if(ref.valid==0){i386_fail(c,"field base must be a local sequential struct or slice");return;}if(i386_struct(c,ref.ty)>=0){i386_fail(c,"aggregate value requires a matching struct destination, field access, argument, or return");return;}i386_emit_value_load(c,ref.ty,c.*.locals.data[ref.local].slot-ref.word_offset); }
+        }
+        .idx => |x| {
+            let bt:[]u8=i386_expr_ty(c,x.base);let it:[]u8=i386_expr_ty(c,x.idx);
+            if(i386_int_literal(x.idx)==1){it="usize";}
+            if(i386_negative_int_literal(x.idx)==1){it="i32";}
+            if(!@strEq(it,"i32")&&!@strEq(it,"usize")){i386_fail(c,"index must be i32 or usize in the i686 subset");return;}
+            if(i386_pointer_ty(bt)==1){
+                if(!@strEq(it,"usize")){i386_fail(c,"raw pointer index must be usize on i686");return;}
+                let elem:[]u8=i386_pointer_elem(bt);let stride:i32=i386_elem_size(elem);
+                i386_expr_expected(c,x.base,bt);i386_expr_expected(c,x.idx,"usize");i386_emit_ir(c,I32IROp.ptr_index,stride);return;
+            }
+            if(i386_slice_ty(bt)==1){
+                let elem:[]u8=i386_slice_elem(bt);let stride:i32=i386_elem_size(elem);
+                i386_expr_expected(c,x.base,bt);i386_expr_expected(c,x.idx,it);i386_emit_ir(c,I32IROp.slice_index,stride);return;
+            }
+            i386_fail(c,"indexing requires a supported 32-bit pointer or slice");
+        }
+        .slice_ => |_x| { i386_fail(c,"subslice construction is not implemented in the i686 subset"); }
+        .cast_ => |x| {
+            if(i386_integer_ty(x.target)==0&&!@strEq(x.target,"bool")&&i386_pointer_ty(x.target)==0){i386_fail(c,"casts support only i32, usize, i64, u64, implemented narrow integers, bool, and supported 32-bit pointers in the i686 subset");return;}
+            let old:[]u8=c.*.expected_ty;c.*.expected_ty="";let source:[]u8=i386_expr_ty(c,x.expr);c.*.expected_ty=old;
+            if(i386_int_literal(x.expr)==1&&@strEq(x.target,"usize")){source="usize";}
+            if(i386_int_literal(x.expr)==1&&i386_wide_integer_ty(x.target)==1){source=x.target;}
+            if((i386_pointer_ty(source)==1&&i386_integer_ty(x.target)==1)||(i386_integer_ty(source)==1&&i386_pointer_ty(x.target)==1)){i386_fail(c,"pointer/integer casts are unsupported in the i686 subset");return;}
+            if(i386_cast_allowed(source,x.target)==0){i386_fail(c,_zag_str_concat("unsupported i686 cast from ",_zag_str_concat(source,_zag_str_concat(" to ",x.target))));return;}
+            i386_expr_expected(c,x.expr,source);
+            if(i386_wide_integer_ty(source)==1&&i386_wide_integer_ty(x.target)==0){
+                if(@strEq(x.target,"bool")){i386_emit_ir(c,I32IROp.wide_bool,0);}
+                else{i386_emit_ir(c,I32IROp.truncate_wide,0);i386_emit_normalize(c,x.target);}
+            }else if(i386_wide_integer_ty(source)==0&&i386_wide_integer_ty(x.target)==1){
+                i386_emit_normalize(c,source);
+                if(i386_signed_integer_ty(source)==1){i386_emit_ir(c,I32IROp.widen_signed,0);}else{i386_emit_ir(c,I32IROp.widen_unsigned,0);}
+            }else{i386_emit_normalize(c,x.target);}
         }
         .call => |x| {
             let name:[]u8="";switch(x.callee.*){.id=>|id|{name=id.name;}else=>{}}
             if(@strEq(name,"__catch")){
                 if(x.args.len!=2){i386_fail(c,"catch requires an error union and fallback");return;}
-                let err:i32=i386_new_label(c);let done:i32=i386_new_label(c);i386_expr(c,x.args.data[0]);i386_emit_ir(c,I32IROp.err_jnz,err);i386_emit_ir(c,I32IROp.jmp,done);i386_emit_ir(c,I32IROp.label,err);i386_expr(c,x.args.data[1]);i386_emit_ir(c,I32IROp.label,done);return;
+                let union_ty:[]u8=i386_expr_ty(c,x.args.data[0]);let payload_ty:[]u8=i386_error_payload_ty(union_ty);
+                if(payload_ty.len==0){i386_fail(c,"catch operand must be !i32");return;}
+                let fallback_ty:[]u8=i386_effective_ty(c,x.args.data[1],payload_ty);
+                if(i386_value_types_match(payload_ty,fallback_ty)==0){i386_fail(c,"catch fallback must match the !i32 payload");return;}
+                let err:i32=i386_new_label(c);let done:i32=i386_new_label(c);i386_expr_expected(c,x.args.data[0],union_ty);i386_emit_ir(c,I32IROp.err_jnz,err);i386_emit_ir(c,I32IROp.jmp,done);i386_emit_ir(c,I32IROp.label,err);i386_expr_expected(c,x.args.data[1],payload_ty);i386_emit_ir(c,I32IROp.label,done);return;
             }
             if(@strEq(name,"__catchc")){i386_fail(c,"catch capture is outside the current i686 error subset");return;}
             if(@strEq(name,"_zag_write")){
@@ -111,39 +496,71 @@ fn i386_expr(c: *I386Lower, n: *Node) void {
             let fi:i32=i386_fn(c,name);
             if(fi<0){i386_fail(c,"call target must be a known non-generic i32 function");return;}
             if(x.args.len!=c.*.funcs.data[fi].params){i386_fail(c,"call argument count does not match function signature");return;}
-            let ai:i32=x.args.len-1;while(ai>=0){let pty:[]u8=c.*.funcs.data[fi].param_types.data[ai];let si:i32=i386_struct(c,pty);if(si>=0){let li:i32=-1;switch(x.args.data[ai].*){.id=>|id|{li=i386_local_index(c,id.name);}else=>{}}if(li<0||!@strEq(c.*.locals.data[li].ty,pty)){i386_fail(c,"by-value struct argument must be a matching local");return;}let fw:i32=c.*.structs.data[si].fields.len-1;while(fw>=0){i386_emit_ir(c,I32IROp.load,i386_field_slot(c.*.locals.data[li],fw));fw=fw-1;}}else{let old:[]u8=c.*.expected_ty;c.*.expected_ty=pty;i386_expr(c,x.args.data[ai]);c.*.expected_ty=old;}ai=ai-1;}
-            if(i386_struct(c,c.*.funcs.data[fi].ret_ty)>=0){if(c.*.sret_target<0){i386_fail(c,"aggregate return requires a typed struct destination");return;}i386_emit_ir(c,I32IROp.addr,c.*.sret_target);i386_emit_ir(c,I32IROp.call_sret,((c.*.funcs.data[fi].label as i64)*65536)+(c.*.funcs.data[fi].param_words as i64));return;}
+            let ai:i32=x.args.len-1;while(ai>=0){
+                let pty:[]u8=c.*.funcs.data[fi].param_types.data[ai];let si:i32=i386_struct(c,pty);
+                if(si>=0){let source:I386ValueRef=i386_value_ref(c,x.args.data[ai]);if(source.valid==0||!@strEq(source.ty,pty)){i386_fail(c,"by-value struct argument must be a matching local or sequential field");return;}i386_emit_struct_argument(c,c.*.locals.data[source.local].slot-source.word_offset,si,0);}
+                else{let aty:[]u8=i386_effective_ty(c,x.args.data[ai],pty);if(i386_value_types_match(pty,aty)==0){i386_fail(c,_zag_str_concat("call argument requires an explicit cast from ",_zag_str_concat(aty,_zag_str_concat(" to ",pty))));return;}i386_expr_expected(c,x.args.data[ai],pty);i386_emit_normalize(c,pty);}
+                ai=ai-1;
+            }
+            let ret_si:i32=i386_struct(c,c.*.funcs.data[fi].ret_ty);
+            if(ret_si>=0){if(c.*.sret_target<0){i386_fail(c,"aggregate return requires a typed struct destination");return;}i386_emit_ir(c,I32IROp.addr,c.*.sret_target);i386_emit_ir(c,I32IROp.call_sret,((c.*.funcs.data[fi].label as i64)*65536)+(c.*.funcs.data[fi].param_words as i64));i386_emit_struct_copy(c,c.*.sret_target,c.*.sret_target,ret_si,0);return;}
             // label in high bits, argument count in low 16 bits.
-            let cop:I32IROp=I32IROp.call;if(c.*.funcs.data[fi].returns_error==1){cop=I32IROp.call_err;}else if(i386_slice_ty(c.*.funcs.data[fi].ret_ty)==1){cop=I32IROp.call_pair;}else if(i386_float_ty(c.*.funcs.data[fi].ret_ty)==1){cop=I32IROp.fcall;}else if(i386_float_ty(c.*.funcs.data[fi].ret_ty)==2){cop=I32IROp.f32call;}
+            let cop:I32IROp=I32IROp.call;if(c.*.funcs.data[fi].returns_error==1){cop=I32IROp.call_err;}else if(i386_slice_ty(c.*.funcs.data[fi].ret_ty)==1||i386_wide_integer_ty(c.*.funcs.data[fi].ret_ty)==1){cop=I32IROp.call_pair;}else if(i386_float_ty(c.*.funcs.data[fi].ret_ty)==1){cop=I32IROp.fcall;}else if(i386_float_ty(c.*.funcs.data[fi].ret_ty)==2){cop=I32IROp.f32call;}
             i386_emit_ir(c,cop,((c.*.funcs.data[fi].label as i64)*65536)+(c.*.funcs.data[fi].param_words as i64));
+            i386_emit_normalize(c,c.*.funcs.data[fi].ret_ty);
         }
         else => { i386_fail(c,"expression is outside the i32 backend"); }
+    }
+}
+fn i386_store_struct_expr(c:*I386Lower,n:*Node,ty:[]u8,base:i32)void{
+    let si:i32=i386_struct(c,ty);
+    if(si<0||i386_struct_words(c,si)<1){i386_fail(c,"struct local requires a checked non-recursive matching struct literal, local, or aggregate-return call");return;}
+    let source:I386ValueRef=i386_value_ref(c,n);
+    if(source.valid==1){
+        if(!@strEq(source.ty,ty)){i386_fail(c,"struct local requires a matching struct literal or aggregate-return call");return;}
+        i386_emit_struct_copy(c,base,c.*.locals.data[source.local].slot-source.word_offset,si,0);
+        return;
+    }
+    switch(n.*){
+        .slit_=>|lit|{
+            if(!@strEq(lit.sname,ty)){i386_fail(c,"struct local requires a matching struct literal or aggregate-return call");return;}
+            let field:i32=0;
+            while(field<c.*.structs.data[si].fields.len){
+                if(i386_struct_field_supported(c,c.*.structs.data[si].fields.data[field].pty)==0){i386_fail(c,"struct fields must be supported sequential scalars or acyclic structs");return;}
+                let found:i32=-1;let k:i32=0;while(k<lit.fields.len){if(@strEq(lit.fields.data[k].name,c.*.structs.data[si].fields.data[field].name)){found=k;}k=k+1;}
+                if(found<0){i386_fail(c,"struct literal is missing a field");return;}
+                let fty:[]u8=c.*.structs.data[si].fields.data[field].pty;let off:i32=i386_struct_field_word_offset(c,si,field);
+                if(i386_struct(c,fty)>=0){i386_store_struct_expr(c,lit.fields.data[found].val,fty,base-off);}
+                else{let aty:[]u8=i386_effective_ty(c,lit.fields.data[found].val,fty);if(i386_value_types_match(fty,aty)==0){i386_fail(c,"struct field initializer requires an explicit cast");return;}i386_expr_expected(c,lit.fields.data[found].val,fty);i386_emit_value_store(c,fty,base-off);}
+                field=field+1;
+            }
+        }
+        .call=>|_call|{
+            if(!@strEq(i386_expr_ty(c,n),ty)){i386_fail(c,"struct local requires a matching struct literal or aggregate-return call");return;}
+            let old_target:i32=c.*.sret_target;c.*.sret_target=base;i386_expr(c,n);c.*.sret_target=old_target;
+        }
+        else=>{i386_fail(c,"struct local requires a matching struct literal or aggregate-return call");}
     }
 }
 fn i386_stmt(c: *I386Lower, n: *Node) void {
     switch(n.*) {
         .let_ => |x| {
             if(x.has_init==0) { i386_fail(c,"uninitialized locals are rejected"); return; }
-            if(x.has_dty==1 && i386_word_ty(x.dty)==0 && i386_float_ty(x.dty)==0 && i386_slice_ty(x.dty)==0 && i386_struct(c,x.dty)<0) { i386_fail(c,"local type is not a supported i386 scalar, byte slice, or struct"); return; }
+            if(x.has_dty==1 && i386_word_ty(x.dty)==0 && i386_wide_integer_ty(x.dty)==0 && i386_float_ty(x.dty)==0 && i386_slice_ty(x.dty)==0 && i386_struct(c,x.dty)<0) { i386_fail(c,"local type is not a supported i386 scalar, byte slice, or struct"); return; }
             if(i386_local(c,x.name)!=-1000000) { i386_fail(c,"duplicate local name"); return; }
             if(x.has_dty==1 && i386_struct(c,x.dty)>=0) {
-                let lit_ok:i32=0;let lit:StructLit=StructLit{.sname="",.fields=make[FieldInit](1),.targs=make[[]u8](1)};
-                switch(x.expr.*){.slit_=>|s|{lit=s;lit_ok=1;}else=>{}}
-                let si:i32=i386_struct(c,x.dty);let base:i32=c.*.next_slot+c.*.structs.data[si].fields.len-1;let field:i32=0;
-                c.*.next_slot=c.*.next_slot+c.*.structs.data[si].fields.len;push[I386Local](&c.*.locals,I386Local{.name=x.name,.slot=base,.ty=x.dty});
-                if(lit_ok==0){let old_target:i32=c.*.sret_target;c.*.sret_target=base;i386_expr(c,x.expr);c.*.sret_target=old_target;return;}
-                if(!@strEq(lit.sname,x.dty)){i386_fail(c,"struct local requires a matching struct literal or aggregate-return call");return;}
+                let si:i32=i386_struct(c,x.dty);let words:i32=i386_struct_words(c,si);if(words<1){i386_fail(c,"struct fields must be supported 32-bit scalars or f32/f64 in an acyclic sequential layout");return;}if(c.*.next_slot>I386_MAX_FRAME_WORDS()-words){i386_fail(c,"i386 local spill frame exceeds the bounded 1 MiB limit");return;}let base:i32=c.*.next_slot+words-1;let field:i32=0;
+                c.*.next_slot=c.*.next_slot+words;push[I386Local](&c.*.locals,I386Local{.name=x.name,.slot=base,.ty=x.dty});
                 while(field<c.*.structs.data[si].fields.len){
-                    if(i386_word_ty(c.*.structs.data[si].fields.data[field].pty)==0){i386_fail(c,"struct fields must be supported 32-bit scalars");return;}
-                    let found:i32=-1;let k:i32=0;while(k<lit.fields.len){if(@strEq(lit.fields.data[k].name,c.*.structs.data[si].fields.data[field].name)){found=k;}k=k+1;}
-                    if(found<0){i386_fail(c,"struct literal is missing a field");return;}i386_expr(c,lit.fields.data[found].val);i386_emit_ir(c,I32IROp.store,base-field);field=field+1;
+                    if(i386_struct_field_supported(c,c.*.structs.data[si].fields.data[field].pty)==0){i386_fail(c,"struct fields must be supported sequential scalars or acyclic structs");return;}field=field+1;
                 }
+                i386_store_struct_expr(c,x.expr,x.dty,base);
                 return;
             }
-            let old_expected:[]u8=c.*.expected_ty;if(x.has_dty==1){c.*.expected_ty=x.dty;}i386_expr(c,x.expr);c.*.expected_ty=old_expected;
-            let slot:i32=c.*.next_slot;let ty:[]u8="i32";if(x.has_dty==1){ty=x.dty;}c.*.next_slot=slot+i386_ty_words(ty);
+            let ty:[]u8=i386_uncontextual_ty(c,x.expr);if(x.has_dty==1){ty=x.dty;}let actual:[]u8=i386_effective_ty(c,x.expr,ty);if(i386_value_types_match(ty,actual)==0){i386_fail(c,_zag_str_concat("local initializer requires an explicit cast from ",_zag_str_concat(actual,_zag_str_concat(" to ",ty))));return;}i386_expr_expected(c,x.expr,ty);
+            let slot:i32=c.*.next_slot;c.*.next_slot=slot+i386_ty_words(ty);
             push[I386Local](&c.*.locals,I386Local{.name=x.name,.slot=slot,.ty=ty});
-            if(i386_slice_ty(ty)==1){c.*.locals.data[c.*.locals.len-1].slot=slot+1;i386_emit_ir(c,I32IROp.pair_store,slot+1);}else if(i386_float_ty(ty)==1){i386_emit_ir(c,I32IROp.f64_store,slot as i64);}else if(i386_float_ty(ty)==2){i386_emit_ir(c,I32IROp.f32_store,slot);}else{i386_emit_ir(c,I32IROp.store,slot as i64);}
+            if(i386_slice_ty(ty)==1){c.*.locals.data[c.*.locals.len-1].slot=slot+1;i386_emit_ir(c,I32IROp.pair_store,slot+1);}else if(i386_wide_integer_ty(ty)==1){i386_emit_ir(c,I32IROp.wide_store,slot);}else if(i386_float_ty(ty)==1){i386_emit_ir(c,I32IROp.f64_store,slot as i64);}else if(i386_float_ty(ty)==2){i386_emit_ir(c,I32IROp.f32_store,slot);}else{i386_emit_normalize(c,ty);i386_emit_ir(c,I32IROp.store,slot as i64);}
         }
         .assign => |x| {
             let slot:i32=-1000000;
@@ -151,23 +568,30 @@ fn i386_stmt(c: *I386Lower, n: *Node) void {
             switch(x.target.*) {
                 .id => |id| { slot=i386_local(c,id.name);let li:i32=i386_local_index(c,id.name);if(li>=0){target_ty=c.*.locals.data[li].ty;} }
                 .fld => |f| {
-                    if(@strEq(f.fname,"*")){i386_expr(c,f.base);i386_expr(c,x.expr);i386_emit_ir(c,I32IROp.store_ind,0);return;}
-                    let li:i32=-1;switch(f.base.*){.id=>|id|{li=i386_local_index(c,id.name);}else=>{}}
-                    if(li>=0){let fi:i32=i386_field(c,c.*.locals.data[li].ty,f.fname);if(fi>=0){i386_expr(c,x.expr);i386_emit_ir(c,I32IROp.store,i386_field_slot(c.*.locals.data[li],fi));return;}}
+                    if(@strEq(f.fname,"*")){let pty:[]u8=i386_expr_ty(c,f.base);let elem:[]u8=i386_pointer_elem(pty);let aty:[]u8=i386_effective_ty(c,x.expr,elem);if(elem.len==0||i386_value_types_match(elem,aty)==0){i386_fail(c,"pointer store requires an explicitly matching 32-bit value");return;}i386_expr_expected(c,f.base,pty);i386_expr_expected(c,x.expr,elem);i386_emit_ir(c,I32IROp.store_ind,0);return;}
+                    let ref:I386ValueRef=i386_value_ref(c,x.target);if(ref.valid==1){if(c.*.locals.data[ref.local].slot<0){i386_fail(c,"aggregate mutation through a by-value parameter is unsupported");return;}let dest:i32=c.*.locals.data[ref.local].slot-ref.word_offset;if(i386_struct(c,ref.ty)>=0){i386_store_struct_expr(c,x.expr,ref.ty,dest);return;}let aty:[]u8=i386_effective_ty(c,x.expr,ref.ty);if(i386_value_types_match(ref.ty,aty)==0){i386_fail(c,"struct field assignment requires an explicit cast");return;}i386_expr_expected(c,x.expr,ref.ty);i386_emit_value_store(c,ref.ty,dest);return;}
+                }
+                .idx => |ix| {
+                    let bt:[]u8=i386_expr_ty(c,ix.base);if(i386_pointer_ty(bt)==0){i386_fail(c,"slice mutation is not implemented in the i686 subset");return;}
+                    let elem:[]u8=i386_pointer_elem(bt);if(!@strEq(elem,"i32")&&!@strEq(elem,"usize")){i386_fail(c,"pointer index stores support only i32 and usize elements");return;}
+                    let it:[]u8=i386_expr_ty(c,ix.idx);if(i386_int_literal(ix.idx)==1){it="usize";}if(!@strEq(it,"usize")){i386_fail(c,"raw pointer index must be usize on i686");return;}
+                    let aty:[]u8=i386_effective_ty(c,x.expr,elem);if(i386_value_types_match(elem,aty)==0){i386_fail(c,"pointer index store requires an explicit value cast");return;}
+                    i386_expr_expected(c,ix.base,bt);i386_expr_expected(c,ix.idx,"usize");i386_expr_expected(c,x.expr,elem);i386_emit_ir(c,I32IROp.ptr_store_index,i386_elem_size(elem));return;
                 }
                 else => { }
             }
             if(slot==-1000000) { i386_fail(c,"assignment target must be a local or pointer dereference"); return; }
-            let old_expected:[]u8=c.*.expected_ty;c.*.expected_ty=target_ty;i386_expr(c,x.expr);c.*.expected_ty=old_expected;if(i386_float_ty(target_ty)==1){i386_emit_ir(c,I32IROp.f64_store,slot);}else if(i386_float_ty(target_ty)==2){i386_emit_ir(c,I32IROp.f32_store,slot);}else{i386_emit_ir(c,I32IROp.store,slot as i64);}
+            let target_si:i32=i386_struct(c,target_ty);if(target_si>=0){if(slot<0){i386_fail(c,"aggregate mutation through a by-value parameter is unsupported");return;}i386_store_struct_expr(c,x.expr,target_ty,slot);return;}
+            let aty:[]u8=i386_effective_ty(c,x.expr,target_ty);if(i386_value_types_match(target_ty,aty)==0){i386_fail(c,"assignment requires an explicit cast");return;}i386_expr_expected(c,x.expr,target_ty);if(i386_wide_integer_ty(target_ty)==1){i386_emit_ir(c,I32IROp.wide_store,slot);}else if(i386_float_ty(target_ty)==1){i386_emit_ir(c,I32IROp.f64_store,slot);}else if(i386_float_ty(target_ty)==2){i386_emit_ir(c,I32IROp.f32_store,slot);}else{i386_emit_normalize(c,target_ty);i386_emit_ir(c,I32IROp.store,slot as i64);}
         }
         .ret => |x| {
             if(x.has_expr==0) { i386_fail(c,"i32 return requires a value"); }
             else {
-                let rsi:i32=i386_struct(c,c.*.current_ret_ty);if(rsi>=0){let li:i32=-1;switch(x.expr.*){.id=>|id|{li=i386_local_index(c,id.name);}else=>{}}if(li<0||!@strEq(c.*.locals.data[li].ty,c.*.current_ret_ty)){i386_fail(c,"aggregate return must name a matching local struct");return;}let rf:i32=0;while(rf<c.*.structs.data[rsi].fields.len){i386_emit_ir(c,I32IROp.load,-1);if(rf>0){i386_emit_ir(c,I32IROp.const_,rf*4);i386_emit_ir(c,I32IROp.add,0);}i386_emit_ir(c,I32IROp.load,i386_field_slot(c.*.locals.data[li],rf));i386_emit_ir(c,I32IROp.store_ind,0);rf=rf+1;}i386_emit_ir(c,I32IROp.ret_sret,0);return;}
-                if(i386_slice_ty(c.*.current_ret_ty)==1){i386_expr(c,x.expr);i386_emit_ir(c,I32IROp.ret_pair,0);return;}
+                let rsi:i32=i386_struct(c,c.*.current_ret_ty);if(rsi>=0){let source:I386ValueRef=i386_value_ref(c,x.expr);if(source.valid==0||!@strEq(source.ty,c.*.current_ret_ty)){i386_fail(c,"aggregate return must name a matching local struct or sequential field");return;}i386_emit_struct_sret(c,c.*.locals.data[source.local].slot-source.word_offset,rsi,0,0);i386_emit_ir(c,I32IROp.ret_sret,0);return;}
+                if(i386_slice_ty(c.*.current_ret_ty)==1||i386_wide_integer_ty(c.*.current_ret_ty)==1){let aty:[]u8=i386_effective_ty(c,x.expr,c.*.current_ret_ty);if(i386_value_types_match(c.*.current_ret_ty,aty)==0){i386_fail(c,"two-word return requires an explicitly matching type");return;}i386_expr_expected(c,x.expr,c.*.current_ret_ty);i386_emit_ir(c,I32IROp.ret_pair,0);return;}
                 let ename:[]u8="";switch(x.expr.*){.fld=>|f|{switch(f.base.*){.id=>|id|{if(@strEq(id.name,"error")){ename=f.fname;}}else=>{}}}else=>{}}
                 if(ename.len>0){if(c.*.current_error_fn==0){i386_fail(c,"error return requires !i32");}else{i386_emit_ir(c,I32IROp.ret_err,i386_error_code(ename));}}
-                else { let rt:i32=i386_float_ty(i386_expr_ty(c,x.expr));i386_expr(c,x.expr);if(c.*.current_error_fn==1){i386_emit_ir(c,I32IROp.ret_ok,0);}else if(rt==1){i386_emit_ir(c,I32IROp.fret,0);}else if(rt==2){i386_emit_ir(c,I32IROp.f32ret,0);}else{i386_emit_ir(c,I32IROp.ret,0);} }
+                else { let expected:[]u8=c.*.current_ret_ty;if(c.*.current_error_fn==1){expected="i32";}let actual:[]u8=i386_effective_ty(c,x.expr,expected);let rt:i32=i386_float_ty(expected);i386_expr_expected(c,x.expr,expected);if(c.*.failed!=0){return;}if(i386_value_types_match(expected,actual)==0){i386_fail(c,_zag_str_concat("return requires an explicit cast from ",_zag_str_concat(actual,_zag_str_concat(" to ",expected))));return;}if(c.*.current_error_fn==1){i386_emit_ir(c,I32IROp.ret_ok,0);}else if(rt==1){i386_emit_ir(c,I32IROp.fret,0);}else if(rt==2){i386_emit_ir(c,I32IROp.f32ret,0);}else{i386_emit_normalize(c,expected);i386_emit_ir(c,I32IROp.ret,0);} }
             }
         }
         .if_ => |x| {
@@ -205,22 +629,25 @@ fn lower_i386_i32_program(decls: ArrayList[*Node], out: *I386Lower) i32 {
             .enum_ => |_e| { }
             .fn_decl => |f| {
                 if(i386_fn(out,f.name)>=0){i386_fail(out,"duplicate function");}
-                let rsi:i32=i386_struct(out,f.ret);if(f.tparams.len!=0 || (!@strEq(f.ret,"i32")&&!@strEq(f.ret,"!i32")&&!@strEq(f.ret,"f64")&&!@strEq(f.ret,"f32")&&i386_slice_ty(f.ret)==0&&rsi<0) || f.is_extern==1){i386_fail(out,"functions must be non-generic, defined, and return a supported i386 scalar, byte slice, or basic struct");}
-                if(rsi>=0){let rsf:i32=0;while(rsf<out.*.structs.data[rsi].fields.len){if(i386_word_ty(out.*.structs.data[rsi].fields.data[rsf].pty)==0){i386_fail(out,"aggregate returns require 32-bit scalar fields");}rsf=rsf+1;}}
-                let pi:i32=0;let pwords:i32=0;while(pi<f.params.len){let psi:i32=i386_struct(out,f.params.data[pi].pty);if(i386_word_ty(f.params.data[pi].pty)==0&&i386_float_ty(f.params.data[pi].pty)==0&&i386_slice_ty(f.params.data[pi].pty)==0&&psi<0){i386_fail(out,"function parameter is not a supported i386 scalar, byte slice, or struct");}if(psi>=0){let sf:i32=0;while(sf<out.*.structs.data[psi].fields.len){if(i386_word_ty(out.*.structs.data[psi].fields.data[sf].pty)==0){i386_fail(out,"by-value struct parameters require 32-bit scalar fields");}sf=sf+1;}}pwords=pwords+i386_param_words(out,f.params.data[pi].pty);pi=pi+1;}
+                let rsi:i32=i386_struct(out,f.ret);if(f.tparams.len!=0 || (i386_word_ty(f.ret)==0&&i386_wide_integer_ty(f.ret)==0&&!@strEq(f.ret,"!i32")&&!@strEq(f.ret,"f64")&&!@strEq(f.ret,"f32")&&i386_slice_ty(f.ret)==0&&rsi<0)){i386_fail(out,"functions must be non-generic and return a supported i386 scalar, slice, or basic struct");}
+                if(f.is_extern==1&&out.*.object_mode==0){i386_fail(out,"external functions require --emit-obj or --emit-static");}
+                if(f.is_extern==0 && i386_body_always_returns(f.body)==0){i386_fail(out,_zag_str_concat("function can reach its end without returning: ",f.name));}
+                if(rsi>=0&&i386_struct_words(out,rsi)<1){i386_fail(out,"aggregate returns require 32-bit scalar fields or implemented f32/f64 layout in an acyclic sequential struct");}
+                let pi:i32=0;let pwords:i32=0;while(pi<f.params.len){let psi:i32=i386_struct(out,f.params.data[pi].pty);if(i386_word_ty(f.params.data[pi].pty)==0&&i386_wide_integer_ty(f.params.data[pi].pty)==0&&i386_float_ty(f.params.data[pi].pty)==0&&i386_slice_ty(f.params.data[pi].pty)==0&&psi<0){i386_fail(out,"function parameter is not a supported i386 scalar, byte slice, or struct");}if(psi>=0&&i386_struct_words(out,psi)<1){i386_fail(out,"by-value struct parameters require 32-bit scalar, i64/u64, or implemented f32/f64 layout in an acyclic sequential struct");}let words:i32=i386_param_words(out,f.params.data[pi].pty);if(words<0||pwords>I386_MAX_CALL_WORDS()-words){i386_fail(out,"i386 call argument area exceeds the bounded 64 KiB stack-spill limit");}else{pwords=pwords+words;}pi=pi+1;}
                 let returns_error:i32=0;if(@strEq(f.ret,"!i32")){returns_error=1;}
                 let ptypes:ArrayList[[]u8]=make[[]u8](f.params.len);let pti:i32=0;while(pti<f.params.len){push[[]u8](&ptypes,f.params.data[pti].pty);pti=pti+1;}
-                push[I386Fn](&out.*.funcs,I386Fn{.name=f.name,.label=i386_new_label(out),.params=f.params.len,.param_words=pwords,.param_types=ptypes,.ret_ty=f.ret,.returns_error=returns_error});
-                if(@strEq(f.name,"main")){if(found==1){i386_fail(out,"duplicate main");}found=1;if(f.params.len!=0||!@strEq(f.ret,"i32")){i386_fail(out,"main must be fn main() i32");}}
+                let exported:i32=f.is_pub;if(@strEq(f.name,"main")){exported=1;}
+                push[I386Fn](&out.*.funcs,I386Fn{.name=f.name,.label=i386_new_label(out),.params=f.params.len,.param_words=pwords,.param_types=ptypes,.ret_ty=f.ret,.returns_error=returns_error,.defined=(f.is_extern==0) as i32,.exported=exported,.offset=-1});
+                if(@strEq(f.name,"main")){if(f.is_extern==1){i386_fail(out,"main cannot be external");}else{if(found==1){i386_fail(out,"duplicate main");}found=1;if(f.params.len!=0||!@strEq(f.ret,"i32")){i386_fail(out,"main must be fn main() i32");}}}
             }
             else => { i386_fail(out,"only functions and basic structs are supported"); }
         }
         i=i+1;
     }
-    if(found==0) { i386_fail(out,"missing `fn main() i32`"); }
+    if(found==0&&out.*.object_mode==0) { i386_fail(out,"missing `fn main() i32`"); }
     // Main is emitted first because ELF _start enters the first function.
     let pass:i32=0;while(pass<2){let di:i32=0;while(di<decls.len){switch(decls.data[di].*){.fn_decl=>|f|{
-        if((pass==0&&@strEq(f.name,"main"))||(pass==1&&!@strEq(f.name,"main"))){
+        if(f.is_extern==0&&((pass==0&&@strEq(f.name,"main"))||(pass==1&&!@strEq(f.name,"main")))){
             out.*.locals=make[I386Local](8);out.*.next_slot=0;out.*.break_label=-1;out.*.continue_label=-1;out.*.current_error_fn=0;out.*.current_ret_ty=f.ret;out.*.sret_target=-1;if(@strEq(f.ret,"!i32")){out.*.current_error_fn=1;}
             out.*.expected_ty=f.ret;
             let pi:i32=0;let poff:i32=0;if(i386_struct(out,f.ret)>=0){poff=1;}while(pi<f.params.len){push[I386Local](&out.*.locals,I386Local{.name=f.params.data[pi].name,.slot=-1-poff,.ty=f.params.data[pi].pty});poff=poff+i386_param_words(out,f.params.data[pi].pty);pi=pi+1;}
@@ -229,6 +656,7 @@ fn lower_i386_i32_program(decls: ArrayList[*Node], out: *I386Lower) i32 {
             let before:i32=out.*.ir.len;let j:i32=0;while(j<f.body.len){i386_stmt(out,f.body.data[j]);j=j+1;}
             let has_ret:i32=0;let ri:i32=before;while(ri<out.*.ir.len){if(out.*.ir.data[ri].op==I32IROp.ret||out.*.ir.data[ri].op==I32IROp.ret_pair||out.*.ir.data[ri].op==I32IROp.ret_sret||out.*.ir.data[ri].op==I32IROp.fret||out.*.ir.data[ri].op==I32IROp.f32ret||out.*.ir.data[ri].op==I32IROp.ret_ok||out.*.ir.data[ri].op==I32IROp.ret_err){has_ret=1;}ri=ri+1;}
             if(has_ret==0){i386_fail(out,_zag_str_concat("function lacks return: ",f.name));}
+            if(out.*.next_slot<0||out.*.next_slot>I386_MAX_FRAME_WORDS()){i386_fail(out,"i386 local spill frame exceeds the bounded 1 MiB limit");}
             set[I32IR](&out.*.ir,enter_at,I32IR{.op=I32IROp.enter,.value=out.*.next_slot});
         }}else=>{}}di=di+1;}pass=pass+1;}
     return out.*.failed;
@@ -237,6 +665,221 @@ fn lower_i386_i32_program(decls: ArrayList[*Node], out: *I386Lower) i32 {
 fn i386_b(out:*ArrayList[u8],b:i64) void { push[u8](out,(b&255) as u8); }
 fn i386_i32(out:*ArrayList[u8],v0:i64) void { let v:i64=v0; let i:i32=0; while(i<4){let b:i64=v&255;i386_b(out,b);v=(v-b)/256;i=i+1;} }
 fn i386_patch32(out:*ArrayList[u8],pos:i32,v0:i64) void { let v:i64=v0;let i:i32=0;while(i<4){let b:i64=v&255;set[u8](out,pos+i,b as u8);v=(v-b)/256;i=i+1;} }
+fn i386_fn_label(c:*I386Lower,label:i32)i32{let i:i32=0;while(i<c.*.funcs.len){if(c.*.funcs.data[i].label==label){return i;}i=i+1;}return -1;}
+fn i386_call_disp(c:*I386Lower,out:*ArrayList[u8],patches:*ArrayList[I386Patch],label:i32)void{
+    let fi:i32=i386_fn_label(c,label);let pos:i32=out.*.len;
+    if(fi>=0&&c.*.funcs.data[fi].defined==0){i386_i32(out,-4);push[I686CodeReloc](&c.*.object_relocs,I686CodeReloc{.offset=pos,.name=c.*.funcs.data[fi].name,.typ=2});}
+    else{push[I386Patch](patches,I386Patch{.pos=pos,.label=label});i386_i32(out,0);}
+}
+fn i386_emit_panic(out:*ArrayList[u8],msg:[]u8)void{
+    i386_b(out,0xe8);i386_i32(out,msg.len);
+    let mi:i32=0;while(mi<msg.len){i386_b(out,msg[mi]);mi=mi+1;}
+    i386_b(out,0x59);                         // pop ecx = message
+    i386_b(out,0xba);i386_i32(out,msg.len);   // edx = length
+    i386_b(out,0xbb);i386_i32(out,2);         // ebx = stderr
+    i386_b(out,0xb8);i386_i32(out,4);         // eax = SYS_write
+    i386_b(out,0xcd);i386_b(out,0x80);
+    i386_b(out,0xbb);i386_i32(out,134);       // ebx = failure status
+    i386_b(out,0xb8);i386_i32(out,1);         // eax = SYS_exit
+    i386_b(out,0xcd);i386_b(out,0x80);
+}
+// Emit a near conditional jump over a non-returning panic path. `cc` is the
+// second opcode byte in the 0F 8x near-jump family and describes the valid case.
+fn i386_guard_cc(out:*ArrayList[u8],cc:i32,msg:[]u8)void{
+    i386_b(out,0x0f);i386_b(out,cc);let ok:i32=out.*.len;i386_i32(out,0);
+    i386_emit_panic(out,msg);i386_patch32(out,ok,out.*.len-(ok+4));
+}
+// EAX is a 32-bit base address and ECX is a usize element index. Scale without
+// truncation and reject both multiplication overflow and address wrap.
+fn i386_checked_index_address(out:*ArrayList[u8],stride:i32)void{
+    if(stride!=1){i386_b(out,0x69);i386_b(out,0xc9);i386_i32(out,stride);i386_guard_cc(out,0x81,"panic: i686 index address overflow\n");}
+    i386_b(out,0x01);i386_b(out,0xc8);i386_guard_cc(out,0x83,"panic: i686 index address overflow\n");
+}
+// ECX contains the divisor. Division by zero follows the same observable
+// contract as the x86-64 backend: print a stable diagnostic and exit(134).
+// The near JNE skips the embedded panic path for normal arithmetic.
+fn i386_div_zero_guard(out:*ArrayList[u8]) void {
+    i386_b(out,0x83);i386_b(out,0xf9);i386_b(out,0);
+    i386_b(out,0x0f);i386_b(out,0x85);let nonzero:i32=out.*.len;i386_i32(out,0);
+    i386_emit_panic(out,"panic: division by zero\n");
+    i386_patch32(out,nonzero,out.*.len-(nonzero+4));
+}
+fn i386_emit_wide_compare(out:*ArrayList[u8],op:I32IROp)void{
+    // Expression pairs are high-word then low-word on the spill stack.
+    // Consume right.low/right.high/left.low, leaving left.high at [esp].
+    i386_b(out,0x59);i386_b(out,0x5a);i386_b(out,0x58);
+    if(op==I32IROp.wide_eq||op==I32IROp.wide_ne){
+        i386_b(out,0x31);i386_b(out,0xc8);                 // xor eax,ecx
+        i386_b(out,0x33);i386_b(out,0x14);i386_b(out,0x24); // xor edx,[esp]
+        i386_b(out,0x83);i386_b(out,0xc4);i386_b(out,4);
+        i386_b(out,0x09);i386_b(out,0xd0);                 // or eax,edx
+        i386_b(out,0x85);i386_b(out,0xc0);
+        i386_b(out,0x0f);if(op==I32IROp.wide_eq){i386_b(out,0x94);}else{i386_b(out,0x95);}i386_b(out,0xc0);
+        i386_b(out,0x0f);i386_b(out,0xb6);i386_b(out,0xc0);i386_b(out,0x50);
+        return;
+    }
+    let high_cc:i32=0x9c;let low_cc:i32=0x92;
+    if(op==I32IROp.wide_le){high_cc=0x9e;low_cc=0x96;}
+    else if(op==I32IROp.wide_gt){high_cc=0x9f;low_cc=0x97;}
+    else if(op==I32IROp.wide_ge){high_cc=0x9d;low_cc=0x93;}
+    else if(op==I32IROp.wide_ult){high_cc=0x92;low_cc=0x92;}
+    else if(op==I32IROp.wide_ule){high_cc=0x96;low_cc=0x96;}
+    else if(op==I32IROp.wide_ugt){high_cc=0x97;low_cc=0x97;}
+    else if(op==I32IROp.wide_uge){high_cc=0x93;low_cc=0x93;}
+    i386_b(out,0x39);i386_b(out,0x14);i386_b(out,0x24); // cmp [esp],edx
+    i386_b(out,0x0f);i386_b(out,0x85);let high_path:i32=out.*.len;i386_i32(out,0);
+    i386_b(out,0x39);i386_b(out,0xc8);                 // cmp eax,ecx
+    i386_b(out,0x0f);i386_b(out,low_cc);i386_b(out,0xc0);
+    i386_b(out,0xe9);let finish:i32=out.*.len;i386_i32(out,0);
+    i386_patch32(out,high_path,out.*.len-(high_path+4));
+    i386_b(out,0x0f);i386_b(out,high_cc);i386_b(out,0xc0);
+    i386_patch32(out,finish,out.*.len-(finish+4));
+    i386_b(out,0x83);i386_b(out,0xc4);i386_b(out,4);
+    i386_b(out,0x0f);i386_b(out,0xb6);i386_b(out,0xc0);i386_b(out,0x50);
+}
+fn i386_emit_wide_shift(out:*ArrayList[u8],op:I32IROp)void{
+    i386_b(out,0x59);i386_b(out,0x58);i386_b(out,0x5a); // count, low, high
+    i386_b(out,0x83);i386_b(out,0xe1);i386_b(out,63);
+    i386_b(out,0x83);i386_b(out,0xf9);i386_b(out,32);
+    i386_b(out,0x0f);i386_b(out,0x83);let large:i32=out.*.len;i386_i32(out,0);
+    if(op==I32IROp.wide_shl){
+        i386_b(out,0x0f);i386_b(out,0xa5);i386_b(out,0xc2); // shld edx,eax,cl
+        i386_b(out,0xd3);i386_b(out,0xe0);                 // shl eax,cl
+    }else{
+        i386_b(out,0x0f);i386_b(out,0xad);i386_b(out,0xd0); // shrd eax,edx,cl
+        i386_b(out,0xd3);if(op==I32IROp.wide_shr){i386_b(out,0xea);}else{i386_b(out,0xfa);}
+    }
+    i386_b(out,0xe9);let done:i32=out.*.len;i386_i32(out,0);
+    i386_patch32(out,large,out.*.len-(large+4));
+    i386_b(out,0x83);i386_b(out,0xe1);i386_b(out,31);
+    if(op==I32IROp.wide_shl){
+        i386_b(out,0x89);i386_b(out,0xc2);i386_b(out,0x31);i386_b(out,0xc0);i386_b(out,0xd3);i386_b(out,0xe2);
+    }else if(op==I32IROp.wide_shr){
+        i386_b(out,0x89);i386_b(out,0xd0);i386_b(out,0x31);i386_b(out,0xd2);i386_b(out,0xd3);i386_b(out,0xe8);
+    }else{
+        i386_b(out,0x89);i386_b(out,0xd0);i386_b(out,0xc1);i386_b(out,0xfa);i386_b(out,31);i386_b(out,0xd3);i386_b(out,0xf8);
+    }
+    i386_patch32(out,done,out.*.len-(done+4));
+    i386_b(out,0x52);i386_b(out,0x50);
+}
+fn i386_emit_wide_mul(out:*ArrayList[u8])void{
+    // Form the low 64 bits of
+    // (Llo*Rlo) + ((Llo*Rhi + Lhi*Rlo) << 32) using caller-clobbered
+    // registers only.
+    i386_b(out,0x8b);i386_b(out,0x44);i386_b(out,0x24);i386_b(out,8);
+    i386_b(out,0xf7);i386_b(out,0x24);i386_b(out,0x24); // mul [esp]
+    i386_b(out,0x8b);i386_b(out,0x4c);i386_b(out,0x24);i386_b(out,8);
+    i386_b(out,0x0f);i386_b(out,0xaf);i386_b(out,0x4c);i386_b(out,0x24);i386_b(out,4);
+    i386_b(out,0x01);i386_b(out,0xca);
+    i386_b(out,0x8b);i386_b(out,0x4c);i386_b(out,0x24);i386_b(out,12);
+    i386_b(out,0x0f);i386_b(out,0xaf);i386_b(out,0x0c);i386_b(out,0x24);
+    i386_b(out,0x01);i386_b(out,0xca);
+    i386_b(out,0x89);i386_b(out,0x44);i386_b(out,0x24);i386_b(out,8);
+    i386_b(out,0x89);i386_b(out,0x54);i386_b(out,0x24);i386_b(out,12);
+    i386_b(out,0x83);i386_b(out,0xc4);i386_b(out,8);
+}
+fn i386_emit_wide_divmod(out:*ArrayList[u8],is_signed:i32,want_remainder:i32)void{
+    // Twenty-eight private bytes hold quotient, remainder, loop count, and
+    // sign witnesses. The four incoming operand words remain directly above:
+    // divisor.lo/hi at +28/+32 and dividend.lo/hi at +36/+40.
+    i386_b(out,0x83);i386_b(out,0xec);i386_b(out,28);
+    let zoff:i32=0;while(zoff<=12){i386_b(out,0xc7);i386_b(out,0x44);i386_b(out,0x24);i386_b(out,zoff);i386_i32(out,0);zoff=zoff+4;}
+    i386_b(out,0xc7);i386_b(out,0x44);i386_b(out,0x24);i386_b(out,16);i386_i32(out,64);
+    i386_b(out,0xc7);i386_b(out,0x44);i386_b(out,0x24);i386_b(out,20);i386_i32(out,0);
+    i386_b(out,0xc7);i386_b(out,0x44);i386_b(out,0x24);i386_b(out,24);i386_i32(out,0);
+    if(is_signed==1){
+        i386_b(out,0x8b);i386_b(out,0x44);i386_b(out,0x24);i386_b(out,40);
+        i386_b(out,0xc1);i386_b(out,0xe8);i386_b(out,31);
+        i386_b(out,0x89);i386_b(out,0x44);i386_b(out,0x24);i386_b(out,24);
+        i386_b(out,0x8b);i386_b(out,0x4c);i386_b(out,0x24);i386_b(out,32);
+        i386_b(out,0xc1);i386_b(out,0xe9);i386_b(out,31);
+        i386_b(out,0x31);i386_b(out,0xc1);
+        i386_b(out,0x89);i386_b(out,0x4c);i386_b(out,0x24);i386_b(out,20);
+        // Convert a negative divisor to its unsigned magnitude.
+        i386_b(out,0xf7);i386_b(out,0x44);i386_b(out,0x24);i386_b(out,32);i386_i32(out,2147483648);
+        i386_b(out,0x0f);i386_b(out,0x84);let divisor_positive:i32=out.*.len;i386_i32(out,0);
+        i386_b(out,0xf7);i386_b(out,0x5c);i386_b(out,0x24);i386_b(out,28);
+        i386_b(out,0x83);i386_b(out,0x54);i386_b(out,0x24);i386_b(out,32);i386_b(out,0);
+        i386_b(out,0xf7);i386_b(out,0x5c);i386_b(out,0x24);i386_b(out,32);
+        i386_patch32(out,divisor_positive,out.*.len-(divisor_positive+4));
+        // Convert a negative dividend to its unsigned magnitude.
+        i386_b(out,0xf7);i386_b(out,0x44);i386_b(out,0x24);i386_b(out,40);i386_i32(out,2147483648);
+        i386_b(out,0x0f);i386_b(out,0x84);let dividend_positive:i32=out.*.len;i386_i32(out,0);
+        i386_b(out,0xf7);i386_b(out,0x5c);i386_b(out,0x24);i386_b(out,36);
+        i386_b(out,0x83);i386_b(out,0x54);i386_b(out,0x24);i386_b(out,40);i386_b(out,0);
+        i386_b(out,0xf7);i386_b(out,0x5c);i386_b(out,0x24);i386_b(out,40);
+        i386_patch32(out,dividend_positive,out.*.len-(dividend_positive+4));
+    }
+    i386_b(out,0x8b);i386_b(out,0x44);i386_b(out,0x24);i386_b(out,28);
+    i386_b(out,0x0b);i386_b(out,0x44);i386_b(out,0x24);i386_b(out,32);
+    i386_b(out,0x0f);i386_b(out,0x85);let divisor_nonzero:i32=out.*.len;i386_i32(out,0);
+    i386_emit_panic(out,"panic: division by zero\n");
+    i386_patch32(out,divisor_nonzero,out.*.len-(divisor_nonzero+4));
+
+    let loop:i32=out.*.len;
+    // Pull the dividend's top bit, shift dividend/quotient/remainder left, and
+    // retain the remainder's 65th carry bit in EDX.
+    i386_b(out,0x8b);i386_b(out,0x44);i386_b(out,0x24);i386_b(out,40);
+    i386_b(out,0xc1);i386_b(out,0xe8);i386_b(out,31);
+    i386_b(out,0xd1);i386_b(out,0x64);i386_b(out,0x24);i386_b(out,36);
+    i386_b(out,0xd1);i386_b(out,0x54);i386_b(out,0x24);i386_b(out,40);
+    i386_b(out,0xd1);i386_b(out,0x64);i386_b(out,0x24);i386_b(out,0);
+    i386_b(out,0xd1);i386_b(out,0x54);i386_b(out,0x24);i386_b(out,4);
+    i386_b(out,0xd1);i386_b(out,0x64);i386_b(out,0x24);i386_b(out,8);
+    i386_b(out,0xd1);i386_b(out,0x54);i386_b(out,0x24);i386_b(out,12);
+    i386_b(out,0x0f);i386_b(out,0x92);i386_b(out,0xc2);
+    i386_b(out,0x0f);i386_b(out,0xb6);i386_b(out,0xd2);
+    i386_b(out,0x09);i386_b(out,0x44);i386_b(out,0x24);i386_b(out,8);
+
+    i386_b(out,0x85);i386_b(out,0xd2);
+    i386_b(out,0x0f);i386_b(out,0x85);let carry_subtract:i32=out.*.len;i386_i32(out,0);
+    i386_b(out,0x8b);i386_b(out,0x4c);i386_b(out,0x24);i386_b(out,12);
+    i386_b(out,0x3b);i386_b(out,0x4c);i386_b(out,0x24);i386_b(out,32);
+    i386_b(out,0x0f);i386_b(out,0x87);let high_subtract:i32=out.*.len;i386_i32(out,0);
+    i386_b(out,0x0f);i386_b(out,0x82);let high_no_subtract:i32=out.*.len;i386_i32(out,0);
+    i386_b(out,0x8b);i386_b(out,0x4c);i386_b(out,0x24);i386_b(out,8);
+    i386_b(out,0x3b);i386_b(out,0x4c);i386_b(out,0x24);i386_b(out,28);
+    i386_b(out,0x0f);i386_b(out,0x82);let low_no_subtract:i32=out.*.len;i386_i32(out,0);
+    let subtract:i32=out.*.len;
+    i386_patch32(out,carry_subtract,subtract-(carry_subtract+4));
+    i386_patch32(out,high_subtract,subtract-(high_subtract+4));
+    i386_b(out,0x8b);i386_b(out,0x4c);i386_b(out,0x24);i386_b(out,28);
+    i386_b(out,0x29);i386_b(out,0x4c);i386_b(out,0x24);i386_b(out,8);
+    i386_b(out,0x8b);i386_b(out,0x4c);i386_b(out,0x24);i386_b(out,32);
+    i386_b(out,0x19);i386_b(out,0x4c);i386_b(out,0x24);i386_b(out,12);
+    i386_b(out,0x83);i386_b(out,0x0c);i386_b(out,0x24);i386_b(out,1);
+    let no_subtract:i32=out.*.len;
+    i386_patch32(out,high_no_subtract,no_subtract-(high_no_subtract+4));
+    i386_patch32(out,low_no_subtract,no_subtract-(low_no_subtract+4));
+    i386_b(out,0xff);i386_b(out,0x4c);i386_b(out,0x24);i386_b(out,16);
+    i386_b(out,0x0f);i386_b(out,0x85);let loop_disp:i32=out.*.len;i386_i32(out,loop-(loop_disp+4));
+
+    if(is_signed==1){
+        i386_b(out,0x83);i386_b(out,0x7c);i386_b(out,0x24);i386_b(out,20);i386_b(out,0);
+        i386_b(out,0x0f);i386_b(out,0x84);let quotient_positive:i32=out.*.len;i386_i32(out,0);
+        i386_b(out,0xf7);i386_b(out,0x1c);i386_b(out,0x24);
+        i386_b(out,0x83);i386_b(out,0x54);i386_b(out,0x24);i386_b(out,4);i386_b(out,0);
+        i386_b(out,0xf7);i386_b(out,0x5c);i386_b(out,0x24);i386_b(out,4);
+        i386_patch32(out,quotient_positive,out.*.len-(quotient_positive+4));
+        i386_b(out,0x83);i386_b(out,0x7c);i386_b(out,0x24);i386_b(out,24);i386_b(out,0);
+        i386_b(out,0x0f);i386_b(out,0x84);let remainder_positive:i32=out.*.len;i386_i32(out,0);
+        i386_b(out,0xf7);i386_b(out,0x5c);i386_b(out,0x24);i386_b(out,8);
+        i386_b(out,0x83);i386_b(out,0x54);i386_b(out,0x24);i386_b(out,12);i386_b(out,0);
+        i386_b(out,0xf7);i386_b(out,0x5c);i386_b(out,0x24);i386_b(out,12);
+        i386_patch32(out,remainder_positive,out.*.len-(remainder_positive+4));
+    }
+    if(want_remainder==1){
+        i386_b(out,0x8b);i386_b(out,0x44);i386_b(out,0x24);i386_b(out,8);
+        i386_b(out,0x89);i386_b(out,0x44);i386_b(out,0x24);i386_b(out,36);
+        i386_b(out,0x8b);i386_b(out,0x44);i386_b(out,0x24);i386_b(out,12);
+    }else{
+        i386_b(out,0x8b);i386_b(out,0x04);i386_b(out,0x24);
+        i386_b(out,0x89);i386_b(out,0x44);i386_b(out,0x24);i386_b(out,36);
+        i386_b(out,0x8b);i386_b(out,0x44);i386_b(out,0x24);i386_b(out,4);
+    }
+    i386_b(out,0x89);i386_b(out,0x44);i386_b(out,0x24);i386_b(out,40);
+    i386_b(out,0x83);i386_b(out,0xc4);i386_b(out,36);
+}
 fn encode_i386_i32(c:*I386Lower) ArrayList[u8] {
     let out:ArrayList[u8]=make[u8](128);
     let labels:ArrayList[i32]=make[i32](c.*.next_label+1);let li:i32=0;while(li<c.*.next_label){push[i32](&labels,-1);li=li+1;}
@@ -252,15 +895,55 @@ fn encode_i386_i32(c:*I386Lower) ArrayList[u8] {
             .f64_const => { i386_b(&out,0xb8);i386_i32(&out,(x.value/4294967296)&4294967295);i386_b(&out,0x50);i386_b(&out,0xb8);i386_i32(&out,x.value&4294967295);i386_b(&out,0x50); }
             .load => { i386_b(&out,0x8b);i386_b(&out,0x85);if(x.value<0){i386_i32(&out,8+((0-x.value-1)*4));}else{i386_i32(&out,0-((x.value+1)*4));}i386_b(&out,0x50); }
             .pair_load => { let po:i64=0-((x.value+1)*4);let lo:i64=0-((x.value)*4);if(x.value<0){po=8+((0-x.value-1)*4);lo=po+4;}i386_b(&out,0xff);i386_b(&out,0xb5);i386_i32(&out,lo);i386_b(&out,0xff);i386_b(&out,0xb5);i386_i32(&out,po); }
+            .wide_load => { let low:i64=0-((x.value+1)*4);let high:i64=low-4;if(x.value<0){low=8+((0-x.value-1)*4);high=low+4;}i386_b(&out,0xff);i386_b(&out,0xb5);i386_i32(&out,high);i386_b(&out,0xff);i386_b(&out,0xb5);i386_i32(&out,low); }
             .f32_load => { i386_b(&out,0x8b);i386_b(&out,0x85);if(x.value<0){i386_i32(&out,8+((0-x.value-1)*4));}else{i386_i32(&out,0-((x.value+1)*4));}i386_b(&out,0x50); }
             .f64_load => { let off:i64=0-((x.value+1)*4);let high:i64=off-4;if(x.value<0){off=8+((0-x.value-1)*4);high=off+4;}i386_b(&out,0xff);i386_b(&out,0xb5);i386_i32(&out,high);i386_b(&out,0xff);i386_b(&out,0xb5);i386_i32(&out,off); }
             .store => { i386_b(&out,0x58);i386_b(&out,0x89);i386_b(&out,0x85);i386_i32(&out,0-((x.value+1)*4)); }
             .pair_store => { i386_b(&out,0x58);i386_b(&out,0x89);i386_b(&out,0x85);i386_i32(&out,0-((x.value+1)*4));i386_b(&out,0x58);i386_b(&out,0x89);i386_b(&out,0x85);i386_i32(&out,0-((x.value)*4)); }
+            .wide_store => { i386_b(&out,0x58);i386_b(&out,0x89);i386_b(&out,0x85);i386_i32(&out,0-((x.value+1)*4));i386_b(&out,0x58);i386_b(&out,0x89);i386_b(&out,0x85);i386_i32(&out,0-((x.value+2)*4)); }
             .f32_store => { i386_b(&out,0x58);i386_b(&out,0x89);i386_b(&out,0x85);i386_i32(&out,0-((x.value+1)*4)); }
             .f64_store => { i386_b(&out,0x58);i386_b(&out,0x89);i386_b(&out,0x85);i386_i32(&out,0-((x.value+1)*4));i386_b(&out,0x58);i386_b(&out,0x89);i386_b(&out,0x85);i386_i32(&out,0-((x.value+2)*4)); }
+            .normalize => {
+                i386_b(&out,0x58); // pop eax
+                if(x.value==1){i386_b(&out,0x0f);i386_b(&out,0xbe);i386_b(&out,0xc0);}      // movsx eax,al
+                else if(x.value==2){i386_b(&out,0x0f);i386_b(&out,0xb6);i386_b(&out,0xc0);} // movzx eax,al
+                else if(x.value==3){i386_b(&out,0x0f);i386_b(&out,0xbf);i386_b(&out,0xc0);} // movsx eax,ax
+                else if(x.value==4){i386_b(&out,0x0f);i386_b(&out,0xb7);i386_b(&out,0xc0);} // movzx eax,ax
+                else{
+                    // bool is not merely byte-truncated: every nonzero input
+                    // becomes the canonical ABI value one.
+                    i386_b(&out,0x85);i386_b(&out,0xc0);
+                    i386_b(&out,0x0f);i386_b(&out,0x95);i386_b(&out,0xc0);
+                    i386_b(&out,0x0f);i386_b(&out,0xb6);i386_b(&out,0xc0);
+                }
+                i386_b(&out,0x50);
+            }
+            .widen_signed => { i386_b(&out,0x58);i386_b(&out,0x99);i386_b(&out,0x52);i386_b(&out,0x50); }
+            .widen_unsigned => { i386_b(&out,0x58);i386_b(&out,0x31);i386_b(&out,0xd2);i386_b(&out,0x52);i386_b(&out,0x50); }
+            .truncate_wide => { i386_b(&out,0x58);i386_b(&out,0x83);i386_b(&out,0xc4);i386_b(&out,4);i386_b(&out,0x50); }
+            .wide_bool => { i386_b(&out,0x58);i386_b(&out,0x5a);i386_b(&out,0x09);i386_b(&out,0xd0);i386_b(&out,0x0f);i386_b(&out,0x95);i386_b(&out,0xc0);i386_b(&out,0x0f);i386_b(&out,0xb6);i386_b(&out,0xc0);i386_b(&out,0x50); }
             .addr => { i386_b(&out,0x8d);i386_b(&out,0x85);i386_i32(&out,0-((x.value+1)*4));i386_b(&out,0x50); }
             .deref => { i386_b(&out,0x58);i386_b(&out,0x8b);i386_b(&out,0x00);i386_b(&out,0x50); }
             .store_ind => { i386_b(&out,0x58);i386_b(&out,0x59);i386_b(&out,0x89);i386_b(&out,0x01); }
+            .ptr_index => {
+                i386_b(&out,0x59);i386_b(&out,0x58);i386_checked_index_address(&out,x.value as i32);
+                if(x.value==1){i386_b(&out,0x0f);i386_b(&out,0xb6);i386_b(&out,0x00);}else{i386_b(&out,0x8b);i386_b(&out,0x00);}i386_b(&out,0x50);
+            }
+            .ptr_store_index => {
+                i386_b(&out,0x5a);i386_b(&out,0x59);i386_b(&out,0x58);i386_checked_index_address(&out,x.value as i32);
+                if(x.value==1){i386_b(&out,0x88);i386_b(&out,0x10);}else{i386_b(&out,0x89);i386_b(&out,0x10);}
+            }
+            .slice_index => {
+                // Stack order for a slice value is len, pointer, then index.
+                // One unsigned comparison catches both negative i32 indices
+                // (their high bit is set) and high-bit usize indices.
+                i386_b(&out,0x59);i386_b(&out,0x58);
+                i386_b(&out,0x3b);i386_b(&out,0x0c);i386_b(&out,0x24);
+                i386_guard_cc(&out,0x82,"panic: slice index out of bounds\n");
+                i386_b(&out,0x83);i386_b(&out,0xc4);i386_b(&out,4);
+                i386_checked_index_address(&out,x.value as i32);
+                if(x.value==1){i386_b(&out,0x0f);i386_b(&out,0xb6);i386_b(&out,0x00);}else{i386_b(&out,0x8b);i386_b(&out,0x00);}i386_b(&out,0x50);
+            }
             .malloc => {
                 // mmap2(NULL, bytes+4, RW, PRIVATE|ANON, -1, 0). The leading
                 // word records the exact mapping length for _zag_free.
@@ -282,6 +965,42 @@ fn encode_i386_i32(c:*I386Lower) ArrayList[u8] {
             }
             .add => { i386_b(&out,0x59);i386_b(&out,0x58);i386_b(&out,0x01);i386_b(&out,0xc8);i386_b(&out,0x50); }
             .sub => { i386_b(&out,0x59);i386_b(&out,0x58);i386_b(&out,0x29);i386_b(&out,0xc8);i386_b(&out,0x50); }
+            .mul => { i386_b(&out,0x59);i386_b(&out,0x58);i386_b(&out,0x0f);i386_b(&out,0xaf);i386_b(&out,0xc1);i386_b(&out,0x50); }
+            .div_,.mod_ => {
+                i386_b(&out,0x59);i386_b(&out,0x58); // ecx=right, eax=left
+                i386_div_zero_guard(&out);
+                // idiv faults on INT_MIN/-1. Zag defines that edge as wrapping
+                // INT_MIN for division and zero for remainder.
+                i386_b(&out,0x83);i386_b(&out,0xf9);i386_b(&out,0xff);
+                i386_b(&out,0x0f);i386_b(&out,0x85);let ordinary:i32=out.len;i386_i32(&out,0);
+                if(x.op==I32IROp.div_){i386_b(&out,0xf7);i386_b(&out,0xd8);}
+                else{i386_b(&out,0x31);i386_b(&out,0xc0);}
+                i386_b(&out,0xe9);let done:i32=out.len;i386_i32(&out,0);
+                i386_patch32(&out,ordinary,out.len-(ordinary+4));
+                i386_b(&out,0x99);i386_b(&out,0xf7);i386_b(&out,0xf9);
+                if(x.op==I32IROp.mod_){i386_b(&out,0x89);i386_b(&out,0xd0);}
+                i386_patch32(&out,done,out.len-(done+4));i386_b(&out,0x50);
+            }
+            .udiv_,.umod_ => {
+                i386_b(&out,0x59);i386_b(&out,0x58); // ecx=divisor, eax=dividend
+                i386_div_zero_guard(&out);i386_b(&out,0x31);i386_b(&out,0xd2);i386_b(&out,0xf7);i386_b(&out,0xf1);
+                if(x.op==I32IROp.umod_){i386_b(&out,0x89);i386_b(&out,0xd0);}i386_b(&out,0x50);
+            }
+            .wide_add => { i386_b(&out,0x59);i386_b(&out,0x5a);i386_b(&out,0x58);i386_b(&out,0x01);i386_b(&out,0xc8);i386_b(&out,0x11);i386_b(&out,0x14);i386_b(&out,0x24);i386_b(&out,0x50); }
+            .wide_sub => { i386_b(&out,0x59);i386_b(&out,0x5a);i386_b(&out,0x58);i386_b(&out,0x29);i386_b(&out,0xc8);i386_b(&out,0x19);i386_b(&out,0x14);i386_b(&out,0x24);i386_b(&out,0x50); }
+            .wide_mul => { i386_emit_wide_mul(&out); }
+            .wide_div => { i386_emit_wide_divmod(&out,1,0); }
+            .wide_mod => { i386_emit_wide_divmod(&out,1,1); }
+            .wide_udiv => { i386_emit_wide_divmod(&out,0,0); }
+            .wide_umod => { i386_emit_wide_divmod(&out,0,1); }
+            .wide_and,.wide_or,.wide_xor => {
+                i386_b(&out,0x59);i386_b(&out,0x5a);i386_b(&out,0x58);
+                let opcode:i32=0x21;if(x.op==I32IROp.wide_or){opcode=0x09;}else if(x.op==I32IROp.wide_xor){opcode=0x31;}
+                i386_b(&out,opcode);i386_b(&out,0xc8);i386_b(&out,opcode);i386_b(&out,0x14);i386_b(&out,0x24);i386_b(&out,0x50);
+            }
+            .wide_shl,.wide_shr,.wide_sar => { i386_emit_wide_shift(&out,x.op); }
+            .wide_neg => { i386_b(&out,0x58);i386_b(&out,0xf7);i386_b(&out,0xd8);i386_b(&out,0x5a);i386_b(&out,0x83);i386_b(&out,0xd2);i386_b(&out,0);i386_b(&out,0xf7);i386_b(&out,0xda);i386_b(&out,0x52);i386_b(&out,0x50); }
+            .wide_eq,.wide_ne,.wide_lt,.wide_le,.wide_gt,.wide_ge,.wide_ult,.wide_ule,.wide_ugt,.wide_uge => { i386_emit_wide_compare(&out,x.op); }
             .fadd,.fsub,.fmul,.fdiv => { i386_b(&out,0xdd);i386_b(&out,0x44);i386_b(&out,0x24);i386_b(&out,8);if(x.op==I32IROp.fadd){i386_b(&out,0xdc);i386_b(&out,0x04);i386_b(&out,0x24);}else if(x.op==I32IROp.fsub){i386_b(&out,0xdc);i386_b(&out,0x24);i386_b(&out,0x24);}else if(x.op==I32IROp.fmul){i386_b(&out,0xdc);i386_b(&out,0x0c);i386_b(&out,0x24);}else{i386_b(&out,0xdc);i386_b(&out,0x34);i386_b(&out,0x24);}i386_b(&out,0x83);i386_b(&out,0xc4);i386_b(&out,16);i386_b(&out,0x83);i386_b(&out,0xec);i386_b(&out,8);i386_b(&out,0xdd);i386_b(&out,0x1c);i386_b(&out,0x24); }
             .f32add,.f32sub,.f32mul,.f32div => { i386_b(&out,0xd9);i386_b(&out,0x44);i386_b(&out,0x24);i386_b(&out,4);if(x.op==I32IROp.f32add){i386_b(&out,0xd8);i386_b(&out,0x04);i386_b(&out,0x24);}else if(x.op==I32IROp.f32sub){i386_b(&out,0xd8);i386_b(&out,0x24);i386_b(&out,0x24);}else if(x.op==I32IROp.f32mul){i386_b(&out,0xd8);i386_b(&out,0x0c);i386_b(&out,0x24);}else{i386_b(&out,0xd8);i386_b(&out,0x34);i386_b(&out,0x24);}i386_b(&out,0x83);i386_b(&out,0xc4);i386_b(&out,8);i386_b(&out,0x83);i386_b(&out,0xec);i386_b(&out,4);i386_b(&out,0xd9);i386_b(&out,0x1c);i386_b(&out,0x24); }
             .feq,.fne,.flt,.fle,.fgt,.fge => { i386_b(&out,0xdd);i386_b(&out,0x04);i386_b(&out,0x24);i386_b(&out,0xdd);i386_b(&out,0x44);i386_b(&out,0x24);i386_b(&out,8);i386_b(&out,0xda);i386_b(&out,0xe9);i386_b(&out,0xdf);i386_b(&out,0xe0);i386_b(&out,0x83);i386_b(&out,0xc4);i386_b(&out,16);i386_b(&out,0x9e);i386_b(&out,0x0f);if(x.op==I32IROp.fne){i386_b(&out,0x9a);}else{i386_b(&out,0x9b);}i386_b(&out,0xc2);i386_b(&out,0x0f);if(x.op==I32IROp.feq){i386_b(&out,0x94);}else if(x.op==I32IROp.fne){i386_b(&out,0x95);}else if(x.op==I32IROp.flt){i386_b(&out,0x92);}else if(x.op==I32IROp.fle){i386_b(&out,0x96);}else if(x.op==I32IROp.fgt){i386_b(&out,0x97);}else{i386_b(&out,0x93);}i386_b(&out,0xc0);if(x.op==I32IROp.fne){i386_b(&out,0x08);}else{i386_b(&out,0x20);}i386_b(&out,0xd0);i386_b(&out,0x0f);i386_b(&out,0xb6);i386_b(&out,0xc0);i386_b(&out,0x50); }
@@ -292,15 +1011,19 @@ fn encode_i386_i32(c:*I386Lower) ArrayList[u8] {
             .le => { i386_b(&out,0x59);i386_b(&out,0x58);i386_b(&out,0x39);i386_b(&out,0xc8);i386_b(&out,0x0f);i386_b(&out,0x9e);i386_b(&out,0xc0);i386_b(&out,0x0f);i386_b(&out,0xb6);i386_b(&out,0xc0);i386_b(&out,0x50); }
             .gt => { i386_b(&out,0x59);i386_b(&out,0x58);i386_b(&out,0x39);i386_b(&out,0xc8);i386_b(&out,0x0f);i386_b(&out,0x9f);i386_b(&out,0xc0);i386_b(&out,0x0f);i386_b(&out,0xb6);i386_b(&out,0xc0);i386_b(&out,0x50); }
             .ge => { i386_b(&out,0x59);i386_b(&out,0x58);i386_b(&out,0x39);i386_b(&out,0xc8);i386_b(&out,0x0f);i386_b(&out,0x9d);i386_b(&out,0xc0);i386_b(&out,0x0f);i386_b(&out,0xb6);i386_b(&out,0xc0);i386_b(&out,0x50); }
+            .ult => { i386_b(&out,0x59);i386_b(&out,0x58);i386_b(&out,0x39);i386_b(&out,0xc8);i386_b(&out,0x0f);i386_b(&out,0x92);i386_b(&out,0xc0);i386_b(&out,0x0f);i386_b(&out,0xb6);i386_b(&out,0xc0);i386_b(&out,0x50); }
+            .ule => { i386_b(&out,0x59);i386_b(&out,0x58);i386_b(&out,0x39);i386_b(&out,0xc8);i386_b(&out,0x0f);i386_b(&out,0x96);i386_b(&out,0xc0);i386_b(&out,0x0f);i386_b(&out,0xb6);i386_b(&out,0xc0);i386_b(&out,0x50); }
+            .ugt => { i386_b(&out,0x59);i386_b(&out,0x58);i386_b(&out,0x39);i386_b(&out,0xc8);i386_b(&out,0x0f);i386_b(&out,0x97);i386_b(&out,0xc0);i386_b(&out,0x0f);i386_b(&out,0xb6);i386_b(&out,0xc0);i386_b(&out,0x50); }
+            .uge => { i386_b(&out,0x59);i386_b(&out,0x58);i386_b(&out,0x39);i386_b(&out,0xc8);i386_b(&out,0x0f);i386_b(&out,0x93);i386_b(&out,0xc0);i386_b(&out,0x0f);i386_b(&out,0xb6);i386_b(&out,0xc0);i386_b(&out,0x50); }
             .label => { set[i32](&labels,x.value as i32,out.len); }
             .jz => { i386_b(&out,0x58);i386_b(&out,0x85);i386_b(&out,0xc0);i386_b(&out,0x0f);i386_b(&out,0x84);push[I386Patch](&patches,I386Patch{.pos=out.len,.label=x.value as i32});i386_i32(&out,0); }
             .jmp => { i386_b(&out,0xe9);push[I386Patch](&patches,I386Patch{.pos=out.len,.label=x.value as i32});i386_i32(&out,0); }
-            .call => { let label:i32=(x.value/65536) as i32;let nargs:i32=(x.value&65535) as i32;i386_b(&out,0xe8);push[I386Patch](&patches,I386Patch{.pos=out.len,.label=label});i386_i32(&out,0);if(nargs>0){i386_b(&out,0x81);i386_b(&out,0xc4);i386_i32(&out,nargs*4);}i386_b(&out,0x50); }
-            .call_pair => { let label:i32=(x.value/65536) as i32;let nargs:i32=(x.value&65535) as i32;i386_b(&out,0xe8);push[I386Patch](&patches,I386Patch{.pos=out.len,.label=label});i386_i32(&out,0);if(nargs>0){i386_b(&out,0x81);i386_b(&out,0xc4);i386_i32(&out,nargs*4);}i386_b(&out,0x52);i386_b(&out,0x50); }
-            .call_sret => { let label:i32=(x.value/65536) as i32;let nargs:i32=(x.value&65535) as i32;i386_b(&out,0xe8);push[I386Patch](&patches,I386Patch{.pos=out.len,.label=label});i386_i32(&out,0);if(nargs>0){i386_b(&out,0x81);i386_b(&out,0xc4);i386_i32(&out,nargs*4);} }
-            .fcall => { let label:i32=(x.value/65536) as i32;let nargs:i32=(x.value&65535) as i32;i386_b(&out,0xe8);push[I386Patch](&patches,I386Patch{.pos=out.len,.label=label});i386_i32(&out,0);if(nargs>0){i386_b(&out,0x81);i386_b(&out,0xc4);i386_i32(&out,nargs*4);}i386_b(&out,0x83);i386_b(&out,0xec);i386_b(&out,8);i386_b(&out,0xdd);i386_b(&out,0x1c);i386_b(&out,0x24); }
-            .f32call => { let label:i32=(x.value/65536) as i32;let nargs:i32=(x.value&65535) as i32;i386_b(&out,0xe8);push[I386Patch](&patches,I386Patch{.pos=out.len,.label=label});i386_i32(&out,0);if(nargs>0){i386_b(&out,0x81);i386_b(&out,0xc4);i386_i32(&out,nargs*4);}i386_b(&out,0x83);i386_b(&out,0xec);i386_b(&out,4);i386_b(&out,0xd9);i386_b(&out,0x1c);i386_b(&out,0x24); }
-            .call_err => { let label:i32=(x.value/65536) as i32;let nargs:i32=(x.value&65535) as i32;i386_b(&out,0xe8);push[I386Patch](&patches,I386Patch{.pos=out.len,.label=label});i386_i32(&out,0);if(nargs>0){i386_b(&out,0x81);i386_b(&out,0xc4);i386_i32(&out,nargs*4);}i386_b(&out,0x52);i386_b(&out,0x50); }
+            .call => { let label:i32=(x.value/65536) as i32;let nargs:i32=(x.value&65535) as i32;i386_b(&out,0xe8);i386_call_disp(c,&out,&patches,label);if(nargs>0){i386_b(&out,0x81);i386_b(&out,0xc4);i386_i32(&out,nargs*4);}i386_b(&out,0x50); }
+            .call_pair => { let label:i32=(x.value/65536) as i32;let nargs:i32=(x.value&65535) as i32;i386_b(&out,0xe8);i386_call_disp(c,&out,&patches,label);if(nargs>0){i386_b(&out,0x81);i386_b(&out,0xc4);i386_i32(&out,nargs*4);}i386_b(&out,0x52);i386_b(&out,0x50); }
+            .call_sret => { let label:i32=(x.value/65536) as i32;let nargs:i32=(x.value&65535) as i32;i386_b(&out,0xe8);i386_call_disp(c,&out,&patches,label);if(nargs>0){i386_b(&out,0x81);i386_b(&out,0xc4);i386_i32(&out,nargs*4);} }
+            .fcall => { let label:i32=(x.value/65536) as i32;let nargs:i32=(x.value&65535) as i32;i386_b(&out,0xe8);i386_call_disp(c,&out,&patches,label);if(nargs>0){i386_b(&out,0x81);i386_b(&out,0xc4);i386_i32(&out,nargs*4);}i386_b(&out,0x83);i386_b(&out,0xec);i386_b(&out,8);i386_b(&out,0xdd);i386_b(&out,0x1c);i386_b(&out,0x24); }
+            .f32call => { let label:i32=(x.value/65536) as i32;let nargs:i32=(x.value&65535) as i32;i386_b(&out,0xe8);i386_call_disp(c,&out,&patches,label);if(nargs>0){i386_b(&out,0x81);i386_b(&out,0xc4);i386_i32(&out,nargs*4);}i386_b(&out,0x83);i386_b(&out,0xec);i386_b(&out,4);i386_b(&out,0xd9);i386_b(&out,0x1c);i386_b(&out,0x24); }
+            .call_err => { let label:i32=(x.value/65536) as i32;let nargs:i32=(x.value&65535) as i32;i386_b(&out,0xe8);i386_call_disp(c,&out,&patches,label);if(nargs>0){i386_b(&out,0x81);i386_b(&out,0xc4);i386_i32(&out,nargs*4);}i386_b(&out,0x52);i386_b(&out,0x50); }
             .err_jnz => { i386_b(&out,0x58);i386_b(&out,0x5a);i386_b(&out,0x85);i386_b(&out,0xd2);i386_b(&out,0x0f);i386_b(&out,0x85);push[I386Patch](&patches,I386Patch{.pos=out.len,.label=x.value as i32});i386_i32(&out,0);i386_b(&out,0x50); }
             .try_ => { i386_b(&out,0x58);i386_b(&out,0x5a);i386_b(&out,0x85);i386_b(&out,0xd2);i386_b(&out,0x74);i386_b(&out,4);i386_b(&out,0x31);i386_b(&out,0xc0);i386_b(&out,0xc9);i386_b(&out,0xc3);i386_b(&out,0x50); }
             // Linux i386 write(2): eax=4, ebx=fd, ecx=buf, edx=count.
@@ -332,5 +1055,12 @@ fn encode_i386_i32(c:*I386Lower) ArrayList[u8] {
         i=i+1;
     }
     let p:i32=0;while(p<patches.len){let q:I386Patch=patches.data[p];i386_patch32(&out,q.pos,(labels.data[q.label]-(q.pos+4)) as i64);p=p+1;}
+    let fi:i32=0;while(fi<c.*.funcs.len){if(c.*.funcs.data[fi].defined==1){c.*.funcs.data[fi].offset=labels.data[c.*.funcs.data[fi].label];}fi=fi+1;}
     return out;
+}
+
+fn i386_object_code(c:*I386Lower,text:ArrayList[u8]) I686ObjectCode {
+    let symbols:ArrayList[I686CodeSymbol]=make[I686CodeSymbol](c.*.funcs.len+1);let has_main:i32=0;let i:i32=0;
+    while(i<c.*.funcs.len){let f:I386Fn=c.*.funcs.data[i];if(f.defined==0||f.exported==1){let size:i32=0;if(f.defined==1){let end:i32=text.len;let j:i32=0;while(j<c.*.funcs.len){let q:I386Fn=c.*.funcs.data[j];if(q.defined==1&&q.offset>f.offset&&q.offset<end){end=q.offset;}j=j+1;}size=end-f.offset;}push[I686CodeSymbol](&symbols,I686CodeSymbol{.name=f.name,.offset=f.offset,.size=size,.defined=f.defined});}if(f.defined==1&&@strEq(f.name,"main")){has_main=1;}i=i+1;}
+    return I686ObjectCode{.text=text,.symbols=symbols,.relocs=c.*.object_relocs,.has_main=has_main};
 }

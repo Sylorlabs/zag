@@ -14,6 +14,143 @@ fn sm_hash_fields(h:ZagdHash)[]u8{return _zag_str_concat(_zag_i64_to_str(h.first
 fn sm_text_has(text:[]u8,needle:[]u8)i32{let i:i32=0;while(i+needle.len<=text.len){let j:i32=0;while(j<needle.len&&text[i+j]==needle[j]){j=j+1;}if(j==needle.len){return 1;}i=i+1;}return 0;}
 struct SmConst { value:i64, valid:i32 }
 fn sm_const(n:*Node)SmConst{let out:SmConst=SmConst{.value=0,.valid=0};switch(n.*){.ilit=>|x|{let v:i64=_zag_str_to_i64(x.text);if(v>=(0-1000000)&&v<=1000000){out.value=v;out.valid=1;}}.un=>|u|{let a:SmConst=sm_const(u.e);if(a.valid==1&&@strEq(u.op,"-")&&a.value!=(0-1000000)){out.value=0-a.value;out.valid=1;}}.bin=>|b|{let a:SmConst=sm_const(b.l);let c:SmConst=sm_const(b.r);if(a.valid==1&&c.valid==1){if(@strEq(b.op,"+")){out.value=a.value+c.value;out.valid=1;}else if(@strEq(b.op,"-")){out.value=a.value-c.value;out.valid=1;}else if(@strEq(b.op,"*")){out.value=a.value*c.value;out.valid=1;}else if(@strEq(b.op,"/")&&c.value!=0){out.value=a.value/c.value;out.valid=1;}else if(@strEq(b.op,"%")&&c.value!=0){out.value=a.value%c.value;out.valid=1;}if(out.value<(0-1000000)||out.value>1000000){out.valid=0;}}}else=>{}}return out;}
+
+// A deliberately narrow exact lifetime slice. These facts are derived only
+// from the parsed foreground AST; neither this producer nor the AST-free
+// reader scans source text for allocator spellings or identifier uses.
+//
+// The native x86-64 raw-slice runtime gives zalloc/zalloc_i an eight-byte word
+// stride. A candidate is accepted only when its allocation and unique matching
+// free are direct statements in the same function and every intervening use is
+// a scalar index or `.len` observation. Control flow, shadowing, slicing,
+// pointer formation, whole-buffer calls/returns/stores, and use-after-free all
+// fail closed. These are advisory facts, not transformation authority.
+struct SmBufferLife { name:[]u8, alloc_name:[]u8, free_name:[]u8, count:i64, bytes:i64, alloc_stmt:i32, free_stmt:i32, free_count:i32, invalid:i32 }
+fn sm_buffer_id(n:*Node,name:[]u8)i32{switch(n.*){.id=>|x|{return @strEq(x.name,name) as i32;}else=>{}}return 0;}
+fn sm_buffer_candidate(n:*Node,stmt:i32)SmBufferLife{
+    let none:SmBufferLife=SmBufferLife{.name="",.alloc_name="",.free_name="",.count=0,.bytes=0,.alloc_stmt=stmt,.free_stmt=0-1,.free_count=0,.invalid=1};
+    switch(n.*){.let_=>|l|{
+        if(l.has_dty!=1||l.has_init!=1){return none;}
+        let alloc_name:[]u8="";let free_name:[]u8="";
+        if(@strEq(l.dty,"[]f32")){alloc_name="zalloc";free_name="zfree";}
+        else if(@strEq(l.dty,"[]i32")){alloc_name="zalloc_i";free_name="zfree_i";}
+        else{return none;}
+        switch(l.expr.*){.call=>|c|{
+            if(len[[]u8](c.targs)!=0||len[*Node](c.args)!=1||sm_buffer_id(c.callee,alloc_name)==0){return none;}
+            let count:SmConst=sm_const(get[*Node](c.args,0));if(count.valid!=1||count.value<=0||count.value>1000000){return none;}
+            return SmBufferLife{.name=l.name,.alloc_name=alloc_name,.free_name=free_name,.count=count.value,.bytes=count.value*8,.alloc_stmt=stmt,.free_stmt=0-1,.free_count=0,.invalid=0};
+        }else=>{return none;}}
+    }else=>{}}return none;
+}
+fn sm_buffer_exact_free(n:*Node,name:[]u8,free_name:[]u8)i32{
+    switch(n.*){.estmt=>|e|{switch(e.expr.*){.call=>|c|{
+        if(len[[]u8](c.targs)==0&&len[*Node](c.args)==1&&sm_buffer_id(c.callee,free_name)==1&&sm_buffer_id(get[*Node](c.args,0),name)==1){return 1;}
+    }else=>{}}}else=>{}}return 0;
+}
+fn sm_buffer_expr_contains(n:*Node,name:[]u8)i32{
+    switch(n.*){
+        .id=>|x|{return @strEq(x.name,name) as i32;}
+        .bin=>|x|{return sm_buffer_expr_contains(x.l,name)|sm_buffer_expr_contains(x.r,name);}
+        .un=>|x|{return sm_buffer_expr_contains(x.e,name);}
+        .call=>|x|{if(sm_buffer_expr_contains(x.callee,name)==1){return 1;}let i:i32=0;while(i<len[*Node](x.args)){if(sm_buffer_expr_contains(get[*Node](x.args,i),name)==1){return 1;}i=i+1;}return 0;}
+        .idx=>|x|{return sm_buffer_expr_contains(x.base,name)|sm_buffer_expr_contains(x.idx,name);}
+        .fld=>|x|{return sm_buffer_expr_contains(x.base,name);}
+        .slice_=>|x|{let found:i32=sm_buffer_expr_contains(x.base,name)|sm_buffer_expr_contains(x.lo,name);if(x.has_hi==1){return found|sm_buffer_expr_contains(x.hi,name);}return found;}
+        .cast_=>|x|{return sm_buffer_expr_contains(x.expr,name);}
+        .slit_=>|x|{let i:i32=0;while(i<len[FieldInit](x.fields)){if(sm_buffer_expr_contains(get[FieldInit](x.fields,i).val,name)==1){return 1;}i=i+1;}return 0;}
+        .switch_=>|x|{if(sm_buffer_expr_contains(x.subject,name)==1){return 1;}let i:i32=0;while(i<len[SwitchArm](x.arms)){if(sm_buffer_body_contains(get[SwitchArm](x.arms,i).body,name)==1){return 1;}i=i+1;}return sm_buffer_body_contains(x.els_body,name);}
+        else=>{}
+    }return 0;
+}
+fn sm_buffer_stmt_contains(n:*Node,name:[]u8)i32{
+    switch(n.*){
+        .let_=>|x|{if(@strEq(x.name,name)){return 1;}if(x.has_init==1){return sm_buffer_expr_contains(x.expr,name);}}
+        .ret=>|x|{if(x.has_expr==1){return sm_buffer_expr_contains(x.expr,name);}}
+        .if_=>|x|{return sm_buffer_expr_contains(x.cond,name)|sm_buffer_body_contains(x.then_body,name)|sm_buffer_body_contains(x.els_body,name);}
+        .while_=>|x|{return sm_buffer_expr_contains(x.cond,name)|sm_buffer_body_contains(x.body,name);}
+        .unsafe_=>|x|{return sm_buffer_body_contains(x.body,name);}
+        .assign=>|x|{return sm_buffer_expr_contains(x.target,name)|sm_buffer_expr_contains(x.expr,name);}
+        .estmt=>|x|{return sm_buffer_expr_contains(x.expr,name);}
+        .switch_=>|x|{return sm_buffer_expr_contains(n,name);}
+        else=>{}
+    }return 0;
+}
+fn sm_buffer_body_contains(body:ArrayList[*Node],name:[]u8)i32{let i:i32=0;while(i<len[*Node](body)){if(sm_buffer_stmt_contains(get[*Node](body,i),name)==1){return 1;}i=i+1;}return 0;}
+fn sm_buffer_stmt_declares(n:*Node,name:[]u8)i32{
+    switch(n.*){
+        .let_=>|x|{return @strEq(x.name,name) as i32;}
+        .if_=>|x|{return sm_buffer_body_declares(x.then_body,name)|sm_buffer_body_declares(x.els_body,name);}
+        .while_=>|x|{return sm_buffer_body_declares(x.body,name);}
+        .unsafe_=>|x|{return sm_buffer_body_declares(x.body,name);}
+        .switch_=>|x|{let i:i32=0;while(i<len[SwitchArm](x.arms)){if(sm_buffer_body_declares(get[SwitchArm](x.arms,i).body,name)==1){return 1;}i=i+1;}return sm_buffer_body_declares(x.els_body,name);}
+        else=>{}
+    }return 0;
+}
+fn sm_buffer_body_declares(body:ArrayList[*Node],name:[]u8)i32{let i:i32=0;while(i<len[*Node](body)){if(sm_buffer_stmt_declares(get[*Node](body,i),name)==1){return 1;}i=i+1;}return 0;}
+fn sm_buffer_expr_safe(n:*Node,name:[]u8)i32{
+    switch(n.*){
+        .id=>|x|{return (1-(@strEq(x.name,name) as i32));}
+        .bin=>|x|{return sm_buffer_expr_safe(x.l,name)&sm_buffer_expr_safe(x.r,name);}
+        // Address formation and other unary operators are conservatively
+        // rejected whenever they mention the buffer, even through an index.
+        .un=>|x|{if(sm_buffer_expr_contains(x.e,name)==1){return 0;}return 1;}
+        .call=>|x|{if(sm_buffer_expr_safe(x.callee,name)==0){return 0;}let i:i32=0;while(i<len[*Node](x.args)){if(sm_buffer_expr_safe(get[*Node](x.args,i),name)==0){return 0;}i=i+1;}return 1;}
+        .idx=>|x|{if(sm_buffer_id(x.base,name)==1){return sm_buffer_expr_safe(x.idx,name);}return sm_buffer_expr_safe(x.base,name)&sm_buffer_expr_safe(x.idx,name);}
+        .fld=>|x|{if(sm_buffer_id(x.base,name)==1){return @strEq(x.fname,"len") as i32;}return sm_buffer_expr_safe(x.base,name);}
+        .slice_=>|x|{if(sm_buffer_expr_contains(n,name)==1){return 0;}return 1;}
+        .cast_=>|x|{return sm_buffer_expr_safe(x.expr,name);}
+        .slit_=>|x|{let i:i32=0;while(i<len[FieldInit](x.fields)){if(sm_buffer_expr_safe(get[FieldInit](x.fields,i).val,name)==0){return 0;}i=i+1;}return 1;}
+        // A switch expression can contain hidden control transfers in arm
+        // bodies. Reject it inside an observed lifetime even when the buffer
+        // itself is absent.
+        .switch_=>|_x|{return 0;}
+        else=>{}
+    }return 1;
+}
+fn sm_buffer_stmt_safe(n:*Node,name:[]u8)i32{
+    switch(n.*){
+        .let_=>|x|{if(@strEq(x.name,name)){return 0;}if(x.has_init==1){return sm_buffer_expr_safe(x.expr,name);}return 1;}
+        .assign=>|x|{return sm_buffer_expr_safe(x.target,name)&sm_buffer_expr_safe(x.expr,name);}
+        .estmt=>|x|{return sm_buffer_expr_safe(x.expr,name);}
+        // Return/break/continue and structured control flow can bypass or
+        // repeat the direct free, so this exact statement-order proof declines.
+        else=>{}
+    }return 0;
+}
+fn sm_buffer_emit_pair(lines:*ArrayList[u8],fn_name:[]u8,a:SmBufferLife,b:SmBufferLife)void{
+    let reuse:i64=a.bytes;if(b.bytes<reuse){reuse=b.bytes;}
+    aj(lines,"buffer_pair=");aj(lines,fn_name);aj(lines,"\tfirst=");aj(lines,a.name);aj(lines,"\tfirst_bytes=");smf_append_i64(lines,a.bytes);
+    aj(lines,"\tfirst_alloc_stmt=");smf_append_i64(lines,a.alloc_stmt);aj(lines,"\tfirst_free_stmt=");smf_append_i64(lines,a.free_stmt);
+    aj(lines,"\tsecond=");aj(lines,b.name);aj(lines,"\tsecond_bytes=");smf_append_i64(lines,b.bytes);aj(lines,"\tsecond_alloc_stmt=");smf_append_i64(lines,b.alloc_stmt);aj(lines,"\tsecond_free_stmt=");smf_append_i64(lines,b.free_stmt);
+    aj(lines,"\treuse_bytes=");smf_append_i64(lines,reuse);aj(lines,"\tword_bytes=8\tnon_overlap=1\tbasis=proven-foreground-ast\tautomatic=0\tsource_changes=0\texecutable_authority=0\tanalysis_bound=64\tvalidity=linux-x86_64-local-raw-word-zalloc-exactly-one-zfree-no-alias-escape-call-exposure\n");
+}
+fn sm_buffer_facts(f:FnDecl,lines:*ArrayList[u8])void{
+    let lives:ArrayList[SmBufferLife]=make[SmBufferLife](4);let i:i32=0;let overflow:i32=0;
+    while(i<len[*Node](f.body)){let life:SmBufferLife=sm_buffer_candidate(get[*Node](f.body,i),i);if(life.name.len>0){if(len[SmBufferLife](lives)>=64){overflow=1;}else{push[SmBufferLife](&lives,life);}}i=i+1;}
+    if(overflow==1){free[SmBufferLife](&lives);return;}
+    let li:i32=0;while(li<len[SmBufferLife](lives)){let life:SmBufferLife=get[SmBufferLife](lives,li);
+        let pi:i32=0;while(pi<len[Param](f.params)){if(@strEq(get[Param](f.params,pi).name,life.name)){life.invalid=1;}pi=pi+1;}
+        i=0;while(i<len[*Node](f.body)){let n:*Node=get[*Node](f.body,i);
+            if(i!=life.alloc_stmt&&sm_buffer_stmt_declares(n,life.name)==1){life.invalid=1;}
+            if(sm_buffer_exact_free(n,life.name,life.free_name)==1){life.free_count=life.free_count+1;if(life.free_stmt<0){life.free_stmt=i;}}
+            i=i+1;
+        }
+        if(life.free_count!=1||life.free_stmt<=life.alloc_stmt){life.invalid=1;}
+        i=0;while(i<len[*Node](f.body)){let n:*Node=get[*Node](f.body,i);
+            if(i!=life.alloc_stmt&&i!=life.free_stmt){
+                if(i>life.alloc_stmt&&i<life.free_stmt){if(sm_buffer_stmt_safe(n,life.name)==0){life.invalid=1;}}
+                else if(sm_buffer_stmt_contains(n,life.name)==1){life.invalid=1;}
+            }
+            i=i+1;
+        }
+        lives.data[li]=life;li=li+1;
+    }
+    // Adjacent valid candidates are sufficient to expose a reuse chain and
+    // keep fact production linear. Non-adjacent disjoint pairs are omitted
+    // rather than allowing quadratic manifest growth.
+    let previous:i32=0-1;i=0;while(i<len[SmBufferLife](lives)){let current:SmBufferLife=get[SmBufferLife](lives,i);if(current.invalid==0){if(previous>=0){let before:SmBufferLife=get[SmBufferLife](lives,previous);if(before.free_stmt<current.alloc_stmt){sm_buffer_emit_pair(lines,f.name,before,current);}}previous=i;}i=i+1;}
+    free[SmBufferLife](&lives);
+}
 fn sm_literal_node(n:*Node)i32{return sm_const(n).valid;}
 fn sm_constant_return(f:FnDecl)i32{if(len[*Node](f.body)!=1){return 0;}let result:i32=0;let n:*Node=get[*Node](f.body,0);switch(n.*){.ret=>|r|{if(r.has_expr==1){result=sm_literal_node(r.expr);}}else=>{}}return result;}
 fn sm_calls_expr(caller:[]u8,n:*Node,eff:map.StringMap[i32],lines:*ArrayList[u8])void{switch(n.*){.call=>|c|{let name:[]u8=callee_name(c.callee);if(name.len>0){aj(lines,_zag_str_concat("call_edge=",_zag_str_concat(caller,_zag_str_concat("\t",_zag_str_concat(name,"\n")))));}sm_calls_expr(caller,c.callee,eff,lines);let i:i32=0;while(i<len[*Node](c.args)){sm_calls_expr(caller,get[*Node](c.args,i),eff,lines);i=i+1;}}.bin=>|b|{sm_calls_expr(caller,b.l,eff,lines);sm_calls_expr(caller,b.r,eff,lines);}.un=>|u|sm_calls_expr(caller,u.e,eff,lines),.idx=>|x|{sm_calls_expr(caller,x.base,eff,lines);sm_calls_expr(caller,x.idx,eff,lines);}.fld=>|x|sm_calls_expr(caller,x.base,eff,lines),.slice_=>|s|{sm_calls_expr(caller,s.base,eff,lines);sm_calls_expr(caller,s.lo,eff,lines);if(s.has_hi==1){sm_calls_expr(caller,s.hi,eff,lines);}}.cast_=>|c|sm_calls_expr(caller,c.expr,eff,lines),.slit_=>|s|{let i:i32=0;while(i<len[FieldInit](s.fields)){sm_calls_expr(caller,get[FieldInit](s.fields,i).val,eff,lines);i=i+1;}}.switch_=>|s|{sm_calls_expr(caller,s.subject,eff,lines);let i:i32=0;while(i<len[SwitchArm](s.arms)){sm_calls_body(caller,get[SwitchArm](s.arms,i).body,eff,lines);i=i+1;}sm_calls_body(caller,s.els_body,eff,lines);}else=>{}}}
@@ -48,23 +185,89 @@ fn sm_value_facts_body(caller:[]u8,body:ArrayList[*Node],tenv:*ArrayList[ZTBind]
     else=>{}
 }i=i+1;}}
 
-fn semantic_manifest_build(module_path:[]u8,source:[]u8,profile:ModuleProfile,decls:ArrayList[*Node],eff:map.StringMap[i32],modules:ArrayList[ResolvedModule],imports:ArrayList[ResolvedImport])*SemanticManifest{
-    let pubh:ZagdHash=zagd_hash_empty();let effh:ZagdHash=zagd_hash_empty();let layh:ZagdHash=zagd_hash_empty();let lines:ArrayList[u8]=make[u8](256);
+// Graph facts are produced by the already parsed and merged foreground AST.
+// Do not recover origins, call edges, or type uses by scanning source: a node
+// without an exact origin is an explicitly incomplete graph and disables
+// fine-grained daemon invalidation.
+fn sm_graph_safe(value:[]u8)i32{if(value.len==0){return 0;}let i:i32=0;while(i<value.len){if(value[i]=='\n'||value[i]=='\r'||value[i]=='\t'){return 0;}i=i+1;}return 1;}
+fn sm_module_known(modules:ArrayList[ResolvedModule],module_path:[]u8,path:[]u8)i32{if(@strEq(path,"<root>")){return 1;}let i:i32=0;while(i<modules.len){if(@strEq(modules.data[i].path,path)){return 1;}i=i+1;}return 0;}
+fn sm_module_name(module_path:[]u8,path:[]u8)[]u8{if(@strEq(path,"<root>")){return module_path;}return path;}
+// Parser-synthesized Script body/report/wrapper declarations intentionally
+// have no source-file origin. They are compiler-owned root declarations, not
+// missing import provenance. Preserve that distinction in the semantic graph
+// so their fixed runtime edges can be cached exactly without weakening checks
+// for ordinary source or imported declarations.
+fn sm_script_generated_fn(name:[]u8) i32 {
+    if(@strEq(name,"main")){return 1;}
+    let prefix:[]u8="__zag_compiler_script_";
+    return (name.len>=prefix.len&&@strEq(name[0..prefix.len],prefix)) as i32;
+}
+fn sm_fn_graph_origin(module_path:[]u8,f:FnDecl)[]u8{
+    if(f.origin.len==0&&sm_script_generated_fn(f.name)==1){return module_path;}
+    return sm_module_name(module_path,f.origin);
+}
+fn sm_fn_graph_origin_known(modules:ArrayList[ResolvedModule],module_path:[]u8,f:FnDecl)i32{
+    if(f.origin.len==0&&sm_script_generated_fn(f.name)==1){return 1;}
+    return sm_module_known(modules,module_path,f.origin);
+}
+fn sm_fn_declared(decls:ArrayList[*Node],name:[]u8)i32{let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(@strEq(f.name,name)){return 1;}}else=>{}}i=i+1;}return 0;}
+fn sm_struct_declared(decls:ArrayList[*Node],name:[]u8)i32{let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.struct_=>|s|{if(@strEq(s.name,name)){return 1;}}else=>{}}i=i+1;}return 0;}
+fn sm_graph_decl_node(graph:*ArrayList[u8],origin:[]u8,name:[]u8,identity:ZagdHash)void{let node:[]u8=_zag_str_concat("decl_node=",name);node=_zag_str_concat(node,"\t");node=_zag_str_concat(node,origin);node=_zag_str_concat(node,"\t");node=_zag_str_concat(node,sm_hash_fields(identity));aj(graph,_zag_str_concat(node,"\n"));}
+fn sm_graph_decl_edges(graph:*ArrayList[u8],origin:[]u8,name:[]u8,identity:ZagdHash)void{let module_edge:[]u8=_zag_str_concat("decl_module_edge=",origin);module_edge=_zag_str_concat(module_edge,"\t");aj(graph,_zag_str_concat(module_edge,_zag_str_concat(name,"\n")));sm_graph_decl_node(graph,origin,name,identity);let region:[]u8=_zag_str_concat("decl_codegen_region=",name);region=_zag_str_concat(region,"\t");aj(graph,_zag_str_concat(region,_zag_str_concat(sm_hash_fields(identity),"\n")));}
+fn sm_graph_type_edges(name:[]u8,f:FnDecl,decls:ArrayList[*Node],graph:*ArrayList[u8])void{let i:i32=0;while(i<f.params.len){let p:Param=f.params.data[i];if(sm_graph_safe(p.pty)==1){aj(graph,_zag_str_concat("decl_type_edge=",_zag_str_concat(name,_zag_str_concat("\t",_zag_str_concat(p.pty,"\n")))));if(sm_struct_declared(decls,p.pty)==1){aj(graph,_zag_str_concat("decl_layout_edge=",_zag_str_concat(name,_zag_str_concat("\t",_zag_str_concat(p.pty,"\n")))));}}i=i+1;}if(sm_graph_safe(f.ret)==1){aj(graph,_zag_str_concat("decl_type_edge=",_zag_str_concat(name,_zag_str_concat("\t",_zag_str_concat(f.ret,"\n")))));if(sm_struct_declared(decls,f.ret)==1){aj(graph,_zag_str_concat("decl_layout_edge=",_zag_str_concat(name,_zag_str_concat("\t",_zag_str_concat(f.ret,"\n")))));}}}
+fn sm_graph_struct_edges(name:[]u8,s:StructDecl,decls:ArrayList[*Node],graph:*ArrayList[u8])void{let i:i32=0;while(i<s.fields.len){let p:Param=s.fields.data[i];if(sm_graph_safe(p.pty)==1){aj(graph,_zag_str_concat("decl_type_edge=",_zag_str_concat(name,_zag_str_concat("\t",_zag_str_concat(p.pty,"\n")))));if(sm_struct_declared(decls,p.pty)==1){aj(graph,_zag_str_concat("decl_layout_edge=",_zag_str_concat(name,_zag_str_concat("\t",_zag_str_concat(p.pty,"\n")))));}}i=i+1;}}
+// Runtime/pseudo calls are emitted by the fixed compiler image rather than a
+// user declaration. They are still exact graph inputs: record their spelling
+// as a distinct edge, but do not incorrectly classify the generated Script
+// wrapper as an unresolved user call. Unknown non-runtime calls remain a
+// fail-closed incomplete graph and therefore disable executable caching.
+fn sm_graph_runtime_call(name:[]u8)i32{
+    if(@strEq(name,"__catch")||@strEq(name,"__catchc")){return 1;}
+    if(name.len>=5&&@strEq(name[0..5],"_zag_")){return 1;}
+    if(name.len>0&&name[0]=='@'){return 1;}
+    return 0;
+}
+fn sm_graph_calls(call_lines:ArrayList[u8],decls:ArrayList[*Node],graph:*ArrayList[u8],complete:*i32)void{let start:i32=0;let i:i32=0;while(i<=call_lines.len){if(i==call_lines.len||call_lines.data[i]=='\n'){let line:[]u8=call_lines.data[start..i];if(line.len>10&&@strEq(line[0..10],"call_edge=")){let edge:[]u8=line[10..];let tab:i32=0;while(tab<edge.len&&edge[tab]!='\t'){tab=tab+1;}if(tab==edge.len||sm_graph_safe(edge[0..tab])==0||sm_graph_safe(edge[tab+1..])==0){complete.*=0;}else if(sm_fn_declared(decls,edge[tab+1..])==1){aj(graph,_zag_str_concat("fn_call_edge=",_zag_str_concat(edge,"\n")));}else if(sm_graph_runtime_call(edge[tab+1..])==1){aj(graph,_zag_str_concat("runtime_call_edge=",_zag_str_concat(edge,"\n")));}else{complete.*=0;}}start=i+1;}i=i+1;}}
+
+fn semantic_manifest_build_mode(module_path:[]u8,source:[]u8,profile:ModuleProfile,decls:ArrayList[*Node],eff:map.StringMap[i32],modules:ArrayList[ResolvedModule],imports:ArrayList[ResolvedImport],compact:i32)*SemanticManifest{
+    let pubh:ZagdHash=zagd_hash_empty();let effh:ZagdHash=zagd_hash_empty();let layh:ZagdHash=zagd_hash_empty();let lines:ArrayList[u8]=make[u8](256);let graph:ArrayList[u8]=make[u8](256);let semantic_graph:ArrayList[u8]=make[u8](256);let graph_complete:i32=1;
     let i:i32=0;while(i<len[*Node](decls)){let node:*Node=get[*Node](decls,i);switch(node.*){
         .fn_decl=>|f|{
             let sig:[]u8=_zag_str_concat("fn ",f.name);let j:i32=0;while(j<len[Param](f.params)){sig=_zag_str_concat(sig,_zag_str_concat("|",sm_param_text(get[Param](f.params,j))));j=j+1;}sig=_zag_str_concat(sig,_zag_str_concat("->",_zag_str_concat(f.ret,_zag_str_concat("!",f.ret_eff))));
-            let mask:i32=map.get[i32](eff,f.name) orelse 0;let canonical:ArrayList[u8]=make[u8](128);aj_node(&canonical,node);let declid:ZagdHash=zagd_content_hash(canonical.data[0..canonical.len]);let decl_line:[]u8=_zag_str_concat("decl_fn=",f.name);decl_line=_zag_str_concat(decl_line,_zag_str_concat("\t",sm_hash_fields(declid)));decl_line=_zag_str_concat(decl_line,_zag_str_concat("\tline=",_zag_i64_to_str(f.line)));decl_line=_zag_str_concat(decl_line,_zag_str_concat("\teffect=",_zag_str_concat(_zag_i64_to_str(mask),"\n")));aj(&lines,decl_line);
-            let call_lines:ArrayList[u8]=make[u8](64);sm_calls_body(f.name,f.body,eff,&call_lines);let leaf:i32=(call_lines.len==0) as i32;let constant:i32=sm_constant_return(f);let fact:[]u8=_zag_str_concat("fact_fn=",f.name);fact=_zag_str_concat(fact,_zag_str_concat("\teffect_free=",_zag_i64_to_str((mask==0) as i32)));fact=_zag_str_concat(fact,_zag_str_concat("\tleaf=",_zag_i64_to_str(leaf)));fact=_zag_str_concat(fact,_zag_str_concat("\tconstant_return=",_zag_i64_to_str(constant)));fact=_zag_str_concat(fact,_zag_str_concat("\talloc=",_zag_i64_to_str(mask&1)));fact=_zag_str_concat(fact,_zag_str_concat("\tio=",_zag_i64_to_str((mask&4)/4)));fact=_zag_str_concat(fact,"\n");aj(&lines,fact);aj(&lines,call_lines.data[0..call_lines.len]);
-            let tenv:ArrayList[ZTBind]=make[ZTBind](f.params.len+8);let eenv:map.StringMap[i32]=map.make[i32](16);let pi:i32=0;while(pi<f.params.len){let p:Param=f.params.data[pi];push[ZTBind](&tenv,ZTBind{.name=p.name,.ty=p.pty});pi=pi+1;}seed_params(f,&eenv);sm_value_facts_body(f.name,f.body,&tenv,&eenv,decls,eff,&lines);
+            let mask:i32=map.get[i32](eff,f.name) orelse 0;let canonical:ArrayList[u8]=make[u8](128);aj_node(&canonical,node);let declid:ZagdHash=zagd_content_hash(canonical.data[0..canonical.len]);free[u8](&canonical);let decl_line:[]u8=_zag_str_concat("decl_fn=",f.name);decl_line=_zag_str_concat(decl_line,_zag_str_concat("\t",sm_hash_fields(declid)));decl_line=_zag_str_concat(decl_line,_zag_str_concat("\tline=",_zag_i64_to_str(f.line)));decl_line=_zag_str_concat(decl_line,_zag_str_concat("\teffect=",_zag_str_concat(_zag_i64_to_str(mask),"\n")));aj(&lines,decl_line);
+            let origin:[]u8=sm_fn_graph_origin(module_path,f);if(sm_graph_safe(f.name)==0||sm_graph_safe(origin)==0||sm_fn_graph_origin_known(modules,module_path,f)==0){graph_complete=0;}else{sm_graph_decl_edges(&graph,origin,f.name,declid);sm_graph_type_edges(f.name,f,decls,&graph);}
+            let call_lines:ArrayList[u8]=make[u8](64);sm_calls_body(f.name,f.body,eff,&call_lines);sm_graph_calls(call_lines,decls,&graph,&graph_complete);let leaf:i32=(call_lines.len==0) as i32;let constant:i32=sm_constant_return(f);let fact:[]u8=_zag_str_concat("fact_fn=",f.name);fact=_zag_str_concat(fact,_zag_str_concat("\teffect_free=",_zag_i64_to_str((mask==0) as i32)));fact=_zag_str_concat(fact,_zag_str_concat("\tleaf=",_zag_i64_to_str(leaf)));fact=_zag_str_concat(fact,_zag_str_concat("\tconstant_return=",_zag_i64_to_str(constant)));fact=_zag_str_concat(fact,_zag_str_concat("\talloc=",_zag_i64_to_str(mask&1)));fact=_zag_str_concat(fact,_zag_str_concat("\tio=",_zag_i64_to_str((mask&4)/4)));fact=_zag_str_concat(fact,"\n");aj(&lines,fact);aj(&lines,call_lines.data[0..call_lines.len]);free[u8](&call_lines);
+            if(compact==0){sm_buffer_facts(f,&lines);let tenv:ArrayList[ZTBind]=make[ZTBind](f.params.len+8);let eenv:map.StringMap[i32]=map.make[i32](16);let pi:i32=0;while(pi<f.params.len){let p:Param=f.params.data[pi];push[ZTBind](&tenv,ZTBind{.name=p.name,.ty=p.pty});pi=pi+1;}seed_params(f,&eenv);sm_value_facts_body(f.name,f.body,&tenv,&eenv,decls,eff,&lines);free[ZTBind](&tenv);}
             if(f.is_pub==1){pubh=sm_add(pubh,sig);effh=sm_add(effh,_zag_str_concat(f.name,_zag_str_concat("=",_zag_i64_to_str(mask))));aj(&lines,_zag_str_concat("public_fn=",_zag_str_concat(sig,_zag_str_concat("\teffect=",_zag_str_concat(_zag_i64_to_str(mask),"\n")))));}
         }
-        .struct_=>|s|{if(s.is_pub==1){let shape:[]u8=_zag_str_concat("struct ",s.name);let j:i32=0;while(j<len[Param](s.fields)){shape=_zag_str_concat(shape,_zag_str_concat("|",sm_param_text(get[Param](s.fields,j))));j=j+1;}pubh=sm_add(pubh,shape);layh=sm_add(layh,shape);aj(&lines,_zag_str_concat("public_layout=",_zag_str_concat(shape,"\n")));}}
+        .struct_=>|s|{let shape:[]u8=_zag_str_concat("struct ",s.name);let j:i32=0;while(j<len[Param](s.fields)){shape=_zag_str_concat(shape,_zag_str_concat("|",sm_param_text(get[Param](s.fields,j))));j=j+1;}
+            let layout_id:ZagdHash=zagd_content_hash(shape);let origin:[]u8=sm_module_name(module_path,s.origin);
+            if(sm_graph_safe(s.name)==0||sm_graph_safe(origin)==0||sm_module_known(modules,module_path,s.origin)==0){graph_complete=0;}else{
+                sm_graph_decl_edges(&graph,origin,s.name,layout_id);
+                aj(&graph,_zag_str_concat("layout_node=",_zag_str_concat(s.name,_zag_str_concat("\t",_zag_str_concat(sm_hash_fields(layout_id),"\n")))));
+                sm_graph_struct_edges(s.name,s,decls,&graph);
+            }
+            if(s.is_pub==1){pubh=sm_add(pubh,shape);layh=sm_add(layh,shape);aj(&lines,_zag_str_concat("public_layout=",_zag_str_concat(shape,"\n")));}}
         else=>{}
     }i=i+1;}
-    let root:ZagdHash=zagd_content_hash(source);let profile_name:[]u8="strict";if(profile==ModuleProfile.script){profile_name="script";}
-    let body:ArrayList[u8]=make[u8](512);aj(&body,"format=zag-semantic-manifest-v1\nadvisory=true\nexecutable_authority=false\ncomplete=true\n");
-    aj(&body,_zag_str_concat("module=",_zag_str_concat(module_path,"\n")));aj(&body,_zag_str_concat("profile=",_zag_str_concat(profile_name,"\n")));aj(&body,_zag_str_concat("source=",_zag_str_concat(sm_hash_fields(root),"\n")));aj(&body,_zag_str_concat("public=",_zag_str_concat(sm_hash_fields(pubh),"\n")));aj(&body,_zag_str_concat("effects=",_zag_str_concat(sm_hash_fields(effh),"\n")));aj(&body,_zag_str_concat("layouts=",_zag_str_concat(sm_hash_fields(layh),"\n")));aj(&body,lines.data[0..lines.len]);
-    i=0;while(i<len[ResolvedModule](modules)){let m:ResolvedModule=get[ResolvedModule](modules,i);let name:[]u8=m.path;if(@strEq(name,"<root>")){name=module_path;}aj(&body,_zag_str_concat("module_node=",_zag_str_concat(name,_zag_str_concat("\t",_zag_str_concat(sm_hash_fields(zagd_content_hash(m.source)),"\n")))));i=i+1;}i=0;while(i<len[ResolvedImport](imports)){let edge:ResolvedImport=get[ResolvedImport](imports,i);let from:[]u8=edge.importer;if(@strEq(from,"<root>")){from=module_path;}aj(&body,_zag_str_concat("import_edge=",_zag_str_concat(from,_zag_str_concat("\t",_zag_str_concat(edge.imported,"\n")))));i=i+1;}
-    let sum:ZagdHash=zagd_content_hash(body.data[0..body.len]);let text:[]u8=_zag_str_concat(body.data[0..body.len],_zag_str_concat("checksum=",_zag_str_concat(sm_hash_fields(sum),"\n")));
+    // Module/import edges are from the resolver's merged module graph, not
+    // text recovery. Keep raw module content hashes in the published graph for
+    // stale-snapshot validation, but exclude them from semantic graph identity:
+    // comments and formatting must not invalidate codegen/artifact identity.
+    // Declaration identities, graph topology, call/type/layout edges, and
+    // module names remain semantic identity inputs.
+    aj(&semantic_graph,graph.data[0..graph.len]);
+    i=0;while(i<len[ResolvedModule](modules)){let m:ResolvedModule=get[ResolvedModule](modules,i);let name:[]u8=m.path;if(@strEq(name,"<root>")){name=module_path;}if(sm_graph_safe(name)==0){graph_complete=0;}else{aj(&graph,_zag_str_concat("module_node=",_zag_str_concat(name,_zag_str_concat("\t",_zag_str_concat(sm_hash_fields(zagd_content_hash(m.source)),"\n")))));aj(&semantic_graph,_zag_str_concat("module_identity_node=",_zag_str_concat(name,"\n")));}i=i+1;}
+    i=0;while(i<len[ResolvedImport](imports)){let edge:ResolvedImport=get[ResolvedImport](imports,i);let from:[]u8=edge.importer;if(@strEq(from,"<root>")){from=module_path;}if(sm_graph_safe(from)==0||sm_graph_safe(edge.imported)==0){graph_complete=0;}else{let import_line:[]u8=_zag_str_concat("import_edge=",_zag_str_concat(from,_zag_str_concat("\t",_zag_str_concat(edge.imported,"\n"))));aj(&graph,import_line);aj(&semantic_graph,import_line);}i=i+1;}
+    let root:ZagdHash=zagd_content_hash(source);let profile_name:[]u8="strict";if(profile==ModuleProfile.script){profile_name="script";}let graphh:ZagdHash=zagd_content_hash(semantic_graph.data[0..semantic_graph.len]);
+    let body:ArrayList[u8]=make[u8](512);aj(&body,"format=zag-semantic-manifest-v1\nadvisory=true\nexecutable_authority=false\ncomplete=true\ndetail_level=");if(compact==1){aj(&body,"compact\n");}else{aj(&body,"full\n");}
+    aj(&body,_zag_str_concat("module=",_zag_str_concat(module_path,"\n")));aj(&body,_zag_str_concat("profile=",_zag_str_concat(profile_name,"\n")));aj(&body,_zag_str_concat("source=",_zag_str_concat(sm_hash_fields(root),"\n")));aj(&body,_zag_str_concat("public=",_zag_str_concat(sm_hash_fields(pubh),"\n")));aj(&body,_zag_str_concat("effects=",_zag_str_concat(sm_hash_fields(effh),"\n")));aj(&body,_zag_str_concat("layouts=",_zag_str_concat(sm_hash_fields(layh),"\n")));aj(&body,_zag_str_concat("graph=",_zag_str_concat(sm_hash_fields(graphh),"\n")));aj(&body,_zag_str_concat("graph_complete=",_zag_str_concat(_zag_i64_to_str(graph_complete),"\n")));aj(&body,lines.data[0..lines.len]);aj(&body,graph.data[0..graph.len]);
+    let sum:ZagdHash=zagd_content_hash(body.data[0..body.len]);let text:[]u8=_zag_str_concat(body.data[0..body.len],_zag_str_concat("checksum=",_zag_str_concat(sm_hash_fields(sum),"\n")));free[u8](&body);free[u8](&lines);free[u8](&graph);free[u8](&semantic_graph);
     return new(SemanticManifest{.text=text,.public_identity=pubh,.effect_identity=effh,.layout_identity=layh});
 }
+fn semantic_manifest_build(module_path:[]u8,source:[]u8,profile:ModuleProfile,decls:ArrayList[*Node],eff:map.StringMap[i32],modules:ArrayList[ResolvedModule],imports:ArrayList[ResolvedImport])*SemanticManifest{return semantic_manifest_build_mode(module_path,source,profile,decls,eff,modules,imports,0);}
+// Large merged units use the same exact declaration/module/type/call graph and
+// public/effect/layout identities, but omit recursive expression witnesses and
+// local buffer-lifetime facts. Those details are advisory; freshness and graph
+// authority remain complete and checksum-bound.
+fn semantic_manifest_build_compact(module_path:[]u8,source:[]u8,profile:ModuleProfile,decls:ArrayList[*Node],eff:map.StringMap[i32],modules:ArrayList[ResolvedModule],imports:ArrayList[ResolvedImport])*SemanticManifest{return semantic_manifest_build_mode(module_path,source,profile,decls,eff,modules,imports,1);}

@@ -86,5 +86,33 @@ else
   bad "target support matrix is missing or overclaims GPU runtime support"
 fi
 
+if rg -q 'allowlist is .*`env`' docs/ZAGSCRIPT_SEMANTICS.md && \
+   rg -q '`args\(\)` materializes a typed `ScriptList\[\[\]u8\]`' docs/ZAGSCRIPT_SEMANTICS.md && \
+   ! rg -q 'materialized argument collection.*remain[s]? candidate' docs/ZAGSCRIPT_SEMANTICS.md; then
+  ok "Zag Script prelude documentation matches implemented env and args bindings"
+else
+  bad "Zag Script prelude documentation is stale or contradicts env and args implementation"
+fi
+
+if [ -x tests/run_i686_release_gate.sh ] && \
+   rg -q 'run_i686_release_gate.sh' README.md docs/X86_TARGET_POLICY.md docs/X86_FEATURES.md tests/run_zagscript_master_gate.sh && \
+   rg -q 'ZAG_I686_REFERENCE_TOOLS=0' tests/run_i686_release_gate.sh && \
+   rg -q 'Not certified: full language/public C ABI parity, dynamic/TLS linking, ARM' tests/run_i686_release_gate.sh && \
+   rg -q 'Full i686 target.*not complete' docs/X86_TARGET_POLICY.md; then
+  ok "i686 authority is wired without overclaiming parity or host-tool evidence"
+else
+  bad "i686 authority wiring or support boundary is stale"
+fi
+
+if [ -x tests/run_v1_compatibility_gate.sh ] && \
+   rg -q 'run_v1_compatibility_gate.sh' tests/run_zagscript_master_gate.sh README.md && \
+   rg -q 'run_native_arm64.sh' tests/run_v1_compatibility_gate.sh && \
+   rg -q 'run_arm64_selfhost.sh' tests/run_v1_compatibility_gate.sh && \
+   rg -q 'run_abi_layout.sh' tests/run_v1_compatibility_gate.sh; then
+  ok "master gate covers distinct existing v1 and ARM compatibility authorities"
+else
+  bad "master gate omits distinct existing v1 compatibility authority"
+fi
+
 echo "════ docs-consistency pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]

@@ -19,6 +19,7 @@ fn zagd_sys_unlink() i64 { return 87; }
 fn zagd_sys_kill() i64 { return 62; }
 fn zagd_sys_getdents64() i64 { return 217; }
 fn zagd_sys_openat() i64 { return 257; }
+fn zagd_sys_newfstatat() i64 { return 262; }
 
 fn zagd_in_cloexec() i64 { return 524288; }
 fn zagd_in_create() i64 { return 256; }
@@ -29,6 +30,7 @@ fn zagd_in_moved_from() i64 { return 64; }
 fn zagd_in_moved_to() i64 { return 128; }
 fn zagd_in_delete_self() i64 { return 1024; }
 fn zagd_in_move_self() i64 { return 2048; }
+fn zagd_in_q_overflow() i64 { return 16384; }
 fn zagd_in_ignored() i64 { return 32768; }
 fn zagd_in_attrib() i64 { return 4; }
 fn zagd_in_isdir() i64 { return 1073741824; }
@@ -39,6 +41,7 @@ fn zagd_watch_mask() i64 { return 36814; }
 fn zagd_at_fdcwd() i64 { return 0 - 100; }
 fn zagd_o_directory_read() i64 { return 589824; }
 fn zagd_o_lock_create() i64 { return 524481; }
+fn zagd_at_symlink_nofollow() i64 { return 256; }
 
 struct ZagdTimespec { sec: i64, nsec: i64 }
 
@@ -58,6 +61,45 @@ fn zagd_c_string(value: []u8) ArrayList[u8] {
     return out;
 }
 
+// Small append-only byte builder used by the daemon's long-running paths.
+// `_zag_str_concat` returns a fresh allocation, so repeated concatenation in a
+// watcher loop retained a geometric chain of old buffers until the process was
+// killed.  These helpers keep one growable backing allocation per record and
+// make it straightforward for callers to free it after the synchronous write.
+fn zagd_text(capacity:i32) ArrayList[u8] { return make[u8](capacity); }
+fn zagd_text_append(out:*ArrayList[u8], value:[]u8) void {
+    let i:i32=0;
+    while(i<value.len){push[u8](out,value[i]);i=i+1;}
+}
+fn zagd_text_append_byte(out:*ArrayList[u8], value:u8) void { push[u8](out,value); }
+fn zagd_text_append_i64(out:*ArrayList[u8], value:i64) void {
+    // Decimal conversion without allocating a temporary runtime string.  The
+    // daemon's persisted hashes and counters may be negative, including the
+    // minimum signed value, so divide/remainder rather than negating it.
+    let n:i64=value;
+    if(n==0){push[u8](out,'0');return;}
+    if(n<0){push[u8](out,'-');}
+    let digits:ArrayList[u8]=make[u8](24);
+    while(n!=0){
+        let q:i64=n/10;
+        let rem:i64=n-q*10;
+        if(rem<0){rem=0-rem;}
+        push[u8](&digits,(rem+48) as u8);
+        n=q;
+    }
+    let i:i32=digits.len-1;
+    while(i>=0){push[u8](out,digits.data[i]);i=i-1;}
+    free[u8](&digits);
+}
+fn zagd_text_clone(value:[]u8) []u8 {
+    let out:ArrayList[u8]=make[u8](value.len+1);
+    zagd_text_append(&out,value);
+    return out.data[0..out.len];
+}
+// Only call for slices returned by `zagd_text_clone` or `zagd_join_path`.
+// Literals and borrowed slices are intentionally never passed here.
+fn zagd_text_free(value:[]u8) void { _zag_free(_zag_slice_ptr(value)); }
+
 fn zagd_ptr(bytes: []u8) i64 { return _zag_slice_ptr(bytes) as i64; }
 
 fn zagd_inotify_open() i64 {
@@ -66,8 +108,10 @@ fn zagd_inotify_open() i64 {
 
 fn zagd_inotify_watch(fd: i64, path: []u8) i64 {
     let cpath: ArrayList[u8] = zagd_c_string(path);
-    return _zag_raw_syscall(zagd_sys_inotify_add_watch(), fd,
+    let rc:i64=_zag_raw_syscall(zagd_sys_inotify_add_watch(), fd,
         zagd_ptr(cpath.data[0..cpath.len]), zagd_watch_mask(), 0, 0, 0);
+    free[u8](&cpath);
+    return rc;
 }
 
 fn zagd_close(fd: i64) void {
@@ -77,6 +121,7 @@ fn zagd_close(fd: i64) void {
 fn zagd_unlink(path: []u8) void {
     let cpath: ArrayList[u8] = zagd_c_string(path);
     let _rc: i64 = _zag_raw_syscall(zagd_sys_unlink(), zagd_ptr(cpath.data[0..cpath.len]), 0, 0, 0, 0, 0);
+    free[u8](&cpath);
 }
 
 fn zagd_read_events(fd: i64, buffer: *ArrayList[u8]) i64 {
@@ -117,7 +162,8 @@ fn zagd_has_suffix(value: []u8, suffix: []u8) i32 {
 fn zagd_ignored_name(name: []u8) i32 {
     if (name.len == 0) { return 1; }
     if (@strEq(name, ".zagd.status") || @strEq(name, ".zagd.lock") ||
-        @strEq(name, ".zagd.stop") || @strEq(name, ".zag-cache") ||
+        @strEq(name, ".zagd.stop") || @strEq(name, ".zagd.rescan") ||
+        @strEq(name, ".zag-cache") ||
         @strEq(name, ".zig-cache") || @strEq(name, "zig-cache") ||
         @strEq(name, ".git") || @strEq(name, "node_modules") ||
         @strEq(name, "__pycache__") || @strEq(name, "build") ||
@@ -128,9 +174,22 @@ fn zagd_ignored_name(name: []u8) i32 {
     return 0;
 }
 
+fn zagd_source_name(name:[]u8)i32 {
+    return (zagd_has_suffix(name,".zag")==1||zagd_has_suffix(name,".zs")==1) as i32;
+}
+
+fn zagd_event_requires_rescan(mask:i64)i32 {
+    return zagd_mask_has(mask,zagd_in_q_overflow());
+}
+
 fn zagd_join_path(root: []u8, name: []u8) []u8 {
-    if (root.len > 0 && root[root.len - 1] == '/') { return _zag_str_concat(root, name); }
-    return _zag_str_concat(root, _zag_str_concat("/", name));
+    let slash:i32=1;
+    if(root.len>0&&root[root.len-1]=='/'){slash=0;}
+    let out:ArrayList[u8]=make[u8](root.len+name.len+slash+1);
+    zagd_text_append(&out,root);
+    if(slash==1){zagd_text_append_byte(&out,'/');}
+    zagd_text_append(&out,name);
+    return out.data[0..out.len];
 }
 
 fn zagd_fork() i64 { return _zag_raw_syscall(zagd_sys_fork(), 0, 0, 0, 0, 0, 0); }
@@ -148,18 +207,68 @@ fn zagd_pid_alive(pid: i64) i32 {
 
 fn zagd_open_lock(path: []u8) i64 {
     let cpath: ArrayList[u8] = zagd_c_string(path);
-    return _zag_raw_syscall(zagd_sys_openat(), zagd_at_fdcwd(),
+    let rc:i64=_zag_raw_syscall(zagd_sys_openat(), zagd_at_fdcwd(),
         zagd_ptr(cpath.data[0..cpath.len]), zagd_o_lock_create(), 384, 0, 0);
+    free[u8](&cpath);
+    return rc;
 }
 
 fn zagd_open_directory(path: []u8) i64 {
     let cpath: ArrayList[u8] = zagd_c_string(path);
-    return _zag_raw_syscall(zagd_sys_openat(), zagd_at_fdcwd(),
+    let rc:i64=_zag_raw_syscall(zagd_sys_openat(), zagd_at_fdcwd(),
         zagd_ptr(cpath.data[0..cpath.len]), zagd_o_directory_read(), 0, 0, 0);
+    free[u8](&cpath);
+    return rc;
 }
 
 fn zagd_getdents(fd: i64, buffer: *ArrayList[u8]) i64 {
     if (buffer.*.len < 4096) { while (buffer.*.len < 4096) { push[u8](buffer, 0 as u8); } }
     return _zag_raw_syscall(zagd_sys_getdents64(), fd,
         zagd_ptr(buffer.*.data[0..buffer.*.len]), buffer.*.len, 0, 0, 0);
+}
+
+// lstat-style kind query. Project-internal symlinks are deliberately not
+// followed: a watched project cannot make the quiet daemon traverse or read an
+// arbitrary target outside its root. Linux x86-64 struct stat stores st_mode at
+// byte offset 24; the high nibble is S_IFDIR=4, S_IFREG=8, S_IFLNK=10.
+fn zagd_path_kind(path:[]u8)i32 {
+    let cpath:ArrayList[u8]=zagd_c_string(path);
+    let stat:ArrayList[u8]=make[u8](144);
+    while(stat.len<144){push[u8](&stat,0);}
+    let rc:i64=_zag_raw_syscall(zagd_sys_newfstatat(),zagd_at_fdcwd(),
+        zagd_ptr(cpath.data[0..cpath.len]),zagd_ptr(stat.data[0..stat.len]),
+        zagd_at_symlink_nofollow(),0,0);
+    let kind:i32=0;
+    if(rc==0){kind=(zagd_u32_at(stat.data[0..stat.len],24)/4096) as i32;}
+    free[u8](&cpath);
+    free[u8](&stat);
+    return kind;
+}
+
+fn zagd_path_is_regular(path:[]u8)i32{return (zagd_path_kind(path)==8) as i32;}
+fn zagd_path_is_directory(path:[]u8)i32{return (zagd_path_kind(path)==4) as i32;}
+fn zagd_path_is_symlink(path:[]u8)i32{return (zagd_path_kind(path)==10) as i32;}
+
+// Bounded lstat size query for cache accounting. Cache limits are capped at
+// 2 GiB, so any high 32-bit size component is represented by a 4 GiB sentinel
+// rather than decoded by reading or allocating the payload. Non-regular cache
+// entries are also over-limit: the trim path will unlink the entry itself and
+// will never follow a symlink supplied in place of a cache record.
+fn zagd_path_size(path:[]u8)i64 {
+    let cpath:ArrayList[u8]=zagd_c_string(path);
+    let stat:ArrayList[u8]=make[u8](144);
+    while(stat.len<144){push[u8](&stat,0);}
+    let rc:i64=_zag_raw_syscall(zagd_sys_newfstatat(),zagd_at_fdcwd(),
+        zagd_ptr(cpath.data[0..cpath.len]),zagd_ptr(stat.data[0..stat.len]),
+        zagd_at_symlink_nofollow(),0,0);
+    let size:i64=0;
+    if(rc==0){
+        let kind:i32=(zagd_u32_at(stat.data[0..stat.len],24)/4096) as i32;
+        let high:i64=zagd_u32_at(stat.data[0..stat.len],52);
+        if(kind!=8||high!=0){size=4294967296;}
+        else{size=zagd_u32_at(stat.data[0..stat.len],48);}
+    }
+    free[u8](&cpath);
+    free[u8](&stat);
+    return size;
 }

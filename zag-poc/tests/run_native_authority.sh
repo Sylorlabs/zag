@@ -11,6 +11,48 @@ tmp="${TMPDIR:-/tmp}/zag-native-authority.$$"
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 mkdir -p "$tmp/bin"
 
+authority_limit=${ZAG_SELFHOST_MEMORY_MAX_BYTES:-}
+authority_swap=${ZAG_SELFHOST_SWAP_MAX_BYTES:-0}
+authority_guard=0
+case "$authority_swap" in ''|*[!0-9]*) echo "native authority: invalid swap guard" >&2; exit 1;; esac
+if command -v systemd-run >/dev/null 2>&1 &&
+   systemctl --user is-system-running >/dev/null 2>&1; then
+    if [ -z "$authority_limit" ]; then
+        authority_total_kib=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo)
+        authority_available_kib=$(awk '/^MemAvailable:/ { print $2; exit }' /proc/meminfo)
+        authority_physical_limit=$((authority_total_kib * 1024 * 60 / 100))
+        authority_available_limit=$(((authority_available_kib - 2097152) * 1024))
+        authority_limit=$authority_physical_limit
+        if [ "$authority_limit" -gt "$authority_available_limit" ]; then
+            authority_limit=$authority_available_limit
+        fi
+    fi
+    case "$authority_limit" in ''|*[!0-9]*) echo "native authority: invalid memory guard" >&2; exit 1;; esac
+    [ "$authority_limit" -ge 1073741824 ] || {
+        echo "native authority: refusing self-rebuild with less than 1 GiB after reserve" >&2
+        exit 1
+    }
+    authority_guard=1
+    echo "  memory guard: cgroup memory max=$authority_limit bytes, swap max=$authority_swap bytes"
+elif [ -n "$authority_limit" ] || [ "$authority_swap" -ne 0 ]; then
+    echo "native authority: explicit memory or swap limit requires a user systemd manager" >&2
+    exit 1
+fi
+
+authority_rebuild() {
+    if [ "$authority_guard" -eq 1 ]; then
+        systemd-run --user --quiet --wait --collect --pipe \
+            -p Type=exec -p "WorkingDirectory=$PWD" \
+            -p "MemoryMax=$authority_limit" -p "MemorySwapMax=$authority_swap" \
+            -p CPUWeight=1 -p IOWeight=1 -p Nice=10 \
+            /usr/bin/env "PATH=$tmp/bin:$PATH" ./znc selfhost/native/znc.zag \
+            -o "$tmp/znc-stage2" --no-analyze --no-zagd --no-foreground-cache
+    else
+        PATH="$tmp/bin:$PATH" ./znc selfhost/native/znc.zag \
+            -o "$tmp/znc-stage2" --no-analyze --no-zagd --no-foreground-cache
+    fi
+}
+
 bash tests/check_pure_zag_tree.sh
 
 for tool in cc gcc clang as ld; do
@@ -33,7 +75,7 @@ check_static_elf() {
 }
 
 echo "── native authority: poison cc/gcc/clang/as/ld ──"
-if PATH="$tmp/bin:$PATH" ./znc selfhost/native/znc.zag -o "$tmp/znc-stage2" --no-analyze --no-zagd >"$tmp/rebuild.log" 2>&1; then
+if authority_rebuild >"$tmp/rebuild.log" 2>&1; then
     echo "  ok  native seed rebuilt znc without a host C toolchain"
     pass=$((pass + 1))
     check_static_elf "$tmp/znc-stage2" "stage-2 compiler"
@@ -50,7 +92,8 @@ printf 'fn main() i32 { print_int(42); return 0; }\n' > "$tmp/smoke.zag"
 # largest allocation in this gate solely to count execve calls.
 if command -v strace >/dev/null 2>&1; then
     if PATH="$tmp/bin:$PATH" strace -f -e trace=execve -o "$tmp/exec.log" \
-       ./znc "$tmp/smoke.zag" -o "$tmp/smoke-traced" --no-analyze --no-zagd >"$tmp/traced.log" 2>&1 && \
+       ./znc "$tmp/smoke.zag" -o "$tmp/smoke-traced" --no-analyze --no-zagd \
+       --no-foreground-cache >"$tmp/traced.log" 2>&1 && \
        [ "$(grep -c 'execve(' "$tmp/exec.log")" -eq 1 ]; then
         echo "  ok  syscall trace shows no child tool execution"
         pass=$((pass + 1))
@@ -65,7 +108,8 @@ else
     echo "  --  strace unavailable; PATH poisoning remains enforced"
 fi
 
-if PATH="$tmp/bin:$PATH" "$tmp/znc-stage2" "$tmp/smoke.zag" -o "$tmp/smoke" >"$tmp/smoke.log" 2>&1 && \
+if PATH="$tmp/bin:$PATH" "$tmp/znc-stage2" "$tmp/smoke.zag" -o "$tmp/smoke" \
+   --no-zagd --no-foreground-cache >"$tmp/smoke.log" 2>&1 && \
    [ "$("$tmp/smoke")" = 42 ]; then
     echo "  ok  stage-2 compiler built and ran a Zag program"
     pass=$((pass + 1))
@@ -83,6 +127,25 @@ if ! rg -n '^[[:space:]]*(cc|gcc|clang|as|ld)[[:space:]]|\./zagc([[:space:]]|$)'
 else
     echo "  XX  supported workflow names a host compiler command"
     cat "$tmp/refs"
+    fail=$((fail + 1))
+fi
+
+if rg -q '^bootstrap_compile \./znc selfhost/native/znc\.zag ' bootstrap.sh &&
+   rg -q '^bootstrap_compile "\$bootstrap_tmp/znc-stage1" selfhost/native/znc\.zag ' bootstrap.sh &&
+   rg -q '^bootstrap_compile "\$bootstrap_tmp/znc-stage2" selfhost/native/znc\.zag ' bootstrap.sh &&
+   rg -q 'cmp -s "\$bootstrap_tmp/znc-stage2" "\$bootstrap_tmp/znc-stage3"' bootstrap.sh &&
+   [ "$(rg -c -- '--no-analyze --no-foreground-cache --no-zagd' bootstrap.sh)" -ge 3 ] &&
+   rg -q '^bootstrap: selfhost/native/znc\.zag selfhost/zagd_daemon\.zag$' Makefile &&
+   rg -q '^znc: bootstrap$' Makefile &&
+   rg -q '^zagd: bootstrap$' Makefile &&
+   rg -q -- '--no-analyze --no-zagd --no-foreground-cache' \
+       tests/check_native_bootstrap_repro.sh &&
+   rg -q -- '--no-analyze --no-zagd --no-foreground-cache' \
+       tests/run_native_memory_regression.sh; then
+    echo "  ok  supported self-rebuilds require a fixpoint and disable advisory cache and daemon"
+    pass=$((pass + 1))
+else
+    echo "  XX  supported self-rebuild may skip its fixpoint or use advisory cache/daemon"
     fail=$((fail + 1))
 fi
 
