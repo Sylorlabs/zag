@@ -1481,6 +1481,7 @@ struct Cg {
     dynamic_names: *ArrayList[[]u8], // GOT slots, in declaration order
     allow_popcnt:i32,
     allow_bmi1:i32,
+    safety_checked:i32, // emit edition-2027 raw-pointer null/alignment guards
 }
 
 fn cg_dynamic_index(cg: *Cg, name: []u8) i32 {
@@ -1768,6 +1769,15 @@ fn cg_elem_is_byte(ty: []u8) i32 {
 fn cg_elem_stride(cg: *Cg, ty: []u8) i32 {
     if (cg_elem_is_byte(ty) == 1) { return 1; }
     return cg_type_size(cg, ty);
+}
+
+// Native layout is byte-packed only for i8/u8 buffers. Every other lowered
+// scalar, pointer, and aggregate field starts on an 8-byte boundary; aggregate
+// SIZE is not its alignment (a struct can validly occupy 24 bytes).
+fn cg_type_alignment(cg: *Cg, ty: []u8) i32 {
+    let _unused: *Cg = cg;
+    if (cg_elem_is_byte(ty) == 1) { return 1; }
+    return 8;
 }
 
 // BYTE offset of field `fname` within struct `sname` = cumulative 8-aligned sum
@@ -3554,6 +3564,33 @@ fn cg_push_base_addr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayLis
     }
 }
 
+// `--safety=checked` is an edition-2027 native mode.  It keeps raw-pointer
+// checks out of the default/release path, but before every instrumented raw
+// access it rejects null and addresses that cannot meet the lowered element's
+// alignment.  Bounds and allocator-liveness require allocation metadata and
+// are deliberately handled by later runtime instrumentation rather than being
+// implied by this guard.
+//
+// Input/output: RAX is the address being accessed.  R8/RCX are scratch.
+fn cg_emit_checked_raw_access(out:*ArrayList[Instr],cg:*Cg,align:i32)void{
+    if(cg.*.safety_checked==0){return;}
+    let nonnull:i32=cg_fresh(cg);let after_null:i32=cg_fresh(cg);
+    push[Instr](out,i_cmp_imm(R_RAX(),0));
+    push[Instr](out,i_jne(nonnull));
+    cg_emit_panic(out,"zag safety: null raw pointer access",after_null,cg);
+    push[Instr](out,i_label(nonnull));
+    if(align>1){
+        let aligned:i32=cg_fresh(cg);let after_align:i32=cg_fresh(cg);
+        push[Instr](out,i_mov_rr(R_R8(),R_RAX()));
+        push[Instr](out,i_mov_imm(R_RCX(),(align-1) as i64));
+        push[Instr](out,i_and(R_R8(),R_RCX()));
+        push[Instr](out,i_cmp_imm(R_R8(),0));
+        push[Instr](out,i_je(aligned));
+        cg_emit_panic(out,"zag safety: misaligned raw pointer access",after_align,cg);
+        push[Instr](out,i_label(aligned));
+    }
+}
+
 fn cg_lower_addr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[FnSym], cg: *Cg) void {
     switch (n.*) {
         .id => |x| {
@@ -3584,6 +3621,11 @@ fn cg_lower_addr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
             if (@strEq(f.fname, "*")) {
                 // p.* — the address is the pointer value itself.
                 cg_lower_expr(out, f.base, env, syms, cg);   // pushes pointer value
+                push[Instr](out,i_pop(R_RAX()));
+                let pty:[]u8=cg_expr_type(f.base,env,syms,cg);
+                let align:i32=1;if(pty.len>1&&pty[0]=='*'){align=cg_type_alignment(cg,cg_norm_type(pty[1..]));}
+                cg_emit_checked_raw_access(out,cg,align);
+                push[Instr](out,i_push(R_RAX()));
                 return;
             }
             // s.field / p.*.field : compute base address, add field byte offset.
@@ -3665,6 +3707,7 @@ fn cg_lower_addr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                     push[Instr](out, i_imul(R_RCX(), R_RDX()));
                 }
                 push[Instr](out, i_add(R_RAX(), R_RCX()));    // rax = ptr + stride*i
+                cg_emit_checked_raw_access(out,cg,cg_type_alignment(cg,cg_norm_type(ixt[1..])));
                 push[Instr](out, i_push(R_RAX()));
                 return;
             }
@@ -4125,11 +4168,16 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                 let pet: []u8 = "";
                 if (pt.len > 1 && pt[0] == '*') { pet = pt[1..]; }
                 if (pet.len > 0 && cg_type_is_agg(cg, pet) == 1) {
-                    cg_lower_expr(out, f.base, env, syms, cg);   // pushes pointer = block addr
+                    cg_lower_expr(out, f.base, env, syms, cg);
+                    push[Instr](out,i_pop(R_RAX()));
+                    cg_emit_checked_raw_access(out,cg,cg_type_alignment(cg,pet));
+                    push[Instr](out,i_push(R_RAX()));            // pointer = block addr
                     return;
                 }
                 cg_lower_expr(out, f.base, env, syms, cg);   // pushes pointer value
                 push[Instr](out, i_pop(R_RAX()));
+                let align:i32=1;if(pet.len>0){align=cg_type_alignment(cg,pet);}
+                cg_emit_checked_raw_access(out,cg,align);
                 push[Instr](out, i_load(R_RAX(), R_RAX(), 0));
                 push[Instr](out, i_push(R_RAX()));
                 return;
@@ -4260,6 +4308,7 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                         push[Instr](out, i_imul(R_RCX(), R_RDX()));
                     }
                     push[Instr](out, i_add(R_RAX(), R_RCX()));      // rax = ptr + stride*i
+                    cg_emit_checked_raw_access(out,cg,cg_type_alignment(cg,elemty));
                     if (cg_type_is_agg(cg, elemty) == 1) {
                         // aggregate element: value = element ADDRESS.
                         push[Instr](out, i_push(R_RAX()));
@@ -11554,7 +11603,7 @@ fn cg_decls_use_rns(decls: ArrayList[*Node]) i32 {
     return 0;
 }
 
-fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8], dynamic_mode: i32,allow_popcnt:i32,allow_bmi1:i32) ArrayList[Instr] {
+fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8], dynamic_mode: i32,allow_popcnt:i32,allow_bmi1:i32,safety_checked:i32) ArrayList[Instr] {
     let out: ArrayList[Instr] = make[Instr](128);
     let top_err: i32 = 0;
 
@@ -11745,6 +11794,7 @@ fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *Ar
         .dynamic_names = &dynamic_names,
         .allow_popcnt=allow_popcnt,
         .allow_bmi1=allow_bmi1,
+        .safety_checked=safety_checked,
     };
 
     // ── _start stub (emitted FIRST → entry_off = 0) ──
@@ -11824,11 +11874,12 @@ fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *Ar
 }
 
 fn lower_program(decls0in: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8]) ArrayList[Instr] {
-    return lower_program_mode_cpu(decls0in, errout, dataout, 0,0,0);
+    return lower_program_mode_cpu(decls0in, errout, dataout, 0,0,0,0);
 }
-fn lower_program_mode(decls0in:ArrayList[*Node],errout:*i32,dataout:*ArrayList[u8],dynamic_mode:i32)ArrayList[Instr]{return lower_program_mode_cpu(decls0in,errout,dataout,dynamic_mode,0,0);}
-fn lower_program_cpu(decls0in:ArrayList[*Node],errout:*i32,dataout:*ArrayList[u8],allow_popcnt:i32)ArrayList[Instr]{return lower_program_mode_cpu(decls0in,errout,dataout,0,allow_popcnt,0);}
+fn lower_program_mode(decls0in:ArrayList[*Node],errout:*i32,dataout:*ArrayList[u8],dynamic_mode:i32)ArrayList[Instr]{return lower_program_mode_cpu(decls0in,errout,dataout,dynamic_mode,0,0,0);}
+fn lower_program_cpu(decls0in:ArrayList[*Node],errout:*i32,dataout:*ArrayList[u8],allow_popcnt:i32)ArrayList[Instr]{return lower_program_mode_cpu(decls0in,errout,dataout,0,allow_popcnt,0,0);}
 // znc uses this counted entry for the executable-cache boundary. A validated
 // hit must leave the caller-owned witness at zero; a miss must increment it
 // exactly once before authoritative lowering.
-fn lower_program_mode_cpu_counted(decls0in:ArrayList[*Node],errout:*i32,dataout:*ArrayList[u8],dynamic_mode:i32,allow_popcnt:i32,allow_bmi1:i32,witness:*i64)ArrayList[Instr]{witness.*=witness.*+1;return lower_program_mode_cpu(decls0in,errout,dataout,dynamic_mode,allow_popcnt,allow_bmi1);}
+fn lower_program_mode_cpu_counted(decls0in:ArrayList[*Node],errout:*i32,dataout:*ArrayList[u8],dynamic_mode:i32,allow_popcnt:i32,allow_bmi1:i32,witness:*i64)ArrayList[Instr]{witness.*=witness.*+1;return lower_program_mode_cpu(decls0in,errout,dataout,dynamic_mode,allow_popcnt,allow_bmi1,0);}
+fn lower_program_mode_cpu_counted_safety(decls0in:ArrayList[*Node],errout:*i32,dataout:*ArrayList[u8],dynamic_mode:i32,allow_popcnt:i32,allow_bmi1:i32,safety_checked:i32,witness:*i64)ArrayList[Instr]{witness.*=witness.*+1;return lower_program_mode_cpu(decls0in,errout,dataout,dynamic_mode,allow_popcnt,allow_bmi1,safety_checked);}

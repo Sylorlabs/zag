@@ -12,7 +12,7 @@ tmp=$(mktemp -d /tmp/zag-v2-options.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT
 printf 'fn main() i32 { return 0; }\n' >"$tmp/main.zag"
 pass=0 fail=0
-for option in --safety=checked --sanitize=memory --target-feature=avx2 --gpu-runtime=vulkan --edition=2027; do
+for option in --sanitize=memory --target-feature=avx2 --gpu-runtime=vulkan --edition=2027; do
   out="$tmp/out"
   rm -f "$out"
   if "$ZNC" "$tmp/main.zag" -o "$out" "$option" >"$tmp/log" 2>&1 || [ -e "$out" ]; then
@@ -39,14 +39,14 @@ else
   pass=$((pass + 1))
 fi
 
-if "$ZNC" check "$tmp/main.zag" --safety=checked >"$tmp/check.log" 2>&1; then
-  echo "  XX  check rejects unimplemented v2 option"
+if "$ZNC" check "$tmp/main.zag" --sanitize=memory >"$tmp/check.log" 2>&1; then
+  echo "  XX  check rejects unimplemented sanitizer option"
   fail=$((fail + 1))
 elif grep -q E0202 "$tmp/check.log"; then
-  echo "  ok  check rejects unimplemented v2 option"
+  echo "  ok  check rejects unimplemented sanitizer option"
   pass=$((pass + 1))
 else
-  echo "  XX  check rejects unimplemented v2 option (missing E0202)"
+  echo "  XX  check rejects unimplemented sanitizer option (missing E0202)"
   fail=$((fail + 1))
 fi
 echo "════ v2-options pass=$pass fail=$fail ════"

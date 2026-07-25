@@ -38,9 +38,10 @@ else
 fi
 
 if [ -f docs/V2_SAFETY_TOOLING.md ] && \
-   rg -q 'rejects the proposed v2' docs/V2_SAFETY_TOOLING.md && \
+   rg -q 'partially implemented for edition-2027 native' docs/V2_SAFETY_TOOLING.md && \
+   rg -q 'Sanitizer options remain rejected' docs/V2_SAFETY_TOOLING.md && \
    rg -q 'Current status remains unsupported' docs/V2_SAFETY_TOOLING.md; then
-  ok "safety-tooling document is explicit about unsupported status"
+  ok "safety-tooling document scopes checked mode and unsupported sanitizers"
 else
   bad "safety-tooling document is missing or overclaims implementation"
 fi

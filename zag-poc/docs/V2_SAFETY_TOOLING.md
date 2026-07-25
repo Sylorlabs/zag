@@ -1,14 +1,18 @@
 # Zag v2 safety tooling (draft)
 
-Status: specification only.  The current compiler rejects the proposed v2
-driver options rather than silently accepting them.  No sanitizer is claimed
-until this document has implementation, negative tests, and runtime evidence.
+Status: `--safety=checked` is partially implemented for edition-2027 native
+x86-64 output. It traps null and misaligned raw-pointer dereferences/indexes
+before the access, and is rejected on every other target rather than silently
+downgrading. Dynamic bounds and allocator-lifetime checks are not part of this
+first slice. Sanitizer options remain rejected until they have implementation,
+negative tests, and runtime evidence.
 
 ## Modes
 
-- `--safety=checked` preserves language traps and enables available dynamic
-  checks for raw-pointer alignment/bounds/lifetime, invalid shifts, division by
-  zero, and invalid tags.
+- `--safety=checked` preserves language traps and currently enables dynamic
+  raw-pointer null/alignment checks on native x86-64. Bounds, allocator
+  lifetime, invalid shifts, division by zero, and invalid tags remain separate
+  implementation work; this mode does not claim them yet.
 - `--safety=release` retains defined-language traps while allowing proven
   redundant checks to be removed.  It never converts a safe operation into
   ambient undefined behavior.

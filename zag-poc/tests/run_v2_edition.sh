@@ -36,6 +36,80 @@ reject() {
 }
 
 reject "v1 rejects v2 unsafe syntax" 2026 E0200
+mkdir -p "$tmp/v2-checked-null"
+printf 'name = "v2checkednull"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-null/zag.mod"
+printf 'fn main() i32 { unsafe { let p:*const i32=null as *const i32; return p.*; } }\n' >"$tmp/v2-checked-null/main.zag"
+if (cd "$tmp/v2-checked-null" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-checked-null/log" 2>&1 && [ -x "$tmp/v2-checked-null/out" ]; then
+  set +e
+  "$tmp/v2-checked-null/out" >"$tmp/v2-checked-null/out.log" 2>"$tmp/v2-checked-null/err.log"
+  checked_null_rc=$?
+  set -e
+  if [ "$checked_null_rc" -ne 0 ] && grep -q 'zag safety: null raw pointer access' "$tmp/v2-checked-null/err.log"; then
+    echo "  ok  checked safety traps null raw-pointer dereference"
+    pass=$((pass + 1))
+  else
+    echo "  XX  checked safety null dereference (exit=$checked_null_rc)"; sed -n '1,8p' "$tmp/v2-checked-null/log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  checked safety null program did not compile"; sed -n '1,8p' "$tmp/v2-checked-null/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-checked-aggregate"
+printf 'name = "v2checkedaggregate"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-aggregate/zag.mod"
+printf 'struct Triple { a:i64, b:i64, c:i64 } fn main() i32 { unsafe { let p:*Triple=_zag_malloc(24) as *Triple; p.*.a=7; p.*.b=11; p.*.c=24; let result:i64=p.*.a+p.*.b+p.*.c; _zag_free(p); return result as i32; } }\n' >"$tmp/v2-checked-aggregate/main.zag"
+if (cd "$tmp/v2-checked-aggregate" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-checked-aggregate/log" 2>&1 &&
+   [ -x "$tmp/v2-checked-aggregate/out" ]; then
+  set +e
+  "$tmp/v2-checked-aggregate/out"
+  checked_aggregate_rc=$?
+  set -e
+  if [ "$checked_aggregate_rc" -eq 42 ]; then
+    echo "  ok  checked safety permits valid 8-aligned 24-byte aggregate access"
+    pass=$((pass + 1))
+  else
+    echo "  XX  checked safety aggregate access (exit=$checked_aggregate_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  checked safety aggregate program did not compile"; sed -n '1,8p' "$tmp/v2-checked-aggregate/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-checked-misaligned"
+printf 'name = "v2checkedmisaligned"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-misaligned/zag.mod"
+printf 'fn main() i32 { unsafe { let bytes:*i8=_zag_malloc(32) as *i8; let p:*const i32=(&bytes[1]) as *const i32; let result:i32=p.*; _zag_free(bytes); return result; } }\n' >"$tmp/v2-checked-misaligned/main.zag"
+if (cd "$tmp/v2-checked-misaligned" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-checked-misaligned/log" 2>&1 && [ -x "$tmp/v2-checked-misaligned/out" ]; then
+  set +e
+  "$tmp/v2-checked-misaligned/out" >"$tmp/v2-checked-misaligned/out.log" 2>"$tmp/v2-checked-misaligned/err.log"
+  checked_misaligned_rc=$?
+  set -e
+  if [ "$checked_misaligned_rc" -ne 0 ] && grep -q 'zag safety: misaligned raw pointer access' "$tmp/v2-checked-misaligned/err.log"; then
+    echo "  ok  checked safety traps misaligned raw-pointer dereference"
+    pass=$((pass + 1))
+  else
+    echo "  XX  checked safety misaligned dereference (exit=$checked_misaligned_rc)"; sed -n '1,8p' "$tmp/v2-checked-misaligned/log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  checked safety misaligned program did not compile"; sed -n '1,8p' "$tmp/v2-checked-misaligned/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-checked-wasm"
+printf 'name = "v2checkedwasm"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-wasm/zag.mod"
+printf 'fn main() i32 { return 0; }\n' >"$tmp/v2-checked-wasm/main.zag"
+if (cd "$tmp/v2-checked-wasm" && "$ZNC" main.zag -o out --target wasm --safety=checked) >"$tmp/v2-checked-wasm/log" 2>&1 || [ -e "$tmp/v2-checked-wasm/out" ]; then
+  echo "  XX  checked safety rejects unsupported target"; sed -n '1,8p' "$tmp/v2-checked-wasm/log"; fail=$((fail + 1))
+elif grep -q 'implemented only for the native x86-64 target' "$tmp/v2-checked-wasm/log"; then
+  echo "  ok  checked safety rejects unsupported target without artifact"
+  pass=$((pass + 1))
+else
+  echo "  XX  checked safety target rejection missing diagnostic"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-callback-lifetime"
+printf 'name = "v2callbacklifetime"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-callback-lifetime/zag.mod"
+printf 'fn maker() fn() i32 { let x:i32=42; return fn[&x]() i32 { return x.*; }; } fn main() i32 { let f:fn() i32=maker(); return f(); }\n' >"$tmp/v2-callback-lifetime/main.zag"
+if (cd "$tmp/v2-callback-lifetime" && "$ZNC" main.zag -o out) >"$tmp/v2-callback-lifetime/log" 2>&1 || [ -e "$tmp/v2-callback-lifetime/out" ]; then
+  echo "  XX  callback capture lifetime rejects without artifact"; sed -n '1,8p' "$tmp/v2-callback-lifetime/log"; fail=$((fail + 1))
+elif grep -q 'capturing closure requires an explicit v2 lifetime contract' "$tmp/v2-callback-lifetime/log"; then
+  echo "  ok  callback capture lifetime rejects without artifact"
+  pass=$((pass + 1))
+else
+  echo "  XX  callback capture lifetime diagnostic missing"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-unsafe"
 printf 'name = "v2unsafe"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-unsafe/zag.mod"
 printf 'fn main() i32 { unsafe { print_i64(42); } return 0; }\n' >"$tmp/v2-unsafe/main.zag"
