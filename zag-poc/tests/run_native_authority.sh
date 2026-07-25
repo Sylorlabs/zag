@@ -120,7 +120,7 @@ else
     fail=$((fail + 1))
 fi
 
-if ! rg -n '^[[:space:]]*(cc|gcc|clang|as|ld)[[:space:]]|\./zagc([[:space:]]|$)' \
+if ! grep -E -n '^[[:space:]]*(cc|gcc|clang|as|ld)[[:space:]]|\./zagc([[:space:]]|$)' \
     bootstrap.sh tests/run_native.sh >"$tmp/refs"; then
     echo "  ok  supported bootstrap and native suite contain no host or legacy compiler invocation"
     pass=$((pass + 1))
@@ -130,17 +130,17 @@ else
     fail=$((fail + 1))
 fi
 
-if rg -q '^bootstrap_compile \./znc selfhost/native/znc\.zag ' bootstrap.sh &&
-   rg -q '^bootstrap_compile "\$bootstrap_tmp/znc-stage1" selfhost/native/znc\.zag ' bootstrap.sh &&
-   rg -q '^bootstrap_compile "\$bootstrap_tmp/znc-stage2" selfhost/native/znc\.zag ' bootstrap.sh &&
-   rg -q 'cmp -s "\$bootstrap_tmp/znc-stage2" "\$bootstrap_tmp/znc-stage3"' bootstrap.sh &&
-   [ "$(rg -c -- '--no-analyze --no-foreground-cache --no-zagd' bootstrap.sh)" -ge 3 ] &&
-   rg -q '^bootstrap: selfhost/native/znc\.zag selfhost/zagd_daemon\.zag$' Makefile &&
-   rg -q '^znc: bootstrap$' Makefile &&
-   rg -q '^zagd: bootstrap$' Makefile &&
-   rg -q -- '--no-analyze --no-zagd --no-foreground-cache' \
+if grep -E -q '^bootstrap_compile \./znc selfhost/native/znc\.zag ' bootstrap.sh &&
+   grep -E -q '^bootstrap_compile "\$bootstrap_tmp/znc-stage1" selfhost/native/znc\.zag ' bootstrap.sh &&
+   grep -E -q '^bootstrap_compile "\$bootstrap_tmp/znc-stage2" selfhost/native/znc\.zag ' bootstrap.sh &&
+   grep -E -q 'cmp -s "\$bootstrap_tmp/znc-stage2" "\$bootstrap_tmp/znc-stage3"' bootstrap.sh &&
+   [ "$(grep -E -c -- '--no-analyze --no-foreground-cache --no-zagd' bootstrap.sh)" -ge 3 ] &&
+   grep -E -q '^bootstrap: selfhost/native/znc\.zag selfhost/zagd_daemon\.zag$' Makefile &&
+   grep -E -q '^znc: bootstrap$' Makefile &&
+   grep -E -q '^zagd: bootstrap$' Makefile &&
+   grep -E -q -- '--no-analyze --no-zagd --no-foreground-cache' \
        tests/check_native_bootstrap_repro.sh &&
-   rg -q -- '--no-analyze --no-zagd --no-foreground-cache' \
+   grep -E -q -- '--no-analyze --no-zagd --no-foreground-cache' \
        tests/run_native_memory_regression.sh; then
     echo "  ok  supported self-rebuilds require a fixpoint and disable advisory cache and daemon"
     pass=$((pass + 1))
