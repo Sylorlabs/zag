@@ -89,9 +89,13 @@ reuse part of an unmapped large range for an arena; retaining the old tombstone
 would falsely reject the new object's valid free. Because the ABI carries only
 a raw pointer, an old alias cannot be distinguished from a later live
 allocation at that identical address. This is allocator-integrity
-instrumentation, not general provenance or use-after-free instrumentation:
-arbitrary forged addresses and accesses through an already-freed pointer still
-require the unsafe programmer to uphold their contract.
+instrumentation, not general provenance or use-after-free instrumentation. A
+stale dereference of a dedicated large mapping does trap at the operating
+system's unmapped-page boundary; the allocator lifetime gate exercises that
+behavior. It is not a typed diagnostic, does not cover small arena allocations,
+and cannot distinguish an old alias from a later allocation at the same
+address. Arbitrary forged addresses and the remaining unsafe dereference cases
+still require the unsafe programmer to uphold their contract.
 
 ## Pointer categories and lifetime
 

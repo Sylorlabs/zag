@@ -130,6 +130,25 @@ else
   echo "  XX  large-map stale-realloc program did not compile"; sed -n '1,8p' "$tmp/large_stale_realloc.log"; fail=$((fail + 1))
 fi
 
+# A freed large allocation is unmapped rather than returned to a small-block
+# free list. A stale raw dereference must therefore trap at the OS boundary;
+# this is a real runtime guard for the dedicated-map subset, not a claim of
+# general small-allocation use-after-free instrumentation.
+printf '%s\n' 'fn main() i32 { let p:*i32 = _zag_malloc(524289) as *i32; p.* = 42; _zag_free(p); return p.*; }' >"$tmp/large_stale_deref.zag"
+if "$ZNC" "$tmp/large_stale_deref.zag" -o "$tmp/large_stale_deref" --no-zagd --no-analyze --no-foreground-cache >"$tmp/large_stale_deref.log" 2>&1; then
+  set +e
+  "$tmp/large_stale_deref" >"$tmp/large_stale_deref.out" 2>"$tmp/large_stale_deref.err"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ]; then
+    echo "  ok  large-map stale dereference traps after unmap"; pass=$((pass + 1))
+  else
+    echo "  XX  large-map stale dereference unexpectedly returned"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  large-map stale-dereference program did not compile"; sed -n '1,8p' "$tmp/large_stale_deref.log"; fail=$((fail + 1))
+fi
+
 cat >"$tmp/large_to_small_address_reuse.zag" <<'ZAG'
 fn main() i32 {
     // Payload + allocator header is exactly one 1 MiB mapping. Linux normally
