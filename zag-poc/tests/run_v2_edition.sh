@@ -470,13 +470,19 @@ else
 fi
 mkdir -p "$tmp/v2-global-pointer"
 printf 'name = "v2globalpointer"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-global-pointer/zag.mod"
-printf 'global let p:*i32; fn main() i32 { return 0; }\n' >"$tmp/v2-global-pointer/main.zag"
-if (cd "$tmp/v2-global-pointer" && "$ZNC" main.zag -o out) >"$tmp/v2-global-pointer/log" 2>&1 || [ -e "$tmp/v2-global-pointer/out" ]; then
-  echo "  XX  pointer global rejects without artifact"; sed -n '1,8p' "$tmp/v2-global-pointer/log"; fail=$((fail + 1))
-elif grep -q 'no global lifetime contract' "$tmp/v2-global-pointer/log"; then
-  echo "  ok  pointer global rejects without artifact"; pass=$((pass + 1))
+printf 'extern fn _zag_malloc(n:i64)*u8; extern fn _zag_free(p:*u8)void; global let p:*u8; fn main() i32 { unsafe { p = _zag_malloc(8); p.* = 42; let out:i32 = p.*; _zag_free(p); return out; } }\n' >"$tmp/v2-global-pointer/main.zag"
+if (cd "$tmp/v2-global-pointer" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-global-pointer/log" 2>&1 && [ -x "$tmp/v2-global-pointer/out" ]; then
+  set +e
+  "$tmp/v2-global-pointer/out"
+  global_pointer_rc=$?
+  set -e
+  if [ "$global_pointer_rc" -eq 42 ]; then
+    echo "  ok  pointer global owns checked allocation through release"; pass=$((pass + 1))
+  else
+    echo "  XX  pointer global execution (exit=$global_pointer_rc)"; fail=$((fail + 1))
+  fi
 else
-  echo "  XX  pointer global rejection missing lifetime diagnostic"; fail=$((fail + 1))
+  echo "  XX  pointer global checked ownership compiles"; sed -n '1,10p' "$tmp/v2-global-pointer/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-global-init"
 printf 'name = "v2globalinit"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-global-init/zag.mod"

@@ -82,11 +82,13 @@ Strict modules keep ordinary top-level `let` rejected with an explicit v2
 lifetime-contract diagnostic. Edition-2027 native x86-64 additionally accepts
 the narrow explicit declaration `global let name: Primitive;`: it is a
 root-module-only, zero-initialized, one-word BSS cell with an explicit primitive
-scalar type. It has no dynamic initializer, pointer, optional, callback,
-aggregate, import, ownership-transfer, or destructor contract. The compiler's
+scalar or raw-pointer type. Pointer cells participate in ordinary named
+ownership and checked allocation provenance when assigned/released through the
+implemented allocator APIs. They have no dynamic initializer, optional,
+callback, aggregate, import, or destructor contract. The compiler's
 remaining BSS is private allocator/runtime state, and top-level `const` is a
-nullary-function desugaring rather than a static object. Pointer-bearing and
-aggregate globals remain rejected until initialization ordering, destruction,
+nullary-function desugaring rather than a static object. Aggregate, callback,
+and optional globals remain rejected until initialization ordering, destruction,
 and lifetime/provenance contracts are implemented.
 
 Captureless callbacks are ordinary function values. A scalar by-value capture
