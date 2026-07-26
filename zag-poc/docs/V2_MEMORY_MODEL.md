@@ -94,6 +94,9 @@ handles after same-address reuse fail before raw free. It supplies
 `allocate`, `allocate_zeroed`, `resize`, and consuming `deallocate`; it does
 not provide opaque language capabilities, custom/arena/fixed-buffer allocators,
 or a general static lifetime analysis for allocator values.
+The current runtime record also rejects a live cross-handle field splice when
+its generation belongs to another allocation; this is exact-record validation,
+not language-level opaque ownership.
 Its compiler-private register, validate, and free hooks also reject outside
 checked mode; importing the allocator module cannot silently weaken that handle
 boundary into an unchecked free path.

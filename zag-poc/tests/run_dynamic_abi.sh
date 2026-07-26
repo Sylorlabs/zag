@@ -158,5 +158,20 @@ else
     bad "split --export-symbol missing export diagnostic"
 fi
 
+# Object aliases, PIE, loader-path, rpath/soname, and archive-selection flags
+# would change ELF/link semantics. The native writer cannot implement those
+# requests by falling through to its ordinary ET_EXEC output.
+for linker_flag in --emit-object --emit=obj -c --pie -pie --whole-archive --no-whole-archive \
+                   --dynamic-linker=/lib/ld-linux-x86-64.so.2 --rpath=/tmp/zag --soname=libzag.so; do
+    linker_name=$(printf '%s' "$linker_flag" | tr -cd '[:alnum:]')
+    if (cd "$WORK/v2-cabi" && "$ZNC_BIN" main.zag "$linker_flag" --no-zagd --no-analyze -o "$linker_name.out") >"$WORK/v2-cabi/$linker_name.log" 2>&1 || [ -e "$WORK/v2-cabi/$linker_name.out" ]; then
+        bad "$linker_flag emitted a misleading linker artifact"
+    elif grep -q "v2 compiler option is not implemented: $linker_flag" "$WORK/v2-cabi/$linker_name.log"; then
+        ok "$linker_flag fails closed"
+    else
+        bad "$linker_flag missing linker-option diagnostic"
+    fi
+done
+
 echo "════ dynamic ABI pass=$pass fail=$fail ════"
 [ "$fail" = 0 ]

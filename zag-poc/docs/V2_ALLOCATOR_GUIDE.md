@@ -22,6 +22,9 @@ alignment remains unsupported rather than silently rounded. `deallocate`
 validates all four against checked-runtime provenance before it frees: an
 invalid base, copied released handle, forged length, wrong alignment, or stale
 generation after address reuse terminates before allocator metadata is touched.
+The same exact-tuple check rejects a live cross-handle splice: a second live
+pointer/capacity/alignment combined with another handle's generation is not a
+valid identity.
 This requires native x86-64 `--safety=checked`; other targets and unchecked
 builds reject the validation boundary rather than silently weakening it. The
 v2 compiler gate proves that an unchecked call reports that requirement and

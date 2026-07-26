@@ -144,6 +144,26 @@ if (cd "$tmp/v2-system-allocator-forged-alignment" && "$ZNC" main.zag -o out --s
 else
   echo "  XX  forged SystemAllocator alignment did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-alignment/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-system-allocator-forged-generation"
+printf 'name = "v2systemallocatorforgedgeneration"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-forged-generation/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-forged-generation/std"
+# Splice a live second descriptor with the first allocation's generation. This
+# must not be accepted merely because every individual field came from a valid
+# current handle: identity is the exact live tuple, including generation.
+printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let first:Allocation=try allocator.allocate(24,8); let second:Allocation=try allocator.allocate(64,8); let forged:Allocation=Allocation{.ptr=second.ptr,.len=second.len,.alignment=second.alignment,.generation=first.generation}; try allocator.deallocate(forged); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-forged-generation/main.zag"
+if (cd "$tmp/v2-system-allocator-forged-generation" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-forged-generation/log" 2>&1 && [ -x "$tmp/v2-system-allocator-forged-generation/out" ]; then
+  set +e
+  "$tmp/v2-system-allocator-forged-generation/out" >"$tmp/v2-system-allocator-forged-generation/out.log" 2>"$tmp/v2-system-allocator-forged-generation/err.log"
+  forged_generation_allocator_rc=$?
+  set -e
+  if [ "$forged_generation_allocator_rc" -ne 0 ] && grep -q 'stale Allocation generation' "$tmp/v2-system-allocator-forged-generation/err.log"; then
+    echo "  ok  SystemAllocator rejects live cross-handle generation splice"; pass=$((pass + 1))
+  else
+    echo "  XX  forged SystemAllocator generation splice (exit=$forged_generation_allocator_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-generation/log"; sed -n '1,8p' "$tmp/v2-system-allocator-forged-generation/err.log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  forged SystemAllocator generation splice did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-generation/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-system-allocator-stale"
 printf 'name = "v2systemallocatorstale"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-stale/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-stale/std"
