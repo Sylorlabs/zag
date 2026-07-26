@@ -11,7 +11,7 @@ negative tests, and runtime evidence.
 
 - `--safety=checked` preserves language traps and currently enables dynamic
   raw-pointer null/alignment checks plus bounds and freed-region checks for
-  ordinary `_zag_malloc`/`new`/`_zag_realloc` allocations on native x86-64.
+  up to 3,072 ordinary `_zag_malloc`/`new`/`_zag_realloc` allocations on native x86-64.
   The table records allocator capacity (small blocks are class-rounded), so an
   access whose root and final address stay within that tracked live region is
   allowed; a one-past or wider access traps before the load/store. A tracked

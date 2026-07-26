@@ -45,6 +45,12 @@ Calls that receive an owner must explicitly declare `@borrows`,
 inspectable instead of implicit. A separate return-lifetime check rejects
 addresses of local values and local fields returned directly, through
 direct aliases, or inside named pointer-carrying struct/union literals. A
+direct `_zag_realloc(named_owner, size)` is modeled as an atomic ownership
+transfer to the assigned result: both `let replacement = ...` and
+`owner = ...` retire the old named root only when that result becomes the new
+owner. This does not model failure-return ownership, aliased or computed
+arguments, or general allocator APIs; those cases remain fail-closed or
+unsafe-programmer responsibility.
 bounded mutation-aware pass additionally follows owner and current-frame roots
 stored in named struct/union values through 64 nested field components,
 field/whole-value assignment, value copies, and conservative branch joins. It
@@ -59,7 +65,8 @@ local allocation root; arbitrary pointer arithmetic, heap-wide alias identity,
 allocator handles, interprocedural summaries beyond the three contracts,
 arbitrary-depth or heap-resident container provenance, and general
 global/callback/reference lifetime proof remain unimplemented. In
-`--safety=checked` native x86-64 builds, a bounded ordinary-allocation table
+`--safety=checked` native x86-64 builds, a bounded 3,072-entry
+ordinary-allocation table
 also validates null/alignment plus access width and freed-state for
 `_zag_malloc`/`new`/`_zag_realloc` regions. That runtime table deliberately
 passes through stack/static/foreign and untracked allocator-family pointers;

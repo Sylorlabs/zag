@@ -428,6 +428,22 @@ if (cd "$tmp/v2-owned-assignment-release" && "$ZNC" main.zag -o out) >"$tmp/v2-o
 else
   echo "  XX  assignment-owned allocation release"; sed -n '1,8p' "$tmp/v2-owned-assignment-release/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-owned-realloc-transfer"
+printf 'name = "v2ownedrealloctransfer"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-realloc-transfer/zag.mod"
+printf 'fn main() i32 { unsafe { let p:*i8=_zag_malloc(16) as *i8; p.*=7; let q:*i8=_zag_realloc(p,32) as *i8; q.*=42; _zag_free(q); } return 0; }\n' >"$tmp/v2-owned-realloc-transfer/main.zag"
+if (cd "$tmp/v2-owned-realloc-transfer" && "$ZNC" main.zag -o out) >"$tmp/v2-owned-realloc-transfer/log" 2>&1 && [ -x "$tmp/v2-owned-realloc-transfer/out" ] && "$tmp/v2-owned-realloc-transfer/out"; then
+  echo "  ok  realloc transfers a named owner to its replacement"; pass=$((pass + 1))
+else
+  echo "  XX  realloc named-owner transfer"; sed -n '1,8p' "$tmp/v2-owned-realloc-transfer/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owned-realloc-overwrite"
+printf 'name = "v2ownedreallocoverwrite"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-realloc-overwrite/zag.mod"
+printf 'fn main() i32 { unsafe { let p:*i8=_zag_malloc(16) as *i8; p.*=7; p=_zag_realloc(p,32) as *i8; p.*=42; _zag_free(p); } return 0; }\n' >"$tmp/v2-owned-realloc-overwrite/main.zag"
+if (cd "$tmp/v2-owned-realloc-overwrite" && "$ZNC" main.zag -o out) >"$tmp/v2-owned-realloc-overwrite/log" 2>&1 && [ -x "$tmp/v2-owned-realloc-overwrite/out" ] && "$tmp/v2-owned-realloc-overwrite/out"; then
+  echo "  ok  realloc may replace its named owner in place"; pass=$((pass + 1))
+else
+  echo "  XX  realloc in-place owner replacement"; sed -n '1,8p' "$tmp/v2-owned-realloc-overwrite/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-owned-consume"
 printf 'name = "v2ownedconsume"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-consume/zag.mod"
 printf 'struct Node { value:i32 } fn consume(p:*mut Node) void @consumes { unsafe { delete(p); } } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; consume(p); print_i64(p as i64); } return 0; }\n' >"$tmp/v2-owned-consume/main.zag"
