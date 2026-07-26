@@ -24,6 +24,9 @@ qualified.  Conversion between host and device pointers is forbidden; buffer
 objects mediate transfer.  Workgroup variables have one instance per
 workgroup, private variables one per invocation, and device/global storage has
 a lifetime governed by its host handle.  Constant/uniform storage is read-only.
+Native x86-64 lowering rejects `*device` and `*workgroup` dereference/indexing;
+it must not reinterpret device addresses as host pointers while the GPU runtime
+is unavailable.
 
 Invocation, workgroup, and grid dimensions are validated against backend limits
 before submission.  A kernel must include an explicit `id < len` guard unless

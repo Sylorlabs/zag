@@ -1,7 +1,8 @@
 # Zag v2 CPU control guide (draft)
 
-Inline assembly, SIMD, target features, cache hints, timestamp counters, and
-CPU intrinsics are not implemented in v2.  They will be target extensions, not
+Portable inline assembly, SIMD, target-feature selection, timestamp counters,
+and the broad CPU-intrinsic surface are not implemented in v2.  The supported
+baseline cache-hint and scalar intrinsic slices are target extensions, not
 portable syntax dressed up as a no-op.  Every intrinsic declares feature
 requirements, operand types/alignment, effects, and whether it requires an
 unsafe boundary.
@@ -11,6 +12,10 @@ Compiler-style `-m...` controls, LLVM-style target/feature options, and Rust
 `-C...` controls (including `-march`, ISA-feature switches, target CPU, and
 word-size requests) are rejected rather than silently compiling the generic
 baseline. They do not grant permission to emit SIMD or other optional opcodes.
+
+The native `@prefetch(*T)` slice emits baseline x86-64 `PREFETCHT0` after
+checking its one raw-pointer operand. It is advisory only: it creates no
+allocation, validity, ordering, synchronization, or realtime guarantee.
 
 Assembly must name every input/output, register/immediate constraint,
 read-write/early-clobber property, clobbered register/flags state, and memory

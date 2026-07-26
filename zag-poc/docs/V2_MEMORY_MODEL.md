@@ -37,6 +37,8 @@ This is a v2 (`edition = "2027"`) contract, not a description of current v1
 types, requires explicit optional unwrapping before nullable raw-pointer
 dereference, indexing, or arithmetic,
 rejects casts between distinct generic/host/device/workgroup address spaces,
+and rejects native x86-64 dereference or indexing of `*device`/`*workgroup`
+pointers until a GPU runtime owns those address spaces,
 executes bounded native dereference cases, rejects dereference outside unsafe,
 rejects writes through `*const`, and performs an edition-2027 static ownership
 flow pass. That pass follows direct local aliases of compiler-recognized

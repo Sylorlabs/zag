@@ -748,6 +748,26 @@ if (cd "$tmp/v2-deref" && "$ZNC" main.zag -o out) >"$tmp/v2-deref/log" 2>&1 && [
 else
   echo "  XX  unsafe raw-pointer dereference compiles"; sed -n '1,8p' "$tmp/v2-deref/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-device-native-deref"
+printf 'name = "v2devicenativederef"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-device-native-deref/zag.mod"
+printf 'unsafe fn load(p:*device i32) i32 { return p.*; } fn main() i32 { return 0; }\n' >"$tmp/v2-device-native-deref/main.zag"
+if (cd "$tmp/v2-device-native-deref" && "$ZNC" main.zag -o out) >"$tmp/v2-device-native-deref/log" 2>&1 || [ -e "$tmp/v2-device-native-deref/out" ]; then
+  echo "  XX  native device pointer dereference rejects"; sed -n '1,8p' "$tmp/v2-device-native-deref/log"; fail=$((fail + 1))
+elif grep -q '\*device/\*workgroup dereference requires a GPU runtime' "$tmp/v2-device-native-deref/log"; then
+  echo "  ok  native device pointer dereference rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  native device pointer dereference rejection missing diagnostic"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-workgroup-native-index"
+printf 'name = "v2workgroupnativeindex"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-workgroup-native-index/zag.mod"
+printf 'unsafe fn load(p:*workgroup i32) i32 { return p[0]; } fn main() i32 { return 0; }\n' >"$tmp/v2-workgroup-native-index/main.zag"
+if (cd "$tmp/v2-workgroup-native-index" && "$ZNC" main.zag -o out) >"$tmp/v2-workgroup-native-index/log" 2>&1 || [ -e "$tmp/v2-workgroup-native-index/out" ]; then
+  echo "  XX  native workgroup pointer indexing rejects"; sed -n '1,8p' "$tmp/v2-workgroup-native-index/log"; fail=$((fail + 1))
+elif grep -q '\*device/\*workgroup indexing requires a GPU runtime' "$tmp/v2-workgroup-native-index/log"; then
+  echo "  ok  native workgroup pointer indexing rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  native workgroup pointer indexing rejection missing diagnostic"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-safe-deref"
 printf 'name = "v2safederef"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-safe-deref/zag.mod"
 printf 'fn read(p: *const i32) i32 { return p.*; } fn main() i32 { return 0; }\n' >"$tmp/v2-safe-deref/main.zag"
@@ -1631,6 +1651,16 @@ elif grep -q '@pure function' "$tmp/v2-volatile-pure/log"; then
   echo "  ok  volatile Unsafe effect reaches pure function"; pass=$((pass + 1))
 else
   echo "  XX  volatile pure-effect diagnostic missing"; sed -n '1,12p' "$tmp/v2-volatile-pure/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-prefetch-unsafe"
+printf 'name = "v2prefetchunsafe"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-prefetch-unsafe/zag.mod"
+printf 'fn read(p:*const i64) i64 { @prefetch(p); return 0; } fn main() i32 { let word:i64=0; let p:*const i64=(&word) as *const i64; return read(p) as i32; }\n' >"$tmp/v2-prefetch-unsafe/main.zag"
+if (cd "$tmp/v2-prefetch-unsafe" && "$ZNC" main.zag -o out) >"$tmp/v2-prefetch-unsafe/log" 2>&1 || [ -e "$tmp/v2-prefetch-unsafe/out" ]; then
+  echo "  XX  prefetch outside unsafe rejects"; sed -n '1,12p' "$tmp/v2-prefetch-unsafe/log"; fail=$((fail + 1))
+elif grep -Eq 'unsafe|capability violation' "$tmp/v2-prefetch-unsafe/log"; then
+  echo "  ok  prefetch outside unsafe rejects"; pass=$((pass + 1))
+else
+  echo "  XX  prefetch unsafe diagnostic missing"; sed -n '1,12p' "$tmp/v2-prefetch-unsafe/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-fence-pure"
 printf 'name = "v2fencepure"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-fence-pure/zag.mod"
