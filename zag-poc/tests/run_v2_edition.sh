@@ -484,6 +484,21 @@ if (cd "$tmp/v2-global-pointer" && "$ZNC" main.zag -o out --safety=checked) >"$t
 else
   echo "  XX  pointer global checked ownership compiles"; sed -n '1,10p' "$tmp/v2-global-pointer/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-global-pointer-stale"
+printf 'name = "v2globalpointerstale"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-global-pointer-stale/zag.mod"
+# Preserve the address as an integer before the explicit release, then attempt
+# to reload it through global storage.  This must be rejected by the typed
+# lifetime proof before it can become a runtime escape hatch.
+printf 'extern fn _zag_malloc(n:i64)*u8; extern fn _zag_free(p:*u8)void; global let p:*u8; global let saved:i64; fn main() i32 { unsafe { p = _zag_malloc(8); p.* = 42; saved = p as i64; _zag_free(p); p = saved as *u8; return p.* as i32; } }\n' >"$tmp/v2-global-pointer-stale/main.zag"
+if (cd "$tmp/v2-global-pointer-stale" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-global-pointer-stale/log" 2>&1 ||
+   [ -e "$tmp/v2-global-pointer-stale/out" ]; then
+  echo "  XX  stale pointer cannot escape through global storage"; sed -n '1,10p' "$tmp/v2-global-pointer-stale/log"; fail=$((fail + 1))
+elif grep -q 'use after free of named allocation `p`' "$tmp/v2-global-pointer-stale/log" &&
+     grep -q 'owned allocation escapes through non-local aggregate store' "$tmp/v2-global-pointer-stale/log"; then
+  echo "  ok  stale pointer cannot escape through global storage without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  stale global pointer rejection missing lifetime diagnostic"; sed -n '1,10p' "$tmp/v2-global-pointer-stale/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-global-init"
 printf 'name = "v2globalinit"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-global-init/zag.mod"
 printf 'global let counter:i32 = 1; fn main() i32 { return 0; }\n' >"$tmp/v2-global-init/main.zag"
