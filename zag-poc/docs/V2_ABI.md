@@ -52,6 +52,9 @@ public-symbol visibility. Accordingly, native `--emit-obj`, `--emit-static`,
 `--emit-shared`, and its common shared/library-output spellings fail before
 artifact creation rather than silently producing an executable. The separate i686 object/archive path is not v2 C ABI evidence and
 rejects v2 `@cabi` declarations.
+Likewise, `--export`, `--export-dynamic`, and `--export-symbol` requests are
+rejected: `pub fn` does not create a public C symbol in the current native
+writer.
 
 A native export/static-object increment requires codegen to return exact public
 function offsets and sizes, plus a new x86-64 `ET_REL` writer with section,

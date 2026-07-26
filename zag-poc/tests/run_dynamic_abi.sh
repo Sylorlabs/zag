@@ -138,5 +138,25 @@ for shared_flag in --shared --emit-dylib --emit-lib --emit=shared; do
     fi
 done
 
+# Symbol-export controls are equally unavailable without an x86-64 symbol
+# table and public ABI. They must not make `pub fn` look externally callable.
+for export_flag in --export --export-dynamic --export-symbol=exported_answer; do
+    export_name=$(printf '%s' "$export_flag" | tr -cd '[:alnum:]')
+    if (cd "$WORK/v2-cabi" && "$ZNC_BIN" main.zag "$export_flag" --no-zagd --no-analyze -o "$export_name.out") >"$WORK/v2-cabi/$export_name.log" 2>&1 || [ -e "$WORK/v2-cabi/$export_name.out" ]; then
+        bad "$export_flag emitted a misleading export artifact"
+    elif grep -q "v2 compiler option is not implemented: $export_flag" "$WORK/v2-cabi/$export_name.log"; then
+        ok "$export_flag fails closed"
+    else
+        bad "$export_flag missing export diagnostic"
+    fi
+done
+if (cd "$WORK/v2-cabi" && "$ZNC_BIN" main.zag --export-symbol exported_answer --no-zagd --no-analyze -o split-export.out) >"$WORK/v2-cabi/split-export.log" 2>&1 || [ -e "$WORK/v2-cabi/split-export.out" ]; then
+    bad "split --export-symbol emitted a misleading export artifact"
+elif grep -q 'v2 compiler option is not implemented: --export-symbol' "$WORK/v2-cabi/split-export.log"; then
+    ok "split --export-symbol fails closed"
+else
+    bad "split --export-symbol missing export diagnostic"
+fi
+
 echo "════ dynamic ABI pass=$pass fail=$fail ════"
 [ "$fail" = 0 ]
