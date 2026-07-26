@@ -15,9 +15,14 @@ chain, and introducing operation.
 Indirect calls are checked against effect-qualified function types.  The
 implemented slice tracks direct function-valued locals, including reassignment
 to a closure, so a later indirect call cannot retain a stale safe effect row.
-Generic instantiations, callbacks, imports, extern declarations, and device
-helpers still need the complete latent-effect coverage; an unknown
-indirect/FFI contract remains conservatively effectful and unsafe.
+Calls through an aggregate field, index, or computed callee are now rejected
+inside constrained functions with the complete implemented effect universe
+until the value carries a verified row.  This is a fail-closed boundary, not
+aggregate effect inference: it prevents untracked Atomic/FFI/GPU-like work
+from acquiring a harmless field spelling.  Generic instantiations, aggregate
+row propagation, imports, extern declarations, and device helpers still need
+the complete latent-effect coverage; an unknown indirect/FFI contract remains
+conservatively effectful and unsafe.
 
 ## Inference and witnesses
 
@@ -35,10 +40,10 @@ transfer/dispatch remain visible to realtime, kernel, and sandbox constraints.
 
 ## Required adversarial checks
 
-The v2 suite now rejects effects introduced through direct calls and a
-reassigned function-valued local, as well as the existing callback and pure
-contract witnesses.  It still needs adversarial coverage for generic
-instantiation, methods, stored function values in aggregates, imported
-externs, device helpers, and runtime intrinsics.  An unsafe block must not
-erase `Alloc`, `Block`, `FFI`, or GPU effects; those broader checks are not
-implemented yet.
+The v2 suite now rejects effects introduced through direct calls, a reassigned
+function-valued local, and an opaque aggregate function call, as well as the
+existing callback and pure-contract witnesses.  It still needs adversarial
+coverage for generic instantiation, methods, verified rows for stored function
+values in aggregates, imported externs, device helpers, and runtime intrinsics.
+An unsafe block must not erase `Alloc`, `Block`, `FFI`, or GPU effects; those
+broader checks are not implemented yet.

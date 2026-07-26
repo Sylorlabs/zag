@@ -48,7 +48,10 @@ checked width/alignment probes; full device capability validation remains
 unsupported. Fixed unsafe i64 atomics and a literal-validated load/store
 memory-order subset are implemented, but atomic storage, RMW/CAS/fence order
 selection, threads, and a complete concurrency model remain
-unsupported. Inline `asm` remains fail-closed. Pointer provenance identity, bounds and alignment
+unsupported. The only packed-SIMD operation is unsafe four-lane `i32` addition
+through raw pointers on native x86-64; vector value types, wider SIMD, and
+target-selected ISA variants remain unsupported. Inline `asm` remains
+fail-closed. Pointer provenance identity, bounds and alignment
 instrumentation, source-span audit records, indirect
 function-value/callback/generic/FFI propagation, and the complete
 unsafe-operation inventory are not yet implemented.

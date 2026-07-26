@@ -20,8 +20,10 @@ The current C-call surface is intentionally narrow and fail-closed:
   covers a fixed seven-integer call, including one stack argument);
 - one `R_X86_64_GLOB_DAT` GOT slot per non-`_zag_` extern declaration;
 - explicit safe SONAMEs only; no path-bearing dependency names;
-- no float, aggregate, callback, TLS, variadic, debug, hot-reload, or mixed
-  static/dynamic linking support yet.
+- no float, aggregate, TLS, variadic, debug, hot-reload, or mixed
+  static/dynamic linking support yet. The sole callback exception is a direct,
+  captureless named scalar/pointer Zag function passed to a declared `fn(P...)R`
+  parameter as one code pointer; function-value aliases and captures reject.
 
 Ordinary builds remain static. `--needed` without `--dynamic`, an unsupported
 ABI class, an unsafe SONAME, or an empty import surface rejects the build.

@@ -414,7 +414,35 @@ fn zt_fn_has_annot(decls: ArrayList[*Node], name: []u8, annot: []u8) i32 {
 // may enter the native System V dynamic-import path.  Keep the accepted set to
 // machine scalars and raw pointers until aggregate/float classification has
 // executable conformance coverage.
+// A C callback is represented in source as `fn(P...) R`, but it is *not* a
+// Zag fat function at the ABI boundary.  The native dynamic lowering admits
+// only a direct, captureless named function and passes its code address as one
+// SysV word.  Keep the nested signature scalar-only: no aggregates, floats,
+// variadics, closures, or hidden environment are implied by this spelling.
+fn zt_cabi_callback_type_ok(ty0: []u8) i32 {
+    if (ty0.len < 5 || ty0[0] != 'f' || ty0[1] != 'n' || ty0[2] != '(') { return 0; }
+    let close: i32 = 0 - 1;
+    let i: i32 = 3;
+    while (i < ty0.len) {
+        if (ty0[i] == ')') { close = i; i = ty0.len; }
+        else { i = i + 1; }
+    }
+    if (close < 0 || close + 1 >= ty0.len) { return 0; }
+    let params: []u8 = ty0[3..close];
+    let start: i32 = 0;
+    i = 0;
+    while (i <= params.len) {
+        if (i == params.len || params[i] == ',') {
+            if (i > start && zt_cabi_type_ok(params[start..i]) == 0) { return 0; }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return zt_cabi_type_ok(ty0[close + 1..]);
+}
+
 fn zt_cabi_type_ok(ty0: []u8) i32 {
+    if (zt_cabi_callback_type_ok(ty0) == 1) { return 1; }
     if (ty0.len > 0 && ty0[0] == '*') { return 1; }
     if (@strEq(ty0, "void") || @strEq(ty0, "bool")) { return 1; }
     if (@strEq(ty0, "i8") || @strEq(ty0, "u8") || @strEq(ty0, "i16") || @strEq(ty0, "u16")) { return 1; }
@@ -768,6 +796,19 @@ fn zt_is_v2_volatile_dword_ptr(ty: []u8) i32 {
     return @strEq(zt_v2_pointee_type(ty), "u32");
 }
 
+// The first user-visible SIMD surface transports four i32 lanes through raw
+// memory.  It remains deliberately narrower than a general vector type: only
+// the exact baseline SSE2 operation has a typed contract today.
+fn zt_is_v2_simd_i32_ptr(ty: []u8) i32 {
+    return @strEq(zt_v2_pointee_type(ty), "i32");
+}
+
+fn zt_is_v2_simd_i32_write_ptr(ty: []u8) i32 {
+    if (@strEq(zt_v2_pointee_type(ty), "i32") == 0) { return 0; }
+    if (zt_starts(ty, "*mut ") == 1 || zt_starts(ty, "*host ") == 1) { return 1; }
+    return 0;
+}
+
 fn zt_machine_expr_type(n: *Node, env: ArrayList[ZTBind]) []u8 {
     return switch (n.*) {
         .id => |x| zt_env_get(env, x.name),
@@ -883,6 +924,24 @@ fn zt_check_machine_expr(n: *Node, env: ArrayList[ZTBind], decls: ArrayList[*Nod
                         errors = errors + zt_machine_error("@prefetch requires a raw pointer", context);
                     } else if (zt_v2_pointer_space(pty) == 2 || zt_v2_pointer_space(pty) == 3) {
                         errors = errors + zt_machine_error("@prefetch on *device/*workgroup requires a GPU runtime", context);
+                    }
+                }
+            }
+            if (@strEq(direct, "@simdAddI32x4")) {
+                if (unsafe_scope == 0) {
+                    errors = errors + zt_machine_error("packed SIMD requires unsafe", context);
+                }
+                if (len[*Node](c.args) != 3) {
+                    errors = errors + zt_machine_error("@simdAddI32x4 expects dst, lhs, rhs raw i32 pointers", context);
+                } else {
+                    let dst_ty: []u8 = zt_machine_expr_type(get[*Node](c.args, 0), env);
+                    let lhs_ty: []u8 = zt_machine_expr_type(get[*Node](c.args, 1), env);
+                    let rhs_ty: []u8 = zt_machine_expr_type(get[*Node](c.args, 2), env);
+                    if (zt_is_v2_simd_i32_write_ptr(dst_ty) == 0) {
+                        errors = errors + zt_machine_error("@simdAddI32x4 dst requires *mut/*host i32", context);
+                    }
+                    if (zt_is_v2_simd_i32_ptr(lhs_ty) == 0 || zt_is_v2_simd_i32_ptr(rhs_ty) == 0) {
+                        errors = errors + zt_machine_error("@simdAddI32x4 inputs require *const/*mut/*host i32", context);
                     }
                 }
             }
@@ -1298,6 +1357,12 @@ fn zt_check_embedded_terminal_call(n:*Node,decls:ArrayList[*Node],root_statement
 fn zt_compiler_nonretaining_call(name:[]u8)i32{
     return (@strEq(name,"_zag_println")||@strEq(name,"_zag_eprintln")||
         @strEq(name,"_zag_write_stdout")||@strEq(name,"_zag_write_stderr")||
+        // The bounded SIMD intrinsic completes synchronously and retains none
+        // of its three raw-pointer arguments.  Its separate typed/unsafe and
+        // checked-access rules remain in force; this only prevents the
+        // ownership flow from mistaking a compiler intrinsic for an unknown
+        // escaping foreign call.
+        @strEq(name,"@simdAddI32x4")||
         // SystemAllocator registers a bounded compiler-owned provenance record
         // synchronously; it does not transfer or retain the source owner.
         @strEq(name,"_zag_allocation_register")) as i32;
@@ -2005,7 +2070,7 @@ fn zt_agg_check_calls(n:*Node,flow:*ZTAggFlow,decls:ArrayList[*Node],context:[]u
     switch(n.*){
         .call=>|c|{
             let ai:i32=0;while(ai<c.args.len){errors=errors+zt_agg_check_calls(c.args.data[ai],flow,decls,context,arena);ai=ai+1;}
-            let name:[]u8=zt_direct_name(c.callee);let borrow:i32=zt_borrow_mode(decls,name);
+            let name:[]u8=zt_direct_name(c.callee);let borrow:i32=zt_borrow_mode(decls,name);let nonretaining:i32=zt_compiler_nonretaining_call(name);
             let consumes:i32=((zt_owned_release_name(name)==1||zt_fn_has_annot(decls,name,"@consumes")==1) as i32);
             ai=0;while(ai<c.args.len){
                 let owner:[]u8=zt_agg_expr_stored_root(c.args.data[ai],flow.*.prov,1,arena);
@@ -2017,12 +2082,12 @@ fn zt_agg_check_calls(n:*Node,flow:*ZTAggFlow,decls:ArrayList[*Node],context:[]u
                         if(exact.len>0){
                             if(zt_in_names(flow.*.freed,exact)==1){errors=errors+zt_machine_error("double free of aggregate-stored allocation",context);}else{zt_agg_mark_released(flow,exact);}
                         }else{errors=errors+zt_machine_error(_zag_str_concat("aggregate ownership transfer is not explicit (root `",_zag_str_concat(owner,"`)")),context);}
-                    }else if(borrow==0){
+                    }else if(borrow==0&&nonretaining==0){
                         let shown:[]u8=name;if(shown.len==0){shown="<indirect>";}
                         errors=errors+zt_machine_error(_zag_str_concat("owned allocation escapes through uncontracted call `",_zag_str_concat(shown,_zag_str_concat("` (root `",_zag_str_concat(owner,"`)")))),context);
                     }
                 }
-                if(stack.len>0&&borrow==0){
+                if(stack.len>0&&borrow==0&&nonretaining==0){
                     let shown:[]u8=name;if(shown.len==0){shown="<indirect>";}
                     errors=errors+zt_machine_error(_zag_str_concat("address of local `",_zag_str_concat(stack,_zag_str_concat("` escapes through aggregate argument to uncontracted call `",_zag_str_concat(shown,"`")))),context);
                 }
@@ -2279,7 +2344,16 @@ fn zt_check_v2_borrow_contracts(decls:ArrayList[*Node],file:[]u8)i32{
                 if(f.params.len<1){errors=errors+zt_machine_error("borrow contract requires a first owner parameter",context);}
                 else{
                     let pi:i32=1;
-                    while(pi<f.params.len){if(zt_borrow_aux_scalar_type(f.params.data[pi].pty)==0){errors=errors+zt_machine_error("borrow contract auxiliary parameters must be builtin scalars",context);}pi=pi+1;}
+                    while(pi<f.params.len){
+                        let aux:[]u8=f.params.data[pi].pty;
+                        // A declared C callback is a one-word code pointer, not
+                        // a Zag closure value. Permit it as an auxiliary only
+                        // on an explicit @cabi extern borrow contract; ordinary
+                        // aggregate/callback auxiliaries remain fail-closed.
+                        let cabi_callback:i32=((f.is_extern==1&&zt_fn_has_annot(decls,f.name,"@cabi")==1&&zt_cabi_callback_type_ok(aux)==1) as i32);
+                        if(zt_borrow_aux_scalar_type(aux)==0&&cabi_callback==0){errors=errors+zt_machine_error("borrow contract auxiliary parameters must be builtin scalars or declared scalar C callbacks",context);}
+                        pi=pi+1;
+                    }
                     let param:[]u8=zt_contract_param_name(f);zt_borrow_set(&borrows,param,param,mode);zt_alias_set(&aliases,param,param);
                 }
             }

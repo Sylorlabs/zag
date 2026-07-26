@@ -35,6 +35,7 @@ run_gate "unsafe lexical and raw-pointer boundary" bash tests/run_v2_edition.sh
 run_gate "mutation-aware aggregate provenance" bash tests/run_v2_aggregate_provenance.sh
 run_gate "v2 atomic i64 operations" bash tests/run_v2_atomic_exchange.sh
 run_gate "v2 atomic load/store memory-order validation" bash tests/run_v2_atomic_orders.sh
+run_gate "fail-closed indirect effect boundary" bash tests/run_v2_effect_adversarial.sh
 run_gate "v2 option rejection" bash tests/run_v2_option_rejection.sh
 run_gate "malformed-input crash corpus" bash tests/run_crash_corpus.sh
 run_gate "deterministic fuzz smoke" bash tests/run_fuzz_smoke.sh
@@ -51,14 +52,15 @@ run_gate "validated x86 byte-swap intrinsic" bash tests/run_x86_byte_swap.sh
 run_gate "validated x86 leading-zeros intrinsic" bash tests/run_x86_leading_zeros.sh
 run_gate "validated x86 prefetch intrinsic" bash tests/run_x86_prefetch.sh
 run_gate "validated x86 volatile MMIO widths" bash tests/run_x86_volatile_widths.sh
+run_gate "validated x86 SSE2 SIMD add" bash tests/run_x86_simd_add_i32x4.sh
 
 unsupported "pointer and memory model" "raw pointer categories and lexical checks exist, but provenance/alignment/lifetime instrumentation is incomplete"
 unsupported "allocator and reclamation" "checked native SystemAllocator handles now carry runtime allocator identity, but opaque language capabilities, custom/arena/fixed-buffer and debug allocators, and a general lifetime model are incomplete"
 unsupported "volatile/MMIO" "checked native 8/16/32-bit and word transactions exist, but physical device validation, address capabilities, and the complete MMIO contract are incomplete"
 unsupported "atomics and concurrency" "fixed unsafe x86-64 i64 operations plus literal-validated load/store orders exist, but atomic storage, orders on RMW/CAS/fences, threads, and a v2 concurrency model remain incomplete"
-unsupported "C ABI and dynamic linking" "checked v2 @cabi scalar dynamic imports and ELF loading exist, but bidirectional ABI, exports, callbacks, shared-object conformance, and unload/lifetime contracts are incomplete"
-unsupported "CPU intrinsics/SIMD/inline assembly" "validated x86 scalar intrinsics exist, but packed SIMD, inline-assembly constraints/clobbers, and full target-feature/effect checking are incomplete"
-unsupported "effect adversarial suite" "direct Unsafe propagation is tested, but indirect calls and Atomic/FFI/GPU effects are incomplete"
+unsupported "C ABI and dynamic linking" "checked v2 @cabi scalar dynamic imports, ELF loading, and a direct captureless scalar/pointer callback to libc qsort exist, but general bidirectional ABI, exports, shared-object conformance, and unload/lifetime contracts are incomplete"
+unsupported "CPU intrinsics/SIMD/inline assembly" "validated x86 scalar intrinsics and bounded unsafe SSE2 i32x4 add exist, but vector types/ABI, additional SIMD, inline-assembly constraints/clobbers, and full target-feature/effect checking are incomplete"
+unsupported "effect adversarial suite" "opaque aggregate/computed indirect calls now fail closed, but verified aggregate rows and Atomic/FFI/GPU effect models remain incomplete"
 unsupported "physical GPU execution" "no runtime enumerate/allocate/dispatch/readback path"
 unsupported "sanitizers" "bounded native --sanitize=memory exists with deterministic free poisoning, but red zones, guard pages, allocation-site reports, and custom allocator coverage are incomplete"
 unsupported "documentation verification map" "verification matrix exists but records incomplete required capabilities"

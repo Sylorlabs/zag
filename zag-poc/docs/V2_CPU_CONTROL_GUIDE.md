@@ -17,6 +17,14 @@ The native `@prefetch(*T)` slice emits baseline x86-64 `PREFETCHT0` after
 checking its one raw-pointer operand. It is advisory only: it creates no
 allocation, validity, ordering, synchronization, or realtime guarantee.
 
+`unsafe { @simdAddI32x4(dst, lhs, rhs) }` is the only user-visible packed-SIMD
+operation. Its arguments are raw `i32` pointers (`dst` is `*mut i32` or
+`*host i32`; inputs may also be const); it performs exactly four unaligned,
+modulo-2^32 lane additions using baseline x86-64 SSE2 `MOVDQU`/`PADDD`/`MOVDQU`.
+Checked mode validates each 16-byte allocation access. It does not establish a
+vector value ABI, alignment promise, aliasing policy, optional ISA selection,
+or general inline-assembly facility.
+
 Assembly must name every input/output, register/immediate constraint,
 read-write/early-clobber property, clobbered register/flags state, and memory
 effect.  Machine-code tests inspect the selected target instruction and execute

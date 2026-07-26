@@ -100,6 +100,41 @@ else
     sed -n '1,16p' "$WORK/v2-cabi/stack.log"
 fi
 
+# A bounded bidirectional ABI witness: libc `qsort` calls a direct named Zag
+# comparator. The callback is passed as one SysV code pointer, not Zag's normal
+# `{code, environment}` function-value representation. Its scalar/pointer
+# signature is exact and it is valid for the executable's whole lifetime.
+printf 'name = "v2cabicallback"\nversion = "0"\nedition = "2027"\n' >"$WORK/v2-cabi/zag.mod"
+printf 'extern fn qsort(base:*i64,n:i64,size:i64,cmp:fn(*i64,*i64)i32) void @cabi @borrows_mut; fn compare(a:*i64,b:*i64) i32 { unsafe { if(a.* < b.*){return -1;} if(a.* > b.*){return 1;} return 0; } } fn main() i32 { unsafe { let p:*i64=_zag_malloc(24) as *i64; p[0]=9; p[1]=2; p[2]=5; qsort(p,3,8,compare); let ok:i32=((p[0]==2)&&(p[1]==5)&&(p[2]==9)) as i32; _zag_free(p); if(ok==1){return 42;} return 1; } }\n' >"$WORK/v2-cabi/main.zag"
+if (cd "$WORK/v2-cabi" && "$ZNC_BIN" main.zag --dynamic --needed libc.so.6 --no-zagd --no-analyze -o callback) >"$WORK/v2-cabi/callback.log" 2>&1 && [ -x "$WORK/v2-cabi/callback" ]; then
+    "$WORK/v2-cabi/callback"
+    rc=$?
+    [ "$rc" = 42 ] && ok "v2 @cabi direct Zag callback executes through libc qsort" || bad "v2 @cabi callback exit=$rc"
+else
+    bad "v2 @cabi callback build"
+    sed -n '1,20p' "$WORK/v2-cabi/callback.log"
+fi
+
+# The callback rule intentionally rejects aliases and captures. Either would
+# require a distinct ownership/effect/lifetime contract, and the latter would
+# otherwise leak the Zag fat-function environment pointer into C.
+printf 'extern fn qsort(base:*i64,n:i64,size:i64,cmp:fn(*i64,*i64)i32) void @cabi @borrows_mut; fn compare(a:*i64,b:*i64) i32 { return 0; } fn main() i32 { unsafe { let p:*i64=_zag_malloc(8) as *i64; let alias:fn(*i64,*i64)i32=compare; qsort(p,1,8,alias); _zag_free(p); return 0; } }\n' >"$WORK/v2-cabi/main.zag"
+if (cd "$WORK/v2-cabi" && "$ZNC_BIN" main.zag --dynamic --needed libc.so.6 --no-zagd --no-analyze -o callback-alias) >"$WORK/v2-cabi/callback-alias.log" 2>&1; then
+    bad "v2 @cabi callback alias accepted"
+else
+    grep -q 'direct captureless function with an exact scalar/pointer signature' "$WORK/v2-cabi/callback-alias.log" && ok "v2 @cabi callback alias fails closed" || bad "missing callback-alias diagnostic"
+fi
+
+printf 'extern fn qsort(base:*i64,n:i64,size:i64,cmp:fn(*i64,*i64)i32) void @cabi @borrows_mut; fn main() i32 { unsafe { let p:*i64=_zag_malloc(8) as *i64; let bias:i64=0; let captured:fn(*i64,*i64)i32=fn[bias](a:*i64,b:*i64)i32 { return bias as i32; }; qsort(p,1,8,captured); _zag_free(p); return 0; } }\n' >"$WORK/v2-cabi/main.zag"
+if (cd "$WORK/v2-cabi" && "$ZNC_BIN" main.zag --dynamic --needed libc.so.6 --no-zagd --no-analyze -o callback-captured) >"$WORK/v2-cabi/callback-captured.log" 2>&1; then
+    bad "v2 @cabi captured callback accepted"
+else
+    # Current ownership checking rejects the captured closure before dynamic
+    # lowering; if that ordering changes, lowering must still reject it rather
+    # than passing Zag's `{code,env}` value to C.
+    grep -Eq 'direct captureless function with an exact scalar/pointer signature|owned allocation `captured`' "$WORK/v2-cabi/callback-captured.log" && ok "v2 @cabi captured callback fails closed" || bad "missing captured-callback diagnostic"
+fi
+
 printf 'name = "v2bareextern"\nversion = "0"\nedition = "2027"\n' >"$WORK/v2-cabi/zag.mod"
 printf 'extern fn getpid() i64; fn main() i32 { return 0; }\n' >"$WORK/v2-cabi/main.zag"
 if (cd "$WORK/v2-cabi" && "$ZNC_BIN" main.zag --dynamic --needed libc.so.6 --no-zagd --no-analyze -o bare) >"$WORK/v2-cabi/bare.log" 2>&1; then

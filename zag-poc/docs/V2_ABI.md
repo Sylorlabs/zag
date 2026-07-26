@@ -40,13 +40,23 @@ resolution semantics have tests.
 
 ## Current status
 
-The only implemented v2 ABI slice is an unsafe, outbound scalar/pointer
-`extern fn ... @cabi` import through the native x86-64 dynamic ELF writer.
+The implemented v2 ABI slice is an unsafe scalar/pointer `extern fn ... @cabi`
+import through the native x86-64 dynamic ELF writer, plus a tightly bounded
+callback form: a foreign parameter written as `fn(P...) R` may receive only a
+direct, non-generic, captureless named Zag function with the exact same
+scalar/pointer signature. The lowering passes that function's raw SysV code
+address, not Zag's ordinary `{code, environment}` function value. Aliases,
+closures/captures, floats, aggregates, variadics, callbacks returned from C,
+and callback ownership/unload contracts remain rejected or unimplemented.
+Any pointer argument given to such an import still requires an explicit
+`@borrows`/`@borrows_mut`/`@consumes` lifetime contract; the qsort witness uses
+`@borrows_mut` for its in-place buffer.
 Executable evidence covers both a no-argument integer import, a six-register
 mixed integer/pointer `mmap` import followed by pointer-return `munmap`, and a
 fixed seven-word scalar call whose seventh `mmap` offset is consumed from the
-SysV stack; this does not extend the supported surface to aggregates, floats,
-callbacks, variadics, exports, or imports with ownership/lifetime contracts.
+SysV stack, plus libc `qsort` calling a Zag comparator; this does not extend
+the supported surface to aggregates, floats, general callbacks, variadics,
+exports, or imports with ownership/lifetime contracts.
 It has no v2 export surface: the native x86-64 writer emits `ET_EXEC` with
 program headers only, not an `ET_REL` object, section table, `.symtab`, or
 public-symbol visibility. Accordingly, native `--emit-obj`, `--emit-static`,
