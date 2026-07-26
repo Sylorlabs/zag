@@ -25,10 +25,13 @@ builds reject the validation boundary rather than silently weakening it.
 
 This is not yet the complete allocator model. The generation is compiler-
 minted and runtime-checked, but not an opaque language capability; allocator
-identity, `resize`, custom allocators, arenas, and fixed-buffer allocators are
-still unimplemented. `allocate_zeroed` is
+identity, custom allocators, arenas, and fixed-buffer allocators are still
+unimplemented. `resize` and `allocate_zeroed` are
 implemented for the checked native SystemAllocator: it returns the ordinary
-minted handle after clearing its exact recorded capacity.
+minted handle after clearing its exact recorded capacity. `resize` validates
+the old handle, allocates the replacement first, copies the overlap, then
+consumes the old handle; a fallible replacement allocation therefore leaves the
+old handle live.
 
 Arena and fixed-buffer allocators are useful only when their lifetime/reset
 semantics are explicit.  A fixed-buffer allocation may satisfy `@noalloc` or

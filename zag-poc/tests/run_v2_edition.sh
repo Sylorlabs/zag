@@ -154,6 +154,23 @@ if (cd "$tmp/v2-system-allocator-zeroed" && "$ZNC" main.zag -o out --safety=chec
 else
   echo "  XX  SystemAllocator zeroed allocation did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-zeroed/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-system-allocator-resize"
+printf 'name = "v2systemallocatorresize"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-resize/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-resize/std"
+printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); unsafe { block.ptr[0]=42; } let grown:Allocation=try allocator.resize(block,64,8); unsafe { let value:i32=grown.ptr[0] as i32; try allocator.deallocate(grown); return value; } } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-resize/main.zag"
+if (cd "$tmp/v2-system-allocator-resize" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-resize/log" 2>&1 && [ -x "$tmp/v2-system-allocator-resize/out" ]; then
+  set +e
+  "$tmp/v2-system-allocator-resize/out"
+  resize_allocator_rc=$?
+  set -e
+  if [ "$resize_allocator_rc" -eq 42 ]; then
+    echo "  ok  SystemAllocator resize preserves bytes and returns replacement"; pass=$((pass + 1))
+  else
+    echo "  XX  SystemAllocator resize execution (exit=$resize_allocator_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-resize/log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  SystemAllocator resize did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-resize/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-captureless-callback"
 printf 'name = "v2capturelesscallback"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-captureless-callback/zag.mod"
 printf 'fn main() i32 { let f:fn() i32=fn[]() i32 { return 42; }; return f(); }\n' >"$tmp/v2-captureless-callback/main.zag"
