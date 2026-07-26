@@ -137,6 +137,23 @@ if (cd "$tmp/v2-system-allocator-reuse" && "$ZNC" main.zag -o out --safety=check
 else
   echo "  XX  SystemAllocator replacement handle did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-reuse/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-system-allocator-zeroed"
+printf 'name = "v2systemallocatorzeroed"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-zeroed/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-zeroed/std"
+printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let dirty:Allocation=try allocator.allocate(24,8); unsafe { dirty.ptr[0]=77; } try allocator.deallocate(dirty); let zeroed:Allocation=try allocator.allocate_zeroed(24,8); unsafe { let value:i32=zeroed.ptr[0] as i32; try allocator.deallocate(zeroed); return value; } } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-zeroed/main.zag"
+if (cd "$tmp/v2-system-allocator-zeroed" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-zeroed/log" 2>&1 && [ -x "$tmp/v2-system-allocator-zeroed/out" ]; then
+  set +e
+  "$tmp/v2-system-allocator-zeroed/out"
+  zeroed_allocator_rc=$?
+  set -e
+  if [ "$zeroed_allocator_rc" -eq 0 ]; then
+    echo "  ok  SystemAllocator zeroed allocation clears reused bytes"; pass=$((pass + 1))
+  else
+    echo "  XX  SystemAllocator zeroed allocation execution (exit=$zeroed_allocator_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-zeroed/log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  SystemAllocator zeroed allocation did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-zeroed/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-captureless-callback"
 printf 'name = "v2capturelesscallback"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-captureless-callback/zag.mod"
 printf 'fn main() i32 { let f:fn() i32=fn[]() i32 { return 42; }; return f(); }\n' >"$tmp/v2-captureless-callback/main.zag"
