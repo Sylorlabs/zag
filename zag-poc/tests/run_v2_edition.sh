@@ -156,6 +156,22 @@ if (cd "$tmp/v2-checked-heap-uaf" && "$ZNC" main.zag -o out --safety=checked) >"
 else
   echo "  XX  checked safety heap UAF program did not compile"; sed -n '1,8p' "$tmp/v2-checked-heap-uaf/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-checked-realloc-uaf"
+printf 'name = "v2checkedreallocuaf"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-realloc-uaf/zag.mod"
+printf 'fn main() i32 { unsafe { let p:*i8=_zag_malloc(16) as *i8; p.*=7; let saved:i64=(p as i64)+0; let q:*i8=_zag_realloc(p,32) as *i8; q.*=42; _zag_free(q); let stale:*i8=saved as *i8; return stale.* as i32; } }\n' >"$tmp/v2-checked-realloc-uaf/main.zag"
+if (cd "$tmp/v2-checked-realloc-uaf" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-checked-realloc-uaf/log" 2>&1 && [ -x "$tmp/v2-checked-realloc-uaf/out" ]; then
+  set +e
+  "$tmp/v2-checked-realloc-uaf/out" >"$tmp/v2-checked-realloc-uaf/out.log" 2>"$tmp/v2-checked-realloc-uaf/err.log"
+  checked_realloc_uaf_rc=$?
+  set -e
+  if [ "$checked_realloc_uaf_rc" -ne 0 ] && grep -q 'zag safety: use after free of allocator pointer' "$tmp/v2-checked-realloc-uaf/err.log"; then
+    echo "  ok  checked safety traps stale pointer after realloc"; pass=$((pass + 1))
+  else
+    echo "  XX  checked safety realloc lifetime check (exit=$checked_realloc_uaf_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  checked safety realloc UAF program did not compile"; sed -n '1,8p' "$tmp/v2-checked-realloc-uaf/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-checked-interior-free"
 printf 'name = "v2checkedinteriorfree"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-interior-free/zag.mod"
 printf 'fn main() i32 { unsafe { let p:*i8=_zag_malloc(16) as *i8; p.*=16; let forged:i64=(p as i64)+8; _zag_free(forged as *i8); _zag_free(p); return 0; } }\n' >"$tmp/v2-checked-interior-free/main.zag"
