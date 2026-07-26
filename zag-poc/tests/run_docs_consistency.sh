@@ -47,6 +47,14 @@ else
   bad "safety-tooling document is missing or overclaims implementation"
 fi
 
+if rg -q 'raw-pointer BSS globals' docs/V2_IMPLEMENTATION_PLAN.md && \
+   rg -q 'raw-pointer globals' docs/V2_FINAL_VERIFICATION.md && \
+   rg -U -q 'raw-pointer\s+global cell above is an exception' docs/V2_MEMORY_MODEL.md; then
+  ok "v2 memory documents retain the narrow pointer-global boundary"
+else
+  bad "v2 memory documents are stale about supported pointer globals"
+fi
+
 if [ -f docs/V2_SUPPORT_MATRIX.generated.md ] && \
    rg -q 'REQUIRED FAILURE: UNSUPPORTED' docs/V2_SUPPORT_MATRIX.generated.md; then
   ok "generated support matrix retains required unsupported failures"

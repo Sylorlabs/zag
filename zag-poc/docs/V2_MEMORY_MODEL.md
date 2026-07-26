@@ -97,9 +97,11 @@ an owned return or must be released with `close(callback)` on every path. The
 native close operation clears the fat-function environment before returning it
 to the allocator. Pointer captures remain rejected because they retain a
 defining-frame address, and aggregate captures remain rejected because their
-separate heap copies do not yet have a destruction protocol. Pointer-bearing or
-aggregate globals, pointer captures, and aggregate captures therefore remain
-explicit unsupported lifetime paths rather than ambient unsafe behavior.
+separate heap copies do not yet have a destruction protocol. Aggregate globals,
+pointer captures, and aggregate captures therefore remain explicit unsupported
+lifetime paths rather than ambient unsafe behavior. The narrow raw-pointer
+global cell above is an exception with no initializer or destructor protocol;
+it is not a general pointer-bearing global object model.
 
 The native x86-64 allocator also marks a small allocation's size header as
 freed before it links that allocation into a free list, and restores the live

@@ -109,6 +109,12 @@ promote the documented i686 subset to complete language/public-C-ABI,
 dynamic/TLS, or external-distribution parity, or turn unsupported v2/GPU work
 into a release claim.
 
+Zag v2 is an active, fail-closed development track rather than a production
+release. Its matrix and executable gate are in
+[docs/V2_FINAL_VERIFICATION.md](docs/V2_FINAL_VERIFICATION.md) and
+`tests/run_v2_release_gate.sh`; required unsupported rows deliberately keep
+that gate failing until their implementation and execution evidence exist.
+
 Native cross-target and self-hosting gates:
 
 ```sh
