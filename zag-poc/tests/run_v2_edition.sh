@@ -579,6 +579,16 @@ elif grep -Eq '@pure[^[:space:]]* constraint broken' "$tmp/v2-pure-callback-reas
 else
   echo "  XX  pure callback reassignment missing Unsafe diagnostic"; sed -n '1,12p' "$tmp/v2-pure-callback-reassignment/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-pure-callback-contract-reassignment"
+printf 'name = "v2purecallbackcontractreassignment"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-pure-callback-contract-reassignment/zag.mod"
+printf 'fn clean() i32 { return 1; } fn bad() i32 { let op:fn() i32 !pure=clean; op=fn[]() i32 { unsafe { return 7; } }; return 0; } fn main() i32 { return bad(); }\n' >"$tmp/v2-pure-callback-contract-reassignment/main.zag"
+if (cd "$tmp/v2-pure-callback-contract-reassignment" && "$ZNC" main.zag -o out) >"$tmp/v2-pure-callback-contract-reassignment/log" 2>&1 || [ -e "$tmp/v2-pure-callback-contract-reassignment/out" ]; then
+  echo "  XX  pure callback reassignment preserves local contract"; sed -n '1,12p' "$tmp/v2-pure-callback-contract-reassignment/log"; fail=$((fail + 1))
+elif grep -q 'assigning typed local.*effect contract' "$tmp/v2-pure-callback-contract-reassignment/log"; then
+  echo "  ok  pure callback reassignment preserves local contract"; pass=$((pass + 1))
+else
+  echo "  XX  pure callback reassignment contract diagnostic missing"; sed -n '1,12p' "$tmp/v2-pure-callback-contract-reassignment/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-pure-unsafe"
 printf 'name = "v2pureunsafe"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-pure-unsafe/zag.mod"
 printf 'unsafe fn raw() i32 { return 42; } fn bad() i32 @pure { unsafe { return raw(); } } fn main() i32 { return 0; }\n' >"$tmp/v2-pure-unsafe/main.zag"
@@ -964,6 +974,24 @@ if (cd "$tmp/v2-owned-borrow-contract" && "$ZNC" check main.zag) >"$tmp/v2-owned
   echo "  ok  declared borrow permits owned call"; pass=$((pass + 1))
 else
   echo "  XX  declared borrow permits owned call"; sed -n '1,8p' "$tmp/v2-owned-borrow-contract/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owned-borrow-scalar-contract"
+printf 'name = "v2ownedborrowscalarcontract"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-borrow-scalar-contract/zag.mod"
+printf 'struct Node { value:i32 } fn inspect(p:*mut Node, limit:i64) void @borrows { if (limit < 0) { return; } } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; inspect(p,1); delete(p); } return 0; }\n' >"$tmp/v2-owned-borrow-scalar-contract/main.zag"
+if (cd "$tmp/v2-owned-borrow-scalar-contract" && "$ZNC" check main.zag) >"$tmp/v2-owned-borrow-scalar-contract/log" 2>&1; then
+  echo "  ok  borrow contract permits scalar auxiliary parameter"; pass=$((pass + 1))
+else
+  echo "  XX  borrow contract scalar auxiliary parameter"; sed -n '1,8p' "$tmp/v2-owned-borrow-scalar-contract/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owned-borrow-pointer-aux"
+printf 'name = "v2ownedborrowpointeraux"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-borrow-pointer-aux/zag.mod"
+printf 'struct Node { value:i32 } fn bad(p:*mut Node, other:*mut Node) void @borrows { } fn main() i32 { return 0; }\n' >"$tmp/v2-owned-borrow-pointer-aux/main.zag"
+if (cd "$tmp/v2-owned-borrow-pointer-aux" && "$ZNC" main.zag -o out) >"$tmp/v2-owned-borrow-pointer-aux/log" 2>&1 || [ -e "$tmp/v2-owned-borrow-pointer-aux/out" ]; then
+  echo "  XX  borrow contract pointer auxiliary parameter rejects"; sed -n '1,8p' "$tmp/v2-owned-borrow-pointer-aux/log"; fail=$((fail + 1))
+elif grep -q 'borrow contract auxiliary parameters must be builtin scalars' "$tmp/v2-owned-borrow-pointer-aux/log"; then
+  echo "  ok  borrow contract pointer auxiliary parameter rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  borrow contract pointer auxiliary rejection missing diagnostic"; sed -n '1,8p' "$tmp/v2-owned-borrow-pointer-aux/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-owned-borrow-mut-contract"
 printf 'name = "v2ownedborrowmutcontract"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-borrow-mut-contract/zag.mod"

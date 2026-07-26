@@ -46,9 +46,11 @@ old handle live.
 
 In particular, a fixed-buffer allocator is intentionally rejected as a public
 v2 surface for now. Its constructor must retain a caller-owned buffer while its
-allocation operation mutates allocator state and accepts size/alignment; the
-current typed borrow contracts are unary and cannot express that multi-argument
-lifetime/mutation contract without weakening ownership checks. There is no
+allocation operation mutates allocator state and accepts size/alignment. Borrow
+contracts now permit scalar auxiliary parameters, but still track only a first
+owner parameter and reject a receiver/second pointer/aggregate lifetime; that
+does not express this multi-argument lifetime/mutation contract without
+weakening ownership checks. There is no
 special-case fallback, no hidden heap path, and no claimed `@noalloc` or
 `@realtime` behavior until that contract and executable exhaustion/reset tests
 exist.

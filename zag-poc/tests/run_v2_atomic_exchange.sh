@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Narrow executable proof for the bounded public v2 atomic operations.  It does not
-# start threads: this verifies the emitted x86 XCHG and its fail-closed source /
+# start threads: this verifies the emitted x86 atomic transactions and its fail-closed source /
 # runtime boundary, not a broader concurrency model.
 set -eu
 cd "$(dirname "$0")/.."
@@ -17,16 +17,17 @@ project() { mkdir -p "$tmp/$1"; printf 'name = "v2atomic"\nversion = "0"\neditio
 
 project exchange
 printf '%s\n' \
-  'fn id(value:i64) i64 { return value; } fn main() i32 { unsafe { let value:i64=7; let p:*mut i64=(&value) as *mut i64; let cp:*const i64=(&value) as *const i64; let first:i64=@atomicLoad64(cp); @atomicStore64(p,19); let old:i64=@atomicExchange64(p,42); let won:i64=@atomicCompareExchange64(p,42,99); let lost:i64=@atomicCompareExchange64(p,42,7); let called:i64=@atomicCompareExchange64(p,id(99),id(123)); let last:i64=@atomicLoad64(p); if(first==7&&old==19&&won==42&&lost==99&&called==99&&last==123&&value==123){return 42;} return 1; } }' \
+  'fn id(value:i64) i64 { return value; } fn main() i32 { unsafe { let value:i64=7; let p:*mut i64=(&value) as *mut i64; let cp:*const i64=(&value) as *const i64; let first:i64=@atomicLoad64(cp); @atomicStore64(p,19); let old:i64=@atomicExchange64(p,42); let added:i64=@atomicFetchAdd64(p,id(5)); let won:i64=@atomicCompareExchange64(p,47,99); let lost:i64=@atomicCompareExchange64(p,47,7); let called:i64=@atomicCompareExchange64(p,id(99),id(123)); let last:i64=@atomicLoad64(p); if(first==7&&old==19&&added==42&&won==47&&lost==99&&called==99&&last==123&&value==123){return 42;} return 1; } }' \
   >"$tmp/exchange/main.zag"
 if (cd "$tmp/exchange" && "$ZNC" main.zag --safety=checked --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/exchange/log" 2>&1 && [ -x "$tmp/exchange/out" ]; then
   set +e; "$tmp/exchange/out"; rc=$?; set -e
   # Zag emits a section-less ELF; inspect raw opcodes. Exchange/store are
   # REX.W XCHG (48 87 /r), load is LOCK REX.W XADD (f0 48 0f c1 /r), and
-  # compare-exchange is LOCK REX.W CMPXCHG (f0 48/4c 0f b1 /r; REX.R is
+  # fetch-add is LOCK REX.W XADD (f0 48 0f c1 /r); compare-exchange is LOCK
+  # REX.W CMPXCHG (f0 48/4c 0f b1 /r; REX.R is
   # required here because the desired value is carried in r8).
   if [ "$rc" -eq 42 ] && od -An -tx1 -v "$tmp/exchange/out" | tr -d ' \n' | grep -Eq '4887[0-9a-f]{2}' && od -An -tx1 -v "$tmp/exchange/out" | tr -d ' \n' | grep -Eq 'f0480fc1[0-9a-f]{2}' && od -An -tx1 -v "$tmp/exchange/out" | tr -d ' \n' | grep -Eq 'f0(48|4c)0fb1[0-9a-f]{2}'; then
-    ok "atomic load/store/exchange/compare-exchange execute with locked xadd, xchg, and cmpxchg"
+    ok "atomic load/store/exchange/fetch-add/compare-exchange execute with locked xadd, xchg, and cmpxchg"
   else
     bad "atomic exchange execution or xchg encoding"; sed -n '1,12p' "$tmp/exchange/log"
   fi
@@ -88,6 +89,38 @@ if (cd "$tmp/cas-arity" && "$ZNC" main.zag --no-zagd --no-analyze --no-foregroun
   bad "atomic compare-exchange accepted wrong arity"
 else
   grep -q 'atomic compare-exchange has the wrong argument count' "$tmp/cas-arity/log" && ok "atomic compare-exchange rejects wrong arity" || bad "missing compare-exchange arity diagnostic"
+fi
+
+project fetch-unsafe
+printf '%s\n' 'fn main() i32 { let value:i64=7; let p:*mut i64=(&value) as *mut i64; return @atomicFetchAdd64(p,1) as i32; }' >"$tmp/fetch-unsafe/main.zag"
+if (cd "$tmp/fetch-unsafe" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/fetch-unsafe/log" 2>&1 || [ -e "$tmp/fetch-unsafe/out" ]; then
+  bad "fetch-add outside unsafe was accepted"
+else
+  grep -q 'atomic fetch-add requires unsafe' "$tmp/fetch-unsafe/log" && ok "fetch-add requires unsafe" || bad "missing fetch-add unsafe diagnostic"
+fi
+
+project fetch-const
+printf '%s\n' 'fn main() i32 { unsafe { let value:i64=7; let p:*const i64=(&value) as *const i64; return @atomicFetchAdd64(p,1) as i32; } }' >"$tmp/fetch-const/main.zag"
+if (cd "$tmp/fetch-const" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/fetch-const/log" 2>&1 || [ -e "$tmp/fetch-const/out" ]; then
+  bad "fetch-add accepted a const pointer"
+else
+  grep -q 'requires an explicitly mutable' "$tmp/fetch-const/log" && ok "fetch-add rejects non-mutable pointer" || bad "missing fetch-add pointer diagnostic"
+fi
+
+project fetch-arity
+printf '%s\n' 'fn main() i32 { unsafe { let value:i64=7; let p:*mut i64=(&value) as *mut i64; return @atomicFetchAdd64(p) as i32; } }' >"$tmp/fetch-arity/main.zag"
+if (cd "$tmp/fetch-arity" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/fetch-arity/log" 2>&1 || [ -e "$tmp/fetch-arity/out" ]; then
+  bad "fetch-add accepted wrong arity"
+else
+  grep -q 'atomic i64 operation has the wrong argument count' "$tmp/fetch-arity/log" && ok "fetch-add rejects wrong arity" || bad "missing fetch-add arity diagnostic"
+fi
+
+project fetch-type
+printf '%s\n' 'fn main() i32 { unsafe { let value:i64=7; let p:*mut i64=(&value) as *mut i64; let wrong:i32=1; return @atomicFetchAdd64(p,wrong) as i32; } }' >"$tmp/fetch-type/main.zag"
+if (cd "$tmp/fetch-type" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/fetch-type/log" 2>&1 || [ -e "$tmp/fetch-type/out" ]; then
+  bad "fetch-add accepted a non-i64 value"
+else
+  grep -q 'atomic fetch-add value must be i64' "$tmp/fetch-type/log" && ok "fetch-add requires i64 values" || bad "missing fetch-add value diagnostic"
 fi
 
 project value-type

@@ -1,10 +1,11 @@
 # Zag v2 concurrency guide (draft)
 
-The current v2 public atomic slice is intentionally four fixed-order
+The current v2 public atomic slice is intentionally five fixed-order
 operations: `@atomicLoad64(ptr: *const/*mut i64) i64`,
 `@atomicStore64(ptr: *mut i64, value: i64) void`, and
 `@atomicExchange64(ptr: *mut i64, value: i64) i64`, plus
-`@atomicCompareExchange64(ptr: *mut i64, expected: i64, desired: i64) i64`.
+`@atomicCompareExchange64(ptr: *mut i64, expected: i64, desired: i64) i64`
+and `@atomicFetchAdd64(ptr: *mut i64, delta: i64) i64`.
 Compare-exchange returns the old word whether the swap succeeds or fails. They are callable only
 inside an `unsafe` block on Linux x86-64 native output. Load emits `LOCK XADD`
 with zero, preserving and returning the old word; store/exchange use memory
@@ -28,8 +29,9 @@ unsafe contracts.  `@realtime` code must use bounded lock-free algorithms or
 explicitly fail capability checking; mutexes, condition waits, sleep, and OS
 thread operations are not permitted there.
 
-`tests/run_v2_atomic_exchange.sh` proves load/store/exchange/compare-exchange
-results and inspects the emitted ELF for locked `xadd`, `xchg`, and `cmpxchg`;
+`tests/run_v2_atomic_exchange.sh` proves load/store/exchange/compare-exchange/
+fetch-add results and inspects the emitted ELF for locked `xadd`, `xchg`, and
+`cmpxchg`;
 it also covers compare-exchange unsafe, arity, mutability, and value-type
 rejection, `Unsafe` effect rejection in `@pure`, and the shared misalignment
 failure path. A successful
