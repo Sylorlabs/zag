@@ -451,6 +451,14 @@ if (cd "$tmp/v2-sanitize-memory" && "$ZNC" main.zag -o out --sanitize=memory) >"
 else
   echo "  XX  memory sanitizer compiles released-allocation witness"; sed -n '1,10p' "$tmp/v2-sanitize-memory/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-raw-slice-release"
+printf 'name = "v2rawslicerelease"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-raw-slice-release/zag.mod"
+printf 'fn main() i32 { let xs:[]i32 = zalloc_i(1); xs[0] = 7; zfree_i(xs); return 0; }\n' >"$tmp/v2-raw-slice-release/main.zag"
+if (cd "$tmp/v2-raw-slice-release" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-raw-slice-release/log" 2>&1 && [ -x "$tmp/v2-raw-slice-release/out" ]; then
+  echo "  ok  checked raw-slice release discharges ownership"; pass=$((pass + 1))
+else
+  echo "  XX  checked raw-slice release discharges ownership"; sed -n '1,10p' "$tmp/v2-raw-slice-release/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-global-format"
 printf 'name = "v2globalformat"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-global-format/zag.mod"
 printf 'global let counter:i32; fn main() i32 { counter=7; return counter; }\n' >"$tmp/v2-global-format/main.zag"

@@ -20,8 +20,9 @@ silently downgrading. Other sanitizer modes remain rejected.
   new allocation. Checked `_zag_free` and `_zag_realloc` additionally require
   an exact live allocation base before reading allocator headers, so a forged
   interior pointer traps rather than corrupting a small-block free list. Stack,
-  static, foreign, raw-slice, and cache-aligned regions
-  are intentionally not rejected merely because they are untracked. This is
+  static and foreign regions are intentionally not rejected merely because
+  they are untracked. `zalloc` and cache-aligned raw-slice mappings now enter
+  the same bounded registry and retire on their paired free. This is
   bounded runtime instrumentation, not universal pointer provenance: forged
   pointers, address reuse (ABA), and untracked allocator families remain unsafe
   programmer responsibility. Invalid shifts, division by zero, and invalid
