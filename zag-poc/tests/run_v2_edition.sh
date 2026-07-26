@@ -459,6 +459,17 @@ if (cd "$tmp/v2-raw-slice-release" && "$ZNC" main.zag -o out --safety=checked) >
 else
   echo "  XX  checked raw-slice release discharges ownership"; sed -n '1,10p' "$tmp/v2-raw-slice-release/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-raw-slice-stale"
+printf 'name = "v2rawslicestale"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-raw-slice-stale/zag.mod"
+printf 'fn main() i32 { let xs:[]i32 = zalloc_i(1); xs[0] = 7; zfree_i(xs); return xs[0]; }\n' >"$tmp/v2-raw-slice-stale/main.zag"
+if (cd "$tmp/v2-raw-slice-stale" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-raw-slice-stale/log" 2>&1 ||
+   [ -e "$tmp/v2-raw-slice-stale/out" ]; then
+  echo "  XX  released raw slice rejects use"; sed -n '1,10p' "$tmp/v2-raw-slice-stale/log"; fail=$((fail + 1))
+elif grep -q 'use after free of named allocation `xs`' "$tmp/v2-raw-slice-stale/log"; then
+  echo "  ok  released raw slice rejects use without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  released raw slice rejection missing lifetime diagnostic"; sed -n '1,10p' "$tmp/v2-raw-slice-stale/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-global-format"
 printf 'name = "v2globalformat"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-global-format/zag.mod"
 printf 'global let counter:i32; fn main() i32 { counter=7; return counter; }\n' >"$tmp/v2-global-format/main.zag"
