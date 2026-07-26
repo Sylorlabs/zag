@@ -16,15 +16,17 @@ try allocator.deallocate(block);
 ```
 
 The implemented `Allocation` carries a pointer, exact native capacity, chosen
-native alignment, and a runtime-minted lifetime generation. The current native
+native alignment, a runtime-minted lifetime generation, and the checked
+allocator identity that minted it. The current native
 surface accepts power-of-two alignment requests 1, 2, 4, and 8; stronger
 alignment remains unsupported rather than silently rounded. `deallocate`
-validates all four against checked-runtime provenance before it frees: an
+validates the complete five-field identity tuple against checked-runtime
+provenance before it frees: an
 invalid base, copied released handle, forged length, wrong alignment, or stale
 generation after address reuse terminates before allocator metadata is touched.
 The same exact-tuple check rejects a live cross-handle splice: a second live
-pointer/capacity/alignment combined with another handle's generation is not a
-valid identity.
+pointer/capacity/alignment combined with another handle's generation or
+allocator identity is not a valid identity.
 This requires native x86-64 `--safety=checked`; other targets and unchecked
 builds reject the validation boundary rather than silently weakening it. The
 v2 compiler gate proves that an unchecked call reports that requirement and
@@ -40,9 +42,18 @@ the peak. Consuming that handle restores live bytes while retaining the
 monotonic allocation count. These counters describe native payload capacity
 only; they are not a general leak detector or allocator identity API.
 
-This is not yet the complete allocator model. The generation is compiler-
-minted and runtime-checked, but not an opaque language capability; allocator
-identity, custom allocators, arenas, and fixed-buffer allocators are still
+The handle gate also forges a live descriptor with only `allocator_id` changed;
+checked deallocation rejects it before native free. This proves allocator
+identity is an enforced runtime ownership field rather than documentation-only
+metadata, while the single public SystemAllocator identity remains a bounded
+slice rather than a complete custom-allocator capability system.
+
+This is not yet the complete allocator model. The generation and allocator
+identity are runtime-checked tokens, but they are not yet opaque language
+capabilities and the public constructor currently exposes only identity `1`;
+the checked register boundary rejects forged constructor identities until a
+second allocator family has its own descriptor and lifetime contract.
+Custom allocators, arenas, and fixed-buffer allocators are still
 unimplemented. `resize` and `allocate_zeroed` are
 implemented for the checked native SystemAllocator: it returns the ordinary
 minted handle after clearing its exact recorded capacity. `resize` validates

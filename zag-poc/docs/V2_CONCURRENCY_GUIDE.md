@@ -26,9 +26,9 @@ This is not a general atomic or concurrency API: there are no atomic storage
 types, selectable memory orders, fences with
 language ordering semantics, thread spawn/join, or race detector. The raw
 pointer's allocation, lifetime, sharing, and absence of mixed atomic/non-atomic
-access remain the caller's unsafe contract. `@volatileLoad` and
-`@volatileStore` remain MMIO transactions, not atomics: they neither synchronize
-threads nor imply a memory order.
+access remain the caller's unsafe contract. `@volatileLoad`/`@volatileStore`
+and their explicit 8/16/32-bit companions remain MMIO transactions, not
+atomics: they neither synchronize threads nor imply a memory order.
 `@memoryFence` remains a legacy native `mfence` emission, not a typed fence
 operation; it carries the `Unsafe` effect and cannot make a `@pure` or
 `@realtime` function appear compliant.

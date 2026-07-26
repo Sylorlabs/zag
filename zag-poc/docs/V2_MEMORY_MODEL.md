@@ -89,16 +89,20 @@ not evidence that those stronger rules already hold.
 
 The checked native `SystemAllocator` is a separate, deliberately narrow
 allocator-handle boundary. It returns fallible `Allocation` records carrying a
-native pointer, exact reserved capacity, accepted alignment (1, 2, 4, or 8),
-and a runtime-minted generation. `deallocate` and `resize` validate all of
-those fields, so forged capacity/alignment, copied released handles, and stale
-handles after same-address reuse fail before raw free. It supplies
+native pointer, exact reserved capacity, accepted alignment (1, 2, 4, or 8), a
+runtime-minted generation, and the identity of the allocator registry that
+minted the handle. `deallocate` and `resize` validate all of those fields, so
+forged capacity/alignment/identity, copied released handles, and stale handles
+after same-address reuse fail before raw free. It supplies
 `allocate`, `allocate_zeroed`, `resize`, and consuming `deallocate`; it does
 not provide opaque language capabilities, custom/arena/fixed-buffer allocators,
 or a general static lifetime analysis for allocator values.
 The current runtime record also rejects a live cross-handle field splice when
-its generation belongs to another allocation; this is exact-record validation,
-not language-level opaque ownership.
+its generation or allocator identity belongs to another allocation; this is
+exact-record validation, not language-level opaque ownership. The public
+`system_allocator()` constructor currently mints only identity `1`; the checked
+register boundary rejects forged constructor identities, so this slice does
+not claim a complete multi-allocator capability system.
 Its compiler-private register, validate, and free hooks also reject outside
 checked mode; importing the allocator module cannot silently weaken that handle
 boundary into an unchecked free path.
@@ -119,28 +123,38 @@ nullary-function desugaring rather than a static object. Aggregate, callback,
 and optional globals remain rejected until initialization ordering, destruction,
 and lifetime/provenance contracts are implemented.
 
-## Implemented volatile/MMIO word and byte slice
+## Implemented volatile/MMIO byte, halfword, dword, and word slice
 
 Edition-2027 native x86-64 provides `@volatileLoad(ptr)` and
 `@volatileStore(ptr, value)` for explicit 64-bit transactions, plus
-`@volatileLoad8(ptr)` and `@volatileStore8(ptr, value)` for explicit byte
-transactions. All are legal only inside `unsafe` (or an `unsafe fn`). The word
+`@volatileLoad8(ptr)`/`@volatileStore8(ptr, value)`,
+`@volatileLoad16(ptr)`/`@volatileStore16(ptr, value)`, and
+`@volatileLoad32(ptr)`/`@volatileStore32(ptr, value)` for explicit byte,
+16-bit, and 32-bit transactions. All are legal only inside `unsafe` (or an
+`unsafe fn`). The word
 forms accept only
 `*const i64`, `*mut i64`, `*host i64` and their `u64`/`isize`/`usize`
-counterparts; byte forms accept only `*const u8`, `*mut u8`, or `*host u8`.
-Stores reject `*const`. Each lowers to exactly one native memory load or store;
+counterparts; byte, halfword, and dword forms accept only `*const/*mut/*host`
+`u8`, `u16`, and `u32` respectively. Stores reject `*const`. Each lowers to
+exactly one native memory load or store;
 the compiler does not fold, coalesce, or reorder these transactions in its
 native lowering. `@volatileLoad8` zero-extends its loaded byte, and
-`@volatileStore8` writes only the low byte of its lowered scalar value. Store
-preserves its checked address across value-expression calls before issuing that
+`@volatileStore8` writes only the low byte of its lowered scalar value. The
+16/32-bit forms similarly zero-extend loads and write only the low 16/32 bits,
+preserving the requested device-register width even though the backend's
+scalar stack is 64-bit. Store preserves its checked address across
+value-expression calls before issuing that
 one memory transaction. They are **not atomic**, provide no memory ordering,
 and do not imply a fence.
 
 With `--safety=checked`, a volatile transaction uses the same immediate
 null/alignment/live-allocation/bounds probe as an ordinary raw access. Unknown
 stack, static, and foreign/MMIO addresses remain outside that registry and are
-therefore the unsafe caller's responsibility. The proof does not validate a
-physical device register, concurrent access, or address fabrication.
+therefore the unsafe caller's responsibility. Width and alignment are
+validated (`u8`/1, `u16`/2, `u32`/4, and word/8); the proof does not validate a
+physical device register, device capability, concurrent access, or address
+fabrication. Device/workgroup pointers remain rejected until a GPU/MMIO
+capability contract exists.
 
 Captureless callbacks are ordinary function values. A scalar by-value capture
 uses a heap environment that is an owned v2 resource: it may be transferred by

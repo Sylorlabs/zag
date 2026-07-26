@@ -113,7 +113,7 @@ fi
 mkdir -p "$tmp/v2-system-allocator-forged"
 printf 'name = "v2systemallocatorforged"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-forged/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-forged/std"
-printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let forged:Allocation=Allocation{.ptr=block.ptr,.len=block.len-8,.alignment=block.alignment,.generation=block.generation}; try allocator.deallocate(forged); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-forged/main.zag"
+printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let forged:Allocation=Allocation{.ptr=block.ptr,.len=block.len-8,.alignment=block.alignment,.generation=block.generation,.allocator_id=block.allocator_id}; try allocator.deallocate(forged); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-forged/main.zag"
 if (cd "$tmp/v2-system-allocator-forged" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-forged/log" 2>&1 && [ -x "$tmp/v2-system-allocator-forged/out" ]; then
   set +e
   "$tmp/v2-system-allocator-forged/out" >"$tmp/v2-system-allocator-forged/out.log" 2>"$tmp/v2-system-allocator-forged/err.log"
@@ -130,7 +130,7 @@ fi
 mkdir -p "$tmp/v2-system-allocator-forged-alignment"
 printf 'name = "v2systemallocatorforgedalignment"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-forged-alignment/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-forged-alignment/std"
-printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let forged:Allocation=Allocation{.ptr=block.ptr,.len=block.len,.alignment=4,.generation=block.generation}; try allocator.deallocate(forged); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-forged-alignment/main.zag"
+printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let forged:Allocation=Allocation{.ptr=block.ptr,.len=block.len,.alignment=4,.generation=block.generation,.allocator_id=block.allocator_id}; try allocator.deallocate(forged); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-forged-alignment/main.zag"
 if (cd "$tmp/v2-system-allocator-forged-alignment" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-forged-alignment/log" 2>&1 && [ -x "$tmp/v2-system-allocator-forged-alignment/out" ]; then
   set +e
   "$tmp/v2-system-allocator-forged-alignment/out" >"$tmp/v2-system-allocator-forged-alignment/out.log" 2>"$tmp/v2-system-allocator-forged-alignment/err.log"
@@ -150,7 +150,7 @@ ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-forged-generation/std"
 # Splice a live second descriptor with the first allocation's generation. This
 # must not be accepted merely because every individual field came from a valid
 # current handle: identity is the exact live tuple, including generation.
-printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let first:Allocation=try allocator.allocate(24,8); let second:Allocation=try allocator.allocate(64,8); let forged:Allocation=Allocation{.ptr=second.ptr,.len=second.len,.alignment=second.alignment,.generation=first.generation}; try allocator.deallocate(forged); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-forged-generation/main.zag"
+printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let first:Allocation=try allocator.allocate(24,8); let second:Allocation=try allocator.allocate(64,8); let forged:Allocation=Allocation{.ptr=second.ptr,.len=second.len,.alignment=second.alignment,.generation=first.generation,.allocator_id=second.allocator_id}; try allocator.deallocate(forged); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-forged-generation/main.zag"
 if (cd "$tmp/v2-system-allocator-forged-generation" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-forged-generation/log" 2>&1 && [ -x "$tmp/v2-system-allocator-forged-generation/out" ]; then
   set +e
   "$tmp/v2-system-allocator-forged-generation/out" >"$tmp/v2-system-allocator-forged-generation/out.log" 2>"$tmp/v2-system-allocator-forged-generation/err.log"
@@ -163,6 +163,48 @@ if (cd "$tmp/v2-system-allocator-forged-generation" && "$ZNC" main.zag -o out --
   fi
 else
   echo "  XX  forged SystemAllocator generation splice did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-generation/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-system-allocator-forged-identity"
+printf 'name = "v2systemallocatorforgedidentity"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-forged-identity/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-forged-identity/std"
+# A descriptor with a live pointer, capacity, alignment, and generation but a
+# different allocator identity must not cross the checked deallocation
+# boundary. This is the runtime proof that identity is part of the ownership
+# token rather than advisory source metadata.
+printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let forged:Allocation=Allocation{.ptr=block.ptr,.len=block.len,.alignment=block.alignment,.generation=block.generation,.allocator_id=block.allocator_id+1}; try allocator.deallocate(forged); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-forged-identity/main.zag"
+if (cd "$tmp/v2-system-allocator-forged-identity" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-forged-identity/log" 2>&1 && [ -x "$tmp/v2-system-allocator-forged-identity/out" ]; then
+  set +e
+  "$tmp/v2-system-allocator-forged-identity/out" >"$tmp/v2-system-allocator-forged-identity/out.log" 2>"$tmp/v2-system-allocator-forged-identity/err.log"
+  forged_identity_allocator_rc=$?
+  set -e
+  if [ "$forged_identity_allocator_rc" -ne 0 ] && grep -q 'allocator identity does not match Allocation handle' "$tmp/v2-system-allocator-forged-identity/err.log"; then
+    echo "  ok  SystemAllocator rejects forged allocator identity"; pass=$((pass + 1))
+  else
+    echo "  XX  forged SystemAllocator allocator identity (exit=$forged_identity_allocator_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-identity/log"; sed -n '1,8p' "$tmp/v2-system-allocator-forged-identity/err.log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  forged SystemAllocator allocator identity did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-identity/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-system-allocator-forged-constructor"
+printf 'name = "v2systemallocatorforgedconstructor"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-forged-constructor/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-forged-constructor/std"
+# A public aggregate literal may spell an unsupported identity, but the native
+# register boundary must reject it before minting a descriptor. This keeps the
+# currently implemented identity set fail-closed until another allocator
+# family has its own runtime/lifetime contract.
+printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=SystemAllocator{.allocator_id=2}; let block:Allocation=try allocator.allocate(24,8); try allocator.deallocate(block); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-forged-constructor/main.zag"
+if (cd "$tmp/v2-system-allocator-forged-constructor" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-forged-constructor/log" 2>&1 && [ -x "$tmp/v2-system-allocator-forged-constructor/out" ]; then
+  set +e
+  "$tmp/v2-system-allocator-forged-constructor/out" >"$tmp/v2-system-allocator-forged-constructor/out.log" 2>"$tmp/v2-system-allocator-forged-constructor/err.log"
+  forged_constructor_allocator_rc=$?
+  set -e
+  if [ "$forged_constructor_allocator_rc" -ne 0 ] && grep -q 'unsupported allocator identity' "$tmp/v2-system-allocator-forged-constructor/err.log"; then
+    echo "  ok  SystemAllocator rejects unsupported constructor identity"; pass=$((pass + 1))
+  else
+    echo "  XX  unsupported SystemAllocator constructor identity (exit=$forged_constructor_allocator_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-constructor/log"; sed -n '1,8p' "$tmp/v2-system-allocator-forged-constructor/err.log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  unsupported SystemAllocator constructor identity did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-constructor/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-system-allocator-stale"
 printf 'name = "v2systemallocatorstale"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-stale/zag.mod"

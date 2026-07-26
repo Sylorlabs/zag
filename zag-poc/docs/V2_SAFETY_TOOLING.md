@@ -35,8 +35,9 @@ silently downgrading. Other sanitizer modes remain rejected.
   provenance checks as `--safety=checked` and fails process exit on a nonzero
   ordinary-allocation live witness. It does not yet provide red zones,
   poisoning, guard pages, allocation-site reports, or custom-allocator
-  tracking. Its SystemAllocator-handle checks retain the same generation
-  validation as checked mode; that does not make raw-pointer ABA generally safe.
+  tracking. Its SystemAllocator-handle checks retain the same generation and
+  allocator-identity validation as checked mode; that does not make
+  raw-pointer ABA generally safe.
 - `--sanitize=undefined` is not implemented and is rejected; it does not
   instrument integer conversion/overflow, shifts, tags, or other preconditions.
 - `--sanitize=thread` is not implemented and is rejected; it records no

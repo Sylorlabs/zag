@@ -42,8 +42,12 @@ in every scope, and calling an unsafe function requires an unsafe call site.
 Unsafe blocks and direct calls infer the `Unsafe` effect, which `@pure` and
 `@realtime` reject. Nullable raw pointers require explicit unwrapping before
 dereference, and direct casts between generic, host, device, and workgroup
-address spaces are rejected. `volatile`, `atomic`, and `asm` remain fail-closed
-and unsupported. Pointer provenance identity, bounds and alignment
+address spaces are rejected. Native x86-64 has a bounded unsafe volatile/MMIO
+slice (`@volatileLoad`/`Store` and explicit 8/16/32-bit companions) with
+checked width/alignment probes; full device capability validation remains
+unsupported. Fixed unsafe i64 atomics are implemented, but atomic storage,
+selectable memory orders, threads, and a complete concurrency model remain
+unsupported. Inline `asm` remains fail-closed. Pointer provenance identity, bounds and alignment
 instrumentation, source-span audit records, indirect
 function-value/callback/generic/FFI propagation, and the complete
 unsafe-operation inventory are not yet implemented.
