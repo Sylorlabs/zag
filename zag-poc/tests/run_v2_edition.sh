@@ -435,6 +435,22 @@ if (cd "$tmp/v2-explicit-global" && "$ZNC" main.zag -o out) >"$tmp/v2-explicit-g
 else
   echo "  XX  explicit scalar global compiles"; sed -n '1,10p' "$tmp/v2-explicit-global/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-sanitize-memory"
+printf 'name = "v2sanitizememory"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-sanitize-memory/zag.mod"
+printf 'extern fn _zag_malloc(n:i64)*u8; extern fn _zag_free(p:*u8)void; fn main() i32 { let p:*u8 = _zag_malloc(16); _zag_free(p); return 37; }\n' >"$tmp/v2-sanitize-memory/main.zag"
+if (cd "$tmp/v2-sanitize-memory" && "$ZNC" main.zag -o out --sanitize=memory) >"$tmp/v2-sanitize-memory/log" 2>&1 && [ -x "$tmp/v2-sanitize-memory/out" ]; then
+  set +e
+  "$tmp/v2-sanitize-memory/out"
+  sanitize_memory_rc=$?
+  set -e
+  if [ "$sanitize_memory_rc" -eq 37 ]; then
+    echo "  ok  memory sanitizer preserves released-allocation exit status"; pass=$((pass + 1))
+  else
+    echo "  XX  memory sanitizer released-allocation execution (exit=$sanitize_memory_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  memory sanitizer compiles released-allocation witness"; sed -n '1,10p' "$tmp/v2-sanitize-memory/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-global-format"
 printf 'name = "v2globalformat"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-global-format/zag.mod"
 printf 'global let counter:i32; fn main() i32 { counter=7; return counter; }\n' >"$tmp/v2-global-format/main.zag"

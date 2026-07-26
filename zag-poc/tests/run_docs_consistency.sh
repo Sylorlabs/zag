@@ -38,10 +38,11 @@ else
 fi
 
 if [ -f docs/V2_SAFETY_TOOLING.md ] && \
-   rg -q 'partially implemented for edition-2027 native' docs/V2_SAFETY_TOOLING.md && \
-   rg -q 'Sanitizer options remain rejected' docs/V2_SAFETY_TOOLING.md && \
+   rg -q 'partial `--sanitize=memory` mode are' docs/V2_SAFETY_TOOLING.md && \
+   rg -q 'Other sanitizer modes remain rejected' docs/V2_SAFETY_TOOLING.md && \
+   rg -q 'does not yet provide red zones' docs/V2_SAFETY_TOOLING.md && \
    rg -q 'Current status remains unsupported' docs/V2_SAFETY_TOOLING.md; then
-  ok "safety-tooling document scopes checked mode and unsupported sanitizers"
+  ok "safety-tooling document scopes partial memory sanitizer and unsupported modes"
 else
   bad "safety-tooling document is missing or overclaims implementation"
 fi

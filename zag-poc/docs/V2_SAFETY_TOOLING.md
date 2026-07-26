@@ -1,11 +1,12 @@
 # Zag v2 safety tooling (draft)
 
-Status: `--safety=checked` is partially implemented for edition-2027 native
-x86-64 output. It traps null and misaligned raw-pointer dereferences/indexes,
-and it checks bounds and freed-state for ordinary allocator regions tracked by
-the native runtime. It is rejected on every other target rather than silently
-downgrading. Sanitizer options remain rejected until they have implementation,
-negative tests, and runtime evidence.
+Status: `--safety=checked` and the partial `--sanitize=memory` mode are
+implemented for edition-2027 native x86-64 output. They trap null and
+misaligned raw-pointer dereferences/indexes, and check bounds and freed-state
+for ordinary allocator regions tracked by the native runtime. Memory sanitizer
+mode additionally fails process exit when the ordinary allocator's live-capacity
+witness is nonzero. Both modes are rejected on every other target rather than
+silently downgrading. Other sanitizer modes remain rejected.
 
 ## Modes
 
@@ -28,9 +29,11 @@ negative tests, and runtime evidence.
 - `--safety=release` retains defined-language traps while allowing proven
   redundant checks to be removed.  It never converts a safe operation into
   ambient undefined behavior.
-- `--sanitize=memory` adds allocator metadata, freed-region poisoning/guard
-  pages where practical, double/invalid-free detection, red zones, and a leak
-  report at process exit.
+- `--sanitize=memory` currently enables the same bounded ordinary-allocation
+  provenance checks as `--safety=checked` and fails process exit on a nonzero
+  ordinary-allocation live witness. It does not yet provide red zones,
+  poisoning, guard pages, allocation-site reports, custom-allocator tracking,
+  or ABA-resistant identity.
 - `--sanitize=undefined` instruments checked integer conversion/overflow,
   shifts, null/misalignment, invalid enum/union tags, and other specified
   dynamic preconditions.
