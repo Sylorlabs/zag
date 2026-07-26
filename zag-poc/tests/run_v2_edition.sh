@@ -36,6 +36,22 @@ reject() {
 }
 
 reject "v1 rejects v2 unsafe syntax" 2026 E0200
+mkdir -p "$tmp/v2-captureless-callback"
+printf 'name = "v2capturelesscallback"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-captureless-callback/zag.mod"
+printf 'fn main() i32 { let f:fn() i32=fn[]() i32 { return 42; }; return f(); }\n' >"$tmp/v2-captureless-callback/main.zag"
+if (cd "$tmp/v2-captureless-callback" && "$ZNC" main.zag -o out) >"$tmp/v2-captureless-callback/log" 2>&1 && [ -x "$tmp/v2-captureless-callback/out" ]; then
+  set +e
+  "$tmp/v2-captureless-callback/out"
+  captureless_callback_rc=$?
+  set -e
+  if [ "$captureless_callback_rc" -eq 42 ]; then
+    echo "  ok  captureless callback executes without a lifetime environment"; pass=$((pass + 1))
+  else
+    echo "  XX  captureless callback execution (exit=$captureless_callback_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  captureless callback compile"; sed -n '1,8p' "$tmp/v2-captureless-callback/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-checked-null"
 printf 'name = "v2checkednull"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-null/zag.mod"
 printf 'fn main() i32 { unsafe { let p:*const i32=null as *const i32; return p.*; } }\n' >"$tmp/v2-checked-null/main.zag"
@@ -340,6 +356,22 @@ elif grep -q E0204 "$tmp/v2-global/log" && grep -q 'global lifetime contract' "$
   echo "  ok  v2 mutable global requires an explicit lifetime contract without artifact"; pass=$((pass + 1))
 else
   echo "  XX  v2 global lifetime rejection missing diagnostic"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-top-level-const"
+printf 'name = "v2toplevelconst"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-top-level-const/zag.mod"
+printf 'const answer:i32=42; fn main() i32 { return answer; }\n' >"$tmp/v2-top-level-const/main.zag"
+if (cd "$tmp/v2-top-level-const" && "$ZNC" main.zag -o out) >"$tmp/v2-top-level-const/log" 2>&1 && [ -x "$tmp/v2-top-level-const/out" ]; then
+  set +e
+  "$tmp/v2-top-level-const/out"
+  top_level_const_rc=$?
+  set -e
+  if [ "$top_level_const_rc" -eq 42 ]; then
+    echo "  ok  top-level const remains a callable value, not mutable storage"; pass=$((pass + 1))
+  else
+    echo "  XX  top-level const execution (exit=$top_level_const_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  top-level const compile"; sed -n '1,8p' "$tmp/v2-top-level-const/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-const-write"
 printf 'name = "v2constwrite"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-const-write/zag.mod"
