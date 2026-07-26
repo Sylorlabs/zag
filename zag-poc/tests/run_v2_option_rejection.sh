@@ -17,7 +17,8 @@ printf 'fn main() i32 { return 0; }\n' >"$tmp/main.zag"
 pass=0 fail=0
 for option in --sanitize=undefined --sanitize=thread --safety=release --target-feature=avx2 --gpu-runtime=vulkan --edition=2027 \
               -g --debug-info --debug=full --emit-debug --strip --strip-debug --emit-asm -S --emit-ir --emit-llvm \
-              -fsanitize=address -fsanitize=undefined -fno-sanitize-recover=all; do
+              -fsanitize=address -fsanitize=undefined -fno-sanitize-recover=all \
+              -mavx2 -march=native -msse4.2 -mbmi -m32; do
   out="$tmp/out"
   rm -f "$out"
   if "$ZNC" "$tmp/main.zag" -o "$out" "$option" >"$tmp/log" 2>&1 || [ -e "$out" ]; then

@@ -48,7 +48,8 @@ implemented for the checked native SystemAllocator: it returns the ordinary
 minted handle after clearing its exact recorded capacity. `resize` validates
 the old handle, allocates the replacement first, copies the overlap, then
 consumes the old handle; a fallible replacement allocation therefore leaves the
-old handle live.
+old handle live. On a successful resize, copied descriptors from the old
+lifetime are retired with that old handle and reject before a second free.
 
 In particular, `fixed_buffer_allocator(...)` and `arena_allocator(...)` are
 explicitly rejected as public v2 surface spellings for now. Their constructors

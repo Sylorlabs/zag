@@ -249,6 +249,26 @@ if (cd "$tmp/v2-system-allocator-resize" && "$ZNC" main.zag -o out --safety=chec
 else
   echo "  XX  SystemAllocator resize did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-resize/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-system-allocator-resize-stale"
+printf 'name = "v2systemallocatorresizestale"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-resize-stale/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-resize-stale/std"
+# Resize allocates the replacement first, then retires the old handle. A copy
+# made before the call must therefore be rejected after success, not treated as
+# a second valid descriptor for the old allocation lifetime.
+printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let stale:Allocation=block; let grown:Allocation=try allocator.resize(block,64,8); try allocator.deallocate(stale); try allocator.deallocate(grown); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-resize-stale/main.zag"
+if (cd "$tmp/v2-system-allocator-resize-stale" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-resize-stale/log" 2>&1 && [ -x "$tmp/v2-system-allocator-resize-stale/out" ]; then
+  set +e
+  "$tmp/v2-system-allocator-resize-stale/out" >"$tmp/v2-system-allocator-resize-stale/out.log" 2>"$tmp/v2-system-allocator-resize-stale/err.log"
+  resize_stale_allocator_rc=$?
+  set -e
+  if [ "$resize_stale_allocator_rc" -ne 0 ] && grep -q 'invalid or released Allocation handle' "$tmp/v2-system-allocator-resize-stale/err.log"; then
+    echo "  ok  SystemAllocator resize retires copied old handle"; pass=$((pass + 1))
+  else
+    echo "  XX  stale SystemAllocator resize handle (exit=$resize_stale_allocator_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-resize-stale/log"; sed -n '1,8p' "$tmp/v2-system-allocator-resize-stale/err.log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  stale SystemAllocator resize handle did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-resize-stale/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-system-allocator-alignment"
 printf 'name = "v2systemallocatoralignment"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-alignment/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-alignment/std"

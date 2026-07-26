@@ -197,6 +197,9 @@ Every pointer derives from a live allocation, static object, or a documented
 target object such as an MMIO region.  Derived pointers retain that allocation's
 provenance and bounds.  A pointer becomes invalid when its allocation is freed;
 all derived pointers become invalid on a successful resize that moves storage.
+For the checked `SystemAllocator` handle boundary, a successful resize also
+retires copied descriptors for the old allocation lifetime before they can be
+used for a second free.
 Safe code cannot create a pointer without a checked origin.  Unsafe integer
 conversion creates an *untrusted* pointer that may only be dereferenced when
 the unsafe caller satisfies alignment, extent, lifetime, address-space, and
