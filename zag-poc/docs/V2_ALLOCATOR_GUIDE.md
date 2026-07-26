@@ -15,17 +15,18 @@ let block: Allocation = try allocator.allocate(bytes, 8);
 try allocator.deallocate(block);
 ```
 
-The implemented `Allocation` carries a pointer, exact native capacity, and
-8-byte alignment. `deallocate` validates all three against checked-runtime
-provenance before it frees: an invalid base, copied released handle, forged
-length, or wrong alignment terminates before allocator metadata is touched.
+The implemented `Allocation` carries a pointer, exact native capacity,
+8-byte alignment, and a runtime-minted lifetime generation. `deallocate`
+validates all four against checked-runtime provenance before it frees: an
+invalid base, copied released handle, forged length, wrong alignment, or stale
+generation after address reuse terminates before allocator metadata is touched.
 This requires native x86-64 `--safety=checked`; other targets and unchecked
 builds reject the validation boundary rather than silently weakening it.
 
-This is not yet the complete allocator model. Handles do not yet carry an
-allocator identity or non-forgeable generation, so ABA after address reuse is
-still outside the guarantee. `resize`, `allocate_zeroed`, custom allocators,
-arenas, and fixed-buffer allocators are specified but not implemented.
+This is not yet the complete allocator model. The generation is compiler-
+minted and runtime-checked, but not an opaque language capability; allocator
+identity, `resize`, `allocate_zeroed`, custom allocators, arenas, and
+fixed-buffer allocators are still unimplemented.
 
 Arena and fixed-buffer allocators are useful only when their lifetime/reset
 semantics are explicit.  A fixed-buffer allocation may satisfy `@noalloc` or
