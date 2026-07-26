@@ -120,6 +120,23 @@ if (cd "$tmp/v2-system-allocator-aba" && "$ZNC" main.zag -o out --safety=checked
 else
   echo "  XX  SystemAllocator ABA program did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-aba/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-system-allocator-reuse"
+printf 'name = "v2systemallocatorreuse"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-reuse/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-reuse/std"
+printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let first:Allocation=try allocator.allocate(24,8); try allocator.deallocate(first); let replacement:Allocation=try allocator.allocate(24,8); try allocator.deallocate(replacement); return 42; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-reuse/main.zag"
+if (cd "$tmp/v2-system-allocator-reuse" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-reuse/log" 2>&1 && [ -x "$tmp/v2-system-allocator-reuse/out" ]; then
+  set +e
+  "$tmp/v2-system-allocator-reuse/out"
+  reuse_allocator_rc=$?
+  set -e
+  if [ "$reuse_allocator_rc" -eq 42 ]; then
+    echo "  ok  SystemAllocator accepts replacement handle after address reuse"; pass=$((pass + 1))
+  else
+    echo "  XX  SystemAllocator replacement handle execution (exit=$reuse_allocator_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-reuse/log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  SystemAllocator replacement handle did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-reuse/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-captureless-callback"
 printf 'name = "v2capturelesscallback"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-captureless-callback/zag.mod"
 printf 'fn main() i32 { let f:fn() i32=fn[]() i32 { return 42; }; return f(); }\n' >"$tmp/v2-captureless-callback/main.zag"
