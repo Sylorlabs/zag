@@ -17,7 +17,7 @@ project() { mkdir -p "$tmp/$1"; printf 'name = "v2atomic"\nversion = "0"\neditio
 
 project exchange
 printf '%s\n' \
-  'fn id(value:i64) i64 { return value; } fn main() i32 { unsafe { let value:i64=7; let p:*mut i64=(&value) as *mut i64; let cp:*const i64=(&value) as *const i64; let first:i64=@atomicLoad64(cp); @atomicStore64(p,19); let old:i64=@atomicExchange64(p,42); let added:i64=@atomicFetchAdd64(p,id(5)); let subbed:i64=@atomicFetchSub64(p,id(5)); let won:i64=@atomicCompareExchange64(p,42,99); let lost:i64=@atomicCompareExchange64(p,47,7); let called:i64=@atomicCompareExchange64(p,id(99),id(123)); let last:i64=@atomicLoad64(p); if(first==7&&old==19&&added==42&&subbed==47&&won==42&&lost==99&&called==99&&last==123&&value==123){return 42;} return 1; } }' \
+  'fn id(value:i64) i64 { return value; } fn main() i32 { unsafe { let value:i64=7; let p:*mut i64=(&value) as *mut i64; let cp:*const i64=(&value) as *const i64; let first:i64=@atomicLoad64(cp); @atomicStore64(p,19); let old:i64=@atomicExchange64(p,42); let added:i64=@atomicFetchAdd64(p,id(5)); let subbed:i64=@atomicFetchSub64(p,id(5)); let won:i64=@atomicCompareExchange64(p,42,99); let lost:i64=@atomicCompareExchange64(p,47,7); let called:i64=@atomicCompareExchange64(p,id(99),id(123)); let anded:i64=@atomicFetchAnd64(p,id(255)); let ored:i64=@atomicFetchOr64(p,id(256)); let xored:i64=@atomicFetchXor64(p,id(384)); let last:i64=@atomicLoad64(p); if(first==7&&old==19&&added==42&&subbed==47&&won==42&&lost==99&&called==99&&anded==123&&ored==123&&xored==379&&last==251&&value==251){return 42;} return 1; } }' \
   >"$tmp/exchange/main.zag"
 if (cd "$tmp/exchange" && "$ZNC" main.zag --safety=checked --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/exchange/log" 2>&1 && [ -x "$tmp/exchange/out" ]; then
   set +e; "$tmp/exchange/out"; rc=$?; set -e
@@ -27,7 +27,7 @@ if (cd "$tmp/exchange" && "$ZNC" main.zag --safety=checked --no-zagd --no-analyz
   # REX.W CMPXCHG (f0 48/4c 0f b1 /r; REX.R is
   # required here because the desired value is carried in r8).
   if [ "$rc" -eq 42 ] && od -An -tx1 -v "$tmp/exchange/out" | tr -d ' \n' | grep -Eq '4887[0-9a-f]{2}' && od -An -tx1 -v "$tmp/exchange/out" | tr -d ' \n' | grep -Eq 'f0480fc1[0-9a-f]{2}' && od -An -tx1 -v "$tmp/exchange/out" | tr -d ' \n' | grep -Eq 'f0(48|4c)0fb1[0-9a-f]{2}'; then
-    ok "atomic load/store/exchange/fetch-add/sub/compare-exchange execute with locked xadd, xchg, and cmpxchg"
+    ok "atomic load/store/exchange/fetch-add/sub/and/or/xor/compare-exchange execute with locked xadd, xchg, and cmpxchg"
   else
     bad "atomic exchange execution or xchg encoding"; sed -n '1,12p' "$tmp/exchange/log"
   fi
@@ -121,6 +121,38 @@ if (cd "$tmp/fetch-type" && "$ZNC" main.zag --no-zagd --no-analyze --no-foregrou
   bad "fetch-add accepted a non-i64 value"
 else
   grep -q 'atomic fetch-add/sub value must be i64' "$tmp/fetch-type/log" && ok "fetch-add requires i64 values" || bad "missing fetch-add value diagnostic"
+fi
+
+project bitwise-unsafe
+printf '%s\n' 'fn main() i32 { let value:i64=7; let p:*mut i64=(&value) as *mut i64; return @atomicFetchAnd64(p,1) as i32; }' >"$tmp/bitwise-unsafe/main.zag"
+if (cd "$tmp/bitwise-unsafe" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/bitwise-unsafe/log" 2>&1 || [ -e "$tmp/bitwise-unsafe/out" ]; then
+  bad "fetch-and outside unsafe was accepted"
+else
+  grep -q 'atomic fetch operation requires unsafe' "$tmp/bitwise-unsafe/log" && ok "fetch-and requires unsafe" || bad "missing fetch-and unsafe diagnostic"
+fi
+
+project bitwise-const
+printf '%s\n' 'fn main() i32 { unsafe { let value:i64=7; let p:*const i64=(&value) as *const i64; return @atomicFetchOr64(p,1) as i32; } }' >"$tmp/bitwise-const/main.zag"
+if (cd "$tmp/bitwise-const" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/bitwise-const/log" 2>&1 || [ -e "$tmp/bitwise-const/out" ]; then
+  bad "fetch-or accepted a const pointer"
+else
+  grep -q 'atomic fetch operation requires an explicitly mutable' "$tmp/bitwise-const/log" && ok "fetch-or rejects non-mutable pointer" || bad "missing fetch-or pointer diagnostic"
+fi
+
+project bitwise-type
+printf '%s\n' 'fn main() i32 { unsafe { let value:i64=7; let p:*mut i64=(&value) as *mut i64; let wrong:i32=1; return @atomicFetchXor64(p,wrong) as i32; } }' >"$tmp/bitwise-type/main.zag"
+if (cd "$tmp/bitwise-type" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/bitwise-type/log" 2>&1 || [ -e "$tmp/bitwise-type/out" ]; then
+  bad "fetch-xor accepted a non-i64 value"
+else
+  grep -q 'atomic fetch operation value must be i64' "$tmp/bitwise-type/log" && ok "fetch-xor requires i64 values" || bad "missing fetch-xor value diagnostic"
+fi
+
+project bitwise-pure
+printf '%s\n' 'fn bad() i64 @pure { unsafe { let value:i64=7; let p:*mut i64=(&value) as *mut i64; return @atomicFetchOr64(p,1); } } fn main() i32 { return 0; }' >"$tmp/bitwise-pure/main.zag"
+if (cd "$tmp/bitwise-pure" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/bitwise-pure/log" 2>&1 || [ -e "$tmp/bitwise-pure/out" ]; then
+  bad "pure fetch-or was accepted"
+else
+  grep -q 'capability violation.*pure' "$tmp/bitwise-pure/log" && ok "atomic fetch-or Unsafe effect reaches pure constraint" || bad "missing fetch-or pure-effect diagnostic"
 fi
 
 project sub-unsafe

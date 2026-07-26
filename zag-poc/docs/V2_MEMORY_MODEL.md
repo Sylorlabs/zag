@@ -34,7 +34,8 @@ is used and its operation is proven nonblocking.
 
 This is a v2 (`edition = "2027"`) contract, not a description of current v1
 `*T` lowering. The compiler now accepts qualified and nullable raw-pointer
-types, requires explicit optional unwrapping before nullable dereference,
+types, requires explicit optional unwrapping before nullable raw-pointer
+dereference, indexing, or arithmetic,
 rejects casts between distinct generic/host/device/workgroup address spaces,
 executes bounded native dereference cases, rejects dereference outside unsafe,
 rejects writes through `*const`, and performs an edition-2027 static ownership

@@ -1226,6 +1226,16 @@ elif grep -q 'nullable raw pointer must be explicitly unwrapped' "$tmp/v2-nullab
 else
   echo "  XX  nullable raw pointer rejection missing diagnostic"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-nullable-index"
+printf 'name = "v2nullableindex"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-nullable-index/zag.mod"
+printf 'unsafe fn load(p: ?*const i32) i32 { return p[0]; } fn main() i32 { return 0; }\n' >"$tmp/v2-nullable-index/main.zag"
+if (cd "$tmp/v2-nullable-index" && "$ZNC" main.zag -o out) >"$tmp/v2-nullable-index/log" 2>&1 || [ -e "$tmp/v2-nullable-index/out" ]; then
+  echo "  XX  nullable raw pointer indexing requires unwrap"; sed -n '1,8p' "$tmp/v2-nullable-index/log"; fail=$((fail + 1))
+elif grep -q 'nullable raw pointer must be explicitly unwrapped before indexing' "$tmp/v2-nullable-index/log"; then
+  echo "  ok  nullable raw pointer indexing requires unwrap without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  nullable raw pointer indexing rejection missing diagnostic"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-nullable-unwrapped"
 printf 'name = "v2nullableunwrapped"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-nullable-unwrapped/zag.mod"
 printf 'unsafe fn load(p: ?*const i32) i32 { return p.?.*; } fn main() i32 { let x: i32 = 42; unsafe { return load((&x) as *const i32); } }\n' >"$tmp/v2-nullable-unwrapped/main.zag"
