@@ -1445,6 +1445,8 @@ fn cg_slit_sname(s: StructLit) []u8 {
 // program that never prints/allocs therefore contains NONE of those routine
 // bodies — the binary is smaller and disassembly shows no dead code. The flags
 // live behind a pointer hop (`cg.*`) so the threaded Cg sees the updates.
+struct GlobalSym { name: []u8, ty: []u8, addr: i64 }
+
 struct Cg {
     next:   i32,
     err:    i32,
@@ -1482,6 +1484,74 @@ struct Cg {
     allow_popcnt:i32,
     allow_bmi1:i32,
     safety_checked:i32, // emit edition-2027 raw-pointer null/alignment guards
+    globals: *ArrayList[GlobalSym], // explicit zero-initialized v2 scalar globals
+}
+
+// User globals occupy the unused tail of the writable BSS mapping.  This is
+// intentionally separate from allocator metadata and bounded by the ELF BSS
+// size.  Only one-word zero-initialized scalar cells are admitted here; pointer
+// ownership, aggregates, and dynamic initializers need their own v2 contract.
+fn CG_GLOBAL_BASE() i64 { return BSS_VBASE() + 115712; }
+fn CG_GLOBAL_CAP() i32 { return 1920; }
+fn cg_global_find(cg: *Cg, name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < cg.*.globals.*.len) {
+        if (@strEq(get[GlobalSym](cg.*.globals.*, i).name, name)) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+fn cg_global_type(cg: *Cg, name: []u8) []u8 {
+    let i: i32 = cg_global_find(cg, name);
+    if (i < 0) { return ""; }
+    return get[GlobalSym](cg.*.globals.*, i).ty;
+}
+fn cg_global_addr(cg: *Cg, name: []u8) i64 {
+    let i: i32 = cg_global_find(cg, name);
+    if (i < 0) { return 0; }
+    return get[GlobalSym](cg.*.globals.*, i).addr;
+}
+
+fn cg_global_zero_initializer(l: Let) i32 {
+    if (l.has_init == 0) { return 1; }
+    switch (l.expr.*) {
+        .ilit => |x| { if (cg_parse_i64(x.text) == 0) { return 1; } }
+        .id => |x| { if (@strEq(x.name, "null")) { return 1; } }
+        else => { }
+    }
+    return 0;
+}
+
+fn cg_collect_globals(decls: ArrayList[*Node], cg0: *Cg, out: *ArrayList[GlobalSym]) void {
+    let i: i32 = 0;
+    while (i < decls.len) {
+        switch (decls.data[i].*) {
+            .let_ => |l| {
+                if (l.is_global == 1) {
+                    let ty: []u8 = cg_norm_type(l.dty);
+                    if (l.has_dty == 0 || ty.len == 0 || ty[0] == '*' ||
+                        cg_type_is_agg(cg0, ty) == 1 || cg_is_fn_type(ty) == 1) {
+                        cg_err(cg0, "native: global storage currently supports only explicitly typed scalar values");
+                    } else if (cg_global_zero_initializer(l) == 0) {
+                        cg_err(cg0, "native: global storage currently requires zero initialization");
+                    } else if (out.*.len >= CG_GLOBAL_CAP()) {
+                        cg_err(cg0, "native: global storage capacity exhausted");
+                    } else {
+                        let gi: i32 = 0;
+                        let duplicate: i32 = 0;
+                        while (gi < out.*.len) {
+                            if (@strEq(out.*.data[gi].name, l.name)) { duplicate = 1; }
+                            gi = gi + 1;
+                        }
+                        if (duplicate == 1) { cg_err(cg0, "native: duplicate global declaration"); }
+                        else { push[GlobalSym](out, GlobalSym{ .name = l.name, .ty = ty, .addr = CG_GLOBAL_BASE() + ((out.*.len as i64) * 8) }); }
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
 }
 
 fn cg_dynamic_index(cg: *Cg, name: []u8) i32 {
@@ -2423,6 +2493,8 @@ fn cg_scan_typeof(sc: *ScanCtx, cg: *Cg, n: *Node) []u8 {
                 if (@strEq(get[[]u8](sc.*.names, i), x.name)) { return get[[]u8](sc.*.types, i); }
                 i = i + 1;
             }
+            let gty: []u8 = cg_global_type(cg, x.name);
+            if (gty.len > 0) { return gty; }
             // Plain function name used as a value → fat_fn.
             let j: i32 = 0;
             while (j < len[[]u8](sc.*.fnames)) {
@@ -3295,6 +3367,8 @@ fn cg_expr_type(n: *Node, env: *Env, syms: ArrayList[FnSym], cg: *Cg) []u8 {
         .id => |x| {
             let sty: []u8 = cg_slot_type(env.*, x.name);
             if (sty.len > 0) { return sty; }
+            let gty: []u8 = cg_global_type(cg, x.name);
+            if (gty.len > 0) { return gty; }
             // closure or plain fn used as a value → fat_fn aggregate.
             if (cg_is_clos_name(x.name) == 1) { return "fat_fn"; }
             if (cg_find_fn(syms, x.name) >= 0) {
@@ -3610,6 +3684,12 @@ fn cg_lower_addr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
         .id => |x| {
             let disp: i32 = cg_slot_find(env.*, x.name);
             if (disp == cg_not_found()) {
+                let gaddr: i64 = cg_global_addr(cg, x.name);
+                if (gaddr != 0) {
+                    push[Instr](out, i_mov_imm(R_RAX(), gaddr));
+                    push[Instr](out, i_push(R_RAX()));
+                    return;
+                }
                 cg_err(cg, "native: unknown identifier (address-of)");
                 push[Instr](out, i_mov_imm(R_RAX(), 0));
                 push[Instr](out, i_push(R_RAX()));
@@ -3796,6 +3876,13 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
         .id => |x| {
             let disp: i32 = cg_slot_find(env.*, x.name);
             if (disp == cg_not_found()) {
+                let gaddr: i64 = cg_global_addr(cg, x.name);
+                if (gaddr != 0) {
+                    push[Instr](out, i_mov_imm(R_RAX(), gaddr));
+                    push[Instr](out, i_load(R_RAX(), R_RAX(), 0));
+                    push[Instr](out, i_push(R_RAX()));
+                    return;
+                }
                 // boolean literals (the parser lowers true/false to plain Idents
                 // that are not locals): true → 1, false → 0.
                 if (@strEq(x.name, "true")) {
@@ -8025,6 +8112,12 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                 let stty: []u8 = cg_slot_type(env.*, tname);
                 if (stty.len == 0) { stty = cg_expr_type(a.expr, env, syms, cg); }
                 cg_emit_norm_scalar_for_ty(out, stty, R_RAX());
+                let gaddr: i64 = cg_global_addr(cg, tname);
+                if (gaddr != 0) {
+                    push[Instr](out, i_mov_imm(R_RCX(), gaddr));
+                    push[Instr](out, i_store(R_RCX(), 0, R_RAX()));
+                    return;
+                }
                 let disp: i32 = cg_slot_find(env.*, tname);
                 if (disp == cg_not_found()) {
                     // assignment to an as-yet-unseen name: allocate it
@@ -11987,6 +12080,7 @@ fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *Ar
             .struct_ => |_s| { }   // type decl: no code; consulted for layout.
             .enum_   => |_e| { }
             .union_  => |_u| { }
+            .let_    => |l| { if (l.is_global == 0) { _zag_eprintln("native: skipping unsupported top-level declaration"); top_err = top_err + 1; } }
             else => {
                 // genuinely unsupported top-level construct.
                 _zag_eprintln("native: skipping unsupported top-level decl");
@@ -12016,6 +12110,7 @@ fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *Ar
     let rt_used: ArrayList[i32] = make[i32](RT_COUNT() + 1);
     let rti: i32 = 0;
     while (rti < RT_COUNT()) { push[i32](&rt_used, 0); rti = rti + 1; }
+    let globals: ArrayList[GlobalSym] = make[GlobalSym](8);
     let cg: Cg = Cg{
         .next = rt_base + RT_COUNT(),
         .err = top_err,
@@ -12049,7 +12144,9 @@ fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *Ar
         .allow_popcnt=allow_popcnt,
         .allow_bmi1=allow_bmi1,
         .safety_checked=safety_checked,
+        .globals=&globals,
     };
+    cg_collect_globals(decls, &cg, &globals);
 
     // ── _start stub (emitted FIRST → entry_off = 0) ──
     //   mov r15, rsp ; call main ; mov rdi, rax ; mov rax, 60 ; syscall
@@ -12068,6 +12165,7 @@ fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *Ar
         push[Instr](&out, i_mov_imm(R_RAX(), 60));
         push[Instr](&out, i_syscall());
         cg_release_program_indexes(&syms,&rt_used,&dynamic_names);
+        free[GlobalSym](&globals);
         return out;
     }
     push[Instr](&out, i_mov_rr(15, R_RSP()));   // r15 = initial rsp (argc/argv base)
@@ -12124,6 +12222,7 @@ fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *Ar
 
     errout.* = cg.err;
     cg_release_program_indexes(&syms,&rt_used,&dynamic_names);
+    free[GlobalSym](&globals);
     return out;
 }
 

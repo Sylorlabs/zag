@@ -419,6 +419,51 @@ elif grep -q E0204 "$tmp/v2-global/log" && grep -q 'global lifetime contract' "$
 else
   echo "  XX  v2 global lifetime rejection missing diagnostic"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-explicit-global"
+printf 'name = "v2explicitglobal"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-explicit-global/zag.mod"
+printf 'global let counter:i32; fn bump() void { counter = counter + 42; } fn main() i32 { bump(); return counter; }\n' >"$tmp/v2-explicit-global/main.zag"
+if (cd "$tmp/v2-explicit-global" && "$ZNC" main.zag -o out) >"$tmp/v2-explicit-global/log" 2>&1 && [ -x "$tmp/v2-explicit-global/out" ]; then
+  set +e
+  "$tmp/v2-explicit-global/out"
+  explicit_global_rc=$?
+  set -e
+  if [ "$explicit_global_rc" -eq 42 ]; then
+    echo "  ok  explicit zero-initialized scalar global reads and writes"; pass=$((pass + 1))
+  else
+    echo "  XX  explicit scalar global execution (exit=$explicit_global_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  explicit scalar global compiles"; sed -n '1,10p' "$tmp/v2-explicit-global/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-global-format"
+printf 'name = "v2globalformat"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-global-format/zag.mod"
+printf 'global let counter:i32; fn main() i32 { counter=7; return counter; }\n' >"$tmp/v2-global-format/main.zag"
+if (cd "$tmp/v2-global-format" && "$ZNC" fmt --in-place main.zag) >"$tmp/v2-global-format/log" 2>&1 &&
+   grep -q '^global let counter: i32;' "$tmp/v2-global-format/main.zag"; then
+  echo "  ok  formatter preserves explicit global storage"; pass=$((pass + 1))
+else
+  echo "  XX  formatter preserves explicit global storage"; sed -n '1,12p' "$tmp/v2-global-format/main.zag"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-global-pointer"
+printf 'name = "v2globalpointer"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-global-pointer/zag.mod"
+printf 'global let p:*i32; fn main() i32 { return 0; }\n' >"$tmp/v2-global-pointer/main.zag"
+if (cd "$tmp/v2-global-pointer" && "$ZNC" main.zag -o out) >"$tmp/v2-global-pointer/log" 2>&1 || [ -e "$tmp/v2-global-pointer/out" ]; then
+  echo "  XX  pointer global rejects without artifact"; sed -n '1,8p' "$tmp/v2-global-pointer/log"; fail=$((fail + 1))
+elif grep -q 'no global lifetime contract' "$tmp/v2-global-pointer/log"; then
+  echo "  ok  pointer global rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  pointer global rejection missing lifetime diagnostic"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-global-init"
+printf 'name = "v2globalinit"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-global-init/zag.mod"
+printf 'global let counter:i32 = 1; fn main() i32 { return 0; }\n' >"$tmp/v2-global-init/main.zag"
+if (cd "$tmp/v2-global-init" && "$ZNC" main.zag -o out) >"$tmp/v2-global-init/log" 2>&1 || [ -e "$tmp/v2-global-init/out" ]; then
+  echo "  XX  nonzero global initializer rejects without artifact"; sed -n '1,8p' "$tmp/v2-global-init/log"; fail=$((fail + 1))
+elif grep -q 'zero initialization' "$tmp/v2-global-init/log"; then
+  echo "  ok  nonzero global initializer rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  nonzero global initializer rejection missing diagnostic"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-top-level-const"
 printf 'name = "v2toplevelconst"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-top-level-const/zag.mod"
 printf 'const answer:i32=42; fn main() i32 { return answer; }\n' >"$tmp/v2-top-level-const/main.zag"
