@@ -223,11 +223,57 @@ printf 'name = "v2callbacklifetime"\nversion = "0"\nedition = "2027"\n' >"$tmp/v
 printf 'fn maker() fn() i32 { let x:i32=42; return fn[&x]() i32 { return x.*; }; } fn main() i32 { let f:fn() i32=maker(); return f(); }\n' >"$tmp/v2-callback-lifetime/main.zag"
 if (cd "$tmp/v2-callback-lifetime" && "$ZNC" main.zag -o out) >"$tmp/v2-callback-lifetime/log" 2>&1 || [ -e "$tmp/v2-callback-lifetime/out" ]; then
   echo "  XX  callback capture lifetime rejects without artifact"; sed -n '1,8p' "$tmp/v2-callback-lifetime/log"; fail=$((fail + 1))
-elif grep -q 'capturing closure requires an explicit v2 lifetime contract' "$tmp/v2-callback-lifetime/log"; then
-  echo "  ok  callback capture lifetime rejects without artifact"
+elif grep -q 'capturing pointer closure requires an explicit v2 lifetime contract' "$tmp/v2-callback-lifetime/log"; then
+  echo "  ok  callback pointer capture lifetime rejects without artifact"
   pass=$((pass + 1))
 else
   echo "  XX  callback capture lifetime diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-callback-owned"
+printf 'name = "v2callbackowned"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-callback-owned/zag.mod"
+printf 'fn maker() fn() i32 { let x:i32=42; return fn[x]() i32 { return x; }; } fn main() i32 { let f:fn() i32=maker(); let result:i32=f(); close(f); return result; }\n' >"$tmp/v2-callback-owned/main.zag"
+if (cd "$tmp/v2-callback-owned" && "$ZNC" main.zag -o out) >"$tmp/v2-callback-owned/log" 2>&1 && [ -x "$tmp/v2-callback-owned/out" ]; then
+  set +e
+  "$tmp/v2-callback-owned/out"
+  callback_owned_rc=$?
+  set -e
+  if [ "$callback_owned_rc" -eq 42 ]; then
+    echo "  ok  scalar callback capture survives return and close"; pass=$((pass + 1))
+  else
+    echo "  XX  scalar callback ownership execution (exit=$callback_owned_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  scalar callback ownership compile"; sed -n '1,8p' "$tmp/v2-callback-owned/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-callback-leak"
+printf 'name = "v2callbackleak"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-callback-leak/zag.mod"
+printf 'fn main() i32 { let x:i32=42; let f:fn() i32=fn[x]() i32 { return x; }; return 0; }\n' >"$tmp/v2-callback-leak/main.zag"
+if (cd "$tmp/v2-callback-leak" && "$ZNC" main.zag -o out) >"$tmp/v2-callback-leak/log" 2>&1 || [ -e "$tmp/v2-callback-leak/out" ]; then
+  echo "  XX  callback environment leak rejects without artifact"; sed -n '1,8p' "$tmp/v2-callback-leak/log"; fail=$((fail + 1))
+elif grep -q 'owned allocation `f` is neither released nor returned' "$tmp/v2-callback-leak/log"; then
+  echo "  ok  callback environment leak rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  callback environment leak diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-callback-aggregate"
+printf 'name = "v2callbackaggregate"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-callback-aggregate/zag.mod"
+printf 'struct Pair { value:i32 } fn main() i32 { let pair:Pair=Pair{.value=42}; let f:fn() i32=fn[pair]() i32 { return pair.value; }; close(f); return 0; }\n' >"$tmp/v2-callback-aggregate/main.zag"
+if (cd "$tmp/v2-callback-aggregate" && "$ZNC" main.zag -o out) >"$tmp/v2-callback-aggregate/log" 2>&1 || [ -e "$tmp/v2-callback-aggregate/out" ]; then
+  echo "  XX  callback aggregate capture rejects without artifact"; sed -n '1,8p' "$tmp/v2-callback-aggregate/log"; fail=$((fail + 1))
+elif grep -q 'captured aggregate closures require a destruction protocol' "$tmp/v2-callback-aggregate/log"; then
+  echo "  ok  callback aggregate capture rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  callback aggregate capture diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-callback-after-close"
+printf 'name = "v2callbackafterclose"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-callback-after-close/zag.mod"
+printf 'fn main() i32 { let x:i32=42; let f:fn() i32=fn[x]() i32 { return x; }; close(f); return f(); }\n' >"$tmp/v2-callback-after-close/main.zag"
+if (cd "$tmp/v2-callback-after-close" && "$ZNC" main.zag -o out) >"$tmp/v2-callback-after-close/log" 2>&1 || [ -e "$tmp/v2-callback-after-close/out" ]; then
+  echo "  XX  callback use after close rejects without artifact"; sed -n '1,8p' "$tmp/v2-callback-after-close/log"; fail=$((fail + 1))
+elif grep -q 'use after free of named allocation `f`' "$tmp/v2-callback-after-close/log"; then
+  echo "  ok  callback use after close rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  callback use-after-close diagnostic missing"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-unsafe"
 printf 'name = "v2unsafe"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-unsafe/zag.mod"

@@ -85,6 +85,16 @@ nullary function desugaring rather than a static object. A real global API
 requires initialization ordering, data/BSS lowering, and an explicit lifetime
 and ownership contract; none is implied by this rejection.
 
+Captureless callbacks are ordinary function values. A scalar by-value capture
+uses a heap environment that is an owned v2 resource: it may be transferred by
+an owned return or must be released with `close(callback)` on every path. The
+native close operation clears the fat-function environment before returning it
+to the allocator. Pointer captures remain rejected because they retain a
+defining-frame address, and aggregate captures remain rejected because their
+separate heap copies do not yet have a destruction protocol. Mutable globals,
+pointer captures, and aggregate captures therefore remain explicit unsupported
+lifetime paths rather than ambient unsafe behavior.
+
 The native x86-64 allocator also marks a small allocation's size header as
 freed before it links that allocation into a free list, and restores the live
 mark when reusing it. A repeated runtime `delete`/`_zag_free` of such a block
