@@ -81,6 +81,23 @@ if (cd "$tmp/v2-system-allocator" && "$ZNC" main.zag -o out --safety=checked) >"
 else
   echo "  XX  SystemAllocator handle compiles"; sed -n '1,16p' "$tmp/v2-system-allocator/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-system-allocator-telemetry"
+printf 'name = "v2systemallocatortelemetry"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-telemetry/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-telemetry/std"
+printf '@import("std/allocator.zag") extern fn _zag_allocator_allocation_count() i64 extern fn _zag_allocator_live_bytes() i64 extern fn _zag_allocator_peak_live_bytes() i64 fn work() !i32 { let base_count:i64=_zag_allocator_allocation_count(); let base_live:i64=_zag_allocator_live_bytes(); let base_peak:i64=_zag_allocator_peak_live_bytes(); let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); if (_zag_allocator_allocation_count()!=base_count+1 || _zag_allocator_live_bytes()!=base_live+32 || _zag_allocator_peak_live_bytes()<base_live+32 || _zag_allocator_peak_live_bytes()<base_peak) { return 7; } try allocator.deallocate(block); if (_zag_allocator_allocation_count()!=base_count+1 || _zag_allocator_live_bytes()!=base_live || _zag_allocator_peak_live_bytes()<base_peak) { return 8; } return 42; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-telemetry/main.zag"
+if (cd "$tmp/v2-system-allocator-telemetry" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-telemetry/log" 2>&1 && [ -x "$tmp/v2-system-allocator-telemetry/out" ]; then
+  set +e
+  "$tmp/v2-system-allocator-telemetry/out"
+  system_allocator_telemetry_rc=$?
+  set -e
+  if [ "$system_allocator_telemetry_rc" -eq 42 ]; then
+    echo "  ok  SystemAllocator telemetry counts allocation and retires exact capacity"; pass=$((pass + 1))
+  else
+    echo "  XX  SystemAllocator allocation telemetry execution (exit=$system_allocator_telemetry_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-telemetry/log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  SystemAllocator allocation telemetry compiles"; sed -n '1,16p' "$tmp/v2-system-allocator-telemetry/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-system-allocator-forged"
 printf 'name = "v2systemallocatorforged"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-forged/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-forged/std"

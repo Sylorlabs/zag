@@ -29,20 +29,18 @@ silently downgrading. Other sanitizer modes remain rejected.
   narrower and separately records a generation, so copied handles cannot be
   reused after the same native address is reissued. Invalid shifts, division by zero, and invalid
   tags remain separate implementation work.
-- `--safety=release` retains defined-language traps while allowing proven
-  redundant checks to be removed.  It never converts a safe operation into
-  ambient undefined behavior.
+- `--safety=release` is not implemented and is rejected by the v2 option gate;
+  no release-mode check-elision or safety contract exists.
 - `--sanitize=memory` currently enables the same bounded ordinary-allocation
   provenance checks as `--safety=checked` and fails process exit on a nonzero
   ordinary-allocation live witness. It does not yet provide red zones,
   poisoning, guard pages, allocation-site reports, or custom-allocator
   tracking. Its SystemAllocator-handle checks retain the same generation
   validation as checked mode; that does not make raw-pointer ABA generally safe.
-- `--sanitize=undefined` instruments checked integer conversion/overflow,
-  shifts, null/misalignment, invalid enum/union tags, and other specified
-  dynamic preconditions.
-- `--sanitize=thread` records synchronization and reports detected conflicting
-  non-atomic accesses.  It is diagnostic tooling, not a proof of race freedom.
+- `--sanitize=undefined` is not implemented and is rejected; it does not
+  instrument integer conversion/overflow, shifts, tags, or other preconditions.
+- `--sanitize=thread` is not implemented and is rejected; it records no
+  synchronization or conflicting accesses.
 
 These are selected build modes, not source-level promises.  They compose with
 the effect system: instrumentation itself must not make an `@realtime` or

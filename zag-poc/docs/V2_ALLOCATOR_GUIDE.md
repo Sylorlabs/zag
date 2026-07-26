@@ -27,6 +27,13 @@ builds reject the validation boundary rather than silently weakening it. The
 v2 compiler gate proves that an unchecked call reports that requirement and
 does not leave an executable artifact.
 
+The same gate proves the native telemetry boundary for a checked handle: a
+24-byte request increments the lifetime allocation count once, records its
+exact 32-byte size-class capacity as live bytes, and raises (but never lowers)
+the peak. Consuming that handle restores live bytes while retaining the
+monotonic allocation count. These counters describe native payload capacity
+only; they are not a general leak detector or allocator identity API.
+
 This is not yet the complete allocator model. The generation is compiler-
 minted and runtime-checked, but not an opaque language capability; allocator
 identity, custom allocators, arenas, and fixed-buffer allocators are still

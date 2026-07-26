@@ -41,6 +41,9 @@ if [ -f docs/V2_SAFETY_TOOLING.md ] && \
    rg -q 'partial `--sanitize=memory` mode are' docs/V2_SAFETY_TOOLING.md && \
    rg -q 'Other sanitizer modes remain rejected' docs/V2_SAFETY_TOOLING.md && \
    rg -q 'does not yet provide red zones' docs/V2_SAFETY_TOOLING.md && \
+   rg -q '`--sanitize=undefined` is not implemented and is rejected' docs/V2_SAFETY_TOOLING.md && \
+   rg -q '`--sanitize=thread` is not implemented and is rejected' docs/V2_SAFETY_TOOLING.md && \
+   rg -q '`--safety=release` is not implemented and is rejected' docs/V2_SAFETY_TOOLING.md && \
    rg -q 'Current status remains unsupported' docs/V2_SAFETY_TOOLING.md; then
   ok "safety-tooling document scopes partial memory sanitizer and unsupported modes"
 else
