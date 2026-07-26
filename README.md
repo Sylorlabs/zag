@@ -25,7 +25,7 @@ Zig's philosophy is "no hidden allocations, no hidden control flow." It enforces
 
 ### The three tiers Zig never touches
 
-**Tier 1: proven capabilities.** The compiler is not a linter. It does not warn. It either proves the claim or the program does not compile. The proof is a call-graph reachability analysis over an effect lattice (`Alloc`, `Lock`, `IO`, `Panic`). On the supported `./znc` path this covers call-graph effects today. Deeper `@total` arithmetic proofs (division by zero with guards, bounds) are on the legacy `./zagc` path via ghost_engine or Z3. A witness chain looks like:
+**Tier 1: proven capabilities.** The compiler is not a linter. It does not warn. It either proves the claim or the program does not compile. The proof is a call-graph reachability analysis over an effect lattice (`Alloc`, `Lock`, `IO`, `Panic`). On the supported `./znc` path this covers call-graph effects today. Deeper `@total` arithmetic proofs are gated separately and must be checked with the native total gate; they are not a blanket claim that every arithmetic precondition is solved.
 
 ```
 ✗ VIOLATION  renderBad @realtime
@@ -44,8 +44,8 @@ let budget: u_any     = items * price; // can't overflow; grows as needed; Alloc
 let poly:   rns_3     = coefficient;   // parallel mod-arithmetic over 3 coprime channels
 ```
 
-**Tier 3: GPU frontend emission (legacy path).** MLIR emission for `@kernel`
-sources exists on a legacy differential path.  It has no verified GPU runtime,
+**Tier 3: GPU frontend emission (development path).** MLIR emission for `@kernel`
+sources exists as a development/differential frontend. It has no verified GPU runtime,
 dispatch, readback, or kernel-effect proof and is not a GPU backend.
 
 ---
@@ -66,18 +66,11 @@ chmod +x znc bootstrap.sh
 optimizes, and emits a static x86-64 ELF with no external tools. See
 [`zag-poc/INSTALL.md`](zag-poc/INSTALL.md) and [`zag-poc/BOOTSTRAP.md`](zag-poc/BOOTSTRAP.md).
 
-**Optional: ghost_engine / Z3** (for `@total` division-by-zero proofs on the legacy `./zagc` differential path):
-```bash
-( cd ../ghost_engine && zig build zag-verify )   # if ghost_engine is available
-bash prove.sh
-```
-Without a prover, `./znc` still proves all call-graph effects (`@realtime`, `@noalloc`, `@pure`).
-
-**Optional: MLIR toolchain** (GPU targets via `selfhost/mlir.zag` on the legacy `./zagc` path):
-```bash
-# Ubuntu / Debian
-apt install mlir-tools llvm-18
-```
+No C-emitting compiler or external prover is required for the supported path.
+The retired bootstrap/oracle implementations are available only through Git
+history. GPU MLIR targets are development/differential frontends; they are not
+physical GPU execution and do not require an MLIR installation for ordinary
+native builds.
 
 ### GitHub syntax highlighting
 
@@ -143,7 +136,11 @@ The compiler found the chain (`gain` calls `reverbScratch` which calls `zalloc`)
     └── native codegen ──► static x86-64 ELF (./znc)
 ```
 
-The supported compiler is a self-hosted Zag program in `zag-poc/selfhost/native/` (`znc.zag`). The Python prototype and Zig bootstrap live only in git history at tag `v0.0-zig-bootstrap`. `./zagc` remains as a differential oracle. GPU and multi-target builds are on that legacy path.
+The supported compiler is a self-hosted Zag program in `zag-poc/selfhost/native/`
+(`znc.zag`). The Python prototype, Zig bootstrap, and C-emitting `zagc` path
+live only in Git history. The supported tree emits x86-64 and experimental
+ARM64 machine code, WASM output, and bounded GPU frontend/bundle artifacts
+without Python, C, Zig, LLVM, or a host C toolchain.
 
 ### The effect system
 
@@ -321,7 +318,7 @@ examples/
   generic_map.zag         generic map[T] with effect composition
   posit_multi.zag         p8/p16/p32/p64 family arithmetic
   quire.zag               512-bit exact accumulator
-  gpu_matmul_mx.zag       MX-FP8 kernel (legacy ./zagc GPU path)
+  gpu_matmul_mx.zag       MX-FP8 kernel (development GPU frontend path)
 ```
 
 ---
@@ -330,16 +327,32 @@ examples/
 
 Zag v1 is a self-hosted native compiler (`./znc`) that boots from a committed seed, rebuilds itself without a host C toolchain, and ships a growing stdlib under `selfhost/std/`.
 
-| Area | `./znc` (supported) | Legacy `./zagc` |
-|---|---|---|
-| Call-graph effect proofs (`@realtime`, `@noalloc`, `@pure`) | Yes | Yes |
-| Witness chains, effect polymorphism, closures | Yes | Yes |
-| Posits, quire, saturating ints, `u11`, fixed-point, RNS | Yes | Yes |
-| Native stdlib, LSP, formatter, DWARF | Yes | Partial |
-| `@total` SMT proofs (in-process solver) | Gated (`run_native_total.sh`) | Yes |
-| GPU frontend / MLIR emission | Yes (`--target gpu-*`; `run_native_gpu.sh`) | Yes |
-| WebAssembly | Yes (`--target wasm`; `run_native_wasm.sh`) | Yes |
-| multi-arch CPU | ARM64: Yes, experimental; RISC-V: No | Yes |
+### Readiness boundary
+
+The current evidence supports a bounded Linux/x86-64 experimental release, not
+a general C replacement. The first master-gate phase currently passes a
+three-generation pure-Zag rebuild to a byte-identical fixpoint. A complete
+release claim still requires the declared native, compatibility, Script, and
+target gates to pass on the exact release tree.
+
+The following remain explicitly outside a production-v2 claim: a complete
+provenance/alignment/lifetime model, public atomics and volatile/MMIO, complete
+C ABI and dynamic-library interoperability, sanitizers, and physical GPU
+execution. GPU MLIR and ZGK1/VM evidence must not be described as device
+dispatch or readback proof. See
+[`zag-poc/docs/V2_FINAL_VERIFICATION.md`](zag-poc/docs/V2_FINAL_VERIFICATION.md)
+and [`zag-poc/docs/GPU_COMPILER_DRIVER_BOUNDARY.md`](zag-poc/docs/GPU_COMPILER_DRIVER_BOUNDARY.md).
+
+| Area | Current supported status |
+|---|---|
+| Call-graph effect proofs (`@realtime`, `@noalloc`, `@pure`) | Yes |
+| Witness chains, effect polymorphism, closures | Yes |
+| Posits, quire, saturating ints, `u11`, fixed-point, RNS | Yes |
+| Native stdlib, LSP, formatter, DWARF | Yes |
+| `@total` proofs | Gated (`run_native_total.sh`); bounded, not universal arithmetic proof |
+| GPU frontend / bundle emission | Frontend/VM evidence only (`run_native_gpu.sh`); no physical dispatch |
+| WebAssembly emission | Yes (`--target wasm`; `run_native_wasm.sh`); runtime scope is bounded |
+| multi-arch CPU | ARM64: experimental; RISC-V: unsupported |
 
 Release gates:
 
@@ -350,9 +363,18 @@ bash tests/run_native.sh
 bash tests/run_native_gpu.sh
 bash tests/run_native_wasm.sh
 bash tests/run_native_total.sh
+bash tests/run_zagscript_release_gate.sh
 ```
 
-`bash run_tests.sh` is an older differential suite against `./zagc`. CI keeps it informational, not a release blocker.
+The authoritative v2 gate is intentionally fail-closed and remains nonzero
+while any required v2 capability is marked `UNSUPPORTED`:
+
+```bash
+bash tests/run_v2_release_gate.sh
+```
+
+`bash run_tests.sh` is a historical differential suite retained only for
+archival comparison; it is not a supported compiler path or a release gate.
 
 ---
 
@@ -370,7 +392,7 @@ zag-poc/
   tests/                           v1 release gates
   examples/                        small demonstration programs
   programs/                        larger acceptance programs + GAPS.md
-  run_tests.sh                     legacy ./zagc differential suite
+  run_tests.sh                     historical differential suite (archival)
 editors/vscode/                    VS Code extension
 linguist/                          GitHub Linguist registration notes
 ```

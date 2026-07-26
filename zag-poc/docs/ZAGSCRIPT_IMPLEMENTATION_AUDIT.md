@@ -1,209 +1,263 @@
 # Zag Script implementation audit
 
-Status: architecture record updated through the first working Zag Script and
-Linux `zagd` implementation, 2026-07-18. The sections retain the pre-change
-evidence and distinguish it from later implemented behavior and remaining gaps.
+Status: current architecture record, 2026-07-24. This document distinguishes
+implemented behavior from bounded proof slices and unsupported roadmap work.
 
-## Pre-change baseline
+## Baseline recorded before implementation
 
-The clean `zag-v2-machine-control` worktree was verified before implementation
-with `znc 2026.07.0-dev (edition 2026)`. The required gates passed:
+The clean `zag-v2-machine-control` worktree used
+`znc 2026.07.0-dev (edition 2026)`. The requested pre-change gates reported:
 
 - `tests/run_native_authority.sh`: `pass=7 fail=0`
-- `tests/run_native.sh`: `pass=133 fail=0` (native edge: `pass=33 fail=0`)
+- `tests/run_native.sh`: `pass=133 fail=0`
 - `tests/run_native_gpu.sh`: `pass=5 fail=0`
 - `tests/run_native_wasm.sh`: `pass=17 fail=0`
 - `tests/run_native_total.sh`: `pass=8 fail=0`
 
-These totals describe their actual gate boundaries. The GPU MLIR case checks
-frontend structure rather than runtime launch, and the WASM gate explicitly
-marks runtime scenarios unsupported where the pure-Zag WASM runtime does not
-exist. They are not broader execution claims.
+Those are the gates' actual boundaries. The GPU suite proves frontend/bundle
+structure, not physical GPU execution. The WASM suite proves emission and
+records runtime cases as unsupported where no pure-Zag runtime exists.
 
-## Current compiler path
+## Supported compiler path
 
-The supported compiler is `selfhost/native/znc.zag`. It reads a root source,
-lexes and parses it, runs shared declared-type checks, semantic/effect analysis
-and the static analyzer, lowers through `selfhost/native/ncodegen.zag`, encodes
-instructions in `selfhost/native/x86.zag`, and writes an ELF64 executable with
-`selfhost/native/elf.zag`. The supported path is self-hosted Zag and uses Linux
-syscalls directly; it does not require a host C compiler, assembler, linker,
-LLVM, Zig, Python, or libc.
+`selfhost/native/znc.zag` is the supported compiler. It reads source, uses the
+shared lexer/parser/typed/effect authorities, lowers native x86-64 instructions,
+encodes them, and writes ELF directly. The supported bootstrap and native path
+uses Zag plus Linux syscalls; it does not require Python, a C compiler, LLVM,
+Zig, an assembler, or a linker.
 
 ## 1. File-level syntax
 
-`selfhost/lex.zag` produces tokens. `resolve_src` in `selfhost/parse.zag` parses
-each file's top level. It currently accepts imports, link directives, functions,
-constants, structs, enums, unions, error declarations, operator contracts and
-interfaces. Any executable statement at file scope reaches diagnostic E0010.
-There is no parsed module object and no script-profile bit.
+`selfhost/lex.zag` produces the shared token stream.
+`parse_compilation_unit_dir` and `resolve_src` in `selfhost/parse.zag` parse
+file-level syntax. The root parser recognizes exactly one `script;`, records
+`ModuleProfile.script`, and accepts root executable statements only in that
+profile. It diagnoses duplicates, ordering errors, generated-name collisions,
+and a conflicting user `main`. Comments may precede activation.
 
-Required change: parse exactly one root-level `script;` declaration, retain its
-source location, and represent profile and root statements explicitly. The
-parser must continue rejecting top-level statements in regular modules.
+CLI activation and the optional `.zs` surface inject profile activation only
+into the compiler's in-memory source. They then enter this same parser; neither
+path owns a second language implementation.
 
 ## 2. AST declarations and statements
 
-`selfhost/ast.zag` defines one tagged union, `Node`. Declaration variants include
-`fn_decl`, `struct_`, `enum_`, `union_`, and `link_dir`. Statement variants
-include `let_`, `ret`, `if_`, `while_`, `break_`, `continue_`, `unsafe_`,
-`assign`, `estmt`, and `switch_`. Function bodies are `ArrayList[*Node]`.
-`parse_program_dir` currently returns a flat `ArrayList[*Node]`, so file identity,
-profile, and root statements are not preserved as first-class compilation data.
+`selfhost/ast.zag` defines the single tagged `Node` union. Declaration variants
+include functions and type declarations. Statement variants include local
+bindings, assignments, expression statements, return, conditional, loop,
+switch, and unsafe blocks.
 
-Required change: add a compilation/module representation containing profile,
-declarations, root statements, root identity, and source metadata. Reuse the
-existing statement nodes and `parse_stmt`; do not create a second parser or AST.
+`CompilationUnit` explicitly contains the module profile, merged declarations,
+resolved module sources, and resolved import edges. During root parsing, Script
+statements are retained in source order inside the compiler-owned Script-body
+function; imported root statements are discarded rather than merged into that
+body. Thus root executable work is ordinary statement AST, not a second AST or
+a later filename inference.
 
 ## 3. Entry discovery and lowering
 
-`lower_program_mode` in `selfhost/native/ncodegen.zag` builds a function symbol
-table and looks up the literal name `main`. It emits `_start` first, preserves
-the kernel entry stack pointer in `r15`, calls `main`, places the return value in
-the Linux exit status argument, and invokes syscall 60. Missing `main` is a
-native-codegen error. Normal execution begins at `fn main() i32` or
-`fn main() void` as specified by the v1 language specification.
+Regular Zag still requires the literal user declaration `main`.
+`lower_program_mode_cpu` in `selfhost/native/ncodegen.zag` finds it and emits
+Linux `_start`, preserving the initial process stack, calling `main`, and
+exiting through syscall 60.
 
-Required change: before ordinary semantic and backend lowering, synthesize a
-collision-proof internal script-body function and an outer process-entry
-wrapper only for the selected root script. Imported script bodies must not be
-merged into executable root work. A regular module must retain the current
-literal-`main` behavior.
+For a selected Script root, the parser synthesizes reserved, unaddressable
+compiler functions for the Script body and uncaught-error reporter, plus a
+generated `main`. The wrapper:
 
-## 4. Allocation today
+1. creates the bounded Script context with argument metadata, read-only
+   environment policy, project capability bits, limits, validated execution
+   policy ids, allocator state, and error-reporter policy;
+2. invokes root statements once, in source order;
+3. catches an uncaught Zag error and reports a nonzero status;
+4. reaches the deterministic unbuffered-output flush boundary;
+5. unmaps the default Script arena or frees every tracked bounded-heap block,
+   then releases the context; and
+6. returns the process status.
 
-The language has `new`, `delete`, `zalloc`, `_zag_malloc`, `_zag_realloc`, and
-`_zag_free` paths. Native support routines use raw `mmap`/`munmap`; the current
-backend includes a size-class/free-list allocator and reallocating helpers.
-Some older `zalloc` paths are documented in code as retaining mappings. Stack
-locals occupy compiler-assigned frame slots. There is no ownership checker,
-borrow checker, garbage collector, RAII, destructor system, or general lifetime
-inference. Allocation failure and bounds behavior are not yet a complete
-language-wide safety boundary.
+Source declarations cannot use the reserved compiler namespace. Imported
+Script bodies never become entry points.
 
-Required change: a script allocator must be explicit in runtime state, bounded,
-fail observably, and used only by script conveniences. The implemented bounded
-bump arena retains charged payload until generated shutdown and then unmaps its
-complete mapping. It does not replace explicit allocation in imported strict
-libraries.
+## 4. Allocation
+
+The native runtime implements the ordinary `new`/`delete`,
+`_zag_malloc`/`_zag_realloc`/`_zag_free`, `zalloc`/`zfree`, and
+cache-aligned paths without libc. Small ordinary allocations use segregated
+free lists over mmap arenas; large blocks use dedicated mappings. Live headers
+and stale-realloc checks fail closed for the supported allocator boundary.
+
+Native logical-allocation observers report allocation events, current live
+payload capacity, and peak live payload capacity. Temporary returned-slice
+descriptors are copied into compiler-owned frame scratch and released. Raw
+word-slice mappings use a bounded pointer/size registry, so copied descriptors,
+invalid size metadata, failed unmaps, and double frees do not silently corrupt
+telemetry or unmap a live replacement. This registry is a runtime guard, not a
+general ownership proof.
+
+Script payloads default to one bounded process-lifetime arena. A second
+supported policy, `script_bounded_heap`, allocates a compiler-tracked native
+block for each successful Script allocation and frees all complete blocks at
+generated shutdown. The arena charges requested payload bytes; the bounded
+heap charges payload plus its 16-byte ownership header, including for
+zero-length requests. The limit covers supported Script collections, builders,
+strings, returned file data, bounded process results, `script_alloc`, and root
+Script `new`. Superseded Script buffers remain charged until generated
+shutdown. Native size-class slack and explicit imported strict-library
+allocation are outside that budget. `read_file` does not use full-file staging:
+it preflights a regular file and reads directly into exactly one charged Script
+allocation. A temporary NUL-terminated path bridge is bounded to 4097 bytes,
+released after `open(2)`, and remains outside the Script payload budget.
+Root Script `make` and raw allocator use are rejected when their cost would
+bypass Script accounting.
 
 ## 5. Runtime helpers
 
-Native codegen conditionally emits syscall-based helpers for stdout/stderr,
-integer and float formatting, allocation/reallocation/free, string operations,
-arguments, file existence/read/write, time, environment access, and process
-execution. `selfhost/std/io.zag`, `process.zag`, `collections.zag`, `strbuf.zag`,
-and related modules provide ordinary Zag wrappers. The root-only Script
-`process_run_timeout` prelude maps to strict Zag's
-`process_run_bounded`: it uses a monotonic deadline, bounded capture, a child
-process group, and deterministic reap/cleanup. This is a Linux x86-64 syscall
-implementation, not a general cross-platform process abstraction.
+`ncodegen.zag` conditionally emits syscall-only helpers for output, arguments,
+allocation, strings, files, time, environment lookup, and bounded process
+execution. Ordinary modules under `selfhost/std/` expose the strict-Zag forms.
+Script root `env("NAME")` is a separate compiler-bound wrapper over the
+existing environment primitive: `NAME` must be a literal simple name in the
+exact `environment_allow` project list, defaults deny all names, the returned
+read-only view is capped at 4096 bytes, and imported strict code receives no
+new implicit environment authority.
 
-Required change: implement the script prelude as ordinary documented Zag
-declarations backed by these primitives. Do not implicitly expose all of std.
+The root-only Script prelude is a small allowlist, not the full standard
+library. Its conveniences map to ordinary declarations or compiler-owned
+context calls. Process execution has an explicit timeout and capture bound.
+Collections remain statically typed; no universal dynamic `any` value is
+introduced.
 
-## 6. Safety properties currently enforced
+## 6. Safety properties currently proven or enforced
 
-The semantic pass computes transitive effect bitsets and checks claims including
-`@pure`, `@noalloc`, `@realtime`, and `@total`, with witness diagnostics for
-represented violations. Shared typed checks reject tested representation and
-declared-type mismatches. Capturing closures are documented and checked as
-stack-bound in supported cases. The native backend has regression coverage for
-specific ABI, allocator, exact-width memory access, diagnostics, and semantics.
-These are scoped compiler properties, not a proof of whole-language memory
-safety.
+The shared compiler currently enforces these scoped properties:
+
+- transitive effect claims represented by `@pure`, `@noalloc`, `@realtime`,
+  `@total`, and their witness diagnostics;
+- declared-type, supported layout, call-arity, and duplicate-definition checks;
+- policy-specific Script allocation limits and capability-policy denials;
+- Script-context values cannot cross the specifically analyzed free, field,
+  pointer, nonlocal, extern, or unresolved-call escape boundaries;
+- reachable Script helper summaries are computed to a bounded fixed point;
+- edition-2027 named allocation origins, aliases, consuming calls, owned-return
+  summaries, branch joins, explicit shared/exclusive borrow contracts, and
+  tested callee-frame address returns through named aggregate aliases;
+- supported native allocator double-free, stale-realloc, raw-slice registry,
+  bounds, and allocation-failure paths; and
+- cache records must match compiler, complete source/module identity, profile,
+  configuration, target, payload length, and checksums before reuse.
+
+Each item is limited to constructs represented by its analysis or runtime
+metadata. Tests include negative cases and require no output artifact after a
+compile-time rejection.
 
 ## 7. Safety properties not implemented
 
-There is no complete ownership, borrowing, provenance, alias, lifetime,
-automatic reclamation, concurrency memory model, exception unwinding, or
-target-complete trap specification. An arena does not establish any of these.
-Script lifetime escape checks, bounded Script allocation, configured capability
-policy, timeout-enforced process execution, and structured top-level error
-reporting are implemented for their documented subset. Automatic CPU/GPU
-placement remains unimplemented. Documentation and diagnostics must describe
-these gaps without converting estimates or conventions into proofs.
+Zag does not yet have a complete language-wide ownership/borrowing system,
+arbitrary-pointer provenance metadata, automatic reclamation for all explicit
+allocators, a mature concurrency memory model, exception unwinding, or a
+target-complete trap specification. The edition-2027 checker is a conservative
+named-origin and explicit-contract slice; it is not a proof about arbitrary
+integer-derived pointers, mutation-aware aggregate/global provenance, callback
+escapes, or every heap graph. An arena and a raw allocation registry do not make
+the language universally memory-safe.
+
+Automatic physical CPU/GPU repartitioning, packed-SIMD synthesis, general PGO,
+and kernel tuning are unsupported. Planner records label these alternatives
+unsupported and non-automatic instead of fabricating equivalence or speedups.
 
 ## 8. Native x86-64 to ELF
 
-`ncodegen.zag` lowers AST to the target-neutral-in-name but currently
-x86-oriented `Instr` representation in `isa.zag`. Register promotion,
-optimization, and peephole passes operate on that instruction list. `x86.zag`
-encodes bytes. `elf.zag` writes little-endian ELF64 headers, load segments,
-entry address, text, read-only data, and allocator/runtime BSS directly. No
-external assembler or linker is involved on this path.
+`ncodegen.zag` lowers AST into the `Instr` representation from `isa.zag`.
+`regalloc.zag`, `optimize.zag`, and `peephole.zag` perform deterministic local
+passes. `x86.zag` encodes permitted instructions. `elf.zag` writes little-endian
+ELF64 headers, RX code, read-only data, and a zero-filled runtime BSS segment.
+
+CPU profiles are explicit. `generic` permits the conservative baseline.
+`native` combines CPUID with OSXSAVE/XGETBV where OS state is relevant and only
+advertises optional instructions that both the encoder and tests implement.
+Foreground cache hits substitute checksum-validated encoded code/data before
+ELF assembly; any miss or corruption runs ordinary lowering.
 
 ## 9. Imports and merged modules
 
-`@import` is resolved during parsing. Ordinary unqualified imports merge
-declarations into one flat stream; qualified imports rewrite names to qualified
-internal forms. `std:` imports resolve to compiler-owned standard-library
-locations. Circular imports are diagnosed, and `zag.mod` dependencies are
-validated. Because the current result loses per-file module boundaries, script
-work must preserve root-vs-import identity before merging. Public declarations
-from a script module may be imported, but its root statement list must never be
-spliced into the importing program's executable body.
+`@import` resolution remains part of the shared parser. Unqualified imports
+merge declarations; qualified imports receive rewritten internal names.
+`std:` resolves compiler-owned modules. Circular imports and invalid
+`zag.mod` dependencies fail.
 
-## 10. Incremental-cache candidates
+`CompilationUnit.modules` preserves path/source identity and
+`CompilationUnit.imports` preserves edges even though declarations form one
+lowering stream. Semantic manifests include those module hashes and edges.
+Public declarations from a Script module remain importable, but its root body
+does not execute when that file is imported.
 
-The lexer/parser, import graph construction, shared typing, semantic/effect
-analysis, static analysis, function-level native lowering, encoded machine code,
-and final ELF assembly are separable cache candidates. The foreground compiler
-now has an exact whole-program machine-code cache boundary: compiler image,
-root/import content, target profile, ABI/profile, configuration, and code/data
-checksums must all match before backend work is skipped. `zagd` additionally
-persists advisory declaration and semantic records; those can never authorize
-an executable.
+## 10. Incremental-cache boundaries
 
-Cache reuse must be validated against source hashes, compiler version, target,
-feature profile, public signatures/layouts, dependencies, and relevant options.
-A cache miss or corrupt cache must fall back to ordinary compilation.
+Useful separable boundaries are source hashing, parsing, module edges,
+declaration fingerprints, types/effects, function/caller/layout invalidation,
+native lowering, encoded code/data, and ELF assembly.
 
-## 11. Required Zag Script changes
+`zagd` persists content-addressed snapshots, semantic/module manifests,
+declaration indexes, advisory plan records, and bounded deep measurements.
+Filesystem events are only hints: complete-file hashes establish identity.
+Comment-only, private-body, public-shape/layout, root-profile, and target changes
+have distinct conservative invalidation classes.
 
-1. Introduce explicit module/profile/root metadata without a second language.
-2. Parse `script;` and root statements through the existing lexer/parser.
-3. Preserve module identity across import resolution.
-4. Synthesize internal script body and wrapper before normal sema/codegen.
-5. Add a bounded `ScriptContext` and minimal prelude using ordinary Zag APIs.
-6. Add profile-aware diagnostics, error boundary, explain, strict-check and
-   conservative hardening reports.
-7. Add tests for parsing, lowering, imports, runtime limits, errors and CLI.
-8. Add content-addressed analysis records usable by `zagd` but never required
-   for a correct foreground build.
+The foreground machine cache is a separate correctness-checked fast path.
+Its v4 record binds the exact compiler image and version, project root, source
+label, comment-insensitive root/import token identities, freshly validated
+semantic graph, CPU feature profile, ABI/pipeline mode, and resolved
+strict/Script runtime policy. The source label is required because generated
+Script diagnostics embed it. Reads require real cache directories and
+`O_NOFOLLOW`/`O_NONBLOCK` regular files, use same-descriptor pre/post `fstat`,
+and enforce record, payload, and project-cache limits before checksum
+revalidation. Unique `O_EXCL` staging files publish payloads first and the
+authoritative record last. A validated hit substitutes the encoded code/data
+and the lowering witness remains zero; every miss lowers exactly once. Static
+archives, DWARF, hot-layout metadata, and final ELF output are still produced
+fresh. The daemon counts and evicts the triplet as one unit. Neither cache is a
+correctness dependency.
+
+## 11. Changes made for Zag Script
+
+The implementation added:
+
+1. explicit profile/module/import metadata;
+2. shared-parser `script;` and root statement support;
+3. root-only generated entry and error boundary;
+4. a bounded default arena, an explicit tracked-heap alternative, and a small
+   prelude;
+5. typed list, string-builder, path, argument, process, and basic JSON APIs;
+6. `script`, `explain`, `harden`, and `check --strict`;
+7. configurable allocator/CPU/device/layout/capability defaults where supported;
+8. content-addressed foreground and background analysis caches;
+9. inotify snapshots, stability windows, overflow recovery, and dependency
+   invalidation; and
+10. focused positive, negative, stress, compatibility, and resource tests.
+
+`harden` remains deliberately conservative: it emits an ordinary reviewable
+candidate only where conversion is established and otherwise reports an honest
+partial/unsupported item.
 
 ## 12. Regular Zag invariants
 
-Regular Zag retains declaration-only file scope, explicit `main`, current
-allocator selection, explicit device and layout choices, import semantics,
-effect rules, ABI, native lowering, and CLI build form. It receives no generated
-entry point, implicit prelude, source rewrite, hidden long-lived script runtime,
-automatic concurrency, or daemon dependency. Explicit choices always outrank
-planner advice. Existing passing gates remain release requirements.
+A regular source still has declaration-only file scope, requires its own
+`main`, retains explicit allocation/device/layout choices, and receives no
+Script allocator context or prelude. The daemon never rewrites source and cannot authorize
+an executable. Normal backend optimizations remain semantics-preserving and
+independent of `zagd`. Regular Zag may show a configurable, evidence-backed
+advisory; unsupported planner scaffolding stays silent. The shipped project
+default is `notifications=advisory`, which emits at most one warning after a
+supported human-review fact exists; `notifications=errors_only` makes routine
+commands quiet. Neither setting grants automatic source or architecture authority.
+`--no-zagd` and a missing or corrupt daemon/cache always leave foreground
+checking and compilation usable.
 
-## Implementation delta
+## Verification authority
 
-Items 1 through 4 and the initial parts of 5 through 8 now exist in the ordinary
-self-hosted path: explicit Script profile metadata, root statements, generated
-managed entry point, bounded `script_alloc`, root-only overrideable prelude,
-error boundary, `explain`, focused strict checks, conservative hardening,
-inotify snapshots and fail-closed advisory cache records. Regular Zag retains
-the invariants above and planner output remains advisory.
-
-The remaining safety boundary is explicit. Compiler-owned Script payloads now
-come from one bounded mapping that is reclaimed at generated shutdown. The
-Script allocation budget counts
-Script collection/string/file-result/bounded-process payloads and root top-level
-`new`, but not ordinary `make`, imported strict allocation, allocator metadata,
-or file-reader staging.
-There is no ownership/borrowing proof, reclamation for allocations outside the
-Script arena, or complete source-to-runtime lifetime analysis. Named top-level
-errors and source paths, bounded process capture, statically typed Script lists,
-scalar JSON plus typed homogeneous arrays/string objects and Unicode escapes,
-project-configured supported defaults, and stable background semantic rechecks
-are implemented. Restart reuse validates snapshot metadata, semantic
-import/caller/layout identities, and declaration fingerprints, but uncertain
-module-resolution cases conservatively invalidate rather than reuse. Adaptive/
-deep candidates have bounded deterministic budgets and consume only
-checksum-bound proven facts; broad deep search, PGO, packed-SIMD tuning, GPU
-kernel tuning, and autonomous microbenchmark selection are not implemented.
+`tests/run_zagscript_release_gate.sh` is the aggregate Linux x86-64 first-release
+gate. The separate i686 suites certify only their documented ELF32/i386 subset
+until the broader ABI/runtime matrix passes. Self-hosted source changes also
+require `bootstrap.sh`, `tests/check_native_bootstrap_repro.sh`, and the bounded
+memory regression gate. Benchmark reports are evidence only when they include
+the exact commit, hardware, input hashes, commands, at least 30 runs, dispersion,
+and generic/native output equivalence.

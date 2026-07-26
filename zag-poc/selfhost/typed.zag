@@ -87,6 +87,51 @@ fn zt_decl_names(decls: ArrayList[*Node]) ArrayList[[]u8] {
     return names;
 }
 
+// Explicit globals are one-word BSS cells. Pointer globals are admitted only
+// through this declaration boundary; aggregate/callback/optional storage still
+// lacks a destruction and ownership contract and remains rejected.
+fn zt_global_scalar_type(ty: []u8) i32 {
+    if (ty.len == 0 || @strEq(ty, "void")) { return 0; }
+    if (ty[0] == '*') { return 1; }
+    if (zt_starts(ty, "[]") == 1 || ty[0] == '?' || ty[0] == '!' || zt_starts(ty, "fn(") == 1) { return 0; }
+    return zt_is_builtin(ty);
+}
+fn zt_global_zero_initializer(l: Let) i32 {
+    if (l.has_init == 0) { return 1; }
+    switch (l.expr.*) {
+        .ilit => |x| { if (x.text.len == 1 && x.text[0] == '0') { return 1; } }
+        else => { }
+    }
+    return 0;
+}
+fn zt_check_globals(decls: ArrayList[*Node], file: []u8) i32 {
+    if (@strEq(v2_project_edition(file), "2027") == 0) { return 0; }
+    let errors: i32 = 0;
+    let names: ArrayList[[]u8] = make[[]u8](8);
+    let i: i32 = 0;
+    while (i < decls.len) {
+        switch (decls.data[i].*) {
+            .let_ => |l| { if (l.is_global == 1) {
+                if (l.has_dty == 0 || zt_global_scalar_type(l.dty) == 0) { errors = errors + zt_machine_error("global storage requires an explicitly typed scalar or pointer; aggregates, callbacks, and optionals have no global lifetime contract", "global declaration"); }
+                if (zt_global_zero_initializer(l) == 0) { errors = errors + zt_machine_error("global storage currently permits only zero initialization", "global declaration"); }
+                if (zt_in_names(names, l.name) == 1) { errors = errors + zt_machine_error("duplicate global declaration", "global declaration"); }
+                else { push[[]u8](&names, l.name); }
+            }}
+            else => { }
+        }
+        i = i + 1;
+    }
+    free[[]u8](&names);
+    return errors;
+}
+fn zt_seed_globals(env: *ArrayList[ZTBind], decls: ArrayList[*Node]) void {
+    let i: i32 = 0;
+    while (i < decls.len) {
+        switch (decls.data[i].*) { .let_ => |l| { if (l.is_global == 1) { push[ZTBind](env, ZTBind{.name=l.name,.ty=l.dty}); } } else => { } }
+        i = i + 1;
+    }
+}
+
 fn zt_report_unknown(name: []u8, context: []u8) i32 {
     _zag_eprintln(_zag_str_concat(_zag_str_concat(
         _zag_str_concat("error[E0202]: unknown type '", name),
@@ -308,11 +353,14 @@ fn zt_subst_type(t: []u8, names: ArrayList[[]u8], vals: ArrayList[[]u8]) []u8 {
             out = _zag_str_concat(out, zt_subst_type(get[[]u8](args, ai), names, vals));
             ai = ai + 1;
         }
-        return _zag_str_concat(out, "]");
+        let result:[]u8=_zag_str_concat(out, "]");
+        free[[]u8](&args);
+        return result;
     }
     return t;
 }
-fn zt_fn_tparams(decls: ArrayList[*Node], name: []u8) ArrayList[[]u8] {
+fn zt_fn_tparams(decls: ArrayList[*Node], name: []u8,
+                 fallback: ArrayList[[]u8]) ArrayList[[]u8] {
     let i: i32 = 0;
     while (i < len[*Node](decls)) {
         switch (get[*Node](decls, i).*) {
@@ -321,7 +369,10 @@ fn zt_fn_tparams(decls: ArrayList[*Node], name: []u8) ArrayList[[]u8] {
         }
         i = i + 1;
     }
-    return make[[]u8](0);
+    // Unknown calls have no declared parameter/return type to substitute, so
+    // a borrowed caller list is a safe allocation-free fallback; its contents
+    // are never consulted against an absent declared type.
+    return fallback;
 }
 fn zt_fn_param(decls: ArrayList[*Node], name: []u8, index: i32) []u8 {
     let i: i32 = 0;
@@ -357,6 +408,56 @@ fn zt_fn_has_annot(decls: ArrayList[*Node], name: []u8, annot: []u8) i32 {
     }
     return 0;
 }
+
+// The first v2 foreign-function boundary is intentionally declaration-driven.
+// A bare `extern` is not silently a C declaration: only `extern fn ... @cabi`
+// may enter the native System V dynamic-import path.  Keep the accepted set to
+// machine scalars and raw pointers until aggregate/float classification has
+// executable conformance coverage.
+fn zt_cabi_type_ok(ty0: []u8) i32 {
+    if (ty0.len > 0 && ty0[0] == '*') { return 1; }
+    if (@strEq(ty0, "void") || @strEq(ty0, "bool")) { return 1; }
+    if (@strEq(ty0, "i8") || @strEq(ty0, "u8") || @strEq(ty0, "i16") || @strEq(ty0, "u16")) { return 1; }
+    if (@strEq(ty0, "i32") || @strEq(ty0, "u32") || @strEq(ty0, "i64") || @strEq(ty0, "u64")) { return 1; }
+    return 0;
+}
+
+fn zt_check_v2_cabi_declarations(decls: ArrayList[*Node], file: []u8) i32 {
+    if (@strEq(v2_project_edition(file), "2027") == 0) { return 0; }
+    let errors: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .fn_decl => |f| {
+                let cabi: i32 = zt_fn_has_annot(decls, f.name, "@cabi");
+                // Compiler runtime declarations remain an implementation ABI,
+                // never part of the public C ABI surface.
+                let runtime: i32 = zt_starts(f.name, "_zag_");
+                if (cabi == 1 && f.is_extern == 0) {
+                    errors = errors + zt_machine_error("@cabi is valid only on extern functions", _zag_str_concat("function ", f.name));
+                }
+                if (f.is_extern == 1 && runtime == 0 && cabi == 0) {
+                    errors = errors + zt_machine_error("v2 foreign imports require explicit @cabi", _zag_str_concat("function ", f.name));
+                }
+                if (cabi == 1) {
+                    let abi_ok: i32 = zt_cabi_type_ok(f.ret);
+                    let pi: i32 = 0;
+                    while (pi < len[Param](f.params)) {
+                        if (zt_cabi_type_ok(get[Param](f.params, pi).pty) == 0) { abi_ok = 0; }
+                        pi = pi + 1;
+                    }
+                    if (abi_ok == 0) {
+                        errors = errors + zt_machine_error("v2 @cabi supports only scalar integers, bool, raw pointers, and void", _zag_str_concat("function ", f.name));
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return errors;
+}
+
 fn zt_direct_name(n: *Node) []u8 {
     return switch (n.*) { .id => |x| x.name, else => "" };
 }
@@ -445,7 +546,7 @@ fn zt_expr_type(n: *Node, env: ArrayList[ZTBind], decls: ArrayList[*Node], conte
         .call => |c| {
             let errors: i32 = 0;
             let name: []u8 = zt_direct_name(c.callee);
-            let tparams: ArrayList[[]u8] = zt_fn_tparams(decls, name);
+            let tparams: ArrayList[[]u8] = zt_fn_tparams(decls, name, c.targs);
             let i: i32 = 0;
             while (i < len[*Node](c.args)) {
                 let a: ZTExpr = zt_expr_type(get[*Node](c.args, i), env, decls, context);
@@ -474,6 +575,17 @@ fn zt_expr_type(n: *Node, env: ArrayList[ZTBind], decls: ArrayList[*Node], conte
                 (@strEq(l.ty, "bool") || @strEq(r.ty, "bool") ||
                  @strEq(l.ty, "[]u8") || @strEq(r.ty, "[]u8"))) {
                 errors = errors + zt_type_error(l.ty, r.ty, context);
+            }
+            // Raw-pointer ordering would expose an address relation that is
+            // not a stable v2 provenance property.  Keep equality available
+            // for identity/null tests, but reject < <= > >= before lowering.
+            if ((@strEq(b.op, "<") || @strEq(b.op, ">") ||
+                 @strEq(b.op, "<=") || @strEq(b.op, ">=")) &&
+                ((l.known == 1 && (zt_is_v2_raw_pointer(l.ty) == 1 ||
+                                   zt_is_nullable_v2_raw_pointer(l.ty) == 1)) ||
+                 (r.known == 1 && (zt_is_v2_raw_pointer(r.ty) == 1 ||
+                                   zt_is_nullable_v2_raw_pointer(r.ty) == 1)))) {
+                errors = errors + zt_machine_error("raw-pointer ordering comparisons are unsupported; use equality only", context);
             }
             if (@strEq(b.op, "==") || @strEq(b.op, "!=") || @strEq(b.op, "<") ||
                 @strEq(b.op, ">") || @strEq(b.op, "<=") || @strEq(b.op, ">=") ||
@@ -539,19 +651,23 @@ fn zt_expr_body(body: ArrayList[*Node], env: *ArrayList[ZTBind], decls: ArrayLis
                 errors = errors + zt_expr_type(x.cond, env.*, decls, context).errors;
                 let te: ArrayList[ZTBind] = zt_env_clone(env.*);
                 errors = errors + zt_expr_body(x.then_body, &te, decls, fn_ret, context);
+                free[ZTBind](&te);
                 if (x.has_els == 1) {
                     let ee: ArrayList[ZTBind] = zt_env_clone(env.*);
                     errors = errors + zt_expr_body(x.els_body, &ee, decls, fn_ret, context);
+                    free[ZTBind](&ee);
                 }
             }
             .while_ => |w| {
                 errors = errors + zt_expr_type(w.cond, env.*, decls, context).errors;
                 let we: ArrayList[ZTBind] = zt_env_clone(env.*);
                 errors = errors + zt_expr_body(w.body, &we, decls, fn_ret, context);
+                free[ZTBind](&we);
             }
             .unsafe_ => |u| {
                 let ue: ArrayList[ZTBind] = zt_env_clone(env.*);
                 errors = errors + zt_expr_body(u.body, &ue, decls, fn_ret, context);
+                free[ZTBind](&ue);
             }
             .estmt => |e| { errors = errors + zt_expr_type(e.expr, env.*, decls, context).errors; }
             else => { }
@@ -569,6 +685,7 @@ fn zt_check_expressions(decls: ArrayList[*Node]) i32 {
             .fn_decl => |f| {
                 if (f.is_extern == 0 && zt_starts(f.name, "__iface_") == 0) {
                     let env: ArrayList[ZTBind] = make[ZTBind](len[Param](f.params) + 8);
+                    zt_seed_globals(&env, decls);
                     let pi: i32 = 0;
                     while (pi < len[Param](f.params)) {
                         let p: Param = get[Param](f.params, pi);
@@ -577,6 +694,7 @@ fn zt_check_expressions(decls: ArrayList[*Node]) i32 {
                     }
                     errors = errors + zt_expr_body(f.body, &env, decls, f.ret,
                                                    _zag_str_concat("function ", f.name));
+                    free[ZTBind](&env);
                 }
             }
             else => { }
@@ -615,6 +733,41 @@ fn zt_v2_pointer_space(ty0: []u8) i32 {
     return 0;
 }
 
+// Volatile/MMIO accepts only explicit qualified raw pointers. Keep qualifier
+// stripping here instead of accepting a bare `*T`: this is a v2 raw-pointer
+// operation and must retain its explicit address-space and mutability spelling.
+fn zt_v2_pointee_type(ty0: []u8) []u8 {
+    if (ty0.len < 2 || ty0[0] != '*') { return ""; }
+    let ty: []u8 = ty0[1..];
+    if (zt_starts(ty, "const ") == 1) { return ty[6..]; }
+    if (zt_starts(ty, "mut ") == 1) { return ty[4..]; }
+    if (zt_starts(ty, "host ") == 1) { return ty[5..]; }
+    return "";
+}
+
+fn zt_is_v2_volatile_word_ptr(ty: []u8) i32 {
+    let elem: []u8 = zt_v2_pointee_type(ty);
+    if (@strEq(elem, "i64") || @strEq(elem, "u64") ||
+        @strEq(elem, "isize") || @strEq(elem, "usize")) { return 1; }
+    return 0;
+}
+
+fn zt_is_v2_volatile_byte_ptr(ty: []u8) i32 {
+    return @strEq(zt_v2_pointee_type(ty), "u8");
+}
+
+// MMIO register widths are explicit in the intrinsic name.  Keep the
+// 16/32-bit forms unsigned so a device transaction cannot accidentally gain
+// sign-extension semantics from a signed language scalar; callers may cast
+// the returned value when a signed interpretation is intended.
+fn zt_is_v2_volatile_half_ptr(ty: []u8) i32 {
+    return @strEq(zt_v2_pointee_type(ty), "u16");
+}
+
+fn zt_is_v2_volatile_dword_ptr(ty: []u8) i32 {
+    return @strEq(zt_v2_pointee_type(ty), "u32");
+}
+
 fn zt_machine_expr_type(n: *Node, env: ArrayList[ZTBind]) []u8 {
     return switch (n.*) {
         .id => |x| zt_env_get(env, x.name),
@@ -630,6 +783,49 @@ fn zt_machine_expr_type(n: *Node, env: ArrayList[ZTBind]) []u8 {
     };
 }
 
+// Fixed-width atomics are not generic numeric stores.  Integer literals retain
+// the normal contextual i64 spelling, but a typed value must already be i64 so
+// an i32/u64/bool binding cannot silently become the 64-bit memory payload.
+// Unknown generic/backend expressions stay deferred to their later checker.
+fn zt_machine_atomic_i64_value(n: *Node, env: ArrayList[ZTBind],
+                               decls: ArrayList[*Node], context: []u8) i32 {
+    let value: ZTExpr = zt_expr_type(n, env, decls, context);
+    if (value.known == 0 || value.literal == 1) { return 1; }
+    if (@strEq(value.ty, "i64")) { return 1; }
+    return 0;
+}
+
+// Memory-order operands are deliberately compile-time literals in this first
+// selectable-order slice.  The numeric ABI is stable and documented: 0
+// relaxed, 1 acquire, 2 release, 3 acq_rel, 4 seq_cst.  Rejecting a runtime
+// value here prevents a caller from smuggling an unvalidated order through a
+// raw intrinsic until an order enum/type exists.
+fn zt_machine_atomic_order(n: *Node) i32 {
+    switch (n.*) {
+        .ilit => |x| {
+            if (@strEq(x.text, "0")) { return 0; }
+            if (@strEq(x.text, "1")) { return 1; }
+            if (@strEq(x.text, "2")) { return 2; }
+            if (@strEq(x.text, "3")) { return 3; }
+            if (@strEq(x.text, "4")) { return 4; }
+        }
+        else => { }
+    }
+    return -1;
+}
+
+fn zt_machine_volatile_value(n: *Node, env: ArrayList[ZTBind],
+                             decls: ArrayList[*Node], context: []u8,
+                             width: i32) i32 {
+    let value: ZTExpr = zt_expr_type(n, env, decls, context);
+    // Integer literals are contextually typed by the fixed-width intrinsic.
+    if (value.known == 0 || value.literal == 1) { return 1; }
+    if (width == 1) { return @strEq(value.ty, "u8"); }
+    if (width == 2) { return @strEq(value.ty, "u16"); }
+    if (width == 4) { return @strEq(value.ty, "u32"); }
+    return 1;
+}
+
 fn zt_machine_error(rule: []u8, context: []u8) i32 {
     _zag_eprintln(_zag_str_concat(_zag_str_concat("error[E0204]: ", rule),
                                   _zag_str_concat(" in ", context)));
@@ -639,13 +835,15 @@ fn zt_machine_error(rule: []u8, context: []u8) i32 {
 fn zt_check_machine_expr(n: *Node, env: ArrayList[ZTBind], decls: ArrayList[*Node],
                          unsafe_scope: i32, writing: i32, context: []u8) i32 {
     switch (n.*) {
-        // A plain `fn(...) T` value cannot yet carry the Unsafe effect.  Letting
-        // an `unsafe fn` escape through that type would make a later indirect
-        // call look safe, so reject the conversion until function types have a
-        // typed safety contract. Direct calls are handled below.
+        // A plain `fn(...) T` value cannot yet carry Unsafe or foreign-ABI
+        // authority. Letting an unsafe fn or @cabi import escape through that
+        // type would make a later indirect call look safe, so reject the
+        // conversion until function types have a typed safety/ABI contract.
+        // Direct calls are handled below.
         .id => |x| {
-            if (zt_fn_has_annot(decls, x.name, "@unsafe") == 1) {
-                return zt_machine_error("unsafe function values are not implemented; call the function directly inside unsafe", context);
+            if (zt_fn_has_annot(decls, x.name, "@unsafe") == 1 ||
+                zt_fn_has_annot(decls, x.name, "@cabi") == 1) {
+                return zt_machine_error("unsafe or C-ABI function values are not implemented; call the function directly inside unsafe", context);
             }
             return 0;
         }
@@ -662,14 +860,193 @@ fn zt_check_machine_expr(n: *Node, env: ArrayList[ZTBind], decls: ArrayList[*Nod
             }
             if (direct.len > 0 && zt_fn_has_annot(decls, direct, "@unsafe") == 1 && unsafe_scope == 0) {
                 errors = errors + zt_machine_error("call to unsafe function requires unsafe", context);
+            } else if (direct.len > 0 && zt_fn_has_annot(decls, direct, "@cabi") == 1 && unsafe_scope == 0) {
+                errors = errors + zt_machine_error("call to @cabi function requires unsafe", context);
+            }
+            // These allocator families cannot be represented by the current
+            // one-owner contract: construction must retain a caller buffer
+            // while allocation mutates allocator state. Make the boundary an
+            // explicit v2 rejection rather than allowing a future spelling to
+            // look like an ordinary uncontracted call.
+            if (@strEq(direct, "fixed_buffer_allocator") || @strEq(direct, "arena_allocator")) {
+                errors = errors + zt_machine_error("fixed-buffer and arena allocators are unsupported: they require a mutable receiver and retained buffer-owner lifetime contract", context);
+            }
+            if (@strEq(direct, "@prefetch")) {
+                if (unsafe_scope == 0) {
+                    errors = errors + zt_machine_error("prefetch requires unsafe", context);
+                }
+                if (len[*Node](c.args) != 1) {
+                    errors = errors + zt_machine_error("@prefetch expects one raw pointer", context);
+                } else {
+                    let pty: []u8 = zt_machine_expr_type(get[*Node](c.args, 0), env);
+                    if (zt_is_v2_raw_pointer(pty) == 0) {
+                        errors = errors + zt_machine_error("@prefetch requires a raw pointer", context);
+                    } else if (zt_v2_pointer_space(pty) == 2 || zt_v2_pointer_space(pty) == 3) {
+                        errors = errors + zt_machine_error("@prefetch on *device/*workgroup requires a GPU runtime", context);
+                    }
+                }
+            }
+            if (@strEq(direct, "@volatileLoad") || @strEq(direct, "@volatileStore") ||
+                @strEq(direct, "@volatileLoad8") || @strEq(direct, "@volatileStore8") ||
+                @strEq(direct, "@volatileLoad16") || @strEq(direct, "@volatileStore16") ||
+                @strEq(direct, "@volatileLoad32") || @strEq(direct, "@volatileStore32")) {
+                if (unsafe_scope == 0) {
+                    errors = errors + zt_machine_error("volatile/MMIO access requires unsafe", context);
+                }
+                let need: i32 = 1;
+                let byte_width: i32 = 0;
+                if (@strEq(direct, "@volatileLoad8") || @strEq(direct, "@volatileStore8")) { byte_width = 1; }
+                if (@strEq(direct, "@volatileLoad16") || @strEq(direct, "@volatileStore16")) { byte_width = 2; }
+                if (@strEq(direct, "@volatileLoad32") || @strEq(direct, "@volatileStore32")) { byte_width = 4; }
+                if (@strEq(direct, "@volatileStore") || @strEq(direct, "@volatileStore8") ||
+                    @strEq(direct, "@volatileStore16") || @strEq(direct, "@volatileStore32")) { need = 2; }
+                if (len[*Node](c.args) != need) {
+                    errors = errors + zt_machine_error("volatile/MMIO intrinsic has the wrong argument count", context);
+                } else if (len[*Node](c.args) > 0) {
+                    let pty: []u8 = zt_machine_expr_type(get[*Node](c.args, 0), env);
+                    if ((byte_width == 1 && zt_is_v2_volatile_byte_ptr(pty) == 0) ||
+                        (byte_width == 2 && zt_is_v2_volatile_half_ptr(pty) == 0) ||
+                        (byte_width == 4 && zt_is_v2_volatile_dword_ptr(pty) == 0) ||
+                        (byte_width == 0 && zt_is_v2_volatile_word_ptr(pty) == 0)) {
+                        if (byte_width == 1) {
+                            errors = errors + zt_machine_error("volatile/MMIO byte access requires *const/*mut/*host u8", context);
+                        } else if (byte_width == 2) {
+                            errors = errors + zt_machine_error("volatile/MMIO halfword access requires *const/*mut/*host u16", context);
+                        } else if (byte_width == 4) {
+                            errors = errors + zt_machine_error("volatile/MMIO dword access requires *const/*mut/*host u32", context);
+                        } else {
+                            errors = errors + zt_machine_error("volatile/MMIO requires *const/*mut/*host i64, u64, isize, or usize", context);
+                        }
+                    }
+                    if ((@strEq(direct, "@volatileStore") || @strEq(direct, "@volatileStore8") ||
+                         @strEq(direct, "@volatileStore16") || @strEq(direct, "@volatileStore32")) &&
+                        zt_starts(pty, "*const ") == 1) {
+                        errors = errors + zt_machine_error("volatile/MMIO store cannot write through *const", context);
+                    }
+                    if ((@strEq(direct, "@volatileStore8") || @strEq(direct, "@volatileStore16") ||
+                         @strEq(direct, "@volatileStore32")) &&
+                        zt_machine_volatile_value(get[*Node](c.args, 1), env, decls, context, byte_width) == 0) {
+                        if (byte_width == 1) {
+                            errors = errors + zt_machine_error("volatile/MMIO byte store value must be u8", context);
+                        } else if (byte_width == 2) {
+                            errors = errors + zt_machine_error("volatile/MMIO halfword store value must be u16", context);
+                        } else {
+                            errors = errors + zt_machine_error("volatile/MMIO dword store value must be u32", context);
+                        }
+                    }
+                }
+            }
+            if (@strEq(direct, "@atomicExchange64") || @strEq(direct, "@atomicLoad64") || @strEq(direct, "@atomicStore64") || @strEq(direct, "@atomicFetchAdd64") || @strEq(direct, "@atomicFetchSub64") || @strEq(direct, "@atomicFetchAnd64") || @strEq(direct, "@atomicFetchOr64") || @strEq(direct, "@atomicFetchXor64")) {
+                if (unsafe_scope == 0) {
+                    if (@strEq(direct, "@atomicExchange64")) {
+                        errors = errors + zt_machine_error("atomic exchange requires unsafe", context);
+                    } else if (@strEq(direct, "@atomicFetchAdd64") || @strEq(direct, "@atomicFetchSub64")) {
+                        errors = errors + zt_machine_error("atomic fetch-add/sub requires unsafe", context);
+                    } else if (@strEq(direct, "@atomicFetchAnd64") || @strEq(direct, "@atomicFetchOr64") || @strEq(direct, "@atomicFetchXor64")) {
+                        errors = errors + zt_machine_error("atomic fetch operation requires unsafe", context);
+                    } else {
+                        errors = errors + zt_machine_error("atomic operation requires unsafe", context);
+                    }
+                }
+                let expected:i32=2;
+                if (@strEq(direct,"@atomicLoad64")) { expected=1; }
+                if (len[*Node](c.args) != expected) {
+                    errors = errors + zt_machine_error("atomic i64 operation has the wrong argument count", context);
+                } else {
+                    let pty: []u8 = zt_machine_expr_type(get[*Node](c.args, 0), env);
+                    let ptr_ok:i32=0;
+                    if (@strEq(direct,"@atomicLoad64")) {
+                        if (@strEq(pty,"*const i64") || @strEq(pty,"*mut i64")) { ptr_ok=1; }
+                    } else if (@strEq(pty,"*mut i64")) { ptr_ok=1; }
+                    if (ptr_ok == 0) {
+                        if (@strEq(direct, "@atomicExchange64")) {
+                            errors = errors + zt_machine_error("@atomicExchange64 requires an explicitly mutable, naturally aligned *mut i64", context);
+                        } else if (@strEq(direct, "@atomicFetchAdd64") || @strEq(direct, "@atomicFetchSub64")) {
+                            errors = errors + zt_machine_error("atomic fetch-add/sub requires an explicitly mutable, naturally aligned *mut i64", context);
+                        } else if (@strEq(direct, "@atomicFetchAnd64") || @strEq(direct, "@atomicFetchOr64") || @strEq(direct, "@atomicFetchXor64")) {
+                            errors = errors + zt_machine_error("atomic fetch operation requires an explicitly mutable, naturally aligned *mut i64", context);
+                        } else {
+                            errors = errors + zt_machine_error("atomic i64 operation requires an explicitly aligned *const/*mut i64; stores/exchanges require *mut", context);
+                        }
+                    }
+                    if (!@strEq(direct, "@atomicLoad64") &&
+                        zt_machine_atomic_i64_value(get[*Node](c.args, 1), env, decls, context) == 0) {
+                        if (@strEq(direct, "@atomicFetchAdd64") || @strEq(direct, "@atomicFetchSub64")) {
+                            errors = errors + zt_machine_error("atomic fetch-add/sub value must be i64", context);
+                        } else if (@strEq(direct, "@atomicFetchAnd64") || @strEq(direct, "@atomicFetchOr64") || @strEq(direct, "@atomicFetchXor64")) {
+                            errors = errors + zt_machine_error("atomic fetch operation value must be i64", context);
+                        } else {
+                            errors = errors + zt_machine_error("atomic store/exchange value must be i64", context);
+                        }
+                    }
+                }
+            }
+            if (@strEq(direct, "@atomicCompareExchange64")) {
+                if (unsafe_scope == 0) {
+                    errors = errors + zt_machine_error("atomic compare-exchange requires unsafe", context);
+                }
+                if (len[*Node](c.args) != 3) {
+                    errors = errors + zt_machine_error("atomic compare-exchange has the wrong argument count", context);
+                } else {
+                    let pty: []u8 = zt_machine_expr_type(get[*Node](c.args, 0), env);
+                    if (@strEq(pty, "*mut i64") == 0) {
+                        errors = errors + zt_machine_error("@atomicCompareExchange64 requires an explicitly mutable, naturally aligned *mut i64", context);
+                    }
+                    if (zt_machine_atomic_i64_value(get[*Node](c.args, 1), env, decls, context) == 0 ||
+                        zt_machine_atomic_i64_value(get[*Node](c.args, 2), env, decls, context) == 0) {
+                        errors = errors + zt_machine_error("atomic compare-exchange values must be i64", context);
+                    }
+                }
+            }
+            if (@strEq(direct, "@atomicLoad64Order") || @strEq(direct, "@atomicStore64Order")) {
+                if (unsafe_scope == 0) {
+                    errors = errors + zt_machine_error("atomic memory-order operation requires unsafe", context);
+                }
+                let loading:i32 = (@strEq(direct, "@atomicLoad64Order") as i32);
+                let expected:i32 = 2;
+                if (loading == 0) { expected = 3; }
+                if (len[*Node](c.args) != expected) {
+                    errors = errors + zt_machine_error("atomic memory-order operation has the wrong argument count", context);
+                } else {
+                    let pty:[]u8 = zt_machine_expr_type(get[*Node](c.args, 0), env);
+                    let ptr_ok:i32 = 0;
+                    if (loading == 1) {
+                        if (@strEq(pty, "*const i64") || @strEq(pty, "*mut i64")) { ptr_ok = 1; }
+                    } else if (@strEq(pty, "*mut i64")) { ptr_ok = 1; }
+                    if (ptr_ok == 0) {
+                        errors = errors + zt_machine_error("atomic memory-order operation requires an explicitly aligned *const/*mut i64; stores require *mut", context);
+                    }
+                    let order_arg:i32 = 1;
+                    if (loading == 0) { order_arg = 2; }
+                    let order:i32 = zt_machine_atomic_order(get[*Node](c.args, order_arg));
+                    if (order < 0) {
+                        errors = errors + zt_machine_error("atomic memory order must be an integer literal 0=relaxed, 1=acquire, 2=release, 3=acq_rel, or 4=seq_cst", context);
+                    } else if ((loading == 1 && (order == 2 || order == 3)) ||
+                               (loading == 0 && (order == 1 || order == 3))) {
+                        if (loading == 1) {
+                            errors = errors + zt_machine_error("atomic load memory order cannot be release or acq_rel", context);
+                        } else {
+                            errors = errors + zt_machine_error("atomic store memory order cannot be acquire or acq_rel", context);
+                        }
+                    }
+                    if (loading == 0 && zt_machine_atomic_i64_value(get[*Node](c.args, 1), env, decls, context) == 0) {
+                        errors = errors + zt_machine_error("atomic store memory-order value must be an i64", context);
+                    }
+                }
             }
             switch (c.callee.*) {
                 .fld => |f| {
                     let ty: []u8 = zt_machine_expr_type(f.base, env);
-                    if (zt_is_v2_raw_pointer(ty) == 1 &&
-                        (@strEq(f.fname, "add") || @strEq(f.fname, "sub") ||
-                         @strEq(f.fname, "byte_add")) && unsafe_scope == 0) {
-                        errors = errors + zt_machine_error("raw-pointer arithmetic requires unsafe", context);
+                    if (@strEq(f.fname, "add") || @strEq(f.fname, "sub") ||
+                        @strEq(f.fname, "byte_add")) {
+                        if (zt_is_nullable_v2_raw_pointer(ty) == 1) {
+                            errors = errors + zt_machine_error("nullable raw pointer must be explicitly unwrapped before pointer arithmetic", context);
+                        } else if (@strEq(ty, "*opaque") &&
+                                   (@strEq(f.fname, "add") || @strEq(f.fname, "sub"))) {
+                            errors = errors + zt_machine_error("*opaque supports byte_add only; convert explicitly to a typed pointer before element arithmetic", context);
+                        } else if (zt_is_v2_raw_pointer(ty) == 1 && unsafe_scope == 0) {
+                            errors = errors + zt_machine_error("raw-pointer arithmetic requires unsafe", context);
+                        }
                     }
                 }
                 else => { }
@@ -684,7 +1061,14 @@ fn zt_check_machine_expr(n: *Node, env: ArrayList[ZTBind], decls: ArrayList[*Nod
         .idx => |x| {
             let errors: i32 = zt_check_machine_expr(x.base, env, decls, unsafe_scope, 0, context) +
                               zt_check_machine_expr(x.idx, env, decls, unsafe_scope, 0, context);
-            if (zt_is_v2_raw_pointer(zt_machine_expr_type(x.base, env)) == 1 && unsafe_scope == 0) {
+            let base_ty: []u8 = zt_machine_expr_type(x.base, env);
+            if (zt_is_nullable_v2_raw_pointer(base_ty) == 1) {
+                errors = errors + zt_machine_error("nullable raw pointer must be explicitly unwrapped before indexing", context);
+            } else if (@strEq(base_ty, "*opaque")) {
+                errors = errors + zt_machine_error("*opaque cannot be indexed without an explicit typed conversion", context);
+            } else if (zt_v2_pointer_space(base_ty) == 2 || zt_v2_pointer_space(base_ty) == 3) {
+                errors = errors + zt_machine_error("*device/*workgroup indexing requires a GPU runtime", context);
+            } else if (zt_is_v2_raw_pointer(base_ty) == 1 && unsafe_scope == 0) {
                 errors = errors + zt_machine_error("raw-pointer indexing requires unsafe", context);
             }
             return errors;
@@ -704,6 +1088,8 @@ fn zt_check_machine_expr(n: *Node, env: ArrayList[ZTBind], decls: ArrayList[*Nod
                     }
                     if (@strEq(ty, "*opaque")) {
                         errors = errors + zt_machine_error("*opaque cannot be dereferenced without an explicit typed conversion", context);
+                    } else if (zt_v2_pointer_space(ty) == 2 || zt_v2_pointer_space(ty) == 3) {
+                        errors = errors + zt_machine_error("*device/*workgroup dereference requires a GPU runtime", context);
                     }
                 }
             }
@@ -746,19 +1132,23 @@ fn zt_check_machine_body(body: ArrayList[*Node], env: *ArrayList[ZTBind], decls:
                 errors = errors + zt_check_machine_expr(x.cond, env.*, decls, unsafe_scope, 0, context);
                 let te: ArrayList[ZTBind] = zt_env_clone(env.*);
                 errors = errors + zt_check_machine_body(x.then_body, &te, decls, unsafe_scope, context);
+                free[ZTBind](&te);
                 if (x.has_els == 1) {
                     let ee: ArrayList[ZTBind] = zt_env_clone(env.*);
                     errors = errors + zt_check_machine_body(x.els_body, &ee, decls, unsafe_scope, context);
+                    free[ZTBind](&ee);
                 }
             }
             .while_ => |w| {
                 errors = errors + zt_check_machine_expr(w.cond, env.*, decls, unsafe_scope, 0, context);
                 let we: ArrayList[ZTBind] = zt_env_clone(env.*);
                 errors = errors + zt_check_machine_body(w.body, &we, decls, unsafe_scope, context);
+                free[ZTBind](&we);
             }
             .unsafe_ => |u| {
                 let ue: ArrayList[ZTBind] = zt_env_clone(env.*);
                 errors = errors + zt_check_machine_body(u.body, &ue, decls, 1, context);
+                free[ZTBind](&ue);
             }
             else => { }
         }
@@ -774,6 +1164,7 @@ fn zt_check_machine_control(decls: ArrayList[*Node]) i32 {
         switch (get[*Node](decls, i).*) {
             .fn_decl => |f| {
                 let env: ArrayList[ZTBind] = make[ZTBind](len[Param](f.params) + 8);
+                zt_seed_globals(&env, decls);
                 let pi: i32 = 0;
                 while (pi < len[Param](f.params)) {
                     let p: Param = get[Param](f.params, pi);
@@ -783,6 +1174,7 @@ fn zt_check_machine_control(decls: ArrayList[*Node]) i32 {
                 let fn_unsafe: i32 = zt_fn_has_annot(decls, f.name, "@unsafe");
                 errors = errors + zt_check_machine_body(f.body, &env, decls, fn_unsafe,
                     _zag_str_concat("function ", f.name));
+                free[ZTBind](&env);
             }
             else => { }
         }
@@ -791,50 +1183,1126 @@ fn zt_check_machine_control(decls: ArrayList[*Node]) i32 {
     return errors;
 }
 
-// Conservative first lifetime check for the v2 allocator milestone.  It only
-// follows a straight-line named `delete`/`_zag_free` call; branches and aliases
-// stay for dynamic instrumentation rather than being guessed here.
-fn zt_check_direct_free_body(body: ArrayList[*Node], freed: *ArrayList[[]u8], context: []u8) i32 {
-    let errors: i32 = 0;
-    let i: i32 = 0;
-    while (i < len[*Node](body)) {
-        switch (get[*Node](body, i).*) {
-            .estmt => |e| {
-                switch (e.expr.*) {
-                    .call => |c| {
-                        let name: []u8 = zt_direct_name(c.callee);
-                        if ((@strEq(name, "delete") || @strEq(name, "_zag_free")) && len[*Node](c.args) == 1) {
-                            switch (get[*Node](c.args, 0).*) {
-                                .id => |p| {
-                                    if (zt_in_names(freed.*, p.name) == 1) {
-                                        errors = errors + zt_machine_error("double free of named allocation", context);
-                                    } else { push[[]u8](freed, p.name); }
-                                }
-                                else => { }
-                            }
-                        }
+// Edition-2027 ownership is a conservative, compiler-rooted proof.  It tracks
+// named allocation origins, direct aliases, explicit ownership contracts and
+// validated owned-return summaries.  It is deliberately not a claim of general
+// heap provenance, dynamic bounds, or runtime use-after-free instrumentation.
+struct ZTOwnAlias { name: []u8, root: []u8 }
+struct ZTOwnSummary { name: []u8, returns_owned: i32 }
+struct ZTOwnReturnInfo { owned: i32, plain: i32 }
+
+fn zt_alias_root(aliases:ArrayList[ZTOwnAlias],name:[]u8)[]u8{let i:i32=0;while(i<aliases.len){if(@strEq(aliases.data[i].name,name)){return aliases.data[i].root;}i=i+1;}return name;}
+fn zt_alias_set(aliases:*ArrayList[ZTOwnAlias],name:[]u8,root:[]u8)void{let i:i32=0;while(i<aliases.*.len){if(@strEq(aliases.*.data[i].name,name)){aliases.*.data[i].root=root;return;}i=i+1;}push[ZTOwnAlias](aliases,ZTOwnAlias{.name=name,.root=root});}
+fn zt_names_clone(names:ArrayList[[]u8])ArrayList[[]u8]{let out:ArrayList[[]u8]=make[[]u8](names.len+1);let i:i32=0;while(i<names.len){push[[]u8](&out,names.data[i]);i=i+1;}return out;}
+fn zt_alias_clone(aliases:ArrayList[ZTOwnAlias])ArrayList[ZTOwnAlias]{let out:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](aliases.len+1);let i:i32=0;while(i<aliases.len){push[ZTOwnAlias](&out,aliases.data[i]);i=i+1;}return out;}
+fn zt_names_merge(into:*ArrayList[[]u8],from:ArrayList[[]u8])void{let i:i32=0;while(i<from.len){if(zt_in_names(into.*,from.data[i])==0){push[[]u8](into,from.data[i]);}i=i+1;}}
+fn zt_names_intersect(a:ArrayList[[]u8],b:ArrayList[[]u8])ArrayList[[]u8]{let out:ArrayList[[]u8]=make[[]u8](a.len+1);let i:i32=0;while(i<a.len){if(zt_in_names(b,a.data[i])==1){push[[]u8](&out,a.data[i]);}i=i+1;}return out;}
+fn zt_names_remove(names:*ArrayList[[]u8],name:[]u8)void{let i:i32=0;while(i<names.*.len){if(@strEq(names.*.data[i],name)){let j:i32=i;while(j+1<names.*.len){names.*.data[j]=names.*.data[j+1];j=j+1;}names.*.len=names.*.len-1;return;}i=i+1;}}
+fn zt_alias_agree(a:ArrayList[ZTOwnAlias],b:ArrayList[ZTOwnAlias])ArrayList[ZTOwnAlias]{let out:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](a.len+b.len+1);let i:i32=0;while(i<a.len){let x:ZTOwnAlias=a.data[i];if(@strEq(x.root,zt_alias_root(b,x.name))){zt_alias_set(&out,x.name,x.root);}i=i+1;}i=0;while(i<b.len){let x:ZTOwnAlias=b.data[i];if(@strEq(x.root,zt_alias_root(a,x.name))){zt_alias_set(&out,x.name,x.root);}i=i+1;}return out;}
+// Flow joins return fresh backing arrays. Replace a state only through these
+// helpers so the superseded backing allocation cannot accumulate across
+// fixed-point passes or nested control flow. Elements are borrowed AST text.
+fn zt_names_replace(dst:*ArrayList[[]u8],next:ArrayList[[]u8])void{free[[]u8](dst);dst.*=next;}
+fn zt_alias_replace(dst:*ArrayList[ZTOwnAlias],next:ArrayList[ZTOwnAlias])void{free[ZTOwnAlias](dst);dst.*=next;}
+// A representation-only cast preserves the identity of its operand.  This is
+// intentionally narrower than a general expression root: field/index/slice
+// projections can denote a distinct value, and unary operators can construct
+// a different value.  Only the forms below are safe to use when transferring
+// a named ownership or borrow alias.
+fn zt_expr_transparent_id(n:*Node)[]u8{
+    switch(n.*){
+        .id=>|x|{return x.name;}
+        .cast_=>|x|{return zt_expr_transparent_id(x.expr);}
+        // The runtime slice-pointer projection changes representation, not
+        // ownership. Recognizing this exact compiler ABI lets edition-2027
+        // prove `_zag_free(_zag_slice_ptr(staged))` without treating arbitrary
+        // calls or field projections as transparent aliases.
+        .call=>|x|{
+            if(@strEq(zt_direct_name(x.callee),"_zag_slice_ptr")&&x.args.len==1){
+                return zt_expr_transparent_id(x.args.data[0]);
+            }
+        }
+        else=>{}
+    }
+    return "";
+}
+
+fn zt_expr_uses_name(n: *Node, name: []u8, aliases:ArrayList[ZTOwnAlias]) i32 {
+    switch (n.*) {
+        .id => |x| { return @strEq(zt_alias_root(aliases,x.name), name) as i32; }
+        .bin => |x| { return zt_expr_uses_name(x.l,name,aliases)|zt_expr_uses_name(x.r,name,aliases); }
+        .un => |x| { return zt_expr_uses_name(x.e,name,aliases); }
+        .call => |x| { let hit:i32=zt_expr_uses_name(x.callee,name,aliases);let i:i32=0;while(i<x.args.len){hit=hit|zt_expr_uses_name(x.args.data[i],name,aliases);i=i+1;}return hit; }
+        .idx => |x| { return zt_expr_uses_name(x.base,name,aliases)|zt_expr_uses_name(x.idx,name,aliases); }
+        .fld => |x| { return zt_expr_uses_name(x.base,name,aliases); }
+        .cast_ => |x| { return zt_expr_uses_name(x.expr,name,aliases); }
+        .slice_ => |x| { return zt_expr_uses_name(x.base,name,aliases)|zt_expr_uses_name(x.lo,name,aliases)|zt_expr_uses_name(x.hi,name,aliases); }
+        .slit_ => |x| { let i:i32=0;while(i<x.fields.len){if(zt_expr_uses_name(x.fields.data[i].val,name,aliases)==1){return 1;}i=i+1;} }
+        else => { }
+    }
+    return 0;
+}
+fn zt_check_freed_expr(n:*Node,freed:ArrayList[[]u8],aliases:ArrayList[ZTOwnAlias],context:[]u8)i32{let errors:i32=0;let i:i32=0;while(i<freed.len){let name:[]u8=freed.data[i];if(zt_expr_uses_name(n,name,aliases)==1){errors=errors+zt_machine_error(_zag_str_concat("use after free of named allocation `",_zag_str_concat(name,"`")),context);}i=i+1;}return errors;}
+
+fn zt_owner_summary_returns(sums:ArrayList[ZTOwnSummary],name:[]u8)i32{let i:i32=0;while(i<sums.len){if(@strEq(sums.data[i].name,name)){return sums.data[i].returns_owned;}i=i+1;}return 0;}
+fn zt_owned_acquire_name(n:*Node,sums:ArrayList[ZTOwnSummary])[]u8{switch(n.*){.id=>|x|{if(zt_starts(x.name,"__clos_cap_")==1){return x.name;}}.cast_=>|c|{return zt_owned_acquire_name(c.expr,sums);}.call=>|c|{let name:[]u8=zt_direct_name(c.callee);if(@strEq(name,"new")||@strEq(name,"_zag_malloc")||@strEq(name,"_zag_realloc")||@strEq(name,"zalloc")||@strEq(name,"zalloc_i")||@strEq(name,"@cacheAlignedAlloc")||@strEq(name,"_zag_read_file")||@strEq(name,"_zag_strdup")||@strEq(name,"_zag_str_concat")||@strEq(name,"_zag_i64_to_str")||@strEq(name,"_zag_u64_to_str")||@strEq(name,"_zag_exec_capture")||zt_owner_summary_returns(sums,name)==1){return name;}}else=>{}}return "";}
+// `_zag_realloc(owner, size)` is the one runtime operation that consumes one
+// named owner and returns its replacement in a single expression.  Preserve
+// the ordinary raw-pointer surface, but let the v2 ownership flow recognize
+// the direct transparent first argument as an atomic transfer boundary.
+fn zt_realloc_source_name(n:*Node)[]u8{switch(n.*){
+    .cast_=>|c|{return zt_realloc_source_name(c.expr);}
+    .call=>|c|{if(@strEq(zt_direct_name(c.callee),"_zag_realloc")&&c.args.len==2){return zt_expr_transparent_id(c.args.data[0]);}}
+    else=>{}
+}return "";}
+// Exact terminal operations for edition-2027 named owners. Script payloads
+// allocated by `_zag_script_alloc` are intentionally absent: their owner is the
+// generated context, and only `_zag_script_context_shutdown` releases it.
+fn zt_owned_release_name(name:[]u8)i32{
+    return (@strEq(name,"delete")||@strEq(name,"_zag_free")||@strEq(name,"zfree")||@strEq(name,"zfree_i")||@strEq(name,"@cacheAlignedFree")||@strEq(name,"close")||
+        @strEq(name,"_zag_str_free")||
+        @strEq(name,"_zag_script_context_shutdown")) as i32;
+}
+// Releasing or consuming an owner has an immediate flow effect.  It therefore
+// cannot be embedded in a value, condition, or another call: this first
+// ownership slice has no sequencing contract for such a value-producing use.
+// Reject it at the source boundary instead of letting a later leak/escape
+// diagnostic misdescribe the program.
+fn zt_check_embedded_terminal_call(n:*Node,decls:ArrayList[*Node],root_statement:i32,context:[]u8)i32{
+    switch(n.*){
+        .call=>|c|{
+            let errors:i32=0;let name:[]u8=zt_direct_name(c.callee);
+            if(root_statement==0&&(zt_owned_release_name(name)==1||zt_fn_has_annot(decls,name,"@consumes")==1)){
+                errors=errors+zt_machine_error("release or @consumes call must be a standalone statement",context);
+            }
+            errors=errors+zt_check_embedded_terminal_call(c.callee,decls,0,context);
+            let i:i32=0;while(i<c.args.len){errors=errors+zt_check_embedded_terminal_call(c.args.data[i],decls,0,context);i=i+1;}
+            return errors;
+        }
+        .bin=>|x|{return zt_check_embedded_terminal_call(x.l,decls,0,context)+zt_check_embedded_terminal_call(x.r,decls,0,context);}
+        .un=>|x|{return zt_check_embedded_terminal_call(x.e,decls,0,context);}
+        .idx=>|x|{return zt_check_embedded_terminal_call(x.base,decls,0,context)+zt_check_embedded_terminal_call(x.idx,decls,0,context);}
+        .fld=>|x|{return zt_check_embedded_terminal_call(x.base,decls,0,context);}
+        .cast_=>|x|{return zt_check_embedded_terminal_call(x.expr,decls,0,context);}
+        .slice_=>|x|{return zt_check_embedded_terminal_call(x.base,decls,0,context)+zt_check_embedded_terminal_call(x.lo,decls,0,context)+zt_check_embedded_terminal_call(x.hi,decls,0,context);}
+        .slit_=>|x|{let errors:i32=0;let i:i32=0;while(i<x.fields.len){errors=errors+zt_check_embedded_terminal_call(x.fields.data[i].val,decls,0,context);i=i+1;}return errors;}
+        else=>{}
+    }return 0;
+}
+// These compiler-reserved output bridges synchronously consume their byte
+// arguments and never retain a pointer.  Treating them as an unknown external
+// call would reject generated Script diagnostics and ordinary output after an
+// owned helper result is formed.  Keep this deliberately narrow: user calls
+// and every other `_zag_*` bridge remain uncontracted unless they declare a
+// normal ownership/borrow annotation.
+fn zt_compiler_nonretaining_call(name:[]u8)i32{
+    return (@strEq(name,"_zag_println")||@strEq(name,"_zag_eprintln")||
+        @strEq(name,"_zag_write_stdout")||@strEq(name,"_zag_write_stderr")||
+        // SystemAllocator registers a bounded compiler-owned provenance record
+        // synchronously; it does not transfer or retain the source owner.
+        @strEq(name,"_zag_allocation_register")) as i32;
+}
+fn zt_owned_expr_root(n:*Node,owned:ArrayList[[]u8],aliases:ArrayList[ZTOwnAlias])[]u8{switch(n.*){.id=>|x|{let root:[]u8=zt_alias_root(aliases,x.name);if(zt_in_names(owned,root)==1){return root;}}.cast_=>|x|{return zt_owned_expr_root(x.expr,owned,aliases);}.fld=>|x|{return zt_owned_expr_root(x.base,owned,aliases);}.idx=>|x|{return zt_owned_expr_root(x.base,owned,aliases);}.slice_=>|x|{return zt_owned_expr_root(x.base,owned,aliases);}.un=>|x|{return zt_owned_expr_root(x.e,owned,aliases);}.call=>|x|{if(@strEq(zt_direct_name(x.callee),"_zag_slice_ptr")&&x.args.len==1){return zt_owned_expr_root(x.args.data[0],owned,aliases);}}else=>{}}return "";}
+
+fn zt_return_info_body(body:ArrayList[*Node],must:*ArrayList[[]u8],may:*ArrayList[[]u8],aliases:*ArrayList[ZTOwnAlias],sums:ArrayList[ZTOwnSummary],info:*ZTOwnReturnInfo)void{
+    let i:i32=0;while(i<body.len){switch(body.data[i].*){
+        .let_=>|l|{if(l.has_init==1){if(zt_owned_acquire_name(l.expr,sums).len>0){let source:[]u8=zt_realloc_source_name(l.expr);if(source.len>0){let root:[]u8=zt_alias_root(aliases.*,source);zt_names_remove(must,root);zt_names_remove(may,root);}if(zt_in_names(must.*,l.name)==0){push[[]u8](must,l.name);}if(zt_in_names(may.*,l.name)==0){push[[]u8](may,l.name);}zt_alias_set(aliases,l.name,l.name);}else{let source:[]u8=zt_expr_transparent_id(l.expr);if(source.len>0){zt_alias_set(aliases,l.name,zt_alias_root(aliases.*,source));}}}}
+        .assign=>|a|{let target:[]u8=zt_expr_transparent_id(a.target);if(target.len>0){if(zt_owned_acquire_name(a.expr,sums).len>0){let source:[]u8=zt_realloc_source_name(a.expr);if(source.len>0){let root:[]u8=zt_alias_root(aliases.*,source);zt_names_remove(must,root);zt_names_remove(may,root);}if(zt_in_names(must.*,target)==0){push[[]u8](must,target);}if(zt_in_names(may.*,target)==0){push[[]u8](may,target);}zt_alias_set(aliases,target,target);}else{let source:[]u8=zt_expr_transparent_id(a.expr);if(source.len>0){zt_alias_set(aliases,target,zt_alias_root(aliases.*,source));}}}}
+        .ret=>|r|{if(r.has_expr==0){info.*.plain=1;}else if(zt_owned_acquire_name(r.expr,sums).len>0||zt_owned_expr_root(r.expr,must.*,aliases.*).len>0){info.*.owned=1;}else if(zt_owned_expr_root(r.expr,may.*,aliases.*).len>0){info.*.owned=1;info.*.plain=1;}else{info.*.plain=1;}}
+        .unsafe_=>|u|{zt_return_info_body(u.body,must,may,aliases,sums,info);}
+        .if_=>|x|{
+            let tm:ArrayList[[]u8]=zt_names_clone(must.*);let ty:ArrayList[[]u8]=zt_names_clone(may.*);let ta:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);
+            zt_return_info_body(x.then_body,&tm,&ty,&ta,sums,info);
+            let em:ArrayList[[]u8]=zt_names_clone(must.*);let ey:ArrayList[[]u8]=zt_names_clone(may.*);let ea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);
+            zt_return_info_body(x.els_body,&em,&ey,&ea,sums,info);
+            let next_must:ArrayList[[]u8]=zt_names_intersect(tm,em);
+            let next_may:ArrayList[[]u8]=zt_names_clone(ty);zt_names_merge(&next_may,ey);
+            let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(ta,ea);
+            free[[]u8](&tm);free[[]u8](&ty);free[ZTOwnAlias](&ta);
+            free[[]u8](&em);free[[]u8](&ey);free[ZTOwnAlias](&ea);
+            zt_names_replace(must,next_must);zt_names_replace(may,next_may);zt_alias_replace(aliases,next_aliases);
+        }
+        .while_=>|x|{
+            let bm:ArrayList[[]u8]=zt_names_clone(must.*);let by:ArrayList[[]u8]=zt_names_clone(may.*);let ba:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);
+            let wm:ArrayList[[]u8]=zt_names_clone(bm);let wy:ArrayList[[]u8]=zt_names_clone(by);let wa:ArrayList[ZTOwnAlias]=zt_alias_clone(ba);
+            zt_return_info_body(x.body,&wm,&wy,&wa,sums,info);
+            let next_must:ArrayList[[]u8]=zt_names_intersect(bm,wm);
+            let next_may:ArrayList[[]u8]=zt_names_clone(by);zt_names_merge(&next_may,wy);
+            let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(ba,wa);
+            free[[]u8](&bm);free[[]u8](&by);free[ZTOwnAlias](&ba);
+            free[[]u8](&wm);free[[]u8](&wy);free[ZTOwnAlias](&wa);
+            zt_names_replace(must,next_must);zt_names_replace(may,next_may);zt_alias_replace(aliases,next_aliases);
+        }
+        .switch_=>|x|{
+            let bm:ArrayList[[]u8]=zt_names_clone(must.*);let by:ArrayList[[]u8]=zt_names_clone(may.*);let ba:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);
+            let jm:ArrayList[[]u8]=make[[]u8](bm.len+2);let jy:ArrayList[[]u8]=make[[]u8](by.len+2);let ja:ArrayList[ZTOwnAlias]=zt_alias_clone(ba);
+            let have:i32=0;let ai:i32=0;
+            while(ai<x.arms.len){
+                let am:ArrayList[[]u8]=zt_names_clone(bm);let ay:ArrayList[[]u8]=zt_names_clone(by);let aa:ArrayList[ZTOwnAlias]=zt_alias_clone(ba);
+                zt_return_info_body(x.arms.data[ai].body,&am,&ay,&aa,sums,info);
+                if(have==0){
+                    free[[]u8](&jm);jm=am;free[[]u8](&jy);jy=ay;free[ZTOwnAlias](&ja);ja=aa;have=1;
+                }else{
+                    let next_must:ArrayList[[]u8]=zt_names_intersect(jm,am);free[[]u8](&jm);free[[]u8](&am);jm=next_must;
+                    zt_names_merge(&jy,ay);free[[]u8](&ay);
+                    let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(ja,aa);free[ZTOwnAlias](&ja);free[ZTOwnAlias](&aa);ja=next_aliases;
+                }
+                ai=ai+1;
+            }
+            let em:ArrayList[[]u8]=zt_names_clone(bm);let ey:ArrayList[[]u8]=zt_names_clone(by);let ea:ArrayList[ZTOwnAlias]=zt_alias_clone(ba);
+            zt_return_info_body(x.els_body,&em,&ey,&ea,sums,info);
+            if(have==0){
+                free[[]u8](&jm);jm=em;free[[]u8](&jy);jy=ey;free[ZTOwnAlias](&ja);ja=ea;
+            }else{
+                let next_must:ArrayList[[]u8]=zt_names_intersect(jm,em);free[[]u8](&jm);free[[]u8](&em);jm=next_must;
+                zt_names_merge(&jy,ey);free[[]u8](&ey);
+                let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(ja,ea);free[ZTOwnAlias](&ja);free[ZTOwnAlias](&ea);ja=next_aliases;
+            }
+            free[[]u8](&bm);free[[]u8](&by);free[ZTOwnAlias](&ba);
+            zt_names_replace(must,jm);zt_names_replace(may,jy);zt_alias_replace(aliases,ja);
+        }
+        else=>{}
+    }i=i+1;}
+}
+fn zt_fn_return_info(f:FnDecl,decls:ArrayList[*Node],sums:ArrayList[ZTOwnSummary])ZTOwnReturnInfo{
+    let info:ZTOwnReturnInfo=ZTOwnReturnInfo{.owned=0,.plain=0};
+    let must:ArrayList[[]u8]=make[[]u8](4);let may:ArrayList[[]u8]=make[[]u8](4);let aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);
+    if(zt_fn_has_annot(decls,f.name,"@consumes")==1&&f.params.len>0){push[[]u8](&must,f.params.data[0].name);push[[]u8](&may,f.params.data[0].name);zt_alias_set(&aliases,f.params.data[0].name,f.params.data[0].name);}
+    zt_return_info_body(f.body,&must,&may,&aliases,sums,&info);
+    free[[]u8](&must);free[[]u8](&may);free[ZTOwnAlias](&aliases);
+    return info;
+}
+fn zt_build_owner_summaries(decls:ArrayList[*Node])ArrayList[ZTOwnSummary]{let sums:ArrayList[ZTOwnSummary]=make[ZTOwnSummary](decls.len+1);let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(f.is_extern==0){push[ZTOwnSummary](&sums,ZTOwnSummary{.name=f.name,.returns_owned=0});}}else=>{}}i=i+1;}let pass:i32=0;while(pass<=sums.len){i=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(f.is_extern==0){let info:ZTOwnReturnInfo=zt_fn_return_info(f,decls,sums);if(info.owned==1&&info.plain==0){let si:i32=0;while(si<sums.len){if(@strEq(sums.data[si].name,f.name)){sums.data[si].returns_owned=1;}si=si+1;}}}}else=>{}}i=i+1;}pass=pass+1;}return sums;}
+fn zt_check_owner_summary_errors(decls:ArrayList[*Node],sums:ArrayList[ZTOwnSummary])i32{let errors:i32=0;let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(f.is_extern==0){let info:ZTOwnReturnInfo=zt_fn_return_info(f,decls,sums);if(info.owned==1&&info.plain==1){errors=errors+zt_machine_error(_zag_str_concat("function `",_zag_str_concat(f.name,"` mixes owned and non-owned return provenance")),_zag_str_concat("function ",f.name));}}}else=>{}}i=i+1;}return errors;}
+
+fn zt_collect_owned_body(body:ArrayList[*Node],owned:*ArrayList[[]u8],returned:*ArrayList[[]u8],aliases:*ArrayList[ZTOwnAlias],sums:ArrayList[ZTOwnSummary])void{let i:i32=0;while(i<body.len){switch(body.data[i].*){
+    .let_=>|l|{if(l.has_init==1){if(zt_owned_acquire_name(l.expr,sums).len>0){let source:[]u8=zt_realloc_source_name(l.expr);if(source.len>0){zt_names_remove(owned,zt_alias_root(aliases.*,source));}if(zt_in_names(owned.*,l.name)==0){push[[]u8](owned,l.name);}zt_alias_set(aliases,l.name,l.name);}else{let source:[]u8=zt_expr_transparent_id(l.expr);if(source.len>0){zt_alias_set(aliases,l.name,zt_alias_root(aliases.*,source));}}}}
+    .assign=>|a|{let target:[]u8=zt_expr_transparent_id(a.target);let source:[]u8=zt_expr_transparent_id(a.expr);let acquired:[]u8=zt_owned_acquire_name(a.expr,sums);if(target.len>0){if(acquired.len>0){let realloc_source:[]u8=zt_realloc_source_name(a.expr);if(realloc_source.len>0){zt_names_remove(owned,zt_alias_root(aliases.*,realloc_source));}if(zt_in_names(owned.*,target)==0){push[[]u8](owned,target);}zt_alias_set(aliases,target,target);}else if(source.len>0){zt_alias_set(aliases,target,zt_alias_root(aliases.*,source));}else{zt_alias_set(aliases,target,"");}}}
+    .ret=>|r|{if(r.has_expr==1){let root:[]u8=zt_owned_expr_root(r.expr,owned.*,aliases.*);if(root.len>0&&zt_in_names(returned.*,root)==0){push[[]u8](returned,root);}}}
+    .if_=>|x|{let ta:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);zt_collect_owned_body(x.then_body,owned,returned,&ta,sums);let ea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);zt_collect_owned_body(x.els_body,owned,returned,&ea,sums);free[ZTOwnAlias](&ta);free[ZTOwnAlias](&ea);}
+    .while_=>|x|{let wa:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);zt_collect_owned_body(x.body,owned,returned,&wa,sums);free[ZTOwnAlias](&wa);}
+    .unsafe_=>|x|{zt_collect_owned_body(x.body,owned,returned,aliases,sums);}
+    .switch_=>|x|{let ai:i32=0;while(ai<x.arms.len){let aa:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);zt_collect_owned_body(x.arms.data[ai].body,owned,returned,&aa,sums);free[ZTOwnAlias](&aa);ai=ai+1;}let ea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);zt_collect_owned_body(x.els_body,owned,returned,&ea,sums);free[ZTOwnAlias](&ea);}
+    else=>{}
+}i=i+1;}}
+
+fn zt_check_direct_free_body(body:ArrayList[*Node],freed:*ArrayList[[]u8],aliases:*ArrayList[ZTOwnAlias],decls:ArrayList[*Node],sums:ArrayList[ZTOwnSummary],context:[]u8)i32{
+    let errors:i32=0;let i:i32=0;
+    while(i<body.len){switch(body.data[i].*){
+        .let_=>|l|{if(l.has_init==1){errors=errors+zt_check_embedded_terminal_call(l.expr,decls,0,context)+zt_check_freed_expr(l.expr,freed.*,aliases.*,context);if(zt_owned_acquire_name(l.expr,sums).len>0){zt_alias_set(aliases,l.name,l.name);}else{let source:[]u8=zt_expr_transparent_id(l.expr);if(source.len>0){zt_alias_set(aliases,l.name,zt_alias_root(aliases.*,source));}}}}
+        .ret=>|r|{if(r.has_expr==1){errors=errors+zt_check_embedded_terminal_call(r.expr,decls,0,context)+zt_check_freed_expr(r.expr,freed.*,aliases.*,context);}}
+        .assign=>|a|{errors=errors+zt_check_embedded_terminal_call(a.target,decls,0,context)+zt_check_embedded_terminal_call(a.expr,decls,0,context)+zt_check_freed_expr(a.target,freed.*,aliases.*,context)+zt_check_freed_expr(a.expr,freed.*,aliases.*,context);let target:[]u8=zt_expr_transparent_id(a.target);let source:[]u8=zt_expr_transparent_id(a.expr);if(target.len>0){if(zt_owned_acquire_name(a.expr,sums).len>0){zt_alias_set(aliases,target,target);}else if(source.len>0){zt_alias_set(aliases,target,zt_alias_root(aliases.*,source));}else{zt_alias_set(aliases,target,"");}}}
+        .estmt=>|e|{switch(e.expr.*){.call=>|c|{let name:[]u8=zt_direct_name(c.callee);if(zt_owned_release_name(name)==1&&c.args.len==1){let owner:[]u8=zt_expr_transparent_id(c.args.data[0]);if(owner.len==0){errors=errors+zt_machine_error("release requires a named owner argument",context);}else{let root:[]u8=zt_alias_root(aliases.*,owner);if(zt_in_names(freed.*,root)==1){errors=errors+zt_machine_error("double free of named allocation",context);}else{push[[]u8](freed,root);}}}else if(zt_fn_has_annot(decls,name,"@consumes")==1&&c.args.len>0){let owner:[]u8=zt_expr_transparent_id(c.args.data[0]);if(owner.len==0){errors=errors+zt_machine_error("@consumes requires a named owner argument",context);}else{let root:[]u8=zt_alias_root(aliases.*,owner);if(zt_in_names(freed.*,root)==1){errors=errors+zt_machine_error("consumes an already released owner",context);}else{push[[]u8](freed,root);}}}else{errors=errors+zt_check_embedded_terminal_call(e.expr,decls,1,context)+zt_check_freed_expr(e.expr,freed.*,aliases.*,context);}}else=>{errors=errors+zt_check_embedded_terminal_call(e.expr,decls,1,context)+zt_check_freed_expr(e.expr,freed.*,aliases.*,context);}}}
+        .unsafe_=>|u|{errors=errors+zt_check_direct_free_body(u.body,freed,aliases,decls,sums,context);}
+        .if_=>|x|{
+            errors=errors+zt_check_embedded_terminal_call(x.cond,decls,0,context)+zt_check_freed_expr(x.cond,freed.*,aliases.*,context);
+            let base:ArrayList[[]u8]=zt_names_clone(freed.*);let basea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);
+            let tf:ArrayList[[]u8]=zt_names_clone(base);let ta:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);
+            errors=errors+zt_check_direct_free_body(x.then_body,&tf,&ta,decls,sums,context);
+            let ef:ArrayList[[]u8]=zt_names_clone(base);let ea:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);
+            if(x.has_els==1){errors=errors+zt_check_direct_free_body(x.els_body,&ef,&ea,decls,sums,context);}
+            let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(ta,ea);
+            zt_names_merge(freed,tf);zt_names_merge(freed,ef);
+            free[[]u8](&base);free[ZTOwnAlias](&basea);free[[]u8](&tf);free[ZTOwnAlias](&ta);free[[]u8](&ef);free[ZTOwnAlias](&ea);
+            zt_alias_replace(aliases,next_aliases);
+        }
+        .while_=>|x|{
+            errors=errors+zt_check_embedded_terminal_call(x.cond,decls,0,context)+zt_check_freed_expr(x.cond,freed.*,aliases.*,context);
+            let basea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);
+            let wf:ArrayList[[]u8]=zt_names_clone(freed.*);let wa:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);
+            errors=errors+zt_check_direct_free_body(x.body,&wf,&wa,decls,sums,context);
+            let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(basea,wa);
+            zt_names_merge(freed,wf);
+            free[ZTOwnAlias](&basea);free[[]u8](&wf);free[ZTOwnAlias](&wa);
+            zt_alias_replace(aliases,next_aliases);
+        }
+        .switch_=>|x|{
+            errors=errors+zt_check_embedded_terminal_call(x.subject,decls,0,context)+zt_check_freed_expr(x.subject,freed.*,aliases.*,context);
+            let base:ArrayList[[]u8]=zt_names_clone(freed.*);let basea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);
+            let joined:ArrayList[[]u8]=zt_names_clone(base);let joined_alias:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);
+            let have:i32=0;let ai:i32=0;
+            while(ai<x.arms.len){
+                let af:ArrayList[[]u8]=zt_names_clone(base);let aa:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);
+                errors=errors+zt_check_direct_free_body(x.arms.data[ai].body,&af,&aa,decls,sums,context);
+                zt_names_merge(&joined,af);free[[]u8](&af);
+                if(have==0){free[ZTOwnAlias](&joined_alias);joined_alias=aa;have=1;}
+                else{let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(joined_alias,aa);free[ZTOwnAlias](&joined_alias);free[ZTOwnAlias](&aa);joined_alias=next_aliases;}
+                ai=ai+1;
+            }
+            let ef:ArrayList[[]u8]=zt_names_clone(base);let ea:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);
+            errors=errors+zt_check_direct_free_body(x.els_body,&ef,&ea,decls,sums,context);
+            zt_names_merge(&joined,ef);free[[]u8](&ef);
+            if(have==0){free[ZTOwnAlias](&joined_alias);joined_alias=ea;}
+            else{let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(joined_alias,ea);free[ZTOwnAlias](&joined_alias);free[ZTOwnAlias](&ea);joined_alias=next_aliases;}
+            zt_names_merge(freed,joined);
+            free[[]u8](&base);free[ZTOwnAlias](&basea);free[[]u8](&joined);
+            zt_alias_replace(aliases,joined_alias);
+        }
+        else=>{}
+    }i=i+1;}return errors;
+}
+
+// Per-owner terminal lattice: 0 live, 1 discharged on every path, 2 differs.
+fn zt_owner_terminal_state(body:ArrayList[*Node],root:[]u8,aliases:*ArrayList[ZTOwnAlias],decls:ArrayList[*Node],sums:ArrayList[ZTOwnSummary],state:i32)i32{
+    let out:i32=state;let i:i32=0;
+    while(i<body.len){switch(body.data[i].*){
+        .let_=>|l|{if(l.has_init==1){if(zt_owned_acquire_name(l.expr,sums).len>0){let source:[]u8=zt_realloc_source_name(l.expr);if(source.len>0&&@strEq(zt_alias_root(aliases.*,source),root)){out=1;}zt_alias_set(aliases,l.name,l.name);}else{let source:[]u8=zt_expr_transparent_id(l.expr);if(source.len>0){zt_alias_set(aliases,l.name,zt_alias_root(aliases.*,source));}}}}
+        .assign=>|a|{let target:[]u8=zt_expr_transparent_id(a.target);let source:[]u8=zt_expr_transparent_id(a.expr);if(target.len>0){if(zt_owned_acquire_name(a.expr,sums).len>0){let realloc_source:[]u8=zt_realloc_source_name(a.expr);if(realloc_source.len>0&&@strEq(zt_alias_root(aliases.*,realloc_source),root)&&@strEq(target,root)==0){out=1;}zt_alias_set(aliases,target,target);}else if(source.len>0){zt_alias_set(aliases,target,zt_alias_root(aliases.*,source));}else{zt_alias_set(aliases,target,"");}}}
+        .ret=>|r|{if(r.has_expr==1&&zt_expr_uses_name(r.expr,root,aliases.*)==1){out=1;}}
+        .estmt=>|e|{switch(e.expr.*){.call=>|c|{let name:[]u8=zt_direct_name(c.callee);if((zt_owned_release_name(name)==1&&c.args.len==1||zt_fn_has_annot(decls,name,"@consumes")==1&&c.args.len>0)&&zt_expr_uses_name(c.args.data[0],root,aliases.*)==1){out=1;}}else=>{}}}
+        .unsafe_=>|u|{out=zt_owner_terminal_state(u.body,root,aliases,decls,sums,out);}
+        .if_=>|x|{
+            let basea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);
+            let ta:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);let ts:i32=zt_owner_terminal_state(x.then_body,root,&ta,decls,sums,out);
+            let ea:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);let es:i32=out;if(x.has_els==1){es=zt_owner_terminal_state(x.els_body,root,&ea,decls,sums,out);}
+            let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(ta,ea);
+            free[ZTOwnAlias](&basea);free[ZTOwnAlias](&ta);free[ZTOwnAlias](&ea);
+            zt_alias_replace(aliases,next_aliases);
+            if(ts==es){out=ts;}else{out=2;}
+        }
+        .while_=>|x|{
+            let basea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);let wa:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);
+            let ws:i32=zt_owner_terminal_state(x.body,root,&wa,decls,sums,out);
+            let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(basea,wa);
+            free[ZTOwnAlias](&basea);free[ZTOwnAlias](&wa);zt_alias_replace(aliases,next_aliases);
+            if(ws!=out){out=2;}
+        }
+        .switch_=>|x|{
+            let basea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);let joined:i32=-1;
+            let joined_alias:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);let have:i32=0;let ai:i32=0;
+            while(ai<x.arms.len){
+                let aa:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);
+                let arm:i32=zt_owner_terminal_state(x.arms.data[ai].body,root,&aa,decls,sums,out);
+                if(joined<0){joined=arm;}else if(joined!=arm){joined=2;}
+                if(have==0){free[ZTOwnAlias](&joined_alias);joined_alias=aa;have=1;}
+                else{let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(joined_alias,aa);free[ZTOwnAlias](&joined_alias);free[ZTOwnAlias](&aa);joined_alias=next_aliases;}
+                ai=ai+1;
+            }
+            let ea:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);let els:i32=zt_owner_terminal_state(x.els_body,root,&ea,decls,sums,out);
+            if(joined<0){joined=els;}else if(joined!=els){joined=2;}
+            if(have==0){free[ZTOwnAlias](&joined_alias);joined_alias=ea;}
+            else{let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(joined_alias,ea);free[ZTOwnAlias](&joined_alias);free[ZTOwnAlias](&ea);joined_alias=next_aliases;}
+            free[ZTOwnAlias](&basea);zt_alias_replace(aliases,joined_alias);out=joined;
+        }
+        else=>{}
+    }i=i+1;}return out;
+}
+
+// Calls are checked recursively so casts, aggregates, and nested calls cannot
+// launder an owned root past the explicit contract boundary.
+fn zt_check_owned_call(n:*Node,owned:ArrayList[[]u8],aliases:ArrayList[ZTOwnAlias],decls:ArrayList[*Node],context:[]u8)i32{
+    let errors:i32=0;
+    switch(n.*){
+        .call=>|c|{let name:[]u8=zt_direct_name(c.callee);let contracted:i32=((zt_owned_release_name(name)==1||@strEq(name,"_zag_realloc")||@strEq(name,"_zag_slice_ptr")||zt_compiler_nonretaining_call(name)==1||zt_fn_has_annot(decls,name,"@consumes")==1||zt_borrow_mode(decls,name)>0) as i32;let ai:i32=0;while(ai<c.args.len){let oi:i32=0;while(oi<owned.len){let root:[]u8=owned.data[oi];if(contracted==0&&zt_expr_uses_name(c.args.data[ai],root,aliases)==1){let shown:[]u8=name;if(shown.len==0){shown="<indirect>";}errors=errors+zt_machine_error(_zag_str_concat("owned allocation escapes through uncontracted call `",_zag_str_concat(shown,_zag_str_concat("` (root `",_zag_str_concat(root,"`)")))),context);}oi=oi+1;}errors=errors+zt_check_owned_call(c.args.data[ai],owned,aliases,decls,context);ai=ai+1;}}
+        .bin=>|x|{errors=errors+zt_check_owned_call(x.l,owned,aliases,decls,context)+zt_check_owned_call(x.r,owned,aliases,decls,context);}
+        .un=>|x|{errors=errors+zt_check_owned_call(x.e,owned,aliases,decls,context);}
+        .idx=>|x|{errors=errors+zt_check_owned_call(x.base,owned,aliases,decls,context)+zt_check_owned_call(x.idx,owned,aliases,decls,context);}
+        .fld=>|x|{errors=errors+zt_check_owned_call(x.base,owned,aliases,decls,context);}
+        .cast_=>|x|{errors=errors+zt_check_owned_call(x.expr,owned,aliases,decls,context);}
+        .slice_=>|x|{errors=errors+zt_check_owned_call(x.base,owned,aliases,decls,context)+zt_check_owned_call(x.lo,owned,aliases,decls,context)+zt_check_owned_call(x.hi,owned,aliases,decls,context);}
+        .slit_=>|x|{let i:i32=0;while(i<x.fields.len){errors=errors+zt_check_owned_call(x.fields.data[i].val,owned,aliases,decls,context);i=i+1;}}
+        else=>{}
+    }
+    return errors;
+}
+// Control expressions are call-capable too.  Check their arguments before
+// descending into branch bodies so an owner cannot escape only through a
+// condition or switch subject and then appear safely released afterwards.
+fn zt_check_owned_escapes_body(body:ArrayList[*Node],owned:ArrayList[[]u8],aliases:*ArrayList[ZTOwnAlias],decls:ArrayList[*Node],sums:ArrayList[ZTOwnSummary],context:[]u8)i32{
+    let errors:i32=0;let i:i32=0;while(i<body.len){switch(body.data[i].*){
+        .let_=>|l|{if(l.has_init==1){errors=errors+zt_check_owned_call(l.expr,owned,aliases.*,decls,context);if(zt_owned_acquire_name(l.expr,sums).len>0){zt_alias_set(aliases,l.name,l.name);}else{let source:[]u8=zt_expr_transparent_id(l.expr);if(source.len>0){zt_alias_set(aliases,l.name,zt_alias_root(aliases.*,source));}}}}
+        .assign=>|a|{errors=errors+zt_check_owned_call(a.expr,owned,aliases.*,decls,context);let target:[]u8=zt_expr_transparent_id(a.target);let source:[]u8=zt_expr_transparent_id(a.expr);if(target.len>0){if(zt_owned_acquire_name(a.expr,sums).len>0){zt_alias_set(aliases,target,target);}else if(source.len>0){zt_alias_set(aliases,target,zt_alias_root(aliases.*,source));}}}
+        .ret=>|r|{if(r.has_expr==1){errors=errors+zt_check_owned_call(r.expr,owned,aliases.*,decls,context);}}
+        .estmt=>|e|{errors=errors+zt_check_owned_call(e.expr,owned,aliases.*,decls,context);}
+        .unsafe_=>|u|{errors=errors+zt_check_owned_escapes_body(u.body,owned,aliases,decls,sums,context);}
+        .if_=>|x|{
+            errors=errors+zt_check_owned_call(x.cond,owned,aliases.*,decls,context);
+            let base:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);let ta:ArrayList[ZTOwnAlias]=zt_alias_clone(base);
+            errors=errors+zt_check_owned_escapes_body(x.then_body,owned,&ta,decls,sums,context);
+            let ea:ArrayList[ZTOwnAlias]=zt_alias_clone(base);if(x.has_els==1){errors=errors+zt_check_owned_escapes_body(x.els_body,owned,&ea,decls,sums,context);}
+            let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(ta,ea);
+            free[ZTOwnAlias](&base);free[ZTOwnAlias](&ta);free[ZTOwnAlias](&ea);zt_alias_replace(aliases,next_aliases);
+        }
+        .while_=>|x|{
+            errors=errors+zt_check_owned_call(x.cond,owned,aliases.*,decls,context);
+            let base:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);let wa:ArrayList[ZTOwnAlias]=zt_alias_clone(base);
+            errors=errors+zt_check_owned_escapes_body(x.body,owned,&wa,decls,sums,context);
+            let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(base,wa);
+            free[ZTOwnAlias](&base);free[ZTOwnAlias](&wa);zt_alias_replace(aliases,next_aliases);
+        }
+        .switch_=>|x|{
+            errors=errors+zt_check_owned_call(x.subject,owned,aliases.*,decls,context);
+            let base:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);let joined:ArrayList[ZTOwnAlias]=zt_alias_clone(base);
+            let have:i32=0;let ai:i32=0;
+            while(ai<x.arms.len){
+                let aa:ArrayList[ZTOwnAlias]=zt_alias_clone(base);
+                errors=errors+zt_check_owned_escapes_body(x.arms.data[ai].body,owned,&aa,decls,sums,context);
+                if(have==0){free[ZTOwnAlias](&joined);joined=aa;have=1;}
+                else{let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(joined,aa);free[ZTOwnAlias](&joined);free[ZTOwnAlias](&aa);joined=next_aliases;}
+                ai=ai+1;
+            }
+            let ea:ArrayList[ZTOwnAlias]=zt_alias_clone(base);errors=errors+zt_check_owned_escapes_body(x.els_body,owned,&ea,decls,sums,context);
+            if(have==0){free[ZTOwnAlias](&joined);joined=ea;}
+            else{let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(joined,ea);free[ZTOwnAlias](&joined);free[ZTOwnAlias](&ea);joined=next_aliases;}
+            free[ZTOwnAlias](&base);zt_alias_replace(aliases,joined);
+        }
+        else=>{}
+    }i=i+1;}return errors;
+}
+
+// Reject replacing a still-live owner. This is a fail-closed generation guard;
+// a later ownership IR can assign distinct origin IDs and permit proven reuse.
+fn zt_check_owner_state_body(body:ArrayList[*Node],live:*ArrayList[[]u8],aliases:*ArrayList[ZTOwnAlias],decls:ArrayList[*Node],sums:ArrayList[ZTOwnSummary],context:[]u8)i32{
+    let errors:i32=0;let i:i32=0;while(i<body.len){switch(body.data[i].*){
+        .let_=>|l|{if(l.has_init==1){if(zt_owned_acquire_name(l.expr,sums).len>0){let source:[]u8=zt_realloc_source_name(l.expr);if(source.len>0){zt_names_remove(live,zt_alias_root(aliases.*,source));}let old:[]u8=zt_alias_root(aliases.*,l.name);if(zt_in_names(live.*,old)==1){errors=errors+zt_machine_error(_zag_str_concat("live owned allocation `",_zag_str_concat(old,"` is overwritten before release or transfer")),context);}if(zt_in_names(live.*,l.name)==0){push[[]u8](live,l.name);}zt_alias_set(aliases,l.name,l.name);}else{let source:[]u8=zt_expr_transparent_id(l.expr);if(source.len>0){zt_alias_set(aliases,l.name,zt_alias_root(aliases.*,source));}}}}
+        .assign=>|a|{let target:[]u8=zt_expr_transparent_id(a.target);if(target.len>0){if(zt_owned_acquire_name(a.expr,sums).len>0){let source:[]u8=zt_realloc_source_name(a.expr);if(source.len>0){zt_names_remove(live,zt_alias_root(aliases.*,source));}let old:[]u8=zt_alias_root(aliases.*,target);if(zt_in_names(live.*,old)==1){errors=errors+zt_machine_error(_zag_str_concat("live owned allocation `",_zag_str_concat(old,"` is overwritten before release or transfer")),context);}if(zt_in_names(live.*,target)==0){push[[]u8](live,target);}zt_alias_set(aliases,target,target);}else{let source:[]u8=zt_expr_transparent_id(a.expr);if(source.len>0){zt_alias_set(aliases,target,zt_alias_root(aliases.*,source));}}}}
+        .ret=>|r|{if(r.has_expr==1){let root:[]u8=zt_owned_expr_root(r.expr,live.*,aliases.*);if(root.len>0){zt_names_remove(live,root);}}}
+        .estmt=>|e|{switch(e.expr.*){.call=>|c|{let name:[]u8=zt_direct_name(c.callee);if((zt_owned_release_name(name)==1&&c.args.len==1||zt_fn_has_annot(decls,name,"@consumes")==1&&c.args.len>0)){let root:[]u8=zt_owned_expr_root(c.args.data[0],live.*,aliases.*);if(root.len>0){zt_names_remove(live,root);}}}else=>{}}}
+        .unsafe_=>|u|{errors=errors+zt_check_owner_state_body(u.body,live,aliases,decls,sums,context);}
+        .if_=>|x|{
+            let base:ArrayList[[]u8]=zt_names_clone(live.*);let basea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);
+            let tl:ArrayList[[]u8]=zt_names_clone(base);let ta:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);
+            errors=errors+zt_check_owner_state_body(x.then_body,&tl,&ta,decls,sums,context);
+            let el:ArrayList[[]u8]=zt_names_clone(base);let ea:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);
+            if(x.has_els==1){errors=errors+zt_check_owner_state_body(x.els_body,&el,&ea,decls,sums,context);}
+            let next_live:ArrayList[[]u8]=zt_names_clone(tl);zt_names_merge(&next_live,el);
+            let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(ta,ea);
+            free[[]u8](&base);free[ZTOwnAlias](&basea);free[[]u8](&tl);free[ZTOwnAlias](&ta);free[[]u8](&el);free[ZTOwnAlias](&ea);
+            zt_names_replace(live,next_live);zt_alias_replace(aliases,next_aliases);
+        }
+        .while_=>|x|{
+            let base:ArrayList[[]u8]=zt_names_clone(live.*);let basea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);
+            let wl:ArrayList[[]u8]=zt_names_clone(base);let wa:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);
+            errors=errors+zt_check_owner_state_body(x.body,&wl,&wa,decls,sums,context);
+            let next_live:ArrayList[[]u8]=zt_names_clone(base);zt_names_merge(&next_live,wl);
+            let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(basea,wa);
+            free[[]u8](&base);free[ZTOwnAlias](&basea);free[[]u8](&wl);free[ZTOwnAlias](&wa);
+            zt_names_replace(live,next_live);zt_alias_replace(aliases,next_aliases);
+        }
+        .switch_=>|x|{
+            let base:ArrayList[[]u8]=zt_names_clone(live.*);let basea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);
+            let joined:ArrayList[[]u8]=make[[]u8](base.len+2);let joined_alias:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);
+            let have:i32=0;let ai:i32=0;
+            while(ai<x.arms.len){
+                let al:ArrayList[[]u8]=zt_names_clone(base);let aa:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);
+                errors=errors+zt_check_owner_state_body(x.arms.data[ai].body,&al,&aa,decls,sums,context);
+                zt_names_merge(&joined,al);free[[]u8](&al);
+                if(have==0){free[ZTOwnAlias](&joined_alias);joined_alias=aa;have=1;}
+                else{let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(joined_alias,aa);free[ZTOwnAlias](&joined_alias);free[ZTOwnAlias](&aa);joined_alias=next_aliases;}
+                ai=ai+1;
+            }
+            let el:ArrayList[[]u8]=zt_names_clone(base);let ea:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);
+            errors=errors+zt_check_owner_state_body(x.els_body,&el,&ea,decls,sums,context);
+            zt_names_merge(&joined,el);free[[]u8](&el);
+            if(have==0){free[ZTOwnAlias](&joined_alias);joined_alias=ea;}
+            else{let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(joined_alias,ea);free[ZTOwnAlias](&joined_alias);free[ZTOwnAlias](&ea);joined_alias=next_aliases;}
+            free[[]u8](&base);free[ZTOwnAlias](&basea);
+            zt_names_replace(live,joined);zt_alias_replace(aliases,joined_alias);
+        }
+        else=>{}
+    }i=i+1;}return errors;
+}
+
+fn zt_check_v2_direct_frees(decls:ArrayList[*Node],file:[]u8)i32{
+    if(@strEq(v2_project_edition(file),"2027")==0){return 0;}
+    let sums:ArrayList[ZTOwnSummary]=zt_build_owner_summaries(decls);
+    let errors:i32=zt_check_owner_summary_errors(decls,sums);let i:i32=0;
+    while(i<decls.len){switch(decls.data[i].*){
+        .fn_decl=>|f|{
+            let context:[]u8=_zag_str_concat("function ",f.name);
+            let consumes:i32=zt_fn_has_annot(decls,f.name,"@consumes");
+            let borrow:i32=zt_borrow_mode(decls,f.name);
+            if(consumes==1&&borrow>0){errors=errors+zt_machine_error("@consumes cannot be combined with a borrow contract",context);}
+            if(consumes==1&&f.params.len<1){errors=errors+zt_machine_error("@consumes requires a first owner parameter",context);}else if(consumes==1){let pi:i32=1;while(pi<f.params.len){if(zt_borrow_aux_scalar_type(f.params.data[pi].pty)==0){errors=errors+zt_machine_error("@consumes auxiliary parameters must be builtin scalars",context);}pi=pi+1;}}
+            let freed:ArrayList[[]u8]=make[[]u8](4);let aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);
+            errors=errors+zt_check_direct_free_body(f.body,&freed,&aliases,decls,sums,context);
+            free[[]u8](&freed);free[ZTOwnAlias](&aliases);
+            let owned:ArrayList[[]u8]=make[[]u8](4);let returned:ArrayList[[]u8]=make[[]u8](2);let transfer_aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);
+            if(consumes==1&&f.params.len>0&&f.is_extern==0){push[[]u8](&owned,f.params.data[0].name);zt_alias_set(&transfer_aliases,f.params.data[0].name,f.params.data[0].name);}
+            zt_collect_owned_body(f.body,&owned,&returned,&transfer_aliases,sums);
+            free[[]u8](&returned);free[ZTOwnAlias](&transfer_aliases);
+            let escape_aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);if(consumes==1&&f.params.len>0&&f.is_extern==0){zt_alias_set(&escape_aliases,f.params.data[0].name,f.params.data[0].name);}
+            errors=errors+zt_check_owned_escapes_body(f.body,owned,&escape_aliases,decls,sums,context);
+            free[ZTOwnAlias](&escape_aliases);
+            let live:ArrayList[[]u8]=make[[]u8](4);let state_aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);if(consumes==1&&f.params.len>0&&f.is_extern==0){push[[]u8](&live,f.params.data[0].name);zt_alias_set(&state_aliases,f.params.data[0].name,f.params.data[0].name);}
+            errors=errors+zt_check_owner_state_body(f.body,&live,&state_aliases,decls,sums,context);
+            free[[]u8](&live);free[ZTOwnAlias](&state_aliases);
+            let oi:i32=0;while(oi<owned.len){
+                let name:[]u8=owned.data[oi];let flow_aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);
+                if(consumes==1&&f.params.len>0&&f.is_extern==0){zt_alias_set(&flow_aliases,f.params.data[0].name,f.params.data[0].name);}
+                let terminal:i32=zt_owner_terminal_state(f.body,name,&flow_aliases,decls,sums,0);
+                free[ZTOwnAlias](&flow_aliases);
+                if(terminal==0){if(consumes==1&&f.params.len>0&&f.is_extern==0&&@strEq(name,f.params.data[0].name)){errors=errors+zt_machine_error(_zag_str_concat("@consumes parameter `",_zag_str_concat(name,"` is not released or transferred on every control-flow path")),context);}else{errors=errors+zt_machine_error(_zag_str_concat("owned allocation `",_zag_str_concat(name,"` is neither released nor returned")),context);}}
+                else if(terminal==2){if(consumes==1&&f.params.len>0&&f.is_extern==0&&@strEq(name,f.params.data[0].name)){errors=errors+zt_machine_error(_zag_str_concat("@consumes parameter `",_zag_str_concat(name,"` is not released or transferred on every control-flow path")),context);}else{errors=errors+zt_machine_error(_zag_str_concat("owned allocation `",_zag_str_concat(name,"` is not released or returned on every control-flow path")),context);}}
+                oi=oi+1;
+            }
+            free[[]u8](&owned);
+        }
+        else=>{}
+    }i=i+1;}
+    free[ZTOwnSummary](&sums);
+    return errors;
+}
+
+// ── edition-2027 stack-address return slice ───────────────────────────────
+// Native lowering represents `&local` as an address in the current frame.
+// Returning that address would therefore create a dangling pointer as soon as
+// the callee returns. This deliberately bounded pass proves direct local and
+// local-field addresses, direct aliases, and aggregate literals returned
+// through pointer-carrying structs or unions. The mutation-aware named-
+// container pass below owns aggregate aliases, field updates, and pass/store
+// escapes. Together they still do not claim arbitrary heap-graph provenance,
+// callback/global lifetime proof, or a complete lifetime system.
+//
+// A local whose lowered representation is already a pointer is excluded:
+// cg_lower_addr deliberately evaluates `&p` for a pointer local as the pointer
+// value that p denotes, not as the address of p's frame slot.
+fn zt_stack_alias_root(aliases:ArrayList[ZTOwnAlias],name:[]u8)[]u8{let i:i32=0;while(i<aliases.len){if(@strEq(aliases.data[i].name,name)){return aliases.data[i].root;}i=i+1;}return "";}
+fn zt_stack_local_has(locals:ArrayList[ZTBind],name:[]u8)i32{return (zt_env_get(locals,name).len>0) as i32;}
+// Looking for an address anywhere inside a scalar return expression is
+// unsound: `return p.*`, `return load(&x)`, and comparisons involving an
+// address all return copied scalar values, not the frame address itself.
+// Analyze raw pointers and aggregates whose declared representation can carry
+// one. Aggregate fields are followed through named struct/union declarations;
+// generic struct fields use the return type's explicit arguments. This is a
+// type-directed gate for the escape walk, not a complete layout computation.
+fn zt_stack_return_may_carry_address(ty0:[]u8,decls:ArrayList[*Node],depth:i32)i32{
+    if(depth>16){return 1;}
+    let ty:[]u8=ty0;
+    while(ty.len>0&&(ty[0]=='!'||ty[0]=='?')){ty=ty[1..];}
+    if(ty.len>0&&ty[0]=='*'){return 1;}
+    if(zt_starts(ty,"[]")==1){return 1;}
+    let base:[]u8=ty;
+    let args:ArrayList[[]u8]=make[[]u8](0);
+    if(is_generic_app(ty)){
+        let lb:i32=zt_find(ty,'[');
+        base=ty[0..lb];
+        free[[]u8](&args);
+        args=split_args(ty[lb+1..ty.len-1]);
+    }
+    let i:i32=0;
+    while(i<decls.len){
+        switch(decls.data[i].*){
+            .struct_=>|s|{
+                if(@strEq(s.name,base)){
+                    let carries:i32=0;let fi:i32=0;
+                    while(fi<s.fields.len&&carries==0){
+                        let field_ty:[]u8=zt_subst_type(s.fields.data[fi].pty,s.tparams,args);
+                        if(zt_stack_return_may_carry_address(field_ty,decls,depth+1)==1){carries=1;}
+                        fi=fi+1;
                     }
-                    else => { }
+                    free[[]u8](&args);
+                    return carries;
                 }
             }
-            .unsafe_ => |u| { errors = errors + zt_check_direct_free_body(u.body, freed, context); }
-            else => { }
+            .union_=>|u|{
+                if(@strEq(u.name,base)){
+                    let carries:i32=0;let fi:i32=0;
+                    while(fi<u.fields.len&&carries==0){
+                        if(zt_stack_return_may_carry_address(u.fields.data[fi].pty,decls,depth+1)==1){carries=1;}
+                        fi=fi+1;
+                    }
+                    free[[]u8](&args);
+                    return carries;
+                }
+            }
+            else=>{}
         }
-        i = i + 1;
+        i=i+1;
     }
+    free[[]u8](&args);
+    return 0;
+}
+fn zt_stack_addressable_local_root(n:*Node,locals:ArrayList[ZTBind])[]u8{switch(n.*){
+    .id=>|x|{if(zt_stack_local_has(locals,x.name)==1){return x.name;}}
+    .cast_=>|x|{return zt_stack_addressable_local_root(x.expr,locals);}
+    .fld=>|x|{return zt_stack_addressable_local_root(x.base,locals);}
+    else=>{}
+}return "";}
+fn zt_stack_direct_address_root(n:*Node,locals:ArrayList[ZTBind],aliases:ArrayList[ZTOwnAlias])[]u8{switch(n.*){
+    .id=>|x|{return zt_stack_alias_root(aliases,x.name);}
+    .cast_=>|x|{return zt_stack_direct_address_root(x.expr,locals,aliases);}
+    .un=>|x|{if(@strEq(x.op,"&")){return zt_stack_addressable_local_root(x.e,locals);}}
+    else=>{}
+}return "";}
+fn zt_stack_pointer_value_type(ty0:[]u8)i32{let ty:[]u8=ty0;while(ty.len>0&&(ty[0]=='!'||ty[0]=='?')){ty=ty[1..];}return ((ty.len>0&&ty[0]=='*')||zt_starts(ty,"[]")==1) as i32;}
+// Return expressions are searched recursively so a direct address cannot be
+// hidden by a cast, aggregate literal, or an immediately returned call result.
+// The latter is conservative: without an explicit non-escaping call contract,
+// the compiler cannot prove that a returned call does not forward its argument.
+fn zt_stack_return_address_root(n:*Node,locals:ArrayList[ZTBind],aliases:ArrayList[ZTOwnAlias])[]u8{let direct:[]u8=zt_stack_direct_address_root(n,locals,aliases);if(direct.len>0){return direct;}switch(n.*){
+    .bin=>|x|{let left:[]u8=zt_stack_return_address_root(x.l,locals,aliases);if(left.len>0){return left;}return zt_stack_return_address_root(x.r,locals,aliases);}
+    .un=>|x|{return zt_stack_return_address_root(x.e,locals,aliases);}
+    .call=>|x|{let callee:[]u8=zt_stack_return_address_root(x.callee,locals,aliases);if(callee.len>0){return callee;}let i:i32=0;while(i<x.args.len){let root:[]u8=zt_stack_return_address_root(x.args.data[i],locals,aliases);if(root.len>0){return root;}i=i+1;}}
+    .idx=>|x|{let base:[]u8=zt_stack_return_address_root(x.base,locals,aliases);if(base.len>0){return base;}return zt_stack_return_address_root(x.idx,locals,aliases);}
+    .fld=>|x|{return zt_stack_return_address_root(x.base,locals,aliases);}
+    .slice_=>|x|{let base:[]u8=zt_stack_return_address_root(x.base,locals,aliases);if(base.len>0){return base;}let lo:[]u8=zt_stack_return_address_root(x.lo,locals,aliases);if(lo.len>0){return lo;}if(x.has_hi==1){return zt_stack_return_address_root(x.hi,locals,aliases);}}
+    .slit_=>|x|{let i:i32=0;while(i<x.fields.len){let root:[]u8=zt_stack_return_address_root(x.fields.data[i].val,locals,aliases);if(root.len>0){return root;}i=i+1;}}
+    else=>{}
+}return "";}
+fn zt_check_stack_address_body(body:ArrayList[*Node],env:*ArrayList[ZTBind],locals:*ArrayList[ZTBind],aliases:*ArrayList[ZTOwnAlias],decls:ArrayList[*Node],context:[]u8)i32{
+    let errors:i32=0;let i:i32=0;while(i<body.len){switch(body.data[i].*){
+        .let_=>|l|{let ty:[]u8=l.dty;if(l.has_dty==0&&l.has_init==1){let inferred:ZTExpr=zt_expr_type(l.expr,env.*,decls,context);if(inferred.known==1){ty=inferred.ty;}}if(ty.len==0){ty="?";}if(l.has_init==1){let root:[]u8=zt_stack_direct_address_root(l.expr,locals.*,aliases.*);if(zt_stack_pointer_value_type(ty)==1){root=zt_stack_return_address_root(l.expr,locals.*,aliases.*);}zt_alias_set(aliases,l.name,root);}push[ZTBind](env,ZTBind{.name=l.name,.ty=ty});if(ty[0]!='*'){push[ZTBind](locals,ZTBind{.name=l.name,.ty=ty});}}
+        .assign=>|a|{let target:[]u8=zt_expr_transparent_id(a.target);if(target.len>0){let root:[]u8=zt_stack_direct_address_root(a.expr,locals.*,aliases.*);if(zt_stack_pointer_value_type(zt_env_get(env.*,target))==1){root=zt_stack_return_address_root(a.expr,locals.*,aliases.*);}zt_alias_set(aliases,target,root);}}
+        .ret=>|r|{if(r.has_expr==1){let root:[]u8=zt_stack_return_address_root(r.expr,locals.*,aliases.*);if(root.len>0){errors=errors+zt_machine_error(_zag_str_concat("address of local `",_zag_str_concat(root,"` escapes through return")),context);}}}
+        // unsafe is a lexical safety authority, not a lifetime escape hatch.
+        // Keep the current dataflow state so an outer alias assigned inside the
+        // block remains visible at the function return boundary.
+        .unsafe_=>|u|{errors=errors+zt_check_stack_address_body(u.body,env,locals,aliases,decls,context);}
+        .if_=>|x|{
+            let base_env:ArrayList[ZTBind]=zt_env_clone(env.*);let base_locals:ArrayList[ZTBind]=zt_env_clone(locals.*);let base_aliases:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);
+            let te:ArrayList[ZTBind]=zt_env_clone(base_env);let tl:ArrayList[ZTBind]=zt_env_clone(base_locals);let ta:ArrayList[ZTOwnAlias]=zt_alias_clone(base_aliases);
+            errors=errors+zt_check_stack_address_body(x.then_body,&te,&tl,&ta,decls,context);
+            let ee:ArrayList[ZTBind]=zt_env_clone(base_env);let el:ArrayList[ZTBind]=zt_env_clone(base_locals);let ea:ArrayList[ZTOwnAlias]=zt_alias_clone(base_aliases);
+            if(x.has_els==1){errors=errors+zt_check_stack_address_body(x.els_body,&ee,&el,&ea,decls,context);}
+            let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(ta,ea);
+            free[ZTBind](&base_env);free[ZTBind](&base_locals);free[ZTOwnAlias](&base_aliases);
+            free[ZTBind](&te);free[ZTBind](&tl);free[ZTOwnAlias](&ta);free[ZTBind](&ee);free[ZTBind](&el);free[ZTOwnAlias](&ea);
+            zt_alias_replace(aliases,next_aliases);
+        }
+        .while_=>|x|{
+            let base_env:ArrayList[ZTBind]=zt_env_clone(env.*);let base_locals:ArrayList[ZTBind]=zt_env_clone(locals.*);let base_aliases:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);
+            let we:ArrayList[ZTBind]=zt_env_clone(base_env);let wl:ArrayList[ZTBind]=zt_env_clone(base_locals);let wa:ArrayList[ZTOwnAlias]=zt_alias_clone(base_aliases);
+            errors=errors+zt_check_stack_address_body(x.body,&we,&wl,&wa,decls,context);
+            let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(base_aliases,wa);
+            free[ZTBind](&base_env);free[ZTBind](&base_locals);free[ZTOwnAlias](&base_aliases);
+            free[ZTBind](&we);free[ZTBind](&wl);free[ZTOwnAlias](&wa);zt_alias_replace(aliases,next_aliases);
+        }
+        .switch_=>|x|{
+            let base_env:ArrayList[ZTBind]=zt_env_clone(env.*);let base_locals:ArrayList[ZTBind]=zt_env_clone(locals.*);let base_aliases:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);
+            let joined:ArrayList[ZTOwnAlias]=zt_alias_clone(base_aliases);let have:i32=0;let ai:i32=0;
+            while(ai<x.arms.len){
+                let ae:ArrayList[ZTBind]=zt_env_clone(base_env);let al:ArrayList[ZTBind]=zt_env_clone(base_locals);let aa:ArrayList[ZTOwnAlias]=zt_alias_clone(base_aliases);
+                errors=errors+zt_check_stack_address_body(x.arms.data[ai].body,&ae,&al,&aa,decls,context);
+                free[ZTBind](&ae);free[ZTBind](&al);
+                if(have==0){free[ZTOwnAlias](&joined);joined=aa;have=1;}
+                else{let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(joined,aa);free[ZTOwnAlias](&joined);free[ZTOwnAlias](&aa);joined=next_aliases;}
+                ai=ai+1;
+            }
+            let ee:ArrayList[ZTBind]=zt_env_clone(base_env);let el:ArrayList[ZTBind]=zt_env_clone(base_locals);let ea:ArrayList[ZTOwnAlias]=zt_alias_clone(base_aliases);
+            if(x.has_els==1){errors=errors+zt_check_stack_address_body(x.els_body,&ee,&el,&ea,decls,context);}
+            free[ZTBind](&ee);free[ZTBind](&el);
+            if(have==0){free[ZTOwnAlias](&joined);joined=ea;}
+            else{let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(joined,ea);free[ZTOwnAlias](&joined);free[ZTOwnAlias](&ea);joined=next_aliases;}
+            free[ZTBind](&base_env);free[ZTBind](&base_locals);free[ZTOwnAlias](&base_aliases);zt_alias_replace(aliases,joined);
+        }
+        else=>{}
+    }i=i+1;}return errors;
+}
+fn zt_check_v2_stack_address_escapes(decls:ArrayList[*Node],file:[]u8)i32{
+    if(@strEq(v2_project_edition(file),"2027")==0){return 0;}
+    let errors:i32=0;let i:i32=0;
+    while(i<decls.len){switch(decls.data[i].*){
+        .fn_decl=>|f|{if(f.is_extern==0&&zt_stack_return_may_carry_address(f.ret,decls,0)==1){
+            let context:[]u8=_zag_str_concat("function ",f.name);let env:ArrayList[ZTBind]=make[ZTBind](f.params.len+8);
+            let pi:i32=0;while(pi<f.params.len){let p:Param=f.params.data[pi];push[ZTBind](&env,ZTBind{.name=p.name,.ty=p.pty});pi=pi+1;}
+            let locals:ArrayList[ZTBind]=make[ZTBind](4);let aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);
+            errors=errors+zt_check_stack_address_body(f.body,&env,&locals,&aliases,decls,context);
+            free[ZTBind](&env);free[ZTBind](&locals);free[ZTOwnAlias](&aliases);
+        }}
+        else=>{}
+    }i=i+1;}
     return errors;
 }
 
-fn zt_check_v2_direct_frees(decls: ArrayList[*Node], file: []u8) i32 {
-    if (@strEq(v2_project_edition(file), "2027") == 0) { return 0; }
-    let errors: i32 = 0; let i: i32 = 0;
-    while (i < len[*Node](decls)) {
-        switch (get[*Node](decls, i).*) {
-            .fn_decl => |f| { let freed: ArrayList[[]u8] = make[[]u8](4); errors = errors + zt_check_direct_free_body(f.body, &freed, _zag_str_concat("function ", f.name)); }
-            else => { }
-        }
-        i = i + 1;
+// ── edition-2027 mutation-aware aggregate provenance ──────────────────────
+// The direct ownership and stack-return passes above prove scalar names and
+// aggregate literals.  This pass preserves those proven roots after they are
+// stored in a named struct/union value.  Provenance is attached to a bounded
+// field path so a field overwrite clears only that field, a value copy keeps
+// an independent copy, and a whole-value overwrite clears the complete prior
+// value. Beyond 64 nested fields the entry is retained as uncertain at the
+// deepest proven prefix; only a whole/prefix overwrite can then clear it.
+//
+// kind 1 is an owned allocation root; kind 2 is a current-frame address root.
+// Elements are borrowed AST strings.  No source spelling is synthesized.
+struct ZTAggPath {
+    name: []u8,
+    node: i32,
+    depth: i32,
+    overflow: i32,
+}
+struct ZTAggPathNode { parent: i32, field: []u8 }
+struct ZTAggProv { path: ZTAggPath, root: []u8, kind: i32, uncertain: i32 }
+struct ZTAggFlow {
+    prov: ArrayList[ZTAggProv],
+    owners: ArrayList[[]u8],
+    owner_aliases: ArrayList[ZTOwnAlias],
+    freed: ArrayList[[]u8],
+    env: ArrayList[ZTBind],
+    locals: ArrayList[ZTBind],
+    stack_aliases: ArrayList[ZTOwnAlias],
+    containers: ArrayList[[]u8],
+    bindings: ArrayList[[]u8],
+}
+
+fn zt_agg_empty_path()ZTAggPath{return ZTAggPath{.name="",.node=-1,.depth=0,.overflow=0};}
+fn zt_agg_root_path(name:[]u8)ZTAggPath{return ZTAggPath{.name=name,.node=-1,.depth=0,.overflow=0};}
+fn zt_agg_path_append(arena:*ArrayList[ZTAggPathNode],p0:ZTAggPath,field:[]u8)ZTAggPath{
+    let p:ZTAggPath=p0;
+    if(p.name.len==0){return p;}
+    if(p.depth>=64){p.overflow=1;return p;}
+    let i:i32=0;while(i<arena.*.len){let x:ZTAggPathNode=arena.*.data[i];if(x.parent==p.node&&@strEq(x.field,field)){p.node=i;p.depth=p.depth+1;return p;}i=i+1;}
+    push[ZTAggPathNode](arena,ZTAggPathNode{.parent=p.node,.field=field});p.node=arena.*.len-1;p.depth=p.depth+1;
+    return p;
+}
+fn zt_agg_expr_path(n:*Node,arena:*ArrayList[ZTAggPathNode])ZTAggPath{
+    switch(n.*){
+        .id=>|x|{return zt_agg_root_path(x.name);}
+        .cast_=>|x|{return zt_agg_expr_path(x.expr,arena);}
+        .fld=>|x|{return zt_agg_path_append(arena,zt_agg_expr_path(x.base,arena),x.fname);}
+        else=>{}
     }
+    return zt_agg_empty_path();
+}
+fn zt_agg_path_prefix(arena:ArrayList[ZTAggPathNode],a:ZTAggPath,b:ZTAggPath)i32{
+    if(a.name.len==0||b.name.len==0||@strEq(a.name,b.name)==0||a.depth>b.depth){return 0;}
+    let bn:i32=b.node;let skip:i32=b.depth-a.depth;let i:i32=0;while(i<skip){bn=arena.data[bn].parent;i=i+1;}
+    let an:i32=a.node;while(an>=0&&bn>=0){if(@strEq(arena.data[an].field,arena.data[bn].field)==0){return 0;}an=arena.data[an].parent;bn=arena.data[bn].parent;}
+    if(an!=bn){return 0;}
+    return 1;
+}
+fn zt_agg_path_equal(arena:ArrayList[ZTAggPathNode],a:ZTAggPath,b:ZTAggPath)i32{
+    if(a.depth!=b.depth||a.overflow!=b.overflow){return 0;}
+    return zt_agg_path_prefix(arena,a,b);
+}
+fn zt_agg_prov_clone(src:ArrayList[ZTAggProv])ArrayList[ZTAggProv]{let out:ArrayList[ZTAggProv]=make[ZTAggProv](src.len+1);let i:i32=0;while(i<src.len){push[ZTAggProv](&out,src.data[i]);i=i+1;}return out;}
+fn zt_agg_prov_has(dst:ArrayList[ZTAggProv],x:ZTAggProv,arena:ArrayList[ZTAggPathNode])i32{let i:i32=0;while(i<dst.len){let y:ZTAggProv=dst.data[i];if(y.kind==x.kind&&y.uncertain==x.uncertain&&@strEq(y.root,x.root)&&zt_agg_path_equal(arena,y.path,x.path)==1){return 1;}i=i+1;}return 0;}
+fn zt_agg_prov_merge(dst:*ArrayList[ZTAggProv],src:ArrayList[ZTAggProv],arena:ArrayList[ZTAggPathNode])void{let i:i32=0;while(i<src.len){if(zt_agg_prov_has(dst.*,src.data[i],arena)==0){push[ZTAggProv](dst,src.data[i]);}i=i+1;}}
+fn zt_agg_prov_replace(dst:*ArrayList[ZTAggProv],next:ArrayList[ZTAggProv])void{free[ZTAggProv](dst);dst.*=next;}
+fn zt_agg_prov_clear(prov:*ArrayList[ZTAggProv],target:ZTAggPath,arena:ArrayList[ZTAggPathNode])void{
+    if(target.name.len==0){return;}
+    let i:i32=0;
+    while(i<prov.*.len){
+        let entry:ZTAggProv=prov.*.data[i];
+        // An overflowed field write is not a proven complete overwrite. Keep
+        // the earlier entry so later escape checking remains fail closed.
+        if(target.overflow==0&&zt_agg_path_prefix(arena,target,entry.path)==1){
+            let j:i32=i;while(j+1<prov.*.len){prov.*.data[j]=prov.*.data[j+1];j=j+1;}prov.*.len=prov.*.len-1;
+        }else{i=i+1;}
+    }
+}
+fn zt_agg_prov_root(prov:ArrayList[ZTAggProv],path:ZTAggPath,kind:i32,arena:ArrayList[ZTAggPathNode])[]u8{
+    if(path.name.len==0){return "";}
+    let i:i32=0;while(i<prov.len){let x:ZTAggProv=prov.data[i];if(x.kind==kind&&(zt_agg_path_prefix(arena,path,x.path)==1||zt_agg_path_prefix(arena,x.path,path)==1)){return x.root;}i=i+1;}return "";
+}
+fn zt_agg_expr_stored_root(n:*Node,prov:ArrayList[ZTAggProv],kind:i32,arena:*ArrayList[ZTAggPathNode])[]u8{
+    let path:ZTAggPath=zt_agg_expr_path(n,arena);let direct:[]u8=zt_agg_prov_root(prov,path,kind,arena.*);if(direct.len>0){return direct;}
+    switch(n.*){
+        .bin=>|x|{let l:[]u8=zt_agg_expr_stored_root(x.l,prov,kind,arena);if(l.len>0){return l;}return zt_agg_expr_stored_root(x.r,prov,kind,arena);}
+        .un=>|x|{return zt_agg_expr_stored_root(x.e,prov,kind,arena);}
+        .call=>|x|{let i:i32=0;while(i<x.args.len){let root:[]u8=zt_agg_expr_stored_root(x.args.data[i],prov,kind,arena);if(root.len>0){return root;}i=i+1;}}
+        .idx=>|x|{let b:[]u8=zt_agg_expr_stored_root(x.base,prov,kind,arena);if(b.len>0){return b;}return zt_agg_expr_stored_root(x.idx,prov,kind,arena);}
+        .slice_=>|x|{let b:[]u8=zt_agg_expr_stored_root(x.base,prov,kind,arena);if(b.len>0){return b;}let lo:[]u8=zt_agg_expr_stored_root(x.lo,prov,kind,arena);if(lo.len>0){return lo;}if(x.has_hi==1){return zt_agg_expr_stored_root(x.hi,prov,kind,arena);}}
+        .slit_=>|x|{let i:i32=0;while(i<x.fields.len){let root:[]u8=zt_agg_expr_stored_root(x.fields.data[i].val,prov,kind,arena);if(root.len>0){return root;}i=i+1;}}
+        else=>{}
+    }
+    return "";
+}
+fn zt_agg_expr_has_stored_root(n:*Node,prov:ArrayList[ZTAggProv],kind:i32,wanted:[]u8,arena:*ArrayList[ZTAggPathNode])i32{
+    let path:ZTAggPath=zt_agg_expr_path(n,arena);
+    if(path.name.len>0){let i:i32=0;while(i<prov.len){let x:ZTAggProv=prov.data[i];if(x.kind==kind&&@strEq(x.root,wanted)&&(zt_agg_path_prefix(arena.*,path,x.path)==1||zt_agg_path_prefix(arena.*,x.path,path)==1)){return 1;}i=i+1;}}
+    switch(n.*){
+        .bin=>|x|{return zt_agg_expr_has_stored_root(x.l,prov,kind,wanted,arena)|zt_agg_expr_has_stored_root(x.r,prov,kind,wanted,arena);}
+        .un=>|x|{return zt_agg_expr_has_stored_root(x.e,prov,kind,wanted,arena);}
+        .call=>|x|{let i:i32=0;while(i<x.args.len){if(zt_agg_expr_has_stored_root(x.args.data[i],prov,kind,wanted,arena)==1){return 1;}i=i+1;}}
+        .idx=>|x|{return zt_agg_expr_has_stored_root(x.base,prov,kind,wanted,arena)|zt_agg_expr_has_stored_root(x.idx,prov,kind,wanted,arena);}
+        .slice_=>|x|{if(zt_agg_expr_has_stored_root(x.base,prov,kind,wanted,arena)==1||zt_agg_expr_has_stored_root(x.lo,prov,kind,wanted,arena)==1){return 1;}if(x.has_hi==1){return zt_agg_expr_has_stored_root(x.hi,prov,kind,wanted,arena);}}
+        .slit_=>|x|{let i:i32=0;while(i<x.fields.len){if(zt_agg_expr_has_stored_root(x.fields.data[i].val,prov,kind,wanted,arena)==1){return 1;}i=i+1;}}
+        else=>{}
+    }
+    return 0;
+}
+fn zt_agg_type_is_value(ty:[]u8,decls:ArrayList[*Node])i32{
+    if(ty.len==0||ty[0]=='*'||ty[0]=='?'||ty[0]=='!'||zt_starts(ty,"[]")==1){return 0;}
+    let base:[]u8=ty;if(is_generic_app(ty)){let lb:i32=zt_find(ty,'[');base=ty[0..lb];}
+    let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.struct_=>|s|{if(@strEq(s.name,base)){return 1;}}.union_=>|u|{if(@strEq(u.name,base)){return 1;}}else=>{}}i=i+1;}
+    return 0;
+}
+fn zt_agg_add_entry(prov:*ArrayList[ZTAggProv],path:ZTAggPath,root:[]u8,kind:i32,uncertain:i32,arena:ArrayList[ZTAggPathNode])void{
+    if(path.name.len==0||root.len==0){return;}
+    let x:ZTAggProv=ZTAggProv{.path=path,.root=root,.kind=kind,.uncertain=uncertain|path.overflow};
+    if(zt_agg_prov_has(prov.*,x,arena)==0){push[ZTAggProv](prov,x);}
+}
+fn zt_agg_remap_suffix(arena:*ArrayList[ZTAggPathNode],src_depth:i32,node:i32,depth:i32,dst0:ZTAggPath)ZTAggPath{
+    let dst:ZTAggPath=dst0;
+    if(depth<=src_depth||node<0){return dst;}
+    let item:ZTAggPathNode=arena.*.data[node];
+    dst=zt_agg_remap_suffix(arena,src_depth,item.parent,depth-1,dst);
+    return zt_agg_path_append(arena,dst,item.field);
+}
+fn zt_agg_remap_path(arena:*ArrayList[ZTAggPathNode],src:ZTAggPath,dst:ZTAggPath,value:ZTAggPath)ZTAggPath{
+    let out:ZTAggPath=zt_agg_remap_suffix(arena,src.depth,value.node,value.depth,dst);
+    if(src.overflow==1||value.overflow==1){out.overflow=1;}
+    return out;
+}
+fn zt_agg_write_expr(flow:*ZTAggFlow,target:ZTAggPath,n:*Node,old:ArrayList[ZTAggProv],sums:ArrayList[ZTOwnSummary],context:[]u8,arena:*ArrayList[ZTAggPathNode])i32{
+    let errors:i32=0;
+    let source:ZTAggPath=zt_agg_expr_path(n,arena);
+    if(source.name.len>0){
+        let i:i32=0;while(i<old.len){let x:ZTAggProv=old.data[i];if(zt_agg_path_prefix(arena.*,source,x.path)==1){zt_agg_add_entry(&flow.*.prov,zt_agg_remap_path(arena,source,target,x.path),x.root,x.kind,x.uncertain,arena.*);}i=i+1;}
+    }
+    switch(n.*){
+        .cast_=>|x|{errors=errors+zt_agg_write_expr(flow,target,x.expr,old,sums,context,arena);}
+        .slit_=>|x|{let i:i32=0;while(i<x.fields.len){errors=errors+zt_agg_write_expr(flow,zt_agg_path_append(arena,target,x.fields.data[i].name),x.fields.data[i].val,old,sums,context,arena);i=i+1;}}
+        else=>{
+            let owner:[]u8=zt_owned_expr_root(n,flow.*.owners,flow.*.owner_aliases);
+            if(owner.len>0){zt_agg_add_entry(&flow.*.prov,target,owner,1,0,arena.*);}
+            let stack:[]u8=zt_stack_direct_address_root(n,flow.*.locals,flow.*.stack_aliases);
+            if(stack.len>0){zt_agg_add_entry(&flow.*.prov,target,stack,2,0,arena.*);}
+            if(target.depth>0&&zt_owned_acquire_name(n,sums).len>0){
+                zt_agg_add_entry(&flow.*.prov,target,"<unnamed-aggregate-owner>",1,1,arena.*);
+                errors=errors+zt_machine_error("owned allocation stored in an aggregate requires a named owner binding",context);
+            }
+        }
+    }
+    return errors;
+}
+fn zt_agg_assign_value(flow:*ZTAggFlow,target:ZTAggPath,n:*Node,sums:ArrayList[ZTOwnSummary],context:[]u8,arena:*ArrayList[ZTAggPathNode])i32{
+    let old:ArrayList[ZTAggProv]=zt_agg_prov_clone(flow.*.prov);
+    zt_agg_prov_clear(&flow.*.prov,target,arena.*);
+    let errors:i32=zt_agg_write_expr(flow,target,n,old,sums,context,arena);
+    free[ZTAggProv](&old);
+    return errors;
+}
+fn zt_agg_flow_new(cap:i32)ZTAggFlow{return ZTAggFlow{
+    .prov=make[ZTAggProv](cap),.owners=make[[]u8](cap),.owner_aliases=make[ZTOwnAlias](cap),.freed=make[[]u8](cap),
+    .env=make[ZTBind](cap),.locals=make[ZTBind](cap),.stack_aliases=make[ZTOwnAlias](cap),.containers=make[[]u8](cap),.bindings=make[[]u8](cap),
+};}
+fn zt_agg_flow_clone(src:ZTAggFlow)ZTAggFlow{return ZTAggFlow{
+    .prov=zt_agg_prov_clone(src.prov),.owners=zt_names_clone(src.owners),.owner_aliases=zt_alias_clone(src.owner_aliases),.freed=zt_names_clone(src.freed),
+    .env=zt_env_clone(src.env),.locals=zt_env_clone(src.locals),.stack_aliases=zt_alias_clone(src.stack_aliases),.containers=zt_names_clone(src.containers),.bindings=zt_names_clone(src.bindings),
+};}
+fn zt_agg_flow_free(flow:*ZTAggFlow)void{
+    free[ZTAggProv](&flow.*.prov);free[[]u8](&flow.*.owners);free[ZTOwnAlias](&flow.*.owner_aliases);free[[]u8](&flow.*.freed);
+    free[ZTBind](&flow.*.env);free[ZTBind](&flow.*.locals);free[ZTOwnAlias](&flow.*.stack_aliases);free[[]u8](&flow.*.containers);free[[]u8](&flow.*.bindings);
+}
+fn zt_agg_flow_join(base:ZTAggFlow,a:ZTAggFlow,b:ZTAggFlow,arena:ArrayList[ZTAggPathNode])ZTAggFlow{
+    let out:ZTAggFlow=zt_agg_flow_clone(base);
+    let prov:ArrayList[ZTAggProv]=make[ZTAggProv](a.prov.len+b.prov.len+1);zt_agg_prov_merge(&prov,a.prov,arena);zt_agg_prov_merge(&prov,b.prov,arena);zt_agg_prov_replace(&out.prov,prov);
+    let owners:ArrayList[[]u8]=make[[]u8](a.owners.len+b.owners.len+1);zt_names_merge(&owners,a.owners);zt_names_merge(&owners,b.owners);zt_names_replace(&out.owners,owners);
+    let freed:ArrayList[[]u8]=make[[]u8](a.freed.len+b.freed.len+1);zt_names_merge(&freed,a.freed);zt_names_merge(&freed,b.freed);zt_names_replace(&out.freed,freed);
+    let owner_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(a.owner_aliases,b.owner_aliases);zt_alias_replace(&out.owner_aliases,owner_aliases);
+    let stack_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(a.stack_aliases,b.stack_aliases);zt_alias_replace(&out.stack_aliases,stack_aliases);
+    return out;
+}
+fn zt_agg_flow_replace(dst:*ZTAggFlow,next:ZTAggFlow)void{zt_agg_flow_free(dst);dst.*=next;}
+fn zt_agg_check_freed_expr(n:*Node,flow:ZTAggFlow,context:[]u8,arena:*ArrayList[ZTAggPathNode])i32{
+    let errors:i32=0;let i:i32=0;while(i<flow.freed.len){let root:[]u8=flow.freed.data[i];if(root.len>0&&zt_agg_expr_has_stored_root(n,flow.prov,1,root,arena)==1){errors=errors+zt_machine_error(_zag_str_concat("use after free of named allocation `",_zag_str_concat(root,"`")),context);}i=i+1;}return errors;
+}
+fn zt_agg_mark_released(flow:*ZTAggFlow,root:[]u8)void{if(root.len==0){return;}if(zt_in_names(flow.*.freed,root)==0){push[[]u8](&flow.*.freed,root);}zt_names_remove(&flow.*.owners,root);}
+fn zt_agg_exact_consumable_root(prov:ArrayList[ZTAggProv],path:ZTAggPath,arena:ArrayList[ZTAggPathNode])[]u8{
+    if(path.name.len==0||path.depth==0||path.overflow==1){return "";}
+    let root:[]u8="";let found:i32=0;let i:i32=0;
+    while(i<prov.len){let x:ZTAggProv=prov.data[i];if(x.kind==1&&(zt_agg_path_prefix(arena,path,x.path)==1||zt_agg_path_prefix(arena,x.path,path)==1)){
+        if(x.uncertain==1||zt_agg_path_equal(arena,path,x.path)==0){return "";}
+        if(found==1&&@strEq(root,x.root)==0){return "";}root=x.root;found=1;
+    }i=i+1;}
+    return root;
+}
+fn zt_agg_check_calls(n:*Node,flow:*ZTAggFlow,decls:ArrayList[*Node],context:[]u8,arena:*ArrayList[ZTAggPathNode])i32{
+    let errors:i32=0;
+    switch(n.*){
+        .call=>|c|{
+            let ai:i32=0;while(ai<c.args.len){errors=errors+zt_agg_check_calls(c.args.data[ai],flow,decls,context,arena);ai=ai+1;}
+            let name:[]u8=zt_direct_name(c.callee);let borrow:i32=zt_borrow_mode(decls,name);
+            let consumes:i32=((zt_owned_release_name(name)==1||zt_fn_has_annot(decls,name,"@consumes")==1) as i32);
+            ai=0;while(ai<c.args.len){
+                let owner:[]u8=zt_agg_expr_stored_root(c.args.data[ai],flow.*.prov,1,arena);
+                let stack:[]u8=zt_agg_expr_stored_root(c.args.data[ai],flow.*.prov,2,arena);
+                if(owner.len>0){
+                    if(consumes==1&&c.args.len>0){
+                        let path:ZTAggPath=zt_agg_expr_path(c.args.data[ai],arena);
+                        let exact:[]u8=zt_agg_exact_consumable_root(flow.*.prov,path,arena.*);
+                        if(exact.len>0){
+                            if(zt_in_names(flow.*.freed,exact)==1){errors=errors+zt_machine_error("double free of aggregate-stored allocation",context);}else{zt_agg_mark_released(flow,exact);}
+                        }else{errors=errors+zt_machine_error(_zag_str_concat("aggregate ownership transfer is not explicit (root `",_zag_str_concat(owner,"`)")),context);}
+                    }else if(borrow==0){
+                        let shown:[]u8=name;if(shown.len==0){shown="<indirect>";}
+                        errors=errors+zt_machine_error(_zag_str_concat("owned allocation escapes through uncontracted call `",_zag_str_concat(shown,_zag_str_concat("` (root `",_zag_str_concat(owner,"`)")))),context);
+                    }
+                }
+                if(stack.len>0&&borrow==0){
+                    let shown:[]u8=name;if(shown.len==0){shown="<indirect>";}
+                    errors=errors+zt_machine_error(_zag_str_concat("address of local `",_zag_str_concat(stack,_zag_str_concat("` escapes through aggregate argument to uncontracted call `",_zag_str_concat(shown,"`")))),context);
+                }
+                ai=ai+1;
+            }
+            if(consumes==1&&c.args.len>0){
+                let direct:[]u8=zt_owned_expr_root(c.args.data[0],flow.*.owners,flow.*.owner_aliases);
+                if(direct.len>0){zt_agg_mark_released(flow,direct);}
+            }
+        }
+        .bin=>|x|{errors=errors+zt_agg_check_calls(x.l,flow,decls,context,arena)+zt_agg_check_calls(x.r,flow,decls,context,arena);}
+        .un=>|x|{errors=errors+zt_agg_check_calls(x.e,flow,decls,context,arena);}
+        .idx=>|x|{errors=errors+zt_agg_check_calls(x.base,flow,decls,context,arena)+zt_agg_check_calls(x.idx,flow,decls,context,arena);}
+        .fld=>|x|{errors=errors+zt_agg_check_calls(x.base,flow,decls,context,arena);}
+        .cast_=>|x|{errors=errors+zt_agg_check_calls(x.expr,flow,decls,context,arena);}
+        .slice_=>|x|{errors=errors+zt_agg_check_calls(x.base,flow,decls,context,arena)+zt_agg_check_calls(x.lo,flow,decls,context,arena);if(x.has_hi==1){errors=errors+zt_agg_check_calls(x.hi,flow,decls,context,arena);}}
+        .slit_=>|x|{let i:i32=0;while(i<x.fields.len){errors=errors+zt_agg_check_calls(x.fields.data[i].val,flow,decls,context,arena);i=i+1;}}
+        else=>{}
+    }
+    return errors;
+}
+fn zt_agg_nonlocal_store(n:*Node,target:ZTAggPath,flow:ZTAggFlow,context:[]u8,arena:*ArrayList[ZTAggPathNode])i32{
+    let owner:[]u8=zt_agg_expr_stored_root(n,flow.prov,1,arena);if(owner.len==0){owner=zt_owned_expr_root(n,flow.owners,flow.owner_aliases);}
+    if(owner.len==0){let oi:i32=0;while(oi<flow.owners.len&&owner.len==0){if(zt_expr_uses_name(n,flow.owners.data[oi],flow.owner_aliases)==1){owner=flow.owners.data[oi];}oi=oi+1;}}
+    let stack:[]u8=zt_agg_expr_stored_root(n,flow.prov,2,arena);if(stack.len==0){stack=zt_stack_return_address_root(n,flow.locals,flow.stack_aliases);}
+    let local:i32=(target.name.len>0&&((target.depth==0&&zt_in_names(flow.bindings,target.name)==1)||zt_in_names(flow.containers,target.name)==1)) as i32;
+    if(local==1){return 0;}
+    let errors:i32=0;
+    if(owner.len>0){errors=errors+zt_machine_error(_zag_str_concat("owned allocation escapes through non-local aggregate store (root `",_zag_str_concat(owner,"`)")),context);}
+    if(stack.len>0){errors=errors+zt_machine_error(_zag_str_concat("address of local `",_zag_str_concat(stack,"` escapes through non-local aggregate store")),context);}
+    return errors;
+}
+fn zt_agg_check_body(body:ArrayList[*Node],flow:*ZTAggFlow,decls:ArrayList[*Node],sums:ArrayList[ZTOwnSummary],context:[]u8,arena:*ArrayList[ZTAggPathNode])i32{
+    let errors:i32=0;let i:i32=0;
+    while(i<body.len){switch(body.data[i].*){
+        .let_=>|l|{
+            if(l.has_init==1){errors=errors+zt_agg_check_freed_expr(l.expr,flow.*,context,arena)+zt_agg_check_calls(l.expr,flow,decls,context,arena);}
+            let ty:[]u8=l.dty;if(l.has_dty==0&&l.has_init==1){let inferred:ZTExpr=zt_expr_type(l.expr,flow.*.env,decls,context);if(inferred.known==1){ty=inferred.ty;}}
+            if(ty.len==0){ty="?";}push[ZTBind](&flow.*.env,ZTBind{.name=l.name,.ty=ty});
+            if(zt_in_names(flow.*.bindings,l.name)==0){push[[]u8](&flow.*.bindings,l.name);}
+            if(ty[0]!='*'){push[ZTBind](&flow.*.locals,ZTBind{.name=l.name,.ty=ty});}
+            if(zt_agg_type_is_value(ty,decls)==1){if(zt_in_names(flow.*.containers,l.name)==0){push[[]u8](&flow.*.containers,l.name);}if(l.has_init==1){errors=errors+zt_agg_assign_value(flow,zt_agg_root_path(l.name),l.expr,sums,context,arena);}}
+            else if(l.has_init==1&&(zt_agg_expr_stored_root(l.expr,flow.*.prov,1,arena).len>0||zt_agg_expr_stored_root(l.expr,flow.*.prov,2,arena).len>0)){errors=errors+zt_agg_assign_value(flow,zt_agg_root_path(l.name),l.expr,sums,context,arena);}
+            if(l.has_init==1){
+                if(zt_owned_acquire_name(l.expr,sums).len>0){if(zt_in_names(flow.*.owners,l.name)==0){push[[]u8](&flow.*.owners,l.name);}zt_alias_set(&flow.*.owner_aliases,l.name,l.name);}
+                else{let source:[]u8=zt_expr_transparent_id(l.expr);if(source.len>0){zt_alias_set(&flow.*.owner_aliases,l.name,zt_alias_root(flow.*.owner_aliases,source));}}
+                zt_alias_set(&flow.*.stack_aliases,l.name,zt_stack_direct_address_root(l.expr,flow.*.locals,flow.*.stack_aliases));
+            }
+        }
+        .assign=>|a|{
+            errors=errors+zt_agg_check_freed_expr(a.expr,flow.*,context,arena)+zt_agg_check_calls(a.expr,flow,decls,context,arena);
+            let target:ZTAggPath=zt_agg_expr_path(a.target,arena);
+            errors=errors+zt_agg_nonlocal_store(a.expr,target,flow.*,context,arena);
+            if(target.name.len>0&&zt_in_names(flow.*.containers,target.name)==1){errors=errors+zt_agg_assign_value(flow,target,a.expr,sums,context,arena);}
+            let direct:[]u8=zt_expr_transparent_id(a.target);
+            if(direct.len>0){
+                if(zt_in_names(flow.*.containers,direct)==0){
+                    if(zt_agg_expr_stored_root(a.expr,flow.*.prov,1,arena).len>0||zt_agg_expr_stored_root(a.expr,flow.*.prov,2,arena).len>0){errors=errors+zt_agg_assign_value(flow,zt_agg_root_path(direct),a.expr,sums,context,arena);}
+                    else{zt_agg_prov_clear(&flow.*.prov,zt_agg_root_path(direct),arena.*);}
+                }
+                if(zt_owned_acquire_name(a.expr,sums).len>0){if(zt_in_names(flow.*.owners,direct)==0){push[[]u8](&flow.*.owners,direct);}zt_alias_set(&flow.*.owner_aliases,direct,direct);}
+                else{let source:[]u8=zt_expr_transparent_id(a.expr);if(source.len>0){zt_alias_set(&flow.*.owner_aliases,direct,zt_alias_root(flow.*.owner_aliases,source));}}
+                zt_alias_set(&flow.*.stack_aliases,direct,zt_stack_direct_address_root(a.expr,flow.*.locals,flow.*.stack_aliases));
+            }
+        }
+        .ret=>|r|{if(r.has_expr==1){
+            errors=errors+zt_agg_check_freed_expr(r.expr,flow.*,context,arena)+zt_agg_check_calls(r.expr,flow,decls,context,arena);
+            let owner:[]u8=zt_agg_expr_stored_root(r.expr,flow.*.prov,1,arena);if(owner.len>0){errors=errors+zt_machine_error(_zag_str_concat("owned allocation stored in an aggregate escapes through return (root `",_zag_str_concat(owner,"`)")),context);}
+            let stack:[]u8=zt_agg_expr_stored_root(r.expr,flow.*.prov,2,arena);if(stack.len>0){errors=errors+zt_machine_error(_zag_str_concat("address of local `",_zag_str_concat(stack,"` escapes through return")),context);}
+        }}
+        .estmt=>|e|{errors=errors+zt_agg_check_freed_expr(e.expr,flow.*,context,arena)+zt_agg_check_calls(e.expr,flow,decls,context,arena);}
+        .unsafe_=>|u|{errors=errors+zt_agg_check_body(u.body,flow,decls,sums,context,arena);}
+        .if_=>|x|{
+            errors=errors+zt_agg_check_freed_expr(x.cond,flow.*,context,arena)+zt_agg_check_calls(x.cond,flow,decls,context,arena);
+            let base:ZTAggFlow=zt_agg_flow_clone(flow.*);let then_flow:ZTAggFlow=zt_agg_flow_clone(base);errors=errors+zt_agg_check_body(x.then_body,&then_flow,decls,sums,context,arena);
+            let else_flow:ZTAggFlow=zt_agg_flow_clone(base);if(x.has_els==1){errors=errors+zt_agg_check_body(x.els_body,&else_flow,decls,sums,context,arena);}
+            let joined:ZTAggFlow=zt_agg_flow_join(base,then_flow,else_flow,arena.*);
+            zt_agg_flow_free(&base);zt_agg_flow_free(&then_flow);zt_agg_flow_free(&else_flow);zt_agg_flow_replace(flow,joined);
+        }
+        .while_=>|x|{
+            errors=errors+zt_agg_check_freed_expr(x.cond,flow.*,context,arena)+zt_agg_check_calls(x.cond,flow,decls,context,arena);
+            let base:ZTAggFlow=zt_agg_flow_clone(flow.*);let loop_flow:ZTAggFlow=zt_agg_flow_clone(base);errors=errors+zt_agg_check_body(x.body,&loop_flow,decls,sums,context,arena);
+            let joined:ZTAggFlow=zt_agg_flow_join(base,base,loop_flow,arena.*);
+            zt_agg_flow_free(&base);zt_agg_flow_free(&loop_flow);zt_agg_flow_replace(flow,joined);
+        }
+        .switch_=>|x|{
+            errors=errors+zt_agg_check_freed_expr(x.subject,flow.*,context,arena)+zt_agg_check_calls(x.subject,flow,decls,context,arena);
+            let base:ZTAggFlow=zt_agg_flow_clone(flow.*);let joined:ZTAggFlow=zt_agg_flow_clone(base);let ai:i32=0;
+            while(ai<x.arms.len){let arm:ZTAggFlow=zt_agg_flow_clone(base);errors=errors+zt_agg_check_body(x.arms.data[ai].body,&arm,decls,sums,context,arena);let next:ZTAggFlow=zt_agg_flow_join(base,joined,arm,arena.*);zt_agg_flow_free(&joined);zt_agg_flow_free(&arm);joined=next;ai=ai+1;}
+            if(x.has_els==1){let els:ZTAggFlow=zt_agg_flow_clone(base);errors=errors+zt_agg_check_body(x.els_body,&els,decls,sums,context,arena);let next:ZTAggFlow=zt_agg_flow_join(base,joined,els,arena.*);zt_agg_flow_free(&joined);zt_agg_flow_free(&els);joined=next;}
+            zt_agg_flow_free(&base);zt_agg_flow_replace(flow,joined);
+        }
+        else=>{}
+    }i=i+1;}
+    return errors;
+}
+fn zt_check_v2_aggregate_provenance(decls:ArrayList[*Node],file:[]u8)i32{
+    if(@strEq(v2_project_edition(file),"2027")==0){return 0;}
+    let sums:ArrayList[ZTOwnSummary]=zt_build_owner_summaries(decls);let errors:i32=0;let i:i32=0;
+    while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(f.is_extern==0){
+        let flow:ZTAggFlow=zt_agg_flow_new(f.params.len+8);let arena:ArrayList[ZTAggPathNode]=make[ZTAggPathNode](16);let pi:i32=0;while(pi<f.params.len){let p:Param=f.params.data[pi];push[ZTBind](&flow.env,ZTBind{.name=p.name,.ty=p.pty});pi=pi+1;}
+        if(zt_fn_has_annot(decls,f.name,"@consumes")==1&&f.params.len>0){let root:[]u8=f.params.data[0].name;push[[]u8](&flow.owners,root);zt_alias_set(&flow.owner_aliases,root,root);}
+        errors=errors+zt_agg_check_body(f.body,&flow,decls,sums,_zag_str_concat("function ",f.name),&arena);
+        zt_agg_flow_free(&flow);free[ZTAggPathNode](&arena);
+    }}else=>{}}i=i+1;}
+    free[ZTOwnSummary](&sums);
+    return errors;
+}
+
+// ── edition-2027 explicit borrow-contract slice ───────────────────────────
+// Contracts are deliberately opt-in.  @borrows declares that the first named
+// parameter is shared/read-only.  @borrows_mut permits mutation by the callee;
+// when its result is bound to a local, that local is an escaping exclusive
+// borrow for the remainder of this function.  We have no lexical end-borrow
+// syntax yet, so retaining that exclusive state is conservative: callers must
+// not use the owner (or a non-borrow alias) while it remains active.
+//
+// This pass is edition-2027 only.  It does not reinterpret ordinary pointers
+// or calls in 2026 projects, and it never assumes an unknown call borrows.
+struct ZTBorrowAlias { name: []u8, root: []u8, mode: i32 }
+fn zt_borrow_replace(dst:*ArrayList[ZTBorrowAlias],next:ArrayList[ZTBorrowAlias])void{free[ZTBorrowAlias](dst);dst.*=next;}
+fn zt_borrow_mode(decls:ArrayList[*Node],name:[]u8)i32{if(zt_fn_has_annot(decls,name,"@borrows_mut")==1){return 2;}if(zt_fn_has_annot(decls,name,"@borrows")==1){return 1;}return 0;}
+// A borrow contract has exactly one tracked owner: parameter zero. Later
+// parameters may tune that operation only when they are plain builtin scalar
+// values, so they cannot carry a second owner, borrowed pointer, aggregate, or
+// callback across the contract boundary.
+fn zt_borrow_aux_scalar_type(ty:[]u8)i32{
+    if(ty.len==0||@strEq(ty,"void")){return 0;}
+    if(ty[0]=='*'||ty[0]=='?'||ty[0]=='!'||zt_starts(ty,"[]")==1||zt_starts(ty,"fn(")==1){return 0;}
+    return zt_is_builtin(ty);
+}
+fn zt_borrow_alias_mode(borrows:ArrayList[ZTBorrowAlias],name:[]u8)i32{let i:i32=0;while(i<borrows.len){if(@strEq(borrows.data[i].name,name)){return borrows.data[i].mode;}i=i+1;}return 0;}
+fn zt_borrow_alias_root(borrows:ArrayList[ZTBorrowAlias],name:[]u8)[]u8{let i:i32=0;while(i<borrows.len){if(@strEq(borrows.data[i].name,name)){return borrows.data[i].root;}i=i+1;}return name;}
+fn zt_borrow_set(borrows:*ArrayList[ZTBorrowAlias],name:[]u8,root:[]u8,mode:i32)void{let i:i32=0;while(i<borrows.*.len){if(@strEq(borrows.*.data[i].name,name)){borrows.*.data[i]=ZTBorrowAlias{.name=name,.root=root,.mode=mode};return;}i=i+1;}push[ZTBorrowAlias](borrows,ZTBorrowAlias{.name=name,.root=root,.mode=mode});}
+fn zt_borrow_clone(borrows:ArrayList[ZTBorrowAlias])ArrayList[ZTBorrowAlias]{let out:ArrayList[ZTBorrowAlias]=make[ZTBorrowAlias](borrows.len+1);let i:i32=0;while(i<borrows.len){push[ZTBorrowAlias](&out,borrows.data[i]);i=i+1;}return out;}
+fn zt_borrow_agree(a:ArrayList[ZTBorrowAlias],b:ArrayList[ZTBorrowAlias])ArrayList[ZTBorrowAlias]{let out:ArrayList[ZTBorrowAlias]=make[ZTBorrowAlias](a.len+b.len+1);let i:i32=0;while(i<a.len){let x:ZTBorrowAlias=a.data[i];if(zt_borrow_alias_mode(b,x.name)==x.mode&&@strEq(zt_borrow_alias_root(b,x.name),x.root)){zt_borrow_set(&out,x.name,x.root,x.mode);}i=i+1;}i=0;while(i<b.len){let x:ZTBorrowAlias=b.data[i];if(zt_borrow_alias_mode(a,x.name)==x.mode&&@strEq(zt_borrow_alias_root(a,x.name),x.root)){zt_borrow_set(&out,x.name,x.root,x.mode);}i=i+1;}return out;}
+fn zt_borrow_root_has(borrows:ArrayList[ZTBorrowAlias],root:[]u8,mode:i32)i32{let i:i32=0;while(i<borrows.len){if(borrows.data[i].mode==mode&&@strEq(borrows.data[i].root,root)){return 1;}i=i+1;}return 0;}
+fn zt_borrow_expr_root(n:*Node,aliases:ArrayList[ZTOwnAlias],borrows:ArrayList[ZTBorrowAlias])[]u8{let name:[]u8=zt_expr_transparent_id(n);if(name.len==0){return "";}let b:[]u8=zt_borrow_alias_root(borrows,name);return zt_alias_root(aliases,b);}
+fn zt_borrowed_expr_root(n:*Node,decls:ArrayList[*Node],aliases:ArrayList[ZTOwnAlias],borrows:ArrayList[ZTBorrowAlias])[]u8{
+    switch(n.*){
+        .id=>|x|{let root:[]u8=zt_alias_root(aliases,zt_borrow_alias_root(borrows,x.name));if(zt_borrow_alias_mode(borrows,x.name)>0||zt_borrow_root_has(borrows,root,1)==1||zt_borrow_root_has(borrows,root,2)==1){return root;}}
+        .cast_=>|x|{return zt_borrowed_expr_root(x.expr,decls,aliases,borrows);}
+        .un=>|x|{return zt_borrowed_expr_root(x.e,decls,aliases,borrows);}
+        .fld=>|x|{return zt_borrowed_expr_root(x.base,decls,aliases,borrows);}
+        .idx=>|x|{return zt_borrowed_expr_root(x.base,decls,aliases,borrows);}
+        .slice_=>|x|{return zt_borrowed_expr_root(x.base,decls,aliases,borrows);}
+        .bin=>|x|{let l:[]u8=zt_borrowed_expr_root(x.l,decls,aliases,borrows);if(l.len>0){return l;}return zt_borrowed_expr_root(x.r,decls,aliases,borrows);}
+        .slit_=>|x|{let i:i32=0;while(i<x.fields.len){let root:[]u8=zt_borrowed_expr_root(x.fields.data[i].val,decls,aliases,borrows);if(root.len>0){return root;}i=i+1;}}
+        .call=>|x|{let mode:i32=zt_borrow_mode(decls,zt_direct_name(x.callee));if(mode>0&&x.args.len>0){let root:[]u8=zt_borrow_expr_root(x.args.data[0],aliases,borrows);if(root.len>0){return root;}}let i:i32=0;while(i<x.args.len){let root:[]u8=zt_borrowed_expr_root(x.args.data[i],decls,aliases,borrows);if(root.len>0){return root;}i=i+1;}}
+        else=>{}
+    }
+    return "";
+}
+fn zt_check_active_borrow_expr(n:*Node,aliases:ArrayList[ZTOwnAlias],borrows:ArrayList[ZTBorrowAlias],context:[]u8)i32{switch(n.*){.id=>|x|{let root:[]u8=zt_alias_root(aliases,zt_borrow_alias_root(borrows,x.name));if(zt_borrow_root_has(borrows,root,2)==1&&zt_borrow_alias_mode(borrows,x.name)!=2){return zt_machine_error(_zag_str_concat("owner `",_zag_str_concat(root,"` is unavailable while an exclusive mutable borrow is active")),context);}}.bin=>|x|{return zt_check_active_borrow_expr(x.l,aliases,borrows,context)+zt_check_active_borrow_expr(x.r,aliases,borrows,context);}.un=>|x|{return zt_check_active_borrow_expr(x.e,aliases,borrows,context);}.call=>|x|{let errors:i32=zt_check_active_borrow_expr(x.callee,aliases,borrows,context);let i:i32=0;while(i<x.args.len){errors=errors+zt_check_active_borrow_expr(x.args.data[i],aliases,borrows,context);i=i+1;}return errors;}.idx=>|x|{return zt_check_active_borrow_expr(x.base,aliases,borrows,context)+zt_check_active_borrow_expr(x.idx,aliases,borrows,context);}.fld=>|x|{return zt_check_active_borrow_expr(x.base,aliases,borrows,context);}.cast_=>|x|{return zt_check_active_borrow_expr(x.expr,aliases,borrows,context);}.slice_=>|x|{return zt_check_active_borrow_expr(x.base,aliases,borrows,context)+zt_check_active_borrow_expr(x.lo,aliases,borrows,context)+zt_check_active_borrow_expr(x.hi,aliases,borrows,context);}.slit_=>|x|{let errors:i32=0;let i:i32=0;while(i<x.fields.len){errors=errors+zt_check_active_borrow_expr(x.fields.data[i].val,aliases,borrows,context);i=i+1;}return errors;}else=>{}}return 0;}
+fn zt_check_borrow_write(n:*Node,aliases:ArrayList[ZTOwnAlias],borrows:ArrayList[ZTBorrowAlias],context:[]u8)i32{switch(n.*){.id=>|x|{let root:[]u8=zt_alias_root(aliases,zt_borrow_alias_root(borrows,x.name));let mode:i32=zt_borrow_alias_mode(borrows,x.name);if(mode==1){return zt_machine_error("cannot mutate through a shared borrow",context);}if(zt_borrow_root_has(borrows,root,2)==1&&mode!=2){return zt_machine_error(_zag_str_concat("cannot mutate owner `",_zag_str_concat(root,"` while an exclusive mutable borrow is active")),context);}if(zt_borrow_root_has(borrows,root,1)==1&&mode!=2){return zt_machine_error(_zag_str_concat("cannot mutate owner `",_zag_str_concat(root,"` while a shared borrow is active")),context);}}.fld=>|x|{return zt_check_borrow_write(x.base,aliases,borrows,context);}.idx=>|x|{return zt_check_borrow_write(x.base,aliases,borrows,context);}.un=>|x|{return zt_check_borrow_write(x.e,aliases,borrows,context);}else=>{}}return 0;}
+fn zt_call_borrow_mode(n:*Node,decls:ArrayList[*Node])i32{switch(n.*){.call=>|c|{return zt_borrow_mode(decls,zt_direct_name(c.callee));}.cast_=>|c|{return zt_call_borrow_mode(c.expr,decls);}else=>{}}return 0;}
+fn zt_call_borrow_root(n:*Node,decls:ArrayList[*Node],aliases:ArrayList[ZTOwnAlias],borrows:ArrayList[ZTBorrowAlias])[]u8{switch(n.*){.call=>|c|{if(zt_borrow_mode(decls,zt_direct_name(c.callee))>0&&c.args.len>0){return zt_borrow_expr_root(c.args.data[0],aliases,borrows);}}.cast_=>|c|{return zt_call_borrow_root(c.expr,decls,aliases,borrows);}else=>{}}return "";}
+fn zt_check_borrow_call(n:*Node,decls:ArrayList[*Node],aliases:ArrayList[ZTOwnAlias],borrows:ArrayList[ZTBorrowAlias],context:[]u8)i32{
+    let errors:i32=0;
+    switch(n.*){
+        .call=>|c|{
+            let ai:i32=0;while(ai<c.args.len){errors=errors+zt_check_borrow_call(c.args.data[ai],decls,aliases,borrows,context);ai=ai+1;}
+            let name:[]u8=zt_direct_name(c.callee);let mode:i32=zt_borrow_mode(decls,name);let argi:i32=0;
+            while(argi<c.args.len){let root:[]u8=zt_borrowed_expr_root(c.args.data[argi],decls,aliases,borrows);if(root.len>0){if(zt_fn_has_annot(decls,name,"@consumes")==1||zt_owned_release_name(name)==1){errors=errors+zt_machine_error(_zag_str_concat("cannot pass a borrow to a consuming call (root `",_zag_str_concat(root,"`)")),context);}else if(mode==0&&zt_compiler_nonretaining_call(name)==0){let shown:[]u8=name;if(shown.len==0){shown="<indirect>";}errors=errors+zt_machine_error(_zag_str_concat("borrowed value `",_zag_str_concat(root,_zag_str_concat("` escapes through uncontracted call `",_zag_str_concat(shown,"`")))),context);}}argi=argi+1;}
+            if(mode>0){if(c.args.len<1){errors=errors+zt_machine_error("borrow contract requires a first named owner argument",context);}else{let arg:[]u8=zt_expr_transparent_id(c.args.data[0]);if(arg.len==0){errors=errors+zt_machine_error("borrow contract requires a named owner argument",context);}else{let root:[]u8=zt_borrow_expr_root(c.args.data[0],aliases,borrows);let existing:i32=zt_borrow_alias_mode(borrows,arg);if(mode==2&&(existing==1||zt_borrow_root_has(borrows,root,1)==1)){errors=errors+zt_machine_error("cannot create an exclusive mutable borrow while a shared borrow is active",context);}if(mode==2&&zt_borrow_root_has(borrows,root,2)==1&&existing!=2){errors=errors+zt_machine_error("cannot create a second exclusive mutable borrow while one is active",context);}}}}
+        }
+        .bin=>|x|{errors=errors+zt_check_borrow_call(x.l,decls,aliases,borrows,context)+zt_check_borrow_call(x.r,decls,aliases,borrows,context);}
+        .un=>|x|{errors=errors+zt_check_borrow_call(x.e,decls,aliases,borrows,context);}
+        .idx=>|x|{errors=errors+zt_check_borrow_call(x.base,decls,aliases,borrows,context)+zt_check_borrow_call(x.idx,decls,aliases,borrows,context);}
+        .fld=>|x|{errors=errors+zt_check_borrow_call(x.base,decls,aliases,borrows,context);}
+        .cast_=>|x|{errors=errors+zt_check_borrow_call(x.expr,decls,aliases,borrows,context);}
+        .slice_=>|x|{errors=errors+zt_check_borrow_call(x.base,decls,aliases,borrows,context)+zt_check_borrow_call(x.lo,decls,aliases,borrows,context)+zt_check_borrow_call(x.hi,decls,aliases,borrows,context);}
+        .slit_=>|x|{let i:i32=0;while(i<x.fields.len){errors=errors+zt_check_borrow_call(x.fields.data[i].val,decls,aliases,borrows,context);i=i+1;}}
+        else=>{}
+    }
+    return errors;
+}
+fn zt_contract_param_name(f:FnDecl)[]u8{if(f.params.len==0){return "";}return f.params.data[0].name;}
+fn zt_check_borrow_body(body:ArrayList[*Node],aliases:*ArrayList[ZTOwnAlias],borrows:*ArrayList[ZTBorrowAlias],decls:ArrayList[*Node],context:[]u8)i32{
+    let errors:i32=0;let i:i32=0;
+    while(i<body.len){switch(body.data[i].*){
+        .let_=>|l|{if(l.has_init==1){
+            errors=errors+zt_check_active_borrow_expr(l.expr,aliases.*,borrows.*,context)+zt_check_borrow_call(l.expr,decls,aliases.*,borrows.*,context);
+            let source:[]u8=zt_expr_transparent_id(l.expr);
+            // A local copy of a borrow is still that same borrow.  Recording
+            // this prevents an alias from laundering a borrowed value into an
+            // @consumes call or release operation.
+            if(source.len>0){let root:[]u8=zt_alias_root(aliases.*,zt_borrow_alias_root(borrows.*,source));zt_alias_set(aliases,l.name,root);let copied_mode:i32=zt_borrow_alias_mode(borrows.*,source);if(copied_mode>0){zt_borrow_set(borrows,l.name,root,copied_mode);}}
+            let mode:i32=zt_call_borrow_mode(l.expr,decls);
+            if(mode>0){let root:[]u8=zt_call_borrow_root(l.expr,decls,aliases.*,borrows.*);if(root.len>0){zt_borrow_set(borrows,l.name,root,mode);zt_alias_set(aliases,l.name,root);}}
+        }}
+        .ret=>|r|{if(r.has_expr==1){errors=errors+zt_check_active_borrow_expr(r.expr,aliases.*,borrows.*,context)+zt_check_borrow_call(r.expr,decls,aliases.*,borrows.*,context);}}
+        .assign=>|a|{errors=errors+zt_check_active_borrow_expr(a.expr,aliases.*,borrows.*,context)+zt_check_borrow_call(a.expr,decls,aliases.*,borrows.*,context)+zt_check_borrow_write(a.target,aliases.*,borrows.*,context);let target:[]u8=zt_expr_transparent_id(a.target);if(target.len>0){let source:[]u8=zt_expr_transparent_id(a.expr);if(source.len>0){let root:[]u8=zt_alias_root(aliases.*,zt_borrow_alias_root(borrows.*,source));zt_alias_set(aliases,target,root);zt_borrow_set(borrows,target,root,zt_borrow_alias_mode(borrows.*,source));}let mode:i32=zt_call_borrow_mode(a.expr,decls);if(mode>0){let root:[]u8=zt_call_borrow_root(a.expr,decls,aliases.*,borrows.*);if(root.len>0){zt_borrow_set(borrows,target,root,mode);zt_alias_set(aliases,target,root);}}}}
+        .estmt=>|e|{errors=errors+zt_check_active_borrow_expr(e.expr,aliases.*,borrows.*,context)+zt_check_borrow_call(e.expr,decls,aliases.*,borrows.*,context);switch(e.expr.*){.call=>|c|{let name:[]u8=zt_direct_name(c.callee);if(zt_owned_release_name(name)==1&&c.args.len==1){if(zt_borrow_alias_mode(borrows.*,zt_expr_transparent_id(c.args.data[0]))>0){errors=errors+zt_machine_error("cannot release through a borrow",context);}else{errors=errors+zt_check_borrow_write(c.args.data[0],aliases.*,borrows.*,context);}}}else=>{}}}
+        .unsafe_=>|u|{errors=errors+zt_check_borrow_body(u.body,aliases,borrows,decls,context);}
+        .if_=>|x|{
+            errors=errors+zt_check_active_borrow_expr(x.cond,aliases.*,borrows.*,context);
+            let basea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);let baseb:ArrayList[ZTBorrowAlias]=zt_borrow_clone(borrows.*);
+            let ta:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);let tb:ArrayList[ZTBorrowAlias]=zt_borrow_clone(baseb);
+            errors=errors+zt_check_borrow_body(x.then_body,&ta,&tb,decls,context);
+            let ea:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);let eb:ArrayList[ZTBorrowAlias]=zt_borrow_clone(baseb);
+            if(x.has_els==1){errors=errors+zt_check_borrow_body(x.els_body,&ea,&eb,decls,context);}
+            let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(ta,ea);let next_borrows:ArrayList[ZTBorrowAlias]=zt_borrow_agree(tb,eb);
+            free[ZTOwnAlias](&basea);free[ZTBorrowAlias](&baseb);free[ZTOwnAlias](&ta);free[ZTBorrowAlias](&tb);free[ZTOwnAlias](&ea);free[ZTBorrowAlias](&eb);
+            zt_alias_replace(aliases,next_aliases);zt_borrow_replace(borrows,next_borrows);
+        }
+        .while_=>|x|{
+            errors=errors+zt_check_active_borrow_expr(x.cond,aliases.*,borrows.*,context);
+            let basea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);let baseb:ArrayList[ZTBorrowAlias]=zt_borrow_clone(borrows.*);
+            let wa:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);let wb:ArrayList[ZTBorrowAlias]=zt_borrow_clone(baseb);
+            errors=errors+zt_check_borrow_body(x.body,&wa,&wb,decls,context);
+            let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(basea,wa);let next_borrows:ArrayList[ZTBorrowAlias]=zt_borrow_agree(baseb,wb);
+            free[ZTOwnAlias](&basea);free[ZTBorrowAlias](&baseb);free[ZTOwnAlias](&wa);free[ZTBorrowAlias](&wb);
+            zt_alias_replace(aliases,next_aliases);zt_borrow_replace(borrows,next_borrows);
+        }
+        .switch_=>|s|{
+            errors=errors+zt_check_active_borrow_expr(s.subject,aliases.*,borrows.*,context);
+            let basea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);let baseb:ArrayList[ZTBorrowAlias]=zt_borrow_clone(borrows.*);
+            let ja:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);let jb:ArrayList[ZTBorrowAlias]=zt_borrow_clone(baseb);
+            let have:i32=0;let ai:i32=0;
+            while(ai<s.arms.len){
+                let aa:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);let ab:ArrayList[ZTBorrowAlias]=zt_borrow_clone(baseb);
+                errors=errors+zt_check_borrow_body(s.arms.data[ai].body,&aa,&ab,decls,context);
+                if(have==0){free[ZTOwnAlias](&ja);ja=aa;free[ZTBorrowAlias](&jb);jb=ab;have=1;}
+                else{
+                    let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(ja,aa);free[ZTOwnAlias](&ja);free[ZTOwnAlias](&aa);ja=next_aliases;
+                    let next_borrows:ArrayList[ZTBorrowAlias]=zt_borrow_agree(jb,ab);free[ZTBorrowAlias](&jb);free[ZTBorrowAlias](&ab);jb=next_borrows;
+                }
+                ai=ai+1;
+            }
+            let ea:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);let eb:ArrayList[ZTBorrowAlias]=zt_borrow_clone(baseb);
+            errors=errors+zt_check_borrow_body(s.els_body,&ea,&eb,decls,context);
+            if(have==0){free[ZTOwnAlias](&ja);ja=ea;free[ZTBorrowAlias](&jb);jb=eb;}
+            else{
+                let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(ja,ea);free[ZTOwnAlias](&ja);free[ZTOwnAlias](&ea);ja=next_aliases;
+                let next_borrows:ArrayList[ZTBorrowAlias]=zt_borrow_agree(jb,eb);free[ZTBorrowAlias](&jb);free[ZTBorrowAlias](&eb);jb=next_borrows;
+            }
+            free[ZTOwnAlias](&basea);free[ZTBorrowAlias](&baseb);
+            zt_alias_replace(aliases,ja);zt_borrow_replace(borrows,jb);
+        }
+        else=>{}
+    }i=i+1;}return errors;
+}
+fn zt_check_v2_borrow_contracts(decls:ArrayList[*Node],file:[]u8)i32{
+    if(@strEq(v2_project_edition(file),"2027")==0){return 0;}
+    let errors:i32=0;let i:i32=0;
+    while(i<decls.len){switch(decls.data[i].*){
+        .fn_decl=>|f|{
+            let context:[]u8=_zag_str_concat("function ",f.name);
+            let shared:i32=zt_fn_has_annot(decls,f.name,"@borrows");let mutable:i32=zt_fn_has_annot(decls,f.name,"@borrows_mut");let mode:i32=zt_borrow_mode(decls,f.name);
+            let aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);let borrows:ArrayList[ZTBorrowAlias]=make[ZTBorrowAlias](4);
+            if(shared==1&&mutable==1){errors=errors+zt_machine_error("@borrows cannot be combined with @borrows_mut",context);}
+            if(mode>0){
+                if(f.params.len<1){errors=errors+zt_machine_error("borrow contract requires a first owner parameter",context);}
+                else{
+                    let pi:i32=1;
+                    while(pi<f.params.len){if(zt_borrow_aux_scalar_type(f.params.data[pi].pty)==0){errors=errors+zt_machine_error("borrow contract auxiliary parameters must be builtin scalars",context);}pi=pi+1;}
+                    let param:[]u8=zt_contract_param_name(f);zt_borrow_set(&borrows,param,param,mode);zt_alias_set(&aliases,param,param);
+                }
+            }
+            errors=errors+zt_check_borrow_body(f.body,&aliases,&borrows,decls,context);
+            free[ZTOwnAlias](&aliases);free[ZTBorrowAlias](&borrows);
+        }
+        else=>{}
+    }i=i+1;}
+    return errors;
+}
+
+// Capturing closures own a heap environment and enter the edition-2027
+// ownership flow: a scalar capture by value may be returned/transferred or
+// released with `close` on every path. Pointer captures retain a defining-frame
+// address and remain fail-closed. Native lowering also rejects aggregate
+// captures until nested heap copies have a destruction protocol.
+fn zt_check_v2_closure_lifetimes(decls:ArrayList[*Node],file:[]u8)i32{
+    if(@strEq(v2_project_edition(file),"2027")==0){return 0;}
+    let errors:i32=0;let i:i32=0;
+    while(i<decls.len){switch(decls.data[i].*){
+        .fn_decl=>|f|{if(f.caps>0&&zt_find(f.cap_names,'*')>=0){errors=errors+zt_machine_error("capturing pointer closure requires an explicit v2 lifetime contract",_zag_str_concat("closure ",f.name));}}
+        else=>{}
+    }i=i+1;}
     return errors;
 }
 
@@ -860,6 +2328,7 @@ fn typed_check_program(decls0: ArrayList[*Node], file: []u8) i32 {
                     errors = errors + zt_validate_type(get[Param](u.fields, fi).pty, decls, none, context);
                     fi = fi + 1;
                 }
+                free[[]u8](&none);
             }
             .fn_decl => |f| {
                 let context: []u8 = _zag_str_concat("function ", f.name);
@@ -875,9 +2344,16 @@ fn typed_check_program(decls0: ArrayList[*Node], file: []u8) i32 {
         }
         i = i + 1;
     }
+    errors = errors + zt_check_globals(decls0, file);
+    errors = errors + zt_check_v2_cabi_declarations(decls0, file);
     errors = errors + zt_check_expressions(decls0);
     errors = errors + zt_check_machine_control(decls0);
     errors = errors + zt_check_v2_direct_frees(decls0, file);
+    errors = errors + zt_check_v2_stack_address_escapes(decls0, file);
+    errors = errors + zt_check_v2_aggregate_provenance(decls0, file);
+    errors = errors + zt_check_v2_borrow_contracts(decls0, file);
+    errors = errors + zt_check_v2_closure_lifetimes(decls0, file);
+    free[[]u8](&decls);
     if (errors > 0) {
         _zag_eprintln(_zag_str_concat(_zag_str_concat("znc: typed declaration check FAILED for ", file),
                                      _zag_str_concat(" (errors=", _zag_str_concat(_zag_i64_to_str(errors as i64), ")"))));

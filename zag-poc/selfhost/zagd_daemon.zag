@@ -8,6 +8,9 @@
 @import("zagd_incremental.zag")
 @import("zagd_benchmark.zag")
 @import("zagd_profile.zag")
+@import("planner_authority.zag")
+@import("zagd_identity.zag")
+@import("native/x86_cpu_profile.zag")
 @import("semantic_manifest_format.zag")
 @import("version.zag")
 
@@ -15,19 +18,53 @@ extern fn _zag_read_file(path: []u8) []u8
 extern fn _zag_write_file(path: []u8, content: []u8) i32
 extern fn _zag_file_exists(path: []u8) i32
 extern fn _zag_exec_cmd(command: []u8) i32
+extern fn _zag_allocator_allocation_count() i64
+extern fn _zag_allocator_live_bytes() i64
+extern fn _zag_allocator_peak_live_bytes() i64
+
+fn zagd_apply_memory_limit(bytes:i64)i32 {
+    // Linux x86-64 setrlimit(RLIMIT_AS, &{soft,hard}). A daemon is advisory,
+    // so it must be contained by the configured process address-space budget
+    // instead of competing with foreground applications until the OOM killer
+    // intervenes.
+    let limits:ArrayList[i64]=make[i64](2);
+    limits.data[0]=bytes;limits.data[1]=bytes;
+    let applied:i32=(_zag_raw_syscall(160,9,limits.data as i64,0,0,0,0)==0) as i32;
+    free[i64](&limits);
+    return applied;
+}
 
 struct ZagdWatch { wd: i64, path: []u8 }
 struct ZagdFileState { path: []u8, hash: ZagdHash, facts:ZagdSourceFacts, exists: i32 }
+// Cache maintenance is advisory, but it must be observable: a missing
+// advisory record must never be mistaken for a successful foreground result.
+struct ZagdCacheTrim { outcome:i32, bytes_before:i64, bytes_after:i64 }
 
 fn zagd_incremental_file(path:[]u8,source:[]u8,facts:ZagdSourceFacts)ZagdIncrementalFile{return zagd_incremental_extract(path,source,facts,"linux-x86_64-generic");}
-fn zagd_incremental_path(root:[]u8)[]u8{return zagd_join_path(zagd_join_path(zagd_join_path(root,".zag-cache"),"zagd"),"incremental.record");}
-fn zagd_persist_incremental(root:[]u8,index:ZagdIncrementalIndex)i32{let payload:[]u8=zagd_incremental_index_encode(index);if(payload.len==0){return 0;}let final:[]u8=zagd_incremental_path(root);return zagd_store_transaction(_zag_str_concat(final,".tmp"),final,payload);}
-fn zagd_incremental_index_reused(index:ZagdIncrementalIndex)i32{if(index.valid!=1||index.advisory!=1||index.executable_authority!=0){return 0;}let i:i32=0;while(i<index.files.len){let file:ZagdIncrementalFile=index.files.data[i];if(file.valid==1&&_zag_file_exists(file.path)==1&&zagd_hash_equal(zagd_content_hash(_zag_read_file(file.path)),file.content)==1){return 1;}i=i+1;}return 0;}
+fn zagd_incremental_copy_names(file:*ZagdIncrementalFile)void{file.*.path=zagd_text_clone(file.*.path);let i:i32=0;while(i<file.*.declarations.len){file.*.declarations.data[i].name=zagd_text_clone(file.*.declarations.data[i].name);i=i+1;}}
+fn zagd_incremental_free_owned_file(file:*ZagdIncrementalFile)void{if(file.*.valid==1){zagd_text_free(file.*.path);let i:i32=0;while(i<file.*.declarations.len){zagd_text_free(file.*.declarations.data[i].name);i=i+1;}}free[ZagdDeclFingerprint](&file.*.declarations);}
+fn zagd_incremental_put_owned(index:*ZagdIncrementalIndex,file:ZagdIncrementalFile)void{let found:i32=zagd_incremental_index_find(index.*,file.path);if(found<0){push[ZagdIncrementalFile](&index.*.files,file);}else{zagd_incremental_free_owned_file(&index.*.files.data[found]);index.*.files.data[found]=file;}}
+fn zagd_incremental_remove_owned(index:*ZagdIncrementalIndex,path:[]u8)i32{let found:i32=zagd_incremental_index_find(index.*,path);if(found<0){return 0;}zagd_incremental_free_owned_file(&index.*.files.data[found]);let i:i32=found;while(i+1<index.*.files.len){index.*.files.data[i]=index.*.files.data[i+1];i=i+1;}index.*.files.len=index.*.files.len-1;return 1;}
+fn zagd_incremental_free_owned_index(index:*ZagdIncrementalIndex)void{let i:i32=0;while(i<index.*.files.len){zagd_incremental_free_owned_file(&index.*.files.data[i]);i=i+1;}free[ZagdIncrementalFile](&index.*.files);}
+// Decoded paths and declaration names borrow the record buffer, while their
+// ArrayList backing buffers are independent allocations. Keep those ownership
+// modes explicit: release borrowed container storage without touching text,
+// or clone the complete index before it enters the mutable daemon state.
+fn zagd_incremental_free_borrowed_index(index:*ZagdIncrementalIndex)void{let i:i32=0;while(i<index.*.files.len){free[ZagdDeclFingerprint](&index.*.files.data[i].declarations);i=i+1;}free[ZagdIncrementalFile](&index.*.files);}
+fn zagd_incremental_clone_owned(index:ZagdIncrementalIndex)ZagdIncrementalIndex{
+    let out:ZagdIncrementalIndex=zi_index_bad();out.graph_identity=index.graph_identity;out.graph_complete=index.graph_complete;out.valid=index.valid;out.advisory=index.advisory;out.executable_authority=index.executable_authority;
+    let i:i32=0;while(i<index.files.len){let source:ZagdIncrementalFile=index.files.data[i];let copy:ZagdIncrementalFile=source;copy.path=zagd_text_clone(source.path);copy.declarations=make[ZagdDeclFingerprint](source.declarations.len+1);let j:i32=0;while(j<source.declarations.len){let decl:ZagdDeclFingerprint=source.declarations.data[j];decl.name=zagd_text_clone(decl.name);push[ZagdDeclFingerprint](&copy.declarations,decl);j=j+1;}push[ZagdIncrementalFile](&out.files,copy);i=i+1;}
+    return out;
+}
+fn zagd_incremental_path(root:[]u8)[]u8{let base:[]u8=zagd_join_path(root,".zag-cache");let dir:[]u8=zagd_join_path(base,"zagd");let path:[]u8=zagd_join_path(dir,"incremental.record");zagd_text_free(dir);zagd_text_free(base);return path;}
+fn zagd_persist_incremental(root:[]u8,index:ZagdIncrementalIndex)i32{let payload:[]u8=zagd_incremental_index_encode_compact(index);if(payload.len==0){return 0;}let final:[]u8=zagd_incremental_path(root);let suffix:[]u8=_zag_str_concat(final,".tmp");let written:i32=zagd_store_transaction(suffix,final,payload);zagd_text_free(payload);zagd_text_free(final);zagd_text_free(suffix);return written;}
+fn zagd_incremental_bind_manifest(index:*ZagdIncrementalIndex,manifest:SemanticManifestView)void{index.*.graph_identity=zagd_hash_empty();index.*.graph_complete=0;if(manifest.valid==1){index.*.graph_identity=manifest.graph_identity;index.*.graph_complete=manifest.graph_complete;}}
+fn zagd_incremental_index_reused(index:ZagdIncrementalIndex,manifest:SemanticManifestView)i32{if(index.valid!=1||index.advisory!=1||index.executable_authority!=0||index.files.len==0||index.graph_complete!=1||manifest.valid!=1||manifest.graph_complete!=1||zagd_hash_equal(index.graph_identity,manifest.graph_identity)==0){return 0;}let i:i32=0;while(i<index.files.len){let file:ZagdIncrementalFile=index.files.data[i];if(file.valid!=1||_zag_file_exists(file.path)==0){return 0;}let bytes:[]u8=_zag_read_file(file.path);let matches:i32=0;if(bytes.len>=0){matches=zagd_hash_equal(zagd_content_hash(bytes),file.content);_zag_free(_zag_slice_ptr(bytes));}if(matches==0){return 0;}i=i+1;}return 1;}
 
 fn zagd_shell_quote(value:[]u8)[]u8{
-    let out:[]u8="'";let i:i32=0;
-    while(i<value.len){if(value[i]=='\''){out=_zag_str_concat(out,"'\\''");}else{out=_zag_str_concat(out,value[i..i+1]);}i=i+1;}
-    return _zag_str_concat(out,"'");
+    let out:ArrayList[u8]=zagd_text(value.len+8);zagd_text_append_byte(&out,'\'');let i:i32=0;
+    while(i<value.len){if(value[i]=='\''){zagd_text_append(&out,"'\\''");}else{zagd_text_append_byte(&out,value[i]);}i=i+1;}
+    zagd_text_append_byte(&out,'\'');return out.data[0..out.len];
 }
 fn zagd_exe_dir(path:[]u8)[]u8{let last:i32=0-1;let i:i32=0;while(i<path.len){if(path[i]=='/'){last=i;}i=i+1;}if(last<0){return ".";}if(last==0){return "/";}return path[0..last];}
 fn zagd_is_zag_source(path:[]u8)i32{return path.len>=4&&@strEq(path[path.len-4..],".zag");}
@@ -37,79 +74,310 @@ fn zagd_semantic_check(root:[]u8,root_source:[]u8,semantic_path:[]u8)i32{
     // is only a compatibility fallback for older background launches; letting
     // it override an explicit root lets unrelated foreground builds redirect
     // this daemon into a much larger compilation unit.
-    let selected:[]u8=root_source;let control:[]u8=zagd_join_path(root,".zagd.root-source");if(selected.len==0&&_zag_file_exists(control)==1){selected=zagd_trim_line(_zag_read_file(control));}
-    if(selected.len==0){return 0;}
-    let source:[]u8=selected;if(source[0]!='/'&&@strEq(root,".")==0){source=zagd_join_path(root,source);}
-    if(_zag_file_exists(source)==0){zagd_unlink(semantic_path);return 0;}
+    let selected:[]u8=root_source;let selected_owned:i32=0;let control:[]u8=zagd_join_path(root,".zagd.root-source");if(selected.len==0&&_zag_file_exists(control)==1){selected=zagd_trim_line(_zag_read_file(control));selected_owned=1;}zagd_text_free(control);
+    if(selected.len==0){if(selected_owned==1){_zag_free(_zag_slice_ptr(selected));}return 0;}
+    let source:[]u8=selected;let source_owned:i32=0;
+    if(source.len>0&&source[0]!='/'&&@strEq(root,".")==0){source=zagd_join_path(root,source);source_owned=1;}
+    if(_zag_file_exists(source)==0){zagd_unlink(semantic_path);if(source_owned==1){zagd_text_free(source);}if(selected_owned==1){_zag_free(_zag_slice_ptr(selected));}return 0;}
     // A prior manifest must never survive a failed check as apparent truth.
     zagd_unlink(semantic_path);
-    zagd_unlink(zagd_join_path(root,".zagd.semantic-ready"));
+    zagd_unlink_project(root,".zagd.semantic-ready");
     let compiler:[]u8=zagd_join_path(zagd_exe_dir(_zag_arg(0)),"znc");
-    if(_zag_file_exists(compiler)==0){return 0;}
-    let command:[]u8=_zag_str_concat(zagd_shell_quote(compiler),_zag_str_concat(" check ",_zag_str_concat(zagd_shell_quote(source)," --no-zagd --no-analyze >/dev/null 2>/dev/null")));
-    return _zag_exec_cmd(command)==0;
+    if(_zag_file_exists(compiler)==0){zagd_text_free(compiler);if(source_owned==1){zagd_text_free(source);}if(selected_owned==1){_zag_free(_zag_slice_ptr(selected));}return 0;}
+    let compiler_quote:[]u8=zagd_shell_quote(compiler);let source_quote:[]u8=zagd_shell_quote(source);let command:ArrayList[u8]=zagd_text(compiler_quote.len+source_quote.len+64);zagd_text_append(&command,compiler_quote);zagd_text_append(&command," check ");zagd_text_append(&command,source_quote);zagd_text_append(&command," --no-zagd --no-analyze >/dev/null 2>/dev/null");let ok:i32=(_zag_exec_cmd(command.data[0..command.len])==0) as i32;free[u8](&command);zagd_text_free(compiler_quote);zagd_text_free(source_quote);zagd_text_free(compiler);if(source_owned==1){zagd_text_free(source);}if(selected_owned==1){_zag_free(_zag_slice_ptr(selected));}return ok;
 }
 
 fn zagd_path_less(a:[]u8,b:[]u8)i32{let n:i32=a.len;if(b.len<n){n=b.len;}let i:i32=0;while(i<n){if(a[i]<b[i]){return 1;}if(a[i]>b[i]){return 0;}i=i+1;}if(a.len<b.len){return 1;}return 0;}
 fn zagd_relative(root:[]u8,path:[]u8)[]u8{if(path.len>root.len&&@strEq(path[0..root.len],root)&&path[root.len]=='/'){return path[root.len+1..];}return path;}
-fn zagd_snapshot_records(root:[]u8,records:ArrayList[ZagdFileState],parent:ZagdHash)ZagdSnapshot{
+// The launcher may pass a project-relative root (`app.zag`) while inotify
+// reports an absolute path.  Compare both identities without relying on the
+// current working directory, so root-invalidity handling cannot silently miss
+// a stable editor save.
+fn zagd_is_selected_root(root:[]u8,root_source:[]u8,full:[]u8)i32{
+    if(root_source.len==0){return 0;}
+    if(@strEq(full,root_source)){return 1;}
+    if(@strEq(zagd_relative(root,full),root_source)){return 1;}
+    if(root_source[0]=='/'){return 0;}
+    let joined:[]u8=zagd_join_path(root,root_source);let same:i32=(@strEq(full,joined) as i32);zagd_text_free(joined);return same;
+}
+fn zagd_path_in_project(root:[]u8,path:[]u8)i32{
+    return (@strEq(root,path)||
+        (path.len>root.len&&@strEq(path[0..root.len],root)&&path[root.len]=='/')) as i32;
+}
+fn zagd_source_path_is_zs(path:[]u8)i32{return path.len>=3&&@strEq(path[path.len-3..],".zs");}
+fn zagd_source_starts_script(source:[]u8)i32{
+    let i:i32=0;
+    while(i<source.len){
+        while(i<source.len&&(source[i]==' '||source[i]=='\t'||source[i]=='\n'||source[i]=='\r')){i=i+1;}
+        if(i+1<source.len&&source[i]=='/'&&source[i+1]=='/'){
+            while(i<source.len&&source[i]!='\n'){i=i+1;}
+        } else {
+            if(i+7<=source.len&&@strEq(source[i..i+7],"script;")){return 1;}
+            return 0;
+        }
+    }
+    return 0;
+}
+fn zagd_activation_source(path:[]u8,source:[]u8)[]u8{
+    if(zagd_source_path_is_zs(path)==1&&zagd_source_starts_script(source)==0){
+        return _zag_str_concat("script;\n",source);
+    }
+    return source;
+}
+// Resolve the selected root once and own the canonical project-relative text
+// for the daemon lifetime. A later invalid semantic check must not erase or
+// redirect the root identity of the watcher that was originally requested.
+fn zagd_snapshot_root_module(root:[]u8,requested:[]u8,
+        semantic:SemanticManifestView)[]u8{
+    let selected:[]u8=requested;let selected_buffer:[]u8="";let selected_owned:i32=0;
+    if(selected.len==0){
+        let control:[]u8=zagd_join_path(root,".zagd.root-source");
+        if(_zag_file_exists(control)==1){selected_buffer=_zag_read_file(control);if(selected_buffer.len>=0){selected=zagd_trim_line(selected_buffer);selected_owned=1;}}
+        zagd_text_free(control);
+    }
+    if(selected.len==0&&semantic.valid==1){selected=semantic.module;}
+    let rel:[]u8=zagd_relative(root,selected);let out:[]u8="";
+    if(rel.len>0&&zagd_index_path_safe(rel)==1){out=zagd_text_clone(rel);}
+    if(selected_owned==1){_zag_free(_zag_slice_ptr(selected_buffer));}
+    return out;
+}
+fn zagd_snapshot_root_source_disk(root:[]u8,module:[]u8)ZagdHash{
+    if(module.len==0){return zagd_hash_empty();}
+    let path:[]u8=zagd_join_path(root,module);if(zagd_path_is_regular(path)==0){zagd_text_free(path);return zagd_hash_empty();}
+    let source:[]u8=_zag_read_file(path);zagd_text_free(path);if(source.len<0){return zagd_hash_empty();}
+    let hash:ZagdHash=zagd_content_hash(source);_zag_free(_zag_slice_ptr(source));return hash;
+}
+fn zagd_snapshot_records(root:[]u8,root_module:[]u8,semantic:SemanticManifestView,
+        records:ArrayList[ZagdFileState],parent:ZagdHash)ZagdSnapshot{
     let order:ArrayList[ZagdFileState]=make[ZagdFileState](records.len);let i:i32=0;while(i<records.len){if(records.data[i].exists==1){push[ZagdFileState](&order,records.data[i]);}i=i+1;}
     i=0;while(i<order.len){let best:i32=i;let j:i32=i+1;while(j<order.len){if(zagd_path_less(order.data[j].path,order.data[best].path)==1){best=j;}j=j+1;}if(best!=i){let t:ZagdFileState=order.data[i];order.data[i]=order.data[best];order.data[best]=t;}i=i+1;}
-    let root_hash:ZagdHash=zagd_content_hash(root);let id:ZagdHash=zagd_snapshot_begin(root_hash);i=0;while(i<order.len){id=zagd_snapshot_add(id,zagd_relative(root,order.data[i].path),order.data[i].hash);i=i+1;}return zagd_make_snapshot(id,parent,root_hash,order.len,1);
+    let root_hash:ZagdHash=zagd_content_hash(root);let module_hash:ZagdHash=zagd_content_hash(root_module);
+    let source_hash:ZagdHash=zagd_hash_empty();let root_found:i32=(root_module.len==0) as i32;
+    i=0;while(i<order.len){if(root_module.len>0&&@strEq(zagd_relative(root,order.data[i].path),root_module)){source_hash=order.data[i].hash;root_found=1;}i=i+1;}
+    let graph:ZagdHash=zagd_hash_empty();let graph_complete:i32=0;
+    if(semantic.valid==1&&semantic.graph_complete==1&&root_module.len>0&&@strEq(semantic.module,root_module)){graph=semantic.graph_identity;graph_complete=1;}
+    let id:ZagdHash=zagd_snapshot_begin(root_hash,module_hash,source_hash,graph,graph_complete);
+    i=0;while(i<order.len){id=zagd_snapshot_add(id,zagd_relative(root,order.data[i].path),order.data[i].hash);i=i+1;}
+    let timestamp:i64=_zag_clock_monotonic_ms();if(timestamp<0){timestamp=0;}
+    let snapshot:ZagdSnapshot=zagd_make_snapshot(id,parent,root_hash,module_hash,
+        source_hash,graph,graph_complete,timestamp,order.len,root_found);
+    free[ZagdFileState](&order);return snapshot;
 }
 fn zagd_index_path_safe(path:[]u8)i32{let i:i32=0;while(i<path.len){if(path[i]=='\n'||path[i]=='\r'||path[i]=='\t'){return 0;}i=i+1;}return zagd_canonical_relative(path);}
-fn zagd_hash_fields(h:ZagdHash)[]u8{return _zag_str_concat(_zag_i64_to_str(h.first),_zag_str_concat("\t",_zag_str_concat(_zag_i64_to_str(h.second),_zag_str_concat("\t",_zag_i64_to_str(h.bytes)))));}
-fn zagd_persist_snapshot(root:[]u8,mode:i32,s:ZagdSnapshot,records:ArrayList[ZagdFileState]) i32 {
-    let base:[]u8=zagd_join_path(root,".zag-cache");let dir:[]u8=zagd_join_path(base,"zagd");if(zagd_store_mkdir(base)==0||zagd_store_mkdir(dir)==0){return 0;}
-    let body:[]u8=_zag_str_concat("advisory=true\nexecutable_authority=false\ncompiler=",_zag_str_concat(zag_version(),_zag_str_concat("\ntarget=linux-x86_64-generic\nprofile=regular-or-script-root\nmode=",_zag_str_concat(zagd_mode_name(mode),_zag_str_concat("\nsnapshot_first=",_zag_str_concat(_zag_i64_to_str(s.identity.first),_zag_str_concat("\nsnapshot_second=",_zag_str_concat(_zag_i64_to_str(s.identity.second),_zag_str_concat("\nparent_first=",_zag_str_concat(_zag_i64_to_str(s.parent.first),_zag_str_concat("\nfile_count=",_zag_str_concat(_zag_i64_to_str(s.file_count),"\n"))))))))))));
+fn zagd_append_hash_fields(out:*ArrayList[u8],h:ZagdHash)void{zagd_text_append_i64(out,h.first);zagd_text_append_byte(out,'\t');zagd_text_append_i64(out,h.second);zagd_text_append_byte(out,'\t');zagd_text_append_i64(out,h.bytes);}
+fn zagd_persist_snapshot(root:[]u8,root_module:[]u8,mode:i32,s:ZagdSnapshot,
+        records:ArrayList[ZagdFileState]) i32 {
+    if(s.valid!=1||s.timestamp_ms<0||s.semantic_graph_complete<0||s.semantic_graph_complete>1||
+        (root_module.len>0&&zagd_index_path_safe(root_module)==0)||
+        zagd_hash_equal(s.root_module,zagd_content_hash(root_module))==0){return 0;}
+    let base:[]u8=zagd_join_path(root,".zag-cache");let dir:[]u8=zagd_join_path(base,"zagd");if(zagd_store_mkdir(base)==0||zagd_store_mkdir(dir)==0){zagd_text_free(base);zagd_text_free(dir);return 0;}
+    let body:ArrayList[u8]=zagd_text(1280);zagd_text_append(&body,"format=zagd-snapshot-v2\nadvisory=true\nexecutable_authority=false\ncomplete=true\nvalidity=valid\ncompiler=");zagd_text_append(&body,zag_version());zagd_text_append(&body,"\ntarget=linux-x86_64-generic\nprofile=regular-or-script-root\nmode=");zagd_text_append(&body,zagd_mode_name(mode));zagd_text_append(&body,"\nroot_module_present=");if(root_module.len>0){zagd_text_append(&body,"1\nroot_module=");zagd_text_append(&body,root_module);}else{zagd_text_append(&body,"0\nroot_module=<unspecified>");}zagd_text_append(&body,"\nroot_project=");zagd_append_hash_fields(&body,s.root);zagd_text_append(&body,"\nroot_source=");zagd_append_hash_fields(&body,s.root_source);zagd_text_append(&body,"\nsemantic_graph=");zagd_append_hash_fields(&body,s.semantic_graph);zagd_text_append(&body,"\nsemantic_graph_complete=");zagd_text_append_i64(&body,s.semantic_graph_complete);zagd_text_append(&body,"\ntimestamp_ms=");zagd_text_append_i64(&body,s.timestamp_ms);zagd_text_append(&body,"\ntimestamp_basis=linux-monotonic-ms\ntimestamp_in_identity=false\nsnapshot_identity=");zagd_append_hash_fields(&body,s.identity);zagd_text_append(&body,"\nparent_identity=");zagd_append_hash_fields(&body,s.parent);zagd_text_append(&body,"\nfile_count=");zagd_text_append_i64(&body,s.file_count);zagd_text_append_byte(&body,'\n');
     let order:ArrayList[ZagdFileState]=make[ZagdFileState](records.len);let oi:i32=0;while(oi<records.len){if(records.data[oi].exists==1){push[ZagdFileState](&order,records.data[oi]);}oi=oi+1;}oi=0;while(oi<order.len){let best:i32=oi;let oj:i32=oi+1;while(oj<order.len){if(zagd_path_less(order.data[oj].path,order.data[best].path)==1){best=oj;}oj=oj+1;}if(best!=oi){let swap:ZagdFileState=order.data[oi];order.data[oi]=order.data[best];order.data[best]=swap;}oi=oi+1;}
-    oi=0;while(oi<order.len){let rel:[]u8=zagd_relative(root,order.data[oi].path);if(zagd_index_path_safe(rel)==0){return 0;}let f:ZagdSourceFacts=order.data[oi].facts;body=_zag_str_concat(body,_zag_str_concat("file=",_zag_str_concat(rel,_zag_str_concat("\t",_zag_str_concat(zagd_hash_fields(order.data[oi].hash),_zag_str_concat("\t",_zag_str_concat(zagd_hash_fields(f.semantic),_zag_str_concat("\t",_zag_str_concat(zagd_hash_fields(f.public_shape),_zag_str_concat("\t",_zag_str_concat(zagd_hash_fields(f.root_profile),_zag_str_concat("\t",_zag_str_concat(_zag_i64_to_str(f.valid),"\n")))))))))))));oi=oi+1;}
-    let sum:ZagdHash=zagd_content_hash(body);let payload:[]u8=_zag_str_concat(body,_zag_str_concat("checksum_first=",_zag_str_concat(_zag_i64_to_str(sum.first),_zag_str_concat("\nchecksum_second=",_zag_str_concat(_zag_i64_to_str(sum.second),"\n")))));
-    let final:[]u8=zagd_join_path(dir,"snapshot.record");let temp:[]u8=zagd_join_path(dir,"snapshot.record.tmp");return zagd_store_transaction(temp,final,payload);
+    oi=0;while(oi<order.len){let rel:[]u8=zagd_relative(root,order.data[oi].path);if(zagd_index_path_safe(rel)==0){free[u8](&body);free[ZagdFileState](&order);zagd_text_free(base);zagd_text_free(dir);return 0;}let f:ZagdSourceFacts=order.data[oi].facts;zagd_text_append(&body,"file=");zagd_text_append(&body,rel);zagd_text_append_byte(&body,'\t');zagd_append_hash_fields(&body,order.data[oi].hash);zagd_text_append_byte(&body,'\t');zagd_append_hash_fields(&body,f.semantic);zagd_text_append_byte(&body,'\t');zagd_append_hash_fields(&body,f.public_shape);zagd_text_append_byte(&body,'\t');zagd_append_hash_fields(&body,f.root_profile);zagd_text_append_byte(&body,'\t');zagd_text_append_i64(&body,f.valid);zagd_text_append_byte(&body,'\n');oi=oi+1;}
+    let sum:ZagdHash=zagd_content_hash(body.data[0..body.len]);zagd_text_append(&body,"checksum_first=");zagd_text_append_i64(&body,sum.first);zagd_text_append(&body,"\nchecksum_second=");zagd_text_append_i64(&body,sum.second);zagd_text_append_byte(&body,'\n');
+    let final:[]u8=zagd_join_path(dir,"snapshot.record");let temp:[]u8=zagd_join_path(dir,"snapshot.record.tmp");let written:i32=zagd_store_transaction(temp,final,body.data[0..body.len]);free[u8](&body);zagd_text_free(final);zagd_text_free(temp);zagd_text_free(base);zagd_text_free(dir);free[ZagdFileState](&order);return written;
 }
 
 fn zagd_tab_field(line:[]u8,want:i32)[]u8{let field:i32=0;let start:i32=0;let i:i32=0;while(i<=line.len){if(i==line.len||line[i]=='\t'){if(field==want){return line[start..i];}field=field+1;start=i+1;}i=i+1;}return "";}
-fn zagd_restore_index(root:[]u8,text:[]u8,records:*ArrayList[ZagdFileState])i32{let start:i32=0;let i:i32=0;let count:i32=0;while(i<=text.len){if(i==text.len||text[i]=='\n'){let line:[]u8=text[start..i];if(line.len>5&&@strEq(line[0..5],"file=")){let payload:[]u8=line[5..];let rel:[]u8=zagd_tab_field(payload,0);if(zagd_index_path_safe(rel)==0){return 0-1;}let nums:ArrayList[i64]=make[i64](13);let k:i32=1;while(k<=13){let n:i64=zagd_parse_nonnegative(zagd_tab_field(payload,k));if(n<0){return 0-1;}push[i64](&nums,n);k=k+1;}let content:ZagdHash=ZagdHash{.first=nums.data[0],.second=nums.data[1],.bytes=nums.data[2]};let facts:ZagdSourceFacts=ZagdSourceFacts{.content=content,.semantic=ZagdHash{.first=nums.data[3],.second=nums.data[4],.bytes=nums.data[5]},.public_shape=ZagdHash{.first=nums.data[6],.second=nums.data[7],.bytes=nums.data[8]},.root_profile=ZagdHash{.first=nums.data[9],.second=nums.data[10],.bytes=nums.data[11]},.valid=nums.data[12] as i32};push[ZagdFileState](records,ZagdFileState{.path=zagd_join_path(root,rel),.hash=content,.facts=facts,.exists=1});count=count+1;}start=i+1;}i=i+1;}return count;}
-fn zagd_persist_plan(root:[]u8,mode:i32,semantic:SemanticManifestView,run:ZagdPlannerRun)i32{let base:[]u8=zagd_join_path(root,".zag-cache");let dir:[]u8=zagd_join_path(base,"zagd");if(zagd_store_mkdir(base)==0||zagd_store_mkdir(dir)==0){return 0;}let body:[]u8="advisory=true\nexecutable_authority=false\nbasis=proven-manifest-facts\nsource_changes=false\nperformance_benefit=unknown\nequivalence=canonical-literal-or-bounded-integer-arithmetic-return\n";body=_zag_str_concat(body,_zag_str_concat("mode=",_zag_str_concat(zagd_mode_name(mode),"\n")));body=_zag_str_concat(body,_zag_str_concat("semantic_source_first=",_zag_str_concat(_zag_i64_to_str(semantic.source.first),"\n")));body=_zag_str_concat(body,_zag_str_concat("budget=",_zag_str_concat(_zag_i64_to_str(run.budget),"\n")));body=_zag_str_concat(body,_zag_str_concat("evaluated=",_zag_str_concat(_zag_i64_to_str(run.evaluated),"\n")));body=_zag_str_concat(body,_zag_str_concat("suggestions=",_zag_str_concat(_zag_i64_to_str(run.suggestions),"\n")));let sum:ZagdHash=zagd_content_hash(body);let payload:[]u8=_zag_str_concat(body,_zag_str_concat("checksum_first=",_zag_str_concat(_zag_i64_to_str(sum.first),"\n")));return zagd_store_transaction(zagd_join_path(dir,"plan.record.tmp"),zagd_join_path(dir,"plan.record"),payload);}
-fn zagd_persist_artifacts(root:[]u8,semantic_text:[]u8,inv:SemanticInvalidation)i32{let view:SemanticManifestView=semantic_manifest_decode(semantic_text);if(view.valid==0){return 0;}let base:[]u8=zagd_join_path(root,".zag-cache");let dir:[]u8=zagd_join_path(base,"zagd");if(zagd_store_mkdir(base)==0||zagd_store_mkdir(dir)==0){return 0;}let identity:ZagdHash=semantic_manifest_artifact_identity(semantic_text,zag_version(),"linux-x86_64-generic");let body:[]u8="format=zagd-artifact-index-v1\nadvisory=true\nexecutable_authority=false\ncomplete=true\ncompiler=";body=_zag_str_concat(body,_zag_str_concat(zag_version(),"\ntarget=linux-x86_64-generic\n"));body=_zag_str_concat(body,_zag_str_concat("semantic_source=",_zag_str_concat(zagd_hash_fields(view.source),"\n")));body=_zag_str_concat(body,_zag_str_concat("artifact_identity=",_zag_str_concat(zagd_hash_fields(identity),"\n")));body=_zag_str_concat(body,_zag_str_concat("declaration_dependents_invalidated=",_zag_str_concat(_zag_i64_to_str(inv.declaration_dependents),"\n")));body=_zag_str_concat(body,_zag_str_concat("layout_invalidated=",_zag_str_concat(_zag_i64_to_str(inv.layout_changed),"\n")));body=_zag_str_concat(body,_zag_str_concat("codegen_invalidated=",_zag_str_concat(_zag_i64_to_str(inv.codegen_invalidated),"\n")));body=_zag_str_concat(body,_zag_str_concat("comment_only=",_zag_str_concat(_zag_i64_to_str(inv.comment_only),"\n")));let sum:ZagdHash=zagd_content_hash(body);let payload:[]u8=_zag_str_concat(body,_zag_str_concat("checksum_first=",_zag_str_concat(_zag_i64_to_str(sum.first),_zag_str_concat("\nchecksum_second=",_zag_str_concat(_zag_i64_to_str(sum.second),"\n")))));return zagd_store_transaction(zagd_join_path(dir,"artifact.record.tmp"),zagd_join_path(dir,"artifact.record"),payload);}
-fn zagd_persist_profile_plan(root:[]u8,view:SemanticManifestView,mode:i32)i32{
-    if(mode!=zagd_mode_deep()||view.valid==0){return 0;}let profile_text:[]u8=_zag_read_file(zagd_join_path(root,".zagd.profile"));if(profile_text.len<=0){return 0;}let compiler_bytes:[]u8=_zag_read_file("/proc/self/exe");if(compiler_bytes.len<=0){return 0;}let target:ZagdHash=zagd_content_hash("linux-x86_64-generic");let profile:ZagdProfile=zagd_profile_decode(profile_text,zagd_content_hash(compiler_bytes),view.source,target,256);if(profile.valid==0){return 0;}
-    let hot:ArrayList[ZagdProfileSample]=zagd_select_hot_regions(profile,16);let plans:ArrayList[ZagdBackendRegionPlan]=zagd_backend_plan(hot,ZagdBackendFeatures{.popcnt=0,.bmi1=0,.packed_simd=0});let body:[]u8="format=zagd-profile-plan-v1\nadvisory=true\nexecutable_authority=false\nmode=deep\nsource_changes=false\ntarget=linux-x86_64-generic\n";body=_zag_str_concat(body,"hot_regions=");body=_zag_str_concat(body,_zag_i64_to_str(hot.len));body=_zag_str_concat(body,"\n");
-    let i:i32=0;while(i<plans.len){let p:ZagdBackendRegionPlan=plans.data[i];body=_zag_str_concat(body,"region=");body=_zag_str_concat(body,p.region);body=_zag_str_concat(body,"\tkind=");body=_zag_str_concat(body,_zag_i64_to_str(p.kind));body=_zag_str_concat(body,"\tselected=");body=_zag_str_concat(body,_zag_i64_to_str(p.selected));body=_zag_str_concat(body,"\tsupported=");body=_zag_str_concat(body,_zag_i64_to_str(p.supported));body=_zag_str_concat(body,"\n");i=i+1;}
-    let sum:ZagdHash=zagd_content_hash(body);let payload:[]u8=_zag_str_concat(body,_zag_str_concat("checksum_first=",_zag_str_concat(_zag_i64_to_str(sum.first),"\n")));let dir:[]u8=zagd_join_path(zagd_join_path(root,".zag-cache"),"zagd");return zagd_store_transaction(zagd_join_path(dir,"profile-plan.record.tmp"),zagd_join_path(dir,"profile-plan.record"),payload);
+fn zagd_restore_index(root:[]u8,text:[]u8,records:*ArrayList[ZagdFileState])i32{
+    let start:i32=0;let i:i32=0;let count:i32=0;
+    while(i<=text.len){if(i==text.len||text[i]=='\n'){let line:[]u8=text[start..i];
+        if(line.len>5&&@strEq(line[0..5],"file=")){
+            let payload:[]u8=line[5..];let rel:[]u8=zagd_tab_field(payload,0);if(zagd_index_path_safe(rel)==0){return 0-1;}
+            let nums:ArrayList[i64]=make[i64](13);let k:i32=1;let valid:i32=1;
+            while(k<=13){let n:i64=zagd_parse_nonnegative(zagd_tab_field(payload,k));if(n<0){valid=0;k=14;}else{push[i64](&nums,n);k=k+1;}}
+            if(valid==0){free[i64](&nums);return 0-1;}
+            let content:ZagdHash=ZagdHash{.first=nums.data[0],.second=nums.data[1],.bytes=nums.data[2]};
+            let facts:ZagdSourceFacts=ZagdSourceFacts{.content=content,.semantic=ZagdHash{.first=nums.data[3],.second=nums.data[4],.bytes=nums.data[5]},.public_shape=ZagdHash{.first=nums.data[6],.second=nums.data[7],.bytes=nums.data[8]},.root_profile=ZagdHash{.first=nums.data[9],.second=nums.data[10],.bytes=nums.data[11]},.valid=nums.data[12] as i32};
+            push[ZagdFileState](records,ZagdFileState{.path=zagd_join_path(root,rel),.hash=content,.facts=facts,.exists=1});free[i64](&nums);count=count+1;
+        }
+        start=i+1;
+    }i=i+1;}
+    return count;
 }
-fn zagd_persist_candidates(root:[]u8,semantic_text:[]u8,mode:i32)i32{
-    let view:SemanticManifestView=semantic_manifest_decode(semantic_text);if(view.valid==0||mode<zagd_mode_adaptive()){return 0;}
-    let _profile_plan:i32=zagd_persist_profile_plan(root,view,mode);
-    let allocs:i32=semantic_manifest_fact_count(semantic_text,"\talloc=1");let facts:ZagdPlanFacts=ZagdPlanFacts{.temporary_bytes=(allocs as i64)*4096,.repeated_allocations=allocs,.non_overlapping_buffers=(allocs>0) as i32,.cpu_loop=(semantic_manifest_decl_count(semantic_text)>0) as i32,.explicit_allocator=0,.explicit_device=0};
-    let target:ZagdHash=zagd_content_hash("linux-x86_64-generic");let generated:ArrayList[ZagdConcreteCandidate]=zagd_generate_candidates(facts,view.source,target,(@strEq(smf_value(semantic_text,"profile"),"script")) as i32,4,0);let finalists:ArrayList[ZagdConcreteCandidate]=zagd_prune_dominated(generated,268435456,4,0);
-    let body:[]u8="format=zagd-candidates-v1\nadvisory=true\nexecutable_authority=false\nsource_changes=false\n";body=_zag_str_concat(body,"source=");body=_zag_str_concat(body,zagd_hash_fields(view.source));body=_zag_str_concat(body,"\ntarget=");body=_zag_str_concat(body,zagd_hash_fields(target));body=_zag_str_concat(body,"\ngenerated=");body=_zag_str_concat(body,_zag_i64_to_str(generated.len));body=_zag_str_concat(body,"\nfinalists=");body=_zag_str_concat(body,_zag_i64_to_str(finalists.len));body=_zag_str_concat(body,"\n");
-    let i:i32=0;while(i<finalists.len){let c:ZagdConcreteCandidate=finalists.data[i];body=_zag_str_concat(body,"candidate=");body=_zag_str_concat(body,_zag_i64_to_str(c.kind));body=_zag_str_concat(body,"\tautomatic=");body=_zag_str_concat(body,_zag_i64_to_str(c.automatic));body=_zag_str_concat(body,"\tprovenance=");body=_zag_str_concat(body,_zag_i64_to_str(c.provenance));body=_zag_str_concat(body,"\truntime_ns=");body=_zag_str_concat(body,_zag_i64_to_str(c.runtime_ns));body=_zag_str_concat(body,"\n");i=i+1;}
-    let sum:ZagdHash=zagd_content_hash(body);let payload:[]u8=_zag_str_concat(body,_zag_str_concat("checksum_first=",_zag_str_concat(_zag_i64_to_str(sum.first),"\n")));let dir:[]u8=zagd_join_path(zagd_join_path(root,".zag-cache"),"zagd");return zagd_store_transaction(zagd_join_path(dir,"candidates.record.tmp"),zagd_join_path(dir,"candidates.record"),payload);
+// CPU selection is planner input, never build authority.  The shared profile
+// module derives the semantic identity from this explicit target key so daemon
+// production and foreground validation cannot drift.
+fn zagd_plan_semantic_identity(text:[]u8,cpu:X86CpuProfile)ZagdHash{
+    if(cpu.valid==0){return zagd_hash_empty();}
+    return zagd_profile_semantic_identity(text,zag_version(),cpu.cache_key);
 }
-fn zagd_deep_control_path(root:[]u8,name:[]u8)[]u8{let value:[]u8=zagd_trim_line(_zag_read_file(zagd_join_path(root,name)));if(value.len==0){return "";}if(value[0]=='/'){return value;}return zagd_join_path(root,value);}
+fn zagd_manifest_modules_current(root:[]u8,text:[]u8)i32{
+    let view:SemanticManifestView=semantic_manifest_decode(text);
+    if(view.valid==0){return 0;}
+    let found:i32=0;let start:i32=0;let i:i32=0;
+    while(i<=text.len){
+        if(i==text.len||text[i]=='\n'){
+            let line:[]u8=text[start..i];
+            if(line.len>12&&@strEq(line[0..12],"module_node=")){
+                let node:[]u8=line[12..];let tab:i32=0;
+                while(tab<node.len&&node[tab]!='\t'){tab=tab+1;}
+                if(tab==node.len){return 0;}
+                let name:[]u8=node[0..tab];
+                if(zagd_index_path_safe(name)==0){return 0;}
+                let path:[]u8=zagd_join_path(root,name);
+                if(zagd_path_is_regular(path)==0){zagd_text_free(path);return 0;}
+                let bytes:[]u8=_zag_read_file(path);
+                if(bytes.len<0){zagd_text_free(path);return 0;}
+                let source:[]u8=bytes;let injected:i32=0;
+                if(@strEq(name,view.module)&&zagd_source_path_is_zs(path)==1&&
+                    zagd_source_starts_script(bytes)==0){
+                    source=_zag_str_concat("script;\n",bytes);injected=1;
+                }
+                let current:ZagdHash=zagd_content_hash(source);
+                if(injected==1){_zag_free(_zag_slice_ptr(source));}
+                _zag_free(_zag_slice_ptr(bytes));
+                let matches:i32=zagd_hash_equal(current,smf_hash(node[tab+1..]));zagd_text_free(path);
+                if(matches==0){return 0;}
+                found=found+1;
+            }
+            start=i+1;
+        }
+        i=i+1;
+    }
+    return (found>0) as i32;
+}
+fn zagd_persist_plan(root:[]u8,mode:i32,semantic:SemanticManifestView,run:ZagdPlannerRun,cpu:X86CpuProfile)i32{
+    let base:[]u8=zagd_join_path(root,".zag-cache");let dir:[]u8=zagd_join_path(base,"zagd");
+    if(zagd_store_mkdir(base)==0||zagd_store_mkdir(dir)==0){zagd_text_free(base);zagd_text_free(dir);return 0;}
+    let body:ArrayList[u8]=zagd_text(512);
+    zagd_text_append(&body,"advisory=true\nexecutable_authority=false\nbasis=proven-manifest-facts\nsource_changes=false\nperformance_benefit=unknown\nequivalence=canonical-literal-or-bounded-integer-arithmetic-return\nmode=");zagd_text_append(&body,zagd_mode_name(mode));zagd_text_append(&body,"\ncpu_profile=");zagd_text_append(&body,cpu.canonical);zagd_text_append(&body,"\ncpu_detection=");zagd_text_append(&body,cpu.detection);zagd_text_append(&body,"\ntarget_cache_key=");zagd_text_append(&body,cpu.cache_key);zagd_text_append(&body,"\nsemantic_source_first=");zagd_text_append_i64(&body,semantic.source.first);zagd_text_append(&body,"\nbudget=");zagd_text_append_i64(&body,run.budget);zagd_text_append(&body,"\nevaluated=");zagd_text_append_i64(&body,run.evaluated);zagd_text_append(&body,"\nsuggestions=");zagd_text_append_i64(&body,run.suggestions);zagd_text_append(&body,"\n");
+    let sum:ZagdHash=zagd_content_hash(body.data[0..body.len]);zagd_text_append(&body,"checksum_first=");zagd_text_append_i64(&body,sum.first);zagd_text_append_byte(&body,'\n');
+    let temp:[]u8=zagd_join_path(dir,"plan.record.tmp");let final:[]u8=zagd_join_path(dir,"plan.record");let written:i32=zagd_store_transaction(temp,final,body.data[0..body.len]);free[u8](&body);zagd_text_free(temp);zagd_text_free(final);zagd_text_free(base);zagd_text_free(dir);return written;
+}
+fn zagd_persist_artifacts(root:[]u8,semantic_text:[]u8,inv:SemanticInvalidation)i32{
+    let view:SemanticManifestView=semantic_manifest_decode(semantic_text);if(view.valid==0){return 0;}
+    let base:[]u8=zagd_join_path(root,".zag-cache");let dir:[]u8=zagd_join_path(base,"zagd");if(zagd_store_mkdir(base)==0||zagd_store_mkdir(dir)==0){zagd_text_free(base);zagd_text_free(dir);return 0;}
+    let identity:ZagdHash=semantic_manifest_artifact_identity(semantic_text,zag_version(),"linux-x86_64-generic");let machine_link:ZagdHash=semantic_manifest_machine_cache_link(semantic_text,zag_version(),"linux-x86_64-generic");let body:ArrayList[u8]=zagd_text(768);
+    zagd_text_append(&body,"format=zagd-artifact-index-v2\nadvisory=true\nexecutable_authority=false\ncomplete=true\ncompiler=");zagd_text_append(&body,zag_version());zagd_text_append(&body,"\ntarget=linux-x86_64-generic\nsemantic_source=");zagd_append_hash_fields(&body,view.source);zagd_text_append(&body,"\ngraph_identity=");zagd_append_hash_fields(&body,view.graph_identity);zagd_text_append(&body,"\ngraph_complete=");zagd_text_append_i64(&body,view.graph_complete);zagd_text_append(&body,"\nartifact_identity=");zagd_append_hash_fields(&body,identity);zagd_text_append(&body,"\nforeground_machine_cache_link=");zagd_append_hash_fields(&body,machine_link);zagd_text_append(&body,"\nforeground_machine_cache_authority=false\ndeclaration_dependents_invalidated=");zagd_text_append_i64(&body,inv.declaration_dependents);zagd_text_append(&body,"\nlayout_invalidated=");zagd_text_append_i64(&body,inv.layout_changed);zagd_text_append(&body,"\ncodegen_invalidated=");zagd_text_append_i64(&body,inv.codegen_invalidated);zagd_text_append(&body,"\ncomment_only=");zagd_text_append_i64(&body,inv.comment_only);zagd_text_append_byte(&body,'\n');
+    let sum:ZagdHash=zagd_content_hash(body.data[0..body.len]);zagd_text_append(&body,"checksum_first=");zagd_text_append_i64(&body,sum.first);zagd_text_append(&body,"\nchecksum_second=");zagd_text_append_i64(&body,sum.second);zagd_text_append_byte(&body,'\n');
+    let temp:[]u8=zagd_join_path(dir,"artifact.record.tmp");let final:[]u8=zagd_join_path(dir,"artifact.record");let written:i32=zagd_store_transaction(temp,final,body.data[0..body.len]);free[u8](&body);zagd_text_free(temp);zagd_text_free(final);zagd_text_free(base);zagd_text_free(dir);return written;
+}
+fn zagd_persist_profile_plan(root:[]u8,semantic_text:[]u8,mode:i32,cpu:X86CpuProfile)i32{
+    let stale_base:[]u8=zagd_join_path(root,".zag-cache");let stale_dir:[]u8=zagd_join_path(stale_base,"zagd");let stale_final:[]u8=zagd_join_path(stale_dir,"profile-plan.record");zagd_unlink(stale_final);zagd_text_free(stale_final);zagd_text_free(stale_dir);zagd_text_free(stale_base);
+    let view:SemanticManifestView=semantic_manifest_decode(semantic_text);let semantic_identity:ZagdHash=zagd_plan_semantic_identity(semantic_text,cpu);
+    if(mode!=zagd_mode_deep()||view.valid==0||view.graph_complete!=1||cpu.valid==0||semantic_identity.bytes<=0||
+        zagd_manifest_modules_current(root,semantic_text)==0){return 0;}
+    let profile_path:[]u8=zagd_join_path(root,".zagd.profile");if(_zag_file_exists(profile_path)==0){zagd_text_free(profile_path);return 0;}
+    let profile_text:[]u8=_zag_read_file(profile_path);zagd_text_free(profile_path);if(profile_text.len<=0){if(profile_text.len>=0){_zag_free(_zag_slice_ptr(profile_text));}return 0;}
+    let compiler_bytes:[]u8=_zag_read_file("/proc/self/exe");if(compiler_bytes.len<=0){if(compiler_bytes.len>=0){_zag_free(_zag_slice_ptr(compiler_bytes));}_zag_free(_zag_slice_ptr(profile_text));return 0;}
+    // Bind the consumable plan to the exact sibling foreground compiler image,
+    // not merely the daemon image or a version string. A compiler replacement
+    // makes the old plan a metadata miss even if the daemon has not restarted.
+    let foreground_compiler_path:[]u8=zagd_join_path(zagd_exe_dir(_zag_arg(0)),"znc");
+    let foreground_compiler_bytes:[]u8=_zag_read_file(foreground_compiler_path);
+    zagd_text_free(foreground_compiler_path);
+    if(foreground_compiler_bytes.len<=0){
+        if(foreground_compiler_bytes.len>=0){_zag_free(_zag_slice_ptr(foreground_compiler_bytes));}
+        _zag_free(_zag_slice_ptr(compiler_bytes));_zag_free(_zag_slice_ptr(profile_text));return 0;
+    }
+    let foreground_compiler_identity:ZagdHash=zagd_content_hash(foreground_compiler_bytes);
+    let compiler_identity:ZagdHash=zagd_content_hash(compiler_bytes);let target:ZagdHash=zagd_content_hash(cpu.cache_key);let profile_identity:ZagdHash=zagd_content_hash(profile_text);let profile:ZagdProfile=zagd_profile_decode(profile_text,compiler_identity,semantic_identity,target,256);
+    if(profile.valid==0){free[ZagdProfileSample](&profile.samples);_zag_free(_zag_slice_ptr(foreground_compiler_bytes));_zag_free(_zag_slice_ptr(compiler_bytes));_zag_free(_zag_slice_ptr(profile_text));return 0;}
+    let hot:ArrayList[ZagdProfileSample]=zagd_select_hot_regions(profile,16);let plans:ArrayList[ZagdBackendRegionPlan]=zagd_backend_plan_validated(hot,ZagdBackendFeatures{.popcnt=cpu.features.popcnt,.bmi1=cpu.features.bmi1,.packed_simd=0},semantic_text);
+    // The profile's `source_*` key is the plan semantic identity.  The v3
+    // record also carries the independently decoded source and graph keys so
+    // the foreground compiler can reject stale evidence without granting it
+    // executable-cache or instruction-selection authority.
+    let body:ArrayList[u8]=zagd_text(2304);zagd_text_append(&body,"format=zagd-profile-plan-v3\nadvisory=true\nexecutable_authority=false\nforeground_consumption=metadata-only\ncodegen_effect=none\nmode=deep\nsource_changes=false\ntarget=linux-x86_64\nprovenance=measured-profile-and-derived-validation\ncompiler=");zagd_text_append(&body,zag_version());zagd_text_append(&body,"\nforeground_compiler_identity=");zagd_append_hash_fields(&body,foreground_compiler_identity);zagd_text_append(&body,"\ncpu_profile=");zagd_text_append(&body,cpu.canonical);zagd_text_append(&body,"\ncpu_detection=");zagd_text_append(&body,cpu.detection);zagd_text_append(&body,"\ntarget_cache_key=");zagd_text_append(&body,cpu.cache_key);zagd_text_append(&body,"\nsemantic_source=");zagd_append_hash_fields(&body,view.source);zagd_text_append(&body,"\nsemantic_graph=");zagd_append_hash_fields(&body,view.graph_identity);zagd_text_append(&body,"\nsemantic_graph_complete=");zagd_text_append_i64(&body,view.graph_complete);zagd_text_append(&body,"\nprofile_source_identity=");zagd_append_hash_fields(&body,semantic_identity);zagd_text_append(&body,"\ntarget_identity=");zagd_append_hash_fields(&body,target);zagd_text_append(&body,"\nprofile_compiler_identity=");zagd_append_hash_fields(&body,compiler_identity);zagd_text_append(&body,"\nprofile_payload_identity=");zagd_append_hash_fields(&body,profile_identity);zagd_text_append(&body,"\nprofile_samples=");zagd_text_append_i64(&body,profile.samples.len);zagd_text_append(&body,"\nhot_regions=");zagd_text_append_i64(&body,hot.len);zagd_text_append(&body,"\nsemantic_identity=");zagd_append_hash_fields(&body,semantic_identity);zagd_text_append_byte(&body,'\n');
+    let eligible:i32=0;let i:i32=0;while(i<plans.len){let p:ZagdBackendRegionPlan=plans.data[i];let declared:i32=zagd_profile_manifest_declared(semantic_text,p.region);let decision:[]u8="advisory_only";if(declared==0||p.supported==0){decision="rejected";}else{eligible=eligible+1;}zagd_text_append(&body,"region=");zagd_text_append(&body,p.region);zagd_text_append(&body,"\tcount=");zagd_text_append_i64(&body,hot.data[i].count);zagd_text_append(&body,"\tbackend_kind=");zagd_text_append_i64(&body,p.kind);zagd_text_append(&body,"\tsemantic_declared=");zagd_text_append_i64(&body,declared);zagd_text_append(&body,"\tinstruction_permitted=");zagd_text_append_i64(&body,p.supported);zagd_text_append(&body,"\tdecision=");zagd_text_append(&body,decision);zagd_text_append(&body,"\treason=");zagd_text_append(&body,p.reason);zagd_text_append_byte(&body,'\n');i=i+1;}
+    zagd_text_append(&body,"eligible_regions=");zagd_text_append_i64(&body,eligible);zagd_text_append_byte(&body,'\n');
+    let sum:ZagdHash=zagd_content_hash(body.data[0..body.len]);zagd_text_append(&body,"checksum_first=");zagd_text_append_i64(&body,sum.first);zagd_text_append(&body,"\nchecksum_second=");zagd_text_append_i64(&body,sum.second);zagd_text_append(&body,"\nchecksum_bytes=");zagd_text_append_i64(&body,sum.bytes);zagd_text_append_byte(&body,'\n');
+    let base:[]u8=zagd_join_path(root,".zag-cache");let dir:[]u8=zagd_join_path(base,"zagd");let temp:[]u8=zagd_join_path(dir,"profile-plan.record.tmp");let final:[]u8=zagd_join_path(dir,"profile-plan.record");zagd_unlink(final);let written:i32=zagd_store_transaction(temp,final,body.data[0..body.len]);
+    zagd_text_free(final);zagd_text_free(temp);zagd_text_free(dir);zagd_text_free(base);free[u8](&body);free[ZagdBackendRegionPlan](&plans);free[ZagdProfileSample](&hot);free[ZagdProfileSample](&profile.samples);_zag_free(_zag_slice_ptr(foreground_compiler_bytes));_zag_free(_zag_slice_ptr(compiler_bytes));_zag_free(_zag_slice_ptr(profile_text));return written;
+}
+fn zagd_persist_candidates(root:[]u8,semantic_text:[]u8,mode:i32,cpu:X86CpuProfile)i32{
+    let base:[]u8=zagd_join_path(root,".zag-cache");let dir:[]u8=zagd_join_path(base,"zagd");let final:[]u8=zagd_join_path(dir,"candidates.record");zagd_unlink(final);
+    let view:SemanticManifestView=semantic_manifest_decode(semantic_text);let semantic_identity:ZagdHash=zagd_plan_semantic_identity(semantic_text,cpu);
+    if(view.valid==0||mode<zagd_mode_adaptive()||semantic_identity.bytes<=0||
+        zagd_manifest_modules_current(root,semantic_text)==0){zagd_text_free(final);zagd_text_free(dir);zagd_text_free(base);return 0;}
+    let _profile_plan:i32=zagd_persist_profile_plan(root,semantic_text,mode,cpu);
+    // The AST-free decoder accepts only checksum-valid, compiler-produced
+    // lifetime facts with the complete narrow proof boundary. They support a
+    // human advisory record below, but never make the executable buffer-reuse
+    // candidate supported: no transform or equivalence revalidation exists.
+    // The sole supported executable decision remains the existing Script CPU
+    // default when this daemon's resolved target exactly matches it.
+    let compact_manifest:i32=(@strEq(smf_value(semantic_text,"detail_level"),"compact")) as i32;
+    let buffer_lifetimes:SemanticBufferLifetimeFacts=semantic_manifest_buffer_lifetime_facts(semantic_text);
+    let cfg_path:[]u8=zagd_join_path(root,".zagd.conf");let cfg_text:[]u8=_zag_read_file(cfg_path);zagd_text_free(cfg_path);let cfg:PlannerConfig=planner_default_config();if(cfg_text.len>=0){let parsed:PlannerConfig=planner_parse_config(cfg_text);if(parsed.valid==1){cfg=parsed;}}
+    let configured_cpu:X86CpuProfile=parse_x86_cpu_profile(cfg.default_cpu);if(cfg_text.len>=0){_zag_free(_zag_slice_ptr(cfg_text));}let cpu_matches:i32=(configured_cpu.valid==1&&@strEq(configured_cpu.cache_key,cpu.cache_key)) as i32;
+    let proven_buffer_bytes:i64=0;let proven_buffer_pairs:i32=0;if(buffer_lifetimes.valid==1){proven_buffer_bytes=buffer_lifetimes.reusable_bytes;proven_buffer_pairs=buffer_lifetimes.pairs;}
+    let facts:ZagdPlanFacts=ZagdPlanFacts{.temporary_bytes=proven_buffer_bytes,.repeated_allocations=0,
+        .non_overlapping_buffers=(proven_buffer_pairs>0) as i32,.cpu_loop=0,.explicit_allocator=0,.explicit_device=0,
+        .script_cpu_unspecified=1,.script_cpu_target_compatible=cpu_matches};
+    let target:ZagdHash=zagd_content_hash(cpu.cache_key);let generated:ArrayList[ZagdConcreteCandidate]=zagd_generate_candidates(facts,semantic_identity,target,(@strEq(smf_value(semantic_text,"profile"),"script")) as i32,5,0);let finalists:ArrayList[ZagdConcreteCandidate]=zagd_prune_dominated(generated,268435456,5,0);
+    let selection:[]u8="unsupported-roadmap-alternatives";if(finalists.len==1&&finalists.data[0].kind==zagd_candidate_script_default_cpu()){selection="script-default-cpu";}
+    let body:ArrayList[u8]=zagd_text(2048);zagd_text_append(&body,"format=zagd-candidates-v2\nadvisory=true\nexecutable_authority=false\nsource_changes=false\nsemantic_detail_level=");if(compact_manifest==1){zagd_text_append(&body,"compact");}else{zagd_text_append(&body,"full");}zagd_text_append(&body,"\nlifetime_analysis_available=");if(compact_manifest==1){zagd_text_append(&body,"false");}else{zagd_text_append(&body,"true");}zagd_text_append(&body,"\nlifetime_advice_supported=");if(proven_buffer_pairs>0){zagd_text_append(&body,"true");}else{zagd_text_append(&body,"false");}zagd_text_append(&body,"\nlifetime_advice_automatic=false\nlifetime_advice_source_changes=false\nlifetime_provenance=");if(compact_manifest==1){zagd_text_append(&body,"unavailable-compact-manifest");}else{zagd_text_append(&body,"proven-foreground-ast");}zagd_text_append(&body,"\nlifetime_pairs=");zagd_text_append_i64(&body,proven_buffer_pairs);zagd_text_append(&body,"\nlifetime_reusable_bytes=");zagd_text_append_i64(&body,proven_buffer_bytes);zagd_text_append(&body,"\nlifetime_analysis_bound=64\nlifetime_validity=");if(compact_manifest==1){zagd_text_append(&body,"unavailable-compact-manifest");}else{zagd_text_append(&body,"linux-x86_64-local-raw-word-zalloc-exactly-one-zfree-no-alias-escape-call-exposure");}zagd_text_append(&body,"\nselection=");zagd_text_append(&body,selection);zagd_text_append(&body,"\ncpu_profile=");zagd_text_append(&body,cpu.canonical);zagd_text_append(&body,"\ntarget_cache_key=");zagd_text_append(&body,cpu.cache_key);zagd_text_append(&body,"\nsource=");zagd_append_hash_fields(&body,view.source);zagd_text_append(&body,"\nsemantic_identity=");zagd_append_hash_fields(&body,semantic_identity);zagd_text_append(&body,"\ntarget=");zagd_append_hash_fields(&body,target);zagd_text_append(&body,"\ngenerated=");zagd_text_append_i64(&body,generated.len);zagd_text_append(&body,"\nfinalists=");zagd_text_append_i64(&body,finalists.len);zagd_text_append_byte(&body,'\n');
+    let i:i32=0;while(i<generated.len){let c:ZagdConcreteCandidate=generated.data[i];zagd_text_append(&body,"candidate=");zagd_text_append_i64(&body,c.kind);zagd_text_append(&body,"\tautomatic=");zagd_text_append_i64(&body,c.automatic);zagd_text_append(&body,"\tsupported=");zagd_text_append_i64(&body,c.supported);zagd_text_append(&body,"\tequivalent=");zagd_text_append_i64(&body,c.equivalent);zagd_text_append(&body,"\tprovenance=");zagd_text_append(&body,zagd_provenance_name(c.provenance));zagd_text_append(&body,"\tevidence_basis=");zagd_text_append(&body,c.evidence_basis);zagd_text_append(&body,"\tvalidity=");zagd_text_append(&body,c.validity);zagd_text_append(&body,"\trejected_reason=");zagd_text_append(&body,c.rejected_reason);zagd_text_append(&body,"\truntime_ns=");zagd_text_append_i64(&body,c.runtime_ns);zagd_text_append(&body,"\tmemory_bytes=");zagd_text_append_i64(&body,c.memory_bytes);zagd_text_append_byte(&body,'\n');i=i+1;}
+    let sum:ZagdHash=zagd_content_hash(body.data[0..body.len]);zagd_text_append(&body,"checksum_first=");zagd_text_append_i64(&body,sum.first);zagd_text_append_byte(&body,'\n');let temp:[]u8=zagd_join_path(dir,"candidates.record.tmp");let written:i32=zagd_store_transaction(temp,final,body.data[0..body.len]);free[u8](&body);free[ZagdConcreteCandidate](&generated);free[ZagdConcreteCandidate](&finalists);zagd_text_free(temp);zagd_text_free(final);zagd_text_free(dir);zagd_text_free(base);return written;
+}
+fn zagd_deep_control_path(root:[]u8,name:[]u8)[]u8{
+    let control:[]u8=zagd_join_path(root,name);if(_zag_file_exists(control)==0){zagd_text_free(control);return "";}
+    let raw:[]u8=_zag_read_file(control);zagd_text_free(control);if(raw.len<0){return "";}
+    let value:[]u8=zagd_trim_line(raw);if(value.len==0){_zag_free(_zag_slice_ptr(raw));return "";}
+    if(value[0]=='/'){return value;}
+    let resolved:[]u8=zagd_join_path(root,value);_zag_free(_zag_slice_ptr(raw));return resolved;
+}
 fn zagd_deep_value_safe(value:[]u8)i32{if(value.len==0){return 0;}let i:i32=0;while(i<value.len){if(value[i]=='\n'||value[i]=='\r'||value[i]=='\t'){return 0;}i=i+1;}return 1;}
-fn zagd_deep_source_current(root:[]u8,view:SemanticManifestView)i32{let path:[]u8=view.module;if(path.len==0){return 0;}if(path[0]!='/'){path=zagd_join_path(root,path);}if(_zag_file_exists(path)==0){return 0;}return zagd_hash_equal(zagd_content_hash(_zag_read_file(path)),view.source);}
-fn zagd_persist_deep_measurement(root:[]u8,view:SemanticManifestView,target:ZagdHash,reference:[]u8,finalist:[]u8,total_ms:i64,runs:i32)i32{if(zagd_deep_value_safe(reference)==0||zagd_deep_value_safe(finalist)==0){return 0;}let body:[]u8="format=zagd-deep-measurement-v1\nadvisory=true\nexecutable_authority=false\nmode=deep\nexplicit=true\nequivalence=exact-output-stderr-exit-signal-state\n";body=_zag_str_concat(body,_zag_str_concat("source=",_zag_str_concat(zagd_hash_fields(view.source),"\n")));body=_zag_str_concat(body,_zag_str_concat("target=",_zag_str_concat(zagd_hash_fields(target),"\n")));body=_zag_str_concat(body,_zag_str_concat("reference=",_zag_str_concat(reference,"\n")));body=_zag_str_concat(body,_zag_str_concat("finalist=",_zag_str_concat(finalist,"\n")));body=_zag_str_concat(body,_zag_str_concat("runs=",_zag_str_concat(_zag_i64_to_str(runs),"\n")));body=_zag_str_concat(body,_zag_str_concat("runtime_ms_mean=",_zag_str_concat(_zag_i64_to_str(total_ms/(runs as i64)),"\n")));let sum:ZagdHash=zagd_content_hash(body);let payload:[]u8=_zag_str_concat(body,_zag_str_concat("checksum_first=",_zag_str_concat(_zag_i64_to_str(sum.first),"\n")));let dir:[]u8=zagd_join_path(zagd_join_path(root,".zag-cache"),"zagd");return zagd_store_transaction(zagd_join_path(dir,"deep-measurement.record.tmp"),zagd_join_path(dir,"deep-measurement.record"),payload);}
-fn zagd_execute_deep_controls(root:[]u8,mode:i32,view:SemanticManifestView,stop_path:[]u8)i32{
-    let measurement_path:[]u8=zagd_join_path(zagd_join_path(zagd_join_path(root,".zag-cache"),"zagd"),"deep-measurement.record");zagd_unlink(measurement_path);
-    if(mode!=zagd_mode_deep()||view.valid==0||zagd_deep_source_current(root,view)==0){return 0;}
-    let reference:[]u8=zagd_deep_control_path(root,".zagd.deep-reference");let finalist:[]u8=zagd_deep_control_path(root,".zagd.deep-finalist");if(reference.len==0||finalist.len==0||_zag_file_exists(reference)==0||_zag_file_exists(finalist)==0){return 0;}
-    let target:ZagdHash=zagd_content_hash("linux-x86_64-generic");let req:ZagdBenchmarkRequest=ZagdBenchmarkRequest{.explicit=1,.mode=mode,.finalists=1,.timeout_ms=1000,.max_memory=67108864,.source=view.source,.stable_source=view.source,.target=target,.active_target=target,.cancelled=0,.network=0,.gpu=0,.source_writes=0};let decision:ZagdBenchmarkDecision=zagd_benchmark_decide(req);if(decision.allowed==0){return 0;}
-    let cancelled:i32=0;let total:i64=0;let run:i32=0;while(run<3){if(_zag_file_exists(stop_path)==1||zagd_deep_source_current(root,view)==0){cancelled=1;return 0;}let baseline:ZagdExecutionResult=zagd_execute_finalist(reference,1000,67108864,1048576,&cancelled);if(zagd_deep_source_current(root,view)==0){return 0;}let candidate:ZagdExecutionResult=zagd_execute_finalist(finalist,1000,67108864,1048576,&cancelled);if(zagd_measurement_may_persist(decision,baseline,candidate)==0){return 0;}total=total+candidate.elapsed_ms;run=run+1;}
-    if(_zag_file_exists(stop_path)==1||zagd_deep_source_current(root,view)==0){return 0;}return zagd_persist_deep_measurement(root,view,target,zagd_relative(root,reference),zagd_relative(root,finalist),total,3);
+fn zagd_deep_semantics_current(root:[]u8,expected:ZagdHash,cpu:X86CpuProfile)i32{
+    let base:[]u8=zagd_join_path(root,".zag-cache");let dir:[]u8=zagd_join_path(base,"zagd");let path:[]u8=zagd_join_path(dir,"semantic.record");zagd_text_free(dir);zagd_text_free(base);
+    if(zagd_path_is_regular(path)==0){zagd_text_free(path);return 0;}
+    let text:[]u8=_zag_read_file(path);zagd_text_free(path);if(text.len<=0){if(text.len>=0){_zag_free(_zag_slice_ptr(text));}return 0;}
+    let current:ZagdHash=zagd_plan_semantic_identity(text,cpu);
+    let valid:i32=(zagd_hash_equal(current,expected)==1&&zagd_manifest_modules_current(root,text)==1) as i32;
+    _zag_free(_zag_slice_ptr(text));return valid;
 }
-fn zagd_cache_trim(root:[]u8,max_bytes:i64)i32{
-    let dir:[]u8=zagd_join_path(zagd_join_path(root,".zag-cache"),"zagd");
+fn zagd_persist_deep_measurement(root:[]u8,view:SemanticManifestView,semantic_identity:ZagdHash,cpu:X86CpuProfile,target:ZagdHash,reference:[]u8,finalist:[]u8,total_ms:i64,runs:i32)i32{
+    if(zagd_deep_value_safe(reference)==0||zagd_deep_value_safe(finalist)==0||runs<1){return 0;}
+    let body:ArrayList[u8]=zagd_text(1024);zagd_text_append(&body,"format=zagd-deep-measurement-v2\nadvisory=true\nexecutable_authority=false\nmode=deep\nexplicit=true\nforeground_consumption=false\nprovenance=measured\nequivalence=exact-output-stderr-exit-signal-state\ncpu_profile=");zagd_text_append(&body,cpu.canonical);zagd_text_append(&body,"\ntarget_cache_key=");zagd_text_append(&body,cpu.cache_key);zagd_text_append(&body,"\nsource=");zagd_append_hash_fields(&body,view.source);zagd_text_append(&body,"\nsemantic_identity=");zagd_append_hash_fields(&body,semantic_identity);zagd_text_append(&body,"\ntarget=");zagd_append_hash_fields(&body,target);zagd_text_append(&body,"\nreference=");zagd_text_append(&body,reference);zagd_text_append(&body,"\nfinalist=");zagd_text_append(&body,finalist);zagd_text_append(&body,"\nruns=");zagd_text_append_i64(&body,runs);zagd_text_append(&body,"\nruntime_ms_mean=");zagd_text_append_i64(&body,total_ms/(runs as i64));zagd_text_append_byte(&body,'\n');
+    let sum:ZagdHash=zagd_content_hash(body.data[0..body.len]);zagd_text_append(&body,"checksum_first=");zagd_text_append_i64(&body,sum.first);zagd_text_append_byte(&body,'\n');
+    let base:[]u8=zagd_join_path(root,".zag-cache");let dir:[]u8=zagd_join_path(base,"zagd");let temp:[]u8=zagd_join_path(dir,"deep-measurement.record.tmp");let final:[]u8=zagd_join_path(dir,"deep-measurement.record");let written:i32=zagd_store_transaction(temp,final,body.data[0..body.len]);zagd_text_free(final);zagd_text_free(temp);zagd_text_free(dir);zagd_text_free(base);free[u8](&body);return written;
+}
+fn zagd_execute_deep_controls(root:[]u8,mode:i32,semantic_text:[]u8,cpu:X86CpuProfile,stop_path:[]u8)i32{
+    let base:[]u8=zagd_join_path(root,".zag-cache");let dir:[]u8=zagd_join_path(base,"zagd");let measurement_path:[]u8=zagd_join_path(dir,"deep-measurement.record");zagd_unlink(measurement_path);zagd_text_free(measurement_path);zagd_text_free(dir);zagd_text_free(base);
+    let view:SemanticManifestView=semantic_manifest_decode(semantic_text);let semantic_identity:ZagdHash=zagd_plan_semantic_identity(semantic_text,cpu);
+    if(mode!=zagd_mode_deep()||view.valid==0||semantic_identity.bytes<=0||
+        zagd_deep_semantics_current(root,semantic_identity,cpu)==0){return 0;}
+    let reference:[]u8=zagd_deep_control_path(root,".zagd.deep-reference");let finalist:[]u8=zagd_deep_control_path(root,".zagd.deep-finalist");
+    if(reference.len==0||finalist.len==0||_zag_file_exists(reference)==0||_zag_file_exists(finalist)==0){if(reference.len>0){zagd_text_free(reference);}if(finalist.len>0){zagd_text_free(finalist);}return 0;}
+    let target:ZagdHash=zagd_content_hash(cpu.cache_key);let req:ZagdBenchmarkRequest=ZagdBenchmarkRequest{.explicit=1,.mode=mode,.finalists=1,.timeout_ms=1000,.max_memory=67108864,.source=semantic_identity,.stable_source=semantic_identity,.target=target,.active_target=target,.cancelled=0,.network=0,.gpu=0,.source_writes=0};let decision:ZagdBenchmarkDecision=zagd_benchmark_decide(req);
+    if(decision.allowed==0){zagd_text_free(reference);zagd_text_free(finalist);return 0;}
+    let cancelled:i32=0;let total:i64=0;let run:i32=0;let valid:i32=1;
+    while(run<3&&valid==1){
+        if(_zag_file_exists(stop_path)==1||zagd_deep_semantics_current(root,semantic_identity,cpu)==0){cancelled=1;valid=0;}
+        else{
+            let baseline:ZagdExecutionResult=zagd_execute_finalist(reference,1000,67108864,1048576,&cancelled);
+            if(zagd_deep_semantics_current(root,semantic_identity,cpu)==0){valid=0;zagd_execution_result_free(&baseline);}
+            else{
+                let candidate:ZagdExecutionResult=zagd_execute_finalist(finalist,1000,67108864,1048576,&cancelled);
+                if(zagd_measurement_may_persist(decision,baseline,candidate)==0){valid=0;}
+                else{total=total+candidate.elapsed_ms;run=run+1;}
+                zagd_execution_result_free(&baseline);zagd_execution_result_free(&candidate);
+            }
+        }
+    }
+    let written:i32=0;if(valid==1&&run==3&&_zag_file_exists(stop_path)==0&&zagd_deep_semantics_current(root,semantic_identity,cpu)==1){written=zagd_persist_deep_measurement(root,view,semantic_identity,cpu,target,zagd_relative(root,reference),zagd_relative(root,finalist),total,3);}
+    zagd_text_free(reference);zagd_text_free(finalist);return written;
+}
+fn zagd_cache_trim_name(outcome:i32)[]u8{if(outcome==0){return "semantic-invalidated";}if(outcome==2){return "trimmed";}return "within-limit";}
+fn zagd_file_size(path:[]u8)i64{return zagd_path_size(path);}
+fn zagd_cache_trim(root:[]u8,max_bytes:i64)ZagdCacheTrim{
+    let base:[]u8=zagd_join_path(root,".zag-cache");let dir:[]u8=zagd_join_path(base,"zagd");
     let snapshot:[]u8=zagd_join_path(dir,"snapshot.record");let plan:[]u8=zagd_join_path(dir,"plan.record");let semantic:[]u8=zagd_join_path(dir,"semantic.record");let artifact:[]u8=zagd_join_path(dir,"artifact.record");let candidates:[]u8=zagd_join_path(dir,"candidates.record");let incremental:[]u8=zagd_join_path(dir,"incremental.record");let measurement:[]u8=zagd_join_path(dir,"deep-measurement.record");let profile_plan:[]u8=zagd_join_path(dir,"profile-plan.record");
-    let total:i64=0;if(_zag_file_exists(snapshot)==1){total=total+(_zag_read_file(snapshot).len as i64);}if(_zag_file_exists(plan)==1){total=total+(_zag_read_file(plan).len as i64);}if(_zag_file_exists(semantic)==1){total=total+(_zag_read_file(semantic).len as i64);}
-    if(_zag_file_exists(artifact)==1){total=total+(_zag_read_file(artifact).len as i64);}if(_zag_file_exists(candidates)==1){total=total+(_zag_read_file(candidates).len as i64);}if(_zag_file_exists(incremental)==1){total=total+(_zag_read_file(incremental).len as i64);}if(_zag_file_exists(measurement)==1){total=total+(_zag_read_file(measurement).len as i64);}if(_zag_file_exists(profile_plan)==1){total=total+(_zag_read_file(profile_plan).len as i64);}if(total>max_bytes&&_zag_file_exists(measurement)==1){total=total-(_zag_read_file(measurement).len as i64);zagd_unlink(measurement);}if(total>max_bytes&&_zag_file_exists(profile_plan)==1){total=total-(_zag_read_file(profile_plan).len as i64);zagd_unlink(profile_plan);}if(total>max_bytes&&_zag_file_exists(candidates)==1){total=total-(_zag_read_file(candidates).len as i64);zagd_unlink(candidates);}if(total>max_bytes&&_zag_file_exists(artifact)==1){total=total-(_zag_read_file(artifact).len as i64);zagd_unlink(artifact);}if(total>max_bytes&&_zag_file_exists(plan)==1){total=total-(_zag_read_file(plan).len as i64);zagd_unlink(plan);}if(total>max_bytes&&_zag_file_exists(incremental)==1){total=total-(_zag_read_file(incremental).len as i64);zagd_unlink(incremental);}
-    if(total>max_bytes&&_zag_file_exists(snapshot)==1){total=total-(_zag_read_file(snapshot).len as i64);zagd_unlink(snapshot);}
-    if(total>max_bytes&&_zag_file_exists(semantic)==1){zagd_unlink(semantic);return 0;}return 1;
+    let foreground:[]u8=zagd_join_path(base,"foreground");let machine_record:[]u8=zagd_join_path(foreground,"machine.record");let machine_code:[]u8=zagd_join_path(foreground,"machine.code");let machine_data:[]u8=zagd_join_path(foreground,"machine.data");let foreground_bytes:i64=zagd_file_size(machine_record)+zagd_file_size(machine_code)+zagd_file_size(machine_data);
+    let total:i64=zagd_file_size(snapshot)+zagd_file_size(plan)+zagd_file_size(semantic)+zagd_file_size(artifact)+zagd_file_size(candidates)+zagd_file_size(incremental)+zagd_file_size(measurement)+zagd_file_size(profile_plan)+foreground_bytes;let trimmed:i32=0;let before:i64=total;
+    if(total>max_bytes&&zagd_file_size(measurement)>0){total=total-zagd_file_size(measurement);zagd_unlink(measurement);trimmed=1;}if(total>max_bytes&&zagd_file_size(profile_plan)>0){total=total-zagd_file_size(profile_plan);zagd_unlink(profile_plan);trimmed=1;}if(total>max_bytes&&zagd_file_size(candidates)>0){total=total-zagd_file_size(candidates);zagd_unlink(candidates);trimmed=1;}if(total>max_bytes&&zagd_file_size(artifact)>0){total=total-zagd_file_size(artifact);zagd_unlink(artifact);trimmed=1;}if(total>max_bytes&&zagd_file_size(plan)>0){total=total-zagd_file_size(plan);zagd_unlink(plan);trimmed=1;}if(total>max_bytes&&foreground_bytes>0){total=total-foreground_bytes;zagd_unlink(machine_record);zagd_unlink(machine_code);zagd_unlink(machine_data);trimmed=1;}if(total>max_bytes&&zagd_file_size(incremental)>0){total=total-zagd_file_size(incremental);zagd_unlink(incremental);trimmed=1;}
+    if(total>max_bytes&&zagd_file_size(snapshot)>0){total=total-zagd_file_size(snapshot);zagd_unlink(snapshot);trimmed=1;}
+    let outcome:i32=1;if(total>max_bytes&&zagd_file_size(semantic)>0){zagd_unlink(semantic);outcome=0;}else if(trimmed==1){outcome=2;}
+    let after:i64=zagd_cache_bytes(root);zagd_text_free(machine_data);zagd_text_free(machine_code);zagd_text_free(machine_record);zagd_text_free(foreground);zagd_text_free(profile_plan);zagd_text_free(measurement);zagd_text_free(incremental);zagd_text_free(candidates);zagd_text_free(artifact);zagd_text_free(semantic);zagd_text_free(plan);zagd_text_free(snapshot);zagd_text_free(dir);zagd_text_free(base);return ZagdCacheTrim{.outcome=outcome,.bytes_before=before,.bytes_after=after};
 }
-fn zagd_revalidate_index(records:ArrayList[ZagdFileState])i32{let i:i32=0;while(i<records.len){if(_zag_file_exists(records.data[i].path)==0){return 0;}let bytes:[]u8=_zag_read_file(records.data[i].path);if(zagd_hash_equal(zagd_content_hash(bytes),records.data[i].hash)==0){return 0;}i=i+1;}return 1;}
-fn zagd_semantic_manifest(root:[]u8,path:[]u8)SemanticManifestView{let bad:SemanticManifestView=semantic_manifest_decode("");if(_zag_file_exists(path)==0){return bad;}let view:SemanticManifestView=semantic_manifest_decode(_zag_read_file(path));if(view.valid==0||zagd_index_path_safe(view.module)==0){return bad;}let source_path:[]u8=zagd_join_path(root,view.module);if(_zag_file_exists(source_path)==0||zagd_hash_equal(zagd_content_hash(_zag_read_file(source_path)),view.source)==0){return bad;}return view;}
-fn zagd_seed_semantic_records(root:[]u8,text:[]u8,records:*ArrayList[ZagdFileState])void{let start:i32=0;let i:i32=0;while(i<=text.len){if(i==text.len||text[i]=='\n'){let line:[]u8=text[start..i];if(line.len>12&&@strEq(line[0..12],"module_node=")){let node:[]u8=line[12..];let tab:i32=0;while(tab<node.len&&node[tab]!='\t'){tab=tab+1;}if(tab<node.len){let name:[]u8=node[0..tab];let path:[]u8=name;if(name.len==0||name[0]!='/'){path=zagd_join_path(root,name);}if(_zag_file_exists(path)==1){let bytes:[]u8=_zag_read_file(path);let hash:ZagdHash=zagd_content_hash(bytes);if(zagd_hash_equal(hash,smf_hash(node[tab+1..]))==1){let facts:ZagdSourceFacts=zagd_source_facts(bytes);let _seed:i32=zagd_record_changed(records,path,hash,facts,1);}}}}start=i+1;}i=i+1;}}
+// Status uses the same bounded record set as eviction. This is measured at
+// publication time, never guessed from a configured cap.
+fn zagd_file_size_join(root:[]u8,name:[]u8)i64{let path:[]u8=zagd_join_path(root,name);let size:i64=zagd_file_size(path);zagd_text_free(path);return size;}
+fn zagd_cache_bytes(root:[]u8)i64{let base:[]u8=zagd_join_path(root,".zag-cache");let dir:[]u8=zagd_join_path(base,"zagd");let names:ArrayList[[]u8]=make[[]u8](8);push[[]u8](&names,"snapshot.record");push[[]u8](&names,"plan.record");push[[]u8](&names,"semantic.record");push[[]u8](&names,"artifact.record");push[[]u8](&names,"candidates.record");push[[]u8](&names,"incremental.record");push[[]u8](&names,"deep-measurement.record");push[[]u8](&names,"profile-plan.record");let total:i64=0;let i:i32=0;while(i<names.len){total=total+zagd_file_size_join(dir,names.data[i]);i=i+1;}free[[]u8](&names);let foreground:[]u8=zagd_join_path(base,"foreground");total=total+zagd_file_size_join(foreground,"machine.record");total=total+zagd_file_size_join(foreground,"machine.code");total=total+zagd_file_size_join(foreground,"machine.data");zagd_text_free(foreground);zagd_text_free(dir);zagd_text_free(base);return total;}
+fn zagd_revalidate_index(records:ArrayList[ZagdFileState])i32{let i:i32=0;while(i<records.len){if(_zag_file_exists(records.data[i].path)==0){return 0;}let bytes:[]u8=_zag_read_file(records.data[i].path);let valid:i32=0;if(bytes.len>=0){valid=zagd_hash_equal(zagd_content_hash(bytes),records.data[i].hash);_zag_free(_zag_slice_ptr(bytes));}if(valid==0){return 0;}i=i+1;}return 1;}
+fn zagd_seed_semantic_records(root:[]u8,text:[]u8,records:*ArrayList[ZagdFileState])void{let start:i32=0;let i:i32=0;while(i<=text.len){if(i==text.len||text[i]=='\n'){let line:[]u8=text[start..i];if(line.len>12&&@strEq(line[0..12],"module_node=")){let node:[]u8=line[12..];let tab:i32=0;while(tab<node.len&&node[tab]!='\t'){tab=tab+1;}if(tab<node.len){let name:[]u8=node[0..tab];let path:[]u8=name;let path_owned:i32=0;if(name.len==0||name[0]!='/'){path=zagd_join_path(root,name);path_owned=1;}if(_zag_file_exists(path)==1){let bytes:[]u8=_zag_read_file(path);if(bytes.len>=0){let hash:ZagdHash=zagd_content_hash(bytes);if(zagd_hash_equal(hash,smf_hash(node[tab+1..]))==1){let facts:ZagdSourceFacts=zagd_source_facts(bytes);let _seed:i32=zagd_record_changed(records,path,hash,facts,1);}_zag_free(_zag_slice_ptr(bytes));}}if(path_owned==1){zagd_text_free(path);}}}start=i+1;}i=i+1;}}
 
 fn zagd_parse_pid(value: []u8) i64 {
     let result: i64 = 0;
@@ -121,12 +389,22 @@ fn zagd_parse_pid(value: []u8) i64 {
     return result;
 }
 
-fn zagd_claim_singleton(lock_path: []u8) i64 {
+fn zagd_lock_record_after_start_window(lock_path:[]u8)[]u8{
+    let record:[]u8=_zag_read_file(lock_path);if(zagd_parse_pid(record)>=2&&zli_lock_start(record).len>0){return record;}
+    // An O_EXCL winner may not yet have written its record, or the write may
+    // be briefly observed mid-flight. Bound the wait so a crash cannot wedge
+    // the project, but do not tear down a normal concurrent starter instantly.
+    let waits:i32=0;while(waits<50){zagd_sleep_ms(1);let reread:[]u8=_zag_read_file(lock_path);if(zagd_parse_pid(reread)>=2&&zli_lock_start(reread).len>0){if(record.len>=0){_zag_free(_zag_slice_ptr(record));}return reread;}if(record.len>=0){_zag_free(_zag_slice_ptr(record));}record=reread;waits=waits+1;}return record;
+}
+
+fn zagd_claim_singleton(lock_path: []u8, root: []u8) i64 {
     let fd: i64 = zagd_open_lock(lock_path);
     if (fd >= 0) { return fd; }
-    let prior: i64 = zagd_parse_pid(_zag_read_file(lock_path));
-    if (prior < 2) { return 0 - 1; }
-    if (zagd_pid_alive(prior) == 1) { return 0 - 1; }
+    let prior_record: []u8 = zagd_lock_record_after_start_window(lock_path);
+    let prior: i64 = zagd_parse_pid(prior_record);
+    if (prior < 2) { if(prior_record.len>=0){_zag_free(_zag_slice_ptr(prior_record));}zagd_unlink(lock_path);return zagd_open_lock(lock_path); }
+    if (zagd_lock_identity_alive(prior_record, root) == 1) { _zag_free(_zag_slice_ptr(prior_record));return 0 - 1; }
+    _zag_free(_zag_slice_ptr(prior_record));
     zagd_unlink(lock_path);
     return zagd_open_lock(lock_path);
 }
@@ -140,11 +418,19 @@ fn zagd_watch_path(fd: i64, path: []u8, watches: *ArrayList[ZagdWatch]) i32 {
     if (watches.*.len >= 4096) { return 0; }
     let wd: i64 = zagd_inotify_watch(fd, path);
     if (wd < 0) { return 0; }
-    push[ZagdWatch](watches, ZagdWatch{ .wd = wd, .path = path });
+    // The caller commonly passes a one-event joined path.  Watch ownership is
+    // explicit so that the event buffer can always be released after dispatch.
+    push[ZagdWatch](watches, ZagdWatch{ .wd = wd, .path = zagd_text_clone(path) });
     return 1;
+}
+fn zagd_free_watches(watches:*ArrayList[ZagdWatch])void{
+    let i:i32=0;while(i<watches.*.len){zagd_text_free(watches.*.data[i].path);i=i+1;}
+    free[ZagdWatch](watches);
 }
 
 fn zagd_scan_directories(fd: i64, root: []u8, watches: *ArrayList[ZagdWatch]) void {
+    // Never follow a project-internal directory symlink into another tree.
+    if(zagd_path_is_directory(root)==0){return;}
     if (zagd_watch_path(fd, root, watches) == 0) { return; }
     let dirfd: i64 = zagd_open_directory(root);
     if (dirfd < 0) { return; }
@@ -161,14 +447,19 @@ fn zagd_scan_directories(fd: i64, root: []u8, watches: *ArrayList[ZagdWatch]) vo
                 else {
                     let dtype: i32 = entries.data[off + 18] as i32;
                     let name: []u8 = zagd_event_name(entries.data[0..nread as i32], off + 19, reclen - 19);
-                    if (dtype == 4 && @strEq(name, ".") == 0 && @strEq(name, "..") == 0 && zagd_ignored_name(name) == 0) {
-                        zagd_scan_directories(fd, zagd_join_path(root, name), watches);
+                    if (@strEq(name, ".") == 0 && @strEq(name, "..") == 0 && zagd_ignored_name(name) == 0) {
+                        let child:[]u8=zagd_join_path(root,name);
+                        if(dtype==4||(dtype==0&&zagd_path_is_directory(child)==1)){
+                            zagd_scan_directories(fd,child,watches);
+                        }
+                        zagd_text_free(child);
                     }
                     off = off + reclen;
                 }
             }
         }
     }
+    free[u8](&entries);
     zagd_close(dirfd);
 }
 
@@ -180,6 +471,11 @@ fn zagd_watch_base(watches: *ArrayList[ZagdWatch], wd: i64) []u8 {
     }
     return "";
 }
+
+fn zagd_path_parent(path:[]u8)[]u8{let end:i32=path.len;while(end>1&&path[end-1]=='/'){end=end-1;}let slash:i32=0-1;let i:i32=0;while(i<end){if(path[i]=='/'){slash=i;}i=i+1;}if(slash<0){return ".";}if(slash==0){return "/";}return path[0..slash];}
+fn zagd_path_name(path:[]u8)[]u8{let end:i32=path.len;while(end>1&&path[end-1]=='/'){end=end-1;}let slash:i32=0-1;let i:i32=0;while(i<end){if(path[i]=='/'){slash=i;}i=i+1;}return path[slash+1..end];}
+fn zagd_unlink_project(root:[]u8,name:[]u8)void{let path:[]u8=zagd_join_path(root,name);zagd_unlink(path);zagd_text_free(path);}
+fn zagd_publish_event(mask:i64)i32{return (zagd_mask_has(mask,zagd_in_close_write())==1||zagd_mask_has(mask,zagd_in_moved_to())==1||zagd_mask_has(mask,zagd_in_create())==1) as i32;}
 
 fn zagd_record_changed(records: *ArrayList[ZagdFileState], path: []u8,
         hash: ZagdHash, facts:ZagdSourceFacts, exists: i32) i32 {
@@ -196,8 +492,207 @@ fn zagd_record_changed(records: *ArrayList[ZagdFileState], path: []u8,
         }
         i = i + 1;
     }
-    push[ZagdFileState](records, ZagdFileState{ .path = path, .hash = hash, .facts=facts, .exists = exists });
+    // A delete hint or ignored symlink for an untracked path changes no source
+    // identity and must not create a phantom absent record.
+    if(exists==0){return 0-1;}
+    // Event names and directory joins are temporary buffers.  Keep an owned
+    // copy only for a newly tracked file so a rapid event stream does not
+    // retain one path allocation per notification.
+    push[ZagdFileState](records, ZagdFileState{ .path = zagd_text_clone(path), .hash = hash, .facts=facts, .exists = exists });
     return zagd_change_unknown();
+}
+fn zagd_free_records(records:*ArrayList[ZagdFileState])void{
+    let i:i32=0;while(i<records.*.len){zagd_text_free(records.*.data[i].path);i=i+1;}
+    free[ZagdFileState](records);
+}
+
+struct ZagdSourceObservation {
+    stable:i32,
+    exists:i32,
+    hash:ZagdHash,
+    facts:ZagdSourceFacts,
+}
+
+struct ZagdStableRescan {
+    stable:i32,
+    records:ArrayList[ZagdFileState],
+}
+
+fn zagd_observe_source(path:[]u8)ZagdSourceObservation {
+    let empty:ZagdHash=zagd_content_hash("");
+    let absent:ZagdSourceObservation=ZagdSourceObservation{
+        .stable=0,.exists=0,.hash=empty,.facts=zagd_source_facts("") };
+    // lstat fail-closed: regular files are read; symlinks, directories and
+    // vanished paths all have absent source identity.
+    if(zagd_path_is_regular(path)==0){return absent;}
+    let bytes:[]u8=_zag_read_file(path);
+    if(bytes.len<0){return absent;}
+    let observed:ZagdSourceObservation=ZagdSourceObservation{.stable=0,.exists=1,
+        .hash=zagd_content_hash(bytes),.facts=zagd_source_facts(bytes)};
+    _zag_free(_zag_slice_ptr(bytes));
+    return observed;
+}
+
+fn zagd_observation_equal(a:ZagdSourceObservation,b:ZagdSourceObservation)i32 {
+    if(a.exists!=b.exists){return 0;}
+    if(a.exists==0){return 1;}
+    return zagd_hash_equal(a.hash,b.hash);
+}
+
+fn zagd_observation_matches_record(records:ArrayList[ZagdFileState],path:[]u8,
+        observed:ZagdSourceObservation)i32 {
+    let i:i32=0;
+    while(i<records.len){
+        let record:ZagdFileState=records.data[i];
+        if(@strEq(record.path,path)){
+            if(record.exists!=observed.exists){return 0;}
+            if(observed.exists==0){return 1;}
+            return zagd_hash_equal(record.hash,observed.hash);
+        }
+        i=i+1;
+    }
+    return (observed.exists==0) as i32;
+}
+
+fn zagd_observe_source_stable(path:[]u8,window_ms:i64,
+        records:ArrayList[ZagdFileState])ZagdSourceObservation {
+    // A symlink event is not a deletion of a tracked source.  Treat it as a
+    // stable ignored hint so an editor-created link cannot force the daemon
+    // into `stabilizing`, invalidate semantic facts, or pull its target into a
+    // snapshot. Actual deletions remain absent observations below.
+    if(zagd_path_is_symlink(path)==1){
+        let ignored:ZagdSourceObservation=ZagdSourceObservation{.stable=1,.exists=0,
+            .hash=zagd_content_hash(""),.facts=zagd_source_facts("")};
+        return ignored;
+    }
+    let prior:ZagdSourceObservation=zagd_observe_source(path);
+    // A queued hint for bytes already in the published snapshot is safe to
+    // discard immediately. This drains rapid-save event bursts without paying
+    // one stability window per duplicate, while a genuinely new observation
+    // still requires two equal complete reads below.
+    if(zagd_observation_matches_record(records,path,prior)==1){
+        prior.stable=1;
+        return prior;
+    }
+    let tries:i32=0;
+    while(tries<4){
+        zagd_sleep_ms(window_ms);
+        let next:ZagdSourceObservation=zagd_observe_source(path);
+        if(zagd_observation_equal(prior,next)==1){next.stable=1;return next;}
+        prior=next;
+        tries=tries+1;
+    }
+    // The caller must invalidate analysis but retain its previous snapshot.
+    prior.stable=0;
+    return prior;
+}
+
+fn zagd_scan_source_tree(root:[]u8,out:*ArrayList[ZagdFileState],complete:*i32)void {
+    if(complete.*==0||out.*.len>=4096){complete.*=0;return;}
+    if(zagd_path_is_directory(root)==0){complete.*=0;return;}
+    let dirfd:i64=zagd_open_directory(root);
+    if(dirfd<0){complete.*=0;return;}
+    let entries:ArrayList[u8]=make[u8](4096);
+    let scanning:i32=1;
+    while(scanning==1&&complete.*==1){
+        let nread:i64=zagd_getdents(dirfd,&entries);
+        if(nread==0){scanning=0;}
+        else if(nread<0){complete.*=0;scanning=0;}
+        else {
+            let off:i32=0;
+            while(off+19<=nread&&complete.*==1){
+                let reclen:i32=zagd_u16_at(entries.data[0..nread as i32],off+16);
+                if(reclen<19||off+reclen>nread){complete.*=0;off=nread as i32;}
+                else {
+                    let dtype:i32=entries.data[off+18] as i32;
+                    let name:[]u8=zagd_event_name(entries.data[0..nread as i32],off+19,reclen-19);
+                    if(@strEq(name,".")==0&&@strEq(name,"..")==0&&zagd_ignored_name(name)==0){
+                        let full:[]u8=zagd_join_path(root,name);
+                        if(dtype==4||(dtype==0&&zagd_path_is_directory(full)==1)){
+                            zagd_scan_source_tree(full,out,complete);
+                        } else if(zagd_source_name(name)==1&&zagd_path_is_regular(full)==1){
+                            let bytes:[]u8=_zag_read_file(full);
+                            if(bytes.len<0){complete.*=0;}
+                            else if(out.*.len>=4096){_zag_free(_zag_slice_ptr(bytes));complete.*=0;}
+                            else {
+                                let hash:ZagdHash=zagd_content_hash(bytes);
+                                push[ZagdFileState](out,ZagdFileState{.path=zagd_text_clone(full),.hash=hash,
+                                    .facts=zagd_source_facts(bytes),.exists=1});
+                                _zag_free(_zag_slice_ptr(bytes));
+                            }
+                        }
+                        zagd_text_free(full);
+                    }
+                    off=off+reclen;
+                }
+            }
+        }
+    }
+    free[u8](&entries);
+    zagd_close(dirfd);
+}
+
+fn zagd_scan_sources_once(root:[]u8)ZagdStableRescan {
+    let records:ArrayList[ZagdFileState]=make[ZagdFileState](32);
+    let complete:i32=1;
+    zagd_scan_source_tree(root,&records,&complete);
+    return ZagdStableRescan{.stable=complete,.records=records};
+}
+
+fn zagd_record_sets_equal(a:ArrayList[ZagdFileState],b:ArrayList[ZagdFileState])i32 {
+    if(a.len!=b.len){return 0;}
+    let i:i32=0;
+    while(i<a.len){
+        let found:i32=0;
+        let j:i32=0;
+        while(j<b.len){
+            if(@strEq(a.data[i].path,b.data[j].path)&&
+                zagd_hash_equal(a.data[i].hash,b.data[j].hash)==1){found=1;}
+            j=j+1;
+        }
+        if(found==0){return 0;}
+        i=i+1;
+    }
+    return 1;
+}
+
+fn zagd_rescan_sources_stable(root:[]u8,window_ms:i64)ZagdStableRescan {
+    let prior:ZagdStableRescan=zagd_scan_sources_once(root);
+    let tries:i32=0;
+    while(tries<4&&prior.stable==1){
+        zagd_sleep_ms(window_ms);
+        let next:ZagdStableRescan=zagd_scan_sources_once(root);
+        if(next.stable==1&&zagd_record_sets_equal(prior.records,next.records)==1){
+            next.stable=1;
+            zagd_free_records(&prior.records);
+            return next;
+        }
+        zagd_free_records(&prior.records);
+        prior=next;
+        tries=tries+1;
+    }
+    prior.stable=0;
+    return prior;
+}
+
+fn zagd_incremental_from_records(records:ArrayList[ZagdFileState])ZagdIncrementalIndex {
+    let index:ZagdIncrementalIndex=zi_index_bad();
+    index.valid=1;index.advisory=1;index.executable_authority=0;
+    let i:i32=0;
+    while(i<records.len){
+        let record:ZagdFileState=records.data[i];
+        if(record.exists==1&&record.facts.valid==1){
+            let bytes:[]u8=_zag_read_file(record.path);
+            if(bytes.len>=0&&zagd_hash_equal(zagd_content_hash(bytes),record.hash)==1){
+                let file:ZagdIncrementalFile=zagd_incremental_file(record.path,bytes,record.facts);
+                if(file.valid==1){zagd_incremental_copy_names(&file);zagd_incremental_put_owned(&index,file);}
+                else{free[ZagdDeclFingerprint](&file.declarations);}
+            }
+            if(bytes.len>=0){_zag_free(_zag_slice_ptr(bytes));}
+        }
+        i=i+1;
+    }
+    return index;
 }
 
 fn zagd_change_name(change:i32)[]u8{if(change==zagd_change_none()){return "none";}if(change==zagd_change_nonsemantic()){return "nonsemantic";}if(change==zagd_change_private_body()){return "private-body";}if(change==zagd_change_public_shape()){return "public-shape";}if(change==zagd_change_root_profile()){return "root-profile";}if(change==zagd_change_target_profile()){return "target-profile";}return "unknown";}
@@ -232,67 +727,144 @@ fn zagd_parse_window(value: []u8) i64 {
     return result;
 }
 
-fn zagd_status_text(pid: i64, mode: i32, state: []u8, file: []u8,
-        hash: ZagdHash, events: i64, snapshot:ZagdSnapshot, change:i32, cache_reused:i32, incremental_reused:i32, incremental_change:i32, semantic:SemanticManifestView, dependents:i32, affected_decls:i32, plan:ZagdPlannerRun) []u8 {
-    let out: []u8 = "version=1\n";
-    out = _zag_str_concat(out, _zag_str_concat("pid=", _zag_str_concat(_zag_i64_to_str(pid), "\n")));
-    out = _zag_str_concat(out, _zag_str_concat("mode=", _zag_str_concat(zagd_mode_name(mode), "\n")));
-    out = _zag_str_concat(out, _zag_str_concat("state=", _zag_str_concat(state, "\n")));
-    out = _zag_str_concat(out, "singleton=true\nnetwork=false\ngpu_background=false\n");
-    if(cache_reused==1){out=_zag_str_concat(out,"cache_reused=true\n");}else{out=_zag_str_concat(out,"cache_reused=false\n");}
-    if(incremental_reused==1){out=_zag_str_concat(out,"incremental_cache_reused=true\n");}else{out=_zag_str_concat(out,"incremental_cache_reused=false\n");}out=_zag_str_concat(out,_zag_str_concat("incremental_invalidation=",_zag_str_concat(zagd_change_name(incremental_change),"\n")));
-    if(semantic.valid==1){out=_zag_str_concat(out,"semantic_manifest=true\n");out=_zag_str_concat(out,_zag_str_concat("semantic_public_first=",_zag_str_concat(_zag_i64_to_str(semantic.public_identity.first),"\n")));out=_zag_str_concat(out,_zag_str_concat("semantic_effects_first=",_zag_str_concat(_zag_i64_to_str(semantic.effect_identity.first),"\n")));out=_zag_str_concat(out,_zag_str_concat("semantic_layouts_first=",_zag_str_concat(_zag_i64_to_str(semantic.layout_identity.first),"\n")));}else{out=_zag_str_concat(out,"semantic_manifest=false\n");}
-    out = _zag_str_concat(out, _zag_str_concat("events=", _zag_str_concat(_zag_i64_to_str(events), "\n")));
-    out = _zag_str_concat(out, _zag_str_concat("last_change=", _zag_str_concat(zagd_change_name(change), "\n")));
-    out = _zag_str_concat(out,_zag_str_concat("affected_dependents=",_zag_str_concat(_zag_i64_to_str(dependents),"\n")));
-    out = _zag_str_concat(out,_zag_str_concat("affected_declarations=",_zag_str_concat(_zag_i64_to_str(affected_decls),"\n")));
-    out=_zag_str_concat(out,_zag_str_concat("planner_budget=",_zag_str_concat(_zag_i64_to_str(plan.budget),"\n")));out=_zag_str_concat(out,_zag_str_concat("planner_evaluated=",_zag_str_concat(_zag_i64_to_str(plan.evaluated),"\n")));out=_zag_str_concat(out,_zag_str_concat("planner_suggestions=",_zag_str_concat(_zag_i64_to_str(plan.suggestions),"\n")));if(plan.cancelled==1){out=_zag_str_concat(out,"planner_state=cancelled\n");}else if(plan.complete==1){out=_zag_str_concat(out,"planner_state=complete\n");}else{out=_zag_str_concat(out,"planner_state=running\n");}
-    out = _zag_str_concat(out, _zag_str_concat("last_file=", _zag_str_concat(file, "\n")));
-    out = _zag_str_concat(out, _zag_str_concat("content_hash_first=", _zag_str_concat(_zag_i64_to_str(hash.first), "\n")));
-    out = _zag_str_concat(out, _zag_str_concat("content_hash_second=", _zag_str_concat(_zag_i64_to_str(hash.second), "\n")));
-    out = _zag_str_concat(out, _zag_str_concat("snapshot_first=", _zag_str_concat(_zag_i64_to_str(snapshot.identity.first), "\n")));
-    out = _zag_str_concat(out, _zag_str_concat("snapshot_second=", _zag_str_concat(_zag_i64_to_str(snapshot.identity.second), "\n")));
-    out = _zag_str_concat(out, _zag_str_concat("snapshot_parent_first=", _zag_str_concat(_zag_i64_to_str(snapshot.parent.first), "\n")));
-    out = _zag_str_concat(out, _zag_str_concat("snapshot_file_count=", _zag_str_concat(_zag_i64_to_str(snapshot.file_count), "\n")));
-    return out;
+fn zagd_semantic_validation_name(validation:i32,semantic:SemanticManifestView)[]u8{if(validation==1){return "validated";}if(validation==2){return "failed";}if(semantic.valid==1){return "restored";}return "unavailable";}
+fn zagd_status_line(out:*ArrayList[u8],key:[]u8,value:[]u8)void{zagd_text_append(out,key);zagd_text_append_byte(out,'=');zagd_text_append(out,value);zagd_text_append_byte(out,'\n');}
+fn zagd_status_i64(out:*ArrayList[u8],key:[]u8,value:i64)void{zagd_text_append(out,key);zagd_text_append_byte(out,'=');zagd_text_append_i64(out,value);zagd_text_append_byte(out,'\n');}
+fn zagd_status_append(out:*ArrayList[u8],pid:i64,mode:i32,state:[]u8,file:[]u8,
+        hash:ZagdHash,events:i64,snapshot:ZagdSnapshot,change:i32,cache_reused:i32,
+        incremental_reused:i32,incremental_change:i32,semantic:SemanticManifestView,
+        semantic_validation:i32,dependents:i32,affected_decls:i32,plan:ZagdPlannerRun,
+        cancellations:i64,trim:ZagdCacheTrim)void{
+    zagd_text_append(out,"version=1\n");zagd_status_i64(out,"pid",pid);
+    zagd_status_line(out,"mode",zagd_mode_name(mode));zagd_status_line(out,"state",state);
+    zagd_text_append(out,"singleton=true\nnetwork=false\ngpu_background=false\n");
+    if(cache_reused==1){zagd_text_append(out,"cache_reused=true\n");}else{zagd_text_append(out,"cache_reused=false\n");}
+    if(incremental_reused==1){zagd_text_append(out,"incremental_cache_reused=true\n");}else{zagd_text_append(out,"incremental_cache_reused=false\n");}
+    zagd_status_line(out,"incremental_invalidation",zagd_change_name(incremental_change));
+    if(semantic.valid==1){
+        zagd_text_append(out,"semantic_manifest=true\n");
+        zagd_status_i64(out,"semantic_public_first",semantic.public_identity.first);
+        zagd_status_i64(out,"semantic_effects_first",semantic.effect_identity.first);
+        zagd_status_i64(out,"semantic_layouts_first",semantic.layout_identity.first);
+        zagd_status_i64(out,"semantic_graph_first",semantic.graph_identity.first);
+        zagd_status_i64(out,"semantic_graph_complete",semantic.graph_complete);
+    }else{zagd_text_append(out,"semantic_manifest=false\n");}
+    zagd_status_line(out,"semantic_validation",zagd_semantic_validation_name(semantic_validation,semantic));
+    zagd_status_i64(out,"events",events);zagd_status_line(out,"last_change",zagd_change_name(change));
+    zagd_status_i64(out,"affected_dependents",dependents);zagd_status_i64(out,"affected_declarations",affected_decls);
+    zagd_status_i64(out,"planner_budget",plan.budget);zagd_status_i64(out,"planner_evaluated",plan.evaluated);
+    zagd_status_i64(out,"planner_suggestions",plan.suggestions);zagd_status_i64(out,"planner_cancellations",cancellations);
+    if(plan.cancelled==1){zagd_text_append(out,"planner_state=cancelled\n");}else if(plan.complete==1){zagd_text_append(out,"planner_state=complete\n");}else{zagd_text_append(out,"planner_state=running\n");}
+    zagd_status_line(out,"cache_eviction",zagd_cache_trim_name(trim.outcome));
+    zagd_status_i64(out,"cache_bytes_before_trim",trim.bytes_before);zagd_status_i64(out,"cache_bytes_after_trim",trim.bytes_after);
+    // Logical allocator payload witnesses let the daemon diagnose its own
+    // retained allocations. RSS and the cgroup/RLIMIT remain the hard safety
+    // boundaries because allocator arenas and kernel pages are distinct.
+    zagd_status_i64(out,"allocator_allocation_count",_zag_allocator_allocation_count());
+    zagd_status_i64(out,"allocator_live_bytes",_zag_allocator_live_bytes());
+    zagd_status_i64(out,"allocator_peak_live_bytes",_zag_allocator_peak_live_bytes());
+    zagd_status_line(out,"last_file",file);zagd_status_i64(out,"content_hash_first",hash.first);
+    zagd_status_i64(out,"content_hash_second",hash.second);zagd_status_i64(out,"snapshot_first",snapshot.identity.first);
+    zagd_status_i64(out,"snapshot_second",snapshot.identity.second);zagd_status_i64(out,"snapshot_parent_first",snapshot.parent.first);
+    zagd_status_i64(out,"snapshot_root_module_first",snapshot.root_module.first);
+    zagd_status_i64(out,"snapshot_root_source_first",snapshot.root_source.first);
+    zagd_status_i64(out,"snapshot_semantic_graph_first",snapshot.semantic_graph.first);
+    zagd_status_i64(out,"snapshot_semantic_graph_complete",snapshot.semantic_graph_complete);
+    zagd_status_i64(out,"snapshot_timestamp_ms",snapshot.timestamp_ms);
+    zagd_status_i64(out,"snapshot_file_count",snapshot.file_count);
 }
 
 fn zagd_write_status(path: []u8, pid: i64, mode: i32, state: []u8,
-        file: []u8, hash: ZagdHash, events: i64, snapshot:ZagdSnapshot, change:i32, cache_reused:i32, incremental_reused:i32, incremental_change:i32, semantic:SemanticManifestView, dependents:i32, affected_decls:i32, plan:ZagdPlannerRun) i32 {
-    return _zag_write_file(path, zagd_status_text(pid, mode, state, file, hash, events,snapshot,change,cache_reused,incremental_reused,incremental_change,semantic,dependents,affected_decls,plan));
+        file: []u8, hash: ZagdHash, events: i64, snapshot:ZagdSnapshot, change:i32, cache_reused:i32, incremental_reused:i32, incremental_change:i32, semantic:SemanticManifestView, semantic_validation:i32, dependents:i32, affected_decls:i32, plan:ZagdPlannerRun, cancellations:i64, trim:ZagdCacheTrim) i32 {
+    let slash:i32=0-1;let i:i32=0;while(i<path.len){if(path[i]=='/'){slash=i;}i=i+1;}
+    let root:[]u8=".";if(slash>0){root=path[0..slash];}
+    let status:ArrayList[u8]=zagd_text(1024);
+    zagd_status_append(&status,pid,mode,state,file,hash,events,snapshot,change,cache_reused,
+        incremental_reused,incremental_change,semantic,semantic_validation,dependents,
+        affected_decls,plan,cancellations,trim);
+    zagd_text_append(&status,"watcher=inotify\n");
+    if(@strEq(state,"error-inotify-init")||@strEq(state,"error-inotify-watch")){zagd_text_append(&status,"watcher_health=error\n");}else{zagd_text_append(&status,"watcher_health=ok\n");}
+    zagd_status_i64(&status,"cache_bytes",zagd_cache_bytes(root));
+    let written:i32=_zag_write_file(path,status.data[0..status.len]);
+    free[u8](&status);
+    return written;
 }
 
-fn zagd_run(root: []u8, root_source:[]u8, mode: i32, window_ms: i64,max_cache_bytes:i64) i32 {
+fn zagd_run(root: []u8, root_source:[]u8, mode: i32, window_ms: i64,max_cache_bytes:i64,cpu:X86CpuProfile) i32 {
     zagd_set_low_priority();
     let status_path: []u8 = zagd_join_path(root, ".zagd.status");
     let stop_path: []u8 = zagd_join_path(root, ".zagd.stop");
     let lock_path: []u8 = zagd_join_path(root, ".zagd.lock");
     let pid: i64 = zagd_pid();
     let empty: ZagdHash = zagd_content_hash("");
-    let snapshot: ZagdSnapshot = zagd_make_snapshot(empty, empty, zagd_content_hash(root), 0, 1);
+    let snapshot: ZagdSnapshot = zagd_make_snapshot(empty,empty,zagd_content_hash(root),
+        empty,empty,empty,0,0,0,1);
     let cache_reused:i32=0;
-    let incremental_reused:i32=0;let incremental_change:i32=zagd_change_unknown();let incremental_index:ZagdIncrementalIndex=zi_index_bad();
+    let incremental_reused:i32=0;let incremental_change:i32=zagd_change_unknown();let incremental_index:ZagdIncrementalIndex=zi_index_bad();let incremental_owned:i32=1;
     let records: ArrayList[ZagdFileState] = make[ZagdFileState](32);
     let snapshot_path:[]u8=zagd_join_path(zagd_join_path(zagd_join_path(root,".zag-cache"),"zagd"),"snapshot.record");
     let semantic_path:[]u8=zagd_join_path(zagd_join_path(zagd_join_path(root,".zag-cache"),"zagd"),"semantic.record");
-    let incremental_path:[]u8=zagd_incremental_path(root);if(_zag_file_exists(incremental_path)==1){incremental_index=zagd_incremental_index_decode(_zag_read_file(incremental_path));if(incremental_index.valid==1&&zagd_incremental_index_reused(incremental_index)==1){incremental_reused=1;incremental_change=zagd_change_none();}else{incremental_index=zi_index_bad();}}
     let semantic_text:[]u8=_zag_read_file(semantic_path);
-    let semantic:SemanticManifestView=zagd_semantic_manifest(root,semantic_path);
+    let semantic_text_owned:i32=(semantic_text.len>=0) as i32;
+    let semantic:SemanticManifestView=semantic_manifest_decode(semantic_text);
+    if(semantic.valid==1&&zagd_manifest_modules_current(root,semantic_text)==0){semantic.valid=0;}
+    let snapshot_root_module:[]u8=zagd_snapshot_root_module(root,root_source,semantic);
+    let incremental_path:[]u8=zagd_incremental_path(root);
+    if(_zag_file_exists(incremental_path)==1){
+        let incremental_text:[]u8=_zag_read_file(incremental_path);
+        if(incremental_text.len>=0){
+            let decoded_index:ZagdIncrementalIndex=zagd_incremental_index_decode(incremental_text);
+            if(decoded_index.valid==1&&zagd_incremental_index_reused(decoded_index,semantic)==1){
+                let owned_index:ZagdIncrementalIndex=zagd_incremental_clone_owned(decoded_index);
+                zagd_incremental_free_owned_index(&incremental_index);
+                incremental_index=owned_index;incremental_reused=1;incremental_change=zagd_change_none();
+            }
+            zagd_incremental_free_borrowed_index(&decoded_index);
+            _zag_free(_zag_slice_ptr(incremental_text));
+        }
+    }
+    let semantic_validation:i32=0;
+    let planner_cancellations:i64=0;
     let affected_dependents:i32=0;
     let affected_declarations:i32=0;
     let planner_run:ZagdPlannerRun=zagd_planner_start(mode,256);zagd_planner_step(&planner_run,semantic_manifest_decl_count(semantic_text),0);
     zagd_planner_accept_constants(&planner_run,semantic_manifest_constant_count(semantic_text));
-    let _initial_plan:i32=zagd_persist_plan(root,mode,semantic,planner_run);
-    let initial_inv:SemanticInvalidation=SemanticInvalidation{.semantic_changed=1,.declaration_dependents=semantic_manifest_decl_count(semantic_text),.layout_changed=1,.codegen_invalidated=1,.comment_only=0};let _initial_artifacts:i32=zagd_persist_artifacts(root,semantic_text,initial_inv);
-    let _initial_candidates:i32=zagd_persist_candidates(root,semantic_text,mode);
-    if(zagd_cache_trim(root,max_cache_bytes)==0){semantic.valid=0;}
-    if(_zag_file_exists(snapshot_path)==1){let saved:[]u8=_zag_read_file(snapshot_path);let restored:ZagdSnapshotRecord=zagd_snapshot_record_compatible(saved,zag_version(),"linux-x86_64-generic",zagd_mode_name(mode));if(restored.valid==1&&zagd_restore_index(root,saved,&records)==restored.file_count&&zagd_revalidate_index(records)==1){snapshot.identity=restored.identity;snapshot.parent=restored.parent;snapshot.file_count=restored.file_count;cache_reused=1;}else{records.len=0;}}
+    // Shared cache publication and eviction happen only after singleton
+    // authority is established below. A losing concurrent starter may inspect
+    // advisory state, but it must never unlink or replace the active daemon's
+    // records before returning the duplicate-daemon diagnostic.
+    let cache_trim:ZagdCacheTrim=ZagdCacheTrim{.outcome=1,.bytes_before=0,.bytes_after=0};
+    if(_zag_file_exists(snapshot_path)==1){
+        let saved:[]u8=_zag_read_file(snapshot_path);
+        if(saved.len>=0){
+            let expected_graph:ZagdHash=zagd_hash_empty();let expected_graph_complete:i32=0;
+            if(semantic.valid==1&&semantic.graph_complete==1&&snapshot_root_module.len>0&&
+                @strEq(semantic.module,snapshot_root_module)){expected_graph=semantic.graph_identity;expected_graph_complete=1;}
+            let restored:ZagdSnapshotRecord=zagd_snapshot_record_compatible(saved,zag_version(),
+                "linux-x86_64-generic",zagd_mode_name(mode),snapshot_root_module,
+                zagd_snapshot_root_source_disk(root,snapshot_root_module),zagd_content_hash(root),
+                expected_graph,expected_graph_complete);
+            if(restored.valid==1&&zagd_restore_index(root,saved,&records)==restored.file_count&&
+                zagd_revalidate_index(records)==1){
+                let recomputed:ZagdSnapshot=zagd_snapshot_records(root,snapshot_root_module,
+                    semantic,records,restored.parent);
+                if(recomputed.valid==1&&zagd_hash_equal(recomputed.identity,restored.identity)==1&&
+                    recomputed.file_count==restored.file_count){
+                    recomputed.timestamp_ms=restored.timestamp_ms;snapshot=recomputed;cache_reused=1;
+                }
+            }
+            if(cache_reused==0){zagd_free_records(&records);records=make[ZagdFileState](32);}
+            _zag_free(_zag_slice_ptr(saved));
+        }
+    }
     if(semantic.valid==1){zagd_seed_semantic_records(root,semantic_text,&records);}
-
     if (mode == zagd_mode_off()) {
         if (_zag_file_exists(lock_path) == 1) {
-            let owner:i64=zagd_parse_pid(_zag_read_file(lock_path));
-            if(owner<2||zagd_pid_alive(owner)==0){zagd_unlink(lock_path);}
+            let owner_record:[]u8=zagd_lock_record_after_start_window(lock_path);
+            let owner:i64=zagd_parse_pid(owner_record);
+            let owner_alive:i32=0;if(owner>=2){owner_alive=zagd_lock_identity_alive(owner_record,root);}
+            if(owner_record.len>=0){_zag_free(_zag_slice_ptr(owner_record));}
+            if(owner<2||owner_alive==0){zagd_unlink(lock_path);}
             else {
                 let _stop_write: i32 = _zag_write_file(stop_path, "stop\n");
                 let waits: i32 = 0;
@@ -302,43 +874,99 @@ fn zagd_run(root: []u8, root_source:[]u8, mode: i32, window_ms: i64,max_cache_by
                 }
                 if (_zag_file_exists(lock_path) == 1) {
                     _zag_eprintln("zagd: active daemon did not stop before timeout");
+                    if(snapshot_root_module.len>0){zagd_text_free(snapshot_root_module);}
                     return 7;
                 }
             }
         }
-        let _wr: i32 = zagd_write_status(status_path, pid, mode, "stopped", "", empty, 0, snapshot,zagd_change_none(),cache_reused,incremental_reused,incremental_change,semantic,affected_dependents,affected_declarations,planner_run);
+        cache_trim=zagd_cache_trim(root,max_cache_bytes);if(cache_trim.outcome==0){semantic.valid=0;}
+        let _wr: i32 = zagd_write_status(status_path, pid, mode, "stopped", "", empty, 0, snapshot,zagd_change_none(),cache_reused,incremental_reused,incremental_change,semantic,semantic_validation,affected_dependents,affected_declarations,planner_run,planner_cancellations,cache_trim);
+        if(snapshot_root_module.len>0){zagd_text_free(snapshot_root_module);}
         return 0;
     }
 
     zagd_unlink(stop_path);
 
-    let lock_fd: i64 = zagd_claim_singleton(lock_path);
+    let lock_fd: i64 = zagd_claim_singleton(lock_path, root);
     if (lock_fd < 0) {
         _zag_eprintln("zagd: project already has an active or starting daemon");
+        if(snapshot_root_module.len>0){zagd_text_free(snapshot_root_module);}
         return 6;
     }
-    let _lock_write: i32 = _zag_write_file(lock_path, _zag_i64_to_str(pid));
+    let lock_record:[]u8=zagd_lock_record(pid);
+    if(lock_record.len==0||_zag_write_file(lock_path,lock_record)!=0){
+        if(lock_record.len>0){zagd_text_free(lock_record);}
+        zagd_close(lock_fd);zagd_unlink(lock_path);
+        _zag_eprintln("zagd: could not publish project singleton identity");
+        if(snapshot_root_module.len>0){zagd_text_free(snapshot_root_module);}
+        return 7;
+    }
+    zagd_text_free(lock_record);
+    // A missing, corrupt, mode-incompatible, or source-stale snapshot must
+    // never leave the watcher with an empty baseline.  Run this only after
+    // acquiring the singleton lock: rebuilding advisory records before that
+    // point would let a losing concurrent starter modify shared cache files.
+    // The bounded two-read scan is a cache miss, never cache reuse; the
+    // foreground semantic manifest remains the authority for graph facts.
+    if(cache_reused==0){
+        let initial_rescan:ZagdStableRescan=zagd_rescan_sources_stable(root,window_ms);
+        if(initial_rescan.stable==1){
+            zagd_free_records(&records);records=initial_rescan.records;
+            let initial_parent:ZagdHash=snapshot.identity;
+            snapshot=zagd_snapshot_records(root,snapshot_root_module,semantic,records,initial_parent);
+            let _initial_snapshot_write:i32=zagd_persist_snapshot(root,snapshot_root_module,
+                mode,snapshot,records);
+            if(incremental_owned==1){zagd_incremental_free_owned_index(&incremental_index);}
+            incremental_index=zagd_incremental_from_records(records);incremental_owned=1;
+            incremental_reused=0;incremental_change=zagd_change_unknown();
+            if(semantic.valid==1){zagd_incremental_bind_manifest(&incremental_index,semantic);}
+            let _initial_incremental_write:i32=zagd_persist_incremental(root,incremental_index);
+        }else{
+            // `zagd_rescan_sources_stable` owns its returned record paths on
+            // both success and failure; discard an unstable attempt rather
+            // than retaining a half-written project view.
+            zagd_free_records(&initial_rescan.records);
+        }
+    }
+    let _initial_plan:i32=zagd_persist_plan(root,mode,semantic,planner_run,cpu);
+    let initial_inv:SemanticInvalidation=SemanticInvalidation{.semantic_changed=1,.declaration_dependents=semantic_manifest_decl_count(semantic_text),.layout_changed=1,.codegen_invalidated=1,.comment_only=0};
+    let _initial_artifacts:i32=zagd_persist_artifacts(root,semantic_text,initial_inv);
+    let _initial_candidates:i32=zagd_persist_candidates(root,semantic_text,mode,cpu);
+    cache_trim=zagd_cache_trim(root,max_cache_bytes);if(cache_trim.outcome==0){semantic.valid=0;}
     // Finalists run only after this daemon owns the project singleton.
-    let _initial_deep:i32=zagd_execute_deep_controls(root,mode,semantic,stop_path);
+    let _initial_deep:i32=zagd_execute_deep_controls(root,mode,semantic_text,cpu,stop_path);
 
     let fd: i64 = zagd_inotify_open();
     if (fd < 0) {
         zagd_close(lock_fd); zagd_unlink(lock_path);
-        let _wr: i32 = zagd_write_status(status_path, pid, mode, "error-inotify-init", "", empty, 0, snapshot,zagd_change_none(),cache_reused,incremental_reused,incremental_change,semantic,affected_dependents,affected_declarations,planner_run);
+        let _wr: i32 = zagd_write_status(status_path, pid, mode, "error-inotify-init", "", empty, 0, snapshot,zagd_change_none(),cache_reused,incremental_reused,incremental_change,semantic,semantic_validation,affected_dependents,affected_declarations,planner_run,planner_cancellations,cache_trim);
+        if(snapshot_root_module.len>0){zagd_text_free(snapshot_root_module);}
         return 2;
     }
     let watches: ArrayList[ZagdWatch] = make[ZagdWatch](16);
     zagd_scan_directories(fd, root, &watches);
-    if (watches.len == 0) {
+    let project_watch_count:i32=watches.len;
+    // A directory's own inotify watch can be removed before its final
+    // IN_DELETE_SELF is consumed during recursive removal. Watch its parent as
+    // a second, stable lifecycle witness so temporary/generated projects cannot
+    // leave an orphan daemon behind.
+    let root_parent:[]u8=zagd_path_parent(root);let root_name:[]u8=zagd_path_name(root);
+    if(@strEq(root_parent,root)==0){let _root_guard:i32=zagd_watch_path(fd,root_parent,&watches);}
+    if (project_watch_count == 0) {
         zagd_close(fd);
         zagd_close(lock_fd); zagd_unlink(lock_path);
-        let _wr: i32 = zagd_write_status(status_path, pid, mode, "error-inotify-watch", "", empty, 0, snapshot,zagd_change_none(),cache_reused,incremental_reused,incremental_change,semantic,affected_dependents,affected_declarations,planner_run);
+        let _wr: i32 = zagd_write_status(status_path, pid, mode, "error-inotify-watch", "", empty, 0, snapshot,zagd_change_none(),cache_reused,incremental_reused,incremental_change,semantic,semantic_validation,affected_dependents,affected_declarations,planner_run,planner_cancellations,cache_trim);
+        if(snapshot_root_module.len>0){zagd_text_free(snapshot_root_module);}
         return 3;
     }
 
-    let _wr0: i32 = zagd_write_status(status_path, pid, mode, "idle", "", empty, 0, snapshot,zagd_change_none(),cache_reused,incremental_reused,incremental_change,semantic,affected_dependents,affected_declarations,planner_run);
+    let _wr0: i32 = zagd_write_status(status_path, pid, mode, "idle", "", empty, 0, snapshot,zagd_change_none(),cache_reused,incremental_reused,incremental_change,semantic,semantic_validation,affected_dependents,affected_declarations,planner_run,planner_cancellations,cache_trim);
     let buffer: ArrayList[u8] = make[u8](4096);
-    let running: i32 = 1;
+    // A daemonize parent may publish the singleton just before a foreground
+    // shutdown creates the stop file. If that happens before watches are
+    // ready, no inotify event is queued for this descriptor. Honor the
+    // already-published stop exactly once before the first blocking read.
+    let running: i32 = (_zag_file_exists(stop_path)==0) as i32;
     let event_count: i64 = 0;
     while (running == 1) {
         // Blocking inotify read: unchanged projects consume no polling CPU.
@@ -355,70 +983,250 @@ fn zagd_run(root: []u8, root_source:[]u8, mode: i32, window_ms: i64,max_cache_by
                     off = nread as i32;
                 } else {
                     let name: []u8 = zagd_event_name(buffer.data[0..nread as i32], off + 16, name_len);
-                    if (@strEq(name, ".zagd.stop")) {
+                    let event_base:[]u8=zagd_watch_base(&watches,event_wd);
+                    if(zagd_event_requires_rescan(mask)==1||(@strEq(name,".zagd.rescan")&&zagd_publish_event(mask)==1)){
+                        // IN_Q_OVERFLOW means event history is incomplete. Treat
+                        // it as global invalidation, then accept only two equal,
+                        // bounded full-tree scans. `.zagd.rescan` exercises the
+                        // same safe recovery path for supervision and tests.
+                        let rescan_label:[]u8="<inotify-overflow-rescan>";
+                        if(@strEq(name,".zagd.rescan")){
+                            rescan_label="<explicit-rescan>";
+                            zagd_unlink_project(root,".zagd.rescan");
+                        }
+                        let prior_declarations:i32=semantic_manifest_decl_count(semantic_text);
+                        zagd_planner_step(&planner_run,0,1);
+                        planner_cancellations=planner_cancellations+1;
+                        semantic.valid=0;semantic_validation=2;if(semantic_text_owned==1){_zag_free(_zag_slice_ptr(semantic_text));semantic_text_owned=0;}semantic_text="";
+                        incremental_reused=0;incremental_change=zagd_change_unknown();
+                        if(incremental_owned==1){zagd_incremental_free_owned_index(&incremental_index);}incremental_index=zi_index_bad();incremental_owned=1;
+                        zagd_unlink(semantic_path);
+                        zagd_unlink(incremental_path);
+                        zagd_unlink_project(root,".zagd.semantic-ready");
+                        let rescanned:ZagdStableRescan=zagd_rescan_sources_stable(root,window_ms);
+                        if(rescanned.stable==1){
+                            zagd_free_records(&records);
+                            records=rescanned.records;
+                            cache_reused=0;
+                            let prior_snapshot:ZagdHash=snapshot.identity;
+                            event_count=event_count+1;
+                            if(incremental_owned==1){zagd_incremental_free_owned_index(&incremental_index);}incremental_index=zagd_incremental_from_records(records);incremental_owned=1;
+                            let _incremental_write:i32=zagd_persist_incremental(root,incremental_index);
+                            let checked:i32=zagd_semantic_check(root,root_source,semantic_path);
+                            if(checked==1){
+                                let checked_text:[]u8=_zag_read_file(semantic_path);
+                                let checked_view:SemanticManifestView=semantic_manifest_decode(checked_text);
+                                if(checked_view.valid==1&&zagd_manifest_modules_current(root,checked_text)==1){if(semantic_text_owned==1){_zag_free(_zag_slice_ptr(semantic_text));}semantic_text=checked_text;semantic_text_owned=1;semantic=checked_view;semantic_validation=1;zagd_incremental_bind_manifest(&incremental_index,semantic);let _incremental_semantic_write:i32=zagd_persist_incremental(root,incremental_index);}else if(checked_text.len>=0){_zag_free(_zag_slice_ptr(checked_text));}
+                            }
+                            zagd_unlink_project(root,".zagd.semantic-ready");
+                            snapshot=zagd_snapshot_records(root,snapshot_root_module,semantic,
+                                records,prior_snapshot);
+                            let _snapshot_write:i32=zagd_persist_snapshot(root,
+                                snapshot_root_module,mode,snapshot,records);
+                            affected_dependents=prior_declarations;
+                            affected_declarations=prior_declarations;
+                            planner_run=zagd_planner_start(mode,256);
+                            zagd_planner_step(&planner_run,semantic_manifest_decl_count(semantic_text),0);
+                            zagd_planner_accept_constants(&planner_run,semantic_manifest_constant_count(semantic_text));
+                            let _plan_write:i32=zagd_persist_plan(root,mode,semantic,planner_run,cpu);
+                            let conservative:SemanticInvalidation=SemanticInvalidation{.semantic_changed=1,
+                                .declaration_dependents=prior_declarations,.layout_changed=1,
+                                .codegen_invalidated=1,.comment_only=0};
+                            let _artifact_write:i32=zagd_persist_artifacts(root,semantic_text,conservative);
+                            let _candidate_write:i32=zagd_persist_candidates(root,semantic_text,mode,cpu);
+                            let rescan_trim:ZagdCacheTrim=zagd_cache_trim(root,max_cache_bytes);
+                            if(rescan_trim.outcome==0){semantic.valid=0;}
+                            let _rescan_status:i32=zagd_write_status(status_path,pid,mode,"idle",
+                                rescan_label,empty,event_count,snapshot,zagd_change_unknown(),
+                                cache_reused,incremental_reused,incremental_change,semantic,
+                                semantic_validation,affected_dependents,affected_declarations,
+                                planner_run,planner_cancellations,rescan_trim);
+                        } else {
+                            zagd_free_records(&rescanned.records);
+                            let rescan_trim:ZagdCacheTrim=zagd_cache_trim(root,max_cache_bytes);
+                            let _rescan_status:i32=zagd_write_status(status_path,pid,mode,"stabilizing",
+                                rescan_label,empty,event_count,snapshot,zagd_change_unknown(),
+                                cache_reused,incremental_reused,incremental_change,semantic,
+                                semantic_validation,prior_declarations,prior_declarations,
+                                planner_run,planner_cancellations,rescan_trim);
+                        }
+                    } else if (@strEq(event_base,root_parent)==1&&@strEq(name,root_name)==1&&
+                        (zagd_mask_has(mask,zagd_in_delete())==1||zagd_mask_has(mask,zagd_in_moved_from())==1)) {
+                        running=0;
+                    } else if (zagd_mask_has(mask, zagd_in_delete_self()) == 1 ||
+                        zagd_mask_has(mask, zagd_in_move_self()) == 1 ||
+                        zagd_mask_has(mask, zagd_in_ignored()) == 1) {
+                        // The watched project root vanished or was atomically
+                        // replaced. It no longer has a stable source identity,
+                        // so terminate instead of keeping an orphan daemon.
                         running = 0;
-                    } else if(@strEq(name,".zagd.semantic-ready")){
-                        zagd_sleep_ms(window_ms);let next_text:[]u8=_zag_read_file(semantic_path);let next_semantic:SemanticManifestView=zagd_semantic_manifest(root,semantic_path);if(next_semantic.valid==1){let artifact_inv:SemanticInvalidation=semantic_manifest_invalidation(semantic_text,next_text);affected_declarations=artifact_inv.declaration_dependents;semantic_text=next_text;semantic=next_semantic;zagd_planner_step(&planner_run,0,1);planner_run=zagd_planner_start(mode,256);zagd_planner_step(&planner_run,semantic_manifest_decl_count(semantic_text),0);zagd_planner_accept_constants(&planner_run,semantic_manifest_constant_count(semantic_text));let _plan_write:i32=zagd_persist_plan(root,mode,semantic,planner_run);let _artifact_write:i32=zagd_persist_artifacts(root,semantic_text,artifact_inv);let _candidate_write:i32=zagd_persist_candidates(root,semantic_text,mode);let _deep_write:i32=zagd_execute_deep_controls(root,mode,semantic,stop_path);if(zagd_cache_trim(root,max_cache_bytes)==0){semantic.valid=0;}event_count=event_count+1;let _ready_status:i32=zagd_write_status(status_path,pid,mode,"idle",".zagd.semantic-ready",zagd_content_hash(next_text),event_count,snapshot,zagd_change_none(),cache_reused,incremental_reused,incremental_change,semantic,0,affected_declarations,planner_run);}zagd_unlink(zagd_join_path(root,".zagd.semantic-ready"));
+                    } else if (@strEq(name, ".zagd.stop")) {
+                        running = 0;
+                    } else if(@strEq(name,".zagd.semantic-ready")&&zagd_publish_event(mask)==1){
+                        zagd_sleep_ms(window_ms);
+                        let next_text:[]u8=_zag_read_file(semantic_path);
+                        if(next_text.len>=0){
+                            let next_semantic:SemanticManifestView=semantic_manifest_decode(next_text);
+                            if(next_semantic.valid==1&&zagd_manifest_modules_current(root,next_text)==1){
+                                let artifact_inv:SemanticInvalidation=semantic_manifest_invalidation(semantic_text,next_text);
+                                affected_declarations=artifact_inv.declaration_dependents;
+                                if(semantic_text_owned==1){_zag_free(_zag_slice_ptr(semantic_text));}
+                                semantic_text=next_text;semantic_text_owned=1;semantic=next_semantic;semantic_validation=1;
+                                zagd_incremental_bind_manifest(&incremental_index,semantic);
+                                let _incremental_semantic_write:i32=zagd_persist_incremental(root,incremental_index);
+                                let prior_ready_snapshot:ZagdHash=snapshot.identity;
+                                snapshot=zagd_snapshot_records(root,snapshot_root_module,semantic,
+                                    records,prior_ready_snapshot);
+                                let _ready_snapshot_write:i32=zagd_persist_snapshot(root,
+                                    snapshot_root_module,mode,snapshot,records);
+                                zagd_planner_step(&planner_run,0,1);
+                                planner_run=zagd_planner_start(mode,256);
+                                zagd_planner_step(&planner_run,semantic_manifest_decl_count(semantic_text),0);
+                                zagd_planner_accept_constants(&planner_run,semantic_manifest_constant_count(semantic_text));
+                                let _plan_write:i32=zagd_persist_plan(root,mode,semantic,planner_run,cpu);
+                                let _artifact_write:i32=zagd_persist_artifacts(root,semantic_text,artifact_inv);
+                                let _candidate_write:i32=zagd_persist_candidates(root,semantic_text,mode,cpu);
+                                let _deep_write:i32=zagd_execute_deep_controls(root,mode,semantic_text,cpu,stop_path);
+                                let ready_trim:ZagdCacheTrim=zagd_cache_trim(root,max_cache_bytes);
+                                if(ready_trim.outcome==0){semantic.valid=0;}
+                                event_count=event_count+1;
+                                let _ready_status:i32=zagd_write_status(status_path,pid,mode,"idle",
+                                    ".zagd.semantic-ready",zagd_content_hash(next_text),event_count,
+                                    snapshot,zagd_change_none(),cache_reused,incremental_reused,
+                                    incremental_change,semantic,semantic_validation,0,
+                                    affected_declarations,planner_run,planner_cancellations,ready_trim);
+                            }else{_zag_free(_zag_slice_ptr(next_text));}
+                        }
+                        zagd_unlink_project(root,".zagd.semantic-ready");
                     // The watcher may observe every filesystem write in the
                     // project tree. Planner analysis is source-driven: never
                     // hash or parse compiler binaries, object files, editor
                     // databases, or other arbitrary payloads merely because
                     // they share a watched directory.
-                    } else if (zagd_ignored_name(name) == 0 && zagd_has_suffix(name, ".zag") == 1) {
+                    } else if (zagd_ignored_name(name) == 0 &&
+                        zagd_mask_has(mask, zagd_in_isdir()) == 1 &&
+                        (zagd_mask_has(mask, zagd_in_create()) == 1 || zagd_mask_has(mask, zagd_in_moved_to()) == 1)) {
                         let base: []u8 = zagd_watch_base(&watches, event_wd);
                         let full: []u8 = zagd_join_path(base, name);
-                        if (zagd_mask_has(mask, zagd_in_isdir()) == 1 &&
-                            (zagd_mask_has(mask, zagd_in_create()) == 1 || zagd_mask_has(mask, zagd_in_moved_to()) == 1)) {
-                            zagd_scan_directories(fd, full, &watches);
-                        }
+                        // Directories do not have a source identity themselves.
+                        // Add their recursive watches before accepting later file
+                        // events, then leave source hashing to the .zag branch.
+                        zagd_scan_directories(fd, full, &watches);
+                        zagd_text_free(full);
+                    } else if (zagd_ignored_name(name) == 0 && zagd_source_name(name) == 1) {
+                        let base: []u8 = zagd_watch_base(&watches, event_wd);
+                        let full: []u8 = zagd_join_path(base, name);
+                        // The parent guard watch exists only to observe root
+                        // deletion/recreation. Events for sibling projects or
+                        // arbitrary files beside this project must never be
+                        // treated as source events for this daemon.
+                        if(zagd_path_in_project(root,full)==1){
                         // Events are hints. Wait, then read the complete file and
                         // derive identity from bytes rather than metadata.
-                        zagd_sleep_ms(window_ms);
-                        let exists: i32 = _zag_file_exists(full);
-                        let hash: ZagdHash = empty;
-                        let facts:ZagdSourceFacts=zagd_source_facts("");
-                        if (exists == 1) {
-                            let bytes: []u8 = _zag_read_file(full);
-                            if (bytes.len >= 0) {
-                                hash = zagd_content_hash(bytes);facts=zagd_source_facts(bytes);
-                                // Coalesce queued partial/atomic saves by requiring
-                                // bounded content stability, not merely one event delay.
-                                let stable_tries:i32=0;let stable:i32=0;
-                                while(stable==0&&stable_tries<4){zagd_sleep_ms(window_ms);let again:[]u8=_zag_read_file(full);let again_hash:ZagdHash=zagd_content_hash(again);if(zagd_hash_equal(hash,again_hash)==1){stable=1;}else{hash=again_hash;facts=zagd_source_facts(again);}stable_tries=stable_tries+1;}
-                            }
-                        }
-                        let change:i32=zagd_record_changed(&records, full, hash,facts, exists);
-                        if (change >= 0) {
-                            zagd_planner_step(&planner_run,0,1);planner_run=zagd_planner_start(mode,256);zagd_planner_step(&planner_run,0,0);
+                        let observed:ZagdSourceObservation=zagd_observe_source_stable(full,window_ms,records);
+                        if(observed.stable==0){
+                            // A half-written source is not a snapshot. Cancel
+                            // analysis and fail closed until a later event yields
+                            // two equal observations.
+                            let prior_declarations:i32=semantic_manifest_decl_count(semantic_text);
+                            zagd_planner_step(&planner_run,0,1);
+                            planner_cancellations=planner_cancellations+1;
+                            semantic.valid=0;semantic_validation=2;if(semantic_text_owned==1){_zag_free(_zag_slice_ptr(semantic_text));semantic_text_owned=0;}semantic_text="";
+                            incremental_reused=0;incremental_change=zagd_change_unknown();
+                            zagd_unlink(semantic_path);
+                            zagd_unlink_project(root,".zagd.semantic-ready");
+                            let unstable_trim:ZagdCacheTrim=zagd_cache_trim(root,max_cache_bytes);
+                            let _unstable_status:i32=zagd_write_status(status_path,pid,mode,
+                                "stabilizing",full,observed.hash,event_count,snapshot,
+                                zagd_change_unknown(),cache_reused,incremental_reused,
+                                incremental_change,semantic,semantic_validation,
+                                prior_declarations,prior_declarations,planner_run,
+                                planner_cancellations,unstable_trim);
+                        } else {
+                            let exists:i32=observed.exists;
+                            let hash:ZagdHash=observed.hash;
+                            let facts:ZagdSourceFacts=observed.facts;
+                            let change:i32=zagd_record_changed(&records, full, hash,facts, exists);
+                            if (change >= 0) {
+                            zagd_planner_step(&planner_run,0,1);planner_cancellations=planner_cancellations+1;planner_run=zagd_planner_start(mode,256);zagd_planner_step(&planner_run,0,0);
                             let relative_changed:[]u8=zagd_relative(root,full);affected_dependents=0;if(change==zagd_change_public_shape()){affected_dependents=semantic_manifest_transitive_dependents(semantic_text,full);if(affected_dependents==0){affected_dependents=semantic_manifest_transitive_dependents(semantic_text,relative_changed);}}
-                            if(semantic.valid==1&&(semantic_manifest_module_stale(semantic_text,full,hash)==1||semantic_manifest_module_stale(semantic_text,relative_changed,hash)==1)){semantic.valid=0;}
-                            if(semantic.valid==1&&@strEq(full,zagd_join_path(root,semantic.module))&&zagd_hash_equal(hash,semantic.source)==0){semantic.valid=0;}
-                            if(zagd_is_zag_source(full)==1){
+                            let root_changed:i32=zagd_is_selected_root(root,root_source,full);
+                            let manifest_changed:i32=((semantic_manifest_module_stale(semantic_text,full,hash)==1||semantic_manifest_module_stale(semantic_text,relative_changed,hash)==1) as i32);
+                            if(semantic.valid==1&&manifest_changed==1){semantic.valid=0;}
+                            let semantic_module_path:[]u8=zagd_join_path(root,semantic.module);
+                            if(semantic.valid==1&&@strEq(full,semantic_module_path)&&zagd_hash_equal(hash,semantic.source)==0){semantic.valid=0;}
+                            zagd_text_free(semantic_module_path);
+                            // A `.zag` file outside the selected module graph
+                            // is still observed and indexed, but it must not
+                            // erase a valid semantic/artifact snapshot simply
+                            // because it is an unfinished generated scratch
+                            // file. Recheck only the selected root or a module
+                            // proven to participate in the current manifest.
+                            if(zagd_is_zag_source(full)==1&&(root_changed==1||manifest_changed==1)){
                                 let checked:i32=zagd_semantic_check(root,root_source,semantic_path);
-                                if(checked==1){let checked_text:[]u8=_zag_read_file(semantic_path);let checked_view:SemanticManifestView=zagd_semantic_manifest(root,semantic_path);if(checked_view.valid==1){semantic_text=checked_text;semantic=checked_view;}}
-                                else{semantic.valid=0;}
-                                zagd_unlink(zagd_join_path(root,".zagd.semantic-ready"));
+                                if(checked==1){let checked_text:[]u8=_zag_read_file(semantic_path);let checked_view:SemanticManifestView=semantic_manifest_decode(checked_text);if(checked_view.valid==1&&zagd_manifest_modules_current(root,checked_text)==1){if(semantic_text_owned==1){_zag_free(_zag_slice_ptr(semantic_text));}semantic_text=checked_text;semantic_text_owned=1;semantic=checked_view;semantic_validation=1;zagd_incremental_bind_manifest(&incremental_index,semantic);}else{if(checked_text.len>=0){_zag_free(_zag_slice_ptr(checked_text));}semantic.valid=0;semantic_validation=2;if(root_changed==1){zagd_unlink(semantic_path);}}}
+                                else{semantic.valid=0;semantic_validation=2;if(root_changed==1){zagd_unlink(semantic_path);}}
+                                zagd_unlink_project(root,".zagd.semantic-ready");
                             }
                             event_count = event_count + 1;
                             let prior:ZagdHash=snapshot.identity;
-                            snapshot=zagd_snapshot_records(root,records,prior);
-                            let _cache_write:i32=zagd_persist_snapshot(root,mode,snapshot,records);
-                            if(exists==1&&facts.valid==1){let stable_source:[]u8=_zag_read_file(full);let current_incremental:ZagdIncrementalFile=zagd_incremental_file(full,stable_source,facts);let previous_incremental:ZagdIncrementalFile=zagd_incremental_index_get(incremental_index,full);let decision:ZagdIncrementalDecision=zagd_incremental_decide(previous_incremental,current_incremental);incremental_change=decision.change;if(incremental_change==zagd_change_unknown()){incremental_change=change;}incremental_reused=decision.reuse_parse;zagd_incremental_index_put(&incremental_index,current_incremental);incremental_index.valid=1;incremental_index.advisory=1;incremental_index.executable_authority=0;let _incremental_write:i32=zagd_persist_incremental(root,incremental_index);}else{incremental_change=zagd_change_unknown();incremental_reused=0;}
-                            if(zagd_cache_trim(root,max_cache_bytes)==0){semantic.valid=0;}
+                            snapshot=zagd_snapshot_records(root,snapshot_root_module,semantic,
+                                records,prior);
+                            // Persist only the latest content-addressed snapshot.
+                            // The transactional writer replaces the prior
+                            // record and releases all temporary containers, so
+                            // rapid saves do not retain an in-memory event log.
+                            let _cache_write:i32=zagd_persist_snapshot(root,
+                                snapshot_root_module,mode,snapshot,records);
+                            if(exists==1&&facts.valid==1){
+                                let stable_source:[]u8=_zag_read_file(full);
+                                if(stable_source.len>=0){
+                                    let current_incremental:ZagdIncrementalFile=zagd_incremental_file(full,stable_source,facts);
+                                    if(current_incremental.valid==1){
+                                        zagd_incremental_copy_names(&current_incremental);
+                                        let previous_at:i32=zagd_incremental_index_find(incremental_index,full);
+                                        incremental_change=change;incremental_reused=0;
+                                        if(previous_at>=0){let decision:ZagdIncrementalDecision=zagd_incremental_decide(incremental_index.files.data[previous_at],current_incremental);incremental_change=decision.change;if(incremental_change==zagd_change_unknown()){incremental_change=change;}incremental_reused=decision.reuse_parse;}
+                                        zagd_incremental_put_owned(&incremental_index,current_incremental);
+                                        incremental_index.valid=1;incremental_index.advisory=1;incremental_index.executable_authority=0;
+                                        let _incremental_write:i32=zagd_persist_incremental(root,incremental_index);
+                                    }else{free[ZagdDeclFingerprint](&current_incremental.declarations);incremental_change=zagd_change_unknown();incremental_reused=0;}
+                                    _zag_free(_zag_slice_ptr(stable_source));
+                                }else{incremental_change=zagd_change_unknown();incremental_reused=0;}
+                            }else{
+                                incremental_change=zagd_change_unknown();incremental_reused=0;
+                                let removed:i32=zagd_incremental_remove_owned(&incremental_index,full);
+                                if(removed==1){incremental_index.valid=1;incremental_index.advisory=1;incremental_index.executable_authority=0;let _incremental_delete_write:i32=zagd_persist_incremental(root,incremental_index);}
+                            }
+                            let event_trim:ZagdCacheTrim=zagd_cache_trim(root,max_cache_bytes);if(event_trim.outcome==0){semantic.valid=0;}
                             let _wr: i32 = zagd_write_status(status_path, pid, mode,
-                                "idle", full, hash, event_count, snapshot,change,cache_reused,incremental_reused,incremental_change,semantic,affected_dependents,affected_declarations,planner_run);
+                                "idle", full, hash, event_count, snapshot,change,cache_reused,incremental_reused,incremental_change,semantic,semantic_validation,affected_dependents,affected_declarations,planner_run,planner_cancellations,event_trim);
+                            }
                         }
+                        }
+                        zagd_text_free(full);
                     }
                     off = off + 16 + name_len;
                 }
             }
         }
     }
+    // A clean shutdown is also a persistence boundary. This covers a stop that
+    // races the final stable event without making the cache authoritative.
+    let _final_snapshot_write:i32=zagd_persist_snapshot(root,snapshot_root_module,
+        mode,snapshot,records);
     zagd_close(fd);
     zagd_close(lock_fd);
+    free[u8](&buffer);
+    zagd_free_watches(&watches);
+    zagd_free_records(&records);
     zagd_unlink(lock_path);
     zagd_unlink(stop_path);
-    let _wr1: i32 = zagd_write_status(status_path, pid, mode, "stopped", "", empty, event_count, snapshot,zagd_change_none(),cache_reused,incremental_reused,incremental_change,semantic,affected_dependents,affected_declarations,planner_run);
+    let _wr1: i32 = zagd_write_status(status_path, pid, mode, "stopped", "", empty, event_count, snapshot,zagd_change_none(),cache_reused,incremental_reused,incremental_change,semantic,semantic_validation,affected_dependents,affected_declarations,planner_run,planner_cancellations,cache_trim);
+    if(semantic_text_owned==1){_zag_free(_zag_slice_ptr(semantic_text));}
+    if(incremental_owned==1){zagd_incremental_free_owned_index(&incremental_index);}
+    if(snapshot_root_module.len>0){zagd_text_free(snapshot_root_module);}
+    zagd_text_free(incremental_path);zagd_text_free(semantic_path);zagd_text_free(snapshot_path);zagd_text_free(lock_path);zagd_text_free(stop_path);zagd_text_free(status_path);
     return 0;
 }
 
@@ -428,9 +1236,11 @@ fn main() i32 {
     let mode: i32 = zagd_mode_light();
     let window_ms: i64 = 75;
     let daemonize: i32 = 0;
+    let max_memory_bytes:i64=536870912;
     let max_cache_bytes:i64=2147483648;
     let max_workers:i32=1;
-    let notifications:[]u8="errors_only";
+    let notifications:[]u8="advisory";
+    let cpu_request:[]u8="generic";
     let i: i32 = 1;
     while (i < _zag_argc()) {
         let arg: []u8 = _zag_arg(i);
@@ -451,30 +1261,60 @@ fn main() i32 {
             i=i+1;max_cache_bytes=zagd_parse_nonnegative(_zag_arg(i));
             if(max_cache_bytes<1048576||max_cache_bytes>2147483648){_zag_eprintln("zagd: --max-cache-bytes must be 1048576..2147483648");return 4;}
         }
+        else if (@strEq(arg,"--max-memory-bytes") && i+1<_zag_argc()) {
+            i=i+1;max_memory_bytes=zagd_parse_nonnegative(_zag_arg(i));
+            if(max_memory_bytes<67108864||max_memory_bytes>2147483648){_zag_eprintln("zagd: --max-memory-bytes must be 67108864..2147483648");return 4;}
+        }
         else if (@strEq(arg,"--max-workers") && i+1<_zag_argc()) {
             i=i+1;let workers:i64=zagd_parse_nonnegative(_zag_arg(i));
             if(workers!=1){_zag_eprintln("zagd: this build supports exactly one quiet worker");return 4;}max_workers=1;
         }
+        else if (@strEq(arg,"--cpu") && i+1<_zag_argc()) {
+            i=i+1;cpu_request=_zag_arg(i);
+        }
+        else if(arg.len>6&&@strEq(arg[0..6],"--cpu=")) { cpu_request=arg[6..]; }
         else if (@strEq(arg,"--notifications") && i+1<_zag_argc()) {
             i=i+1;notifications=_zag_arg(i);
-            if(@strEq(notifications,"errors_only")==0){_zag_eprintln("zagd: this build supports --notifications errors_only");return 4;}
+            if(@strEq(notifications,"errors_only")==0&&@strEq(notifications,"advisory")==0){_zag_eprintln("zagd: --notifications must be errors_only or advisory");return 4;}
         }
         i = i + 1;
     }
+    // `znc watch` may obtain its project root from getcwd with a trailing
+    // separator. Canonicalize the boundary once so prefix checks, parent
+    // guards, module paths, and content-addressed snapshots all describe the
+    // same project rather than silently dropping every child event.
+    while(root.len>1&&root[root.len-1]=='/'){root=root[0..root.len-1];}
+    let cpu:X86CpuProfile=parse_x86_cpu_profile(cpu_request);
+    if(cpu.valid==0){_zag_eprintln(_zag_str_concat("zagd: ",cpu.diagnostic));return 4;}
+    if(zagd_apply_memory_limit(max_memory_bytes)==0){_zag_eprintln("zagd: could not apply process memory limit");return 7;}
     if (daemonize == 1) {
         let child: i64 = zagd_fork();
         if (child < 0) { _zag_eprintln("zagd: fork failed"); return 5; }
         if (child > 0) {
-            // Do not report successful auto-start until the child owns the
-            // project lock. O_EXCL in the child arbitrates concurrent starters.
+            // Do not report successful auto-start until the child owns and has
+            // fully published the project lock. Mere path existence is not
+            // enough: it may be a stale/malformed record that the child is
+            // still replacing, or a partial record observed between O_EXCL and
+            // publication. Require this exact child's PID, start token,
+            // command line, and project root before returning success.
             let lock_path: []u8 = zagd_join_path(root, ".zagd.lock");
             let tries: i32 = 0;
-            while (tries < 100 && _zag_file_exists(lock_path) == 0) {
-                zagd_sleep_ms(1);
+            let child_owns: i32 = 0;
+            while (tries < 1000 && child_owns == 0) {
+                let record: []u8 = _zag_read_file(lock_path);
+                if (record.len >= 0) {
+                    if (zagd_parse_pid(record) == child &&
+                        zagd_lock_identity_alive(record, root) == 1) {
+                        child_owns = 1;
+                    }
+                    _zag_free(_zag_slice_ptr(record));
+                }
+                if (child_owns == 0) { zagd_sleep_ms(1); }
                 tries = tries + 1;
             }
-            if (_zag_file_exists(lock_path) == 0) {
-                _zag_eprintln("zagd: child did not acquire project singleton");
+            zagd_text_free(lock_path);
+            if (child_owns == 0) {
+                _zag_eprintln("zagd: child did not publish a valid project singleton identity");
                 return 6;
             }
             _zag_println(_zag_i64_to_str(child));
@@ -482,5 +1322,5 @@ fn main() i32 {
         }
         zagd_close(0); zagd_close(1); zagd_close(2);
     }
-    return zagd_run(root, root_source, mode, window_ms,max_cache_bytes);
+    return zagd_run(root, root_source, mode, window_ms,max_cache_bytes,cpu);
 }

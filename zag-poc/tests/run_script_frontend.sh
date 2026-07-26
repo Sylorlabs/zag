@@ -12,6 +12,26 @@ basic_status=$?
 set -e
 test "$basic_status" -eq 7
 
+# The minimal product promise is literal: a single physical source line can
+# select the profile, execute its top-level expression, and exit normally.
+printf '%s\n' 'script; println("one-line");' >"$tmp_dir/one-line.zag"
+"$znc_bin" "$tmp_dir/one-line.zag" -o "$tmp_dir/one-line" --no-analyze --no-zagd >/dev/null
+test "$("$tmp_dir/one-line")" = 'one-line'
+
+# Root statements are not reordered while the compiler creates its hidden
+# body/wrapper.  The combined output is a directly observable source-order
+# witness rather than an AST-only assertion.
+printf '%s\n' \
+    'script;' \
+    'print("first:");' \
+    'print("second:");' \
+    'println("third");' \
+    'return 0;' >"$tmp_dir/source-order.zag"
+"$znc_bin" "$tmp_dir/source-order.zag" -o "$tmp_dir/source-order" --no-analyze --no-zagd >/dev/null
+test "$("$tmp_dir/source-order")" = 'first:
+second:
+third'
+
 # A top-level return exits only the hidden body; the generated wrapper still
 # owns deterministic shutdown and preserves the requested process status.
 "$znc_bin" tests/script_frontend/top_level_return.zag -o "$tmp_dir/top-return" --no-analyze >/dev/null

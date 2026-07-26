@@ -41,8 +41,8 @@ complete feature.
 |---|---|---|
 | Native x86-64 ELF | `native/ncodegen.zag`, `x86.zag`, `elf.zag`; authority and native gates | Executable static ELF path, verified by current tests. |
 | Self-hosting/no host toolchain | `bootstrap.sh`, `tests/run_native_authority.sh` | Verified on the snapshot; stage-2 compiler and smoke ELF passed. |
-| Parser/AST/effect checker | `lex.zag`, `parse.zag`, `ast.zag`, `sema.zag` | v1 constructs and the existing effect annotations are implemented; no v2 unsafe/memory/concurrency model. |
-| Heap allocation | `cg_lower_new`, `_zag_malloc`, `_zag_realloc`, `_zag_free` paths | Allocation and a deallocation call path exist, but no specified allocator contract, ownership model, safety instrumentation, or v2 raw-allocation API. |
+| Parser/AST/effect checker | `lex.zag`, `parse.zag`, `ast.zag`, `sema.zag`, `typed.zag` | v1 constructs and existing effect annotations are implemented; v2 now has bounded unsafe/pointer, allocator, volatile-width, and atomic slices, while the complete memory/concurrency model remains incomplete. |
+| Heap allocation | `cg_lower_new`, `_zag_malloc`, `_zag_realloc`, `_zag_free` paths; checked `std/allocator.zag` `SystemAllocator` | Raw allocation remains an incomplete v2 contract, but checked native `SystemAllocator` now exposes fallible allocate/zeroed/resize/deallocate handles with capacity, alignment, runtime allocator identity, and generation validation. General ownership, debug allocation, and raw-allocation safety are still incomplete. |
 | Checked slice indexing | native `cg_lower_expr` emits an OOB panic path | Existing execution tests cover ordinary slices; trap policy is not a complete target-independent memory model. |
 | Current effects | `sema.zag` bitmask: Alloc, Panic, IO, Lock, Raises | Transitive direct-call analysis exists; no formal v2 lattice for unsafe, volatile, atomics, FFI, threads, or GPU runtime actions. |
 | ARM64 | `acodegen.zag`, `aarch64.zag`, separate tests | Experimental only; source contains explicit unsupported lowering cases. |
@@ -69,7 +69,10 @@ complete feature.
    frozen v1 spec says reclamation is not portable v1.  The implementation is
    an extension and must not be described as portable v1 memory reclamation.
 5. `@memoryFence` emits `mfence`, but this is not a complete atomic API or
-   concurrency model and has no defined memory-order interface.
+   concurrency model and has no typed memory-order interface. The bounded
+   `@atomicLoad64Order`/`@atomicStore64Order` forms validate literal orders
+   and lower their x86 load/store subset, but do not establish a general
+   happens-before model.
 
 ## 4. Implemented but insufficiently documented
 

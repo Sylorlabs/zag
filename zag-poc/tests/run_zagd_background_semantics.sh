@@ -3,9 +3,27 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 tmp=$(mktemp -d /tmp/zagd-background-sema.XXXXXX)
-trap 'if [ -d "$tmp/project" ]; then printf stop > "$tmp/project/.zagd.stop" 2>/dev/null || true; fi; rm -rf "$tmp"' EXIT
 compiler=${ZNC:-"$(pwd)/znc"}
 compiler=$(realpath "$compiler")
+cleanup() {
+    if [ -d "$tmp/project" ]; then
+        (cd "$tmp/project" && "$compiler" shutdown >/dev/null 2>&1) || true
+        printf stop > "$tmp/project/.zagd.stop" 2>/dev/null || true
+        for _ in $(seq 1 100); do
+            test ! -e "$tmp/project/.zagd.lock" && break
+            sleep 0.01
+        done
+    fi
+    # The daemon can complete its final atomic status publication just after
+    # the lock disappears; retry only inside this unique mktemp directory.
+    for _ in $(seq 1 20); do
+        rm -rf "$tmp" || true
+        test ! -e "$tmp" && return
+        sleep 0.01
+    done
+    test ! -e "$tmp"
+}
+trap cleanup EXIT
 
 "$compiler" selfhost/zagd_daemon.zag -o "$tmp/zagd" --no-zagd --no-analyze >/dev/null
 ln -s "$compiler" "$tmp/znc"

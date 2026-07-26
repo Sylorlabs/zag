@@ -40,5 +40,26 @@ resolution semantics have tests.
 
 ## Current status
 
-This is a v2 design contract only.  Existing v1 `extern` parsing/native
-lowering does not satisfy it, and no stable v2 ABI is claimed.
+The only implemented v2 ABI slice is an unsafe, outbound scalar/pointer
+`extern fn ... @cabi` import through the native x86-64 dynamic ELF writer.
+Executable evidence covers both a no-argument integer import, a six-register
+mixed integer/pointer `mmap` import followed by pointer-return `munmap`, and a
+fixed seven-word scalar call whose seventh `mmap` offset is consumed from the
+SysV stack; this does not extend the supported surface to aggregates, floats,
+callbacks, variadics, exports, or imports with ownership/lifetime contracts.
+It has no v2 export surface: the native x86-64 writer emits `ET_EXEC` with
+program headers only, not an `ET_REL` object, section table, `.symtab`, or
+public-symbol visibility. Accordingly, native `--emit-obj`, `--emit-static`,
+`--emit-shared`, object aliases, PIE, loader-path, rpath/soname,
+archive-selection, and common shared/library-output spellings fail before
+artifact creation rather than silently producing an executable. The separate i686 object/archive path is not v2 C ABI evidence and
+rejects v2 `@cabi` declarations.
+Likewise, `--export`, `--export-dynamic`, and `--export-symbol` requests are
+rejected: `pub fn` does not create a public C symbol in the current native
+writer.
+
+A native export/static-object increment requires codegen to return exact public
+function offsets and sizes, plus a new x86-64 `ET_REL` writer with section,
+symbol, and relocation authority. It must then establish a separately tested
+calling convention (including aggregates, sret, and unwind/visibility policy).
+Until that work exists, no stable v2 export or static C ABI is claimed.

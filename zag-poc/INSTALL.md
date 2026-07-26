@@ -110,13 +110,22 @@ pure Zag and does not use Python, C, or Zig.
 
 ```sh
 sudo make install
-# Installs znc and zagd → /usr/local/bin
+# Installs znc, zagd, and zagd-user-service → /usr/local/bin
+# Installs the strict and Script standard-library modules → /usr/local/lib/zag/std
+# Installs the editable project policy template → /usr/local/share/zag/zagd.conf.example
 ```
 
 Or manually:
 
 ```sh
 sudo install -m755 znc zagd /usr/local/bin/
+sudo install -m755 tools/zagd-user-service.sh /usr/local/bin/zagd-user-service
+sudo install -d /usr/local/lib/zag/std
+sudo install -m644 std/*.zag /usr/local/lib/zag/std/
+sudo install -m644 selfhost/std/process.zag selfhost/std/script_*.zag \
+  /usr/local/lib/zag/std/
+sudo install -d /usr/local/share/zag
+sudo install -m644 examples/zagd.conf /usr/local/share/zag/zagd.conf.example
 ```
 
 After installing, you can compile Zag programs from anywhere:
@@ -135,6 +144,27 @@ suggestions are advisory.
 Use `--no-zagd` on an individual foreground command when a hermetic invocation
 must not start or contact the background service; this never changes project
 configuration.
+
+To use the shipped bounded defaults and change them per project, copy the
+template rather than editing installed files:
+
+```sh
+cp /usr/local/share/zag/zagd.conf.example .zagd.conf
+```
+
+The default `mode=light` keeps the daemon resident; change only `mode=off` to
+make a persistent opt-out. Explicit compiler choices still override Script
+defaults in the file, and normal Zag remains advisory-only.
+
+To keep a project planner active across login and restart it after an
+unexpected exit, install its bounded systemd user service:
+
+```sh
+zagd-user-service install myprogram.zag adaptive
+```
+
+The service is per project, uses the same `.zagd.conf` policy, and is never a
+foreground build correctness dependency.
 
 ## Troubleshooting
 

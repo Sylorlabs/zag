@@ -36,7 +36,10 @@ The result boundary is implemented independently: `ProcessResult` contains a
 compiler-owned opaque handle. Typed ordinary-Zag getters expose status, state,
 and captured output. The handle layout is fixed at four 64-bit words (status,
 state, output pointer, output length), so module name prefixing cannot change the
-runtime ABI. The supervisor constructs this handle directly.
+runtime ABI. The supervisor constructs this handle directly. A root Script owns
+the handle through its selected allocator: the arena charges 32 bytes, while
+the bounded heap charges 48 bytes and links the complete header-plus-payload
+block for deterministic shutdown reclamation.
 
 Adding only a timer around the current call,
 killing only the shell PID, or returning partial output as success would be an

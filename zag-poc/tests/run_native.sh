@@ -9,12 +9,19 @@ SRC="nt_src_x86_$$.zag"
 mkdir -p "$WORK"
 trap 'rm -rf "$WORK"; rm -f "$SRC"' EXIT
 
-# Rebuild the native driver with the supported Zag-native seed.
-if ! ./znc selfhost/native/znc.zag -o "$WORK/znc_drv" >"$WORK/zn_build" 2>&1; then
-    echo "  XX  znc driver build"; sed -n '1,20p' "$WORK/zn_build"
-    echo "════ native pass=0 fail=1 ════"; exit 1
+# A standalone invocation still proves a fresh Zag-native driver rebuild. A
+# higher-level authority gate that has already established the exact fixed
+# point may pass ZNC explicitly and avoid repeating the largest compiler
+# allocation solely to run the backend corpus.
+if [ -z "${ZNC:-}" ]; then
+    if ! ./znc selfhost/native/znc.zag -o "$WORK/znc_drv" \
+        --no-analyze --no-zagd --no-foreground-cache \
+        >"$WORK/zn_build" 2>&1; then
+        echo "  XX  znc driver build"; sed -n '1,20p' "$WORK/zn_build"
+        echo "════ native pass=0 fail=1 ════"; exit 1
+    fi
+    ZNC="$WORK/znc_drv"
 fi
-ZNC="$WORK/znc_drv"
 
 # nt <name> <source> <expected-exit>
 nt(){

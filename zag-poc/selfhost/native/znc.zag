@@ -34,6 +34,8 @@
 @import("../mlir.zag")    // GPU MLIR emitter (lean — no codegen.zag dependency)
 @import("../gfx1010.zag") // deterministic validated RDNA1 kernel bundles
 @import("../planner_authority.zag") // line-wise planner configuration authority
+@import("../zagd_identity.zag") // PID-reuse-safe daemon singleton identity
+@import("../zagd_profile.zag") // checksum-bound foreground profile metadata
 @import("../semantic_manifest_publish.zag") // advisory sema identities for zagd
 @import("wasm.zag")       // WASM binary emitter
 @import("acodegen.zag")   // AArch64 lean codegen (--target arm64 only)
@@ -282,13 +284,22 @@ fn collect_extern_syms(decls: ArrayList[*Node]) ArrayList[[]u8] {
     return syms;
 }
 
-fn znc_dynamic_extern_syms(decls: ArrayList[*Node]) ArrayList[[]u8] {
+fn znc_fn_has_annot(f: FnDecl, annot: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[[]u8](f.annots)) {
+        if (@strEq(get[[]u8](f.annots, i), annot)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn znc_dynamic_extern_syms(decls: ArrayList[*Node], v2_edition: i32) ArrayList[[]u8] {
     let syms: ArrayList[[]u8] = make[[]u8](8);
     let i: i32 = 0;
     while (i < len[*Node](decls)) {
         switch (get[*Node](decls, i).*) {
             .fn_decl => |f| {
-                if (f.is_extern == 1 && starts_with(f.name, "_zag_") == 0) {
+                if (f.is_extern == 1 && starts_with(f.name, "_zag_") == 0 && (v2_edition == 0 || znc_fn_has_annot(f, "@cabi") == 1)) {
                     let found: i32 = 0;
                     let j: i32 = 0;
                     while (j < syms.len) {
@@ -544,19 +555,69 @@ fn i686_target() i32 {
     return 0;
 }
 
+// The v2 `@cabi` contract currently has exactly one implemented lowering:
+// outbound scalar/pointer imports in the native x86-64 dynamic ELF writer.
+// Other target backends may happen to parse an extern declaration, but they do
+// not share that ABI contract; reject before they can emit an object/binary
+// whose public symbols would be mistaken for a supported v2 C boundary.
+fn znc_decls_have_cabi(decls: ArrayList[*Node]) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .fn_decl => |f| {
+                let ai: i32 = 0;
+                while (ai < len[[]u8](f.annots)) {
+                    if (@strEq(get[[]u8](f.annots, ai), "@cabi")) { return 1; }
+                    ai = ai + 1;
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn znc_reject_v2_cabi_non_native(path: []u8) i32 {
+    if (@strEq(v2_project_edition(path), "2027") == 0) { return 0; }
+    let src: []u8 = _zag_read_file(path);
+    if (src.len < 0) { return 0; } // target builder reports an ordinary read error
+    let unit: CompilationUnit = parse_compilation_unit_dir(src, dir_of(path));
+    if (znc_decls_have_cabi(unit.decls) == 1) {
+        _zag_eprintln("znc: v2 @cabi imports are currently supported only for native x86-64 --dynamic output");
+        _zag_eprintln("note: no v2 C ABI object, archive, WASM, ARM64, or GPU artifact was emitted");
+        return 1;
+    }
+    return 0;
+}
+
 fn build_i686_minimal(path: []u8) i32 {
     let src:[]u8=_zag_read_file(path);
     if (src.len < 0) { _zag_eprintln("znc i686: cannot read source"); return 1; }
     if(has_flag("--link-i686")==1){let linked:[]u8=out_flag();if(linked.len==0){linked=default_out(path);}let inputs:ArrayList[[]u8]=make[[]u8](4);push[[]u8](&inputs,src);let ai:i32=2;while(ai<_zag_argc()){let a:[]u8=_zag_arg(ai);if(@strEq(a,"-o")||@strEq(a,"--target")){ai=ai+2;}else if(a.len>0&&a[0]=='-'){ai=ai+1;}else{let extra:[]u8=_zag_read_file(a);if(extra.len<0){_zag_eprintln(_zag_str_concat("znc i686: cannot read link input: ",a));return 1;}push[[]u8](&inputs,extra);ai=ai+1;}}if(write_i686_linked_objects(linked,inputs)!=0){return 1;}_zag_println(_zag_str_concat("znc: linked ELF32/i386 executable ",linked));return 0;}
+    // Target selection must not bypass the language authorities shared by the
+    // normal native, ARM64, WASM, and GPU paths.  Keep this before lowering and
+    // artifact creation; only the target-specific backend remains isolated.
+    if(v2_validate_source(path,src)!=0){return 1;}
     let unit:CompilationUnit=parse_compilation_unit_dir(src,dir_of(path));
     if(unit.profile==ModuleProfile.script) { _zag_eprintln("znc i686: unsupported construct: Zag Script runtime is not implemented"); return 1; }
-    let lower:I386Lower=I386Lower{.ir=make[I32IR](32),.locals=make[I386Local](8),.funcs=make[I386Fn](8),.structs=make[StructDecl](4),.strings=make[[]u8](4),.failed=0,.next_label=0,.next_slot=0,.break_label=-1,.continue_label=-1,.current_error_fn=0,.expected_ty="",.current_ret_ty="",.sret_target=-1};
-    if(lower_i386_i32_program(unit.decls,&lower)!=0) { return 1; }
+    let decls:ArrayList[*Node]=unit.decls;
+    lo_operators(decls);
+    let aerrs:i32=znc_check_arity(decls);
+    if(aerrs>0){_zag_println("znc: arity check FAILED");return 1;}
+    let derrs:i32=znc_check_dups(decls);
+    if(derrs>0){_zag_println("znc: duplicate-definition check FAILED");return 1;}
+    if(typed_check_program(decls,path)>0){return 1;}
+    let eff:map__StringMap[i32]=analyze(decls);
+    let viols:i32=report_violations(decls,eff,src,path);
+    if(viols>0){_zag_println("znc: capability check FAILED");return 1;}
+    let object_mode:i32=((has_flag("--emit-obj")==1||has_flag("--emit-static")==1) as i32);
+    let lower:I386Lower=I386Lower{.ir=make[I32IR](32),.locals=make[I386Local](8),.funcs=make[I386Fn](8),.structs=make[StructDecl](4),.strings=make[[]u8](4),.object_relocs=make[I686CodeReloc](4),.failed=0,.next_label=0,.next_slot=0,.break_label=-1,.continue_label=-1,.current_error_fn=0,.expected_ty="",.current_ret_ty="",.sret_target=-1,.object_mode=object_mode};
+    if(lower_i386_i32_program(decls,&lower)!=0) { return 1; }
     let text:ArrayList[u8]=encode_i386_i32(&lower);
     let out:[]u8=out_flag();
     if (out.len==0) { out=default_out(path); }
-    if(has_flag("--emit-obj")==1){if(write_i686_object(out,text)!=0){_zag_eprintln("znc i686: failed to write ELF32 object");return 1;}_zag_println(_zag_str_concat("znc: wrote ELF32/i386 object ",out));return 0;}
-    if(has_flag("--emit-static")==1){if(write_i686_archive(out,text)!=0){_zag_eprintln("znc i686: failed to write static archive");return 1;}_zag_println(_zag_str_concat("znc: wrote ELF32/i386 archive ",out));return 0;}
+    if(object_mode==1){let code:I686ObjectCode=i386_object_code(&lower,text);if(has_flag("--emit-obj")==1){if(write_i686_object_code(out,code)!=0){_zag_eprintln("znc i686: failed to write ELF32 object");return 1;}_zag_println(_zag_str_concat("znc: wrote ELF32/i386 object ",out));return 0;}if(write_i686_archive_code(out,code)!=0){_zag_eprintln("znc i686: failed to write static archive");return 1;}_zag_println(_zag_str_concat("znc: wrote ELF32/i386 archive ",out));return 0;}
     if (write_i686_text(out,text)!=0) { _zag_eprintln("znc i686: failed to write ELF32 executable"); return 1; }
     _zag_println(_zag_str_concat("znc: wrote ELF32/i386 i32 binary ",out));
     return 0;
@@ -861,8 +922,9 @@ fn znc_check_dups(decls: ArrayList[*Node]) i32 {
 fn znc_check_src(path: []u8, src: []u8) i32 {
     if (v2_validate_source(path, src) != 0) { return 1; }
     let unit: CompilationUnit = parse_compilation_unit_dir(src, dir_of(path));
-    znc_configure_script_unit(&unit, path);
     if (znc_validate_script_defaults(path, unit) != 0) { return 1; }
+    if (znc_configure_script_unit(&unit, path) != 0) { return 1; }
+    if (znc_validate_script_capabilities(path, unit) != 0) { return 1; }
     let decls: ArrayList[*Node] = unit.decls;
     lo_operators(decls);
     let aerrs: i32 = znc_check_arity(decls);
@@ -883,7 +945,8 @@ fn znc_check_src(path: []u8, src: []u8) i32 {
         return 1;
     }
     if (run_analyzer(decls, path) != 0) { return 1; }
-    znc_publish_semantics(path,src,unit,decls,eff);
+    let published:i32=znc_publish_semantics(path,src,unit,decls,eff);
+    znc_maybe_regular_advisory(path,unit,published);
     return 0;
 }
 
@@ -1121,6 +1184,31 @@ fn source_starts_script(src: []u8) i32 {
     return 0;
 }
 
+fn source_path_is_zs(path:[]u8)i32 {
+    if(path.len<3){return 0;}
+    return @strEq(path[path.len-3..path.len],".zs") as i32;
+}
+
+fn contains_text(text:[]u8,needle:[]u8)i32 {
+    if(needle.len==0){return 1;}
+    let i:i32=0;
+    while(i+needle.len<=text.len){
+        if(@strEq(text[i..i+needle.len],needle)){return 1;}
+        i=i+1;
+    }
+    return 0;
+}
+
+// `.zs` is an optional activation convenience, not a separate language or
+// compiler. It selects the same ModuleProfile.script path as `script;` and
+// `znc script`, and never rewrites the source file.
+fn znc_activate_script_source(path:[]u8,src:[]u8,force:i32)[]u8 {
+    if((force==1||source_path_is_zs(path)==1)&&source_starts_script(src)==0){
+        return _zag_str_concat("script;\n",src);
+    }
+    return src;
+}
+
 fn flag_value(name: []u8) []u8 {
     let i: i32 = 1;
     while (i < _zag_argc()) {
@@ -1182,9 +1270,10 @@ fn validate_x86_cpu_flag() i32 {
     return 0;
 }
 
-// Native output is currently Linux ELF64 x86-64 only.  Rejecting unsupported
-// target spellings here is essential: silently producing ELF64 for `i686`
-// would make pointer width and ABI claims that the compiler cannot satisfy.
+// Target validation must fail closed: an unknown target must never silently
+// receive the host ELF/ABI.  i686 aliases are routed to the dedicated ELF32
+// driver before this validator is reached, but remain accepted here so this
+// shared validation helper does not publish a stale "not implemented" claim.
 fn validate_x86_target_flag() i32 {
     let target: []u8 = flag_value("--target");
     let i: i32 = 1;
@@ -1199,10 +1288,7 @@ fn validate_x86_target_flag() i32 {
     if (selected.len == 0 || @strEq(selected, "x86_64") ||
         @strEq(selected, "x86-64") || @strEq(selected, "linux-x86_64")) { return 0; }
     if (@strEq(selected, "i686") || @strEq(selected, "x86") ||
-        @strEq(selected, "linux-i686")) {
-        _zag_eprintln("znc: i686 is not implemented: ELF32, 32-bit pointers, i386 ABI, register allocation, and Linux syscalls remain required");
-        return 1;
-    }
+        @strEq(selected, "linux-i686")) { return 0; }
     _zag_eprintln(_zag_str_concat("znc: unsupported target: ", selected));
     return 1;
 }
@@ -1240,7 +1326,20 @@ fn znc_fmt(fpath: []u8, in_place: i32) i32 {
         _zag_println(fpath);
         return 1;
     }
-    let formatted: ArrayList[u8] = fmt_program(src);
+    // The formatter consumes the canonical grammar. Python-shaped Script is
+    // normalized through the same frontend used by compilation; formatting a
+    // `.zs` file therefore produces valid explicit Zag without introducing a
+    // second formatter or parser.
+    let format_src: []u8 = script_syntax_normalize(znc_activate_script_source(fpath, src, 0));
+    if(source_path_is_zs(fpath)==1||@strEq(format_src,src)==0){
+        if(in_place==1){
+            let wrc:i32=_zag_write_file(fpath,format_src);
+            if(wrc!=0){_zag_println("znc fmt: write failed");return 1;}
+            _zag_print("znc fmt: normalized ");_zag_println(fpath);
+        }else{_zag_print(format_src);}
+        return 0;
+    }
+    let formatted: ArrayList[u8] = fmt_program(format_src);
     if (in_place == 1) {
         let wrc: i32 = _zag_write_file(fpath, formatted.data[0..formatted.len]);
         if (wrc != 0) { _zag_println("znc fmt: write failed"); return 1; }
@@ -1268,14 +1367,108 @@ fn znc_emit_total_cex(decls: ArrayList[*Node], eff: map__StringMap[i32]) void {
     }
 }
 
-fn znc_script_alloc_call(name:[]u8)i32{if(@strEq(name,"_zag_script_alloc")||@strEq(name,"script_read_file")||@strEq(name,"script_string_concat")||@strEq(name,"script_string_builder_new")||@strEq(name,"process_run_bounded_script")||@strEq(name,"_zag_script_new")||@strEq(name,"script_args")||@strEq(name,"script_path_join")||@strEq(name,"script_path_basename")||@strEq(name,"script_path_dirname")||@strEq(name,"script_path_extension")||starts_with(name,"script_list")){return 1;}return 0;}
+// These are exact compiler-bound Script-context value producers. Prefix
+// matching is forbidden here: an ordinary user function such as
+// `script_list_sink` must be analyzed from its body, not granted runtime
+// authority because of its spelling.
+fn znc_script_alloc_call(name:[]u8)i32{
+    if(@strEq(name,"_zag_script_alloc")||@strEq(name,"_zag_script_new")||
+       @strEq(name,"script_input")||@strEq(name,"script_read_file")||
+       @strEq(name,"script_string_concat")||@strEq(name,"script_string_builder_new")||
+       @strEq(name,"process_run_bounded_script")||@strEq(name,"script_args")||
+       @strEq(name,"script_path_join")||@strEq(name,"script_path_basename")||
+       @strEq(name,"script_path_dirname")||@strEq(name,"script_path_extension")||
+       @strEq(name,"script_list_new")||@strEq(name,"script_list1")||
+       @strEq(name,"script_list2")||@strEq(name,"script_list3")||
+       @strEq(name,"script_list4")||@strEq(name,"script_list_append")||
+       @strEq(name,"script_list_len")||@strEq(name,"script_list_get")||
+       @strEq(name,"script_list_failed")){return 1;}
+    return 0;
+}
 struct ZScriptLifeSummary{name:[]u8,returns_script:i32,escapes_script:i32}
 fn znc_script_summary(sums:ArrayList[ZScriptLifeSummary],name:[]u8)ZScriptLifeSummary{let i:i32=0;while(i<sums.len){if(@strEq(sums.data[i].name,name)){return sums.data[i];}i=i+1;}return ZScriptLifeSummary{.name="",.returns_script=0,.escapes_script=1};}
 fn znc_script_known_fn(decls:ArrayList[*Node],name:[]u8)i32{let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(@strEq(f.name,name)&&f.is_extern==0){return 1;}}else=>{}}i=i+1;}return 0;}
-fn znc_script_safe_consumer(name:[]u8)i32{if(starts_with(name,"process_result_")||starts_with(name,"string_builder_")||@strEq(name,"@strEq")){return 1;}return (@strEq(name,"print")||@strEq(name,"println")||@strEq(name,"write_file")||@strEq(name,"_zag_print")||@strEq(name,"_zag_println")||@strEq(name,"_zag_write_file")||@strEq(name,"script_list_append")||@strEq(name,"script_list_len")||@strEq(name,"script_list_get")||znc_script_alloc_call(name)==1) as i32;}
-// Script-context payloads are bump-arena allocations. They carry no ordinary
-// heap header, so delete/_zag_free must never receive one. Generated Script
-// shutdown owns arena reclamation.
+fn znc_script_any_decl(decls:ArrayList[*Node],name:[]u8)i32{let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(@strEq(f.name,name)){return 1;}}else=>{}}i=i+1;}return 0;}
+fn znc_script_fn_origin(decls:ArrayList[*Node],name:[]u8,origin:[]u8)i32{
+    let i:i32=0;
+    while(i<decls.len){
+        switch(decls.data[i].*){
+            .fn_decl=>|f|{
+                if(f.is_extern==0&&@strEq(f.name,name)&&@strEq(f.origin,origin)){return 1;}
+            }
+            else=>{}
+        }
+        i=i+1;
+    }
+    return 0;
+}
+// Standard Script helpers are trusted only when the resolver says that the
+// declaration came from the compiler-owned std module. A project file with
+// the same basename or function name receives no such authority.
+fn znc_script_std_fn(decls:ArrayList[*Node],name:[]u8,module:[]u8)i32{
+    let expected:[]u8=canon_path(resolve_import_path(module,"."));
+    return znc_script_fn_origin(decls,name,expected);
+}
+fn znc_script_std_safe_consumer(decls:ArrayList[*Node],name:[]u8)i32{
+    if(@strEq(name,"process_result_status")||@strEq(name,"process_result_state")||
+       @strEq(name,"process_result_output")||@strEq(name,"process_result_new")||
+       @strEq(name,"process_run_bounded")||@strEq(name,"process_run_bounded_script")){
+        return znc_script_std_fn(decls,name,"std:process");
+    }
+    if(@strEq(name,"string_builder_from_buffer")||@strEq(name,"script_string_builder_new")||
+       @strEq(name,"string_builder_append")||@strEq(name,"string_builder_len")||
+       @strEq(name,"string_builder_failed")||@strEq(name,"string_builder_output")){
+        return znc_script_std_fn(decls,name,"std:script_string_builder");
+    }
+    if(@strEq(name,"script_list_new")||@strEq(name,"script_list1")||
+       @strEq(name,"script_list2")||@strEq(name,"script_list3")||
+       @strEq(name,"script_list4")||@strEq(name,"script_list_append")||
+       @strEq(name,"script_list_len")||@strEq(name,"script_list_get")||
+       @strEq(name,"script_list_failed")||@strEq(name,"script_args")){
+        return znc_script_std_fn(decls,name,"std:script_list");
+    }
+    if(@strEq(name,"script_read_file")){return znc_script_std_fn(decls,name,"std:script_io");}
+    if(@strEq(name,"script_input")){return znc_script_std_fn(decls,name,"std:script_input");}
+    if(@strEq(name,"script_string_concat")){return znc_script_std_fn(decls,name,"std:script_string");}
+    if(@strEq(name,"script_path_join")||@strEq(name,"script_path_basename")||
+       @strEq(name,"script_path_dirname")||@strEq(name,"script_path_extension")){
+        return znc_script_std_fn(decls,name,"std:script_path");
+    }
+    return 0;
+}
+fn znc_script_runtime_safe_consumer(decls:ArrayList[*Node],name:[]u8)i32{
+    if(@strEq(name,"@strEq")){return 1;}
+    // Root helper bodies are intentionally not rewritten with the hidden
+    // ScriptContext, but these context-free output conveniences retain their
+    // ordinary prelude meaning. Any source declaration, including an extern,
+    // wins and must be analyzed or rejected instead of receiving this trust.
+    if(@strEq(name,"print")||@strEq(name,"println")||@strEq(name,"write_file")){
+        return (znc_script_any_decl(decls,name)==0) as i32;
+    }
+    // These spellings are compiler-reserved synchronous output bridges. The
+    // shipped `std:rt` necessarily declares them as externs, including in a
+    // relocatable install; that declaration describes the bridge rather than
+    // a user helper which could retain the argument. They may observe a
+    // Script-context slice for the duration of the call but cannot retain it.
+    if(@strEq(name,"_zag_print")||@strEq(name,"_zag_println")||
+       @strEq(name,"_zag_eprintln")){return 1;}
+    if(@strEq(name,"_zag_write_file")||@strEq(name,"_zag_script_alloc")||
+       @strEq(name,"_zag_script_new")||@strEq(name,"_zag_script_alloc_used")){
+        // A source definition wins over other backend spellings. This makes
+        // direct runtime-name shadowing fail closed and lets its computed
+        // summary decide whether a Script-context argument escapes.
+        return (znc_script_any_decl(decls,name)==0) as i32;
+    }
+    return 0;
+}
+fn znc_script_safe_consumer(decls:ArrayList[*Node],name:[]u8)i32{
+    if(znc_script_runtime_safe_consumer(decls,name)==1){return 1;}
+    return znc_script_std_safe_consumer(decls,name);
+}
+// Script-context payloads are either bump-arena addresses or bounded-heap
+// addresses after a compiler-owned ownership header. Neither exposed pointer
+// is an ordinary native allocator pointer, so delete/_zag_free must never
+// receive one. Generated Script shutdown owns policy-specific reclamation.
 fn znc_script_foreign_free(name:[]u8)i32{return (@strEq(name,"delete")||@strEq(name,"_zag_free")) as i32;}
 fn znc_script_env_has(env:ArrayList[ZTBind],name:[]u8)i32{let i:i32=0;while(i<env.len){if(@strEq(env.data[i].name,name)){return 1;}i=i+1;}return 0;}
 fn znc_script_env_tainted(env:ArrayList[ZTBind],name:[]u8)i32{let i:i32=0;while(i<env.len){if(@strEq(env.data[i].name,name)&&@strEq(env.data[i].ty,"script-lifetime")){return 1;}i=i+1;}return 0;}
@@ -1283,26 +1476,335 @@ fn znc_script_env_mark(env:*ArrayList[ZTBind],name:[]u8)void{let i:i32=0;while(i
 fn znc_script_arm_value_tainted(body:ArrayList[*Node],env:ArrayList[ZTBind],sums:ArrayList[ZScriptLifeSummary])i32{if(body.len==0){return 0;}let last:*Node=body.data[body.len-1];switch(last.*){.estmt=>|x|{return znc_script_tainted(x.expr,env,sums);}.ret=>|x|{if(x.has_expr==1){return znc_script_tainted(x.expr,env,sums);}}else=>{}}return 0;}
 fn znc_script_tainted(n:*Node,env:ArrayList[ZTBind],sums:ArrayList[ZScriptLifeSummary])i32{switch(n.*){.id=>|x|{return znc_script_env_tainted(env,x.name);}.call=>|x|{let name:[]u8=callee_name(x.callee);if(znc_script_alloc_call(name)==1){return 1;}let s:ZScriptLifeSummary=znc_script_summary(sums,name);if(s.name.len>0&&s.returns_script==1){let i:i32=0;while(i<x.args.len){if(znc_script_tainted(x.args.data[i],env,sums)==1){return 1;}i=i+1;}return 1;}}.bin=>|x|{return znc_script_tainted(x.l,env,sums)|znc_script_tainted(x.r,env,sums);}.un=>|x|{return znc_script_tainted(x.e,env,sums);}.fld=>|x|{return znc_script_tainted(x.base,env,sums);}.idx=>|x|{return znc_script_tainted(x.base,env,sums);}.cast_=>|x|{return znc_script_tainted(x.expr,env,sums);}.slice_=>|x|{return znc_script_tainted(x.base,env,sums);}.slit_=>|x|{let i:i32=0;while(i<len[FieldInit](x.fields)){if(znc_script_tainted(get[FieldInit](x.fields,i).val,env,sums)==1){return 1;}i=i+1;}}.switch_=>|x|{let i:i32=0;while(i<len[SwitchArm](x.arms)){if(znc_script_arm_value_tainted(get[SwitchArm](x.arms,i).body,env,sums)==1){return 1;}i=i+1;}if(x.has_els==1){return znc_script_arm_value_tainted(x.els_body,env,sums);}}else=>{}}return 0;}
 fn znc_script_escape_body(body:ArrayList[*Node],env:ArrayList[ZTBind],decls:ArrayList[*Node],sums:ArrayList[ZScriptLifeSummary],report:i32)i32{let failures:i32=0;let i:i32=0;while(i<body.len){switch(body.data[i].*){.let_=>|x|{if(x.has_init==1){failures=failures+znc_script_call_escape(x.expr,env,decls,sums,report);}}.ret=>|x|{if(x.has_expr==1){failures=failures+znc_script_call_escape(x.expr,env,decls,sums,report);}}.estmt=>|x|{failures=failures+znc_script_call_escape(x.expr,env,decls,sums,report);}.assign=>|x|{failures=failures+znc_script_call_escape(x.target,env,decls,sums,report)+znc_script_call_escape(x.expr,env,decls,sums,report);}.if_=>|x|{failures=failures+znc_script_call_escape(x.cond,env,decls,sums,report)+znc_script_escape_body(x.then_body,env,decls,sums,report)+znc_script_escape_body(x.els_body,env,decls,sums,report);}.while_=>|x|{failures=failures+znc_script_call_escape(x.cond,env,decls,sums,report)+znc_script_escape_body(x.body,env,decls,sums,report);}.unsafe_=>|x|{failures=failures+znc_script_escape_body(x.body,env,decls,sums,report);}.switch_=>|x|{failures=failures+znc_script_call_escape(x.subject,env,decls,sums,report);let ai:i32=0;while(ai<len[SwitchArm](x.arms)){failures=failures+znc_script_escape_body(get[SwitchArm](x.arms,ai).body,env,decls,sums,report);ai=ai+1;}failures=failures+znc_script_escape_body(x.els_body,env,decls,sums,report);}else=>{}}i=i+1;}return failures;}
-fn znc_script_call_escape(n:*Node,env:ArrayList[ZTBind],decls:ArrayList[*Node],sums:ArrayList[ZScriptLifeSummary],report:i32)i32{let failures:i32=0;switch(n.*){.call=>|c|{let name:[]u8=callee_name(c.callee);let may_escape:i32=0;if(znc_script_safe_consumer(name)==0){if(znc_script_known_fn(decls,name)==0){may_escape=1;}else if(znc_script_summary(sums,name).escapes_script==1){may_escape=1;}}let j:i32=0;while(j<c.args.len){if(znc_script_tainted(c.args.data[j],env,sums)==1){if(znc_script_foreign_free(name)==1){if(report==1){_zag_eprintln(_zag_str_concat("znc script lifetime: `",_zag_str_concat(name,"` cannot deallocate a Script-context value; it is reclaimed only at generated Script shutdown")));}failures=failures+1;}else if(may_escape==1){if(report==1){_zag_eprintln(_zag_str_concat("znc script lifetime: Script-context value may escape through helper, extern, or unknown call to `",_zag_str_concat(name,"`")));}failures=failures+1;}}failures=failures+znc_script_call_escape(c.args.data[j],env,decls,sums,report);j=j+1;}}.bin=>|x|{failures=failures+znc_script_call_escape(x.l,env,decls,sums,report)+znc_script_call_escape(x.r,env,decls,sums,report);}.un=>|x|{failures=failures+znc_script_call_escape(x.e,env,decls,sums,report);}.fld=>|x|{failures=failures+znc_script_call_escape(x.base,env,decls,sums,report);}.idx=>|x|{failures=failures+znc_script_call_escape(x.base,env,decls,sums,report)+znc_script_call_escape(x.idx,env,decls,sums,report);}.cast_=>|x|{failures=failures+znc_script_call_escape(x.expr,env,decls,sums,report);}.slice_=>|x|{failures=failures+znc_script_call_escape(x.base,env,decls,sums,report);}.slit_=>|x|{let i:i32=0;while(i<len[FieldInit](x.fields)){failures=failures+znc_script_call_escape(get[FieldInit](x.fields,i).val,env,decls,sums,report);i=i+1;}}.switch_=>|x|{failures=failures+znc_script_call_escape(x.subject,env,decls,sums,report);let ai:i32=0;while(ai<len[SwitchArm](x.arms)){failures=failures+znc_script_escape_body(get[SwitchArm](x.arms,ai).body,env,decls,sums,report);ai=ai+1;}failures=failures+znc_script_escape_body(x.els_body,env,decls,sums,report);}else=>{}}return failures;}
+fn znc_script_call_escape(n:*Node,env:ArrayList[ZTBind],decls:ArrayList[*Node],sums:ArrayList[ZScriptLifeSummary],report:i32)i32{let failures:i32=0;switch(n.*){.call=>|c|{let name:[]u8=callee_name(c.callee);let may_escape:i32=0;if(znc_script_safe_consumer(decls,name)==0){if(znc_script_known_fn(decls,name)==0){may_escape=1;}else if(znc_script_summary(sums,name).escapes_script==1){may_escape=1;}}let j:i32=0;while(j<c.args.len){if(znc_script_tainted(c.args.data[j],env,sums)==1){if(znc_script_foreign_free(name)==1){if(report==1){_zag_eprintln(_zag_str_concat("znc script lifetime: `",_zag_str_concat(name,"` cannot deallocate a Script-context value; it is reclaimed only at generated Script shutdown")));}failures=failures+1;}else if(may_escape==1){if(report==1){_zag_eprintln(_zag_str_concat("znc script lifetime: Script-context value may escape through helper, extern, or unknown call to `",_zag_str_concat(name,"`")));}failures=failures+1;}}failures=failures+znc_script_call_escape(c.args.data[j],env,decls,sums,report);j=j+1;}}.bin=>|x|{failures=failures+znc_script_call_escape(x.l,env,decls,sums,report)+znc_script_call_escape(x.r,env,decls,sums,report);}.un=>|x|{failures=failures+znc_script_call_escape(x.e,env,decls,sums,report);}.fld=>|x|{failures=failures+znc_script_call_escape(x.base,env,decls,sums,report);}.idx=>|x|{failures=failures+znc_script_call_escape(x.base,env,decls,sums,report)+znc_script_call_escape(x.idx,env,decls,sums,report);}.cast_=>|x|{failures=failures+znc_script_call_escape(x.expr,env,decls,sums,report);}.slice_=>|x|{failures=failures+znc_script_call_escape(x.base,env,decls,sums,report);}.slit_=>|x|{let i:i32=0;while(i<len[FieldInit](x.fields)){failures=failures+znc_script_call_escape(get[FieldInit](x.fields,i).val,env,decls,sums,report);i=i+1;}}.switch_=>|x|{failures=failures+znc_script_call_escape(x.subject,env,decls,sums,report);let ai:i32=0;while(ai<len[SwitchArm](x.arms)){failures=failures+znc_script_escape_body(get[SwitchArm](x.arms,ai).body,env,decls,sums,report);ai=ai+1;}failures=failures+znc_script_escape_body(x.els_body,env,decls,sums,report);}else=>{}}return failures;}
 fn znc_script_lifetime_body(body:ArrayList[*Node],env:*ArrayList[ZTBind],decls:ArrayList[*Node],sums:ArrayList[ZScriptLifeSummary],report:i32,returns:*i32)i32{let failures:i32=0;let i:i32=0;while(i<body.len){let n:*Node=body.data[i];switch(n.*){.let_=>|x|{if(znc_script_env_has(env.*,x.name)==0){push[ZTBind](env,ZTBind{.name=x.name,.ty=""});}if(x.has_init==1){failures=failures+znc_script_call_escape(x.expr,env.*,decls,sums,report);if(znc_script_tainted(x.expr,env.*,sums)==1){znc_script_env_mark(env,x.name);}}}.ret=>|x|{if(x.has_expr==1){failures=failures+znc_script_call_escape(x.expr,env.*,decls,sums,report);if(znc_script_tainted(x.expr,env.*,sums)==1){returns.*=1;}}}.assign=>|x|{failures=failures+znc_script_call_escape(x.expr,env.*,decls,sums,report);if(znc_script_tainted(x.expr,env.*,sums)==1){let local:i32=0;let local_name:[]u8="";switch(x.target.*){.id=>|id|{local=znc_script_env_has(env.*,id.name);local_name=id.name;}else=>{}}if(local==0){if(report==1){_zag_eprintln("znc script lifetime: Script-context value stored through a field, pointer, or nonlocal target");}failures=failures+1;}else{znc_script_env_mark(env,local_name);}}}.estmt=>|x|{failures=failures+znc_script_call_escape(x.expr,env.*,decls,sums,report);}.if_=>|x|{failures=failures+znc_script_call_escape(x.cond,env.*,decls,sums,report)+znc_script_lifetime_body(x.then_body,env,decls,sums,report,returns)+znc_script_lifetime_body(x.els_body,env,decls,sums,report,returns);}.while_=>|x|{failures=failures+znc_script_call_escape(x.cond,env.*,decls,sums,report)+znc_script_lifetime_body(x.body,env,decls,sums,report,returns);}.unsafe_=>|x|{failures=failures+znc_script_lifetime_body(x.body,env,decls,sums,report,returns);}.switch_=>|x|{failures=failures+znc_script_call_escape(x.subject,env.*,decls,sums,report);let ai:i32=0;while(ai<len[SwitchArm](x.arms)){failures=failures+znc_script_lifetime_body(get[SwitchArm](x.arms,ai).body,env,decls,sums,report,returns);ai=ai+1;}failures=failures+znc_script_lifetime_body(x.els_body,env,decls,sums,report,returns);}else=>{}}i=i+1;}return failures;}
 fn znc_script_lifetime_check(decls:ArrayList[*Node])i32{let sums:ArrayList[ZScriptLifeSummary]=make[ZScriptLifeSummary](16);let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(f.is_extern==0){push[ZScriptLifeSummary](&sums,ZScriptLifeSummary{.name=f.name,.returns_script=0,.escapes_script=0});}}else=>{}}i=i+1;}let pass:i32=0;while(pass<=sums.len){i=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(f.is_extern==0){let env:ArrayList[ZTBind]=make[ZTBind](f.params.len+8);let pi:i32=0;while(pi<f.params.len){push[ZTBind](&env,ZTBind{.name=f.params.data[pi].name,.ty="script-lifetime"});pi=pi+1;}let ret:i32=0;let escapes:i32=znc_script_lifetime_body(f.body,&env,decls,sums,0,&ret);let si:i32=0;while(si<sums.len){if(@strEq(sums.data[si].name,f.name)){if(ret==1){sums.data[si].returns_script=1;}if(escapes>0){sums.data[si].escapes_script=1;}}si=si+1;}}}else=>{}}i=i+1;}pass=pass+1;}i=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(@strEq(f.name,"__zag_compiler_script_body_7f3a")){let env:ArrayList[ZTBind]=make[ZTBind](8);let ret:i32=0;return znc_script_lifetime_body(f.body,&env,decls,sums,1,&ret);}}else=>{}}i=i+1;}return 0;}
 fn znc_ast_has_call_expr(n:*Node,name:[]u8)i32{switch(n.*){.call=>|x|{if(@strEq(callee_name(x.callee),name)){return 1;}let i:i32=0;while(i<x.args.len){if(znc_ast_has_call_expr(x.args.data[i],name)==1){return 1;}i=i+1;}}.bin=>|x|{return znc_ast_has_call_expr(x.l,name)|znc_ast_has_call_expr(x.r,name);}.un=>|x|{return znc_ast_has_call_expr(x.e,name);}.fld=>|x|{return znc_ast_has_call_expr(x.base,name);}.idx=>|x|{return znc_ast_has_call_expr(x.base,name)|znc_ast_has_call_expr(x.idx,name);}.cast_=>|x|{return znc_ast_has_call_expr(x.expr,name);}.slice_=>|x|{return znc_ast_has_call_expr(x.base,name)|znc_ast_has_call_expr(x.lo,name);}.slit_=>|x|{let i:i32=0;while(i<len[FieldInit](x.fields)){if(znc_ast_has_call_expr(get[FieldInit](x.fields,i).val,name)==1){return 1;}i=i+1;}}else=>{}}return 0;}
-fn znc_ast_body_has_call(body:ArrayList[*Node],name:[]u8)i32{let i:i32=0;while(i<body.len){switch(body.data[i].*){.let_=>|x|{if(x.has_init==1&&znc_ast_has_call_expr(x.expr,name)==1){return 1;}}.estmt=>|x|{if(znc_ast_has_call_expr(x.expr,name)==1){return 1;}}.assign=>|x|{if(znc_ast_has_call_expr(x.expr,name)==1){return 1;}}.if_=>|x|{if(znc_ast_has_call_expr(x.cond,name)==1||znc_ast_body_has_call(x.then_body,name)==1||znc_ast_body_has_call(x.els_body,name)==1){return 1;}}.while_=>|x|{if(znc_ast_has_call_expr(x.cond,name)==1||znc_ast_body_has_call(x.body,name)==1){return 1;}}.switch_=>|x|{if(znc_ast_has_call_expr(x.subject,name)==1){return 1;}let ai:i32=0;while(ai<len[SwitchArm](x.arms)){if(znc_ast_body_has_call(get[SwitchArm](x.arms,ai).body,name)==1){return 1;}ai=ai+1;}if(znc_ast_body_has_call(x.els_body,name)==1){return 1;}}else=>{}}i=i+1;}return 0;}
-fn znc_script_root_make_expr(n:*Node)i32{switch(n.*){.call=>|x|{if(@strEq(callee_name(x.callee),"make")){return 1;}let i:i32=0;while(i<x.args.len){if(znc_script_root_make_expr(x.args.data[i])==1){return 1;}i=i+1;}}.bin=>|x|{return znc_script_root_make_expr(x.l)|znc_script_root_make_expr(x.r);}.un=>|x|{return znc_script_root_make_expr(x.e);}.fld=>|x|{return znc_script_root_make_expr(x.base);}.idx=>|x|{return znc_script_root_make_expr(x.base)|znc_script_root_make_expr(x.idx);}.cast_=>|x|{return znc_script_root_make_expr(x.expr);}.slice_=>|x|{return znc_script_root_make_expr(x.base)|znc_script_root_make_expr(x.lo);}.slit_=>|x|{let i:i32=0;while(i<len[FieldInit](x.fields)){if(znc_script_root_make_expr(get[FieldInit](x.fields,i).val)==1){return 1;}i=i+1;}}else=>{}}return 0;}
-fn znc_script_root_make_body(body:ArrayList[*Node])i32{let i:i32=0;while(i<body.len){switch(body.data[i].*){.let_=>|x|{if(x.has_init==1&&znc_script_root_make_expr(x.expr)==1){return 1;}}.ret=>|x|{if(x.has_expr==1&&znc_script_root_make_expr(x.expr)==1){return 1;}}.estmt=>|x|{if(znc_script_root_make_expr(x.expr)==1){return 1;}}.assign=>|x|{if(znc_script_root_make_expr(x.expr)==1){return 1;}}.if_=>|x|{if(znc_script_root_make_expr(x.cond)==1||znc_script_root_make_body(x.then_body)==1||znc_script_root_make_body(x.els_body)==1){return 1;}}.while_=>|x|{if(znc_script_root_make_expr(x.cond)==1||znc_script_root_make_body(x.body)==1){return 1;}}.unsafe_=>|x|{if(znc_script_root_make_body(x.body)==1){return 1;}}.switch_=>|x|{if(znc_script_root_make_expr(x.subject)==1){return 1;}let ai:i32=0;while(ai<len[SwitchArm](x.arms)){if(znc_script_root_make_body(get[SwitchArm](x.arms,ai).body)==1){return 1;}ai=ai+1;}if(znc_script_root_make_body(x.els_body)==1){return 1;}}else=>{}}i=i+1;}return 0;}
-fn znc_script_unaccounted_root_make(decls:ArrayList[*Node])i32{let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(@strEq(f.name,"__zag_compiler_script_body_7f3a")&&znc_script_root_make_body(f.body)==1){_zag_eprintln("znc script allocation: root make is not charged to ScriptContext; use list/string_builder/script_alloc or an explicit strict-Zag allocator");return 1;}}else=>{}}i=i+1;}return 0;}
+fn znc_ast_body_has_call(body:ArrayList[*Node],name:[]u8)i32{let i:i32=0;while(i<body.len){switch(body.data[i].*){.let_=>|x|{if(x.has_init==1&&znc_ast_has_call_expr(x.expr,name)==1){return 1;}}.ret=>|x|{if(x.has_expr==1&&znc_ast_has_call_expr(x.expr,name)==1){return 1;}}.estmt=>|x|{if(znc_ast_has_call_expr(x.expr,name)==1){return 1;}}.assign=>|x|{if(znc_ast_has_call_expr(x.expr,name)==1){return 1;}}.if_=>|x|{if(znc_ast_has_call_expr(x.cond,name)==1||znc_ast_body_has_call(x.then_body,name)==1||znc_ast_body_has_call(x.els_body,name)==1){return 1;}}.while_=>|x|{if(znc_ast_has_call_expr(x.cond,name)==1||znc_ast_body_has_call(x.body,name)==1){return 1;}}.unsafe_=>|x|{if(znc_ast_body_has_call(x.body,name)==1){return 1;}}.switch_=>|x|{if(znc_ast_has_call_expr(x.subject,name)==1){return 1;}let ai:i32=0;while(ai<len[SwitchArm](x.arms)){if(znc_ast_body_has_call(get[SwitchArm](x.arms,ai).body,name)==1){return 1;}ai=ai+1;}if(znc_ast_body_has_call(x.els_body,name)==1){return 1;}}else=>{}}i=i+1;}return 0;}
+// Root executable statements are rewritten by script_bind_expr: `new` becomes
+// _zag_script_new and is charged to ScriptContext. Ordinary root helpers do
+// not have a hidden context parameter, so accepting raw `new` there would
+// silently allocate outside the bounded script arena. Keep that boundary
+// explicit until helpers can receive a context by an ordinary Zag signature.
+// Result bits: 1 = ordinary make/new, 2 = allocating runtime/builtin that is
+// not charged to the active ScriptContext. Keep this exact list aligned with
+// the allocating sources in sema.zag; deallocators are intentionally absent.
+fn znc_script_unaccounted_alloc_call(name:[]u8,helper:i32)i32{
+    if(@strEq(name,"make")||(helper==1&&@strEq(name,"new"))){return 1;}
+    if(@strEq(name,"_zag_malloc")||@strEq(name,"_zag_realloc")||
+       @strEq(name,"_zag_strdup")||@strEq(name,"_zag_str_concat")||
+       @strEq(name,"_zag_i64_to_str")||@strEq(name,"_zag_u64_to_str")||
+       @strEq(name,"_zag_read_file")||@strEq(name,"_zag_exec_capture")||
+       @strEq(name,"_zag_script_context_init")||@strEq(name,"zalloc")||
+       @strEq(name,"zalloc_i")||@strEq(name,"@cacheAlignedAlloc")){return 2;}
+    return 0;
+}
+fn znc_script_root_unaccounted_expr(n:*Node,helper:i32)i32{
+    switch(n.*){
+        .call=>|x|{
+            let found:i32=znc_script_unaccounted_alloc_call(callee_name(x.callee),helper);
+            let i:i32=0;
+            while(i<x.args.len){found=found|znc_script_root_unaccounted_expr(x.args.data[i],helper);i=i+1;}
+            return found;
+        }
+        .bin=>|x|{return znc_script_root_unaccounted_expr(x.l,helper)|znc_script_root_unaccounted_expr(x.r,helper);}
+        .un=>|x|{return znc_script_root_unaccounted_expr(x.e,helper);}
+        .fld=>|x|{return znc_script_root_unaccounted_expr(x.base,helper);}
+        .idx=>|x|{return znc_script_root_unaccounted_expr(x.base,helper)|znc_script_root_unaccounted_expr(x.idx,helper);}
+        .cast_=>|x|{return znc_script_root_unaccounted_expr(x.expr,helper);}
+        .slice_=>|x|{
+            let found:i32=znc_script_root_unaccounted_expr(x.base,helper)|znc_script_root_unaccounted_expr(x.lo,helper);
+            if(x.has_hi==1){found=found|znc_script_root_unaccounted_expr(x.hi,helper);}
+            return found;
+        }
+        .slit_=>|x|{
+            let found:i32=0;let i:i32=0;
+            while(i<len[FieldInit](x.fields)){found=found|znc_script_root_unaccounted_expr(get[FieldInit](x.fields,i).val,helper);i=i+1;}
+            return found;
+        }
+        .switch_=>|x|{
+            let found:i32=znc_script_root_unaccounted_expr(x.subject,helper);let ai:i32=0;
+            while(ai<len[SwitchArm](x.arms)){found=found|znc_script_root_unaccounted_body(get[SwitchArm](x.arms,ai).body,helper);ai=ai+1;}
+            found=found|znc_script_root_unaccounted_body(x.els_body,helper);
+            return found;
+        }
+        else=>{}
+    }
+    return 0;
+}
+fn znc_script_root_unaccounted_body(body:ArrayList[*Node],helper:i32)i32{
+    let found:i32=0;let i:i32=0;
+    while(i<body.len){
+        switch(body.data[i].*){
+            .let_=>|x|{if(x.has_init==1){found=found|znc_script_root_unaccounted_expr(x.expr,helper);}}
+            .ret=>|x|{if(x.has_expr==1){found=found|znc_script_root_unaccounted_expr(x.expr,helper);}}
+            .estmt=>|x|{found=found|znc_script_root_unaccounted_expr(x.expr,helper);}
+            .assign=>|x|{found=found|znc_script_root_unaccounted_expr(x.expr,helper);}
+            .if_=>|x|{found=found|znc_script_root_unaccounted_expr(x.cond,helper)|znc_script_root_unaccounted_body(x.then_body,helper)|znc_script_root_unaccounted_body(x.els_body,helper);}
+            .while_=>|x|{found=found|znc_script_root_unaccounted_expr(x.cond,helper)|znc_script_root_unaccounted_body(x.body,helper);}
+            .unsafe_=>|x|{found=found|znc_script_root_unaccounted_body(x.body,helper);}
+            .switch_=>|x|{
+                found=found|znc_script_root_unaccounted_expr(x.subject,helper);let ai:i32=0;
+                while(ai<len[SwitchArm](x.arms)){found=found|znc_script_root_unaccounted_body(get[SwitchArm](x.arms,ai).body,helper);ai=ai+1;}
+                found=found|znc_script_root_unaccounted_body(x.els_body,helper);
+            }
+            else=>{}
+        }
+        i=i+1;
+    }
+    return found;
+}
+fn znc_script_name_seen(names:ArrayList[[]u8],name:[]u8)i32{let i:i32=0;while(i<names.len){if(@strEq(names.data[i],name)){return 1;}i=i+1;}return 0;}
+fn znc_script_unaccounted_root_make(decls:ArrayList[*Node])i32{
+    // Only declarations parsed from the Script root are subject to its implicit
+    // allocator policy. Imported strict modules retain their explicit allocator
+    // contracts and cannot be silently rewritten or charged to ScriptContext.
+    let reachable:ArrayList[[]u8]=make[[]u8](8);push[[]u8](&reachable,"__zag_compiler_script_body_7f3a");let cursor:i32=0;
+    while(cursor<reachable.len){let caller:[]u8=reachable.data[cursor];let fi:i32=0;while(fi<decls.len){switch(decls.data[fi].*){.fn_decl=>|f|{if(@strEq(f.origin,"<root>")&&znc_script_name_seen(reachable,f.name)==0){let ci:i32=0;while(ci<decls.len){switch(decls.data[ci].*){.fn_decl=>|owner|{if(@strEq(owner.name,caller)&&znc_ast_body_has_call(owner.body,f.name)==1){push[[]u8](&reachable,f.name);}}else=>{}}ci=ci+1;}}}else=>{}}fi=fi+1;}cursor=cursor+1;}
+    let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{let root_body:i32=@strEq(f.name,"__zag_compiler_script_body_7f3a");let root_helper:i32=@strEq(f.origin,"<root>");if(znc_script_name_seen(reachable,f.name)==1&&(root_body==1||root_helper==1)){let unaccounted:i32=znc_script_root_unaccounted_body(f.body,root_body==0);if((unaccounted&2)!=0){if(root_body==1){_zag_eprintln("znc script allocation: raw runtime allocator is not charged to ScriptContext; use script_alloc/list/string_builder or an explicit strict-Zag allocator");}else{_zag_eprintln(_zag_str_concat("znc script allocation: reachable Script helper `",_zag_str_concat(f.name,"` uses a raw runtime allocator outside ScriptContext; use script_alloc/list/string_builder or an explicit strict-Zag module")));}return 1;}if((unaccounted&1)!=0){if(root_body==1){_zag_eprintln("znc script allocation: root make is not charged to ScriptContext; use list/string_builder/script_alloc or an explicit strict-Zag allocator");}else{_zag_eprintln(_zag_str_concat("znc script allocation: reachable Script helper `",_zag_str_concat(f.name,"` uses make or new outside ScriptContext; use script_alloc/list/string_builder or an explicit strict-Zag module")));}return 1;}}}else=>{}}i=i+1;}return 0;
+}
+
+// Compiler-owned Script helpers are part of the allocator authority boundary,
+// not an opaque trusted blob. Resolve their exact std origins, walk their AST
+// bodies, and reject any call outside the small synchronous runtime contract or
+// another compiler-owned helper. This is deliberately independent of spelling:
+// a project function with the same name never receives this authority.
+fn znc_script_std_origin_kind(origin:[]u8)i32{
+    if(@strEq(origin,canon_path(resolve_import_path("std:process",".")))){return 1;}
+    if(@strEq(origin,canon_path(resolve_import_path("std:script_io",".")))){return 2;}
+    if(@strEq(origin,canon_path(resolve_import_path("std:script_input",".")))){return 3;}
+    if(@strEq(origin,canon_path(resolve_import_path("std:script_string_builder",".")))){return 4;}
+    if(@strEq(origin,canon_path(resolve_import_path("std:script_list",".")))){return 5;}
+    if(@strEq(origin,canon_path(resolve_import_path("std:script_string",".")))){return 6;}
+    if(@strEq(origin,canon_path(resolve_import_path("std:script_path",".")))){return 7;}
+    return 0;
+}
+fn znc_script_compiler_std_call(decls:ArrayList[*Node],name:[]u8)i32{
+    let i:i32=0;
+    while(i<decls.len){
+        switch(decls.data[i].*){
+            .fn_decl=>|f|{
+                if(f.is_extern==0&&@strEq(f.name,name)&&
+                    znc_script_std_origin_kind(f.origin)>0){return 1;}
+            }
+            else=>{}
+        }
+        i=i+1;
+    }
+    return 0;
+}
+fn znc_script_std_runtime_call(kind:i32,owner:[]u8,name:[]u8)i32{
+    if(@strEq(name,"@sizeOf")||@strEq(name,"@strEq")){return 1;}
+    if(@strEq(name,"_zag_eprintln")){return 1;}
+    if(@strEq(name,"_zag_script_alloc")){
+        if(kind==3||kind==4||kind==5||kind==6||kind==7){return 1;}
+        if(kind==2&&@strEq(owner,"script_read_file")){return 1;}
+        return (kind==1&&@strEq(owner,"process_alloc")) as i32;
+    }
+    if(kind==2){
+        if(@strEq(owner,"script_read_file")&&
+            (@strEq(name,"_zag_script_file_size")||
+             @strEq(name,"_zag_script_read_file_into"))){return 1;}
+        return 0;
+    }
+    if(kind==3){
+        return (@strEq(name,"_zag_print")||@strEq(name,"_zag_read_fd")) as i32;
+    }
+    if(kind==5){
+        if(@strEq(name,"_zag_argc")||@strEq(name,"_zag_arg")){return 1;}
+        // A generic list getter has no error-return value. Its checked
+        // out-of-bounds boundary reports and terminates instead of exposing a
+        // raw pointer dereference through a corrupted ScriptList descriptor.
+        return (@strEq(owner,"script_list_get")&&@strEq(name,"_zag_exit")) as i32;
+    }
+    if(kind==1){
+        if(@strEq(name,"_zag_malloc")){
+            return @strEq(owner,"process_alloc") as i32;
+        }
+        if(@strEq(name,"_zag_process_result_abi_new")||
+            @strEq(name,"_zag_script_process_result_abi_new")){
+            return @strEq(owner,"process_result_new") as i32;
+        }
+        if(@strEq(name,"_zag_raw_syscall")){
+            return @strEq(owner,"process_run_bounded_internal") as i32;
+        }
+        if(@strEq(name,"_zag_argc")||@strEq(name,"_zag_arg")||
+           @strEq(name,"_zag_exec_cmd")||@strEq(name,"_zag_exit")||
+           @strEq(name,"_zag_clock_monotonic_ms")||
+           @strEq(name,"_zag_process_result_status")||
+           @strEq(name,"_zag_process_result_state")||
+           @strEq(name,"_zag_process_result_output")||
+           @strEq(name,"_zag_slice_ptr")){return 1;}
+    }
+    return 0;
+}
+fn znc_script_std_calls_expr(n:*Node,kind:i32,owner:[]u8,
+    decls:ArrayList[*Node],report:i32)i32{
+    let errors:i32=0;
+    switch(n.*){
+        .call=>|x|{
+            let name:[]u8=callee_name(x.callee);
+            if(znc_script_std_runtime_call(kind,owner,name)==0&&
+                znc_script_compiler_std_call(decls,name)==0){
+                if(report==1){
+                    let shown:[]u8=name;if(shown.len==0){shown="<indirect>";}
+                    _zag_eprintln(_zag_str_concat(
+                        "znc script helper body: compiler-owned helper `",
+                        _zag_str_concat(owner,_zag_str_concat(
+                        "` calls an unapproved allocator, runtime, extern, or helper `",
+                        _zag_str_concat(shown,"`")))));
+                }
+                errors=errors+1;
+            }
+            let i:i32=0;
+            while(i<x.args.len){
+                errors=errors+znc_script_std_calls_expr(x.args.data[i],kind,
+                    owner,decls,report);
+                i=i+1;
+            }
+        }
+        .bin=>|x|{errors=errors+znc_script_std_calls_expr(x.l,kind,owner,decls,report)+znc_script_std_calls_expr(x.r,kind,owner,decls,report);}
+        .un=>|x|{errors=errors+znc_script_std_calls_expr(x.e,kind,owner,decls,report);}
+        .fld=>|x|{errors=errors+znc_script_std_calls_expr(x.base,kind,owner,decls,report);}
+        .idx=>|x|{errors=errors+znc_script_std_calls_expr(x.base,kind,owner,decls,report)+znc_script_std_calls_expr(x.idx,kind,owner,decls,report);}
+        .cast_=>|x|{errors=errors+znc_script_std_calls_expr(x.expr,kind,owner,decls,report);}
+        .slice_=>|x|{
+            errors=errors+znc_script_std_calls_expr(x.base,kind,owner,decls,report)+znc_script_std_calls_expr(x.lo,kind,owner,decls,report);
+            if(x.has_hi==1){errors=errors+znc_script_std_calls_expr(x.hi,kind,owner,decls,report);}
+        }
+        .slit_=>|x|{let i:i32=0;while(i<x.fields.len){errors=errors+znc_script_std_calls_expr(x.fields.data[i].val,kind,owner,decls,report);i=i+1;}}
+        .switch_=>|x|{
+            errors=errors+znc_script_std_calls_expr(x.subject,kind,owner,decls,report);
+            let ai:i32=0;while(ai<x.arms.len){errors=errors+znc_script_std_calls_body(x.arms.data[ai].body,kind,owner,decls,report);ai=ai+1;}
+            errors=errors+znc_script_std_calls_body(x.els_body,kind,owner,decls,report);
+        }
+        else=>{}
+    }
+    return errors;
+}
+fn znc_script_std_calls_body(body:ArrayList[*Node],kind:i32,owner:[]u8,
+    decls:ArrayList[*Node],report:i32)i32{
+    let errors:i32=0;let i:i32=0;
+    while(i<body.len){
+        switch(body.data[i].*){
+            .let_=>|x|{if(x.has_init==1){errors=errors+znc_script_std_calls_expr(x.expr,kind,owner,decls,report);}}
+            .ret=>|x|{if(x.has_expr==1){errors=errors+znc_script_std_calls_expr(x.expr,kind,owner,decls,report);}}
+            .estmt=>|x|{errors=errors+znc_script_std_calls_expr(x.expr,kind,owner,decls,report);}
+            .assign=>|x|{errors=errors+znc_script_std_calls_expr(x.target,kind,owner,decls,report)+znc_script_std_calls_expr(x.expr,kind,owner,decls,report);}
+            .if_=>|x|{errors=errors+znc_script_std_calls_expr(x.cond,kind,owner,decls,report)+znc_script_std_calls_body(x.then_body,kind,owner,decls,report)+znc_script_std_calls_body(x.els_body,kind,owner,decls,report);}
+            .while_=>|x|{errors=errors+znc_script_std_calls_expr(x.cond,kind,owner,decls,report)+znc_script_std_calls_body(x.body,kind,owner,decls,report);}
+            .unsafe_=>|x|{errors=errors+znc_script_std_calls_body(x.body,kind,owner,decls,report);}
+            .switch_=>|x|{
+                errors=errors+znc_script_std_calls_expr(x.subject,kind,owner,decls,report);
+                let ai:i32=0;while(ai<x.arms.len){errors=errors+znc_script_std_calls_body(x.arms.data[ai].body,kind,owner,decls,report);ai=ai+1;}
+                errors=errors+znc_script_std_calls_body(x.els_body,kind,owner,decls,report);
+            }
+            else=>{}
+        }
+        i=i+1;
+    }
+    return errors;
+}
+fn znc_script_call_count_expr(n:*Node,name:[]u8)i32{
+    let count:i32=0;
+    switch(n.*){
+        .call=>|x|{if(@strEq(callee_name(x.callee),name)){count=count+1;}let i:i32=0;while(i<x.args.len){count=count+znc_script_call_count_expr(x.args.data[i],name);i=i+1;}}
+        .bin=>|x|{count=count+znc_script_call_count_expr(x.l,name)+znc_script_call_count_expr(x.r,name);}
+        .un=>|x|{count=count+znc_script_call_count_expr(x.e,name);}
+        .fld=>|x|{count=count+znc_script_call_count_expr(x.base,name);}
+        .idx=>|x|{count=count+znc_script_call_count_expr(x.base,name)+znc_script_call_count_expr(x.idx,name);}
+        .cast_=>|x|{count=count+znc_script_call_count_expr(x.expr,name);}
+        .slice_=>|x|{count=count+znc_script_call_count_expr(x.base,name)+znc_script_call_count_expr(x.lo,name);if(x.has_hi==1){count=count+znc_script_call_count_expr(x.hi,name);}}
+        .slit_=>|x|{let i:i32=0;while(i<x.fields.len){count=count+znc_script_call_count_expr(x.fields.data[i].val,name);i=i+1;}}
+        else=>{}
+    }
+    return count;
+}
+fn znc_script_call_count_body(body:ArrayList[*Node],name:[]u8)i32{
+    let count:i32=0;let i:i32=0;
+    while(i<body.len){
+        switch(body.data[i].*){
+            .let_=>|x|{if(x.has_init==1){count=count+znc_script_call_count_expr(x.expr,name);}}
+            .ret=>|x|{if(x.has_expr==1){count=count+znc_script_call_count_expr(x.expr,name);}}
+            .estmt=>|x|{count=count+znc_script_call_count_expr(x.expr,name);}
+            .assign=>|x|{count=count+znc_script_call_count_expr(x.target,name)+znc_script_call_count_expr(x.expr,name);}
+            .if_=>|x|{count=count+znc_script_call_count_expr(x.cond,name)+znc_script_call_count_body(x.then_body,name)+znc_script_call_count_body(x.els_body,name);}
+            .while_=>|x|{count=count+znc_script_call_count_expr(x.cond,name)+znc_script_call_count_body(x.body,name);}
+            .unsafe_=>|x|{count=count+znc_script_call_count_body(x.body,name);}
+            .switch_=>|x|{count=count+znc_script_call_count_expr(x.subject,name);let ai:i32=0;while(ai<x.arms.len){count=count+znc_script_call_count_body(x.arms.data[ai].body,name);ai=ai+1;}count=count+znc_script_call_count_body(x.els_body,name);}
+            else=>{}
+        }
+        i=i+1;
+    }
+    return count;
+}
+fn znc_script_read_file_stage_check(decls:ArrayList[*Node])i32{
+    let i:i32=0;
+    while(i<decls.len){
+        switch(decls.data[i].*){
+            .fn_decl=>|f|{
+                if(@strEq(f.name,"script_read_file")&&
+                    znc_script_std_origin_kind(f.origin)==2){
+                    if(znc_script_call_count_body(f.body,"_zag_read_file")!=0||
+                       znc_script_call_count_body(f.body,"_zag_free")!=0||
+                       znc_script_call_count_body(f.body,
+                           "_zag_script_file_size")!=1||
+                       znc_script_call_count_body(f.body,
+                           "_zag_script_read_file_into")!=1||
+                       znc_script_call_count_body(f.body,
+                           "_zag_script_alloc")!=1){
+                        _zag_eprintln("znc script helper body: script_read_file must preflight and read directly into exactly one Script allocation without native full-file staging");
+                        return 1;
+                    }
+                    return 0;
+                }
+            }
+            else=>{}
+        }
+        i=i+1;
+    }
+    return 0;
+}
+fn znc_script_std_body_check(decls:ArrayList[*Node])i32{
+    let errors:i32=0;let i:i32=0;
+    while(i<decls.len){
+        switch(decls.data[i].*){
+            .fn_decl=>|f|{
+                let kind:i32=znc_script_std_origin_kind(f.origin);
+                if(kind>0&&f.is_extern==0){
+                    errors=errors+znc_script_std_calls_body(f.body,kind,f.name,
+                        decls,1);
+                }
+            }
+            else=>{}
+        }
+        i=i+1;
+    }
+    errors=errors+znc_script_read_file_stage_check(decls);
+    return errors;
+}
 
 fn znc_check(path: []u8) i32 {
     if (path.len == 0) { _zag_println("znc: no source file"); return 1; }
     let src: []u8 = _zag_read_file(path);
     if (src.len < 0) { _zag_print("znc: cannot read "); _zag_println(path); return 1; }
+    src=znc_activate_script_source(path,src,0);
     if (v2_validate_source(path, src) != 0) { return 1; }
     let unit: CompilationUnit = parse_compilation_unit_dir(src, dir_of(path));
-    znc_configure_script_unit(&unit, path);
-    if(unit.profile==ModuleProfile.script&&(znc_script_lifetime_check(unit.decls)!=0||znc_script_unaccounted_root_make(unit.decls)!=0)){return 1;}
+    if(znc_validate_script_defaults(path,unit)!=0){return 1;}
+    if(znc_configure_script_unit(&unit,path)!=0){return 1;}
+    if(znc_validate_script_capabilities(path,unit)!=0){return 1;}
+    if(unit.profile==ModuleProfile.script&&(znc_script_std_body_check(unit.decls)!=0||znc_script_lifetime_check(unit.decls)!=0||znc_script_unaccounted_root_make(unit.decls)!=0)){return 1;}
     if (has_flag("--strict") == 1 && unit.profile == ModuleProfile.script) {
         _zag_eprintln("znc: strict check FAILED: generated script entry point remains implicit");
-        _zag_eprintln("unresolved: implicit bounded Script allocator remains");
+        let strict_choices:PlannerChoices=znc_script_explicit_choices();
+        if(strict_choices.allocator_explicit==1){
+            _zag_eprintln(_zag_str_concat("resolved: explicit Script allocator policy selected: ",
+                strict_choices.allocator));
+            _zag_eprintln("unresolved: Script allocator contract must still be expanded to an ordinary strict-Zag allocator");
+        }else{
+            _zag_eprintln("unresolved: implicit bounded Script allocator remains");
+        }
         let di:i32=0;while(di<unit.decls.len){switch(unit.decls.data[di].*){.fn_decl=>|f|{if(@strEq(f.name,"__zag_compiler_script_body_7f3a")&&znc_ast_body_has_call(f.body,"make")==1){_zag_eprintln("unresolved: ordinary make allocation is not charged to the Script context");}}else=>{}}di=di+1;}
         if (znc_contains(src, "read_file(") == 1 || znc_contains(src, "write_file(") == 1) {
             _zag_eprintln("unresolved: filesystem capability has no explicit policy");
@@ -1312,6 +1814,9 @@ fn znc_check(path: []u8) i32 {
         }
         if (znc_contains(src, "process_run_timeout(") == 1) {
             _zag_eprintln("unresolved: process capability policy remains implicit (timeout is explicit)");
+        }
+        if (znc_script_generated_calls(unit, "_zag_script_env_get") == 1) {
+            _zag_eprintln("unresolved: environment capability has no explicit strict-Zag policy");
         }
         if (znc_contains(src, "list(") == 1 || znc_contains(src, "args(") == 1 || znc_contains(src, "string_builder(") == 1) {
             _zag_eprintln("unresolved: temporary collection remains tied to the Script context");
@@ -1328,6 +1833,14 @@ fn znc_check(path: []u8) i32 {
     }
     let decls: ArrayList[*Node] = unit.decls;
     lo_operators(decls);
+    // `check` is a semantic authority, not a lighter advisory path. Keep it
+    // aligned with every build target so type, ownership, arity, and duplicate
+    // diagnostics cannot be bypassed by choosing this command.
+    let aerrs:i32=znc_check_arity(decls);
+    if(aerrs>0){_zag_println("znc: arity check FAILED");return 1;}
+    let derrs:i32=znc_check_dups(decls);
+    if(derrs>0){_zag_println("znc: duplicate-definition check FAILED");return 1;}
+    if(typed_check_program(decls,path)>0){return 1;}
     let eff: map__StringMap[i32] = analyze(decls);
     let viols: i32 = report_violations(decls, eff, src, path);
     if (viols > 0) {
@@ -1337,7 +1850,8 @@ fn znc_check(path: []u8) i32 {
     }
     smt_report_proofs(decls, eff);
     if (run_analyzer(decls, path) != 0) { return 1; }
-    znc_publish_semantics(path,src,unit,decls,eff);
+    let published:i32=znc_publish_semantics(path,src,unit,decls,eff);
+    znc_maybe_regular_advisory(path,unit,published);
     _zag_println("znc: OK — all capability claims proven");
     return 0;
 }
@@ -1346,21 +1860,143 @@ fn znc_format_json(value:[]u8)i32 { if (@strEq(value,"json")){return 1;}return 0
 fn znc_format_text(value:[]u8)i32 { if (@strEq(value,"text")){return 1;}return 0; }
 fn znc_json_bool(value:i32)[]u8{if(value==1){return "true";}return "false";}
 
+// Explain must not retain a second whole-AST allocation map just to describe
+// Script conveniences. This bounded streaming walk visits only the generated
+// root Script body after its normal prelude binding. Statement spans are not
+// represented by the AST, so location is explicitly unknown rather than
+// guessed from a text search. Imported strict helpers are deliberately out of
+// scope: their allocator contracts remain explicit library policy.
+struct ZExplainOperation {
+    operation: []u8,
+    allocation: []u8,
+    allocation_bytes: []u8,
+    copy: []u8,
+    copy_bytes: []u8,
+}
+struct ZExplainOperationState { json: i32, first: i32, emitted: i32, truncated: i32 }
+
+fn znc_explain_operation(name: []u8) ZExplainOperation {
+    if (@strEq(name, "_zag_script_alloc")) { return ZExplainOperation{.operation="script_alloc",.allocation="script_context",.allocation_bytes="unknown",.copy="zero",.copy_bytes="0"}; }
+    if (@strEq(name, "script_input")) { return ZExplainOperation{.operation="input",.allocation="script_context",.allocation_bytes="4096",.copy="zero",.copy_bytes="0"}; }
+    if (@strEq(name, "script_read_file")) { return ZExplainOperation{.operation="read_file",.allocation="script_context",.allocation_bytes="unknown",.copy="file_bytes_to_script_context",.copy_bytes="unknown"}; }
+    if (@strEq(name, "script_string_concat")) { return ZExplainOperation{.operation="string_concat",.allocation="script_context",.allocation_bytes="unknown",.copy="both_input_slices",.copy_bytes="unknown"}; }
+    if (@strEq(name, "script_string_builder_new")) { return ZExplainOperation{.operation="string_builder",.allocation="script_context",.allocation_bytes="unknown",.copy="zero",.copy_bytes="0"}; }
+    if (@strEq(name, "string_builder_append")) { return ZExplainOperation{.operation="string_builder_append",.allocation="zero",.allocation_bytes="0",.copy="appended_bytes",.copy_bytes="unknown"}; }
+    if (@strEq(name, "string_builder_output")) { return ZExplainOperation{.operation="string_builder_output",.allocation="zero",.allocation_bytes="0",.copy="zero",.copy_bytes="0"}; }
+    if (@strEq(name, "process_run_bounded_script")) { return ZExplainOperation{.operation="process_run_timeout",.allocation="script_context",.allocation_bytes="unknown",.copy="command_bytes",.copy_bytes="unknown"}; }
+    if (@strEq(name, "_zag_script_new")) { return ZExplainOperation{.operation="new",.allocation="script_context",.allocation_bytes="unknown",.copy="zero",.copy_bytes="0"}; }
+    if (@strEq(name, "_zag_script_env_get")) { return ZExplainOperation{.operation="env",.allocation="zero",.allocation_bytes="0",.copy="zero",.copy_bytes="0"}; }
+    if (@strEq(name, "script_args")) { return ZExplainOperation{.operation="args",.allocation="script_context",.allocation_bytes="unknown",.copy="argument_slice_descriptors",.copy_bytes="unknown"}; }
+    if (@strEq(name, "script_path_join")) { return ZExplainOperation{.operation="path_join",.allocation="script_context",.allocation_bytes="unknown",.copy="both_input_slices",.copy_bytes="unknown"}; }
+    if (@strEq(name, "script_path_basename")) { return ZExplainOperation{.operation="path_basename",.allocation="zero",.allocation_bytes="0",.copy="zero",.copy_bytes="0"}; }
+    if (@strEq(name, "script_path_dirname")) { return ZExplainOperation{.operation="path_dirname",.allocation="zero",.allocation_bytes="0",.copy="zero",.copy_bytes="0"}; }
+    if (@strEq(name, "script_path_extension")) { return ZExplainOperation{.operation="path_extension",.allocation="zero",.allocation_bytes="0",.copy="zero",.copy_bytes="0"}; }
+    if (@strEq(name, "script_list1") || @strEq(name, "script_list2") || @strEq(name, "script_list3") || @strEq(name, "script_list4") || @strEq(name, "script_list_new")) { return ZExplainOperation{.operation="list",.allocation="script_context",.allocation_bytes="unknown",.copy="initial_elements",.copy_bytes="unknown"}; }
+    if (@strEq(name, "script_list_append")) { return ZExplainOperation{.operation="list_append",.allocation="conditional_script_context",.allocation_bytes="unknown",.copy="conditional_existing_elements_on_growth",.copy_bytes="unknown"}; }
+    if (@strEq(name, "script_list_len") || @strEq(name, "script_list_get") || @strEq(name, "script_list_failed") || @strEq(name, "_zag_script_alloc_used")) { return ZExplainOperation{.operation="collection_or_allocator_query",.allocation="zero",.allocation_bytes="0",.copy="zero",.copy_bytes="0"}; }
+    return ZExplainOperation{.operation="",.allocation="",.allocation_bytes="",.copy="",.copy_bytes=""};
+}
+
+fn znc_explain_emit_operation(name: []u8, state: *ZExplainOperationState) void {
+    let op: ZExplainOperation = znc_explain_operation(name);
+    if (op.operation.len == 0) { return; }
+    // A cap makes explain output and compiler memory predictable even for a
+    // generated file with thousands of Script calls. The count is of emitted
+    // witnesses, not a program-wide allocation total.
+    if (state.*.emitted >= 64) { state.*.truncated = 1; return; }
+    if (state.*.json == 1) {
+        if (state.*.first == 0) { _zag_print(","); }
+        _zag_print("{\"operation\":\"");_zag_print(op.operation);
+        _zag_print("\",\"allocation\":{\"value\":\"");_zag_print(op.allocation);
+        _zag_print("\",\"bytes\":\"");_zag_print(op.allocation_bytes);
+        _zag_print("\",\"basis\":\"proven\"},\"copy\":{\"value\":\"");_zag_print(op.copy);
+        _zag_print("\",\"bytes\":\"");_zag_print(op.copy_bytes);
+        _zag_print("\",\"basis\":\"proven\"},\"source_location\":{\"value\":\"unavailable\",\"basis\":\"unknown\"},\"provenance\":\"proven\"}");
+    } else {
+        _zag_print("implicit operation: ");_zag_print(op.operation);
+        _zag_print(" allocation=");_zag_print(op.allocation);
+        _zag_print(" allocation_bytes=");_zag_print(op.allocation_bytes);
+        _zag_print(" copy=");_zag_print(op.copy);
+        _zag_print(" copy_bytes=");_zag_print(op.copy_bytes);
+        _zag_println(" location=unavailable provenance=proven");
+    }
+    state.*.first = 0;
+    state.*.emitted = state.*.emitted + 1;
+}
+
+fn znc_explain_operations_expr(n: *Node, state: *ZExplainOperationState) void {
+    switch (n.*) {
+        .call => |c| {
+            znc_explain_operations_expr(c.callee, state);
+            let i:i32=0;while(i<c.args.len){znc_explain_operations_expr(c.args.data[i],state);i=i+1;}
+            znc_explain_emit_operation(callee_name(c.callee), state);
+        }
+        .bin => |x| { znc_explain_operations_expr(x.l,state); znc_explain_operations_expr(x.r,state); }
+        .un => |x| { znc_explain_operations_expr(x.e,state); }
+        .fld => |x| { znc_explain_operations_expr(x.base,state); }
+        .idx => |x| { znc_explain_operations_expr(x.base,state); znc_explain_operations_expr(x.idx,state); }
+        .cast_ => |x| { znc_explain_operations_expr(x.expr,state); }
+        .slice_ => |x| { znc_explain_operations_expr(x.base,state); znc_explain_operations_expr(x.lo,state); if(x.has_hi==1){znc_explain_operations_expr(x.hi,state);} }
+        .slit_ => |x| { let i:i32=0;while(i<x.fields.len){znc_explain_operations_expr(x.fields.data[i].val,state);i=i+1;} }
+        .switch_ => |x| { znc_explain_operations_expr(x.subject,state); let i:i32=0;while(i<x.arms.len){znc_explain_operations_body(x.arms.data[i].body,state);i=i+1;}znc_explain_operations_body(x.els_body,state); }
+        else => { }
+    }
+}
+
+fn znc_explain_operations_body(body: ArrayList[*Node], state: *ZExplainOperationState) void {
+    let i:i32=0;while(i<body.len){
+        switch(body.data[i].*) {
+            .let_ => |x| { if(x.has_init==1){znc_explain_operations_expr(x.expr,state);} }
+            .ret => |x| { if(x.has_expr==1){znc_explain_operations_expr(x.expr,state);} }
+            .estmt => |x| { znc_explain_operations_expr(x.expr,state); }
+            .assign => |x| { znc_explain_operations_expr(x.target,state);znc_explain_operations_expr(x.expr,state); }
+            .if_ => |x| { znc_explain_operations_expr(x.cond,state);znc_explain_operations_body(x.then_body,state);znc_explain_operations_body(x.els_body,state); }
+            .while_ => |x| { znc_explain_operations_expr(x.cond,state);znc_explain_operations_body(x.body,state); }
+            .unsafe_ => |x| { znc_explain_operations_body(x.body,state); }
+            .switch_ => |x| { znc_explain_operations_expr(x.subject,state);let ai:i32=0;while(ai<x.arms.len){znc_explain_operations_body(x.arms.data[ai].body,state);ai=ai+1;}znc_explain_operations_body(x.els_body,state); }
+            else => { }
+        }
+        i=i+1;
+    }
+}
+
+fn znc_explain_script_operations(decls: ArrayList[*Node], state: *ZExplainOperationState) void {
+    let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(@strEq(f.name,"__zag_compiler_script_body_7f3a")){znc_explain_operations_body(f.body,state);return;}}else=>{}}i=i+1;}
+}
+
 fn znc_explain(path: []u8) i32 {
     if (path.len == 0) { _zag_eprintln("znc explain: no source file"); return 1; }
     let src: []u8 = _zag_read_file(path);
     if (src.len < 0) { _zag_eprintln("znc explain: cannot read source file"); return 1; }
+    src=znc_activate_script_source(path,src,0);
     if (v2_validate_source(path, src) != 0) { return 1; }
     let unit: CompilationUnit = parse_compilation_unit_dir(src, dir_of(path));
-    znc_configure_script_unit(&unit, path);
+    if(znc_validate_script_defaults(path,unit)!=0){return 1;}
+    if(znc_configure_script_unit(&unit,path)!=0){return 1;}
     let config: PlannerConfig = znc_project_config(znc_project_root(dir_of(path)), 0);
     let scripted: i32 = 0;
     if (unit.profile == ModuleProfile.script) { scripted = 1; }
+    // Explain is inspection, not execution authority. Keep denied operations
+    // visible in its report instead of refusing the report that tells the user
+    // why a build/check will fail.
+    let denied_read:i32=(scripted==1&&config.allow_filesystem_read==0&&
+        znc_script_generated_calls(unit,"script_read_file")==1) as i32;
+    let denied_write:i32=(scripted==1&&config.allow_filesystem_write==0&&
+        znc_script_generated_calls(unit,"_zag_write_file")==1) as i32;
+    let denied_process:i32=(scripted==1&&config.allow_process==0&&
+        znc_script_generated_calls(unit,"process_run_bounded_script")==1) as i32;
+    let denied_environment:i32=0;
+    if(scripted==1){denied_environment=znc_script_env_violations(unit,config,0);}
+    let denied_count:i32=denied_read+denied_write+denied_process+denied_environment;
     let planner_input: PlannerChoices = znc_script_explicit_choices();
     let resolution: PlannerResolution = planner_resolve(scripted, src, config, planner_input, 0);
+    let allocator_basis:[]u8="derived";
+    if(planner_input.allocator_explicit==1){allocator_basis="explicit";}
     let semantic_decls:ArrayList[*Node]=unit.decls;lo_operators(semantic_decls);
     let semantic_effects:map__StringMap[i32]=analyze(semantic_decls);
-    let semantic_facts:*SemanticManifest=semantic_manifest_build(path,src,unit.profile,semantic_decls,semantic_effects,unit.modules,unit.imports);
+    let semantic_text:[]u8=smp_bounded_manifest(path,src,unit,semantic_effects);
+    let semantic_detail:[]u8=smf_value(semantic_text,"detail_level");
+    let semantic_witnesses:i32=(1-(@strEq(semantic_detail,"compact") as i32));
     let format: []u8 = flag_value("--format");
     if (format.len > 0 && @strEq(format, "text") == 0 && @strEq(format, "json") == 0) {
         _zag_eprintln("znc explain: --format must be text or json"); return 1;
@@ -1369,39 +2005,95 @@ fn znc_explain(path: []u8) i32 {
     if (@strEq(format, "json")) { json = 1; }
     if (json == 1) {
         if (scripted == 1) {
-            let cap_policy:[]u8=_zag_str_concat(",\"capability_policy\":{\"filesystem_read\":",_zag_str_concat(znc_json_bool(config.allow_filesystem_read),_zag_str_concat(",\"filesystem_write\":",_zag_str_concat(znc_json_bool(config.allow_filesystem_write),_zag_str_concat(",\"process\":",_zag_str_concat(znc_json_bool(config.allow_process),",\"network\":false,\"basis\":\"proven\"}"))))));
-            let prefix: []u8 = "{\"schema_version\":1,\"profile\":{\"value\":\"script\",\"basis\":\"proven\"},\"entry_point\":{\"value\":\"compiler-generated managed wrapper\",\"basis\":\"derived\"},\"allocator\":{\"value\":\"script_process_arena\",\"basis\":\"derived\"},\"script_memory_bytes\":{\"value\":";
-            let plan:[]u8=_zag_str_concat(",\"basis\":\"derived\"},\"error_boundary\":{\"value\":\"named error diagnostic and nonzero exit\",\"basis\":\"derived\"},\"prelude\":{\"value\":[\"print\",\"println\",\"read_file\",\"write_file\",\"args_len\",\"arg\",\"string_concat\",\"string_builder\",\"list\",\"process_run_timeout\",\"script_alloc\",\"script_alloc_used\"],\"basis\":\"proven\"},\"capabilities\":{\"filesystem\":\"derived from calls\",\"process\":\"bounded shell execution when called\",\"network\":\"unsupported\",\"device\":\"",_zag_str_concat(znc_json_escape(resolution.choices.device),"\"},\"effects\":{\"value\":\"per-expression type/effect witnesses embedded in semantic_facts\",\"basis\":\"proven\"},\"hidden_allocations\":{\"value\":\"Script-context APIs are charged; root make is rejected\",\"basis\":\"proven\"},\"hidden_copies\":{\"value\":\"string concatenation, list growth, file/process capture, and builder finish copy owned bytes\",\"basis\":\"proven\"},\"execution_plan\":{\"cpu\":\""));
-            let suffix:[]u8=_zag_str_concat(plan,_zag_str_concat(znc_json_escape(resolution.choices.cpu),_zag_str_concat("\",\"device\":\"",_zag_str_concat(znc_json_escape(resolution.choices.device),_zag_str_concat("\",\"layout\":\"",_zag_str_concat(znc_json_escape(resolution.choices.layout),_zag_str_concat("\",\"basis\":\"derived\"},\"semantic_facts\":{\"format\":\"zag-semantic-manifest-v1\",\"value\":\"",_zag_str_concat(znc_json_escape(semantic_facts.*.text),"\",\"basis\":\"derived\"},\"reclamation\":{\"value\":\"bounded Script arena unmapped at shutdown\",\"basis\":\"proven\"},\"unresolved\":[\"remaining expression type witnesses\",\"ordinary make accounting\"],\"source_changes\":false}"))))))));
-            _zag_println(_zag_str_concat(prefix, _zag_str_concat(_zag_i64_to_str(config.script_memory_bytes),_zag_str_concat(cap_policy, suffix))));
+            let cap_policy:[]u8=",\"capability_policy\":{\"filesystem_read\":";
+            cap_policy=_zag_str_concat(cap_policy,znc_json_bool(config.allow_filesystem_read));
+            cap_policy=_zag_str_concat(cap_policy,",\"filesystem_write\":");cap_policy=_zag_str_concat(cap_policy,znc_json_bool(config.allow_filesystem_write));
+            cap_policy=_zag_str_concat(cap_policy,",\"process\":");cap_policy=_zag_str_concat(cap_policy,znc_json_bool(config.allow_process));
+            cap_policy=_zag_str_concat(cap_policy,",\"environment_lookup\":");cap_policy=_zag_str_concat(cap_policy,znc_json_bool(config.environment_allow.len>0));
+            cap_policy=_zag_str_concat(cap_policy,",\"environment_allow\":\"");cap_policy=_zag_str_concat(cap_policy,znc_json_escape(config.environment_allow));
+            cap_policy=_zag_str_concat(cap_policy,"\",\"network\":false,\"policy_satisfied\":");cap_policy=_zag_str_concat(cap_policy,znc_json_bool(denied_count==0));
+            cap_policy=_zag_str_concat(cap_policy,",\"denied_operation_count\":");cap_policy=_zag_str_concat(cap_policy,_zag_i64_to_str(denied_count as i64));cap_policy=_zag_str_concat(cap_policy,",\"basis\":\"proven\"}");
+            let prefix: []u8 = "{\"schema_version\":1,\"profile\":{\"value\":\"script\",\"basis\":\"proven\"},\"entry_point\":{\"value\":\"compiler-generated managed wrapper\",\"basis\":\"derived\"},\"allocator\":{\"value\":\"";
+            prefix=_zag_str_concat(prefix,znc_json_escape(resolution.choices.allocator));
+            prefix=_zag_str_concat(prefix,"\",\"basis\":\"");
+            prefix=_zag_str_concat(prefix,allocator_basis);
+            prefix=_zag_str_concat(prefix,"\"},\"script_memory_bytes\":{\"value\":");
+            let before_ops:[]u8=",\"error_boundary\":{\"value\":\"named error diagnostic and nonzero exit\",\"basis\":\"derived\"},\"prelude\":{\"value\":[\"print\",\"println\",\"say\",\"input\",\"env\",\"read_file\",\"write_file\",\"args_len\",\"arg\",\"string_concat\",\"string_builder\",\"list\",\"process_run_timeout\",\"script_alloc\",\"script_alloc_used\"],\"basis\":\"proven\"},\"capabilities\":{\"filesystem\":\"derived from calls\",\"environment\":\"exact allowlist only\",\"process\":\"bounded shell execution when called\",\"network\":\"unsupported\"},\"effects\":{\"value\":\"declaration effects are embedded; expression-witness availability is explicit in semantic_facts\",\"basis\":\"proven\"},\"hidden_allocations\":{\"value\":\"per-operation root Script evidence follows; strict/imported library allocation is outside this report\",\"basis\":\"proven\"},\"hidden_copies\":{\"value\":\"per-operation root Script evidence follows; byte totals are unknown unless stated\",\"basis\":\"proven\"},\"implicit_operations\":{\"scope\":\"compiler_bound_root_script_calls\",\"items\":[";
+            _zag_print(prefix);_zag_print(_zag_i64_to_str(config.script_memory_bytes));_zag_print(",\"basis\":\"derived\"}");_zag_print(cap_policy);_zag_print(before_ops);
+            let operations:ZExplainOperationState=ZExplainOperationState{.json=1,.first=1,.emitted=0,.truncated=0};
+            znc_explain_script_operations(unit.decls,&operations);
+            _zag_print("],\"emitted\":");_zag_print(_zag_i64_to_str(operations.emitted as i64));
+            _zag_print(",\"truncated\":");_zag_print(znc_json_bool(operations.truncated));
+            _zag_print(",\"basis\":\"proven\",\"unclassified\":\"imported strict-library calls are outside compiler-bound Script operation evidence\"},\"execution_plan\":{\"cpu\":\"");_zag_print(znc_json_escape(resolution.choices.cpu));
+            _zag_print("\",\"device\":\"");_zag_print(znc_json_escape(resolution.choices.device));
+            _zag_print("\",\"layout\":\"");_zag_print(znc_json_escape(resolution.choices.layout));
+            _zag_print("\",\"basis\":\"derived\"},\"semantic_facts\":{\"format\":\"zag-semantic-manifest-v1\",\"detail_level\":\"");_zag_print(semantic_detail);
+            _zag_print("\",\"expression_witnesses_available\":");_zag_print(znc_json_bool(semantic_witnesses));_zag_print(",\"value\":\"");_zag_print(znc_json_escape(semantic_text));
+            _zag_print("\",\"basis\":\"derived\"},\"reclamation\":{\"value\":\"");
+            _zag_print(znc_json_escape(znc_script_allocator_reclamation(
+                resolution.choices.allocator)));
+            _zag_print("\",\"basis\":\"proven\"},\"unresolved\":[\"statement source spans unavailable\",\"strict-library allocation contracts remain explicit\"],\"source_changes\":false}");
+            _zag_println("");
         } else {
-            _zag_println(_zag_str_concat("{\"schema_version\":1,\"profile\":{\"value\":\"strict\",\"basis\":\"proven\"},\"entry_point\":{\"value\":\"user-defined\",\"basis\":\"derived\"},\"allocator\":{\"value\":\"no script default\",\"basis\":\"proven\"},\"effects\":{\"value\":\"per-expression type/effect witnesses embedded in semantic_facts\",\"basis\":\"proven\"},\"hidden_copies\":{\"value\":\"none introduced by the profile\",\"basis\":\"proven\"},\"semantic_facts\":{\"format\":\"zag-semantic-manifest-v1\",\"value\":\"",_zag_str_concat(znc_json_escape(semantic_facts.*.text),"\",\"basis\":\"proven\"},\"execution_plan\":{\"value\":\"generic x86-64-v1\",\"basis\":\"derived\"}}")));
+            _zag_print("{\"schema_version\":1,\"profile\":{\"value\":\"strict\",\"basis\":\"proven\"},\"entry_point\":{\"value\":\"user-defined\",\"basis\":\"derived\"},\"allocator\":{\"value\":\"no script default\",\"basis\":\"proven\"},\"effects\":{\"value\":\"declaration effects are embedded; expression-witness availability is explicit in semantic_facts\",\"basis\":\"proven\"},\"hidden_copies\":{\"value\":\"none introduced by the profile\",\"basis\":\"proven\"},\"implicit_operations\":{\"scope\":\"not_script\",\"items\":[],\"emitted\":0,\"truncated\":false,\"basis\":\"proven\"},\"semantic_facts\":{\"format\":\"zag-semantic-manifest-v1\",\"detail_level\":\"");_zag_print(semantic_detail);_zag_print("\",\"expression_witnesses_available\":");_zag_print(znc_json_bool(semantic_witnesses));_zag_print(",\"value\":\"");_zag_print(znc_json_escape(semantic_text));_zag_println("\",\"basis\":\"proven\"},\"execution_plan\":{\"value\":\"generic x86-64-v1\",\"basis\":\"derived\"}}");
         }
         return 0;
     }
     _zag_print("profile: "); if (scripted == 1) { _zag_println("script [proven]"); } else { _zag_println("strict [proven]"); }
     if (scripted == 1) {
         _zag_println("entry point: compiler-generated managed wrapper; top-level statements run in source order [derived]");
-        _zag_print("allocator: script_process_arena requested-payload budget ");
-        _zag_print(_zag_i64_to_str(config.script_memory_bytes));
-        _zag_println(" bytes; root new, read_file results, and bounded process allocations are charged; ordinary make and allocator metadata remain outside [derived]");
+        _zag_print("allocator: ");
+        _zag_print(resolution.choices.allocator);
+        if(@strEq(resolution.choices.allocator,"script_bounded_heap")){
+            _zag_print(" payload-plus-header budget ");
+            _zag_print(_zag_i64_to_str(config.script_memory_bytes));
+            _zag_print(" bytes; each successful Script allocation charges payload plus its 16-byte ownership header and owns a tracked native block reclaimed at shutdown; native allocator class slack and ordinary make remain outside this Script budget [");
+        }else{
+            _zag_print(" requested-payload budget ");
+            _zag_print(_zag_i64_to_str(config.script_memory_bytes));
+            _zag_print(" bytes; root new, read_file results, and bounded process allocations are charged to one arena; ordinary make and allocator metadata remain outside [");
+        }
+        _zag_print(allocator_basis);_zag_println("]");
         _zag_println("implicit error boundary: numeric error code + root-operation diagnostic, then nonzero exit [derived]");
-        _zag_println("prelude: print, println, read_file, write_file, args_len, arg, string_concat, string_builder, list, process_run_timeout, script_alloc, script_alloc_used [proven]");
+        _zag_println("prelude: print, println, say, input, env, read_file, write_file, args_len, arg, string_concat, string_builder, list, process_run_timeout, script_alloc, script_alloc_used [proven]");
         if (config.allow_filesystem_read==1) { _zag_println("filesystem read capability: allowed by project policy [proven]"); } else { _zag_println("filesystem read capability: denied by project policy [proven]"); }
         if (config.allow_filesystem_write==1) { _zag_println("filesystem write capability: allowed by project policy [proven]"); } else { _zag_println("filesystem write capability: denied by project policy [proven]"); }
         if (config.allow_process==1) { _zag_println("process capability: allowed only through bounded process API [proven]"); } else { _zag_println("process capability: denied by project policy [proven]"); }
+        if(config.environment_allow.len>0){_zag_print("environment capability: exact read-only allowlist ");_zag_print(config.environment_allow);_zag_println(" [proven]");}else{_zag_println("environment capability: denied by empty project allowlist [proven]");}
+        if(denied_read==1){_zag_println("policy conflict: read_file is used while filesystem read is denied [proven]");}
+        if(denied_write==1){_zag_println("policy conflict: write_file is used while filesystem write is denied [proven]");}
+        if(denied_process==1){_zag_println("policy conflict: process_run_timeout is used while process execution is denied [proven]");}
+        if(denied_environment>0){_zag_println("policy conflict: env is used without an exact permitted environment_allow name [proven]");}
         _zag_println("network capability: no Script prelude API implemented [proven]");
     } else {
         _zag_println("entry point: user-defined; no script wrapper [derived]");
         _zag_println("allocator: no script default [proven]");
     }
-    _zag_println("expression types/effects: typed frontend and sema witnesses follow; unsupported forms are explicitly unknown [proven]");
-    _zag_println("semantic declaration/type/effect facts (compiler manifest) [proven]:");
-    _zag_print(semantic_facts.*.text);
-    _zag_println("hidden allocation: root new, string/list/builder/file/process results use Script accounting; unaccounted root make is rejected [proven]");
-    if(scripted==1){_zag_println("hidden copies: string/list growth, file/process capture, and builder finish copy owned bytes [proven]");}else{_zag_println("hidden copies: none introduced by the strict profile [proven]");}
-    _zag_println("reclamation: bounded Script arena unmapped at shutdown [proven]");
-    _zag_println("unresolved: only expression forms tagged type_basis=unknown, ordinary make accounting [unknown]");
+    if(semantic_witnesses==1){_zag_println("expression types/effects: typed frontend and sema witnesses follow; unsupported forms are explicitly unknown [proven]");}
+    else{_zag_println("expression types/effects: compact manifest omits per-expression witnesses; declaration effects and exact semantic graph remain available [proven]");}
+    _zag_print("semantic declaration/type/effect facts (compiler manifest, detail-level=");_zag_print(semantic_detail);_zag_println(") [proven]:");
+    _zag_print(semantic_text);
+    _zag_println("hidden allocation: per-operation root Script evidence follows; imported strict-library allocation is outside this report [proven]");
+    if(scripted==1){
+        _zag_println("hidden copies: per-operation root Script evidence follows; byte totals are unknown unless stated [proven]");
+        _zag_println("implicit operations: compiler-bound root Script calls only; location is unavailable because statement spans are not represented [proven]");
+        let operations:ZExplainOperationState=ZExplainOperationState{.json=0,.first=1,.emitted=0,.truncated=0};
+        znc_explain_script_operations(unit.decls,&operations);
+        if(operations.emitted==0){_zag_println("implicit operations: zero classified root Script allocation/copy operations [proven]");}
+        if(operations.truncated==1){_zag_println("implicit operations: output truncated after 64 witnesses [proven]");}
+    }else{
+        _zag_println("hidden copies: none introduced by the strict profile [proven]");
+        _zag_println("implicit operations: zero; this is not a Script profile [proven]");
+    }
+    if(scripted==1){
+        _zag_print("reclamation: ");
+        _zag_print(znc_script_allocator_reclamation(resolution.choices.allocator));
+        _zag_println(" [proven]");
+    }else{
+        _zag_println("reclamation: no Script runtime resources [proven]");
+    }
+    if(semantic_witnesses==1){_zag_println("unresolved: only expression forms tagged type_basis=unknown, ordinary make accounting [unknown]");}
+    else{_zag_println("unresolved: compact manifest omits expression/value and local buffer-lifetime witnesses; ordinary make accounting remains unknown [unknown]");}
     if (scripted == 1) {
         _zag_print("execution plan: cpu="); _zag_print(resolution.choices.cpu);
         _zag_print(", device="); _zag_print(resolution.choices.device);
@@ -1461,23 +2153,167 @@ fn znc_harden_decl_end(src: []u8, start: i32) i32 {
     return 0 - 1;
 }
 
+struct ZHardenScriptMarker { start:i32, end:i32, valid:i32 }
+
+fn znc_harden_token_offset(src:[]u8, token:Token) i32 {
+    let line:i32=1;
+    let at:i32=0;
+    while(at<src.len&&line<token.line){if(src[at]=='\n'){line=line+1;}at=at+1;}
+    if(line!=token.line||token.col<1){return -1;}
+    let offset:i32=at+token.col-1;
+    if(offset<0||offset>=src.len){return -1;}
+    return offset;
+}
+
+// The compilation unit already carries the authoritative profile. This helper
+// only recovers the lexer-confirmed source span needed to retain leading
+// comments and declarations in the rendered candidate; it never treats a
+// comment or string containing `script;` as a profile declaration. The end
+// comes from the semicolon token rather than assuming the bytes are adjacent.
+fn znc_harden_script_marker(src: []u8) ZHardenScriptMarker {
+    let tokens:ArrayList[Token]=lex(src);
+    let i:i32=0;
+    while(i+1<tokens.len){
+        let marker:Token=tokens.data[i];
+        if(marker.kind==Tk.Ident&&@strEq(marker.val,"script")&&tokens.data[i+1].kind==Tk.Semi){
+            let start:i32=znc_harden_token_offset(src,marker);
+            let semi:i32=znc_harden_token_offset(src,tokens.data[i+1]);
+            if(start>=0&&semi>=start){return ZHardenScriptMarker{.start=start,.end=semi+1,.valid=1};}
+            return ZHardenScriptMarker{.start=-1,.end=-1,.valid=0};
+        }
+        i=i+1;
+    }
+    return ZHardenScriptMarker{.start=-1,.end=-1,.valid=0};
+}
+
+// Harden works from the normal Script-bound root body, not from a second
+// parser or a substring heuristic. A bound convenience has an implicit
+// context/capability contract that this conservative strict candidate cannot
+// rewrite exactly yet, so it remains an explicit unsupported item.
+fn znc_harden_bound_script_call(name: []u8) i32 {
+    if (znc_script_alloc_call(name) == 1 || starts_with(name, "script_list") ||
+        starts_with(name, "string_builder_")) { return 1; }
+    if (@strEq(name, "_zag_print") || @strEq(name, "_zag_println") ||
+        @strEq(name, "_zag_write_file") || @strEq(name, "_zag_argc") ||
+        @strEq(name, "_zag_arg") || @strEq(name, "_zag_script_alloc") ||
+        @strEq(name, "_zag_script_alloc_used")) { return 1; }
+    return 0;
+}
+
+fn znc_harden_expr_has_try(n:*Node) i32 {
+    switch(n.*) {
+        .un => |x| { if(@strEq(x.op,"try")){return 1;}return znc_harden_expr_has_try(x.e); }
+        .call => |x| { let i:i32=0;while(i<x.args.len){if(znc_harden_expr_has_try(x.args.data[i])==1){return 1;}i=i+1;}return znc_harden_expr_has_try(x.callee); }
+        .bin => |x| { return znc_harden_expr_has_try(x.l)|znc_harden_expr_has_try(x.r); }
+        .fld => |x| { return znc_harden_expr_has_try(x.base); }
+        .idx => |x| { return znc_harden_expr_has_try(x.base)|znc_harden_expr_has_try(x.idx); }
+        .cast_ => |x| { return znc_harden_expr_has_try(x.expr); }
+        .slice_ => |x| { let found:i32=znc_harden_expr_has_try(x.base)|znc_harden_expr_has_try(x.lo);if(x.has_hi==1){found=found|znc_harden_expr_has_try(x.hi);}return found; }
+        .slit_ => |x| { let i:i32=0;while(i<x.fields.len){if(znc_harden_expr_has_try(x.fields.data[i].val)==1){return 1;}i=i+1;} }
+        .switch_ => |x| { if(znc_harden_expr_has_try(x.subject)==1){return 1;}let i:i32=0;while(i<x.arms.len){if(znc_harden_body_has_try(x.arms.data[i].body)==1){return 1;}i=i+1;}return znc_harden_body_has_try(x.els_body); }
+        else => { }
+    }
+    return 0;
+}
+
+fn znc_harden_body_has_try(body:ArrayList[*Node]) i32 {
+    let i:i32=0;while(i<body.len){switch(body.data[i].*) {
+        .let_ => |x| { if(x.has_init==1&&znc_harden_expr_has_try(x.expr)==1){return 1;} }
+        .ret => |x| { if(x.has_expr==1&&znc_harden_expr_has_try(x.expr)==1){return 1;} }
+        .estmt => |x| { if(znc_harden_expr_has_try(x.expr)==1){return 1;} }
+        .assign => |x| { if(znc_harden_expr_has_try(x.target)==1||znc_harden_expr_has_try(x.expr)==1){return 1;} }
+        .if_ => |x| { if(znc_harden_expr_has_try(x.cond)==1||znc_harden_body_has_try(x.then_body)==1||znc_harden_body_has_try(x.els_body)==1){return 1;} }
+        .while_ => |x| { if(znc_harden_expr_has_try(x.cond)==1||znc_harden_body_has_try(x.body)==1){return 1;} }
+        .unsafe_ => |x| { if(znc_harden_body_has_try(x.body)==1){return 1;} }
+        .switch_ => |x| { if(znc_harden_expr_has_try(x.subject)==1){return 1;}let ai:i32=0;while(ai<x.arms.len){if(znc_harden_body_has_try(x.arms.data[ai].body)==1){return 1;}ai=ai+1;}if(znc_harden_body_has_try(x.els_body)==1){return 1;} }
+        else => { }
+    }i=i+1;}return 0;
+}
+
+fn znc_harden_root_facts(decls:ArrayList[*Node], prelude:*i32, has_try:*i32) void {
+    let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(@strEq(f.name,"__zag_compiler_script_body_7f3a")){if(znc_harden_body_has_try(f.body)==1){has_try.*=1;}let names:ArrayList[[]u8]=make[[]u8](29);push[[]u8](&names,"_zag_print");push[[]u8](&names,"_zag_println");push[[]u8](&names,"_zag_write_file");push[[]u8](&names,"_zag_argc");push[[]u8](&names,"_zag_arg");push[[]u8](&names,"_zag_script_alloc");push[[]u8](&names,"_zag_script_alloc_used");push[[]u8](&names,"_zag_script_env_get");push[[]u8](&names,"script_input");push[[]u8](&names,"script_read_file");push[[]u8](&names,"script_string_concat");push[[]u8](&names,"script_string_builder_new");push[[]u8](&names,"process_run_bounded_script");push[[]u8](&names,"_zag_script_new");push[[]u8](&names,"script_args");push[[]u8](&names,"script_path_join");push[[]u8](&names,"script_path_basename");push[[]u8](&names,"script_path_dirname");push[[]u8](&names,"script_path_extension");push[[]u8](&names,"script_list1");push[[]u8](&names,"script_list2");push[[]u8](&names,"script_list3");push[[]u8](&names,"script_list4");push[[]u8](&names,"script_list_new");push[[]u8](&names,"script_list_append");push[[]u8](&names,"string_builder_append");let ni:i32=0;while(ni<names.len){if(znc_ast_body_has_call(f.body,names.data[ni])==1){prelude.*=1;}ni=ni+1;}return;}}else=>{}}i=i+1;}
+}
+
+fn znc_harden_bit(value:i32)[]u8 { if(value==1){return "1";}return "0"; }
+fn znc_harden_explicit_header(config:PlannerConfig)[]u8 {
+    let resolved:PlannerResolution = planner_resolve(1, "", config,
+        znc_script_explicit_choices(), 0);
+    let capability_bits:i64 = znc_script_capability_bits(config);
+    let execution_policy:i64 = znc_script_execution_policy(resolved);
+    let header:[]u8="\n// Generated by znc harden. These declarations make the former Script runtime policy explicit.\nconst __zag_hardened_script_memory_limit: i64 = ";
+    header=_zag_str_concat(header,_zag_i64_to_str(config.script_memory_bytes));
+    header=_zag_str_concat(header,_zag_str_concat(";\nconst __zag_hardened_allow_filesystem_read: i32 = ",
+        znc_harden_bit(config.allow_filesystem_read)));
+    header=_zag_str_concat(header,_zag_str_concat(";\nconst __zag_hardened_allow_filesystem_write: i32 = ",
+        znc_harden_bit(config.allow_filesystem_write)));
+    header=_zag_str_concat(header,_zag_str_concat(";\nconst __zag_hardened_allow_process: i32 = ",
+        znc_harden_bit(config.allow_process)));
+    header=_zag_str_concat(header,_zag_str_concat(";\nconst __zag_hardened_capability_bits: i64 = ",
+        _zag_i64_to_str(capability_bits)));
+    header=_zag_str_concat(header,_zag_str_concat(";\n// allocator policy: ",
+        resolved.choices.allocator));
+    header=_zag_str_concat(header,_zag_str_concat("\nconst __zag_hardened_allocator_policy_id: i32 = ",
+        _zag_i64_to_str(znc_script_allocator_policy_id(
+            resolved.choices.allocator) as i64)));
+    header=_zag_str_concat(header,_zag_str_concat(";\nconst __zag_hardened_execution_policy: i64 = ",
+        _zag_i64_to_str(execution_policy)));
+    // The public hardened candidate stays valid in frozen edition 2026. Its
+    // context handle is an opaque byte pointer at the ABI boundary; `*opaque`
+    // is reserved for edition-2027 raw-pointer syntax.
+    header=_zag_str_concat(header,
+        ";\nextern fn _zag_script_context_init(limit:i64, capabilities:i64, execution_policy:i64) *u8\nextern fn _zag_script_context_shutdown(context:*u8) void\n\nfn __zag_hardened_status_boundary(status:i32) i32 {\n    // No propagated Script error operation was present in this candidate.\n    return status;\n}\n\nfn __zag_hardened_script_body(__zag_hardened_context:*u8) i32 {\n");
+    return header;
+}
+
+fn znc_harden_atomic_output(output:[]u8,text:[]u8) i32 {
+    let temp:[]u8=_zag_str_concat(output,".harden.tmp");
+    if(_zag_file_exists(temp)==1){_zag_eprintln(_zag_str_concat("znc harden: temporary output already exists: ",temp));return 0;}
+    if(_zag_write_file(temp,text)!=0){return 0;}
+    let a:ArrayList[u8]=make[u8](temp.len+1);let b:ArrayList[u8]=make[u8](output.len+1);let i:i32=0;while(i<temp.len){push[u8](&a,temp[i]);i=i+1;}push[u8](&a,0 as u8);i=0;while(i<output.len){push[u8](&b,output[i]);i=i+1;}push[u8](&b,0 as u8);
+    let renamed:i64=_zag_raw_syscall(82,_zag_slice_ptr(a.data[0..a.len]) as i64,_zag_slice_ptr(b.data[0..b.len]) as i64,0,0,0,0);
+    if(renamed!=0){let _cleanup:i64=_zag_raw_syscall(87,_zag_slice_ptr(a.data[0..a.len]) as i64,0,0,0,0,0);return 0;}
+    return 1;
+}
+
+fn znc_harden_unsupported_items(prelude:i32, root_try:i32, late:i32, reserved:i32, invalid:i32)[]u8 {
+    let out:[]u8="[";
+    let first:i32=1;
+    if(prelude==1){out=_zag_str_concat(out,"{\"kind\":\"script_prelude\",\"basis\":\"proven\",\"reason\":\"compiler-bound prelude call needs explicit API and policy translation\"}");first=0;}
+    if(root_try==1){if(first==0){out=_zag_str_concat(out,",");}out=_zag_str_concat(out,"{\"kind\":\"error_boundary\",\"basis\":\"proven\",\"reason\":\"root try propagation needs an explicit strict error model\"}");first=0;}
+    if(late==1){if(first==0){out=_zag_str_concat(out,",");}out=_zag_str_concat(out,"{\"kind\":\"declaration_order\",\"basis\":\"proven\",\"reason\":\"declaration follows executable top-level statement\"}");first=0;}
+    if(reserved==1){if(first==0){out=_zag_str_concat(out,",");}out=_zag_str_concat(out,"{\"kind\":\"private_name_collision\",\"basis\":\"proven\",\"reason\":\"source uses reserved hardened wrapper prefix\"}");first=0;}
+    if(invalid==1){if(first==0){out=_zag_str_concat(out,",");}out=_zag_str_concat(out,"{\"kind\":\"candidate_validation\",\"basis\":\"proven\",\"reason\":\"generated strict candidate failed compiler validation\"}");}
+    return _zag_str_concat(out,"]");
+}
+
+fn znc_harden_text_unsupported(prelude:i32, root_try:i32, late:i32, reserved:i32, invalid:i32)void {
+    if(prelude==1){_zag_println("unsupported: script_prelude [proven] compiler-bound prelude call needs explicit API and policy translation");}
+    if(root_try==1){_zag_println("unsupported: error_boundary [proven] root try propagation needs an explicit strict error model");}
+    if(late==1){_zag_println("unsupported: declaration_order [proven] declaration follows executable top-level statement");}
+    if(reserved==1){_zag_println("unsupported: private_name_collision [proven] source uses reserved hardened wrapper prefix");}
+    if(invalid==1){_zag_println("unsupported: candidate_validation [proven] generated strict candidate failed compiler validation");}
+}
+
 fn znc_harden(path: []u8) i32 {
     if (path.len == 0) { _zag_eprintln("znc harden: no source file"); return 1; }
-    let src: []u8 = _zag_read_file(path);
-    if (src.len < 0) { _zag_eprintln("znc harden: cannot read source file"); return 1; }
+    let source_snapshot: []u8 = _zag_read_file(path);
+    if (source_snapshot.len < 0) { _zag_eprintln("znc harden: cannot read source file"); return 1; }
+    let src:[]u8=script_syntax_normalize(znc_activate_script_source(path,source_snapshot,0));
     let unit: CompilationUnit = parse_compilation_unit_dir(src, dir_of(path));
     if (unit.profile != ModuleProfile.script) {
         _zag_eprintln("znc harden: source is already regular Zag; no script profile to expand");
         return 1;
     }
-    let marker: i32 = -1;
-    let i: i32 = 0;
-    while (i + 7 <= src.len && marker < 0) {
-        if (src[i] == 's' && @strEq(src[i..i + 7], "script;")) { marker = i; }
-        i = i + 1;
-    }
-    if (marker < 0) { _zag_eprintln("znc harden: script marker not found"); return 1; }
-    let cursor: i32 = marker + 7;
+    if(znc_validate_script_defaults(path,unit)!=0){return 1;}
+    if(znc_configure_script_unit(&unit,path)!=0){return 1;}
+    if(znc_validate_script_capabilities(path,unit)!=0){return 1;}
+    let config:PlannerConfig=znc_project_config(znc_project_root(dir_of(path)),0);
+    let harden_input:PlannerChoices=znc_script_explicit_choices();
+    let harden_resolution:PlannerResolution=planner_resolve(1,"",config,
+        harden_input,0);
+    let marker:ZHardenScriptMarker=znc_harden_script_marker(src);
+    if (marker.valid == 0) { _zag_eprintln("znc harden: script marker not found"); return 1; }
+    let cursor: i32 = marker.end;
     let declarations: []u8 = "";
     let body_start: i32 = cursor;
     let scanning: i32 = 1;
@@ -1493,50 +2329,99 @@ fn znc_harden(path: []u8) i32 {
     // Moving declarations that occur after execution could reorder observable
     // initialization. Reject them instead of guessing.
     let later: i32 = znc_harden_space(src, body_start);
+    let late_declaration:i32=0;
     let line: i32 = later;
     while (line < src.len) {
         if ((line == 0 || src[line - 1] == '\n') && znc_harden_decl_start(src, znc_harden_space(src, line)) == 1) {
-            _zag_eprintln("znc harden: declaration after executable Script statement requires manual placement");
-            return 1;
+            late_declaration=1;
         }
         while (line < src.len && src[line] != '\n') { line = line + 1; }
         if (line < src.len) { line = line + 1; }
     }
-    let candidate: []u8 = _zag_str_concat(src[0..marker], _zag_str_concat(declarations,
-        _zag_str_concat("\nfn main() i32 {\n", _zag_str_concat(src[body_start..src.len], "\n}\n"))));
+    let unresolved_prelude:i32=0;
+    let root_try:i32=0;
+    znc_harden_root_facts(unit.decls,&unresolved_prelude,&root_try);
+    // Names in this reserved private prefix would make the generated wrapper
+    // ambiguous. Do not rename user symbols or silently take ownership of them.
+    let reserved_conflict:i32=contains_text(src,"__zag_hardened_");
+    let supported:i32=((unresolved_prelude==0&&root_try==0&&late_declaration==0&&reserved_conflict==0) as i32);
+    let candidate:[]u8="";
+    if(supported==1){
+        let header:[]u8=znc_harden_explicit_header(config);
+        candidate=_zag_str_concat(src[0..marker.start],declarations);
+        candidate=_zag_str_concat(candidate,header);
+        candidate=_zag_str_concat(candidate,src[body_start..src.len]);
+        candidate=_zag_str_concat(candidate,"\n}\n\nfn main() i32 {\n    let __zag_hardened_context:*u8 = _zag_script_context_init(__zag_hardened_script_memory_limit, __zag_hardened_capability_bits, __zag_hardened_execution_policy) as *u8;\n    let __zag_hardened_status:i32 = __zag_hardened_script_body(__zag_hardened_context);\n    _zag_script_context_shutdown(__zag_hardened_context);\n    return __zag_hardened_status_boundary(__zag_hardened_status);\n}\n");
+    }
     let output: []u8 = flag_value("--output");
     let report_format:[]u8=flag_value("--format");
     if (report_format.len>0&&znc_format_text(report_format)==0&&znc_format_json(report_format)==0){_zag_eprintln("znc harden: --format must be text or json");return 1;}
+    if(output.len>0&&@strEq(output,path)){_zag_eprintln("znc harden: --output must not name the source file");return 1;}
+    let candidate_valid:i32=supported;
+    if(candidate_valid==1&&znc_check_src(path,candidate)!=0){candidate_valid=0;}
     if (has_flag("--apply")==1) {
+        if(candidate_valid==0){_zag_eprintln("znc harden: apply refused: no semantics-preserving strict candidate is available; inspect the structured unsupported report");return 1;}
         let test_command:[]u8=flag_value("--test-command");
         if(test_command.len==0){_zag_eprintln("znc harden: --apply requires --test-command so behavioral parity is tested");return 1;}
         let current:[]u8=_zag_read_file(path);
-        if(current.len<0||@strEq(current,src)==0){_zag_eprintln("znc harden: source changed after snapshot; refusing apply");return 1;}
+        if(current.len<0||@strEq(current,source_snapshot)==0){_zag_eprintln("znc harden: source changed after snapshot; refusing apply");return 1;}
         let backup:[]u8=_zag_str_concat(path,".harden.bak");
         if(_zag_file_exists(backup)==1){_zag_eprintln(_zag_str_concat("znc harden: rollback file already exists: ",backup));return 1;}
         if(znc_check_src(path,candidate)!=0){_zag_eprintln("znc harden: generated candidate failed strict semantic checking");return 1;}
-        if(_zag_write_file(backup,src)!=0){_zag_eprintln("znc harden: failed to create rollback copy");return 1;}
-        if(_zag_write_file(path,candidate)!=0){let _restore:i32=_zag_write_file(path,src);_zag_eprintln("znc harden: apply write failed; source restored");return 1;}
+        if(_zag_write_file(backup,source_snapshot)!=0){_zag_eprintln("znc harden: failed to create rollback copy");return 1;}
+        if(_zag_write_file(path,candidate)!=0){let _restore:i32=_zag_write_file(path,source_snapshot);_zag_eprintln("znc harden: apply write failed; source restored");return 1;}
         let test_rc:i32=_zag_exec_cmd(test_command);
-        if(test_rc!=0){let restored:i32=_zag_write_file(path,src);if(restored!=0){_zag_eprintln("znc harden: parity tests failed and automatic rollback failed");return 1;}_zag_eprintln("znc harden: parity tests failed; source restored from snapshot");return 1;}
+        if(test_rc!=0){let restored:i32=_zag_write_file(path,source_snapshot);if(restored!=0){_zag_eprintln("znc harden: parity tests failed and automatic rollback failed");return 1;}_zag_eprintln("znc harden: parity tests failed; source restored from snapshot");return 1;}
         if(znc_format_json(report_format)==1){_zag_println(_zag_str_concat("{\"schema_version\":1,\"status\":\"applied\",\"source_modified\":true,\"rollback\":\"",_zag_str_concat(znc_json_escape(backup),"\",\"tests\":\"passed\"}")));}else{_zag_println(_zag_str_concat("harden applied; rollback copy: ",backup));}
         return 0;
     }
-    if (output.len > 0) {
-        if (_zag_write_file(output, candidate) != 0) { _zag_eprintln("znc harden: failed to write candidate"); return 1; }
+    if (output.len > 0 && candidate_valid==1) {
+        if (znc_harden_atomic_output(output, candidate) == 0) { _zag_eprintln("znc harden: failed to atomically write candidate"); return 1; }
         if (znc_format_json(report_format)==0){_zag_println(_zag_str_concat("harden candidate written: ", output));}
-    } else if (znc_format_json(report_format)==0) {
+    } else if (output.len==0 && candidate_valid==1 && znc_format_json(report_format)==0) {
         _zag_print(candidate);
     }
     if (znc_format_json(report_format)==1){
-        let rendered:[]u8="";if(output.len==0){rendered=znc_json_escape(candidate);}
-        _zag_println(_zag_str_concat("{\"schema_version\":1,\"status\":\"preview\",\"source_modified\":false,\"output\":\"",_zag_str_concat(znc_json_escape(output),_zag_str_concat("\",\"candidate\":\"",_zag_str_concat(rendered,"\",\"assumptions\":[\"top-level return becomes process exit\",\"native primitives remain ordinary Zag declarations\"],\"parity_tests\":[\"stdout stderr and exit parity\",\"filesystem failure\",\"allocation-limit behavior\"],\"unsupported\":[\"declarations after executable statements\",\"implicit allocator expansion\",\"capability policy synthesis\"]}")))));
+        let rendered:[]u8="";if(output.len==0&&candidate_valid==1){rendered=znc_json_escape(candidate);}
+        let status:[]u8="unsupported";if(candidate_valid==1){status="preview";}
+        let unsupported:[]u8=znc_harden_unsupported_items(unresolved_prelude,root_try,late_declaration,reserved_conflict,(supported==1&&candidate_valid==0) as i32);
+        _zag_print("{\"schema_version\":2,\"status\":\"");_zag_print(status);
+        _zag_print("\",\"candidate_compilable\":");_zag_print(znc_json_bool(candidate_valid));
+        _zag_print(",\"candidate_checked\":");_zag_print(znc_json_bool(candidate_valid));
+        _zag_print(",\"source_modified\":false,\"allocator_policy\":{\"value\":\"");
+        _zag_print(znc_json_escape(harden_resolution.choices.allocator));
+        _zag_print("\",\"id\":");_zag_print(_zag_i64_to_str(
+            znc_script_allocator_policy_id(harden_resolution.choices.allocator) as i64));
+        _zag_print(",\"basis\":\"");
+        if(harden_input.allocator_explicit==1){_zag_print("explicit");}else{_zag_print("derived");}
+        _zag_print("\",\"reclamation\":\"");
+        _zag_print(znc_json_escape(znc_script_allocator_reclamation(
+            harden_resolution.choices.allocator)));
+        _zag_print("\"},\"output\":\"");_zag_print(znc_json_escape(output));
+        _zag_print("\",\"candidate\":\"");_zag_print(rendered);
+        _zag_print("\",\"assumptions\":[\"top-level source order is preserved inside explicit body\",\"Script memory and capability policy constants are explicit\",\"no propagated root error operation is present\"],\"parity_tests\":[\"stdout stderr and exit parity\",\"nonzero status parity\",\"filesystem/process capability denial\",\"allocation-limit behavior\"],\"unsupported\":");
+        _zag_print(unsupported);_zag_println("}");
         return 0;
     }
-    _zag_println("harden report: conservative statement-only expansion");
-    _zag_println("assumptions: top-level return becomes process exit; native primitives remain explicit ordinary Zag declarations");
-    _zag_println("tests required: stdout/stderr and exit parity; filesystem failure; allocation-limit behavior");
-    _zag_println("unsupported conversions: declarations after executable statements, implicit allocator expansion, capability policy synthesis");
+    if(candidate_valid==0){
+        _zag_println("harden status: unsupported; no strict candidate was written");
+        znc_harden_text_unsupported(unresolved_prelude,root_try,late_declaration,reserved_conflict,(supported==1&&candidate_valid==0) as i32);
+    }else{
+        _zag_println("harden status: preview; explicit strict-Zag candidate passed compiler validation");
+        _zag_println("harden report: conservative explicit context/allocator/capability expansion");
+        _zag_println("assumptions: top-level source order and status return are preserved; no propagated root error operation is present");
+        _zag_print("explicit policy: allocator=");
+        _zag_print(harden_resolution.choices.allocator);
+        _zag_print(" id=");
+        _zag_print(_zag_i64_to_str(znc_script_allocator_policy_id(
+            harden_resolution.choices.allocator) as i64));
+        _zag_print("; ");
+        _zag_print(znc_script_allocator_reclamation(
+            harden_resolution.choices.allocator));
+        _zag_println("; script memory and filesystem/process capability constants; context init/shutdown around root body");
+        _zag_println("error boundary: explicit status boundary is identity because no root try propagation was present [proven]");
+        _zag_println("tests required: stdout/stderr and exit parity; nonzero status parity; filesystem/process capability denial; allocation-limit behavior");
+    }
     return 0;
 }
 
@@ -1608,8 +2493,8 @@ fn znc_project_relative(root:[]u8,path:[]u8)[]u8{
     return path;
 }
 
-fn znc_publish_semantics(path:[]u8,src:[]u8,unit:CompilationUnit,decls:ArrayList[*Node],eff:map__StringMap[i32])void{
-    let root:[]u8=znc_project_root(dir_of(path));let module_path:[]u8=znc_project_relative(root,path);let _published:i32=semantic_manifest_publish(root,module_path,src,unit,eff);
+fn znc_publish_semantics(path:[]u8,src:[]u8,unit:CompilationUnit,decls:ArrayList[*Node],eff:map__StringMap[i32])i32{
+    let root:[]u8=znc_project_root(dir_of(path));let module_path:[]u8=znc_project_relative(root,path);return semantic_manifest_publish(root,module_path,src,unit,eff);
 }
 
 fn znc_contains(haystack: []u8, needle: []u8) i32 {
@@ -1644,16 +2529,64 @@ fn znc_project_mode(root: []u8) []u8 {
     return parsed.mode;
 }
 
-fn znc_configure_script_unit(unit: *CompilationUnit, path: []u8) void {
-    if (unit.*.profile != ModuleProfile.script) { return; }
+fn znc_script_capability_bits(cfg:PlannerConfig) i64 {
+    // Environment bit 3 is granted only when the project has an exact
+    // allowlist. Network and device have no Script prelude API, so their
+    // reserved bits remain zero instead of fabricating permissions.
+    return (cfg.allow_filesystem_read as i64) +
+        ((cfg.allow_filesystem_write as i64) * 2) +
+        ((cfg.allow_process as i64) * 4) +
+        (((cfg.environment_allow.len > 0) as i64) * 8);
+}
+
+fn znc_script_cpu_policy_id(name:[]u8) i32 {
+    let profile:X86CpuProfile = parse_x86_cpu_profile(name);
+    if (profile.valid == 0) { return 0; }
+    if (profile.request_kind == 2) { return 2; }
+    if (profile.request_kind == 4) { return 0; }
+    return 1;
+}
+
+fn znc_script_allocator_policy_id(name:[]u8) i32 {
+    if (@strEq(name, "script_process_arena")) { return 1; }
+    if (@strEq(name, "script_bounded_heap")) { return 2; }
+    return 0;
+}
+
+fn znc_script_allocator_reclamation(name:[]u8) []u8 {
+    if (@strEq(name, "script_bounded_heap")) {
+        return "all tracked bounded-heap blocks freed at generated shutdown";
+    }
+    return "one bounded Script arena unmapped at generated shutdown";
+}
+
+fn znc_script_execution_policy(resolved:PlannerResolution) i64 {
+    let device_id:i32 = 0;
+    let layout_id:i32 = 0;
+    if (@strEq(resolved.choices.device, "cpu")) { device_id = 1; }
+    if (@strEq(resolved.choices.layout, "compiler_owned")) { layout_id = 1; }
+    return script_execution_policy_bits(
+        znc_script_allocator_policy_id(resolved.choices.allocator),
+        znc_script_cpu_policy_id(resolved.choices.cpu), device_id, layout_id);
+}
+
+fn znc_configure_script_unit(unit: *CompilationUnit, path: []u8) i32 {
+    if (unit.*.profile != ModuleProfile.script) { return 0; }
     let root: []u8 = znc_project_root(dir_of(path));
     let cfg: PlannerConfig = znc_project_config(root, 0);
     let input: PlannerChoices = znc_script_explicit_choices();
     let resolved: PlannerResolution = planner_resolve(1, "", cfg, input, 0);
     // These are the only runtime choices implemented today. Rejecting other
     // configured values happens in the foreground build before codegen.
-    let _configured: i32 = compilation_unit_set_script_memory_limit(unit, cfg.script_memory_bytes);
-    let _source_label: i32 = compilation_unit_set_script_source_label(unit, path);
+    let configured: i32 = compilation_unit_set_script_memory_limit(unit, cfg.script_memory_bytes);
+    let runtime_policy:i32 = compilation_unit_set_script_runtime_policy(unit,
+        znc_script_capability_bits(cfg), znc_script_execution_policy(resolved));
+    let source_label: i32 = compilation_unit_set_script_source_label(unit, path);
+    if(configured!=0||runtime_policy!=0||source_label!=0){
+        _zag_eprintln("znc: internal error: could not configure compiler-owned Script entry policy");
+        return 1;
+    }
+    return 0;
 }
 
 
@@ -1663,14 +2596,18 @@ fn znc_validate_script_defaults(path: []u8, unit: CompilationUnit) i32 {
     let input: PlannerChoices = znc_script_explicit_choices();
     let r: PlannerResolution = planner_resolve(1, "", cfg, input, 0);
     if (r.diagnostic.len > 0) { _zag_eprintln(r.diagnostic); return 1; }
-    if (@strEq(r.choices.allocator, "script_process_arena") == 0 ||
+    if (znc_script_allocator_policy_id(r.choices.allocator) == 0 ||
         @strEq(r.choices.device, "cpu") == 0 ||
         @strEq(r.choices.layout, "compiler_owned") == 0) {
-        _zag_eprintln("znc: unsupported Zag Script planner default; supported allocator=script_process_arena, device=cpu, layout=compiler_owned");
+        _zag_eprintln("znc: unsupported Zag Script planner default; supported allocator=script_process_arena or script_bounded_heap, device=cpu, layout=compiler_owned");
         return 1;
     }
     let p: X86CpuProfile = parse_x86_cpu_profile(r.choices.cpu);
     if (p.valid == 0) { _zag_eprintln(_zag_str_concat("znc: ", p.diagnostic)); return 1; }
+    if (znc_script_cpu_policy_id(r.choices.cpu) == 0) {
+        _zag_eprintln("znc: unsupported Zag Script CPU policy; supported cpu=generic or cpu=native");
+        return 1;
+    }
     return 0;
 }
 
@@ -1707,12 +2644,103 @@ fn znc_script_block_calls(body:ArrayList[*Node],target:[]u8)i32{
 }
 fn znc_script_generated_calls(unit:CompilationUnit,target:[]u8)i32{let i:i32=0;while(i<len[*Node](unit.decls)){switch(get[*Node](unit.decls,i).*){.fn_decl=>|f|{if(@strEq(f.name,"__zag_compiler_script_body_7f3a")){return znc_script_block_calls(f.body,target);}}else=>{}}i=i+1;}return 0;}
 
+// Environment is deliberately unlike a dynamic dictionary: every Script-root
+// request must use a literal simple name that appears exactly in the project
+// policy. Imported strict modules are not walked here and retain their own
+// explicit APIs and authority.
+fn znc_environment_allow_has(list:[]u8,name:[]u8)i32{
+    let start:i32=0;let i:i32=0;
+    while(i<=list.len){
+        if(i==list.len||list[i]==','){
+            if(@strEq(list[start..i],name)){return 1;}
+            start=i+1;
+        }
+        i=i+1;
+    }
+    return 0;
+}
+fn znc_script_environment_literal(text:[]u8)[]u8{
+    // AST string tokens retain their quotes. Environment policy deliberately
+    // accepts only a plain ASCII identifier, so escaped/computed names have no
+    // alternate spelling to decode here.
+    if(text.len<2||text[0]!='"'||text[text.len-1]!='"'){return "";}
+    let value:[]u8=text[1..text.len-1];
+    let i:i32=0;while(i<value.len){if(value[i]=='\\'){return "";}i=i+1;}
+    return value;
+}
+fn znc_script_env_expr_violations(n:*Node,cfg:PlannerConfig,report:i32)i32{
+    let failures:i32=0;
+    switch(n.*){
+        .call=>|c|{
+            let name:[]u8=callee_name(c.callee);
+            if(@strEq(name,"_zag_getenv")){
+                if(report==1){_zag_eprintln("znc script capability: direct _zag_getenv is unavailable in Zag Script; use env(\"NAME\") with environment_allow");}
+                failures=failures+1;
+            }
+            if(@strEq(name,"_zag_script_env_get")){
+                if(c.args.len!=2){
+                    if(report==1){_zag_eprintln("znc script capability: env requires one literal simple variable name");}
+                    failures=failures+1;
+                }else{
+                    switch(c.args.data[1].*){
+                        .slit=>|s|{
+                            let variable:[]u8=znc_script_environment_literal(s.text);
+                            if(planner_environment_name_valid(variable)==0){
+                                if(report==1){_zag_eprintln("znc script capability: env requires a literal simple variable name so environment_allow can be checked");}
+                                failures=failures+1;
+                            }else if(znc_environment_allow_has(cfg.environment_allow,variable)==0){
+                                if(report==1){_zag_eprintln(_zag_str_concat("znc script capability: env(\"",_zag_str_concat(variable,"\") denied; add the exact name to environment_allow")));}
+                                failures=failures+1;
+                            }
+                        }
+                        else=>{if(report==1){_zag_eprintln("znc script capability: env requires a literal simple variable name so environment_allow can be checked");}failures=failures+1;}
+                    }
+                }
+            }
+            failures=failures+znc_script_env_expr_violations(c.callee,cfg,report);
+            let i:i32=0;while(i<c.args.len){failures=failures+znc_script_env_expr_violations(c.args.data[i],cfg,report);i=i+1;}
+        }
+        .bin=>|x|{failures=failures+znc_script_env_expr_violations(x.l,cfg,report)+znc_script_env_expr_violations(x.r,cfg,report);}
+        .un=>|x|{failures=failures+znc_script_env_expr_violations(x.e,cfg,report);}
+        .fld=>|x|{failures=failures+znc_script_env_expr_violations(x.base,cfg,report);}
+        .idx=>|x|{failures=failures+znc_script_env_expr_violations(x.base,cfg,report)+znc_script_env_expr_violations(x.idx,cfg,report);}
+        .cast_=>|x|{failures=failures+znc_script_env_expr_violations(x.expr,cfg,report);}
+        .slice_=>|x|{failures=failures+znc_script_env_expr_violations(x.base,cfg,report)+znc_script_env_expr_violations(x.lo,cfg,report);if(x.has_hi==1){failures=failures+znc_script_env_expr_violations(x.hi,cfg,report);}}
+        .slit_=>|x|{let i:i32=0;while(i<x.fields.len){failures=failures+znc_script_env_expr_violations(x.fields.data[i].val,cfg,report);i=i+1;}}
+        .switch_=>|x|{failures=failures+znc_script_env_expr_violations(x.subject,cfg,report);let i:i32=0;while(i<x.arms.len){failures=failures+znc_script_env_body_violations(x.arms.data[i].body,cfg,report);i=i+1;}failures=failures+znc_script_env_body_violations(x.els_body,cfg,report);}
+        else=>{}
+    }
+    return failures;
+}
+fn znc_script_env_body_violations(body:ArrayList[*Node],cfg:PlannerConfig,report:i32)i32{
+    let failures:i32=0;let i:i32=0;
+    while(i<body.len){
+        switch(body.data[i].*){
+            .let_=>|x|{if(x.has_init==1){failures=failures+znc_script_env_expr_violations(x.expr,cfg,report);}}
+            .ret=>|x|{if(x.has_expr==1){failures=failures+znc_script_env_expr_violations(x.expr,cfg,report);}}
+            .estmt=>|x|{failures=failures+znc_script_env_expr_violations(x.expr,cfg,report);}
+            .assign=>|x|{failures=failures+znc_script_env_expr_violations(x.target,cfg,report)+znc_script_env_expr_violations(x.expr,cfg,report);}
+            .if_=>|x|{failures=failures+znc_script_env_expr_violations(x.cond,cfg,report)+znc_script_env_body_violations(x.then_body,cfg,report)+znc_script_env_body_violations(x.els_body,cfg,report);}
+            .while_=>|x|{failures=failures+znc_script_env_expr_violations(x.cond,cfg,report)+znc_script_env_body_violations(x.body,cfg,report);}
+            .unsafe_=>|x|{failures=failures+znc_script_env_body_violations(x.body,cfg,report);}
+            .switch_=>|x|{failures=failures+znc_script_env_expr_violations(x.subject,cfg,report);let ai:i32=0;while(ai<x.arms.len){failures=failures+znc_script_env_body_violations(x.arms.data[ai].body,cfg,report);ai=ai+1;}failures=failures+znc_script_env_body_violations(x.els_body,cfg,report);}
+            else=>{}
+        }
+        i=i+1;
+    }
+    return failures;
+}
+fn znc_script_env_violations(unit:CompilationUnit,cfg:PlannerConfig,report:i32)i32{
+    let i:i32=0;while(i<unit.decls.len){switch(unit.decls.data[i].*){.fn_decl=>|f|{if(@strEq(f.name,"__zag_compiler_script_body_7f3a")){return znc_script_env_body_violations(f.body,cfg,report);}}else=>{}}i=i+1;}return 0;
+}
+
 fn znc_validate_script_capabilities(path:[]u8,unit:CompilationUnit)i32{
     if(unit.profile!=ModuleProfile.script){return 0;}
     let cfg:PlannerConfig=znc_project_config(znc_project_root(dir_of(path)),1);let violations:i32=0;
     if(cfg.allow_filesystem_read==0&&znc_script_generated_calls(unit,"script_read_file")==1){_zag_eprintln("znc script capability: read_file denied by allow_filesystem_read=false");violations=violations+1;}
     if(cfg.allow_filesystem_write==0&&znc_script_generated_calls(unit,"_zag_write_file")==1){_zag_eprintln("znc script capability: write_file denied by allow_filesystem_write=false");violations=violations+1;}
     if(cfg.allow_process==0&&znc_script_generated_calls(unit,"process_run_bounded_script")==1){_zag_eprintln("znc script capability: process_run_timeout denied by allow_process=false");violations=violations+1;}
+    violations=violations+znc_script_env_violations(unit,cfg,1);
     return violations;
 }
 
@@ -1767,6 +2795,7 @@ fn znc_zagd_exec_config(root: []u8, root_source:[]u8, mode: []u8, cfg: PlannerCo
     if(root_source.len>0){command=_zag_str_concat(command,_zag_str_concat(" --root-source ",znc_shell_quote(root_source)));}
     command=_zag_str_concat(command,_zag_str_concat(" --mode ",znc_shell_quote(mode)));
     command=_zag_str_concat(command,_zag_str_concat(" --window-ms ",_zag_i64_to_str(cfg.stability_window_ms)));
+    command=_zag_str_concat(command,_zag_str_concat(" --max-memory-bytes ",_zag_i64_to_str(cfg.max_memory_bytes)));
     command=_zag_str_concat(command,_zag_str_concat(" --max-cache-bytes ",_zag_i64_to_str(cfg.max_cache_bytes)));
     command=_zag_str_concat(command,_zag_str_concat(" --max-workers ",_zag_i64_to_str(cfg.max_workers as i64)));
     command=_zag_str_concat(command,_zag_str_concat(" --notifications ",znc_shell_quote(cfg.notifications)));
@@ -1780,12 +2809,8 @@ fn znc_zagd_exec(root: []u8, mode: []u8, window_ms: i64, daemonize: i32) i32 {
 }
 
 fn znc_zagd_lock_alive(root: []u8) i32 {
-    let lock_pid: i64 = znc_parse_pid(_zag_read_file(_zag_str_concat(root, "/.zagd.lock")));
-    if (lock_pid < 2) { return 0; }
-    let probe: i64 = _zag_raw_syscall(62, lock_pid, 0, 0, 0, 0, 0);
-    // ESRCH (-3) proves the process is gone. EPERM still proves it exists.
-    if (probe == (0 - 3)) { return 0; }
-    return 1;
+    let record:[]u8=_zag_read_file(_zag_str_concat(root, "/.zagd.lock"));
+    return zagd_lock_identity_alive(record,root);
 }
 
 fn znc_zagd_ensure(root: []u8, root_source:[]u8) void {
@@ -1920,8 +2945,192 @@ fn znc_zagd_shutdown() i32 {
 
 fn znc_manifest_fact_count(text:[]u8,needle:[]u8)i32{if(semantic_manifest_decode(text).valid==0){return 0;}let count:i32=0;let start:i32=0;let i:i32=0;while(i<=text.len){if(i==text.len||text[i]=='\n'){let line:[]u8=text[start..i];if(line.len>8&&@strEq(line[0..8],"fact_fn=")&&smf_line_has(line,needle)){count=count+1;}start=i+1;}i=i+1;}return count;}
 fn znc_manifest_value_unknown_count(text:[]u8)i32{if(semantic_manifest_decode(text).valid==0){return 0;}let count:i32=0;let start:i32=0;let i:i32=0;while(i<=text.len){if(i==text.len||text[i]=='\n'){let line:[]u8=text[start..i];if(line.len>11&&@strEq(line[0..11],"value_type=")&&smf_line_has(line,"\tbasis=unknown")){count=count+1;}start=i+1;}i=i+1;}return count;}
-fn znc_suggest_rec_json(id:[]u8,automatic:i32,confidence:i32,evidence:[]u8,action:[]u8)[]u8{let a:[]u8="false";if(automatic==1){a="true";}return _zag_str_concat("{\"id\":\"",_zag_str_concat(id,_zag_str_concat("\",\"automatic\":",_zag_str_concat(a,_zag_str_concat(",\"confidence\":",_zag_str_concat(_zag_i64_to_str(confidence),_zag_str_concat(",\"provenance\":\"derived\",\"evidence\":\"",_zag_str_concat(evidence,_zag_str_concat("\",\"action\":\"",_zag_str_concat(action,"\"}"))))))))));}
-fn znc_suggest_add(list:*[]u8,count:*i32,item:[]u8)void{if(count.*>0){list.*=_zag_str_concat(list.*,",");}list.*=_zag_str_concat(list.*,item);count.*=count.*+1;}
+fn znc_manifest_path_safe(path:[]u8)i32{
+    if(path.len==0||path[0]=='/'||path[path.len-1]=='/'||path[0]=='\\'){return 0;}
+    let segment:i32=0;let i:i32=0;
+    while(i<=path.len){
+        if(i==path.len||path[i]=='/'){
+            let part:[]u8=path[segment..i];
+            if(part.len==0||@strEq(part,".")||@strEq(part,"..")){return 0;}
+            segment=i+1;
+        } else if(path[i]=='\\'||path[i]=='\n'||path[i]=='\r'||path[i]=='\t'){return 0;}
+        i=i+1;
+    }
+    return 1;
+}
+fn znc_manifest_modules_current(root:[]u8,text:[]u8)i32{
+    let manifest:SemanticManifestView=semantic_manifest_decode(text);if(manifest.valid==0){return 0;}
+    let found:i32=0;let start:i32=0;let i:i32=0;
+    while(i<=text.len){
+        if(i==text.len||text[i]=='\n'){
+            let line:[]u8=text[start..i];
+            if(line.len>12&&@strEq(line[0..12],"module_node=")){
+                let node:[]u8=line[12..];let tab:i32=0;while(tab<node.len&&node[tab]!='\t'){tab=tab+1;}
+                if(tab==node.len){return 0;}
+                let name:[]u8=node[0..tab];if(znc_manifest_path_safe(name)==0){return 0;}
+                let path:[]u8=_zag_str_concat(root,_zag_str_concat("/",name));let bytes:[]u8=_zag_read_file(path);if(bytes.len<0){return 0;}
+                let source:[]u8=bytes;let activated:i32=0;
+                if(@strEq(name,manifest.module)&&source_path_is_zs(path)==1&&source_starts_script(bytes)==0){
+                    source=_zag_str_concat("script;\n",bytes);activated=1;
+                }
+                let current:ZagdHash=zagd_content_hash(source);
+                if(activated==1){_zag_free(_zag_slice_ptr(source));}
+                _zag_free(_zag_slice_ptr(bytes));
+                if(zagd_hash_equal(current,smf_hash(node[tab+1..]))==0){return 0;}
+                found=found+1;
+            }
+            start=i+1;
+        }
+        i=i+1;
+    }
+    return (found>0) as i32;
+}
+// Exact module-source matching closes the race between a parsed foreground
+// unit and the transactionally published semantic record. A concurrently
+// published manifest for another root/import state is an optimization miss.
+fn znc_profile_manifest_module_count(text:[]u8,name:[]u8,want:ZagdHash)i32{
+    let matches:i32=0;let start:i32=0;let i:i32=0;
+    while(i<=text.len){
+        if(i==text.len||text[i]=='\n'){
+            let line:[]u8=text[start..i];
+            if(line.len>12&&@strEq(line[0..12],"module_node=")){
+                let node:[]u8=line[12..];let tab:i32=0;while(tab<node.len&&node[tab]!='\t'){tab=tab+1;}
+                if(tab<node.len&&@strEq(node[0..tab],name)&&zagd_hash_equal(smf_hash(node[tab+1..]),want)==1){matches=matches+1;}
+            }
+            start=i+1;
+        }
+        i=i+1;
+    }
+    return matches;
+}
+fn znc_profile_manifest_matches_unit(text:[]u8,src:[]u8,modules:ArrayList[ResolvedModule])i32{
+    let view:SemanticManifestView=semantic_manifest_decode(text);
+    if(view.valid==0||view.graph_complete!=1||zagd_hash_equal(view.source,zagd_content_hash(src))==0){return 0;}
+    let node_count:i32=0;let start:i32=0;let i:i32=0;
+    while(i<=text.len){if(i==text.len||text[i]=='\n'){let line:[]u8=text[start..i];if(line.len>12&&@strEq(line[0..12],"module_node=")){node_count=node_count+1;}start=i+1;}i=i+1;}
+    if(node_count!=modules.len){return 0;}
+    i=0;while(i<modules.len){
+        let module:ResolvedModule=modules.data[i];let name:[]u8=module.path;
+        if(@strEq(name,"<root>")){name=view.module;}
+        if(znc_profile_manifest_module_count(text,name,zagd_content_hash(module.source))!=1){return 0;}
+        i=i+1;
+    }
+    return 1;
+}
+struct ZncForegroundCacheSemantic { graph:ZagdHash, valid:i32 }
+// Executable cache authority binds to the foreground compiler's just-published
+// parsed/resolved semantic graph. The record is reread through the same bounded
+// O_NOFOLLOW regular-file path used by machine payloads and must exactly match
+// every module in this compilation. Incomplete/large advisory manifests simply
+// disable executable caching; lowering remains authoritative.
+fn znc_foreground_cache_semantic(root:[]u8,src:[]u8,modules:ArrayList[ResolvedModule],published:i32)ZncForegroundCacheSemantic{
+    let bad:ZncForegroundCacheSemantic=ZncForegroundCacheSemantic{.graph=zagd_hash_empty(),.valid=0};if(published!=1){return bad;}
+    let path:[]u8=_zag_str_concat(root,"/.zag-cache/zagd/semantic.record");let record:ForegroundBoundedRead=fc_read_bounded(path,8388608);if(record.ok==0){free[u8](&record.bytes);return bad;}
+    let text:[]u8=record.bytes.data[0..record.bytes.len];let view:SemanticManifestView=semantic_manifest_decode(text);if(view.valid==0||view.graph_complete!=1||znc_profile_manifest_matches_unit(text,src,modules)==0){free[u8](&record.bytes);return bad;}
+    let out:ZncForegroundCacheSemantic=ZncForegroundCacheSemantic{.graph=view.graph_identity,.valid=1};free[u8](&record.bytes);return out;
+}
+fn znc_foreground_profile_use(root:[]u8,src:[]u8,modules:ArrayList[ResolvedModule],
+    compiler_bytes:[]u8,cpu:X86CpuProfile)ZagdForegroundProfileUse{
+    if(has_flag("--no-zagd-profile")==1){return zpf_bad("disabled-by-command");}
+    if(compiler_bytes.len<=0||cpu.valid==0){return zpf_bad("foreground-input-unavailable");}
+    let semantic_text:[]u8=_zag_read_file(_zag_str_concat(root,"/.zag-cache/zagd/semantic.record"));
+    if(semantic_text.len<=0){if(semantic_text.len>=0){_zag_free(_zag_slice_ptr(semantic_text));}return zpf_bad("missing-semantic-record");}
+    if(znc_profile_manifest_matches_unit(semantic_text,src,modules)==0){
+        _zag_free(_zag_slice_ptr(semantic_text));return zpf_bad("semantic-record-not-current-compilation");
+    }
+    let plan_text:[]u8=_zag_read_file(_zag_str_concat(root,"/.zag-cache/zagd/profile-plan.record"));
+    let use:ZagdForegroundProfileUse=zagd_foreground_profile_consume(plan_text,semantic_text,
+        zag_version(),zagd_content_hash(compiler_bytes),cpu.cache_key);
+    if(plan_text.len>=0){_zag_free(_zag_slice_ptr(plan_text));}
+    _zag_free(_zag_slice_ptr(semantic_text));return use;
+}
+// Return -1 for no valid current plan. A nonnegative result is the count of
+// rows consumed through the same fail-closed metadata path used by builds.
+fn znc_profile_plan_eligible(root:[]u8,manifest_text:[]u8)i32{
+    let text:[]u8=_zag_read_file(_zag_str_concat(root,"/.zag-cache/zagd/profile-plan.record"));
+    let compiler_bytes:[]u8=_zag_read_file("/proc/self/exe");let cpu:X86CpuProfile=parse_x86_cpu_profile("generic");
+    let use:ZagdForegroundProfileUse=zagd_foreground_profile_consume(text,manifest_text,zag_version(),
+        zagd_content_hash(compiler_bytes),cpu.cache_key);
+    if(text.len>=0){_zag_free(_zag_slice_ptr(text));}if(compiler_bytes.len>=0){_zag_free(_zag_slice_ptr(compiler_bytes));}
+    if(use.valid==0){return 0-1;}return use.eligible_regions;
+}
+fn znc_suggest_rec_json(id:[]u8,supported:i32,automatic:i32,confidence:i32,basis:[]u8,evidence:[]u8,action:[]u8,validity:[]u8,rejected:[]u8)[]u8{
+    let out:[]u8="{\"id\":\"";out=_zag_str_concat(out,znc_json_escape(id));
+    out=_zag_str_concat(out,_zag_str_concat("\",\"supported\":",znc_json_bool(supported)));
+    out=_zag_str_concat(out,_zag_str_concat(",\"automatic\":",znc_json_bool(automatic)));
+    out=_zag_str_concat(out,_zag_str_concat(",\"confidence\":",_zag_i64_to_str(confidence)));
+    out=_zag_str_concat(out,_zag_str_concat(",\"evidence_basis\":\"",_zag_str_concat(znc_json_escape(basis),"\"")));
+    out=_zag_str_concat(out,_zag_str_concat(",\"evidence\":\"",_zag_str_concat(znc_json_escape(evidence),"\"")));
+    out=_zag_str_concat(out,_zag_str_concat(",\"action\":\"",_zag_str_concat(znc_json_escape(action),"\"")));
+    out=_zag_str_concat(out,_zag_str_concat(",\"validity\":\"",_zag_str_concat(znc_json_escape(validity),"\"")));
+    out=_zag_str_concat(out,_zag_str_concat(",\"rejected_reason\":\"",_zag_str_concat(znc_json_escape(rejected),"\"}")));
+    return out;
+}
+fn znc_suggest_add(list:*[]u8,count:*i32,supported_count:*i32,supported:i32,item:[]u8)void{if(count.*>0){list.*=_zag_str_concat(list.*,",");}list.*=_zag_str_concat(list.*,item);count.*=count.*+1;if(supported==1){supported_count.*=supported_count.*+1;}}
+fn znc_suggest_text_line(id:[]u8,supported:i32,automatic:i32,basis:[]u8,validity:[]u8,rejected:[]u8)void{
+    let line:[]u8=_zag_str_concat("  ",_zag_str_concat(id,_zag_str_concat(": supported=",_zag_str_concat(znc_json_bool(supported),_zag_str_concat(" automatic=",_zag_str_concat(znc_json_bool(automatic),_zag_str_concat(" basis=",_zag_str_concat(basis,_zag_str_concat(" validity=",validity)))))))));
+    if(rejected.len>0){line=_zag_str_concat(line,_zag_str_concat(" rejected_reason=",rejected));}
+    _zag_println(line);
+}
+fn znc_script_default_supported(id:[]u8,value:[]u8)i32{
+    if(@strEq(id,"script-default-allocator")){return (znc_script_allocator_policy_id(value)>0) as i32;}
+    if(@strEq(id,"script-default-device")){return @strEq(value,"cpu") as i32;}
+    if(@strEq(id,"script-default-layout")){return @strEq(value,"compiler_owned") as i32;}
+    if(@strEq(id,"script-default-cpu")){return (znc_script_cpu_policy_id(value)>0) as i32;}
+    return 0;
+}
+fn znc_supported_regular_advice_count(manifest_text:[]u8)i32{
+    // Allocation-effect review is a real, supported human advisory. It does not
+    // itself infer lifetime, non-overlap, byte size, or an executable
+    // transformation. The separate buffer facts below have their own exact,
+    // fail-closed AST proof and still grant no transformation authority.
+    let count:i32=znc_manifest_fact_count(manifest_text,"\talloc=1");let buffers:SemanticBufferLifetimeFacts=semantic_manifest_buffer_lifetime_facts(manifest_text);if(buffers.valid==1){return count+buffers.pairs;}return count;
+}
+fn znc_maybe_regular_advisory(path:[]u8,unit:CompilationUnit,published:i32)void{
+    if(published!=1||unit.profile==ModuleProfile.script||has_flag("--no-zagd")==1){return;}
+    let root:[]u8=znc_project_root(dir_of(path));let cfg:PlannerConfig=znc_project_config(root,0);
+    if(@strEq(cfg.notifications,"advisory")==0||znc_zagd_lock_alive(root)==0){return;}
+    let manifest_text:[]u8=_zag_read_file(_zag_str_concat(root,"/.zag-cache/zagd/semantic.record"));
+    if(manifest_text.len<0||znc_manifest_modules_current(root,manifest_text)==0){return;}
+    let count:i32=znc_manifest_fact_count(manifest_text,"\talloc=1");
+    if(count>0){_zag_eprintln(_zag_str_concat("znc: advisory: ",_zag_str_concat(_zag_i64_to_str(count),_zag_str_concat(" allocation-effect declaration(s) available for review; run `znc suggest` (no source changes)",""))));}
+    let buffers:SemanticBufferLifetimeFacts=semantic_manifest_buffer_lifetime_facts(manifest_text);
+    if(buffers.valid==1&&buffers.pairs>0){_zag_eprintln(_zag_str_concat("znc: advisory: ",_zag_str_concat(_zag_i64_to_str(buffers.pairs),_zag_str_concat(" AST-proven disjoint local raw-buffer pair(s) available for review; run `znc suggest` (no source changes)",""))));}
+}
+
+// `optimize --preview` deliberately has no transformation path. It exposes the
+// same checksum-bound planner facts as `suggest`, but accepts only inspection
+// flags so a typo cannot turn a normal advisory command into source mutation.
+fn znc_optimize_preview() i32 {
+    let preview: i32 = 0;
+    let i: i32 = 2;
+    while (i < _zag_argc()) {
+        let arg: []u8 = _zag_arg(i);
+        if (@strEq(arg, "--preview")) { preview = 1; i = i + 1; }
+        else if (@strEq(arg, "--no-zagd")) { i = i + 1; }
+        else if (@strEq(arg, "--format")) {
+            if (i + 1 >= _zag_argc()) { _zag_eprintln("znc optimize: --format must be text or json"); return 2; }
+            i = i + 2;
+        }
+        else if (@strEq(arg, "--apply") || @strEq(arg, "--in-place") ||
+                 @strEq(arg, "--write") || @strEq(arg, "--output") ||
+                 @strEq(arg, "-o") || @strEq(arg, "--replace")) {
+            _zag_eprintln("znc optimize: mutation flags are unsupported; use --preview for a read-only advisory");
+            return 2;
+        }
+        else {
+            _zag_eprintln("znc optimize: only --preview, --format text|json, and --no-zagd are supported");
+            return 2;
+        }
+    }
+    if (preview == 0) { _zag_eprintln("znc optimize: only --preview is implemented; no automatic transformation exists"); return 2; }
+    let json: i32 = znc_output_format();
+    if (json < 0) { _zag_eprintln("znc optimize: --format must be text or json"); return 2; }
+    // Preserve valid JSON as a single machine-readable object. Text gains a
+    // short boundary statement before the existing suggestion rendering.
+    if (json == 0) { _zag_println("znc optimize preview: read-only advisory; source_changes=false"); }
+    return znc_zagd_suggest();
+}
 
 fn znc_zagd_suggest() i32 {
     let root: []u8 = znc_project_root(".");
@@ -1935,15 +3144,32 @@ fn znc_zagd_suggest() i32 {
         else { _zag_println("zagd suggest: no active snapshot; regular Zag remains unchanged"); }
         return 0;
     }
-    let source_path:[]u8=_zag_str_concat(root,_zag_str_concat("/",manifest.module));let source:[]u8=_zag_read_file(source_path);if(source.len<0||zagd_hash_equal(zagd_content_hash(source),manifest.source)==0){if(json==1){_zag_println("{\"advisory\":true,\"available\":false,\"reason\":\"stale-source\",\"source_changes\":false}");}else{_zag_println("zagd suggest: semantic snapshot is stale; no recommendation used");}return 0;}
-    let script:i32=(@strEq(smf_value(manifest_text,"profile"),"script")) as i32;let recs:[]u8="";let count:i32=0;
-    let constants:i32=semantic_manifest_constant_count(manifest_text);if(constants>0){znc_suggest_add(&recs,&count,znc_suggest_rec_json("constant-return-fold",0,100,_zag_str_concat(_zag_i64_to_str(constants)," proven constant-return declaration(s)"),"backend may fold or inline after equivalence validation"));}
-    let leaves:i32=znc_manifest_fact_count(manifest_text,"\teffect_free=1\tleaf=1");if(leaves>0){znc_suggest_add(&recs,&count,znc_suggest_rec_json("pure-leaf-inline",0,90,_zag_str_concat(_zag_i64_to_str(leaves)," effect-free leaf declaration(s)"),"consider bounded inline candidates"));}
-    let allocs:i32=znc_manifest_fact_count(manifest_text,"\talloc=1");if(allocs>0){znc_suggest_add(&recs,&count,znc_suggest_rec_json("allocation-review",0,80,_zag_str_concat(_zag_i64_to_str(allocs)," allocation-effect declaration(s)"),"inspect lifetime and buffer reuse opportunities"));}
-    let unknown:i32=znc_manifest_value_unknown_count(manifest_text);if(unknown>0){znc_suggest_add(&recs,&count,znc_suggest_rec_json("explicit-value-types",0,70,_zag_str_concat(_zag_i64_to_str(unknown)," unresolved local type witness(es)"),"add explicit types before strict promotion"));}
-    if(script==1){let cfg:PlannerConfig=znc_project_config(root,0);let explicit:PlannerChoices=znc_script_explicit_choices();if(explicit.allocator_explicit==0&&znc_contains(source,".allocator")==0){znc_suggest_add(&recs,&count,znc_suggest_rec_json("script-default-allocator",1,100,"allocator unspecified",_zag_str_concat("apply configured default ",cfg.default_allocator)));}if(explicit.device_explicit==0&&znc_contains(source,".device")==0){znc_suggest_add(&recs,&count,znc_suggest_rec_json("script-default-device",1,100,"device unspecified",_zag_str_concat("apply configured default ",cfg.default_device)));}if(explicit.layout_explicit==0&&znc_contains(source,".layout")==0){znc_suggest_add(&recs,&count,znc_suggest_rec_json("script-default-layout",1,100,"layout unspecified",_zag_str_concat("apply configured default ",cfg.default_layout)));}}
-    if(json==1){_zag_println(_zag_str_concat("{\"advisory\":true,\"available\":true,\"profile\":\"",_zag_str_concat(smf_value(manifest_text,"profile"),_zag_str_concat("\",\"source_changes\":false,\"checksum_bound\":true,\"recommendation_count\":",_zag_str_concat(_zag_i64_to_str(count),_zag_str_concat(",\"recommendations\":[",_zag_str_concat(recs,"]}")))))));return 0;}
-    _zag_println(_zag_str_concat("zagd suggestions: profile=",_zag_str_concat(smf_value(manifest_text,"profile"),_zag_str_concat(" checksum-bound=true source_changes=false count=",_zag_i64_to_str(count)))));if(constants>0){_zag_println(_zag_str_concat("  advisory constant-return-fold: proven declarations=",_zag_i64_to_str(constants)));}if(leaves>0){_zag_println(_zag_str_concat("  advisory pure-leaf-inline: effect-free leaves=",_zag_i64_to_str(leaves)));}if(allocs>0){_zag_println(_zag_str_concat("  advisory allocation-review: allocation effects=",_zag_i64_to_str(allocs)));}if(unknown>0){_zag_println(_zag_str_concat("  advisory explicit-value-types: unresolved witnesses=",_zag_i64_to_str(unknown)));}if(script==1){_zag_println("  automatic Script defaults are reported only where source choices are unspecified; explicit choices win");}
+    if(znc_manifest_modules_current(root,manifest_text)==0){if(json==1){_zag_println("{\"advisory\":true,\"available\":false,\"reason\":\"stale-module-graph\",\"source_changes\":false}");}else{_zag_println("zagd suggest: semantic/module snapshot is stale; no recommendation used");}return 0;}
+    let script:i32=(@strEq(smf_value(manifest_text,"profile"),"script")) as i32;let detail_level:[]u8=smf_value(manifest_text,"detail_level");if(detail_level.len==0){detail_level="legacy-full";}let detailed_witnesses:i32=(1-(@strEq(detail_level,"compact") as i32));let recs:[]u8="";let count:i32=0;let supported_count:i32=0;
+    let constants:i32=semantic_manifest_constant_count(manifest_text);if(constants>0){znc_suggest_add(&recs,&count,&supported_count,0,znc_suggest_rec_json("constant-return-fold",0,0,100,"proven",_zag_str_concat(_zag_i64_to_str(constants)," constant-return declaration(s)"),"none; ordinary backend optimization remains independent","current semantic manifest and module graph","no planner-owned transformation and equivalence-revalidation pipeline"));}
+    let leaves:i32=znc_manifest_fact_count(manifest_text,"\teffect_free=1\tleaf=1");if(leaves>0){znc_suggest_add(&recs,&count,&supported_count,0,znc_suggest_rec_json("pure-leaf-inline",0,0,100,"proven",_zag_str_concat(_zag_i64_to_str(leaves)," effect-free leaf declaration(s)"),"none; ordinary backend optimization remains independent","current semantic manifest and module graph","no planner-owned inline transformation and equivalence-revalidation pipeline"));}
+    let allocs:i32=znc_manifest_fact_count(manifest_text,"\talloc=1");if(allocs>0){znc_suggest_add(&recs,&count,&supported_count,1,znc_suggest_rec_json("allocation-review",1,0,100,"proven",_zag_str_concat(_zag_i64_to_str(allocs)," allocation-effect declaration(s); no lifetime or byte-size inference"),"review explicit allocator and lifetime policy","current checksum-bound semantic manifest and module graph",""));}
+    let buffer_lifetimes:SemanticBufferLifetimeFacts=semantic_manifest_buffer_lifetime_facts(manifest_text);if(buffer_lifetimes.valid==1&&buffer_lifetimes.pairs>0){let evidence:[]u8=_zag_str_concat(_zag_i64_to_str(buffer_lifetimes.pairs),_zag_str_concat(" statement-ordered disjoint local raw-buffer pair(s); largest exact shared capacity ",_zag_str_concat(_zag_i64_to_str(buffer_lifetimes.reusable_bytes)," byte(s)")));znc_suggest_add(&recs,&count,&supported_count,1,znc_suggest_rec_json("proven-buffer-lifetimes",1,0,100,"proven-foreground-ast",evidence,"review an explicit buffer-reuse refactor; no transform is applied","Linux x86-64 local []f32/[]i32 raw-word allocations with constant size, exactly one direct matching free, no shadow, alias, escape, whole-buffer call exposure, control-flow crossing, or use after free, and at most 64 candidates per function",""));}
+    let unknown:i32=znc_manifest_value_unknown_count(manifest_text);if(unknown>0){znc_suggest_add(&recs,&count,&supported_count,1,znc_suggest_rec_json("explicit-value-types",1,0,100,"derived",_zag_str_concat(_zag_i64_to_str(unknown)," unresolved local type witness(es)"),"add explicit types before strict promotion","current checksum-bound semantic manifest and module graph",""));}
+    let profile_eligible:i32=znc_profile_plan_eligible(root,manifest_text);if(profile_eligible>=0){znc_suggest_add(&recs,&count,&supported_count,0,znc_suggest_rec_json("profile-guided-hot-regions",0,0,100,"measured-and-derived",_zag_str_concat(_zag_i64_to_str(profile_eligible)," checksum-bound hot region(s) passed current declaration and generic-target validation"),"metadata consumed for reporting; foreground code generation remains unchanged","exact foreground compiler image, semantic source/graph, and generic CPU target","metadata-only consumer; no declaration-to-machine-region map"));}
+    let script_allocator:i32=0;let script_device:i32=0;let script_layout:i32=0;let script_cpu:i32=0;
+    if(script==1){
+        let cfg:PlannerConfig=znc_project_config(root,0);let explicit:PlannerChoices=znc_script_explicit_choices();
+        if(explicit.allocator_explicit==0){script_allocator=znc_script_default_supported("script-default-allocator",cfg.default_allocator);let rejected:[]u8="";if(script_allocator==0){rejected="configured allocator is not implemented by the current Script runtime";}znc_suggest_add(&recs,&count,&supported_count,script_allocator,znc_suggest_rec_json("script-default-allocator",script_allocator,script_allocator,100,"derived","allocator unspecified",_zag_str_concat("configured default ",cfg.default_allocator),"project configuration plus current Script runtime",rejected));}
+        if(explicit.device_explicit==0){script_device=znc_script_default_supported("script-default-device",cfg.default_device);let rejected:[]u8="";if(script_device==0){rejected="configured device is not implemented by the current Script runtime";}znc_suggest_add(&recs,&count,&supported_count,script_device,znc_suggest_rec_json("script-default-device",script_device,script_device,100,"derived","device unspecified",_zag_str_concat("configured default ",cfg.default_device),"project configuration plus current Script runtime",rejected));}
+        if(explicit.layout_explicit==0){script_layout=znc_script_default_supported("script-default-layout",cfg.default_layout);let rejected:[]u8="";if(script_layout==0){rejected="configured layout is not implemented by the current Script runtime";}znc_suggest_add(&recs,&count,&supported_count,script_layout,znc_suggest_rec_json("script-default-layout",script_layout,script_layout,100,"derived","layout unspecified",_zag_str_concat("configured default ",cfg.default_layout),"project configuration plus current Script runtime",rejected));}
+        if(explicit.cpu_explicit==0){script_cpu=znc_script_default_supported("script-default-cpu",cfg.default_cpu);let rejected:[]u8="";if(script_cpu==0){rejected="configured CPU profile is not recognized or permitted";}znc_suggest_add(&recs,&count,&supported_count,script_cpu,znc_suggest_rec_json("script-default-cpu",script_cpu,script_cpu,100,"derived","CPU profile unspecified",_zag_str_concat("configured default ",cfg.default_cpu),"project configuration plus implemented x86 CPU profiles",rejected));}
+    }
+    if(json==1){_zag_println(_zag_str_concat("{\"advisory\":true,\"available\":true,\"profile\":\"",_zag_str_concat(smf_value(manifest_text,"profile"),_zag_str_concat("\",\"detail_level\":\"",_zag_str_concat(detail_level,_zag_str_concat("\",\"expression_witnesses_available\":",_zag_str_concat(znc_json_bool(detailed_witnesses),_zag_str_concat(",\"buffer_lifetime_witnesses_available\":",_zag_str_concat(znc_json_bool(detailed_witnesses),_zag_str_concat(",\"source_changes\":false,\"checksum_bound\":true,\"module_graph_current\":true,\"recommendation_count\":",_zag_str_concat(_zag_i64_to_str(count),_zag_str_concat(",\"supported_count\":",_zag_str_concat(_zag_i64_to_str(supported_count),_zag_str_concat(",\"recommendations\":[",_zag_str_concat(recs,"]}")))))))))))))));return 0;}
+    _zag_println(_zag_str_concat("zagd suggestions: profile=",_zag_str_concat(smf_value(manifest_text,"profile"),_zag_str_concat(" detail-level=",_zag_str_concat(detail_level,_zag_str_concat(" checksum-bound=true module-graph-current=true source_changes=false count=",_zag_str_concat(_zag_i64_to_str(count),_zag_str_concat(" supported=",_zag_i64_to_str(supported_count)))))))));
+    if(detailed_witnesses==0){_zag_println("  compact detail: expression/value/copy and local buffer-lifetime witnesses unavailable; no recommendation is inferred from their omission");}
+    if(constants>0){znc_suggest_text_line("constant-return-fold",0,0,"proven","current semantic manifest and module graph","no planner-owned transformation and equivalence-revalidation pipeline");}
+    if(leaves>0){znc_suggest_text_line("pure-leaf-inline",0,0,"proven","current semantic manifest and module graph","no planner-owned inline transformation and equivalence-revalidation pipeline");}
+    if(allocs>0){znc_suggest_text_line("allocation-review",1,0,"proven","current checksum-bound semantic manifest and module graph","");}
+    if(buffer_lifetimes.valid==1&&buffer_lifetimes.pairs>0){znc_suggest_text_line("proven-buffer-lifetimes",1,0,"proven-foreground-ast","Linux x86-64 local constant raw-word allocations with unique direct frees, no alias, escape, call exposure, control-flow crossing, or use after free, and at most 64 candidates per function","");}
+    if(unknown>0){znc_suggest_text_line("explicit-value-types",1,0,"derived","current checksum-bound semantic manifest and module graph","");}
+    if(profile_eligible>=0){znc_suggest_text_line("profile-guided-hot-regions",0,0,"measured-and-derived","exact foreground compiler image, semantic source/graph, and generic CPU target","metadata-only consumer; no declaration-to-machine-region map");}
+    if(script==1){let cfg:PlannerConfig=znc_project_config(root,0);let explicit:PlannerChoices=znc_script_explicit_choices();if(explicit.allocator_explicit==0){let r:[]u8="";if(script_allocator==0){r="configured allocator is not implemented by the current Script runtime";}znc_suggest_text_line("script-default-allocator",script_allocator,script_allocator,"derived","project configuration plus current Script runtime",r);}if(explicit.device_explicit==0){let r:[]u8="";if(script_device==0){r="configured device is not implemented by the current Script runtime";}znc_suggest_text_line("script-default-device",script_device,script_device,"derived","project configuration plus current Script runtime",r);}if(explicit.layout_explicit==0){let r:[]u8="";if(script_layout==0){r="configured layout is not implemented by the current Script runtime";}znc_suggest_text_line("script-default-layout",script_layout,script_layout,"derived","project configuration plus current Script runtime",r);}if(explicit.cpu_explicit==0){let r:[]u8="";if(script_cpu==0){r="configured CPU profile is not recognized or permitted";}znc_suggest_text_line("script-default-cpu",script_cpu,script_cpu,"derived","project configuration plus implemented x86 CPU profiles",r);}}
     return 0;
 }
 
@@ -2017,11 +3243,13 @@ fn main() i32 {
         _zag_println("       znc <source.zag> --target arm64 [-o out] [--run]");
         _zag_println("       znc <source.zag> --target macos-arm64 [-o out] [--run]");
         _zag_println("       znc script <source.zag> [-o out] [--run]");
+        _zag_println("         [--script-allocator script_process_arena|script_bounded_heap]");
         _zag_println("       znc explain <source.zag> [--format text|json]");
         _zag_println("       znc harden <source.zag> [--output candidate.zag]");
         _zag_println("       znc check <source.zag> [--strict]");
         _zag_println("       znc watch [--mode off|light|adaptive|deep]");
         _zag_println("       znc status | shutdown | suggest");
+        _zag_println("       znc optimize --preview [--format text|json]");
         _zag_println("       znc [build] --hot <source.zag> [-o out]   (hot-reloadable build)");
         _zag_println("       znc hot-patch <source.zag>                (stage a live code patch)");
         _zag_println("       znc fmt [--in-place] <source.zag>");
@@ -2030,6 +3258,10 @@ fn main() i32 {
         _zag_println("  analyzer (leak + efficiency lints) runs by default:");
         _zag_println("    --no-analyze        disable the analyzer");
         _zag_println("    --no-zagd           skip background planning for this invocation");
+        _zag_println("    --no-zagd-profile   skip advisory foreground profile metadata");
+        _zag_println("    --profile-report    report profile metadata hit/miss and authority");
+        _zag_println("    --no-foreground-cache force fresh backend lowering (recovery/testing)");
+        _zag_println("    --cache-report      report validated hit/miss, lowering count, and substitution");
         _zag_println("    --analyze-strict    treat analyzer findings as errors");
         _zag_println("    --analyze-pedantic  also emit strength-reduction hints");
         _zag_println("  compiles Zag to native x86-64 ELF — dynamic mode still uses no cc/as/ld");
@@ -2069,6 +3301,7 @@ fn main() i32 {
         if (@strEq(cmd, "shutdown")) { return znc_zagd_shutdown(); }
         return znc_zagd_suggest();
     }
+    if (@strEq(cmd, "optimize")) { return znc_optimize_preview(); }
     if (@strEq(cmd, "hot-patch")) { return znc_hot_patch(first_nonflag_from(2)); }
     if (@strEq(cmd, "explain")) {
         let epath: []u8 = first_nonflag_from(2);
@@ -2096,15 +3329,31 @@ fn main() i32 {
     znc_zagd_ensure(znc_project_root(dir_of(path)),path);
 
     let gtarget: []u8 = gpu_target();
-    if (gtarget.len > 0) { return build_gpu(path, gtarget); }
-    if (gfx1010_target() == 1) { return build_gfx1010(path); }
-    if (wasm_target() == 1) { return build_wasm(path); }
-    if (macos_arm64_target() == 1) { return build_macos_arm64(path); }
-    if (arm64_target() == 1) { return build_arm64(path); }
-    if (i686_target() == 1) { return build_i686_minimal(path); }
+    if ((has_flag("--safety=checked") == 1 || has_flag("--sanitize=memory") == 1) &&
+        (gtarget.len > 0 || gfx1010_target() == 1 || wasm_target() == 1 ||
+         macos_arm64_target() == 1 || arm64_target() == 1 || i686_target() == 1)) {
+        _zag_eprintln("E0202: checked safety and --sanitize=memory are implemented only for the native x86-64 target");
+        _zag_eprintln("note: the requested target has no checked raw-pointer or memory-sanitizer lowering; no executable was emitted");
+        return 1;
+    }
+    if (gtarget.len > 0) { if (znc_reject_v2_cabi_non_native(path) != 0) { return 1; } return build_gpu(path, gtarget); }
+    if (gfx1010_target() == 1) { if (znc_reject_v2_cabi_non_native(path) != 0) { return 1; } return build_gfx1010(path); }
+    if (wasm_target() == 1) { if (znc_reject_v2_cabi_non_native(path) != 0) { return 1; } return build_wasm(path); }
+    if (macos_arm64_target() == 1) { if (znc_reject_v2_cabi_non_native(path) != 0) { return 1; } return build_macos_arm64(path); }
+    if (arm64_target() == 1) { if (znc_reject_v2_cabi_non_native(path) != 0) { return 1; } return build_arm64(path); }
+    if (i686_target() == 1) { if (znc_reject_v2_cabi_non_native(path) != 0) { return 1; } return build_i686_minimal(path); }
 
     if (validate_x86_target_flag() != 0) { return 1; }
     if (validate_x86_cpu_flag() != 0) { return 1; }
+    // The default native writer emits ET_EXEC with program headers only.  Do
+    // not silently turn an x86-64 object/archive request into an executable:
+    // there is no x86-64 ET_REL writer, section table, or public-symbol table
+    // yet.  i686 handles these flags above through its separate proven path.
+    if (has_flag("--emit-obj") == 1 || has_flag("--emit-static") == 1) {
+        _zag_eprintln("znc: native x86-64 --emit-obj/--emit-static is not implemented; no artifact was emitted");
+        _zag_eprintln("note: current x86-64 output is ET_EXEC without a section or public-symbol table; use the separately bounded i686 object path only for its documented ABI");
+        return 1;
+    }
 
     let src: []u8 = _zag_read_file(path);
     if (src.len < 0) {
@@ -2115,16 +3364,16 @@ fn main() i32 {
 
     // CLI activation is the same parser profile as an in-file `script;`
     // declaration. Prefixing is compilation-local and never rewrites source.
-    if (@strEq(cmd, "script") && source_starts_script(src) == 0) { src = _zag_str_concat("script;\n", src); }
+    src=znc_activate_script_source(path,src,(@strEq(cmd,"script")) as i32);
 
     if (v2_validate_source(path, src) != 0) { return 1; }
 
     // parse → apply configurable Script defaults → effect-check → lower → ELF
     let unit: CompilationUnit = parse_compilation_unit_dir(src, dir_of(path));
-    znc_configure_script_unit(&unit, path);
     if (znc_validate_script_defaults(path, unit) != 0) { return 1; }
+    if (znc_configure_script_unit(&unit, path) != 0) { return 1; }
     if (znc_validate_script_capabilities(path, unit) != 0) { return 1; }
-    if (unit.profile==ModuleProfile.script && (znc_script_lifetime_check(unit.decls)!=0 || znc_script_unaccounted_root_make(unit.decls)!=0)) { return 1; }
+    if (unit.profile==ModuleProfile.script && (znc_script_std_body_check(unit.decls)!=0 || znc_script_lifetime_check(unit.decls)!=0 || znc_script_unaccounted_root_make(unit.decls)!=0)) { return 1; }
     let decls: ArrayList[*Node] = unit.decls;
 
     // Lower operator contracts (x + y → big_add(x, y)) so sema sees the real calls.
@@ -2158,7 +3407,8 @@ fn main() i32 {
 
     // Leak + efficiency analysis (analyze.zag). On by default; --no-analyze to skip.
     if (run_analyzer(decls, path) != 0) { return 1; }
-    znc_publish_semantics(path,src,unit,decls,eff);
+    let published:i32=znc_publish_semantics(path,src,unit,decls,eff);
+    znc_maybe_regular_advisory(path,unit,published);
 
     // Collect @link directives and strip them from decls before codegen.
     // (ncodegen pass-1 aborts on unknown top-level node kinds.)
@@ -2174,6 +3424,12 @@ fn main() i32 {
     // Collect `extern fn` names — the symbols we need from static libraries.
     let extern_syms: ArrayList[[]u8] = collect_extern_syms(code_decls);
     let dynamic_mode: i32 = has_flag("--dynamic");
+    let sanitize_memory: i32 = has_flag("--sanitize=memory");
+    let safety_checked: i32 = has_flag("--safety=checked") | sanitize_memory;
+    // Edition 2027 (v2) enables ownership rules the x86 backend enforces
+    // (e.g. failing closed on aggregate closure captures). Regular Zag
+    // (edition 2026) stays source-preserving and matches the arm64 backend.
+    let v2_edition: i32 = @strEq(v2_project_edition(path), "2027") as i32;
     let needed_libs: ArrayList[[]u8] = znc_needed_libs();
     if (dynamic_mode == 0 && needed_libs.len > 0) {
         _zag_eprintln("znc: --needed requires explicit --dynamic mode");
@@ -2197,30 +3453,95 @@ fn main() i32 {
     // /proc/self/exe follows PATH launches and symlinks to the exact running
     // compiler image, unlike argv[0], which may not be a readable path.
     let compiler_bytes:[]u8=_zag_read_file("/proc/self/exe");
+    let project_root:[]u8=znc_project_root(dir_of(path));
+    // This read is automatic but metadata-only. It validates the exact parsed
+    // module set, compiler image, semantic graph and target; neither a hit nor
+    // a miss changes lowering, optimization passes, cache keys, or ELF output.
+    let foreground_profile_use:ZagdForegroundProfileUse=znc_foreground_profile_use(
+        project_root,src,unit.modules,compiler_bytes,selected_cpu);
+    let compiler_available:i32=(compiler_bytes.len>0) as i32;
+    let compiler_identity:ZagdHash=zagd_hash_empty();
+    if(compiler_available==1){compiler_identity=zagd_content_hash(compiler_bytes);}
+    // Both consumers retain only the image hash. Do not keep a second full
+    // compiler image resident through lowering, linking, debug emission, or
+    // execution.
+    if(compiler_bytes.len>=0){_zag_free(_zag_slice_ptr(compiler_bytes));}
+    let cache_semantic:ZncForegroundCacheSemantic=znc_foreground_cache_semantic(
+        project_root,src,unit.modules,published);
     let cache_hit:i32=0;let cache_stored:i32=0;
-    if(compiler_bytes.len>0){
+    let cache_expected_code:ZagdHash=zagd_hash_empty();let cache_expected_data:ZagdHash=zagd_hash_empty();
+    let lower_calls:i64=0;
+    // A bootstrap/recovery build must be able to force fresh lowering even
+    // when this compiler's import graph changed. The foreground cache is
+    // always an optimization, never an authority for self-hosting.
+    // Checked safety instrumentation changes emitted code. Keep it outside the
+    // existing foreground-cache identity until that identity carries the mode.
+    if(compiler_available==1&&cache_semantic.valid==1&&has_flag("--no-foreground-cache")==0&&safety_checked==0){
         let profile_text:[]u8="strict";if(unit.profile==ModuleProfile.script){profile_text="script";}
-        let project_root:[]u8=znc_project_root(dir_of(path));let config_text:[]u8=_zag_read_file(_zag_str_concat(project_root,"/.zagd.conf"));
-        let abi_text:[]u8=_zag_str_concat("sysv-x86_64-zag-abi-v1|",_zag_str_concat(profile_text,_zag_str_concat("|dynamic=",_zag_str_concat(_zag_i64_to_str(dynamic_mode),_zag_str_concat("|config=",config_text)))));
-        let cache_key:ForegroundCacheKey=fc_key(compiler_bytes,src,unit.modules,selected_cpu.cache_key,abi_text);
-        let cached:ForegroundCacheResult=foreground_cache_load(project_root,cache_key);
-        if(cached.hit==1){free[u8](&code);free[u8](&data);code=cached.code;data=cached.data;cache_hit=1;}
+        let cache_config:PlannerConfig=znc_project_config(project_root,0);
+        // CLI Script choices override project defaults and alter generated
+        // runtime code. Bind the resolved policy, not merely .zagd.conf, so a
+        // machine-code cache entry can never cross allocator/capability/limit
+        // identities.
+        let script_runtime_identity:[]u8="none";
+        if(unit.profile==ModuleProfile.script){
+            let cache_resolution:PlannerResolution=planner_resolve(1,"",
+                cache_config,znc_script_explicit_choices(),0);
+            script_runtime_identity=_zag_str_concat("limit=",
+                _zag_i64_to_str(cache_config.script_memory_bytes));
+            script_runtime_identity=_zag_str_concat(script_runtime_identity,
+                _zag_str_concat("|capabilities=",_zag_i64_to_str(
+                    znc_script_capability_bits(cache_config))));
+            script_runtime_identity=_zag_str_concat(script_runtime_identity,
+                _zag_str_concat("|execution=",_zag_i64_to_str(
+                    znc_script_execution_policy(cache_resolution))));
+        }
+        // Dynamic mode changes call lowering and is part of the cached-blob
+        // identity. Static -l/-L/zag.mod inputs are intentionally absent:
+        // archive selection and relocation happen fresh below, after code/data
+        // substitution. --debug likewise derives DWARF from the current AST
+        // after writing a fresh ELF, and --hot only records current blob sizes.
+        // Neither is allowed to make cached code/data authoritative for those
+        // later steps.
+        let abi_text:[]u8="sysv-x86_64-zag-abi-v2|pipeline=ncodegen-regalloc-optimize-peephole-encode";
+        abi_text=_zag_str_concat(abi_text,"|dynamic=");
+        abi_text=_zag_str_concat(abi_text,_zag_i64_to_str(dynamic_mode));
+        let policy_text:[]u8=_zag_str_concat("profile=",profile_text);
+        policy_text=_zag_str_concat(policy_text,"|script_runtime=");
+        policy_text=_zag_str_concat(policy_text,script_runtime_identity);
+        policy_text=_zag_str_concat(policy_text,_zag_str_concat("|edition=",v2_project_edition(path)));
+        let cache_key:ForegroundCacheKey=fc_key_identity(compiler_identity,zag_version(),project_root,path,src,unit.modules,cache_semantic.graph,selected_cpu.cache_key,abi_text,policy_text);
+        let cached:ForegroundCacheResult=foreground_cache_load(project_root,cache_key,cache_config.max_cache_bytes);
+        if(cached.hit==1){free[u8](&code);free[u8](&data);code=cached.code;data=cached.data;cache_expected_code=zagd_content_hash(code.data[0..code.len]);cache_expected_data=zagd_content_hash(data.data[0..data.len]);cache_hit=1;}
         else{
-            free[u8](&cached.code);free[u8](&cached.data);let nerr:i32=0;let prog:ArrayList[Instr]=lower_program_mode_cpu(code_decls,&nerr,&data,dynamic_mode,selected_cpu.features.popcnt,selected_cpu.features.bmi1);
+            free[u8](&cached.code);free[u8](&cached.data);let nerr:i32=0;lower_calls=lower_calls+1;let prog:ArrayList[Instr]=lower_program_mode_cpu(code_decls,&nerr,&data,dynamic_mode,selected_cpu.features.popcnt,selected_cpu.features.bmi1,safety_checked,sanitize_memory,v2_edition);
             if(nerr>0){_zag_println("znc: build aborted — unsupported constructs (see messages above)");return 1;}
             let prog2:ArrayList[Instr]=regalloc(prog);let prog3:ArrayList[Instr]=optimize(prog2);let opt:ArrayList[Instr]=peephole(prog3);free[u8](&code);code=encode(opt);free[Instr](&prog);free[Instr](&prog2);free[Instr](&prog3);free[Instr](&opt);
-            cache_stored=foreground_cache_store(project_root,cache_key,code,data);
+            cache_stored=foreground_cache_store(project_root,cache_key,code,data,cache_config.max_cache_bytes);
         }
     }else{
-        let nerr:i32=0;let prog:ArrayList[Instr]=lower_program_mode_cpu(code_decls,&nerr,&data,dynamic_mode,selected_cpu.features.popcnt,selected_cpu.features.bmi1);if(nerr>0){_zag_println("znc: build aborted — unsupported constructs (see messages above)");return 1;}let prog2:ArrayList[Instr]=regalloc(prog);let prog3:ArrayList[Instr]=optimize(prog2);let opt:ArrayList[Instr]=peephole(prog3);free[u8](&code);code=encode(opt);free[Instr](&prog);free[Instr](&prog2);free[Instr](&prog3);free[Instr](&opt);
+        let nerr:i32=0;lower_calls=lower_calls+1;let prog:ArrayList[Instr]=lower_program_mode_cpu(code_decls,&nerr,&data,dynamic_mode,selected_cpu.features.popcnt,selected_cpu.features.bmi1,safety_checked,sanitize_memory,v2_edition);if(nerr>0){_zag_println("znc: build aborted — unsupported constructs (see messages above)");return 1;}let prog2:ArrayList[Instr]=regalloc(prog);let prog3:ArrayList[Instr]=optimize(prog2);let opt:ArrayList[Instr]=peephole(prog3);free[u8](&code);code=encode(opt);free[Instr](&prog);free[Instr](&prog2);free[Instr](&prog3);free[Instr](&opt);
     }
-    if(has_flag("--cache-report")==1){if(cache_hit==1){_zag_println("znc cache: HIT revalidated machine code and data; codegen skipped");}else if(cache_stored==1){_zag_println("znc cache: MISS stored machine code and data");}else{_zag_println("znc cache: MISS cache unavailable");}}
+    if(cache_hit==1&&(lower_calls!=0||zagd_hash_equal(cache_expected_code,zagd_content_hash(code.data[0..code.len]))==0||zagd_hash_equal(cache_expected_data,zagd_content_hash(data.data[0..data.len]))==0)){_zag_eprintln("znc: internal error: foreground cache hit did not preserve the validated code/data substitution boundary");return 1;}
+    if(cache_hit==0&&lower_calls!=1){_zag_eprintln("znc: internal error: foreground cache miss did not execute exactly one authoritative lowering");return 1;}
+    if(has_flag("--cache-report")==1){if(cache_hit==1){_zag_println(_zag_str_concat("znc cache: HIT revalidated machine code and data; codegen skipped; lowering_calls=0 payload_substituted=true code=",_zag_str_concat(fc_fields(cache_expected_code),_zag_str_concat(" data=",fc_fields(cache_expected_data)))));}else if(cache_stored==1){_zag_println(_zag_str_concat("znc cache: MISS stored machine code and data; lowering_calls=",_zag_i64_to_str(lower_calls)));}else{_zag_println(_zag_str_concat("znc cache: MISS cache unavailable; lowering_calls=",_zag_i64_to_str(lower_calls)));}}
+    if(has_flag("--profile-report")==1){
+        if(foreground_profile_use.valid==1){
+            _zag_println(_zag_str_concat("znc profile: METADATA-HIT hot_regions=",
+                _zag_str_concat(_zag_i64_to_str(foreground_profile_use.hot_regions as i64),
+                _zag_str_concat(" eligible_regions=",_zag_str_concat(_zag_i64_to_str(foreground_profile_use.eligible_regions as i64),
+                " codegen_effect=none cache_key_effect=none")))));
+        }else{
+            _zag_println(_zag_str_concat("znc profile: METADATA-MISS reason=",
+                _zag_str_concat(foreground_profile_use.reason," codegen_effect=none cache_key_effect=none")));
+        }
+    }
 
     let out: []u8 = out_flag();
     if (out.len == 0) { out = default_out(path); }
 
     if (dynamic_mode == 1) {
-        let dynamic_syms: ArrayList[[]u8] = znc_dynamic_extern_syms(code_decls);
+        let dynamic_syms: ArrayList[[]u8] = znc_dynamic_extern_syms(code_decls, v2_edition);
         if (dynamic_syms.len == 0) {
             _zag_eprintln("znc: --dynamic program declares no non-runtime extern symbols");
             return 1;

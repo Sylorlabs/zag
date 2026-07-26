@@ -8,28 +8,23 @@
 #   make install   — install znc to /usr/local/bin
 #   make clean     — remove generated artifacts (keeps the znc seed)
 
-.PHONY: all bootstrap znc zagd test test-zagd-product test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-analyzer test-hot-reload test-dynamic-abi test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-std-namespace \
+.PHONY: all bootstrap znc zagd test test-zagscript-release test-zagscript-master test-v1-compat test-zagd-product test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-analyzer test-hot-reload test-dynamic-abi test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-std-namespace \
         test-diagnostics test-tooling test-programs test-native test-abi-layout test-arm64 \
         test-differential-backends test-arm64-selfhost test-macos-arm64-release clean install
 
 # ── Primary target ────────────────────────────────────────────────────────────
-all: znc zagd
+all: bootstrap
 
 # ── Build the native compiler from seed ──────────────────────────────────────
-znc: selfhost/native/znc.zag
-	@echo "── rebuilding znc from seed (no cc/as/ld/libc) ──"
-	./znc selfhost/native/znc.zag -o znc.new
-	mv -f znc.new znc
-	@echo "   ./znc rebuilt"
+bootstrap: selfhost/native/znc.zag selfhost/zagd_daemon.zag
+	@echo "── rebuilding fixed-point znc + zagd (no cc/as/ld/libc) ──"
+	bash bootstrap.sh
 
-bootstrap: znc zagd
-	@echo "Bootstrap complete — seed: ./znc"
+# Keep the historical target names, but route both through the fixpoint
+# bootstrap so `make znc` cannot install an unproven stage-1 compiler.
+znc: bootstrap
 
-zagd: selfhost/zagd_daemon.zag znc
-	@echo "── building zagd (pure Zag, no libc) ──"
-	./znc selfhost/zagd_daemon.zag -o zagd.new --no-analyze --no-zagd
-	chmod +x zagd.new
-	mv -f zagd.new zagd
+zagd: bootstrap
 
 # ── Test targets ─────────────────────────────────────────────────────────────
 
@@ -96,6 +91,15 @@ test-programs:
 test-zagd-product: znc zagd
 	bash tests/run_zagd_product.sh
 
+test-zagscript-release:
+	bash tests/run_zagscript_release_gate.sh
+
+test-zagscript-master:
+	bash tests/run_zagscript_master_gate.sh
+
+test-v1-compat:
+	bash tests/run_v1_compatibility_gate.sh
+
 # Full native backend suite, Zag → ELF, no cc/as/ld/libc.
 test-native:
 	@echo "── native backend suite ──"
@@ -137,13 +141,19 @@ test: znc test-pure-tree test-authority test-bootstrap test-semantics test-typed
 install: znc zagd
 	install -m755 znc /usr/local/bin/znc
 	install -m755 zagd /usr/local/bin/zagd
+	install -m755 tools/zagd-user-service.sh /usr/local/bin/zagd-user-service
 	install -d /usr/local/lib/zag/std
+	install -d /usr/local/share/zag
+	install -m644 examples/zagd.conf /usr/local/share/zag/zagd.conf.example
 	install -m644 std/*.zag /usr/local/lib/zag/std/
 	install -m644 selfhost/std/process.zag /usr/local/lib/zag/std/process.zag
+	install -m644 selfhost/std/script_io.zag /usr/local/lib/zag/std/script_io.zag
+	install -m644 selfhost/std/script_input.zag /usr/local/lib/zag/std/script_input.zag
 	install -m644 selfhost/std/script_string_builder.zag /usr/local/lib/zag/std/script_string_builder.zag
 	install -m644 selfhost/std/script_list.zag /usr/local/lib/zag/std/script_list.zag
 	install -m644 selfhost/std/script_string.zag /usr/local/lib/zag/std/script_string.zag
-	@echo "Installed znc + zagd → /usr/local/bin and std → /usr/local/lib/zag/std"
+	install -m644 selfhost/std/script_path.zag /usr/local/lib/zag/std/script_path.zag
+	@echo "Installed znc + zagd + service control → /usr/local/bin, std → /usr/local/lib/zag/std, policy template → /usr/local/share/zag"
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 # Removes generated artifacts. Does NOT remove the znc seed binary.

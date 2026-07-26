@@ -149,13 +149,48 @@ fn zag_rt_eff(name: []u8) i32 {
 }
 
 fn builtin_eff(name: []u8) i32 {
+    // Volatile/MMIO intrinsics are explicitly unsafe effects.  They are not
+    // atomics and do not add synchronization; marking them Unsafe keeps them
+    // out of @pure and @realtime callers transitively.
+    if (@strEq(name, "@volatileLoad")) { return 32; }
+    if (@strEq(name, "@volatileStore")) { return 32; }
+    if (@strEq(name, "@volatileLoad8")) { return 32; }
+    if (@strEq(name, "@volatileStore8")) { return 32; }
+    if (@strEq(name, "@volatileLoad16")) { return 32; }
+    if (@strEq(name, "@volatileStore16")) { return 32; }
+    if (@strEq(name, "@volatileLoad32")) { return 32; }
+    if (@strEq(name, "@volatileStore32")) { return 32; }
+    // A legacy native fence does emit MFENCE, but it has no typed ordering or
+    // shared-lifetime model. It is still target-level machine control, so it
+    // cannot satisfy a @pure or @realtime effect contract by being untracked.
+    if (@strEq(name, "@memoryFence")) { return 32; }
+    // Atomic is currently a deliberately unsafe raw-pointer primitive.  Its
+    // machine atomicity is real, but it cannot establish shared-object
+    // lifetime, race freedom, or thread creation on its own.
+    if (@strEq(name, "@atomicExchange64")) { return 32; }
+    if (@strEq(name, "@atomicLoad64")) { return 32; }
+    if (@strEq(name, "@atomicStore64")) { return 32; }
+    if (@strEq(name, "@atomicCompareExchange64")) { return 32; }
+    if (@strEq(name, "@atomicFetchAdd64")) { return 32; }
+    if (@strEq(name, "@atomicFetchSub64")) { return 32; }
+    if (@strEq(name, "@atomicFetchAnd64")) { return 32; }
+    if (@strEq(name, "@atomicFetchOr64")) { return 32; }
+    if (@strEq(name, "@atomicFetchXor64")) { return 32; }
+    if (@strEq(name, "@atomicLoad64Order")) { return 32; }
+    if (@strEq(name, "@atomicStore64Order")) { return 32; }
+    // Prefetch consumes a raw pointer and emits target-level machine control.
+    // It is advisory, but the pointer validity/ownership contract is not
+    // represented by the v2 type system, so keep it behind Unsafe rather than
+    // allowing it in @pure or @realtime callers.
+    if (@strEq(name, "@prefetch")) { return 32; }
     if (@strEq(name, "zalloc"))     { return 1; }
     if (@strEq(name, "zfree"))      { return 1; }
     if (@strEq(name, "zalloc_i"))   { return 1; }
     if (@strEq(name, "zfree_i"))    { return 1; }
     if (@strEq(name, "lock"))       { return 8; }
     // cache-line control: the aligned allocator/deallocator genuinely touch the
-    // heap (Alloc); @prefetch / @cacheLineSize / @cacheAlign are pure hints (0).
+    // heap (Alloc); @cacheLineSize is a pure constant, while @prefetch is
+    // Unsafe because its raw-pointer validity contract is not modeled.
     if (@strEq(name, "@cacheAlignedAlloc")) { return 1; }
     if (@strEq(name, "@cacheAlignedFree"))  { return 1; }
     if (@strEq(name, "print_str"))  { return 4; }
@@ -176,6 +211,10 @@ fn annot_eff(a: []u8) i32 {
     if (@strEq(a, "@io"))    { return 4; }
     if (@strEq(a, "@lock"))  { return 8; }
     if (@strEq(a, "@unsafe")) { return 32; }
+    // A v2 C-ABI import crosses a foreign implementation boundary. Its body
+    // and transitive behavior are outside the Zag proof, so propagate Unsafe
+    // into callers rather than treating @cabi as metadata only.
+    if (@strEq(a, "@cabi")) { return 32; }
     return 0;
 }
 
@@ -710,22 +749,28 @@ fn is_fn_pty(t: []u8) i32 {
 }
 
 // The effects a fn-type's row annotation FORBIDS of any value stored into it.
-//   @realtime/@pure → {Alloc,IO,Lock}=13   @noalloc → 1   @total → 2
+//   @realtime/@pure → {Alloc,IO,Lock,Unsafe}=45   @noalloc → 1   @total → 2
 //   ! pure          → all (must be pure)   ! e (effect variable) → none
+// Keep this universe in lock-step with the bitmask actually inferred above:
+// Alloc, Panic, IO, Lock, Raises, Unsafe.  The older v1 `15` mask accidentally
+// omitted Raises and Unsafe, so an @realtime callback default could become
+// negative after subtracting bit 32 and !pure function values could launder an
+// Unsafe operation through a higher-order call.
+fn effect_universe() i32 { return 63; }
 fn row_forbidden(eff: []u8) i32 {
     if (eff.len == 0) { return 0; }
     if (eff[0] == '@') { return forbidden_bits(eff); }
-    if (@strEq(eff, "!pure")) { return 15; }
+    if (@strEq(eff, "!pure")) { return effect_universe(); }
     return 0;
 }
 
 // Worst-case latent effect of CALLING a fn value carrying this row, when no
 // more precise binding is known = all effects the row does not forbid.
 fn row_default_call(eff: []u8) i32 {
-    if (eff.len == 0) { return 15; }
-    if (eff[0] == '@') { return 15 - forbidden_bits(eff); }
+    if (eff.len == 0) { return effect_universe(); }
+    if (eff[0] == '@') { return effect_universe() - forbidden_bits(eff); }
     if (@strEq(eff, "!pure")) { return 0; }
-    return 15;
+    return effect_universe();
 }
 
 fn decl_fn_name(d: *Node) []u8 {
@@ -803,8 +848,17 @@ fn val_eff(n: *Node, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map
         else  => 0,
     };
 }
+// The storage-contract pass keeps the function value's current latent effect
+// in the low six bits and its declared forbidden row above it.  The ordinary
+// latent-effect walk stores only the low payload, so decoding here is safe for
+// both environments and prevents assignment from forgetting a local contract.
+fn store_effect_payload(value: i32) i32 { return value % 64; }
+fn store_effect_forbidden(value: i32) i32 { return value / 64; }
+fn store_effect_pack(payload: i32, forbidden: i32) i32 {
+    return (payload % 64) + ((forbidden % 64) * 64);
+}
 fn val_eff_id(nm: []u8, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map.StringMap[i32]) i32 {
-    if (map.has[i32](env.*, nm)) { return map.get[i32](env.*, nm) orelse 0; }
+    if (map.has[i32](env.*, nm)) { return store_effect_payload(map.get[i32](env.*, nm) orelse 0); }
     let b: i32 = builtin_eff(nm);
     if (b != 0) { return b; }
     if (find_fn(decls, nm) >= 0) { return map.get[i32](eff, nm) orelse 0; }  // named fn / hoisted closure
@@ -838,11 +892,26 @@ fn le_stmt(n: *Node, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map
         .if_     => |x| bor(bor(le_expr(x.cond, env, decls, eff, depth), le_body(x.then_body, env, decls, eff, depth)), le_body(x.els_body, env, decls, eff, depth)),
         .while_  => |w| bor(le_expr(w.cond, env, decls, eff, depth), le_body(w.body, env, decls, eff, depth)),
         .unsafe_ => |u| bor(32, le_body(u.body, env, decls, eff, depth)),
-        .assign  => |a| bor(le_expr(a.target, env, decls, eff, depth), le_expr(a.expr, env, decls, eff, depth)),
+        .assign  => |a| le_assign(a, env, decls, eff, depth),
         .switch_ => |sw| bor(le_expr(sw.subject, env, decls, eff, depth), le_switch(sw, env, decls, eff, depth)),
         .estmt   => |e| le_expr(e.expr, env, decls, eff, depth),
         else     => 0,
     };
+}
+// Function-valued locals are mutable.  Preserve the latent effect of their
+// replacement so an indirect call after `op = value` cannot retain the stale
+// effect row from the initializer and launder Unsafe through @pure/@realtime.
+fn le_assign(a: Assign, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map.StringMap[i32], depth: i32) i32 {
+    let acc: i32 = bor(le_expr(a.target, env, decls, eff, depth), le_expr(a.expr, env, decls, eff, depth));
+    switch (a.target.*) {
+        .id => |id| {
+            if (map.has[i32](env.*, id.name)) {
+                map.put[i32](env, id.name, val_eff(a.expr, env, decls, eff));
+            }
+        }
+        else => { }
+    }
+    return acc;
 }
 fn le_ret(r: Return, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map.StringMap[i32], depth: i32) i32 {
     if (r.has_expr == 1) { return le_expr(r.expr, env, decls, eff, depth); }
@@ -1045,7 +1114,7 @@ fn store_stmt(n: *Node, env: *map.StringMap[i32], f: FnDecl, decls: ArrayList[*N
     return switch (n.*) {
         .let_    => |l| store_let(l, env, decls, eff, src, file),
         .ret     => |r| store_ret(r, env, f, decls, eff, src, file),
-        .assign  => |a| store_expr(a.expr, env, decls, eff, src, file),
+        .assign  => |a| store_assign(a, env, decls, eff, src, file),
         .estmt   => |e| store_expr(e.expr, env, decls, eff, src, file),
         .if_     => |x| store_body(x.then_body, env, f, decls, eff, src, file) + store_body(x.els_body, env, f, decls, eff, src, file),
         .while_  => |w| store_body(w.body, env, f, decls, eff, src, file),
@@ -1071,22 +1140,42 @@ fn store_let(l: Let, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map
         if (forb != 0) {
             acc = acc + contract_check(_zag_str_concat("storing into typed local `", _zag_str_concat(l.name, "` breaks its effect contract")), forb, val_eff(l.expr, env, decls, eff), src, file);
         }
-        // track the local so later checks resolve it (bound ⇒ contract default)
-        if (l.eff.len > 0) { map.put[i32](env, l.name, row_default_call(l.eff)); }
-        else { map.put[i32](env, l.name, val_eff(l.expr, env, decls, eff)); }
+        // Retain both the current value effect and the declared row: a later
+        // assignment must be checked against the same local contract.
+        map.put[i32](env, l.name, store_effect_pack(val_eff(l.expr, env, decls, eff), forb));
+    }
+    return acc;
+}
+fn store_assign(a: Assign, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map.StringMap[i32], src: []u8, file: []u8) i32 {
+    let acc: i32 = store_expr(a.expr, env, decls, eff, src, file);
+    switch (a.target.*) {
+        .id => |id| {
+            if (map.has[i32](env.*, id.name)) {
+                let prior: i32 = map.get[i32](env.*, id.name) orelse 0;
+                let forb: i32 = store_effect_forbidden(prior);
+                let value: i32 = val_eff(a.expr, env, decls, eff);
+                if (forb != 0) {
+                    acc = acc + contract_check(_zag_str_concat("assigning typed local `", _zag_str_concat(id.name, "` breaks its effect contract")), forb, value, src, file);
+                }
+                map.put[i32](env, id.name, store_effect_pack(value, forb));
+            }
+        }
+        else => { }
     }
     return acc;
 }
 fn store_ret(r: Return, env: *map.StringMap[i32], f: FnDecl, decls: ArrayList[*Node], eff: map.StringMap[i32], src: []u8, file: []u8) i32 {
     if (r.has_expr == 0) { return 0; }
     let acc: i32 = store_expr(r.expr, env, decls, eff, src, file);
-    // Escape check: returning a capturing closure would dangle (env lives on the stack).
+    // Only pointer captures retain the defining frame. Scalar captures are
+    // copied into the native heap environment and are governed by the v2
+    // ownership pass (`close`/owned return) after this capability pass.
     if (ret_escapes_capturing(r.expr, decls) == 1) {
         diag_emit("E0006",
             _zag_str_concat("capturing closure escapes function `", _zag_str_concat(f.name, "`")),
             file, f.line, 1, f.name.len,
-            "the captured environment lives on the stack; returning the closure causes a dangling reference",
-            "heap closures (Phase-1) are not yet supported — restructure to avoid returning the closure",
+            "a pointer capture retains a defining-frame address; returning the closure would dangle",
+            "capture a scalar by value or keep the pointer callback within the defining frame",
             src);
         acc = acc + 1;
     }
@@ -1106,7 +1195,16 @@ fn ret_escapes_capturing(n: *Node, decls: ArrayList[*Node]) i32 {
 fn id_caps(nm: []u8, decls: ArrayList[*Node]) i32 {
     let fi: i32 = find_fn(decls, nm);
     if (fi < 0) { return 0; }
-    if (fn_caps(get[*Node](decls, fi)) > 0) { return 1; }
+    switch (get[*Node](decls, fi).*) {
+        .fn_decl => |f| {
+            let i: i32 = 0;
+            while (i < f.cap_names.len) {
+                if (f.cap_names[i] == '*') { return 1; }
+                i = i + 1;
+            }
+        }
+        else => { }
+    }
     return 0;
 }
 fn store_expr(n: *Node, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map.StringMap[i32], src: []u8, file: []u8) i32 {

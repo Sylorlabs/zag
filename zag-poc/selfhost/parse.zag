@@ -8,6 +8,7 @@
 @import("ast.zag")
 @import("lex.zag")
 @import("diag.zag")
+@import("script_syntax.zag")
 
 struct Parser {
     toks:     ArrayList[Token],
@@ -17,6 +18,7 @@ struct Parser {
     fn_eff:   []u8,               // effect row of the most recently parsed fn type ("" if none/non-fn)
     consts:   ArrayList[[]u8],    // top-level `const` names → desugared to nullary fns; bare refs auto-call
     unsafe_next: i32,              // top-level `unsafe fn` marker consumed by parse_fn
+    pipe_op: i32,               // allow `|` as an operator when parsing expressions
     origin:   []u8,                // module currently being parsed
 }
 
@@ -236,7 +238,7 @@ fn parse_bin(p: *Parser, min: i32) *Node {
         // `catch |e|`, switch arms, closure lists) consumes its pipes before
         // reaching here, so this is unambiguous.
         let is_op: bool = at_k(p, Tk.Op);
-        if (!is_op && at_k(p, Tk.Pipe)) { is_op = true; }
+        if (!is_op && p.*.pipe_op == 1 && at_k(p, Tk.Pipe)) { is_op = true; }
         if (is_op) {
             let op: []u8 = cur(p).val;
             let prec: i32 = op_prec(op);
@@ -382,7 +384,12 @@ fn parse_closure(p: *Parser) *Node {
         _zag_exit(1);
     }
     let body: ArrayList[*Node] = parse_block(p);
-    let name: []u8 = _zag_str_concat("__clos_", _zag_i64_to_str(p.*.cctr as i64));
+    // Capturing closures carry an owned heap environment in native lowering.
+    // The distinct private prefix lets the v2 ownership pass require `close`
+    // without imposing it on ordinary captureless function values.
+    let clos_prefix: []u8 = "__clos_";
+    if (ncaps > 0) { clos_prefix = "__clos_cap_"; }
+    let name: []u8 = _zag_str_concat(clos_prefix, _zag_i64_to_str(p.*.cctr as i64));
     p.*.cctr = p.*.cctr + 1;
     let fd: *Node = new(Node{ .fn_decl = FnDecl{
         .name = name, .tparams = make[[]u8](1), .params = params, .ret = ret,
@@ -508,7 +515,7 @@ fn parse_const(p: *Parser) *Node {
 
 // forward decl: parse_for desugars a `for` into let+while and is mutually
 // recursive with parse_block (a for body is itself a block).
-fn parse_for(p: *Parser) ArrayList[*Node];
+fn parse_for(p: *Parser, script_collection: i32) ArrayList[*Node];
 
 fn parse_block(p: *Parser) ArrayList[*Node] {
     let _o: Token = adv(p);  // {
@@ -517,7 +524,7 @@ fn parse_block(p: *Parser) ArrayList[*Node] {
         // `for` is desugared to `let`+`while` and expands to MULTIPLE statements,
         // so it's handled here (parse_stmt returns a single node).
         if (at_k(p, Tk.KwFor)) {
-            let ex: ArrayList[*Node] = parse_for(p);
+            let ex: ArrayList[*Node] = parse_for(p, 0);
             let ei: i32 = 0;
             while (ei < len[*Node](ex)) { push[*Node](&stmts, get[*Node](ex, ei)); ei = ei + 1; }
         } else {
@@ -532,10 +539,13 @@ fn parse_block(p: *Parser) ArrayList[*Node] {
 //   for (lo..hi) |i| { B }   →   let i:i64 = lo;  while (i < hi)  { B; i = i+1; }
 //   for (xs)     |x| { B }   →   let __fiN:i64=0; while (__fiN < xs.len) { let x = xs[__fiN]; B; __fiN=__fiN+1; }
 // Returns the desugared statement list. No new AST node / no codegen change.
-fn parse_for(p: *Parser) ArrayList[*Node] {
+fn parse_for(p: *Parser, script_collection: i32) ArrayList[*Node] {
     let _f: Token = adv(p);   // for
     let _o: Token = adv(p);   // (
+    let old_pipe_op: i32 = p.*.pipe_op;
+    p.*.pipe_op = 0;
     let first: *Node = parse_expr(p);
+    p.*.pipe_op = old_pipe_op;
     let is_range: i32 = 0;
     let hi: *Node = first;
     if (at_k(p, Tk.DotDot)) {
@@ -573,12 +583,25 @@ fn parse_for(p: *Parser) ArrayList[*Node] {
         push[*Node](&out, mk_let(idx, "i64", 1, 1, mk_int("0")));
         let wbody: ArrayList[*Node] = make[*Node](len[*Node](body) + 2);
         if (has_cap == 1) {
-            push[*Node](&wbody, mk_let(cap, "", 0, 1, mk_index(first, mk_ident(idx))));
+            if (script_collection == 1) {
+                let item_args: ArrayList[*Node] = make[*Node](2);
+                push[*Node](&item_args, first);
+                push[*Node](&item_args, mk_ident(idx));
+                push[*Node](&wbody, mk_let(cap, "", 0, 1, mk_call(mk_ident("item_at"), item_args)));
+            } else {
+                push[*Node](&wbody, mk_let(cap, "", 0, 1, mk_index(first, mk_ident(idx))));
+            }
         }
         let bi: i32 = 0;
         while (bi < len[*Node](body)) { push[*Node](&wbody, get[*Node](body, bi)); bi = bi + 1; }
         push[*Node](&wbody, mk_assign(mk_ident(idx), mk_bin("+", mk_ident(idx), mk_int("1"))));
-        push[*Node](&out, mk_while(mk_bin("<", mk_ident(idx), mk_field(first, "len")), wbody));
+        if (script_collection == 1) {
+            let len_args: ArrayList[*Node] = make[*Node](1);
+            push[*Node](&len_args, first);
+            push[*Node](&out, mk_while(mk_bin("<", mk_ident(idx), mk_call(mk_ident("script_list_len"), len_args)), wbody));
+        } else {
+            push[*Node](&out, mk_while(mk_bin("<", mk_ident(idx), mk_field(first, "len")), wbody));
+        }
     }
     return out;
 }
@@ -667,7 +690,7 @@ fn parse_stmt(p: *Parser) *Node {
             has_init = 1;
         }
         eat_semi(p);
-        return new(Node{ .let_ = Let{ .name = name, .dty = dty, .has_dty = has_dty, .has_init = has_init, .expr = e, .eff = leff, .calign = calign } });
+        return new(Node{ .let_ = Let{ .name = name, .dty = dty, .has_dty = has_dty, .has_init = has_init, .expr = e, .eff = leff, .calign = calign, .is_global = 0 } });
     }
     if (at_k(p, Tk.KwReturn)) {
         let _t: Token = adv(p);
@@ -745,6 +768,36 @@ fn parse_stmt(p: *Parser) *Node {
     }
     eat_semi(p);
     return mk_estmt(e);
+}
+
+// File-scope storage is deliberately a distinct declaration.  It is only
+// reached from parse_file's `global let` branch; ordinary `let` remains a
+// statement and strict top-level `let` continues to fail closed.
+fn parse_global_let(p: *Parser) *Node {
+    let _global: Token = adv(p);
+    if (!at_k(p, Tk.KwLet)) {
+        diag_emit("E0204", "global declaration must use `global let name: Type;`", "", cur(p).line, cur(p).col, cur(p).val.len, "global storage must declare an explicit type", "write `global let name: Type;`", "");
+        _zag_exit(1);
+    }
+    let _let: Token = adv(p);
+    let name: []u8 = adv(p).val;
+    if (!at_k(p, Tk.Colon)) {
+        diag_emit("E0204", "global storage requires an explicit type", "", cur(p).line, cur(p).col, cur(p).val.len, "global inference and dynamic initialization have no v2 lifetime contract", "write `global let name: Type;`", "");
+        _zag_exit(1);
+    }
+    let _colon: Token = adv(p);
+    p.*.fn_eff = "";
+    let dty: []u8 = parse_type(p);
+    let leff: []u8 = p.*.fn_eff;
+    let has_init: i32 = 0;
+    let e: *Node = mk_ident("");
+    if (at_op(p, "=")) {
+        let _eq: Token = adv(p);
+        e = parse_expr(p);
+        has_init = 1;
+    }
+    eat_semi(p);
+    return new(Node{ .let_ = Let{ .name = name, .dty = dty, .has_dty = 1, .has_init = has_init, .expr = e, .eff = leff, .calign = 0, .is_global = 1 } });
 }
 
 // ── declarations ────────────────────────────────────────────────────────────
@@ -866,7 +919,7 @@ fn parse_struct(p: *Parser, is_pub: i32) *Node {
         let _r: Token = adv(p);
     }
     let fields: ArrayList[Param] = parse_field_list(p);
-    return new(Node{ .struct_ = StructDecl{ .name = name, .fields = fields, .tparams = tparams, .is_pub = is_pub } });
+    return new(Node{ .struct_ = StructDecl{ .name = name, .fields = fields, .tparams = tparams, .is_pub = is_pub, .origin = p.*.origin } });
 }
 
 fn parse_union(p: *Parser) *Node {
@@ -1311,7 +1364,7 @@ fn q_rewrite_stmt(n: *Node, names: ArrayList[[]u8], qual: []u8, locals: *ArrayLi
         .let_ => |l| {
             // the initializer sees the OUTER scope; the binding starts after it.
             q_rewrite_expr(l.expr, names, qual, locals);
-            n.* = Node{ .let_ = Let{ .name = l.name, .dty = q_subst_type(l.dty, names, qual), .has_dty = l.has_dty, .has_init = l.has_init, .expr = l.expr, .eff = l.eff, .calign = l.calign } };
+            n.* = Node{ .let_ = Let{ .name = l.name, .dty = q_subst_type(l.dty, names, qual), .has_dty = l.has_dty, .has_init = l.has_init, .expr = l.expr, .eff = l.eff, .calign = l.calign, .is_global = l.is_global } };
             push[[]u8](locals, l.name);
         }
         .ret => |r| { if (r.has_expr == 1) { q_rewrite_expr(r.expr, names, qual, locals); } }
@@ -1445,14 +1498,16 @@ fn qualify_decl(d: *Node, names: ArrayList[[]u8], qual: []u8) *Node {
                 .cap_names = f.cap_names,
                 .cap_types = f.cap_types,
                 .line = f.line,
-                .is_pub = f.is_pub } });
+                .is_pub = f.is_pub,
+                .origin = f.origin } });
         }
         .struct_ => |s| {
             return new(Node{ .struct_ = StructDecl{
                 .name = qpref(qual, s.name),
                 .fields = qualify_params(s.fields, names, qual),
                 .tparams = s.tparams,
-                .is_pub = s.is_pub } });
+                .is_pub = s.is_pub,
+                .origin = s.origin } });
         }
         .enum_ => |e| {
             return new(Node{ .enum_ = EnumDecl{ .name = qpref(qual, e.name), .members = e.members } });
@@ -1686,13 +1741,21 @@ fn resolve_import_path(relpath: []u8, base_dir: []u8) []u8 {
         // not have that tree and fall through to their bundled standard library.
         let bundled: []u8 = normalize_import_path(join_path(join_path(exe_dir,"std"),std_name));
         if (_zag_file_exists(bundled) == 1) { return bundled; }
-        if (@strEq(std_name, "process.zag") || @strEq(std_name, "script_io.zag") || @strEq(std_name, "script_string_builder.zag") ||
+        if (@strEq(std_name, "process.zag") || @strEq(std_name, "script_io.zag") || @strEq(std_name, "script_input.zag") || @strEq(std_name, "script_string_builder.zag") ||
             @strEq(std_name, "script_list.zag") || @strEq(std_name, "script_string.zag") || @strEq(std_name, "script_path.zag")) {
             let selfhost_module: []u8 = normalize_import_path(join_path(join_path(exe_dir, "selfhost/std"), std_name));
             if (_zag_file_exists(selfhost_module) == 1) { return selfhost_module; }
             let source_module: []u8 = normalize_import_path(join_path("selfhost/std", std_name));
             if (_zag_file_exists(source_module) == 1) { return source_module; }
         }
+        // A staged or relocatable installation uses <prefix>/bin/znc and
+        // <prefix>/lib/zag/std. This is checked before the conventional fixed
+        // prefix so packaging tests and alternate prefixes do not need to
+        // mutate /usr/local merely to prove that every installed Script module
+        // resolves.
+        let install_prefix: []u8 = dir_of(exe_dir);
+        let prefix_std: []u8 = normalize_import_path(join_path(join_path(install_prefix, "lib/zag/std"), std_name));
+        if (_zag_file_exists(prefix_std) == 1) { return prefix_std; }
         let installed: []u8 = join_path("/usr/local/lib/zag/std",std_name);
         if (_zag_file_exists(installed) == 1) { return installed; }
         return bundled;
@@ -1899,6 +1962,10 @@ fn script_bind_expr(n: *Node, decls: ArrayList[*Node]) void {
                 if (@strEq(id.name, "script_alloc_used")) { bind = 2; }
                 if (@strEq(id.name, "print")) { bind = 3; }
                 if (@strEq(id.name, "println")) { bind = 4; }
+                // `say` is the beginner-facing spelling for one value followed
+                // by a newline. It lowers to the same ordinary runtime
+                // declaration as println, and a user-declared `say` still wins.
+                if (@strEq(id.name, "say")) { bind = 4; }
                 if (@strEq(id.name, "read_file")) { bind = 5; }
                 if (@strEq(id.name, "write_file")) { bind = 6; }
                 if (@strEq(id.name, "args_len")) { bind = 7; }
@@ -1913,6 +1980,15 @@ fn script_bind_expr(n: *Node, decls: ArrayList[*Node]) void {
                 if (@strEq(id.name, "path_basename")) { bind = 16; }
                 if (@strEq(id.name, "path_dirname")) { bind = 17; }
                 if (@strEq(id.name, "path_extension")) { bind = 18; }
+                // Beginner-facing collection names. These are Script-root
+                // conveniences only; strict Zag retains the explicit generic
+                // ScriptList APIs and ordinary user declarations still win.
+                if (@strEq(id.name, "append")) { bind = 19; }
+                if (@strEq(id.name, "length")) { bind = 20; }
+                if (@strEq(id.name, "len")) { bind = 20; }
+                if (@strEq(id.name, "item_at")) { bind = 21; }
+                if (@strEq(id.name, "input")) { bind = 22; }
+                if (@strEq(id.name, "env")) { bind = 23; }
                 if (bind > 0 && script_has_user_fn(decls, id.name) == 1) { bind = 0; }
             } else => { } }
             let i: i32 = 0;
@@ -1938,6 +2014,29 @@ fn script_bind_expr(n: *Node, decls: ArrayList[*Node]) void {
                 else if (bind == 16) { n.* = mk_call(mk_ident("script_path_basename"), args).*; }
                 else if (bind == 17) { n.* = mk_call(mk_ident("script_path_dirname"), args).*; }
                 else if (bind == 18) { n.* = mk_call(mk_ident("script_path_extension"), args).*; }
+                else if (bind == 19) {
+                    if (len[*Node](c.args) != 2) { _zag_eprintln("Zag Script append expects a list and one value"); _zag_exit(1); }
+                    let append_args: ArrayList[*Node] = make[*Node](2);
+                    push[*Node](&append_args, mk_un("&", get[*Node](c.args, 0)));
+                    push[*Node](&append_args, get[*Node](c.args, 1));
+                    n.* = mk_call(mk_ident("script_list_append"), append_args).*;
+                }
+                else if (bind == 20) {
+                    if (len[*Node](c.args) != 1) { _zag_eprintln("Zag Script length expects one collection"); _zag_exit(1); }
+                    n.* = mk_call(mk_ident("script_list_len"), c.args).*;
+                }
+                else if (bind == 21) {
+                    if (len[*Node](c.args) != 2) { _zag_eprintln("Zag Script item_at expects a collection and an index"); _zag_exit(1); }
+                    n.* = mk_call(mk_ident("script_list_get"), c.args).*;
+                }
+                else if (bind == 22) {
+                    if (len[*Node](c.args) != 1) { _zag_eprintln("Zag Script input expects one prompt"); _zag_exit(1); }
+                    n.* = mk_call(mk_ident("script_input"), args).*;
+                }
+                else if (bind == 23) {
+                    if (len[*Node](c.args) != 1) { _zag_eprintln("Zag Script env expects one variable name"); _zag_exit(1); }
+                    n.* = mk_call(mk_ident("_zag_script_env_get"), args).*;
+                }
                 else {
                     let list_arity: i32 = len[*Node](c.args);
                     if (list_arity < 1 || list_arity > 4) {
@@ -2008,8 +2107,9 @@ fn script_try_operation_body(body:ArrayList[*Node])[]u8{let i:i32=0;while(i<body
 // applied once over all declarations afterward.
 // `loading` is the current in-progress import stack for circular detection.
 fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayList[*Node], aliases: *ArrayList[[]u8], loading: *ArrayList[[]u8], is_root: i32, root_profile: *i32, current_path:[]u8, modules:*ArrayList[ResolvedModule], imports:*ArrayList[ResolvedImport]) void {
-    let toks: ArrayList[Token] = lex(src);
-    let p: Parser = Parser{ .toks = toks, .i = 0, .closures = make[*Node](2), .cctr = 0, .fn_eff = "", .consts = make[[]u8](4), .unsafe_next = 0, .origin = current_path };
+    let parse_src:[]u8=script_syntax_normalize(src);
+    let toks: ArrayList[Token] = lex(parse_src);
+    let p: Parser = Parser{ .toks = toks, .i = 0, .closures = make[*Node](2), .cctr = 0, .fn_eff = "", .consts = make[[]u8](4), .unsafe_next = 0, .pipe_op = 1, .origin = current_path };
     let script_seen: i32 = 0;
     let executable_seen: i32 = 0;
     let script_body: ArrayList[*Node] = make[*Node](8);
@@ -2017,7 +2117,7 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
         if (at_k(&p, Tk.Ident) && @strEq(cur(&p).val, "script")) {
             let st: Token = adv(&p);
             if (!at_k(&p, Tk.Semi)) {
-                diag_emit("E0012", "script profile declaration must be `script;`", "", st.line, st.col, 6, "the script declaration is a file-level marker", "add `;` after `script`", src);
+                diag_emit("E0012", "script profile declaration must be `script;`", "", st.line, st.col, 6, "the script declaration is a file-level marker", "add `;` after `script`", parse_src);
                 _zag_exit(1);
             }
             let _semi: Token = adv(&p);
@@ -2087,12 +2187,47 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
             push[*Node](out, parse_const(&p));
         } else if (at_k(&p, Tk.Annot) || at_k(&p, Tk.KwExtern) || at_k(&p, Tk.KwFn)) {
             push[*Node](out, parse_fn(&p, 0));
+        } else if (at_k(&p, Tk.KwGlobal)) {
+            if (is_root == 0) {
+                diag_emit("E0204", "global storage is permitted only in the root compilation unit", "", cur(&p).line, cur(&p).col, cur(&p).val.len, "imported modules have no static initialization or lifetime contract", "move the global declaration to the root module", src);
+                _zag_exit(1);
+            }
+            push[*Node](out, parse_global_let(&p));
+        } else if (at_k(&p, Tk.KwLet) && script_seen == 0) {
+            // A top-level `let` would require source-level static storage,
+            // initialization ordering, and lifetime/provenance rules.  The
+            // native BSS is compiler-private runtime state, not a user global
+            // namespace, so fail closed rather than silently treating this as
+            // a local or Script statement in a strict module.
+            diag_emit("E0204",
+                "top-level mutable globals require an explicit v2 global lifetime contract",
+                "", cur(&p).line, cur(&p).col, cur(&p).val.len,
+                "strict Zag modules have no user-global storage lowering",
+                "move the value into a function or use an explicit future global API",
+                src);
+            _zag_exit(1);
         } else if (script_seen == 1) {
             // Imported script modules retain their ordinary declarations but
             // never contribute executable body statements to the root.
             executable_seen = 1;
-            let stmt: *Node = parse_stmt(&p);
-            if (is_root == 1) { push[*Node](&script_body, stmt); }
+            // A canonical `for` expands to an index binding plus a while loop,
+            // so it cannot travel through parse_stmt's single-node result.
+            // Script top level must use the same expansion path as a function
+            // block or ownership analysis would see `for(...)` as an unknown
+            // ordinary call.
+            if (at_k(&p, Tk.KwFor)) {
+                let expanded: ArrayList[*Node] = parse_for(&p, 1);
+                if (is_root == 1) {
+                    let ei: i32 = 0;
+                    while (ei < len[*Node](expanded)) {
+                        push[*Node](&script_body, get[*Node](expanded, ei));
+                        ei = ei + 1;
+                    }
+                }
+            } else {
+                let stmt: *Node = parse_stmt(&p);
+                if (is_root == 1) { push[*Node](&script_body, stmt); }
+            }
         } else {
             diag_emit("E0010",
                 _zag_str_concat("unexpected token at top level: `", _zag_str_concat(cur(&p).val, "`")),
@@ -2178,12 +2313,35 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
                     seen, out, aliases, loading, modules, imports);
             }
         }
+        if (script_has_user_fn(out.*, "input") == 0) {
+            let wants_input:i32=0;let input_i:i32=0;let input_needle:[]u8="input(";
+            while(input_i+input_needle.len<=src.len&&wants_input==0){if(@strEq(src[input_i..input_i+input_needle.len],input_needle)){wants_input=1;}input_i=input_i+1;}
+            if(wants_input==1){load_module(resolve_import_path("std:script_input",base_dir),"",0,seen,out,aliases,loading,modules,imports);}
+        }
         if (script_has_user_fn(out.*, "list") == 0) {
             let wants_list: i32 = 0;
             let li: i32 = 0;
             let list_needle: []u8 = "list(";
             while (li + list_needle.len <= src.len && wants_list == 0) {
                 if (@strEq(src[li..li + list_needle.len], list_needle)) { wants_list = 1; }
+                li = li + 1;
+            }
+            let beginner_list_needle: []u8 = "append(";
+            li = 0;
+            while (li + beginner_list_needle.len <= src.len && wants_list == 0) {
+                if (@strEq(src[li..li + beginner_list_needle.len], beginner_list_needle)) { wants_list = 1; }
+                li = li + 1;
+            }
+            let beginner_length_needle: []u8 = "length(";
+            li = 0;
+            while (li + beginner_length_needle.len <= src.len && wants_list == 0) {
+                if (@strEq(src[li..li + beginner_length_needle.len], beginner_length_needle)) { wants_list = 1; }
+                li = li + 1;
+            }
+            let beginner_item_needle: []u8 = "item_at(";
+            li = 0;
+            while (li + beginner_item_needle.len <= src.len && wants_list == 0) {
+                if (@strEq(src[li..li + beginner_item_needle.len], beginner_item_needle)) { wants_list = 1; }
                 li = li + 1;
             }
             if (wants_list == 1) {
@@ -2274,8 +2432,14 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
             .cap_types = "", .line = 0, .is_pub = 0 } }));
 
         let wrapper: ArrayList[*Node] = make[*Node](5);
-        let init_args: ArrayList[*Node] = make[*Node](1);
+        // Compiler-only ScriptContext ABI:
+        //   memory limit, capability bits, validated execution-policy bits.
+        // The foreground driver replaces these defaults with project/CLI
+        // policy after parsing. They are never source-visible declarations.
+        let init_args: ArrayList[*Node] = make[*Node](3);
         push[*Node](&init_args, mk_int("67108864"));
+        push[*Node](&init_args, mk_int("7"));
+        push[*Node](&init_args, mk_int("16843009"));
         push[*Node](&wrapper, mk_let("__zag_script_context", "*opaque", 1, 1,
             mk_call(mk_ident("_zag_script_context_init"), init_args)));
         let body_args: ArrayList[*Node] = make[*Node](1);
@@ -2339,9 +2503,71 @@ fn compilation_unit_set_script_memory_limit(unit: *CompilationUnit, limit_bytes:
                         .let_ => |binding| { switch (binding.expr.*) {
                             .call => |call| { switch (call.callee.*) {
                                 .id => |id| {
-                                    if (@strEq(id.name, "_zag_script_context_init") && len[*Node](call.args) == 1) {
+                                    if (@strEq(id.name, "_zag_script_context_init") && len[*Node](call.args) == 3) {
                                         let arg: *Node = get[*Node](call.args, 0);
                                         arg.* = mk_int(text).*;
+                                        return 0;
+                                    }
+                                }
+                                else => { }
+                            } }
+                            else => { }
+                        } }
+                        else => { }
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Packed policy fields are byte-sized ids:
+// allocator | cpu<<8 | device<<16 | layout<<24.
+// Allocator ids 1 (one process-lifetime arena) and 2 (bounded per-allocation
+// heap with deterministic shutdown reclamation), device=CPU,
+// layout=compiler-owned, and generic/native x86 CPU policies are implementable.
+// Keeping this
+// mutation on the compiler-owned root wrapper ensures imported modules receive
+// neither hidden context nor policy changes.
+fn script_execution_policy_bits(allocator_id:i32, cpu_id:i32,
+    device_id:i32, layout_id:i32) i64 {
+    return (allocator_id as i64) + ((cpu_id as i64) * 256) +
+        ((device_id as i64) * 65536) + ((layout_id as i64) * 16777216);
+}
+
+fn script_execution_policy_supported(bits:i64) i32 {
+    if (bits == script_execution_policy_bits(1, 1, 1, 1)) { return 1; }
+    if (bits == script_execution_policy_bits(1, 2, 1, 1)) { return 1; }
+    if (bits == script_execution_policy_bits(2, 1, 1, 1)) { return 1; }
+    if (bits == script_execution_policy_bits(2, 2, 1, 1)) { return 1; }
+    return 0;
+}
+
+fn compilation_unit_set_script_runtime_policy(unit:*CompilationUnit,
+    capability_bits:i64, execution_policy_bits:i64) i32 {
+    if (unit.*.profile != ModuleProfile.script || capability_bits < 0 ||
+        capability_bits > 15 ||
+        script_execution_policy_supported(execution_policy_bits) == 0) { return 1; }
+    let i:i32 = 0;
+    while (i < len[*Node](unit.*.decls)) {
+        switch (get[*Node](unit.*.decls, i).*) {
+            .fn_decl => |f| {
+                if (@strEq(f.name, "main") && len[*Node](f.body) > 0) {
+                    switch (get[*Node](f.body, 0).*) {
+                        .let_ => |binding| { switch (binding.expr.*) {
+                            .call => |call| { switch (call.callee.*) {
+                                .id => |id| {
+                                    if (@strEq(id.name, "_zag_script_context_init") &&
+                                        len[*Node](call.args) == 3) {
+                                        let capabilities:*Node = get[*Node](call.args, 1);
+                                        capabilities.* =
+                                            mk_int(_zag_i64_to_str(capability_bits)).*;
+                                        let execution:*Node = get[*Node](call.args, 2);
+                                        execution.* =
+                                            mk_int(_zag_i64_to_str(execution_policy_bits)).*;
                                         return 0;
                                     }
                                 }

@@ -38,11 +38,24 @@ else
 fi
 
 if [ -f docs/V2_SAFETY_TOOLING.md ] && \
-   rg -q 'rejects the proposed v2' docs/V2_SAFETY_TOOLING.md && \
+   rg -q 'partial `--sanitize=memory` mode are' docs/V2_SAFETY_TOOLING.md && \
+   rg -q 'Other sanitizer modes remain rejected' docs/V2_SAFETY_TOOLING.md && \
+   rg -q 'does not yet provide red zones' docs/V2_SAFETY_TOOLING.md && \
+   rg -q '`--sanitize=undefined` is not implemented and is rejected' docs/V2_SAFETY_TOOLING.md && \
+   rg -q '`--sanitize=thread` is not implemented and is rejected' docs/V2_SAFETY_TOOLING.md && \
+   rg -q '`--safety=release` is not implemented and is rejected' docs/V2_SAFETY_TOOLING.md && \
    rg -q 'Current status remains unsupported' docs/V2_SAFETY_TOOLING.md; then
-  ok "safety-tooling document is explicit about unsupported status"
+  ok "safety-tooling document scopes partial memory sanitizer and unsupported modes"
 else
   bad "safety-tooling document is missing or overclaims implementation"
+fi
+
+if rg -q 'raw-pointer BSS globals' docs/V2_IMPLEMENTATION_PLAN.md && \
+   rg -q 'raw-pointer globals' docs/V2_FINAL_VERIFICATION.md && \
+   rg -U -q 'raw-pointer\s+global cell above is an exception' docs/V2_MEMORY_MODEL.md; then
+  ok "v2 memory documents retain the narrow pointer-global boundary"
+else
+  bad "v2 memory documents are stale about supported pointer globals"
 fi
 
 if [ -f docs/V2_SUPPORT_MATRIX.generated.md ] && \
@@ -63,9 +76,9 @@ fi
 if [ -f docs/V2_FFI_GUIDE.md ] && [ -f docs/V2_CONCURRENCY_GUIDE.md ] && \
    [ -f docs/V2_ALLOCATOR_GUIDE.md ] && \
    rg -q 'not implemented' docs/V2_FFI_GUIDE.md && \
-   rg -q 'not implemented' docs/V2_CONCURRENCY_GUIDE.md && \
-   rg -q 'not implemented' docs/V2_ALLOCATOR_GUIDE.md; then
-  ok "low-level guides exist without claiming unimplemented APIs"
+   rg -q '@atomicExchange64' docs/V2_CONCURRENCY_GUIDE.md && \
+   rg -q 'not yet the complete allocator model' docs/V2_ALLOCATOR_GUIDE.md; then
+  ok "low-level guides scope implemented allocator surface and unsupported APIs"
 else
   bad "low-level guides are missing or overclaim implementation"
 fi
@@ -84,6 +97,34 @@ if [ -f docs/V2_TARGET_SUPPORT.md ] && \
   ok "target support matrix marks GPU runtime targets unsupported"
 else
   bad "target support matrix is missing or overclaims GPU runtime support"
+fi
+
+if rg -q 'allowlist is .*`env`' docs/ZAGSCRIPT_SEMANTICS.md && \
+   rg -q '`args\(\)` materializes a typed `ScriptList\[\[\]u8\]`' docs/ZAGSCRIPT_SEMANTICS.md && \
+   ! rg -q 'materialized argument collection.*remain[s]? candidate' docs/ZAGSCRIPT_SEMANTICS.md; then
+  ok "Zag Script prelude documentation matches implemented env and args bindings"
+else
+  bad "Zag Script prelude documentation is stale or contradicts env and args implementation"
+fi
+
+if [ -x tests/run_i686_release_gate.sh ] && \
+   rg -q 'run_i686_release_gate.sh' README.md docs/X86_TARGET_POLICY.md docs/X86_FEATURES.md tests/run_zagscript_master_gate.sh && \
+   rg -q 'ZAG_I686_REFERENCE_TOOLS=0' tests/run_i686_release_gate.sh && \
+   rg -q 'Not certified: full language/public C ABI parity, dynamic/TLS linking, ARM' tests/run_i686_release_gate.sh && \
+   rg -q 'Full i686 target.*not complete' docs/X86_TARGET_POLICY.md; then
+  ok "i686 authority is wired without overclaiming parity or host-tool evidence"
+else
+  bad "i686 authority wiring or support boundary is stale"
+fi
+
+if [ -x tests/run_v1_compatibility_gate.sh ] && \
+   rg -q 'run_v1_compatibility_gate.sh' tests/run_zagscript_master_gate.sh README.md && \
+   rg -q 'run_native_arm64.sh' tests/run_v1_compatibility_gate.sh && \
+   rg -q 'run_arm64_selfhost.sh' tests/run_v1_compatibility_gate.sh && \
+   rg -q 'run_abi_layout.sh' tests/run_v1_compatibility_gate.sh; then
+  ok "master gate covers distinct existing v1 and ARM compatibility authorities"
+else
+  bad "master gate omits distinct existing v1 compatibility authority"
 fi
 
 echo "════ docs-consistency pass=$pass fail=$fail ════"

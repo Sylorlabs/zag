@@ -28,6 +28,38 @@ let data = read_file("input.txt");
 show(data);
 ZAG
 (cd "$tmp" && "$ZNC" check helper.zag --no-zagd --no-analyze >/dev/null)
+cat >"$tmp/shadowed_println.zag" <<'ZAG'
+script;
+extern fn retain(value: []u8) void
+fn println(value: []u8) void { retain(value); }
+let data = read_file("input.txt");
+println(data);
+ZAG
+if (cd "$tmp" && "$ZNC" check shadowed_println.zag --no-zagd --no-analyze >shadowed_println.log 2>&1); then
+    echo "user-defined println lifetime escape unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'call to `println`' "$tmp/shadowed_println.log"
+cat >"$tmp/extern_shadowed_println.zag" <<'ZAG'
+script;
+extern fn println(value: []u8) void
+let data = read_file("input.txt");
+println(data);
+ZAG
+if (cd "$tmp" && "$ZNC" check extern_shadowed_println.zag --no-zagd --no-analyze >extern_shadowed_println.log 2>&1); then
+    echo "extern-shadowed println lifetime escape unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'call to `println`' "$tmp/extern_shadowed_println.log"
+cat >"$tmp/prefix_sink.zag" <<'ZAG'
+script;
+extern fn retain(value: []u8) void
+fn script_list_sink(value: []u8) void { retain(value); }
+let data = read_file("input.txt");
+script_list_sink(data);
+ZAG
+if (cd "$tmp" && "$ZNC" check prefix_sink.zag --no-zagd --no-analyze >prefix_sink.log 2>&1); then
+    echo "prefix-named user helper lifetime escape unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'call to `script_list_sink`' "$tmp/prefix_sink.log"
 cat >"$tmp/helper_return.zag" <<'ZAG'
 script;
 extern fn retain(value: []u8) void
@@ -165,4 +197,55 @@ if (cd "$tmp" && "$ZNC" check switch_expression_escape.zag --no-zagd --no-analyz
     echo "Script lifetime escape through switch expression unexpectedly accepted" >&2; exit 1
 fi
 grep -q 'call to `retain`' "$tmp/switch_expression_escape.log"
-echo 'script lifetime: pass=17 fail=0'
+cat >"$tmp/root_helper_make.zag" <<'ZAG'
+script;
+fn build() []u8 { return make[u8](16); }
+let bytes = build();
+println(bytes.len);
+ZAG
+if (cd "$tmp" && "$ZNC" check root_helper_make.zag --no-zagd --no-analyze >root_helper_make.log 2>&1); then
+    echo "reachable root helper make unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'reachable Script helper `build` uses make or new outside ScriptContext' "$tmp/root_helper_make.log"
+cat >"$tmp/root_helper_new.zag" <<'ZAG'
+script;
+struct Pair { value: i64 }
+fn build() *Pair { return new(Pair{ .value = 7 }); }
+let pair = build();
+println(pair.*.value);
+ZAG
+if (cd "$tmp" && "$ZNC" check root_helper_new.zag --no-zagd --no-analyze >root_helper_new.log 2>&1); then
+    echo "reachable root helper new unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'reachable Script helper `build` uses make or new outside ScriptContext' "$tmp/root_helper_new.log"
+cat >"$tmp/root_helper_raw_alloc.zag" <<'ZAG'
+script;
+fn build() *i8 { return _zag_malloc(8) as *i8; }
+let bytes = build();
+println(bytes as i64);
+ZAG
+if (cd "$tmp" && "$ZNC" check root_helper_raw_alloc.zag --no-zagd --no-analyze >root_helper_raw_alloc.log 2>&1); then
+    echo "reachable root helper raw allocator unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'reachable Script helper `build` uses a raw runtime allocator outside ScriptContext' "$tmp/root_helper_raw_alloc.log"
+cat >"$tmp/root_helper_zalloc.zag" <<'ZAG'
+script;
+fn build_words() []f32 { return zalloc(8); }
+let words = build_words();
+println(words.len);
+ZAG
+if (cd "$tmp" && "$ZNC" check root_helper_zalloc.zag --no-zagd --no-analyze >root_helper_zalloc.log 2>&1); then
+    echo "reachable root helper zalloc unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'reachable Script helper `build_words` uses a raw runtime allocator outside ScriptContext' "$tmp/root_helper_zalloc.log"
+cat >"$tmp/root_helper_strdup.zag" <<'ZAG'
+script;
+fn duplicate() []u8 { return _zag_strdup("payload"); }
+let copy = duplicate();
+println(copy);
+ZAG
+if (cd "$tmp" && "$ZNC" check root_helper_strdup.zag --no-zagd --no-analyze >root_helper_strdup.log 2>&1); then
+    echo "reachable root helper _zag_strdup unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'reachable Script helper `duplicate` uses a raw runtime allocator outside ScriptContext' "$tmp/root_helper_strdup.log"
+echo 'script lifetime: pass=25 fail=0'
