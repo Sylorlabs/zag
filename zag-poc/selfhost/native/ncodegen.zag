@@ -1788,7 +1788,8 @@ fn cg_type_size(cg: *Cg, ty0: []u8) i32 {
     if (ty[0] == '*') { return 8; }                 // pointer = scalar
     if (@strEq(ty, "fat_fn")) { return 16; }         // fat_fn = {code_ptr, env_ptr}
     if (cg_is_fn_type(ty) == 1) { return 16; }      // fn-typed = fat_fn = 2 words
-    if (ty.len > 1 && ty[0] == '!') { return 16; } // !T error union = {err_code, val}
+    // !T = {err_code, inline T payload}; aggregate payloads are not truncated.
+    if (ty.len > 1 && ty[0] == '!') { return 8 + cg_round8(cg_type_size(cg, ty[1..])); }
     if (cg_type_is_slice(cg, ty) == 1) { return 16; }  // []u8 = {ptr,len}
     if (ty[0] == '?') {                             // optional ?T = {has, val}
         return 8 + cg_round8(cg_type_size(cg, ty[1..]));
@@ -1969,7 +1970,7 @@ fn cg_type_is_agg(cg: *Cg, ty: []u8) i32 {
 fn cg_agg_words(cg: *Cg, ty: []u8) i32 {
     if (@strEq(ty, "fat_fn")) { return 2; }
     if (cg_is_fn_type(ty) == 1) { return 2; }  // fn(A)B is a fat_fn, always 2 words
-    if (ty.len > 1 && ty[0] == '!') { return 2; }  // !T error union = {err_code, val}
+    if (ty.len > 1 && ty[0] == '!') { return 1 + cg_agg_words(cg, ty[1..]); }
     // interface fat ptr: M fn-ptr words + 1 data-ptr word
     let iM: i32 = iface_method_count(cg.*.decls, ty);
     if (iM > 0) { return iM + 1; }
@@ -4103,25 +4104,35 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                 cg_lower_addr(out, u.e, env, syms, cg);
             } else if (@strEq(u.op, "try")) {
                 // try expr — expr is !T; err_code==0 means success.
-                // If error: propagate (write {err,0} to sret buffer, jump epilogue).
-                // If success: leave val on stack as the expression's value.
+                // If error: propagate a zeroed payload to the caller's sret buffer.
+                // If success: leave a scalar value or aggregate payload address on stack.
                 let l_ok3: i32 = cg_fresh(cg);
                 cg_lower_expr(out, u.e, env, syms, cg);   // pushes ptr to {err,val}
                 push[Instr](out, i_pop(R_RSI()));
                 push[Instr](out, i_load(R_RAX(), R_RSI(), 0));   // err code
                 push[Instr](out, i_cmp_imm(R_RAX(), 0));
                 push[Instr](out, i_je(l_ok3));                    // err==0 → ok
-                // propagate: write {err, 0} into caller's sret buffer
+                // propagate: write {err, zero payload} into caller's sret buffer
                 if (env.*.sret_type.len > 1 && env.*.sret_type[0] == '!') {
                     push[Instr](out, i_load(R_RCX(), R_RBP(), env.*.sret_disp));
                     push[Instr](out, i_store(R_RCX(), 0, R_RAX()));
                     push[Instr](out, i_mov_imm(R_RAX(), 0));
-                    push[Instr](out, i_store(R_RCX(), 8, R_RAX()));
+                    let zi: i32 = 1;
+                    while (zi < cg_agg_words(cg, env.*.sret_type)) {
+                        push[Instr](out, i_store(R_RCX(), zi * 8, R_RAX()));
+                        zi = zi + 1;
+                    }
                     push[Instr](out, i_load(R_RAX(), R_RBP(), env.*.sret_disp));
                 }
                 push[Instr](out, i_jmp(env.*.epilogue));
                 push[Instr](out, i_label(l_ok3));
-                push[Instr](out, i_load(R_RAX(), R_RSI(), 8));   // val on success
+                let try_ty: []u8 = cg_expr_type(u.e, env, syms, cg);
+                let payload_ty: []u8 = try_ty[1..];
+                if (cg_type_is_agg(cg, payload_ty) == 1) {
+                    push[Instr](out, i_lea(R_RAX(), R_RSI(), 8));
+                } else {
+                    push[Instr](out, i_load(R_RAX(), R_RSI(), 8));
+                }
                 push[Instr](out, i_push(R_RAX()));
             } else {
                 cg_err(cg, "native: unsupported unary operator");
@@ -6053,6 +6064,59 @@ fn cg_lower_runtime(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
             cg.*.use_fr = 1;
             push[Instr](out, i_call(cg.*.fr_lbl));
         }
+        push[Instr](out, i_mov_imm(R_RAX(), 0));
+        push[Instr](out, i_push(R_RAX()));
+        return 1;
+    }
+    // Handle-based v2 allocation deallocation validates the allocation
+    // descriptor before it reaches the raw allocator.  The handle records the
+    // exact native capacity returned by SystemAllocator (not merely the
+    // caller's requested lower bound), and SystemAllocator currently requires
+    // its checked native mode so this bounded registry is authoritative.
+    // A forged base, stale/copy-released handle, mismatched length, or wrong
+    // alignment fails before any allocator header is read.
+    if (@strEq(fname, "_zag_allocation_validate")) {
+        if (nargs != 3) { cg_err(cg, "native: _zag_allocation_validate expects pointer, length, alignment"); push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return 1; }
+        if (cg.*.safety_checked == 0) { cg_err(cg, "native: SystemAllocator requires --safety=checked"); push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return 1; }
+        cg_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+        cg_lower_expr(out, get[*Node](c.args, 1), env, syms, cg);
+        cg_lower_expr(out, get[*Node](c.args, 2), env, syms, cg);
+        push[Instr](out, i_pop(R_RDX()));  // declared alignment
+        push[Instr](out, i_pop(R_RSI()));  // exact capacity
+        push[Instr](out, i_pop(R_RDI()));  // base pointer
+        let exact:i32=cg_fresh(cg);let size_ok:i32=cg_fresh(cg);let align_ok:i32=cg_fresh(cg);let done:i32=cg_fresh(cg);
+        cg_emit_alloc_access_exact_probe(out,cg);
+        push[Instr](out,i_cmp_imm(R_R8(),1));
+        push[Instr](out,i_je(exact));
+        cg_emit_panic(out,"zag allocator: invalid or released Allocation handle",exact,cg);
+        push[Instr](out,i_load(R_R9(),R_R10(),8));
+        push[Instr](out,i_cmp(R_RSI(),R_R9()));
+        push[Instr](out,i_je(size_ok));
+        cg_emit_panic(out,"zag allocator: Allocation length does not match live allocation",size_ok,cg);
+        // SystemAllocator always returns 8-byte aligned ordinary allocations.
+        push[Instr](out,i_cmp_imm(R_RDX(),8));
+        push[Instr](out,i_je(align_ok));
+        cg_emit_panic(out,"zag allocator: Allocation alignment does not match SystemAllocator",align_ok,cg);
+        push[Instr](out,i_mov_rr(R_R8(),R_RDI()));
+        push[Instr](out,i_mov_imm(R_R9(),7));
+        push[Instr](out,i_and(R_R8(),R_R9()));
+        push[Instr](out,i_cmp_imm(R_R8(),0));
+        push[Instr](out,i_je(done));
+        cg_emit_panic(out,"zag allocator: misaligned Allocation handle",done,cg);
+        push[Instr](out,i_mov_imm(R_RAX(),1));
+        push[Instr](out,i_push(R_RAX()));
+        return 1;
+    }
+    // Only SystemAllocator.deallocate reaches this after descriptor
+    // validation.  Keep it separate from `_zag_free` so the current
+    // pointer-owner checker does not mistake an Allocation aggregate field for
+    // an unproven raw-pointer release in the allocator implementation itself.
+    if (@strEq(fname, "_zag_allocation_free")) {
+        if (nargs != 1) { cg_err(cg, "native: _zag_allocation_free expects one pointer"); push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return 1; }
+        cg_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+        push[Instr](out, i_pop(R_RDI()));
+        cg.*.use_fr = 1;
+        push[Instr](out, i_call(cg.*.fr_lbl));
         push[Instr](out, i_mov_imm(R_RAX(), 0));
         push[Instr](out, i_push(R_RAX()));
         return 1;
@@ -8139,17 +8203,30 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                 // return that pointer in rax. Handles struct/union literals (incl.
                 // NESTED aggregate fields), string literals, optionals (?T), and
                 // an aggregate VALUE expression (copied word-by-word).
+                let rty: []u8 = cg_norm_type(env.*.sret_type);
+                let sps: i32 = env.*.sret_disp;
+                if (r.has_expr == 0 && @strEq(rty, "!void")) {
+                    // `return;` from !void is the successful {0, zero} value.
+                    push[Instr](out, i_load(R_RCX(), R_RBP(), sps));
+                    push[Instr](out, i_mov_imm(R_RAX(), 0));
+                    let zi: i32 = 0;
+                    while (zi < cg_agg_words(cg, rty)) {
+                        push[Instr](out, i_store(R_RCX(), zi * 8, R_RAX()));
+                        zi = zi + 1;
+                    }
+                    push[Instr](out, i_load(R_RAX(), R_RBP(), sps));
+                    push[Instr](out, i_jmp(env.*.epilogue));
+                    return;
+                }
                 if (r.has_expr == 0) {
                     cg_err(cg, "native: aggregate-returning fn must return a value");
                     push[Instr](out, i_jmp(env.*.epilogue));
                     return;
                 }
-                let rty: []u8 = cg_norm_type(env.*.sret_type);
-                let sps: i32 = env.*.sret_disp;
                 if (rty.len > 1 && rty[0] == '!') {
                     // !T error union return. Two cases:
-                    //   return error.X     → {code, 0} (error path)
-                    //   return val         → {0, val}  (success path)
+                    //   return error.X     → {code, zero payload} (error path)
+                    //   return val         → {0, inline val}      (success path)
                     // IMPORTANT: evaluate the expression BEFORE loading RCX to avoid
                     // expression evaluation (e.g. idiv uses rcx) clobbering the sret ptr.
                     let is_err_ret: i32 = 0;
@@ -8166,13 +8243,28 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                     push[Instr](out, i_pop(R_RAX()));             // rax = err code OR val
                     push[Instr](out, i_load(R_RCX(), R_RBP(), sps)); // rcx = caller's buf
                     if (is_err_ret == 1) {
-                        // {err_code, 0}
+                        // {err_code, zero payload}
                         push[Instr](out, i_store(R_RCX(), 0, R_RAX()));
                         push[Instr](out, i_mov_imm(R_RAX(), 0));
-                        push[Instr](out, i_store(R_RCX(), 8, R_RAX()));
+                        let zi: i32 = 1;
+                        while (zi < cg_agg_words(cg, rty)) {
+                            push[Instr](out, i_store(R_RCX(), zi * 8, R_RAX()));
+                            zi = zi + 1;
+                        }
                     } else {
-                        // {0, val}
-                        push[Instr](out, i_store(R_RCX(), 8, R_RAX()));  // val
+                        // {0, payload}; aggregate payloads are copied in full.
+                        let payload_ty: []u8 = rty[1..];
+                        if (cg_type_is_agg(cg, payload_ty) == 1) {
+                            push[Instr](out, i_mov_rr(R_RSI(), R_RAX()));
+                            let pi: i32 = 0;
+                            while (pi < cg_agg_words(cg, payload_ty)) {
+                                push[Instr](out, i_load(R_RAX(), R_RSI(), pi * 8));
+                                push[Instr](out, i_store(R_RCX(), 8 + pi * 8, R_RAX()));
+                                pi = pi + 1;
+                            }
+                        } else {
+                            push[Instr](out, i_store(R_RCX(), 8, R_RAX()));
+                        }
                         push[Instr](out, i_mov_imm(R_RAX(), 0));
                         push[Instr](out, i_store(R_RCX(), 0, R_RAX()));  // err = 0
                     }

@@ -36,6 +36,73 @@ reject() {
 }
 
 reject "v1 rejects v2 unsafe syntax" 2026 E0200
+mkdir -p "$tmp/v2-error-aggregate"
+printf 'name = "v2erroraggregate"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-error-aggregate/zag.mod"
+printf 'error { Bad } struct Triple { a:i32, b:i32, c:i32 } fn make(flag:i32) !Triple { if (flag == 0) { return error.Bad; } return Triple{.a=7,.b=11,.c=24}; } fn work(flag:i32) !i32 { let value:Triple=try make(flag); return value.a+value.b+value.c; } fn main() i32 { return work(1) catch 1; }\n' >"$tmp/v2-error-aggregate/main.zag"
+if (cd "$tmp/v2-error-aggregate" && "$ZNC" main.zag -o out) >"$tmp/v2-error-aggregate/log" 2>&1 && [ -x "$tmp/v2-error-aggregate/out" ]; then
+  set +e
+  "$tmp/v2-error-aggregate/out"
+  error_aggregate_rc=$?
+  set -e
+  if [ "$error_aggregate_rc" -eq 42 ]; then
+    echo "  ok  aggregate error-union payload survives try propagation"; pass=$((pass + 1))
+  else
+    echo "  XX  aggregate error-union payload execution (exit=$error_aggregate_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  aggregate error-union payload compiles"; sed -n '1,12p' "$tmp/v2-error-aggregate/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-system-allocator"
+printf 'name = "v2systemallocator"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator/std"
+printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); unsafe { block.ptr[0]=42; let result:i32=block.ptr[0] as i32; try allocator.deallocate(block); return result; } } fn main() i32 { return work() catch 1; }\n' >"$tmp/v2-system-allocator/main.zag"
+if (cd "$tmp/v2-system-allocator" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator/log" 2>&1 && [ -x "$tmp/v2-system-allocator/out" ]; then
+  set +e
+  "$tmp/v2-system-allocator/out"
+  system_allocator_rc=$?
+  set -e
+  if [ "$system_allocator_rc" -eq 42 ]; then
+    echo "  ok  SystemAllocator returns and consumes exact Allocation handle"; pass=$((pass + 1))
+  else
+    echo "  XX  SystemAllocator handle execution (exit=$system_allocator_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  SystemAllocator handle compiles"; sed -n '1,16p' "$tmp/v2-system-allocator/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-system-allocator-forged"
+printf 'name = "v2systemallocatorforged"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-forged/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-forged/std"
+printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let forged:Allocation=Allocation{.ptr=block.ptr,.len=block.len-8,.alignment=block.alignment}; try allocator.deallocate(forged); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-forged/main.zag"
+if (cd "$tmp/v2-system-allocator-forged" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-forged/log" 2>&1 && [ -x "$tmp/v2-system-allocator-forged/out" ]; then
+  set +e
+  "$tmp/v2-system-allocator-forged/out" >"$tmp/v2-system-allocator-forged/out.log" 2>"$tmp/v2-system-allocator-forged/err.log"
+  forged_allocator_rc=$?
+  set -e
+  if [ "$forged_allocator_rc" -ne 0 ] && grep -q 'Allocation length does not match live allocation' "$tmp/v2-system-allocator-forged/err.log"; then
+    echo "  ok  SystemAllocator rejects forged Allocation length at runtime"; pass=$((pass + 1))
+  else
+    echo "  XX  forged SystemAllocator handle (exit=$forged_allocator_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-forged/log"; sed -n '1,8p' "$tmp/v2-system-allocator-forged/err.log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  forged SystemAllocator handle did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-forged/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-system-allocator-stale"
+printf 'name = "v2systemallocatorstale"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-stale/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-stale/std"
+printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let first:Allocation=try allocator.allocate(24,8); let stale:Allocation=first; try allocator.deallocate(first); try allocator.deallocate(stale); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-stale/main.zag"
+if (cd "$tmp/v2-system-allocator-stale" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-stale/log" 2>&1 && [ -x "$tmp/v2-system-allocator-stale/out" ]; then
+  set +e
+  "$tmp/v2-system-allocator-stale/out" >"$tmp/v2-system-allocator-stale/out.log" 2>"$tmp/v2-system-allocator-stale/err.log"
+  stale_allocator_rc=$?
+  set -e
+  if [ "$stale_allocator_rc" -ne 0 ] && grep -q 'invalid or released Allocation handle' "$tmp/v2-system-allocator-stale/err.log"; then
+    echo "  ok  SystemAllocator rejects copied released handle at runtime"; pass=$((pass + 1))
+  else
+    echo "  XX  stale SystemAllocator handle (exit=$stale_allocator_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-stale/log"; sed -n '1,8p' "$tmp/v2-system-allocator-stale/err.log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  stale SystemAllocator handle did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-stale/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-captureless-callback"
 printf 'name = "v2capturelesscallback"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-captureless-callback/zag.mod"
 printf 'fn main() i32 { let f:fn() i32=fn[]() i32 { return 42; }; return f(); }\n' >"$tmp/v2-captureless-callback/main.zag"

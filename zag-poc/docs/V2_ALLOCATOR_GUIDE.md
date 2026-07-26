@@ -1,25 +1,31 @@
 # Zag v2 allocator guide (draft)
 
-The v2 allocator interface is specified but not implemented. Allocation is
-fallible, explicit, and effectful; reclamation is included in `Alloc` because a
-deallocator can call an allocator or OS service. An allocator handle describes
-the backing resource, alignment capability, ownership of returned allocations,
-and whether an operation can block.
+The native x86-64 checked-mode `SystemAllocator` is implemented as the first
+v2 allocator surface. Allocation is fallible, explicit, and effectful;
+reclamation is included in `Alloc` because a deallocator can call an allocator
+or OS service. The implemented handle describes the native backing resource,
+exact reserved capacity, and alignment.
 
 The planned source surface is deliberately explicit:
 
 ```zag
-let block: Allocation = try system_allocator.allocate(bytes, alignment);
-try system_allocator.deallocate(block);
+@import("std/allocator.zag")
+let allocator: SystemAllocator = system_allocator();
+let block: Allocation = try allocator.allocate(bytes, 8);
+try allocator.deallocate(block);
 ```
 
-`Allocation` carries the pointer, exact byte length, alignment, allocator
-identity, and a non-forgeable lifetime generation. `resize` consumes the old
-handle only on success and returns the replacement handle; a failure leaves the
-old handle live. `allocate_zeroed` has the same handle contract. These are the
-required semantics, not current compiler behavior: no `Allocator`,
-`Allocation`, `try`-based allocator result, custom allocator, or generation
-handle is currently accepted by the compiler.
+The implemented `Allocation` carries a pointer, exact native capacity, and
+8-byte alignment. `deallocate` validates all three against checked-runtime
+provenance before it frees: an invalid base, copied released handle, forged
+length, or wrong alignment terminates before allocator metadata is touched.
+This requires native x86-64 `--safety=checked`; other targets and unchecked
+builds reject the validation boundary rather than silently weakening it.
+
+This is not yet the complete allocator model. Handles do not yet carry an
+allocator identity or non-forgeable generation, so ABA after address reuse is
+still outside the guarantee. `resize`, `allocate_zeroed`, custom allocators,
+arenas, and fixed-buffer allocators are specified but not implemented.
 
 Arena and fixed-buffer allocators are useful only when their lifetime/reset
 semantics are explicit.  A fixed-buffer allocation may satisfy `@noalloc` or
