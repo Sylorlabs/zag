@@ -110,13 +110,13 @@ The two-release rule applies from the first `2026.06.x` release onward.
 | x86-64 Linux    | **Supported**   | Primary target; native ELF, no libc             |
 | ARM64 Linux     | **Experimental** | `--target arm64`; static AArch64 ELF, no libc. Full core-language parity: structs/slices/enums/unions/optionals/generics/error-unions/f32+f64 (incl. %g printing)/closures/structural interfaces; the 6 example programs are byte-identical to x86 (tests/run_native_arm64.sh, via qemu-user). Not yet: sat/fixed/posit/RNS numerics, DWARF, >8-arg calls. |
 | RISC-V Linux    | Planned         | Requires RV64GC ISA + ELF backend              |
-| macOS (any)     | Not planned yet | Requires Mach-O backend                         |
+| Apple Silicon macOS | **Supported** | `--target macos-arm64`; signed PIE Mach-O, Darwin entry/syscall ABI, native release/self-host gate |
 | Windows         | Not planned     | Requires PE/COFF backend                        |
 
-The ABI used is Linux syscall (`SYS_write`, `SYS_read`, `SYS_mmap`, `SYS_exit`,
-etc.). Generated binaries have no dynamic loader dependency and no libc
-dependency. The runtime uses basic Linux I/O, memory, process, and monotonic
-clock syscalls directly.
+Linux targets use the Linux syscall ABI (`SYS_write`, `SYS_read`, `SYS_mmap`,
+`SYS_exit`, etc.) and have no dynamic-loader or libc dependency. Apple Silicon
+macOS targets use the Darwin entry and syscall ABI, are position-independent,
+and carry an embedded deterministic ad-hoc signature for loading through dyld.
 
 ## v1 Commitments
 

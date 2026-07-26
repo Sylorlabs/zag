@@ -52,7 +52,9 @@ dispatch, readback, or kernel-effect proof and is not a GPU backend.
 
 ## Install
 
-**Requirements:** x86-64 Linux only. No Python, Zig, `cc`, LLVM, or libc build chain.
+**Requirements:** x86-64 Linux, ARM64 Linux, or Apple Silicon macOS. No Python,
+Zig, `cc`, LLVM, or libc build chain. The committed `znc` seed is for Linux;
+Apple Silicon uses the `znc-macos-arm64` release/CI artifact.
 
 ```bash
 git clone https://github.com/Sylorlabs/zag.git
@@ -62,8 +64,17 @@ chmod +x znc bootstrap.sh
 ./znc examples/numeric.zag -o numeric --run
 ```
 
+On Apple Silicon macOS, download the `znc-macos-arm64` release/CI artifact and
+use it directly (it defaults to signed `macos-arm64` output):
+
+```bash
+chmod +x znc-macos-arm64
+./znc-macos-arm64 examples/numeric.zag -o numeric --run
+```
+
 `./znc` is the supported v1 compiler: it lexes, parses, type-checks, proves capabilities,
-optimizes, and emits a static x86-64 ELF with no external tools. See
+optimizes, and emits static Linux ELF or signed Apple Silicon Mach-O binaries with
+no external tools. See
 [`zag-poc/INSTALL.md`](zag-poc/INSTALL.md) and [`zag-poc/BOOTSTRAP.md`](zag-poc/BOOTSTRAP.md).
 
 No C-emitting compiler or external prover is required for the supported path.

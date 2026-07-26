@@ -93,11 +93,15 @@ fi
 mv -f "$bootstrap_tmp/znc-stage3" znc
 echo "   ./znc rebuilt itself and reached a byte-identical fixpoint"
 
-bootstrap_compile ./znc selfhost/zagd_daemon.zag -o "$bootstrap_tmp/zagd" \
+zagd_source=selfhost/zagd_daemon.zag
+if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then
+    zagd_source=selfhost/zagd_macos_daemon.zag
+fi
+bootstrap_compile ./znc "$zagd_source" -o "$bootstrap_tmp/zagd" \
     --no-analyze --no-zagd --no-foreground-cache
 chmod +x "$bootstrap_tmp/zagd"
 mv -f "$bootstrap_tmp/zagd" zagd
-echo "   ./zagd built from selfhost/zagd_daemon.zag with the fixed-point compiler"
+echo "   ./zagd built from $zagd_source with the fixed-point compiler"
 
 echo "== done. Supported compiler: ./znc; automatic planner: ./zagd =="
 echo "   retired bootstrap implementations are available only through Git history."

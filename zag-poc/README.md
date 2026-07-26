@@ -2,8 +2,9 @@
 
 The supported compiler is `znc`. It writes static Linux ELF binaries, signed
 Apple Silicon Mach-O binaries (`--target macos-arm64`), WebAssembly
-(`--target wasm`), or GPU MLIR frontend output (`--target gpu-*`). GPU MLIR
-output is not a GPU executable or dispatch runtime. No `cc`, no `as`, no `ld`,
+(`--target wasm`), or GPU MLIR frontend output (`--target gpu-*`).
+GPU MLIR output is not a GPU executable or dispatch runtime. GPU MLIR is not
+physical GPU execution. No `cc`, no `as`, no `ld`,
 no libc, no Zig, no LLVM is used by these compiler paths.
 
 ## Zag Script
@@ -146,6 +147,8 @@ Native cross-target and self-hosting gates:
 bash tests/run_native.sh
 bash tests/run_native_arm64.sh
 bash tests/run_arm64_selfhost.sh
+# Native Apple Silicon macOS (signed Mach-O runtime + self-host fixpoint):
+ZNC=./znc-macos-arm64 bash tests/run_macos_arm64_release.sh
 ```
 
 ## Retired C-emitting compiler

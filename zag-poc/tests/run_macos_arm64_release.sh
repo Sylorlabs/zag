@@ -65,4 +65,27 @@ output="$("$tmpdir/runtime" alpha beta)"
 rm -f /tmp/zag_macos_arm64_runtime.txt
 echo "  ok  Darwin runtime: argv, heap, file I/O, process, stdout"; pass=$((pass + 1))
 
+# zagd uses a Darwin-specific bounded polling adapter.  Exercise the same
+# sibling-binary lifecycle a normal `znc watch` invocation uses: detached
+# start, advisory status, and clean shutdown.  The daemon is never part of
+# foreground compiler correctness, but its platform adapter must not quietly
+# regress to Linux inotify assumptions.
+"$tmpdir/znc-gen1" selfhost/zagd_macos_daemon.zag --target macos-arm64 --no-zagd --no-analyze -o "$tmpdir/zagd"
+require_macho_arm64 "$tmpdir/zagd"
+require_signed "$tmpdir/zagd"
+mkdir "$tmpdir/zagd-project"
+cp examples/numeric.zag "$tmpdir/zagd-project/main.zag"
+(
+    cd "$tmpdir/zagd-project"
+    "$tmpdir/znc-gen1" watch main.zag --mode light
+    sleep 1
+    status="$("$tmpdir/znc-gen1" status)"
+    [[ "$status" == *"target=macos-arm64"* ]]
+    [[ "$status" == *"state=idle"* ]]
+    "$tmpdir/znc-gen1" shutdown
+)
+[ "$(grep '^state=' "$tmpdir/zagd-project/.zagd.status")" = "state=stopped" ]
+[ ! -e "$tmpdir/zagd-project/.zagd.lock" ]
+echo "  ok  Darwin zagd lifecycle: watch, status, shutdown"; pass=$((pass + 1))
+
 echo "════ macos-arm64-release pass=$pass fail=0 ════"

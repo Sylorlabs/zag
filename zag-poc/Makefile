@@ -1,6 +1,6 @@
 # Zag compiler Makefile
 #
-# Primary compiler: ./znc  (native x86-64 ELF, zero cc/as/ld/libc)
+# Primary compiler: ./znc  (Linux ELF or Apple Silicon Mach-O, zero cc/as/ld/libc)
 #
 # Supported workflow:
 #   make           — rebuild znc from seed (= bootstrap)

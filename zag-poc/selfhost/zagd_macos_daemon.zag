@@ -1,0 +1,152 @@
+// Darwin/Apple-Silicon adapter for zagd.
+//
+// macOS does not expose Linux inotify.  This adapter deliberately uses a
+// bounded polling watcher for the selected root module instead of pretending
+// Linux raw syscalls are portable.  It keeps planner state advisory: a missed
+// poll can only delay metadata refresh and never changes foreground compiler
+// correctness.
+
+@import("zagd.zag")
+@import("../std/list.zag")
+
+extern fn _zag_raw_syscall(num: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) i64
+extern fn _zag_darwin_fork() i64
+extern fn _zag_argc() i32
+extern fn _zag_arg(i: i32) []u8
+extern fn _zag_read_file(path: []u8) []u8
+extern fn _zag_write_file(path: []u8, content: []u8) i32
+extern fn _zag_file_exists(path: []u8) i32
+extern fn _zag_exec_cmd(command: []u8) i32
+extern fn _zag_slice_ptr(s: []u8) *i8
+
+struct ZmdTimespec { sec: i64, nsec: i64 }
+
+fn zmd_sleep_ms(ms: i64) void {
+    let wait: i64 = ms;
+    if (wait < 1) { wait = 1; }
+    let ts: ZmdTimespec = ZmdTimespec{.sec=wait / 1000,
+        .nsec=(wait % 1000) * 1000000};
+    // Darwin arm64 nanosleep(2), with the Darwin syscall number carried by
+    // the macOS-only raw-syscall adapter.
+    let _rc: i64 = _zag_raw_syscall(240, (&ts) as i64, 0, 0, 0, 0, 0);
+}
+
+fn zmd_pid() i64 { return _zag_raw_syscall(20, 0, 0, 0, 0, 0, 0); }
+fn zmd_fork() i64 { return _zag_darwin_fork(); }
+
+fn zmd_cstr(value: []u8) ArrayList[u8] {
+    let out: ArrayList[u8] = make[u8](value.len + 1);
+    let i: i32 = 0;
+    while (i < value.len) { push[u8](&out, value[i]); i = i + 1; }
+    push[u8](&out, 0 as u8);
+    return out;
+}
+
+fn zmd_unlink(path: []u8) void {
+    let cpath: ArrayList[u8] = zmd_cstr(path);
+    // Darwin unlink(2).
+    let _rc: i64 = _zag_raw_syscall(10, _zag_slice_ptr(cpath.data[0..cpath.len]) as i64,
+        0, 0, 0, 0, 0);
+}
+
+fn zmd_join(root: []u8, leaf: []u8) []u8 {
+    if (root.len > 0 && root[root.len - 1] == '/') { return _zag_str_concat(root, leaf); }
+    return _zag_str_concat(root, _zag_str_concat("/", leaf));
+}
+
+fn zmd_quote(value: []u8) []u8 {
+    let out: []u8 = "'";
+    let i: i32 = 0;
+    while (i < value.len) {
+        if (value[i] == '\'') { out = _zag_str_concat(out, "'\\''"); }
+        else { out = _zag_str_concat(out, value[i..i + 1]); }
+        i = i + 1;
+    }
+    return _zag_str_concat(out, "'");
+}
+
+fn zmd_dir(path: []u8) []u8 {
+    let last: i32 = 0 - 1;
+    let i: i32 = 0;
+    while (i < path.len) { if (path[i] == '/') { last = i; } i = i + 1; }
+    if (last < 0) { return "."; }
+    if (last == 0) { return "/"; }
+    return path[0..last];
+}
+
+fn zmd_status(root: []u8, pid: i64, mode: []u8, state: []u8, events: i64) void {
+    let text: []u8 = "advisory=true\nexecutable_authority=false\ntarget=macos-arm64\nwatcher=polling-root-module\n";
+    text = _zag_str_concat(text, _zag_str_concat("pid=", _zag_i64_to_str(pid)));
+    text = _zag_str_concat(text, _zag_str_concat("\nmode=", mode));
+    text = _zag_str_concat(text, _zag_str_concat("\nstate=", state));
+    text = _zag_str_concat(text, _zag_str_concat("\nevents=", _zag_i64_to_str(events)));
+    let _rc: i32 = _zag_write_file(zmd_join(root, ".zagd.status"), _zag_str_concat(text, "\n"));
+}
+
+fn zmd_check(root: []u8, source: []u8) void {
+    if (source.len == 0 || _zag_file_exists(source) == 0) { return; }
+    let compiler: []u8 = zmd_join(zmd_dir(_zag_arg(0)), "znc");
+    let command: []u8 = _zag_str_concat(zmd_quote(compiler),
+        _zag_str_concat(" check ", _zag_str_concat(zmd_quote(source), " --no-zagd --no-analyze >/dev/null 2>/dev/null")));
+    let _rc: i32 = _zag_exec_cmd(command);
+}
+
+fn zmd_arg_value(flag: []u8) []u8 {
+    let i: i32 = 1;
+    while (i + 1 < _zag_argc()) {
+        if (@strEq(_zag_arg(i), flag)) { return _zag_arg(i + 1); }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn main() i32 {
+    let root: []u8 = zmd_arg_value("--root");
+    if (root.len == 0) { root = "."; }
+    let source: []u8 = zmd_arg_value("--root-source");
+    let mode: []u8 = zmd_arg_value("--mode");
+    if (mode.len == 0) { mode = "light"; }
+    let stop: []u8 = zmd_join(root, ".zagd.stop");
+    let lock: []u8 = zmd_join(root, ".zagd.lock");
+
+    if (@strEq(mode, "off")) {
+        let _stop: i32 = _zag_write_file(stop, "stop\n");
+        zmd_unlink(lock);
+        zmd_status(root, 0, mode, "stopped", 0);
+        return 0;
+    }
+
+    let daemonize: i32 = (@strEq(zmd_arg_value("--daemonize"), "") == 0) as i32;
+    // --daemonize is a presence flag, so inspect the complete argument list.
+    let ai: i32 = 1; let want_daemon: i32 = 0;
+    while (ai < _zag_argc()) { if (@strEq(_zag_arg(ai), "--daemonize")) { want_daemon = 1; } ai = ai + 1; }
+    if (want_daemon == 1) {
+        let child: i64 = zmd_fork();
+        if (child < 0) { return 1; }
+        if (child > 0) { return 0; }
+    }
+
+    zmd_unlink(stop);
+    let pid: i64 = zmd_pid();
+    let _lock: i32 = _zag_write_file(lock, _zag_str_concat(_zag_i64_to_str(pid), "\n"));
+    let prior: []u8 = _zag_read_file(source);
+    let prior_hash: ZagdHash = zagd_content_hash(prior);
+    let events: i64 = 0;
+    zmd_status(root, pid, mode, "idle", events);
+
+    while (_zag_file_exists(stop) == 0) {
+        zmd_sleep_ms(250);
+        let current: []u8 = _zag_read_file(source);
+        let current_hash: ZagdHash = zagd_content_hash(current);
+        if (zagd_hash_equal(prior_hash, current_hash) == 0) {
+            prior_hash = current_hash;
+            events = events + 1;
+            zmd_status(root, pid, mode, "checking", events);
+            zmd_check(root, source);
+            zmd_status(root, pid, mode, "idle", events);
+        }
+    }
+    zmd_unlink(stop); zmd_unlink(lock);
+    zmd_status(root, pid, mode, "stopped", events);
+    return 0;
+}

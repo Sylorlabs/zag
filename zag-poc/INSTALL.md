@@ -104,6 +104,17 @@ bash tests/run_arm64_selfhost.sh
 On x86-64 these use qemu-user only to execute ARM64 output. The compiler remains
 pure Zag and does not use Python, C, or Zig.
 
+### Native Apple Silicon macOS gate
+
+Run this on an ARM64 Mac with the `znc-macos-arm64` seed (or a self-hosted
+generation) selected through `ZNC`. It verifies signed Mach-O emission, the
+Darwin loader and syscall runtime, and the byte-identical macOS self-hosting
+fixpoint:
+
+```sh
+ZNC=./znc-macos-arm64 bash tests/run_macos_arm64_release.sh
+```
+
 ---
 
 ## Permanent install
@@ -141,6 +152,11 @@ explicitly with `znc watch --mode light|adaptive|deep|off`, `znc status`,
 `znc suggest`, and `znc shutdown`. A project may set `mode=off` (or another
 mode) in `.zagd.conf`. The daemon never rewrites source and regular Zag
 suggestions are advisory.
+
+On Apple Silicon macOS, `zagd` uses a bounded polling watcher for the selected
+root module because inotify is Linux-only. It supports the same watch/status/
+shutdown lifecycle, but a change may be observed on the next polling interval;
+it never affects foreground compiler correctness.
 Use `--no-zagd` on an individual foreground command when a hermetic invocation
 must not start or contact the background service; this never changes project
 configuration.

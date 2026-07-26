@@ -1,9 +1,10 @@
 # Zag — the bootstrap, and how to walk its history
 
 Zag is a from-scratch, self-hosting systems language. The compiler that builds
-Zag is **written in Zag**, and the native backend emits ELF executables **with
-no `cc`, `as`, `ld`, `libc`, `Zig`, or `LLVM`** — only the CPU instruction set,
-the ELF format, and the Linux syscall ABI sit beneath it.
+Zag is **written in Zag**, and the native backend emits Linux ELF or Apple
+Silicon Mach-O executables **with no `cc`, `as`, `ld`, `libc`, `Zig`, or
+`LLVM`** — only the CPU instruction set and the target object/runtime ABI sit
+beneath it.
 
 Like every self-hosted language (Rust started in OCaml, Go in C, Zig in C++),
 Zag was bootstrapped from a compiler written in another language, then that
@@ -75,8 +76,9 @@ Python, C, or Zig emitter.
 with `./znc selfhost/native/znc_target.zag -o znc-target`) for differential
 checks; it is not required for normal use.
 
-Generated x86-64 programs use Linux syscalls and have no dynamic loader or libc
-dependency.
+Generated Linux programs use Linux syscalls and have no dynamic loader or libc
+dependency. Apple Silicon macOS programs are signed PIE Mach-O executables that
+use the Darwin entry/syscall ABI and load through dyld.
 
 The retired `zagc`, C emitter, runtime, and oracle suites exist only in Git
 history. Do not restore them to the current tree or use them as a fallback.
@@ -102,6 +104,7 @@ bash tests/run_native_total.sh        # @total proofs on ./znc
 ./tests/check_native_target_repro.sh     # optional: byte-identical ./znc-target fixpoint
 ```
 
-ARM64 is cross-compiled and self-hosted from the x86-64 `znc` seed. QEMU may be
-used to execute ARM64 binaries on x86-64; it is test infrastructure, not part of
-the compiler or bootstrap chain.
+ARM64 Linux is cross-compiled and self-hosted from the x86-64 `znc` seed; QEMU
+may execute those binaries on x86-64 as test infrastructure. Apple Silicon
+macOS uses the `znc-macos-arm64` release/CI seed and is verified natively with
+the Darwin Mach-O release gate.
