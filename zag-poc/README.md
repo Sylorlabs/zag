@@ -116,10 +116,13 @@ release. Its matrix and executable gate are in
 that gate failing until their implementation and execution evidence exist. The
 latest isolated run is 20 passing categories and 10 required failures; this is
 not a C replacement or a production-v2 claim yet. The passing slices include
-checked native word volatile transactions, scalar `@cabi` dynamic imports,
-validated x86 POPCNT/ANDN/trailing-zero intrinsics, and bounded native memory
-sanitizer coverage. Atomics, general pointer/allocator lifetime, full C ABI,
-SIMD/assembly, and physical GPU execution remain explicitly fail-closed.
+checked native word volatile transactions, fixed unsafe i64 atomic
+load/store/exchange operations, scalar `@cabi` dynamic imports, validated x86
+POPCNT/ANDN/trailing-zero intrinsics, and bounded native memory sanitizer
+coverage. General atomics/concurrency, pointer/allocator lifetime, full C ABI,
+SIMD/assembly, and physical GPU execution remain explicitly fail-closed; the
+atomic slice accepts only i64 bound values and is not a general memory-order or
+threading model.
 Its current checked native x86-64 allocator slice is
 [`SystemAllocator`](docs/V2_ALLOCATOR_GUIDE.md): fallible allocate, zeroed
 allocate, resize, and deallocate use capacity/alignment/generation-validated

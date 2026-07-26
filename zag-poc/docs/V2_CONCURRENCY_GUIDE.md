@@ -7,8 +7,9 @@ operations: `@atomicLoad64(ptr: *const/*mut i64) i64`,
 inside an `unsafe` block on Linux x86-64 native output. Load emits `LOCK XADD`
 with zero, preserving and returning the old word; store/exchange use memory
 `XCHG`, which is implicitly locked by x86. The compiler rejects invalid
-mutability and the runtime rejects null or misaligned addresses before issuing
-the instruction. With `--safety=checked`, ordinary allocator liveness/bounds
+mutability and non-`i64` bound store/exchange values; integer literals are
+contextually accepted as `i64`. The runtime rejects null or misaligned addresses
+before issuing the instruction. With `--safety=checked`, ordinary allocator liveness/bounds
 instrumentation also runs before each operation.
 
 This is not a general atomic or concurrency API: there are no atomic storage

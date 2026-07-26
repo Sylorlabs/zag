@@ -64,6 +64,14 @@ else
   grep -q 'wrong argument count' "$tmp/load-arity/log" && ok "atomic load rejects wrong arity" || bad "missing load arity diagnostic"
 fi
 
+project value-type
+printf '%s\n' 'fn main() i32 { unsafe { let value:i64=7; let p:*mut i64=(&value) as *mut i64; let wrong:i32=9; @atomicStore64(p,wrong); return @atomicExchange64(p,wrong) as i32; } }' >"$tmp/value-type/main.zag"
+if (cd "$tmp/value-type" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/value-type/log" 2>&1 || [ -e "$tmp/value-type/out" ]; then
+  bad "atomic store/exchange accepted a non-i64 value"
+else
+  grep -q 'atomic store/exchange value must be i64' "$tmp/value-type/log" && ok "atomic store/exchange require i64 values" || bad "missing atomic value-type diagnostic"
+fi
+
 project misaligned
 printf '%s\n' 'fn main() i32 { unsafe { let bytes:*i8=_zag_malloc(16) as *i8; let p:*mut i64=(&bytes[1]) as *mut i64; let result:i64=@atomicExchange64(p,1); _zag_free(bytes); return result as i32; } }' >"$tmp/misaligned/main.zag"
 if (cd "$tmp/misaligned" && "$ZNC" main.zag --safety=checked --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/misaligned/log" 2>&1 && [ -x "$tmp/misaligned/out" ]; then

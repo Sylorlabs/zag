@@ -35,6 +35,15 @@ the old handle, allocates the replacement first, copies the overlap, then
 consumes the old handle; a fallible replacement allocation therefore leaves the
 old handle live.
 
+In particular, a fixed-buffer allocator is intentionally rejected as a public
+v2 surface for now. Its constructor must retain a caller-owned buffer while its
+allocation operation mutates allocator state and accepts size/alignment; the
+current typed borrow contracts are unary and cannot express that multi-argument
+lifetime/mutation contract without weakening ownership checks. There is no
+special-case fallback, no hidden heap path, and no claimed `@noalloc` or
+`@realtime` behavior until that contract and executable exhaustion/reset tests
+exist.
+
 Arena and fixed-buffer allocators are useful only when their lifetime/reset
 semantics are explicit.  A fixed-buffer allocation may satisfy `@noalloc` or
 `@realtime` only after the compiler proves it does not fall through to a heap
