@@ -50,7 +50,7 @@ unsupported "C ABI and dynamic linking" "no bidirectional C ABI/shared-library e
 unsupported "CPU intrinsics/SIMD/inline assembly" "no v2 operand/clobber checked asm interface"
 unsupported "effect adversarial suite" "direct Unsafe propagation is tested, but indirect calls and Atomic/FFI/GPU effects are incomplete"
 unsupported "physical GPU execution" "no runtime enumerate/allocate/dispatch/readback path"
-unsupported "sanitizers" "crash corpus and deterministic fuzz smoke exist, but no sanitizer modes"
+unsupported "sanitizers" "bounded native --sanitize=memory exists, but red zones, poisoning, custom allocator coverage, and ABA-resistant identity are incomplete"
 unsupported "documentation verification map" "verification matrix exists but records incomplete required capabilities"
 
 echo "════ v2-release pass=$pass fail=$fail ════"
