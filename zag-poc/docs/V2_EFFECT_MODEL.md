@@ -12,10 +12,12 @@ permissions: `@noalloc` excludes `Alloc`; `@realtime` excludes `Alloc`, `Block`,
 host-only effects.  Each rejection prints the annotated function, call edge
 chain, and introducing operation.
 
-Indirect calls are checked against effect-qualified function types.  Generic
-instantiations, closures, callbacks, imports, extern declarations, and device
-helpers retain their latent effects; an unknown indirect/FFI contract is
-conservatively effectful and unsafe.
+Indirect calls are checked against effect-qualified function types.  The
+implemented slice tracks direct function-valued locals, including reassignment
+to a closure, so a later indirect call cannot retain a stale safe effect row.
+Generic instantiations, callbacks, imports, extern declarations, and device
+helpers still need the complete latent-effect coverage; an unknown
+indirect/FFI contract remains conservatively effectful and unsafe.
 
 ## Inference and witnesses
 
@@ -33,8 +35,10 @@ transfer/dispatch remain visible to realtime, kernel, and sandbox constraints.
 
 ## Required adversarial checks
 
-The v2 suite must reject effects introduced through direct calls, closures,
-stored function values, generic instantiation, methods, callbacks, imported
-externs, device helpers, and runtime intrinsics.  An unsafe block must not erase
-`Alloc`, `Block`, `FFI`, or GPU effects.  These v2 adversarial checks are not
+The v2 suite now rejects effects introduced through direct calls and a
+reassigned function-valued local, as well as the existing callback and pure
+contract witnesses.  It still needs adversarial coverage for generic
+instantiation, methods, stored function values in aggregates, imported
+externs, device helpers, and runtime intrinsics.  An unsafe block must not
+erase `Alloc`, `Block`, `FFI`, or GPU effects; those broader checks are not
 implemented yet.
