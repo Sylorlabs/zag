@@ -52,6 +52,18 @@ if (cd "$tmp/v2-error-aggregate" && "$ZNC" main.zag -o out) >"$tmp/v2-error-aggr
 else
   echo "  XX  aggregate error-union payload compiles"; sed -n '1,12p' "$tmp/v2-error-aggregate/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-system-allocator-unchecked"
+printf 'name = "v2systemallocatorunchecked"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-unchecked/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-unchecked/std"
+printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); try allocator.deallocate(block); return 0; } fn main() i32 { return work() catch 1; }\n' >"$tmp/v2-system-allocator-unchecked/main.zag"
+if (cd "$tmp/v2-system-allocator-unchecked" && "$ZNC" main.zag -o out) >"$tmp/v2-system-allocator-unchecked/log" 2>&1 ||
+   [ -e "$tmp/v2-system-allocator-unchecked/out" ]; then
+  echo "  XX  SystemAllocator unchecked boundary rejects"; sed -n '1,16p' "$tmp/v2-system-allocator-unchecked/log"; fail=$((fail + 1))
+elif grep -q 'SystemAllocator requires --safety=checked' "$tmp/v2-system-allocator-unchecked/log"; then
+  echo "  ok  SystemAllocator unchecked boundary rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  SystemAllocator unchecked rejection missing diagnostic"; sed -n '1,16p' "$tmp/v2-system-allocator-unchecked/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-system-allocator"
 printf 'name = "v2systemallocator"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator/std"
@@ -85,6 +97,23 @@ if (cd "$tmp/v2-system-allocator-forged" && "$ZNC" main.zag -o out --safety=chec
   fi
 else
   echo "  XX  forged SystemAllocator handle did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-forged/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-system-allocator-forged-alignment"
+printf 'name = "v2systemallocatorforgedalignment"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-forged-alignment/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-forged-alignment/std"
+printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let forged:Allocation=Allocation{.ptr=block.ptr,.len=block.len,.alignment=4,.generation=block.generation}; try allocator.deallocate(forged); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-forged-alignment/main.zag"
+if (cd "$tmp/v2-system-allocator-forged-alignment" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-forged-alignment/log" 2>&1 && [ -x "$tmp/v2-system-allocator-forged-alignment/out" ]; then
+  set +e
+  "$tmp/v2-system-allocator-forged-alignment/out" >"$tmp/v2-system-allocator-forged-alignment/out.log" 2>"$tmp/v2-system-allocator-forged-alignment/err.log"
+  forged_alignment_allocator_rc=$?
+  set -e
+  if [ "$forged_alignment_allocator_rc" -ne 0 ] && grep -q 'Allocation alignment does not match SystemAllocator' "$tmp/v2-system-allocator-forged-alignment/err.log"; then
+    echo "  ok  SystemAllocator rejects forged Allocation alignment at runtime"; pass=$((pass + 1))
+  else
+    echo "  XX  forged SystemAllocator alignment (exit=$forged_alignment_allocator_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-alignment/log"; sed -n '1,8p' "$tmp/v2-system-allocator-forged-alignment/err.log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  forged SystemAllocator alignment did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-alignment/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-system-allocator-stale"
 printf 'name = "v2systemallocatorstale"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-stale/zag.mod"
@@ -778,6 +807,16 @@ elif grep -q 'double free of named allocation' "$tmp/v2-double-free/log"; then
   echo "  ok  statically evident double free rejects without artifact"; pass=$((pass + 1))
 else
   echo "  XX  double-free rejection missing diagnostic"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-embedded-release"
+printf 'name = "v2embeddedrelease"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-embedded-release/zag.mod"
+printf 'fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let ignored:i32=delete(p) as i32; } return 0; }\n' >"$tmp/v2-embedded-release/main.zag"
+if (cd "$tmp/v2-embedded-release" && "$ZNC" main.zag -o out) >"$tmp/v2-embedded-release/log" 2>&1 || [ -e "$tmp/v2-embedded-release/out" ]; then
+  echo "  XX  embedded release rejects without artifact"; sed -n '1,8p' "$tmp/v2-embedded-release/log"; fail=$((fail + 1))
+elif grep -q 'release or @consumes call must be a standalone statement' "$tmp/v2-embedded-release/log"; then
+  echo "  ok  embedded release rejects with an ownership-boundary diagnostic"; pass=$((pass + 1))
+else
+  echo "  XX  embedded release rejection missing diagnostic"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-use-after-free"
 printf 'name = "v2useafterfree"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-use-after-free/zag.mod"

@@ -23,7 +23,9 @@ validates all four against checked-runtime provenance before it frees: an
 invalid base, copied released handle, forged length, wrong alignment, or stale
 generation after address reuse terminates before allocator metadata is touched.
 This requires native x86-64 `--safety=checked`; other targets and unchecked
-builds reject the validation boundary rather than silently weakening it.
+builds reject the validation boundary rather than silently weakening it. The
+v2 compiler gate proves that an unchecked call reports that requirement and
+does not leave an executable artifact.
 
 This is not yet the complete allocator model. The generation is compiler-
 minted and runtime-checked, but not an opaque language capability; allocator
