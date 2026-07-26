@@ -59,6 +59,11 @@ More detail lives in [INSTALL.md](INSTALL.md) and [BOOTSTRAP.md](BOOTSTRAP.md). 
 make test
 ```
 
+`--debug` is the only supported native debug-output request; it appends the
+current bounded DWARF metadata.  `-g`, alternate debug spellings, strip
+controls, and assembly/IR-output requests are rejected rather than silently
+writing an ordinary executable.
+
 ## LSP
 
 Build the language server:

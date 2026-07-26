@@ -9,9 +9,11 @@ access, MMIO access, and provenance-erasing cast require `unsafe`.
 
 Pointer add/subtract scales by `size_of(T)`, is defined only within one live
 allocation plus one-past, and traps in checked instrumentation otherwise.
-Difference/comparison across allocations is rejected except equality against
-null.  Misalignment is rejected or traps; byte pointers are the explicit route
-for byte arithmetic.  Reallocation invalidates old pointers.  Use-after-free,
+Raw-pointer ordering comparisons are rejected. Equality/inequality is raw
+address identity; equality against null is the portable cross-allocation test,
+not a proof of common allocation provenance. Misalignment is rejected or
+traps; byte pointers are the explicit route for byte arithmetic. Reallocation
+invalidates old pointers.  Use-after-free,
 double-free, and invalid-free are undefined in release unsafe code but detected
 by the debug allocator where practical.
 

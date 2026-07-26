@@ -835,6 +835,17 @@ elif grep -q 'cannot write through' "$tmp/v2-const-write/log"; then
 else
   echo "  XX  const raw pointer mutation rejection missing diagnostic"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-raw-pointer-order"
+printf 'name = "v2rawpointerorder"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-raw-pointer-order/zag.mod"
+printf 'unsafe fn ordered(p: *mut i32, q: *mut i32) bool { return p < q; } fn main() i32 { return 0; }\n' >"$tmp/v2-raw-pointer-order/main.zag"
+if (cd "$tmp/v2-raw-pointer-order" && "$ZNC" main.zag -o out) >"$tmp/v2-raw-pointer-order/log" 2>&1 ||
+   [ -e "$tmp/v2-raw-pointer-order/out" ]; then
+  echo "  XX  raw pointer ordering rejects without artifact"; sed -n '1,8p' "$tmp/v2-raw-pointer-order/log"; fail=$((fail + 1))
+elif grep -q 'raw-pointer ordering comparisons are unsupported' "$tmp/v2-raw-pointer-order/log"; then
+  echo "  ok  raw pointer ordering rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  raw pointer ordering rejection missing diagnostic"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-double-free"
 printf 'name = "v2doublefree"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-double-free/zag.mod"
 printf 'fn main() i32 { unsafe { let p: *mut i32 = new(42) as *mut i32; delete(p); delete(p); } return 0; }\n' >"$tmp/v2-double-free/main.zag"
