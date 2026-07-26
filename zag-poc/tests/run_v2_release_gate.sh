@@ -47,6 +47,7 @@ run_gate "validated x86 POPCNT intrinsic" bash tests/run_x86_popcount.sh
 run_gate "validated x86 BMI1 ANDN intrinsic" bash tests/run_x86_andn.sh
 run_gate "validated x86 trailing-zeros intrinsic" bash tests/run_x86_trailing_zeros.sh
 run_gate "validated x86 byte-swap intrinsic" bash tests/run_x86_byte_swap.sh
+run_gate "validated x86 leading-zeros intrinsic" bash tests/run_x86_leading_zeros.sh
 
 unsupported "pointer and memory model" "raw pointer categories and lexical checks exist, but provenance/alignment/lifetime instrumentation is incomplete"
 unsupported "allocator and reclamation" "checked native SystemAllocator handles exist, but opaque identity, custom/arena/fixed-buffer and debug allocators, and a general lifetime model are incomplete"
