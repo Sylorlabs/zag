@@ -1,18 +1,27 @@
 # Zag v2 safety tooling (draft)
 
 Status: `--safety=checked` is partially implemented for edition-2027 native
-x86-64 output. It traps null and misaligned raw-pointer dereferences/indexes
-before the access, and is rejected on every other target rather than silently
-downgrading. Dynamic bounds and allocator-lifetime checks are not part of this
-first slice. Sanitizer options remain rejected until they have implementation,
+x86-64 output. It traps null and misaligned raw-pointer dereferences/indexes,
+and it checks bounds and freed-state for ordinary allocator regions tracked by
+the native runtime. It is rejected on every other target rather than silently
+downgrading. Sanitizer options remain rejected until they have implementation,
 negative tests, and runtime evidence.
 
 ## Modes
 
 - `--safety=checked` preserves language traps and currently enables dynamic
-  raw-pointer null/alignment checks on native x86-64. Bounds, allocator
-  lifetime, invalid shifts, division by zero, and invalid tags remain separate
-  implementation work; this mode does not claim them yet.
+  raw-pointer null/alignment checks plus bounds and freed-region checks for
+  ordinary `_zag_malloc`/`new`/`_zag_realloc` allocations on native x86-64.
+  The table records allocator capacity (small blocks are class-rounded), so an
+  access whose root and final address stay within that tracked live region is
+  allowed; a one-past or wider access traps before the load/store. A tracked
+  freed region traps before access until that exact address is reissued for a
+  new allocation. Stack, static, foreign, raw-slice, and cache-aligned regions
+  are intentionally not rejected merely because they are untracked. This is
+  bounded runtime instrumentation, not universal pointer provenance: forged
+  pointers, address reuse (ABA), and untracked allocator families remain unsafe
+  programmer responsibility. Invalid shifts, division by zero, and invalid
+  tags remain separate implementation work.
 - `--safety=release` retains defined-language traps while allowing proven
   redundant checks to be removed.  It never converts a safe operation into
   ambient undefined behavior.

@@ -55,11 +55,16 @@ callee's frame.
 
 This is still a conservative intraprocedural static analysis, not universal
 runtime memory instrumentation. Its provenance identity is a compiler-tracked
-local allocation root; dynamic bounds, arbitrary pointer arithmetic, heap-wide
-alias identity, alignment checks, allocator handles, interprocedural summaries
-beyond the three contracts, arbitrary-depth or heap-resident container
-provenance, general global/callback/reference lifetime proof, and runtime
-use-after-free detection remain unimplemented. Paths deeper than the bounded
+local allocation root; arbitrary pointer arithmetic, heap-wide alias identity,
+allocator handles, interprocedural summaries beyond the three contracts,
+arbitrary-depth or heap-resident container provenance, and general
+global/callback/reference lifetime proof remain unimplemented. In
+`--safety=checked` native x86-64 builds, a bounded ordinary-allocation table
+also validates null/alignment plus access width and freed-state for
+`_zag_malloc`/`new`/`_zag_realloc` regions. That runtime table deliberately
+passes through stack/static/foreign and untracked allocator-family pointers;
+it cannot defeat raw-address forgery or same-address reuse, so it is not a
+general use-after-free proof. Paths deeper than the bounded
 field proof retain an uncertain provenance marker and fail closed until a
 proven prefix or whole container is overwritten. This establishes only named
 local aggregate provenance within the checked function, not general aggregate

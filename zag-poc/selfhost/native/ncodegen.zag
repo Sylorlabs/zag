@@ -3567,12 +3567,14 @@ fn cg_push_base_addr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayLis
 // `--safety=checked` is an edition-2027 native mode.  It keeps raw-pointer
 // checks out of the default/release path, but before every instrumented raw
 // access it rejects null and addresses that cannot meet the lowered element's
-// alignment.  Bounds and allocator-liveness require allocation metadata and
-// are deliberately handled by later runtime instrumentation rather than being
-// implied by this guard.
+// alignment.  It also consults the ordinary-allocation registry: an address in
+// a retired allocation fails deterministically, and an address in a live
+// allocation must fit the lowered access width.  Addresses outside that
+// registry are deliberately passed through for stack/static/FFI raw pointers.
 //
-// Input/output: RAX is the address being accessed.  R8/RCX are scratch.
-fn cg_emit_checked_raw_access(out:*ArrayList[Instr],cg:*Cg,align:i32)void{
+// Input/output: RDI is the pointer expression's allocation root and RAX is
+// the final address being accessed. R8/RCX/RDX/RSI are scratch.
+fn cg_emit_checked_raw_access(out:*ArrayList[Instr],cg:*Cg,align:i32,width:i32)void{
     if(cg.*.safety_checked==0){return;}
     let nonnull:i32=cg_fresh(cg);let after_null:i32=cg_fresh(cg);
     push[Instr](out,i_cmp_imm(R_RAX(),0));
@@ -3589,6 +3591,18 @@ fn cg_emit_checked_raw_access(out:*ArrayList[Instr],cg:*Cg,align:i32)void{
         cg_emit_panic(out,"zag safety: misaligned raw pointer access",after_align,cg);
         push[Instr](out,i_label(aligned));
     }
+    let access_ok:i32=cg_fresh(cg);let after_freed:i32=cg_fresh(cg);let after_bounds:i32=cg_fresh(cg);
+    push[Instr](out,i_mov_imm(R_RSI(),width as i64));
+    cg_emit_alloc_access_probe(out,cg);
+    push[Instr](out,i_cmp_imm(R_R8(),0-1));
+    push[Instr](out,i_jne(access_ok));
+    cg_emit_panic(out,"zag safety: use after free of allocator pointer",after_freed,cg);
+    push[Instr](out,i_label(access_ok));
+    push[Instr](out,i_cmp_imm(R_R8(),0-2));
+    let bounds_ok:i32=cg_fresh(cg);
+    push[Instr](out,i_jne(bounds_ok));
+    cg_emit_panic(out,"zag safety: allocator pointer access out of bounds",after_bounds,cg);
+    push[Instr](out,i_label(bounds_ok));
 }
 
 fn cg_lower_addr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[FnSym], cg: *Cg) void {
@@ -3622,9 +3636,10 @@ fn cg_lower_addr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                 // p.* — the address is the pointer value itself.
                 cg_lower_expr(out, f.base, env, syms, cg);   // pushes pointer value
                 push[Instr](out,i_pop(R_RAX()));
+                push[Instr](out,i_mov_rr(R_RDI(),R_RAX()));
                 let pty:[]u8=cg_expr_type(f.base,env,syms,cg);
                 let align:i32=1;if(pty.len>1&&pty[0]=='*'){align=cg_type_alignment(cg,cg_norm_type(pty[1..]));}
-                cg_emit_checked_raw_access(out,cg,align);
+                cg_emit_checked_raw_access(out,cg,align,cg_elem_stride(cg,cg_norm_type(pty[1..])));
                 push[Instr](out,i_push(R_RAX()));
                 return;
             }
@@ -3702,12 +3717,13 @@ fn cg_lower_addr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                 cg_lower_expr(out, ix.idx, env, syms, cg);    // pushes i
                 push[Instr](out, i_pop(R_RCX()));             // rcx = i
                 push[Instr](out, i_pop(R_RAX()));             // rax = ptr
+                push[Instr](out, i_mov_rr(R_RDI(), R_RAX())); // rdi = allocation root
                 if (stride != 1) {
                     push[Instr](out, i_mov_imm(R_RDX(), stride as i64));
                     push[Instr](out, i_imul(R_RCX(), R_RDX()));
                 }
                 push[Instr](out, i_add(R_RAX(), R_RCX()));    // rax = ptr + stride*i
-                cg_emit_checked_raw_access(out,cg,cg_type_alignment(cg,cg_norm_type(ixt[1..])));
+                cg_emit_checked_raw_access(out,cg,cg_type_alignment(cg,cg_norm_type(ixt[1..])),stride);
                 push[Instr](out, i_push(R_RAX()));
                 return;
             }
@@ -4170,14 +4186,16 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                 if (pet.len > 0 && cg_type_is_agg(cg, pet) == 1) {
                     cg_lower_expr(out, f.base, env, syms, cg);
                     push[Instr](out,i_pop(R_RAX()));
-                    cg_emit_checked_raw_access(out,cg,cg_type_alignment(cg,pet));
+                    push[Instr](out,i_mov_rr(R_RDI(),R_RAX()));
+                    cg_emit_checked_raw_access(out,cg,cg_type_alignment(cg,pet),cg_elem_stride(cg,pet));
                     push[Instr](out,i_push(R_RAX()));            // pointer = block addr
                     return;
                 }
                 cg_lower_expr(out, f.base, env, syms, cg);   // pushes pointer value
                 push[Instr](out, i_pop(R_RAX()));
+                push[Instr](out,i_mov_rr(R_RDI(),R_RAX()));
                 let align:i32=1;if(pet.len>0){align=cg_type_alignment(cg,pet);}
-                cg_emit_checked_raw_access(out,cg,align);
+                cg_emit_checked_raw_access(out,cg,align,cg_elem_stride(cg,pet));
                 push[Instr](out, i_load(R_RAX(), R_RAX(), 0));
                 push[Instr](out, i_push(R_RAX()));
                 return;
@@ -4303,12 +4321,13 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                     cg_lower_expr(out, ix.idx, env, syms, cg);      // pushes i
                     push[Instr](out, i_pop(R_RCX()));               // rcx = i
                     push[Instr](out, i_pop(R_RAX()));               // rax = ptr
+                    push[Instr](out, i_mov_rr(R_RDI(), R_RAX()));   // rdi = allocation root
                     if (stride != 1) {
                         push[Instr](out, i_mov_imm(R_RDX(), stride as i64));
                         push[Instr](out, i_imul(R_RCX(), R_RDX()));
                     }
                     push[Instr](out, i_add(R_RAX(), R_RCX()));      // rax = ptr + stride*i
-                    cg_emit_checked_raw_access(out,cg,cg_type_alignment(cg,elemty));
+                    cg_emit_checked_raw_access(out,cg,cg_type_alignment(cg,elemty),stride);
                     if (cg_type_is_agg(cg, elemty) == 1) {
                         // aggregate element: value = element ADDRESS.
                         push[Instr](out, i_push(R_RAX()));
@@ -9030,8 +9049,157 @@ fn RAW_SLICE_REGISTRY_CAP() i64 { return 2048; }
 // diagnostic rather than allocating recursive bookkeeping.
 fn LARGE_ALLOC_REGISTRY() i64 { return BSS_VBASE() + 33792; }
 fn LARGE_ALLOC_REGISTRY_CAP() i64 { return 2048; }
+// [BSS+66560, BSS+115712) is a fixed table of {user_pointer,size} pairs for
+// every ordinary allocator result, including small arena blocks.  A positive
+// pointer means live and a negative pointer means freed.  Checked raw-access
+// instrumentation uses range containment rather than exact equality, so an
+// interior pointer can be checked for both liveness and bounds before it is
+// dereferenced.  Pointers not issued by the ordinary allocator intentionally
+// have no entry: stack, static, and FFI pointer semantics remain explicit raw
+// pointer responsibility rather than being spuriously rejected as "unknown".
+// As with the other provenance tables, this is bounded fail-closed runtime
+// instrumentation; exact-address reuse necessarily begins a new lifetime.
+fn ALLOC_ACCESS_REGISTRY() i64 { return BSS_VBASE() + 66560; }
+fn ALLOC_ACCESS_REGISTRY_CAP() i64 { return 3072; }
 fn ALLOC_MAX_SMALL() i64 { return 524288; }     // 16 << 15
 fn ALLOC_ARENA() i64 { return 1048576; }        // 1 MiB arenas
+
+// Publish an ordinary allocator result to the checked-access registry.
+// Input: rax=user pointer, rsi=payload capacity.  Both inputs are preserved.
+// Tombstones are reused only for the same address: a copied stale pointer then
+// remains detectable until the allocator genuinely starts a new lifetime at
+// that address.
+fn cg_emit_alloc_access_acquire(out:*ArrayList[Instr],cg:*Cg)void{
+    let loop:i32=cg_fresh(cg);let insert:i32=cg_fresh(cg);let next:i32=cg_fresh(cg);
+    let full:i32=cg_fresh(cg);let after_full:i32=cg_fresh(cg);let done:i32=cg_fresh(cg);
+    push[Instr](out,i_mov_imm(R_RCX(),0));
+    push[Instr](out,i_label(loop));
+    push[Instr](out,i_cmp_imm(R_RCX(),ALLOC_ACCESS_REGISTRY_CAP()));
+    push[Instr](out,i_jge(full));
+    push[Instr](out,i_mov_rr(R_R10(),R_RCX()));
+    push[Instr](out,i_mov_imm(R_R9(),16));
+    push[Instr](out,i_imul(R_R10(),R_R9()));
+    push[Instr](out,i_add_imm(R_R10(),ALLOC_ACCESS_REGISTRY()));
+    push[Instr](out,i_load(R_R8(),R_R10(),0));
+    push[Instr](out,i_cmp_imm(R_R8(),0));
+    push[Instr](out,i_je(insert));
+    push[Instr](out,i_jg(next));
+    push[Instr](out,i_neg(R_R8()));
+    push[Instr](out,i_cmp(R_R8(),R_RAX()));
+    push[Instr](out,i_jne(next));
+    push[Instr](out,i_label(insert));
+    push[Instr](out,i_store(R_R10(),0,R_RAX()));
+    push[Instr](out,i_store(R_R10(),8,R_RSI()));
+    push[Instr](out,i_jmp(done));
+    push[Instr](out,i_label(next));
+    push[Instr](out,i_add_imm(R_RCX(),1));
+    push[Instr](out,i_jmp(loop));
+    push[Instr](out,i_label(full));
+    cg_emit_panic(out,"zag runtime: checked allocation provenance registry exhausted",after_full,cg);
+    push[Instr](out,i_label(done));
+}
+
+// Retire an ordinary allocator result. Input: rdi=user pointer. A missing
+// entry is left to the existing allocator-header/large-map validation path;
+// every pointer published by __malloc is expected to be found exactly.
+fn cg_emit_alloc_access_release(out:*ArrayList[Instr],cg:*Cg)void{
+    let loop:i32=cg_fresh(cg);let next:i32=cg_fresh(cg);let found:i32=cg_fresh(cg);let done:i32=cg_fresh(cg);
+    push[Instr](out,i_mov_imm(R_RCX(),0));
+    push[Instr](out,i_label(loop));
+    push[Instr](out,i_cmp_imm(R_RCX(),ALLOC_ACCESS_REGISTRY_CAP()));
+    push[Instr](out,i_jge(done));
+    push[Instr](out,i_mov_rr(R_R10(),R_RCX()));
+    push[Instr](out,i_mov_imm(R_R9(),16));
+    push[Instr](out,i_imul(R_R10(),R_R9()));
+    push[Instr](out,i_add_imm(R_R10(),ALLOC_ACCESS_REGISTRY()));
+    push[Instr](out,i_load(R_R8(),R_R10(),0));
+    push[Instr](out,i_cmp_imm(R_R8(),0));
+    push[Instr](out,i_je(next));
+    push[Instr](out,i_jg(found));
+    push[Instr](out,i_neg(R_R8()));
+    push[Instr](out,i_cmp(R_R8(),R_RDI()));
+    push[Instr](out,i_jmp(next));
+    push[Instr](out,i_label(found));
+    push[Instr](out,i_cmp(R_R8(),R_RDI()));
+    push[Instr](out,i_jne(next));
+    push[Instr](out,i_neg(R_R8()));
+    push[Instr](out,i_store(R_R10(),0,R_R8()));
+    push[Instr](out,i_jmp(done));
+    push[Instr](out,i_label(next));
+    push[Instr](out,i_add_imm(R_RCX(),1));
+    push[Instr](out,i_jmp(loop));
+    push[Instr](out,i_label(done));
+}
+
+// Checked-access range probe. Input: rdi=allocation root, rax=final address,
+// rsi=access width. Output: r8=0 if the root is not an ordinary allocation, 1
+// for a live in-bounds range, -1 for a freed root, and -2 for a live allocation
+// bounds violation. It does not reject unknown roots so stack/static/FFI raw
+// pointers remain usable. The comparison form avoids forming address+width and
+// therefore does not turn an overflowing forged address into an accidental
+// in-bounds access.  Matching the root first prevents `p[far]` from being
+// accepted merely because its final address happens to land in another live
+// allocation.
+fn cg_emit_alloc_access_probe(out:*ArrayList[Instr],cg:*Cg)void{
+    let loop:i32=cg_fresh(cg);let next:i32=cg_fresh(cg);let nonzero:i32=cg_fresh(cg);
+    let have_base:i32=cg_fresh(cg);let contains:i32=cg_fresh(cg);let freed:i32=cg_fresh(cg);
+    let bounds:i32=cg_fresh(cg);let valid:i32=cg_fresh(cg);let done:i32=cg_fresh(cg);
+    push[Instr](out,i_mov_imm(R_R8(),0));
+    push[Instr](out,i_mov_imm(R_RCX(),0));
+    push[Instr](out,i_label(loop));
+    push[Instr](out,i_cmp_imm(R_RCX(),ALLOC_ACCESS_REGISTRY_CAP()));
+    push[Instr](out,i_jge(done));
+    push[Instr](out,i_mov_rr(R_R10(),R_RCX()));
+    push[Instr](out,i_mov_imm(R_R9(),16));
+    push[Instr](out,i_imul(R_R10(),R_R9()));
+    push[Instr](out,i_add_imm(R_R10(),ALLOC_ACCESS_REGISTRY()));
+    push[Instr](out,i_load(R_R9(),R_R10(),0));
+    push[Instr](out,i_cmp_imm(R_R9(),0));
+    push[Instr](out,i_jne(nonzero));
+    push[Instr](out,i_jmp(next));
+    push[Instr](out,i_label(nonzero));
+    push[Instr](out,i_mov_rr(R_RDX(),R_R9()));
+    push[Instr](out,i_cmp_imm(R_RDX(),0));
+    push[Instr](out,i_jg(have_base));
+    push[Instr](out,i_neg(R_RDX()));
+    push[Instr](out,i_label(have_base));
+    push[Instr](out,i_cmp(R_RDI(),R_RDX()));
+    push[Instr](out,i_jl(next));
+    push[Instr](out,i_load(R_R10(),R_R10(),8));
+    push[Instr](out,i_mov_rr(R_R8(),R_RDI()));
+    push[Instr](out,i_sub(R_R8(),R_RDX()));
+    push[Instr](out,i_cmp(R_R8(),R_R10()));
+    push[Instr](out,i_jl(contains));
+    push[Instr](out,i_jmp(next));
+    push[Instr](out,i_jmp(contains));
+    push[Instr](out,i_label(contains));
+    push[Instr](out,i_cmp_imm(R_R9(),0));
+    push[Instr](out,i_jl(freed));
+    // capacity-width is safe only after checking capacity >= width.
+    push[Instr](out,i_sub(R_R10(),R_RSI()));
+    push[Instr](out,i_cmp_imm(R_R10(),0));
+    push[Instr](out,i_jl(bounds));
+    push[Instr](out,i_cmp(R_RAX(),R_RDX()));
+    push[Instr](out,i_jl(bounds));
+    push[Instr](out,i_mov_rr(R_R8(),R_RAX()));
+    push[Instr](out,i_sub(R_R8(),R_RDX()));
+    push[Instr](out,i_cmp(R_R8(),R_R10()));
+    push[Instr](out,i_jle(valid));
+    push[Instr](out,i_jmp(bounds));
+    push[Instr](out,i_label(freed));
+    push[Instr](out,i_mov_imm(R_R8(),0-1));
+    push[Instr](out,i_jmp(done));
+    push[Instr](out,i_label(bounds));
+    push[Instr](out,i_mov_imm(R_R8(),0-2));
+    push[Instr](out,i_jmp(done));
+    push[Instr](out,i_label(valid));
+    push[Instr](out,i_mov_imm(R_R8(),1));
+    push[Instr](out,i_jmp(done));
+    push[Instr](out,i_label(next));
+    push[Instr](out,i_add_imm(R_RCX(),1));
+    push[Instr](out,i_jmp(loop));
+    push[Instr](out,i_label(done));
+}
 
 // Register a newly mapped large ordinary allocation. Input: rax=user pointer,
 // rsi=exact payload size. It does not clobber either input. The registry has
@@ -9215,6 +9383,7 @@ fn cg_emit_malloc(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     push[Instr](out, i_add_imm(R_RAX(), 8));
     push[Instr](out, i_mov_rr(R_RSI(),R_RCX()));
     cg_emit_large_alloc_acquire(out,cg);
+    if(cg.*.safety_checked==1){cg_emit_alloc_access_acquire(out,cg);}
     cg_emit_allocator_acquire(out, R_RSI(), cg);
     push[Instr](out, i_ret());
 
@@ -9235,6 +9404,7 @@ fn cg_emit_malloc(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     push[Instr](out, i_neg(R_R9()));
     push[Instr](out, i_store(R_RAX(), 0 - 8, R_R9()));
     cg_emit_large_alloc_forget_small_reuse(out,cg);
+    if(cg.*.safety_checked==1){cg_emit_alloc_access_acquire(out,cg);}
     cg_emit_allocator_acquire(out, R_RSI(), cg);
     push[Instr](out, i_ret());
 
@@ -9268,6 +9438,7 @@ fn cg_emit_malloc(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     push[Instr](out, i_mov_rr(R_RAX(), R_RDX()));
     push[Instr](out, i_add_imm(R_RAX(), 8));         // ptr = block + 8
     cg_emit_large_alloc_forget_small_reuse(out,cg);
+    if(cg.*.safety_checked==1){cg_emit_alloc_access_acquire(out,cg);}
     cg_emit_allocator_acquire(out, R_RSI(), cg);
     push[Instr](out, i_ret());
 }
@@ -9326,6 +9497,7 @@ fn cg_emit_free(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     push[Instr](out, i_store(R_RDI(), 0 - 8, R_RSI()));  // mark freed first
     push[Instr](out, i_store(R_RDI(), 0, R_R9()));       // [ptr] = old head
     push[Instr](out, i_store(R_R8(), 0, R_RDI()));       // head = ptr
+    if(cg.*.safety_checked==1){cg_emit_alloc_access_release(out,cg);}
     push[Instr](out,i_jmp(l_ret));
     push[Instr](out,i_label(l_missing_big));
     cg_emit_panic(out,"zag runtime: invalid unregistered large allocation",l_big,cg);
@@ -9350,6 +9522,7 @@ fn cg_emit_free(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     push[Instr](out,i_neg(R_R9()));
     push[Instr](out,i_store(R_R10(),0,R_R9()));
     cg_emit_allocator_release(out,R_RSI());
+    if(cg.*.safety_checked==1){cg_emit_alloc_access_release(out,cg);}
     push[Instr](out,i_ret());
     push[Instr](out,i_label(l_invalid));
     cg_emit_panic(out,"zag runtime: invalid or double free",l_ret,cg);

@@ -88,6 +88,71 @@ if (cd "$tmp/v2-checked-misaligned" && "$ZNC" main.zag -o out --safety=checked) 
 else
   echo "  XX  checked safety misaligned program did not compile"; sed -n '1,8p' "$tmp/v2-checked-misaligned/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-checked-heap-oob"
+printf 'name = "v2checkedheapoob"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-heap-oob/zag.mod"
+printf 'fn main() i32 { unsafe { let p:*i8=_zag_malloc(16) as *i8; let value:i8=p[16]; _zag_free(p); return value as i32; } }\n' >"$tmp/v2-checked-heap-oob/main.zag"
+if (cd "$tmp/v2-checked-heap-oob" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-checked-heap-oob/log" 2>&1 && [ -x "$tmp/v2-checked-heap-oob/out" ]; then
+  set +e
+  "$tmp/v2-checked-heap-oob/out" >"$tmp/v2-checked-heap-oob/out.log" 2>"$tmp/v2-checked-heap-oob/err.log"
+  checked_heap_oob_rc=$?
+  set -e
+  if [ "$checked_heap_oob_rc" -ne 0 ] && grep -q 'zag safety: allocator pointer access out of bounds' "$tmp/v2-checked-heap-oob/err.log"; then
+    echo "  ok  checked safety traps tracked heap pointer one-past access"
+    pass=$((pass + 1))
+  else
+    echo "  XX  checked safety heap bounds check (exit=$checked_heap_oob_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  checked safety heap bounds program did not compile"; sed -n '1,8p' "$tmp/v2-checked-heap-oob/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-checked-heap-live"
+printf 'name = "v2checkedheaplive"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-heap-live/zag.mod"
+printf 'fn main() i32 { unsafe { let p:*i8=_zag_malloc(16) as *i8; p[0]=42; let value:i8=p[0]; _zag_free(p); return value as i32; } }\n' >"$tmp/v2-checked-heap-live/main.zag"
+if (cd "$tmp/v2-checked-heap-live" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-checked-heap-live/log" 2>&1 &&
+   [ -x "$tmp/v2-checked-heap-live/out" ]; then
+  set +e
+  "$tmp/v2-checked-heap-live/out"
+  checked_heap_live_rc=$?
+  set -e
+  if [ "$checked_heap_live_rc" -eq 42 ]; then
+    echo "  ok  checked safety permits in-bounds tracked heap access"
+    pass=$((pass + 1))
+  else
+    echo "  XX  checked safety in-bounds heap access (exit=$checked_heap_live_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  checked safety in-bounds heap program did not compile"; sed -n '1,8p' "$tmp/v2-checked-heap-live/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-checked-heap-uaf"
+printf 'name = "v2checkedheapuaf"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-heap-uaf/zag.mod"
+printf 'fn release(p:*i8) void { unsafe { _zag_free(p); } } fn main() i32 { unsafe { let p:*i8=_zag_malloc(16) as *i8; let f:fn(*i8) void=release; p.*=7; f(p); return p.* as i32; } }\n' >"$tmp/v2-checked-heap-uaf/main.zag"
+if (cd "$tmp/v2-checked-heap-uaf" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-checked-heap-uaf/log" 2>&1 ||
+   [ -e "$tmp/v2-checked-heap-uaf/out" ]; then
+  echo "  XX  checked safety retains static ownership boundary"; sed -n '1,8p' "$tmp/v2-checked-heap-uaf/log"; fail=$((fail + 1))
+elif grep -q E0204 "$tmp/v2-checked-heap-uaf/log"; then
+  echo "  ok  checked safety retains static ownership boundary before runtime UAF guard"
+  pass=$((pass + 1))
+else
+  echo "  XX  checked safety ownership rejection missing E0204"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-checked-stack"
+printf 'name = "v2checkedstack"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-stack/zag.mod"
+printf 'fn main() i32 { unsafe { let x:i32=42; let p:*const i32=(&x) as *const i32; return p.*; } }\n' >"$tmp/v2-checked-stack/main.zag"
+if (cd "$tmp/v2-checked-stack" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-checked-stack/log" 2>&1 &&
+   [ -x "$tmp/v2-checked-stack/out" ]; then
+  set +e
+  "$tmp/v2-checked-stack/out"
+  checked_stack_rc=$?
+  set -e
+  if [ "$checked_stack_rc" -eq 42 ]; then
+    echo "  ok  checked safety preserves untracked stack raw-pointer access"
+    pass=$((pass + 1))
+  else
+    echo "  XX  checked safety stack pointer access (exit=$checked_stack_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  checked safety stack pointer access"; sed -n '1,8p' "$tmp/v2-checked-stack/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-checked-wasm"
 printf 'name = "v2checkedwasm"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-wasm/zag.mod"
 printf 'fn main() i32 { return 0; }\n' >"$tmp/v2-checked-wasm/main.zag"
