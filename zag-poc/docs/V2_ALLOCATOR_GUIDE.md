@@ -15,8 +15,10 @@ let block: Allocation = try allocator.allocate(bytes, 8);
 try allocator.deallocate(block);
 ```
 
-The implemented `Allocation` carries a pointer, exact native capacity,
-8-byte alignment, and a runtime-minted lifetime generation. `deallocate`
+The implemented `Allocation` carries a pointer, exact native capacity, chosen
+native alignment, and a runtime-minted lifetime generation. The current native
+surface accepts power-of-two alignment requests 1, 2, 4, and 8; stronger
+alignment remains unsupported rather than silently rounded. `deallocate`
 validates all four against checked-runtime provenance before it frees: an
 invalid base, copied released handle, forged length, wrong alignment, or stale
 generation after address reuse terminates before allocator metadata is touched.

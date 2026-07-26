@@ -171,6 +171,23 @@ if (cd "$tmp/v2-system-allocator-resize" && "$ZNC" main.zag -o out --safety=chec
 else
   echo "  XX  SystemAllocator resize did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-resize/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-system-allocator-alignment"
+printf 'name = "v2systemallocatoralignment"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-alignment/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-alignment/std"
+printf '%s\n' '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,4); if ((block.ptr as i64) % 4 != 0) { return 7; } try allocator.deallocate(block); return 42; } fn main() i32 { return work() catch 9; }' >"$tmp/v2-system-allocator-alignment/main.zag"
+if (cd "$tmp/v2-system-allocator-alignment" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-alignment/log" 2>&1 && [ -x "$tmp/v2-system-allocator-alignment/out" ]; then
+  set +e
+  "$tmp/v2-system-allocator-alignment/out"
+  alignment_allocator_rc=$?
+  set -e
+  if [ "$alignment_allocator_rc" -eq 42 ]; then
+    echo "  ok  SystemAllocator records dynamic supported alignment"; pass=$((pass + 1))
+  else
+    echo "  XX  SystemAllocator dynamic alignment execution (exit=$alignment_allocator_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-alignment/log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  SystemAllocator dynamic alignment did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-alignment/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-captureless-callback"
 printf 'name = "v2capturelesscallback"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-captureless-callback/zag.mod"
 printf 'fn main() i32 { let f:fn() i32=fn[]() i32 { return 42; }; return f(); }\n' >"$tmp/v2-captureless-callback/main.zag"
