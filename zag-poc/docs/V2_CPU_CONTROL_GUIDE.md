@@ -7,8 +7,9 @@ requirements, operand types/alignment, effects, and whether it requires an
 unsafe boundary.
 
 The only current CPU selection is the documented `--cpu` profile resolver.
-Compiler-style `-m...` controls, including `-march`, ISA-feature switches, and
-word-size requests, are rejected rather than silently compiling the generic
+Compiler-style `-m...` controls, LLVM-style target/feature options, and Rust
+`-C...` controls (including `-march`, ISA-feature switches, target CPU, and
+word-size requests) are rejected rather than silently compiling the generic
 baseline. They do not grant permission to emit SIMD or other optional opcodes.
 
 Assembly must name every input/output, register/immediate constraint,
