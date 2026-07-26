@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Narrow executable proof for the only public v2 atomic operation.  It does not
+# Narrow executable proof for the bounded public v2 atomic operations.  It does not
 # start threads: this verifies the emitted x86 XCHG and its fail-closed source /
 # runtime boundary, not a broader concurrency model.
 set -eu
@@ -17,14 +17,16 @@ project() { mkdir -p "$tmp/$1"; printf 'name = "v2atomic"\nversion = "0"\neditio
 
 project exchange
 printf '%s\n' \
-  'fn main() i32 { unsafe { let value:i64=7; let p:*mut i64=(&value) as *mut i64; let cp:*const i64=(&value) as *const i64; let first:i64=@atomicLoad64(cp); @atomicStore64(p,19); let old:i64=@atomicExchange64(p,42); let last:i64=@atomicLoad64(p); if(first==7&&old==19&&last==42&&value==42){return 42;} return 1; } }' \
+  'fn id(value:i64) i64 { return value; } fn main() i32 { unsafe { let value:i64=7; let p:*mut i64=(&value) as *mut i64; let cp:*const i64=(&value) as *const i64; let first:i64=@atomicLoad64(cp); @atomicStore64(p,19); let old:i64=@atomicExchange64(p,42); let won:i64=@atomicCompareExchange64(p,42,99); let lost:i64=@atomicCompareExchange64(p,42,7); let called:i64=@atomicCompareExchange64(p,id(99),id(123)); let last:i64=@atomicLoad64(p); if(first==7&&old==19&&won==42&&lost==99&&called==99&&last==123&&value==123){return 42;} return 1; } }' \
   >"$tmp/exchange/main.zag"
 if (cd "$tmp/exchange" && "$ZNC" main.zag --safety=checked --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/exchange/log" 2>&1 && [ -x "$tmp/exchange/out" ]; then
   set +e; "$tmp/exchange/out"; rc=$?; set -e
   # Zag emits a section-less ELF; inspect raw opcodes. Exchange/store are
-  # REX.W XCHG (48 87 /r); load is LOCK REX.W XADD (f0 48 0f c1 /r).
-  if [ "$rc" -eq 42 ] && od -An -tx1 -v "$tmp/exchange/out" | tr -d ' \n' | grep -Eq '4887[0-9a-f]{2}' && od -An -tx1 -v "$tmp/exchange/out" | tr -d ' \n' | grep -Eq 'f0480fc1[0-9a-f]{2}'; then
-    ok "atomic load/store/exchange execute with locked xadd and xchg"
+  # REX.W XCHG (48 87 /r), load is LOCK REX.W XADD (f0 48 0f c1 /r), and
+  # compare-exchange is LOCK REX.W CMPXCHG (f0 48/4c 0f b1 /r; REX.R is
+  # required here because the desired value is carried in r8).
+  if [ "$rc" -eq 42 ] && od -An -tx1 -v "$tmp/exchange/out" | tr -d ' \n' | grep -Eq '4887[0-9a-f]{2}' && od -An -tx1 -v "$tmp/exchange/out" | tr -d ' \n' | grep -Eq 'f0480fc1[0-9a-f]{2}' && od -An -tx1 -v "$tmp/exchange/out" | tr -d ' \n' | grep -Eq 'f0(48|4c)0fb1[0-9a-f]{2}'; then
+    ok "atomic load/store/exchange/compare-exchange execute with locked xadd, xchg, and cmpxchg"
   else
     bad "atomic exchange execution or xchg encoding"; sed -n '1,12p' "$tmp/exchange/log"
   fi
@@ -40,12 +42,28 @@ else
   grep -q 'atomic exchange requires unsafe' "$tmp/unsafe/log" && ok "atomic exchange requires unsafe" || bad "missing unsafe diagnostic"
 fi
 
+project cas-unsafe
+printf '%s\n' 'fn main() i32 { let value:i64=7; let p:*mut i64=(&value) as *mut i64; return @atomicCompareExchange64(p,7,9) as i32; }' >"$tmp/cas-unsafe/main.zag"
+if (cd "$tmp/cas-unsafe" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/cas-unsafe/log" 2>&1 || [ -e "$tmp/cas-unsafe/out" ]; then
+  bad "atomic compare-exchange outside unsafe was accepted"
+else
+  grep -q 'atomic compare-exchange requires unsafe' "$tmp/cas-unsafe/log" && ok "atomic compare-exchange requires unsafe" || bad "missing compare-exchange unsafe diagnostic"
+fi
+
 project type
 printf '%s\n' 'fn main() i32 { unsafe { let value:i64=7; let p:*const i64=(&value) as *const i64; return @atomicExchange64(p,9) as i32; } }' >"$tmp/type/main.zag"
 if (cd "$tmp/type" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/type/log" 2>&1 || [ -e "$tmp/type/out" ]; then
   bad "const atomic pointer was accepted"
 else
   grep -q 'requires an explicitly mutable' "$tmp/type/log" && ok "atomic exchange rejects non-mutable pointer" || bad "missing pointer diagnostic"
+fi
+
+project cas-const
+printf '%s\n' 'fn main() i32 { unsafe { let value:i64=7; let p:*const i64=(&value) as *const i64; return @atomicCompareExchange64(p,7,9) as i32; } }' >"$tmp/cas-const/main.zag"
+if (cd "$tmp/cas-const" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/cas-const/log" 2>&1 || [ -e "$tmp/cas-const/out" ]; then
+  bad "const compare-exchange pointer was accepted"
+else
+  grep -q 'requires an explicitly mutable' "$tmp/cas-const/log" && ok "atomic compare-exchange rejects non-mutable pointer" || bad "missing compare-exchange pointer diagnostic"
 fi
 
 project store-const
@@ -64,12 +82,36 @@ else
   grep -q 'wrong argument count' "$tmp/load-arity/log" && ok "atomic load rejects wrong arity" || bad "missing load arity diagnostic"
 fi
 
+project cas-arity
+printf '%s\n' 'fn main() i32 { unsafe { let value:i64=7; let p:*mut i64=(&value) as *mut i64; return @atomicCompareExchange64(p,7) as i32; } }' >"$tmp/cas-arity/main.zag"
+if (cd "$tmp/cas-arity" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/cas-arity/log" 2>&1 || [ -e "$tmp/cas-arity/out" ]; then
+  bad "atomic compare-exchange accepted wrong arity"
+else
+  grep -q 'atomic compare-exchange has the wrong argument count' "$tmp/cas-arity/log" && ok "atomic compare-exchange rejects wrong arity" || bad "missing compare-exchange arity diagnostic"
+fi
+
 project value-type
 printf '%s\n' 'fn main() i32 { unsafe { let value:i64=7; let p:*mut i64=(&value) as *mut i64; let wrong:i32=9; @atomicStore64(p,wrong); return @atomicExchange64(p,wrong) as i32; } }' >"$tmp/value-type/main.zag"
 if (cd "$tmp/value-type" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/value-type/log" 2>&1 || [ -e "$tmp/value-type/out" ]; then
   bad "atomic store/exchange accepted a non-i64 value"
 else
   grep -q 'atomic store/exchange value must be i64' "$tmp/value-type/log" && ok "atomic store/exchange require i64 values" || bad "missing atomic value-type diagnostic"
+fi
+
+project cas-value-type
+printf '%s\n' 'fn main() i32 { unsafe { let value:i64=7; let p:*mut i64=(&value) as *mut i64; let wrong:i32=9; return @atomicCompareExchange64(p,wrong,wrong) as i32; } }' >"$tmp/cas-value-type/main.zag"
+if (cd "$tmp/cas-value-type" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/cas-value-type/log" 2>&1 || [ -e "$tmp/cas-value-type/out" ]; then
+  bad "atomic compare-exchange accepted non-i64 values"
+else
+  grep -q 'atomic compare-exchange values must be i64' "$tmp/cas-value-type/log" && ok "atomic compare-exchange requires i64 values" || bad "missing compare-exchange value diagnostic"
+fi
+
+project cas-pure
+printf '%s\n' 'fn bad() i64 @pure { unsafe { let value:i64=7; let p:*mut i64=(&value) as *mut i64; return @atomicCompareExchange64(p,7,9); } } fn main() i32 { return 0; }' >"$tmp/cas-pure/main.zag"
+if (cd "$tmp/cas-pure" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/cas-pure/log" 2>&1 || [ -e "$tmp/cas-pure/out" ]; then
+  bad "pure compare-exchange was accepted"
+else
+  grep -q 'capability violation.*pure' "$tmp/cas-pure/log" && ok "atomic compare-exchange Unsafe effect reaches pure constraint" || bad "missing compare-exchange pure-effect diagnostic"
 fi
 
 project misaligned

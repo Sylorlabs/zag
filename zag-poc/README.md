@@ -117,7 +117,7 @@ that gate failing until their implementation and execution evidence exist. The
 latest isolated run is 20 passing categories and 10 required failures; this is
 not a C replacement or a production-v2 claim yet. The passing slices include
 checked native word volatile transactions, fixed unsafe i64 atomic
-load/store/exchange operations, scalar `@cabi` dynamic imports, validated x86
+load/store/exchange/compare-exchange operations, scalar `@cabi` dynamic imports, validated x86
 POPCNT/ANDN/trailing-zero intrinsics, and bounded native memory sanitizer
 coverage. General atomics/concurrency, pointer/allocator lifetime, full C ABI,
 SIMD/assembly, and physical GPU execution remain explicitly fail-closed; the
