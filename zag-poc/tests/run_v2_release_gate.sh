@@ -34,6 +34,7 @@ run_gate "v2 edition boundary" bash tests/run_v2_edition.sh
 run_gate "unsafe lexical and raw-pointer boundary" bash tests/run_v2_edition.sh
 run_gate "mutation-aware aggregate provenance" bash tests/run_v2_aggregate_provenance.sh
 run_gate "v2 atomic i64 operations" bash tests/run_v2_atomic_exchange.sh
+run_gate "v2 atomic load/store memory-order validation" bash tests/run_v2_atomic_orders.sh
 run_gate "v2 option rejection" bash tests/run_v2_option_rejection.sh
 run_gate "malformed-input crash corpus" bash tests/run_crash_corpus.sh
 run_gate "deterministic fuzz smoke" bash tests/run_fuzz_smoke.sh
@@ -54,7 +55,7 @@ run_gate "validated x86 volatile MMIO widths" bash tests/run_x86_volatile_widths
 unsupported "pointer and memory model" "raw pointer categories and lexical checks exist, but provenance/alignment/lifetime instrumentation is incomplete"
 unsupported "allocator and reclamation" "checked native SystemAllocator handles now carry runtime allocator identity, but opaque language capabilities, custom/arena/fixed-buffer and debug allocators, and a general lifetime model are incomplete"
 unsupported "volatile/MMIO" "checked native 8/16/32-bit and word transactions exist, but physical device validation, address capabilities, and the complete MMIO contract are incomplete"
-unsupported "atomics and concurrency" "fixed unsafe x86-64 i64 load/store/exchange/compare-exchange/fetch-add/sub/and/or/xor exists, but atomic storage, memory orders, threads, and a v2 concurrency model remain incomplete"
+unsupported "atomics and concurrency" "fixed unsafe x86-64 i64 operations plus literal-validated load/store orders exist, but atomic storage, orders on RMW/CAS/fences, threads, and a v2 concurrency model remain incomplete"
 unsupported "C ABI and dynamic linking" "checked v2 @cabi scalar dynamic imports and ELF loading exist, but bidirectional ABI, exports, callbacks, shared-object conformance, and unload/lifetime contracts are incomplete"
 unsupported "CPU intrinsics/SIMD/inline assembly" "validated x86 scalar intrinsics exist, but packed SIMD, inline-assembly constraints/clobbers, and full target-feature/effect checking are incomplete"
 unsupported "effect adversarial suite" "direct Unsafe propagation is tested, but indirect calls and Atomic/FFI/GPU effects are incomplete"

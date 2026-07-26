@@ -16,7 +16,8 @@ The current C-call surface is intentionally narrow and fail-closed:
 
 - outbound calls only;
 - integer, boolean, pointer, and void parameters/returns;
-- System V AMD64 register and stack argument placement;
+- System V AMD64 register and stack argument placement (the executable gate
+  covers a fixed seven-integer call, including one stack argument);
 - one `R_X86_64_GLOB_DAT` GOT slot per non-`_zag_` extern declaration;
 - explicit safe SONAMEs only; no path-bearing dependency names;
 - no float, aggregate, callback, TLS, variadic, debug, hot-reload, or mixed

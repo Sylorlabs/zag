@@ -13,6 +13,16 @@ rejected until function types carry an explicit ABI/effect contract. This keeps
 `@pure` and `@realtime` callers from laundering foreign behavior through an
 otherwise effect-free declaration.
 
+The native x86-64 lowering also has executable coverage for fixed-arity calls
+that exceed the six integer argument registers: additional scalar arguments
+are placed on the SysV AMD64 stack with the required call-site alignment. The
+release fixture calls libc's `syscall` symbol with seven `i64` arguments and
+uses the seventh Linux `mmap` offset to distinguish an invalid unaligned call
+from a successful mapping (libc reports the invalid call as `-1`). This proves the stack placement rule only; it does
+not make variadic declarations, aggregate classification, or arbitrary foreign
+prototypes supported. `syscall` is declared with a fixed seven-word signature
+in that fixture so no variadic function-value or format contract is inferred.
+
 `@cabi` is fail-closed for every other current target/output, including the
 otherwise-supported i686 `--emit-obj` / `--emit-static` path: no v2 C ABI
 object, archive, WASM, ARM64, or GPU artifact is emitted. Those target-specific

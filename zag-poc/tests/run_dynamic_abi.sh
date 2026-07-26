@@ -82,6 +82,24 @@ else
     sed -n '1,16p' "$WORK/v2-cabi/mmap.log"
 fi
 
+# Exercise the SysV AMD64 stack-argument path.  `syscall` is declared with a
+# fixed seven-integer signature here (the libc symbol is variadic in C, but a
+# fixed call with these scalar representations has the same register/stack
+# ABI).  The seventh argument is Linux `mmap`'s file offset: an unaligned
+# offset must produce libc's `-1` error result, proving the callee consumed the stack word;
+# a zero offset then allocates a page which is written and unmapped.  This
+# remains a fixed-arity scalar import, not a variadic-ABI claim.
+printf 'name = "v2cabistack"\nversion = "0"\nedition = "2027"\n' >"$WORK/v2-cabi/zag.mod"
+printf 'extern fn syscall(n:i64,a1:i64,a2:i64,a3:i64,a4:i64,a5:i64,a6:i64) i64 @cabi; fn main() i32 { unsafe { let bad:i64=syscall(9,0,4096,3,34,-1,1); if(bad != 0-1){return 1;} let p:i64=syscall(9,0,4096,3,34,-1,0); if(p < 4096){return 2;} (p as *u8)[0]=42; let gone:i64=syscall(11,p,4096,0,0,0,0); if(gone != 0){return 3;} return 42; } }\n' >"$WORK/v2-cabi/main.zag"
+if (cd "$WORK/v2-cabi" && "$ZNC_BIN" main.zag --dynamic --needed libc.so.6 --no-zagd --no-analyze -o stack) >"$WORK/v2-cabi/stack.log" 2>&1 && [ -x "$WORK/v2-cabi/stack" ]; then
+    "$WORK/v2-cabi/stack"
+    rc=$?
+    [ "$rc" = 42 ] && ok "v2 @cabi seven-argument stack import executes" || bad "v2 @cabi stack import exit=$rc"
+else
+    bad "v2 @cabi seven-argument stack import build"
+    sed -n '1,16p' "$WORK/v2-cabi/stack.log"
+fi
+
 printf 'name = "v2bareextern"\nversion = "0"\nedition = "2027"\n' >"$WORK/v2-cabi/zag.mod"
 printf 'extern fn getpid() i64; fn main() i32 { return 0; }\n' >"$WORK/v2-cabi/main.zag"
 if (cd "$WORK/v2-cabi" && "$ZNC_BIN" main.zag --dynamic --needed libc.so.6 --no-zagd --no-analyze -o bare) >"$WORK/v2-cabi/bare.log" 2>&1; then

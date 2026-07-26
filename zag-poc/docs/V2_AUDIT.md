@@ -69,7 +69,10 @@ complete feature.
    frozen v1 spec says reclamation is not portable v1.  The implementation is
    an extension and must not be described as portable v1 memory reclamation.
 5. `@memoryFence` emits `mfence`, but this is not a complete atomic API or
-   concurrency model and has no defined memory-order interface.
+   concurrency model and has no typed memory-order interface. The bounded
+   `@atomicLoad64Order`/`@atomicStore64Order` forms validate literal orders
+   and lower their x86 load/store subset, but do not establish a general
+   happens-before model.
 
 ## 4. Implemented but insufficiently documented
 

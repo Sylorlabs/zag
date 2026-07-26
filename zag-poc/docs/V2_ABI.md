@@ -42,10 +42,11 @@ resolution semantics have tests.
 
 The only implemented v2 ABI slice is an unsafe, outbound scalar/pointer
 `extern fn ... @cabi` import through the native x86-64 dynamic ELF writer.
-Executable evidence covers both a no-argument integer import and a six-register
-mixed integer/pointer `mmap` import followed by pointer-return `munmap`; this
-does not extend the supported surface to aggregates, floats, callbacks,
-variadics, exports, or imports with ownership/lifetime contracts.
+Executable evidence covers both a no-argument integer import, a six-register
+mixed integer/pointer `mmap` import followed by pointer-return `munmap`, and a
+fixed seven-word scalar call whose seventh `mmap` offset is consumed from the
+SysV stack; this does not extend the supported surface to aggregates, floats,
+callbacks, variadics, exports, or imports with ownership/lifetime contracts.
 It has no v2 export surface: the native x86-64 writer emits `ET_EXEC` with
 program headers only, not an `ET_REL` object, section table, `.symtab`, or
 public-symbol visibility. Accordingly, native `--emit-obj`, `--emit-static`,
