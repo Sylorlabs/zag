@@ -569,6 +569,16 @@ elif grep -q 'effect contract' "$tmp/v2-pure-callback-unsafe/log"; then
 else
   echo "  XX  pure callback Unsafe diagnostic missing"; sed -n '1,12p' "$tmp/v2-pure-callback-unsafe/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-pure-callback-reassignment"
+printf 'name = "v2purecallbackreassignment"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-pure-callback-reassignment/zag.mod"
+printf 'fn clean() i32 { return 1; } fn bad() i32 @pure { let op:fn() i32=clean; op=fn[]() i32 { unsafe { return 7; } }; return op(); } fn main() i32 { return 0; }\n' >"$tmp/v2-pure-callback-reassignment/main.zag"
+if (cd "$tmp/v2-pure-callback-reassignment" && "$ZNC" main.zag -o out) >"$tmp/v2-pure-callback-reassignment/log" 2>&1 || [ -e "$tmp/v2-pure-callback-reassignment/out" ]; then
+  echo "  XX  pure callback reassignment rejects Unsafe effect"; sed -n '1,12p' "$tmp/v2-pure-callback-reassignment/log"; fail=$((fail + 1))
+elif grep -Eq '@pure[^[:space:]]* constraint broken' "$tmp/v2-pure-callback-reassignment/log"; then
+  echo "  ok  pure callback reassignment propagates Unsafe effect"; pass=$((pass + 1))
+else
+  echo "  XX  pure callback reassignment missing Unsafe diagnostic"; sed -n '1,12p' "$tmp/v2-pure-callback-reassignment/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-pure-unsafe"
 printf 'name = "v2pureunsafe"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-pure-unsafe/zag.mod"
 printf 'unsafe fn raw() i32 { return 42; } fn bad() i32 @pure { unsafe { return raw(); } } fn main() i32 { return 0; }\n' >"$tmp/v2-pure-unsafe/main.zag"

@@ -67,6 +67,21 @@ else
     sed -n '1,16p' "$WORK/v2-cabi/build.log"
 fi
 
+# Exercise the implemented six-register scalar/pointer C-ABI path rather than
+# inferring it from the zero-argument getpid witness. `mmap` returns a raw
+# pointer and accepts mixed integer/pointer arguments; `munmap` proves the
+# returned pointer can cross the same explicitly unsafe outbound boundary.
+printf 'name = "v2cabimmap"\nversion = "0"\nedition = "2027"\n' >"$WORK/v2-cabi/zag.mod"
+printf 'extern fn mmap(addr:*u8, len:i64, prot:i32, flags:i32, fd:i32, offset:i64) *u8 @cabi; extern fn munmap(addr:*u8, len:i64) i32 @cabi; fn main() i32 { unsafe { let p:*u8=mmap(null as *u8,4096,3,34,-1,0); if (p == null as *u8) { return 1; } p[0]=42; if (p[0] != 42) { return 2; } if (munmap(p,4096) != 0) { return 3; } return 42; } }\n' >"$WORK/v2-cabi/main.zag"
+if (cd "$WORK/v2-cabi" && "$ZNC_BIN" main.zag --dynamic --needed libc.so.6 --no-zagd --no-analyze -o mmap) >"$WORK/v2-cabi/mmap.log" 2>&1 && [ -x "$WORK/v2-cabi/mmap" ]; then
+    "$WORK/v2-cabi/mmap"
+    rc=$?
+    [ "$rc" = 42 ] && ok "v2 @cabi six-argument pointer import executes" || bad "v2 @cabi mmap execution exit=$rc"
+else
+    bad "v2 @cabi six-argument pointer import build"
+    sed -n '1,16p' "$WORK/v2-cabi/mmap.log"
+fi
+
 printf 'name = "v2bareextern"\nversion = "0"\nedition = "2027"\n' >"$WORK/v2-cabi/zag.mod"
 printf 'extern fn getpid() i64; fn main() i32 { return 0; }\n' >"$WORK/v2-cabi/main.zag"
 if (cd "$WORK/v2-cabi" && "$ZNC_BIN" main.zag --dynamic --needed libc.so.6 --no-zagd --no-analyze -o bare) >"$WORK/v2-cabi/bare.log" 2>&1; then
