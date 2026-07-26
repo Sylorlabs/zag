@@ -44,13 +44,14 @@ the old handle, allocates the replacement first, copies the overlap, then
 consumes the old handle; a fallible replacement allocation therefore leaves the
 old handle live.
 
-In particular, a fixed-buffer allocator is intentionally rejected as a public
-v2 surface for now. Its constructor must retain a caller-owned buffer while its
-allocation operation mutates allocator state and accepts size/alignment. Borrow
-contracts now permit scalar auxiliary parameters, but still track only a first
-owner parameter and reject a receiver/second pointer/aggregate lifetime; that
-does not express this multi-argument lifetime/mutation contract without
-weakening ownership checks. There is no
+In particular, `fixed_buffer_allocator(...)` and `arena_allocator(...)` are
+explicitly rejected as public v2 surface spellings for now. Their constructors
+must retain a caller-owned buffer while allocation mutates allocator state and
+accepts size/alignment. Borrow contracts now permit scalar auxiliary
+parameters, but still track only a first owner parameter and reject a
+receiver/second pointer/aggregate lifetime; that does not express this
+multi-argument lifetime/mutation contract without weakening ownership checks.
+There is no
 special-case fallback, no hidden heap path, and no claimed `@noalloc` or
 `@realtime` behavior until that contract and executable exhaustion/reset tests
 exist.

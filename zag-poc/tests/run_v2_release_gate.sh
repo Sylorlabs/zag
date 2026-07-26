@@ -49,7 +49,7 @@ run_gate "validated x86 trailing-zeros intrinsic" bash tests/run_x86_trailing_ze
 
 unsupported "pointer and memory model" "raw pointer categories and lexical checks exist, but provenance/alignment/lifetime instrumentation is incomplete"
 unsupported "allocator and reclamation" "checked native SystemAllocator handles exist, but opaque identity, custom/arena/fixed-buffer and debug allocators, and a general lifetime model are incomplete"
-unsupported "volatile/MMIO" "checked native word transactions exist, but smaller-width registers, device validation, and the complete MMIO contract are incomplete"
+unsupported "volatile/MMIO" "checked native 8-bit and word transactions exist, but 16/32-bit registers, device validation, and the complete MMIO contract are incomplete"
 unsupported "atomics and concurrency" "fixed unsafe x86-64 i64 load/store/exchange/compare-exchange/fetch-add/sub/and/or/xor exists, but atomic storage, memory orders, threads, and a v2 concurrency model remain incomplete"
 unsupported "C ABI and dynamic linking" "checked v2 @cabi scalar dynamic imports and ELF loading exist, but bidirectional ABI, exports, callbacks, shared-object conformance, and unload/lifetime contracts are incomplete"
 unsupported "CPU intrinsics/SIMD/inline assembly" "validated x86 scalar intrinsics exist, but packed SIMD, inline-assembly constraints/clobbers, and full target-feature/effect checking are incomplete"

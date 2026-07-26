@@ -29,6 +29,9 @@ pointer's allocation, lifetime, sharing, and absence of mixed atomic/non-atomic
 access remain the caller's unsafe contract. `@volatileLoad` and
 `@volatileStore` remain MMIO transactions, not atomics: they neither synchronize
 threads nor imply a memory order.
+`@memoryFence` remains a legacy native `mfence` emission, not a typed fence
+operation; it carries the `Unsafe` effect and cannot make a `@pure` or
+`@realtime` function appear compliant.
 
 Safe concurrent APIs own or synchronize every mutable shared object.  Raw
 shared access, lifetime handoff, and mixed atomic/non-atomic transitions are

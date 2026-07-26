@@ -234,6 +234,16 @@ if (cd "$tmp/v2-system-allocator-alignment" && "$ZNC" main.zag -o out --safety=c
 else
   echo "  XX  SystemAllocator dynamic alignment did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-alignment/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-fixed-buffer-allocator"
+printf 'name = "v2fixedbufferallocator"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-fixed-buffer-allocator/zag.mod"
+printf 'fn main() i32 { let allocator = fixed_buffer_allocator(0, 0); return 0; }\n' >"$tmp/v2-fixed-buffer-allocator/main.zag"
+if (cd "$tmp/v2-fixed-buffer-allocator" && "$ZNC" main.zag -o out) >"$tmp/v2-fixed-buffer-allocator/log" 2>&1 || [ -e "$tmp/v2-fixed-buffer-allocator/out" ]; then
+  echo "  XX  fixed-buffer allocator rejects before an artifact"; sed -n '1,12p' "$tmp/v2-fixed-buffer-allocator/log"; fail=$((fail + 1))
+elif grep -q 'fixed-buffer and arena allocators are unsupported' "$tmp/v2-fixed-buffer-allocator/log"; then
+  echo "  ok  fixed-buffer allocator has an explicit lifetime-contract rejection"; pass=$((pass + 1))
+else
+  echo "  XX  fixed-buffer allocator rejection missing diagnostic"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-system-allocator-callback-escape"
 printf 'name = "v2systemallocatorcallbackescape"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-callback-escape/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-callback-escape/std"
@@ -1473,6 +1483,53 @@ if (cd "$tmp/v2-volatile-positive" && "$ZNC" main.zag -o out --safety=checked) >
 else
   echo "  XX  checked native volatile word transaction compiles"; sed -n '1,16p' "$tmp/v2-volatile-positive/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-volatile-byte-positive"
+printf 'name = "v2volatilebytepositive"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-volatile-byte-positive/zag.mod"
+# Store8 writes the low byte; Load8 must zero-extend it into the result.
+printf 'fn main() i32 { let byte:u8=0; unsafe { let p:*mut u8=(&byte) as *mut u8; @volatileStore8(p,322); return @volatileLoad8(p) as i32; } }\n' >"$tmp/v2-volatile-byte-positive/main.zag"
+if (cd "$tmp/v2-volatile-byte-positive" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-volatile-byte-positive/log" 2>&1 && [ -x "$tmp/v2-volatile-byte-positive/out" ]; then
+  set +e
+  "$tmp/v2-volatile-byte-positive/out"
+  volatile_byte_rc=$?
+  set -e
+  if [ "$volatile_byte_rc" -eq 66 ]; then
+    echo "  ok  checked native volatile byte transaction truncates and zero-extends"; pass=$((pass + 1))
+  else
+    echo "  XX  checked native volatile byte transaction (exit=$volatile_byte_rc)"; sed -n '1,12p' "$tmp/v2-volatile-byte-positive/log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  checked native volatile byte transaction compiles"; sed -n '1,16p' "$tmp/v2-volatile-byte-positive/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-volatile-byte-safe"
+printf 'name = "v2volatilebytesafe"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-volatile-byte-safe/zag.mod"
+printf 'fn read(p:*const u8) u8 { return @volatileLoad8(p); } fn main() i32 { return 0; }\n' >"$tmp/v2-volatile-byte-safe/main.zag"
+if (cd "$tmp/v2-volatile-byte-safe" && "$ZNC" main.zag -o out) >"$tmp/v2-volatile-byte-safe/log" 2>&1 || [ -e "$tmp/v2-volatile-byte-safe/out" ]; then
+  echo "  XX  volatile byte access outside unsafe rejects"; sed -n '1,12p' "$tmp/v2-volatile-byte-safe/log"; fail=$((fail + 1))
+elif grep -q 'volatile/MMIO access requires unsafe' "$tmp/v2-volatile-byte-safe/log"; then
+  echo "  ok  volatile byte access outside unsafe rejects"; pass=$((pass + 1))
+else
+  echo "  XX  volatile byte unsafe diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-volatile-byte-const"
+printf 'name = "v2volatilebyteconst"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-volatile-byte-const/zag.mod"
+printf 'fn main() i32 { let byte:u8=0; unsafe { let p:*const u8=(&byte) as *const u8; @volatileStore8(p,42); } return 0; }\n' >"$tmp/v2-volatile-byte-const/main.zag"
+if (cd "$tmp/v2-volatile-byte-const" && "$ZNC" main.zag -o out) >"$tmp/v2-volatile-byte-const/log" 2>&1 || [ -e "$tmp/v2-volatile-byte-const/out" ]; then
+  echo "  XX  volatile byte const store rejects"; sed -n '1,12p' "$tmp/v2-volatile-byte-const/log"; fail=$((fail + 1))
+elif grep -q 'volatile/MMIO store cannot write through \*const' "$tmp/v2-volatile-byte-const/log"; then
+  echo "  ok  volatile byte const store rejects"; pass=$((pass + 1))
+else
+  echo "  XX  volatile byte const-store diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-volatile-byte-width"
+printf 'name = "v2volatilebytewidth"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-volatile-byte-width/zag.mod"
+printf 'fn main() i32 { let word:i32=0; unsafe { let p:*mut i32=(&word) as *mut i32; @volatileStore8(p,42); } return 0; }\n' >"$tmp/v2-volatile-byte-width/main.zag"
+if (cd "$tmp/v2-volatile-byte-width" && "$ZNC" main.zag -o out) >"$tmp/v2-volatile-byte-width/log" 2>&1 || [ -e "$tmp/v2-volatile-byte-width/out" ]; then
+  echo "  XX  volatile byte pointer type rejects"; sed -n '1,12p' "$tmp/v2-volatile-byte-width/log"; fail=$((fail + 1))
+elif grep -q 'volatile/MMIO byte access requires' "$tmp/v2-volatile-byte-width/log"; then
+  echo "  ok  volatile byte pointer type rejects"; pass=$((pass + 1))
+else
+  echo "  XX  volatile byte pointer type diagnostic missing"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-volatile-safe"
 printf 'name = "v2volatilesafe"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-volatile-safe/zag.mod"
 printf 'fn read(p:*mut i64) i64 { return @volatileLoad(p); } fn main() i32 { let word:i64=0; unsafe { let p:*mut i64=(&word) as *mut i64; return read(p) as i32; } }\n' >"$tmp/v2-volatile-safe/main.zag"
@@ -1502,6 +1559,16 @@ elif grep -q '@pure function' "$tmp/v2-volatile-pure/log"; then
   echo "  ok  volatile Unsafe effect reaches pure function"; pass=$((pass + 1))
 else
   echo "  XX  volatile pure-effect diagnostic missing"; sed -n '1,12p' "$tmp/v2-volatile-pure/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-fence-pure"
+printf 'name = "v2fencepure"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-fence-pure/zag.mod"
+printf 'fn fenced() i32 @pure { @memoryFence(); return 0; } fn main() i32 { return 0; }\n' >"$tmp/v2-fence-pure/main.zag"
+if (cd "$tmp/v2-fence-pure" && "$ZNC" main.zag -o out) >"$tmp/v2-fence-pure/log" 2>&1 || [ -e "$tmp/v2-fence-pure/out" ]; then
+  echo "  XX  legacy fence Unsafe effect reaches pure function"; sed -n '1,12p' "$tmp/v2-fence-pure/log"; fail=$((fail + 1))
+elif grep -q 'capability violation.*pure' "$tmp/v2-fence-pure/log"; then
+  echo "  ok  legacy fence Unsafe effect reaches pure function"; pass=$((pass + 1))
+else
+  echo "  XX  legacy fence pure-effect diagnostic missing"; sed -n '1,12p' "$tmp/v2-fence-pure/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-volatile-width"
 printf 'name = "v2volatilewidth"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-volatile-width/zag.mod"

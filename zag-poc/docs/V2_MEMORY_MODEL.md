@@ -94,6 +94,9 @@ handles after same-address reuse fail before raw free. It supplies
 `allocate`, `allocate_zeroed`, `resize`, and consuming `deallocate`; it does
 not provide opaque language capabilities, custom/arena/fixed-buffer allocators,
 or a general static lifetime analysis for allocator values.
+The reserved `fixed_buffer_allocator(...)` and `arena_allocator(...)` spellings
+therefore reject with a lifetime-contract diagnostic rather than falling back
+to an uncontracted raw-pointer call.
 
 Strict modules keep ordinary top-level `let` rejected with an explicit v2
 lifetime-contract diagnostic. Edition-2027 native x86-64 additionally accepts
@@ -108,17 +111,22 @@ nullary-function desugaring rather than a static object. Aggregate, callback,
 and optional globals remain rejected until initialization ordering, destruction,
 and lifetime/provenance contracts are implemented.
 
-## Implemented volatile/MMIO word slice
+## Implemented volatile/MMIO word and byte slice
 
 Edition-2027 native x86-64 provides `@volatileLoad(ptr)` and
-`@volatileStore(ptr, value)` for one explicit unsafe/MMIO boundary. Both are
-legal only inside `unsafe` (or an `unsafe fn`) and accept only
+`@volatileStore(ptr, value)` for explicit 64-bit transactions, plus
+`@volatileLoad8(ptr)` and `@volatileStore8(ptr, value)` for explicit byte
+transactions. All are legal only inside `unsafe` (or an `unsafe fn`). The word
+forms accept only
 `*const i64`, `*mut i64`, `*host i64` and their `u64`/`isize`/`usize`
-counterparts. Stores reject `*const`. Each lowers to exactly one 64-bit native
-memory load or store; the compiler does not fold, coalesce, or reorder these
-transactions in its native lowering. Store preserves its checked address across
-value-expression calls before issuing that one memory transaction. They are **not atomic**, provide no memory
-ordering, and do not imply a fence.
+counterparts; byte forms accept only `*const u8`, `*mut u8`, or `*host u8`.
+Stores reject `*const`. Each lowers to exactly one native memory load or store;
+the compiler does not fold, coalesce, or reorder these transactions in its
+native lowering. `@volatileLoad8` zero-extends its loaded byte, and
+`@volatileStore8` writes only the low byte of its lowered scalar value. Store
+preserves its checked address across value-expression calls before issuing that
+one memory transaction. They are **not atomic**, provide no memory ordering,
+and do not imply a fence.
 
 With `--safety=checked`, a volatile transaction uses the same immediate
 null/alignment/live-allocation/bounds probe as an ordinary raw access. Unknown
