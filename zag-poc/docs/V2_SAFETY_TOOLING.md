@@ -16,7 +16,10 @@ negative tests, and runtime evidence.
   access whose root and final address stay within that tracked live region is
   allowed; a one-past or wider access traps before the load/store. A tracked
   freed region traps before access until that exact address is reissued for a
-  new allocation. Stack, static, foreign, raw-slice, and cache-aligned regions
+  new allocation. Checked `_zag_free` and `_zag_realloc` additionally require
+  an exact live allocation base before reading allocator headers, so a forged
+  interior pointer traps rather than corrupting a small-block free list. Stack,
+  static, foreign, raw-slice, and cache-aligned regions
   are intentionally not rejected merely because they are untracked. This is
   bounded runtime instrumentation, not universal pointer provenance: forged
   pointers, address reuse (ABA), and untracked allocator families remain unsafe

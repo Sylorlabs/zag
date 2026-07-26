@@ -71,6 +71,13 @@ local aggregate provenance within the checked function, not general aggregate
 or heap-graph provenance. v1 pointer indexing and `new`/`delete` extensions are
 not evidence that those stronger rules already hold.
 
+Strict modules do not currently expose mutable user-global storage: a
+top-level `let` fails with an explicit v2 lifetime-contract diagnostic. The
+compiler's BSS is private allocator/runtime state, and top-level `const` is a
+nullary function desugaring rather than a static object. A real global API
+requires initialization ordering, data/BSS lowering, and an explicit lifetime
+and ownership contract; none is implied by this rejection.
+
 The native x86-64 allocator also marks a small allocation's size header as
 freed before it links that allocation into a free list, and restores the live
 mark when reusing it. A repeated runtime `delete`/`_zag_free` of such a block

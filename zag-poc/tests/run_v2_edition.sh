@@ -125,15 +125,37 @@ else
 fi
 mkdir -p "$tmp/v2-checked-heap-uaf"
 printf 'name = "v2checkedheapuaf"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-heap-uaf/zag.mod"
-printf 'fn release(p:*i8) void { unsafe { _zag_free(p); } } fn main() i32 { unsafe { let p:*i8=_zag_malloc(16) as *i8; let f:fn(*i8) void=release; p.*=7; f(p); return p.* as i32; } }\n' >"$tmp/v2-checked-heap-uaf/main.zag"
-if (cd "$tmp/v2-checked-heap-uaf" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-checked-heap-uaf/log" 2>&1 ||
-   [ -e "$tmp/v2-checked-heap-uaf/out" ]; then
-  echo "  XX  checked safety retains static ownership boundary"; sed -n '1,8p' "$tmp/v2-checked-heap-uaf/log"; fail=$((fail + 1))
-elif grep -q E0204 "$tmp/v2-checked-heap-uaf/log"; then
-  echo "  ok  checked safety retains static ownership boundary before runtime UAF guard"
-  pass=$((pass + 1))
+printf 'fn main() i32 { unsafe { let p:*i8=_zag_malloc(16) as *i8; p.*=7; let saved:i64=(p as i64)+0; _zag_free(p); let q:*i8=saved as *i8; return q.* as i32; } }\n' >"$tmp/v2-checked-heap-uaf/main.zag"
+if (cd "$tmp/v2-checked-heap-uaf" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-checked-heap-uaf/log" 2>&1 && [ -x "$tmp/v2-checked-heap-uaf/out" ]; then
+  set +e
+  "$tmp/v2-checked-heap-uaf/out" >"$tmp/v2-checked-heap-uaf/out.log" 2>"$tmp/v2-checked-heap-uaf/err.log"
+  checked_heap_uaf_rc=$?
+  set -e
+  if [ "$checked_heap_uaf_rc" -ne 0 ] && grep -q 'zag safety: use after free of allocator pointer' "$tmp/v2-checked-heap-uaf/err.log"; then
+    echo "  ok  checked safety traps tracked heap use after free"
+    pass=$((pass + 1))
+  else
+    echo "  XX  checked safety heap lifetime check (exit=$checked_heap_uaf_rc)"; fail=$((fail + 1))
+  fi
 else
-  echo "  XX  checked safety ownership rejection missing E0204"; fail=$((fail + 1))
+  echo "  XX  checked safety heap UAF program did not compile"; sed -n '1,8p' "$tmp/v2-checked-heap-uaf/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-checked-interior-free"
+printf 'name = "v2checkedinteriorfree"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-interior-free/zag.mod"
+printf 'fn main() i32 { unsafe { let p:*i8=_zag_malloc(16) as *i8; p.*=16; let forged:i64=(p as i64)+8; _zag_free(forged as *i8); _zag_free(p); return 0; } }\n' >"$tmp/v2-checked-interior-free/main.zag"
+if (cd "$tmp/v2-checked-interior-free" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-checked-interior-free/log" 2>&1 && [ -x "$tmp/v2-checked-interior-free/out" ]; then
+  set +e
+  "$tmp/v2-checked-interior-free/out" >"$tmp/v2-checked-interior-free/out.log" 2>"$tmp/v2-checked-interior-free/err.log"
+  checked_interior_free_rc=$?
+  set -e
+  if [ "$checked_interior_free_rc" -ne 0 ] && grep -q 'zag safety: invalid or freed allocator pointer' "$tmp/v2-checked-interior-free/err.log"; then
+    echo "  ok  checked safety rejects forged interior free before header access"
+    pass=$((pass + 1))
+  else
+    echo "  XX  checked safety forged interior free (exit=$checked_interior_free_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  checked safety interior-free program did not compile"; sed -n '1,8p' "$tmp/v2-checked-interior-free/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-checked-stack"
 printf 'name = "v2checkedstack"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-stack/zag.mod"
@@ -308,6 +330,16 @@ elif grep -q E0204 "$tmp/v2-safe-deref/log"; then
   echo "  ok  safe scope rejects raw-pointer dereference without artifact"; pass=$((pass + 1))
 else
   echo "  XX  safe scope raw-pointer rejection missing E0204"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-global"
+printf 'name = "v2global"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-global/zag.mod"
+printf 'let global_pointer:*i32 = null as *i32; fn main() i32 { return 0; }\n' >"$tmp/v2-global/main.zag"
+if (cd "$tmp/v2-global" && "$ZNC" main.zag -o out) >"$tmp/v2-global/log" 2>&1 || [ -e "$tmp/v2-global/out" ]; then
+  echo "  XX  v2 mutable global fails closed"; sed -n '1,8p' "$tmp/v2-global/log"; fail=$((fail + 1))
+elif grep -q E0204 "$tmp/v2-global/log" && grep -q 'global lifetime contract' "$tmp/v2-global/log"; then
+  echo "  ok  v2 mutable global requires an explicit lifetime contract without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  v2 global lifetime rejection missing diagnostic"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-const-write"
 printf 'name = "v2constwrite"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-const-write/zag.mod"
