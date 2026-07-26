@@ -7,6 +7,11 @@ native x86-64 dynamic ELF loader under an explicit `unsafe` call site. This is
 import-only evidence, not a general C ABI guarantee; existing v1 `extern`
 usage remains outside the v2 ABI guarantee.
 
+`@cabi` is fail-closed for every other current target/output, including the
+otherwise-supported i686 `--emit-obj` / `--emit-static` path: no v2 C ABI
+object, archive, WASM, ARM64, or GPU artifact is emitted. Those target-specific
+ABIs need their own calling-convention and executable conformance evidence.
+
 Every declaration records calling convention, exact integer widths, aggregate
 representation, pointer mutability/nullability, ownership transfer, callback
 lifetime, error convention, and whether the foreign side may block, allocate,

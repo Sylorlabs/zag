@@ -82,5 +82,15 @@ else
     grep -q 'v2 @cabi imports require --dynamic' "$WORK/v2-cabi/nodynamic.log" && ok "v2 @cabi rejects without dynamic mode" || bad "missing dynamic-mode diagnostic"
 fi
 
+# `--emit-obj` has a real i686 ET_REL path, but it is not evidence for the
+# native x86-64 v2 C ABI.  A v2 @cabi declaration must fail before that target
+# can emit an apparently-C-compatible object.
+printf 'extern fn getpid() i64 @cabi; fn main() i32 { return 0; }\n' >"$WORK/v2-cabi/main.zag"
+if (cd "$WORK/v2-cabi" && "$ZNC_BIN" main.zag --target i686 --emit-obj --no-zagd --no-analyze -o foreign.o) >"$WORK/v2-cabi/i686.log" 2>&1 || [ -e "$WORK/v2-cabi/foreign.o" ]; then
+    bad "v2 @cabi emitted non-native object"
+else
+    grep -q 'supported only for native x86-64 --dynamic' "$WORK/v2-cabi/i686.log" && ok "v2 @cabi rejects non-native object target" || bad "missing non-native ABI diagnostic"
+fi
+
 echo "════ dynamic ABI pass=$pass fail=$fail ════"
 [ "$fail" = 0 ]

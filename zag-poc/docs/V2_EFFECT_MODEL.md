@@ -1,9 +1,11 @@
 # Zag v2 effect model (draft)
 
-Effects are inferred across the typed call graph and carry source witnesses.
-The v2 lattice extends v1 with `Unsafe`, `Volatile`, `Atomic`, `Thread`,
-`Block`, `FFI`, `DynLoad`, `DeviceAlloc`, `DeviceTransfer`, `DeviceDispatch`,
-and `Diverge`; existing `Alloc`, `IO`, `Lock`, `Panic`, and `Raises` remain.
+Effects are inferred across the typed call graph. The implemented lattice is
+`Alloc`, `Panic`, `IO`, `Lock`, `Raises`, and `Unsafe`; this is not yet the
+broader planned v2 lattice for `Volatile`, `Atomic`, `Thread`, `Block`, `FFI`,
+dynamic loading, or GPU work. Function-value rows use the same six-bit
+universe, so `@realtime`/`@pure` callback contracts exclude `Unsafe` as well
+as allocation, I/O, and locking.
 Effects compose by set union.  Capability annotations express exclusions, not
 permissions: `@noalloc` excludes `Alloc`; `@realtime` excludes `Alloc`, `Block`,
 `Lock`, and OS/FFI operations unless specifically approved; `@kernel` excludes

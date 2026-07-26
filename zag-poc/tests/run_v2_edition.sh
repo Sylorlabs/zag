@@ -497,6 +497,32 @@ elif grep -q 'unsafe function values are not implemented' "$tmp/v2-unsafe-value/
 else
   echo "  XX  unsafe function value rejection missing diagnostic"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-realtime-callback"
+printf 'name = "v2realtimecallback"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-realtime-callback/zag.mod"
+printf 'fn clean() i32 { return 42; } fn run(op:fn() i32 @realtime) i32 @realtime { return op(); } fn main() i32 { return run(clean); }\n' >"$tmp/v2-realtime-callback/main.zag"
+if (cd "$tmp/v2-realtime-callback" && "$ZNC" main.zag -o out) >"$tmp/v2-realtime-callback/log" 2>&1 && [ -x "$tmp/v2-realtime-callback/out" ]; then
+  set +e
+  "$tmp/v2-realtime-callback/out"
+  realtime_callback_rc=$?
+  set -e
+  if [ "$realtime_callback_rc" -eq 42 ]; then
+    echo "  ok  realtime callback default uses complete effect universe"; pass=$((pass + 1))
+  else
+    echo "  XX  realtime callback execution (exit=$realtime_callback_rc)"; sed -n '1,12p' "$tmp/v2-realtime-callback/log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  realtime callback contract compiles"; sed -n '1,12p' "$tmp/v2-realtime-callback/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-pure-callback-unsafe"
+printf 'name = "v2purecallbackunsafe"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-pure-callback-unsafe/zag.mod"
+printf 'fn dirty() i32 { unsafe { return 1; } } fn main() i32 { let op:fn() i32 !pure=dirty; return op(); }\n' >"$tmp/v2-pure-callback-unsafe/main.zag"
+if (cd "$tmp/v2-pure-callback-unsafe" && "$ZNC" main.zag -o out) >"$tmp/v2-pure-callback-unsafe/log" 2>&1 || [ -e "$tmp/v2-pure-callback-unsafe/out" ]; then
+  echo "  XX  pure callback contract rejects Unsafe value"; sed -n '1,12p' "$tmp/v2-pure-callback-unsafe/log"; fail=$((fail + 1))
+elif grep -q 'effect contract' "$tmp/v2-pure-callback-unsafe/log"; then
+  echo "  ok  pure callback contract rejects Unsafe value"; pass=$((pass + 1))
+else
+  echo "  XX  pure callback Unsafe diagnostic missing"; sed -n '1,12p' "$tmp/v2-pure-callback-unsafe/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-pure-unsafe"
 printf 'name = "v2pureunsafe"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-pure-unsafe/zag.mod"
 printf 'unsafe fn raw() i32 { return 42; } fn bad() i32 @pure { unsafe { return raw(); } } fn main() i32 { return 0; }\n' >"$tmp/v2-pure-unsafe/main.zag"
