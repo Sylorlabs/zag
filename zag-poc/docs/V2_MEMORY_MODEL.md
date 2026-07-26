@@ -62,9 +62,9 @@ callee's frame.
 This is still a conservative intraprocedural static analysis, not universal
 runtime memory instrumentation. Its provenance identity is a compiler-tracked
 local allocation root; arbitrary pointer arithmetic, heap-wide alias identity,
-allocator handles, interprocedural summaries beyond the three contracts,
-arbitrary-depth or heap-resident container provenance, and general
-global/callback/reference lifetime proof remain unimplemented. In
+interprocedural summaries beyond the three contracts, arbitrary-depth or
+heap-resident container provenance, and general global/callback/reference
+lifetime proof remain unimplemented. In
 `--safety=checked` native x86-64 builds, a bounded 3,072-entry
 ordinary-allocation table
 also validates null/alignment plus access width and freed-state for
@@ -77,6 +77,16 @@ proven prefix or whole container is overwritten. This establishes only named
 local aggregate provenance within the checked function, not general aggregate
 or heap-graph provenance. v1 pointer indexing and `new`/`delete` extensions are
 not evidence that those stronger rules already hold.
+
+The checked native `SystemAllocator` is a separate, deliberately narrow
+allocator-handle boundary. It returns fallible `Allocation` records carrying a
+native pointer, exact reserved capacity, accepted alignment (1, 2, 4, or 8),
+and a runtime-minted generation. `deallocate` and `resize` validate all of
+those fields, so forged capacity/alignment, copied released handles, and stale
+handles after same-address reuse fail before raw free. It supplies
+`allocate`, `allocate_zeroed`, `resize`, and consuming `deallocate`; it does
+not provide opaque language capabilities, custom/arena/fixed-buffer allocators,
+or a general static lifetime analysis for allocator values.
 
 Strict modules keep ordinary top-level `let` rejected with an explicit v2
 lifetime-contract diagnostic. Edition-2027 native x86-64 additionally accepts

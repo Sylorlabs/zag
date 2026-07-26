@@ -43,14 +43,14 @@ run_gate "WASM emission regression (no runtime)" bash tests/run_native_wasm.sh
 run_gate "GPU frontend validation (not execution)" bash tests/run_native_gpu.sh
 
 unsupported "pointer and memory model" "raw pointer categories and lexical checks exist, but provenance/alignment/lifetime instrumentation is incomplete"
-unsupported "allocator and reclamation" "no specified v2 allocator API or debug allocator"
+unsupported "allocator and reclamation" "checked native SystemAllocator handles exist, but opaque identity, custom/arena/fixed-buffer and debug allocators, and a general lifetime model are incomplete"
 unsupported "volatile/MMIO" "no language-level volatile operations"
 unsupported "atomics and concurrency" "no public atomic API or v2 memory model implementation"
 unsupported "C ABI and dynamic linking" "no bidirectional C ABI/shared-library execution suite"
 unsupported "CPU intrinsics/SIMD/inline assembly" "no v2 operand/clobber checked asm interface"
 unsupported "effect adversarial suite" "direct Unsafe propagation is tested, but indirect calls and Atomic/FFI/GPU effects are incomplete"
 unsupported "physical GPU execution" "no runtime enumerate/allocate/dispatch/readback path"
-unsupported "sanitizers" "bounded native --sanitize=memory exists, but red zones, poisoning, custom allocator coverage, and ABA-resistant identity are incomplete"
+unsupported "sanitizers" "bounded native --sanitize=memory exists, but red zones, poisoning, allocation-site reports, and custom allocator coverage are incomplete"
 unsupported "documentation verification map" "verification matrix exists but records incomplete required capabilities"
 
 echo "════ v2-release pass=$pass fail=$fail ════"

@@ -25,7 +25,9 @@ silently downgrading. Other sanitizer modes remain rejected.
   the same bounded registry and retire on their paired free. This is
   bounded runtime instrumentation, not universal pointer provenance: forged
   pointers, address reuse (ABA), and untracked allocator families remain unsafe
-  programmer responsibility. Invalid shifts, division by zero, and invalid
+  programmer responsibility. The checked `SystemAllocator` handle boundary is
+  narrower and separately records a generation, so copied handles cannot be
+  reused after the same native address is reissued. Invalid shifts, division by zero, and invalid
   tags remain separate implementation work.
 - `--safety=release` retains defined-language traps while allowing proven
   redundant checks to be removed.  It never converts a safe operation into
@@ -33,8 +35,9 @@ silently downgrading. Other sanitizer modes remain rejected.
 - `--sanitize=memory` currently enables the same bounded ordinary-allocation
   provenance checks as `--safety=checked` and fails process exit on a nonzero
   ordinary-allocation live witness. It does not yet provide red zones,
-  poisoning, guard pages, allocation-site reports, custom-allocator tracking,
-  or ABA-resistant identity.
+  poisoning, guard pages, allocation-site reports, or custom-allocator
+  tracking. Its SystemAllocator-handle checks retain the same generation
+  validation as checked mode; that does not make raw-pointer ABA generally safe.
 - `--sanitize=undefined` instruments checked integer conversion/overflow,
   shifts, null/misalignment, invalid enum/union tags, and other specified
   dynamic preconditions.

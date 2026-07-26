@@ -12,10 +12,10 @@ surface rather than granting a premature green release.
 `docs/V2_SUPPORT_MATRIX.generated.md` is separately generated from that gate's
 inventory; it cannot turn an unsupported category into a release pass.
 
-Latest isolated working-copy run (2026-07-15): **14 passing categories, 10
+Latest isolated working-copy run (2026-07-25): **15 passing categories, 10
 failing required categories, exit 1**. Passing categories include bootstrap,
 v1 semantic/native compatibility, shared declared-type authority, the v2
-edition/option gates, hard-error handling, malformed-input and deterministic
+edition/option gates, mutation-aware aggregate provenance, hard-error handling, malformed-input and deterministic
 fuzz smoke, documentation/matrix checks, WASM emission regression, and GPU frontend
 validation. Every failure below is intentional fail-closed release evidence,
 not a skipped test.
@@ -40,7 +40,7 @@ not a skipped test.
 | CPU intrinsics, SIMD, inline assembly | `V2_LANGUAGE_SPEC.md`, `V2_UNSAFE_MODEL.md` | none | none | none | no machine-code assertions | UNSUPPORTED |
 | GPU address spaces and kernel effects | `V2_GPU_MODEL.md`, `V2_EFFECT_MODEL.md` | MLIR/gfx bundle emitters do not have a v2 typed authority | `tests/run_native_gpu.sh` checks emitted output | no address-space/effect rejection tests | none | FRONTEND ONLY |
 | GPU target binary and physical dispatch | `V2_GPU_MODEL.md` | none: no device enumeration/context/buffer/dispatch/readback path | none | no OOB/effect rejection at runtime | none | UNSUPPORTED |
-| Sanitizers and debug allocator | `V2_SAFETY_TOOLING.md` | native x86-64 `--sanitize=memory` enables bounded ordinary-allocation checked provenance and exits nonzero on a nonzero live-allocation witness | `tests/run_v2_edition.sh` executes a released-allocation sanitizer witness | unsupported target rejects without artifact; ordinary direct leaks are also rejected statically | native x86-64 execution | PARTIAL / no red zones, poisoning, guard pages, allocation-site reports, custom allocator tracking, or ABA-resistant identity |
+| Sanitizers and debug allocator | `V2_SAFETY_TOOLING.md` | native x86-64 `--sanitize=memory` enables bounded ordinary-allocation checked provenance and exits nonzero on a nonzero live-allocation witness; checked `SystemAllocator` handles retain generation validation | `tests/run_v2_edition.sh` executes a released-allocation sanitizer witness and a stale-generation handle rejection | unsupported target rejects without artifact; ordinary direct leaks are also rejected statically | native x86-64 execution | PARTIAL / no red zones, poisoning, guard pages, allocation-site reports, or custom allocator tracking; raw-pointer ABA remains outside the handle boundary |
 | Fuzzing and malformed-input corpus | `V2_IMPLEMENTATION_PLAN.md` | `tests/run_crash_corpus.sh`, `tests/run_fuzz_smoke.sh`; `tests/crash_corpus/` | crash corpus rejects ten minimized malformed sources; deterministic byte smoke has seven cases | both suites assert nonzero exit, timeout failure, no artifact, and no signal termination | compiler invocation only | PARTIAL / no coverage-guided fuzzing or sanitizers |
 | Differential and performance evidence | `V2_IMPLEMENTATION_PLAN.md` | legacy differential scripts exist | `tests/run_differential.sh` is v1 evidence | no v2 semantic differential suite | no v2 benchmarks | PARTIAL / not v2 support |
 

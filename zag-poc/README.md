@@ -114,6 +114,11 @@ release. Its matrix and executable gate are in
 [docs/V2_FINAL_VERIFICATION.md](docs/V2_FINAL_VERIFICATION.md) and
 `tests/run_v2_release_gate.sh`; required unsupported rows deliberately keep
 that gate failing until their implementation and execution evidence exist.
+Its current checked native x86-64 allocator slice is
+[`SystemAllocator`](docs/V2_ALLOCATOR_GUIDE.md): fallible allocate, zeroed
+allocate, resize, and deallocate use capacity/alignment/generation-validated
+handles. This is not a general allocator, raw-pointer memory-safety guarantee,
+or a v2 release claim.
 
 Native cross-target and self-hosting gates:
 
