@@ -17,14 +17,14 @@ project() { mkdir -p "$tmp/$1"; printf 'name = "v2atomic"\nversion = "0"\neditio
 
 project exchange
 printf '%s\n' \
-  'fn main() i32 { unsafe { let value:i64=7; let p:*mut i64=(&value) as *mut i64; let old:i64=@atomicExchange64(p,19); let now:i64=@atomicExchange64(p,42); if(old==7&&now==19&&value==42){return 42;} return 1; } }' \
+  'fn main() i32 { unsafe { let value:i64=7; let p:*mut i64=(&value) as *mut i64; let cp:*const i64=(&value) as *const i64; let first:i64=@atomicLoad64(cp); @atomicStore64(p,19); let old:i64=@atomicExchange64(p,42); let last:i64=@atomicLoad64(p); if(first==7&&old==19&&last==42&&value==42){return 42;} return 1; } }' \
   >"$tmp/exchange/main.zag"
 if (cd "$tmp/exchange" && "$ZNC" main.zag --safety=checked --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/exchange/log" 2>&1 && [ -x "$tmp/exchange/out" ]; then
   set +e; "$tmp/exchange/out"; rc=$?; set -e
-  # Zag emits a section-less ELF; inspect the raw opcode rather than relying
-  # on objdump's section table.  The lowering is REX.W 87 /r (48 87 xx).
-  if [ "$rc" -eq 42 ] && od -An -tx1 -v "$tmp/exchange/out" | tr -d ' \n' | grep -Eq '4887[0-9a-f]{2}'; then
-    ok "atomic exchange executes and emitted ELF contains memory xchg"
+  # Zag emits a section-less ELF; inspect raw opcodes. Exchange/store are
+  # REX.W XCHG (48 87 /r); load is LOCK REX.W XADD (f0 48 0f c1 /r).
+  if [ "$rc" -eq 42 ] && od -An -tx1 -v "$tmp/exchange/out" | tr -d ' \n' | grep -Eq '4887[0-9a-f]{2}' && od -An -tx1 -v "$tmp/exchange/out" | tr -d ' \n' | grep -Eq 'f0480fc1[0-9a-f]{2}'; then
+    ok "atomic load/store/exchange execute with locked xadd and xchg"
   else
     bad "atomic exchange execution or xchg encoding"; sed -n '1,12p' "$tmp/exchange/log"
   fi
@@ -46,6 +46,22 @@ if (cd "$tmp/type" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cac
   bad "const atomic pointer was accepted"
 else
   grep -q 'requires an explicitly mutable' "$tmp/type/log" && ok "atomic exchange rejects non-mutable pointer" || bad "missing pointer diagnostic"
+fi
+
+project store-const
+printf '%s\n' 'fn main() i32 { unsafe { let value:i64=7; let p:*const i64=(&value) as *const i64; @atomicStore64(p,9); return 0; } }' >"$tmp/store-const/main.zag"
+if (cd "$tmp/store-const" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/store-const/log" 2>&1 || [ -e "$tmp/store-const/out" ]; then
+  bad "atomic store through const pointer was accepted"
+else
+  grep -q 'stores/exchanges require \*mut' "$tmp/store-const/log" && ok "atomic store rejects const pointer" || bad "missing store mutability diagnostic"
+fi
+
+project load-arity
+printf '%s\n' 'fn main() i32 { unsafe { let value:i64=7; let p:*mut i64=(&value) as *mut i64; return @atomicLoad64(p,1) as i32; } }' >"$tmp/load-arity/main.zag"
+if (cd "$tmp/load-arity" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/load-arity/log" 2>&1 || [ -e "$tmp/load-arity/out" ]; then
+  bad "atomic load accepted wrong arity"
+else
+  grep -q 'wrong argument count' "$tmp/load-arity/log" && ok "atomic load rejects wrong arity" || bad "missing load arity diagnostic"
 fi
 
 project misaligned
