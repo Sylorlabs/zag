@@ -48,9 +48,9 @@ does not extend the supported surface to aggregates, floats, callbacks,
 variadics, exports, or imports with ownership/lifetime contracts.
 It has no v2 export surface: the native x86-64 writer emits `ET_EXEC` with
 program headers only, not an `ET_REL` object, section table, `.symtab`, or
-public-symbol visibility. Accordingly, native `--emit-obj` and
-`--emit-static` fail before artifact creation rather than silently producing an
-executable. The separate i686 object/archive path is not v2 C ABI evidence and
+public-symbol visibility. Accordingly, native `--emit-obj`, `--emit-static`,
+and `--emit-shared` fail before artifact creation rather than silently producing
+an executable. The separate i686 object/archive path is not v2 C ABI evidence and
 rejects v2 `@cabi` declarations.
 
 A native export/static-object increment requires codegen to return exact public

@@ -2,7 +2,8 @@
 
 The complete model below is not implemented. The current executable slice is
 limited to edition-2027 native x86-64 `@atomicLoad64`, `@atomicStore64`,
-`@atomicExchange64`, `@atomicCompareExchange64`, and `@atomicFetchAdd64` on naturally aligned raw
+`@atomicExchange64`, `@atomicCompareExchange64`, `@atomicFetchAdd64`, and
+`@atomicFetchSub64` on naturally aligned raw
 `i64` pointers. These are unsafe,
 fixed full-order x86 transactions; storage types, selectable memory orders,
 fences, threads, and litmus evidence remain release blockers. See

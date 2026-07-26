@@ -113,7 +113,8 @@ legal only inside `unsafe` (or an `unsafe fn`) and accept only
 `*const i64`, `*mut i64`, `*host i64` and their `u64`/`isize`/`usize`
 counterparts. Stores reject `*const`. Each lowers to exactly one 64-bit native
 memory load or store; the compiler does not fold, coalesce, or reorder these
-transactions in its native lowering. They are **not atomic**, provide no memory
+transactions in its native lowering. Store preserves its checked address across
+value-expression calls before issuing that one memory transaction. They are **not atomic**, provide no memory
 ordering, and do not imply a fence.
 
 With `--safety=checked`, a volatile transaction uses the same immediate

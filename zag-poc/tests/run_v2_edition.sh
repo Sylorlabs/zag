@@ -1420,14 +1420,14 @@ fi
 # raw source scanner used by the early edition gate.
 mkdir -p "$tmp/v2-volatile-positive"
 printf 'name = "v2volatilepositive"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-volatile-positive/zag.mod"
-printf 'fn main() i32 { let word:i64=41; unsafe { let p:*mut i64=(&word) as *mut i64; @volatileStore(p,42); return @volatileLoad(p) as i32; } }\n' >"$tmp/v2-volatile-positive/main.zag"
+printf 'fn sixth(a:i64,b:i64,c:i64,d:i64,e:i64,f:i64) i64 { return f; } fn main() i32 { let word:i64=41; unsafe { let p:*mut i64=(&word) as *mut i64; @volatileStore(p,sixth(1,2,3,4,5,42)); return @volatileLoad(p) as i32; } }\n' >"$tmp/v2-volatile-positive/main.zag"
 if (cd "$tmp/v2-volatile-positive" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-volatile-positive/log" 2>&1 && [ -x "$tmp/v2-volatile-positive/out" ]; then
   set +e
   "$tmp/v2-volatile-positive/out"
   volatile_rc=$?
   set -e
   if [ "$volatile_rc" -eq 42 ]; then
-    echo "  ok  checked native volatile word transaction executes"; pass=$((pass + 1))
+    echo "  ok  checked native volatile word transaction preserves address across value call"; pass=$((pass + 1))
   else
     echo "  XX  checked native volatile word transaction (exit=$volatile_rc)"; sed -n '1,12p' "$tmp/v2-volatile-positive/log"; fail=$((fail + 1))
   fi

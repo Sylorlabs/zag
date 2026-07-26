@@ -116,5 +116,13 @@ else
     grep -q 'native x86-64 --emit-obj/--emit-static is not implemented' "$WORK/v2-cabi/native-object.log" && ok "native x86-64 object request fails closed" || bad "missing native object diagnostic"
 fi
 
+# A shared-object request is also unsupported: it must not be ignored and
+# silently fall through to the ET_EXEC writer.
+if (cd "$WORK/v2-cabi" && "$ZNC_BIN" main.zag --emit-shared --no-zagd --no-analyze -o native.so) >"$WORK/v2-cabi/native-shared.log" 2>&1 || [ -e "$WORK/v2-cabi/native.so" ]; then
+    bad "native x86-64 emitted a misleading shared-object artifact"
+else
+    grep -q 'v2 compiler option is not implemented: --emit-shared' "$WORK/v2-cabi/native-shared.log" && ok "native x86-64 shared-object request fails closed" || bad "missing native shared-object diagnostic"
+fi
+
 echo "════ dynamic ABI pass=$pass fail=$fail ════"
 [ "$fail" = 0 ]
