@@ -41,6 +41,8 @@ silently downgrading. Other sanitizer modes remain rejected.
   instrument integer conversion/overflow, shifts, tags, or other preconditions.
 - `--sanitize=thread` is not implemented and is rejected; it records no
   synchronization or conflicting accesses.
+- Compiler-style `-fsanitize=...` and `-fno-sanitize...` controls are also
+  rejected. They never silently select, disable, or modify Zag instrumentation.
 
 These are selected build modes, not source-level promises.  They compose with
 the effect system: instrumentation itself must not make an `@realtime` or

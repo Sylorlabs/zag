@@ -64,6 +64,18 @@ elif grep -q 'SystemAllocator requires --safety=checked' "$tmp/v2-system-allocat
 else
   echo "  XX  SystemAllocator unchecked rejection missing diagnostic"; sed -n '1,16p' "$tmp/v2-system-allocator-unchecked/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-system-allocator-internal-free-unchecked"
+printf 'name = "v2systemallocatorinternalfreeunchecked"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-internal-free-unchecked/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-internal-free-unchecked/std"
+printf '@import("std/allocator.zag") fn main() i32 { unsafe { _zag_allocation_free(null as *u8); } return 0; }\n' >"$tmp/v2-system-allocator-internal-free-unchecked/main.zag"
+if (cd "$tmp/v2-system-allocator-internal-free-unchecked" && "$ZNC" main.zag -o out) >"$tmp/v2-system-allocator-internal-free-unchecked/log" 2>&1 ||
+   [ -e "$tmp/v2-system-allocator-internal-free-unchecked/out" ]; then
+  echo "  XX  unchecked internal allocator free rejects"; sed -n '1,16p' "$tmp/v2-system-allocator-internal-free-unchecked/log"; fail=$((fail + 1))
+elif grep -q 'SystemAllocator requires --safety=checked' "$tmp/v2-system-allocator-internal-free-unchecked/log"; then
+  echo "  ok  unchecked internal allocator free rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  unchecked internal allocator-free rejection missing diagnostic"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-system-allocator"
 printf 'name = "v2systemallocator"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator/std"

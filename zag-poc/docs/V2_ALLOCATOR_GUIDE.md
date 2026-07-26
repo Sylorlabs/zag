@@ -25,7 +25,10 @@ generation after address reuse terminates before allocator metadata is touched.
 This requires native x86-64 `--safety=checked`; other targets and unchecked
 builds reject the validation boundary rather than silently weakening it. The
 v2 compiler gate proves that an unchecked call reports that requirement and
-does not leave an executable artifact.
+does not leave an executable artifact. The compiler-private
+`_zag_allocation_register`, `_zag_allocation_validate`, and
+`_zag_allocation_free` hooks are also checked-mode-only, so an imported helper
+spelling cannot silently open an unchecked handle-free path.
 
 The same gate proves the native telemetry boundary for a checked handle: a
 24-byte request increments the lifetime allocation count once, records its

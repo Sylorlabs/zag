@@ -60,9 +60,9 @@ make test
 ```
 
 `--debug` is the only supported native debug-output request; it appends the
-current bounded DWARF metadata.  `-g`, alternate debug spellings, strip
-controls, and assembly/IR-output requests are rejected rather than silently
-writing an ordinary executable.
+current bounded DWARF metadata.  `-g`, parameterized/alternate debug spellings,
+strip controls, and assembly/IR-output requests are rejected rather than
+silently writing an ordinary executable.
 
 ## LSP
 
@@ -121,7 +121,7 @@ release. Its matrix and executable gate are in
 that gate failing until their implementation and execution evidence exist. The
 latest isolated run (2026-07-26) is 20 passing categories and 10 required failures; this is
 not a C replacement or a production-v2 claim yet. The passing slices include
-checked native word volatile transactions, fixed unsafe i64 atomic
+checked native word and byte volatile transactions, fixed unsafe i64 atomic
 load/store/exchange/compare-exchange/fetch-add/sub/and/or/xor operations, scalar `@cabi` dynamic imports, validated x86
 POPCNT/ANDN/trailing-zero intrinsics, and bounded native memory sanitizer
 coverage. General atomics/concurrency, pointer/allocator lifetime, full C ABI,
@@ -133,8 +133,11 @@ threading model.
 Its current checked native x86-64 allocator slice is
 [`SystemAllocator`](docs/V2_ALLOCATOR_GUIDE.md): fallible allocate, zeroed
 allocate, resize, and deallocate use capacity/alignment/generation-validated
-handles. This is not a general allocator, raw-pointer memory-safety guarantee,
-or a v2 release claim.
+handles. Reserved `fixed_buffer_allocator(...)` and `arena_allocator(...)`
+spellings reject until their retained-buffer and mutable-receiver lifetime
+contract exists. Legacy `@memoryFence` emits `mfence` but is unsafe and is not a
+typed memory-order API. This is not a general allocator, raw-pointer
+memory-safety guarantee, or a v2 release claim.
 
 Native cross-target and self-hosting gates:
 

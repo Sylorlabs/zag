@@ -94,6 +94,9 @@ handles after same-address reuse fail before raw free. It supplies
 `allocate`, `allocate_zeroed`, `resize`, and consuming `deallocate`; it does
 not provide opaque language capabilities, custom/arena/fixed-buffer allocators,
 or a general static lifetime analysis for allocator values.
+Its compiler-private register, validate, and free hooks also reject outside
+checked mode; importing the allocator module cannot silently weaken that handle
+boundary into an unchecked free path.
 The reserved `fixed_buffer_allocator(...)` and `arena_allocator(...)` spellings
 therefore reject with a lifetime-contract diagnostic rather than falling back
 to an uncontracted raw-pointer call.
