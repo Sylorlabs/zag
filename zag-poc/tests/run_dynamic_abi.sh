@@ -124,5 +124,19 @@ else
     grep -q 'v2 compiler option is not implemented: --emit-shared' "$WORK/v2-cabi/native-shared.log" && ok "native x86-64 shared-object request fails closed" || bad "missing native shared-object diagnostic"
 fi
 
+# Common shared/library spellings must be equally explicit.  None currently
+# names an implemented object format, so accepting one as ET_EXEC would lie
+# about its ABI just as --emit-shared did.
+for shared_flag in --shared --emit-dylib --emit-lib --emit=shared; do
+    shared_name=$(printf '%s' "$shared_flag" | tr -cd '[:alnum:]')
+    if (cd "$WORK/v2-cabi" && "$ZNC_BIN" main.zag "$shared_flag" --no-zagd --no-analyze -o "$shared_name.out") >"$WORK/v2-cabi/$shared_name.log" 2>&1 || [ -e "$WORK/v2-cabi/$shared_name.out" ]; then
+        bad "$shared_flag emitted a misleading output artifact"
+    elif grep -q "v2 compiler option is not implemented: $shared_flag" "$WORK/v2-cabi/$shared_name.log"; then
+        ok "$shared_flag fails closed"
+    else
+        bad "$shared_flag missing output-mode diagnostic"
+    fi
+done
+
 echo "════ dynamic ABI pass=$pass fail=$fail ════"
 [ "$fail" = 0 ]

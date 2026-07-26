@@ -1009,6 +1009,24 @@ if (cd "$tmp/v2-owned-consume-contract" && "$ZNC" check main.zag) >"$tmp/v2-owne
 else
   echo "  XX  declared consume permits owned transfer"; sed -n '1,8p' "$tmp/v2-owned-consume-contract/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-owned-consume-scalar-contract"
+printf 'name = "v2ownedconsumescalarcontract"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-consume-scalar-contract/zag.mod"
+printf 'struct Node { value:i32 } fn dispose(p:*mut Node, count:i64) void @consumes { unsafe { delete(p); } } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; dispose(p,1); } return 0; }\n' >"$tmp/v2-owned-consume-scalar-contract/main.zag"
+if (cd "$tmp/v2-owned-consume-scalar-contract" && "$ZNC" check main.zag) >"$tmp/v2-owned-consume-scalar-contract/log" 2>&1; then
+  echo "  ok  consume contract permits scalar auxiliary parameter"; pass=$((pass + 1))
+else
+  echo "  XX  consume contract scalar auxiliary parameter"; sed -n '1,8p' "$tmp/v2-owned-consume-scalar-contract/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owned-consume-pointer-aux"
+printf 'name = "v2ownedconsumepointeraux"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-consume-pointer-aux/zag.mod"
+printf 'struct Node { value:i32 } fn bad(p:*mut Node, other:*mut Node) void @consumes { unsafe { delete(p); } } fn main() i32 { return 0; }\n' >"$tmp/v2-owned-consume-pointer-aux/main.zag"
+if (cd "$tmp/v2-owned-consume-pointer-aux" && "$ZNC" main.zag -o out) >"$tmp/v2-owned-consume-pointer-aux/log" 2>&1 || [ -e "$tmp/v2-owned-consume-pointer-aux/out" ]; then
+  echo "  XX  consume contract pointer auxiliary parameter rejects"; sed -n '1,8p' "$tmp/v2-owned-consume-pointer-aux/log"; fail=$((fail + 1))
+elif grep -q '@consumes auxiliary parameters must be builtin scalars' "$tmp/v2-owned-consume-pointer-aux/log"; then
+  echo "  ok  consume contract pointer auxiliary parameter rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  consume contract pointer auxiliary rejection missing diagnostic"; sed -n '1,8p' "$tmp/v2-owned-consume-pointer-aux/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-owned-condition-alias-escape"
 printf 'name = "v2ownedconditionaliasescape"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-condition-alias-escape/zag.mod"
 printf 'struct Node { value:i32 } fn retain(p:*mut Node) i32 { return 0; } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; let q:*mut Node=p; if (retain(q) == 0) { } delete(p); } return 0; }\n' >"$tmp/v2-owned-condition-alias-escape/main.zag"
