@@ -863,6 +863,22 @@ if (cd "$tmp/v2-sanitize-memory" && "$ZNC" main.zag -o out --sanitize=memory) >"
 else
   echo "  XX  memory sanitizer compiles released-allocation witness"; sed -n '1,10p' "$tmp/v2-sanitize-memory/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-sanitize-memory-poison"
+printf 'name = "v2sanitizememorypoison"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-sanitize-memory-poison/zag.mod"
+printf 'fn main() i32 { unsafe { let p:*i8 = _zag_malloc(16) as *i8; p[8] = 7; _zag_free(p); let q:*i8 = _zag_malloc(16) as *i8; let marker:i32 = q[8] as i32; _zag_free(q); return marker; } }\n' >"$tmp/v2-sanitize-memory-poison/main.zag"
+if (cd "$tmp/v2-sanitize-memory-poison" && "$ZNC" main.zag -o out --sanitize=memory) >"$tmp/v2-sanitize-memory-poison/log" 2>&1 && [ -x "$tmp/v2-sanitize-memory-poison/out" ]; then
+  set +e
+  "$tmp/v2-sanitize-memory-poison/out"
+  sanitize_memory_poison_rc=$?
+  set -e
+  if [ "$sanitize_memory_poison_rc" -eq 165 ] || [ "$sanitize_memory_poison_rc" -eq -91 ]; then
+    echo "  ok  memory sanitizer poisons reused freed payload"; pass=$((pass + 1))
+  else
+    echo "  XX  memory sanitizer poison witness (exit=$sanitize_memory_poison_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  memory sanitizer poison witness compiles"; sed -n '1,10p' "$tmp/v2-sanitize-memory-poison/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-raw-slice-release"
 printf 'name = "v2rawslicerelease"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-raw-slice-release/zag.mod"
 printf 'fn main() i32 { let xs:[]i32 = zalloc_i(1); xs[0] = 7; zfree_i(xs); return 0; }\n' >"$tmp/v2-raw-slice-release/main.zag"

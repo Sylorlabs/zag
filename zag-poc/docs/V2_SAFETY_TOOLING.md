@@ -34,8 +34,11 @@ silently downgrading. Other sanitizer modes remain rejected.
 - `--sanitize=memory` currently enables the same bounded ordinary-allocation
   provenance checks as `--safety=checked` and fails process exit on a nonzero
   ordinary-allocation live witness. It does not yet provide red zones,
-  poisoning, guard pages, allocation-site reports, or custom-allocator
-  tracking. Its SystemAllocator-handle checks retain the same generation and
+  guard pages, allocation-site reports, or custom-allocator tracking. On every
+  ordinary free under sanitizer mode it provides deterministic byte poisoning (`0xA5`)
+  before the block enters the free list or is unmapped; this is useful evidence
+  when a stale alias escapes the provenance table, but it is not a red-zone or
+  general use-after-free proof. Its SystemAllocator-handle checks retain the same generation and
   allocator-identity validation as checked mode; that does not make
   raw-pointer ABA generally safe.
 - `--sanitize=undefined` is not implemented and is rejected; it does not
@@ -55,7 +58,8 @@ sanitizer on an unsupported target, but it may not downgrade it silently.
 The current native reports are fixed diagnostic strings and a nonzero process
 outcome. Checked raw-access traps name null, alignment, bounds, or retired
 allocator state; the memory-sanitizer exit trap says only that live ordinary
-allocation capacity remains. They do **not** contain source locations,
+allocation capacity remains, and poison bytes do not identify an allocation
+site. They do **not** contain source locations,
 function names, addresses, sizes, allocation/free sites, redzone bytes, or a
 backtrace. The allocator telemetry observers can expose aggregate live/peak
 capacity to a program, but are not allocation-site reporting. Thread
