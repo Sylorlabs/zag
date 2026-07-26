@@ -1,5 +1,11 @@
 # Zag v2 concurrency model (draft)
 
+The complete model below is not implemented. The current executable slice is
+limited to edition-2027 native x86-64 `@atomicExchange64(*mut i64, i64)`, an
+unsafe, naturally aligned exchange with full x86 ordering; storage types,
+selectable memory orders, fences, threads, and litmus evidence remain release
+blockers. See `docs/V2_CONCURRENCY_GUIDE.md` for the implemented boundary.
+
 Data races on non-atomic shared storage are forbidden behavior.  Atomic scalar
 and pointer operations provide relaxed, acquire, release, acq_rel, and seq_cst
 orders; invalid order-operation combinations are compile-time errors.  Atomic

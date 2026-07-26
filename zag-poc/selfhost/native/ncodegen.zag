@@ -1568,6 +1568,15 @@ fn cg_dynamic_index(cg: *Cg, name: []u8) i32 {
 
 fn cg_dynamic_got_vaddr() i64 { return 150994944; } // elf_dynamic.zag 0x9000000
 
+fn cg_fn_has_annot(f: FnDecl, annot: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[[]u8](f.annots)) {
+        if (@strEq(get[[]u8](f.annots, i), annot)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
 // The initial C ABI surface is deliberately narrow: one-word integers, bool,
 // pointers, and void. Aggregates and floats use Zag-native conventions and are
 // rejected until their SysV classification is implemented and tested.
@@ -3392,6 +3401,12 @@ fn cg_expr_type(n: *Node, env: *Env, syms: ArrayList[FnSym], cg: *Cg) []u8 {
                     // let/print/bin paths don't re-convert an already-converted
                     // value (and @floatCast preserves its float operand's type).
                     if (cid.name.len > 0) { if (cid.name[0] == '@') {
+                        if (@strEq(cid.name, "@volatileLoad")) {
+                            if (len[*Node](c.args) == 1) {
+                                return "i64";
+                            }
+                            return "";
+                        }
                         if (@strEq(cid.name, "@intToFloat")) { return "f64"; }
                         if (@strEq(cid.name, "@floatToInt")) { return "i32"; }
                         if (@strEq(cid.name, "@floatCast")) {
@@ -3680,6 +3695,27 @@ fn cg_emit_checked_raw_access(out:*ArrayList[Instr],cg:*Cg,align:i32,width:i32)v
     push[Instr](out,i_jne(bounds_ok));
     cg_emit_panic(out,"zag safety: allocator pointer access out of bounds",after_bounds,cg);
     push[Instr](out,i_label(bounds_ok));
+}
+
+// The public v2 atomic slice is one naturally aligned 64-bit exchange.  Unlike
+// ordinary raw access, null/alignment validation is unconditional: x86 XCHG on
+// a malformed address must never become an accidental segfault-based contract.
+// Input/output: RAX is the address.  R8/RCX are scratch.  The caller retains a
+// copy when it needs the address after this probe.
+fn cg_emit_atomic_i64_pointer_check(out:*ArrayList[Instr],cg:*Cg)void{
+    let nonnull:i32=cg_fresh(cg);let after_null:i32=cg_fresh(cg);
+    let aligned:i32=cg_fresh(cg);let after_align:i32=cg_fresh(cg);
+    push[Instr](out,i_cmp_imm(R_RAX(),0));
+    push[Instr](out,i_jne(nonnull));
+    cg_emit_panic(out,"zag atomic: null *mut i64",after_null,cg);
+    push[Instr](out,i_label(nonnull));
+    push[Instr](out,i_mov_rr(R_R8(),R_RAX()));
+    push[Instr](out,i_mov_imm(R_RCX(),7));
+    push[Instr](out,i_and(R_R8(),R_RCX()));
+    push[Instr](out,i_cmp_imm(R_R8(),0));
+    push[Instr](out,i_je(aligned));
+    cg_emit_panic(out,"zag atomic: misaligned *mut i64",after_align,cg);
+    push[Instr](out,i_label(aligned));
 }
 
 fn cg_lower_addr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[FnSym], cg: *Cg) void {
@@ -5868,6 +5904,103 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
         return;
     }
 
+    // `@atomicExchange64(ptr, value) -> old` is the first public atomic API:
+    // Linux x86-64 only, raw `*mut i64`, and full XCHG ordering.  It intentionally
+    // exposes no selectable memory-order vocabulary, loads/stores, CAS, or
+    // threads; those need independent lowering and litmus coverage.
+    if (@strEq(b, "atomicExchange64")) {
+        if (nargs != 2) {
+            cg_err(cg, "native: @atomicExchange64 expects *mut i64 and i64");
+            push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;
+        }
+        let pty:[]u8=cg_expr_type(get[*Node](c.args,0),env,syms,cg);
+        if (@strEq(pty,"*mut i64")==0) {
+            cg_err(cg,"native: @atomicExchange64 requires *mut i64");
+            push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;
+        }
+        cg_lower_expr(out,get[*Node](c.args,0),env,syms,cg);
+        push[Instr](out,i_pop(R_RAX()));
+        cg_emit_atomic_i64_pointer_check(out,cg);
+        // The allocator probe preserves RAX on its normal path, but keep the
+        // address on the compiler value stack so this lowering does not depend
+        // on a non-existent R11 register in the self-hosted ISA.
+        push[Instr](out,i_push(R_RAX()));
+        push[Instr](out,i_mov_rr(R_RDI(),R_RAX()));
+        cg_emit_checked_raw_access(out,cg,8,8);
+        push[Instr](out,i_pop(R_RDI()));
+        cg_lower_expr(out,get[*Node](c.args,1),env,syms,cg);
+        push[Instr](out,i_pop(R_RAX()));
+        push[Instr](out,i_xchg_mem(R_RDI(),R_RAX()));
+        push[Instr](out,i_push(R_RAX()));
+        return;
+    }
+
+    // One executable v2 volatile/MMIO slice: explicit 64-bit transactions on
+    // raw pointers only.  `i_load`/`i_store` are emitted exactly once here and
+    // this backend has no motion/CSE pass, so they retain their observable
+    // transaction.  They are deliberately NOT atomics and do not imply a
+    // hardware fence.  In checked mode the same dynamic null/alignment/liveness
+    // checks as an ordinary raw dereference run before the transaction.
+    if (@strEq(b, "volatileLoad")) {
+        if (nargs != 1) {
+            cg_err(cg, "native: @volatileLoad expects one raw word pointer");
+            push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return;
+        }
+        let pty: []u8 = cg_expr_type(get[*Node](c.args, 0), env, syms, cg);
+        let elem: []u8 = pty;
+        if (elem.len > 1 && elem[0] == '*') { elem = elem[1..]; }
+        if (cg_starts_with(elem, "const ") == 1) { elem = elem[6..]; }
+        else if (cg_starts_with(elem, "mut ") == 1) { elem = elem[4..]; }
+        else if (cg_starts_with(elem, "host ") == 1) { elem = elem[5..]; }
+        else { elem = ""; }
+        elem = cg_norm_type(elem);
+        if (@strEq(elem, "i64") == 0 && @strEq(elem, "u64") == 0 && @strEq(elem, "isize") == 0 && @strEq(elem, "usize") == 0) { elem = ""; }
+        if (elem.len == 0) {
+            cg_err(cg, "native: @volatileLoad requires *const/*mut/*host 64-bit scalar pointer");
+            push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return;
+        }
+        cg_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+        push[Instr](out, i_pop(R_RAX()));
+        push[Instr](out, i_mov_rr(R_RDI(), R_RAX()));
+        cg_emit_checked_raw_access(out, cg, 8, 8);
+        push[Instr](out, i_load(R_RAX(), R_RAX(), 0));
+        push[Instr](out, i_push(R_RAX()));
+        return;
+    }
+    if (@strEq(b, "volatileStore")) {
+        if (nargs != 2) {
+            cg_err(cg, "native: @volatileStore expects raw word pointer and value");
+            push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return;
+        }
+        let pty: []u8 = cg_expr_type(get[*Node](c.args, 0), env, syms, cg);
+        let elem: []u8 = pty;
+        if (elem.len > 1 && elem[0] == '*') { elem = elem[1..]; }
+        if (cg_starts_with(elem, "const ") == 1) { elem = elem[6..]; }
+        else if (cg_starts_with(elem, "mut ") == 1) { elem = elem[4..]; }
+        else if (cg_starts_with(elem, "host ") == 1) { elem = elem[5..]; }
+        else { elem = ""; }
+        elem = cg_norm_type(elem);
+        if (@strEq(elem, "i64") == 0 && @strEq(elem, "u64") == 0 && @strEq(elem, "isize") == 0 && @strEq(elem, "usize") == 0) { elem = ""; }
+        if (elem.len == 0 || cg_starts_with(pty, "*const ") == 1) {
+            cg_err(cg, "native: @volatileStore requires *mut/*host 64-bit scalar pointer");
+            push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return;
+        }
+        // Evaluate pointer before value but retain both across the checked probe.
+        cg_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+        push[Instr](out, i_pop(R_R9()));
+        cg_lower_expr(out, get[*Node](c.args, 1), env, syms, cg);
+        push[Instr](out, i_pop(R_R10()));
+        push[Instr](out, i_push(R_R10()));
+        push[Instr](out, i_mov_rr(R_RAX(), R_R9()));
+        push[Instr](out, i_mov_rr(R_RDI(), R_RAX()));
+        cg_emit_checked_raw_access(out, cg, 8, 8);
+        push[Instr](out, i_pop(R_R10()));
+        push[Instr](out, i_store(R_RAX(), 0, R_R10()));
+        push[Instr](out, i_mov_imm(R_RAX(), 0));
+        push[Instr](out, i_push(R_RAX()));
+        return;
+    }
+
     // ── ROUND 3: quire builtins → REWRITE to a runtime call ──────────────────
     // @quireZero() → znrt_quire_zero()  (returns ZnrtQuire by value, via sret)
     // @quireFMA(q,a,b) → znrt_quire_fma(q,a,b)  (q is a by-value aggregate arg)
@@ -7539,7 +7672,7 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
 
     let lbl: i32 = cg_find_fn(syms, fname);
     if (lbl < 0) {
-        cg_err(cg, "native: call to unknown function");
+        cg_err(cg, _zag_str_concat("native: call to unknown function `", _zag_str_concat(fname, "`")));
         push[Instr](out, i_mov_imm(R_RAX(), 0));
         push[Instr](out, i_push(R_RAX()));
         return;
@@ -12173,6 +12306,10 @@ fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *Ar
         let d: *Node = get[*Node](decls, di);
         switch (d.*) {
             .fn_decl => |f| {
+                if (v2_edition == 1 && cg_fn_has_annot(f, "@cabi") == 1 && f.is_extern == 0) {
+                    _zag_eprintln("native: @cabi is valid only on extern functions");
+                    top_err = top_err + 1;
+                }
                 if (len[[]u8](f.tparams) > 0) {
                     // generic template: no code, instances carry it.
                 } else if (f.is_extern == 1) {
@@ -12182,7 +12319,10 @@ fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *Ar
                     // lowered natively at the CALL site, and a call to an
                     // un-supported extern is caught loudly there as "call to
                     // unknown function". So a mere extern decl is harmless.
-                    if (dynamic_mode == 1 && cg_starts_with(f.name, "_zag_") == 0) {
+                    if (v2_edition == 1 && cg_fn_has_annot(f, "@cabi") == 1 && dynamic_mode == 0) {
+                        _zag_eprintln("native: v2 @cabi imports require --dynamic and an explicit --needed SONAME");
+                        top_err = top_err + 1;
+                    } else if (dynamic_mode == 1 && cg_starts_with(f.name, "_zag_") == 0 && (v2_edition == 0 || cg_fn_has_annot(f, "@cabi") == 1)) {
                         let abi_ok: i32 = cg_dynamic_abi_type_ok(f.ret);
                         let ap: i32 = 0;
                         while (ap < len[Param](f.params)) {

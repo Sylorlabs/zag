@@ -73,7 +73,7 @@ fi
 if [ -f docs/V2_FFI_GUIDE.md ] && [ -f docs/V2_CONCURRENCY_GUIDE.md ] && \
    [ -f docs/V2_ALLOCATOR_GUIDE.md ] && \
    rg -q 'not implemented' docs/V2_FFI_GUIDE.md && \
-   rg -q 'not implemented' docs/V2_CONCURRENCY_GUIDE.md && \
+   rg -q '@atomicExchange64' docs/V2_CONCURRENCY_GUIDE.md && \
    rg -q 'not yet the complete allocator model' docs/V2_ALLOCATOR_GUIDE.md; then
   ok "low-level guides scope implemented allocator surface and unsupported APIs"
 else

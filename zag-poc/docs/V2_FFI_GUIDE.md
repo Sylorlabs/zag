@@ -1,7 +1,11 @@
 # Zag v2 FFI guide (draft)
 
-FFI is not implemented in v2.  This guide is the contract future bindings must
-meet; existing v1 `extern` usage remains outside the v2 ABI guarantee.
+The complete v2 FFI contract is not implemented. A deliberately narrow
+edition-2027 slice now accepts `extern fn ... @cabi` declarations for scalar
+integers, `bool`, `void`, and raw pointers, and can resolve them through the
+native x86-64 dynamic ELF loader under an explicit `unsafe` call site. This is
+import-only evidence, not a general C ABI guarantee; existing v1 `extern`
+usage remains outside the v2 ABI guarantee.
 
 Every declaration records calling convention, exact integer widths, aggregate
 representation, pointer mutability/nullability, ownership transfer, callback

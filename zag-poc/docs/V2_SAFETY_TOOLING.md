@@ -51,11 +51,18 @@ sanitizer on an unsupported target, but it may not downgrade it silently.
 
 ## Diagnostics and reporting
 
-Each trap/report contains source location where known, function, violated rule,
-relevant type/address/size, and the allocation or synchronization witness when
-available.  The debug allocator records allocation and free sites.  Sanitizer
-reports are nonzero process outcomes in test mode.  Guarded allocations and
-thread instrumentation are explicitly unsuitable for hard real-time use.
+The current native reports are fixed diagnostic strings and a nonzero process
+outcome. Checked raw-access traps name null, alignment, bounds, or retired
+allocator state; the memory-sanitizer exit trap says only that live ordinary
+allocation capacity remains. They do **not** contain source locations,
+function names, addresses, sizes, allocation/free sites, redzone bytes, or a
+backtrace. The allocator telemetry observers can expose aggregate live/peak
+capacity to a program, but are not allocation-site reporting. Thread
+instrumentation and guarded allocations do not exist in this implementation.
+Known source-level owner leaks are normally rejected earlier by the edition-2027
+typed ownership pass, so the sanitizer's exit witness is a backstop for
+lowered/runtime paths rather than a replacement for that static rule; it does
+not yet have an independent source-level leak execution regression.
 
 ## Exit criteria
 

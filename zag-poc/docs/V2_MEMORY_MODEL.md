@@ -101,6 +101,23 @@ nullary-function desugaring rather than a static object. Aggregate, callback,
 and optional globals remain rejected until initialization ordering, destruction,
 and lifetime/provenance contracts are implemented.
 
+## Implemented volatile/MMIO word slice
+
+Edition-2027 native x86-64 provides `@volatileLoad(ptr)` and
+`@volatileStore(ptr, value)` for one explicit unsafe/MMIO boundary. Both are
+legal only inside `unsafe` (or an `unsafe fn`) and accept only
+`*const i64`, `*mut i64`, `*host i64` and their `u64`/`isize`/`usize`
+counterparts. Stores reject `*const`. Each lowers to exactly one 64-bit native
+memory load or store; the compiler does not fold, coalesce, or reorder these
+transactions in its native lowering. They are **not atomic**, provide no memory
+ordering, and do not imply a fence.
+
+With `--safety=checked`, a volatile transaction uses the same immediate
+null/alignment/live-allocation/bounds probe as an ordinary raw access. Unknown
+stack, static, and foreign/MMIO addresses remain outside that registry and are
+therefore the unsafe caller's responsibility. The proof does not validate a
+physical device register, concurrent access, or address fabrication.
+
 Captureless callbacks are ordinary function values. A scalar by-value capture
 uses a heap environment that is an owned v2 resource: it may be transferred by
 an owned return or must be released with `close(callback)` on every path. The

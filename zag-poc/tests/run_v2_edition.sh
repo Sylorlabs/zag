@@ -1278,6 +1278,62 @@ else
 fi
 # v1 comments and strings are not syntax and must not accidentally trigger the
 # raw source scanner used by the early edition gate.
+mkdir -p "$tmp/v2-volatile-positive"
+printf 'name = "v2volatilepositive"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-volatile-positive/zag.mod"
+printf 'fn main() i32 { let word:i64=41; unsafe { let p:*mut i64=(&word) as *mut i64; @volatileStore(p,42); return @volatileLoad(p) as i32; } }\n' >"$tmp/v2-volatile-positive/main.zag"
+if (cd "$tmp/v2-volatile-positive" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-volatile-positive/log" 2>&1 && [ -x "$tmp/v2-volatile-positive/out" ]; then
+  set +e
+  "$tmp/v2-volatile-positive/out"
+  volatile_rc=$?
+  set -e
+  if [ "$volatile_rc" -eq 42 ]; then
+    echo "  ok  checked native volatile word transaction executes"; pass=$((pass + 1))
+  else
+    echo "  XX  checked native volatile word transaction (exit=$volatile_rc)"; sed -n '1,12p' "$tmp/v2-volatile-positive/log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  checked native volatile word transaction compiles"; sed -n '1,16p' "$tmp/v2-volatile-positive/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-volatile-safe"
+printf 'name = "v2volatilesafe"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-volatile-safe/zag.mod"
+printf 'fn read(p:*mut i64) i64 { return @volatileLoad(p); } fn main() i32 { let word:i64=0; unsafe { let p:*mut i64=(&word) as *mut i64; return read(p) as i32; } }\n' >"$tmp/v2-volatile-safe/main.zag"
+if (cd "$tmp/v2-volatile-safe" && "$ZNC" main.zag -o out) >"$tmp/v2-volatile-safe/log" 2>&1 || [ -e "$tmp/v2-volatile-safe/out" ]; then
+  echo "  XX  volatile access outside unsafe rejects"; sed -n '1,12p' "$tmp/v2-volatile-safe/log"; fail=$((fail + 1))
+elif grep -q 'volatile/MMIO access requires unsafe' "$tmp/v2-volatile-safe/log"; then
+  echo "  ok  volatile access outside unsafe rejects"; pass=$((pass + 1))
+else
+  echo "  XX  volatile unsafe diagnostic missing"; sed -n '1,12p' "$tmp/v2-volatile-safe/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-volatile-const"
+printf 'name = "v2volatileconst"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-volatile-const/zag.mod"
+printf 'fn main() i32 { let word:i64=0; unsafe { let p:*const i64=(&word) as *const i64; @volatileStore(p,42); } return 0; }\n' >"$tmp/v2-volatile-const/main.zag"
+if (cd "$tmp/v2-volatile-const" && "$ZNC" main.zag -o out) >"$tmp/v2-volatile-const/log" 2>&1 || [ -e "$tmp/v2-volatile-const/out" ]; then
+  echo "  XX  volatile const store rejects"; sed -n '1,12p' "$tmp/v2-volatile-const/log"; fail=$((fail + 1))
+elif grep -q 'volatile/MMIO store cannot write through \*const' "$tmp/v2-volatile-const/log"; then
+  echo "  ok  volatile const store rejects"; pass=$((pass + 1))
+else
+  echo "  XX  volatile const-store diagnostic missing"; sed -n '1,12p' "$tmp/v2-volatile-const/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-volatile-pure"
+printf 'name = "v2volatilepure"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-volatile-pure/zag.mod"
+printf 'fn read(p:*const i64) i64 @pure { unsafe { return @volatileLoad(p); } } fn main() i32 { return 0; }\n' >"$tmp/v2-volatile-pure/main.zag"
+if (cd "$tmp/v2-volatile-pure" && "$ZNC" main.zag -o out) >"$tmp/v2-volatile-pure/log" 2>&1 || [ -e "$tmp/v2-volatile-pure/out" ]; then
+  echo "  XX  volatile Unsafe effect reaches pure function"; sed -n '1,12p' "$tmp/v2-volatile-pure/log"; fail=$((fail + 1))
+elif grep -q '@pure function' "$tmp/v2-volatile-pure/log"; then
+  echo "  ok  volatile Unsafe effect reaches pure function"; pass=$((pass + 1))
+else
+  echo "  XX  volatile pure-effect diagnostic missing"; sed -n '1,12p' "$tmp/v2-volatile-pure/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-volatile-width"
+printf 'name = "v2volatilewidth"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-volatile-width/zag.mod"
+printf 'fn main() i32 { let word:i32=0; unsafe { let p:*mut i32=(&word) as *mut i32; @volatileStore(p,42); } return 0; }\n' >"$tmp/v2-volatile-width/main.zag"
+if (cd "$tmp/v2-volatile-width" && "$ZNC" main.zag -o out) >"$tmp/v2-volatile-width/log" 2>&1 || [ -e "$tmp/v2-volatile-width/out" ]; then
+  echo "  XX  volatile narrow-width transaction rejects"; sed -n '1,12p' "$tmp/v2-volatile-width/log"; fail=$((fail + 1))
+elif grep -q 'volatile/MMIO requires' "$tmp/v2-volatile-width/log"; then
+  echo "  ok  volatile narrow-width transaction rejects"; pass=$((pass + 1))
+else
+  echo "  XX  volatile width diagnostic missing"; sed -n '1,12p' "$tmp/v2-volatile-width/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v1-text"
 printf 'name = "v1text"\nversion = "0"\nedition = "2026"\n' >"$tmp/v1-text/zag.mod"
 printf 'fn main() i32 { print_str("unsafe *mut"); // volatile atomic asm *device\n return 42; }\n' >"$tmp/v1-text/main.zag"
