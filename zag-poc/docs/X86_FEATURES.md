@@ -15,6 +15,7 @@ in the encoder.
 | `x86-64`, `x86-64-v1` | implemented aliases |
 | SSE2 | advertised by the generic profile; scalar floating point and baseline MOVDQU memcpy chunks |
 | SSE3, SSSE3, SSE4.1, SSE4.2 | not advertised |
+| baseline scalar byte swap | `byte_swap64(i64)` lowers to `BSWAP r64`; fixed x86-64 instruction, not SIMD |
 | POPCNT | generic fallback; native-gated opcode; cached dispatch with `--cpu=runtime` |
 | AVX, AVX2, FMA, BMI1, BMI2, AVX-512 | not advertised |
 | `native` | CPUID/OS-gated SSE2 plus POPCNT when present and tested |

@@ -208,8 +208,10 @@ access-permission preconditions.
 ## Operations and failures
 
 `p.add(n)`, `p.sub(n)`, and `p[n]` use element counts.  `p.byte_add(n)` is the
-explicit byte operation and is only available on byte/opaque pointers.  A
-nonzero operation on null, an operation outside `[base, one_past]`, subtracting
+explicit byte operation and is only available on byte/opaque pointers. An
+`*opaque` value therefore rejects element arithmetic and indexing until an
+explicit conversion supplies a pointee type and stride. A nonzero operation on
+null, an operation outside `[base, one_past]`, subtracting
 or ordering pointers from distinct allocations, and a pointer difference that
 does not fit the result type are rejected in checked builds and trap in
 instrumented unsafe code.  Equality is defined for any two pointers; ordering

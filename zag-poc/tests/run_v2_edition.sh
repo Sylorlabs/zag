@@ -908,6 +908,26 @@ elif grep -q 'raw-pointer ordering comparisons are unsupported' "$tmp/v2-raw-poi
 else
   echo "  XX  raw pointer ordering rejection missing diagnostic"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-opaque-element-arithmetic"
+printf 'name = "v2opaqueelementarithmetic"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-opaque-element-arithmetic/zag.mod"
+printf 'unsafe fn advance(p:*opaque) *opaque { return p.add(1); } fn main() i32 { return 0; }\n' >"$tmp/v2-opaque-element-arithmetic/main.zag"
+if (cd "$tmp/v2-opaque-element-arithmetic" && "$ZNC" main.zag -o out) >"$tmp/v2-opaque-element-arithmetic/log" 2>&1 || [ -e "$tmp/v2-opaque-element-arithmetic/out" ]; then
+  echo "  XX  opaque pointer element arithmetic rejects"; sed -n '1,8p' "$tmp/v2-opaque-element-arithmetic/log"; fail=$((fail + 1))
+elif grep -q '\*opaque supports byte_add only' "$tmp/v2-opaque-element-arithmetic/log"; then
+  echo "  ok  opaque pointer element arithmetic rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  opaque pointer element-arithmetic rejection missing diagnostic"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-opaque-index"
+printf 'name = "v2opaqueindex"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-opaque-index/zag.mod"
+printf 'unsafe fn load(p:*opaque) i32 { return p[0]; } fn main() i32 { return 0; }\n' >"$tmp/v2-opaque-index/main.zag"
+if (cd "$tmp/v2-opaque-index" && "$ZNC" main.zag -o out) >"$tmp/v2-opaque-index/log" 2>&1 || [ -e "$tmp/v2-opaque-index/out" ]; then
+  echo "  XX  opaque pointer indexing rejects"; sed -n '1,8p' "$tmp/v2-opaque-index/log"; fail=$((fail + 1))
+elif grep -q '\*opaque cannot be indexed without an explicit typed conversion' "$tmp/v2-opaque-index/log"; then
+  echo "  ok  opaque pointer indexing rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  opaque pointer indexing rejection missing diagnostic"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-double-free"
 printf 'name = "v2doublefree"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-double-free/zag.mod"
 printf 'fn main() i32 { unsafe { let p: *mut i32 = new(42) as *mut i32; delete(p); delete(p); } return 0; }\n' >"$tmp/v2-double-free/main.zag"
