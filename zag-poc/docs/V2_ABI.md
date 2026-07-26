@@ -40,5 +40,17 @@ resolution semantics have tests.
 
 ## Current status
 
-This is a v2 design contract only.  Existing v1 `extern` parsing/native
-lowering does not satisfy it, and no stable v2 ABI is claimed.
+The only implemented v2 ABI slice is an unsafe, outbound scalar/pointer
+`extern fn ... @cabi` import through the native x86-64 dynamic ELF writer.
+It has no v2 export surface: the native x86-64 writer emits `ET_EXEC` with
+program headers only, not an `ET_REL` object, section table, `.symtab`, or
+public-symbol visibility. Accordingly, native `--emit-obj` and
+`--emit-static` fail before artifact creation rather than silently producing an
+executable. The separate i686 object/archive path is not v2 C ABI evidence and
+rejects v2 `@cabi` declarations.
+
+A native export/static-object increment requires codegen to return exact public
+function offsets and sizes, plus a new x86-64 `ET_REL` writer with section,
+symbol, and relocation authority. It must then establish a separately tested
+calling convention (including aggregates, sret, and unwind/visibility policy).
+Until that work exists, no stable v2 export or static C ABI is claimed.

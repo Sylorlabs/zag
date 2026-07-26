@@ -492,7 +492,7 @@ printf 'name = "v2unsafevalue"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-uns
 printf 'unsafe fn raw() i32 { return 42; } fn main() i32 { let f: fn() i32 = raw; return f(); }\n' >"$tmp/v2-unsafe-value/main.zag"
 if (cd "$tmp/v2-unsafe-value" && "$ZNC" main.zag -o out) >"$tmp/v2-unsafe-value/log" 2>&1 || [ -e "$tmp/v2-unsafe-value/out" ]; then
   echo "  XX  unsafe function value rejects without artifact"; sed -n '1,8p' "$tmp/v2-unsafe-value/log"; fail=$((fail + 1))
-elif grep -q 'unsafe function values are not implemented' "$tmp/v2-unsafe-value/log"; then
+elif grep -Eq 'unsafe function values are not implemented|unsafe or C-ABI function values are not implemented' "$tmp/v2-unsafe-value/log"; then
   echo "  ok  unsafe function value rejects without artifact"; pass=$((pass + 1))
 else
   echo "  XX  unsafe function value rejection missing diagnostic"; fail=$((fail + 1))
@@ -532,6 +532,26 @@ elif grep -q E0002 "$tmp/v2-pure-unsafe/log"; then
   echo "  ok  Unsafe effect propagates into pure constraint"; pass=$((pass + 1))
 else
   echo "  XX  pure Unsafe-effect rejection missing E0002"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-cabi-pure"
+printf 'name = "v2cabipure"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-cabi-pure/zag.mod"
+printf 'extern fn foreign() i64 @cabi; fn bad() i64 @pure { unsafe { return foreign(); } } fn main() i32 { return 0; }\n' >"$tmp/v2-cabi-pure/main.zag"
+if (cd "$tmp/v2-cabi-pure" && "$ZNC" check main.zag) >"$tmp/v2-cabi-pure/log" 2>&1; then
+  echo "  XX  C-ABI Unsafe effect reaches pure constraint"; sed -n '1,12p' "$tmp/v2-cabi-pure/log"; fail=$((fail + 1))
+elif grep -q E0002 "$tmp/v2-cabi-pure/log"; then
+  echo "  ok  C-ABI Unsafe effect reaches pure constraint"; pass=$((pass + 1))
+else
+  echo "  XX  C-ABI pure-effect diagnostic missing"; sed -n '1,12p' "$tmp/v2-cabi-pure/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-cabi-value"
+printf 'name = "v2cabivalue"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-cabi-value/zag.mod"
+printf 'extern fn foreign() i64 @cabi; fn main() i32 { unsafe { let f:fn() i64=foreign; return 0; } }\n' >"$tmp/v2-cabi-value/main.zag"
+if (cd "$tmp/v2-cabi-value" && "$ZNC" check main.zag) >"$tmp/v2-cabi-value/log" 2>&1; then
+  echo "  XX  C-ABI function value rejects without typed contract"; sed -n '1,12p' "$tmp/v2-cabi-value/log"; fail=$((fail + 1))
+elif grep -q 'unsafe or C-ABI function values are not implemented' "$tmp/v2-cabi-value/log"; then
+  echo "  ok  C-ABI function value rejects without typed contract"; pass=$((pass + 1))
+else
+  echo "  XX  C-ABI function-value diagnostic missing"; sed -n '1,12p' "$tmp/v2-cabi-value/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-unsafe-type"
 printf 'name = "v2unsafetype"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-unsafe-type/zag.mod"
