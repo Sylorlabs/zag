@@ -188,6 +188,30 @@ if (cd "$tmp/v2-system-allocator-alignment" && "$ZNC" main.zag -o out --safety=c
 else
   echo "  XX  SystemAllocator dynamic alignment did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-alignment/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-system-allocator-callback-escape"
+printf 'name = "v2systemallocatorcallbackescape"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-callback-escape/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-callback-escape/std"
+printf '@import("std/allocator.zag") fn make() !fn() i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); return fn[block]() i32 { return block.len as i32; }; } fn main() i32 { return 0; }\n' >"$tmp/v2-system-allocator-callback-escape/main.zag"
+if (cd "$tmp/v2-system-allocator-callback-escape" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-callback-escape/log" 2>&1 ||
+   [ -e "$tmp/v2-system-allocator-callback-escape/out" ]; then
+  echo "  XX  Allocation handle callback capture rejects"; sed -n '1,16p' "$tmp/v2-system-allocator-callback-escape/log"; fail=$((fail + 1))
+elif grep -q 'captured aggregate closures require a destruction protocol' "$tmp/v2-system-allocator-callback-escape/log"; then
+  echo "  ok  Allocation handle callback capture rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  Allocation handle callback rejection missing lifetime diagnostic"; sed -n '1,16p' "$tmp/v2-system-allocator-callback-escape/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-system-allocator-global-escape"
+printf 'name = "v2systemallocatorglobalescape"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-global-escape/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-global-escape/std"
+printf '@import("std/allocator.zag") global let block:Allocation; fn main() i32 { return 0; }\n' >"$tmp/v2-system-allocator-global-escape/main.zag"
+if (cd "$tmp/v2-system-allocator-global-escape" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-global-escape/log" 2>&1 ||
+   [ -e "$tmp/v2-system-allocator-global-escape/out" ]; then
+  echo "  XX  Allocation handle global storage rejects"; sed -n '1,16p' "$tmp/v2-system-allocator-global-escape/log"; fail=$((fail + 1))
+elif grep -q 'aggregates, callbacks, and optionals have no global lifetime contract' "$tmp/v2-system-allocator-global-escape/log"; then
+  echo "  ok  Allocation handle global storage rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  Allocation handle global rejection missing lifetime diagnostic"; sed -n '1,16p' "$tmp/v2-system-allocator-global-escape/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-captureless-callback"
 printf 'name = "v2capturelesscallback"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-captureless-callback/zag.mod"
 printf 'fn main() i32 { let f:fn() i32=fn[]() i32 { return 42; }; return f(); }\n' >"$tmp/v2-captureless-callback/main.zag"
