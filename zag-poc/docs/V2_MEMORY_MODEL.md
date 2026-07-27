@@ -121,6 +121,10 @@ second deallocation through that name or a direct local alias is rejected
 before code generation; the checked runtime's exact-record validation remains
 the backstop for forged descriptors, foreign aliases, and paths outside this
 still-bounded source analysis.
+The same direct-local boundary recognizes `try allocator.resize(block, bytes,
+alignment)` as consuming `block` after a successful replacement is bound. The
+replacement remains usable; the old name and direct aliases do not. This is
+not a general interprocedural transfer summary.
 The current runtime record also rejects a live cross-handle field splice when
 its generation or allocator identity belongs to another allocation; this is
 exact-record validation, not language-level opaque ownership. The public

@@ -31,6 +31,9 @@ For named handles and direct local aliases, edition-2027 additionally treats
 source-level deallocation is rejected before code generation. This is not yet
 an opaque general capability or a proof for arbitrary aliases; exact-record
 runtime validation remains required and active.
+The direct receiver form of `try allocator.resize(block, bytes, alignment)`
+also consumes its named old handle on success and preserves the fresh returned
+handle. Helpers and non-local aliases are outside this current source proof.
 The same exact-tuple check rejects a live cross-handle splice: a second live
 pointer/capacity/alignment combined with another handle's generation or
 allocator identity is not a valid identity.
