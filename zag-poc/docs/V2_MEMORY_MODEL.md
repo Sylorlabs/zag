@@ -115,6 +115,12 @@ not provide opaque language capabilities, custom allocators, or a
 general static lifetime analysis for allocator values. The separate retained
 fixed-buffer slice is implemented below; it is not a general allocator
 protocol.
+For a named `Allocation`, the edition-2027 affine pass also recognizes the
+receiver form `try allocator.deallocate(block)` as a consuming terminal. A
+second deallocation through that name or a direct local alias is rejected
+before code generation; the checked runtime's exact-record validation remains
+the backstop for forged descriptors, foreign aliases, and paths outside this
+still-bounded source analysis.
 The current runtime record also rejects a live cross-handle field splice when
 its generation or allocator identity belongs to another allocation; this is
 exact-record validation, not language-level opaque ownership. The public

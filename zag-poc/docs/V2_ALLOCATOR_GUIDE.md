@@ -26,6 +26,11 @@ validates the complete five-field identity tuple against checked-runtime
 provenance before it frees: an
 invalid base, copied released handle, forged length, wrong alignment, or stale
 generation after address reuse terminates before allocator metadata is touched.
+For named handles and direct local aliases, edition-2027 additionally treats
+`try allocator.deallocate(block)` as an affine consuming terminal: a repeated
+source-level deallocation is rejected before code generation. This is not yet
+an opaque general capability or a proof for arbitrary aliases; exact-record
+runtime validation remains required and active.
 The same exact-tuple check rejects a live cross-handle splice: a second live
 pointer/capacity/alignment combined with another handle's generation or
 allocator identity is not a valid identity.

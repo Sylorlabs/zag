@@ -247,35 +247,23 @@ mkdir -p "$tmp/v2-system-allocator-stale"
 printf 'name = "v2systemallocatorstale"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-stale/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-stale/std"
 printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let first:Allocation=try allocator.allocate(24,8); let stale:Allocation=first; try allocator.deallocate(first); try allocator.deallocate(stale); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-stale/main.zag"
-if (cd "$tmp/v2-system-allocator-stale" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-stale/log" 2>&1 && [ -x "$tmp/v2-system-allocator-stale/out" ]; then
-  set +e
-  "$tmp/v2-system-allocator-stale/out" >"$tmp/v2-system-allocator-stale/out.log" 2>"$tmp/v2-system-allocator-stale/err.log"
-  stale_allocator_rc=$?
-  set -e
-  if [ "$stale_allocator_rc" -ne 0 ] && grep -q 'invalid or released Allocation handle' "$tmp/v2-system-allocator-stale/err.log"; then
-    echo "  ok  SystemAllocator rejects copied released handle at runtime"; pass=$((pass + 1))
-  else
-    echo "  XX  stale SystemAllocator handle (exit=$stale_allocator_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-stale/log"; sed -n '1,8p' "$tmp/v2-system-allocator-stale/err.log"; fail=$((fail + 1))
-  fi
+if (cd "$tmp/v2-system-allocator-stale" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-stale/log" 2>&1 || [ -e "$tmp/v2-system-allocator-stale/out" ]; then
+  echo "  XX  stale SystemAllocator handle must reject before codegen"; sed -n '1,16p' "$tmp/v2-system-allocator-stale/log"; fail=$((fail + 1))
+elif grep -q 'use after SystemAllocator.deallocate' "$tmp/v2-system-allocator-stale/log"; then
+  echo "  ok  SystemAllocator rejects copied released handle before codegen"; pass=$((pass + 1))
 else
-  echo "  XX  stale SystemAllocator handle did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-stale/log"; fail=$((fail + 1))
+  echo "  XX  stale SystemAllocator rejection missing diagnostic"; sed -n '1,16p' "$tmp/v2-system-allocator-stale/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-system-allocator-aba"
 printf 'name = "v2systemallocatoraba"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-aba/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-aba/std"
 printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let first:Allocation=try allocator.allocate(24,8); let stale:Allocation=first; try allocator.deallocate(first); let replacement:Allocation=try allocator.allocate(24,8); if (stale.ptr != replacement.ptr) { return 7; } try allocator.deallocate(stale); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-aba/main.zag"
-if (cd "$tmp/v2-system-allocator-aba" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-aba/log" 2>&1 && [ -x "$tmp/v2-system-allocator-aba/out" ]; then
-  set +e
-  "$tmp/v2-system-allocator-aba/out" >"$tmp/v2-system-allocator-aba/out.log" 2>"$tmp/v2-system-allocator-aba/err.log"
-  aba_allocator_rc=$?
-  set -e
-  if [ "$aba_allocator_rc" -ne 0 ] && grep -q 'stale Allocation generation' "$tmp/v2-system-allocator-aba/err.log"; then
-    echo "  ok  SystemAllocator generation rejects ABA address reuse"; pass=$((pass + 1))
-  else
-    echo "  XX  SystemAllocator ABA generation (exit=$aba_allocator_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-aba/log"; sed -n '1,8p' "$tmp/v2-system-allocator-aba/err.log"; fail=$((fail + 1))
-  fi
+if (cd "$tmp/v2-system-allocator-aba" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-aba/log" 2>&1 || [ -e "$tmp/v2-system-allocator-aba/out" ]; then
+  echo "  XX  SystemAllocator ABA stale handle must reject before codegen"; sed -n '1,16p' "$tmp/v2-system-allocator-aba/log"; fail=$((fail + 1))
+elif grep -q 'use after SystemAllocator.deallocate' "$tmp/v2-system-allocator-aba/log"; then
+  echo "  ok  SystemAllocator rejects ABA stale handle before codegen"; pass=$((pass + 1))
 else
-  echo "  XX  SystemAllocator ABA program did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-aba/log"; fail=$((fail + 1))
+  echo "  XX  SystemAllocator ABA rejection missing diagnostic"; sed -n '1,16p' "$tmp/v2-system-allocator-aba/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-system-allocator-reuse"
 printf 'name = "v2systemallocatorreuse"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-reuse/zag.mod"
