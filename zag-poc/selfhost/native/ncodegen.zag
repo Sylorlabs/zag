@@ -2241,9 +2241,10 @@ fn cg_find_fn(syms: ArrayList[FnSym], name: []u8) i32 {
     return 0 - 1;
 }
 
-// The thread trampoline has no closure ABI, argument marshalling, or return
-// continuation.  Resolve only a concrete direct `fn() void` declaration.
-fn cg_thread_worker_label(cg: *Cg, syms: ArrayList[FnSym], n: *Node) i32 {
+// The thread trampoline has no closure ABI or return continuation. Resolve
+// only a direct `fn() void` or scalar `fn(i64) void` declaration; the latter's
+// value is copied into the affine handle before clone.
+fn cg_thread_worker_label(cg: *Cg, syms: ArrayList[FnSym], n: *Node, with_i64:i32) i32 {
     let name: []u8 = "";
     switch (n.*) { .id => |x| { name = x.name; } else => { return 0 - 1; } }
     let label: i32 = cg_find_fn(syms, name);
@@ -2254,8 +2255,10 @@ fn cg_thread_worker_label(cg: *Cg, syms: ArrayList[FnSym], n: *Node) i32 {
             .fn_decl => |f| {
                 if (@strEq(f.name, name)) {
                     if (f.is_extern == 0 && len[[]u8](f.tparams) == 0 &&
-                        len[Param](f.params) == 0 && @strEq(f.ret, "void") &&
-                        f.caps == 0) { return label; }
+                        len[Param](f.params) == with_i64 && @strEq(f.ret, "void") &&
+                        f.caps == 0) {
+                        if(with_i64==0||@strEq(get[Param](f.params,0).pty,"i64")){return label;}
+                    }
                     return 0 - 1;
                 }
             }
@@ -2825,7 +2828,8 @@ fn cg_scan_call(cg: *Cg, sc: *ScanCtx, c: Call) void {
             // Compiler-lowered thread operations retain their opaque handle and
             // (for spawn) stack mapping across raw syscalls in parent-frame
             // scratch. The child branch never reads these frame slots.
-            if (@strEq(fname[1..], "threadSpawn")) { sc.*.words.* = sc.*.words.* + 2; }
+            // handle/stack/argument scratch for the affine Linux thread boundary.
+            if (@strEq(fname[1..], "threadSpawn")) { sc.*.words.* = sc.*.words.* + 3; }
             if (@strEq(fname[1..], "threadJoin")) { sc.*.words.* = sc.*.words.* + 1; }
             return;
         }
@@ -6308,29 +6312,39 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
     }
 
     // First native thread vertical: Linux x86-64 only, deliberately unsafe,
-    // direct captureless `fn() void` worker, and affine opaque join handle.
+    // direct captureless `fn() void`/`fn(i64) void` worker, and affine opaque
+    // join handle. The sole scalar argument is copied into the handle before
+    // clone, never borrowed from the parent frame.
     // The handle and stack are independent mmap mappings.  `clone` writes and
     // later clears the aligned i32 TID at handle+0; join waits on precisely that
     // cell before unmapping either mapping.  The child returns at the instruction
     // following `syscall`, so it branches immediately to a compiler-known worker
     // label and never resumes the parent lowering or touches parent frame slots.
     if (@strEq(b, "threadSpawn")) {
-        if (nargs != 1) {
-            cg_err(cg, "native: @threadSpawn expects one direct fn() void worker");
+        if (nargs != 1 && nargs != 2) {
+            cg_err(cg, "native: @threadSpawn expects a direct worker, optionally followed by one i64 argument");
             push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;
         }
-        let worker:i32=cg_thread_worker_label(cg,syms,get[*Node](c.args,0));
+        let with_i64:i32=(nargs==2) as i32;
+        let worker:i32=cg_thread_worker_label(cg,syms,get[*Node](c.args,0),with_i64);
         if (worker < 0) {
-            cg_err(cg,"native: @threadSpawn requires a direct non-generic captureless fn() void worker");
+            cg_err(cg,"native: @threadSpawn requires a direct non-generic captureless fn() void or fn(i64) void worker");
             push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;
         }
+        let arg_ty:[]u8="";
+        if(with_i64==1){arg_ty=cg_expr_type(get[*Node](c.args,1),env,syms,cg);}
+        // An empty backend type is an untyped integer literal, which the typed
+        // authority already accepted contextually as i64 for this boundary.
+        if(with_i64==1&&arg_ty.len>0&&@strEq(arg_ty,"i64")==0){cg_err(cg,"native: @threadSpawn worker argument must be i64");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;}
         let handle_slot:i32=cg_slot_scratch(env);
         let stack_slot:i32=cg_slot_scratch(env);
+        let arg_slot:i32=cg_slot_scratch(env);
         let fail:i32=cg_fresh(cg);
         let stack_fail:i32=cg_fresh(cg);
         let stack_unmapped:i32=cg_fresh(cg);
         let child:i32=cg_fresh(cg);
         let done:i32=cg_fresh(cg);
+        if(with_i64==1){cg_lower_expr(out,get[*Node](c.args,1),env,syms,cg);push[Instr](out,i_pop(R_RAX()));push[Instr](out,i_store(R_RBP(),arg_slot,R_RAX()));}
         // mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0)
         push[Instr](out,i_mov_imm(R_RDI(),0));push[Instr](out,i_mov_imm(R_RSI(),4096));
         push[Instr](out,i_mov_imm(R_RDX(),3));push[Instr](out,i_mov_imm(R_R10(),34));
@@ -6339,6 +6353,7 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
         push[Instr](out,i_cmp_imm(R_RAX(),0));push[Instr](out,i_jl(fail));
         push[Instr](out,i_store(R_RBP(),handle_slot,R_RAX()));
         push[Instr](out,i_mov_imm(R_RCX(),0));push[Instr](out,i_store32(R_RAX(),0,R_RCX()));push[Instr](out,i_store(R_RBP(),stack_slot,R_RCX()));
+        if(with_i64==1){push[Instr](out,i_load(R_RCX(),R_RBP(),arg_slot));push[Instr](out,i_store(R_RAX(),24,R_RCX()));}
         // mmap one guard page plus a 64 KiB child stack.
         push[Instr](out,i_mov_imm(R_RDI(),0));push[Instr](out,i_mov_imm(R_RSI(),69632));
         push[Instr](out,i_mov_imm(R_RDX(),3));push[Instr](out,i_mov_imm(R_R10(),34));
@@ -6362,7 +6377,11 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
         push[Instr](out,i_cmp_imm(R_RAX(),0));push[Instr](out,i_je(child));push[Instr](out,i_jl(stack_fail));
         // Parent owns the join handle; the child only owns its execution path.
         push[Instr](out,i_load(R_RAX(),R_RBP(),handle_slot));push[Instr](out,i_jmp(done));
-        push[Instr](out,i_label(child));push[Instr](out,i_call(worker));
+        // Linux x86-64 `syscall` preserves RDX (only RCX/R11 are clobbered),
+        // and RDX is the clone parent-TID pointer: our affine handle. The
+        // child therefore loads its copied scalar from handle+24 without
+        // consulting the parent frame.
+        push[Instr](out,i_label(child));if(with_i64==1){push[Instr](out,i_load(R_RDI(),R_RDX(),24));}push[Instr](out,i_call(worker));
         push[Instr](out,i_mov_imm(R_RDI(),0));push[Instr](out,i_mov_imm(R_RAX(),60));push[Instr](out,i_syscall());
         // SYS_exit must not return. Loop if a hostile environment violates it,
         // rather than falling through into parent cleanup with a child stack.

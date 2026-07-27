@@ -68,9 +68,11 @@ a general happens-before relation, race freedom, or a supported
 threading API.
 
 The first public thread boundary is Linux/x86-64 native only:
-`@threadSpawn(worker) *opaque` accepts exactly one direct, non-generic,
-captureless `fn() void` label inside `unsafe`; `@threadJoin(handle)` consumes
-that named opaque handle inside `unsafe`. Spawn maps a separate guarded 64 KiB
+`@threadSpawn(worker) *opaque` accepts a direct, non-generic, captureless
+`fn() void` label, or `@threadSpawn(worker, value)` accepts `fn(i64) void`
+with one by-value `i64` argument inside `unsafe`; `@threadJoin(handle)` consumes
+that named opaque handle inside `unsafe`. The scalar is copied into the handle
+before `clone`, so it never borrows a parent frame. Spawn maps a separate guarded 64 KiB
 child stack and persistent handle, lowers `clone(2)` with parent/child TID and
 child-clear-TID flags, branches the child directly to the worker, then uses
 `SYS_exit`. Join waits on the kernel-cleared aligned TID with `FUTEX_WAIT` and
@@ -82,7 +84,7 @@ rejecting safe-scope spawn/join, wrong worker/handle shapes, `@pure` use, and
 an unjoined handle.
 
 This is not a general atomic or concurrency API: `AtomicI64` is only a bounded
-native storage primitive; there are no general atomic types, worker arguments/returns, detach, mutexes, condition variables, TLS,
+native storage primitive; there are no general atomic types, pointer/aggregate worker arguments or returns, detach, mutexes, condition variables, TLS,
 or race detector. The raw
 pointer's allocation, lifetime, sharing, and absence of mixed atomic/non-atomic
 access remain the caller's unsafe contract. `@volatileLoad`/`@volatileStore`

@@ -90,11 +90,12 @@ reinterpreted while another thread can access it.
 ## Threads and blocking
 
 Linux/x86-64 native output now has a bounded unsafe `@threadSpawn(worker)` /
-`@threadJoin(handle)` pair. Spawn accepts only a direct captureless `fn() void`
-worker and returns an affine `*opaque` handle; join consumes that handle after
+`@threadJoin(handle)` pair. Spawn accepts a direct captureless `fn() void` or
+`fn(i64) void` worker; the sole scalar argument is copied into the affine
+handle before clone. Join consumes that handle after
 the kernel clears its TID and wakes the futex. This establishes a real kernel
 completion boundary for the worker and join result, but does not yet model
-worker arguments, detach, mutexes, condition variables, TLS, general atomic storage,
+pointer/aggregate worker arguments, returns, detach, mutexes, condition variables, TLS, general atomic storage,
 or general source-level happens-before/race freedom. `selfhost/native/thread_rt.zag`
 remains an unintegrated historical sketch and is not evidence of support.
 Every future stress test must have a timeout and report timeout separately from

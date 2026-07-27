@@ -32,6 +32,23 @@ grep -q 'clone(' "$tmp/valid/thread.log"
 grep -q 'FUTEX_WAIT' "$tmp/valid/thread.log"
 grep -Eq 'mprotect\(.*4096, PROT_NONE\).* = 0' "$tmp/valid/thread.log"
 
+project scalar-arg
+printf '%s\n' \
+  'global let thread_arg_total:i64;' \
+  'fn add_worker(value:i64) void { unsafe { let p:*mut i64=(&thread_arg_total) as *mut i64; let _old:i64=@atomicFetchAdd64(p,value); } }' \
+  'fn main() i32 { unsafe { let h:*opaque=@threadSpawn(add_worker,42); @threadJoin(h); let p:*const i64=(&thread_arg_total) as *const i64; if(@atomicLoad64(p)==42){return 42;} return 1; } }' \
+  >"$tmp/scalar-arg/main.zag"
+(cd "$tmp/scalar-arg" && "$ZNC" main.zag --safety=checked --no-zagd --no-analyze --no-foreground-cache -o app >log 2>&1)
+set +e
+timeout 5 "$tmp/scalar-arg/app"
+rc=$?
+set -e
+if [ "$rc" -ne 42 ]; then
+  echo "thread scalar argument witness returned $rc" >&2
+  sed -n '1,80p' "$tmp/scalar-arg/log" >&2
+  exit 1
+fi
+
 project unsafe
 printf 'fn worker() void {} fn main() i32 { let h:*opaque=@threadSpawn(worker); @threadJoin(h); return 0; }\n' >"$tmp/unsafe/main.zag"
 if (cd "$tmp/unsafe" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/unsafe/log" 2>&1 || [ -e "$tmp/unsafe/out" ]; then
@@ -44,7 +61,21 @@ printf 'fn wrong(x:i32) void {} fn main() i32 { unsafe { let h:*opaque=@threadSp
 if (cd "$tmp/worker" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/worker/log" 2>&1 || [ -e "$tmp/worker/out" ]; then
   echo "thread spawn accepted a nonzero-argument worker" >&2; exit 1
 fi
-grep -q 'direct non-generic captureless fn() void worker' "$tmp/worker/log"
+grep -q 'direct non-generic captureless fn() void or fn(i64) void worker' "$tmp/worker/log"
+
+project argument-shape
+printf 'fn worker(x:i64) void {} fn main() i32 { unsafe { let h:*opaque=@threadSpawn(worker); @threadJoin(h); return 0; } }\n' >"$tmp/argument-shape/main.zag"
+if (cd "$tmp/argument-shape" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/argument-shape/log" 2>&1 || [ -e "$tmp/argument-shape/out" ]; then
+  echo "thread spawn accepted an i64 worker without its required argument" >&2; exit 1
+fi
+grep -q 'direct non-generic captureless fn() void or fn(i64) void worker' "$tmp/argument-shape/log"
+
+project argument-type
+printf 'fn worker(x:i64) void {} fn main() i32 { unsafe { let bad:i32=1; let h:*opaque=@threadSpawn(worker,bad); @threadJoin(h); return 0; } }\n' >"$tmp/argument-type/main.zag"
+if (cd "$tmp/argument-type" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/argument-type/log" 2>&1 || [ -e "$tmp/argument-type/out" ]; then
+  echo "thread spawn accepted a non-i64 worker argument" >&2; exit 1
+fi
+grep -q 'worker argument must be i64' "$tmp/argument-type/log"
 
 project handle
 printf 'fn worker() void {} fn main() i32 { unsafe { let x:i64=0; @threadJoin(x); return 0; } }\n' >"$tmp/handle/main.zag"
