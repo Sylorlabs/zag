@@ -3,8 +3,8 @@
 ## Persistent user service
 
 Ordinary `znc` source commands automatically start the project daemon and it
-remains resident. To start it at Linux user login and restart it after an
-unexpected exit, install the optional project-specific systemd user service:
+remains resident. On Linux, start it at user login and restart it after an
+unexpected exit with the optional project-specific systemd user service:
 
 ```sh
 tools/zagd-user-service.sh install app.zag adaptive
@@ -37,6 +37,21 @@ foreground compiler command. A daemon that does not release ownership causes
 the service command to fail instead of repeatedly launching a second daemon
 that exits with singleton status 6. Unit shutdown itself is bounded to five
 seconds.
+
+On macOS, use the equivalent project-specific LaunchAgent instead:
+
+```sh
+tools/zagd-launchd-service.sh install app.zag adaptive
+# after make install:
+zagd-launchd-service install app.zag adaptive
+```
+
+The adapter generates and validates a private plist in
+`~/Library/LaunchAgents`, uses `launchctl bootstrap` and `kickstart`, keeps the
+planner alive after an unexpected exit, and writes logs to
+`~/Library/Logs/Zag`. `restart`, `shutdown`, `status`, and `uninstall` take the
+same root-source and optional mode. The LaunchAgent is advisory-only, just like
+the Linux unit; it never owns foreground compiler correctness.
 
 After editing ordinary policy such as mode, stability window, cache ceiling, or
 notifications, apply it without reinstalling:

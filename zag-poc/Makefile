@@ -8,7 +8,7 @@
 #   make install   — install znc to /usr/local/bin
 #   make clean     — remove generated artifacts (keeps the znc seed)
 
-.PHONY: all bootstrap znc zagd test test-zagscript-release test-zagscript-master test-v1-compat test-zagd-product test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-analyzer test-hot-reload test-dynamic-abi test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-std-namespace \
+.PHONY: all bootstrap znc zagd test test-zagscript-release test-zagscript-master test-v1-compat test-zagd-product test-zagd-launchd-service test-macho-debug-writer test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-analyzer test-hot-reload test-dynamic-abi test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-std-namespace \
         test-diagnostics test-tooling test-programs test-native test-abi-layout test-arm64 \
         test-differential-backends test-arm64-selfhost test-macos-arm64-release clean install
 
@@ -91,6 +91,12 @@ test-programs:
 test-zagd-product: znc zagd
 	bash tests/run_zagd_product.sh
 
+test-zagd-launchd-service:
+	bash tests/run_zagd_launchd_service.sh
+
+test-macho-debug-writer:
+	bash tests/run_macho_debug_writer.sh
+
 test-zagscript-release:
 	bash tests/run_zagscript_release_gate.sh
 
@@ -142,6 +148,7 @@ install: znc zagd
 	install -m755 znc /usr/local/bin/znc
 	install -m755 zagd /usr/local/bin/zagd
 	install -m755 tools/zagd-user-service.sh /usr/local/bin/zagd-user-service
+	install -m755 tools/zagd-launchd-service.sh /usr/local/bin/zagd-launchd-service
 	install -d /usr/local/lib/zag/std
 	install -d /usr/local/share/zag
 	install -m644 examples/zagd.conf /usr/local/share/zag/zagd.conf.example

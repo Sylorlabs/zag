@@ -14,6 +14,7 @@ for required in \
     /usr/local/bin/znc \
     /usr/local/bin/zagd \
     /usr/local/bin/zagd-user-service \
+    /usr/local/bin/zagd-launchd-service \
     /usr/local/share/zag/zagd.conf.example \
     selfhost/std/process.zag \
     selfhost/std/script_io.zag \

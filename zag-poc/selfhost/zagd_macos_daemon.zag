@@ -1,10 +1,10 @@
 // Darwin/Apple-Silicon adapter for zagd.
 //
-// macOS does not expose Linux inotify.  This adapter deliberately uses a
-// bounded polling watcher for the selected root module instead of pretending
-// Linux raw syscalls are portable.  It keeps planner state advisory: a missed
-// poll can only delay metadata refresh and never changes foreground compiler
-// correctness.
+// macOS does not expose Linux inotify. This adapter uses Darwin kqueue vnode
+// events for the project root, with a bounded polling fallback only if the
+// native event handles cannot be opened. It keeps planner state advisory: a
+// missed event can only delay metadata refresh and never changes foreground
+// compiler correctness.
 
 @import("zagd.zag")
 @import("../std/list.zag")
@@ -20,6 +20,39 @@ extern fn _zag_exec_cmd(command: []u8) i32
 extern fn _zag_slice_ptr(s: []u8) *i8
 
 struct ZmdTimespec { sec: i64, nsec: i64 }
+// Exact Darwin `struct kevent` layout on 64-bit arm64: the SDK applies
+// `#pragma pack(4)`, leaving the six fields at offsets 0, 8, 10, 12, 16, 24.
+struct ZmdKevent { ident: i64, filter: i16, flags: u16, fflags: u32, data: i64, udata: i64 }
+
+fn zmd_kqueue() i64 { return _zag_raw_syscall(362, 0, 0, 0, 0, 0, 0); }
+
+fn zmd_open_event_dir(path: []u8) i64 {
+    let cpath: ArrayList[u8] = zmd_cstr(path);
+    // Darwin open(2), O_EVTONLY. A directory descriptor is sufficient for
+    // EVFILT_VNODE; unlike Linux inotify it has no translated syscall ABI.
+    return _zag_raw_syscall(5, _zag_slice_ptr(cpath.data[0..cpath.len]) as i64,
+        32768, 0, 0, 0, 0);
+}
+
+fn zmd_close(fd: i64) void { let _rc: i64 = _zag_raw_syscall(6, fd, 0, 0, 0, 0, 0); }
+
+fn zmd_kqueue_watch(kq: i64, dirfd: i64) i64 {
+    let change: ZmdKevent = ZmdKevent{.ident=dirfd,.filter=(-4) as i16,
+        .flags=33 as u16,.fflags=127 as u32,.data=0,.udata=0};
+    let timeout: ZmdTimespec = ZmdTimespec{.sec=0,.nsec=0};
+    // Darwin kevent(2): install EVFILT_VNODE | EV_ADD | EV_CLEAR. The SDK ABI
+    // is six arguments after the syscall number, exactly matching the raw
+    // runtime escape hatch.
+    return _zag_raw_syscall(363, kq, (&change) as i64, 1, 0, 0,
+        (&timeout) as i64);
+}
+
+fn zmd_kqueue_wait(kq: i64) i64 {
+    let event: ZmdKevent = ZmdKevent{.ident=0,.filter=0,.flags=0,.fflags=0,.data=0,.udata=0};
+    let timeout: ZmdTimespec = ZmdTimespec{.sec=0,.nsec=250000000};
+    return _zag_raw_syscall(363, kq, 0, 0, (&event) as i64, 1,
+        (&timeout) as i64);
+}
 
 fn zmd_sleep_ms(ms: i64) void {
     let wait: i64 = ms;
@@ -74,8 +107,10 @@ fn zmd_dir(path: []u8) []u8 {
     return path[0..last];
 }
 
-fn zmd_status(root: []u8, pid: i64, mode: []u8, state: []u8, events: i64) void {
-    let text: []u8 = "advisory=true\nexecutable_authority=false\ntarget=macos-arm64\nwatcher=polling-root-module\n";
+fn zmd_status(root: []u8, pid: i64, mode: []u8, state: []u8, events: i64, native_events: i32) void {
+    let watcher: []u8 = "watcher=polling-root-module\n";
+    if (native_events == 1) { watcher = "watcher=kqueue-root\n"; }
+    let text: []u8 = _zag_str_concat("advisory=true\nexecutable_authority=false\ntarget=macos-arm64\n", watcher);
     text = _zag_str_concat(text, _zag_str_concat("pid=", _zag_i64_to_str(pid)));
     text = _zag_str_concat(text, _zag_str_concat("\nmode=", mode));
     text = _zag_str_concat(text, _zag_str_concat("\nstate=", state));
@@ -112,11 +147,10 @@ fn main() i32 {
     if (@strEq(mode, "off")) {
         let _stop: i32 = _zag_write_file(stop, "stop\n");
         zmd_unlink(lock);
-        zmd_status(root, 0, mode, "stopped", 0);
+        zmd_status(root, 0, mode, "stopped", 0, 0);
         return 0;
     }
 
-    let daemonize: i32 = (@strEq(zmd_arg_value("--daemonize"), "") == 0) as i32;
     // --daemonize is a presence flag, so inspect the complete argument list.
     let ai: i32 = 1; let want_daemon: i32 = 0;
     while (ai < _zag_argc()) { if (@strEq(_zag_arg(ai), "--daemonize")) { want_daemon = 1; } ai = ai + 1; }
@@ -127,26 +161,35 @@ fn main() i32 {
     }
 
     zmd_unlink(stop);
+    let kq: i64 = zmd_kqueue();
+    let event_dir: i64 = zmd_open_event_dir(root);
+    let native_events: i32 = (kq >= 0 && event_dir >= 0 && zmd_kqueue_watch(kq, event_dir) >= 0) as i32;
+    if (native_events == 0) { if (event_dir >= 0) { zmd_close(event_dir); } if (kq >= 0) { zmd_close(kq); } }
     let pid: i64 = zmd_pid();
     let _lock: i32 = _zag_write_file(lock, _zag_str_concat(_zag_i64_to_str(pid), "\n"));
     let prior: []u8 = _zag_read_file(source);
     let prior_hash: ZagdHash = zagd_content_hash(prior);
     let events: i64 = 0;
-    zmd_status(root, pid, mode, "idle", events);
+    zmd_status(root, pid, mode, "idle", events, native_events);
 
     while (_zag_file_exists(stop) == 0) {
-        zmd_sleep_ms(250);
-        let current: []u8 = _zag_read_file(source);
-        let current_hash: ZagdHash = zagd_content_hash(current);
-        if (zagd_hash_equal(prior_hash, current_hash) == 0) {
+        let changed: i32 = 1;
+        if (native_events == 1) { changed = (zmd_kqueue_wait(kq) > 0) as i32; }
+        else { zmd_sleep_ms(250); }
+        if (changed == 1) {
+            let current: []u8 = _zag_read_file(source);
+            let current_hash: ZagdHash = zagd_content_hash(current);
+            if (zagd_hash_equal(prior_hash, current_hash) == 0) {
             prior_hash = current_hash;
             events = events + 1;
-            zmd_status(root, pid, mode, "checking", events);
+            zmd_status(root, pid, mode, "checking", events, native_events);
             zmd_check(root, source);
-            zmd_status(root, pid, mode, "idle", events);
+            zmd_status(root, pid, mode, "idle", events, native_events);
+            }
         }
     }
+    if (native_events == 1) { zmd_close(event_dir); zmd_close(kq); }
     zmd_unlink(stop); zmd_unlink(lock);
-    zmd_status(root, pid, mode, "stopped", events);
+    zmd_status(root, pid, mode, "stopped", events, native_events);
     return 0;
 }

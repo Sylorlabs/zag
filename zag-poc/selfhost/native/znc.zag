@@ -509,15 +509,12 @@ fn arm64_target() i32 {
     return 0;
 }
 
-// Bootstrap-safe host probe using only successful process-ID syscalls.  Linux
-// x86-64 assigns both 20 and 39 to getpid; Darwin assigns 20 to getpid and 39
-// to getppid.  This avoids deliberately faulting the Darwin syscall dispatcher.
-// This uses the long-standing raw-syscall intrinsic, so the committed Linux
-// seed can compile the first host-aware macOS compiler without a seed update.
+// The committed macOS bootstrap must not issue a raw host-probe syscall: older
+// seed compilers encode that escape hatch as an invalid Darwin syscall before
+// they have rebuilt the current Darwin backend.  macOS builds therefore use an
+// explicit macos-arm64 target during bootstrap.  Once built, this remains a
+// conservative host fallback rather than guessing from a Linux syscall table.
 fn znc_host_is_macos() i32 {
-    let pid: i64 = _zag_raw_syscall(20, 0, 0, 0, 0, 0, 0);
-    let peer: i64 = _zag_raw_syscall(39, 0, 0, 0, 0, 0, 0);
-    if (pid > 1 && peer > 1 && pid != peer) { return 1; }
     return 0;
 }
 
@@ -956,6 +953,11 @@ fn build_gpu(path: []u8, target: []u8) i32 {
     let src: []u8 = _zag_read_file(path);
     if (src.len < 0) { _zag_print("znc: cannot read "); _zag_println(path); return 1; }
     if (znc_check_src(path, src) != 0) { return 1; }
+    if (@strEq(target,"metal")) {
+        _zag_eprintln("znc gpu-metal: native Metal output is not implemented; no artifact was emitted");
+        _zag_eprintln("note: Zag does not relabel generic MLIR or a Linux DRM path as a Metal shader/runtime");
+        return 1;
+    }
     let mbuf: ArrayList[u8] = emit_mlir_dir(src, dir_of(path), target);
     let mpath: []u8 = _zag_str_concat(stem_of(path), ".mlir");
     if (_zag_write_file(mpath, mbuf.data[0..mbuf.len]) != 0) {
@@ -1032,8 +1034,14 @@ fn build_macos_arm64(path: []u8) i32 {
     let src: []u8 = _zag_read_file(path);
     if (src.len < 0) { _zag_print("znc: cannot read "); _zag_println(path); return 1; }
     if (znc_check_src(path, src) != 0) { return 1; }
-    if (has_flag("--dynamic") == 1 || has_flag("--debug") == 1 || has_flag("--hot") == 1) {
-        _zag_eprintln("znc macos-arm64: --dynamic, --debug, and --hot are not implemented for Mach-O yet");
+    if (validate_macos_arm64_cpu_flag() != 0) { return 1; }
+    if (has_flag("--emit-obj") == 1 || has_flag("--emit-static") == 1) {
+        _zag_eprintln("znc macos-arm64: --emit-obj and --emit-static are not implemented; no artifact was emitted");
+        _zag_eprintln("note: current macOS output is a signed Mach-O executable, not an object or archive substitute");
+        return 1;
+    }
+    if (has_flag("--dynamic") == 1 || has_flag("--hot") == 1) {
+        _zag_eprintln("znc macos-arm64: --dynamic and --hot are not implemented for Mach-O yet");
         return 1;
     }
 
@@ -1063,7 +1071,22 @@ fn build_macos_arm64(path: []u8) i32 {
     let out: []u8 = out_flag();
     if (out.len == 0) { out = default_out(path); }
 
-    let rc: i32 = write_macho_arm64_data(out, code, 0, data);
+    let rc: i32 = 0;
+    if (has_flag("--debug") == 1) {
+        let db: DwarfBuilder = dwarf_new(path);
+        dwarf_build_abbrev(&db); dwarf_emit_compile_unit(&db);
+        let di: i32 = 0;
+        while (di < len[*Node](code_decls)) {
+            switch (get[*Node](code_decls,di).*) {
+                .fn_decl => |f| { dwarf_emit_function(&db,f.name,f.line); }
+                else => { }
+            }
+            di = di + 1;
+        }
+        dwarf_finish(&db); dwarf_emit_line_program(&db);
+        let ds: DwarfSections = dwarf_build(&db);
+        rc = write_macho_arm64_data_debug(out,code,0,data,ds.abbrev,ds.info,ds.line_);
+    } else { rc = write_macho_arm64_data(out, code, 0, data); }
     if (rc != 0) { _zag_eprintln("znc macos-arm64: failed to write signed Mach-O executable"); return 1; }
     _zag_print("znc: [macos-arm64] wrote signed native binary ");
     _zag_print(out);
@@ -1270,6 +1293,21 @@ fn validate_x86_cpu_flag() i32 {
         return 1;
     }
     return 0;
+}
+
+// Apple Silicon code generation is a single arm64 baseline today. Do not
+// route its CPU choice through the Linux/x86 profile parser: it would either
+// inspect /proc or incorrectly advertise x86 extensions. `native` and the
+// named Apple families intentionally select the same proven baseline until a
+// feature-specific arm64 lowering exists.
+fn validate_macos_arm64_cpu_flag() i32 {
+    let cpu: []u8 = cpu_flag_value();
+    if (@strEq(cpu,"generic") || @strEq(cpu,"native") ||
+        @strEq(cpu,"apple-m1") || @strEq(cpu,"apple-m2") ||
+        @strEq(cpu,"apple-silicon")) { return 0; }
+    _zag_eprintln("znc macos-arm64: unsupported CPU profile; supported profiles: generic, native, apple-silicon, apple-m1, apple-m2");
+    _zag_eprintln("note: all supported profiles currently emit the same arm64 baseline; no Linux/x86 feature probe or emulation is used");
+    return 1;
 }
 
 // Target validation must fail closed: an unknown target must never silently
@@ -2272,8 +2310,10 @@ fn znc_harden_atomic_output(output:[]u8,text:[]u8) i32 {
     if(_zag_file_exists(temp)==1){_zag_eprintln(_zag_str_concat("znc harden: temporary output already exists: ",temp));return 0;}
     if(_zag_write_file(temp,text)!=0){return 0;}
     let a:ArrayList[u8]=make[u8](temp.len+1);let b:ArrayList[u8]=make[u8](output.len+1);let i:i32=0;while(i<temp.len){push[u8](&a,temp[i]);i=i+1;}push[u8](&a,0 as u8);i=0;while(i<output.len){push[u8](&b,output[i]);i=i+1;}push[u8](&b,0 as u8);
-    let renamed:i64=_zag_raw_syscall(82,_zag_slice_ptr(a.data[0..a.len]) as i64,_zag_slice_ptr(b.data[0..b.len]) as i64,0,0,0,0);
-    if(renamed!=0){let _cleanup:i64=_zag_raw_syscall(87,_zag_slice_ptr(a.data[0..a.len]) as i64,0,0,0,0,0);return 0;}
+    let rename_sys:i64=82;let unlink_sys:i64=87;
+    if(macos_arm64_target()==1){rename_sys=128;unlink_sys=10;}
+    let renamed:i64=_zag_raw_syscall(rename_sys,_zag_slice_ptr(a.data[0..a.len]) as i64,_zag_slice_ptr(b.data[0..b.len]) as i64,0,0,0,0);
+    if(renamed!=0){let _cleanup:i64=_zag_raw_syscall(unlink_sys,_zag_slice_ptr(a.data[0..a.len]) as i64,0,0,0,0,0);return 0;}
     return 1;
 }
 
@@ -2464,6 +2504,11 @@ fn znc_parent_dir(path: []u8) []u8 {
 fn znc_cwd() []u8 {
     let buf: ArrayList[u8] = make[u8](4096);
     while (buf.len < 4096) { push[u8](&buf, 0 as u8); }
+    // Darwin intentionally has no public getcwd raw syscall in its syscall
+    // table. Project-root code accepts relative paths, so keep `.` on macOS
+    // instead of issuing a guessed Linux number that XNU terminates with
+    // SIGSYS. Linux retains its native getcwd syscall below.
+    if(macos_arm64_target()==1){return ".";}
     let rc: i64 = _zag_raw_syscall(79, _zag_slice_ptr(buf.data[0..buf.len]) as i64, buf.len, 0, 0, 0, 0);
     if (rc <= 1) { return "."; }
     return buf.data[0..(rc as i32) - 1];
@@ -3305,7 +3350,13 @@ fn main() i32 {
         return znc_zagd_suggest();
     }
     if (@strEq(cmd, "optimize")) { return znc_optimize_preview(); }
-    if (@strEq(cmd, "hot-patch")) { return znc_hot_patch(first_nonflag_from(2)); }
+    if (@strEq(cmd, "hot-patch")) {
+        if (macos_arm64_target() == 1) {
+            _zag_eprintln("znc macos-arm64: hot-patch is not implemented; no Linux/x86 in-place patch format is used on Mach-O");
+            return 1;
+        }
+        return znc_hot_patch(first_nonflag_from(2));
+    }
     if (@strEq(cmd, "explain")) {
         let epath: []u8 = first_nonflag_from(2);
         if (epath.len > 0) { znc_zagd_ensure(znc_project_root(dir_of(epath)),epath); }

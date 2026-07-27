@@ -121,7 +121,7 @@ ZNC=./znc-macos-arm64 bash tests/run_macos_arm64_release.sh
 
 ```sh
 sudo make install
-# Installs znc, zagd, and zagd-user-service → /usr/local/bin
+# Installs znc, zagd, zagd-user-service, and zagd-launchd-service → /usr/local/bin
 # Installs the strict and Script standard-library modules → /usr/local/lib/zag/std
 # Installs the editable project policy template → /usr/local/share/zag/zagd.conf.example
 ```
@@ -131,6 +131,7 @@ Or manually:
 ```sh
 sudo install -m755 znc zagd /usr/local/bin/
 sudo install -m755 tools/zagd-user-service.sh /usr/local/bin/zagd-user-service
+sudo install -m755 tools/zagd-launchd-service.sh /usr/local/bin/zagd-launchd-service
 sudo install -d /usr/local/lib/zag/std
 sudo install -m644 std/*.zag /usr/local/lib/zag/std/
 sudo install -m644 selfhost/std/process.zag selfhost/std/script_*.zag \
@@ -153,10 +154,10 @@ explicitly with `znc watch --mode light|adaptive|deep|off`, `znc status`,
 mode) in `.zagd.conf`. The daemon never rewrites source and regular Zag
 suggestions are advisory.
 
-On Apple Silicon macOS, `zagd` uses a bounded polling watcher for the selected
-root module because inotify is Linux-only. It supports the same watch/status/
-shutdown lifecycle, but a change may be observed on the next polling interval;
-it never affects foreground compiler correctness.
+On Apple Silicon macOS, `zagd` uses a native Darwin `kqueue` vnode watch for
+the project root because inotify is Linux-only. It falls back to bounded
+polling only if native event setup fails and supports the same watch/status/
+shutdown lifecycle; it never affects foreground compiler correctness.
 Use `--no-zagd` on an individual foreground command when a hermetic invocation
 must not start or contact the background service; this never changes project
 configuration.
@@ -173,14 +174,20 @@ make a persistent opt-out. Explicit compiler choices still override Script
 defaults in the file, and normal Zag remains advisory-only.
 
 To keep a project planner active across login and restart it after an
-unexpected exit, install its bounded systemd user service:
+unexpected exit, use the native service manager:
 
 ```sh
 zagd-user-service install myprogram.zag adaptive
 ```
 
-The service is per project, uses the same `.zagd.conf` policy, and is never a
-foreground build correctness dependency.
+On Apple Silicon macOS, use the equivalent `launchd` adapter:
+
+```sh
+zagd-launchd-service install myprogram.zag adaptive
+```
+
+Both services are per project, use the same `.zagd.conf` policy, and are never
+a foreground build correctness dependency.
 
 ## Troubleshooting
 
