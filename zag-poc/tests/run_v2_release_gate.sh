@@ -57,11 +57,12 @@ run_gate "validated x86 byte-swap intrinsic" bash tests/run_x86_byte_swap.sh
 run_gate "validated x86 leading-zeros intrinsic" bash tests/run_x86_leading_zeros.sh
 run_gate "validated x86 prefetch intrinsic" bash tests/run_x86_prefetch.sh
 run_gate "validated x86 volatile MMIO widths" bash tests/run_x86_volatile_widths.sh
+run_gate "bounded MMIO-region authority" bash tests/run_mmio_region.sh
 run_gate "validated x86 SSE2 SIMD add" bash tests/run_x86_simd_add_i32x4.sh
 
 unsupported "pointer and memory model" "raw pointer categories and lexical checks exist, but provenance/alignment/lifetime instrumentation is incomplete"
 unsupported "allocator and reclamation" "checked native SystemAllocator handles and bounded retained fixed-buffer/arena regions exist, but opaque language capabilities, custom/debug allocators, and a general lifetime model are incomplete"
-unsupported "volatile/MMIO" "checked native 8/16/32-bit and word transactions exist, but physical device validation, address capabilities, and the complete MMIO contract are incomplete"
+unsupported "volatile/MMIO" "checked native 8/16/32-bit and word transactions plus bounded byte MmioRegion access exist, but physical device validation, opaque hardware authority, and the complete MMIO contract are incomplete"
 unsupported "atomics and concurrency" "fixed unsafe x86-64 i64 operations plus literal-validated load/store/RMW/CAS/fence orders exist, but atomic storage, language-wide fence semantics, threads, litmus evidence, and a v2 concurrency model remain incomplete"
 unsupported "C ABI and dynamic linking" "checked v2 @cabi scalar dynamic imports, a direct captureless scalar/pointer callback, and a relocation-free self-contained scalar @cabi_export ET_REL object exist, but general bidirectional ABI, relocation/static archive/shared-object conformance, and unload/lifetime contracts are incomplete"
 unsupported "CPU intrinsics/SIMD/inline assembly" "validated x86 scalar intrinsics and bounded unsafe SSE2 i32x4 add exist, but vector types/ABI, additional SIMD, inline-assembly constraints/clobbers, and full target-feature/effect checking are incomplete"

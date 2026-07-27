@@ -176,6 +176,16 @@ physical device register, device capability, concurrent access, or address
 fabrication. Device/workgroup pointers remain rejected until a GPU/MMIO
 capability contract exists.
 
+`std/mmio.zag` additionally provides a bounded `MmioRegion` helper for byte
+transactions. Unsafe code supplies one `*mut u8` base and a nonnegative length
+to `mmio_region`; `mmio_read8` and `mmio_write8` reject negative or
+out-of-range offsets with `error.OutOfRange` before deriving the byte pointer
+and issuing the existing volatile operation. This is a useful source-level
+range boundary around a named device window, but it is not opaque hardware
+authority: unsafe code can still forge or copy raw addresses, and the helper
+does not enumerate devices, validate a physical mapping, establish privilege,
+or supply atomic ordering.
+
 Captureless callbacks are ordinary function values. A scalar by-value capture
 uses a heap environment that is an owned v2 resource: it may be transferred by
 an owned return or must be released with `close(callback)` on every path. The
