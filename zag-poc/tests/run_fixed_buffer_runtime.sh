@@ -43,6 +43,23 @@ if (cd "$tmp/stale" && "$ZNC" main.zag -o out --safety=checked --no-zagd) >"$tmp
 else
   echo '  XX  stale fixed-buffer backing harness did not compile'; sed -n '1,20p' "$tmp/stale/log"; exit 1
 fi
+mkdir -p "$tmp/duplicate/std"
+ln -s "$PWD/selfhost/std/allocator.zag" "$tmp/duplicate/std/allocator.zag"
+printf 'name = "fixedbufferduplicate"\nversion = "0"\nedition = "2027"\n' >"$tmp/duplicate/zag.mod"
+printf '%s\n' '@import("std/allocator.zag") fn work() !i32 { let system:SystemAllocator=system_allocator(); let backing:Allocation=try system.allocate(32,8); let first:i64=_zag_fixed_buffer_init(backing.ptr,backing.len,backing.alignment,backing.generation,backing.allocator_id); if(first==0){return 2;} let second:i64=_zag_fixed_buffer_init(backing.ptr,backing.len,backing.alignment,backing.generation,backing.allocator_id); return second as i32; } fn main() i32{return work() catch 9;}' >"$tmp/duplicate/main.zag"
+if (cd "$tmp/duplicate" && "$ZNC" main.zag -o out --safety=checked --no-zagd) >"$tmp/duplicate/log" 2>&1 && [ -x "$tmp/duplicate/out" ]; then
+  set +e
+  "$tmp/duplicate/out" >"$tmp/duplicate/out.log" 2>"$tmp/duplicate/err.log"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ] && grep -q 'already has a live fixed-buffer region' "$tmp/duplicate/err.log"; then
+    echo '  ok  fixed-buffer runtime rejects duplicate live regions for one backing handle'
+  else
+    echo "  XX  duplicate fixed-buffer region runtime result (exit=$rc)"; sed -n '1,12p' "$tmp/duplicate/log"; sed -n '1,12p' "$tmp/duplicate/err.log"; exit 1
+  fi
+else
+  echo '  XX  duplicate fixed-buffer region harness did not compile'; sed -n '1,20p' "$tmp/duplicate/log"; exit 1
+fi
 mkdir -p "$tmp/stale-block/std"
 ln -s "$PWD/selfhost/std/allocator.zag" "$tmp/stale-block/std/allocator.zag"
 printf 'name = "fixedbufferstaleblock"\nversion = "0"\nedition = "2027"\n' >"$tmp/stale-block/zag.mod"
