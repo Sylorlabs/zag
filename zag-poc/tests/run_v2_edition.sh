@@ -72,6 +72,16 @@ if (cd "$tmp/v2-system-allocator-helper-local-return" && "$ZNC" main.zag -o out 
 else
   echo "  XX  allocation helper local transfer"; sed -n '1,12p' "$tmp/v2-system-allocator-helper-local-return/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-system-allocator-helper-multi-local-return"
+printf 'name = "v2systemallocatorhelpermultilocalreturn"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-helper-multi-local-return/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-helper-multi-local-return/std"
+printf '@import("std/allocator.zag") fn make(allocator:SystemAllocator) !Allocation @alloc { let discarded:Allocation=try allocator.allocate(8,8); let result:Allocation=try allocator.allocate(24,8); try allocator.deallocate(discarded); return result; } fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try make(allocator); try allocator.deallocate(block); return 0; } fn main() i32 { return work() catch 1; }\n' >"$tmp/v2-system-allocator-helper-multi-local-return/main.zag"
+if (cd "$tmp/v2-system-allocator-helper-multi-local-return" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-helper-multi-local-return/log" 2>&1 && [ -x "$tmp/v2-system-allocator-helper-multi-local-return/out" ]; then
+  "$tmp/v2-system-allocator-helper-multi-local-return/out"
+  if [ $? -eq 0 ]; then echo "  ok  allocation helper discharges extra local capability"; pass=$((pass + 1)); else echo "  XX  allocation helper multi-local execution"; fail=$((fail + 1)); fi
+else
+  echo "  XX  allocation helper multi-local transfer"; sed -n '1,12p' "$tmp/v2-system-allocator-helper-multi-local-return/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-system-allocator-helper-hidden-leak"
 printf 'name = "v2systemallocatorhelperhiddenleak"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-helper-hidden-leak/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-helper-hidden-leak/std"

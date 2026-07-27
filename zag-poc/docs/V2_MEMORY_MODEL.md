@@ -135,10 +135,10 @@ proven producer summary: it must be a non-extern function, take no
 the checked allocator receiver or transitively return another proven `@alloc`
 producer. Its body may not bind arbitrary minted capabilities locally: that
 would need general local ownership-flow accounting to prove they are returned
-exactly once rather than leaked. The implemented first local-flow case permits one
-private, straight-line `Allocation` binding when that exact binding is returned
-once (or directly deallocated before a later direct producer return). Multiple
-live bindings, assignment, and control-flow joins remain rejected. The
+exactly once rather than leaked. The implemented straight-line local-flow case
+tracks multiple private named `Allocation` bindings: each must be directly
+deallocated, except for one exact binding transferred by return. Assignment and
+control-flow joins remain rejected. The
 annotation alone is not authority; an unproven, foreign, cyclic, mixed, or
 unproven-local return is rejected at the receiving local boundary. This permits
 small allocation factories without permitting an `Allocation` capability to be
