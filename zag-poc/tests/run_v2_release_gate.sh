@@ -34,6 +34,7 @@ run_gate "v2 edition boundary" bash tests/run_v2_edition.sh
 run_gate "unsafe lexical and raw-pointer boundary" bash tests/run_v2_edition.sh
 run_gate "try-wrapped borrow identity" bash tests/run_v2_try_borrow.sh
 run_gate "mutation-aware aggregate provenance" bash tests/run_v2_aggregate_provenance.sh
+run_gate "fixed-buffer checked runtime authority" bash tests/run_fixed_buffer_runtime.sh
 run_gate "v2 atomic i64 operations" bash tests/run_v2_atomic_exchange.sh
 run_gate "v2 atomic load/store memory-order validation" bash tests/run_v2_atomic_orders.sh
 run_gate "fail-closed indirect effect boundary" bash tests/run_v2_effect_adversarial.sh
