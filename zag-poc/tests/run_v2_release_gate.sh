@@ -46,6 +46,7 @@ run_gate "generated support matrix" bash tests/run_v2_support_matrix.sh
 run_gate "WASM emission regression (no runtime)" bash tests/run_native_wasm.sh
 run_gate "GPU frontend validation (not execution)" bash tests/run_native_gpu.sh
 run_gate "dynamic ELF ABI boundary" bash tests/run_dynamic_abi.sh
+run_gate "x86-64 C ABI object export boundary" bash tests/run_x86_64_cabi_object.sh
 run_gate "validated x86 POPCNT intrinsic" bash tests/run_x86_popcount.sh
 run_gate "validated x86 BMI1 ANDN intrinsic" bash tests/run_x86_andn.sh
 run_gate "validated x86 trailing-zeros intrinsic" bash tests/run_x86_trailing_zeros.sh
@@ -59,7 +60,7 @@ unsupported "pointer and memory model" "raw pointer categories and lexical check
 unsupported "allocator and reclamation" "checked native SystemAllocator handles now carry runtime allocator identity, but opaque language capabilities, custom/arena/fixed-buffer and debug allocators, and a general lifetime model are incomplete"
 unsupported "volatile/MMIO" "checked native 8/16/32-bit and word transactions exist, but physical device validation, address capabilities, and the complete MMIO contract are incomplete"
 unsupported "atomics and concurrency" "fixed unsafe x86-64 i64 operations plus literal-validated load/store/RMW/CAS orders exist, but atomic storage, typed fence order, threads, litmus evidence, and a v2 concurrency model remain incomplete"
-unsupported "C ABI and dynamic linking" "checked v2 @cabi scalar dynamic imports, ELF loading, and a direct captureless scalar/pointer callback to libc qsort exist, but general bidirectional ABI, exports, shared-object conformance, and unload/lifetime contracts are incomplete"
+unsupported "C ABI and dynamic linking" "checked v2 @cabi scalar dynamic imports, a direct captureless scalar/pointer callback, and a relocation-free self-contained scalar @cabi_export ET_REL object exist, but general bidirectional ABI, relocation/static archive/shared-object conformance, and unload/lifetime contracts are incomplete"
 unsupported "CPU intrinsics/SIMD/inline assembly" "validated x86 scalar intrinsics and bounded unsafe SSE2 i32x4 add exist, but vector types/ABI, additional SIMD, inline-assembly constraints/clobbers, and full target-feature/effect checking are incomplete"
 unsupported "effect adversarial suite" "opaque aggregate/computed indirect calls and host effects in @kernel now fail closed, but verified aggregate rows, device-helper propagation, and distinct Atomic/FFI/GPU effect models remain incomplete"
 unsupported "physical GPU execution" "no runtime enumerate/allocate/dispatch/readback path"

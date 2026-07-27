@@ -57,19 +57,29 @@ fixed seven-word scalar call whose seventh `mmap` offset is consumed from the
 SysV stack, plus libc `qsort` calling a Zag comparator; this does not extend
 the supported surface to aggregates, floats, general callbacks, variadics,
 exports, or imports with ownership/lifetime contracts.
-It has no v2 export surface: the native x86-64 writer emits `ET_EXEC` with
-program headers only, not an `ET_REL` object, section table, `.symtab`, or
-public-symbol visibility. Accordingly, native `--emit-obj`, `--emit-static`,
-`--emit-shared`, object aliases, PIE, loader-path, rpath/soname,
-archive-selection, and common shared/library-output spellings fail before
-artifact creation rather than silently producing an executable. The separate i686 object/archive path is not v2 C ABI evidence and
-rejects v2 `@cabi` declarations.
+
+There is one deliberately narrow outbound v2 surface: an edition-2027
+`pub fn` annotated `@cabi_export` with only scalar integer, `bool`, raw-pointer,
+or `void` parameters and result can be compiled with native x86-64
+`--emit-obj`. This emits a relocation-free `ELF64 ET_REL` containing `.text`,
+`.symtab`, `.strtab`, and `.shstrtab`; the annotated function is a global
+`STT_FUNC` symbol. `tests/run_x86_64_cabi_object.sh` both inspects that
+artifact and links it into a C executable which calls the exported Zag
+function. The accepted object is self-contained: it has no data section,
+foreign imports, dynamic libraries, archive inputs, or relocations.
+
+This is not a general export or static-linking ABI. Floats, aggregates,
+variadics, callbacks, generics, shared objects, archives, relocation-bearing
+objects, ABI unwind/visibility policy, and ownership/lifetime contracts remain
+unimplemented. `--emit-static`, `--emit-shared`, object aliases, PIE,
+loader-path, rpath/soname, archive-selection, and common shared/library-output
+spellings continue to fail before artifact creation rather than silently
+producing an executable. The separate i686 object/archive path is not v2 C ABI
+evidence and rejects v2 `@cabi` declarations.
 Likewise, `--export`, `--export-dynamic`, and `--export-symbol` requests are
 rejected: `pub fn` does not create a public C symbol in the current native
 writer.
 
-A native export/static-object increment requires codegen to return exact public
-function offsets and sizes, plus a new x86-64 `ET_REL` writer with section,
-symbol, and relocation authority. It must then establish a separately tested
-calling convention (including aggregates, sret, and unwind/visibility policy).
-Until that work exists, no stable v2 export or static C ABI is claimed.
+A complete native export/static-object ABI still requires relocation authority,
+exact symbol-size policy, aggregates/sret, unwinding, visibility, and broad C
+conformance tests. No stable general v2 export or static C ABI is claimed.

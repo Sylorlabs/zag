@@ -160,13 +160,14 @@ else
     grep -q 'supported only for native x86-64 --dynamic' "$WORK/v2-cabi/i686.log" && ok "v2 @cabi rejects non-native object target" || bad "missing non-native ABI diagnostic"
 fi
 
-# The normal x86-64 writer is ET_EXEC only.  Its object/archive flags must not
-# silently produce an executable with no section or public-symbol table.
+# x86-64 `--emit-obj` is deliberately narrower than the general executable
+# path: it requires an explicit v2 `@cabi_export`, so an ordinary public
+# function must still fail before artifact creation.
 printf 'pub fn exported_answer() i64 { return 42; } fn main() i32 { return 0; }\n' >"$WORK/v2-cabi/main.zag"
 if (cd "$WORK/v2-cabi" && "$ZNC_BIN" main.zag --emit-obj --no-zagd --no-analyze -o native.o) >"$WORK/v2-cabi/native-object.log" 2>&1 || [ -e "$WORK/v2-cabi/native.o" ]; then
     bad "native x86-64 emitted a misleading object artifact"
 else
-    grep -q 'native x86-64 --emit-obj/--emit-static is not implemented' "$WORK/v2-cabi/native-object.log" && ok "native x86-64 object request fails closed" || bad "missing native object diagnostic"
+    grep -q 'requires at least one pub fn annotated @cabi_export' "$WORK/v2-cabi/native-object.log" && ok "native x86-64 object request fails closed" || bad "missing native object diagnostic"
 fi
 
 # A shared-object request is also unsupported: it must not be ignored and
