@@ -30,6 +30,11 @@ fixed-buffer allocators may be `@noalloc` after construction.  `@realtime`
 rejects allocator calls unless a statically identified fixed-buffer allocator
 is used and its operation is proven nonblocking.
 
+Current implementation note: this is a target contract, not a present effect
+claim. Edition 2027 admits only a fixed-buffer retained-owner handoff
+(`fixed_buffer_allocator(backing)` followed by top-level `deinit`); block
+allocation, reset, and `@noalloc`/`@realtime` qualification remain unsupported.
+
 ## Status and edition boundary
 
 This is a v2 (`edition = "2027"`) contract, not a description of current v1

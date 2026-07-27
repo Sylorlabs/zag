@@ -367,13 +367,46 @@ else
 fi
 mkdir -p "$tmp/v2-fixed-buffer-allocator"
 printf 'name = "v2fixedbufferallocator"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-fixed-buffer-allocator/zag.mod"
-printf 'fn main() i32 { let allocator = fixed_buffer_allocator(0, 0); return 0; }\n' >"$tmp/v2-fixed-buffer-allocator/main.zag"
-if (cd "$tmp/v2-fixed-buffer-allocator" && "$ZNC" main.zag -o out) >"$tmp/v2-fixed-buffer-allocator/log" 2>&1 || [ -e "$tmp/v2-fixed-buffer-allocator/out" ]; then
-  echo "  XX  fixed-buffer allocator rejects before an artifact"; sed -n '1,12p' "$tmp/v2-fixed-buffer-allocator/log"; fail=$((fail + 1))
-elif grep -q 'fixed-buffer and arena allocators are unsupported' "$tmp/v2-fixed-buffer-allocator/log"; then
-  echo "  ok  fixed-buffer allocator has an explicit lifetime-contract rejection"; pass=$((pass + 1))
+ln -s "$PWD/selfhost/std" "$tmp/v2-fixed-buffer-allocator/std"
+# The first retained-owner slice admits exactly construction followed by
+# top-level deinit.  It deliberately exposes neither block allocation nor
+# reset until their mutation/invalidations have an independently proven
+# compiler contract.
+printf '@import("std/allocator.zag") fn work() !i32 { let system:SystemAllocator=system_allocator(); let backing:Allocation=try system.allocate(64,8); let region:FixedBufferAllocator=try fixed_buffer_allocator(backing); let released:Allocation=try region.deinit(); try system.deallocate(released); return 42; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-fixed-buffer-allocator/main.zag"
+if (cd "$tmp/v2-fixed-buffer-allocator" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-fixed-buffer-allocator/log" 2>&1 && [ -x "$tmp/v2-fixed-buffer-allocator/out" ]; then
+  set +e
+  "$tmp/v2-fixed-buffer-allocator/out"
+  fixed_buffer_allocator_rc=$?
+  set -e
+  if [ "$fixed_buffer_allocator_rc" -eq 42 ]; then
+    echo "  ok  fixed-buffer retained construction/deinit returns the exact live backing"; pass=$((pass + 1))
+  else
+    echo "  XX  fixed-buffer retained construction/deinit execution (exit=$fixed_buffer_allocator_rc)"; sed -n '1,16p' "$tmp/v2-fixed-buffer-allocator/log"; fail=$((fail + 1))
+  fi
 else
-  echo "  XX  fixed-buffer allocator rejection missing diagnostic"; fail=$((fail + 1))
+  echo "  XX  fixed-buffer retained construction/deinit did not compile"; sed -n '1,16p' "$tmp/v2-fixed-buffer-allocator/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-fixed-buffer-block-reject"
+printf 'name = "v2fixedbufferblockreject"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-fixed-buffer-block-reject/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-fixed-buffer-block-reject/std"
+printf '@import("std/allocator.zag") fn work() !i32 { let system:SystemAllocator=system_allocator(); let backing:Allocation=try system.allocate(64,8); let region:FixedBufferAllocator=try fixed_buffer_allocator(backing); let block:FixedBufferBlock=try region.allocate(8,8); let released:Allocation=try region.deinit(); try system.deallocate(released); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-fixed-buffer-block-reject/main.zag"
+if (cd "$tmp/v2-fixed-buffer-block-reject" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-fixed-buffer-block-reject/log" 2>&1 || [ -e "$tmp/v2-fixed-buffer-block-reject/out" ]; then
+  echo "  XX  fixed-buffer block allocation remains fail-closed"; sed -n '1,16p' "$tmp/v2-fixed-buffer-block-reject/log"; fail=$((fail + 1))
+elif grep -q 'fixed-buffer allocation, reset, block access, and aliases are unsupported' "$tmp/v2-fixed-buffer-block-reject/log"; then
+  echo "  ok  fixed-buffer block allocation remains fail-closed"; pass=$((pass + 1))
+else
+  echo "  XX  fixed-buffer block rejection missing diagnostic"; sed -n '1,16p' "$tmp/v2-fixed-buffer-block-reject/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-fixed-buffer-old-backing-reject"
+printf 'name = "v2fixedbufferoldbackingreject"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-fixed-buffer-old-backing-reject/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-fixed-buffer-old-backing-reject/std"
+printf '@import("std/allocator.zag") fn work() !i32 { let system:SystemAllocator=system_allocator(); let backing:Allocation=try system.allocate(64,8); let region:FixedBufferAllocator=try fixed_buffer_allocator(backing); let released:Allocation=try region.deinit(); let stale:Allocation=backing; try system.deallocate(released); return stale.len as i32; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-fixed-buffer-old-backing-reject/main.zag"
+if (cd "$tmp/v2-fixed-buffer-old-backing-reject" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-fixed-buffer-old-backing-reject/log" 2>&1 || [ -e "$tmp/v2-fixed-buffer-old-backing-reject/out" ]; then
+  echo "  XX  fixed-buffer old backing remains unavailable after deinit"; sed -n '1,16p' "$tmp/v2-fixed-buffer-old-backing-reject/log"; fail=$((fail + 1))
+elif grep -q 'retained backing and allocator cannot be used' "$tmp/v2-fixed-buffer-old-backing-reject/log"; then
+  echo "  ok  fixed-buffer old backing remains unavailable after deinit"; pass=$((pass + 1))
+else
+  echo "  XX  fixed-buffer old backing rejection missing diagnostic"; sed -n '1,16p' "$tmp/v2-fixed-buffer-old-backing-reject/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-system-allocator-callback-escape"
 printf 'name = "v2systemallocatorcallbackescape"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-callback-escape/zag.mod"

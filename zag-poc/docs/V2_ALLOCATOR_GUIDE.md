@@ -57,8 +57,12 @@ identity are runtime-checked tokens, but they are not yet opaque language
 capabilities and the public constructor currently exposes only identity `1`;
 the checked register boundary rejects forged constructor identities until a
 second allocator family has its own descriptor and lifetime contract.
-Custom allocators, arenas, and fixed-buffer allocators are still
-unimplemented. `resize` and `allocate_zeroed` are
+Custom allocators and arenas are still unimplemented. A deliberately narrow
+fixed-buffer retained-owner handoff is implemented, but it is not a usable
+fixed-buffer allocation API: it permits construction from one named live
+`Allocation` and a top-level `deinit` into one fresh named `Allocation`, then
+rejects blocks, `allocate`, `reset`, aliases, aggregate storage, escapes, and
+control-flow lifetimes. `resize` and `allocate_zeroed` are
 implemented for the checked native SystemAllocator: it returns the ordinary
 minted handle after clearing its exact recorded capacity. `resize` validates
 the old handle, allocates the replacement first, copies the overlap, then
@@ -66,21 +70,16 @@ consumes the old handle; a fallible replacement allocation therefore leaves the
 old handle live. On a successful resize, copied descriptors from the old
 lifetime are retired with that old handle and reject before a second free.
 
-In particular, `fixed_buffer_allocator(...)` and `arena_allocator(...)` are
-explicitly rejected as public v2 surface spellings for now. Their constructors
-must retain a caller-owned buffer while allocation mutates allocator state and
-accepts size/alignment. Borrow contracts now permit scalar auxiliary
-parameters, but still track only a first owner parameter and reject a
-receiver/second pointer/aggregate lifetime; that does not express this
-multi-argument lifetime/mutation contract without weakening ownership checks.
-There is no
-special-case fallback, no hidden heap path, and no claimed `@noalloc` or
-`@realtime` behavior until that contract and executable exhaustion/reset tests
-exist.
+`arena_allocator(...)` remains explicitly rejected. The fixed-buffer handoff
+does not allocate or reset and therefore makes no `@noalloc` or `@realtime`
+claim. The runtime descriptors are bounded checked metadata, but no executable
+exhaustion/reset proof exists yet; there is no special-case fallback or hidden
+heap path in the admitted construction/deinit sequence.
 
 ## Required fixed-buffer allocator slice
 
-This is the smallest coherent implementation plan; it is **not implemented**.
+Construction/deinit is implemented as the narrow handoff above. The following
+items remain required before fixed-buffer blocks become supported.
 
 1. Extend function annotations from bare strings to parsed contract metadata
    with parameter indices and a return relation. A constructor needs to say
