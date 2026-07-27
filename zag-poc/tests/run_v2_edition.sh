@@ -62,17 +62,15 @@ if (cd "$tmp/v2-system-allocator-helper-return" && "$ZNC" main.zag -o out --safe
 else
   echo "  XX  declared allocation helper return"; sed -n '1,12p' "$tmp/v2-system-allocator-helper-return/log"; fail=$((fail + 1))
 fi
-mkdir -p "$tmp/v2-system-allocator-helper-unproven-return"
-printf 'name = "v2systemallocatorhelperunprovenreturn"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-helper-unproven-return/zag.mod"
-ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-helper-unproven-return/std"
-printf '@import("std/allocator.zag") fn make(allocator:SystemAllocator) !Allocation @alloc { let temporary:Allocation=try allocator.allocate(24,8); return temporary; } fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try make(allocator); return 0; } fn main() i32 { return work() catch 1; }\n' >"$tmp/v2-system-allocator-helper-unproven-return/main.zag"
-if (cd "$tmp/v2-system-allocator-helper-unproven-return" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-helper-unproven-return/log" 2>&1 ||
-   [ -e "$tmp/v2-system-allocator-helper-unproven-return/out" ]; then
-  echo "  XX  unproven allocation helper return rejects"; sed -n '1,12p' "$tmp/v2-system-allocator-helper-unproven-return/log"; fail=$((fail + 1))
-elif grep -q 'Allocation is affine; copy and uncontracted transfer are not allowed' "$tmp/v2-system-allocator-helper-unproven-return/log"; then
-  echo "  ok  unproven allocation helper return rejects"; pass=$((pass + 1))
+mkdir -p "$tmp/v2-system-allocator-helper-local-return"
+printf 'name = "v2systemallocatorhelperlocalreturn"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-helper-local-return/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-helper-local-return/std"
+printf '@import("std/allocator.zag") fn make(allocator:SystemAllocator) !Allocation @alloc { let temporary:Allocation=try allocator.allocate(24,8); return temporary; } fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try make(allocator); try allocator.deallocate(block); return 0; } fn main() i32 { return work() catch 1; }\n' >"$tmp/v2-system-allocator-helper-local-return/main.zag"
+if (cd "$tmp/v2-system-allocator-helper-local-return" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-helper-local-return/log" 2>&1 && [ -x "$tmp/v2-system-allocator-helper-local-return/out" ]; then
+  "$tmp/v2-system-allocator-helper-local-return/out"
+  if [ $? -eq 0 ]; then echo "  ok  allocation helper transfers one local affine capability"; pass=$((pass + 1)); else echo "  XX  allocation helper local transfer execution"; fail=$((fail + 1)); fi
 else
-  echo "  XX  unproven allocation helper return rejection missing diagnostic"; sed -n '1,12p' "$tmp/v2-system-allocator-helper-unproven-return/log"; fail=$((fail + 1))
+  echo "  XX  allocation helper local transfer"; sed -n '1,12p' "$tmp/v2-system-allocator-helper-local-return/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-system-allocator-helper-hidden-leak"
 printf 'name = "v2systemallocatorhelperhiddenleak"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-helper-hidden-leak/zag.mod"

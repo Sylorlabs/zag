@@ -133,11 +133,14 @@ An `@alloc` function may return `Allocation`/`!Allocation` only as a narrow
 proven producer summary: it must be a non-extern function, take no
 `Allocation` parameter, and every explicit return path must directly mint from
 the checked allocator receiver or transitively return another proven `@alloc`
-producer. Its body may not bind another minted capability locally: that would
-need general local ownership-flow accounting to prove it is returned exactly
-once rather than leaked. The annotation alone is not authority; an unproven,
-foreign, cyclic, local-bound, or mixed return is rejected at the receiving
-local boundary. This permits
+producer. Its body may not bind arbitrary minted capabilities locally: that
+would need general local ownership-flow accounting to prove they are returned
+exactly once rather than leaked. The implemented first local-flow case permits one
+private, straight-line `Allocation` binding when that exact binding is returned
+once (or directly deallocated before a later direct producer return). Multiple
+live bindings, assignment, and control-flow joins remain rejected. The
+annotation alone is not authority; an unproven, foreign, cyclic, mixed, or
+unproven-local return is rejected at the receiving local boundary. This permits
 small allocation factories without permitting an `Allocation` capability to be
 silently copied, echoed, or fabricated. It is still not a general
 interprocedural lifetime or allocator protocol.
