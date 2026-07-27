@@ -80,33 +80,19 @@ intrinsic call after backing release traps. Exhaustive block/lifetime coverage
 remains unsupported.
 There is no special-case fallback or hidden heap path.
 
-## Required fixed-buffer allocator slice
+## Fixed-buffer boundary
 
-Construction/deinit is implemented as the narrow handoff above. The following
-items remain required before fixed-buffer blocks become supported.
+The implemented fixed-buffer slice has a compiler-tracked retained backing,
+opaque runtime block tokens, checked byte access, bounded registry reuse, and
+generation invalidation on `reset`. A block access revalidates the retained
+backing handle before deriving an address, so released backing storage cannot
+be reached through a stale direct intrinsic call. Exhaustion returns
+`OutOfMemory` and never falls through to `_zag_malloc`.
 
-1. Extend function annotations from bare strings to parsed contract metadata
-   with parameter indices and a return relation. A constructor needs to say
-   that its mutable receiver stores a borrow of parameter `buffer`; an
-   allocation method needs to say that its result is derived from that stored
-   buffer rather than owned by the heap.
-2. Extend typed borrow state from one `root/mode` pair to a set of parameter
-   roots plus an attached region on aggregate fields. The checker must reject
-   returning the allocator or an allocation after its buffer owner is released,
-   and must keep the receiver unavailable while a mutable allocation/reset
-   operation is active.
-3. Give fixed-buffer allocations a checked runtime descriptor
-   `{ allocator_id, generation, offset, length, alignment }`. A successful
-   `reset` increments the allocator generation; later access/deallocation of a
-   descriptor minted before reset must fail. The descriptor is not a general
-   heap `Allocation` and cannot call `_zag_free`.
-4. Lower only `init`, `allocate`, and `reset` for native checked x86-64 first.
-   Allocation must check cursor, requested alignment, and capacity; exhaustion
-   returns its explicit error and must not fall through to `_zag_malloc`.
-5. Add execution evidence for aligned allocation, exhaustion without heap
-   telemetry growth, buffer/receiver lifetime rejection, reset invalidation,
-   and no `@realtime`/`@noalloc` claim until the effects are independently
-   proved.
+This is deliberately not a general allocator protocol: aliases, aggregate
+storage, escaping blocks/allocators, control-flow lifecycles, arbitrary typed
+allocation, custom arena allocation, and `@noalloc`/`@realtime` qualification
+remain unsupported.
 
 Arena and fixed-buffer allocators are useful only when their lifetime/reset
 semantics are explicit.  A fixed-buffer allocation may satisfy `@noalloc` or
