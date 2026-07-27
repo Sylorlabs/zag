@@ -562,6 +562,40 @@ if (cd "$tmp/v2-checked-heap-oob" && "$ZNC" main.zag -o out --safety=checked) >"
 else
   echo "  XX  checked safety heap bounds program did not compile"; sed -n '1,8p' "$tmp/v2-checked-heap-oob/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-checked-heap-index-overflow"
+printf 'name = "v2checkedheapindexoverflow"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-heap-index-overflow/zag.mod"
+printf 'fn main() i32 { unsafe { let p:*i64=_zag_malloc(8) as *i64; p.*=42; let i:i64=2305843009213693952; let value:i64=p[i]; _zag_free(p as *u8); return value as i32; } }\n' >"$tmp/v2-checked-heap-index-overflow/main.zag"
+if (cd "$tmp/v2-checked-heap-index-overflow" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-checked-heap-index-overflow/log" 2>&1 && [ -x "$tmp/v2-checked-heap-index-overflow/out" ]; then
+  set +e
+  "$tmp/v2-checked-heap-index-overflow/out" >"$tmp/v2-checked-heap-index-overflow/out.log" 2>"$tmp/v2-checked-heap-index-overflow/err.log"
+  checked_heap_index_overflow_rc=$?
+  set -e
+  if [ "$checked_heap_index_overflow_rc" -ne 0 ] && grep -q 'zag safety: raw pointer index arithmetic overflow' "$tmp/v2-checked-heap-index-overflow/err.log"; then
+    echo "  ok  checked safety traps overflowing tracked raw-pointer index"
+    pass=$((pass + 1))
+  else
+    echo "  XX  checked safety raw-pointer index overflow (exit=$checked_heap_index_overflow_rc)"; sed -n '1,8p' "$tmp/v2-checked-heap-index-overflow/log"; sed -n '1,8p' "$tmp/v2-checked-heap-index-overflow/err.log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  checked safety raw-pointer index-overflow program did not compile"; sed -n '1,8p' "$tmp/v2-checked-heap-index-overflow/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-checked-heap-index-store-overflow"
+printf 'name = "v2checkedheapindexstoreoverflow"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-heap-index-store-overflow/zag.mod"
+printf 'fn main() i32 { unsafe { let p:*i64=_zag_malloc(8) as *i64; p.*=42; let i:i64=2305843009213693952; p[i]=99; _zag_free(p as *u8); return 0; } }\n' >"$tmp/v2-checked-heap-index-store-overflow/main.zag"
+if (cd "$tmp/v2-checked-heap-index-store-overflow" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-checked-heap-index-store-overflow/log" 2>&1 && [ -x "$tmp/v2-checked-heap-index-store-overflow/out" ]; then
+  set +e
+  "$tmp/v2-checked-heap-index-store-overflow/out" >"$tmp/v2-checked-heap-index-store-overflow/out.log" 2>"$tmp/v2-checked-heap-index-store-overflow/err.log"
+  checked_heap_index_store_overflow_rc=$?
+  set -e
+  if [ "$checked_heap_index_store_overflow_rc" -ne 0 ] && grep -q 'zag safety: raw pointer index arithmetic overflow' "$tmp/v2-checked-heap-index-store-overflow/err.log"; then
+    echo "  ok  checked safety traps overflowing tracked raw-pointer index store"
+    pass=$((pass + 1))
+  else
+    echo "  XX  checked safety raw-pointer index-store overflow (exit=$checked_heap_index_store_overflow_rc)"; sed -n '1,8p' "$tmp/v2-checked-heap-index-store-overflow/log"; sed -n '1,8p' "$tmp/v2-checked-heap-index-store-overflow/err.log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  checked safety raw-pointer index-store-overflow program did not compile"; sed -n '1,8p' "$tmp/v2-checked-heap-index-store-overflow/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-checked-heap-class-slack"
 printf 'name = "v2checkedheapclassslack"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-heap-class-slack/zag.mod"
 printf 'fn main() i32 { unsafe { let p:*i8=_zag_malloc(1) as *i8; p[1]=7; let value:i8=p[1]; _zag_free(p); return value as i32; } }\n' >"$tmp/v2-checked-heap-class-slack/main.zag"

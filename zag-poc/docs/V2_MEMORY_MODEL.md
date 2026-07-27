@@ -9,6 +9,9 @@ access, MMIO access, and provenance-erasing cast require `unsafe`.
 
 Pointer add/subtract scales by `size_of(T)`, is defined only within one live
 allocation plus one-past, and traps in checked instrumentation otherwise.
+Before a checked native raw `p[i]` access, the compiler rejects signed
+`i * size_of(T)` and base-plus-offset arithmetic that would wrap, before any
+provenance/bounds lookup observes a wrapped address.
 Raw-pointer ordering comparisons are rejected. Equality/inequality is raw
 address identity; equality against null is the portable cross-allocation test,
 not a proof of common allocation provenance. Misalignment is rejected or
