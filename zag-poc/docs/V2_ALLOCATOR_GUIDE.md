@@ -57,7 +57,7 @@ identity are runtime-checked tokens, but they are not yet opaque language
 capabilities and the public constructor currently exposes only identity `1`;
 the checked register boundary rejects forged constructor identities until a
 second allocator family has its own descriptor and lifetime contract.
-Custom allocators and arenas are still unimplemented. The fixed-buffer slice
+Custom allocators remain unimplemented. The fixed-buffer slice
 now permits construction from one named live `Allocation`, named top-level
 `FixedBufferBlock` allocations, checked byte reads/writes, reset with
 generation invalidation, and top-level `deinit` into one fresh named
@@ -71,7 +71,11 @@ consumes the old handle; a fallible replacement allocation therefore leaves the
 old handle live. On a successful resize, copied descriptors from the old
 lifetime are retired with that old handle and reject before a second free.
 
-`arena_allocator(...)` remains explicitly rejected. The fixed-buffer slice
+`arena_allocator(...)` now provides the same bounded retained-owner discipline
+through distinct `ArenaAllocator` and `ArenaBlock` types: one live checked
+backing, named top-level blocks, checked byte access, reset invalidation, and
+top-level deinit handoff. It is not a general allocator capability. The
+fixed-buffer slice
 makes no `@noalloc` or `@realtime` claim. Reset advances a compiler-tracked
 generation and rejects every pre-reset block name; runtime also retires the
 old bounded block rows. Checked block reads and writes revalidate the exact
@@ -91,7 +95,7 @@ be reached through a stale direct intrinsic call. Exhaustion returns
 
 This is deliberately not a general allocator protocol: aliases, aggregate
 storage, escaping blocks/allocators, control-flow lifecycles, arbitrary typed
-allocation, custom arena allocation, and `@noalloc`/`@realtime` qualification
+allocation, custom allocator allocation, and `@noalloc`/`@realtime` qualification
 remain unsupported.
 
 Arena and fixed-buffer allocators are useful only when their lifetime/reset

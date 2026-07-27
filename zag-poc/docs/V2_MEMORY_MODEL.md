@@ -108,7 +108,7 @@ minted the handle. `deallocate` and `resize` validate all of those fields, so
 forged capacity/alignment/identity, copied released handles, and stale handles
 after same-address reuse fail before raw free. It supplies
 `allocate`, `allocate_zeroed`, `resize`, and consuming `deallocate`. It does
-not provide opaque language capabilities, custom or arena allocators, or a
+not provide opaque language capabilities, custom allocators, or a
 general static lifetime analysis for allocator values. The separate retained
 fixed-buffer slice is implemented below; it is not a general allocator
 protocol.
@@ -125,8 +125,10 @@ boundary into an unchecked free path.
 retained-owner lifecycle: one named live backing `Allocation`, named top-level
 blocks, checked byte access, reset, and top-level `deinit` returning that exact
 backing. It rejects aliases, escapes, aggregate storage, and control-flow
-lifetimes. `arena_allocator(...)` remains rejected with a lifetime-contract
-diagnostic rather than falling back to an uncontracted raw-pointer call.
+lifetimes. `arena_allocator(...)` has the same bounded retained-owner
+discipline with its own `ArenaAllocator`/`ArenaBlock` types; it is a checked
+backing-buffer arena, not a general allocator capability or a raw-pointer
+fallback.
 
 Strict modules keep ordinary top-level `let` rejected with an explicit v2
 lifetime-contract diagnostic. Edition-2027 native x86-64 additionally accepts

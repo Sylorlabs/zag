@@ -35,6 +35,7 @@ run_gate "unsafe lexical and raw-pointer boundary" bash tests/run_v2_edition.sh
 run_gate "try-wrapped borrow identity" bash tests/run_v2_try_borrow.sh
 run_gate "mutation-aware aggregate provenance" bash tests/run_v2_aggregate_provenance.sh
 run_gate "fixed-buffer checked runtime authority" bash tests/run_fixed_buffer_runtime.sh
+run_gate "retained arena allocator authority" bash tests/run_arena_allocator.sh
 run_gate "v2 atomic i64 operations" bash tests/run_v2_atomic_exchange.sh
 run_gate "v2 atomic load/store memory-order validation" bash tests/run_v2_atomic_orders.sh
 run_gate "fail-closed indirect effect boundary" bash tests/run_v2_effect_adversarial.sh
@@ -59,7 +60,7 @@ run_gate "validated x86 volatile MMIO widths" bash tests/run_x86_volatile_widths
 run_gate "validated x86 SSE2 SIMD add" bash tests/run_x86_simd_add_i32x4.sh
 
 unsupported "pointer and memory model" "raw pointer categories and lexical checks exist, but provenance/alignment/lifetime instrumentation is incomplete"
-unsupported "allocator and reclamation" "checked native SystemAllocator handles now carry runtime allocator identity, but opaque language capabilities, custom/arena/fixed-buffer and debug allocators, and a general lifetime model are incomplete"
+unsupported "allocator and reclamation" "checked native SystemAllocator handles and bounded retained fixed-buffer/arena regions exist, but opaque language capabilities, custom/debug allocators, and a general lifetime model are incomplete"
 unsupported "volatile/MMIO" "checked native 8/16/32-bit and word transactions exist, but physical device validation, address capabilities, and the complete MMIO contract are incomplete"
 unsupported "atomics and concurrency" "fixed unsafe x86-64 i64 operations plus literal-validated load/store/RMW/CAS/fence orders exist, but atomic storage, language-wide fence semantics, threads, litmus evidence, and a v2 concurrency model remain incomplete"
 unsupported "C ABI and dynamic linking" "checked v2 @cabi scalar dynamic imports, a direct captureless scalar/pointer callback, and a relocation-free self-contained scalar @cabi_export ET_REL object exist, but general bidirectional ABI, relocation/static archive/shared-object conformance, and unload/lifetime contracts are incomplete"
