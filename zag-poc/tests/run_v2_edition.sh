@@ -168,16 +168,16 @@ mkdir -p "$tmp/v2-system-allocator-forged-identity"
 printf 'name = "v2systemallocatorforgedidentity"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-forged-identity/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-forged-identity/std"
 # A descriptor with a live pointer, capacity, alignment, and generation but a
-# different allocator identity must not cross the checked deallocation
-# boundary. This is the runtime proof that identity is part of the ownership
-# token rather than advisory source metadata.
+# different allocator identity must not cross the receiver boundary. The std
+# layer returns its explicit InvalidAllocator error before the runtime registry
+# or free path observes the forged descriptor.
 printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let forged:Allocation=Allocation{.ptr=block.ptr,.len=block.len,.alignment=block.alignment,.generation=block.generation,.allocator_id=block.allocator_id+1}; try allocator.deallocate(forged); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-forged-identity/main.zag"
 if (cd "$tmp/v2-system-allocator-forged-identity" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-forged-identity/log" 2>&1 && [ -x "$tmp/v2-system-allocator-forged-identity/out" ]; then
   set +e
   "$tmp/v2-system-allocator-forged-identity/out" >"$tmp/v2-system-allocator-forged-identity/out.log" 2>"$tmp/v2-system-allocator-forged-identity/err.log"
   forged_identity_allocator_rc=$?
   set -e
-  if [ "$forged_identity_allocator_rc" -ne 0 ] && grep -q 'allocator identity does not match Allocation handle' "$tmp/v2-system-allocator-forged-identity/err.log"; then
+  if [ "$forged_identity_allocator_rc" -eq 9 ]; then
     echo "  ok  SystemAllocator rejects forged allocator identity"; pass=$((pass + 1))
   else
     echo "  XX  forged SystemAllocator allocator identity (exit=$forged_identity_allocator_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-identity/log"; sed -n '1,8p' "$tmp/v2-system-allocator-forged-identity/err.log"; fail=$((fail + 1))
@@ -205,6 +205,43 @@ if (cd "$tmp/v2-system-allocator-forged-constructor" && "$ZNC" main.zag -o out -
   fi
 else
   echo "  XX  unsupported SystemAllocator constructor identity did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-constructor/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-system-allocator-wrong-receiver-free"
+printf 'name = "v2systemallocatorwrongreceiverfree"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-wrong-receiver-free/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-wrong-receiver-free/std"
+# A live descriptor must be consumed only by the exact allocator receiver that
+# minted it. A forged receiver may be representable today, but it must return a
+# language error before validation/free rather than replaying the handle.
+printf '@import("std/allocator.zag") fn work() !i32 { let good:SystemAllocator=system_allocator(); let bad:SystemAllocator=SystemAllocator{.allocator_id=2}; let block:Allocation=try good.allocate(24,8); try bad.deallocate(block); return 1; } fn main() i32 { return work() catch 42; }\n' >"$tmp/v2-system-allocator-wrong-receiver-free/main.zag"
+if (cd "$tmp/v2-system-allocator-wrong-receiver-free" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-wrong-receiver-free/log" 2>&1 && [ -x "$tmp/v2-system-allocator-wrong-receiver-free/out" ]; then
+  set +e
+  "$tmp/v2-system-allocator-wrong-receiver-free/out" >"$tmp/v2-system-allocator-wrong-receiver-free/out.log" 2>"$tmp/v2-system-allocator-wrong-receiver-free/err.log"
+  wrong_receiver_free_rc=$?
+  set -e
+  if [ "$wrong_receiver_free_rc" -eq 42 ]; then
+    echo "  ok  SystemAllocator rejects mismatched deallocation receiver"; pass=$((pass + 1))
+  else
+    echo "  XX  mismatched SystemAllocator deallocation receiver (exit=$wrong_receiver_free_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-wrong-receiver-free/log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  mismatched SystemAllocator deallocation receiver did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-wrong-receiver-free/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-system-allocator-wrong-receiver-resize"
+printf 'name = "v2systemallocatorwrongreceiverresize"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-wrong-receiver-resize/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-wrong-receiver-resize/std"
+printf '@import("std/allocator.zag") fn work() !i32 { let good:SystemAllocator=system_allocator(); let bad:SystemAllocator=SystemAllocator{.allocator_id=2}; let block:Allocation=try good.allocate(24,8); let replacement:Allocation=try bad.resize(block,48,8); try good.deallocate(replacement); return 1; } fn main() i32 { return work() catch 42; }\n' >"$tmp/v2-system-allocator-wrong-receiver-resize/main.zag"
+if (cd "$tmp/v2-system-allocator-wrong-receiver-resize" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-wrong-receiver-resize/log" 2>&1 && [ -x "$tmp/v2-system-allocator-wrong-receiver-resize/out" ]; then
+  set +e
+  "$tmp/v2-system-allocator-wrong-receiver-resize/out" >"$tmp/v2-system-allocator-wrong-receiver-resize/out.log" 2>"$tmp/v2-system-allocator-wrong-receiver-resize/err.log"
+  wrong_receiver_resize_rc=$?
+  set -e
+  if [ "$wrong_receiver_resize_rc" -eq 42 ]; then
+    echo "  ok  SystemAllocator rejects mismatched resize receiver"; pass=$((pass + 1))
+  else
+    echo "  XX  mismatched SystemAllocator resize receiver (exit=$wrong_receiver_resize_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-wrong-receiver-resize/log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  mismatched SystemAllocator resize receiver did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-wrong-receiver-resize/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-system-allocator-stale"
 printf 'name = "v2systemallocatorstale"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-stale/zag.mod"

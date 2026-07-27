@@ -17,7 +17,9 @@ try allocator.deallocate(block);
 
 The implemented `Allocation` carries a pointer, exact native capacity, chosen
 native alignment, a runtime-minted lifetime generation, and the checked
-allocator identity that minted it. The current native
+allocator identity that minted it. `resize` and `deallocate` first bind that
+identity to their `SystemAllocator` receiver and return `InvalidAllocator` on
+a mismatch, before any provenance validation, allocation, copy, or free. The current native
 surface accepts power-of-two alignment requests 1, 2, 4, and 8; stronger
 alignment remains unsupported rather than silently rounded. `deallocate`
 validates the complete five-field identity tuple against checked-runtime
@@ -42,11 +44,13 @@ the peak. Consuming that handle restores live bytes while retaining the
 monotonic allocation count. These counters describe native payload capacity
 only; they are not a general leak detector or allocator identity API.
 
-The handle gate also forges a live descriptor with only `allocator_id` changed;
-checked deallocation rejects it before native free. This proves allocator
-identity is an enforced runtime ownership field rather than documentation-only
-metadata, while the single public SystemAllocator identity remains a bounded
-slice rather than a complete custom-allocator capability system.
+The handle gate also forges a live descriptor with only `allocator_id` changed,
+and invokes `resize`/`deallocate` through a mismatched receiver; both paths
+return `InvalidAllocator` before native free. This proves allocator identity is
+bound to both the handle and its consuming receiver rather than being
+documentation-only metadata, while the single public SystemAllocator identity
+remains a bounded slice rather than a complete custom-allocator capability
+system.
 
 This is not yet the complete allocator model. The generation and allocator
 identity are runtime-checked tokens, but they are not yet opaque language
