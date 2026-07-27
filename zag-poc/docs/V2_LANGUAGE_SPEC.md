@@ -45,9 +45,10 @@ dereference, and direct casts between generic, host, device, and workgroup
 address spaces are rejected. Native x86-64 has a bounded unsafe volatile/MMIO
 slice (`@volatileLoad`/`Store` and explicit 8/16/32-bit companions) with
 checked width/alignment probes; full device capability validation remains
-unsupported. Fixed unsafe i64 atomics and a literal-validated load/store/RMW/CAS
-memory-order subset are implemented, but atomic storage, typed fence order
-selection, threads, and a complete concurrency model remain
+unsupported. Fixed unsafe i64 atomics, raw Linux `@atomicWait32`/`@atomicWake32`
+futex building blocks, and a literal-validated load/store/RMW/CAS memory-order
+subset are implemented, but atomic storage, typed fence order selection,
+threads, and a complete concurrency model remain
 unsupported. The only packed-SIMD operation is unsafe four-lane `i32` addition
 through raw pointers on native x86-64; vector value types, wider SIMD, and
 target-selected ISA variants remain unsupported. Inline `asm` remains

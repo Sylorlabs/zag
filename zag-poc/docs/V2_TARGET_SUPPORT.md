@@ -6,7 +6,7 @@ v2 support unless all required v2 categories are green.
 
 | Target/path | Current evidence | v2 operational status |
 |---|---|---|
-| x86-64 Linux static native | self-hosting bootstrap plus native v1 execution; 33 bounded v2 release-gate checks execute, including checked allocation, raw-pointer, MMIO, atomic, C-ABI, and SSE2 slices | v1 supported; bounded v2 machine-control slices execute, but v2 is **not a supported release target** while required memory-model, concurrency, ABI, sanitizer, and verification rows remain partial or unsupported |
+| x86-64 Linux static native | self-hosting bootstrap plus native v1 execution; 34 bounded v2 release-gate checks execute, including checked allocation, raw-pointer, MMIO, atomic/futex, C-ABI, and SSE2 slices | v1 supported; bounded v2 machine-control slices execute, but v2 is **not a supported release target** while required memory-model, concurrency, ABI, sanitizer, and verification rows remain partial or unsupported |
 | ARM64 native | experimental lowering and separate regression tests | not a v2 supported target |
 | WebAssembly | v1 emission/execution regression gate | not a v2 supported target |
 | GPU MLIR / gfx bundle | frontend output validation only | not a GPU execution backend |

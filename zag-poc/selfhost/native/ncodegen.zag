@@ -3471,6 +3471,10 @@ fn cg_expr_type(n: *Node, env: *Env, syms: ArrayList[FnSym], cg: *Cg) []u8 {
                             if (!@strEq(cid.name, "@atomicLoad64Order") && !@strEq(cid.name, "@atomicCompareExchange64Order") && len[*Node](c.args) == 3) { return "i64"; }
                             return "";
                         }
+                        if (@strEq(cid.name, "@atomicWait32") || @strEq(cid.name, "@atomicWake32")) {
+                            if (len[*Node](c.args) == 2) { return "i64"; }
+                            return "";
+                        }
                         if (@strEq(cid.name, "@volatileLoad8")) {
                             if (len[*Node](c.args) == 1) { return "u8"; }
                             return "";
@@ -3835,6 +3839,25 @@ fn cg_emit_atomic_i64_pointer_check(out:*ArrayList[Instr],cg:*Cg)void{
     push[Instr](out,i_cmp_imm(R_R8(),0));
     push[Instr](out,i_je(aligned));
     cg_emit_panic(out,"zag atomic: misaligned *mut i64",after_align,cg);
+    push[Instr](out,i_label(aligned));
+}
+
+// Linux futex addresses are four-byte aligned i32 words.  Like the existing
+// i64 atomics, reject malformed addresses explicitly instead of allowing an
+// OS-dependent fault to become part of the intrinsic contract.
+fn cg_emit_atomic_i32_pointer_check(out:*ArrayList[Instr],cg:*Cg)void{
+    let nonnull:i32=cg_fresh(cg);let after_null:i32=cg_fresh(cg);
+    let aligned:i32=cg_fresh(cg);let after_align:i32=cg_fresh(cg);
+    push[Instr](out,i_cmp_imm(R_RAX(),0));
+    push[Instr](out,i_jne(nonnull));
+    cg_emit_panic(out,"zag atomic: null i32 futex word",after_null,cg);
+    push[Instr](out,i_label(nonnull));
+    push[Instr](out,i_mov_rr(R_R8(),R_RAX()));
+    push[Instr](out,i_mov_imm(R_RCX(),3));
+    push[Instr](out,i_and(R_R8(),R_RCX()));
+    push[Instr](out,i_cmp_imm(R_R8(),0));
+    push[Instr](out,i_je(aligned));
+    cg_emit_panic(out,"zag atomic: misaligned i32 futex word",after_align,cg);
     push[Instr](out,i_label(aligned));
 }
 
@@ -6125,6 +6148,50 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
         if (order<0) { cg_err(cg,"native: @atomicFence order must be a literal 0..4");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return; }
         if (order!=0) { push[Instr](out,i_mfence()); }
         push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;
+    }
+
+    // Linux x86-64 futex(2) wait/wake building blocks.  These intentionally
+    // expose the raw syscall result (0, a wake count, or -errno): there is no
+    // hidden retry, thread API, or implied ownership/memory-order guarantee.
+    // The kernel reads exactly one aligned i32 futex word.  A mismatched wait
+    // returns -EAGAIN without blocking, which is useful for deterministic
+    // runtime evidence and avoids fabricating a scheduler in the compiler.
+    if (@strEq(b, "atomicWait32") || @strEq(b, "atomicWake32")) {
+        if (nargs != 2) {
+            cg_err(cg, "native: atomic futex operation expects i32 pointer and i32 value");
+            push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;
+        }
+        let pty:[]u8=cg_expr_type(get[*Node](c.args,0),env,syms,cg);
+        let ptr_ok:i32=0;
+        if (@strEq(pty,"*const i32") || @strEq(pty,"*mut i32") || @strEq(pty,"*host i32")) { ptr_ok=1; }
+        if (ptr_ok==0) {
+            cg_err(cg,"native: atomic futex operation requires *const/*mut/*host i32");
+            push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;
+        }
+        let ptr_slot:i32=cg_slot_scratch(env);
+        cg_lower_expr(out,get[*Node](c.args,0),env,syms,cg);
+        push[Instr](out,i_pop(R_RAX()));
+        cg_emit_atomic_i32_pointer_check(out,cg);
+        push[Instr](out,i_store(R_RBP(),ptr_slot,R_RAX()));
+        push[Instr](out,i_mov_rr(R_RDI(),R_RAX()));
+        cg_emit_checked_raw_access(out,cg,4,4);
+        cg_lower_expr(out,get[*Node](c.args,1),env,syms,cg);
+        push[Instr](out,i_pop(R_RDX()));
+        push[Instr](out,i_load(R_RDI(),R_RBP(),ptr_slot));
+        if (@strEq(b,"atomicWait32")) {
+            push[Instr](out,i_mov_imm(R_RSI(),0)); // FUTEX_WAIT
+            push[Instr](out,i_mov_imm(R_R10(),0)); // timeout = NULL
+            push[Instr](out,i_mov_imm(R_R8(),0));
+            push[Instr](out,i_mov_imm(R_R9(),0));
+        } else {
+            push[Instr](out,i_mov_imm(R_RSI(),1)); // FUTEX_WAKE
+            push[Instr](out,i_mov_imm(R_R10(),0));
+            push[Instr](out,i_mov_imm(R_R8(),0));
+            push[Instr](out,i_mov_imm(R_R9(),0));
+        }
+        push[Instr](out,i_mov_imm(R_RAX(),202)); // SYS_futex
+        push[Instr](out,i_syscall());
+        push[Instr](out,i_push(R_RAX()));return;
     }
 
     if (@strEq(b, "memoryFence")) {

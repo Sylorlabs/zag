@@ -16,6 +16,15 @@ fence. Storage types, threads, and litmus evidence remain
 release blockers. See
 `docs/V2_CONCURRENCY_GUIDE.md` for the implemented boundary.
 
+Edition-2027 Linux/x86-64 also has two deliberately narrow futex building
+blocks: `@atomicWait32(ptr: *const/*mut/*host i32, expected: i32) i64` and
+`@atomicWake32(ptr: *const/*mut/*host i32, count: i32) i64`. They issue the
+shared `futex(2)` WAIT/WAKE operations and return the raw kernel result. They
+are unsafe, require a non-null four-byte-aligned host word, and do not supply
+atomic storage, a memory order, retry policy, ownership transfer, or a thread
+API. In particular, a caller must not infer a happens-before edge merely from
+these operations until the language model and typed atomic storage exist.
+
 Data races on non-atomic shared storage are forbidden behavior.  The intended
 full model gives atomic scalar and pointer operations relaxed, acquire,
 release, acq_rel, and seq_cst orders; the implemented slice currently validates
@@ -76,10 +85,11 @@ reinterpreted while another thread can access it.
 
 ## Threads and blocking
 
-No public `spawn`, `join`, mutex, condition-variable, semaphore, TLS, or
-futex API exists today. `selfhost/native/thread_rt.zag` is an unintegrated
-runtime-oriented prototype and is not evidence of a supported language or
-runtime contract. The intended future `spawn` must publish argument ownership
+No public `spawn`, `join`, mutex, condition-variable, semaphore, or TLS API
+exists today. The two raw `@atomicWait32`/`@atomicWake32` futex operations are
+not a thread API or a synchronization proof. `selfhost/native/thread_rt.zag`
+is an unintegrated runtime-oriented prototype and is not evidence of a
+supported language or runtime contract. The intended future `spawn` must publish argument ownership
 before the new thread starts and `join` must establish happens-before from
 completed child actions to the join return. Detach must remain unavailable
 until a lifetime-safe handle and shutdown contract exist. Every future stress

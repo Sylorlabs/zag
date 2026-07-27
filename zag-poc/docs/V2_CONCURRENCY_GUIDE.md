@@ -45,6 +45,18 @@ fence (`mfence` on x86-64 and `dmb` on ARM). It is a typed `Unsafe` operation,
 but does not establish a compiler-wide happens-before graph, prove object
 lifetime, or provide thread/race safety.
 
+On Linux x86-64, `@atomicWait32(ptr, expected) i64` and
+`@atomicWake32(ptr, count) i64` are a separate unsafe futex(2) slice. They
+accept only non-null, four-byte-aligned `*const`, `*mut`, or `*host i32`
+pointers and a typed `i32` expected value/count; checked mode also validates
+tracked allocation liveness and four-byte bounds before the syscall. Wait maps
+to shared `FUTEX_WAIT`; wake maps to shared `FUTEX_WAKE`; both return the raw
+kernel result, including negative errno values. There is deliberately no
+implicit retry, timeout conversion, ownership handoff, or memory-order claim.
+These primitives are useful native building blocks, but they do not establish
+atomic storage, a happens-before relation, race freedom, or a supported
+threading API.
+
 This is not a general atomic or concurrency API: there are no atomic storage
 types, thread spawn/join, or race detector. The raw
 pointer's allocation, lifetime, sharing, and absence of mixed atomic/non-atomic
@@ -74,3 +86,7 @@ timeout-bounded stress test, and a negative effect test.
 load/store/RMW/CAS, invalid load/store and CAS failure combinations,
 runtime-order rejection, unsafe enforcement, typed-fence execution and
 lowering, and the MOV versus locked x86 lowering boundary.
+`tests/run_x86_atomic_futex.sh` runs a deliberately nonblocking mismatched
+wait and waiter-free wake under `strace`, proving actual `FUTEX_WAIT`/`WAKE`
+kernel calls and raw return values while also covering unsafe, type, pure, and
+null-pointer rejection. It is not a thread stress or litmus test.
