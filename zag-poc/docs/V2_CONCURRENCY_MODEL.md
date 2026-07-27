@@ -42,13 +42,13 @@ limited to relaxed/acquire/seq_cst and no stronger than success. On x86-64, the 
 load/store forms use MOV for relaxed/acquire/release and locked transactions
 for seq_cst, while every RMW/CAS order form intentionally retains its existing
 locked seq_cst-superset lowering; this does not establish compiler-wide ordering
-or a happens-before graph. Atomic types are distinct storage types, not a qualifier that can be applied
-to an ordinary object after concurrent access begins.  They provide load,
-store, exchange, compare-exchange, fetch-add/sub/and/or/xor, and fences for
-the scalar and pointer widths that the target can lower correctly.  A load
-cannot use release, a store cannot use acquire, and an invalid ordering is a
-compile-time error.  `compare_exchange` specifies separate success and failure
-orders, with failure no stronger than success and never release/acq_rel.
+or a happens-before graph. Atomic storage types are planned but not implemented.
+The current operations accept unsafe raw `i64` pointers only; they do not
+convert an ordinary object into language-level atomic storage or make mixed
+atomic/non-atomic access safe. A load cannot use release, a store cannot use
+acquire, and an invalid ordering is a compile-time error. `compare_exchange`
+specifies separate success and failure orders, with failure no stronger than
+success and never release/acq_rel.
 
 `@atomicFence(order)` is an unsafe typed operation. `relaxed` emits no machine
 fence; acquire, release, acq_rel, and seq_cst each currently emit the same
@@ -76,10 +76,12 @@ reinterpreted while another thread can access it.
 
 ## Threads and blocking
 
-`spawn` publishes argument ownership before the new thread starts; `join`
-establishes happens-before from all completed child actions to the join return.
-Detach is not provided until a lifetime-safe handle and shutdown contract exist.
-Mutexes are non-reentrant unless explicitly typed otherwise.  Condition waits
-atomically release and later reacquire their mutex, tolerate spurious wakeups,
-and must be used in a predicate loop.  Every stress test has a timeout and
-must report timeout separately from an incorrect result.
+No public `spawn`, `join`, mutex, condition-variable, semaphore, TLS, or
+futex API exists today. `selfhost/native/thread_rt.zag` is an unintegrated
+runtime-oriented prototype and is not evidence of a supported language or
+runtime contract. The intended future `spawn` must publish argument ownership
+before the new thread starts and `join` must establish happens-before from
+completed child actions to the join return. Detach must remain unavailable
+until a lifetime-safe handle and shutdown contract exist. Every future stress
+test must have a timeout and report timeout separately from an incorrect
+result.
