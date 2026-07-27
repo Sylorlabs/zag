@@ -74,6 +74,18 @@ elif grep -q 'Allocation is affine; copy and uncontracted transfer are not allow
 else
   echo "  XX  unproven allocation helper return rejection missing diagnostic"; sed -n '1,12p' "$tmp/v2-system-allocator-helper-unproven-return/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-system-allocator-helper-hidden-leak"
+printf 'name = "v2systemallocatorhelperhiddenleak"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-helper-hidden-leak/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-helper-hidden-leak/std"
+printf '@import("std/allocator.zag") fn make(allocator:SystemAllocator) !Allocation @alloc { let leaked:Allocation=try allocator.allocate(24,8); return try allocator.allocate(24,8); } fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try make(allocator); return 0; } fn main() i32 { return work() catch 1; }\n' >"$tmp/v2-system-allocator-helper-hidden-leak/main.zag"
+if (cd "$tmp/v2-system-allocator-helper-hidden-leak" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-helper-hidden-leak/log" 2>&1 ||
+   [ -e "$tmp/v2-system-allocator-helper-hidden-leak/out" ]; then
+  echo "  XX  allocation helper hidden leak rejects"; sed -n '1,12p' "$tmp/v2-system-allocator-helper-hidden-leak/log"; fail=$((fail + 1))
+elif grep -q 'Allocation is affine; copy and uncontracted transfer are not allowed' "$tmp/v2-system-allocator-helper-hidden-leak/log"; then
+  echo "  ok  allocation helper hidden leak rejects"; pass=$((pass + 1))
+else
+  echo "  XX  allocation helper hidden leak rejection missing diagnostic"; sed -n '1,12p' "$tmp/v2-system-allocator-helper-hidden-leak/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-system-allocator-unchecked"
 printf 'name = "v2systemallocatorunchecked"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-unchecked/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-unchecked/std"
