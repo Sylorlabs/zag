@@ -85,10 +85,12 @@ fi
 
 if [ -f docs/V2_GPU_GUIDE.md ] && [ -f docs/V2_CPU_CONTROL_GUIDE.md ] && \
    rg -q 'does not currently execute a GPU kernel' docs/V2_GPU_GUIDE.md && \
+   rg -q 'direct Linux AMDGPU DRM' docs/V2_GPU_GUIDE.md && \
+   rg -q 'direct Linux AMDGPU DRM' docs/V2_GPU_MODEL.md && \
    rg -q 'not implemented in v2' docs/V2_CPU_CONTROL_GUIDE.md; then
-  ok "GPU and CPU-control guides distinguish plans from implementation"
+  ok "GPU and CPU-control guides distinguish plans from implementation and retain the direct-DRM boundary"
 else
-  bad "GPU or CPU-control guide is missing or overclaims support"
+  bad "GPU or CPU-control guide is missing, overclaims support, or contradicts the direct-DRM boundary"
 fi
 
 if [ -f docs/V2_TARGET_SUPPORT.md ] && \
