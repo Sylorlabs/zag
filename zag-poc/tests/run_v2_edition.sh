@@ -1438,6 +1438,16 @@ elif grep -q 'exclusive mutable borrow while a shared borrow is active' "$tmp/v2
 else
   echo "  XX  shared/exclusive borrow rejection missing diagnostic"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-borrow-aggregate-escape"
+printf 'name = "v2borrowaggregateescape"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-borrow-aggregate-escape/zag.mod"
+printf 'struct Box { ptr:*mut i32 } fn inspect(p:*mut i32) *mut i32 @borrows { return p; } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let box:Box=Box{.ptr=inspect(p)}; delete(p); return 0; } }\n' >"$tmp/v2-borrow-aggregate-escape/main.zag"
+if (cd "$tmp/v2-borrow-aggregate-escape" && "$ZNC" main.zag -o out) >"$tmp/v2-borrow-aggregate-escape/log" 2>&1 || [ -e "$tmp/v2-borrow-aggregate-escape/out" ]; then
+  echo "  XX  borrowed aggregate storage rejects without artifact"; sed -n '1,8p' "$tmp/v2-borrow-aggregate-escape/log"; fail=$((fail + 1))
+elif grep -q 'cannot be stored in an aggregate or computed value' "$tmp/v2-borrow-aggregate-escape/log"; then
+  echo "  ok  borrowed aggregate storage rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  borrowed aggregate storage rejection missing diagnostic"; sed -n '1,8p' "$tmp/v2-borrow-aggregate-escape/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-borrow-alias-consume"
 printf 'name = "v2borrowaliasconsume"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-borrow-alias-consume/zag.mod"
 printf 'struct Node { value:i32 } fn inspect(p:*mut Node) *mut Node @borrows { return p; } fn consume(p:*mut Node) void @consumes { unsafe { delete(p); } } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=42}) as *mut Node; let s:*mut Node=inspect(p); let alias:*mut Node=s; consume(alias); } return 0; }\n' >"$tmp/v2-borrow-alias-consume/main.zag"
