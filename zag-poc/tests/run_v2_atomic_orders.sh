@@ -33,6 +33,40 @@ else
   bad "atomic order forms compile"; sed -n '1,16p' "$tmp/valid/log"
 fi
 
+# Fence orders use the same literal ABI. Relaxed is intentionally a no-op;
+# non-relaxed orders emit the conservative full x86 MFENCE until a target-aware
+# optimizer can prove a weaker form. This checks the executable boundary, not
+# a cross-thread happens-before proof.
+project fence
+printf '%s\n' 'fn main() i32 { unsafe { @atomicFence(0); @atomicFence(4); return 42; } }' >"$tmp/fence/main.zag"
+if (cd "$tmp/fence" && "$ZNC" main.zag --safety=checked --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/fence/log" 2>&1 && [ -x "$tmp/fence/out" ]; then
+  set +e; "$tmp/fence/out"; rc=$?; set -e
+  bytes=$(od -An -tx1 -v "$tmp/fence/out" | tr -d ' \n')
+  if [ "$rc" -eq 42 ] && printf '%s' "$bytes" | grep -q '0faef0'; then
+    ok "typed atomic fence executes and emits MFENCE for non-relaxed order"
+  else
+    bad "typed atomic fence execution or x86 lowering"; sed -n '1,16p' "$tmp/fence/log"
+  fi
+else
+  bad "typed atomic fence compiles"; sed -n '1,16p' "$tmp/fence/log"
+fi
+
+project fence-dynamic
+printf '%s\n' 'fn main() i32 { unsafe { let order:i64=4; @atomicFence(order); return 0; } }' >"$tmp/fence-dynamic/main.zag"
+if (cd "$tmp/fence-dynamic" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/fence-dynamic/log" 2>&1 || [ -e "$tmp/fence-dynamic/out" ]; then
+  bad "runtime atomic fence order was accepted"
+else
+  grep -q 'atomic fence order must be an integer literal' "$tmp/fence-dynamic/log" && ok "atomic fence rejects runtime order" || { bad "missing atomic fence literal diagnostic"; sed -n '1,12p' "$tmp/fence-dynamic/log"; }
+fi
+
+project fence-safe
+printf '%s\n' 'fn main() i32 { @atomicFence(4); return 0; }' >"$tmp/fence-safe/main.zag"
+if (cd "$tmp/fence-safe" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cache -o out) >"$tmp/fence-safe/log" 2>&1 || [ -e "$tmp/fence-safe/out" ]; then
+  bad "safe atomic fence was accepted"
+else
+  grep -q 'atomic fence requires unsafe' "$tmp/fence-safe/log" && ok "atomic fence requires unsafe" || { bad "missing atomic fence unsafe diagnostic"; sed -n '1,12p' "$tmp/fence-safe/log"; }
+fi
+
 # RMW and CAS order forms intentionally retain the established locked x86
 # instructions for every valid literal order.  That is a stronger seq_cst
 # implementation on this target, while the literal interface makes the

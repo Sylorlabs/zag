@@ -9,8 +9,10 @@ limited to edition-2027 native x86-64 `@atomicLoad64`, `@atomicStore64`,
 fixed full-order x86 transactions, plus literal-validated
 `@atomicLoad64Order(ptr, order)`, `@atomicStore64Order(ptr, value, order)`,
 the suffixed RMW order forms, and
-`@atomicCompareExchange64Order(ptr, expected, desired, success, failure)`;
-storage types, fence order selection, threads, and litmus evidence remain
+`@atomicCompareExchange64Order(ptr, expected, desired, success, failure)`, and
+`@atomicFence(order)`. The fence accepts the same literal order ABI: relaxed is
+a no-op, and every non-relaxed order lowers conservatively to a full hardware
+fence. Storage types, threads, and litmus evidence remain
 release blockers. See
 `docs/V2_CONCURRENCY_GUIDE.md` for the implemented boundary.
 
@@ -47,6 +49,12 @@ the scalar and pointer widths that the target can lower correctly.  A load
 cannot use release, a store cannot use acquire, and an invalid ordering is a
 compile-time error.  `compare_exchange` specifies separate success and failure
 orders, with failure no stronger than success and never release/acq_rel.
+
+`@atomicFence(order)` is an unsafe typed operation. `relaxed` emits no machine
+fence; acquire, release, acq_rel, and seq_cst each currently emit the same
+conservative full target fence. This bounded lowering validates fence-order
+inputs, but it does not establish compiler-wide ordering, a happens-before
+model, thread safety, or object lifetime.
 
 `relaxed` provides atomicity only.  A release operation synchronizes with an
 acquire operation that reads its value or its release sequence.  `seq_cst`

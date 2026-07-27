@@ -39,15 +39,20 @@ The bitwise fetches evaluate their pointer and mask once, then use a locked
 compare-exchange retry loop. They are lock-free but not wait-free: contention
 can cause retries, so they remain outside a realtime guarantee.
 
+`@atomicFence(order)` accepts the same literal order ABI. `0=relaxed` emits
+no hardware fence; each non-relaxed order emits a conservative full hardware
+fence (`mfence` on x86-64 and `dmb` on ARM). It is a typed `Unsafe` operation,
+but does not establish a compiler-wide happens-before graph, prove object
+lifetime, or provide thread/race safety.
+
 This is not a general atomic or concurrency API: there are no atomic storage
-types, selectable fence orders, language-level fence semantics,
-thread spawn/join, or race detector. The raw
+types, thread spawn/join, or race detector. The raw
 pointer's allocation, lifetime, sharing, and absence of mixed atomic/non-atomic
 access remain the caller's unsafe contract. `@volatileLoad`/`@volatileStore`
 and their explicit 8/16/32-bit companions remain MMIO transactions, not
 atomics: they neither synchronize threads nor imply a memory order.
-`@memoryFence` remains a legacy native `mfence` emission, not a typed fence
-operation; it carries the `Unsafe` effect and cannot make a `@pure` or
+`@memoryFence` remains a legacy native `mfence` emission; `@atomicFence` is
+the typed fence entry point. Both carry the `Unsafe` effect and cannot make a `@pure` or
 `@realtime` function appear compliant.
 
 Safe concurrent APIs own or synchronize every mutable shared object.  Raw
@@ -67,5 +72,5 @@ model proof. Each future primitive still needs a positive execution test, a
 timeout-bounded stress test, and a negative effect test.
 `tests/run_v2_atomic_orders.sh` separately proves the literal order ABI across
 load/store/RMW/CAS, invalid load/store and CAS failure combinations,
-runtime-order rejection, unsafe enforcement, and the MOV versus locked x86
-lowering boundary.
+runtime-order rejection, unsafe enforcement, typed-fence execution and
+lowering, and the MOV versus locked x86 lowering boundary.
