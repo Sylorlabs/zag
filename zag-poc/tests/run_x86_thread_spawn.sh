@@ -20,7 +20,7 @@ project valid
 cp tests/x86_thread_spawn.zag "$tmp/valid/main.zag"
 (cd "$tmp/valid" && "$ZNC" main.zag --safety=checked --no-zagd --no-analyze --no-foreground-cache -o app >log 2>&1)
 set +e
-timeout 5 strace -f -qq -e trace=clone,futex -o "$tmp/valid/thread.log" "$tmp/valid/app"
+timeout 5 strace -f -qq -e trace=clone,futex,mprotect -o "$tmp/valid/thread.log" "$tmp/valid/app"
 rc=$?
 set -e
 if [ "$rc" -ne 42 ]; then
@@ -30,6 +30,7 @@ if [ "$rc" -ne 42 ]; then
 fi
 grep -q 'clone(' "$tmp/valid/thread.log"
 grep -q 'FUTEX_WAIT' "$tmp/valid/thread.log"
+grep -Eq 'mprotect\(.*4096, PROT_NONE\).* = 0' "$tmp/valid/thread.log"
 
 project unsafe
 printf 'fn worker() void {} fn main() i32 { let h:*opaque=@threadSpawn(worker); @threadJoin(h); return 0; }\n' >"$tmp/unsafe/main.zag"
