@@ -32,9 +32,11 @@ in that fixture so no variadic function-value or format contract is inferred.
 otherwise-supported i686 `--emit-obj` / `--emit-static` path: no v2 C ABI
 object, archive, WASM, ARM64, or GPU artifact is emitted. Those target-specific
 ABIs need their own calling-convention and executable conformance evidence.
-The native x86-64 `--emit-obj` / `--emit-static` flags likewise reject before
-writing: that writer currently produces only `ET_EXEC` and has no public symbol
-table, so `pub fn` is not an exported C symbol.
+Native x86-64 `--emit-obj` supports the documented scalar `@cabi_export`
+boundary and direct scalar/pointer/`bool`/`void` `extern fn @cabi` calls. It
+emits Zag machine code plus only `R_X86_64_PLT32` call relocations; the host
+linker supplies the declared legacy implementation. `--emit-static` still
+rejects before artifact creation.
 
 Every declaration records calling convention, exact integer widths, aggregate
 representation, pointer mutability/nullability, ownership transfer, callback

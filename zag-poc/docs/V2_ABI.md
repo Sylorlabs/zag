@@ -72,17 +72,23 @@ exports, or imports with ownership/lifetime contracts.
 There is one deliberately narrow outbound v2 surface: an edition-2027
 `pub fn` annotated `@cabi_export` with only scalar integer, `bool`, raw-pointer,
 or `void` parameters and result can be compiled with native x86-64
-`--emit-obj`. This emits a relocation-free `ELF64 ET_REL` containing `.text`,
+`--emit-obj`. A self-contained object is relocation-free and contains `.text`,
 `.symtab`, `.strtab`, and `.shstrtab`; the annotated function is a global
-`STT_FUNC` symbol. `tests/run_x86_64_cabi_object.sh` both inspects that
-artifact and links it into a C executable which calls the exported Zag
-function. The accepted object is self-contained: it has no data section,
-foreign imports, dynamic libraries, archive inputs, or relocations.
+`STT_FUNC` symbol. The one supported import form is a direct call from an
+`unsafe` Zag body to a declared scalar/pointer/`bool`/`void` `extern fn @cabi`.
+That object adds `.rela.text`, an undefined global `STT_FUNC` symbol, and one
+`R_X86_64_PLT32` relocation with addend `-4` for each call immediate. The
+compiler still emits Zag machine code directly; a system linker resolves only
+the named legacy boundary. `tests/run_x86_64_cabi_object.sh` inspects both
+forms and links C callers/implementations that execute Zag exports and imports.
+The accepted object has no data section, dynamic libraries, archive inputs,
+GOT/TLS/data relocations, or any relocation form other than that direct call.
 
 This is not a general export or static-linking ABI. Floats, aggregates,
-variadics, callbacks, generics, shared objects, archives, relocation-bearing
-objects, ABI unwind/visibility policy, and ownership/lifetime contracts remain
-unimplemented. `--emit-static`, `--emit-shared`, object aliases, PIE,
+variadics, callbacks, generics, shared objects, archives, general
+relocation/static-object conformance, ABI unwind/visibility policy, and
+ownership/lifetime contracts remain unimplemented. `--emit-static`,
+`--emit-shared`, object aliases, PIE,
 loader-path, rpath/soname, archive-selection, and common shared/library-output
 spellings continue to fail before artifact creation rather than silently
 producing an executable. The separate i686 object/archive path is not v2 C ABI
