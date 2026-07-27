@@ -36,7 +36,7 @@ if (cd "$tmp/wrong-pointee" && "$ZNC" main.zag -o out) >"$tmp/wrong-pointee/log"
     echo "wrong packed SIMD pointer type unexpectedly compiled" >&2
     exit 1
 fi
-grep -Eq 'simdAddI32x4.*i32|i32.*simdAddI32x4' "$tmp/wrong-pointee/log"
+grep -Eq 'packed i32x4 SIMD.*i32|i32.*packed i32x4 SIMD' "$tmp/wrong-pointee/log"
 
 mkdir -p "$tmp/pure"
 printf 'name = "simdpure"\nversion = "0"\nedition = "2027"\n' > "$tmp/pure/zag.mod"
