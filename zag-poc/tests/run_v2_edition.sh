@@ -1362,13 +1362,21 @@ else
 fi
 mkdir -p "$tmp/v2-owned-consume-pointer-aux"
 printf 'name = "v2ownedconsumepointeraux"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-consume-pointer-aux/zag.mod"
-printf 'struct Node { value:i32 } fn bad(p:*mut Node, other:*mut Node) void @consumes { unsafe { delete(p); } } fn main() i32 { return 0; }\n' >"$tmp/v2-owned-consume-pointer-aux/main.zag"
-if (cd "$tmp/v2-owned-consume-pointer-aux" && "$ZNC" main.zag -o out) >"$tmp/v2-owned-consume-pointer-aux/log" 2>&1 || [ -e "$tmp/v2-owned-consume-pointer-aux/out" ]; then
-  echo "  XX  consume contract pointer auxiliary parameter rejects"; sed -n '1,8p' "$tmp/v2-owned-consume-pointer-aux/log"; fail=$((fail + 1))
-elif grep -q '@consumes auxiliary parameters must be builtin scalars' "$tmp/v2-owned-consume-pointer-aux/log"; then
-  echo "  ok  consume contract pointer auxiliary parameter rejects without artifact"; pass=$((pass + 1))
+printf 'struct Node { value:i32 } fn dispose_pair(p:*mut Node, other:*mut Node) void @consumes { unsafe { delete(p); delete(other); } } fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=1}) as *mut Node; let q:*mut Node=new(Node{.value=2}) as *mut Node; dispose_pair(p,q); } return 0; }\n' >"$tmp/v2-owned-consume-pointer-aux/main.zag"
+if (cd "$tmp/v2-owned-consume-pointer-aux" && "$ZNC" check main.zag) >"$tmp/v2-owned-consume-pointer-aux/log" 2>&1; then
+  echo "  ok  consume contract transfers every pointer owner parameter"; pass=$((pass + 1))
 else
-  echo "  XX  consume contract pointer auxiliary rejection missing diagnostic"; sed -n '1,8p' "$tmp/v2-owned-consume-pointer-aux/log"; fail=$((fail + 1))
+  echo "  XX  consume contract transfers every pointer owner parameter"; sed -n '1,8p' "$tmp/v2-owned-consume-pointer-aux/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owned-consume-pointer-partial"
+printf 'name = "v2ownedconsumepointerpartial"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-consume-pointer-partial/zag.mod"
+printf 'struct Node { value:i32 } fn bad(p:*mut Node, other:*mut Node) void @consumes { unsafe { delete(p); } } fn main() i32 { return 0; }\n' >"$tmp/v2-owned-consume-pointer-partial/main.zag"
+if (cd "$tmp/v2-owned-consume-pointer-partial" && "$ZNC" main.zag -o out) >"$tmp/v2-owned-consume-pointer-partial/log" 2>&1 || [ -e "$tmp/v2-owned-consume-pointer-partial/out" ]; then
+  echo "  XX  partial multi-owner consume rejects without artifact"; sed -n '1,8p' "$tmp/v2-owned-consume-pointer-partial/log"; fail=$((fail + 1))
+elif grep -q '@consumes parameter `other` is not released or transferred on every control-flow path' "$tmp/v2-owned-consume-pointer-partial/log"; then
+  echo "  ok  partial multi-owner consume rejects without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  partial multi-owner consume diagnostic missing"; sed -n '1,8p' "$tmp/v2-owned-consume-pointer-partial/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-owned-condition-alias-escape"
 printf 'name = "v2ownedconditionaliasescape"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-condition-alias-escape/zag.mod"

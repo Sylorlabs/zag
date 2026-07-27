@@ -63,10 +63,13 @@ requires every discovered owner to be released or returned on every
 control-flow path, and rejects an owned value passed to an uncontracted call.
 Calls that receive an owner must explicitly declare `@borrows`,
 `@borrows_mut`, or `@consumes`; this makes ownership transfer and retention
-inspectable instead of implicit. Borrow and consume contracts track only their
-first owner parameter, but may take later builtin scalar parameters such as a
-length or count. Later pointers, aggregates, callbacks, slices, optionals, and error
-unions remain rejected because they could carry an untracked second lifetime.
+inspectable instead of implicit. A borrow contract tracks only its first owner
+parameter and may take later builtin scalar parameters such as a length or
+count. A consume contract tracks every explicit raw-pointer or `Allocation`
+parameter as an owner: every such parameter must be released or transferred
+on every path. Scalars remain ordinary values. Aggregates, callbacks, slices,
+optionals, and error unions remain rejected because they could carry an
+untracked lifetime.
 A separate return-lifetime check rejects
 addresses of local values and local fields returned directly, through
 direct aliases, or inside named pointer-carrying struct/union literals. A
