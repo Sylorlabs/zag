@@ -53,8 +53,11 @@ spelling is useful for cross-compilation and reproducible scripts:
 The Mach-O writer, PIE address lowering, SHA-256 ad-hoc signer, Darwin entry ABI,
 and syscall runtime are all implemented in Zag. No Xcode, system assembler,
 linker, `codesign`, C, Python, or Zig is invoked to produce the executable.
-External library linking, `--debug`, and `--hot` are not yet available on this
-target and are rejected instead of silently producing a partial artifact.
+Native dyld binding is available for Zag `extern fn` imports from
+`/usr/lib/libSystem.B.dylib`; the generated executable contains its own Mach-O
+bind stream and ARM64 import stubs. `--debug` with imports, custom dylib
+install names, and `--hot` remain tracked native work and reject rather than
+silently producing a partial artifact.
 
 ---
 
@@ -239,4 +242,5 @@ source.zag
 The Linux result uses Linux syscalls directly and has no runtime dependency
 beyond the kernel. The Apple Silicon result uses the Darwin entry/syscall ABI,
 is position-independent, carries a deterministic embedded ad-hoc signature,
-and loads through macOS dyld without compiler-generated symbol imports.
+and loads through macOS dyld. Zag `extern fn` calls use native dyld-bound
+libSystem import pointers and ARM64 stubs when requested.

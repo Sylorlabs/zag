@@ -10,7 +10,7 @@
 
 .PHONY: all bootstrap znc zagd test test-zagscript-release test-zagscript-master test-v1-compat test-zagd-product test-zagd-launchd-service test-macho-debug-writer test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-analyzer test-hot-reload test-dynamic-abi test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-std-namespace \
         test-diagnostics test-tooling test-programs test-native test-abi-layout test-arm64 \
-        test-differential-backends test-arm64-selfhost test-macos-arm64-release clean install
+        test-differential-backends test-arm64-selfhost test-macos-arm64-release test-macos-dyld-import clean install
 
 # ── Primary target ────────────────────────────────────────────────────────────
 all: bootstrap
@@ -96,6 +96,9 @@ test-zagd-launchd-service:
 
 test-macho-debug-writer:
 	bash tests/run_macho_debug_writer.sh
+
+test-macos-dyld-import:
+	bash tests/run_macos_dyld_import.sh
 
 test-zagscript-release:
 	bash tests/run_zagscript_release_gate.sh

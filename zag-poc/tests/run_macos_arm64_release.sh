@@ -72,6 +72,20 @@ fi
 test ! -e "$tmpdir/cpu-invalid"
 echo "  ok  Apple Silicon CPU policy: native baseline and x86 rejection"; pass=$((pass + 1))
 
+# A real libSystem call verifies LC_DYLD_INFO_ONLY, the dyld bind stream, the
+# ARM64 import stub, and the externally resolved C ABI rather than merely
+# accepting `--dynamic` as a command-line option.
+"$tmpdir/znc-gen1" tests/macos_dyld_getpid.zag --target macos-arm64 --dynamic --no-zagd --no-analyze -o "$tmpdir/dyld-getpid"
+require_macho_arm64 "$tmpdir/dyld-getpid"
+require_signed "$tmpdir/dyld-getpid"
+otool -l "$tmpdir/dyld-getpid" | grep -q 'LC_DYLD_INFO_ONLY'
+set +e
+"$tmpdir/dyld-getpid"
+dyld_status=$?
+set -e
+[ "$dyld_status" -eq 42 ]
+echo "  ok  native dyld libSystem import and ARM64 stub"; pass=$((pass + 1))
+
 if "$tmpdir/znc-gen1" hot-patch examples/numeric.zag --target macos-arm64 >/dev/null 2>&1; then
     echo "XX  macOS target entered the Linux/x86 hot-patch path" >&2
     exit 1

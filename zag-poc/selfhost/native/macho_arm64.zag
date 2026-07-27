@@ -247,6 +247,7 @@ fn write_macho_arm64_data_debug(path: []u8, text: ArrayList[u8], entry_off: i32,
     mo_segment(&buf,"__LINKEDIT",MACHO_BASE()+sig_off,link_size,sig_off,sig_size,1,0);
 
     mo_le(&buf,14,4); mo_le(&buf,32,4); mo_le(&buf,12,4); mo_bytes(&buf,"/usr/lib/dyld"); mo_b(&buf,0);
+    while ((buf.len % 8) != 0) { mo_b(&buf,0); }
     mo_pad_to(&buf,32+72+152+152+has_debug*312+72+32);
     mo_le(&buf,50,4); mo_le(&buf,24,4); mo_le(&buf,1,4); mo_le(&buf,720896,4); mo_le(&buf,720896,4); mo_le(&buf,0,4);
     // LC_UUID is required by modern dyld. Deriving it from program content
@@ -271,4 +272,85 @@ fn write_macho_arm64_data_debug(path: []u8, text: ArrayList[u8], entry_off: i32,
 fn write_macho_arm64_data(path: []u8, text: ArrayList[u8], entry_off: i32, data: ArrayList[u8]) i32 {
     let empty: ArrayList[u8] = make[u8](0);
     return write_macho_arm64_data_debug(path,text,entry_off,data,empty,empty,empty);
+}
+
+// Emit regular dyld bind opcodes for the import-pointer table.  This is the
+// native Mach-O mechanism: dyld writes resolved libSystem addresses into our
+// writable slots before LC_MAIN runs.  No ELF PLT/GOT or compatibility loader
+// is involved.
+fn mo_bind_stream(names: ArrayList[[]u8], data_len: i32) ArrayList[u8] {
+    let out: ArrayList[u8] = make[u8](names.len * 24 + 8);
+    let i: i32 = 0;
+    while (i < names.len) {
+        mo_b(&out, 17);                         // SET_DYLIB_ORDINAL_IMM(1): libSystem
+        mo_b(&out, 64);                         // SET_SYMBOL_TRAILING_FLAGS_IMM(0)
+        if (names.data[i].len > 0 && names.data[i][0] == '_') { mo_bytes(&out,names.data[i]); }
+        else { mo_b(&out,95); mo_bytes(&out,names.data[i]); } // Darwin C ABI leading '_'
+        mo_b(&out,0);
+        mo_b(&out,81);                          // SET_TYPE_IMM(BIND_TYPE_POINTER)
+        mo_b(&out,114);                         // SET_SEGMENT_AND_OFFSET_ULEB(__DATA)
+        let off: i32 = data_len + i * 8;
+        // all generated data is well below 128 bytes in the supported import
+        // mode; retain proper ULEB continuation for larger programs.
+        let v: i32 = off;
+        while (v >= 128) { mo_b(&out,(v % 128) + 128); v = v / 128; }
+        mo_b(&out,v);
+        mo_b(&out,144);                         // DO_BIND
+        i = i + 1;
+    }
+    mo_b(&out,0);                               // DONE
+    return out;
+}
+
+fn write_macho_arm64_dynamic(path: []u8, text: ArrayList[u8], entry_off: i32,
+                              data: ArrayList[u8], imports: ArrayList[[]u8]) i32 {
+    if (imports.len == 0) { return write_macho_arm64_data(path,text,entry_off,data); }
+    let code_off: i64 = MACHO_CODE_OFF();
+    let data_off: i64 = macho_data_fileoff(text.len);
+    let import_bytes: i32 = imports.len * 8;
+    let data_len: i32 = data.len + import_bytes;
+    let bind: ArrayList[u8] = mo_bind_stream(imports,data.len);
+    // Link-edit data has its own page-aligned file/VM mapping.  Keeping the
+    // dyld stream in the post-__DATA padding leaves a conventional contiguous
+    // __LINKEDIT mapping for the loader instead of a mismatched file/VM pair.
+    let bind_off: i64 = macho_align(data_off + (data_len as i64),MACHO_PAGE());
+    let sig_off: i64 = macho_align(bind_off + (bind.len as i64),16);
+    let text_size: i64 = data_off;
+    let data_size: i64 = macho_align(data_len as i64,MACHO_PAGE());
+    let nslots: i64 = (sig_off + MACHO_HASH_PAGE() - 1) / MACHO_HASH_PAGE();
+    let sig_size: i64 = macho_align(20 + 96 + nslots * 32,16);
+    let link_size: i64 = macho_align(sig_off + sig_size - bind_off,MACHO_PAGE());
+    let buf: ArrayList[u8] = make[u8]((sig_off + sig_size) as i32);
+    let uuid_source: ArrayList[u8] = make[u8](text.len + data.len + bind.len);
+    mo_list_bytes(&uuid_source,text); mo_list_bytes(&uuid_source,data); mo_list_bytes(&uuid_source,bind);
+    let uuid_hash: ArrayList[u8] = macho_sha256(uuid_source.data[0..uuid_source.len]);
+
+    mo_le(&buf,4277009103,4); mo_le(&buf,16777228,4); mo_le(&buf,0,4); mo_le(&buf,2,4);
+    mo_le(&buf,11,4); mo_le(&buf,672,4); mo_le(&buf,2097285,4); mo_le(&buf,0,4);
+    mo_segment(&buf,"__PAGEZERO",0,MACHO_BASE(),0,0,0,0);
+    mo_segment(&buf,"__TEXT",MACHO_BASE(),text_size,0,text_size,5,1);
+    mo_section(&buf,"__text","__TEXT",MACHO_BASE()+code_off,text.len,code_off,2,2147484672);
+    mo_segment(&buf,"__DATA",MACHO_BASE()+data_off,data_size,data_off,data_len,3,1);
+    mo_section(&buf,"__data","__DATA",MACHO_BASE()+data_off,data_len,data_off,3,0);
+    mo_segment(&buf,"__LINKEDIT",MACHO_BASE()+bind_off,link_size,bind_off,sig_off+sig_size-bind_off,1,0);
+    mo_le(&buf,14,4); mo_le(&buf,32,4); mo_le(&buf,12,4); mo_bytes(&buf,"/usr/lib/dyld"); mo_b(&buf,0);
+    while ((buf.len % 8) != 0) { mo_b(&buf,0); }
+    mo_le(&buf,50,4); mo_le(&buf,24,4); mo_le(&buf,1,4); mo_le(&buf,720896,4); mo_le(&buf,720896,4); mo_le(&buf,0,4);
+    mo_le(&buf,27,4); mo_le(&buf,24,4);
+    let ui: i32 = 0; while (ui < 16) { mo_b(&buf,get[u8](uuid_hash,ui) as i64); ui = ui + 1; }
+    mo_le(&buf,2147483688,4); mo_le(&buf,24,4); mo_le(&buf,code_off + (entry_off as i64),8); mo_le(&buf,0,8);
+    mo_le(&buf,12,4); mo_le(&buf,56,4); mo_le(&buf,24,4); mo_le(&buf,2,4); mo_le(&buf,0,4); mo_le(&buf,65536,4);
+    mo_bytes(&buf,"/usr/lib/libSystem.B.dylib"); mo_b(&buf,0); while ((buf.len % 8) != 0) { mo_b(&buf,0); }
+    // LC_DYLD_INFO_ONLY: rebase, weak-bind and lazy-bind streams are empty;
+    // bind is the regular import stream located in __LINKEDIT.
+    mo_le(&buf,2147483682,4); mo_le(&buf,48,4);
+    mo_le(&buf,0,4); mo_le(&buf,0,4); mo_le(&buf,bind_off,4); mo_le(&buf,bind.len,4);
+    mo_le(&buf,0,4); mo_le(&buf,0,4); mo_le(&buf,0,4); mo_le(&buf,0,4); mo_le(&buf,0,4); mo_le(&buf,0,4);
+    mo_le(&buf,29,4); mo_le(&buf,16,4); mo_le(&buf,sig_off,4); mo_le(&buf,sig_size,4);
+    if (buf.len > code_off) { return 1; }
+    mo_pad_to(&buf,code_off); mo_list_bytes(&buf,text); mo_pad_to(&buf,data_off); mo_list_bytes(&buf,data);
+    mo_zero(&buf,import_bytes as i64); mo_pad_to(&buf,bind_off); mo_list_bytes(&buf,bind); mo_pad_to(&buf,sig_off);
+    let sig: ArrayList[u8] = mo_signature(buf.data[0..buf.len],text_size);
+    mo_list_bytes(&buf,sig);
+    return _zag_write_exec(path,buf.data[0..buf.len]);
 }
