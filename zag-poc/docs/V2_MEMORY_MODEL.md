@@ -76,8 +76,9 @@ transfer to the assigned result: both `let replacement = ...` and
 owner. This does not model failure-return ownership, aliased or computed
 arguments, or general allocator APIs; those cases remain fail-closed or
 unsafe-programmer responsibility.
-bounded mutation-aware pass additionally follows owner and current-frame roots
-stored in named struct/union values through 64 nested field components,
+mutation-aware pass additionally follows owner and current-frame roots
+stored in named struct/union values through arbitrary source-representable
+nested field paths,
 field/whole-value assignment, value copies, and conservative branch joins. It
 rejects proven pass, return, and non-local store escapes; an overwrite clears
 only the field subtree it proves replaced. The same aggregate rules permit a

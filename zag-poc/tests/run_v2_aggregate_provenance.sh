@@ -99,10 +99,10 @@ printf '%s\n' \
   >"$tmp/owner-branch-may/main.zag"
 reject owner-branch-may "branch join retains may-provenance" 'owned allocation escapes through uncontracted call `retain`'
 
-# The path trie proves 64 field components. Component 65 must retain an
-# uncertain marker at the deepest proven prefix; it must never disappear or be
-# cleared by a write whose complete path the bounded proof cannot represent.
-project owner-over-cap
+# Deep nested paths are tracked exactly rather than switching to a bounded
+# prefix approximation. A clear at the final field must remove the precise
+# provenance entry even after more than 64 components.
+project owner-deep-clear
 over_types='struct Node { value:i32 } struct Nest64 { ptr:*mut Node }'
 i=63
 while [ "$i" -ge 0 ]; do
@@ -118,14 +118,18 @@ done
 over_expr="$over_expr"'Nest64{.ptr=p}'
 i=0
 while [ "$i" -lt 64 ]; do over_expr="$over_expr"'}'; i=$((i + 1)); done
+deep_path=''
+i=0
+while [ "$i" -lt 64 ]; do deep_path="${deep_path}next."; i=$((i + 1)); done
+deep_path="${deep_path}ptr"
 printf '%s\n' \
   "$over_types" \
-  'fn retain(value:Nest0) void { }' \
-  "fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=1}) as *mut Node; let value:Nest0=$over_expr; retain(value); delete(p); } return 0; }" \
-  >"$tmp/owner-over-cap/main.zag"
-reject owner-over-cap "field depth above 64 retains fail-closed owner provenance" 'owned allocation escapes through uncontracted call `retain`'
+  'fn inspect(value:Nest0) void @borrows { }' \
+  "fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=1}) as *mut Node; let value:Nest0=$over_expr; value.$deep_path=null as *mut Node; inspect(value); delete(p); } return 0; }" \
+  >"$tmp/owner-deep-clear/main.zag"
+accept owner-deep-clear "deep field clear removes exact owner provenance"
 
-project stack-over-cap
+project stack-deep-clear
 stack_types='struct Nest64 { ptr:*const i32 }'
 i=63
 while [ "$i" -ge 0 ]; do
@@ -140,10 +144,10 @@ i=0
 while [ "$i" -lt 64 ]; do stack_expr="$stack_expr"'}'; i=$((i + 1)); done
 printf '%s\n' \
   "$stack_types" \
-  'fn retain(value:Nest0) void { }' \
-  "fn main() i32 { let x:i32=42; unsafe { let value:Nest0=$stack_expr; retain(value); } return 0; }" \
-  >"$tmp/stack-over-cap/main.zag"
-reject stack-over-cap "field depth above 64 retains fail-closed stack provenance" 'escapes through aggregate argument to uncontracted call `retain`'
+  "fn safe() Nest0 { let x:i32=42; unsafe { let value:Nest0=$stack_expr; value.$deep_path=null as *const i32; return value; } }" \
+  'fn main() i32 { let value:Nest0=safe(); return 0; }' \
+  >"$tmp/stack-deep-clear/main.zag"
+accept stack-deep-clear "deep field clear removes exact stack provenance"
 
 project owner-safe-clear
 printf '%s\n' \
