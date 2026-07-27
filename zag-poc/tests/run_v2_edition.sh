@@ -1029,6 +1029,26 @@ if (cd "$tmp/v2-sanitize-memory" && "$ZNC" main.zag -o out --sanitize=memory) >"
 else
   echo "  XX  memory sanitizer compiles released-allocation witness"; sed -n '1,10p' "$tmp/v2-sanitize-memory/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-sanitize-memory-large-guard"
+printf 'name = "v2sanitizememorylargeguard"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-sanitize-memory-large-guard/zag.mod"
+# 600000 exceeds the arena allocator's 512 KiB maximum, so this exercises the
+# dedicated mmap path.  In sanitizer mode that path must install and later
+# tear down its trailing PROT_NONE guard page; either syscall failure terminates
+# instead of returning this witness's deliberate exit status.
+printf 'extern fn _zag_malloc(n:i64)*u8; extern fn _zag_free(p:*u8)void; fn main() i32 { unsafe { let p:*u8 = _zag_malloc(600000); p.* = 9; _zag_free(p); return 41; } }\n' >"$tmp/v2-sanitize-memory-large-guard/main.zag"
+if (cd "$tmp/v2-sanitize-memory-large-guard" && "$ZNC" main.zag -o out --sanitize=memory) >"$tmp/v2-sanitize-memory-large-guard/log" 2>&1 && [ -x "$tmp/v2-sanitize-memory-large-guard/out" ]; then
+  set +e
+  "$tmp/v2-sanitize-memory-large-guard/out"
+  sanitize_memory_large_guard_rc=$?
+  set -e
+  if [ "$sanitize_memory_large_guard_rc" -eq 41 ]; then
+    echo "  ok  memory sanitizer guards and releases a large allocation"; pass=$((pass + 1))
+  else
+    echo "  XX  memory sanitizer large guarded-allocation execution (exit=$sanitize_memory_large_guard_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  memory sanitizer compiles guarded large-allocation witness"; sed -n '1,10p' "$tmp/v2-sanitize-memory-large-guard/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-sanitize-memory-logical-oob"
 printf 'name = "v2sanitizememorylogicaloob"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-sanitize-memory-logical-oob/zag.mod"
 printf 'fn main() i32 { unsafe { let p:*i8 = _zag_malloc(1) as *i8; p[1] = 7; _zag_free(p); return 0; } }\n' >"$tmp/v2-sanitize-memory-logical-oob/main.zag"

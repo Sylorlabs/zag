@@ -36,9 +36,15 @@ silently downgrading. Other sanitizer modes remain rejected.
   allocation's exact requested length rather than its class-rounded physical
   capacity, so a checked raw access into small-block class slack traps at the
   access site. It also fails process exit on a nonzero ordinary-allocation live
-  witness. It does not yet provide red zones,
-  guard pages, allocation-site reports, or custom-allocator tracking. On every
-  ordinary free under sanitizer mode it provides deterministic byte poisoning (`0xA5`)
+  witness. Dedicated ordinary allocations larger than 512 KiB additionally
+  reserve one trailing 4 KiB `PROT_NONE` guard page on native Linux x86-64; the
+  allocation fails closed if that setup fails and free reconstructs the full
+  guarded mapping before `munmap`. This is a coarse trailing boundary only:
+  page-rounding leaves up to one accessible page of slack after the exact
+  request, so it does not replace the logical provenance check or provide
+  per-allocation red zones. It does not yet provide red zones, allocation-site
+  reports, or custom-allocator tracking. On every ordinary free under sanitizer
+  mode it provides deterministic byte poisoning (`0xA5`)
   before the block enters the free list or is unmapped; this is useful evidence
   when a stale alias escapes the provenance table, but it is not a red-zone or
   general use-after-free proof. Its SystemAllocator-handle checks retain the same generation and
@@ -66,7 +72,8 @@ site. They do **not** contain source locations,
 function names, addresses, sizes, allocation/free sites, redzone bytes, or a
 backtrace. The allocator telemetry observers can expose aggregate live/peak
 capacity to a program, but are not allocation-site reporting. Thread
-instrumentation and guarded allocations do not exist in this implementation.
+instrumentation and small-allocation guard pages do not exist in this
+implementation.
 Known source-level owner leaks are normally rejected earlier by the edition-2027
 typed ownership pass, so the sanitizer's exit witness is a backstop for
 lowered/runtime paths rather than a replacement for that static rule; it does

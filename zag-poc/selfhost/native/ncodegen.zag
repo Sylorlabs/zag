@@ -10122,6 +10122,7 @@ fn FIXED_BLOCK_STRIDE() i64 { return 40; }
 fn FIXED_BLOCK_NEXT_TOKEN() i64 { return BSS_VBASE() + 206872; }
 fn ALLOC_MAX_SMALL() i64 { return 524288; }     // 16 << 15
 fn ALLOC_ARENA() i64 { return 1048576; }        // 1 MiB arenas
+fn ALLOC_PAGE_SIZE() i64 { return 4096; }
 
 // Publish an ordinary allocator result to the checked-access registry.
 // Input: rax=user pointer, rsi=payload capacity.  Both inputs are preserved.
@@ -10709,6 +10710,10 @@ fn cg_emit_malloc(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     let l_found: i32 = cg_fresh(cg);
     let l_carve: i32 = cg_fresh(cg);
     let l_have:  i32 = cg_fresh(cg);
+    let l_large_header_ok: i32 = cg_fresh(cg);
+    let l_large_round_ok: i32 = cg_fresh(cg);
+    let l_large_map_ok: i32 = cg_fresh(cg);
+    let l_large_guard_ok: i32 = cg_fresh(cg);
 
     push[Instr](out, i_label(lbl));
     // Retain the exact request across arena refill and syscall paths.  The
@@ -10733,13 +10738,54 @@ fn cg_emit_malloc(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     push[Instr](out, i_add_imm(R_RCX(), 1));
     push[Instr](out, i_cmp_imm(R_RCX(), 16));
     push[Instr](out, i_jl(l_class));
-    // large path: dedicated mmap of n+8; header = exact n. Register the user
-    // pointer before returning it so free/realloc can validate it without
-    // touching an eventually unmapped header.
+    // Large path: a dedicated mapping with header = exact n.  In memory
+    // sanitizer mode, round the accessible header+payload up to a page and
+    // append one PROT_NONE page.  This is deliberately an additional hardware
+    // backstop, not the logical OOB diagnostic: checked provenance still
+    // catches ordinary one-past accesses before the instruction executes.
+    // Register the user pointer before returning it so free/realloc can
+    // validate it without touching an eventually unmapped header.
     push[Instr](out, i_push(R_RDI()));               // save n
-    push[Instr](out, i_add_imm(R_RDI(), 8));
+    if(cg.*.sanitize_memory==1){
+        // round(n + header) to a page, then reserve a trailing guard page.
+        push[Instr](out,i_add_imm(R_RDI(),8));
+        push[Instr](out,i_cmp_imm(R_RDI(),0));
+        push[Instr](out,i_jge(l_large_header_ok));
+        cg_emit_panic(out,"zag sanitizer: large allocation size exceeds guarded mapping limit",l_large_header_ok,cg);
+        push[Instr](out,i_add_imm(R_RDI(),ALLOC_PAGE_SIZE()-1));
+        push[Instr](out,i_cmp_imm(R_RDI(),0));
+        push[Instr](out,i_jge(l_large_round_ok));
+        cg_emit_panic(out,"zag sanitizer: large allocation size exceeds guarded mapping limit",l_large_round_ok,cg);
+        push[Instr](out,i_mov_imm(R_R8(),0-ALLOC_PAGE_SIZE()));
+        push[Instr](out,i_and(R_RDI(),R_R8()));
+        push[Instr](out,i_add_imm(R_RDI(),ALLOC_PAGE_SIZE()));
+        push[Instr](out,i_cmp_imm(R_RDI(),0));
+        push[Instr](out,i_jge(l_large_map_ok));
+        cg_emit_panic(out,"zag sanitizer: large allocation size exceeds guarded mapping limit",l_large_map_ok,cg);
+    }else{push[Instr](out,i_add_imm(R_RDI(),8));}
     push[Instr](out, i_call(cg.*.al_lbl));           // rax = mmap base
     push[Instr](out, i_pop(R_RCX()));
+    if(cg.*.sanitize_memory==1){
+        // mprotect(base + round(n+header), page, PROT_NONE).  Preserve the
+        // allocator result and exact request because syscall clobbers rcx.
+        push[Instr](out,i_push(R_RAX()));
+        push[Instr](out,i_push(R_RCX()));
+        push[Instr](out,i_mov_rr(R_RDI(),R_RCX()));
+        push[Instr](out,i_add_imm(R_RDI(),8));
+        push[Instr](out,i_add_imm(R_RDI(),ALLOC_PAGE_SIZE()-1));
+        push[Instr](out,i_mov_imm(R_R8(),0-ALLOC_PAGE_SIZE()));
+        push[Instr](out,i_and(R_RDI(),R_R8()));
+        push[Instr](out,i_add(R_RDI(),R_RAX()));
+        push[Instr](out,i_mov_imm(R_RSI(),ALLOC_PAGE_SIZE()));
+        push[Instr](out,i_mov_imm(R_RDX(),0));        // PROT_NONE
+        push[Instr](out,i_mov_imm(R_RAX(),10));       // sys_mprotect
+        push[Instr](out,i_syscall());
+        push[Instr](out,i_cmp_imm(R_RAX(),0));
+        push[Instr](out,i_je(l_large_guard_ok));
+        cg_emit_panic(out,"zag sanitizer: large allocation guard-page setup failed",l_large_guard_ok,cg);
+        push[Instr](out,i_pop(R_RCX()));
+        push[Instr](out,i_pop(R_RAX()));
+    }
     push[Instr](out, i_store(R_RAX(), 0, R_RCX()));  // [base] = n
     push[Instr](out, i_add_imm(R_RAX(), 8));
     push[Instr](out, i_mov_rr(R_RSI(),R_RCX()));
@@ -10880,9 +10926,16 @@ fn cg_emit_free(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     if(cg.*.sanitize_memory==1){cg_emit_sanitize_poison(out,cg);}
     push[Instr](out,i_push(R_RDI()));
     push[Instr](out,i_push(R_R10()));
-    // munmap(ptr-8, size+8) — syscall 11 (kernel page-rounds the length)
+    // munmap(ptr-8, mapping length) — sanitizer large mappings include their
+    // trailing guard page, so reconstruct that exact page-rounded length.
     push[Instr](out, i_sub_imm(R_RDI(), 8));
-    push[Instr](out, i_add_imm(R_RSI(), 8));
+    if(cg.*.sanitize_memory==1){
+        push[Instr](out,i_add_imm(R_RSI(),8));
+        push[Instr](out,i_add_imm(R_RSI(),ALLOC_PAGE_SIZE()-1));
+        push[Instr](out,i_mov_imm(R_R8(),0-ALLOC_PAGE_SIZE()));
+        push[Instr](out,i_and(R_RSI(),R_R8()));
+        push[Instr](out,i_add_imm(R_RSI(),ALLOC_PAGE_SIZE()));
+    }else{push[Instr](out,i_add_imm(R_RSI(),8));}
     push[Instr](out, i_mov_imm(R_RAX(), 11));
     push[Instr](out, i_syscall());
     push[Instr](out,i_pop(R_R10()));
@@ -10890,7 +10943,12 @@ fn cg_emit_free(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     push[Instr](out,i_cmp_imm(R_RAX(),0));
     push[Instr](out,i_je(l_big_unmapped));
     cg_emit_panic(out,"zag runtime: large allocation unmap failed",l_big_unmapped,cg);
-    push[Instr](out,i_sub_imm(R_RSI(),8));
+    if(cg.*.sanitize_memory==1){
+        // Restore the registry/telemetry payload size rather than the mapping
+        // length used by munmap.
+        push[Instr](out,i_mov_rr(R_RSI(),R_RDI()));
+        push[Instr](out,i_load(R_RSI(),R_R10(),8));
+    }else{push[Instr](out,i_sub_imm(R_RSI(),8));}
     push[Instr](out,i_mov_rr(R_R9(),R_RDI()));
     push[Instr](out,i_neg(R_R9()));
     push[Instr](out,i_store(R_R10(),0,R_R9()));
