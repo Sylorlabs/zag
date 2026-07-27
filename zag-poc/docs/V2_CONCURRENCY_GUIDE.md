@@ -57,8 +57,23 @@ These primitives are useful native building blocks, but they do not establish
 atomic storage, a happens-before relation, race freedom, or a supported
 threading API.
 
+The first public thread boundary is Linux/x86-64 native only:
+`@threadSpawn(worker) *opaque` accepts exactly one direct, non-generic,
+captureless `fn() void` label inside `unsafe`; `@threadJoin(handle)` consumes
+that named opaque handle inside `unsafe`. Spawn maps a separate guarded 64 KiB
+child stack and persistent handle, lowers `clone(2)` with parent/child TID and
+child-clear-TID flags, branches the child directly to the worker, then uses
+`SYS_exit`. Join waits on the kernel-cleared aligned TID with `FUTEX_WAIT` and
+only then unmaps the stack and handle. The handle is affine in the current
+ownership pass: it must be joined or returned, and a joined handle cannot be
+used again. `tests/run_x86_thread_spawn.sh` uses `strace -f` to observe actual
+`clone`, blocking `FUTEX_WAIT`, gate wake, and clear-TID join, while also
+rejecting safe-scope spawn/join, wrong worker/handle shapes, `@pure` use, and
+an unjoined handle.
+
 This is not a general atomic or concurrency API: there are no atomic storage
-types, thread spawn/join, or race detector. The raw
+types, worker arguments/returns, detach, mutexes, condition variables, TLS,
+or race detector. The raw
 pointer's allocation, lifetime, sharing, and absence of mixed atomic/non-atomic
 access remain the caller's unsafe contract. `@volatileLoad`/`@volatileStore`
 and their explicit 8/16/32-bit companions remain MMIO transactions, not
@@ -89,4 +104,6 @@ lowering, and the MOV versus locked x86 lowering boundary.
 `tests/run_x86_atomic_futex.sh` runs a deliberately nonblocking mismatched
 wait and waiter-free wake under `strace`, proving actual `FUTEX_WAIT`/`WAKE`
 kernel calls and raw return values while also covering unsafe, type, pure, and
-null-pointer rejection. It is not a thread stress or litmus test.
+null-pointer rejection. It is not a thread stress or litmus test. The spawn
+test is similarly a bounded process-level witness, not proof of a language-wide
+happens-before, lifetime, or race-freedom model.

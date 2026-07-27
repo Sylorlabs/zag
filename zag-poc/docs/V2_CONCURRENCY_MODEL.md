@@ -85,13 +85,13 @@ reinterpreted while another thread can access it.
 
 ## Threads and blocking
 
-No public `spawn`, `join`, mutex, condition-variable, semaphore, or TLS API
-exists today. The two raw `@atomicWait32`/`@atomicWake32` futex operations are
-not a thread API or a synchronization proof. `selfhost/native/thread_rt.zag`
-is an unintegrated runtime-oriented prototype and is not evidence of a
-supported language or runtime contract. The intended future `spawn` must publish argument ownership
-before the new thread starts and `join` must establish happens-before from
-completed child actions to the join return. Detach must remain unavailable
-until a lifetime-safe handle and shutdown contract exist. Every future stress
-test must have a timeout and report timeout separately from an incorrect
-result.
+Linux/x86-64 native output now has a bounded unsafe `@threadSpawn(worker)` /
+`@threadJoin(handle)` pair. Spawn accepts only a direct captureless `fn() void`
+worker and returns an affine `*opaque` handle; join consumes that handle after
+the kernel clears its TID and wakes the futex. This establishes a real kernel
+completion boundary for the worker and join result, but does not yet model
+worker arguments, detach, mutexes, condition variables, TLS, atomic storage,
+or general source-level happens-before/race freedom. `selfhost/native/thread_rt.zag`
+remains an unintegrated historical sketch and is not evidence of support.
+Every future stress test must have a timeout and report timeout separately from
+an incorrect result.
