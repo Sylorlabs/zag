@@ -59,9 +59,10 @@ the checked register boundary rejects forged constructor identities until a
 second allocator family has its own descriptor and lifetime contract.
 Custom allocators and arenas are still unimplemented. The fixed-buffer slice
 now permits construction from one named live `Allocation`, named top-level
-`FixedBufferBlock` allocations, checked byte reads/writes, and top-level
-`deinit` into one fresh named `Allocation`. It still rejects `reset`, aliases,
-aggregate storage, escapes, and control-flow lifetimes. `resize` and
+`FixedBufferBlock` allocations, checked byte reads/writes, reset with
+generation invalidation, and top-level `deinit` into one fresh named
+`Allocation`. It still rejects aliases, aggregate storage, escapes, and
+control-flow lifetimes. `resize` and
 `allocate_zeroed` are
 implemented for the checked native SystemAllocator: it returns the ordinary
 minted handle after clearing its exact recorded capacity. `resize` validates
@@ -71,10 +72,10 @@ old handle live. On a successful resize, copied descriptors from the old
 lifetime are retired with that old handle and reject before a second free.
 
 `arena_allocator(...)` remains explicitly rejected. The fixed-buffer slice
-makes no `@noalloc` or `@realtime` claim. Its runtime descriptors are bounded
-checked metadata: reset-row reuse and stale-backing rejection are executed, but
-public reset semantics and exhaustive block/lifetime coverage remain
-unsupported. There is no special-case fallback or hidden heap path.
+makes no `@noalloc` or `@realtime` claim. Reset advances a compiler-tracked
+generation and rejects every pre-reset block name; runtime also retires the
+old bounded block rows. Exhaustive block/lifetime coverage remains unsupported.
+There is no special-case fallback or hidden heap path.
 
 ## Required fixed-buffer allocator slice
 

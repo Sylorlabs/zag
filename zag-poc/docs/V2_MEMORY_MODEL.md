@@ -32,8 +32,9 @@ is used and its operation is proven nonblocking.
 
 Current implementation note: this is a target contract, not a present effect
 claim. Edition 2027 admits a linear fixed-buffer retained-owner slice:
-construction, named block allocation, checked byte reads/writes, and top-level
-`deinit`. Reset, aliasing/escape/control-flow lifetimes, and
+construction, named block allocation, checked byte reads/writes, generation-
+invalidating reset, and top-level `deinit`. Aliasing/escape/control-flow
+lifetimes and
 `@noalloc`/`@realtime` qualification remain unsupported.
 
 ## Status and edition boundary

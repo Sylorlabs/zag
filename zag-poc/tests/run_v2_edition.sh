@@ -414,16 +414,33 @@ elif grep -q 'retained backing, allocator, and blocks cannot be copied' "$tmp/v2
 else
   echo "  XX  fixed-buffer block alias rejection missing diagnostic"; sed -n '1,16p' "$tmp/v2-fixed-buffer-block-alias-reject/log"; fail=$((fail + 1))
 fi
-mkdir -p "$tmp/v2-fixed-buffer-reset-reject"
-printf 'name = "v2fixedbufferresetreject"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-fixed-buffer-reset-reject/zag.mod"
-ln -s "$PWD/selfhost/std" "$tmp/v2-fixed-buffer-reset-reject/std"
-printf '@import("std/allocator.zag") fn work() !i32 { let system:SystemAllocator=system_allocator(); let backing:Allocation=try system.allocate(64,8); let region:FixedBufferAllocator=try fixed_buffer_allocator(backing); try region.reset(); let released:Allocation=try region.deinit(); try system.deallocate(released); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-fixed-buffer-reset-reject/main.zag"
-if (cd "$tmp/v2-fixed-buffer-reset-reject" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-fixed-buffer-reset-reject/log" 2>&1 || [ -e "$tmp/v2-fixed-buffer-reset-reject/out" ]; then
-  echo "  XX  fixed-buffer reset rejects before artifact"; sed -n '1,16p' "$tmp/v2-fixed-buffer-reset-reject/log"; fail=$((fail + 1))
-elif grep -q 'retained backing, allocator, and blocks cannot be released' "$tmp/v2-fixed-buffer-reset-reject/log"; then
-  echo "  ok  fixed-buffer reset remains fail-closed"; pass=$((pass + 1))
+mkdir -p "$tmp/v2-fixed-buffer-reset"
+printf 'name = "v2fixedbufferreset"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-fixed-buffer-reset/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-fixed-buffer-reset/std"
+printf '@import("std/allocator.zag") fn work() !i32 { let system:SystemAllocator=system_allocator(); let backing:Allocation=try system.allocate(64,8); let region:FixedBufferAllocator=try fixed_buffer_allocator(backing); let first:FixedBufferBlock=try region.allocate(8,8); try fixed_buffer_write_u8(first,0,7); try region.reset(); let second:FixedBufferBlock=try region.allocate(8,8); try fixed_buffer_write_u8(second,0,42); let value:u8=try fixed_buffer_read_u8(second,0); let released:Allocation=try region.deinit(); try system.deallocate(released); return value as i32; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-fixed-buffer-reset/main.zag"
+if (cd "$tmp/v2-fixed-buffer-reset" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-fixed-buffer-reset/log" 2>&1 && [ -x "$tmp/v2-fixed-buffer-reset/out" ]; then
+  set +e
+  "$tmp/v2-fixed-buffer-reset/out"
+  fixed_buffer_reset_rc=$?
+  set -e
+  if [ "$fixed_buffer_reset_rc" -eq 42 ]; then
+    echo "  ok  fixed-buffer reset invalidates old generation and executes new block"; pass=$((pass + 1))
+  else
+    echo "  XX  fixed-buffer reset execution (exit=$fixed_buffer_reset_rc)"; sed -n '1,16p' "$tmp/v2-fixed-buffer-reset/log"; fail=$((fail + 1))
+  fi
 else
-  echo "  XX  fixed-buffer reset rejection missing diagnostic"; sed -n '1,16p' "$tmp/v2-fixed-buffer-reset-reject/log"; fail=$((fail + 1))
+  echo "  XX  fixed-buffer reset did not compile"; sed -n '1,16p' "$tmp/v2-fixed-buffer-reset/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-fixed-buffer-stale-block-reject"
+printf 'name = "v2fixedbufferstaleblockreject"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-fixed-buffer-stale-block-reject/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-fixed-buffer-stale-block-reject/std"
+printf '@import("std/allocator.zag") fn work() !i32 { let system:SystemAllocator=system_allocator(); let backing:Allocation=try system.allocate(64,8); let region:FixedBufferAllocator=try fixed_buffer_allocator(backing); let first:FixedBufferBlock=try region.allocate(8,8); try region.reset(); let value:u8=try fixed_buffer_read_u8(first,0); let released:Allocation=try region.deinit(); try system.deallocate(released); return value as i32; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-fixed-buffer-stale-block-reject/main.zag"
+if (cd "$tmp/v2-fixed-buffer-stale-block-reject" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-fixed-buffer-stale-block-reject/log" 2>&1 || [ -e "$tmp/v2-fixed-buffer-stale-block-reject/out" ]; then
+  echo "  XX  fixed-buffer stale block rejects before artifact"; sed -n '1,16p' "$tmp/v2-fixed-buffer-stale-block-reject/log"; fail=$((fail + 1))
+elif grep -q 'fixed-buffer reads require one live named FixedBufferBlock' "$tmp/v2-fixed-buffer-stale-block-reject/log"; then
+  echo "  ok  fixed-buffer reset rejects stale block access"; pass=$((pass + 1))
+else
+  echo "  XX  fixed-buffer stale block rejection missing diagnostic"; sed -n '1,16p' "$tmp/v2-fixed-buffer-stale-block-reject/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-fixed-buffer-old-backing-reject"
 printf 'name = "v2fixedbufferoldbackingreject"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-fixed-buffer-old-backing-reject/zag.mod"
