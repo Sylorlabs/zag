@@ -119,7 +119,7 @@ release. Its matrix and executable gate are in
 [docs/V2_FINAL_VERIFICATION.md](docs/V2_FINAL_VERIFICATION.md) and
 `tests/run_v2_release_gate.sh`; required unsupported rows deliberately keep
 that gate failing until their implementation and execution evidence exist. The
-the release gate is intentionally fail-closed while required capability rows
+release gate is intentionally fail-closed while required capability rows
 remain unsupported; it is not a C replacement or a production-v2 claim yet.
 The passing slices include
 checked native word and byte volatile transactions, fixed unsafe i64 atomic
