@@ -18,6 +18,15 @@ Loads reject release/acq_rel; stores reject acquire/acq_rel. On x86-64,
 relaxed/acquire loads and relaxed/release stores lower to ordinary MOV
 transactions, while seq_cst uses the existing locked transaction. This is a
 real ordering-validation/lowering slice, not a thread or race proof.
+The same literal vocabulary is accepted by the suffixed RMW forms
+`@atomicExchange64Order`, `@atomicFetchAdd64Order`,
+`@atomicFetchSub64Order`, `@atomicFetchAnd64Order`,
+`@atomicFetchOr64Order`, and `@atomicFetchXor64Order` with `(ptr, value,
+order)`, plus `@atomicCompareExchange64Order(ptr, expected, desired, success,
+failure)`. Every valid RMW/CAS order currently keeps its established locked
+x86 lowering (a seq_cst superset); CAS failure is restricted to
+relaxed/acquire/seq_cst and may not be stronger than success. This is not a
+claim of relaxed machine code or of a complete language memory model.
 Compare-exchange returns the old word whether the swap succeeds or fails. They are callable only
 inside an `unsafe` block on Linux x86-64 native output. Load emits `LOCK XADD`
 with zero, preserving and returning the old word; store/exchange use memory
@@ -31,7 +40,7 @@ compare-exchange retry loop. They are lock-free but not wait-free: contention
 can cause retries, so they remain outside a realtime guarantee.
 
 This is not a general atomic or concurrency API: there are no atomic storage
-types, selectable orders on RMW/CAS/fences, language-level fence semantics,
+types, selectable fence orders, language-level fence semantics,
 thread spawn/join, or race detector. The raw
 pointer's allocation, lifetime, sharing, and absence of mixed atomic/non-atomic
 access remain the caller's unsafe contract. `@volatileLoad`/`@volatileStore`
@@ -56,6 +65,7 @@ failure path. A successful
 single-thread run is not a memory
 model proof. Each future primitive still needs a positive execution test, a
 timeout-bounded stress test, and a negative effect test.
-`tests/run_v2_atomic_orders.sh` separately proves the literal order ABI,
-invalid load/store combinations, runtime-order rejection, unsafe enforcement,
-and the MOV versus locked x86 lowering boundary.
+`tests/run_v2_atomic_orders.sh` separately proves the literal order ABI across
+load/store/RMW/CAS, invalid load/store and CAS failure combinations,
+runtime-order rejection, unsafe enforcement, and the MOV versus locked x86
+lowering boundary.

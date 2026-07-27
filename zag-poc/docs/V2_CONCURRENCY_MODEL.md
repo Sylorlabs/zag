@@ -7,15 +7,17 @@ limited to edition-2027 native x86-64 `@atomicLoad64`, `@atomicStore64`,
 `@atomicFetchXor64` on naturally aligned raw
 `i64` pointers. These are unsafe,
 fixed full-order x86 transactions, plus literal-validated
-`@atomicLoad64Order(ptr, order)` and `@atomicStore64Order(ptr, value, order)`
-for the load/store subset; storage types, RMW/CAS/fence order selection,
-threads, and litmus evidence remain release blockers. See
+`@atomicLoad64Order(ptr, order)`, `@atomicStore64Order(ptr, value, order)`,
+the suffixed RMW order forms, and
+`@atomicCompareExchange64Order(ptr, expected, desired, success, failure)`;
+storage types, fence order selection, threads, and litmus evidence remain
+release blockers. See
 `docs/V2_CONCURRENCY_GUIDE.md` for the implemented boundary.
 
 Data races on non-atomic shared storage are forbidden behavior.  The intended
 full model gives atomic scalar and pointer operations relaxed, acquire,
 release, acq_rel, and seq_cst orders; the implemented slice currently validates
-only the load/store order forms described above.  Invalid combinations in that
+the load/store/RMW/CAS forms described above.  Invalid combinations in that
 slice are compile-time errors.  Atomic objects require natural alignment and
 have explicit lifetime rules.  Mixed atomic/non-atomic concurrent access is a
 race.
@@ -32,10 +34,13 @@ lock-free atomics remain allowed when their effects otherwise fit.
 
 The implemented order ABI uses literals `0=relaxed`, `1=acquire`,
 `2=release`, `3=acq_rel`, and `4=seq_cst`. Loads reject release/acq_rel and
-stores reject acquire/acq_rel at compile time. On x86-64, the bounded
+stores reject acquire/acq_rel at compile time. RMW forms accept every literal;
+compare-exchange validates separate success/failure literals, with failure
+limited to relaxed/acquire/seq_cst and no stronger than success. On x86-64, the bounded
 load/store forms use MOV for relaxed/acquire/release and locked transactions
-for seq_cst; this does not establish compiler-wide ordering or a happens-before
-graph. Atomic types are distinct storage types, not a qualifier that can be applied
+for seq_cst, while every RMW/CAS order form intentionally retains its existing
+locked seq_cst-superset lowering; this does not establish compiler-wide ordering
+or a happens-before graph. Atomic types are distinct storage types, not a qualifier that can be applied
 to an ordinary object after concurrent access begins.  They provide load,
 store, exchange, compare-exchange, fetch-add/sub/and/or/xor, and fences for
 the scalar and pointer widths that the target can lower correctly.  A load
