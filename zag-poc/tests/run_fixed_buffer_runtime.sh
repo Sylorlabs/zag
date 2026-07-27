@@ -37,8 +37,25 @@ if (cd "$tmp/stale" && "$ZNC" main.zag -o out --safety=checked --no-zagd) >"$tmp
   set -e
   if [ "$rc" -ne 0 ] && grep -q 'invalid or released Allocation handle' "$tmp/stale/err.log"; then
     echo '  ok  fixed-buffer allocation revalidates released backing at runtime'
+  else
+    echo "  XX  stale fixed-buffer backing runtime result (exit=$rc)"; sed -n '1,12p' "$tmp/stale/log"; sed -n '1,12p' "$tmp/stale/err.log"; exit 1
+  fi
+else
+  echo '  XX  stale fixed-buffer backing harness did not compile'; sed -n '1,20p' "$tmp/stale/log"; exit 1
+fi
+mkdir -p "$tmp/stale-block/std"
+ln -s "$PWD/selfhost/std/allocator.zag" "$tmp/stale-block/std/allocator.zag"
+printf 'name = "fixedbufferstaleblock"\nversion = "0"\nedition = "2027"\n' >"$tmp/stale-block/zag.mod"
+printf '%s\n' '@import("std/allocator.zag") fn work() !i32 { let system:SystemAllocator=system_allocator(); let backing:Allocation=try system.allocate(32,8); let region:i64=_zag_fixed_buffer_init(backing.ptr,backing.len,backing.alignment,backing.generation,backing.allocator_id); let block:i64=_zag_fixed_buffer_allocate(region,1,1); try system.deallocate(backing); let value:i64=_zag_fixed_buffer_read_u8(block,0); return value as i32; } fn main() i32{return work() catch 9;}' >"$tmp/stale-block/main.zag"
+if (cd "$tmp/stale-block" && "$ZNC" main.zag -o out --safety=checked --no-zagd) >"$tmp/stale-block/log" 2>&1 && [ -x "$tmp/stale-block/out" ]; then
+  set +e
+  "$tmp/stale-block/out" >"$tmp/stale-block/out.log" 2>"$tmp/stale-block/err.log"
+  rc=$?
+  set -e
+  if [ "$rc" -ne 0 ] && grep -q 'invalid or released Allocation handle' "$tmp/stale-block/err.log"; then
+    echo '  ok  fixed-buffer block access revalidates released backing at runtime'
     exit 0
   fi
-  echo "  XX  stale fixed-buffer backing runtime result (exit=$rc)"; sed -n '1,12p' "$tmp/stale/log"; sed -n '1,12p' "$tmp/stale/err.log"; exit 1
+  echo "  XX  stale fixed-buffer block runtime result (exit=$rc)"; sed -n '1,12p' "$tmp/stale-block/log"; sed -n '1,12p' "$tmp/stale-block/err.log"; exit 1
 fi
-echo '  XX  stale fixed-buffer backing harness did not compile'; sed -n '1,20p' "$tmp/stale/log"; exit 1
+echo '  XX  stale fixed-buffer block harness did not compile'; sed -n '1,20p' "$tmp/stale-block/log"; exit 1

@@ -37,6 +37,12 @@ invalidating reset, and top-level `deinit`. Aliasing/escape/control-flow
 lifetimes and
 `@noalloc`/`@realtime` qualification remain unsupported.
 
+In checked native output, each block access also revalidates the exact retained
+backing `Allocation` tuple before deriving a byte address. This makes a
+forged/direct intrinsic call after backing release trap instead of reaching
+released storage; it is bounded runtime instrumentation, not a general
+lifetime proof.
+
 ## Status and edition boundary
 
 This is a v2 (`edition = "2027"`) contract, not a description of current v1

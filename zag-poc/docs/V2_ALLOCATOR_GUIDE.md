@@ -74,7 +74,10 @@ lifetime are retired with that old handle and reject before a second free.
 `arena_allocator(...)` remains explicitly rejected. The fixed-buffer slice
 makes no `@noalloc` or `@realtime` claim. Reset advances a compiler-tracked
 generation and rejects every pre-reset block name; runtime also retires the
-old bounded block rows. Exhaustive block/lifetime coverage remains unsupported.
+old bounded block rows. Checked block reads and writes revalidate the exact
+retained backing handle at runtime before deriving an address, so a direct
+intrinsic call after backing release traps. Exhaustive block/lifetime coverage
+remains unsupported.
 There is no special-case fallback or hidden heap path.
 
 ## Required fixed-buffer allocator slice
