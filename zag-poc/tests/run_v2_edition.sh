@@ -1448,6 +1448,26 @@ elif grep -q 'cannot mutate owner `p` while a shared borrow is active' "$tmp/v2-
 else
   echo "  XX  branch-local borrow rejection missing diagnostic"; sed -n '1,8p' "$tmp/v2-borrow-branch-may/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-borrow-loop-may"
+printf 'name = "v2borrowloopmay"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-borrow-loop-may/zag.mod"
+printf 'fn inspect(p:*mut i32) *mut i32 @borrows { return p; } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; while (1 == 0) { let q:*mut i32=inspect(p); } delete(p); return 0; } }\n' >"$tmp/v2-borrow-loop-may/main.zag"
+if (cd "$tmp/v2-borrow-loop-may" && "$ZNC" main.zag -o out) >"$tmp/v2-borrow-loop-may/log" 2>&1 || [ -e "$tmp/v2-borrow-loop-may/out" ]; then
+  echo "  XX  loop-local borrow blocks owner release without artifact"; sed -n '1,8p' "$tmp/v2-borrow-loop-may/log"; fail=$((fail + 1))
+elif grep -q 'cannot mutate owner `p` while a shared borrow is active' "$tmp/v2-borrow-loop-may/log"; then
+  echo "  ok  loop-local borrow blocks owner release without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  loop-local borrow rejection missing diagnostic"; sed -n '1,8p' "$tmp/v2-borrow-loop-may/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-borrow-switch-may"
+printf 'name = "v2borrowswitchmay"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-borrow-switch-may/zag.mod"
+printf 'fn inspect(p:*mut i32) *mut i32 @borrows { return p; } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; switch (1) { 1 => { let q:*mut i32=inspect(p); } else => { } } delete(p); return 0; } }\n' >"$tmp/v2-borrow-switch-may/main.zag"
+if (cd "$tmp/v2-borrow-switch-may" && "$ZNC" main.zag -o out) >"$tmp/v2-borrow-switch-may/log" 2>&1 || [ -e "$tmp/v2-borrow-switch-may/out" ]; then
+  echo "  XX  switch-local borrow blocks owner release without artifact"; sed -n '1,8p' "$tmp/v2-borrow-switch-may/log"; fail=$((fail + 1))
+elif grep -q 'cannot mutate owner `p` while a shared borrow is active' "$tmp/v2-borrow-switch-may/log"; then
+  echo "  ok  switch-local borrow blocks owner release without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  switch-local borrow rejection missing diagnostic"; sed -n '1,8p' "$tmp/v2-borrow-switch-may/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-borrow-aggregate-escape"
 printf 'name = "v2borrowaggregateescape"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-borrow-aggregate-escape/zag.mod"
 printf 'struct Box { ptr:*mut i32 } fn inspect(p:*mut i32) *mut i32 @borrows { return p; } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let box:Box=Box{.ptr=inspect(p)}; delete(p); return 0; } }\n' >"$tmp/v2-borrow-aggregate-escape/main.zag"
