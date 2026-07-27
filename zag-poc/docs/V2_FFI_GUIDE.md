@@ -1,5 +1,10 @@
 # Zag v2 FFI guide (draft)
 
+Zag FFI is an adoption boundary, not a compilation strategy: the compiler
+continues to lower Zag source directly to native code.  Use this surface only
+to replace C incrementally or reach unavoidable platform/library interfaces;
+it never converts Zag source to C or relies on C as a backend.
+
 The complete v2 FFI contract is not implemented. A deliberately narrow
 edition-2027 slice now accepts `extern fn ... @cabi` declarations for scalar
 integers, `bool`, `void`, and raw pointers, and can resolve them through the

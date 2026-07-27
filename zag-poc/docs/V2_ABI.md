@@ -8,6 +8,17 @@ or unverified ownership is unsafe.  ABI lowering must validate layout,
 alignment, register classification, stack alignment, sret, and callback
 trampolines with executable C↔Zag tests.
 
+## Direction and compatibility boundary
+
+Zag is a native compiler: Zag source is compiled directly to its own target
+machine code.  C ABI support is **not** a Zag-to-C translation mode, a C
+backend, or a host-C-toolchain dependency.  Its only purpose is incremental
+adoption: a Zag program may replace a legacy C component while still calling
+the platform and library interfaces that have not yet been replaced, and
+existing C programs may call a deliberately exported Zag boundary.  A
+relocation-bearing object, when implemented, is likewise a linker input/output
+format for that bridge—not a request to re-express Zag source as C.
+
 The default path remains direct static ELF without external tools.  Relocatable
 objects, static archives, shared libraries, dynamic loading, and symbol lookup
 are optional selected modes; no mode may silently introduce a host C compiler
