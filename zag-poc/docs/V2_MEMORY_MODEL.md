@@ -129,6 +129,15 @@ The same direct-local boundary recognizes `try allocator.resize(block, bytes,
 alignment)` as consuming `block` after a successful replacement is bound. The
 replacement remains usable; the old name and direct aliases do not. This is
 not a general interprocedural transfer summary.
+An `@alloc` function may return `Allocation`/`!Allocation` only as a narrow
+proven producer summary: it must be a non-extern function, take no
+`Allocation` parameter, and every explicit return path must directly mint from
+the checked allocator receiver or transitively return another proven `@alloc`
+producer. The annotation alone is not authority; an unproven, foreign, cyclic,
+or mixed return is rejected at the receiving local boundary. This permits
+small allocation factories without permitting an `Allocation` capability to be
+silently copied, echoed, or fabricated. It is still not a general
+interprocedural lifetime or allocator protocol.
 Direct local `Allocation` copies, uncontracted assignment transfers, field
 access, casts, and structural literals are rejected before code generation.
 The current runtime record remains the native backstop for stale handles and
