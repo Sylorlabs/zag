@@ -32,8 +32,11 @@ silently downgrading. Other sanitizer modes remain rejected.
 - `--safety=release` is not implemented and is rejected by the v2 option gate;
   no release-mode check-elision or safety contract exists.
 - `--sanitize=memory` currently enables the same bounded ordinary-allocation
-  provenance checks as `--safety=checked` and fails process exit on a nonzero
-  ordinary-allocation live witness. It does not yet provide red zones,
+  provenance checks as `--safety=checked`, but records each ordinary
+  allocation's exact requested length rather than its class-rounded physical
+  capacity, so a checked raw access into small-block class slack traps at the
+  access site. It also fails process exit on a nonzero ordinary-allocation live
+  witness. It does not yet provide red zones,
   guard pages, allocation-site reports, or custom-allocator tracking. On every
   ordinary free under sanitizer mode it provides deterministic byte poisoning (`0xA5`)
   before the block enters the free list or is unmapped; this is useful evidence

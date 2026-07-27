@@ -562,6 +562,23 @@ if (cd "$tmp/v2-checked-heap-oob" && "$ZNC" main.zag -o out --safety=checked) >"
 else
   echo "  XX  checked safety heap bounds program did not compile"; sed -n '1,8p' "$tmp/v2-checked-heap-oob/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-checked-heap-class-slack"
+printf 'name = "v2checkedheapclassslack"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-heap-class-slack/zag.mod"
+printf 'fn main() i32 { unsafe { let p:*i8=_zag_malloc(1) as *i8; p[1]=7; let value:i8=p[1]; _zag_free(p); return value as i32; } }\n' >"$tmp/v2-checked-heap-class-slack/main.zag"
+if (cd "$tmp/v2-checked-heap-class-slack" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-checked-heap-class-slack/log" 2>&1 && [ -x "$tmp/v2-checked-heap-class-slack/out" ]; then
+  set +e
+  "$tmp/v2-checked-heap-class-slack/out"
+  checked_heap_class_slack_rc=$?
+  set -e
+  if [ "$checked_heap_class_slack_rc" -eq 7 ]; then
+    echo "  ok  checked safety retains physical small-block capacity"
+    pass=$((pass + 1))
+  else
+    echo "  XX  checked safety class capacity witness (exit=$checked_heap_class_slack_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  checked safety class capacity witness did not compile"; sed -n '1,8p' "$tmp/v2-checked-heap-class-slack/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-checked-heap-live"
 printf 'name = "v2checkedheaplive"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-heap-live/zag.mod"
 printf 'fn main() i32 { unsafe { let p:*i8=_zag_malloc(16) as *i8; p[0]=42; let value:i8=p[0]; _zag_free(p); return value as i32; } }\n' >"$tmp/v2-checked-heap-live/main.zag"
@@ -977,6 +994,23 @@ if (cd "$tmp/v2-sanitize-memory" && "$ZNC" main.zag -o out --sanitize=memory) >"
   fi
 else
   echo "  XX  memory sanitizer compiles released-allocation witness"; sed -n '1,10p' "$tmp/v2-sanitize-memory/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-sanitize-memory-logical-oob"
+printf 'name = "v2sanitizememorylogicaloob"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-sanitize-memory-logical-oob/zag.mod"
+printf 'fn main() i32 { unsafe { let p:*i8 = _zag_malloc(1) as *i8; p[1] = 7; _zag_free(p); return 0; } }\n' >"$tmp/v2-sanitize-memory-logical-oob/main.zag"
+if (cd "$tmp/v2-sanitize-memory-logical-oob" && "$ZNC" main.zag -o out --sanitize=memory) >"$tmp/v2-sanitize-memory-logical-oob/log" 2>&1 && [ -x "$tmp/v2-sanitize-memory-logical-oob/out" ]; then
+  set +e
+  "$tmp/v2-sanitize-memory-logical-oob/out" >"$tmp/v2-sanitize-memory-logical-oob/out.log" 2>"$tmp/v2-sanitize-memory-logical-oob/err.log"
+  sanitize_memory_logical_oob_rc=$?
+  set -e
+  if [ "$sanitize_memory_logical_oob_rc" -ne 0 ] && grep -q 'zag safety: allocator pointer access out of bounds' "$tmp/v2-sanitize-memory-logical-oob/err.log"; then
+    echo "  ok  memory sanitizer traps class-slack logical overflow"
+    pass=$((pass + 1))
+  else
+    echo "  XX  memory sanitizer logical bounds witness (exit=$sanitize_memory_logical_oob_rc)"; sed -n '1,8p' "$tmp/v2-sanitize-memory-logical-oob/log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  memory sanitizer logical bounds witness did not compile"; sed -n '1,10p' "$tmp/v2-sanitize-memory-logical-oob/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-sanitize-memory-poison"
 printf 'name = "v2sanitizememorypoison"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-sanitize-memory-poison/zag.mod"
