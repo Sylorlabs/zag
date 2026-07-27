@@ -15,9 +15,10 @@ let block: Allocation = try allocator.allocate(bytes, 8);
 try allocator.deallocate(block);
 ```
 
-The implemented `Allocation` carries a pointer, exact native capacity, chosen
-native alignment, a runtime-minted lifetime generation, and the checked
-allocator identity that minted it. `resize` and `deallocate` first bind that
+The compiler-owned `Allocation` capability carries a pointer, exact native
+capacity, chosen native alignment, a runtime-minted lifetime generation, and
+the checked allocator identity that minted it. These fields are opaque: source
+cannot construct, cast, or read the capability layout. `resize` and `deallocate` first bind that
 identity to their `SystemAllocator` receiver and return `InvalidAllocator` on
 a mismatch, before any provenance validation, allocation, copy, or free. The current native
 surface accepts power-of-two alignment requests 1, 2, 4, and 8; stronger
@@ -28,18 +29,16 @@ invalid base, copied released handle, forged length, wrong alignment, or stale
 generation after address reuse terminates before allocator metadata is touched.
 For named handles and direct local aliases, edition-2027 additionally treats
 `try allocator.deallocate(block)` as an affine consuming terminal: a repeated
-source-level deallocation is rejected before code generation. This is not yet
-an opaque general capability or a proof for arbitrary aliases; exact-record
+source-level deallocation is rejected before code generation. The capability is
+opaque, but this is still not a proof for arbitrary aliases; exact-record
 runtime validation remains required and active.
 The direct receiver form of `try allocator.resize(block, bytes, alignment)`
 also consumes its named old handle on success and preserves the fresh returned
 handle. Helpers and non-local aliases are outside this current source proof.
-Ordinary direct local `Allocation` copies and uncontracted assignments reject
-before code generation. Structural literals remain a temporary runtime-checked
-surface, not an opaque language capability.
-The same exact-tuple check rejects a live cross-handle splice: a second live
-pointer/capacity/alignment combined with another handle's generation or
-allocator identity is not a valid identity.
+Ordinary direct local `Allocation` copies, uncontracted assignments, structural
+literals, field access, and casts reject before code generation. Public checked
+byte access is `allocation_read_u8` and `allocation_write_u8`; neither exposes
+a raw address or descriptor field.
 This requires native x86-64 `--safety=checked`; other targets and unchecked
 builds reject the validation boundary rather than silently weakening it. The
 v2 compiler gate proves that an unchecked call reports that requirement and
@@ -64,8 +63,7 @@ remains a bounded slice rather than a complete custom-allocator capability
 system.
 
 This is not yet the complete allocator model. The generation and allocator
-identity are runtime-checked tokens, but they are not yet opaque language
-capabilities and the public constructor currently exposes only identity `1`;
+identity are opaque runtime-checked tokens and the public constructor currently exposes only identity `1`;
 the checked register boundary rejects forged constructor identities until a
 second allocator family has its own descriptor and lifetime contract.
 Custom allocators remain unimplemented. The fixed-buffer slice
@@ -73,7 +71,8 @@ now permits construction from one named live `Allocation`, named top-level
 `FixedBufferBlock` allocations, checked byte reads/writes, reset with
 generation invalidation, and top-level `deinit` into one fresh named
 `Allocation`. It still rejects aliases, aggregate storage, escapes, and
-control-flow lifetimes. `resize` and
+arbitrary control-flow lifetimes, except for a proven reset loop whose blocks
+cannot cross an iteration. `resize` and
 `allocate_zeroed` are
 implemented for the checked native SystemAllocator: it returns the ordinary
 minted handle after clearing its exact recorded capacity. `resize` validates

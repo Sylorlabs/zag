@@ -2656,6 +2656,9 @@ fn cg_scan_typeof(sc: *ScanCtx, cg: *Cg, n: *Node) []u8 {
                     // ROUND 3: quire builtins carry an aggregate/p32 result type so
                     // a `let q: quire = @quireZero()` is sized as an aggregate here.
                     if (cid.name.len > 0) { if (cid.name[0] == '@') {
+                        if (@strEq(cid.name,"@allocationCreate") || @strEq(cid.name,"@allocationRegionDeinit")) { return "Allocation"; }
+                        if (@strEq(cid.name,"@allocationLen") || @strEq(cid.name,"@allocationAllocatorId")) { return "i64"; }
+                        if (@strEq(cid.name,"@allocationReadU8")) { return "u8"; }
                         let qr: []u8 = cg_quire_builtin_ret(cid.name[1..]);
                         if (qr.len > 0) { return cg_norm_type(qr); }
                         return "";
@@ -2805,6 +2808,13 @@ fn cg_scan_call(cg: *Cg, sc: *ScanCtx, c: Call) void {
             }
             // @cacheAlignedAlloc builds a 2-word {ptr,n} block in the frame.
             if (@strEq(fname[1..], "cacheAlignedAlloc")) { sc.*.words.* = sc.*.words.* + 2; }
+            // Allocation creation materializes its opaque five-word ABI value
+            // directly in the caller frame; byte operations retain three
+            // scalar temporaries across validation and the checked access.
+            if (@strEq(fname[1..], "allocationCreate")) { sc.*.words.* = sc.*.words.* + 5; }
+            if (@strEq(fname[1..], "allocationRegionDeinit")) { sc.*.words.* = sc.*.words.* + 5; }
+            if (@strEq(fname[1..], "allocationReadU8")) { sc.*.words.* = sc.*.words.* + 3; }
+            if (@strEq(fname[1..], "allocationWriteU8")) { sc.*.words.* = sc.*.words.* + 3; }
             // Compiler-lowered thread operations retain their opaque handle and
             // (for spawn) stack mapping across raw syscalls in parent-frame
             // scratch. The child branch never reads these frame slots.
@@ -6196,6 +6206,54 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
         if (order<0) { cg_err(cg,"native: @atomicFence order must be a literal 0..4");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return; }
         if (order!=0) { push[Instr](out,i_mfence()); }
         push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;
+    }
+
+    // Allocation is a compiler-owned affine capability.  These primitives
+    // materialize and consume its five-word ABI record without giving source
+    // code access to the record's fields.  They deliberately reuse the
+    // checked handle registry below: this is direct native lowering, not a
+    // source-to-C compatibility layer.
+    if (@strEq(b,"allocationCreate")) {
+        if(nargs!=4){cg_err(cg,"native: @allocationCreate expects pointer, length, alignment, allocator identity");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;}
+        if(cg.*.safety_checked==0){cg_err(cg,"native: SystemAllocator requires --safety=checked");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;}
+        let result:i32=cg_slot_scratch_n(env,5);
+        cg_lower_expr(out,get[*Node](c.args,0),env,syms,cg);cg_lower_expr(out,get[*Node](c.args,1),env,syms,cg);cg_lower_expr(out,get[*Node](c.args,2),env,syms,cg);cg_lower_expr(out,get[*Node](c.args,3),env,syms,cg);
+        push[Instr](out,i_pop(R_RCX()));push[Instr](out,i_pop(R_RDX()));push[Instr](out,i_pop(R_RSI()));push[Instr](out,i_pop(R_RDI()));
+        push[Instr](out,i_store(R_RBP(),result+0,R_RDI()));push[Instr](out,i_store(R_RBP(),result+8,R_RSI()));push[Instr](out,i_store(R_RBP(),result+16,R_RDX()));push[Instr](out,i_store(R_RBP(),result+32,R_RCX()));
+        cg_emit_alloc_handle_register(out,cg);
+        push[Instr](out,i_store(R_RBP(),result+24,R_RAX()));push[Instr](out,i_lea(R_RAX(),R_RBP(),result));push[Instr](out,i_push(R_RAX()));return;
+    }
+    if (@strEq(b,"allocationValidate") || @strEq(b,"allocationFree") || @strEq(b,"allocationLen") || @strEq(b,"allocationAllocatorId")) {
+        if(nargs!=1){cg_err(cg,"native: allocation handle operation expects one Allocation");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;}
+        if(cg.*.safety_checked==0){cg_err(cg,"native: Allocation requires --safety=checked");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;}
+        cg_lower_expr(out,get[*Node](c.args,0),env,syms,cg);push[Instr](out,i_pop(R_R10()));
+        push[Instr](out,i_load(R_RDI(),R_R10(),0));push[Instr](out,i_load(R_RSI(),R_R10(),8));push[Instr](out,i_load(R_RDX(),R_R10(),16));push[Instr](out,i_load(R_RCX(),R_R10(),24));push[Instr](out,i_load(R_R8(),R_R10(),32));
+        if(@strEq(b,"allocationFree")){push[Instr](out,i_push(R_RDI()));cg_emit_alloc_handle_validate(out,cg);push[Instr](out,i_pop(R_RDI()));cg.*.use_fr=1;push[Instr](out,i_push(R_RDI()));push[Instr](out,i_call(cg.*.fr_lbl));push[Instr](out,i_pop(R_RDI()));cg_emit_alloc_handle_release(out,cg);push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;}
+        if(@strEq(b,"allocationLen")||@strEq(b,"allocationAllocatorId")){if(@strEq(b,"allocationLen")){push[Instr](out,i_push(R_RSI()));}else{push[Instr](out,i_push(R_R8()));}cg_emit_alloc_handle_validate(out,cg);push[Instr](out,i_pop(R_RAX()));push[Instr](out,i_push(R_RAX()));return;}
+        cg_emit_alloc_handle_validate(out,cg);push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;
+    }
+    if (@strEq(b,"allocationReadU8") || @strEq(b,"allocationWriteU8")) {
+        let writing:i32=(@strEq(b,"allocationWriteU8") as i32);let expect:i32=2;if(writing==1){expect=3;}
+        if(nargs!=expect){cg_err(cg,"native: allocation byte operation has wrong arity");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;}
+        if(cg.*.safety_checked==0){cg_err(cg,"native: Allocation requires --safety=checked");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;}
+        let slots:i32=cg_slot_scratch_n(env,3);
+        cg_lower_expr(out,get[*Node](c.args,0),env,syms,cg);push[Instr](out,i_pop(R_RAX()));push[Instr](out,i_store(R_RBP(),slots,R_RAX()));
+        cg_lower_expr(out,get[*Node](c.args,1),env,syms,cg);push[Instr](out,i_pop(R_RAX()));push[Instr](out,i_store(R_RBP(),slots+8,R_RAX()));
+        if(writing==1){cg_lower_expr(out,get[*Node](c.args,2),env,syms,cg);push[Instr](out,i_pop(R_RAX()));push[Instr](out,i_store(R_RBP(),slots+16,R_RAX()));}
+        push[Instr](out,i_load(R_R10(),R_RBP(),slots));push[Instr](out,i_load(R_RDI(),R_R10(),0));push[Instr](out,i_load(R_RSI(),R_R10(),8));push[Instr](out,i_load(R_RDX(),R_R10(),16));push[Instr](out,i_load(R_RCX(),R_R10(),24));push[Instr](out,i_load(R_R8(),R_R10(),32));cg_emit_alloc_handle_validate(out,cg);
+        push[Instr](out,i_load(R_RDI(),R_RBP(),slots));push[Instr](out,i_load(R_RDI(),R_RDI(),0));push[Instr](out,i_mov_rr(R_RAX(),R_RDI()));push[Instr](out,i_load(R_RCX(),R_RBP(),slots+8));push[Instr](out,i_add(R_RAX(),R_RCX()));cg_emit_checked_raw_access(out,cg,1,1);
+        if(writing==1){push[Instr](out,i_load(R_R10(),R_RBP(),slots+16));push[Instr](out,i_store8(R_RAX(),0,R_R10()));push[Instr](out,i_mov_imm(R_RAX(),0));}else{push[Instr](out,i_load8(R_RAX(),R_RAX(),0));}push[Instr](out,i_push(R_RAX()));return;
+    }
+    if (@strEq(b,"allocationRegionInit")) {
+        if(nargs!=1){cg_err(cg,"native: @allocationRegionInit expects one Allocation");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;}
+        if(cg.*.safety_checked==0){cg_err(cg,"native: Allocation region requires --safety=checked");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;}
+        cg_lower_expr(out,get[*Node](c.args,0),env,syms,cg);push[Instr](out,i_pop(R_R10()));push[Instr](out,i_load(R_RDI(),R_R10(),0));push[Instr](out,i_load(R_RSI(),R_R10(),8));push[Instr](out,i_load(R_RDX(),R_R10(),16));push[Instr](out,i_load(R_RCX(),R_R10(),24));push[Instr](out,i_load(R_R8(),R_R10(),32));cg_emit_fixed_region_init(out,cg);push[Instr](out,i_push(R_RAX()));return;
+    }
+    if (@strEq(b,"allocationRegionDeinit")) {
+        if(nargs!=1){cg_err(cg,"native: @allocationRegionDeinit expects one region token");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;}
+        if(cg.*.safety_checked==0){cg_err(cg,"native: Allocation region requires --safety=checked");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;}
+        let result:i32=cg_slot_scratch_n(env,5);cg_lower_expr(out,get[*Node](c.args,0),env,syms,cg);push[Instr](out,i_pop(R_RDI()));cg_emit_fixed_region_take(out,cg);
+        push[Instr](out,i_store(R_RBP(),result+0,R_RDI()));push[Instr](out,i_store(R_RBP(),result+8,R_RSI()));push[Instr](out,i_store(R_RBP(),result+16,R_RDX()));push[Instr](out,i_store(R_RBP(),result+24,R_RCX()));push[Instr](out,i_store(R_RBP(),result+32,R_R8()));push[Instr](out,i_lea(R_RAX(),R_RBP(),result));push[Instr](out,i_push(R_RAX()));return;
     }
 
     // Linux x86-64 futex(2) wait/wake building blocks.  These intentionally
@@ -10675,6 +10733,19 @@ fn cg_emit_fixed_block_byte_address(out:*ArrayList[Instr],cg:*Cg)void{
     // cannot read or write through a released allocation.
     push[Instr](out,i_push(R_RDI()));push[Instr](out,i_push(R_RSI()));push[Instr](out,i_push(R_R10()));push[Instr](out,i_load(R_RDI(),R_R10(),8));push[Instr](out,i_load(R_RSI(),R_R10(),16));push[Instr](out,i_load(R_RDX(),R_R10(),24));push[Instr](out,i_load(R_RCX(),R_R10(),32));push[Instr](out,i_load(R_R8(),R_R10(),40));cg_emit_alloc_handle_validate(out,cg);push[Instr](out,i_pop(R_R10()));push[Instr](out,i_pop(R_RSI()));push[Instr](out,i_pop(R_RDI()));
     push[Instr](out,i_load(R_R9(),R_RDI(),16));push[Instr](out,i_load(R_R8(),R_R10(),56));push[Instr](out,i_cmp(R_R9(),R_R8()));push[Instr](out,i_je(generation));cg_emit_panic(out,"zag allocator: stale fixed-buffer block generation",generation,cg);push[Instr](out,i_label(generation));push[Instr](out,i_cmp_imm(R_RSI(),0));push[Instr](out,i_jge(nonnegative));cg_emit_panic(out,"zag allocator: negative fixed-buffer block index",nonnegative,cg);push[Instr](out,i_label(nonnegative));push[Instr](out,i_load(R_R9(),R_RDI(),32));push[Instr](out,i_cmp(R_RSI(),R_R9()));push[Instr](out,i_jl(inbounds));cg_emit_panic(out,"zag allocator: fixed-buffer block index out of bounds",inbounds,cg);push[Instr](out,i_label(inbounds));push[Instr](out,i_load(R_RAX(),R_R10(),8));push[Instr](out,i_load(R_R9(),R_RDI(),24));push[Instr](out,i_add(R_RAX(),R_R9()));push[Instr](out,i_add(R_RAX(),R_RSI()));
+}
+
+// Consume a region token and recover its exact retained Allocation tuple.
+// The tuple is revalidated before the region becomes inactive; returning it is
+// therefore a move of the original capability, never reconstruction from
+// caller-controlled fields. Inputs: rdi=region token. Outputs: rdi=ptr,
+// rsi=len, rdx=alignment, rcx=generation, r8=allocator identity.
+fn cg_emit_fixed_region_take(out:*ArrayList[Instr],cg:*Cg)void{
+    let found:i32=cg_fresh(cg);let done:i32=cg_fresh(cg);
+    push[Instr](out,i_push(R_RDI()));cg_emit_fixed_region_find(out,cg);push[Instr](out,i_cmp_imm(R_R8(),1));push[Instr](out,i_je(found));cg_emit_panic(out,"zag allocator: inactive fixed-buffer region",found,cg);push[Instr](out,i_label(found));
+    push[Instr](out,i_push(R_R10()));push[Instr](out,i_load(R_RDI(),R_R10(),8));push[Instr](out,i_load(R_RSI(),R_R10(),16));push[Instr](out,i_load(R_RDX(),R_R10(),24));push[Instr](out,i_load(R_RCX(),R_R10(),32));push[Instr](out,i_load(R_R8(),R_R10(),40));cg_emit_alloc_handle_validate(out,cg);push[Instr](out,i_pop(R_R10()));
+    push[Instr](out,i_pop(R_RDI()));push[Instr](out,i_push(R_R10()));cg_emit_fixed_block_retire_region(out,cg);push[Instr](out,i_pop(R_R10()));push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_store(R_R10(),64,R_RAX()));push[Instr](out,i_store(R_R10(),0,R_RAX()));
+    push[Instr](out,i_load(R_RDI(),R_R10(),8));push[Instr](out,i_load(R_RSI(),R_R10(),16));push[Instr](out,i_load(R_RDX(),R_R10(),24));push[Instr](out,i_load(R_RCX(),R_R10(),32));push[Instr](out,i_load(R_R8(),R_R10(),40));push[Instr](out,i_label(done));
 }
 
 // Retire a region only when the caller presents the exact Allocation tuple it

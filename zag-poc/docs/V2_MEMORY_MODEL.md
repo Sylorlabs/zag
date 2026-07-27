@@ -104,17 +104,17 @@ or heap-graph provenance. v1 pointer indexing and `new`/`delete` extensions are
 not evidence that those stronger rules already hold.
 
 The checked native `SystemAllocator` is a separate, deliberately narrow
-allocator-handle boundary. It returns fallible `Allocation` records carrying a
-native pointer, exact reserved capacity, accepted alignment (1, 2, 4, or 8), a
-runtime-minted generation, and the identity of the allocator registry that
-minted the handle. `deallocate` and `resize` validate all of those fields, so
-forged capacity/alignment/identity, copied released handles, and stale handles
-after same-address reuse fail before raw free. It supplies
-`allocate`, `allocate_zeroed`, `resize`, and consuming `deallocate`. It does
-not provide opaque language capabilities, custom allocators, or a
-general static lifetime analysis for allocator values. The separate retained
-fixed-buffer slice is implemented below; it is not a general allocator
-protocol.
+allocator-handle boundary. It returns fallible opaque `Allocation`
+capabilities. The compiler owns their native pointer, exact reserved capacity,
+accepted alignment (1, 2, 4, or 8), runtime-minted generation, and allocator
+registry identity; source cannot construct, cast, or read those fields.
+`deallocate` and `resize` validate the complete hidden identity, so copied
+released handles and stale handles after same-address reuse fail before raw
+free. It supplies `allocate`, `allocate_zeroed`, `resize`, consuming
+`deallocate`, and checked `allocation_read_u8`/`allocation_write_u8`. It does
+not provide custom allocators or a general static lifetime analysis for
+allocator values. The separate retained fixed-buffer slice is implemented
+below; it is not a general allocator protocol.
 For a named `Allocation`, the edition-2027 affine pass also recognizes the
 receiver form `try allocator.deallocate(block)` as a consuming terminal. A
 second deallocation through that name or a direct local alias is rejected
@@ -125,13 +125,11 @@ The same direct-local boundary recognizes `try allocator.resize(block, bytes,
 alignment)` as consuming `block` after a successful replacement is bound. The
 replacement remains usable; the old name and direct aliases do not. This is
 not a general interprocedural transfer summary.
-Direct local `Allocation` copies and uncontracted assignment transfers are
-also rejected before code generation. The record is not opaque yet: a
-structural literal can still reach the checked runtime, where exact-record
-validation rejects forged identity, capacity, alignment, or generation.
-The current runtime record also rejects a live cross-handle field splice when
-its generation or allocator identity belongs to another allocation; this is
-exact-record validation, not language-level opaque ownership. The public
+Direct local `Allocation` copies, uncontracted assignment transfers, field
+access, casts, and structural literals are rejected before code generation.
+The current runtime record remains the native backstop for stale handles and
+same-address reuse; its representation is compiler-owned rather than a public
+descriptor. The public
 `system_allocator()` constructor currently mints only identity `1`; the checked
 register boundary rejects forged constructor identities, so this slice does
 not claim a complete multi-allocator capability system.
@@ -141,8 +139,11 @@ boundary into an unchecked free path.
 `fixed_buffer_allocator(...)` is admitted only through the edition-2027
 retained-owner lifecycle: one named live backing `Allocation`, named top-level
 blocks, checked byte access, reset, and top-level `deinit` returning that exact
-backing. It rejects aliases, escapes, aggregate storage, and control-flow
-lifetimes. `arena_allocator(...)` has the same bounded retained-owner
+backing. It rejects aliases, escapes, aggregate storage, and arbitrary
+control-flow lifetimes. A narrow proven loop may repeatedly allocate an
+ephemeral block, use checked byte access, and reset that same named region;
+this is the bounded arena steady-state and does not let a block cross an
+iteration. `arena_allocator(...)` has the same bounded retained-owner
 discipline with its own `ArenaAllocator`/`ArenaBlock` types; it is a checked
 backing-buffer arena, not a general allocator capability or a raw-pointer
 fallback.

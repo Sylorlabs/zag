@@ -79,7 +79,7 @@ fi
 mkdir -p "$tmp/v2-system-allocator"
 printf 'name = "v2systemallocator"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator/std"
-printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); unsafe { block.ptr[0]=42; let result:i32=block.ptr[0] as i32; try allocator.deallocate(block); return result; } } fn main() i32 { return work() catch 1; }\n' >"$tmp/v2-system-allocator/main.zag"
+printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); try allocation_write_u8(block,0,42); let result:i32=(try allocation_read_u8(block,0)) as i32; try allocator.deallocate(block); return result; } fn main() i32 { return work() catch 1; }\n' >"$tmp/v2-system-allocator/main.zag"
 if (cd "$tmp/v2-system-allocator" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator/log" 2>&1 && [ -x "$tmp/v2-system-allocator/out" ]; then
   set +e
   "$tmp/v2-system-allocator/out"
@@ -114,35 +114,23 @@ mkdir -p "$tmp/v2-system-allocator-forged"
 printf 'name = "v2systemallocatorforged"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-forged/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-forged/std"
 printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let forged:Allocation=Allocation{.ptr=block.ptr,.len=block.len-8,.alignment=block.alignment,.generation=block.generation,.allocator_id=block.allocator_id}; try allocator.deallocate(forged); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-forged/main.zag"
-if (cd "$tmp/v2-system-allocator-forged" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-forged/log" 2>&1 && [ -x "$tmp/v2-system-allocator-forged/out" ]; then
-  set +e
-  "$tmp/v2-system-allocator-forged/out" >"$tmp/v2-system-allocator-forged/out.log" 2>"$tmp/v2-system-allocator-forged/err.log"
-  forged_allocator_rc=$?
-  set -e
-  if [ "$forged_allocator_rc" -ne 0 ] && grep -q 'Allocation length does not match live allocation' "$tmp/v2-system-allocator-forged/err.log"; then
-    echo "  ok  SystemAllocator rejects forged Allocation length at runtime"; pass=$((pass + 1))
-  else
-    echo "  XX  forged SystemAllocator handle (exit=$forged_allocator_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-forged/log"; sed -n '1,8p' "$tmp/v2-system-allocator-forged/err.log"; fail=$((fail + 1))
-  fi
+if (cd "$tmp/v2-system-allocator-forged" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-forged/log" 2>&1 || [ -e "$tmp/v2-system-allocator-forged/out" ]; then
+  echo "  XX  forged Allocation literal compiled or left an artifact"; sed -n '1,16p' "$tmp/v2-system-allocator-forged/log"; fail=$((fail + 1))
+elif grep -q 'Allocation is opaque' "$tmp/v2-system-allocator-forged/log"; then
+  echo "  ok  SystemAllocator rejects forged Allocation literal before codegen"; pass=$((pass + 1))
 else
-  echo "  XX  forged SystemAllocator handle did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-forged/log"; fail=$((fail + 1))
+  echo "  XX  forged Allocation literal rejection missing diagnostic"; sed -n '1,16p' "$tmp/v2-system-allocator-forged/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-system-allocator-forged-alignment"
 printf 'name = "v2systemallocatorforgedalignment"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-forged-alignment/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-forged-alignment/std"
 printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let forged:Allocation=Allocation{.ptr=block.ptr,.len=block.len,.alignment=4,.generation=block.generation,.allocator_id=block.allocator_id}; try allocator.deallocate(forged); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-forged-alignment/main.zag"
-if (cd "$tmp/v2-system-allocator-forged-alignment" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-forged-alignment/log" 2>&1 && [ -x "$tmp/v2-system-allocator-forged-alignment/out" ]; then
-  set +e
-  "$tmp/v2-system-allocator-forged-alignment/out" >"$tmp/v2-system-allocator-forged-alignment/out.log" 2>"$tmp/v2-system-allocator-forged-alignment/err.log"
-  forged_alignment_allocator_rc=$?
-  set -e
-  if [ "$forged_alignment_allocator_rc" -ne 0 ] && grep -q 'Allocation alignment does not match SystemAllocator' "$tmp/v2-system-allocator-forged-alignment/err.log"; then
-    echo "  ok  SystemAllocator rejects forged Allocation alignment at runtime"; pass=$((pass + 1))
-  else
-    echo "  XX  forged SystemAllocator alignment (exit=$forged_alignment_allocator_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-alignment/log"; sed -n '1,8p' "$tmp/v2-system-allocator-forged-alignment/err.log"; fail=$((fail + 1))
-  fi
+if (cd "$tmp/v2-system-allocator-forged-alignment" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-forged-alignment/log" 2>&1 || [ -e "$tmp/v2-system-allocator-forged-alignment/out" ]; then
+  echo "  XX  forged Allocation alignment literal compiled or left an artifact"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-alignment/log"; fail=$((fail + 1))
+elif grep -q 'Allocation is opaque' "$tmp/v2-system-allocator-forged-alignment/log"; then
+  echo "  ok  SystemAllocator rejects forged Allocation alignment literal before codegen"; pass=$((pass + 1))
 else
-  echo "  XX  forged SystemAllocator alignment did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-alignment/log"; fail=$((fail + 1))
+  echo "  XX  forged Allocation alignment rejection missing diagnostic"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-alignment/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-system-allocator-forged-generation"
 printf 'name = "v2systemallocatorforgedgeneration"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-forged-generation/zag.mod"
@@ -151,18 +139,12 @@ ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-forged-generation/std"
 # must not be accepted merely because every individual field came from a valid
 # current handle: identity is the exact live tuple, including generation.
 printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let first:Allocation=try allocator.allocate(24,8); let second:Allocation=try allocator.allocate(64,8); let forged:Allocation=Allocation{.ptr=second.ptr,.len=second.len,.alignment=second.alignment,.generation=first.generation,.allocator_id=second.allocator_id}; try allocator.deallocate(forged); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-forged-generation/main.zag"
-if (cd "$tmp/v2-system-allocator-forged-generation" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-forged-generation/log" 2>&1 && [ -x "$tmp/v2-system-allocator-forged-generation/out" ]; then
-  set +e
-  "$tmp/v2-system-allocator-forged-generation/out" >"$tmp/v2-system-allocator-forged-generation/out.log" 2>"$tmp/v2-system-allocator-forged-generation/err.log"
-  forged_generation_allocator_rc=$?
-  set -e
-  if [ "$forged_generation_allocator_rc" -ne 0 ] && grep -q 'stale Allocation generation' "$tmp/v2-system-allocator-forged-generation/err.log"; then
-    echo "  ok  SystemAllocator rejects live cross-handle generation splice"; pass=$((pass + 1))
-  else
-    echo "  XX  forged SystemAllocator generation splice (exit=$forged_generation_allocator_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-generation/log"; sed -n '1,8p' "$tmp/v2-system-allocator-forged-generation/err.log"; fail=$((fail + 1))
-  fi
+if (cd "$tmp/v2-system-allocator-forged-generation" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-forged-generation/log" 2>&1 || [ -e "$tmp/v2-system-allocator-forged-generation/out" ]; then
+  echo "  XX  forged Allocation generation literal compiled or left an artifact"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-generation/log"; fail=$((fail + 1))
+elif grep -q 'Allocation is opaque' "$tmp/v2-system-allocator-forged-generation/log"; then
+  echo "  ok  SystemAllocator rejects forged Allocation generation literal before codegen"; pass=$((pass + 1))
 else
-  echo "  XX  forged SystemAllocator generation splice did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-generation/log"; fail=$((fail + 1))
+  echo "  XX  forged Allocation generation rejection missing diagnostic"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-generation/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-system-allocator-forged-identity"
 printf 'name = "v2systemallocatorforgedidentity"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-forged-identity/zag.mod"
@@ -172,18 +154,12 @@ ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-forged-identity/std"
 # layer returns its explicit InvalidAllocator error before the runtime registry
 # or free path observes the forged descriptor.
 printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let forged:Allocation=Allocation{.ptr=block.ptr,.len=block.len,.alignment=block.alignment,.generation=block.generation,.allocator_id=block.allocator_id+1}; try allocator.deallocate(forged); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-forged-identity/main.zag"
-if (cd "$tmp/v2-system-allocator-forged-identity" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-forged-identity/log" 2>&1 && [ -x "$tmp/v2-system-allocator-forged-identity/out" ]; then
-  set +e
-  "$tmp/v2-system-allocator-forged-identity/out" >"$tmp/v2-system-allocator-forged-identity/out.log" 2>"$tmp/v2-system-allocator-forged-identity/err.log"
-  forged_identity_allocator_rc=$?
-  set -e
-  if [ "$forged_identity_allocator_rc" -eq 9 ]; then
-    echo "  ok  SystemAllocator rejects forged allocator identity"; pass=$((pass + 1))
-  else
-    echo "  XX  forged SystemAllocator allocator identity (exit=$forged_identity_allocator_rc)"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-identity/log"; sed -n '1,8p' "$tmp/v2-system-allocator-forged-identity/err.log"; fail=$((fail + 1))
-  fi
+if (cd "$tmp/v2-system-allocator-forged-identity" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-forged-identity/log" 2>&1 || [ -e "$tmp/v2-system-allocator-forged-identity/out" ]; then
+  echo "  XX  forged Allocation identity literal compiled or left an artifact"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-identity/log"; fail=$((fail + 1))
+elif grep -q 'Allocation is opaque' "$tmp/v2-system-allocator-forged-identity/log"; then
+  echo "  ok  SystemAllocator rejects forged Allocation identity literal before codegen"; pass=$((pass + 1))
 else
-  echo "  XX  forged SystemAllocator allocator identity did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-identity/log"; fail=$((fail + 1))
+  echo "  XX  forged Allocation identity rejection missing diagnostic"; sed -n '1,16p' "$tmp/v2-system-allocator-forged-identity/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-system-allocator-forged-constructor"
 printf 'name = "v2systemallocatorforgedconstructor"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-forged-constructor/zag.mod"
@@ -296,7 +272,7 @@ fi
 mkdir -p "$tmp/v2-system-allocator-zeroed"
 printf 'name = "v2systemallocatorzeroed"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-zeroed/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-zeroed/std"
-printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let dirty:Allocation=try allocator.allocate(24,8); unsafe { dirty.ptr[0]=77; } try allocator.deallocate(dirty); let zeroed:Allocation=try allocator.allocate_zeroed(24,8); unsafe { let value:i32=zeroed.ptr[0] as i32; try allocator.deallocate(zeroed); return value; } } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-zeroed/main.zag"
+printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let dirty:Allocation=try allocator.allocate(24,8); try allocation_write_u8(dirty,0,77); try allocator.deallocate(dirty); let zeroed:Allocation=try allocator.allocate_zeroed(24,8); let value:i32=(try allocation_read_u8(zeroed,0)) as i32; try allocator.deallocate(zeroed); return value; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-zeroed/main.zag"
 if (cd "$tmp/v2-system-allocator-zeroed" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-zeroed/log" 2>&1 && [ -x "$tmp/v2-system-allocator-zeroed/out" ]; then
   set +e
   "$tmp/v2-system-allocator-zeroed/out"
@@ -313,7 +289,7 @@ fi
 mkdir -p "$tmp/v2-system-allocator-resize"
 printf 'name = "v2systemallocatorresize"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-resize/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-resize/std"
-printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); unsafe { block.ptr[0]=42; } let grown:Allocation=try allocator.resize(block,64,8); unsafe { let value:i32=grown.ptr[0] as i32; try allocator.deallocate(grown); return value; } } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-resize/main.zag"
+printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); try allocation_write_u8(block,0,42); let grown:Allocation=try allocator.resize(block,64,8); let value:i32=(try allocation_read_u8(grown,0)) as i32; try allocator.deallocate(grown); return value; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-resize/main.zag"
 if (cd "$tmp/v2-system-allocator-resize" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-resize/log" 2>&1 && [ -x "$tmp/v2-system-allocator-resize/out" ]; then
   set +e
   "$tmp/v2-system-allocator-resize/out"
@@ -344,7 +320,7 @@ fi
 mkdir -p "$tmp/v2-system-allocator-alignment"
 printf 'name = "v2systemallocatoralignment"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-alignment/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-alignment/std"
-printf '%s\n' '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,4); if ((block.ptr as i64) % 4 != 0) { return 7; } try allocator.deallocate(block); return 42; } fn main() i32 { return work() catch 9; }' >"$tmp/v2-system-allocator-alignment/main.zag"
+printf '%s\n' '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,4); try allocation_write_u8(block,23,42); let value:i32=(try allocation_read_u8(block,23)) as i32; try allocator.deallocate(block); return value; } fn main() i32 { return work() catch 9; }' >"$tmp/v2-system-allocator-alignment/main.zag"
 if (cd "$tmp/v2-system-allocator-alignment" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-alignment/log" 2>&1 && [ -x "$tmp/v2-system-allocator-alignment/out" ]; then
   set +e
   "$tmp/v2-system-allocator-alignment/out"
