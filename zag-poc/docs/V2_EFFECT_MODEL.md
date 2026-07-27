@@ -8,9 +8,12 @@ universe, so `@realtime`/`@pure` callback contracts exclude `Unsafe` as well
 as allocation, I/O, and locking.
 Effects compose by set union.  Capability annotations express exclusions, not
 permissions: `@noalloc` excludes `Alloc`; `@realtime` excludes `Alloc`, `Block`,
-`Lock`, and OS/FFI operations unless specifically approved; `@kernel` excludes
-host-only effects.  Each rejection prints the annotated function, call edge
-chain, and introducing operation.
+`Lock`, and OS/FFI operations unless specifically approved; `@kernel` currently
+excludes the complete implemented host-effect universe (`Alloc`, `Panic`, `IO`,
+`Lock`, `Raises`, and `Unsafe`).  Thus direct printing, raw atomics, and `@cabi`
+calls reject before GPU frontend emission. This is a conservative kernel-entry
+boundary, not a complete device-helper or GPU-effect system. Each rejection
+prints the annotated function, call edge chain, and introducing operation.
 
 Indirect calls are checked against effect-qualified function types.  The
 implemented slice tracks direct function-valued locals, including reassignment
@@ -41,9 +44,10 @@ transfer/dispatch remain visible to realtime, kernel, and sandbox constraints.
 ## Required adversarial checks
 
 The v2 suite now rejects effects introduced through direct calls, a reassigned
-function-valued local, and an opaque aggregate function call, as well as the
-existing callback and pure-contract witnesses.  It still needs adversarial
-coverage for generic instantiation, methods, verified rows for stored function
-values in aggregates, imported externs, device helpers, and runtime intrinsics.
-An unsafe block must not erase `Alloc`, `Block`, `FFI`, or GPU effects; those
-broader checks are not implemented yet.
+function-valued local, an opaque aggregate function call, and direct `IO`,
+atomic, or C-ABI operations in `@kernel`, as well as the existing callback and
+pure-contract witnesses. It still needs adversarial coverage for generic
+instantiation, methods, verified rows for stored function values in aggregates,
+imported externs, device helpers, and runtime intrinsics. An unsafe block must
+not erase `Alloc`, `Block`, `FFI`, or GPU effects; those broader checks are not
+implemented yet.

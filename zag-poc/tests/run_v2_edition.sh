@@ -758,12 +758,12 @@ if (cd "$tmp/v2-cross-target" && "$ZNC" main.zag --target wasm -o main.wasm) >"$
 else
   echo "  XX  WASM preserves unsafe function and block"; sed -n '1,8p' "$tmp/v2-cross-target/wasm.log"; fail=$((fail + 1))
 fi
-printf 'fn unsafeKernel(out: []i32) void @kernel { unsafe { out[0] = 42; } } fn main() void { }\n' >"$tmp/v2-cross-target/gpu.zag"
+printf 'fn safeKernel(out: []i32) void @kernel { out[0] = 42; } fn main() void { }\n' >"$tmp/v2-cross-target/gpu.zag"
 if (cd "$tmp/v2-cross-target" && "$ZNC" gpu.zag --target gpu-amd) >"$tmp/v2-cross-target/gpu.log" 2>&1 &&
    grep -q 'memref.store' "$tmp/v2-cross-target/gpu.mlir"; then
-  echo "  ok  GPU MLIR preserves unsafe block body"; pass=$((pass + 1))
+  echo "  ok  GPU MLIR preserves safe kernel body"; pass=$((pass + 1))
 else
-  echo "  XX  GPU MLIR preserves unsafe block body"; sed -n '1,8p' "$tmp/v2-cross-target/gpu.log"; fail=$((fail + 1))
+  echo "  XX  GPU MLIR preserves safe kernel body"; sed -n '1,8p' "$tmp/v2-cross-target/gpu.log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-pointer"
 printf 'name = "v2pointer"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-pointer/zag.mod"

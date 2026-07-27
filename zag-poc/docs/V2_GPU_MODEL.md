@@ -1,9 +1,11 @@
 # Zag v2 GPU model (draft)
 
-GPU source is not supported merely because it parses or emits MLIR.  `@kernel`
-and `@device` are target-scoped declarations checked against host/device effect
-rules.  Pointer address spaces are host, device/global, workgroup, private,
-and constant/uniform; implicit crossing is forbidden.  Barriers and fences have
+GPU source is not supported merely because it parses or emits MLIR. `@kernel`
+currently rejects every implemented host effect at the semantic boundary, so
+direct I/O, raw atomics, and C-ABI calls fail before frontend emission. `@device`
+helper reachability and distinct GPU effects are not yet modeled. Pointer
+address spaces are host, device/global, workgroup, private, and
+constant/uniform; implicit crossing is forbidden. Barriers and fences have
 specified workgroup/device scope and cannot be used to synchronize host code.
 
 The first operational backend will be an opt-in Vulkan compute runtime.  It

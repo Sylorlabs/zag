@@ -36,6 +36,7 @@ run_gate "mutation-aware aggregate provenance" bash tests/run_v2_aggregate_prove
 run_gate "v2 atomic i64 operations" bash tests/run_v2_atomic_exchange.sh
 run_gate "v2 atomic load/store memory-order validation" bash tests/run_v2_atomic_orders.sh
 run_gate "fail-closed indirect effect boundary" bash tests/run_v2_effect_adversarial.sh
+run_gate "fail-closed kernel host-effect boundary" bash tests/run_v2_kernel_effects.sh
 run_gate "v2 option rejection" bash tests/run_v2_option_rejection.sh
 run_gate "malformed-input crash corpus" bash tests/run_crash_corpus.sh
 run_gate "deterministic fuzz smoke" bash tests/run_fuzz_smoke.sh
@@ -60,7 +61,7 @@ unsupported "volatile/MMIO" "checked native 8/16/32-bit and word transactions ex
 unsupported "atomics and concurrency" "fixed unsafe x86-64 i64 operations plus literal-validated load/store orders exist, but atomic storage, orders on RMW/CAS/fences, threads, and a v2 concurrency model remain incomplete"
 unsupported "C ABI and dynamic linking" "checked v2 @cabi scalar dynamic imports, ELF loading, and a direct captureless scalar/pointer callback to libc qsort exist, but general bidirectional ABI, exports, shared-object conformance, and unload/lifetime contracts are incomplete"
 unsupported "CPU intrinsics/SIMD/inline assembly" "validated x86 scalar intrinsics and bounded unsafe SSE2 i32x4 add exist, but vector types/ABI, additional SIMD, inline-assembly constraints/clobbers, and full target-feature/effect checking are incomplete"
-unsupported "effect adversarial suite" "opaque aggregate/computed indirect calls now fail closed, but verified aggregate rows and Atomic/FFI/GPU effect models remain incomplete"
+unsupported "effect adversarial suite" "opaque aggregate/computed indirect calls and host effects in @kernel now fail closed, but verified aggregate rows, device-helper propagation, and distinct Atomic/FFI/GPU effect models remain incomplete"
 unsupported "physical GPU execution" "no runtime enumerate/allocate/dispatch/readback path"
 unsupported "sanitizers" "bounded native --sanitize=memory exists with deterministic free poisoning, but red zones, guard pages, allocation-site reports, and custom allocator coverage are incomplete"
 unsupported "documentation verification map" "verification matrix exists but records incomplete required capabilities"
