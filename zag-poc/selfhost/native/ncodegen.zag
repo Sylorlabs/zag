@@ -1580,8 +1580,8 @@ fn cg_fn_has_annot(f: FnDecl, annot: []u8) i32 {
 }
 
 // The initial C ABI surface is deliberately narrow: one-word integers, bool,
-// pointers, and void. Aggregates and floats use Zag-native conventions and are
-// rejected until their SysV classification is implemented and tested.
+// pointers, void, and a validated f64 dynamic-import slice. Aggregates and f32
+// use distinct SysV classifications and remain rejected until tested.
 // Callback signatures use only the existing proven integer/pointer register
 // convention.  At the call site a direct captureless Zag function is lowered
 // to its code address, never to the ordinary two-word Zag fat-function block.
@@ -1599,16 +1599,15 @@ fn cg_dynamic_callback_type_ok(t0: []u8) i32 {
     i = 0;
     while (i <= params.len) {
         if (i == params.len || params[i] == ',') {
-            if (i > start && cg_dynamic_abi_type_ok(params[start..i]) == 0) { return 0; }
+            if (i > start && cg_dynamic_scalar_abi_type_ok(params[start..i]) == 0) { return 0; }
             start = i + 1;
         }
         i = i + 1;
     }
-    return cg_dynamic_abi_type_ok(t0[close + 1..]);
+    return cg_dynamic_scalar_abi_type_ok(t0[close + 1..]);
 }
 
-fn cg_dynamic_abi_type_ok(t0: []u8) i32 {
-    if (cg_dynamic_callback_type_ok(t0) == 1) { return 1; }
+fn cg_dynamic_scalar_abi_type_ok(t0: []u8) i32 {
     let t: []u8 = cg_norm_type(t0);
     if (t.len > 0 && t[0] == '*') { return 1; }
     if (@strEq(t, "void") || @strEq(t, "bool")) { return 1; }
@@ -1616,6 +1615,14 @@ fn cg_dynamic_abi_type_ok(t0: []u8) i32 {
     if (@strEq(t, "i32") || @strEq(t, "u32") || @strEq(t, "i64") || @strEq(t, "u64")) { return 1; }
     return 0;
 }
+fn cg_dynamic_import_type_ok(t0: []u8) i32 {
+    let t: []u8 = cg_norm_type(t0);
+    if (cg_dynamic_callback_type_ok(t0) == 1 || cg_dynamic_scalar_abi_type_ok(t) == 1) { return 1; }
+    return (@strEq(t, "f64") as i32);
+}
+fn cg_dynamic_gpr_arg_index(cg:*Cg,fname:[]u8,idx:i32)i32{let count:i32=0;let i:i32=0;while(i<idx){if(@strEq(cg_norm_type(cg_fn_param_type(cg,fname,i)),"f64")==0){count=count+1;}i=i+1;}return count;}
+fn cg_dynamic_f64_arg_index(cg:*Cg,fname:[]u8,idx:i32)i32{let count:i32=0;let i:i32=0;while(i<idx){if(@strEq(cg_norm_type(cg_fn_param_type(cg,fname,i)),"f64")==1){count=count+1;}i=i+1;}return count;}
+fn cg_dynamic_xmm_arg(index:i32)i32{if(index==0){return R_XMM0();}if(index==1){return R_XMM1();}if(index==2){return R_XMM2();}return R_XMM3();}
 
 // ── native-runtime routine indices (label = cg.*.rt_base + index) ────────────
 // One per `_zag_*` extern we implement with raw syscalls. Bodies are emitted at
@@ -8750,7 +8757,10 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
     // ABI requirement — our frame is 16-aligned after the prologue), if the number
     // of stack args is ODD we push one padding word first.
     let nstack: i32 = 0;
-    if (nargs > 6) { nstack = nargs - 6; }
+    if (dynamic_call == 1) {
+        let gpr_args:i32=0;let ai:i32=0;while(ai<nargs){if(@strEq(cg_norm_type(cg_fn_param_type(cg,fname,ai)),"f64")==0){gpr_args=gpr_args+1;}ai=ai+1;}
+        if(gpr_args>6){nstack=gpr_args-6;}
+    } else if (nargs > 6) { nstack = nargs - 6; }
     let pushed: i32 = nstack;
     if (nstack % 2 == 1) {
         push[Instr](out, i_mov_imm(R_RAX(), 0));   // alignment padding
@@ -8759,18 +8769,22 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
     }
     // push stack args in reverse: arg n-1 first … arg 6 last (→ arg6 at [rsp]).
     let s: i32 = nargs - 1;
-    while (s >= 6) {
-        push[Instr](out, i_load(R_RAX(), R_RBP(), get[i32](aslot, s)));
-        push[Instr](out, i_push(R_RAX()));
-        s = s - 1;
+    while (s >= 0) {
+        let stack_arg:i32=0;
+        if(dynamic_call==1){let pty:[]u8=cg_norm_type(cg_fn_param_type(cg,fname,s));if(@strEq(pty,"f64")==0&&cg_dynamic_gpr_arg_index(cg,fname,s)>=6){stack_arg=1;}}
+        else if(s>=6){stack_arg=1;}
+        if(stack_arg==1){push[Instr](out, i_load(R_RAX(), R_RBP(), get[i32](aslot, s)));push[Instr](out, i_push(R_RAX()));}
+        s=s-1;
     }
-    // load args 0..min(nargs,6)-1 into their registers.
-    let r: i32 = 0;
-    let nreg: i32 = nargs;
-    if (nreg > 6) { nreg = 6; }
-    while (r < nreg) {
-        push[Instr](out, i_load(arg_reg(r), R_RBP(), get[i32](aslot, r)));
-        r = r + 1;
+    // Dynamic C calls classify integer and f64 registers independently under
+    // SysV AMD64. Ordinary Zag calls retain their existing all-GPR convention.
+    if(dynamic_call==1){
+        let r:i32=0;while(r<nargs){let pty:[]u8=cg_norm_type(cg_fn_param_type(cg,fname,r));if(@strEq(pty,"f64")==1){let xi:i32=cg_dynamic_f64_arg_index(cg,fname,r);if(xi>=4){cg_err(cg,"native: v2 f64 dynamic import supports at most four f64 arguments");}else{push[Instr](out,i_load(R_RAX(),R_RBP(),get[i32](aslot,r)));push[Instr](out,i_fmovq_gx(cg_dynamic_xmm_arg(xi),R_RAX()));}}else{let gi:i32=cg_dynamic_gpr_arg_index(cg,fname,r);if(gi<6){push[Instr](out,i_load(arg_reg(gi),R_RBP(),get[i32](aslot,r)));}}r=r+1;}
+    }else{
+        let r: i32 = 0;
+        let nreg: i32 = nargs;
+        if (nreg > 6) { nreg = 6; }
+        while (r < nreg) { push[Instr](out, i_load(arg_reg(r), R_RBP(), get[i32](aslot, r))); r = r + 1; }
     }
     // Instruction emission has consumed every compiler-side arg-slot index.
     // The machine code uses frame offsets, never this host-side array.
@@ -8802,6 +8816,7 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
     } else {
         push[Instr](out, i_call(lbl));
     }
+    if(dynamic_index>=0&&@strEq(cg_norm_type(rt),"f64")==1){push[Instr](out,i_fmovq_xg(R_RAX(),R_XMM0()));}
     // reclaim the stack args + padding we pushed (rsp += 8*pushed).
     if (pushed > 0) {
         push[Instr](out, i_add_imm(R_RSP(), (8 * pushed) as i64));
@@ -13627,14 +13642,21 @@ fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *Ar
                         _zag_eprintln("native: v2 @cabi imports require --dynamic and an explicit --needed SONAME");
                         top_err = top_err + 1;
                     } else if ((dynamic_mode == 1 || object_mode == 1) && cg_starts_with(f.name, "_zag_") == 0 && (v2_edition == 0 || cg_fn_has_annot(f, "@cabi") == 1)) {
-                        let abi_ok: i32 = cg_dynamic_abi_type_ok(f.ret);
+                        let abi_ok: i32 = cg_dynamic_scalar_abi_type_ok(f.ret);
+                        if (v2_edition == 1 && dynamic_mode == 1) { abi_ok = cg_dynamic_import_type_ok(f.ret); }
+                        let fp_args:i32=0;
                         let ap: i32 = 0;
                         while (ap < len[Param](f.params)) {
-                            if (cg_dynamic_abi_type_ok(get[Param](f.params, ap).pty) == 0) { abi_ok = 0; }
+                            let pty:[]u8=get[Param](f.params,ap).pty;
+                            let param_ok:i32=cg_dynamic_scalar_abi_type_ok(pty);
+                            if(v2_edition==1&&dynamic_mode==1){param_ok=cg_dynamic_import_type_ok(pty);}
+                            if (param_ok == 0) { abi_ok = 0; }
+                            if(@strEq(cg_norm_type(pty),"f64")){fp_args=fp_args+1;}
                             ap = ap + 1;
                         }
+                        if(fp_args>4){abi_ok=0;}
                         if (abi_ok == 0) {
-                            _zag_eprintln("native: dynamic extern ABI supports only scalar integers, bool, pointers, and void");
+                            _zag_eprintln("native: dynamic extern ABI supports scalar integers, bool, pointers, void, and up to four v2 f64 arguments");
                             top_err = top_err + 1;
                         } else {
                             let already: i32 = 0;

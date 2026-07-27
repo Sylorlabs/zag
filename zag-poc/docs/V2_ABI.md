@@ -51,22 +51,25 @@ resolution semantics have tests.
 
 ## Current status
 
-The implemented v2 ABI slice is an unsafe scalar/pointer `extern fn ... @cabi`
-import through the native x86-64 dynamic ELF writer, plus a tightly bounded
+The implemented v2 ABI slice is an unsafe scalar/pointer plus `f64` `extern fn ... @cabi`
+import through the native x86-64 dynamic ELF writer. The `f64` form permits up
+to four `f64` arguments, each mapped to `XMM0` through `XMM3`; it is not an
+object-export, `f32`, aggregate, or callback-float ABI. The tree also has a tightly bounded
 callback form: a foreign parameter written as `fn(P...) R` may receive only a
 direct, non-generic, captureless named Zag function with the exact same
 scalar/pointer signature. The lowering passes that function's raw SysV code
 address, not Zag's ordinary `{code, environment}` function value. Aliases,
-closures/captures, floats, aggregates, variadics, callbacks returned from C,
+closures/captures, `f32`, aggregates, variadics, callbacks returned from C,
 and callback ownership/unload contracts remain rejected or unimplemented.
 Any pointer argument given to such an import still requires an explicit
 `@borrows`/`@borrows_mut`/`@consumes` lifetime contract; the qsort witness uses
 `@borrows_mut` for its in-place buffer.
 Executable evidence covers both a no-argument integer import, a six-register
-mixed integer/pointer `mmap` import followed by pointer-return `munmap`, and a
+mixed integer/pointer `mmap` import followed by pointer-return `munmap`, a
+one/two/mixed-register `f64` libm import, and a
 fixed seven-word scalar call whose seventh `mmap` offset is consumed from the
 SysV stack, plus libc `qsort` calling a Zag comparator; this does not extend
-the supported surface to aggregates, floats, general callbacks, variadics,
+the supported surface to aggregates, `f32`, general callbacks, variadics,
 exports, or imports with ownership/lifetime contracts.
 
 There is one deliberately narrow outbound v2 surface: an edition-2027

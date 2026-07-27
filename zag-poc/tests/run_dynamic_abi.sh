@@ -49,7 +49,7 @@ if "$ZNC_BIN" "$WORK/float.zag" --dynamic --needed libm.so.6 \
     --no-analyze -o "$WORK/float" >"$WORK/float.log" 2>&1; then
     bad "unsupported float ABI accepted"
 else
-    grep -q 'supports only scalar integers' "$WORK/float.log" && ok "unsupported ABI class rejected" || bad "missing ABI rejection diagnostic"
+    grep -q 'dynamic extern ABI supports scalar integers' "$WORK/float.log" && ok "legacy float ABI remains rejected without @cabi" || bad "missing ABI rejection diagnostic"
 fi
 
 # Edition-2027 foreign calls require an explicit C-ABI contract and an unsafe
@@ -65,6 +65,21 @@ if (cd "$WORK/v2-cabi" && "$ZNC_BIN" main.zag --dynamic --needed libc.so.6 --no-
 else
     bad "v2 @cabi dynamic import build"
     sed -n '1,16p' "$WORK/v2-cabi/build.log"
+fi
+
+# SysV AMD64 places f64 arguments and results in independent XMM registers.
+# Exercise one, two, and mixed f64/GPR imports through libm; Zag still emits
+# the dynamic ELF and native call sequence itself, with libm only at the
+# declared C boundary.
+printf 'name = "v2cabif64"\nversion = "0"\nedition = "2027"\n' >"$WORK/v2-cabi/zag.mod"
+printf 'extern fn cos(x:f64) f64 @cabi; extern fn pow(x:f64,y:f64) f64 @cabi; extern fn ldexp(x:f64,n:i32) f64 @cabi; fn main() i32 { unsafe { let a:f64=cos(0.0); let b:f64=pow(2.0,3.0); let c:f64=ldexp(1.5,2); if(a>0.99&&b>7.99&&c>5.99){return 42;} return 1; } }\n' >"$WORK/v2-cabi/main.zag"
+if (cd "$WORK/v2-cabi" && "$ZNC_BIN" main.zag --dynamic --needed libm.so.6 --no-zagd --no-analyze -o f64) >"$WORK/v2-cabi/f64.log" 2>&1 && [ -x "$WORK/v2-cabi/f64" ]; then
+    "$WORK/v2-cabi/f64"
+    rc=$?
+    [ "$rc" = 42 ] && ok "v2 @cabi f64 XMM imports execute" || bad "v2 @cabi f64 import exit=$rc"
+else
+    bad "v2 @cabi f64 dynamic import build"
+    sed -n '1,20p' "$WORK/v2-cabi/f64.log"
 fi
 
 # Exercise the implemented six-register scalar/pointer C-ABI path rather than
