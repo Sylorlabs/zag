@@ -41,11 +41,16 @@ require_macho_arm64 "$tmpdir/znc-gen1"
 require_signed "$tmpdir/znc-gen1"
 echo "  ok  signed Mach-O arm64 self-host compiler"; pass=$((pass + 1))
 
-# A compiler executing natively on Darwin must reproduce itself exactly.
+# The first generated compiler incorporates the current source graph and can
+# differ from the trusted seed.  The next two native stages must be identical:
+# this is the same fixed-point criterion used by bootstrap.sh.
 "$tmpdir/znc-gen1" selfhost/native/znc.zag --target macos-arm64 --no-zagd --no-analyze --no-foreground-cache -o "$tmpdir/znc-gen2"
 require_macho_arm64 "$tmpdir/znc-gen2"
 require_signed "$tmpdir/znc-gen2"
-cmp -s "$tmpdir/znc-gen1" "$tmpdir/znc-gen2"
+"$tmpdir/znc-gen2" selfhost/native/znc.zag --target macos-arm64 --no-zagd --no-analyze --no-foreground-cache -o "$tmpdir/znc-gen3"
+require_macho_arm64 "$tmpdir/znc-gen3"
+require_signed "$tmpdir/znc-gen3"
+cmp -s "$tmpdir/znc-gen2" "$tmpdir/znc-gen3"
 echo "  ok  native Darwin self-host fixpoint"; pass=$((pass + 1))
 
 # Exercise the signer independently of the compiler-sized artifact.
