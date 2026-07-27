@@ -38,6 +38,7 @@ run_gate "fixed-buffer checked runtime authority" bash tests/run_fixed_buffer_ru
 run_gate "retained arena allocator authority" bash tests/run_arena_allocator.sh
 run_gate "v2 atomic i64 operations" bash tests/run_v2_atomic_exchange.sh
 run_gate "v2 atomic load/store memory-order validation" bash tests/run_v2_atomic_orders.sh
+run_gate "compiler-reserved AtomicI64 storage" bash tests/run_v2_atomic_storage.sh
 run_gate "validated Linux futex wait/wake boundary" bash tests/run_x86_atomic_futex.sh
 run_gate "validated Linux thread spawn/join boundary" bash tests/run_x86_thread_spawn.sh
 run_gate "fail-closed indirect effect boundary" bash tests/run_v2_effect_adversarial.sh
@@ -65,7 +66,7 @@ run_gate "validated x86 SSE2 SIMD add" bash tests/run_x86_simd_add_i32x4.sh
 unsupported "pointer and memory model" "raw pointer categories and lexical checks exist, but provenance/alignment/lifetime instrumentation is incomplete"
 unsupported "allocator and reclamation" "checked native SystemAllocator handles and bounded retained fixed-buffer/arena regions exist, but opaque language capabilities, custom/debug allocators, and a general lifetime model are incomplete"
 unsupported "volatile/MMIO" "checked native 8/16/32-bit and word transactions plus bounded byte MmioRegion access exist, but physical device validation, opaque hardware authority, and the complete MMIO contract are incomplete"
-unsupported "atomics and concurrency" "fixed unsafe x86-64 i64 operations, raw Linux i32 futex wait/wake, literal-validated load/store/RMW/CAS/fence orders, and a direct captureless join-only Linux thread slice exist, but atomic storage, language-wide fence semantics, general thread arguments/detach, litmus evidence, and a v2 concurrency model remain incomplete"
+unsupported "atomics and concurrency" "compiler-reserved unsafe AtomicI64 receiver operations, raw Linux i32 futex wait/wake, literal-validated load/store/RMW/CAS/fence orders, and a direct captureless join-only Linux thread slice exist, but language-wide fence semantics, general thread arguments/detach, litmus evidence, and a v2 concurrency model remain incomplete"
 unsupported "C ABI and dynamic linking" "checked v2 @cabi scalar dynamic imports, a direct captureless scalar/pointer callback, and scalar @cabi_export ET_REL objects with self-contained output or direct PLT32 import relocations exist, but general bidirectional ABI, relocation/static archive/shared-object conformance, and unload/lifetime contracts are incomplete"
 unsupported "CPU intrinsics/SIMD/inline assembly" "validated x86 scalar intrinsics and bounded unsafe SSE2 i32x4 add exist, but vector types/ABI, additional SIMD, inline-assembly constraints/clobbers, and full target-feature/effect checking are incomplete"
 unsupported "effect adversarial suite" "opaque aggregate/computed indirect calls and host effects in @kernel now fail closed, but verified aggregate rows, device-helper propagation, and distinct Atomic/FFI/GPU effect models remain incomplete"

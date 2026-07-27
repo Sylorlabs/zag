@@ -1,6 +1,16 @@
 # Zag v2 concurrency guide (draft)
 
-The current v2 public atomic slice is intentionally nine fixed-order
+The current v2 public atomic slice has compiler-reserved `AtomicI64` storage
+plus intentionally bounded raw-pointer operations. `AtomicI64` is opaque,
+initialized as `let a:AtomicI64=@atomicI64(0);` or as a zeroed
+`global let a:AtomicI64;`. Inside `unsafe`, it exposes only
+`load(order)`, `store(value, order)`, `exchange(value, order)`,
+`fetch_add/sub/and/or/xor(value, order)`, and
+`compare_exchange(expected, desired, success, failure)`. Source cannot read,
+write, copy, take the address of, cast, embed, pass, or return this storage.
+It lowers directly to the same native x86-64 transactions as the raw API.
+
+The legacy raw v2 atomic slice remains intentionally nine fixed-order
 operations: `@atomicLoad64(ptr: *const/*mut i64) i64`,
 `@atomicStore64(ptr: *mut i64, value: i64) void`, and
 `@atomicExchange64(ptr: *mut i64, value: i64) i64`, plus
@@ -54,7 +64,7 @@ to shared `FUTEX_WAIT`; wake maps to shared `FUTEX_WAKE`; both return the raw
 kernel result, including negative errno values. There is deliberately no
 implicit retry, timeout conversion, ownership handoff, or memory-order claim.
 These primitives are useful native building blocks, but they do not establish
-atomic storage, a happens-before relation, race freedom, or a supported
+a general happens-before relation, race freedom, or a supported
 threading API.
 
 The first public thread boundary is Linux/x86-64 native only:
@@ -71,8 +81,8 @@ used again. `tests/run_x86_thread_spawn.sh` uses `strace -f` to observe actual
 rejecting safe-scope spawn/join, wrong worker/handle shapes, `@pure` use, and
 an unjoined handle.
 
-This is not a general atomic or concurrency API: there are no atomic storage
-types, worker arguments/returns, detach, mutexes, condition variables, TLS,
+This is not a general atomic or concurrency API: `AtomicI64` is only a bounded
+native storage primitive; there are no general atomic types, worker arguments/returns, detach, mutexes, condition variables, TLS,
 or race detector. The raw
 pointer's allocation, lifetime, sharing, and absence of mixed atomic/non-atomic
 access remain the caller's unsafe contract. `@volatileLoad`/`@volatileStore`

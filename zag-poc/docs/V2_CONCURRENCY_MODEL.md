@@ -12,8 +12,9 @@ the suffixed RMW order forms, and
 `@atomicCompareExchange64Order(ptr, expected, desired, success, failure)`, and
 `@atomicFence(order)`. The fence accepts the same literal order ABI: relaxed is
 a no-op, and every non-relaxed order lowers conservatively to a full hardware
-fence. Storage types, threads, and litmus evidence remain
-release blockers. See
+fence. Compiler-reserved `AtomicI64` storage now exists for a deliberately
+narrow receiver-only native slice; threads and litmus evidence remain release
+blockers. See
 `docs/V2_CONCURRENCY_GUIDE.md` for the implemented boundary.
 
 Edition-2027 Linux/x86-64 also has two deliberately narrow futex building
@@ -21,9 +22,9 @@ blocks: `@atomicWait32(ptr: *const/*mut/*host i32, expected: i32) i64` and
 `@atomicWake32(ptr: *const/*mut/*host i32, count: i32) i64`. They issue the
 shared `futex(2)` WAIT/WAKE operations and return the raw kernel result. They
 are unsafe, require a non-null four-byte-aligned host word, and do not supply
-atomic storage, a memory order, retry policy, ownership transfer, or a thread
-API. In particular, a caller must not infer a happens-before edge merely from
-these operations until the language model and typed atomic storage exist.
+a memory order, retry policy, ownership transfer, or a thread API. In
+particular, a caller must not infer a happens-before edge merely from these
+operations; `AtomicI64` does not yet make that general language-model claim.
 
 Data races on non-atomic shared storage are forbidden behavior.  The intended
 full model gives atomic scalar and pointer operations relaxed, acquire,
@@ -51,10 +52,13 @@ limited to relaxed/acquire/seq_cst and no stronger than success. On x86-64, the 
 load/store forms use MOV for relaxed/acquire/release and locked transactions
 for seq_cst, while every RMW/CAS order form intentionally retains its existing
 locked seq_cst-superset lowering; this does not establish compiler-wide ordering
-or a happens-before graph. Atomic storage types are planned but not implemented.
-The current operations accept unsafe raw `i64` pointers only; they do not
-convert an ordinary object into language-level atomic storage or make mixed
-atomic/non-atomic access safe. A load cannot use release, a store cannot use
+or a happens-before graph. `AtomicI64` is compiler-reserved, one-word opaque
+storage initialized locally with `@atomicI64(i64)` or as a zeroed global. Its
+unsafe receiver operations are `load`, `store`, `exchange`, `fetch_add`,
+`fetch_sub`, `fetch_and`, `fetch_or`, `fetch_xor`, and `compare_exchange`.
+It cannot be read, copied, assigned, addressed, cast, embedded, passed, or
+returned. The legacy operations accept unsafe raw `i64` pointers only; neither
+API makes mixed atomic/non-atomic access safe. A load cannot use release, a store cannot use
 acquire, and an invalid ordering is a compile-time error. `compare_exchange`
 specifies separate success and failure orders, with failure no stronger than
 success and never release/acq_rel.
@@ -90,7 +94,7 @@ Linux/x86-64 native output now has a bounded unsafe `@threadSpawn(worker)` /
 worker and returns an affine `*opaque` handle; join consumes that handle after
 the kernel clears its TID and wakes the futex. This establishes a real kernel
 completion boundary for the worker and join result, but does not yet model
-worker arguments, detach, mutexes, condition variables, TLS, atomic storage,
+worker arguments, detach, mutexes, condition variables, TLS, general atomic storage,
 or general source-level happens-before/race freedom. `selfhost/native/thread_rt.zag`
 remains an unintegrated historical sketch and is not evidence of support.
 Every future stress test must have a timeout and report timeout separately from

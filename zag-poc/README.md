@@ -119,8 +119,9 @@ release. Its matrix and executable gate are in
 [docs/V2_FINAL_VERIFICATION.md](docs/V2_FINAL_VERIFICATION.md) and
 `tests/run_v2_release_gate.sh`; required unsupported rows deliberately keep
 that gate failing until their implementation and execution evidence exist. The
-latest isolated run (2026-07-27) is 35 passing executable categories and 10 required failures; this is
-not a C replacement or a production-v2 claim yet. The passing slices include
+the release gate is intentionally fail-closed while required capability rows
+remain unsupported; it is not a C replacement or a production-v2 claim yet.
+The passing slices include
 checked native word and byte volatile transactions, fixed unsafe i64 atomic
 load/store/exchange/compare-exchange/fetch-add/sub/and/or/xor operations, bounded Linux futex wait/wake building blocks, a guarded direct-worker Linux spawn/join boundary, scalar `@cabi` dynamic imports, validated x86
 POPCNT/ANDN/trailing-zero intrinsics, and bounded native memory sanitizer
@@ -128,9 +129,11 @@ coverage. General atomics/concurrency, pointer/allocator lifetime, full C ABI,
 SIMD/assembly, and physical GPU execution remain explicitly fail-closed; unsupported
 native object, static, and shared-object requests also fail closed rather than
 silently producing the wrong artifact. The
-atomic slice accepts i64 transaction values plus a separate raw i32 futex word
-boundary and a Linux/x86-64 unsafe join-only worker slice; it is not a general
-memory-order or threading model.
+atomic slice has compiler-reserved `AtomicI64` storage with unsafe receiver-only
+operations, plus legacy raw i64 pointer transactions, a separate raw i32 futex
+word boundary, and a Linux/x86-64 unsafe join-only worker slice; it is not a
+general memory-order or threading model. The passing count is refreshed only by
+an authoritative post-bootstrap release-gate run.
 Its current checked native x86-64 allocator slice is
 [`SystemAllocator`](docs/V2_ALLOCATOR_GUIDE.md): fallible allocate, zeroed
 allocate, resize, and deallocate use capacity/alignment/generation-validated
