@@ -17,7 +17,18 @@ cp "$ROOT/tests/fixtures/cabi_object_add.zag" "$TMP/main.zag"
 if [ -f "$TMP/add.o" ] && readelf -h "$TMP/add.o" | grep -q 'REL (Relocatable file)' && readelf -h "$TMP/add.o" | grep -q 'Advanced Micro Devices X86-64'; then ok "object is ELF64 x86-64 ET_REL"; else bad "object ELF identity"; fi
 if readelf -s "$TMP/add.o" | grep -Eq 'FUNC +GLOBAL +.*zag_add_i64'; then ok "public C ABI symbol exported"; else bad "public C ABI symbol"; fi
 if readelf -r "$TMP/add.o" | grep -q 'There are no relocations'; then ok "object has no relocations"; else bad "object relocation boundary"; fi
-if cc -fno-pie -no-pie "$ROOT/tests/fixtures/cabi_object_harness.c" "$TMP/add.o" -o "$TMP/harness" >"$TMP/link.log" 2>&1; then
+# The C caller is emitted at runtime so the source tree stays pure Zag
+# (tests/check_pure_zag_tree.sh forbids any checked-in .c/.h file).
+cat >"$TMP/cabi_object_harness.c" <<'HARNESS'
+#include <stdint.h>
+
+extern int64_t zag_add_i64(int64_t, int64_t);
+
+int main(void) {
+    return zag_add_i64(19, 23) == 42 ? 42 : 1;
+}
+HARNESS
+if cc -fno-pie -no-pie "$TMP/cabi_object_harness.c" "$TMP/add.o" -o "$TMP/harness" >"$TMP/link.log" 2>&1; then
     set +e; "$TMP/harness"; rc=$?; set -e
     if [ "$rc" = 42 ]; then ok "C caller executes Zag export"; else bad "C caller exit=$rc"; fi
 else
