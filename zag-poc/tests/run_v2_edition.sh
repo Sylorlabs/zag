@@ -52,6 +52,16 @@ if (cd "$tmp/v2-error-aggregate" && "$ZNC" main.zag -o out) >"$tmp/v2-error-aggr
 else
   echo "  XX  aggregate error-union payload compiles"; sed -n '1,12p' "$tmp/v2-error-aggregate/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-system-allocator-helper-return"
+printf 'name = "v2systemallocatorhelperreturn"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-helper-return/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-helper-return/std"
+printf '@import("std/allocator.zag") fn make(allocator:SystemAllocator) !Allocation @alloc { return try allocator.allocate(24,8); } fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try make(allocator); try allocator.deallocate(block); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-helper-return/main.zag"
+if (cd "$tmp/v2-system-allocator-helper-return" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-helper-return/log" 2>&1 && [ -x "$tmp/v2-system-allocator-helper-return/out" ]; then
+  "$tmp/v2-system-allocator-helper-return/out"
+  if [ $? -eq 0 ]; then echo "  ok  declared allocation helper returns one affine capability"; pass=$((pass + 1)); else echo "  XX  declared allocation helper execution"; fail=$((fail + 1)); fi
+else
+  echo "  XX  declared allocation helper return"; sed -n '1,12p' "$tmp/v2-system-allocator-helper-return/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-system-allocator-unchecked"
 printf 'name = "v2systemallocatorunchecked"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-unchecked/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-unchecked/std"
