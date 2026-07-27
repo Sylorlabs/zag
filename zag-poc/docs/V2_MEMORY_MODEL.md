@@ -31,9 +31,10 @@ rejects allocator calls unless a statically identified fixed-buffer allocator
 is used and its operation is proven nonblocking.
 
 Current implementation note: this is a target contract, not a present effect
-claim. Edition 2027 admits only a fixed-buffer retained-owner handoff
-(`fixed_buffer_allocator(backing)` followed by top-level `deinit`); block
-allocation, reset, and `@noalloc`/`@realtime` qualification remain unsupported.
+claim. Edition 2027 admits a linear fixed-buffer retained-owner slice:
+construction, named block allocation, checked byte reads/writes, and top-level
+`deinit`. Reset, aliasing/escape/control-flow lifetimes, and
+`@noalloc`/`@realtime` qualification remain unsupported.
 
 ## Status and edition boundary
 

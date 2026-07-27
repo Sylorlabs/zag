@@ -57,12 +57,12 @@ identity are runtime-checked tokens, but they are not yet opaque language
 capabilities and the public constructor currently exposes only identity `1`;
 the checked register boundary rejects forged constructor identities until a
 second allocator family has its own descriptor and lifetime contract.
-Custom allocators and arenas are still unimplemented. A deliberately narrow
-fixed-buffer retained-owner handoff is implemented, but it is not a usable
-fixed-buffer allocation API: it permits construction from one named live
-`Allocation` and a top-level `deinit` into one fresh named `Allocation`, then
-rejects blocks, `allocate`, `reset`, aliases, aggregate storage, escapes, and
-control-flow lifetimes. `resize` and `allocate_zeroed` are
+Custom allocators and arenas are still unimplemented. The fixed-buffer slice
+now permits construction from one named live `Allocation`, named top-level
+`FixedBufferBlock` allocations, checked byte reads/writes, and top-level
+`deinit` into one fresh named `Allocation`. It still rejects `reset`, aliases,
+aggregate storage, escapes, and control-flow lifetimes. `resize` and
+`allocate_zeroed` are
 implemented for the checked native SystemAllocator: it returns the ordinary
 minted handle after clearing its exact recorded capacity. `resize` validates
 the old handle, allocates the replacement first, copies the overlap, then
@@ -70,11 +70,11 @@ consumes the old handle; a fallible replacement allocation therefore leaves the
 old handle live. On a successful resize, copied descriptors from the old
 lifetime are retired with that old handle and reject before a second free.
 
-`arena_allocator(...)` remains explicitly rejected. The fixed-buffer handoff
-does not allocate or reset and therefore makes no `@noalloc` or `@realtime`
-claim. The runtime descriptors are bounded checked metadata, but no executable
-exhaustion/reset proof exists yet; there is no special-case fallback or hidden
-heap path in the admitted construction/deinit sequence.
+`arena_allocator(...)` remains explicitly rejected. The fixed-buffer slice
+makes no `@noalloc` or `@realtime` claim. Its runtime descriptors are bounded
+checked metadata: reset-row reuse and stale-backing rejection are executed, but
+public reset semantics and exhaustive block/lifetime coverage remain
+unsupported. There is no special-case fallback or hidden heap path.
 
 ## Required fixed-buffer allocator slice
 
