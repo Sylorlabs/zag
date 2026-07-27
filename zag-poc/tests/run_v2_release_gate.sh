@@ -68,7 +68,7 @@ unsupported "C ABI and dynamic linking" "checked v2 @cabi scalar dynamic imports
 unsupported "CPU intrinsics/SIMD/inline assembly" "validated x86 scalar intrinsics and bounded unsafe SSE2 i32x4 add exist, but vector types/ABI, additional SIMD, inline-assembly constraints/clobbers, and full target-feature/effect checking are incomplete"
 unsupported "effect adversarial suite" "opaque aggregate/computed indirect calls and host effects in @kernel now fail closed, but verified aggregate rows, device-helper propagation, and distinct Atomic/FFI/GPU effect models remain incomplete"
 unsupported "physical GPU execution" "no runtime enumerate/allocate/dispatch/readback path"
-unsupported "sanitizers" "bounded native --sanitize=memory has exact requested-length bounds and deterministic free poisoning, but red zones, guard pages, allocation-site reports, and custom allocator coverage are incomplete"
+unsupported "sanitizers" "bounded native --sanitize=memory has exact requested-length bounds, deterministic free poisoning, and a coarse trailing guard page for dedicated large allocations, but red zones, allocation-site reports, and custom allocator coverage are incomplete"
 unsupported "documentation verification map" "verification matrix exists but records incomplete required capabilities"
 
 echo "════ v2-release pass=$pass fail=$fail ════"
