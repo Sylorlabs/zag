@@ -107,9 +107,11 @@ runtime-minted generation, and the identity of the allocator registry that
 minted the handle. `deallocate` and `resize` validate all of those fields, so
 forged capacity/alignment/identity, copied released handles, and stale handles
 after same-address reuse fail before raw free. It supplies
-`allocate`, `allocate_zeroed`, `resize`, and consuming `deallocate`; it does
-not provide opaque language capabilities, custom/arena/fixed-buffer allocators,
-or a general static lifetime analysis for allocator values.
+`allocate`, `allocate_zeroed`, `resize`, and consuming `deallocate`. It does
+not provide opaque language capabilities, custom or arena allocators, or a
+general static lifetime analysis for allocator values. The separate retained
+fixed-buffer slice is implemented below; it is not a general allocator
+protocol.
 The current runtime record also rejects a live cross-handle field splice when
 its generation or allocator identity belongs to another allocation; this is
 exact-record validation, not language-level opaque ownership. The public
@@ -119,9 +121,12 @@ not claim a complete multi-allocator capability system.
 Its compiler-private register, validate, and free hooks also reject outside
 checked mode; importing the allocator module cannot silently weaken that handle
 boundary into an unchecked free path.
-The reserved `fixed_buffer_allocator(...)` and `arena_allocator(...)` spellings
-therefore reject with a lifetime-contract diagnostic rather than falling back
-to an uncontracted raw-pointer call.
+`fixed_buffer_allocator(...)` is admitted only through the edition-2027
+retained-owner lifecycle: one named live backing `Allocation`, named top-level
+blocks, checked byte access, reset, and top-level `deinit` returning that exact
+backing. It rejects aliases, escapes, aggregate storage, and control-flow
+lifetimes. `arena_allocator(...)` remains rejected with a lifetime-contract
+diagnostic rather than falling back to an uncontracted raw-pointer call.
 
 Strict modules keep ordinary top-level `let` rejected with an explicit v2
 lifetime-contract diagnostic. Edition-2027 native x86-64 additionally accepts
