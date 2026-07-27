@@ -34,6 +34,9 @@ runtime validation remains required and active.
 The direct receiver form of `try allocator.resize(block, bytes, alignment)`
 also consumes its named old handle on success and preserves the fresh returned
 handle. Helpers and non-local aliases are outside this current source proof.
+Ordinary direct local `Allocation` copies and uncontracted assignments reject
+before code generation. Structural literals remain a temporary runtime-checked
+surface, not an opaque language capability.
 The same exact-tuple check rejects a live cross-handle splice: a second live
 pointer/capacity/alignment combined with another handle's generation or
 allocator identity is not a valid identity.

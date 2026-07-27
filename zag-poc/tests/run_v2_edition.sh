@@ -243,6 +243,17 @@ if (cd "$tmp/v2-system-allocator-wrong-receiver-resize" && "$ZNC" main.zag -o ou
 else
   echo "  XX  mismatched SystemAllocator resize receiver did not compile"; sed -n '1,16p' "$tmp/v2-system-allocator-wrong-receiver-resize/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-system-allocator-copy"
+printf 'name = "v2systemallocatorcopy"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-copy/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-copy/std"
+printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let alias:Allocation=block; try allocator.deallocate(block); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-copy/main.zag"
+if (cd "$tmp/v2-system-allocator-copy" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-copy/log" 2>&1 || [ -e "$tmp/v2-system-allocator-copy/out" ]; then
+  echo "  XX  Allocation copy must reject before codegen"; sed -n '1,16p' "$tmp/v2-system-allocator-copy/log"; fail=$((fail + 1))
+elif grep -q 'Allocation is affine; copy and uncontracted transfer are not allowed' "$tmp/v2-system-allocator-copy/log"; then
+  echo "  ok  Allocation direct copy rejects before codegen"; pass=$((pass + 1))
+else
+  echo "  XX  Allocation copy rejection missing diagnostic"; sed -n '1,16p' "$tmp/v2-system-allocator-copy/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-system-allocator-stale"
 printf 'name = "v2systemallocatorstale"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-stale/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-stale/std"

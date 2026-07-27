@@ -125,6 +125,10 @@ The same direct-local boundary recognizes `try allocator.resize(block, bytes,
 alignment)` as consuming `block` after a successful replacement is bound. The
 replacement remains usable; the old name and direct aliases do not. This is
 not a general interprocedural transfer summary.
+Direct local `Allocation` copies and uncontracted assignment transfers are
+also rejected before code generation. The record is not opaque yet: a
+structural literal can still reach the checked runtime, where exact-record
+validation rejects forged identity, capacity, alignment, or generation.
 The current runtime record also rejects a live cross-handle field splice when
 its generation or allocator identity belongs to another allocation; this is
 exact-record validation, not language-level opaque ownership. The public
