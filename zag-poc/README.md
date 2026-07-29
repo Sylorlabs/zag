@@ -121,12 +121,16 @@ release. Its matrix and executable gate are in
 that gate failing until their implementation and execution evidence exist. The
 release gate is intentionally fail-closed while required capability rows
 remain unsupported; it is not a C replacement or a production-v2 claim yet.
+The latest authoritative local run (2026-07-29) completed all 37 executable
+rows and then failed the 10 required unsupported rows. That is strong
+development evidence, not a production release result.
 The passing slices include
 checked native word and byte volatile transactions, fixed unsafe i64 atomic
 load/store/exchange/compare-exchange/fetch-add/sub/and/or/xor operations, bounded Linux futex wait/wake building blocks, a guarded direct-worker Linux spawn/join boundary, scalar plus bounded `f64` `@cabi` dynamic imports, validated x86
-POPCNT/ANDN/trailing-zero intrinsics, and bounded native memory sanitizer
-coverage. General atomics/concurrency, pointer/allocator lifetime, full C ABI,
-SIMD/assembly, and physical GPU execution remain explicitly fail-closed; unsupported
+POPCNT/ANDN/trailing-zero intrinsics, bounded SSE2 four-lane integer add/subtract,
+and bounded native memory sanitizer coverage. General atomics/concurrency,
+pointer/allocator lifetime, full C ABI, portable SIMD/checked inline assembly,
+and physical GPU execution remain explicitly fail-closed; unsupported
 native object, static, and shared-object requests also fail closed rather than
 silently producing the wrong artifact. The
 atomic slice has compiler-reserved `AtomicI64` storage with unsafe receiver-only
@@ -137,11 +141,15 @@ an authoritative post-bootstrap release-gate run.
 Its current checked native x86-64 allocator slice is
 [`SystemAllocator`](docs/V2_ALLOCATOR_GUIDE.md): fallible allocate, zeroed
 allocate, resize, and deallocate use capacity/alignment/generation-validated
-handles. Reserved `fixed_buffer_allocator(...)` and `arena_allocator(...)`
-spellings reject until their retained-buffer and mutable-receiver lifetime
-contract exists. Legacy `@memoryFence` emits `mfence` but is unsafe and is not a
-typed memory-order API. This is not a general allocator, raw-pointer
-memory-safety guarantee, or a v2 release claim.
+handles. `Allocation` is compiler-opaque and affine: insertion into a local
+aggregate moves the capability, the original binding becomes unavailable,
+aggregate copies cannot duplicate it, and consuming an aggregate field
+invalidates every alias to the same identity. Bounded retained
+`fixed_buffer_allocator(...)` and `arena_allocator(...)` regions implement
+checked byte access, generation-invalidating reset, and explicit `deinit`;
+they do not establish a general allocator or heap-graph lifetime model. Legacy
+`@memoryFence` emits `mfence` but is unsafe and is not a typed memory-order API.
+This is not a raw-pointer memory-safety guarantee or a v2 release claim.
 
 Native cross-target and self-hosting gates:
 

@@ -281,6 +281,39 @@ elif grep -q 'Allocation is affine; copy and uncontracted transfer are not allow
 else
   echo "  XX  Allocation copy rejection missing diagnostic"; sed -n '1,16p' "$tmp/v2-system-allocator-copy/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-system-allocator-aggregate-stale"
+printf 'name = "v2systemallocatoraggregatestale"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-aggregate-stale/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-aggregate-stale/std"
+printf '@import("std/allocator.zag") struct Box { block:Allocation } fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let box:Box=Box{.block=block}; try allocator.deallocate(box.block); try allocator.deallocate(block); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-aggregate-stale/main.zag"
+if (cd "$tmp/v2-system-allocator-aggregate-stale" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-aggregate-stale/log" 2>&1 || [ -e "$tmp/v2-system-allocator-aggregate-stale/out" ]; then
+  echo "  XX  aggregate-released Allocation must invalidate original owner"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-stale/log"; fail=$((fail + 1))
+elif grep -q 'use after consumed SystemAllocator handle' "$tmp/v2-system-allocator-aggregate-stale/log"; then
+  echo "  ok  aggregate release invalidates original Allocation owner"; pass=$((pass + 1))
+else
+  echo "  XX  aggregate Allocation stale-handle diagnostic missing"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-stale/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-system-allocator-aggregate-move"
+printf 'name = "v2systemallocatoraggregatemove"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-aggregate-move/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-aggregate-move/std"
+printf '@import("std/allocator.zag") struct Box { block:Allocation } fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let box:Box=Box{.block=block}; try allocator.deallocate(block); try allocator.deallocate(box.block); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-aggregate-move/main.zag"
+if (cd "$tmp/v2-system-allocator-aggregate-move" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-aggregate-move/log" 2>&1 || [ -e "$tmp/v2-system-allocator-aggregate-move/out" ]; then
+  echo "  XX  aggregate insertion must move the Allocation capability"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-move/log"; fail=$((fail + 1))
+elif grep -q 'use after moved Allocation handle' "$tmp/v2-system-allocator-aggregate-move/log"; then
+  echo "  ok  aggregate insertion invalidates the original Allocation binding"; pass=$((pass + 1))
+else
+  echo "  XX  aggregate Allocation move diagnostic missing"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-move/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-system-allocator-aggregate-copy"
+printf 'name = "v2systemallocatoraggregatecopy"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-aggregate-copy/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-aggregate-copy/std"
+printf '@import("std/allocator.zag") struct Box { block:Allocation } fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let box:Box=Box{.block=block}; let copied:Box=box; try allocator.deallocate(copied.block); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-aggregate-copy/main.zag"
+if (cd "$tmp/v2-system-allocator-aggregate-copy" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-aggregate-copy/log" 2>&1 || [ -e "$tmp/v2-system-allocator-aggregate-copy/out" ]; then
+  echo "  XX  aggregate copy must not duplicate an Allocation capability"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-copy/log"; fail=$((fail + 1))
+elif grep -q 'Allocation aggregate copy is not allowed' "$tmp/v2-system-allocator-aggregate-copy/log"; then
+  echo "  ok  aggregate copy cannot duplicate an Allocation capability"; pass=$((pass + 1))
+else
+  echo "  XX  aggregate Allocation copy diagnostic missing"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-copy/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-system-allocator-stale"
 printf 'name = "v2systemallocatorstale"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-stale/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-stale/std"
