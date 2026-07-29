@@ -74,10 +74,13 @@ An `@consumes @returns_owner` helper may instead return one exact consumed
 owner as a value. This is accepted only when compiler summary analysis proves
 that every owned return is the same declared consuming parameter; the caller's
 direct named argument is invalidated and the bound result becomes the sole
-live owner. The annotation is not authority by itself: mixed, fresh, indirect,
-computed, or unproven returns reject, as do calls without this explicit
-contract. A success-path `try helper(owner)` preserves this same identity;
-error paths remain ordinary error propagation and never create a capability.
+live owner. A precisely tracked field of a local value aggregate may make the
+same transfer: its field provenance is discharged and the bound result becomes
+the sole owner. Ambiguous, copied, or untracked field paths reject. The
+annotation is not authority by itself: mixed, fresh, indirect, computed, or
+unproven returns reject, as do calls without this explicit contract. A
+success-path `try helper(owner)` preserves this same identity; error paths
+remain ordinary error propagation and never create a capability.
 This is a small interprocedural identity-transfer boundary, not a
 general capability or heap-graph analysis.
 A separate return-lifetime check rejects

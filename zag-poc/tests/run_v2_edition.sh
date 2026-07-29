@@ -1313,6 +1313,14 @@ if (cd "$tmp/v2-consume-try-return-owner" && "$ZNC" main.zag -o out) >"$tmp/v2-c
 else
   echo "  XX  fallible consuming helper ownership transfer"; sed -n '1,8p' "$tmp/v2-consume-try-return-owner/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-consume-return-owner-aggregate-field"
+printf 'name = "v2consumereturnowneraggregatefield"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-consume-return-owner-aggregate-field/zag.mod"
+printf 'struct Box { ptr:*mut i32 } fn forward(p:*mut i32) *mut i32 @consumes @returns_owner { return p; } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let box:Box=Box{.ptr=p}; let q:*mut i32=forward(box.ptr); delete(q); } return 0; }\n' >"$tmp/v2-consume-return-owner-aggregate-field/main.zag"
+if (cd "$tmp/v2-consume-return-owner-aggregate-field" && "$ZNC" main.zag -o out) >"$tmp/v2-consume-return-owner-aggregate-field/log" 2>&1 && [ -x "$tmp/v2-consume-return-owner-aggregate-field/out" ]; then
+  echo "  ok  aggregate field consumes into its verified returned owner"; pass=$((pass + 1))
+else
+  echo "  XX  aggregate field consuming ownership transfer"; sed -n '1,8p' "$tmp/v2-consume-return-owner-aggregate-field/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-consume-return-owner-use-old"
 printf 'name = "v2consumereturnowneruseold"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-consume-return-owner-use-old/zag.mod"
 printf 'fn forward(p:*mut i32) *mut i32 @consumes @returns_owner { return p; } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let q:*mut i32=forward(p); print_i64(p as i64); delete(q); } return 0; }\n' >"$tmp/v2-consume-return-owner-use-old/main.zag"
