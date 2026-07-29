@@ -129,7 +129,8 @@ checked native word and byte volatile transactions, fixed unsafe i64 atomic
 load/store/exchange/compare-exchange/fetch-add/sub/and/or/xor operations, bounded Linux futex wait/wake building blocks, a guarded direct-worker Linux spawn/join boundary, scalar plus bounded `f64` `@cabi` dynamic imports, validated x86
 POPCNT/ANDN/trailing-zero intrinsics, bounded SSE2 four-lane integer
 add/subtract/and/or/xor operations,
-and bounded native memory sanitizer coverage. General atomics/concurrency,
+and bounded native memory sanitizer coverage with checked 16-byte trailing
+red zones for small ordinary allocations. General atomics/concurrency,
 pointer/allocator lifetime, full C ABI, portable SIMD/checked inline assembly,
 and physical GPU execution remain explicitly fail-closed; unsupported
 native object, static, and shared-object requests also fail closed rather than

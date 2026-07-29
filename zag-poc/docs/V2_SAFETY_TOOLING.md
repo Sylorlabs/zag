@@ -41,9 +41,13 @@ silently downgrading. Other sanitizer modes remain rejected.
   allocation fails closed if that setup fails and free reconstructs the full
   guarded mapping before `munmap`. This is a coarse trailing boundary only:
   page-rounding leaves up to one accessible page of slack after the exact
-  request, so it does not replace the logical provenance check or provide
-  per-allocation red zones. It does not yet provide red zones, allocation-site
-  reports, or custom-allocator tracking. On every ordinary free under sanitizer
+  request, so it does not replace the logical provenance check. Small ordinary
+  allocations reserve a distinct 16-byte trailing red zone, initialize it to
+  `0xD3`, and validate it before poisoning or free-list reuse. This detects
+  writes performed outside Zag's instrumented access path, including the
+  verified libc `memset` boundary. It does not yet provide leading red zones,
+  allocation-site reports, stack/global instrumentation, or custom-allocator
+  tracking. On every ordinary free under sanitizer
   mode it provides deterministic byte poisoning (`0xA5`)
   before the block enters the free list or is unmapped; this is useful evidence
   when a stale alias escapes the provenance table, but it is not a red-zone or

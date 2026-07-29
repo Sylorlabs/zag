@@ -11052,6 +11052,69 @@ fn cg_emit_sanitize_poison(out:*ArrayList[Instr],cg:*Cg)void{
     push[Instr](out,i_pop(R_RDI()));
 }
 
+// Give every sanitizer-mode small allocation a physical 16-byte trailing red
+// zone. The ordinary checked-access registry still reports the exact requested
+// length, so instrumented accesses fail at the access site; this canary is the
+// independent boundary for writes performed by foreign code or otherwise
+// outside Zag's raw-access instrumentation.
+//
+// Initialize inputs: rax=user pointer, rsi=physical class capacity, and
+// [rsp]=exact requested length. All inputs are preserved.
+fn cg_emit_sanitize_redzone_init(out:*ArrayList[Instr],cg:*Cg)void{
+    let loop:i32=cg_fresh(cg);let done:i32=cg_fresh(cg);
+    push[Instr](out,i_push(R_RAX()));push[Instr](out,i_push(R_RSI()));
+    push[Instr](out,i_push(R_RDI()));push[Instr](out,i_push(R_R8()));
+    push[Instr](out,i_push(R_R9()));push[Instr](out,i_push(R_R10()));
+    // Six pushes place the caller-owned requested length 48 bytes above rsp.
+    push[Instr](out,i_load(R_R8(),R_RSP(),48));
+    push[Instr](out,i_mov_rr(R_R9(),R_RAX()));push[Instr](out,i_add(R_R9(),R_R8()));
+    push[Instr](out,i_mov_imm(R_R10(),0));push[Instr](out,i_mov_imm(R_RDI(),211)); // 0xD3
+    push[Instr](out,i_label(loop));push[Instr](out,i_cmp_imm(R_R10(),16));push[Instr](out,i_jge(done));
+    push[Instr](out,i_store8(R_R9(),0,R_RDI()));push[Instr](out,i_add_imm(R_R9(),1));
+    push[Instr](out,i_add_imm(R_R10(),1));push[Instr](out,i_jmp(loop));
+    push[Instr](out,i_label(done));
+    push[Instr](out,i_pop(R_R10()));push[Instr](out,i_pop(R_R9()));
+    push[Instr](out,i_pop(R_R8()));push[Instr](out,i_pop(R_RDI()));
+    push[Instr](out,i_pop(R_RSI()));push[Instr](out,i_pop(R_RAX()));
+}
+
+// Validate a sanitizer small-allocation red zone before poisoning or linking
+// the payload into a free list. Inputs are rdi=user pointer and rsi=physical
+// class capacity. The exact logical length comes from the live checked-access
+// registry entry, never from caller-controlled memory.
+fn cg_emit_sanitize_redzone_validate(out:*ArrayList[Instr],cg:*Cg)void{
+    let scan:i32=cg_fresh(cg);let next:i32=cg_fresh(cg);let found:i32=cg_fresh(cg);
+    let loop:i32=cg_fresh(cg);let byte_ok:i32=cg_fresh(cg);let done:i32=cg_fresh(cg);
+    let missing:i32=cg_fresh(cg);let after_missing:i32=cg_fresh(cg);
+    let corrupt:i32=cg_fresh(cg);let after_corrupt:i32=cg_fresh(cg);
+    push[Instr](out,i_push(R_RDI()));push[Instr](out,i_push(R_RSI()));
+    push[Instr](out,i_mov_imm(R_RCX(),0));
+    push[Instr](out,i_label(scan));push[Instr](out,i_cmp_imm(R_RCX(),ALLOC_ACCESS_REGISTRY_CAP()));
+    push[Instr](out,i_jge(missing));push[Instr](out,i_mov_rr(R_R10(),R_RCX()));
+    push[Instr](out,i_mov_imm(R_R9(),16));push[Instr](out,i_imul(R_R10(),R_R9()));
+    push[Instr](out,i_add_imm(R_R10(),ALLOC_ACCESS_REGISTRY()));
+    push[Instr](out,i_load(R_R8(),R_R10(),0));push[Instr](out,i_cmp(R_R8(),R_RDI()));
+    push[Instr](out,i_je(found));
+    push[Instr](out,i_label(next));push[Instr](out,i_add_imm(R_RCX(),1));push[Instr](out,i_jmp(scan));
+    push[Instr](out,i_label(found));
+    push[Instr](out,i_load(R_R8(),R_R10(),8)); // exact requested length
+    push[Instr](out,i_mov_rr(R_R9(),R_R8()));push[Instr](out,i_add_imm(R_R9(),16));
+    push[Instr](out,i_cmp(R_R9(),R_RSI()));push[Instr](out,i_jg(corrupt));
+    push[Instr](out,i_add(R_RDI(),R_R8()));push[Instr](out,i_mov_imm(R_RCX(),0));
+    push[Instr](out,i_label(loop));push[Instr](out,i_cmp_imm(R_RCX(),16));push[Instr](out,i_jge(done));
+    push[Instr](out,i_load8(R_R9(),R_RDI(),0));push[Instr](out,i_cmp_imm(R_R9(),211));
+    push[Instr](out,i_je(byte_ok));push[Instr](out,i_jmp(corrupt));
+    push[Instr](out,i_label(byte_ok));push[Instr](out,i_add_imm(R_RDI(),1));
+    push[Instr](out,i_add_imm(R_RCX(),1));push[Instr](out,i_jmp(loop));
+    push[Instr](out,i_label(missing));
+    cg_emit_panic(out,"zag sanitizer: small allocation provenance missing",after_missing,cg);
+    push[Instr](out,i_jmp(done));
+    push[Instr](out,i_label(corrupt));
+    cg_emit_panic(out,"zag sanitizer: small allocation trailing red zone corrupted",after_corrupt,cg);
+    push[Instr](out,i_jmp(done));
+    push[Instr](out,i_label(done));push[Instr](out,i_pop(R_RSI()));push[Instr](out,i_pop(R_RDI()));
+}
+
 // Publish an ordinary allocation to the access registry.  Checked mode keeps
 // the allocator's physical class capacity: that is the existing raw-allocation
 // contract.  Memory-sanitizer mode instead publishes the caller's exact
@@ -11071,6 +11134,7 @@ fn cg_emit_alloc_access_acquire_mode(out:*ArrayList[Instr],cg:*Cg)void{
 
 fn cg_emit_malloc(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     let l_size_valid: i32 = cg_fresh(cg);
+    let l_small_target_valid: i32 = cg_fresh(cg);
     let l_class: i32 = cg_fresh(cg);
     let l_found: i32 = cg_fresh(cg);
     let l_carve: i32 = cg_fresh(cg);
@@ -11096,8 +11160,19 @@ fn cg_emit_malloc(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     // class search: rsi = candidate size (16,32,..), rcx = class index
     push[Instr](out, i_mov_imm(R_RSI(), 16));
     push[Instr](out, i_mov_imm(R_RCX(), 0));
+    if(cg.*.sanitize_memory==1){
+        // Reserve a real trailing red zone rather than consuming class slack.
+        // Requests that no longer fit the small boundary use the guarded large
+        // mapping path below.
+        push[Instr](out,i_mov_rr(R_R8(),R_RDI()));
+        push[Instr](out,i_add_imm(R_R8(),16));
+        push[Instr](out,i_cmp_imm(R_R8(),0));
+        push[Instr](out,i_jge(l_small_target_valid));
+        cg_emit_panic(out,"zag sanitizer: allocation size exceeds red-zone limit",l_small_target_valid,cg);
+    }
     push[Instr](out, i_label(l_class));
-    push[Instr](out, i_cmp(R_RSI(), R_RDI()));
+    if(cg.*.sanitize_memory==1){push[Instr](out,i_cmp(R_RSI(),R_R8()));}
+    else{push[Instr](out, i_cmp(R_RSI(), R_RDI()));}
     push[Instr](out, i_jge(l_found));                // class size >= n
     push[Instr](out, i_add(R_RSI(), R_RSI()));
     push[Instr](out, i_add_imm(R_RCX(), 1));
@@ -11177,6 +11252,7 @@ fn cg_emit_malloc(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     push[Instr](out, i_neg(R_R9()));
     push[Instr](out, i_store(R_RAX(), 0 - 8, R_R9()));
     cg_emit_large_alloc_forget_small_reuse(out,cg);
+    if(cg.*.sanitize_memory==1){cg_emit_sanitize_redzone_init(out,cg);}
     if(cg.*.safety_checked==1){cg_emit_alloc_access_acquire_mode(out,cg);}
     cg_emit_allocator_acquire(out, R_RSI(), cg);
     push[Instr](out,i_pop(R_RDI()));
@@ -11212,6 +11288,7 @@ fn cg_emit_malloc(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     push[Instr](out, i_mov_rr(R_RAX(), R_RDX()));
     push[Instr](out, i_add_imm(R_RAX(), 8));         // ptr = block + 8
     cg_emit_large_alloc_forget_small_reuse(out,cg);
+    if(cg.*.sanitize_memory==1){cg_emit_sanitize_redzone_init(out,cg);}
     if(cg.*.safety_checked==1){cg_emit_alloc_access_acquire_mode(out,cg);}
     cg_emit_allocator_acquire(out, R_RSI(), cg);
     push[Instr](out,i_pop(R_RDI()));
@@ -11256,6 +11333,7 @@ fn cg_emit_free(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     push[Instr](out, i_cmp_imm(R_RSI(), 0));
     push[Instr](out, i_jg(l_live));
     cg_emit_panic(out, "zag runtime: invalid or double free", l_live, cg);
+    if(cg.*.sanitize_memory==1){cg_emit_sanitize_redzone_validate(out,cg);}
     if(cg.*.sanitize_memory==1){cg_emit_sanitize_poison(out,cg);}
     cg_emit_allocator_release(out, R_RSI());
     push[Instr](out, i_cmp_imm(R_RSI(), ALLOC_MAX_SMALL()));

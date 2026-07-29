@@ -1149,6 +1149,24 @@ if (cd "$tmp/v2-sanitize-memory" && "$ZNC" main.zag -o out --sanitize=memory) >"
 else
   echo "  XX  memory sanitizer compiles released-allocation witness"; sed -n '1,10p' "$tmp/v2-sanitize-memory/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-sanitize-memory-small-redzone"
+printf 'name = "v2sanitizememorysmallredzone"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-sanitize-memory-small-redzone/zag.mod"
+# libc performs this write outside Zag's compiler-inserted raw-access checks.
+# The small allocator's physical trailing canary must detect it at release.
+printf 'extern fn memset(dst:*u8,value:i32,count:i64)*u8 @cabi; extern fn _zag_malloc(n:i64)*u8; extern fn _zag_free(p:*u8)void; fn main() i32 { unsafe { let p:*u8=_zag_malloc(16); let redzone:*u8=((p as i64)+16) as *u8; let ignored:*u8=memset(redzone,0,1); _zag_free(p); return 42; } }\n' >"$tmp/v2-sanitize-memory-small-redzone/main.zag"
+if (cd "$tmp/v2-sanitize-memory-small-redzone" && "$ZNC" main.zag -o out --sanitize=memory --dynamic --needed libc.so.6) >"$tmp/v2-sanitize-memory-small-redzone/log" 2>&1 && [ -x "$tmp/v2-sanitize-memory-small-redzone/out" ]; then
+  set +e
+  "$tmp/v2-sanitize-memory-small-redzone/out" >"$tmp/v2-sanitize-memory-small-redzone/out.log" 2>"$tmp/v2-sanitize-memory-small-redzone/err.log"
+  sanitize_memory_small_redzone_rc=$?
+  set -e
+  if [ "$sanitize_memory_small_redzone_rc" -ne 0 ] && grep -q 'zag sanitizer: small allocation trailing red zone corrupted' "$tmp/v2-sanitize-memory-small-redzone/err.log"; then
+    echo "  ok  memory sanitizer detects foreign writes into small-allocation red zone"; pass=$((pass + 1))
+  else
+    echo "  XX  memory sanitizer small red-zone witness (exit=$sanitize_memory_small_redzone_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  memory sanitizer compiles small red-zone witness"; sed -n '1,10p' "$tmp/v2-sanitize-memory-small-redzone/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-sanitize-memory-large-guard"
 printf 'name = "v2sanitizememorylargeguard"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-sanitize-memory-large-guard/zag.mod"
 # 600000 exceeds the arena allocator's 512 KiB maximum, so this exercises the

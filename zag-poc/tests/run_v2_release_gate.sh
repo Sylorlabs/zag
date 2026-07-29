@@ -76,7 +76,7 @@ unsupported "atomics and concurrency" "compiler-reserved unsafe AtomicI64 receiv
 unsupported "C ABI and dynamic linking" "checked v2 @cabi scalar plus bounded f64 dynamic imports, a direct captureless scalar/pointer callback, and scalar @cabi_export ET_REL objects with self-contained output or direct PLT32 import relocations exist, but general bidirectional ABI, relocation/static archive/shared-object conformance, and unload/lifetime contracts are incomplete"
 unsupported "CPU intrinsics/SIMD/inline assembly" "validated x86 scalar intrinsics and bounded unsafe SSE2 i32x4 arithmetic/bitwise operations exist, but vector types/ABI, broader SIMD, inline-assembly constraints/clobbers, and full target-feature/effect checking are incomplete"
 unsupported "physical GPU execution" "no runtime enumerate/allocate/dispatch/readback path"
-unsupported "sanitizers" "bounded native --sanitize=memory has exact requested-length bounds, deterministic free poisoning, and a coarse trailing guard page for dedicated large allocations, but red zones, allocation-site reports, and custom allocator coverage are incomplete"
+unsupported "sanitizers" "bounded native --sanitize=memory has exact requested-length bounds, 16-byte checked trailing red zones for small allocations, deterministic free poisoning, and a coarse guard page for dedicated large allocations, but allocation-site reports, stack/global instrumentation, and custom allocator coverage are incomplete"
 unsupported "documentation verification map" "verification matrix exists but records incomplete required capabilities"
 
 echo "════ v2-release pass=$pass fail=$fail ════"
