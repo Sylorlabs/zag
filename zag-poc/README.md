@@ -121,13 +121,14 @@ release. Its matrix and executable gate are in
 that gate failing until their implementation and execution evidence exist. The
 release gate is intentionally fail-closed while required capability rows
 remain unsupported; it is not a C replacement or a production-v2 claim yet.
-The latest authoritative local run (2026-07-29) completed all 37 executable
+The latest authoritative local run (2026-07-29) completed all 38 executable
 rows and then failed the 10 required unsupported rows. That is strong
 development evidence, not a production release result.
 The passing slices include
 checked native word and byte volatile transactions, fixed unsafe i64 atomic
 load/store/exchange/compare-exchange/fetch-add/sub/and/or/xor operations, bounded Linux futex wait/wake building blocks, a guarded direct-worker Linux spawn/join boundary, scalar plus bounded `f64` `@cabi` dynamic imports, validated x86
-POPCNT/ANDN/trailing-zero intrinsics, bounded SSE2 four-lane integer add/subtract,
+POPCNT/ANDN/trailing-zero intrinsics, bounded SSE2 four-lane integer
+add/subtract/and/or/xor operations,
 and bounded native memory sanitizer coverage. General atomics/concurrency,
 pointer/allocator lifetime, full C ABI, portable SIMD/checked inline assembly,
 and physical GPU execution remain explicitly fail-closed; unsupported
