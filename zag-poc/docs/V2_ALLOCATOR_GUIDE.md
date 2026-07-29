@@ -34,11 +34,17 @@ opaque, but this is still not a proof for arbitrary aliases; exact-record
 runtime validation remains required and active.
 The direct receiver form of `try allocator.resize(block, bytes, alignment)`
 also consumes its named old handle on success and preserves the fresh returned
-handle. Helpers and non-local aliases are outside this current source proof.
+handle. The same transition is proven for a precisely tracked local aggregate
+field: insertion moves the capability out of the original name, aggregate
+copies reject, `deallocate(box.block)` consumes the identity, and successful
+`resize(box.block, ...)` produces one live replacement while retiring the old
+field path. Helpers and non-local aliases are outside this current source proof.
 Ordinary direct local `Allocation` copies, uncontracted assignments, structural
-literals, field access, and casts reject before code generation. Public checked
-byte access is `allocation_read_u8` and `allocation_write_u8`; neither exposes
-a raw address or descriptor field.
+literals, descriptor-field inspection, and casts reject before code
+generation. Aggregate carrier fields are usable only through the proven
+consuming boundaries above; they do not expose the opaque descriptor. Public
+checked byte access is `allocation_read_u8` and `allocation_write_u8`; neither
+exposes a raw address or descriptor field.
 This requires native x86-64 `--safety=checked`; other targets and unchecked
 builds reject the validation boundary rather than silently weakening it. The
 v2 compiler gate proves that an unchecked call reports that requirement and

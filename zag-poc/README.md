@@ -144,7 +144,8 @@ allocate, resize, and deallocate use capacity/alignment/generation-validated
 handles. `Allocation` is compiler-opaque and affine: insertion into a local
 aggregate moves the capability, the original binding becomes unavailable,
 aggregate copies cannot duplicate it, and consuming an aggregate field
-invalidates every alias to the same identity. Bounded retained
+invalidates every alias to the same identity. A successful aggregate-field
+`resize` applies the same transition and mints one live replacement. Bounded retained
 `fixed_buffer_allocator(...)` and `arena_allocator(...)` regions implement
 checked byte access, generation-invalidating reset, and explicit `deinit`;
 they do not establish a general allocator or heap-graph lifetime model. Legacy

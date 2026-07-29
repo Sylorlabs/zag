@@ -101,6 +101,16 @@ only the field subtree it proves replaced. The same aggregate rules permit a
 pointer inherited from the caller because that pointer does not identify the
 callee's frame.
 
+Opaque `Allocation` capabilities are stricter than ordinary raw-pointer
+provenance. Storing one in a local aggregate is an affine move that makes the
+original binding unavailable, and copying an aggregate cannot duplicate the
+capability. Compiler-recognized `deallocate(aggregate.field)` consumes the
+shared identity. A successful `resize(aggregate.field, ...)` also consumes that
+old identity and binds the returned value as the one live replacement; later
+use of the original binding or old aggregate path rejects before lowering.
+These rules cover proven local field paths only and do not establish general
+heap-container or interprocedural capability analysis.
+
 This is still a conservative intraprocedural static analysis, not universal
 runtime memory instrumentation. Its provenance identity is a compiler-tracked
 local allocation root; arbitrary pointer arithmetic, heap-wide alias identity,

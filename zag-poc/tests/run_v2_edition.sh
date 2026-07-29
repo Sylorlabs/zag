@@ -314,6 +314,34 @@ elif grep -q 'Allocation aggregate copy is not allowed' "$tmp/v2-system-allocato
 else
   echo "  XX  aggregate Allocation copy diagnostic missing"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-copy/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-system-allocator-aggregate-resize"
+printf 'name = "v2systemallocatoraggregateresize"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-aggregate-resize/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-aggregate-resize/std"
+printf '@import("std/allocator.zag") struct Box { block:Allocation } fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let box:Box=Box{.block=block}; let replacement:Allocation=try allocator.resize(box.block,48,8); try allocation_write_u8(replacement,47,42); let value:u8=try allocation_read_u8(replacement,47); try allocator.deallocate(replacement); return value as i32; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-aggregate-resize/main.zag"
+if (cd "$tmp/v2-system-allocator-aggregate-resize" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-aggregate-resize/log" 2>&1 && [ -x "$tmp/v2-system-allocator-aggregate-resize/out" ]; then
+  set +e
+  "$tmp/v2-system-allocator-aggregate-resize/out"
+  aggregate_resize_rc=$?
+  set -e
+  if [ "$aggregate_resize_rc" -eq 42 ]; then
+    echo "  ok  aggregate field resize transfers the Allocation capability"; pass=$((pass + 1))
+  else
+    echo "  XX  aggregate field resize execution (exit=$aggregate_resize_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  aggregate field resize transfer"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-resize/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-system-allocator-aggregate-resize-stale"
+printf 'name = "v2systemallocatoraggregateresizestale"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-aggregate-resize-stale/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-aggregate-resize-stale/std"
+printf '@import("std/allocator.zag") struct Box { block:Allocation } fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let box:Box=Box{.block=block}; let replacement:Allocation=try allocator.resize(box.block,48,8); try allocator.deallocate(box.block); try allocator.deallocate(replacement); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-aggregate-resize-stale/main.zag"
+if (cd "$tmp/v2-system-allocator-aggregate-resize-stale" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-aggregate-resize-stale/log" 2>&1 || [ -e "$tmp/v2-system-allocator-aggregate-resize-stale/out" ]; then
+  echo "  XX  aggregate field resize must retire the old capability path"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-resize-stale/log"; fail=$((fail + 1))
+elif grep -q 'use after consumed SystemAllocator handle' "$tmp/v2-system-allocator-aggregate-resize-stale/log"; then
+  echo "  ok  aggregate field resize rejects the stale old path"; pass=$((pass + 1))
+else
+  echo "  XX  aggregate resize stale-path diagnostic missing"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-resize-stale/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-system-allocator-stale"
 printf 'name = "v2systemallocatorstale"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-stale/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-stale/std"
