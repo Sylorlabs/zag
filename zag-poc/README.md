@@ -122,7 +122,7 @@ that gate failing until their implementation and execution evidence exist. The
 release gate is intentionally fail-closed while required capability rows
 remain unsupported; it is not a C replacement or a production-v2 claim yet.
 The latest authoritative local run (2026-07-29) completed all 38 executable
-rows and then failed the 10 required unsupported rows. That is strong
+rows and then failed the 9 required unsupported rows. That is strong
 development evidence, not a production release result.
 The passing slices include
 checked native word and byte volatile transactions, fixed unsafe i64 atomic

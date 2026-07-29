@@ -54,8 +54,8 @@ addition, subtraction, AND, OR, and XOR through raw pointers on native x86-64;
 vector value types, wider SIMD, and target-selected ISA variants remain
 unsupported. Inline `asm` remains
 fail-closed. Pointer provenance identity, bounds and alignment
-instrumentation, source-span audit records, verified aggregate effect-row
-calls, the complete device capability model, and the complete
+instrumentation, source-span audit records, the complete device capability
+model, and the complete
 unsafe-operation inventory are not yet implemented.
 
 ## Error policy

@@ -21,9 +21,11 @@ implemented slice tracks direct function-valued locals, including reassignment,
 so a later indirect call cannot retain a stale safe effect row. Calls through
 an aggregate field, index, or computed callee are rejected inside constrained
 functions with the complete ten-bit universe until the value carries a
-verified row. This is a fail-closed boundary, not aggregate effect inference.
-Generic instantiations, aggregate row propagation, imports, and the broader
-device capability model still need complete coverage.
+verified row. Explicit aggregate rows are enforced at construction and field
+mutation, retained for typed locals and parameters, and used at calls.
+Concrete receiver methods resolve through their mangled declaration; generic
+callback arguments retain their instantiated effects. Interface/unknown
+dispatch remains conservatively fail-closed.
 
 ## Inference and witnesses
 
@@ -40,8 +42,10 @@ authorize host submission; and `GPUHost` does not prove physical GPU safety.
 ## Required adversarial checks
 
 The v2 suite rejects effects introduced through direct calls, reassigned
-function-valued locals (including a high-bit Device reassignment), opaque
-aggregate function calls, and direct I/O, atomic, C-ABI, or host-GPU operations
-in `@kernel`. It also proves a direct Device helper remains legal in a kernel.
-It still needs verified aggregate effect-row calls, broader generic and method
-coverage, and the complete device capability inventory.
+function-valued locals (including a high-bit Device reassignment), unqualified
+aggregate calls, effect-row construction and mutation violations, effectful
+methods, generic callbacks, and direct I/O, atomic, C-ABI, or host-GPU
+operations in `@kernel`. It proves verified aggregate rows and pure concrete
+methods remain usable and a direct Device helper remains legal in a kernel.
+New runtime or device operations must enter this lattice before support; an
+unclassified indirect path receives the full universe.
