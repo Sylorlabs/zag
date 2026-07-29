@@ -145,7 +145,10 @@ handles. `Allocation` is compiler-opaque and affine: insertion into a local
 aggregate moves the capability, the original binding becomes unavailable,
 aggregate copies cannot duplicate it, and consuming an aggregate field
 invalidates every alias to the same identity. A successful aggregate-field
-`resize` applies the same transition and mints one live replacement. Bounded retained
+`resize` applies the same transition and mints one live replacement. A
+non-extern `@consumes @returns_owner` helper may make the same transfer only
+when every terminal path returns its one exact `Allocation` parameter; the
+annotation cannot authorize a fresh or ambiguous owner. Bounded retained
 `fixed_buffer_allocator(...)` and `arena_allocator(...)` regions implement
 checked byte access, generation-invalidating reset, and explicit `deinit`;
 they do not establish a general allocator or heap-graph lifetime model. Legacy

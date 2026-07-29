@@ -342,6 +342,45 @@ elif grep -q 'use after consumed SystemAllocator handle' "$tmp/v2-system-allocat
 else
   echo "  XX  aggregate resize stale-path diagnostic missing"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-resize-stale/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-system-allocator-aggregate-owner-transfer"
+printf 'name = "v2systemallocatoraggregateownertransfer"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-aggregate-owner-transfer/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-aggregate-owner-transfer/std"
+printf '@import("std/allocator.zag") struct Box { block:Allocation } fn forward(block:Allocation) Allocation @consumes @returns_owner { return block; } fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let box:Box=Box{.block=block}; let replacement:Allocation=forward(box.block); try allocation_write_u8(replacement,23,42); let value:u8=try allocation_read_u8(replacement,23); try allocator.deallocate(replacement); return value as i32; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-aggregate-owner-transfer/main.zag"
+if (cd "$tmp/v2-system-allocator-aggregate-owner-transfer" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-aggregate-owner-transfer/log" 2>&1 && [ -x "$tmp/v2-system-allocator-aggregate-owner-transfer/out" ]; then
+  set +e
+  "$tmp/v2-system-allocator-aggregate-owner-transfer/out"
+  aggregate_owner_transfer_rc=$?
+  set -e
+  if [ "$aggregate_owner_transfer_rc" -eq 42 ]; then
+    echo "  ok  verified helper transfers an aggregate Allocation field"; pass=$((pass + 1))
+  else
+    echo "  XX  aggregate Allocation helper transfer execution (exit=$aggregate_owner_transfer_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  aggregate Allocation helper transfer"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-owner-transfer/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-system-allocator-aggregate-owner-transfer-stale"
+printf 'name = "v2systemallocatoraggregateownertransferstale"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-aggregate-owner-transfer-stale/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-aggregate-owner-transfer-stale/std"
+printf '@import("std/allocator.zag") struct Box { block:Allocation } fn forward(block:Allocation) Allocation @consumes @returns_owner { return block; } fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let box:Box=Box{.block=block}; let replacement:Allocation=forward(box.block); try allocator.deallocate(box.block); try allocator.deallocate(replacement); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-aggregate-owner-transfer-stale/main.zag"
+if (cd "$tmp/v2-system-allocator-aggregate-owner-transfer-stale" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-aggregate-owner-transfer-stale/log" 2>&1 || [ -e "$tmp/v2-system-allocator-aggregate-owner-transfer-stale/out" ]; then
+  echo "  XX  verified helper transfer must retire the aggregate field"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-owner-transfer-stale/log"; fail=$((fail + 1))
+elif grep -q 'use after consumed SystemAllocator handle' "$tmp/v2-system-allocator-aggregate-owner-transfer-stale/log"; then
+  echo "  ok  verified helper transfer rejects the stale aggregate field"; pass=$((pass + 1))
+else
+  echo "  XX  aggregate helper stale-field diagnostic missing"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-owner-transfer-stale/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-system-allocator-owner-transfer-invalid"
+printf 'name = "v2systemallocatorownertransferinvalid"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-owner-transfer-invalid/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-owner-transfer-invalid/std"
+printf '@import("std/allocator.zag") fn bad(block:Allocation,allocator:SystemAllocator) !Allocation @consumes @returns_owner { return try allocator.allocate(24,8); } fn main() i32 { return 0; }\n' >"$tmp/v2-system-allocator-owner-transfer-invalid/main.zag"
+if (cd "$tmp/v2-system-allocator-owner-transfer-invalid" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-owner-transfer-invalid/log" 2>&1 || [ -e "$tmp/v2-system-allocator-owner-transfer-invalid/out" ]; then
+  echo "  XX  Allocation transfer annotation must not mint unrelated ownership"; sed -n '1,16p' "$tmp/v2-system-allocator-owner-transfer-invalid/log"; fail=$((fail + 1))
+elif grep -q '@returns_owner requires every owned return to be the same @consumes owner parameter' "$tmp/v2-system-allocator-owner-transfer-invalid/log"; then
+  echo "  ok  Allocation transfer annotation cannot authorize a fresh owner"; pass=$((pass + 1))
+else
+  echo "  XX  invalid Allocation owner-transfer diagnostic missing"; sed -n '1,16p' "$tmp/v2-system-allocator-owner-transfer-invalid/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-system-allocator-stale"
 printf 'name = "v2systemallocatorstale"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-stale/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-stale/std"

@@ -76,7 +76,10 @@ that every owned return is the same declared consuming parameter; the caller's
 direct named argument is invalidated and the bound result becomes the sole
 live owner. A precisely tracked field of a local value aggregate may make the
 same transfer: its field provenance is discharged and the bound result becomes
-the sole owner. Ambiguous, copied, or untracked field paths reject. The
+the sole owner. This now includes an opaque `Allocation` field when the helper
+is non-extern, has one exact `Allocation` owner parameter, and every terminal
+path returns that same parameter. Ambiguous, copied, fresh, or untracked field
+paths reject. The
 annotation is not authority by itself: mixed, fresh, indirect, computed, or
 unproven returns reject, as do calls without this explicit contract. A
 success-path `try helper(owner)` preserves this same identity; error paths
