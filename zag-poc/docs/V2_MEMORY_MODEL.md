@@ -76,7 +76,9 @@ that every owned return is the same declared consuming parameter; the caller's
 direct named argument is invalidated and the bound result becomes the sole
 live owner. The annotation is not authority by itself: mixed, fresh, indirect,
 computed, or unproven returns reject, as do calls without this explicit
-contract. This is a small interprocedural identity-transfer boundary, not a
+contract. A success-path `try helper(owner)` preserves this same identity;
+error paths remain ordinary error propagation and never create a capability.
+This is a small interprocedural identity-transfer boundary, not a
 general capability or heap-graph analysis.
 A separate return-lifetime check rejects
 addresses of local values and local fields returned directly, through

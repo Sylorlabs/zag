@@ -1305,6 +1305,14 @@ if (cd "$tmp/v2-consume-return-owner" && "$ZNC" main.zag -o out) >"$tmp/v2-consu
 else
   echo "  XX  verified consuming helper ownership transfer"; sed -n '1,8p' "$tmp/v2-consume-return-owner/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-consume-try-return-owner"
+printf 'name = "v2consumetryreturnowner"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-consume-try-return-owner/zag.mod"
+printf 'fn forward(p:*mut i32) !*mut i32 @consumes @returns_owner { return p; } fn work() !i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let q:*mut i32=try forward(p); delete(q); } return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-consume-try-return-owner/main.zag"
+if (cd "$tmp/v2-consume-try-return-owner" && "$ZNC" main.zag -o out) >"$tmp/v2-consume-try-return-owner/log" 2>&1 && [ -x "$tmp/v2-consume-try-return-owner/out" ]; then
+  echo "  ok  fallible consuming helper preserves exact owner identity"; pass=$((pass + 1))
+else
+  echo "  XX  fallible consuming helper ownership transfer"; sed -n '1,8p' "$tmp/v2-consume-try-return-owner/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-consume-return-owner-use-old"
 printf 'name = "v2consumereturnowneruseold"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-consume-return-owner-use-old/zag.mod"
 printf 'fn forward(p:*mut i32) *mut i32 @consumes @returns_owner { return p; } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let q:*mut i32=forward(p); print_i64(p as i64); delete(q); } return 0; }\n' >"$tmp/v2-consume-return-owner-use-old/main.zag"
