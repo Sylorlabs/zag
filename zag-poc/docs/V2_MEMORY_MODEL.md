@@ -137,8 +137,9 @@ producer. Its body may not bind arbitrary minted capabilities locally: that
 would need general local ownership-flow accounting to prove they are returned
 exactly once rather than leaked. The implemented straight-line local-flow case
 tracks multiple private named `Allocation` bindings: each must be directly
-deallocated, except for one exact binding transferred by return. Assignment and
-control-flow joins remain rejected. The
+deallocated, except for one exact binding transferred by return. A complete
+`if` may transfer that sole remaining binding when every arm returns that exact
+binding; assignment and all other control-flow joins remain rejected. The
 annotation alone is not authority; an unproven, foreign, cyclic, mixed, or
 unproven-local return is rejected at the receiving local boundary. This permits
 small allocation factories without permitting an `Allocation` capability to be

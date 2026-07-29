@@ -72,6 +72,15 @@ if (cd "$tmp/v2-system-allocator-helper-local-return" && "$ZNC" main.zag -o out 
 else
   echo "  XX  allocation helper local transfer"; sed -n '1,12p' "$tmp/v2-system-allocator-helper-local-return/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-system-allocator-helper-branch-return"
+printf 'name = "v2systemallocatorhelperbranchreturn"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-helper-branch-return/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-helper-branch-return/std"
+printf '@import("std/allocator.zag") fn make(allocator:SystemAllocator,flag:i32) !Allocation @alloc { let block:Allocation=try allocator.allocate(24,8); if (flag == 1) { return block; } else { return block; } } fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try make(allocator,1); try allocator.deallocate(block); return 0; } fn main() i32 { return work() catch 1; }\n' >"$tmp/v2-system-allocator-helper-branch-return/main.zag"
+if (cd "$tmp/v2-system-allocator-helper-branch-return" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-helper-branch-return/log" 2>&1 && [ -x "$tmp/v2-system-allocator-helper-branch-return/out" ] && "$tmp/v2-system-allocator-helper-branch-return/out"; then
+  echo "  ok  Allocation producer transfers one local through complete branch"; pass=$((pass + 1))
+else
+  echo "  XX  Allocation producer complete-branch transfer"; sed -n '1,16p' "$tmp/v2-system-allocator-helper-branch-return/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-system-allocator-helper-multi-local-return"
 printf 'name = "v2systemallocatorhelpermultilocalreturn"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-helper-multi-local-return/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-helper-multi-local-return/std"
