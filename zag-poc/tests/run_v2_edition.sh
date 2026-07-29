@@ -768,6 +768,54 @@ if (cd "$tmp/v2-checked-heap-uaf" && "$ZNC" main.zag -o out --safety=checked) >"
 else
   echo "  XX  checked safety heap UAF program did not compile"; sed -n '1,8p' "$tmp/v2-checked-heap-uaf/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-checked-heap-aba"
+printf 'name = "v2checkedheapaba"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-heap-aba/zag.mod"
+printf 'fn main() i32 { unsafe { let p:*i8=_zag_malloc(16) as *i8; let stale_address:i64=(p as i64)+0; _zag_free(p); let successor:*i8=_zag_malloc(16) as *i8; successor.*=42; let stale:*i8=stale_address as *i8; let observed:i32=stale.* as i32; _zag_free(successor); return observed; } }\n' >"$tmp/v2-checked-heap-aba/main.zag"
+if (cd "$tmp/v2-checked-heap-aba" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-checked-heap-aba/log" 2>&1 && [ -x "$tmp/v2-checked-heap-aba/out" ]; then
+  set +e
+  "$tmp/v2-checked-heap-aba/out" >"$tmp/v2-checked-heap-aba/out.log" 2>"$tmp/v2-checked-heap-aba/err.log"
+  checked_heap_aba_rc=$?
+  set -e
+  if [ "$checked_heap_aba_rc" -ne 0 ] && grep -q 'zag safety: use after free of allocator pointer' "$tmp/v2-checked-heap-aba/err.log"; then
+    echo "  ok  checked safety quarantine prevents small-allocation ABA revival"; pass=$((pass + 1))
+  else
+    echo "  XX  checked safety small-allocation ABA quarantine (exit=$checked_heap_aba_rc)"; sed -n '1,8p' "$tmp/v2-checked-heap-aba/err.log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  checked safety small-allocation ABA program did not compile"; sed -n '1,8p' "$tmp/v2-checked-heap-aba/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-checked-large-aba"
+printf 'name = "v2checkedlargeaba"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-large-aba/zag.mod"
+# Linux normally reissues the just-unmapped top-down virtual range for this
+# identical dedicated mapping. Checked mode must reject it before publishing a
+# successor pointer rather than reviving the old raw address.
+printf 'fn main() i32 { unsafe { let p:*i8=_zag_malloc(600000) as *i8; let stale_address:i64=(p as i64)+0; _zag_free(p); let successor:*i8=_zag_malloc(600000) as *i8; successor.*=42; _zag_free(successor); return 7; } }\n' >"$tmp/v2-checked-large-aba/main.zag"
+if (cd "$tmp/v2-checked-large-aba" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-checked-large-aba/log" 2>&1 && [ -x "$tmp/v2-checked-large-aba/out" ]; then
+  set +e
+  "$tmp/v2-checked-large-aba/out" >"$tmp/v2-checked-large-aba/out.log" 2>"$tmp/v2-checked-large-aba/err.log"
+  checked_large_aba_rc=$?
+  set -e
+  if [ "$checked_large_aba_rc" -ne 0 ] && grep -q 'zag safety: allocator address reuse violates checked quarantine' "$tmp/v2-checked-large-aba/err.log"; then
+    echo "  ok  checked safety rejects a kernel-reissued large allocation address"; pass=$((pass + 1))
+  else
+    echo "  XX  checked safety large-allocation ABA quarantine (exit=$checked_large_aba_rc)"; sed -n '1,8p' "$tmp/v2-checked-large-aba/err.log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  checked safety large-allocation ABA program did not compile"; sed -n '1,8p' "$tmp/v2-checked-large-aba/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-release-heap-reuse"
+printf 'name = "v2releaseheapreuse"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-release-heap-reuse/zag.mod"
+printf 'fn main() i32 { unsafe { let p:*i8=_zag_malloc(16) as *i8; let first:i64=(p as i64)+0; _zag_free(p); let successor:*i8=_zag_malloc(16) as *i8; let same:i32=((successor as i64)==first) as i32; _zag_free(successor); if(same==1){return 42;} return 1; } }\n' >"$tmp/v2-release-heap-reuse/main.zag"
+if (cd "$tmp/v2-release-heap-reuse" && "$ZNC" main.zag -o out) >"$tmp/v2-release-heap-reuse/log" 2>&1 && [ -x "$tmp/v2-release-heap-reuse/out" ]; then
+  set +e; "$tmp/v2-release-heap-reuse/out"; release_heap_reuse_rc=$?; set -e
+  if [ "$release_heap_reuse_rc" -eq 42 ]; then
+    echo "  ok  default unchecked allocator retains ordinary small-block reuse"; pass=$((pass + 1))
+  else
+    echo "  XX  default unchecked allocator small-block reuse (exit=$release_heap_reuse_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  default unchecked allocator reuse program did not compile"; sed -n '1,8p' "$tmp/v2-release-heap-reuse/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-checked-realloc-uaf"
 printf 'name = "v2checkedreallocuaf"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-realloc-uaf/zag.mod"
 printf 'fn main() i32 { unsafe { let p:*i8=_zag_malloc(16) as *i8; p.*=7; let saved:i64=(p as i64)+0; let q:*i8=_zag_realloc(p,32) as *i8; q.*=42; _zag_free(q); let stale:*i8=saved as *i8; return stale.* as i32; } }\n' >"$tmp/v2-checked-realloc-uaf/main.zag"
@@ -1206,14 +1254,14 @@ else
 fi
 mkdir -p "$tmp/v2-sanitize-memory-poison"
 printf 'name = "v2sanitizememorypoison"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-sanitize-memory-poison/zag.mod"
-printf 'fn main() i32 { unsafe { let p:*i8 = _zag_malloc(16) as *i8; p[8] = 7; _zag_free(p); let q:*i8 = _zag_malloc(16) as *i8; let marker:i32 = q[8] as i32; _zag_free(q); return marker; } }\n' >"$tmp/v2-sanitize-memory-poison/main.zag"
-if (cd "$tmp/v2-sanitize-memory-poison" && "$ZNC" main.zag -o out --sanitize=memory) >"$tmp/v2-sanitize-memory-poison/log" 2>&1 && [ -x "$tmp/v2-sanitize-memory-poison/out" ]; then
+printf 'extern fn memchr(src:*const u8,value:i32,count:i64)*u8 @cabi @borrows; fn main() i32 { unsafe { let p:*i8=_zag_malloc(16) as *i8; p[8]=7; let stale_address:i64=(p as i64)+0; _zag_free(p); let stale:*const u8=stale_address as *const u8; let found:*u8=memchr(stale,165,16); if(found==null as *u8){return 1;} return 42; } }\n' >"$tmp/v2-sanitize-memory-poison/main.zag"
+if (cd "$tmp/v2-sanitize-memory-poison" && "$ZNC" main.zag -o out --sanitize=memory --dynamic --needed libc.so.6) >"$tmp/v2-sanitize-memory-poison/log" 2>&1 && [ -x "$tmp/v2-sanitize-memory-poison/out" ]; then
   set +e
   "$tmp/v2-sanitize-memory-poison/out"
   sanitize_memory_poison_rc=$?
   set -e
-  if [ "$sanitize_memory_poison_rc" -eq 165 ] || [ "$sanitize_memory_poison_rc" -eq -91 ]; then
-    echo "  ok  memory sanitizer poisons reused freed payload"; pass=$((pass + 1))
+  if [ "$sanitize_memory_poison_rc" -eq 42 ]; then
+    echo "  ok  memory sanitizer poisons quarantined freed payload"; pass=$((pass + 1))
   else
     echo "  XX  memory sanitizer poison witness (exit=$sanitize_memory_poison_rc)"; fail=$((fail + 1))
   fi

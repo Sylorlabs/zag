@@ -69,7 +69,7 @@ run_gate "validated x86 SSE2 SIMD add" bash tests/run_x86_simd_add_i32x4.sh
 run_gate "validated x86 SSE2 SIMD subtract" bash tests/run_x86_simd_sub_i32x4.sh
 run_gate "validated x86 SSE2 SIMD bitwise" bash tests/run_x86_simd_bitwise_i32x4.sh
 
-unsupported "pointer and memory model" "raw pointer categories and lexical checks exist, but provenance/alignment/lifetime instrumentation is incomplete"
+unsupported "pointer and memory model" "checked ordinary allocations quarantine address reuse and raw pointer categories plus lexical checks exist, but identity-carrying provenance, untracked allocator coverage, and general reference lifetimes remain incomplete"
 unsupported "allocator and reclamation" "opaque checked SystemAllocator capabilities and bounded retained fixed-buffer/arena regions exist, but custom/debug allocators and a general lifetime model are incomplete"
 unsupported "volatile/MMIO" "checked native 8/16/32-bit and word transactions plus bounded byte MmioRegion access exist, but physical device validation, opaque hardware authority, and the complete MMIO contract are incomplete"
 unsupported "atomics and concurrency" "compiler-reserved unsafe AtomicI64 receiver operations, raw Linux i32 futex wait/wake, literal-validated load/store/RMW/CAS/fence orders, and a direct captureless join-only Linux thread slice with one copied i64 worker argument exist, but language-wide fence semantics, general thread arguments/detach, litmus evidence, and a v2 concurrency model remain incomplete"

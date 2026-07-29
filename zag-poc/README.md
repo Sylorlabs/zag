@@ -130,7 +130,10 @@ load/store/exchange/compare-exchange/fetch-add/sub/and/or/xor operations, bounde
 POPCNT/ANDN/trailing-zero intrinsics, bounded SSE2 four-lane integer
 add/subtract/and/or/xor operations,
 and bounded native memory sanitizer coverage with checked 16-byte trailing
-red zones for small ordinary allocations. General atomics/concurrency,
+red zones for small ordinary allocations. Checked execution also quarantines
+retired small blocks and rejects ordinary allocator address reuse, preventing
+raw stale aliases from reviving as successor objects within its bounded
+provenance table. General atomics/concurrency,
 pointer/allocator lifetime, full C ABI, portable SIMD/checked inline assembly,
 and physical GPU execution remain explicitly fail-closed; unsupported
 native object, static, and shared-object requests also fail closed rather than

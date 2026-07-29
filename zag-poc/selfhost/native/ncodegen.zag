@@ -10429,10 +10429,10 @@ fn RAW_SLICE_REGISTRY_CAP() i64 { return 2048; }
 // We must consult this table before reading ptr-8: after a successful munmap
 // that header is unmapped, so touching it for a copied/stale pointer could
 // turn a lifetime violation into a process fault. Positive pointers are live;
-// negative pointers are freed tombstones. A tombstone slot is reused if the
-// kernel later gives the allocator that same address again. Pointer-only APIs
-// cannot distinguish a stale alias from that later allocation, so this is
-// bounded allocator-integrity instrumentation, not general UAF detection.
+// negative pointers are freed tombstones. The default unchecked path reuses a
+// matching row if the kernel later gives the allocator that address. Checked
+// mode rejects that mapping before returning it because pointer-only APIs
+// cannot distinguish a stale alias from the successor allocation.
 // The table is intentionally bounded. If every slot is occupied by a distinct
 // live/tombstoned mapping, the next large allocation terminates with a clear
 // diagnostic rather than allocating recursive bookkeeping.
@@ -10446,8 +10446,8 @@ fn LARGE_ALLOC_REGISTRY_CAP() i64 { return 2048; }
 // dereferenced.  Pointers not issued by the ordinary allocator intentionally
 // have no entry: stack, static, and FFI pointer semantics remain explicit raw
 // pointer responsibility rather than being spuriously rejected as "unknown".
-// As with the other provenance tables, this is bounded fail-closed runtime
-// instrumentation; exact-address reuse necessarily begins a new lifetime.
+// This is bounded fail-closed runtime instrumentation. Checked tombstones are
+// never revived, so the table is a cumulative allocation-lifetime budget.
 fn ALLOC_ACCESS_REGISTRY() i64 { return BSS_VBASE() + 66560; }
 fn ALLOC_ACCESS_REGISTRY_CAP() i64 { return 3072; }
 // [BSS+115712, BSS+156672) is a checked SystemAllocator handle table of
@@ -10478,11 +10478,14 @@ fn ALLOC_PAGE_SIZE() i64 { return 4096; }
 
 // Publish an ordinary allocator result to the checked-access registry.
 // Input: rax=user pointer, rsi=payload capacity.  Both inputs are preserved.
-// Tombstones are reused only for the same address: a copied stale pointer then
-// remains detectable until the allocator genuinely starts a new lifetime at
-// that address.
+// Tombstones are never revived in checked mode. A raw pointer carries only an
+// address, so accepting a successor allocation at the same address would make
+// a stale alias indistinguishable from the new object. Checked execution
+// instead fails closed; the default unchecked path does not emit this registry
+// and retains ordinary allocator reuse.
 fn cg_emit_alloc_access_acquire(out:*ArrayList[Instr],cg:*Cg)void{
     let loop:i32=cg_fresh(cg);let insert:i32=cg_fresh(cg);let next:i32=cg_fresh(cg);
+    let reused:i32=cg_fresh(cg);let after_reused:i32=cg_fresh(cg);
     let full:i32=cg_fresh(cg);let after_full:i32=cg_fresh(cg);let done:i32=cg_fresh(cg);
     push[Instr](out,i_mov_imm(R_RCX(),0));
     push[Instr](out,i_label(loop));
@@ -10499,6 +10502,7 @@ fn cg_emit_alloc_access_acquire(out:*ArrayList[Instr],cg:*Cg)void{
     push[Instr](out,i_neg(R_R8()));
     push[Instr](out,i_cmp(R_R8(),R_RAX()));
     push[Instr](out,i_jne(next));
+    push[Instr](out,i_jmp(reused));
     push[Instr](out,i_label(insert));
     push[Instr](out,i_store(R_R10(),0,R_RAX()));
     push[Instr](out,i_store(R_R10(),8,R_RSI()));
@@ -10506,6 +10510,9 @@ fn cg_emit_alloc_access_acquire(out:*ArrayList[Instr],cg:*Cg)void{
     push[Instr](out,i_label(next));
     push[Instr](out,i_add_imm(R_RCX(),1));
     push[Instr](out,i_jmp(loop));
+    push[Instr](out,i_label(reused));
+    cg_emit_panic(out,"zag safety: allocator address reuse violates checked quarantine",after_reused,cg);
+    push[Instr](out,i_jmp(done));
     push[Instr](out,i_label(full));
     cg_emit_panic(out,"zag runtime: checked allocation provenance registry exhausted",after_full,cg);
     push[Instr](out,i_label(done));
@@ -10874,6 +10881,7 @@ fn cg_emit_alloc_access_probe(out:*ArrayList[Instr],cg:*Cg)void{
 fn cg_emit_large_alloc_acquire(out:*ArrayList[Instr],cg:*Cg)void{
     let loop:i32=cg_fresh(cg);let insert:i32=cg_fresh(cg);let reuse:i32=cg_fresh(cg);
     let next:i32=cg_fresh(cg);let full:i32=cg_fresh(cg);let after_full:i32=cg_fresh(cg);
+    let rejected_reuse:i32=cg_fresh(cg);let after_rejected_reuse:i32=cg_fresh(cg);
     let duplicate:i32=cg_fresh(cg);let done:i32=cg_fresh(cg);
     push[Instr](out,i_mov_imm(R_RCX(),0));
     push[Instr](out,i_label(loop));
@@ -10890,12 +10898,14 @@ fn cg_emit_large_alloc_acquire(out:*ArrayList[Instr],cg:*Cg)void{
     push[Instr](out,i_cmp(R_R8(),R_RAX()));
     push[Instr](out,i_je(duplicate));
     push[Instr](out,i_jmp(next));
-    // Reuse a tombstone only when the OS has actually reissued that address;
-    // otherwise preserve it so the immediately copied/stale pointer is caught.
+    // The default unchecked path reuses a tombstone only when the OS has
+    // actually reissued that address. Checked mode cannot distinguish a stale
+    // raw alias from the successor mapping, so it rejects the mapping instead.
     push[Instr](out,i_label(reuse));
     push[Instr](out,i_neg(R_R8()));
     push[Instr](out,i_cmp(R_R8(),R_RAX()));
-    push[Instr](out,i_je(insert));
+    if(cg.*.safety_checked==1){push[Instr](out,i_je(rejected_reuse));}
+    else{push[Instr](out,i_je(insert));}
     push[Instr](out,i_label(next));
     push[Instr](out,i_add_imm(R_RCX(),1));
     push[Instr](out,i_jmp(loop));
@@ -10905,6 +10915,11 @@ fn cg_emit_large_alloc_acquire(out:*ArrayList[Instr],cg:*Cg)void{
     push[Instr](out,i_jmp(done));
     push[Instr](out,i_label(full));
     cg_emit_panic(out,"zag runtime: large allocation provenance registry exhausted",after_full,cg);
+    if(cg.*.safety_checked==1){
+        push[Instr](out,i_label(rejected_reuse));
+        cg_emit_panic(out,"zag safety: allocator address reuse violates checked quarantine",after_rejected_reuse,cg);
+        push[Instr](out,i_jmp(done));
+    }
     push[Instr](out,i_label(duplicate));
     cg_emit_panic(out,"zag runtime: overlapping large allocation",done,cg);
 }
@@ -10952,12 +10967,14 @@ fn cg_emit_large_alloc_probe(out:*ArrayList[Instr],cg:*Cg)void{
 // address range reused for a small arena.  When a newly carved small payload
 // lands at the exact former large user address, its valid free must not be
 // mistaken for a stale large-pointer free.  Pointer-only provenance cannot
-// distinguish that ABA reuse from the old alias, so acquisition of the new
-// small object is the authoritative lifetime boundary: discard the matching
-// large tombstone before publishing the small pointer.
+// distinguish that ABA reuse from the old alias. The default unchecked path treats
+// acquisition of the new small object as the lifetime boundary and discards
+// the matching large tombstone. Checked mode emits no clearing code here; the
+// ordinary checked registry rejects the successor address instead.
 //
 // Input: rax = newly acquired small user pointer.  Preserves rax and rsi.
 fn cg_emit_large_alloc_forget_small_reuse(out:*ArrayList[Instr],cg:*Cg)void{
+    if(cg.*.safety_checked==1){return;}
     let loop:i32=cg_fresh(cg);let next:i32=cg_fresh(cg);
     let clear:i32=cg_fresh(cg);let done:i32=cg_fresh(cg);
     push[Instr](out,i_mov_imm(R_RCX(),0));
@@ -11297,8 +11314,10 @@ fn cg_emit_malloc(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
 
 // ── support routine: __free(rdi=ptr) ──────────────────────────────────────────
 // NULL is ignored. A non-positive header is a deterministic invalid/double
-// free diagnostic for small blocks. Live small headers are negated before the
-// payload joins a free list; the freed block's first word becomes next-pointer.
+// free diagnostic for small blocks. In the default unchecked path, live small
+// headers are negated before the payload joins a free list. Checked/sanitizer mode instead
+// quarantines retired blocks for the process lifetime: raw pointers do not
+// carry a generation, so recycling an address would revive stale aliases.
 // Dedicated large mappings are first checked in the bounded provenance table:
 // their header must never be read after an earlier munmap.
 fn cg_emit_free(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
@@ -11338,6 +11357,12 @@ fn cg_emit_free(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     cg_emit_allocator_release(out, R_RSI());
     push[Instr](out, i_cmp_imm(R_RSI(), ALLOC_MAX_SMALL()));
     push[Instr](out, i_jg(l_missing_big));
+    if(cg.*.safety_checked==1){
+        push[Instr](out,i_neg(R_RSI()));
+        push[Instr](out,i_store(R_RDI(),0-8,R_RSI()));
+        cg_emit_alloc_access_release(out,cg);
+        push[Instr](out,i_jmp(l_ret));
+    }
     // class index from the (exact) class size: rcx = idx, rdx = 16,32,..
     push[Instr](out, i_mov_imm(R_RCX(), 0));
     push[Instr](out, i_mov_imm(R_RDX(), 16));

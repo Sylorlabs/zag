@@ -42,6 +42,8 @@ if [ -f docs/V2_SAFETY_TOOLING.md ] && \
    rg -q 'Other sanitizer modes remain rejected' docs/V2_SAFETY_TOOLING.md && \
    rg -q '16-byte trailing red zone' docs/V2_SAFETY_TOOLING.md && \
    rg -q 'does not yet provide leading red zones' docs/V2_SAFETY_TOOLING.md && \
+   rg -q 'tombstoned address' docs/V2_SAFETY_TOOLING.md && \
+   rg -q 'cumulative checked-lifetime budget' docs/V2_SAFETY_TOOLING.md && \
    rg -q '`--sanitize=undefined` is not implemented and is rejected' docs/V2_SAFETY_TOOLING.md && \
    rg -q '`--sanitize=thread` is not implemented and is rejected' docs/V2_SAFETY_TOOLING.md && \
    rg -q '`--safety=release` is not implemented and is rejected' docs/V2_SAFETY_TOOLING.md && \

@@ -16,16 +16,20 @@ silently downgrading. Other sanitizer modes remain rejected.
   The table records allocator capacity (small blocks are class-rounded), so an
   access whose root and final address stay within that tracked live region is
   allowed; a one-past or wider access traps before the load/store. A tracked
-  freed region traps before access until that exact address is reissued for a
-  new allocation. Checked `_zag_free` and `_zag_realloc` additionally require
+  freed region traps before access. Checked small blocks are quarantined rather
+  than recycled, and any later ordinary allocation at a tombstoned address
+  terminates before its pointer is returned. Checked `_zag_free` and
+  `_zag_realloc` additionally require
   an exact live allocation base before reading allocator headers, so a forged
   interior pointer traps rather than corrupting a small-block free list. Stack,
   static and foreign regions are intentionally not rejected merely because
   they are untracked. `zalloc` and cache-aligned raw-slice mappings now enter
   the same bounded registry and retire on their paired free. This is
   bounded runtime instrumentation, not universal pointer provenance: forged
-  pointers, address reuse (ABA), and untracked allocator families remain unsafe
-  programmer responsibility. The checked `SystemAllocator` handle boundary is
+  pointers and untracked allocator families remain unsafe programmer
+  responsibility. The 3,072 rows are a cumulative checked-lifetime budget
+  because tombstones are not revived; exhaustion fails closed. The checked
+  `SystemAllocator` handle boundary is
   narrower and separately records a generation, so copied handles cannot be
   reused after the same native address is reissued. Invalid shifts, division by zero, and invalid
   tags remain separate implementation work.
@@ -49,11 +53,12 @@ silently downgrading. Other sanitizer modes remain rejected.
   allocation-site reports, stack/global instrumentation, or custom-allocator
   tracking. On every ordinary free under sanitizer
   mode it provides deterministic byte poisoning (`0xA5`)
-  before the block enters the free list or is unmapped; this is useful evidence
+  before the block is quarantined or unmapped; this is useful evidence
   when a stale alias escapes the provenance table, but it is not a red-zone or
   general use-after-free proof. Its SystemAllocator-handle checks retain the same generation and
-  allocator-identity validation as checked mode; that does not make
-  raw-pointer ABA generally safe.
+  allocator-identity validation as checked mode. Ordinary checked allocations
+  cannot undergo address-reuse ABA, but raw pointers from untracked allocator
+  families remain outside that guarantee.
 - `--sanitize=undefined` is not implemented and is rejected; it does not
   instrument integer conversion/overflow, shifts, tags, or other preconditions.
 - `--sanitize=thread` is not implemented and is rejected; it records no
