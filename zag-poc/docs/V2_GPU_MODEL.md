@@ -2,8 +2,11 @@
 
 GPU source is not supported merely because it parses or emits MLIR. `@kernel`
 currently rejects every implemented host effect at the semantic boundary, so
-direct I/O, raw atomics, and C-ABI calls fail before frontend emission. `@device`
-helper reachability and distinct GPU effects are not yet modeled. Pointer
+direct I/O, raw atomics, C-ABI calls, and host GPU resource operations fail
+before frontend emission. Device builtins carry a distinct `Device` effect
+that propagates through direct helpers and is permitted by `@kernel`;
+host allocation/launch operations carry `GPUHost`. A complete `@device`
+capability and helper-invocation model is not yet implemented. Pointer
 address spaces are host, device/global, workgroup, private, and
 constant/uniform; implicit crossing is forbidden. Barriers and fences have
 specified workgroup/device scope and cannot be used to synchronize host code.

@@ -41,5 +41,29 @@ else
   bad "resolved direct call compiles"; sed -n '1,12p' "$tmp/direct/log"
 fi
 
+expect_pure_reject() {
+  local name=$1
+  local source=$2
+  mkdir -p "$tmp/$name"
+  printf 'name = "%s"\nversion = "0"\nedition = "2027"\n' "$name" >"$tmp/$name/zag.mod"
+  printf '%s\n' "$source" >"$tmp/$name/main.zag"
+  if (cd "$tmp/$name" && "$ZNC" check main.zag --no-zagd --no-analyze) >"$tmp/$name/log" 2>&1; then
+    bad "$name effect unexpectedly accepted in @pure"
+  elif grep -q 'E0002' "$tmp/$name/log"; then
+    ok "$name effect propagates through a direct helper"
+  else
+    bad "$name rejection reports effect violation"; sed -n '1,12p' "$tmp/$name/log"
+  fi
+}
+
+expect_pure_reject atomic_helper \
+  'fn touch() void { unsafe { let x:i64=0; @atomicStore64((&x) as *mut i64,1); } } fn bad() void @pure { touch(); } fn main() void {}'
+expect_pure_reject ffi_helper \
+  'extern fn getpid() i64 @cabi; fn foreign() i64 { unsafe { return getpid(); } } fn bad() i64 @pure { return foreign(); } fn main() i32 { return 0; }'
+expect_pure_reject device_helper \
+  'fn lane() i32 { return @gpuThreadIdx(0); } fn bad() i32 @pure { return lane(); } fn main() i32 { return 0; }'
+expect_pure_reject device_reassignment \
+  'fn clean() i32 { return 0; } fn lane() i32 { return @gpuThreadIdx(0); } fn bad() i32 @pure { let op:fn() i32 @pure=clean; op=lane; return op(); } fn main() i32 { return 0; }'
+
 echo "──── v2 effect adversarial: pass=$pass fail=$fail ────"
 [ "$fail" -eq 0 ]
