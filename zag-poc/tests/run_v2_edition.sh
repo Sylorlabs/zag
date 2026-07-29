@@ -363,8 +363,8 @@ ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-resize-stale/std"
 printf '@import("std/allocator.zag") fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let stale:Allocation=block; let grown:Allocation=try allocator.resize(block,64,8); try allocator.deallocate(stale); try allocator.deallocate(grown); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-resize-stale/main.zag"
 if (cd "$tmp/v2-system-allocator-resize-stale" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-resize-stale/log" 2>&1 || [ -e "$tmp/v2-system-allocator-resize-stale/out" ]; then
   echo "  XX  stale SystemAllocator resize handle must reject before codegen"; sed -n '1,16p' "$tmp/v2-system-allocator-resize-stale/log"; fail=$((fail + 1))
-elif grep -q 'use after consumed SystemAllocator handle' "$tmp/v2-system-allocator-resize-stale/log"; then
-  echo "  ok  SystemAllocator resize consumes copied old handle before codegen"; pass=$((pass + 1))
+elif grep -q 'use after consumed SystemAllocator handle\|Allocation is affine; copy and uncontracted transfer are not allowed' "$tmp/v2-system-allocator-resize-stale/log"; then
+  echo "  ok  SystemAllocator rejects copied old handle before codegen"; pass=$((pass + 1))
 else
   echo "  XX  stale SystemAllocator resize rejection missing diagnostic"; sed -n '1,16p' "$tmp/v2-system-allocator-resize-stale/log"; fail=$((fail + 1))
 fi
@@ -1296,6 +1296,34 @@ if (cd "$tmp/v2-owned-alias-return" && "$ZNC" main.zag -o out) >"$tmp/v2-owned-a
   echo "  ok  alias return transfers owned allocation"; pass=$((pass + 1))
 else
   echo "  XX  alias return ownership transfer"; sed -n '1,8p' "$tmp/v2-owned-alias-return/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-consume-return-owner"
+printf 'name = "v2consumereturnowner"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-consume-return-owner/zag.mod"
+printf 'fn forward(p:*mut i32) *mut i32 @consumes @returns_owner { return p; } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let q:*mut i32=forward(p); delete(q); } return 0; }\n' >"$tmp/v2-consume-return-owner/main.zag"
+if (cd "$tmp/v2-consume-return-owner" && "$ZNC" main.zag -o out) >"$tmp/v2-consume-return-owner/log" 2>&1 && [ -x "$tmp/v2-consume-return-owner/out" ]; then
+  echo "  ok  verified consuming helper returns its exact owner"; pass=$((pass + 1))
+else
+  echo "  XX  verified consuming helper ownership transfer"; sed -n '1,8p' "$tmp/v2-consume-return-owner/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-consume-return-owner-use-old"
+printf 'name = "v2consumereturnowneruseold"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-consume-return-owner-use-old/zag.mod"
+printf 'fn forward(p:*mut i32) *mut i32 @consumes @returns_owner { return p; } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let q:*mut i32=forward(p); print_i64(p as i64); delete(q); } return 0; }\n' >"$tmp/v2-consume-return-owner-use-old/main.zag"
+if (cd "$tmp/v2-consume-return-owner-use-old" && "$ZNC" check main.zag) >"$tmp/v2-consume-return-owner-use-old/log" 2>&1; then
+  echo "  XX  consuming helper leaves source usable"; fail=$((fail + 1))
+elif grep -q 'use after free of named allocation `p`' "$tmp/v2-consume-return-owner-use-old/log"; then
+  echo "  ok  consuming helper invalidates the source identity"; pass=$((pass + 1))
+else
+  echo "  XX  consuming helper source-invalidity diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-consume-return-owner-invalid"
+printf 'name = "v2consumereturnownerinvalid"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-consume-return-owner-invalid/zag.mod"
+printf 'fn bad(p:*mut i32) *mut i32 @consumes @returns_owner { unsafe { let q:*mut i32=new(7) as *mut i32; delete(p); return q; } } fn main() i32 { return 0; }\n' >"$tmp/v2-consume-return-owner-invalid/main.zag"
+if (cd "$tmp/v2-consume-return-owner-invalid" && "$ZNC" check main.zag) >"$tmp/v2-consume-return-owner-invalid/log" 2>&1; then
+  echo "  XX  invalid consuming return-owner contract compiles"; fail=$((fail + 1))
+elif grep -q '@returns_owner requires every owned return to be the same @consumes owner parameter' "$tmp/v2-consume-return-owner-invalid/log"; then
+  echo "  ok  invalid consuming return-owner contract rejects"; pass=$((pass + 1))
+else
+  echo "  XX  invalid consuming return-owner diagnostic missing"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-owned-assignment-leak"
 printf 'name = "v2ownedassignmentleak"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owned-assignment-leak/zag.mod"

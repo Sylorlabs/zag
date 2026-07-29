@@ -12,7 +12,7 @@ surface rather than granting a premature green release.
 `docs/V2_SUPPORT_MATRIX.generated.md` is separately generated from that gate's
 inventory; it cannot turn an unsupported category into a release pass.
 
-Latest isolated working-copy run (2026-07-27): **36 passing categories, 10
+Latest isolated working-copy run (2026-07-28): **37 passing categories, 10
 failing required categories, exit 1**. Passing categories include bootstrap,
 v1 semantic/native compatibility, shared declared-type authority, the v2
 edition/option gates, mutation-aware aggregate provenance, hard-error handling, malformed-input and deterministic
