@@ -11,11 +11,25 @@
 //        L0001/L0002  heap RAM     (zalloc/_zag_malloc/_zag_realloc/@cacheAlignedAlloc → zfree/_zag_free/@cacheAlignedFree)
 //        V0001/V0002  GPU VRAM     (@gpuAlloc → @gpuFree)
 //        F0001/F0002  file descr.  (net_socket/net_accept → net_close)
+//        L0010/L0011  string buf   (_zag_str_concat/_zag_strdup/_zag_i64_to_str/_zag_u64_to_str → _zag_str_free)
+//        L0012        string buf   chained-concat inner leak — an unbound string
+//                     acquire passed straight into a non-releasing call (the
+//                     classic `_zag_str_concat(_zag_str_concat(a,b), c)` leak).
 //      Heap uses a lenient "any hand-off = handled" policy (arena-friendly, zero
-//      noise); VRAM and fds use a stricter "released-or-escaped" policy because
-//      their handles are passed to many non-releasing calls (kernels, send/recv).
-//      The *01 code = a bound handle never released; the *02 code = an acquire
-//      whose result is discarded on the spot (can never be released).
+//      noise); VRAM, fds, and STRINGS use a stricter "released-or-escaped" policy
+//      because their handles are passed to many non-releasing calls (kernels,
+//      send/recv, _zag_print, draw_text).  The *01 code = a bound handle never
+//      released; the *02 code = an acquire whose result is discarded on the spot
+//      (can never be released).
+//
+//      STRING CONSUMERS: the only release the compiler hardcodes is the runtime
+//      primitive `_zag_str_free`.  An application that wraps the free in helpers
+//      (e.g. PrismStudio's `append_ff` / `agent_ok1f` which free their owned
+//      argument after use) registers them with the repeatable flag
+//          --analyze-str-consumer=NAME
+//      so the strict policy treats a call to NAME as a release of every string
+//      argument it receives.  This keeps the compiler free of app-specific
+//      names while letting any app teach the ledger its ownership conventions.
 //
 //   2. INEFFICIENCY — work the machine repeats or already knows:
 //        E0101  algebraic identity      x+0, x-0, x*1, x/1
@@ -29,9 +43,12 @@
 // `--no-analyze` silences the pass, `--analyze-pedantic` adds E0103.
 //
 // The heap ACQUIRE set intentionally EXCLUDES the arena-style constructors this
-// compiler leans on (`new`, `make[T]`, `_zag_str_concat`, `_zag_i64_to_str`) —
-// those model short-lived / exit-time-reclaimed values, so demanding an explicit
-// free for them would be noise, not signal.
+// compiler leans on (`new`, `make[T]`) — those model short-lived / exit-time-
+// reclaimed values, so demanding an explicit free for them would be noise.
+// String buffers (`_zag_str_concat` / `_zag_strdup` / `_zag_i64_to_str` /
+// `_zag_u64_to_str`) are NOT excluded: they are class 4, tracked under the
+// strict string policy, because unbounded string churn is the single most
+// common leak class in Zag programs that build text by hand.
 
 @import("diag.zag")
 @import("parse.zag")
@@ -49,7 +66,7 @@ fn az_callee_name(n: *Node) []u8 {
 
 // ── the resource ledger ───────────────────────────────────────────────────────
 // Resource class of an acquire primitive: 1 = heap RAM, 2 = GPU VRAM,
-// 3 = file descriptor / storage.  0 = not an acquire.
+// 3 = file descriptor / storage, 4 = string buffer.  0 = not an acquire.
 fn az_res_class(name: []u8) i32 {
     // heap RAM (manual allocators — arena constructors excluded on purpose)
     if (@strEq(name, "zalloc"))             { return 1; }
@@ -62,6 +79,12 @@ fn az_res_class(name: []u8) i32 {
     // OS file descriptor / socket (storage & network)
     if (@strEq(name, "net_socket"))         { return 3; }
     if (@strEq(name, "net_accept"))         { return 3; }
+    // String buffers (heap-owned []u8 from the runtime string primitives).
+    // Tracked under the STRICT string policy — see az_relpolicy / az_str_consumer.
+    if (@strEq(name, "_zag_str_concat"))    { return 4; }
+    if (@strEq(name, "_zag_strdup"))        { return 4; }
+    if (@strEq(name, "_zag_i64_to_str"))    { return 4; }
+    if (@strEq(name, "_zag_u64_to_str"))    { return 4; }
     return 0;
 }
 // Does `name` release resources of `class`?
@@ -75,28 +98,57 @@ fn az_release_matches(name: []u8, class: i32) i32 {
     }
     if (class == 2) { if (@strEq(name, "@gpuFree")) { return 1; } return 0; }
     if (class == 3) { if (@strEq(name, "net_close")) { return 1; } return 0; }
+    if (class == 4) {
+        // The one hardcoded string release: the runtime primitive.
+        if (@strEq(name, "_zag_str_free")) { return 1; }
+        // App-registered consumers via the repeatable --analyze-str-consumer=NAME
+        // flag.  A call to a registered name releases every string argument it
+        // receives (all-args semantics).  Keeps the compiler free of app names.
+        if (az_str_consumer_registered(name) == 1) { return 1; }
+        return 0;
+    }
+    return 0;
+}
+
+// Is `name` registered as a string-consuming helper via --analyze-str-consumer?
+// Scans argv directly (same pattern as has_flag) so no global state / plumbing.
+// The flag is repeatable: pass it once per helper.
+fn az_str_consumer_registered(name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < _zag_argc()) {
+        if (@strEq(_zag_arg(i), "--analyze-str-consumer") == 1) {
+            if (i + 1 < _zag_argc()) {
+                if (@strEq(_zag_arg(i + 1), name) == 1) { return 1; }
+            }
+        }
+        i = i + 1;
+    }
     return 0;
 }
 fn az_class_desc(class: i32) []u8 {
     if (class == 1) { return "heap allocation"; }
     if (class == 2) { return "GPU VRAM buffer"; }
     if (class == 3) { return "file descriptor"; }
+    if (class == 4) { return "string buffer"; }
     return "resource";
 }
 fn az_class_hint(class: i32) []u8 {
     if (class == 1) { return "free it with the matching deallocator (zfree / _zag_free / @cacheAlignedFree), or return it to transfer ownership"; }
     if (class == 2) { return "free it with @gpuFree, or return it to transfer ownership"; }
     if (class == 3) { return "close it with net_close, or return it to transfer ownership"; }
+    if (class == 4) { return "free it with _zag_str_free (or a registered consuming helper), or return it to transfer ownership; bind intermediates to a let and free them — never nest _zag_str_concat inside _zag_str_concat"; }
     return "release it or return it";
 }
 fn az_leak_code(class: i32) []u8 {
     if (class == 2) { return "V0001"; }
     if (class == 3) { return "F0001"; }
+    if (class == 4) { return "L0010"; }
     return "L0001";
 }
 fn az_drop_code(class: i32) []u8 {
     if (class == 2) { return "V0002"; }
     if (class == 3) { return "F0002"; }
+    if (class == 4) { return "L0011"; }
     return "L0002";
 }
 
@@ -308,7 +360,10 @@ fn az_consumed_stmt(n: *Node, name: []u8, relclass: i32) i32 {
     }
 }
 
-// Heap uses the lenient policy (relclass 0); VRAM/fd use the strict policy.
+// Heap uses the lenient policy (relclass 0); VRAM/fd/strings use strict.
+// Strings are strict because most calls that take a string (_zag_print,
+// draw_text, _zag_str_concat itself) BORROW without freeing — a lenient "any
+// hand-off = handled" policy would mark every leaked string as consumed.
 fn az_relpolicy(class: i32) i32 {
     if (class == 1) { return 0; }
     return class;
@@ -700,10 +755,107 @@ fn az_loop_scan_expr(n: *Node, mutated: ArrayList[[]u8], fname: []u8, fline: i32
     }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+//  CHAINED-CONCAT INNER LEAK  (L0012)
+// ════════════════════════════════════════════════════════════════════════════
+// The dominant string-leak pattern in Zag: a string acquire is passed UNBOUND
+// (no intervening `let`) as an argument to a call that does NOT release it.
+//   _zag_str_concat(_zag_str_concat(a, b), c)   // inner result leaks
+//   _zag_print(_zag_i64_to_str(n))              // the i64 string leaks
+//   draw_text(_zag_str_concat(prefix, name))    // the concat leaks
+// The unbound acquire can never reach a _zag_str_free, so it is a guaranteed
+// leak.  This is more precise than the bound-never-freed lint (L0010): it fires
+// at the exact call site, with no allowlist dependency, and no false positives
+// (a release call like _zag_str_free, or a registered consumer, suppresses it).
+//
+// Is `n` a direct call to a string acquire primitive (class 4)?
+fn az_is_str_acquire_call(n: *Node) i32 {
+    switch (n.*) {
+        .call => |_c| { if (az_acquire_class(n) == 4) { return 1; } return 0; }
+        else => { return 0; }
+    }
+}
+
+// Walk an expression, flagging L0012 at every call whose arguments contain a
+// direct string-acquire call when the outer call is not a string consumer.
+fn az_strleak_expr(n: *Node, fname: []u8, fline: i32, file: []u8) i32 {
+    switch (n.*) {
+        .call => |c| {
+            let acc: i32 = 0;
+            let outer: []u8 = az_callee_name(c.callee);
+            let outer_consumes: i32 = az_release_matches(outer, 4);
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) {
+                let arg: *Node = get[*Node](c.args, i);
+                // Direct unbound acquire passed to a non-releasing call: leak.
+                if (az_is_str_acquire_call(arg) == 1 && outer_consumes == 0) {
+                    let inner: []u8 = az_acquire_name(arg);
+                    az_warn("L0012",
+                        _zag_str_concat("string buffer leak — `", _zag_str_concat(inner, _zag_str_concat("` result is passed unbound to `", _zag_str_concat(outer, _zag_str_concat("`, which does not free it", ""))))),
+                        file, fline,
+                        _zag_str_concat("in function `", _zag_str_concat(fname, _zag_str_concat("`: the inner allocation is never bound to a `let`, so it can never reach _zag_str_free", ""))),
+                        _zag_str_concat("bind the inner call to a `let` and free it (or use a leak-free helper like s3/append_ff), or pass it to a releasing call", ""));
+                    acc = acc + 1;
+                }
+                // Recurse: the arg may itself contain nested unbound acquires.
+                acc = acc + az_strleak_expr(arg, fname, fline, file);
+                i = i + 1;
+            }
+            return acc + az_strleak_expr(c.callee, fname, fline, file);
+        }
+        .bin    => |b| { return az_strleak_expr(b.l, fname, fline, file) + az_strleak_expr(b.r, fname, fline, file); }
+        .un     => |u| { return az_strleak_expr(u.e, fname, fline, file); }
+        .idx    => |x| { return az_strleak_expr(x.base, fname, fline, file) + az_strleak_expr(x.idx, fname, fline, file); }
+        .fld    => |f| { return az_strleak_expr(f.base, fname, fline, file); }
+        .slit_  => |s| {
+            let acc: i32 = 0;
+            let i: i32 = 0;
+            while (i < len[FieldInit](s.fields)) { acc = acc + az_strleak_expr(get[FieldInit](s.fields, i).val, fname, fline, file); i = i + 1; }
+            return acc;
+        }
+        .slice_ => |s| { return az_strleak_expr(s.base, fname, fline, file) + az_strleak_expr(s.lo, fname, fline, file) + az_strleak_expr(s.hi, fname, fline, file); }
+        .cast_  => |c| { return az_strleak_expr(c.expr, fname, fline, file); }
+        else    => { return 0; }
+    }
+}
+fn az_strleak_body(body: ArrayList[*Node], fname: []u8, fline: i32, file: []u8) i32 {
+    let acc: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        acc = acc + az_strleak_stmt(get[*Node](body, i), fname, fline, file);
+        i = i + 1;
+    }
+    return acc;
+}
+fn az_strleak_stmt(n: *Node, fname: []u8, fline: i32, file: []u8) i32 {
+    switch (n.*) {
+        .let_    => |l| { if (l.has_init == 1) { return az_strleak_expr(l.expr, fname, fline, file); } return 0; }
+        .ret     => |r| { if (r.has_expr == 1) { return az_strleak_expr(r.expr, fname, fline, file); } return 0; }
+        .assign  => |a| { return az_strleak_expr(a.target, fname, fline, file) + az_strleak_expr(a.expr, fname, fline, file); }
+        .estmt   => |e| { return az_strleak_expr(e.expr, fname, fline, file); }
+        .if_     => |x| {
+            return az_strleak_expr(x.cond, fname, fline, file)
+                 + az_strleak_body(x.then_body, fname, fline, file)
+                 + az_strleak_body(x.els_body, fname, fline, file);
+        }
+        .while_  => |w| { return az_strleak_expr(w.cond, fname, fline, file) + az_strleak_body(w.body, fname, fline, file); }
+        .unsafe_ => |u| { return az_strleak_body(u.body, fname, fline, file); }
+        .switch_ => |sw| {
+            let acc: i32 = az_strleak_expr(sw.subject, fname, fline, file);
+            let i: i32 = 0;
+            while (i < len[SwitchArm](sw.arms)) { acc = acc + az_strleak_body(get[SwitchArm](sw.arms, i).body, fname, fline, file); i = i + 1; }
+            if (sw.has_els == 1) { acc = acc + az_strleak_body(sw.els_body, fname, fline, file); }
+            return acc;
+        }
+        else => { return 0; }
+    }
+}
+
 // ── entry point ───────────────────────────────────────────────────────────────
 fn az_analyze_fn(f: FnDecl, file: []u8, pedantic: i32) i32 {
     if (f.is_extern == 1) { return 0; }
     let c: i32 = az_scan_leaks(f.body, f.body, f.name, f.line, file);
+    c = c + az_strleak_body(f.body, f.name, f.line, file);
     c = c + az_eff_body(f.body, f.name, f.line, file, pedantic);
     return c;
 }

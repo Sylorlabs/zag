@@ -1,0 +1,969 @@
+// std/vulkan_loader.zag — pure-Zag FFI adapter to the system Vulkan loader.
+//
+// STATUS: RUNTIME-VERIFIED on AMD RX 5700 XT (RADV, Mesa 25.2.8).
+// The C test harness tests/vulkan_runtime_test.c loads Zag-emitted SPIR-V,
+// dispatches the fill kernel, and verifies all 1024 outputs = 42.
+// Run tests/run_gpu_runtime.sh to reproduce.
+//
+// NOTE: This file uses `type` aliases and `[N]T` array syntax that the current
+// Zag parser does not accept. The dispatch logic is reference/documentation
+// code. The actual runtime verification is done through the C harness, which
+// uses the real Vulkan C headers directly.
+//
+// This is the compatibility-tier runtime adapter for vulkan-compat. It loads
+// libvulkan.so.1 (or platform equivalent) via @cabi extern declarations and
+// creates a minimal compute-only VkInstance/VkDevice/VkQueue/VkBuffer/
+// VkPipeline/VkCommandBuffer to submit a SPIR-V compute shader with
+// bounded dispatch dimensions, then reads back results.
+//
+// This module is NON-CERTIFIED. It uses CompatLoad and CompatDispatch effects
+// and is forbidden in @kernel, @realtime, and @pure functions. It is a
+// fallback below native and virtual execution.
+//
+// The extern declarations match the Vulkan 1.0 loader ABI. Only the subset
+// needed for bounded compute dispatch is declared. All functions are tagged
+// @io because they perform OS-level work, and the load/dispatch helpers carry
+// @compatLoad/@compatDispatch annotations.
+//
+// Vulkan handles are opaque pointers (dispatchable) or u64 (non-dispatchable).
+// We use *u8 for dispatchable handles and u64 for non-dispatchable handles
+// directly, since Zag does not support top-level type aliases.
+//
+// INSTANCE VALIDATION: The loader creates a VkInstance with no extensions
+// (compute-only). For development, VK_LAYER_KHRONOS_validation can be enabled
+// by setting enabledLayerCount=1 and ppEnabledLayerNames={"VK_LAYER_KHRONOS_validation"}.
+// This is not enabled by default in production because validation layers have
+// performance overhead and may not be installed on all systems.
+//
+// The SPIR-V binary consumed by this loader uses the Shader capability and
+// GLSL450 memory model (Vulkan-style). It is distinct from the OpenCL SPIR-V
+// binary which uses Kernel capability and OpenCL memory model.
+
+// ── Vulkan handle types ─────────────────────────────────────────────────────
+// Vulkan handles are opaque pointers (dispatchable) or u64 (non-dispatchable).
+// Zag does not support top-level `type` aliases, so dispatchable handles are
+// declared as *u8 and non-dispatchable handles as u64 directly in function
+// signatures below. The struct types (VkInstanceCreateInfo, etc.) are declared
+// as Zag structs for documentation; the C runtime test harness
+// (tests/vulkan_runtime_test.c) uses the real C ABI structs directly.
+
+// Vulkan result codes (subset)
+fn vk_success() i32 { return 0; }
+fn vk_not_ready() i32 { return 1; }
+fn vk_timeout() i32 { return 2; }
+fn vk_error_initialization_failed() i32 { return -3; }
+fn vk_error_out_of_host_memory() i32 { return -2; }
+fn vk_error_out_of_device_memory() i32 { return -1; }
+fn vk_error_device_lost() i32 { return -4; }
+
+// ── Vulkan loader extern declarations ───────────────────────────────────────
+// These are resolved at link time via --dynamic --needed libvulkan.so.1.
+// The loader exposes vkGetInstanceProcAddr and the instance/device-level
+// functions directly. We declare only the subset needed for compute.
+
+extern fn vkCreateInstance(pCreateInfo: *VkInstanceCreateInfo, pAllocator: *u8, pInstance: **u8) i32 @cabi;
+extern fn vkDestroyInstance(instance: *u8, pAllocator: *u8) void @cabi;
+extern fn vkEnumeratePhysicalDevices(instance: *u8, pPhysicalDeviceCount: *u32, pPhysicalDevices: **u8) i32 @cabi;
+extern fn vkGetPhysicalDeviceProperties(physicalDevice: *u8, pProperties: *VkPhysicalDeviceProperties) void @cabi;
+extern fn vkGetPhysicalDeviceMemoryProperties(physicalDevice: *u8, pMemoryProperties: *VkPhysicalDeviceMemoryProperties) void @cabi;
+extern fn vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice: *u8, pQueueFamilyPropertyCount: *u32, pQueueFamilyProperties: *VkQueueFamilyProperties) void @cabi;
+
+extern fn vkCreateDevice(physicalDevice: *u8, pCreateInfo: *VkDeviceCreateInfo, pAllocator: *u8, pDevice: **u8) i32 @cabi;
+extern fn vkDestroyDevice(device: *u8, pAllocator: *u8) void @cabi;
+extern fn vkGetDeviceQueue(device: *u8, queueFamilyIndex: u32, queueIndex: u32, pQueue: **u8) void @cabi;
+
+extern fn vkCreateCommandPool(device: *u8, pCreateInfo: *VkCommandPoolCreateInfo, pAllocator: *u8, pCommandPool: **u8) i32 @cabi;
+extern fn vkDestroyCommandPool(device: *u8, commandPool: *u8, pAllocator: *u8) void @cabi;
+
+extern fn vkAllocateCommandBuffers(device: *u8, pAllocateInfo: *VkCommandBufferAllocateInfo, pCommandBuffers: **u8) i32 @cabi;
+extern fn vkFreeCommandBuffers(device: *u8, commandPool: *u8, commandBufferCount: u32, pCommandBuffers: **u8) void @cabi;
+
+extern fn vkBeginCommandBuffer(commandBuffer: *u8, pBeginInfo: *VkCommandBufferBeginInfo) i32 @cabi;
+extern fn vkEndCommandBuffer(commandBuffer: *u8) i32 @cabi;
+extern fn vkResetCommandBuffer(commandBuffer: *u8, flags: u32) i32 @cabi;
+
+extern fn vkCmdBindPipeline(commandBuffer: *u8, pipelineBindPoint: u32, pipeline: u64) void @cabi;
+extern fn vkCmdBindDescriptorSets(commandBuffer: *u8, pipelineBindPoint: u32, layout: u64, firstSet: u32, descriptorSetCount: u32, pDescriptorSets: *u64, dynamicOffsetCount: u32, pDynamicOffsets: *u32) void @cabi;
+extern fn vkCmdDispatch(commandBuffer: *u8, groupCountX: u32, groupCountY: u32, groupCountZ: u32) void @cabi;
+extern fn vkCmdPushConstants(commandBuffer: *u8, layout: u64, stageFlags: u32, offset: u32, size: u32, pValues: *u8) void @cabi;
+
+extern fn vkCreateBuffer(device: *u8, pCreateInfo: *VkBufferCreateInfo, pAllocator: *u8, pBuffer: *u64) i32 @cabi;
+extern fn vkDestroyBuffer(device: *u8, buffer: u64, pAllocator: *u8) void @cabi;
+extern fn vkGetBufferMemoryRequirements(device: *u8, buffer: u64, pMemoryRequirements: *VkMemoryRequirements) void @cabi;
+extern fn vkBindBufferMemory(device: *u8, buffer: u64, memory: u64, memoryOffset: u64) i32 @cabi;
+
+extern fn vkAllocateMemory(device: *u8, pAllocateInfo: *VkMemoryAllocateInfo, pAllocator: *u8, pMemory: *u64) i32 @cabi;
+extern fn vkFreeMemory(device: *u8, memory: u64, pAllocator: *u8) void @cabi;
+extern fn vkMapMemory(device: *u8, memory: u64, offset: u64, size: u64, flags: u32, ppData: **u8) i32 @cabi;
+extern fn vkUnmapMemory(device: *u8, memory: u64) void @cabi;
+
+extern fn vkCreateShaderModule(device: *u8, pCreateInfo: *VkShaderModuleCreateInfo, pAllocator: *u8, pShaderModule: *u64) i32 @cabi;
+extern fn vkDestroyShaderModule(device: *u8, shaderModule: u64, pAllocator: *u8) void @cabi;
+
+extern fn vkCreateDescriptorSetLayout(device: *u8, pCreateInfo: *VkDescriptorSetLayoutCreateInfo, pAllocator: *u8, pSetLayout: *u64) i32 @cabi;
+extern fn vkDestroyDescriptorSetLayout(device: *u8, descriptorSetLayout: u64, pAllocator: *u8) void @cabi;
+extern fn vkCreatePipelineLayout(device: *u8, pCreateInfo: *VkPipelineLayoutCreateInfo, pAllocator: *u8, pPipelineLayout: *u64) i32 @cabi;
+extern fn vkDestroyPipelineLayout(device: *u8, pipelineLayout: u64, pAllocator: *u8) void @cabi;
+extern fn vkCreateComputePipelines(device: *u8, pipelineCache: u64, createInfoCount: u32, pCreateInfos: *VkComputePipelineCreateInfo, pAllocator: *u8, pPipelines: *u64) i32 @cabi;
+extern fn vkDestroyPipeline(device: *u8, pipeline: u64, pAllocator: *u8) void @cabi;
+
+extern fn vkCreateDescriptorPool(device: *u8, pCreateInfo: *VkDescriptorPoolCreateInfo, pAllocator: *u8, pDescriptorPool: *u64) i32 @cabi;
+extern fn vkDestroyDescriptorPool(device: *u8, descriptorPool: u64, pAllocator: *u8) void @cabi;
+extern fn vkAllocateDescriptorSets(device: *u8, pAllocateInfo: *VkDescriptorSetAllocateInfo, pDescriptorSets: *u64) i32 @cabi;
+
+extern fn vkCreateFence(device: *u8, pCreateInfo: *VkFenceCreateInfo, pAllocator: *u8, pFence: *u64) i32 @cabi;
+extern fn vkDestroyFence(device: *u8, fence: u64, pAllocator: *u8) void @cabi;
+extern fn vkWaitForFences(device: *u8, fenceCount: u32, pFences: *u64, waitAll: u32, timeout: u64) i32 @cabi;
+extern fn vkResetFences(device: *u8, fenceCount: u32, pFences: *u64) i32 @cabi;
+
+extern fn vkQueueSubmit(queue: *u8, submitCount: u32, pSubmits: *VkSubmitInfo, fence: u64) i32 @cabi;
+extern fn vkQueueWaitIdle(queue: *u8) i32 @cabi;
+
+extern fn vkUpdateDescriptorSets(device: *u8, descriptorWriteCount: u32, pDescriptorWrites: *VkWriteDescriptorSet, descriptorCopyCount: u32, pDescriptorCopies: *u8) void @cabi;
+
+// ── Vulkan struct definitions (C-compatible layout) ─────────────────────────
+// These structs must match the Vulkan C ABI exactly. Field order and types
+// are critical for @cabi calls.
+
+struct VkInstanceCreateInfo {
+    sType: i32,
+    pNext: *u8,
+    flags: u32,
+    pApplicationInfo: *u8,
+    enabledLayerCount: u32,
+    ppEnabledLayerNames: *[]u8,
+    enabledExtensionCount: u32,
+    ppEnabledExtensionNames: *[]u8,
+}
+
+struct VkPhysicalDeviceProperties {
+    apiVersion: u32,
+    driverVersion: u32,
+    vendorID: u32,
+    deviceID: u32,
+    deviceType: i32,
+    deviceName: [256]u8,
+    // pipelineCacheUUID and limits/sparseProperties omitted for brevity;
+    // the full struct is 832 bytes on most platforms. This declaration is
+    // sufficient for device name extraction.
+}
+
+struct VkMemoryType {
+    propertyFlags: u32,
+    heapIndex: u32,
+}
+
+struct VkMemoryHeap {
+    size: u64,
+    flags: u32,
+    _pad: u32,
+}
+
+struct VkPhysicalDeviceMemoryProperties {
+    memoryTypeCount: u32,
+    memoryTypes: [32]VkMemoryType,
+    memoryHeapCount: u32,
+    _pad: u32,
+    memoryHeaps: [16]VkMemoryHeap,
+}
+
+struct VkExtent3D {
+    width: u32,
+    height: u32,
+    depth: u32,
+}
+
+struct VkQueueFamilyProperties {
+    queueFlags: u32,
+    queueCount: u32,
+    timestampValidBits: u32,
+    minImageTransferGranularity: VkExtent3D,
+}
+
+struct VkDeviceQueueCreateInfo {
+    sType: i32,
+    pNext: *u8,
+    flags: u32,
+    queueFamilyIndex: u32,
+    queueCount: u32,
+    pQueuePriorities: *f32,
+}
+
+struct VkDeviceCreateInfo {
+    sType: i32,
+    pNext: *u8,
+    flags: u32,
+    enabledLayerCount: u32,
+    ppEnabledLayerNames: *[]u8,
+    enabledExtensionCount: u32,
+    ppEnabledExtensionNames: *[]u8,
+    pEnabledFeatures: *u8,
+}
+
+struct VkCommandPoolCreateInfo {
+    sType: i32,
+    pNext: *u8,
+    flags: u32,
+    queueFamilyIndex: u32,
+}
+
+struct VkCommandBufferAllocateInfo {
+    sType: i32,
+    pNext: *u8,
+    commandPool: *u8,
+    level: u32,
+    commandBufferCount: u32,
+}
+
+struct VkCommandBufferBeginInfo {
+    sType: i32,
+    pNext: *u8,
+    flags: u32,
+    pInheritanceInfo: *u8,
+}
+
+struct VkBufferCreateInfo {
+    sType: i32,
+    pNext: *u8,
+    flags: u32,
+    size: u64,
+    usage: u32,
+    sharingMode: u32,
+    queueFamilyIndexCount: u32,
+    pQueueFamilyIndices: *u32,
+}
+
+struct VkMemoryRequirements {
+    size: u64,
+    alignment: u64,
+    memoryTypeBits: u32,
+}
+
+struct VkMemoryAllocateInfo {
+    sType: i32,
+    pNext: *u8,
+    allocationSize: u64,
+    memoryTypeIndex: u32,
+}
+
+struct VkShaderModuleCreateInfo {
+    sType: i32,
+    pNext: *u8,
+    flags: u32,
+    codeSize: u64,
+    pCode: *u32,
+}
+
+struct VkDescriptorSetLayoutBinding {
+    binding: u32,
+    descriptorType: u32,
+    descriptorCount: u32,
+    stageFlags: u32,
+    pImmutableSamplers: *u8,
+}
+
+struct VkDescriptorSetLayoutCreateInfo {
+    sType: i32,
+    pNext: *u8,
+    flags: u32,
+    bindingCount: u32,
+    pBindings: *VkDescriptorSetLayoutBinding,
+}
+
+struct VkPipelineLayoutCreateInfo {
+    sType: i32,
+    pNext: *u8,
+    flags: u32,
+    setLayoutCount: u32,
+    pSetLayouts: *u64,
+    pushConstantRangeCount: u32,
+    pPushConstantRanges: *u8,
+}
+
+struct VkComputePipelineCreateInfo {
+    sType: i32,
+    pNext: *u8,
+    flags: u32,
+    stage: VkPipelineShaderStageCreateInfo,
+    layout: u64,
+    basePipelineHandle: u64,
+    basePipelineIndex: i32,
+}
+
+struct VkPipelineShaderStageCreateInfo {
+    sType: i32,
+    pNext: *u8,
+    flags: u32,
+    stage: u32,
+    module: u64,
+    pName: *u8,
+    pSpecializationInfo: *u8,
+}
+
+struct VkDescriptorPoolCreateInfo {
+    sType: i32,
+    pNext: *u8,
+    flags: u32,
+    maxSets: u32,
+    poolSizeCount: u32,
+    pPoolSizes: *u8,
+}
+
+struct VkDescriptorSetAllocateInfo {
+    sType: i32,
+    pNext: *u8,
+    descriptorPool: u64,
+    descriptorSetCount: u32,
+    pSetLayouts: *u64,
+}
+
+struct VkFenceCreateInfo {
+    sType: i32,
+    pNext: *u8,
+    flags: u32,
+}
+
+struct VkSubmitInfo {
+    sType: i32,
+    pNext: *u8,
+    waitSemaphoreCount: u32,
+    pWaitSemaphores: *u64,
+    pWaitDstStageMask: *u32,
+    commandBufferCount: u32,
+    pCommandBuffers: **u8,
+    signalSemaphoreCount: u32,
+    pSignalSemaphores: *u64,
+}
+
+struct VkDescriptorBufferInfo {
+    buffer: u64,
+    offset: u64,
+    range: u64,
+}
+
+struct VkWriteDescriptorSet {
+    sType: i32,
+    pNext: *u8,
+    dstSet: u64,
+    dstBinding: u32,
+    dstArrayElement: u32,
+    descriptorCount: u32,
+    descriptorType: u32,
+    pImageInfo: *u8,
+    pBufferInfo: *VkDescriptorBufferInfo,
+    pTexelBufferView: *u8,
+}
+
+struct VkPushConstantRange {
+    stageFlags: u32,
+    offset: u32,
+    size: u32,
+}
+
+struct VkDescriptorPoolSize {
+    descriptorType: u32,
+    descriptorCount: u32,
+}
+
+// ── Vulkan constants ────────────────────────────────────────────────────────
+fn vk_structure_type_instance_create_info() i32 { return 1; }
+fn vk_structure_type_device_queue_create_info() i32 { return 2; }
+fn vk_structure_type_device_create_info() i32 { return 3; }
+fn vk_structure_type_command_pool_create_info() i32 { return 39; }
+fn vk_structure_type_command_buffer_allocate_info() i32 { return 40; }
+fn vk_structure_type_command_buffer_begin_info() i32 { return 42; }
+fn vk_structure_type_buffer_create_info() i32 { return 21; }
+fn vk_structure_type_memory_allocate_info() i32 { return 22; }
+fn vk_structure_type_shader_module_create_info() i32 { return 33; }
+fn vk_structure_type_descriptor_set_layout_create_info() i32 { return 26; }
+fn vk_structure_type_pipeline_layout_create_info() i32 { return 28; }
+fn vk_structure_type_compute_pipeline_create_info() i32 { return 30; }
+fn vk_structure_type_pipeline_shader_stage_create_info() i32 { return 29; }
+fn vk_structure_type_descriptor_pool_create_info() i32 { return 27; }
+fn vk_structure_type_descriptor_set_allocate_info() i32 { return 41; }
+fn vk_structure_type_fence_create_info() i32 { return 44; }
+fn vk_structure_type_submit_info() i32 { return 4; }
+
+fn vk_queue_compute_bit() u32 { return 2; }
+fn vk_buffer_usage_storage_buffer_bit() u32 { return 4; }
+fn vk_sharing_mode_exclusive() u32 { return 0; }
+fn vk_pipeline_bind_point_compute() u32 { return 1; }
+fn vk_shader_stage_compute_bit() u32 { return 32; }
+fn vk_descriptor_type_storage_buffer() u32 { return 7; }
+fn vk_descriptor_pool_create_free_descriptor_set_bit() u32 { return 1; }
+fn vk_command_buffer_level_primary() u32 { return 0; }
+fn vk_command_buffer_usage_one_time_submit_bit() u32 { return 1; }
+fn vk_fence_create_signaled_bit() u32 { return 1; }
+fn vk_memory_property_host_visible_bit() u32 { return 2; }
+fn vk_memory_property_host_coherent_bit() u32 { return 4; }
+fn vk_whole_size() u64 { return 0xFFFFFFFFFFFFFFFF; }
+
+// ── Vulkan compat context ───────────────────────────────────────────────────
+// Holds all Vulkan resources needed for a bounded compute dispatch.
+// Created by zag_vulkan_compat_open, destroyed by zag_vulkan_compat_close.
+struct ZagVulkanCompatContext {
+    instance: *u8,
+    physical_device: *u8,
+    device: *u8,
+    queue: *u8,
+    queue_family: u32,
+    command_pool: *u8,
+    available: bool,
+    error_code: i32,
+    error_msg: [128]u8,
+}
+
+// Opens a minimal Vulkan compute context. Returns a context with
+// available=true if a compute-capable physical device was found.
+// This function carries @compatLoad because it loads the Vulkan library
+// (via @cabi externs resolved at link time) and creates instance/device.
+fn zag_vulkan_compat_open() ZagVulkanCompatContext @compatLoad {
+    let ctx: ZagVulkanCompatContext = ZagVulkanCompatContext{
+        .instance = null as *u8,
+        .physical_device = null as *u8,
+        .device = null as *u8,
+        .queue = null as *u8,
+        .queue_family = 0,
+        .command_pool = null as *u8,
+        .available = false,
+        .error_code = 0,
+        .error_msg = [128]u8{0},
+    };
+    // Create a minimal instance with no extensions (compute-only).
+    let ici: VkInstanceCreateInfo = VkInstanceCreateInfo{
+        .sType = vk_structure_type_instance_create_info(),
+        .pNext = null as *u8,
+        .flags = 0,
+        .pApplicationInfo = null as *u8,
+        .enabledLayerCount = 0,
+        .ppEnabledLayerNames = null as *[]u8,
+        .enabledExtensionCount = 0,
+        .ppEnabledExtensionNames = null as *[]u8,
+    };
+    let rc: i32 = vkCreateInstance(&ici, null as *u8, &ctx.instance);
+    if (rc != vk_success()) {
+        ctx.error_code = rc;
+        return ctx;
+    }
+    // Enumerate physical devices (get count first).
+    let dev_count: u32 = 0;
+    rc = vkEnumeratePhysicalDevices(ctx.instance, &dev_count, null as **u8);
+    if (rc != vk_success() || dev_count == 0) {
+        ctx.error_code = -100;
+        return ctx;
+    }
+    // Get the first physical device.
+    let phys: *u8 = null as *u8;
+    rc = vkEnumeratePhysicalDevices(ctx.instance, &dev_count, &phys);
+    if (rc != vk_success()) {
+        ctx.error_code = -101;
+        return ctx;
+    }
+    ctx.physical_device = phys;
+    // Find a compute-capable queue family by iterating all families.
+    let qf_count: u32 = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(phys, &qf_count, null as *VkQueueFamilyProperties);
+    if (qf_count == 0) {
+        ctx.error_code = -102;
+        return ctx;
+    }
+    let qf_buf: [16]VkQueueFamilyProperties = [16]VkQueueFamilyProperties{VkQueueFamilyProperties{
+        .queueFlags = 0, .queueCount = 0, .timestampValidBits = 0,
+        .minImageTransferGranularity = VkExtent3D{.width = 0, .height = 0, .depth = 0},
+    }};
+    let qf_found: bool = false;
+    let qf_idx: u32 = 0;
+    if (qf_count <= 16) {
+        vkGetPhysicalDeviceQueueFamilyProperties(phys, &qf_count, &qf_buf[0]);
+        let qi: u32 = 0;
+        while (qi < qf_count) {
+            if ((qf_buf[qi].queueFlags & vk_queue_compute_bit()) != 0) {
+                qf_idx = qi;
+                qf_found = true;
+                break;
+            }
+            qi = qi + 1;
+        }
+    }
+    if (!qf_found) {
+        // Fallback: assume queue family 0 has compute.
+        qf_idx = 0;
+    }
+    ctx.queue_family = qf_idx;
+    // Create a logical device with one compute queue.
+    let queue_priority: f32 = 1.0;
+    let dqci: VkDeviceQueueCreateInfo = VkDeviceQueueCreateInfo{
+        .sType = vk_structure_type_device_queue_create_info(),
+        .pNext = null as *u8,
+        .flags = 0,
+        .queueFamilyIndex = qf_idx,
+        .queueCount = 1,
+        .pQueuePriorities = &queue_priority,
+    };
+    let dci: VkDeviceCreateInfo = VkDeviceCreateInfo{
+        .sType = vk_structure_type_device_create_info(),
+        .pNext = null as *u8,
+        .flags = 0,
+        .enabledLayerCount = 0,
+        .ppEnabledLayerNames = null as *[]u8,
+        .enabledExtensionCount = 0,
+        .ppEnabledExtensionNames = null as *[]u8,
+        .pEnabledFeatures = null as *u8,
+    };
+    rc = vkCreateDevice(phys, &dci, null as *u8, &ctx.device);
+    if (rc != vk_success()) {
+        ctx.error_code = rc;
+        return ctx;
+    }
+    vkGetDeviceQueue(ctx.device, qf_idx, 0, &ctx.queue);
+    // Create a command pool.
+    let cpci: VkCommandPoolCreateInfo = VkCommandPoolCreateInfo{
+        .sType = vk_structure_type_command_pool_create_info(),
+        .pNext = null as *u8,
+        .flags = 0,
+        .queueFamilyIndex = qf_idx,
+    };
+    rc = vkCreateCommandPool(ctx.device, &cpci, null as *u8, &ctx.command_pool);
+    if (rc != vk_success()) {
+        ctx.error_code = rc;
+        return ctx;
+    }
+    ctx.available = true;
+    return ctx;
+}
+
+// Closes a Vulkan compat context and releases all resources.
+fn zag_vulkan_compat_close(ctx: *ZagVulkanCompatContext) void @compatLoad {
+    if (ctx.command_pool != null as *u8) {
+        vkDestroyCommandPool(ctx.device, ctx.command_pool, null as *u8);
+        ctx.command_pool = null as *u8;
+    }
+    if (ctx.device != null as *u8) {
+        vkDestroyDevice(ctx.device, null as *u8);
+        ctx.device = null as *u8;
+    }
+    if (ctx.instance != null as *u8) {
+        vkDestroyInstance(ctx.instance, null as *u8);
+        ctx.instance = null as *u8;
+    }
+    ctx.available = false;
+}
+
+// Dispatches a SPIR-V compute shader with bounded dimensions.
+// Full implementation: creates shader module, storage buffer, descriptor set,
+// pipeline, records command buffer, submits with fence, waits, reads back.
+// Returns vk_success() (0) on success, a negative Vulkan result code on error.
+fn zag_vulkan_compat_dispatch(
+    ctx: *ZagVulkanCompatContext,
+    spirv_code: *u32,
+    spirv_word_count: u32,
+    output_buffer: *i32,
+    output_count: u32,
+    push_constants: *u8,
+    push_constant_size: u32,
+    group_count_x: u32,
+    group_count_y: u32,
+    group_count_z: u32,
+    timeout_ns: u64,
+) i32 @compatDispatch {
+    if (!ctx.available) { return -200; }
+    let dev: *u8 = ctx.device;
+
+    // ── 1. Create shader module from SPIR-V binary ───────────────────────
+    let smci: VkShaderModuleCreateInfo = VkShaderModuleCreateInfo{
+        .sType = vk_structure_type_shader_module_create_info(),
+        .pNext = null as *u8,
+        .flags = 0,
+        .codeSize = (spirv_word_count as u64) * 4,
+        .pCode = spirv_code,
+    };
+    let shader_module: u64 = 0;
+    let rc: i32 = vkCreateShaderModule(dev, &smci, null as *u8, &shader_module);
+    if (rc != vk_success()) { return rc; }
+
+    // ── 2. Create storage buffer for output ──────────────────────────────
+    let buf_size: u64 = (output_count as u64) * 4;
+    let bci: VkBufferCreateInfo = VkBufferCreateInfo{
+        .sType = vk_structure_type_buffer_create_info(),
+        .pNext = null as *u8,
+        .flags = 0,
+        .size = buf_size,
+        .usage = vk_buffer_usage_storage_buffer_bit(),
+        .sharingMode = vk_sharing_mode_exclusive(),
+        .queueFamilyIndexCount = 0,
+        .pQueueFamilyIndices = null as *u32,
+    };
+    let buffer: u64 = 0;
+    rc = vkCreateBuffer(dev, &bci, null as *u8, &buffer);
+    if (rc != vk_success()) { vkDestroyShaderModule(dev, shader_module, null as *u8); return rc; }
+
+    // ── 3. Allocate device memory for the buffer ─────────────────────────
+    let mem_reqs: VkMemoryRequirements = VkMemoryRequirements{
+        .size = 0, .alignment = 0, .memoryTypeBits = 0,
+    };
+    vkGetBufferMemoryRequirements(dev, buffer, &mem_reqs);
+
+    // Find a memory type that is host-visible and host-coherent.
+    let mem_props: VkPhysicalDeviceMemoryProperties = VkPhysicalDeviceMemoryProperties{
+        .memoryTypeCount = 0,
+        .memoryTypes = [32]VkMemoryType{VkMemoryType{.propertyFlags = 0, .heapIndex = 0}},
+        .memoryHeapCount = 0,
+        ._pad = 0,
+        .memoryHeaps = [16]VkMemoryHeap{VkMemoryHeap{.size = 0, .flags = 0, ._pad = 0}},
+    };
+    vkGetPhysicalDeviceMemoryProperties(ctx.physical_device, &mem_props);
+    let want_flags: u32 = vk_memory_property_host_visible_bit() | vk_memory_property_host_coherent_bit();
+    let mem_type_idx: u32 = 0;
+    let mem_found: bool = false;
+    let mi: u32 = 0;
+    while (mi < mem_props.memoryTypeCount && mi < 32) {
+        if ((mem_reqs.memoryTypeBits & (1 << mi)) != 0 &&
+            (mem_props.memoryTypes[mi].propertyFlags & want_flags) == want_flags) {
+            mem_type_idx = mi;
+            mem_found = true;
+            break;
+        }
+        mi = mi + 1;
+    }
+    if (!mem_found) {
+        vkDestroyBuffer(dev, buffer, null as *u8);
+        vkDestroyShaderModule(dev, shader_module, null as *u8);
+        return -300; // no suitable memory type
+    }
+
+    let mai: VkMemoryAllocateInfo = VkMemoryAllocateInfo{
+        .sType = vk_structure_type_memory_allocate_info(),
+        .pNext = null as *u8,
+        .allocationSize = mem_reqs.size,
+        .memoryTypeIndex = mem_type_idx,
+    };
+    let buffer_memory: u64 = 0;
+    rc = vkAllocateMemory(dev, &mai, null as *u8, &buffer_memory);
+    if (rc != vk_success()) {
+        vkDestroyBuffer(dev, buffer, null as *u8);
+        vkDestroyShaderModule(dev, shader_module, null as *u8);
+        return rc;
+    }
+    rc = vkBindBufferMemory(dev, buffer, buffer_memory, 0);
+    if (rc != vk_success()) {
+        vkFreeMemory(dev, buffer_memory, null as *u8);
+        vkDestroyBuffer(dev, buffer, null as *u8);
+        vkDestroyShaderModule(dev, shader_module, null as *u8);
+        return rc;
+    }
+
+    // ── 4. Create descriptor set layout (1 storage buffer binding) ───────
+    let binding: VkDescriptorSetLayoutBinding = VkDescriptorSetLayoutBinding{
+        .binding = 0,
+        .descriptorType = vk_descriptor_type_storage_buffer(),
+        .descriptorCount = 1,
+        .stageFlags = vk_shader_stage_compute_bit(),
+        .pImmutableSamplers = null as *u8,
+    };
+    let dslci: VkDescriptorSetLayoutCreateInfo = VkDescriptorSetLayoutCreateInfo{
+        .sType = vk_structure_type_descriptor_set_layout_create_info(),
+        .pNext = null as *u8,
+        .flags = 0,
+        .bindingCount = 1,
+        .pBindings = &binding,
+    };
+    let ds_layout: u64 = 0;
+    rc = vkCreateDescriptorSetLayout(dev, &dslci, null as *u8, &ds_layout);
+    if (rc != vk_success()) {
+        vkFreeMemory(dev, buffer_memory, null as *u8);
+        vkDestroyBuffer(dev, buffer, null as *u8);
+        vkDestroyShaderModule(dev, shader_module, null as *u8);
+        return rc;
+    }
+
+    // ── 5. Create pipeline layout with push constant range ───────────────
+    let pcr: VkPushConstantRange = VkPushConstantRange{
+        .stageFlags = vk_shader_stage_compute_bit(),
+        .offset = 0,
+        .size = push_constant_size,
+    };
+    let plci: VkPipelineLayoutCreateInfo = VkPipelineLayoutCreateInfo{
+        .sType = vk_structure_type_pipeline_layout_create_info(),
+        .pNext = null as *u8,
+        .flags = 0,
+        .setLayoutCount = 1,
+        .pSetLayouts = &ds_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &pcr,
+    };
+    let pipeline_layout: u64 = 0;
+    rc = vkCreatePipelineLayout(dev, &plci, null as *u8, &pipeline_layout);
+    if (rc != vk_success()) {
+        vkDestroyDescriptorSetLayout(dev, ds_layout, null as *u8);
+        vkFreeMemory(dev, buffer_memory, null as *u8);
+        vkDestroyBuffer(dev, buffer, null as *u8);
+        vkDestroyShaderModule(dev, shader_module, null as *u8);
+        return rc;
+    }
+
+    // ── 6. Create compute pipeline ───────────────────────────────────────
+    let stage: VkPipelineShaderStageCreateInfo = VkPipelineShaderStageCreateInfo{
+        .sType = vk_structure_type_pipeline_shader_stage_create_info(),
+        .pNext = null as *u8,
+        .flags = 0,
+        .stage = vk_shader_stage_compute_bit(),
+        .module = shader_module,
+        .pName = "main",
+        .pSpecializationInfo = null as *u8,
+    };
+    let cpci: VkComputePipelineCreateInfo = VkComputePipelineCreateInfo{
+        .sType = vk_structure_type_compute_pipeline_create_info(),
+        .pNext = null as *u8,
+        .flags = 0,
+        .stage = stage,
+        .layout = pipeline_layout,
+        .basePipelineHandle = 0,
+        .basePipelineIndex = 0,
+    };
+    let pipeline: u64 = 0;
+    rc = vkCreateComputePipelines(dev, 0, 1, &cpci, null as *u8, &pipeline);
+    if (rc != vk_success()) {
+        vkDestroyPipelineLayout(dev, pipeline_layout, null as *u8);
+        vkDestroyDescriptorSetLayout(dev, ds_layout, null as *u8);
+        vkFreeMemory(dev, buffer_memory, null as *u8);
+        vkDestroyBuffer(dev, buffer, null as *u8);
+        vkDestroyShaderModule(dev, shader_module, null as *u8);
+        return rc;
+    }
+
+    // ── 7. Create descriptor pool and allocate descriptor set ────────────
+    let pool_size: VkDescriptorPoolSize = VkDescriptorPoolSize{
+        .descriptorType = vk_descriptor_type_storage_buffer(),
+        .descriptorCount = 1,
+    };
+    let dpci: VkDescriptorPoolCreateInfo = VkDescriptorPoolCreateInfo{
+        .sType = vk_structure_type_descriptor_pool_create_info(),
+        .pNext = null as *u8,
+        .flags = vk_descriptor_pool_create_free_descriptor_set_bit(),
+        .maxSets = 1,
+        .poolSizeCount = 1,
+        .pPoolSizes = &pool_size,
+    };
+    let desc_pool: u64 = 0;
+    rc = vkCreateDescriptorPool(dev, &dpci, null as *u8, &desc_pool);
+    if (rc != vk_success()) {
+        vkDestroyPipeline(dev, pipeline, null as *u8);
+        vkDestroyPipelineLayout(dev, pipeline_layout, null as *u8);
+        vkDestroyDescriptorSetLayout(dev, ds_layout, null as *u8);
+        vkFreeMemory(dev, buffer_memory, null as *u8);
+        vkDestroyBuffer(dev, buffer, null as *u8);
+        vkDestroyShaderModule(dev, shader_module, null as *u8);
+        return rc;
+    }
+    let dsai: VkDescriptorSetAllocateInfo = VkDescriptorSetAllocateInfo{
+        .sType = vk_structure_type_descriptor_set_allocate_info(),
+        .pNext = null as *u8,
+        .descriptorPool = desc_pool,
+        .descriptorSetCount = 1,
+        .pSetLayouts = &ds_layout,
+    };
+    let desc_set: u64 = 0;
+    rc = vkAllocateDescriptorSets(dev, &dsai, &desc_set);
+    if (rc != vk_success()) {
+        vkDestroyDescriptorPool(dev, desc_pool, null as *u8);
+        vkDestroyPipeline(dev, pipeline, null as *u8);
+        vkDestroyPipelineLayout(dev, pipeline_layout, null as *u8);
+        vkDestroyDescriptorSetLayout(dev, ds_layout, null as *u8);
+        vkFreeMemory(dev, buffer_memory, null as *u8);
+        vkDestroyBuffer(dev, buffer, null as *u8);
+        vkDestroyShaderModule(dev, shader_module, null as *u8);
+        return rc;
+    }
+
+    // ── 8. Write descriptor set: bind buffer to binding 0 ────────────────
+    let buf_info: VkDescriptorBufferInfo = VkDescriptorBufferInfo{
+        .buffer = buffer,
+        .offset = 0,
+        .range = vk_whole_size(),
+    };
+    let wds: VkWriteDescriptorSet = VkWriteDescriptorSet{
+        .sType = 23, // VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+        .pNext = null as *u8,
+        .dstSet = desc_set,
+        .dstBinding = 0,
+        .dstArrayElement = 0,
+        .descriptorCount = 1,
+        .descriptorType = vk_descriptor_type_storage_buffer(),
+        .pImageInfo = null as *u8,
+        .pBufferInfo = &buf_info,
+        .pTexelBufferView = null as *u8,
+    };
+    vkUpdateDescriptorSets(dev, 1, &wds, 0, null as *u8);
+
+    // ── 9. Allocate and record command buffer ────────────────────────────
+    let cbai: VkCommandBufferAllocateInfo = VkCommandBufferAllocateInfo{
+        .sType = vk_structure_type_command_buffer_allocate_info(),
+        .pNext = null as *u8,
+        .commandPool = ctx.command_pool,
+        .level = vk_command_buffer_level_primary(),
+        .commandBufferCount = 1,
+    };
+    let cmd_buf: *u8 = null as *u8;
+    rc = vkAllocateCommandBuffers(dev, &cbai, &cmd_buf);
+    if (rc != vk_success()) {
+        vkDestroyDescriptorPool(dev, desc_pool, null as *u8);
+        vkDestroyPipeline(dev, pipeline, null as *u8);
+        vkDestroyPipelineLayout(dev, pipeline_layout, null as *u8);
+        vkDestroyDescriptorSetLayout(dev, ds_layout, null as *u8);
+        vkFreeMemory(dev, buffer_memory, null as *u8);
+        vkDestroyBuffer(dev, buffer, null as *u8);
+        vkDestroyShaderModule(dev, shader_module, null as *u8);
+        return rc;
+    }
+    let cbbi: VkCommandBufferBeginInfo = VkCommandBufferBeginInfo{
+        .sType = vk_structure_type_command_buffer_begin_info(),
+        .pNext = null as *u8,
+        .flags = vk_command_buffer_usage_one_time_submit_bit(),
+        .pInheritanceInfo = null as *u8,
+    };
+    rc = vkBeginCommandBuffer(cmd_buf, &cbbi);
+    if (rc != vk_success()) {
+        vkFreeCommandBuffers(dev, ctx.command_pool, 1, &cmd_buf);
+        vkDestroyDescriptorPool(dev, desc_pool, null as *u8);
+        vkDestroyPipeline(dev, pipeline, null as *u8);
+        vkDestroyPipelineLayout(dev, pipeline_layout, null as *u8);
+        vkDestroyDescriptorSetLayout(dev, ds_layout, null as *u8);
+        vkFreeMemory(dev, buffer_memory, null as *u8);
+        vkDestroyBuffer(dev, buffer, null as *u8);
+        vkDestroyShaderModule(dev, shader_module, null as *u8);
+        return rc;
+    }
+    // Bind pipeline, descriptor set, push constants, then dispatch.
+    vkCmdBindPipeline(cmd_buf, vk_pipeline_bind_point_compute(), pipeline);
+    vkCmdBindDescriptorSets(cmd_buf, vk_pipeline_bind_point_compute(), pipeline_layout, 0, 1, &desc_set, 0, null as *u32);
+    if (push_constant_size > 0 && push_constants != null as *u8) {
+        vkCmdPushConstants(cmd_buf, pipeline_layout, vk_shader_stage_compute_bit(), 0, push_constant_size, push_constants);
+    }
+    vkCmdDispatch(cmd_buf, group_count_x, group_count_y, group_count_z);
+    rc = vkEndCommandBuffer(cmd_buf);
+    if (rc != vk_success()) {
+        vkFreeCommandBuffers(dev, ctx.command_pool, 1, &cmd_buf);
+        vkDestroyDescriptorPool(dev, desc_pool, null as *u8);
+        vkDestroyPipeline(dev, pipeline, null as *u8);
+        vkDestroyPipelineLayout(dev, pipeline_layout, null as *u8);
+        vkDestroyDescriptorSetLayout(dev, ds_layout, null as *u8);
+        vkFreeMemory(dev, buffer_memory, null as *u8);
+        vkDestroyBuffer(dev, buffer, null as *u8);
+        vkDestroyShaderModule(dev, shader_module, null as *u8);
+        return rc;
+    }
+
+    // ── 10. Create fence, submit, wait ───────────────────────────────────
+    let fci: VkFenceCreateInfo = VkFenceCreateInfo{
+        .sType = vk_structure_type_fence_create_info(),
+        .pNext = null as *u8,
+        .flags = 0,
+    };
+    let fence: u64 = 0;
+    rc = vkCreateFence(dev, &fci, null as *u8, &fence);
+    if (rc != vk_success()) {
+        vkFreeCommandBuffers(dev, ctx.command_pool, 1, &cmd_buf);
+        vkDestroyDescriptorPool(dev, desc_pool, null as *u8);
+        vkDestroyPipeline(dev, pipeline, null as *u8);
+        vkDestroyPipelineLayout(dev, pipeline_layout, null as *u8);
+        vkDestroyDescriptorSetLayout(dev, ds_layout, null as *u8);
+        vkFreeMemory(dev, buffer_memory, null as *u8);
+        vkDestroyBuffer(dev, buffer, null as *u8);
+        vkDestroyShaderModule(dev, shader_module, null as *u8);
+        return rc;
+    }
+    let si: VkSubmitInfo = VkSubmitInfo{
+        .sType = vk_structure_type_submit_info(),
+        .pNext = null as *u8,
+        .waitSemaphoreCount = 0,
+        .pWaitSemaphores = null as *u64,
+        .pWaitDstStageMask = null as *u32,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmd_buf,
+        .signalSemaphoreCount = 0,
+        .pSignalSemaphores = null as *u64,
+    };
+    rc = vkQueueSubmit(ctx.queue, 1, &si, fence);
+    if (rc != vk_success()) {
+        vkDestroyFence(dev, fence, null as *u8);
+        vkFreeCommandBuffers(dev, ctx.command_pool, 1, &cmd_buf);
+        vkDestroyDescriptorPool(dev, desc_pool, null as *u8);
+        vkDestroyPipeline(dev, pipeline, null as *u8);
+        vkDestroyPipelineLayout(dev, pipeline_layout, null as *u8);
+        vkDestroyDescriptorSetLayout(dev, ds_layout, null as *u8);
+        vkFreeMemory(dev, buffer_memory, null as *u8);
+        vkDestroyBuffer(dev, buffer, null as *u8);
+        vkDestroyShaderModule(dev, shader_module, null as *u8);
+        return rc;
+    }
+    rc = vkWaitForFences(dev, 1, &fence, 1, timeout_ns);
+    if (rc != vk_success()) {
+        vkDestroyFence(dev, fence, null as *u8);
+        vkFreeCommandBuffers(dev, ctx.command_pool, 1, &cmd_buf);
+        vkDestroyDescriptorPool(dev, desc_pool, null as *u8);
+        vkDestroyPipeline(dev, pipeline, null as *u8);
+        vkDestroyPipelineLayout(dev, pipeline_layout, null as *u8);
+        vkDestroyDescriptorSetLayout(dev, ds_layout, null as *u8);
+        vkFreeMemory(dev, buffer_memory, null as *u8);
+        vkDestroyBuffer(dev, buffer, null as *u8);
+        vkDestroyShaderModule(dev, shader_module, null as *u8);
+        return rc; // includes timeout
+    }
+
+    // ── 11. Map memory and read back results ─────────────────────────────
+    let mapped: *u8 = null as *u8;
+    rc = vkMapMemory(dev, buffer_memory, 0, buf_size, 0, &mapped);
+    if (rc != vk_success()) {
+        vkDestroyFence(dev, fence, null as *u8);
+        vkFreeCommandBuffers(dev, ctx.command_pool, 1, &cmd_buf);
+        vkDestroyDescriptorPool(dev, desc_pool, null as *u8);
+        vkDestroyPipeline(dev, pipeline, null as *u8);
+        vkDestroyPipelineLayout(dev, pipeline_layout, null as *u8);
+        vkDestroyDescriptorSetLayout(dev, ds_layout, null as *u8);
+        vkFreeMemory(dev, buffer_memory, null as *u8);
+        vkDestroyBuffer(dev, buffer, null as *u8);
+        vkDestroyShaderModule(dev, shader_module, null as *u8);
+        return rc;
+    }
+    // Copy mapped data to output_buffer.
+    let i: u32 = 0;
+    let out_ptr: *i32 = mapped as *i32;
+    while (i < output_count) {
+        output_buffer[i] = out_ptr[i];
+        i = i + 1;
+    }
+    vkUnmapMemory(dev, buffer_memory);
+
+    // ── 12. Cleanup all per-dispatch resources ────────────────────────────
+    vkDestroyFence(dev, fence, null as *u8);
+    vkFreeCommandBuffers(dev, ctx.command_pool, 1, &cmd_buf);
+    vkDestroyDescriptorPool(dev, desc_pool, null as *u8);
+    vkDestroyPipeline(dev, pipeline, null as *u8);
+    vkDestroyPipelineLayout(dev, pipeline_layout, null as *u8);
+    vkDestroyDescriptorSetLayout(dev, ds_layout, null as *u8);
+    vkFreeMemory(dev, buffer_memory, null as *u8);
+    vkDestroyBuffer(dev, buffer, null as *u8);
+    vkDestroyShaderModule(dev, shader_module, null as *u8);
+    return vk_success();
+}
+
+// Checks if the Vulkan loader is available on the current system.
+// Creates and immediately destroys a minimal *u8 to verify the
+// loader is functional.
+fn zag_vulkan_compat_available() bool @compatLoad {
+    let ici: VkInstanceCreateInfo = VkInstanceCreateInfo{
+        .sType = vk_structure_type_instance_create_info(),
+        .pNext = null as *u8,
+        .flags = 0,
+        .pApplicationInfo = null as *u8,
+        .enabledLayerCount = 0,
+        .ppEnabledLayerNames = null as *[]u8,
+        .enabledExtensionCount = 0,
+        .ppEnabledExtensionNames = null as *[]u8,
+    };
+    let inst: *u8 = null as *u8;
+    let rc: i32 = vkCreateInstance(&ici, null as *u8, &inst);
+    if (rc != vk_success()) { return false; }
+    vkDestroyInstance(inst, null as *u8);
+    return true;
+}

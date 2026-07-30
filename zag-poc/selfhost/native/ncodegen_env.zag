@@ -1,0 +1,329 @@
+// selfhost/native/ncodegen_env.zag — ENVIRONMENT & SLOT MANAGEMENT for the
+// native codegen. Extracted from ncodegen.zag for modularity.
+//
+// Contains: FnSym struct, function symbol table helpers, Env struct (per-function
+// local environment: name → rbp displacement), scope management, break/continue
+// label stacks, slot allocation/lookup/rebinding. These depend on the Cg struct
+// (for cg.decls) which remains in ncodegen.zag.
+
+@import("isa.zag")
+@import("../parse.zag")   // AST (Node/Param/Bin/Call/FnDecl/...) + ArrayList + @strEq + _zag_str_to_i64
+@import("ncodegen_types.zag")   // type predicates (transitive)
+@import("ncodegen_layout.zag")  // layout helpers (transitive)
+
+// ── global function symbol table (name → label id, return type) ──────────────
+struct FnSym { name: []u8, lbl: i32, ret: []u8, nparams: i32 }
+
+// These three tables are compiler-owned indexes. Their entries borrow source
+// spelling or declaration metadata, so release only the ArrayList backings.
+// This helper is used by both lower_program exits after the Cg no longer reads
+// either pointer, including the no-main diagnostic path.
+fn cg_release_program_indexes(syms:*ArrayList[FnSym],rt_used:*ArrayList[i32],dynamic_names:*ArrayList[[]u8])void{
+    free[FnSym](syms);
+    free[i32](rt_used);
+    free[[]u8](dynamic_names);
+}
+
+// Pointer-receiver method mangled name for a receiver of type `rty` and method `fname`.
+// A method `fn (self: *T) m()` registers as `*T_m`; when T is imported (qualified) the
+// module prefix stays BEFORE the `*` (e.g. `a__*Vec_m`), so the `*` must be inserted after
+// the last `__` module separator in rty, NOT prepended to the whole name. (Same-file rty
+// has no `__`, so `*` goes at the front — matching `*Vec_m`.)
+fn cg_ptr_method_name(rty: []u8, fname: []u8) []u8 {
+    let cut: i32 = 0;
+    let i: i32 = 0;
+    while (i + 1 < rty.len) {
+        if (rty[i] == '_' && rty[i + 1] == '_') { cut = i + 2; }
+        i = i + 1;
+    }
+    let s: []u8 = _zag_str_concat(rty[0..cut], "*");
+    s = _zag_str_concat(s, rty[cut..]);
+    s = _zag_str_concat(s, "_");
+    return _zag_str_concat(s, fname);
+}
+
+fn cg_find_fn(syms: ArrayList[FnSym], name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[FnSym](syms)) {
+        if (@strEq(get[FnSym](syms, i).name, name)) { return get[FnSym](syms, i).lbl; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// The thread trampoline has no closure ABI or return continuation. Resolve
+// only a direct `fn() void` or scalar `fn(i64) void` declaration; the latter's
+// value is copied into the affine handle before clone.
+fn cg_thread_worker_label(cg: *Cg, syms: ArrayList[FnSym], n: *Node, with_i64:i32) i32 {
+    let name: []u8 = "";
+    switch (n.*) { .id => |x| { name = x.name; } else => { return 0 - 1; } }
+    let label: i32 = cg_find_fn(syms, name);
+    if (label < 0) { return 0 - 1; }
+    let i: i32 = 0;
+    while (i < len[*Node](cg.*.decls)) {
+        switch (get[*Node](cg.*.decls, i).*) {
+            .fn_decl => |f| {
+                if (@strEq(f.name, name)) {
+                    if (f.is_extern == 0 && len[[]u8](f.tparams) == 0 &&
+                        len[Param](f.params) == with_i64 && @strEq(f.ret, "void") &&
+                        f.caps == 0) {
+                        if(with_i64==0||@strEq(get[Param](f.params,0).pty,"i64")){return label;}
+                    }
+                    return 0 - 1;
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn cg_is_desugared_const(cg: *Cg, name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](cg.*.decls)) {
+        switch (get[*Node](cg.*.decls, i).*) {
+            .fn_decl => |f| {
+                if (@strEq(f.name, name) && len[Param](f.params) == 0) {
+                    let j: i32 = 0;
+                    while (j < len[[]u8](f.annots)) {
+                        if (@strEq(get[[]u8](f.annots, j), "_zag_desugared_const")) { return 1; }
+                        j = j + 1;
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ── per-function local environment (name → rbp displacement, coarse type) ────
+// Each param and each `let` gets one or more 8-byte slots. A SCALAR local owns
+// a single slot at disp = -8*(index+1) and its variable evaluates to that
+// scalar value. A STRUCT-typed local owns N contiguous slots (N = field count)
+// and the variable evaluates to the ADDRESS of the first slot (lea rbp+disp).
+//
+// `types` runs parallel to `names`/`disps`: types[i] is the coarse declared
+// type string of names[i] (e.g. "i32", "P", "*P", "[]u8"). An empty string
+// means "unknown scalar". `frame_words` is the next free 8-byte slot index;
+// allocating an N-word local bumps it by N. The pre-scan in cg_lower_fn sizes
+// the frame to hold the worst case, so growth here never overruns it.
+// ── by-reference aggregates (params, sret) ───────────────────────────────────
+// An aggregate (struct or []u8 slice) is held one of two ways:
+//   • INLINE  — the local owns N contiguous 8-byte words; the variable evaluates
+//               to lea(rbp+disp), the ADDRESS of that block. (`let p = P{..}`.)
+//   • BY-REF  — the local owns a SINGLE word holding a POINTER to a block that
+//               lives elsewhere (the caller's copy, for a by-value param/slice
+//               param). The variable evaluates to load(rbp+disp), the pointer.
+// `byref[i]` (parallel to names/disps/types) is 1 for BY-REF, 0 for INLINE.
+// Field access and `.len`/indexing consult this to pick lea vs load when taking
+// the aggregate's base address. This is how struct/slice by-value parameters get
+// their own copy yet still expose `p.field` syntax.
+struct Env {
+    names:       ArrayList[[]u8],
+    disps:       ArrayList[i32],
+    types:       ArrayList[[]u8],
+    byref:       ArrayList[i32],
+    count:       i32,    // number of named locals
+    scope_base:  i32,    // first binding introduced in the current lexical block
+    frame_words: i32,    // next free 8-byte word index
+    epilogue:    i32,
+    sret_disp:   i32,    // rbp disp of the saved sret pointer (cg_not_found if none)
+    sret_words:  i32,    // word count of the returned aggregate (0 if not sret)
+    sret_type:   []u8,   // the aggregate return type string ("" if not sret)
+    break_lbls:  ArrayList[i32],   // innermost loop exit labels (for `break`)
+    continue_lbls: ArrayList[i32], // innermost loop condition labels (`continue`)
+}
+
+fn cg_env_new(epilogue: i32) Env {
+    return Env{
+        .names = make[[]u8](8),
+        .disps = make[i32](8),
+        .types = make[[]u8](8),
+        .byref = make[i32](8),
+        .count = 0,
+        .scope_base = 0,
+        .frame_words = 0,
+        .epilogue = epilogue,
+        .sret_disp = 0 - 2147483647,
+        .sret_words = 0,
+        .break_lbls = make[i32](4),
+        .continue_lbls = make[i32](4),
+        .sret_type = "",
+    };
+}
+
+// Env owns only its six backing arrays. Their elements are type/name slices
+// borrowed from the parsed AST or static strings, so this releases containers
+// only; it must never attempt to free the text or any AST node.
+fn cg_env_dispose(env: *Env) void {
+    free[[]u8](&env.*.names);
+    free[i32](&env.*.disps);
+    free[[]u8](&env.*.types);
+    free[i32](&env.*.byref);
+    free[i32](&env.*.break_lbls);
+    free[i32](&env.*.continue_lbls);
+}
+
+struct CgScopeMark { count: i32, scope_base: i32 }
+
+fn cg_scope_begin(env: *Env) CgScopeMark {
+    let mark: CgScopeMark = CgScopeMark{
+        .count = len[[]u8](env.*.names),
+        .scope_base = env.*.scope_base,
+    };
+    env.*.scope_base = mark.count;
+    return mark;
+}
+
+fn cg_scope_end(env: *Env, mark: CgScopeMark) void {
+    while (len[[]u8](env.*.names) > mark.count) {
+        let _n: []u8 = pop[[]u8](&env.*.names);
+        let _d: i32 = pop[i32](&env.*.disps);
+        let _t: []u8 = pop[[]u8](&env.*.types);
+        let _b: i32 = pop[i32](&env.*.byref);
+    }
+    env.*.count = mark.count;
+    env.*.scope_base = mark.scope_base;
+}
+
+fn cg_break_push(env: *Env, lbl: i32) void {
+    push[i32](&env.*.break_lbls, lbl);
+}
+
+fn cg_break_pop(env: *Env) void {
+    if (env.*.break_lbls.len > 0) {
+        env.*.break_lbls.len = env.*.break_lbls.len - 1;
+    }
+}
+
+fn cg_break_top(env: *Env) i32 {
+    if (env.*.break_lbls.len == 0) { return 0 - 1; }
+    return get[i32](env.*.break_lbls, env.*.break_lbls.len - 1);
+}
+
+fn cg_continue_push(env: *Env, lbl: i32) void { push[i32](&env.*.continue_lbls, lbl); }
+fn cg_continue_pop(env: *Env) void {
+    if (env.*.continue_lbls.len > 0) { env.*.continue_lbls.len = env.*.continue_lbls.len - 1; }
+}
+fn cg_continue_top(env: *Env) i32 {
+    if (env.*.continue_lbls.len == 0) { return 0 - 1; }
+    return get[i32](env.*.continue_lbls, env.*.continue_lbls.len - 1);
+}
+
+// Is the named local a BY-REF aggregate (its slot holds a pointer to the block)?
+fn cg_slot_byref(env: Env, name: []u8) i32 {
+    let i: i32 = len[[]u8](env.names) - 1;
+    while (i >= 0) {
+        if (@strEq(get[[]u8](env.names, i), name)) { return get[i32](env.byref, i); }
+        i = i - 1;
+    }
+    return 0;
+}
+
+// Type string recorded for a local (empty if none / unknown).
+fn cg_slot_type(env: Env, name: []u8) []u8 {
+    let i: i32 = len[[]u8](env.names) - 1;
+    while (i >= 0) {
+        if (@strEq(get[[]u8](env.names, i), name)) { return get[[]u8](env.types, i); }
+        i = i - 1;
+    }
+    return "";
+}
+
+// Allocate `words` contiguous 8-byte slots for `name` with coarse type `ty`,
+// returning the rbp displacement of the FIRST (lowest-address) word. If the
+// name already exists (shadowing) we reuse its slot AND refresh its type — but
+// only when the existing slot is at least as large, which is the common case
+// (same name re-let). The disp of a local is -8*(first_word_index + words):
+// the first word lives at the most-negative address of the block so that, with
+// our struct field offsets being POSITIVE (base + 8*idx), field accesses stay
+// inside the block.
+fn cg_slot_alloc_br(env: *Env, name: []u8, ty: []u8, words: i32, byref: i32) i32 {
+    let i: i32 = env.*.scope_base;
+    while (i < len[[]u8](env.*.names)) {
+        if (@strEq(get[[]u8](env.*.names, i), name)) {
+            set[[]u8](&env.*.types, i, ty);
+            set[i32](&env.*.byref, i, byref);
+            return get[i32](env.*.disps, i);
+        }
+        i = i + 1;
+    }
+    let first: i32 = env.*.frame_words;
+    // Block occupies words [first .. first+words-1]; the first word sits at the
+    // lowest address: disp = -(8*(first+words)). Field k is at disp + 8*k.
+    let disp: i32 = 0 - (8 * (first + words));
+    push[[]u8](&env.*.names, name);
+    push[i32](&env.*.disps, disp);
+    push[[]u8](&env.*.types, ty);
+    push[i32](&env.*.byref, byref);
+    env.*.count = env.*.count + 1;
+    env.*.frame_words = env.*.frame_words + words;
+    return disp;
+}
+
+// Allocate inline storage (byref=0) for `name`: a scalar (1 word) or an
+// aggregate (N contiguous words). The variable evaluates to the block address.
+fn cg_slot_alloc_typed(env: *Env, name: []u8, ty: []u8, words: i32) i32 {
+    return cg_slot_alloc_br(env, name, ty, words, 0);
+}
+
+// Allocate a single anonymous scratch word (no name), returning its disp. Used
+// for argument-copy temps and sret result blocks; the pre-scan reserves these.
+fn cg_slot_scratch(env: *Env) i32 {
+    let first: i32 = env.*.frame_words;
+    let disp: i32 = 0 - (8 * (first + 1));
+    env.*.frame_words = env.*.frame_words + 1;
+    return disp;
+}
+
+// Reserve `words` contiguous anonymous scratch words; return the LOWEST disp
+// (word 0). Field k sits at disp + 8*k, matching the struct layout contract.
+fn cg_slot_scratch_n(env: *Env, words: i32) i32 {
+    let first: i32 = env.*.frame_words;
+    let disp: i32 = 0 - (8 * (first + words));
+    env.*.frame_words = env.*.frame_words + words;
+    return disp;
+}
+
+// Allocate a single scalar slot for `name` (unknown type), returning its disp.
+fn cg_slot_alloc(env: *Env, name: []u8) i32 {
+    return cg_slot_alloc_typed(env, name, "", 1);
+}
+
+// Look up an existing local's displacement; returns 1 (mod via has-flag) packed
+// as: returns the disp, and -2147483647 sentinel means "not found".
+fn cg_slot_find(env: Env, name: []u8) i32 {
+    let i: i32 = len[[]u8](env.names) - 1;
+    while (i >= 0) {
+        if (@strEq(get[[]u8](env.names, i), name)) { return get[i32](env.disps, i); }
+        i = i - 1;
+    }
+    return 0 - 2147483647;   // sentinel: undefined name
+}
+
+// Update an existing env binding's displacement+type+byref in place, or push a
+// new entry if the name is not yet bound. Used by catch-with-binding to ensure
+// that a reused capture name (e.g. `x catch |e| ...  ...  y catch |e| ...`)
+// always maps to the CURRENT catch's error slot.
+fn cg_slot_rebind(env: *Env, name: []u8, disp: i32, ty: []u8, byref: i32) void {
+    let i: i32 = len[[]u8](env.*.names) - 1;
+    while (i >= 0) {
+        if (@strEq(get[[]u8](env.*.names, i), name)) {
+            set[i32](&env.*.disps, i, disp);
+            set[[]u8](&env.*.types, i, ty);
+            set[i32](&env.*.byref, i, byref);
+            return;
+        }
+        i = i - 1;
+    }
+    push[[]u8](&env.*.names, name);
+    push[i32](&env.*.disps, disp);
+    push[[]u8](&env.*.types, ty);
+    push[i32](&env.*.byref, byref);
+    env.*.count = env.*.count + 1;
+}
+
+fn cg_not_found() i32 { return 0 - 2147483647; }

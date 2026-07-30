@@ -1323,39 +1323,52 @@ fn store_slit(s: StructLit, env: *map.StringMap[i32], decls: ArrayList[*Node], e
 
 // ── error-union assignment check ─────────────────────────────────────────────
 // If `n` is a direct (bare) call — not wrapped in `try` or `catch` — to a
-// function that carries the Raises effect (bit 16, i.e. returns !T), return
-// the callee name.  Otherwise return "".
-fn eu_bare_callee(n: *Node, eff: map.StringMap[i32]) []u8 {
+// function whose DECLARED return type is `!T`, return the callee name.
+// Fallibility is a declarative property of the callee signature; it must be
+// checked against the declared return type, not the transitive effect mask.
+// The fixpoint analysis propagates Raises transitively for capability contracts,
+// but that would flag every caller of a function that transitively calls a !T
+// function — even if the caller itself does not return !T.
+fn eu_bare_callee(n: *Node, decls: ArrayList[*Node]) []u8 {
     switch (n.*) {
         .call => |c| {
             let cn: []u8 = callee_name(c.callee);
-            if ((map.get[i32](eff, cn) orelse 0) & 16 != 0) { return cn; }
+            let fi: i32 = find_fn(decls, cn);
+            if (fi >= 0) {
+                let fd: *Node = get[*Node](decls, fi);
+                switch (fd.*) {
+                    .fn_decl => |f| {
+                        if (is_eu_ret(f.ret) == 1) { return cn; }
+                    }
+                    else => {}
+                }
+            }
             return "";
         }
         else => { return ""; }
     }
 }
 
-// Walk every statement in a list looking for bare !T calls assigned to non-!T
-// let bindings.  Returns the number of violations found.
-fn check_eu_stmts(fn_name: []u8, body: ArrayList[*Node], eff: map.StringMap[i32], src: []u8, file: []u8) i32 {
+// Walk every statement in a list looking for bare !T calls that are not
+// handled with `try` or `catch`.  Returns the number of violations found.
+fn check_eu_stmts(fn_name: []u8, body: ArrayList[*Node], decls: ArrayList[*Node], src: []u8, file: []u8) i32 {
     let acc: i32 = 0;
     let i: i32 = 0;
     while (i < len[*Node](body)) {
-        acc = acc + check_eu_stmt(fn_name, get[*Node](body, i), eff, src, file);
+        acc = acc + check_eu_stmt(fn_name, get[*Node](body, i), decls, src, file);
         i = i + 1;
     }
     return acc;
 }
 
-fn check_eu_stmt(fn_name: []u8, n: *Node, eff: map.StringMap[i32], src: []u8, file: []u8) i32 {
+fn check_eu_stmt(fn_name: []u8, n: *Node, decls: ArrayList[*Node], src: []u8, file: []u8) i32 {
     switch (n.*) {
         .let_ => |l| {
             // Only flag when there is an explicit non-!T type annotation AND an
             // initialiser that is a bare call to a Raises-effect function.
             if (l.has_init == 0) { return 0; }
             if (l.has_dty == 1 && is_eu_ret(l.dty) == 0) {
-                let callee: []u8 = eu_bare_callee(l.expr, eff);
+                let callee: []u8 = eu_bare_callee(l.expr, decls);
                 if (callee.len > 0) {
                     diag_emit("E0008",
                         _zag_str_concat("`", _zag_str_concat(callee, _zag_str_concat("` returns `!T` but result assigned to `", _zag_str_concat(l.name, _zag_str_concat(": ", _zag_str_concat(l.dty, "` without `catch`")))))),
@@ -1366,37 +1379,154 @@ fn check_eu_stmt(fn_name: []u8, n: *Node, eff: map.StringMap[i32], src: []u8, fi
                     return 1;
                 }
             }
+            // For `let x = fallible()` without a type annotation, the result
+            // is silently typed !T — flag it as unhandled unless wrapped in
+            // try/catch.  check_eu_expr handles the expression walk.
+            if (l.has_init == 1) { return check_eu_expr(fn_name, l.expr, decls, src, file); }
             return 0;
         }
-        .if_ => |x| {
-            let a: i32 = check_eu_stmts(fn_name, x.then_body, eff, src, file);
-            let b: i32 = check_eu_stmts(fn_name, x.els_body, eff, src, file);
-            return a + b;
+        .ret => |r| {
+            if (r.has_expr == 1) { return check_eu_expr(fn_name, r.expr, decls, src, file); }
+            return 0;
         }
-        .while_ => |w| { return check_eu_stmts(fn_name, w.body, eff, src, file); }
-        .unsafe_ => |u| { return check_eu_stmts(fn_name, u.body, eff, src, file); }
+        .assign => |a| { return check_eu_expr(fn_name, a.expr, decls, src, file); }
+        .estmt => |e| { return check_eu_expr(fn_name, e.expr, decls, src, file); }
+        .if_ => |x| {
+            let acc: i32 = check_eu_expr(fn_name, x.cond, decls, src, file);
+            acc = acc + check_eu_stmts(fn_name, x.then_body, decls, src, file);
+            acc = acc + check_eu_stmts(fn_name, x.els_body, decls, src, file);
+            return acc;
+        }
+        .while_ => |w| {
+            let acc: i32 = check_eu_expr(fn_name, w.cond, decls, src, file);
+            acc = acc + check_eu_stmts(fn_name, w.body, decls, src, file);
+            return acc;
+        }
+        .unsafe_ => |u| { return check_eu_stmts(fn_name, u.body, decls, src, file); }
         .switch_ => |sw| {
-            let acc: i32 = 0;
+            let acc: i32 = check_eu_expr(fn_name, sw.subject, decls, src, file);
             let si: i32 = 0;
             while (si < len[SwitchArm](sw.arms)) {
-                acc = acc + check_eu_stmts(fn_name, get[SwitchArm](sw.arms, si).body, eff, src, file);
+                acc = acc + check_eu_stmts(fn_name, get[SwitchArm](sw.arms, si).body, decls, src, file);
                 si = si + 1;
             }
-            if (sw.has_els == 1) { acc = acc + check_eu_stmts(fn_name, sw.els_body, eff, src, file); }
+            if (sw.has_els == 1) { acc = acc + check_eu_stmts(fn_name, sw.els_body, decls, src, file); }
             return acc;
         }
         else => { return 0; }
     }
 }
 
-fn check_eu_fn(f: FnDecl, eff: map.StringMap[i32], src: []u8, file: []u8) i32 {
-    if (f.is_extern == 1) { return 0; }
-    return check_eu_stmts(f.name, f.body, eff, src, file);
+// Walk an expression tree flagging bare !T calls (calls to functions returning
+// !T) that are NOT wrapped in `try` (Un("try", ...)) or `catch` (Call to
+// __catch / __catchc).  A !T call that is an argument to __catch/__catchc is
+// handled (the catch consumes the error).  A !T call wrapped in `try` is
+// propagated (the caller must be !T, checked separately by the Raises check).
+// A !T call in any other position (bare statement, argument to a non-catching
+// call, condition, binary operand, etc.) is an unhandled error.
+fn check_eu_expr(fn_name: []u8, n: *Node, decls: ArrayList[*Node], src: []u8, file: []u8) i32 {
+    switch (n.*) {
+        .call => |c| {
+            let cn: []u8 = callee_name(c.callee);
+            // `try` and `catch` wrappers are handled calls — don't flag the
+            // wrapped expression, but DO recurse into catch's fallback branch.
+            if (@strEq(cn, "__catch") == 1 || @strEq(cn, "__catchc") == 1) {
+                // arg 0 is the fallible expression (handled by catch);
+                // recurse into the remaining args (fallback, err binding).
+                let acc: i32 = 0;
+                let i: i32 = 1;
+                while (i < len[*Node](c.args)) {
+                    acc = acc + check_eu_expr(fn_name, get[*Node](c.args, i), decls, src, file);
+                    i = i + 1;
+                }
+                return acc;
+            }
+            // Is this call itself a bare !T call?  (Not wrapped in try/catch,
+            // since those are handled above.)
+            let fi: i32 = find_fn(decls, cn);
+            if (fi >= 0) {
+                let fd: *Node = get[*Node](decls, fi);
+                switch (fd.*) {
+                    .fn_decl => |f| {
+                        if (is_eu_ret(f.ret) == 1) {
+                            diag_emit("E0008",
+                                _zag_str_concat("`", _zag_str_concat(cn, _zag_str_concat("` returns `!T` but the error is not handled", ""))),
+                                file, 0, 0, 1,
+                                _zag_str_concat("in function `", _zag_str_concat(fn_name, _zag_str_concat("`: a fallible function was called without `try` or `catch`", ""))),
+                                _zag_str_concat("wrap with `try` to propagate, or `catch` to handle: `try ", _zag_str_concat(cn, _zag_str_concat("(...)` or `", _zag_str_concat(cn, _zag_str_concat("(...) catch fallback`", ""))))),
+                                src);
+                            // Still recurse into args — they may contain more bare !T calls.
+                            let acc: i32 = 1;
+                            let i: i32 = 0;
+                            while (i < len[*Node](c.args)) {
+                                acc = acc + check_eu_expr(fn_name, get[*Node](c.args, i), decls, src, file);
+                                i = i + 1;
+                            }
+                            return acc;
+                        }
+                    }
+                    else => {}
+                }
+            }
+            // Not a !T call — recurse into arguments.
+            let acc: i32 = 0;
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) {
+                acc = acc + check_eu_expr(fn_name, get[*Node](c.args, i), decls, src, file);
+                i = i + 1;
+            }
+            return acc;
+        }
+        .un => |u| {
+            // `try expr` — the expr is propagated, not unhandled.  Don't flag
+            // the wrapped expression, but DO recurse into it for nested bare
+            // !T calls in argument positions (e.g. `try foo(bar())` where bar()
+            // is !T and unhandled).
+            if (@strEq(u.op, "try") == 1) {
+                // The try'd expression itself is handled.  But if it's a call,
+                // its arguments may contain unhandled !T calls.
+                switch (u.e.*) {
+                    .call => |c| {
+                        let acc: i32 = 0;
+                        let i: i32 = 0;
+                        while (i < len[*Node](c.args)) {
+                            acc = acc + check_eu_expr(fn_name, get[*Node](c.args, i), decls, src, file);
+                            i = i + 1;
+                        }
+                        return acc;
+                    }
+                    else => { return 0; }
+                }
+            }
+            return check_eu_expr(fn_name, u.e, decls, src, file);
+        }
+        .bin    => |b| { return check_eu_expr(fn_name, b.l, decls, src, file) + check_eu_expr(fn_name, b.r, decls, src, file); }
+        .idx    => |x| { return check_eu_expr(fn_name, x.base, decls, src, file) + check_eu_expr(fn_name, x.idx, decls, src, file); }
+        .fld    => |f| { return check_eu_expr(fn_name, f.base, decls, src, file); }
+        .slit_  => |s| {
+            let acc: i32 = 0;
+            let i: i32 = 0;
+            while (i < len[FieldInit](s.fields)) { acc = acc + check_eu_expr(fn_name, get[FieldInit](s.fields, i).val, decls, src, file); i = i + 1; }
+            return acc;
+        }
+        .slice_ => |s| {
+            return check_eu_expr(fn_name, s.base, decls, src, file)
+                 + check_eu_expr(fn_name, s.lo, decls, src, file)
+                 + check_eu_expr(fn_name, s.hi, decls, src, file);
+        }
+        .cast_  => |c| { return check_eu_expr(fn_name, c.expr, decls, src, file); }
+        else    => { return 0; }
+    }
 }
 
-fn check_eu_decl(d: *Node, eff: map.StringMap[i32], src: []u8, file: []u8) i32 {
+fn check_eu_fn(f: FnDecl, decls: ArrayList[*Node], src: []u8, file: []u8) i32 {
+    if (f.is_extern == 1) { return 0; }
+    return check_eu_stmts(f.name, f.body, decls, src, file);
+}
+
+fn check_eu_decl(d: *Node, decls: ArrayList[*Node], src: []u8, file: []u8) i32 {
     return switch (d.*) {
-        .fn_decl => |f| check_eu_fn(f, eff, src, file),
+        .fn_decl => |f| check_eu_fn(f, decls, src, file),
         else     => 0,
     };
 }
@@ -1411,7 +1541,7 @@ fn report_violations(decls: ArrayList[*Node], eff: map.StringMap[i32], src: []u8
         let d: *Node = get[*Node](decls, i);
         total = total + report_decl(d, decls, eff, src, file);
         total = total + store_decl(d, decls, eff, src, file);
-        total = total + check_eu_decl(d, eff, src, file);
+        total = total + check_eu_decl(d, decls, src, file);
         i = i + 1;
     }
     return total;
