@@ -8,6 +8,17 @@ or unverified ownership is unsafe.  ABI lowering must validate layout,
 alignment, register classification, stack alignment, sret, and callback
 trampolines with executable C↔Zag tests.
 
+## Direction and compatibility boundary
+
+Zag is a native compiler: Zag source is compiled directly to its own target
+machine code.  C ABI support is **not** a Zag-to-C translation mode, a C
+backend, or a host-C-toolchain dependency.  Its only purpose is incremental
+adoption: a Zag program may replace a legacy C component while still calling
+the platform and library interfaces that have not yet been replaced, and
+existing C programs may call a deliberately exported Zag boundary.  A
+relocation-bearing object, when implemented, is likewise a linker input/output
+format for that bridge—not a request to re-express Zag source as C.
+
 The default path remains direct static ELF without external tools.  Relocatable
 objects, static archives, shared libraries, dynamic loading, and symbol lookup
 are optional selected modes; no mode may silently introduce a host C compiler
@@ -40,26 +51,55 @@ resolution semantics have tests.
 
 ## Current status
 
-The only implemented v2 ABI slice is an unsafe, outbound scalar/pointer
-`extern fn ... @cabi` import through the native x86-64 dynamic ELF writer.
+The implemented v2 ABI slice is an unsafe scalar/pointer plus `f64` `extern fn ... @cabi`
+import through the native x86-64 dynamic ELF writer. The `f64` form permits up
+to four `f64` arguments, each mapped to `XMM0` through `XMM3`; it is not an
+object-export, `f32`, aggregate, or callback-float ABI. The tree also has a tightly bounded
+callback form: a foreign parameter written as `fn(P...) R` may receive only a
+direct, non-generic, captureless named Zag function with the exact same
+scalar/pointer signature. The lowering passes that function's raw SysV code
+address, not Zag's ordinary `{code, environment}` function value. Aliases,
+closures/captures, `f32`, aggregates, variadics, callbacks returned from C,
+and callback ownership/unload contracts remain rejected or unimplemented.
+Any pointer argument given to such an import still requires an explicit
+`@borrows`/`@borrows_mut`/`@consumes` lifetime contract; the qsort witness uses
+`@borrows_mut` for its in-place buffer.
 Executable evidence covers both a no-argument integer import, a six-register
-mixed integer/pointer `mmap` import followed by pointer-return `munmap`, and a
+mixed integer/pointer `mmap` import followed by pointer-return `munmap`, a
+one/two/mixed-register `f64` libm import, and a
 fixed seven-word scalar call whose seventh `mmap` offset is consumed from the
-SysV stack; this does not extend the supported surface to aggregates, floats,
-callbacks, variadics, exports, or imports with ownership/lifetime contracts.
-It has no v2 export surface: the native x86-64 writer emits `ET_EXEC` with
-program headers only, not an `ET_REL` object, section table, `.symtab`, or
-public-symbol visibility. Accordingly, native `--emit-obj`, `--emit-static`,
-`--emit-shared`, object aliases, PIE, loader-path, rpath/soname,
-archive-selection, and common shared/library-output spellings fail before
-artifact creation rather than silently producing an executable. The separate i686 object/archive path is not v2 C ABI evidence and
-rejects v2 `@cabi` declarations.
+SysV stack, plus libc `qsort` calling a Zag comparator; this does not extend
+the supported surface to aggregates, `f32`, general callbacks, variadics,
+exports, or imports with ownership/lifetime contracts.
+
+There is one deliberately narrow outbound v2 surface: an edition-2027
+`pub fn` annotated `@cabi_export` with only scalar integer, `bool`, raw-pointer,
+or `void` parameters and result can be compiled with native x86-64
+`--emit-obj`. A self-contained object is relocation-free and contains `.text`,
+`.symtab`, `.strtab`, and `.shstrtab`; the annotated function is a global
+`STT_FUNC` symbol. The one supported import form is a direct call from an
+`unsafe` Zag body to a declared scalar/pointer/`bool`/`void` `extern fn @cabi`.
+That object adds `.rela.text`, an undefined global `STT_FUNC` symbol, and one
+`R_X86_64_PLT32` relocation with addend `-4` for each call immediate. The
+compiler still emits Zag machine code directly; a system linker resolves only
+the named legacy boundary. `tests/run_x86_64_cabi_object.sh` inspects both
+forms and links C callers/implementations that execute Zag exports and imports.
+The accepted object has no data section, dynamic libraries, archive inputs,
+GOT/TLS/data relocations, or any relocation form other than that direct call.
+
+This is not a general export or static-linking ABI. Floats, aggregates,
+variadics, callbacks, generics, shared objects, archives, general
+relocation/static-object conformance, ABI unwind/visibility policy, and
+ownership/lifetime contracts remain unimplemented. `--emit-static`,
+`--emit-shared`, object aliases, PIE,
+loader-path, rpath/soname, archive-selection, and common shared/library-output
+spellings continue to fail before artifact creation rather than silently
+producing an executable. The separate i686 object/archive path is not v2 C ABI
+evidence and rejects v2 `@cabi` declarations.
 Likewise, `--export`, `--export-dynamic`, and `--export-symbol` requests are
 rejected: `pub fn` does not create a public C symbol in the current native
 writer.
 
-A native export/static-object increment requires codegen to return exact public
-function offsets and sizes, plus a new x86-64 `ET_REL` writer with section,
-symbol, and relocation authority. It must then establish a separately tested
-calling convention (including aggregates, sret, and unwind/visibility policy).
-Until that work exists, no stable v2 export or static C ABI is claimed.
+A complete native export/static-object ABI still requires relocation authority,
+exact symbol-size policy, aggregates/sret, unwinding, visibility, and broad C
+conformance tests. No stable general v2 export or static C ABI is claimed.

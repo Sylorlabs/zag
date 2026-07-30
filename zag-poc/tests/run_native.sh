@@ -453,5 +453,28 @@ else
     echo "  ok  native edge-case battery (all edge cases pass)"; pass=$((pass+1))
 fi
 
+echo "── #embed compile-time binary file inclusion ──"
+printf 'Hello from embed!' > "$WORK/embed_data.bin"
+cat > "$WORK/embed_test.zag" <<'ZAGEOF'
+extern fn _zag_println(s: []u8) void @io;
+fn main() i32 {
+    let data: []u8 = #embed("embed_data.bin");
+    _zag_println(data);
+    return 0;
+}
+ZAGEOF
+OUT=$("$ZNC" "$WORK/embed_test.zag" -o "$WORK/zag_embed_test" 2>&1)
+if echo "$OUT" | grep -q "error\|aborted"; then
+    echo "  XX  #embed compile failed: $(echo "$OUT" | head -3)"; fail=$((fail+1))
+else
+    RES=$("$WORK/zag_embed_test" 2>&1)
+    if echo "$RES" | grep -q "Hello from embed!"; then
+        echo "  ok  #embed binary data included at compile time"; pass=$((pass+1))
+    else
+        echo "  XX  #embed wrong output: $RES"; fail=$((fail+1))
+    fi
+fi
+rm -f "$WORK/zag_embed_test" "$WORK/embed_test.zag"
+
 echo "════ native pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]

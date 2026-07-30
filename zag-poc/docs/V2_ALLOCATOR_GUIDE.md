@@ -15,18 +15,41 @@ let block: Allocation = try allocator.allocate(bytes, 8);
 try allocator.deallocate(block);
 ```
 
-The implemented `Allocation` carries a pointer, exact native capacity, chosen
-native alignment, a runtime-minted lifetime generation, and the checked
-allocator identity that minted it. The current native
+The compiler-owned `Allocation` capability carries a pointer, exact native
+capacity, chosen native alignment, a runtime-minted lifetime generation, and
+the checked allocator identity that minted it. These fields are opaque: source
+cannot construct, cast, or read the capability layout. `resize` and `deallocate` first bind that
+identity to their `SystemAllocator` receiver and return `InvalidAllocator` on
+a mismatch, before any provenance validation, allocation, copy, or free. The current native
 surface accepts power-of-two alignment requests 1, 2, 4, and 8; stronger
 alignment remains unsupported rather than silently rounded. `deallocate`
 validates the complete five-field identity tuple against checked-runtime
 provenance before it frees: an
 invalid base, copied released handle, forged length, wrong alignment, or stale
 generation after address reuse terminates before allocator metadata is touched.
-The same exact-tuple check rejects a live cross-handle splice: a second live
-pointer/capacity/alignment combined with another handle's generation or
-allocator identity is not a valid identity.
+For named handles and direct local aliases, edition-2027 additionally treats
+`try allocator.deallocate(block)` as an affine consuming terminal: a repeated
+source-level deallocation is rejected before code generation. The capability is
+opaque, but this is still not a proof for arbitrary aliases; exact-record
+runtime validation remains required and active.
+The direct receiver form of `try allocator.resize(block, bytes, alignment)`
+also consumes its named old handle on success and preserves the fresh returned
+handle. The same transition is proven for a precisely tracked local aggregate
+field: insertion moves the capability out of the original name, aggregate
+copies reject, `deallocate(box.block)` consumes the identity, and successful
+`resize(box.block, ...)` produces one live replacement while retiring the old
+field path. A non-extern helper annotated `@consumes @returns_owner` may also
+transfer one exact `Allocation` parameter, including a precisely tracked local
+aggregate field, when every terminal path returns that parameter. The caller
+receives one live replacement name and the old field path is retired.
+Annotations that return a fresh, different, ambiguous, or unproven owner
+reject. Non-local aliases remain outside this current source proof.
+Ordinary direct local `Allocation` copies, uncontracted assignments, structural
+literals, descriptor-field inspection, and casts reject before code
+generation. Aggregate carrier fields are usable only through the proven
+consuming boundaries above; they do not expose the opaque descriptor. Public
+checked byte access is `allocation_read_u8` and `allocation_write_u8`; neither
+exposes a raw address or descriptor field.
 This requires native x86-64 `--safety=checked`; other targets and unchecked
 builds reject the validation boundary rather than silently weakening it. The
 v2 compiler gate proves that an unchecked call reports that requirement and
@@ -42,19 +65,26 @@ the peak. Consuming that handle restores live bytes while retaining the
 monotonic allocation count. These counters describe native payload capacity
 only; they are not a general leak detector or allocator identity API.
 
-The handle gate also forges a live descriptor with only `allocator_id` changed;
-checked deallocation rejects it before native free. This proves allocator
-identity is an enforced runtime ownership field rather than documentation-only
-metadata, while the single public SystemAllocator identity remains a bounded
-slice rather than a complete custom-allocator capability system.
+The handle gate also forges a live descriptor with only `allocator_id` changed,
+and invokes `resize`/`deallocate` through a mismatched receiver; both paths
+return `InvalidAllocator` before native free. This proves allocator identity is
+bound to both the handle and its consuming receiver rather than being
+documentation-only metadata, while the single public SystemAllocator identity
+remains a bounded slice rather than a complete custom-allocator capability
+system.
 
 This is not yet the complete allocator model. The generation and allocator
-identity are runtime-checked tokens, but they are not yet opaque language
-capabilities and the public constructor currently exposes only identity `1`;
+identity are opaque runtime-checked tokens and the public constructor currently exposes only identity `1`;
 the checked register boundary rejects forged constructor identities until a
 second allocator family has its own descriptor and lifetime contract.
-Custom allocators, arenas, and fixed-buffer allocators are still
-unimplemented. `resize` and `allocate_zeroed` are
+Custom allocators remain unimplemented. The fixed-buffer slice
+now permits construction from one named live `Allocation`, named top-level
+`FixedBufferBlock` allocations, checked byte reads/writes, reset with
+generation invalidation, and top-level `deinit` into one fresh named
+`Allocation`. It still rejects aliases, aggregate storage, escapes, and
+arbitrary control-flow lifetimes, except for a proven reset loop whose blocks
+cannot cross an iteration. `resize` and
+`allocate_zeroed` are
 implemented for the checked native SystemAllocator: it returns the ordinary
 minted handle after clearing its exact recorded capacity. `resize` validates
 the old handle, allocates the replacement first, copies the overlap, then
@@ -62,44 +92,32 @@ consumes the old handle; a fallible replacement allocation therefore leaves the
 old handle live. On a successful resize, copied descriptors from the old
 lifetime are retired with that old handle and reject before a second free.
 
-In particular, `fixed_buffer_allocator(...)` and `arena_allocator(...)` are
-explicitly rejected as public v2 surface spellings for now. Their constructors
-must retain a caller-owned buffer while allocation mutates allocator state and
-accepts size/alignment. Borrow contracts now permit scalar auxiliary
-parameters, but still track only a first owner parameter and reject a
-receiver/second pointer/aggregate lifetime; that does not express this
-multi-argument lifetime/mutation contract without weakening ownership checks.
-There is no
-special-case fallback, no hidden heap path, and no claimed `@noalloc` or
-`@realtime` behavior until that contract and executable exhaustion/reset tests
-exist.
+`arena_allocator(...)` now provides the same bounded retained-owner discipline
+through distinct `ArenaAllocator` and `ArenaBlock` types: one live checked
+backing, named top-level blocks, checked byte access, reset invalidation, and
+top-level deinit handoff. It is not a general allocator capability. The
+fixed-buffer slice
+makes no `@noalloc` or `@realtime` claim. Reset advances a compiler-tracked
+generation and rejects every pre-reset block name; runtime also retires the
+old bounded block rows. Checked block reads and writes revalidate the exact
+retained backing handle at runtime before deriving an address, so a direct
+intrinsic call after backing release traps. Exhaustive block/lifetime coverage
+remains unsupported.
+There is no special-case fallback or hidden heap path.
 
-## Required fixed-buffer allocator slice
+## Fixed-buffer boundary
 
-This is the smallest coherent implementation plan; it is **not implemented**.
+The implemented fixed-buffer slice has a compiler-tracked retained backing,
+opaque runtime block tokens, checked byte access, bounded registry reuse, and
+generation invalidation on `reset`. A block access revalidates the retained
+backing handle before deriving an address, so released backing storage cannot
+be reached through a stale direct intrinsic call. Exhaustion returns
+`OutOfMemory` and never falls through to `_zag_malloc`.
 
-1. Extend function annotations from bare strings to parsed contract metadata
-   with parameter indices and a return relation. A constructor needs to say
-   that its mutable receiver stores a borrow of parameter `buffer`; an
-   allocation method needs to say that its result is derived from that stored
-   buffer rather than owned by the heap.
-2. Extend typed borrow state from one `root/mode` pair to a set of parameter
-   roots plus an attached region on aggregate fields. The checker must reject
-   returning the allocator or an allocation after its buffer owner is released,
-   and must keep the receiver unavailable while a mutable allocation/reset
-   operation is active.
-3. Give fixed-buffer allocations a checked runtime descriptor
-   `{ allocator_id, generation, offset, length, alignment }`. A successful
-   `reset` increments the allocator generation; later access/deallocation of a
-   descriptor minted before reset must fail. The descriptor is not a general
-   heap `Allocation` and cannot call `_zag_free`.
-4. Lower only `init`, `allocate`, and `reset` for native checked x86-64 first.
-   Allocation must check cursor, requested alignment, and capacity; exhaustion
-   returns its explicit error and must not fall through to `_zag_malloc`.
-5. Add execution evidence for aligned allocation, exhaustion without heap
-   telemetry growth, buffer/receiver lifetime rejection, reset invalidation,
-   and no `@realtime`/`@noalloc` claim until the effects are independently
-   proved.
+This is deliberately not a general allocator protocol: aliases, aggregate
+storage, escaping blocks/allocators, control-flow lifecycles, arbitrary typed
+allocation, custom allocator allocation, and `@noalloc`/`@realtime` qualification
+remain unsupported.
 
 Arena and fixed-buffer allocators are useful only when their lifetime/reset
 semantics are explicit.  A fixed-buffer allocation may satisfy `@noalloc` or

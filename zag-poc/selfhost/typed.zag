@@ -37,7 +37,7 @@ fn zt_in_names(names: ArrayList[[]u8], name: []u8) i32 {
 }
 
 fn zt_is_builtin(name: []u8) i32 {
-    if (@strEq(name, "void") || @strEq(name, "bool")) { return 1; }
+    if (@strEq(name, "void") || @strEq(name, "bool") || @strEq(name, "AtomicI64")) { return 1; }
     if (@strEq(name, "i8") || @strEq(name, "i16") ||
         @strEq(name, "i32") || @strEq(name, "i64") || @strEq(name, "isize")) { return 1; }
     if (@strEq(name, "u8") || @strEq(name, "u16") ||
@@ -96,6 +96,26 @@ fn zt_global_scalar_type(ty: []u8) i32 {
     if (zt_starts(ty, "[]") == 1 || ty[0] == '?' || ty[0] == '!' || zt_starts(ty, "fn(") == 1) { return 0; }
     return zt_is_builtin(ty);
 }
+fn zt_is_atomic_i64(ty: []u8) i32 { return @strEq(ty, "AtomicI64") as i32; }
+fn zt_contains_atomic_i64(ty: []u8) i32 {
+    let needle: []u8 = "AtomicI64";
+    let i: i32 = 0;
+    while (i + needle.len <= ty.len) {
+        let j: i32 = 0;
+        while (j < needle.len && ty[i + j] == needle[j]) { j = j + 1; }
+        if (j == needle.len) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// AtomicI64 is compiler-reserved storage, never a scalar value.  It has no
+// user-visible representation: no pointer, field, copy, aggregate, parameter,
+// or return boundary may expose its underlying word.
+fn zt_atomic_i64_forbidden_type(ty: []u8) i32 {
+    if (@strEq(ty, "AtomicI64")) { return 1; }
+    return zt_contains_atomic_i64(ty);
+}
 fn zt_global_zero_initializer(l: Let) i32 {
     if (l.has_init == 0) { return 1; }
     switch (l.expr.*) {
@@ -113,6 +133,7 @@ fn zt_check_globals(decls: ArrayList[*Node], file: []u8) i32 {
         switch (decls.data[i].*) {
             .let_ => |l| { if (l.is_global == 1) {
                 if (l.has_dty == 0 || zt_global_scalar_type(l.dty) == 0) { errors = errors + zt_machine_error("global storage requires an explicitly typed scalar or pointer; aggregates, callbacks, and optionals have no global lifetime contract", "global declaration"); }
+                if (l.has_dty == 1 && zt_atomic_i64_forbidden_type(l.dty) == 1 && zt_is_atomic_i64(l.dty) == 0) { errors = errors + zt_machine_error("AtomicI64 global storage cannot be wrapped or addressed", "global declaration"); }
                 if (zt_global_zero_initializer(l) == 0) { errors = errors + zt_machine_error("global storage currently permits only zero initialization", "global declaration"); }
                 if (zt_in_names(names, l.name) == 1) { errors = errors + zt_machine_error("duplicate global declaration", "global declaration"); }
                 else { push[[]u8](&names, l.name); }
@@ -389,6 +410,37 @@ fn zt_fn_param(decls: ArrayList[*Node], name: []u8, index: i32) []u8 {
     }
     return "";
 }
+// A consuming contract owns only explicit one-owner capability forms. Scalars
+// remain ordinary tuning values, while aggregates/slices/callbacks stay
+// fail-closed until their component ownership is modeled.
+fn zt_owner_param_type(ty: []u8) i32 {
+    return ((ty.len > 0 && ty[0] == '*') || @strEq(ty, "Allocation")) as i32;
+}
+fn zt_consumes_param(decls: ArrayList[*Node], name: []u8, index: i32) i32 {
+    if (zt_fn_has_annot(decls, name, "@consumes") == 0) { return 0; }
+    return zt_owner_param_type(zt_fn_param(decls, name, index));
+}
+fn zt_consumes_owner_named(decls: ArrayList[*Node], fname: []u8, pname: []u8) i32 {
+    if (zt_fn_has_annot(decls, fname, "@consumes") == 0) { return 0; }
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .fn_decl => |f| {
+                if (@strEq(f.name, fname)) {
+                    let pi: i32 = 0;
+                    while (pi < len[Param](f.params)) {
+                        let p: Param = get[Param](f.params, pi);
+                        if (@strEq(p.name, pname) && zt_owner_param_type(p.pty) == 1) { return 1; }
+                        pi = pi + 1;
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
 fn zt_fn_has_annot(decls: ArrayList[*Node], name: []u8, annot: []u8) i32 {
     let i: i32 = 0;
     while (i < len[*Node](decls)) {
@@ -411,15 +463,46 @@ fn zt_fn_has_annot(decls: ArrayList[*Node], name: []u8, annot: []u8) i32 {
 
 // The first v2 foreign-function boundary is intentionally declaration-driven.
 // A bare `extern` is not silently a C declaration: only `extern fn ... @cabi`
-// may enter the native System V dynamic-import path.  Keep the accepted set to
-// machine scalars and raw pointers until aggregate/float classification has
-// executable conformance coverage.
-fn zt_cabi_type_ok(ty0: []u8) i32 {
+// may enter the native System V dynamic-import path.  The validated f64 import
+// slice uses SysV XMM registers; aggregates and f32 remain rejected until their
+// distinct classification and layout rules have executable conformance coverage.
+// A C callback is represented in source as `fn(P...) R`, but it is *not* a
+// Zag fat function at the ABI boundary.  The native dynamic lowering admits
+// only a direct, captureless named function and passes its code address as one
+// SysV word.  Keep the nested signature integer/pointer-only: no aggregates, floats,
+// variadics, closures, or hidden environment are implied by this spelling.
+fn zt_cabi_callback_type_ok(ty0: []u8) i32 {
+    if (ty0.len < 5 || ty0[0] != 'f' || ty0[1] != 'n' || ty0[2] != '(') { return 0; }
+    let close: i32 = 0 - 1;
+    let i: i32 = 3;
+    while (i < ty0.len) {
+        if (ty0[i] == ')') { close = i; i = ty0.len; }
+        else { i = i + 1; }
+    }
+    if (close < 0 || close + 1 >= ty0.len) { return 0; }
+    let params: []u8 = ty0[3..close];
+    let start: i32 = 0;
+    i = 0;
+    while (i <= params.len) {
+        if (i == params.len || params[i] == ',') {
+            if (i > start && zt_cabi_scalar_type_ok(params[start..i]) == 0) { return 0; }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return zt_cabi_scalar_type_ok(ty0[close + 1..]);
+}
+
+fn zt_cabi_scalar_type_ok(ty0: []u8) i32 {
     if (ty0.len > 0 && ty0[0] == '*') { return 1; }
     if (@strEq(ty0, "void") || @strEq(ty0, "bool")) { return 1; }
     if (@strEq(ty0, "i8") || @strEq(ty0, "u8") || @strEq(ty0, "i16") || @strEq(ty0, "u16")) { return 1; }
     if (@strEq(ty0, "i32") || @strEq(ty0, "u32") || @strEq(ty0, "i64") || @strEq(ty0, "u64")) { return 1; }
     return 0;
+}
+fn zt_cabi_import_type_ok(ty0: []u8) i32 {
+    if (zt_cabi_callback_type_ok(ty0) == 1 || zt_cabi_scalar_type_ok(ty0) == 1) { return 1; }
+    return (@strEq(ty0, "f64") as i32);
 }
 
 fn zt_check_v2_cabi_declarations(decls: ArrayList[*Node], file: []u8) i32 {
@@ -440,14 +523,19 @@ fn zt_check_v2_cabi_declarations(decls: ArrayList[*Node], file: []u8) i32 {
                     errors = errors + zt_machine_error("v2 foreign imports require explicit @cabi", _zag_str_concat("function ", f.name));
                 }
                 if (cabi == 1) {
-                    let abi_ok: i32 = zt_cabi_type_ok(f.ret);
+                    let abi_ok: i32 = zt_cabi_import_type_ok(f.ret);
+                    // The return uses XMM0 and does not consume an argument register.
+                    let fp_args: i32 = 0;
                     let pi: i32 = 0;
                     while (pi < len[Param](f.params)) {
-                        if (zt_cabi_type_ok(get[Param](f.params, pi).pty) == 0) { abi_ok = 0; }
+                        let pty: []u8 = get[Param](f.params, pi).pty;
+                        if (zt_cabi_import_type_ok(pty) == 0) { abi_ok = 0; }
+                        if (@strEq(pty, "f64")) { fp_args = fp_args + 1; }
                         pi = pi + 1;
                     }
+                    if (fp_args > 4) { abi_ok = 0; }
                     if (abi_ok == 0) {
-                        errors = errors + zt_machine_error("v2 @cabi supports only scalar integers, bool, raw pointers, and void", _zag_str_concat("function ", f.name));
+                        errors = errors + zt_machine_error("v2 @cabi imports support scalar integers, bool, raw pointers, void, and up to four f64 arguments", _zag_str_concat("function ", f.name));
                     }
                 }
             }
@@ -458,13 +546,28 @@ fn zt_check_v2_cabi_declarations(decls: ArrayList[*Node], file: []u8) i32 {
     return errors;
 }
 
+// Object-only outbound C surface: the declaration is still a Zag definition,
+// but its public scalar/pointer signature is checked before an ET_REL symbol is
+// emitted. Layout-sensitive forms remain fail-closed.
+fn zt_check_v2_cabi_exports(decls:ArrayList[*Node],file:[]u8)i32{
+    if(@strEq(v2_project_edition(file),"2027")==0){return 0;}
+    let errors:i32=0;let i:i32=0;while(i<len[*Node](decls)){switch(get[*Node](decls,i).*){.fn_decl=>|f|{
+        if(zt_fn_has_annot(decls,f.name,"@cabi_export")==1){
+            if(f.is_extern==1||f.is_pub==0||len[[]u8](f.tparams)>0){errors=errors+zt_machine_error("@cabi_export requires a defined non-generic pub function",_zag_str_concat("function ",f.name));}
+            if(@strEq(f.name,"main")==1){errors=errors+zt_machine_error("@cabi_export cannot export main", "object entry ownership is reserved to the C linker");}
+            let ok:i32=zt_cabi_scalar_type_ok(f.ret);let p:i32=0;while(p<len[Param](f.params)){if(zt_cabi_scalar_type_ok(get[Param](f.params,p).pty)==0){ok=0;}p=p+1;}
+            if(ok==0){errors=errors+zt_machine_error("@cabi_export supports only scalar integers, bool, raw pointers, and void",_zag_str_concat("function ",f.name));}
+        }
+    }else=>{}}i=i+1;}return errors;
+}
+
 fn zt_direct_name(n: *Node) []u8 {
     return switch (n.*) { .id => |x| x.name, else => "" };
 }
 fn zt_is_numeric(t: []u8) i32 {
     if (t.len == 0) { return 0; }
     if (zt_is_builtin(t) == 0) { return 0; }
-    if (@strEq(t, "void") || @strEq(t, "bool") || @strEq(t, "gpu_buf")) { return 0; }
+    if (@strEq(t, "void") || @strEq(t, "bool") || @strEq(t, "gpu_buf") || @strEq(t, "AtomicI64")) { return 0; }
     return 1;
 }
 fn zt_is_concrete(t: []u8) i32 {
@@ -512,6 +615,7 @@ fn zt_expr_type(n: *Node, env: ArrayList[ZTBind], decls: ArrayList[*Node], conte
             return zt_expr_known("i32", 1, 0);
         }
         .slit => |_s| { return zt_expr_known("[]u8", 0, 0); }
+        .embed => |_e| { return zt_expr_known("[]u8", 0, 0); }
         .id => |x| {
             if (@strEq(x.name, "true") || @strEq(x.name, "false")) { return zt_expr_known("bool", 0, 0); }
             let ty: []u8 = zt_env_get(env, x.name);
@@ -525,6 +629,9 @@ fn zt_expr_type(n: *Node, env: ArrayList[ZTBind], decls: ArrayList[*Node], conte
         }
         .slit_ => |s| {
             let errors: i32 = 0;
+            if (@strEq(s.sname,"Allocation")) {
+                errors = errors + zt_machine_error("Allocation is opaque; use SystemAllocator and allocation access operations", context);
+            }
             let i: i32 = 0;
             while (i < len[FieldInit](s.fields)) {
                 errors = errors + zt_expr_type(get[FieldInit](s.fields, i).val, env, decls, context).errors;
@@ -546,6 +653,31 @@ fn zt_expr_type(n: *Node, env: ArrayList[ZTBind], decls: ArrayList[*Node], conte
         .call => |c| {
             let errors: i32 = 0;
             let name: []u8 = zt_direct_name(c.callee);
+            switch (c.callee.*) {
+                .fld => |f| {
+                    if (zt_is_atomic_i64(zt_expr_type(f.base, env, decls, context).ty) == 1) {
+                        if (@strEq(f.fname, "store")) { return zt_expr_known("void", 0, 0); }
+                        if (@strEq(f.fname, "load") || @strEq(f.fname, "exchange") ||
+                            @strEq(f.fname, "fetch_add") || @strEq(f.fname, "fetch_sub") ||
+                            @strEq(f.fname, "fetch_and") || @strEq(f.fname, "fetch_or") ||
+                            @strEq(f.fname, "fetch_xor") || @strEq(f.fname, "compare_exchange")) {
+                            return zt_expr_known("i64", 0, 0);
+                        }
+                    }
+                }
+                else => { }
+            }
+            // Compiler-lowered thread handles are affine opaque owners.  They
+            // deliberately expose neither a TID nor stack address to source.
+            if (@strEq(name, "@threadSpawn")) { return zt_expr_known("*opaque", 0, 0); }
+            if (@strEq(name, "@threadJoin")) { return zt_expr_known("void", 0, 0); }
+            if (@strEq(name, "@atomicI64") && len[*Node](c.args) == 1) { return zt_expr_known("AtomicI64", 0, 0); }
+            if (@strEq(name, "@allocationCreate") && len[*Node](c.args) == 4) { return zt_expr_known("Allocation", 0, 0); }
+            if (@strEq(name, "@allocationRegionDeinit") && len[*Node](c.args) == 1) { return zt_expr_known("Allocation", 0, 0); }
+            if (@strEq(name, "@allocationRegionInit") && len[*Node](c.args) == 1) { return zt_expr_known("i64", 0, 0); }
+            if ((@strEq(name, "@allocationLen") || @strEq(name, "@allocationAllocatorId")) && len[*Node](c.args) == 1) { return zt_expr_known("i64", 0, 0); }
+            if (@strEq(name, "@allocationReadU8") && len[*Node](c.args) == 2) { return zt_expr_known("u8", 0, 0); }
+            if ((@strEq(name, "@allocationValidate") || @strEq(name, "@allocationFree") || @strEq(name, "@allocationWriteU8")) && len[*Node](c.args) > 0) { return zt_expr_known("void", 0, 0); }
             let tparams: ArrayList[[]u8] = zt_fn_tparams(decls, name, c.targs);
             let i: i32 = 0;
             while (i < len[*Node](c.args)) {
@@ -768,6 +900,28 @@ fn zt_is_v2_volatile_dword_ptr(ty: []u8) i32 {
     return @strEq(zt_v2_pointee_type(ty), "u32");
 }
 
+// The first user-visible SIMD surface transports four i32 lanes through raw
+// memory.  It remains deliberately narrower than a general vector type: only
+// the exact baseline SSE2 operation has a typed contract today.
+fn zt_is_v2_simd_i32_ptr(ty: []u8) i32 {
+    return @strEq(zt_v2_pointee_type(ty), "i32");
+}
+
+fn zt_is_v2_simd_i32_write_ptr(ty: []u8) i32 {
+    if (@strEq(zt_v2_pointee_type(ty), "i32") == 0) { return 0; }
+    if (zt_starts(ty, "*mut ") == 1 || zt_starts(ty, "*host ") == 1) { return 1; }
+    return 0;
+}
+
+// Linux futex words are exactly four naturally aligned bytes.  The first
+// public wait/wake slice accepts only host-addressable i32 raw pointers; a
+// device/workgroup pointer would require a separate GPU synchronization model.
+fn zt_is_v2_futex_i32_ptr(ty: []u8) i32 {
+    if (@strEq(zt_v2_pointee_type(ty), "i32") == 0) { return 0; }
+    if (zt_starts(ty, "*const ") == 1 || zt_starts(ty, "*mut ") == 1 || zt_starts(ty, "*host ") == 1) { return 1; }
+    return 0;
+}
+
 fn zt_machine_expr_type(n: *Node, env: ArrayList[ZTBind]) []u8 {
     return switch (n.*) {
         .id => |x| zt_env_get(env, x.name),
@@ -795,6 +949,40 @@ fn zt_machine_atomic_i64_value(n: *Node, env: ArrayList[ZTBind],
     return 0;
 }
 
+fn zt_machine_atomic_i32_value(n: *Node, env: ArrayList[ZTBind],
+                               decls: ArrayList[*Node], context: []u8) i32 {
+    let value: ZTExpr = zt_expr_type(n, env, decls, context);
+    if (value.known == 0 || value.literal == 1) { return 1; }
+    if (@strEq(value.ty, "i32")) { return 1; }
+    return 0;
+}
+
+// A thread worker is deliberately not a general function value.  The native
+// child trampoline can only call a direct, captureless, non-generic `fn() void`
+// or `fn(i64) void` label. The scalar form is copied into the affine thread
+// handle before clone; pointers, aggregates, captures, returns, and ABI
+// adaptation remain rejected at this boundary.
+fn zt_thread_worker_ok(decls: ArrayList[*Node], name: []u8, with_i64: i32) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .fn_decl => |f| {
+                if (@strEq(f.name, name)) {
+                    if (f.is_extern == 0 && len[[]u8](f.tparams) == 0 &&
+                        len[Param](f.params) == with_i64 && @strEq(f.ret, "void") &&
+                        f.caps == 0) {
+                        if (with_i64 == 0 || @strEq(get[Param](f.params, 0).pty, "i64")) { return 1; }
+                    }
+                    return 0;
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
 // Memory-order operands are deliberately compile-time literals in this first
 // selectable-order slice.  The numeric ABI is stable and documented: 0
 // relaxed, 1 acquire, 2 release, 3 acq_rel, 4 seq_cst.  Rejecting a runtime
@@ -812,6 +1000,18 @@ fn zt_machine_atomic_order(n: *Node) i32 {
         else => { }
     }
     return -1;
+}
+
+// Compare-exchange has separate success/failure orders.  Failure never writes,
+// so release/acq_rel are invalid there; it also cannot be stronger than the
+// successful transaction.  These numeric rules are the complete bounded ABI
+// contract until order is represented by a first-class language type.
+fn zt_machine_atomic_cas_orders_ok(success: i32, failure: i32) i32 {
+    if (success < 0 || failure < 0) { return 0; }
+    if (failure == 0) { return 1; } // relaxed is never stronger
+    if (failure == 1) { return (success == 1 || success == 3 || success == 4) as i32; }
+    if (failure == 4) { return (success == 4) as i32; }
+    return 0; // failure release/acq_rel
 }
 
 fn zt_machine_volatile_value(n: *Node, env: ArrayList[ZTBind],
@@ -841,6 +1041,9 @@ fn zt_check_machine_expr(n: *Node, env: ArrayList[ZTBind], decls: ArrayList[*Nod
         // conversion until function types have a typed safety/ABI contract.
         // Direct calls are handled below.
         .id => |x| {
+            if (zt_is_atomic_i64(zt_machine_expr_type(n, env)) == 1) {
+                return zt_machine_error("AtomicI64 storage is opaque; use its atomic receiver operations only", context);
+            }
             if (zt_fn_has_annot(decls, x.name, "@unsafe") == 1 ||
                 zt_fn_has_annot(decls, x.name, "@cabi") == 1) {
                 return zt_machine_error("unsafe or C-ABI function values are not implemented; call the function directly inside unsafe", context);
@@ -849,28 +1052,61 @@ fn zt_check_machine_expr(n: *Node, env: ArrayList[ZTBind], decls: ArrayList[*Nod
         }
         .bin => |b| { return zt_check_machine_expr(b.l, env, decls, unsafe_scope, 0, context) +
                             zt_check_machine_expr(b.r, env, decls, unsafe_scope, 0, context); }
-        .un => |u| { return zt_check_machine_expr(u.e, env, decls, unsafe_scope, 0, context); }
+        .slit_ => |s| {
+            let errors: i32 = 0;
+            let fi: i32 = 0;
+            while (fi < len[FieldInit](s.fields)) {
+                let value: *Node = get[FieldInit](s.fields, fi).val;
+                errors = errors + zt_check_machine_expr(value, env, decls, unsafe_scope, 0, context);
+                if (zt_is_atomic_i64(zt_expr_type(value, env, decls, context).ty) == 1) {
+                    errors = errors + zt_machine_error("AtomicI64 storage cannot be embedded in an aggregate literal", context);
+                }
+                fi = fi + 1;
+            }
+            return errors;
+        }
+        .un => |u| {
+            let errors:i32=zt_check_machine_expr(u.e, env, decls, unsafe_scope, 0, context);
+            if (zt_is_atomic_i64(zt_machine_expr_type(u.e, env)) == 1) {
+                return errors + zt_machine_error("AtomicI64 storage cannot be addressed, cast, or dereferenced", context);
+            }
+            return errors;
+        }
         .call => |c| {
             let direct: []u8 = zt_direct_name(c.callee);
             let errors: i32 = 0;
+            let atomic_method:i32=0;
+            let atomic_name:[]u8="";
+            switch(c.callee.*){.fld=>|f|{if(zt_is_atomic_i64(zt_machine_expr_type(f.base,env))==1){atomic_method=1;atomic_name=f.fname;}}else=>{}}
             // Do not treat the callee of a direct call as a function value;
             // the lexical call-site rule below is its authority.
-            if (direct.len == 0) {
+            if (direct.len == 0 && atomic_method==0) {
                 errors = zt_check_machine_expr(c.callee, env, decls, unsafe_scope, 0, context);
+            }
+            if (atomic_method==1) {
+                if(unsafe_scope==0){errors=errors+zt_machine_error("AtomicI64 operations require unsafe",context);}
+                if(!(@strEq(atomic_name,"load")||@strEq(atomic_name,"store")||@strEq(atomic_name,"exchange")||@strEq(atomic_name,"fetch_add")||@strEq(atomic_name,"fetch_sub")||@strEq(atomic_name,"fetch_and")||@strEq(atomic_name,"fetch_or")||@strEq(atomic_name,"fetch_xor")||@strEq(atomic_name,"compare_exchange"))){errors=errors+zt_machine_error("unknown AtomicI64 operation",context);}
+                let want:i32=2;if(@strEq(atomic_name,"load")){want=1;}if(@strEq(atomic_name,"compare_exchange")){want=4;}
+                if(len[*Node](c.args)!=want){errors=errors+zt_machine_error("AtomicI64 operation has the wrong argument count",context);}
+                let ai:i32=0;while(ai<len[*Node](c.args)){
+                    let a:ZTExpr=zt_expr_type(get[*Node](c.args,ai),env,decls,context);
+                    let is_order:i32=0;
+                    if(@strEq(atomic_name,"load")&&ai==0){is_order=1;}
+                    if(!@strEq(atomic_name,"load")&&!@strEq(atomic_name,"compare_exchange")&&ai==1){is_order=1;}
+                    if(@strEq(atomic_name,"compare_exchange")&&(ai==2||ai==3)){is_order=1;}
+                    if(is_order==0&&a.known==1&&!@strEq(a.ty,"i64")&&a.literal==0){errors=errors+zt_machine_error("AtomicI64 values must be i64",context);}
+                    ai=ai+1;
+                }
             }
             if (direct.len > 0 && zt_fn_has_annot(decls, direct, "@unsafe") == 1 && unsafe_scope == 0) {
                 errors = errors + zt_machine_error("call to unsafe function requires unsafe", context);
             } else if (direct.len > 0 && zt_fn_has_annot(decls, direct, "@cabi") == 1 && unsafe_scope == 0) {
                 errors = errors + zt_machine_error("call to @cabi function requires unsafe", context);
             }
-            // These allocator families cannot be represented by the current
-            // one-owner contract: construction must retain a caller buffer
-            // while allocation mutates allocator state. Make the boundary an
-            // explicit v2 rejection rather than allowing a future spelling to
-            // look like an ordinary uncontracted call.
-            if (@strEq(direct, "fixed_buffer_allocator") || @strEq(direct, "arena_allocator")) {
-                errors = errors + zt_machine_error("fixed-buffer and arena allocators are unsupported: they require a mutable receiver and retained buffer-owner lifetime contract", context);
-            }
+            // Fixed-buffer and arena construction are admitted only by the
+            // retained-owner pass below. That pass requires a named checked
+            // backing, top-level block lifecycle, reset invalidation, and
+            // deinit handoff; no ambient mutable allocator capability exists.
             if (@strEq(direct, "@prefetch")) {
                 if (unsafe_scope == 0) {
                     errors = errors + zt_machine_error("prefetch requires unsafe", context);
@@ -883,6 +1119,26 @@ fn zt_check_machine_expr(n: *Node, env: ArrayList[ZTBind], decls: ArrayList[*Nod
                         errors = errors + zt_machine_error("@prefetch requires a raw pointer", context);
                     } else if (zt_v2_pointer_space(pty) == 2 || zt_v2_pointer_space(pty) == 3) {
                         errors = errors + zt_machine_error("@prefetch on *device/*workgroup requires a GPU runtime", context);
+                    }
+                }
+            }
+            if (@strEq(direct, "@simdAddI32x4") || @strEq(direct, "@simdSubI32x4") ||
+                @strEq(direct, "@simdAndI32x4") || @strEq(direct, "@simdOrI32x4") ||
+                @strEq(direct, "@simdXorI32x4")) {
+                if (unsafe_scope == 0) {
+                    errors = errors + zt_machine_error("packed SIMD requires unsafe", context);
+                }
+                if (len[*Node](c.args) != 3) {
+                    errors = errors + zt_machine_error("packed i32x4 SIMD expects dst, lhs, rhs raw i32 pointers", context);
+                } else {
+                    let dst_ty: []u8 = zt_machine_expr_type(get[*Node](c.args, 0), env);
+                    let lhs_ty: []u8 = zt_machine_expr_type(get[*Node](c.args, 1), env);
+                    let rhs_ty: []u8 = zt_machine_expr_type(get[*Node](c.args, 2), env);
+                    if (zt_is_v2_simd_i32_write_ptr(dst_ty) == 0) {
+                        errors = errors + zt_machine_error("packed i32x4 SIMD dst requires *mut/*host i32", context);
+                    }
+                    if (zt_is_v2_simd_i32_ptr(lhs_ty) == 0 || zt_is_v2_simd_i32_ptr(rhs_ty) == 0) {
+                        errors = errors + zt_machine_error("packed i32x4 SIMD inputs require *const/*mut/*host i32", context);
                     }
                 }
             }
@@ -981,6 +1237,49 @@ fn zt_check_machine_expr(n: *Node, env: ArrayList[ZTBind], decls: ArrayList[*Nod
                     }
                 }
             }
+            if (@strEq(direct, "@atomicWait32") || @strEq(direct, "@atomicWake32")) {
+                if (unsafe_scope == 0) {
+                    errors = errors + zt_machine_error("atomic futex operation requires unsafe", context);
+                }
+                if (len[*Node](c.args) != 2) {
+                    errors = errors + zt_machine_error("atomic futex operation expects an i32 raw pointer and i32 value", context);
+                } else {
+                    let pty: []u8 = zt_machine_expr_type(get[*Node](c.args, 0), env);
+                    if (zt_is_v2_futex_i32_ptr(pty) == 0) {
+                        errors = errors + zt_machine_error("atomic futex operation requires an explicitly aligned *const/*mut/*host i32", context);
+                    }
+                    if (zt_machine_atomic_i32_value(get[*Node](c.args, 1), env, decls, context) == 0) {
+                        errors = errors + zt_machine_error("atomic futex expected value/count must be i32", context);
+                    }
+                }
+            }
+            if (@strEq(direct, "@threadSpawn")) {
+                if (unsafe_scope == 0) {
+                    errors = errors + zt_machine_error("thread spawn requires unsafe", context);
+                }
+                if (len[*Node](c.args) != 1 && len[*Node](c.args) != 2) {
+                    errors = errors + zt_machine_error("@threadSpawn expects a direct worker, optionally followed by one i64 argument", context);
+                } else {
+                    let worker: []u8 = zt_direct_name(get[*Node](c.args, 0));
+                    let with_i64: i32 = (len[*Node](c.args) == 2) as i32;
+                    if (worker.len == 0 || zt_thread_worker_ok(decls, worker, with_i64) == 0) {
+                        errors = errors + zt_machine_error("@threadSpawn requires a direct non-generic captureless fn() void or fn(i64) void worker", context);
+                    }
+                    if (with_i64 == 1 && zt_machine_atomic_i64_value(get[*Node](c.args, 1), env, decls, context) == 0) {
+                        errors = errors + zt_machine_error("@threadSpawn worker argument must be i64", context);
+                    }
+                }
+            }
+            if (@strEq(direct, "@threadJoin")) {
+                if (unsafe_scope == 0) {
+                    errors = errors + zt_machine_error("thread join requires unsafe", context);
+                }
+                if (len[*Node](c.args) != 1) {
+                    errors = errors + zt_machine_error("@threadJoin expects one owned *opaque handle", context);
+                } else if (@strEq(zt_machine_expr_type(get[*Node](c.args, 0), env), "*opaque") == 0) {
+                    errors = errors + zt_machine_error("@threadJoin requires the named *opaque handle returned by @threadSpawn", context);
+                }
+            }
             if (@strEq(direct, "@atomicCompareExchange64")) {
                 if (unsafe_scope == 0) {
                     errors = errors + zt_machine_error("atomic compare-exchange requires unsafe", context);
@@ -1034,6 +1333,62 @@ fn zt_check_machine_expr(n: *Node, env: ArrayList[ZTBind], decls: ArrayList[*Nod
                     }
                 }
             }
+            if (@strEq(direct, "@atomicExchange64Order") ||
+                @strEq(direct, "@atomicFetchAdd64Order") || @strEq(direct, "@atomicFetchSub64Order") ||
+                @strEq(direct, "@atomicFetchAnd64Order") || @strEq(direct, "@atomicFetchOr64Order") ||
+                @strEq(direct, "@atomicFetchXor64Order")) {
+                if (unsafe_scope == 0) {
+                    errors = errors + zt_machine_error("atomic read-modify-write memory-order operation requires unsafe", context);
+                }
+                if (len[*Node](c.args) != 3) {
+                    errors = errors + zt_machine_error("atomic read-modify-write memory-order operation expects pointer, i64 value, and order", context);
+                } else {
+                    let pty:[]u8 = zt_machine_expr_type(get[*Node](c.args, 0), env);
+                    if (@strEq(pty, "*mut i64") == 0) {
+                        errors = errors + zt_machine_error("atomic read-modify-write memory-order operation requires an explicitly mutable, naturally aligned *mut i64", context);
+                    }
+                    if (zt_machine_atomic_i64_value(get[*Node](c.args, 1), env, decls, context) == 0) {
+                        errors = errors + zt_machine_error("atomic read-modify-write memory-order value must be i64", context);
+                    }
+                    if (zt_machine_atomic_order(get[*Node](c.args, 2)) < 0) {
+                        errors = errors + zt_machine_error("atomic memory order must be an integer literal 0=relaxed, 1=acquire, 2=release, 3=acq_rel, or 4=seq_cst", context);
+                    }
+                }
+            }
+            if (@strEq(direct, "@atomicCompareExchange64Order")) {
+                if (unsafe_scope == 0) {
+                    errors = errors + zt_machine_error("atomic compare-exchange memory-order operation requires unsafe", context);
+                }
+                if (len[*Node](c.args) != 5) {
+                    errors = errors + zt_machine_error("atomic compare-exchange memory-order operation expects pointer, expected, desired, success order, and failure order", context);
+                } else {
+                    let pty:[]u8 = zt_machine_expr_type(get[*Node](c.args, 0), env);
+                    if (@strEq(pty, "*mut i64") == 0) {
+                        errors = errors + zt_machine_error("atomic compare-exchange memory-order operation requires an explicitly mutable, naturally aligned *mut i64", context);
+                    }
+                    if (zt_machine_atomic_i64_value(get[*Node](c.args, 1), env, decls, context) == 0 ||
+                        zt_machine_atomic_i64_value(get[*Node](c.args, 2), env, decls, context) == 0) {
+                        errors = errors + zt_machine_error("atomic compare-exchange memory-order values must be i64", context);
+                    }
+                    let success:i32 = zt_machine_atomic_order(get[*Node](c.args, 3));
+                    let failure:i32 = zt_machine_atomic_order(get[*Node](c.args, 4));
+                    if (success < 0 || failure < 0) {
+                        errors = errors + zt_machine_error("atomic memory order must be an integer literal 0=relaxed, 1=acquire, 2=release, 3=acq_rel, or 4=seq_cst", context);
+                    } else if (zt_machine_atomic_cas_orders_ok(success, failure) == 0) {
+                        errors = errors + zt_machine_error("atomic compare-exchange failure order must be relaxed/acquire/seq_cst and no stronger than success", context);
+                    }
+                }
+            }
+            if (@strEq(direct, "@atomicFence")) {
+                if (unsafe_scope == 0) {
+                    errors = errors + zt_machine_error("atomic fence requires unsafe", context);
+                }
+                if (len[*Node](c.args) != 1) {
+                    errors = errors + zt_machine_error("atomic fence expects one literal memory order", context);
+                } else if (zt_machine_atomic_order(get[*Node](c.args, 0)) < 0) {
+                    errors = errors + zt_machine_error("atomic fence order must be an integer literal 0=relaxed, 1=acquire, 2=release, 3=acq_rel, or 4=seq_cst", context);
+                }
+            }
             switch (c.callee.*) {
                 .fld => |f| {
                     let ty: []u8 = zt_machine_expr_type(f.base, env);
@@ -1062,6 +1417,7 @@ fn zt_check_machine_expr(n: *Node, env: ArrayList[ZTBind], decls: ArrayList[*Nod
             let errors: i32 = zt_check_machine_expr(x.base, env, decls, unsafe_scope, 0, context) +
                               zt_check_machine_expr(x.idx, env, decls, unsafe_scope, 0, context);
             let base_ty: []u8 = zt_machine_expr_type(x.base, env);
+            if (zt_is_atomic_i64(base_ty)==1) { return errors+zt_machine_error("AtomicI64 storage cannot be indexed",context); }
             if (zt_is_nullable_v2_raw_pointer(base_ty) == 1) {
                 errors = errors + zt_machine_error("nullable raw pointer must be explicitly unwrapped before indexing", context);
             } else if (@strEq(base_ty, "*opaque")) {
@@ -1076,6 +1432,8 @@ fn zt_check_machine_expr(n: *Node, env: ArrayList[ZTBind], decls: ArrayList[*Nod
         .fld => |f| {
             let errors: i32 = zt_check_machine_expr(f.base, env, decls, unsafe_scope, 0, context);
             let ty: []u8 = zt_machine_expr_type(f.base, env);
+            if (zt_is_atomic_i64(ty)==1) { return errors+zt_machine_error("AtomicI64 has no readable fields",context); }
+            if (@strEq(ty,"Allocation")) { return errors+zt_machine_error("Allocation is opaque; use allocation access operations",context); }
             if (@strEq(f.fname, "*")) {
                 if (zt_is_nullable_v2_raw_pointer(ty) == 1) {
                     errors = errors + zt_machine_error("nullable raw pointer must be explicitly unwrapped before dereference", context);
@@ -1097,6 +1455,8 @@ fn zt_check_machine_expr(n: *Node, env: ArrayList[ZTBind], decls: ArrayList[*Nod
         }
         .cast_ => |c| {
             let errors: i32 = zt_check_machine_expr(c.expr, env, decls, unsafe_scope, 0, context);
+            if (zt_is_atomic_i64(zt_machine_expr_type(c.expr,env))==1) { return errors+zt_machine_error("AtomicI64 storage cannot be cast",context); }
+            if (@strEq(zt_machine_expr_type(c.expr,env),"Allocation")) { return errors+zt_machine_error("Allocation storage cannot be cast",context); }
             if (zt_is_v2_raw_pointer(c.target) == 1 && unsafe_scope == 0) {
                 errors = errors + zt_machine_error("conversion to a raw pointer requires unsafe", context);
             }
@@ -1114,6 +1474,52 @@ fn zt_check_machine_expr(n: *Node, env: ArrayList[ZTBind], decls: ArrayList[*Nod
     }
 }
 
+// `Allocation` is moving from a runtime-validated record toward an affine
+// language capability.  These are the only direct receiver forms that mint or
+// transfer a fresh handle in the current bounded implementation.  Everything
+// else that produces an Allocation-shaped value is rejected at a local copy
+// boundary until general capability summaries exist.
+// A helper return is an Allocation transfer only with an explicit @alloc
+// declaration, a declared Allocation result, and no Allocation input that it
+// could merely echo.  The annotation is not authority by itself: every return
+// must be a direct allocator mint or a transitively proven @alloc helper.  The
+// graph walk is bounded by the number of declarations, so recursive cycles do
+// not become accidental proof. Unknown and foreign calls remain fail-closed.
+fn zt_allocation_return_base(decls:ArrayList[*Node],name:[]u8)i32{let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(@strEq(f.name,name)&&f.is_extern==0&&zt_fn_has_annot(decls,name,"@alloc")==1&&(@strEq(f.ret,"Allocation")||@strEq(f.ret,"!Allocation"))){let pi:i32=0;while(pi<f.params.len){if(@strEq(f.params.data[pi].pty,"Allocation")){return 0;}pi=pi+1;}return 1;}}else=>{}}i=i+1;}return 0;}
+// A branch may transfer a tracked capability only when every arm terminates by
+// returning that same sole capability.  Keeping this proof deliberately exact
+// avoids treating arbitrary branch-local effects as a capability join.
+fn zt_allocation_exact_terminal_transfer(body:ArrayList[*Node],owner:[]u8)i32{let i:i32=0;while(i<body.len){switch(body.data[i].*){.ret=>|r|{return (r.has_expr==1&&@strEq(zt_expr_transparent_id(r.expr),owner)) as i32;}.if_=>|x|{return (x.has_els==1&&zt_allocation_exact_terminal_transfer(x.then_body,owner)==1&&zt_allocation_exact_terminal_transfer(x.els_body,owner)==1) as i32;}.switch_=>|x|{let ai:i32=0;while(ai<x.arms.len){if(zt_allocation_exact_terminal_transfer(x.arms.data[ai].body,owner)==0){return 0;}ai=ai+1;}return zt_allocation_exact_terminal_transfer(x.els_body,owner);}.unsafe_=>|u|{return zt_allocation_exact_terminal_transfer(u.body,owner);}else=>{return 0;}}i=i+1;}return 0;}
+fn zt_allocation_owner_transfer_contract(decls:ArrayList[*Node],name:[]u8)i32{
+    if(zt_fn_has_annot(decls,name,"@consumes")==0||zt_fn_has_annot(decls,name,"@returns_owner")==0){return 0;}
+    let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(@strEq(f.name,name)&&f.is_extern==0&&(@strEq(f.ret,"Allocation")||@strEq(f.ret,"!Allocation"))){
+        let owner:[]u8="";let count:i32=0;let pi:i32=0;while(pi<f.params.len){if(@strEq(f.params.data[pi].pty,"Allocation")){owner=f.params.data[pi].name;count=count+1;}pi=pi+1;}
+        return (count==1&&zt_allocation_exact_terminal_transfer(f.body,owner)==1) as i32;
+    }}else=>{}}i=i+1;}return 0;
+}
+fn zt_allocation_owner_transfer_expr(n:*Node,decls:ArrayList[*Node])i32{switch(n.*){
+    .un=>|u|{if(@strEq(u.op,"try")){return zt_allocation_owner_transfer_expr(u.e,decls);}}
+    .cast_=>|c|{return zt_allocation_owner_transfer_expr(c.expr,decls);}
+    .call=>|c|{return zt_allocation_owner_transfer_contract(decls,zt_direct_name(c.callee));}
+    else=>{}
+}return 0;}
+fn zt_allocation_proven_return_body(body:ArrayList[*Node],decls:ArrayList[*Node],depth:i32)i32{let seen:i32=0;let live:ArrayList[[]u8]=make[[]u8](4);let i:i32=0;while(i<body.len){switch(body.data[i].*){.let_=>|l|{if(l.has_init==1&&(zt_allocation_mint_expr(l.expr,decls)==1||zt_allocation_proven_helper_expr(l.expr,decls,depth)==1)){if(zt_in_names(live,l.name)==1){free[[]u8](&live);return 0;}push[[]u8](&live,l.name);}}.assign=>|a|{if(zt_allocation_mint_expr(a.expr,decls)==1||zt_allocation_proven_helper_expr(a.expr,decls,depth)==1){free[[]u8](&live);return 0;}}.estmt=>|e|{let released:[]u8=zt_allocator_deallocate_owner(e.expr);if(released.len>0){zt_names_remove(&live,released);}}.ret=>|r|{if(r.has_expr==0){free[[]u8](&live);return 0;}if(zt_allocation_mint_expr(r.expr,decls)==1||zt_allocation_proven_helper_expr(r.expr,decls,depth)==1){if(live.len>0){free[[]u8](&live);return 0;}}else{let local:[]u8=zt_expr_transparent_id(r.expr);if(zt_in_names(live,local)==0){free[[]u8](&live);return 0;}zt_names_remove(&live,local);if(live.len>0){free[[]u8](&live);return 0;}}seen=1;}.if_=>|x|{if(x.has_els==0){free[[]u8](&live);return 0;}if(live.len==1&&zt_allocation_exact_terminal_transfer(x.then_body,live.data[0])==1&&zt_allocation_exact_terminal_transfer(x.els_body,live.data[0])==1){live.len=0;seen=1;}else if(live.len==0&&zt_allocation_proven_return_body(x.then_body,decls,depth)==1&&zt_allocation_proven_return_body(x.els_body,decls,depth)==1){seen=1;}else{free[[]u8](&live);return 0;}}.switch_=>|x|{if(live.len>0){free[[]u8](&live);return 0;}let ai:i32=0;while(ai<x.arms.len){if(zt_allocation_proven_return_body(x.arms.data[ai].body,decls,depth)==0){free[[]u8](&live);return 0;}ai=ai+1;}if(zt_allocation_proven_return_body(x.els_body,decls,depth)==0){free[[]u8](&live);return 0;}seen=1;}.unsafe_=>|u|{if(live.len>0||zt_allocation_proven_return_body(u.body,decls,depth)==0){free[[]u8](&live);return 0;}seen=1;}else=>{}}i=i+1;}let out:i32=(seen==1&&live.len==0) as i32;free[[]u8](&live);return out;}
+fn zt_allocation_proven_helper(decls:ArrayList[*Node],name:[]u8,depth:i32)i32{if(depth>=decls.len||zt_allocation_return_base(decls,name)==0){return 0;}let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(@strEq(f.name,name)){return zt_allocation_proven_return_body(f.body,decls,depth+1);}}else=>{}}i=i+1;}return 0;}
+fn zt_allocation_proven_helper_expr(n:*Node,decls:ArrayList[*Node],depth:i32)i32{switch(n.*){.un=>|u|{if(@strEq(u.op,"try")){return zt_allocation_proven_helper_expr(u.e,decls,depth);}}.cast_=>|c|{return zt_allocation_proven_helper_expr(c.expr,decls,depth);}.call=>|c|{return zt_allocation_proven_helper(decls,zt_direct_name(c.callee),depth);}else=>{}}return 0;}
+fn zt_allocation_return_contract(decls:ArrayList[*Node],name:[]u8)i32{return zt_allocation_proven_helper(decls,name,0);}
+fn zt_allocation_helper_expr(n:*Node,decls:ArrayList[*Node])i32{switch(n.*){.un=>|u|{if(@strEq(u.op,"try")){return zt_allocation_helper_expr(u.e,decls);}}.cast_=>|c|{return zt_allocation_helper_expr(c.expr,decls);}.call=>|c|{return zt_allocation_return_contract(decls,zt_direct_name(c.callee));}else=>{}}return 0;}
+fn zt_allocation_mint_expr(n:*Node,decls:ArrayList[*Node])i32{switch(n.*){
+    .un=>|u|{if(@strEq(u.op,"try")){return zt_allocation_mint_expr(u.e,decls);}}
+    .cast_=>|c|{return zt_allocation_mint_expr(c.expr,decls);}
+    .call=>|c|{switch(c.callee.*){.fld=>|f|{
+        if((@strEq(f.fname,"allocate")||@strEq(f.fname,"allocate_zeroed"))&&c.args.len==2){return 1;}
+        if(@strEq(f.fname,"resize")&&c.args.len==3){return 1;}
+        if(@strEq(f.fname,"deinit")&&c.args.len==0){return 1;}
+    }else=>{}}}
+    else=>{}
+}return 0;}
+fn zt_allocation_literal_expr(n:*Node)i32{return 0;}
+
 fn zt_check_machine_body(body: ArrayList[*Node], env: *ArrayList[ZTBind], decls: ArrayList[*Node],
                          unsafe_scope: i32, context: []u8) i32 {
     let errors: i32 = 0;
@@ -1121,11 +1527,22 @@ fn zt_check_machine_body(body: ArrayList[*Node], env: *ArrayList[ZTBind], decls:
     while (i < len[*Node](body)) {
         switch (get[*Node](body, i).*) {
             .let_ => |l| {
+                if(l.has_init==1){let init:ZTExpr=zt_expr_type(l.expr,env.*,decls,context);if(init.known==1&&@strEq(init.ty,"Allocation")&&zt_allocation_mint_expr(l.expr,decls)==0&&zt_allocation_helper_expr(l.expr,decls)==0&&zt_allocation_owner_transfer_expr(l.expr,decls)==0&&zt_allocation_literal_expr(l.expr)==0){errors=errors+zt_machine_error("Allocation is affine; copy and uncontracted transfer are not allowed",context);}}
+                if (l.has_dty==1 && zt_atomic_i64_forbidden_type(l.dty)==1 && zt_is_atomic_i64(l.dty)==0) {
+                    errors=errors+zt_machine_error("AtomicI64 storage cannot be wrapped or addressed",context);
+                }
+                if (l.has_dty==1 && zt_is_atomic_i64(l.dty)==1) {
+                    if(l.has_init==0){errors=errors+zt_machine_error("AtomicI64 local requires @atomicI64 initializer",context);} else {switch(l.expr.*){.call=>|c|{if(!@strEq(zt_direct_name(c.callee),"@atomicI64")||len[*Node](c.args)!=1){errors=errors+zt_machine_error("AtomicI64 local requires @atomicI64(i64)",context);}}else=>{errors=errors+zt_machine_error("AtomicI64 local requires @atomicI64(i64)",context);}}}
+                    if (l.has_init==1) { switch(l.expr.*){.call=>|c|{if(len[*Node](c.args)==1){let init:ZTExpr=zt_expr_type(get[*Node](c.args,0),env.*,decls,context);if(init.known==1&&!@strEq(init.ty,"i64")&&init.literal==0){errors=errors+zt_machine_error("AtomicI64 initializer must be i64",context);}}}else=>{}} }
+                }
+                if (l.has_dty==0 && l.has_init==1 && zt_is_atomic_i64(zt_expr_type(l.expr,env.*,decls,context).ty)==1) {
+                    errors=errors+zt_machine_error("AtomicI64 local requires an explicit AtomicI64 declaration",context);
+                }
                 if (l.has_init == 1) { errors = errors + zt_check_machine_expr(l.expr, env.*, decls, unsafe_scope, 0, context); }
                 if (l.has_dty == 1) { push[ZTBind](env, ZTBind{ .name = l.name, .ty = l.dty }); }
             }
             .ret => |r| { if (r.has_expr == 1) { errors = errors + zt_check_machine_expr(r.expr, env.*, decls, unsafe_scope, 0, context); } }
-            .assign => |a| { errors = errors + zt_check_machine_expr(a.target, env.*, decls, unsafe_scope, 1, context) +
+            .assign => |a| { let assigned:ZTExpr=zt_expr_type(a.expr,env.*,decls,context);if(assigned.known==1&&@strEq(assigned.ty,"Allocation")&&zt_allocation_mint_expr(a.expr,decls)==0&&zt_allocation_helper_expr(a.expr,decls)==0&&zt_allocation_owner_transfer_expr(a.expr,decls)==0&&zt_allocation_literal_expr(a.expr)==0){errors=errors+zt_machine_error("Allocation is affine; copy and uncontracted transfer are not allowed",context);}errors = errors + zt_check_machine_expr(a.target, env.*, decls, unsafe_scope, 1, context) +
                                                     zt_check_machine_expr(a.expr, env.*, decls, unsafe_scope, 0, context); }
             .estmt => |e| { errors = errors + zt_check_machine_expr(e.expr, env.*, decls, unsafe_scope, 0, context); }
             .if_ => |x| {
@@ -1188,8 +1605,12 @@ fn zt_check_machine_control(decls: ArrayList[*Node]) i32 {
 // validated owned-return summaries.  It is deliberately not a claim of general
 // heap provenance, dynamic bounds, or runtime use-after-free instrumentation.
 struct ZTOwnAlias { name: []u8, root: []u8 }
-struct ZTOwnSummary { name: []u8, returns_owned: i32 }
-struct ZTOwnReturnInfo { owned: i32, plain: i32 }
+struct ZTOwnSummary { name: []u8, returns_owned: i32, return_param: i32 }
+// `return_root` records the single affine identity returned by every owned
+// return in a helper.  It is used only to validate the explicit
+// `@returns_owner` contract below; a plain owned return remains a fresh
+// capability at the caller boundary.
+struct ZTOwnReturnInfo { owned: i32, plain: i32, return_root: []u8, return_conflict: i32 }
 
 fn zt_alias_root(aliases:ArrayList[ZTOwnAlias],name:[]u8)[]u8{let i:i32=0;while(i<aliases.len){if(@strEq(aliases.data[i].name,name)){return aliases.data[i].root;}i=i+1;}return name;}
 fn zt_alias_set(aliases:*ArrayList[ZTOwnAlias],name:[]u8,root:[]u8)void{let i:i32=0;while(i<aliases.*.len){if(@strEq(aliases.*.data[i].name,name)){aliases.*.data[i].root=root;return;}i=i+1;}push[ZTOwnAlias](aliases,ZTOwnAlias{.name=name,.root=root});}
@@ -1245,7 +1666,8 @@ fn zt_expr_uses_name(n: *Node, name: []u8, aliases:ArrayList[ZTOwnAlias]) i32 {
 fn zt_check_freed_expr(n:*Node,freed:ArrayList[[]u8],aliases:ArrayList[ZTOwnAlias],context:[]u8)i32{let errors:i32=0;let i:i32=0;while(i<freed.len){let name:[]u8=freed.data[i];if(zt_expr_uses_name(n,name,aliases)==1){errors=errors+zt_machine_error(_zag_str_concat("use after free of named allocation `",_zag_str_concat(name,"`")),context);}i=i+1;}return errors;}
 
 fn zt_owner_summary_returns(sums:ArrayList[ZTOwnSummary],name:[]u8)i32{let i:i32=0;while(i<sums.len){if(@strEq(sums.data[i].name,name)){return sums.data[i].returns_owned;}i=i+1;}return 0;}
-fn zt_owned_acquire_name(n:*Node,sums:ArrayList[ZTOwnSummary])[]u8{switch(n.*){.id=>|x|{if(zt_starts(x.name,"__clos_cap_")==1){return x.name;}}.cast_=>|c|{return zt_owned_acquire_name(c.expr,sums);}.call=>|c|{let name:[]u8=zt_direct_name(c.callee);if(@strEq(name,"new")||@strEq(name,"_zag_malloc")||@strEq(name,"_zag_realloc")||@strEq(name,"zalloc")||@strEq(name,"zalloc_i")||@strEq(name,"@cacheAlignedAlloc")||@strEq(name,"_zag_read_file")||@strEq(name,"_zag_strdup")||@strEq(name,"_zag_str_concat")||@strEq(name,"_zag_i64_to_str")||@strEq(name,"_zag_u64_to_str")||@strEq(name,"_zag_exec_capture")||zt_owner_summary_returns(sums,name)==1){return name;}}else=>{}}return "";}
+fn zt_owner_summary_return_param(sums:ArrayList[ZTOwnSummary],name:[]u8)i32{let i:i32=0;while(i<sums.len){if(@strEq(sums.data[i].name,name)){return sums.data[i].return_param;}i=i+1;}return -1;}
+fn zt_owned_acquire_name(n:*Node,sums:ArrayList[ZTOwnSummary])[]u8{switch(n.*){.id=>|x|{if(zt_starts(x.name,"__clos_cap_")==1){return x.name;}}.cast_=>|c|{return zt_owned_acquire_name(c.expr,sums);}.un=>|u|{if(@strEq(u.op,"try")){return zt_owned_acquire_name(u.e,sums);}}.call=>|c|{let name:[]u8=zt_direct_name(c.callee);if(@strEq(name,"new")||@strEq(name,"_zag_malloc")||@strEq(name,"_zag_realloc")||@strEq(name,"zalloc")||@strEq(name,"zalloc_i")||@strEq(name,"@cacheAlignedAlloc")||@strEq(name,"@threadSpawn")||@strEq(name,"_zag_read_file")||@strEq(name,"_zag_strdup")||@strEq(name,"_zag_str_concat")||@strEq(name,"_zag_i64_to_str")||@strEq(name,"_zag_u64_to_str")||@strEq(name,"_zag_exec_capture")||zt_owner_summary_returns(sums,name)==1){return name;}}else=>{}}return "";}
 // `_zag_realloc(owner, size)` is the one runtime operation that consumes one
 // named owner and returns its replacement in a single expression.  Preserve
 // the ordinary raw-pointer surface, but let the v2 ownership flow recognize
@@ -1255,24 +1677,64 @@ fn zt_realloc_source_name(n:*Node)[]u8{switch(n.*){
     .call=>|c|{if(@strEq(zt_direct_name(c.callee),"_zag_realloc")&&c.args.len==2){return zt_expr_transparent_id(c.args.data[0]);}}
     else=>{}
 }return "";}
+// A value-producing consuming call is permitted only with an explicit
+// `@returns_owner` declaration and a summary proving that every owned return
+// is the same consumed parameter.  This is an identity transfer, not a fresh
+// allocation: the caller's input name is dead and the result receives the one
+// live capability.  Unknown, indirect, and merely annotated calls stay
+// fail-closed.
+fn zt_return_owner_source_name(n:*Node,sums:ArrayList[ZTOwnSummary])[]u8{switch(n.*){
+    .cast_=>|c|{return zt_return_owner_source_name(c.expr,sums);}
+    // `try` only unwraps the declared error union. On its success path it
+    // preserves the exact returned capability identity, just as it preserves
+    // a borrow result elsewhere in this checker.
+    .un=>|u|{if(@strEq(u.op,"try")){return zt_return_owner_source_name(u.e,sums);}}
+    .call=>|c|{let pi:i32=zt_owner_summary_return_param(sums,zt_direct_name(c.callee));if(pi>=0&&pi<c.args.len){return zt_expr_transparent_id(c.args.data[pi]);}}
+    else=>{}
+}return "";}
+fn zt_owner_transfer_source_name(n:*Node,sums:ArrayList[ZTOwnSummary])[]u8{let source:[]u8=zt_realloc_source_name(n);if(source.len>0){return source;}return zt_return_owner_source_name(n,sums);}
 // Exact terminal operations for edition-2027 named owners. Script payloads
 // allocated by `_zag_script_alloc` are intentionally absent: their owner is the
 // generated context, and only `_zag_script_context_shutdown` releases it.
 fn zt_owned_release_name(name:[]u8)i32{
-    return (@strEq(name,"delete")||@strEq(name,"_zag_free")||@strEq(name,"zfree")||@strEq(name,"zfree_i")||@strEq(name,"@cacheAlignedFree")||@strEq(name,"close")||
+    return (@strEq(name,"delete")||@strEq(name,"_zag_free")||@strEq(name,"zfree")||@strEq(name,"zfree_i")||@strEq(name,"@cacheAlignedFree")||@strEq(name,"@threadJoin")||@strEq(name,"close")||
         @strEq(name,"_zag_str_free")||
         @strEq(name,"_zag_script_context_shutdown")) as i32;
 }
+// SystemAllocator is a receiver API: its owner is the explicit `block`
+// argument, not the receiver.  Keep this recognizer deliberately narrow and
+// structural so the existing affine flow can see `try allocator.deallocate(x)`
+// before code generation.  The runtime still validates the exact descriptor;
+// this adds the earlier source-level no-use-after-consume boundary.
+fn zt_allocator_deallocate_owner(n:*Node)[]u8{switch(n.*){
+    .un=>|u|{if(@strEq(u.op,"try")){return zt_allocator_deallocate_owner(u.e);}}
+    .cast_=>|c|{return zt_allocator_deallocate_owner(c.expr);}
+    .call=>|c|{switch(c.callee.*){.fld=>|f|{if(@strEq(f.fname,"deallocate")&&c.args.len==1){return zt_expr_transparent_id(c.args.data[0]);}}else=>{}}
+    }
+    else=>{}
+}return "";}
+// `resize` has a different surface shape (it produces the replacement), but
+// successful `try allocator.resize(old, bytes, alignment)` consumes `old` just
+// as surely as deallocate.  Recognize only the direct receiver form; arbitrary
+// helper calls remain uncontracted until the general capability-summary pass.
+fn zt_allocator_resize_owner(n:*Node)[]u8{switch(n.*){
+    .un=>|u|{if(@strEq(u.op,"try")){return zt_allocator_resize_owner(u.e);}}
+    .cast_=>|c|{return zt_allocator_resize_owner(c.expr);}
+    .call=>|c|{switch(c.callee.*){.fld=>|f|{if(@strEq(f.fname,"resize")&&c.args.len==3){return zt_expr_transparent_id(c.args.data[0]);}}else=>{}}
+    }
+    else=>{}
+}return "";}
 // Releasing or consuming an owner has an immediate flow effect.  It therefore
 // cannot be embedded in a value, condition, or another call: this first
 // ownership slice has no sequencing contract for such a value-producing use.
 // Reject it at the source boundary instead of letting a later leak/escape
 // diagnostic misdescribe the program.
 fn zt_check_embedded_terminal_call(n:*Node,decls:ArrayList[*Node],root_statement:i32,context:[]u8)i32{
+    if(root_statement==0&&zt_allocator_deallocate_owner(n).len>0){return zt_machine_error("SystemAllocator.deallocate must be a standalone statement",context);}
     switch(n.*){
         .call=>|c|{
             let errors:i32=0;let name:[]u8=zt_direct_name(c.callee);
-            if(root_statement==0&&(zt_owned_release_name(name)==1||zt_fn_has_annot(decls,name,"@consumes")==1)){
+            if(root_statement==0&&(zt_owned_release_name(name)==1||(zt_fn_has_annot(decls,name,"@consumes")==1&&zt_fn_has_annot(decls,name,"@returns_owner")==0))){
                 errors=errors+zt_machine_error("release or @consumes call must be a standalone statement",context);
             }
             errors=errors+zt_check_embedded_terminal_call(c.callee,decls,0,context);
@@ -1298,17 +1760,35 @@ fn zt_check_embedded_terminal_call(n:*Node,decls:ArrayList[*Node],root_statement
 fn zt_compiler_nonretaining_call(name:[]u8)i32{
     return (@strEq(name,"_zag_println")||@strEq(name,"_zag_eprintln")||
         @strEq(name,"_zag_write_stdout")||@strEq(name,"_zag_write_stderr")||
+        // Public Allocation byte access is a synchronous compiler-owned
+        // operation. It validates and touches the allocation but never stores
+        // the affine handle or returns a borrow derived from it.
+        @strEq(name,"allocation_read_u8")||@strEq(name,"allocation_write_u8")||
+        // The bounded SIMD intrinsic completes synchronously and retains none
+        // of its three raw-pointer arguments.  Its separate typed/unsafe and
+        // checked-access rules remain in force; this only prevents the
+        // ownership flow from mistaking a compiler intrinsic for an unknown
+        // escaping foreign call.
+        @strEq(name,"@simdAddI32x4")||@strEq(name,"@simdSubI32x4")||
+        @strEq(name,"@simdAndI32x4")||@strEq(name,"@simdOrI32x4")||
+        @strEq(name,"@simdXorI32x4")||
         // SystemAllocator registers a bounded compiler-owned provenance record
-        // synchronously; it does not transfer or retain the source owner.
-        @strEq(name,"_zag_allocation_register")) as i32;
+        // synchronously; allocationCreate consumes that raw allocation into an
+        // opaque Allocation capability rather than exposing it through an
+        // uncontracted foreign call.
+        @strEq(name,"_zag_allocation_register")||@strEq(name,"@allocationCreate")||
+        @strEq(name,"@allocationValidate")||@strEq(name,"@allocationFree")||
+        @strEq(name,"@allocationLen")||@strEq(name,"@allocationAllocatorId")||
+        @strEq(name,"@allocationReadU8")||@strEq(name,"@allocationWriteU8")||
+        @strEq(name,"@allocationRegionInit")||@strEq(name,"@allocationRegionDeinit")) as i32;
 }
 fn zt_owned_expr_root(n:*Node,owned:ArrayList[[]u8],aliases:ArrayList[ZTOwnAlias])[]u8{switch(n.*){.id=>|x|{let root:[]u8=zt_alias_root(aliases,x.name);if(zt_in_names(owned,root)==1){return root;}}.cast_=>|x|{return zt_owned_expr_root(x.expr,owned,aliases);}.fld=>|x|{return zt_owned_expr_root(x.base,owned,aliases);}.idx=>|x|{return zt_owned_expr_root(x.base,owned,aliases);}.slice_=>|x|{return zt_owned_expr_root(x.base,owned,aliases);}.un=>|x|{return zt_owned_expr_root(x.e,owned,aliases);}.call=>|x|{if(@strEq(zt_direct_name(x.callee),"_zag_slice_ptr")&&x.args.len==1){return zt_owned_expr_root(x.args.data[0],owned,aliases);}}else=>{}}return "";}
 
 fn zt_return_info_body(body:ArrayList[*Node],must:*ArrayList[[]u8],may:*ArrayList[[]u8],aliases:*ArrayList[ZTOwnAlias],sums:ArrayList[ZTOwnSummary],info:*ZTOwnReturnInfo)void{
     let i:i32=0;while(i<body.len){switch(body.data[i].*){
-        .let_=>|l|{if(l.has_init==1){if(zt_owned_acquire_name(l.expr,sums).len>0){let source:[]u8=zt_realloc_source_name(l.expr);if(source.len>0){let root:[]u8=zt_alias_root(aliases.*,source);zt_names_remove(must,root);zt_names_remove(may,root);}if(zt_in_names(must.*,l.name)==0){push[[]u8](must,l.name);}if(zt_in_names(may.*,l.name)==0){push[[]u8](may,l.name);}zt_alias_set(aliases,l.name,l.name);}else{let source:[]u8=zt_expr_transparent_id(l.expr);if(source.len>0){zt_alias_set(aliases,l.name,zt_alias_root(aliases.*,source));}}}}
-        .assign=>|a|{let target:[]u8=zt_expr_transparent_id(a.target);if(target.len>0){if(zt_owned_acquire_name(a.expr,sums).len>0){let source:[]u8=zt_realloc_source_name(a.expr);if(source.len>0){let root:[]u8=zt_alias_root(aliases.*,source);zt_names_remove(must,root);zt_names_remove(may,root);}if(zt_in_names(must.*,target)==0){push[[]u8](must,target);}if(zt_in_names(may.*,target)==0){push[[]u8](may,target);}zt_alias_set(aliases,target,target);}else{let source:[]u8=zt_expr_transparent_id(a.expr);if(source.len>0){zt_alias_set(aliases,target,zt_alias_root(aliases.*,source));}}}}
-        .ret=>|r|{if(r.has_expr==0){info.*.plain=1;}else if(zt_owned_acquire_name(r.expr,sums).len>0||zt_owned_expr_root(r.expr,must.*,aliases.*).len>0){info.*.owned=1;}else if(zt_owned_expr_root(r.expr,may.*,aliases.*).len>0){info.*.owned=1;info.*.plain=1;}else{info.*.plain=1;}}
+        .let_=>|l|{if(l.has_init==1){if(zt_owned_acquire_name(l.expr,sums).len>0){let source:[]u8=zt_owner_transfer_source_name(l.expr,sums);if(source.len>0){let root:[]u8=zt_alias_root(aliases.*,source);zt_names_remove(must,root);zt_names_remove(may,root);}if(zt_in_names(must.*,l.name)==0){push[[]u8](must,l.name);}if(zt_in_names(may.*,l.name)==0){push[[]u8](may,l.name);}zt_alias_set(aliases,l.name,l.name);}else{let source:[]u8=zt_expr_transparent_id(l.expr);if(source.len>0){zt_alias_set(aliases,l.name,zt_alias_root(aliases.*,source));}}}}
+        .assign=>|a|{let target:[]u8=zt_expr_transparent_id(a.target);if(target.len>0){if(zt_owned_acquire_name(a.expr,sums).len>0){let source:[]u8=zt_owner_transfer_source_name(a.expr,sums);if(source.len>0){let root:[]u8=zt_alias_root(aliases.*,source);zt_names_remove(must,root);zt_names_remove(may,root);}if(zt_in_names(must.*,target)==0){push[[]u8](must,target);}if(zt_in_names(may.*,target)==0){push[[]u8](may,target);}zt_alias_set(aliases,target,target);}else{let source:[]u8=zt_expr_transparent_id(a.expr);if(source.len>0){zt_alias_set(aliases,target,zt_alias_root(aliases.*,source));}}}}
+        .ret=>|r|{if(r.has_expr==0){info.*.plain=1;}else{let root:[]u8=zt_owned_expr_root(r.expr,must.*,aliases.*);if(zt_owned_acquire_name(r.expr,sums).len>0||root.len>0){info.*.owned=1;if(root.len==0){info.*.return_conflict=1;}else if(info.*.return_root.len==0){info.*.return_root=root;}else if(@strEq(info.*.return_root,root)==0){info.*.return_conflict=1;}}else if(zt_owned_expr_root(r.expr,may.*,aliases.*).len>0){info.*.owned=1;info.*.plain=1;info.*.return_conflict=1;}else{info.*.plain=1;}}}
         .unsafe_=>|u|{zt_return_info_body(u.body,must,may,aliases,sums,info);}
         .if_=>|x|{
             let tm:ArrayList[[]u8]=zt_names_clone(must.*);let ty:ArrayList[[]u8]=zt_names_clone(may.*);let ta:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);
@@ -1365,19 +1845,19 @@ fn zt_return_info_body(body:ArrayList[*Node],must:*ArrayList[[]u8],may:*ArrayLis
     }i=i+1;}
 }
 fn zt_fn_return_info(f:FnDecl,decls:ArrayList[*Node],sums:ArrayList[ZTOwnSummary])ZTOwnReturnInfo{
-    let info:ZTOwnReturnInfo=ZTOwnReturnInfo{.owned=0,.plain=0};
+    let info:ZTOwnReturnInfo=ZTOwnReturnInfo{.owned=0,.plain=0,.return_root="",.return_conflict=0};
     let must:ArrayList[[]u8]=make[[]u8](4);let may:ArrayList[[]u8]=make[[]u8](4);let aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);
-    if(zt_fn_has_annot(decls,f.name,"@consumes")==1&&f.params.len>0){push[[]u8](&must,f.params.data[0].name);push[[]u8](&may,f.params.data[0].name);zt_alias_set(&aliases,f.params.data[0].name,f.params.data[0].name);}
+    if(zt_fn_has_annot(decls,f.name,"@consumes")==1){let pi:i32=0;while(pi<f.params.len){let p:Param=f.params.data[pi];if(zt_owner_param_type(p.pty)==1){push[[]u8](&must,p.name);push[[]u8](&may,p.name);zt_alias_set(&aliases,p.name,p.name);}pi=pi+1;}}
     zt_return_info_body(f.body,&must,&may,&aliases,sums,&info);
     free[[]u8](&must);free[[]u8](&may);free[ZTOwnAlias](&aliases);
     return info;
 }
-fn zt_build_owner_summaries(decls:ArrayList[*Node])ArrayList[ZTOwnSummary]{let sums:ArrayList[ZTOwnSummary]=make[ZTOwnSummary](decls.len+1);let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(f.is_extern==0){push[ZTOwnSummary](&sums,ZTOwnSummary{.name=f.name,.returns_owned=0});}}else=>{}}i=i+1;}let pass:i32=0;while(pass<=sums.len){i=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(f.is_extern==0){let info:ZTOwnReturnInfo=zt_fn_return_info(f,decls,sums);if(info.owned==1&&info.plain==0){let si:i32=0;while(si<sums.len){if(@strEq(sums.data[si].name,f.name)){sums.data[si].returns_owned=1;}si=si+1;}}}}else=>{}}i=i+1;}pass=pass+1;}return sums;}
-fn zt_check_owner_summary_errors(decls:ArrayList[*Node],sums:ArrayList[ZTOwnSummary])i32{let errors:i32=0;let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(f.is_extern==0){let info:ZTOwnReturnInfo=zt_fn_return_info(f,decls,sums);if(info.owned==1&&info.plain==1){errors=errors+zt_machine_error(_zag_str_concat("function `",_zag_str_concat(f.name,"` mixes owned and non-owned return provenance")),_zag_str_concat("function ",f.name));}}}else=>{}}i=i+1;}return errors;}
+fn zt_build_owner_summaries(decls:ArrayList[*Node])ArrayList[ZTOwnSummary]{let sums:ArrayList[ZTOwnSummary]=make[ZTOwnSummary](decls.len+1);let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(f.is_extern==0){push[ZTOwnSummary](&sums,ZTOwnSummary{.name=f.name,.returns_owned=0,.return_param=-1});}}else=>{}}i=i+1;}let pass:i32=0;while(pass<=sums.len){i=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(f.is_extern==0){let info:ZTOwnReturnInfo=zt_fn_return_info(f,decls,sums);let si:i32=0;while(si<sums.len){if(@strEq(sums.data[si].name,f.name)){if(info.owned==1&&info.plain==0){sums.data[si].returns_owned=1;}if(zt_fn_has_annot(decls,f.name,"@returns_owner")==1&&info.owned==1&&info.plain==0&&info.return_conflict==0&&info.return_root.len>0){let pi:i32=0;while(pi<f.params.len){if(@strEq(f.params.data[pi].name,info.return_root)&&zt_consumes_param(decls,f.name,pi)==1){sums.data[si].return_param=pi;}pi=pi+1;}}}si=si+1;}}}else=>{}}i=i+1;}pass=pass+1;}return sums;}
+fn zt_check_owner_summary_errors(decls:ArrayList[*Node],sums:ArrayList[ZTOwnSummary])i32{let errors:i32=0;let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(f.is_extern==0){let info:ZTOwnReturnInfo=zt_fn_return_info(f,decls,sums);if(info.owned==1&&info.plain==1){errors=errors+zt_machine_error(_zag_str_concat("function `",_zag_str_concat(f.name,"` mixes owned and non-owned return provenance")),_zag_str_concat("function ",f.name));}if(zt_fn_has_annot(decls,f.name,"@returns_owner")==1&&zt_owner_summary_return_param(sums,f.name)<0){errors=errors+zt_machine_error("@returns_owner requires every owned return to be the same @consumes owner parameter",_zag_str_concat("function ",f.name));}}}else=>{}}i=i+1;}return errors;}
 
 fn zt_collect_owned_body(body:ArrayList[*Node],owned:*ArrayList[[]u8],returned:*ArrayList[[]u8],aliases:*ArrayList[ZTOwnAlias],sums:ArrayList[ZTOwnSummary])void{let i:i32=0;while(i<body.len){switch(body.data[i].*){
-    .let_=>|l|{if(l.has_init==1){if(zt_owned_acquire_name(l.expr,sums).len>0){let source:[]u8=zt_realloc_source_name(l.expr);if(source.len>0){zt_names_remove(owned,zt_alias_root(aliases.*,source));}if(zt_in_names(owned.*,l.name)==0){push[[]u8](owned,l.name);}zt_alias_set(aliases,l.name,l.name);}else{let source:[]u8=zt_expr_transparent_id(l.expr);if(source.len>0){zt_alias_set(aliases,l.name,zt_alias_root(aliases.*,source));}}}}
-    .assign=>|a|{let target:[]u8=zt_expr_transparent_id(a.target);let source:[]u8=zt_expr_transparent_id(a.expr);let acquired:[]u8=zt_owned_acquire_name(a.expr,sums);if(target.len>0){if(acquired.len>0){let realloc_source:[]u8=zt_realloc_source_name(a.expr);if(realloc_source.len>0){zt_names_remove(owned,zt_alias_root(aliases.*,realloc_source));}if(zt_in_names(owned.*,target)==0){push[[]u8](owned,target);}zt_alias_set(aliases,target,target);}else if(source.len>0){zt_alias_set(aliases,target,zt_alias_root(aliases.*,source));}else{zt_alias_set(aliases,target,"");}}}
+    .let_=>|l|{if(l.has_init==1){if(zt_owned_acquire_name(l.expr,sums).len>0){let source:[]u8=zt_owner_transfer_source_name(l.expr,sums);if(source.len>0){zt_names_remove(owned,zt_alias_root(aliases.*,source));}if(zt_in_names(owned.*,l.name)==0){push[[]u8](owned,l.name);}zt_alias_set(aliases,l.name,l.name);}else{let source:[]u8=zt_expr_transparent_id(l.expr);if(source.len>0){zt_alias_set(aliases,l.name,zt_alias_root(aliases.*,source));}}}}
+    .assign=>|a|{let target:[]u8=zt_expr_transparent_id(a.target);let source:[]u8=zt_expr_transparent_id(a.expr);let acquired:[]u8=zt_owned_acquire_name(a.expr,sums);if(target.len>0){if(acquired.len>0){let transfer_source:[]u8=zt_owner_transfer_source_name(a.expr,sums);if(transfer_source.len>0){zt_names_remove(owned,zt_alias_root(aliases.*,transfer_source));}if(zt_in_names(owned.*,target)==0){push[[]u8](owned,target);}zt_alias_set(aliases,target,target);}else if(source.len>0){zt_alias_set(aliases,target,zt_alias_root(aliases.*,source));}else{zt_alias_set(aliases,target,"");}}}
     .ret=>|r|{if(r.has_expr==1){let root:[]u8=zt_owned_expr_root(r.expr,owned.*,aliases.*);if(root.len>0&&zt_in_names(returned.*,root)==0){push[[]u8](returned,root);}}}
     .if_=>|x|{let ta:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);zt_collect_owned_body(x.then_body,owned,returned,&ta,sums);let ea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);zt_collect_owned_body(x.els_body,owned,returned,&ea,sums);free[ZTOwnAlias](&ta);free[ZTOwnAlias](&ea);}
     .while_=>|x|{let wa:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);zt_collect_owned_body(x.body,owned,returned,&wa,sums);free[ZTOwnAlias](&wa);}
@@ -1389,10 +1869,10 @@ fn zt_collect_owned_body(body:ArrayList[*Node],owned:*ArrayList[[]u8],returned:*
 fn zt_check_direct_free_body(body:ArrayList[*Node],freed:*ArrayList[[]u8],aliases:*ArrayList[ZTOwnAlias],decls:ArrayList[*Node],sums:ArrayList[ZTOwnSummary],context:[]u8)i32{
     let errors:i32=0;let i:i32=0;
     while(i<body.len){switch(body.data[i].*){
-        .let_=>|l|{if(l.has_init==1){errors=errors+zt_check_embedded_terminal_call(l.expr,decls,0,context)+zt_check_freed_expr(l.expr,freed.*,aliases.*,context);if(zt_owned_acquire_name(l.expr,sums).len>0){zt_alias_set(aliases,l.name,l.name);}else{let source:[]u8=zt_expr_transparent_id(l.expr);if(source.len>0){zt_alias_set(aliases,l.name,zt_alias_root(aliases.*,source));}}}}
+        .let_=>|l|{if(l.has_init==1){errors=errors+zt_check_embedded_terminal_call(l.expr,decls,0,context)+zt_check_freed_expr(l.expr,freed.*,aliases.*,context);if(zt_owned_acquire_name(l.expr,sums).len>0){zt_alias_set(aliases,l.name,l.name);}else{let source:[]u8=zt_expr_transparent_id(l.expr);if(source.len>0){zt_alias_set(aliases,l.name,zt_alias_root(aliases.*,source));}}let transferred:[]u8=zt_return_owner_source_name(l.expr,sums);if(transferred.len>0){let root:[]u8=zt_alias_root(aliases.*,transferred);if(zt_in_names(freed.*,root)==0){push[[]u8](freed,root);}}}}
         .ret=>|r|{if(r.has_expr==1){errors=errors+zt_check_embedded_terminal_call(r.expr,decls,0,context)+zt_check_freed_expr(r.expr,freed.*,aliases.*,context);}}
-        .assign=>|a|{errors=errors+zt_check_embedded_terminal_call(a.target,decls,0,context)+zt_check_embedded_terminal_call(a.expr,decls,0,context)+zt_check_freed_expr(a.target,freed.*,aliases.*,context)+zt_check_freed_expr(a.expr,freed.*,aliases.*,context);let target:[]u8=zt_expr_transparent_id(a.target);let source:[]u8=zt_expr_transparent_id(a.expr);if(target.len>0){if(zt_owned_acquire_name(a.expr,sums).len>0){zt_alias_set(aliases,target,target);}else if(source.len>0){zt_alias_set(aliases,target,zt_alias_root(aliases.*,source));}else{zt_alias_set(aliases,target,"");}}}
-        .estmt=>|e|{switch(e.expr.*){.call=>|c|{let name:[]u8=zt_direct_name(c.callee);if(zt_owned_release_name(name)==1&&c.args.len==1){let owner:[]u8=zt_expr_transparent_id(c.args.data[0]);if(owner.len==0){errors=errors+zt_machine_error("release requires a named owner argument",context);}else{let root:[]u8=zt_alias_root(aliases.*,owner);if(zt_in_names(freed.*,root)==1){errors=errors+zt_machine_error("double free of named allocation",context);}else{push[[]u8](freed,root);}}}else if(zt_fn_has_annot(decls,name,"@consumes")==1&&c.args.len>0){let owner:[]u8=zt_expr_transparent_id(c.args.data[0]);if(owner.len==0){errors=errors+zt_machine_error("@consumes requires a named owner argument",context);}else{let root:[]u8=zt_alias_root(aliases.*,owner);if(zt_in_names(freed.*,root)==1){errors=errors+zt_machine_error("consumes an already released owner",context);}else{push[[]u8](freed,root);}}}else{errors=errors+zt_check_embedded_terminal_call(e.expr,decls,1,context)+zt_check_freed_expr(e.expr,freed.*,aliases.*,context);}}else=>{errors=errors+zt_check_embedded_terminal_call(e.expr,decls,1,context)+zt_check_freed_expr(e.expr,freed.*,aliases.*,context);}}}
+        .assign=>|a|{errors=errors+zt_check_embedded_terminal_call(a.target,decls,0,context)+zt_check_embedded_terminal_call(a.expr,decls,0,context)+zt_check_freed_expr(a.target,freed.*,aliases.*,context)+zt_check_freed_expr(a.expr,freed.*,aliases.*,context);let transferred:[]u8=zt_return_owner_source_name(a.expr,sums);let transferred_root:[]u8=zt_alias_root(aliases.*,transferred);let target:[]u8=zt_expr_transparent_id(a.target);let source:[]u8=zt_expr_transparent_id(a.expr);if(target.len>0){if(zt_owned_acquire_name(a.expr,sums).len>0){zt_alias_set(aliases,target,target);}else if(source.len>0){zt_alias_set(aliases,target,zt_alias_root(aliases.*,source));}else{zt_alias_set(aliases,target,"");}}if(transferred.len>0&&zt_in_names(freed.*,transferred_root)==0){push[[]u8](freed,transferred_root);}}
+        .estmt=>|e|{let allocator_owner:[]u8=zt_allocator_deallocate_owner(e.expr);if(allocator_owner.len>0){let root:[]u8=zt_alias_root(aliases.*,allocator_owner);if(zt_in_names(freed.*,root)==1){errors=errors+zt_machine_error("use after consumed SystemAllocator handle",context);}else{push[[]u8](freed,root);}}else{switch(e.expr.*){.call=>|c|{let name:[]u8=zt_direct_name(c.callee);if(zt_owned_release_name(name)==1&&c.args.len==1){let owner:[]u8=zt_expr_transparent_id(c.args.data[0]);if(owner.len==0){errors=errors+zt_machine_error("release requires a named owner argument",context);}else{let root:[]u8=zt_alias_root(aliases.*,owner);if(zt_in_names(freed.*,root)==1){errors=errors+zt_machine_error("double free of named allocation",context);}else{push[[]u8](freed,root);}}}else if(zt_fn_has_annot(decls,name,"@consumes")==1){let ai:i32=0;while(ai<c.args.len){if(zt_consumes_param(decls,name,ai)==1){let owner:[]u8=zt_expr_transparent_id(c.args.data[ai]);if(owner.len==0){errors=errors+zt_machine_error("@consumes requires named owner arguments",context);}else{let root:[]u8=zt_alias_root(aliases.*,owner);if(zt_in_names(freed.*,root)==1){errors=errors+zt_machine_error("consumes an already released owner",context);}else{push[[]u8](freed,root);}}}ai=ai+1;}}else{errors=errors+zt_check_embedded_terminal_call(e.expr,decls,1,context)+zt_check_freed_expr(e.expr,freed.*,aliases.*,context);}}else=>{errors=errors+zt_check_embedded_terminal_call(e.expr,decls,1,context)+zt_check_freed_expr(e.expr,freed.*,aliases.*,context);}}}}
         .unsafe_=>|u|{errors=errors+zt_check_direct_free_body(u.body,freed,aliases,decls,sums,context);}
         .if_=>|x|{
             errors=errors+zt_check_embedded_terminal_call(x.cond,decls,0,context)+zt_check_freed_expr(x.cond,freed.*,aliases.*,context);
@@ -1446,10 +1926,10 @@ fn zt_check_direct_free_body(body:ArrayList[*Node],freed:*ArrayList[[]u8],aliase
 fn zt_owner_terminal_state(body:ArrayList[*Node],root:[]u8,aliases:*ArrayList[ZTOwnAlias],decls:ArrayList[*Node],sums:ArrayList[ZTOwnSummary],state:i32)i32{
     let out:i32=state;let i:i32=0;
     while(i<body.len){switch(body.data[i].*){
-        .let_=>|l|{if(l.has_init==1){if(zt_owned_acquire_name(l.expr,sums).len>0){let source:[]u8=zt_realloc_source_name(l.expr);if(source.len>0&&@strEq(zt_alias_root(aliases.*,source),root)){out=1;}zt_alias_set(aliases,l.name,l.name);}else{let source:[]u8=zt_expr_transparent_id(l.expr);if(source.len>0){zt_alias_set(aliases,l.name,zt_alias_root(aliases.*,source));}}}}
-        .assign=>|a|{let target:[]u8=zt_expr_transparent_id(a.target);let source:[]u8=zt_expr_transparent_id(a.expr);if(target.len>0){if(zt_owned_acquire_name(a.expr,sums).len>0){let realloc_source:[]u8=zt_realloc_source_name(a.expr);if(realloc_source.len>0&&@strEq(zt_alias_root(aliases.*,realloc_source),root)&&@strEq(target,root)==0){out=1;}zt_alias_set(aliases,target,target);}else if(source.len>0){zt_alias_set(aliases,target,zt_alias_root(aliases.*,source));}else{zt_alias_set(aliases,target,"");}}}
+        .let_=>|l|{if(l.has_init==1){if(zt_owned_acquire_name(l.expr,sums).len>0){let source:[]u8=zt_owner_transfer_source_name(l.expr,sums);if(source.len>0&&@strEq(zt_alias_root(aliases.*,source),root)){out=1;}zt_alias_set(aliases,l.name,l.name);}else{let source:[]u8=zt_expr_transparent_id(l.expr);if(source.len>0){zt_alias_set(aliases,l.name,zt_alias_root(aliases.*,source));}}}}
+        .assign=>|a|{let target:[]u8=zt_expr_transparent_id(a.target);let source:[]u8=zt_expr_transparent_id(a.expr);if(target.len>0){if(zt_owned_acquire_name(a.expr,sums).len>0){let transfer_source:[]u8=zt_owner_transfer_source_name(a.expr,sums);if(transfer_source.len>0&&@strEq(zt_alias_root(aliases.*,transfer_source),root)&&@strEq(target,root)==0){out=1;}zt_alias_set(aliases,target,target);}else if(source.len>0){zt_alias_set(aliases,target,zt_alias_root(aliases.*,source));}else{zt_alias_set(aliases,target,"");}}}
         .ret=>|r|{if(r.has_expr==1&&zt_expr_uses_name(r.expr,root,aliases.*)==1){out=1;}}
-        .estmt=>|e|{switch(e.expr.*){.call=>|c|{let name:[]u8=zt_direct_name(c.callee);if((zt_owned_release_name(name)==1&&c.args.len==1||zt_fn_has_annot(decls,name,"@consumes")==1&&c.args.len>0)&&zt_expr_uses_name(c.args.data[0],root,aliases.*)==1){out=1;}}else=>{}}}
+        .estmt=>|e|{let allocator_owner:[]u8=zt_allocator_deallocate_owner(e.expr);if(allocator_owner.len>0&&@strEq(zt_alias_root(aliases.*,allocator_owner),root)){out=1;}else{switch(e.expr.*){.call=>|c|{let name:[]u8=zt_direct_name(c.callee);if(zt_owned_release_name(name)==1&&c.args.len==1&&zt_expr_uses_name(c.args.data[0],root,aliases.*)==1){out=1;}else if(zt_fn_has_annot(decls,name,"@consumes")==1){let ai:i32=0;while(ai<c.args.len){if(zt_consumes_param(decls,name,ai)==1&&zt_expr_uses_name(c.args.data[ai],root,aliases.*)==1){out=1;}ai=ai+1;}}}else=>{}}}}
         .unsafe_=>|u|{out=zt_owner_terminal_state(u.body,root,aliases,decls,sums,out);}
         .if_=>|x|{
             let basea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);
@@ -1493,7 +1973,7 @@ fn zt_owner_terminal_state(body:ArrayList[*Node],root:[]u8,aliases:*ArrayList[ZT
 fn zt_check_owned_call(n:*Node,owned:ArrayList[[]u8],aliases:ArrayList[ZTOwnAlias],decls:ArrayList[*Node],context:[]u8)i32{
     let errors:i32=0;
     switch(n.*){
-        .call=>|c|{let name:[]u8=zt_direct_name(c.callee);let contracted:i32=((zt_owned_release_name(name)==1||@strEq(name,"_zag_realloc")||@strEq(name,"_zag_slice_ptr")||zt_compiler_nonretaining_call(name)==1||zt_fn_has_annot(decls,name,"@consumes")==1||zt_borrow_mode(decls,name)>0) as i32;let ai:i32=0;while(ai<c.args.len){let oi:i32=0;while(oi<owned.len){let root:[]u8=owned.data[oi];if(contracted==0&&zt_expr_uses_name(c.args.data[ai],root,aliases)==1){let shown:[]u8=name;if(shown.len==0){shown="<indirect>";}errors=errors+zt_machine_error(_zag_str_concat("owned allocation escapes through uncontracted call `",_zag_str_concat(shown,_zag_str_concat("` (root `",_zag_str_concat(root,"`)")))),context);}oi=oi+1;}errors=errors+zt_check_owned_call(c.args.data[ai],owned,aliases,decls,context);ai=ai+1;}}
+        .call=>|c|{let name:[]u8=zt_direct_name(c.callee);let allocator_consume:i32=0;switch(c.callee.*){.fld=>|f|{if((@strEq(f.fname,"deallocate")&&c.args.len==1)||(@strEq(f.fname,"resize")&&c.args.len==3)){allocator_consume=1;}}else=>{}}let ai:i32=0;while(ai<c.args.len){let contracted:i32=(((zt_owned_release_name(name)==1&&ai==0)||(allocator_consume==1&&ai==0)||@strEq(name,"_zag_realloc")||@strEq(name,"_zag_slice_ptr")||zt_compiler_nonretaining_call(name)==1||zt_borrow_mode(decls,name)>0||zt_consumes_param(decls,name,ai)==1) as i32);let oi:i32=0;while(oi<owned.len){let root:[]u8=owned.data[oi];if(contracted==0&&zt_expr_uses_name(c.args.data[ai],root,aliases)==1){let shown:[]u8=name;if(shown.len==0){shown="<indirect>";}errors=errors+zt_machine_error(_zag_str_concat("owned allocation escapes through uncontracted call `",_zag_str_concat(shown,_zag_str_concat("` (root `",_zag_str_concat(root,"`)")))),context);}oi=oi+1;}errors=errors+zt_check_owned_call(c.args.data[ai],owned,aliases,decls,context);ai=ai+1;}}
         .bin=>|x|{errors=errors+zt_check_owned_call(x.l,owned,aliases,decls,context)+zt_check_owned_call(x.r,owned,aliases,decls,context);}
         .un=>|x|{errors=errors+zt_check_owned_call(x.e,owned,aliases,decls,context);}
         .idx=>|x|{errors=errors+zt_check_owned_call(x.base,owned,aliases,decls,context)+zt_check_owned_call(x.idx,owned,aliases,decls,context);}
@@ -1552,12 +2032,39 @@ fn zt_check_owned_escapes_body(body:ArrayList[*Node],owned:ArrayList[[]u8],alias
 
 // Reject replacing a still-live owner. This is a fail-closed generation guard;
 // a later ownership IR can assign distinct origin IDs and permit proven reuse.
+// Aggregate provenance owns field paths while the older direct-owner lattice
+// owns names.  Once a named owner is placed in a value aggregate, terminal
+// accounting belongs to the aggregate pass below: it can see a later exact
+// field consume, whereas the name-only lattice deliberately cannot guess that
+// `box.ptr` is the original capability.  Keep this predicate syntactic and
+// narrow; aggregate terminal accounting remains the authority that proves the
+// capability was actually discharged.
+fn zt_expr_stores_owner_in_aggregate(n:*Node,owner:[]u8,aliases:ArrayList[ZTOwnAlias])i32{switch(n.*){
+    .slit_=>|x|{let i:i32=0;while(i<x.fields.len){if(zt_expr_uses_name(x.fields.data[i].val,owner,aliases)==1){return 1;}i=i+1;}}
+    .call=>|x|{let i:i32=0;while(i<x.args.len){if(zt_expr_stores_owner_in_aggregate(x.args.data[i],owner,aliases)==1){return 1;}i=i+1;}}
+    .bin=>|x|{return zt_expr_stores_owner_in_aggregate(x.l,owner,aliases)|zt_expr_stores_owner_in_aggregate(x.r,owner,aliases);}
+    .un=>|x|{return zt_expr_stores_owner_in_aggregate(x.e,owner,aliases);}
+    .idx=>|x|{return zt_expr_stores_owner_in_aggregate(x.base,owner,aliases)|zt_expr_stores_owner_in_aggregate(x.idx,owner,aliases);}
+    .fld=>|x|{return zt_expr_stores_owner_in_aggregate(x.base,owner,aliases);}
+    .cast_=>|x|{return zt_expr_stores_owner_in_aggregate(x.expr,owner,aliases);}
+    .slice_=>|x|{return zt_expr_stores_owner_in_aggregate(x.base,owner,aliases);}
+    else=>{}
+}return 0;}
+fn zt_body_stores_owner_in_aggregate(body:ArrayList[*Node],owner:[]u8,aliases:*ArrayList[ZTOwnAlias])i32{let i:i32=0;while(i<body.len){switch(body.data[i].*){
+    .let_=>|x|{if(x.has_init==1){if(zt_expr_stores_owner_in_aggregate(x.expr,owner,aliases.*)==1){return 1;}let src:[]u8=zt_expr_transparent_id(x.expr);if(src.len>0){zt_alias_set(aliases,x.name,zt_alias_root(aliases.*,src));}}}
+    .assign=>|x|{if(zt_expr_stores_owner_in_aggregate(x.expr,owner,aliases.*)==1){return 1;}let dst:[]u8=zt_expr_transparent_id(x.target);let src:[]u8=zt_expr_transparent_id(x.expr);if(dst.len>0&&src.len>0){zt_alias_set(aliases,dst,zt_alias_root(aliases.*,src));}}
+    .unsafe_=>|x|{if(zt_body_stores_owner_in_aggregate(x.body,owner,aliases)==1){return 1;}}
+    .if_=>|x|{let a:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);let b:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);let hit:i32=zt_body_stores_owner_in_aggregate(x.then_body,owner,&a)|zt_body_stores_owner_in_aggregate(x.els_body,owner,&b);free[ZTOwnAlias](&a);free[ZTOwnAlias](&b);if(hit==1){return 1;}}
+    .while_=>|x|{let a:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);let hit:i32=zt_body_stores_owner_in_aggregate(x.body,owner,&a);free[ZTOwnAlias](&a);if(hit==1){return 1;}}
+    .switch_=>|x|{let ai:i32=0;while(ai<x.arms.len){let a:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);let hit:i32=zt_body_stores_owner_in_aggregate(x.arms.data[ai].body,owner,&a);free[ZTOwnAlias](&a);if(hit==1){return 1;}ai=ai+1;}let a:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);let hit:i32=zt_body_stores_owner_in_aggregate(x.els_body,owner,&a);free[ZTOwnAlias](&a);if(hit==1){return 1;}}
+    else=>{}
+}i=i+1;}return 0;}
 fn zt_check_owner_state_body(body:ArrayList[*Node],live:*ArrayList[[]u8],aliases:*ArrayList[ZTOwnAlias],decls:ArrayList[*Node],sums:ArrayList[ZTOwnSummary],context:[]u8)i32{
     let errors:i32=0;let i:i32=0;while(i<body.len){switch(body.data[i].*){
-        .let_=>|l|{if(l.has_init==1){if(zt_owned_acquire_name(l.expr,sums).len>0){let source:[]u8=zt_realloc_source_name(l.expr);if(source.len>0){zt_names_remove(live,zt_alias_root(aliases.*,source));}let old:[]u8=zt_alias_root(aliases.*,l.name);if(zt_in_names(live.*,old)==1){errors=errors+zt_machine_error(_zag_str_concat("live owned allocation `",_zag_str_concat(old,"` is overwritten before release or transfer")),context);}if(zt_in_names(live.*,l.name)==0){push[[]u8](live,l.name);}zt_alias_set(aliases,l.name,l.name);}else{let source:[]u8=zt_expr_transparent_id(l.expr);if(source.len>0){zt_alias_set(aliases,l.name,zt_alias_root(aliases.*,source));}}}}
-        .assign=>|a|{let target:[]u8=zt_expr_transparent_id(a.target);if(target.len>0){if(zt_owned_acquire_name(a.expr,sums).len>0){let source:[]u8=zt_realloc_source_name(a.expr);if(source.len>0){zt_names_remove(live,zt_alias_root(aliases.*,source));}let old:[]u8=zt_alias_root(aliases.*,target);if(zt_in_names(live.*,old)==1){errors=errors+zt_machine_error(_zag_str_concat("live owned allocation `",_zag_str_concat(old,"` is overwritten before release or transfer")),context);}if(zt_in_names(live.*,target)==0){push[[]u8](live,target);}zt_alias_set(aliases,target,target);}else{let source:[]u8=zt_expr_transparent_id(a.expr);if(source.len>0){zt_alias_set(aliases,target,zt_alias_root(aliases.*,source));}}}}
+        .let_=>|l|{if(l.has_init==1){if(zt_owned_acquire_name(l.expr,sums).len>0){let source:[]u8=zt_owner_transfer_source_name(l.expr,sums);if(source.len>0){zt_names_remove(live,zt_alias_root(aliases.*,source));}let old:[]u8=zt_alias_root(aliases.*,l.name);if(zt_in_names(live.*,old)==1){errors=errors+zt_machine_error(_zag_str_concat("live owned allocation `",_zag_str_concat(old,"` is overwritten before release or transfer")),context);}if(zt_in_names(live.*,l.name)==0){push[[]u8](live,l.name);}zt_alias_set(aliases,l.name,l.name);}else{let source:[]u8=zt_expr_transparent_id(l.expr);if(source.len>0){zt_alias_set(aliases,l.name,zt_alias_root(aliases.*,source));}}}}
+        .assign=>|a|{let target:[]u8=zt_expr_transparent_id(a.target);if(target.len>0){if(zt_owned_acquire_name(a.expr,sums).len>0){let source:[]u8=zt_owner_transfer_source_name(a.expr,sums);if(source.len>0){zt_names_remove(live,zt_alias_root(aliases.*,source));}let old:[]u8=zt_alias_root(aliases.*,target);if(zt_in_names(live.*,old)==1){errors=errors+zt_machine_error(_zag_str_concat("live owned allocation `",_zag_str_concat(old,"` is overwritten before release or transfer")),context);}if(zt_in_names(live.*,target)==0){push[[]u8](live,target);}zt_alias_set(aliases,target,target);}else{let source:[]u8=zt_expr_transparent_id(a.expr);if(source.len>0){zt_alias_set(aliases,target,zt_alias_root(aliases.*,source));}}}}
         .ret=>|r|{if(r.has_expr==1){let root:[]u8=zt_owned_expr_root(r.expr,live.*,aliases.*);if(root.len>0){zt_names_remove(live,root);}}}
-        .estmt=>|e|{switch(e.expr.*){.call=>|c|{let name:[]u8=zt_direct_name(c.callee);if((zt_owned_release_name(name)==1&&c.args.len==1||zt_fn_has_annot(decls,name,"@consumes")==1&&c.args.len>0)){let root:[]u8=zt_owned_expr_root(c.args.data[0],live.*,aliases.*);if(root.len>0){zt_names_remove(live,root);}}}else=>{}}}
+        .estmt=>|e|{switch(e.expr.*){.call=>|c|{let name:[]u8=zt_direct_name(c.callee);if(zt_owned_release_name(name)==1&&c.args.len==1){let root:[]u8=zt_owned_expr_root(c.args.data[0],live.*,aliases.*);if(root.len>0){zt_names_remove(live,root);}}else if(zt_fn_has_annot(decls,name,"@consumes")==1){let ai:i32=0;while(ai<c.args.len){if(zt_consumes_param(decls,name,ai)==1){let root:[]u8=zt_owned_expr_root(c.args.data[ai],live.*,aliases.*);if(root.len>0){zt_names_remove(live,root);}}ai=ai+1;}}}else=>{}}}
         .unsafe_=>|u|{errors=errors+zt_check_owner_state_body(u.body,live,aliases,decls,sums,context);}
         .if_=>|x|{
             let base:ArrayList[[]u8]=zt_names_clone(live.*);let basea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);
@@ -1613,27 +2120,28 @@ fn zt_check_v2_direct_frees(decls:ArrayList[*Node],file:[]u8)i32{
             let consumes:i32=zt_fn_has_annot(decls,f.name,"@consumes");
             let borrow:i32=zt_borrow_mode(decls,f.name);
             if(consumes==1&&borrow>0){errors=errors+zt_machine_error("@consumes cannot be combined with a borrow contract",context);}
-            if(consumes==1&&f.params.len<1){errors=errors+zt_machine_error("@consumes requires a first owner parameter",context);}else if(consumes==1){let pi:i32=1;while(pi<f.params.len){if(zt_borrow_aux_scalar_type(f.params.data[pi].pty)==0){errors=errors+zt_machine_error("@consumes auxiliary parameters must be builtin scalars",context);}pi=pi+1;}}
+            if(consumes==1){let owner_params:i32=0;let pi:i32=0;while(pi<f.params.len){if(zt_owner_param_type(f.params.data[pi].pty)==1){owner_params=owner_params+1;}pi=pi+1;}if(owner_params==0){errors=errors+zt_machine_error("@consumes requires at least one raw-pointer or Allocation owner parameter",context);}}
             let freed:ArrayList[[]u8]=make[[]u8](4);let aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);
             errors=errors+zt_check_direct_free_body(f.body,&freed,&aliases,decls,sums,context);
             free[[]u8](&freed);free[ZTOwnAlias](&aliases);
             let owned:ArrayList[[]u8]=make[[]u8](4);let returned:ArrayList[[]u8]=make[[]u8](2);let transfer_aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);
-            if(consumes==1&&f.params.len>0&&f.is_extern==0){push[[]u8](&owned,f.params.data[0].name);zt_alias_set(&transfer_aliases,f.params.data[0].name,f.params.data[0].name);}
+            if(consumes==1&&f.is_extern==0){let pi:i32=0;while(pi<f.params.len){let p:Param=f.params.data[pi];if(zt_owner_param_type(p.pty)==1){push[[]u8](&owned,p.name);zt_alias_set(&transfer_aliases,p.name,p.name);}pi=pi+1;}}
             zt_collect_owned_body(f.body,&owned,&returned,&transfer_aliases,sums);
             free[[]u8](&returned);free[ZTOwnAlias](&transfer_aliases);
-            let escape_aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);if(consumes==1&&f.params.len>0&&f.is_extern==0){zt_alias_set(&escape_aliases,f.params.data[0].name,f.params.data[0].name);}
+            let escape_aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);if(consumes==1&&f.is_extern==0){let pi:i32=0;while(pi<f.params.len){let p:Param=f.params.data[pi];if(zt_owner_param_type(p.pty)==1){zt_alias_set(&escape_aliases,p.name,p.name);}pi=pi+1;}}
             errors=errors+zt_check_owned_escapes_body(f.body,owned,&escape_aliases,decls,sums,context);
             free[ZTOwnAlias](&escape_aliases);
-            let live:ArrayList[[]u8]=make[[]u8](4);let state_aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);if(consumes==1&&f.params.len>0&&f.is_extern==0){push[[]u8](&live,f.params.data[0].name);zt_alias_set(&state_aliases,f.params.data[0].name,f.params.data[0].name);}
+            let live:ArrayList[[]u8]=make[[]u8](4);let state_aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);if(consumes==1&&f.is_extern==0){let pi:i32=0;while(pi<f.params.len){let p:Param=f.params.data[pi];if(zt_owner_param_type(p.pty)==1){push[[]u8](&live,p.name);zt_alias_set(&state_aliases,p.name,p.name);}pi=pi+1;}}
             errors=errors+zt_check_owner_state_body(f.body,&live,&state_aliases,decls,sums,context);
             free[[]u8](&live);free[ZTOwnAlias](&state_aliases);
             let oi:i32=0;while(oi<owned.len){
                 let name:[]u8=owned.data[oi];let flow_aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);
-                if(consumes==1&&f.params.len>0&&f.is_extern==0){zt_alias_set(&flow_aliases,f.params.data[0].name,f.params.data[0].name);}
+                if(consumes==1&&f.is_extern==0){let pi:i32=0;while(pi<f.params.len){let p:Param=f.params.data[pi];if(zt_owner_param_type(p.pty)==1){zt_alias_set(&flow_aliases,p.name,p.name);}pi=pi+1;}}
                 let terminal:i32=zt_owner_terminal_state(f.body,name,&flow_aliases,decls,sums,0);
                 free[ZTOwnAlias](&flow_aliases);
-                if(terminal==0){if(consumes==1&&f.params.len>0&&f.is_extern==0&&@strEq(name,f.params.data[0].name)){errors=errors+zt_machine_error(_zag_str_concat("@consumes parameter `",_zag_str_concat(name,"` is not released or transferred on every control-flow path")),context);}else{errors=errors+zt_machine_error(_zag_str_concat("owned allocation `",_zag_str_concat(name,"` is neither released nor returned")),context);}}
-                else if(terminal==2){if(consumes==1&&f.params.len>0&&f.is_extern==0&&@strEq(name,f.params.data[0].name)){errors=errors+zt_machine_error(_zag_str_concat("@consumes parameter `",_zag_str_concat(name,"` is not released or transferred on every control-flow path")),context);}else{errors=errors+zt_machine_error(_zag_str_concat("owned allocation `",_zag_str_concat(name,"` is not released or returned on every control-flow path")),context);}}
+                let aggregate_aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);let aggregate_owned:i32=zt_body_stores_owner_in_aggregate(f.body,name,&aggregate_aliases);free[ZTOwnAlias](&aggregate_aliases);
+                if(aggregate_owned==0){if(terminal==0){if(consumes==1&&f.is_extern==0&&zt_consumes_owner_named(decls,f.name,name)==1){errors=errors+zt_machine_error(_zag_str_concat("@consumes parameter `",_zag_str_concat(name,"` is not released or transferred on every control-flow path")),context);}else{errors=errors+zt_machine_error(_zag_str_concat("owned allocation `",_zag_str_concat(name,"` is neither released nor returned")),context);}}
+                else if(terminal==2){if(consumes==1&&f.is_extern==0&&zt_consumes_owner_named(decls,f.name,name)==1){errors=errors+zt_machine_error(_zag_str_concat("@consumes parameter `",_zag_str_concat(name,"` is not released or transferred on every control-flow path")),context);}else{errors=errors+zt_machine_error(_zag_str_concat("owned allocation `",_zag_str_concat(name,"` is not released or returned on every control-flow path")),context);}}}
                 oi=oi+1;
             }
             free[[]u8](&owned);
@@ -1642,6 +2150,72 @@ fn zt_check_v2_direct_frees(decls:ArrayList[*Node],file:[]u8)i32{
     }i=i+1;}
     free[ZTOwnSummary](&sums);
     return errors;
+}
+
+// ── edition-2027 retained fixed-buffer owner ──────────────────────────────
+// This is intentionally a *small* ownership extension, not a general
+// allocator protocol.  A region may be created from one named Allocation at a
+// top-level let and must be deinitialized into one new named Allocation before
+// the function exits.  Blocks, reset, aliases, aggregate storage, calls, and
+// control-flow lifetimes remain rejected.  Keeping the grammar this narrow
+// makes the backing-root handoff visible to the older owner lattice above.
+struct ZTRetainedState { backing: []u8, allocator: []u8, released: []u8, phase: i32, generation: i32, kind: i32 }
+struct ZTRetainedBlock { name: []u8, generation: i32 }
+// kind 1 is FixedBufferAllocator and kind 2 is ArenaAllocator. Both are
+// checked retained regions over one backing Allocation, but their distinct
+// source types prevent an arena capability from being silently passed through
+// the fixed-buffer surface.
+fn zt_retained_ctor_kind(n:*Node)i32{switch(n.*){.un=>|u|{if(@strEq(u.op,"try")){return zt_retained_ctor_kind(u.e);}}.cast_=>|c|{return zt_retained_ctor_kind(c.expr);}.call=>|c|{let name:[]u8=zt_direct_name(c.callee);if(c.args.len==1&&@strEq(name,"fixed_buffer_allocator")){return 1;}if(c.args.len==1&&@strEq(name,"arena_allocator")){return 2;}}else=>{}}return 0;}
+fn zt_retained_ctor_backing(n:*Node)[]u8{switch(n.*){.un=>|u|{if(@strEq(u.op,"try")){return zt_retained_ctor_backing(u.e);}}.cast_=>|c|{return zt_retained_ctor_backing(c.expr);}.call=>|c|{if(zt_retained_ctor_kind(n)>0){return zt_expr_transparent_id(c.args.data[0]);}}else=>{}}return "";}
+fn zt_retained_deinit_receiver(n:*Node)[]u8{switch(n.*){.un=>|u|{if(@strEq(u.op,"try")){return zt_retained_deinit_receiver(u.e);}}.cast_=>|c|{return zt_retained_deinit_receiver(c.expr);}.call=>|c|{if(c.args.len==0){switch(c.callee.*){.fld=>|f|{if(@strEq(f.fname,"deinit")){return zt_expr_transparent_id(f.base);}}else=>{}}}}else=>{}}return "";}
+fn zt_retained_reset_receiver(n:*Node)[]u8{switch(n.*){.un=>|u|{if(@strEq(u.op,"try")){return zt_retained_reset_receiver(u.e);}}.cast_=>|c|{return zt_retained_reset_receiver(c.expr);}.call=>|c|{if(c.args.len==0){switch(c.callee.*){.fld=>|f|{if(@strEq(f.fname,"reset")){return zt_expr_transparent_id(f.base);}}else=>{}}}}else=>{}}return "";}
+fn zt_retained_block_alloc_receiver(n:*Node)[]u8{switch(n.*){.un=>|u|{if(@strEq(u.op,"try")){return zt_retained_block_alloc_receiver(u.e);}}.cast_=>|c|{return zt_retained_block_alloc_receiver(c.expr);}.call=>|c|{if(c.args.len==2){switch(c.callee.*){.fld=>|f|{if(@strEq(f.fname,"allocate")){return zt_expr_transparent_id(f.base);}}else=>{}}}}else=>{}}return "";}
+fn zt_retained_access_arg(n:*Node,read:i32)[]u8{switch(n.*){.un=>|u|{if(@strEq(u.op,"try")){return zt_retained_access_arg(u.e,read);}}.cast_=>|c|{return zt_retained_access_arg(c.expr,read);}.call=>|c|{let name:[]u8=zt_direct_name(c.callee);let arity:i32=3;if(read==1){arity=2;}if(c.args.len==arity&&((read==1&&(@strEq(name,"fixed_buffer_read_u8")||@strEq(name,"arena_read_u8")))||(read==0&&(@strEq(name,"fixed_buffer_write_u8")||@strEq(name,"arena_write_u8"))))){return zt_expr_transparent_id(c.args.data[0]);}}else=>{}}return "";}
+fn zt_retained_has_fixed_call(n:*Node,allocator:[]u8)i32{switch(n.*){.call=>|c|{let direct:[]u8=zt_direct_name(c.callee);if(@strEq(direct,"fixed_buffer_allocator")||@strEq(direct,"arena_allocator")||@strEq(direct,"fixed_buffer_read_u8")||@strEq(direct,"fixed_buffer_write_u8")||@strEq(direct,"arena_read_u8")||@strEq(direct,"arena_write_u8")){return 1;}switch(c.callee.*){.fld=>|f|{if(allocator.len>0&&@strEq(zt_expr_transparent_id(f.base),allocator)){return 1;}}else=>{}}let i:i32=0;while(i<c.args.len){if(zt_retained_has_fixed_call(c.args.data[i],allocator)==1){return 1;}i=i+1;}}.bin=>|x|{return zt_retained_has_fixed_call(x.l,allocator)|zt_retained_has_fixed_call(x.r,allocator);}.un=>|x|{return zt_retained_has_fixed_call(x.e,allocator);}.idx=>|x|{return zt_retained_has_fixed_call(x.base,allocator)|zt_retained_has_fixed_call(x.idx,allocator);}.fld=>|x|{return zt_retained_has_fixed_call(x.base,allocator);}.cast_=>|x|{return zt_retained_has_fixed_call(x.expr,allocator);}.slice_=>|x|{return zt_retained_has_fixed_call(x.base,allocator)|zt_retained_has_fixed_call(x.lo,allocator)|zt_retained_has_fixed_call(x.hi,allocator);}.slit_=>|x|{let i:i32=0;while(i<x.fields.len){if(zt_retained_has_fixed_call(x.fields.data[i].val,allocator)==1){return 1;}i=i+1;}}else=>{}}return 0;}
+// A loop may repeatedly allocate an ephemeral block and reset the same live
+// region.  That is the bounded arena's intended steady state: reset advances
+// the generation before the next iteration, so no block can cross it.  Keep
+// this narrow syntactic proof; any return, assignment, nested control flow,
+// deinit, or unrecognised fixed-buffer operation remains fail-closed.
+fn zt_retained_reset_loop_safe(body:ArrayList[*Node],s:ZTRetainedState)i32{let i:i32=0;while(i<body.len){switch(body.data[i].*){
+    .let_=>|l|{if(l.has_init==1&&zt_retained_has_fixed_call(l.expr,s.allocator)==1&&@strEq(zt_retained_block_alloc_receiver(l.expr),s.allocator)==0){return 0;}}
+    .estmt=>|e|{if(zt_retained_has_fixed_call(e.expr,s.allocator)==1){let rr:[]u8=zt_retained_reset_receiver(e.expr);let wb:[]u8=zt_retained_access_arg(e.expr,0);if(!@strEq(rr,s.allocator)&&wb.len==0){return 0;}}}
+    .assign=>|a|{if(zt_retained_has_fixed_call(a.expr,s.allocator)==1||zt_retained_has_fixed_call(a.target,s.allocator)==1){return 0;}}
+    .ret=>|_r|{return 0;}.if_=>|_x|{return 0;}.while_=>|_w|{return 0;}.switch_=>|_sw|{return 0;}.unsafe_=>|_u|{return 0;}
+    else=>{}
+}i=i+1;}return 1;}
+fn zt_retained_expr_name(n:*Node,name:[]u8)i32{if(name.len==0){return 0;}switch(n.*){.id=>|x|{return @strEq(x.name,name) as i32;}.bin=>|x|{return zt_retained_expr_name(x.l,name)|zt_retained_expr_name(x.r,name);}.un=>|x|{return zt_retained_expr_name(x.e,name);}.call=>|x|{let hit:i32=zt_retained_expr_name(x.callee,name);let i:i32=0;while(i<x.args.len){hit=hit|zt_retained_expr_name(x.args.data[i],name);i=i+1;}return hit;}.idx=>|x|{return zt_retained_expr_name(x.base,name)|zt_retained_expr_name(x.idx,name);}.fld=>|x|{return zt_retained_expr_name(x.base,name);}.cast_=>|x|{return zt_retained_expr_name(x.expr,name);}.slice_=>|x|{return zt_retained_expr_name(x.base,name)|zt_retained_expr_name(x.lo,name)|zt_retained_expr_name(x.hi,name);}.slit_=>|x|{let i:i32=0;while(i<x.fields.len){if(zt_retained_expr_name(x.fields.data[i].val,name)==1){return 1;}i=i+1;}}else=>{}}return 0;}
+fn zt_retained_uses_live(n:*Node,s:ZTRetainedState)i32{if(s.phase==0){return 0;}return zt_retained_expr_name(n,s.backing)|zt_retained_expr_name(n,s.allocator);}
+fn zt_retained_block_generation(blocks:ArrayList[ZTRetainedBlock],name:[]u8)i32{let i:i32=0;while(i<blocks.len){if(@strEq(blocks.data[i].name,name)){return blocks.data[i].generation;}i=i+1;}return -1;}
+fn zt_retained_uses_blocks(n:*Node,blocks:ArrayList[ZTRetainedBlock])i32{let i:i32=0;while(i<blocks.len){if(zt_retained_expr_name(n,blocks.data[i].name)==1){return 1;}i=i+1;}return 0;}
+fn zt_retained_control_has(body:ArrayList[*Node],s:ZTRetainedState)i32{let i:i32=0;while(i<body.len){switch(body.data[i].*){.let_=>|l|{if(l.has_init==1&&(zt_retained_has_fixed_call(l.expr,s.allocator)==1||zt_retained_uses_live(l.expr,s)==1)){return 1;}}.assign=>|a|{if(zt_retained_has_fixed_call(a.expr,s.allocator)==1||zt_retained_uses_live(a.target,s)==1||zt_retained_uses_live(a.expr,s)==1){return 1;}}.ret=>|r|{if(r.has_expr==1&&zt_retained_uses_live(r.expr,s)==1){return 1;}}.estmt=>|e|{if(zt_retained_has_fixed_call(e.expr,s.allocator)==1||zt_retained_uses_live(e.expr,s)==1){return 1;}}.unsafe_=>|u|{if(zt_retained_control_has(u.body,s)==1){return 1;}}.if_=>|x|{if(zt_retained_uses_live(x.cond,s)==1||zt_retained_control_has(x.then_body,s)==1||zt_retained_control_has(x.els_body,s)==1){return 1;}}.while_=>|x|{if(zt_retained_uses_live(x.cond,s)==1||zt_retained_control_has(x.body,s)==1){return 1;}}.switch_=>|x|{if(zt_retained_uses_live(x.subject,s)==1||zt_retained_control_has(x.els_body,s)==1){return 1;}let ai:i32=0;while(ai<x.arms.len){if(zt_retained_control_has(x.arms.data[ai].body,s)==1){return 1;}ai=ai+1;}}else=>{}}i=i+1;}return 0;}
+fn zt_retained_control_uses_blocks(body:ArrayList[*Node],blocks:ArrayList[ZTRetainedBlock])i32{let i:i32=0;while(i<body.len){switch(body.data[i].*){.let_=>|l|{if(l.has_init==1&&zt_retained_uses_blocks(l.expr,blocks)==1){return 1;}}.assign=>|a|{if(zt_retained_uses_blocks(a.target,blocks)==1||zt_retained_uses_blocks(a.expr,blocks)==1){return 1;}}.ret=>|r|{if(r.has_expr==1&&zt_retained_uses_blocks(r.expr,blocks)==1){return 1;}}.estmt=>|e|{if(zt_retained_uses_blocks(e.expr,blocks)==1){return 1;}}.unsafe_=>|u|{if(zt_retained_control_uses_blocks(u.body,blocks)==1){return 1;}}.if_=>|x|{if(zt_retained_uses_blocks(x.cond,blocks)==1||zt_retained_control_uses_blocks(x.then_body,blocks)==1||zt_retained_control_uses_blocks(x.els_body,blocks)==1){return 1;}}.while_=>|x|{if(zt_retained_uses_blocks(x.cond,blocks)==1||zt_retained_control_uses_blocks(x.body,blocks)==1){return 1;}}.switch_=>|x|{if(zt_retained_uses_blocks(x.subject,blocks)==1||zt_retained_control_uses_blocks(x.els_body,blocks)==1){return 1;}let ai:i32=0;while(ai<x.arms.len){if(zt_retained_control_uses_blocks(x.arms.data[ai].body,blocks)==1){return 1;}ai=ai+1;}}else=>{}}i=i+1;}return 0;}
+fn zt_check_v2_retained_regions(decls:ArrayList[*Node],file:[]u8)i32{
+    if(@strEq(v2_project_edition(file),"2027")==0){return 0;}let errors:i32=0;let fi:i32=0;
+    while(fi<decls.len){switch(decls.data[fi].*){.fn_decl=>|f|{
+        let context:[]u8=_zag_str_concat("function ",f.name);let s:ZTRetainedState=ZTRetainedState{.backing="",.allocator="",.released="",.phase=0,.generation=1,.kind=0};let blocks:ArrayList[ZTRetainedBlock]=make[ZTRetainedBlock](4);let pi:i32=0;
+        while(pi<f.params.len){if(@strEq(f.params.data[pi].pty,"FixedBufferAllocator")||@strEq(f.params.data[pi].pty,"ArenaAllocator")||((@strEq(f.params.data[pi].pty,"FixedBufferBlock")||@strEq(f.params.data[pi].pty,"ArenaBlock"))&&@strEq(f.name,"fixed_buffer_read_u8")==0&&@strEq(f.name,"fixed_buffer_write_u8")==0&&@strEq(f.name,"arena_read_u8")==0&&@strEq(f.name,"arena_write_u8")==0)){errors=errors+zt_machine_error("retained allocator capabilities are only admitted through the top-level lifecycle",context);}pi=pi+1;}
+        let i:i32=0;while(i<f.body.len){switch(f.body.data[i].*){
+            .let_=>|l|{let backing:[]u8=zt_retained_ctor_backing(l.expr);let ctor_kind:i32=zt_retained_ctor_kind(l.expr);let receiver:[]u8=zt_retained_deinit_receiver(l.expr);let block_receiver:[]u8=zt_retained_block_alloc_receiver(l.expr);let read_block:[]u8=zt_retained_access_arg(l.expr,1);
+                if(backing.len>0){let good_type:i32=((ctor_kind==1&&@strEq(l.dty,"FixedBufferAllocator"))||(ctor_kind==2&&@strEq(l.dty,"ArenaAllocator"))) as i32;if(s.phase!=0||good_type==0){errors=errors+zt_machine_error("retained allocator construction requires one top-level checked backing lifecycle",context);}else{s.backing=backing;s.allocator=l.name;s.phase=1;s.kind=ctor_kind;}}
+                else if(receiver.len>0){if(s.phase!=1||@strEq(receiver,s.allocator)==0||@strEq(l.dty,"Allocation")==0||@strEq(l.name,s.backing)==1||@strEq(l.name,s.allocator)==1){errors=errors+zt_machine_error("fixed-buffer deinit must be top-level `let released:Allocation = try allocator.deinit()` with a fresh released binding",context);}else{s.released=l.name;s.phase=2;}}
+                else if(block_receiver.len>0&&((s.kind==1&&@strEq(l.dty,"FixedBufferBlock"))||(s.kind==2&&@strEq(l.dty,"ArenaBlock")))){if(s.phase!=1||@strEq(block_receiver,s.allocator)==0||zt_retained_block_generation(blocks,l.name)>=0){errors=errors+zt_machine_error("retained allocation requires a fresh top-level block binding",context);}else{push[ZTRetainedBlock](&blocks,ZTRetainedBlock{.name=l.name,.generation=s.generation});}}
+                else if(read_block.len>0){if(s.phase!=1||zt_retained_block_generation(blocks,read_block)!=s.generation||@strEq(l.dty,"u8")==0){errors=errors+zt_machine_error("fixed-buffer reads require one live named FixedBufferBlock and a u8 result",context);}}
+                else if(zt_retained_has_fixed_call(l.expr,s.allocator)==1){errors=errors+zt_machine_error("fixed-buffer aliases and unrecognized block operations are unsupported",context);}
+                else if(zt_retained_uses_live(l.expr,s)==1||zt_retained_uses_blocks(l.expr,blocks)==1){errors=errors+zt_machine_error("retained backing, allocator, and blocks cannot be copied, escaped, or used outside their lifecycle operations",context);}
+            }
+            .assign=>|a|{if(zt_retained_has_fixed_call(a.expr,s.allocator)==1||zt_retained_uses_live(a.target,s)==1||zt_retained_uses_live(a.expr,s)==1||zt_retained_uses_blocks(a.target,blocks)==1||zt_retained_uses_blocks(a.expr,blocks)==1){errors=errors+zt_machine_error("retained backing, allocator, and blocks cannot be assigned or escaped",context);}}
+            .ret=>|r|{if(r.has_expr==1&&(zt_retained_uses_live(r.expr,s)==1||zt_retained_uses_blocks(r.expr,blocks)==1)){errors=errors+zt_machine_error("retained backing, allocator, or block cannot escape through return",context);}}
+            .estmt=>|e|{let write_block:[]u8=zt_retained_access_arg(e.expr,0);let reset_receiver:[]u8=zt_retained_reset_receiver(e.expr);if(write_block.len>0){if(s.phase!=1||zt_retained_block_generation(blocks,write_block)!=s.generation){errors=errors+zt_machine_error("fixed-buffer writes require one live named FixedBufferBlock",context);}}else if(reset_receiver.len>0){if(s.phase!=1||@strEq(reset_receiver,s.allocator)==0){errors=errors+zt_machine_error("fixed-buffer reset requires the live retained allocator receiver",context);}else{s.generation=s.generation+1;if(s.generation==0){s.generation=1;}}}else if(zt_retained_has_fixed_call(e.expr,s.allocator)==1||zt_retained_uses_live(e.expr,s)==1||zt_retained_uses_blocks(e.expr,blocks)==1){errors=errors+zt_machine_error("retained backing, allocator, and blocks cannot be released, escaped, or used outside checked accessors",context);}}
+            .unsafe_=>|u|{if(zt_retained_control_has(u.body,s)==1||zt_retained_control_uses_blocks(u.body,blocks)==1){errors=errors+zt_machine_error("retained fixed-buffer lifecycle operations are forbidden inside unsafe or control-flow containers",context);}}
+            .if_=>|x|{if(zt_retained_uses_live(x.cond,s)==1||zt_retained_uses_blocks(x.cond,blocks)==1||zt_retained_control_has(x.then_body,s)==1||zt_retained_control_has(x.els_body,s)==1||zt_retained_control_uses_blocks(x.then_body,blocks)==1||zt_retained_control_uses_blocks(x.els_body,blocks)==1){errors=errors+zt_machine_error("retained fixed-buffer lifecycle operations are forbidden inside unsafe or control-flow containers",context);}}
+            .while_=>|x|{if(zt_retained_uses_live(x.cond,s)==1||zt_retained_uses_blocks(x.cond,blocks)==1||zt_retained_control_uses_blocks(x.body,blocks)==1||(zt_retained_control_has(x.body,s)==1&&zt_retained_reset_loop_safe(x.body,s)==0)){errors=errors+zt_machine_error("retained fixed-buffer lifecycle operations are forbidden inside unsafe or control-flow containers",context);}}
+            .switch_=>|x|{if(zt_retained_uses_live(x.subject,s)==1||zt_retained_uses_blocks(x.subject,blocks)==1||zt_retained_control_has(x.els_body,s)==1||zt_retained_control_uses_blocks(x.els_body,blocks)==1){errors=errors+zt_machine_error("retained fixed-buffer lifecycle operations are forbidden inside unsafe or control-flow containers",context);}let ai:i32=0;while(ai<x.arms.len){if(zt_retained_control_has(x.arms.data[ai].body,s)==1||zt_retained_control_uses_blocks(x.arms.data[ai].body,blocks)==1){errors=errors+zt_machine_error("retained fixed-buffer lifecycle operations are forbidden inside unsafe or control-flow containers",context);}ai=ai+1;}}
+            else=>{}
+        }i=i+1;}
+        if(s.phase==1){errors=errors+zt_machine_error("FixedBufferAllocator must be deinitialized before function exit",context);}
+        free[ZTRetainedBlock](&blocks);
+    }else=>{}}fi=fi+1;}return errors;
 }
 
 // ── edition-2027 stack-address return slice ───────────────────────────────
@@ -1808,11 +2382,11 @@ fn zt_check_v2_stack_address_escapes(decls:ArrayList[*Node],file:[]u8)i32{
 // ── edition-2027 mutation-aware aggregate provenance ──────────────────────
 // The direct ownership and stack-return passes above prove scalar names and
 // aggregate literals.  This pass preserves those proven roots after they are
-// stored in a named struct/union value.  Provenance is attached to a bounded
+// stored in a named struct/union value. Provenance is attached to an interned
 // field path so a field overwrite clears only that field, a value copy keeps
 // an independent copy, and a whole-value overwrite clears the complete prior
-// value. Beyond 64 nested fields the entry is retained as uncertain at the
-// deepest proven prefix; only a whole/prefix overwrite can then clear it.
+// value. Paths are interned in a per-function arena and grow with the source
+// expression, rather than imposing an arbitrary nesting cutoff.
 //
 // kind 1 is an owned allocation root; kind 2 is a current-frame address root.
 // Elements are borrowed AST strings.  No source spelling is synthesized.
@@ -1820,7 +2394,6 @@ struct ZTAggPath {
     name: []u8,
     node: i32,
     depth: i32,
-    overflow: i32,
 }
 struct ZTAggPathNode { parent: i32, field: []u8 }
 struct ZTAggProv { path: ZTAggPath, root: []u8, kind: i32, uncertain: i32 }
@@ -1829,6 +2402,7 @@ struct ZTAggFlow {
     owners: ArrayList[[]u8],
     owner_aliases: ArrayList[ZTOwnAlias],
     freed: ArrayList[[]u8],
+    moved: ArrayList[[]u8],
     env: ArrayList[ZTBind],
     locals: ArrayList[ZTBind],
     stack_aliases: ArrayList[ZTOwnAlias],
@@ -1836,12 +2410,11 @@ struct ZTAggFlow {
     bindings: ArrayList[[]u8],
 }
 
-fn zt_agg_empty_path()ZTAggPath{return ZTAggPath{.name="",.node=-1,.depth=0,.overflow=0};}
-fn zt_agg_root_path(name:[]u8)ZTAggPath{return ZTAggPath{.name=name,.node=-1,.depth=0,.overflow=0};}
+fn zt_agg_empty_path()ZTAggPath{return ZTAggPath{.name="",.node=-1,.depth=0};}
+fn zt_agg_root_path(name:[]u8)ZTAggPath{return ZTAggPath{.name=name,.node=-1,.depth=0};}
 fn zt_agg_path_append(arena:*ArrayList[ZTAggPathNode],p0:ZTAggPath,field:[]u8)ZTAggPath{
     let p:ZTAggPath=p0;
     if(p.name.len==0){return p;}
-    if(p.depth>=64){p.overflow=1;return p;}
     let i:i32=0;while(i<arena.*.len){let x:ZTAggPathNode=arena.*.data[i];if(x.parent==p.node&&@strEq(x.field,field)){p.node=i;p.depth=p.depth+1;return p;}i=i+1;}
     push[ZTAggPathNode](arena,ZTAggPathNode{.parent=p.node,.field=field});p.node=arena.*.len-1;p.depth=p.depth+1;
     return p;
@@ -1863,7 +2436,7 @@ fn zt_agg_path_prefix(arena:ArrayList[ZTAggPathNode],a:ZTAggPath,b:ZTAggPath)i32
     return 1;
 }
 fn zt_agg_path_equal(arena:ArrayList[ZTAggPathNode],a:ZTAggPath,b:ZTAggPath)i32{
-    if(a.depth!=b.depth||a.overflow!=b.overflow){return 0;}
+    if(a.depth!=b.depth){return 0;}
     return zt_agg_path_prefix(arena,a,b);
 }
 fn zt_agg_prov_clone(src:ArrayList[ZTAggProv])ArrayList[ZTAggProv]{let out:ArrayList[ZTAggProv]=make[ZTAggProv](src.len+1);let i:i32=0;while(i<src.len){push[ZTAggProv](&out,src.data[i]);i=i+1;}return out;}
@@ -1875,9 +2448,7 @@ fn zt_agg_prov_clear(prov:*ArrayList[ZTAggProv],target:ZTAggPath,arena:ArrayList
     let i:i32=0;
     while(i<prov.*.len){
         let entry:ZTAggProv=prov.*.data[i];
-        // An overflowed field write is not a proven complete overwrite. Keep
-        // the earlier entry so later escape checking remains fail closed.
-        if(target.overflow==0&&zt_agg_path_prefix(arena,target,entry.path)==1){
+        if(zt_agg_path_prefix(arena,target,entry.path)==1){
             let j:i32=i;while(j+1<prov.*.len){prov.*.data[j]=prov.*.data[j+1];j=j+1;}prov.*.len=prov.*.len-1;
         }else{i=i+1;}
     }
@@ -1921,7 +2492,7 @@ fn zt_agg_type_is_value(ty:[]u8,decls:ArrayList[*Node])i32{
 }
 fn zt_agg_add_entry(prov:*ArrayList[ZTAggProv],path:ZTAggPath,root:[]u8,kind:i32,uncertain:i32,arena:ArrayList[ZTAggPathNode])void{
     if(path.name.len==0||root.len==0){return;}
-    let x:ZTAggProv=ZTAggProv{.path=path,.root=root,.kind=kind,.uncertain=uncertain|path.overflow};
+    let x:ZTAggProv=ZTAggProv{.path=path,.root=root,.kind=kind,.uncertain=uncertain};
     if(zt_agg_prov_has(prov.*,x,arena)==0){push[ZTAggProv](prov,x);}
 }
 fn zt_agg_remap_suffix(arena:*ArrayList[ZTAggPathNode],src_depth:i32,node:i32,depth:i32,dst0:ZTAggPath)ZTAggPath{
@@ -1933,21 +2504,32 @@ fn zt_agg_remap_suffix(arena:*ArrayList[ZTAggPathNode],src_depth:i32,node:i32,de
 }
 fn zt_agg_remap_path(arena:*ArrayList[ZTAggPathNode],src:ZTAggPath,dst:ZTAggPath,value:ZTAggPath)ZTAggPath{
     let out:ZTAggPath=zt_agg_remap_suffix(arena,src.depth,value.node,value.depth,dst);
-    if(src.overflow==1||value.overflow==1){out.overflow=1;}
     return out;
 }
-fn zt_agg_write_expr(flow:*ZTAggFlow,target:ZTAggPath,n:*Node,old:ArrayList[ZTAggProv],sums:ArrayList[ZTOwnSummary],context:[]u8,arena:*ArrayList[ZTAggPathNode])i32{
+fn zt_agg_root_is_allocation(flow:ZTAggFlow,root:[]u8)i32{return @strEq(zt_env_get(flow.env,root),"Allocation") as i32;}
+fn zt_agg_acquires_owner(n:*Node,ty:[]u8,decls:ArrayList[*Node],sums:ArrayList[ZTOwnSummary])i32{
+    if(zt_owned_acquire_name(n,sums).len>0){return 1;}
+    if(@strEq(ty,"Allocation")&&(zt_allocation_mint_expr(n,decls)==1||zt_allocation_helper_expr(n,decls)==1)){return 1;}
+    return 0;
+}
+fn zt_agg_write_expr(flow:*ZTAggFlow,target:ZTAggPath,n:*Node,old:ArrayList[ZTAggProv],decls:ArrayList[*Node],sums:ArrayList[ZTOwnSummary],context:[]u8,arena:*ArrayList[ZTAggPathNode])i32{
     let errors:i32=0;
     let source:ZTAggPath=zt_agg_expr_path(n,arena);
     if(source.name.len>0){
-        let i:i32=0;while(i<old.len){let x:ZTAggProv=old.data[i];if(zt_agg_path_prefix(arena.*,source,x.path)==1){zt_agg_add_entry(&flow.*.prov,zt_agg_remap_path(arena,source,target,x.path),x.root,x.kind,x.uncertain,arena.*);}i=i+1;}
+        let i:i32=0;while(i<old.len){let x:ZTAggProv=old.data[i];if(zt_agg_path_prefix(arena.*,source,x.path)==1){
+            if(x.kind==1&&zt_agg_root_is_allocation(flow.*,x.root)==1&&zt_agg_path_equal(arena.*,source,target)==0){errors=errors+zt_machine_error("Allocation aggregate copy is not allowed; transfer the capability through an explicit consuming boundary",context);}
+            else{zt_agg_add_entry(&flow.*.prov,zt_agg_remap_path(arena,source,target,x.path),x.root,x.kind,x.uncertain,arena.*);}
+        }i=i+1;}
     }
     switch(n.*){
-        .cast_=>|x|{errors=errors+zt_agg_write_expr(flow,target,x.expr,old,sums,context,arena);}
-        .slit_=>|x|{let i:i32=0;while(i<x.fields.len){errors=errors+zt_agg_write_expr(flow,zt_agg_path_append(arena,target,x.fields.data[i].name),x.fields.data[i].val,old,sums,context,arena);i=i+1;}}
+        .cast_=>|x|{errors=errors+zt_agg_write_expr(flow,target,x.expr,old,decls,sums,context,arena);}
+        .slit_=>|x|{let i:i32=0;while(i<x.fields.len){errors=errors+zt_agg_write_expr(flow,zt_agg_path_append(arena,target,x.fields.data[i].name),x.fields.data[i].val,old,decls,sums,context,arena);i=i+1;}}
         else=>{
             let owner:[]u8=zt_owned_expr_root(n,flow.*.owners,flow.*.owner_aliases);
-            if(owner.len>0){zt_agg_add_entry(&flow.*.prov,target,owner,1,0,arena.*);}
+            if(owner.len>0){
+                zt_agg_add_entry(&flow.*.prov,target,owner,1,0,arena.*);
+                if(target.depth>0&&zt_agg_root_is_allocation(flow.*,owner)==1&&zt_in_names(flow.*.moved,owner)==0){push[[]u8](&flow.*.moved,owner);}
+            }
             let stack:[]u8=zt_stack_direct_address_root(n,flow.*.locals,flow.*.stack_aliases);
             if(stack.len>0){zt_agg_add_entry(&flow.*.prov,target,stack,2,0,arena.*);}
             if(target.depth>0&&zt_owned_acquire_name(n,sums).len>0){
@@ -1958,23 +2540,23 @@ fn zt_agg_write_expr(flow:*ZTAggFlow,target:ZTAggPath,n:*Node,old:ArrayList[ZTAg
     }
     return errors;
 }
-fn zt_agg_assign_value(flow:*ZTAggFlow,target:ZTAggPath,n:*Node,sums:ArrayList[ZTOwnSummary],context:[]u8,arena:*ArrayList[ZTAggPathNode])i32{
+fn zt_agg_assign_value(flow:*ZTAggFlow,target:ZTAggPath,n:*Node,decls:ArrayList[*Node],sums:ArrayList[ZTOwnSummary],context:[]u8,arena:*ArrayList[ZTAggPathNode])i32{
     let old:ArrayList[ZTAggProv]=zt_agg_prov_clone(flow.*.prov);
     zt_agg_prov_clear(&flow.*.prov,target,arena.*);
-    let errors:i32=zt_agg_write_expr(flow,target,n,old,sums,context,arena);
+    let errors:i32=zt_agg_write_expr(flow,target,n,old,decls,sums,context,arena);
     free[ZTAggProv](&old);
     return errors;
 }
 fn zt_agg_flow_new(cap:i32)ZTAggFlow{return ZTAggFlow{
-    .prov=make[ZTAggProv](cap),.owners=make[[]u8](cap),.owner_aliases=make[ZTOwnAlias](cap),.freed=make[[]u8](cap),
+    .prov=make[ZTAggProv](cap),.owners=make[[]u8](cap),.owner_aliases=make[ZTOwnAlias](cap),.freed=make[[]u8](cap),.moved=make[[]u8](cap),
     .env=make[ZTBind](cap),.locals=make[ZTBind](cap),.stack_aliases=make[ZTOwnAlias](cap),.containers=make[[]u8](cap),.bindings=make[[]u8](cap),
 };}
 fn zt_agg_flow_clone(src:ZTAggFlow)ZTAggFlow{return ZTAggFlow{
-    .prov=zt_agg_prov_clone(src.prov),.owners=zt_names_clone(src.owners),.owner_aliases=zt_alias_clone(src.owner_aliases),.freed=zt_names_clone(src.freed),
+    .prov=zt_agg_prov_clone(src.prov),.owners=zt_names_clone(src.owners),.owner_aliases=zt_alias_clone(src.owner_aliases),.freed=zt_names_clone(src.freed),.moved=zt_names_clone(src.moved),
     .env=zt_env_clone(src.env),.locals=zt_env_clone(src.locals),.stack_aliases=zt_alias_clone(src.stack_aliases),.containers=zt_names_clone(src.containers),.bindings=zt_names_clone(src.bindings),
 };}
 fn zt_agg_flow_free(flow:*ZTAggFlow)void{
-    free[ZTAggProv](&flow.*.prov);free[[]u8](&flow.*.owners);free[ZTOwnAlias](&flow.*.owner_aliases);free[[]u8](&flow.*.freed);
+    free[ZTAggProv](&flow.*.prov);free[[]u8](&flow.*.owners);free[ZTOwnAlias](&flow.*.owner_aliases);free[[]u8](&flow.*.freed);free[[]u8](&flow.*.moved);
     free[ZTBind](&flow.*.env);free[ZTBind](&flow.*.locals);free[ZTOwnAlias](&flow.*.stack_aliases);free[[]u8](&flow.*.containers);free[[]u8](&flow.*.bindings);
 }
 fn zt_agg_flow_join(base:ZTAggFlow,a:ZTAggFlow,b:ZTAggFlow,arena:ArrayList[ZTAggPathNode])ZTAggFlow{
@@ -1982,17 +2564,24 @@ fn zt_agg_flow_join(base:ZTAggFlow,a:ZTAggFlow,b:ZTAggFlow,arena:ArrayList[ZTAgg
     let prov:ArrayList[ZTAggProv]=make[ZTAggProv](a.prov.len+b.prov.len+1);zt_agg_prov_merge(&prov,a.prov,arena);zt_agg_prov_merge(&prov,b.prov,arena);zt_agg_prov_replace(&out.prov,prov);
     let owners:ArrayList[[]u8]=make[[]u8](a.owners.len+b.owners.len+1);zt_names_merge(&owners,a.owners);zt_names_merge(&owners,b.owners);zt_names_replace(&out.owners,owners);
     let freed:ArrayList[[]u8]=make[[]u8](a.freed.len+b.freed.len+1);zt_names_merge(&freed,a.freed);zt_names_merge(&freed,b.freed);zt_names_replace(&out.freed,freed);
+    let moved:ArrayList[[]u8]=make[[]u8](a.moved.len+b.moved.len+1);zt_names_merge(&moved,a.moved);zt_names_merge(&moved,b.moved);zt_names_replace(&out.moved,moved);
     let owner_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(a.owner_aliases,b.owner_aliases);zt_alias_replace(&out.owner_aliases,owner_aliases);
     let stack_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(a.stack_aliases,b.stack_aliases);zt_alias_replace(&out.stack_aliases,stack_aliases);
     return out;
 }
 fn zt_agg_flow_replace(dst:*ZTAggFlow,next:ZTAggFlow)void{zt_agg_flow_free(dst);dst.*=next;}
 fn zt_agg_check_freed_expr(n:*Node,flow:ZTAggFlow,context:[]u8,arena:*ArrayList[ZTAggPathNode])i32{
-    let errors:i32=0;let i:i32=0;while(i<flow.freed.len){let root:[]u8=flow.freed.data[i];if(root.len>0&&zt_agg_expr_has_stored_root(n,flow.prov,1,root,arena)==1){errors=errors+zt_machine_error(_zag_str_concat("use after free of named allocation `",_zag_str_concat(root,"`")),context);}i=i+1;}return errors;
+    let errors:i32=0;let i:i32=0;
+    while(i<flow.freed.len){let root:[]u8=flow.freed.data[i];if(root.len>0&&(zt_agg_expr_has_stored_root(n,flow.prov,1,root,arena)==1||zt_expr_uses_name(n,root,flow.owner_aliases)==1)){
+        if(zt_agg_root_is_allocation(flow,root)==1){errors=errors+zt_machine_error("use after consumed SystemAllocator handle",context);}
+        else{errors=errors+zt_machine_error(_zag_str_concat("use after free of named allocation `",_zag_str_concat(root,"`")),context);}
+    }i=i+1;}
+    i=0;while(i<flow.moved.len){let root:[]u8=flow.moved.data[i];if(root.len>0&&zt_in_names(flow.freed,root)==0&&zt_expr_uses_name(n,root,flow.owner_aliases)==1){errors=errors+zt_machine_error("use after moved Allocation handle",context);}i=i+1;}
+    return errors;
 }
 fn zt_agg_mark_released(flow:*ZTAggFlow,root:[]u8)void{if(root.len==0){return;}if(zt_in_names(flow.*.freed,root)==0){push[[]u8](&flow.*.freed,root);}zt_names_remove(&flow.*.owners,root);}
 fn zt_agg_exact_consumable_root(prov:ArrayList[ZTAggProv],path:ZTAggPath,arena:ArrayList[ZTAggPathNode])[]u8{
-    if(path.name.len==0||path.depth==0||path.overflow==1){return "";}
+    if(path.name.len==0||path.depth==0){return "";}
     let root:[]u8="";let found:i32=0;let i:i32=0;
     while(i<prov.len){let x:ZTAggProv=prov.data[i];if(x.kind==1&&(zt_agg_path_prefix(arena,path,x.path)==1||zt_agg_path_prefix(arena,x.path,path)==1)){
         if(x.uncertain==1||zt_agg_path_equal(arena,path,x.path)==0){return "";}
@@ -2005,9 +2594,11 @@ fn zt_agg_check_calls(n:*Node,flow:*ZTAggFlow,decls:ArrayList[*Node],context:[]u
     switch(n.*){
         .call=>|c|{
             let ai:i32=0;while(ai<c.args.len){errors=errors+zt_agg_check_calls(c.args.data[ai],flow,decls,context,arena);ai=ai+1;}
-            let name:[]u8=zt_direct_name(c.callee);let borrow:i32=zt_borrow_mode(decls,name);
-            let consumes:i32=((zt_owned_release_name(name)==1||zt_fn_has_annot(decls,name,"@consumes")==1) as i32);
+            let name:[]u8=zt_direct_name(c.callee);let borrow:i32=zt_borrow_mode(decls,name);let nonretaining:i32=zt_compiler_nonretaining_call(name);let allocator_consume:i32=0;switch(c.callee.*){.fld=>|f|{
+                if((@strEq(f.fname,"deallocate")&&c.args.len==1)||(@strEq(f.fname,"resize")&&c.args.len==3)){allocator_consume=1;}
+            }else=>{}}
             ai=0;while(ai<c.args.len){
+                let consumes:i32=(((zt_owned_release_name(name)==1&&ai==0)||(allocator_consume==1&&ai==0)||zt_consumes_param(decls,name,ai)==1) as i32);
                 let owner:[]u8=zt_agg_expr_stored_root(c.args.data[ai],flow.*.prov,1,arena);
                 let stack:[]u8=zt_agg_expr_stored_root(c.args.data[ai],flow.*.prov,2,arena);
                 if(owner.len>0){
@@ -2017,20 +2608,21 @@ fn zt_agg_check_calls(n:*Node,flow:*ZTAggFlow,decls:ArrayList[*Node],context:[]u
                         if(exact.len>0){
                             if(zt_in_names(flow.*.freed,exact)==1){errors=errors+zt_machine_error("double free of aggregate-stored allocation",context);}else{zt_agg_mark_released(flow,exact);}
                         }else{errors=errors+zt_machine_error(_zag_str_concat("aggregate ownership transfer is not explicit (root `",_zag_str_concat(owner,"`)")),context);}
-                    }else if(borrow==0){
+                    }else if(borrow==0&&nonretaining==0){
                         let shown:[]u8=name;if(shown.len==0){shown="<indirect>";}
                         errors=errors+zt_machine_error(_zag_str_concat("owned allocation escapes through uncontracted call `",_zag_str_concat(shown,_zag_str_concat("` (root `",_zag_str_concat(owner,"`)")))),context);
                     }
                 }
-                if(stack.len>0&&borrow==0){
+                if(stack.len>0&&borrow==0&&nonretaining==0){
                     let shown:[]u8=name;if(shown.len==0){shown="<indirect>";}
                     errors=errors+zt_machine_error(_zag_str_concat("address of local `",_zag_str_concat(stack,_zag_str_concat("` escapes through aggregate argument to uncontracted call `",_zag_str_concat(shown,"`")))),context);
                 }
                 ai=ai+1;
             }
-            if(consumes==1&&c.args.len>0){
-                let direct:[]u8=zt_owned_expr_root(c.args.data[0],flow.*.owners,flow.*.owner_aliases);
-                if(direct.len>0){zt_agg_mark_released(flow,direct);}
+            ai=0;while(ai<c.args.len){
+                let consumes:i32=(((zt_owned_release_name(name)==1&&ai==0)||(allocator_consume==1&&ai==0)||zt_consumes_param(decls,name,ai)==1) as i32);
+                if(consumes==1){let direct:[]u8=zt_owned_expr_root(c.args.data[ai],flow.*.owners,flow.*.owner_aliases);if(direct.len>0){if(zt_in_names(flow.*.freed,direct)==1){errors=errors+zt_machine_error("use after consumed SystemAllocator handle",context);}else{zt_agg_mark_released(flow,direct);}}}
+                ai=ai+1;
             }
         }
         .bin=>|x|{errors=errors+zt_agg_check_calls(x.l,flow,decls,context,arena)+zt_agg_check_calls(x.r,flow,decls,context,arena);}
@@ -2064,10 +2656,10 @@ fn zt_agg_check_body(body:ArrayList[*Node],flow:*ZTAggFlow,decls:ArrayList[*Node
             if(ty.len==0){ty="?";}push[ZTBind](&flow.*.env,ZTBind{.name=l.name,.ty=ty});
             if(zt_in_names(flow.*.bindings,l.name)==0){push[[]u8](&flow.*.bindings,l.name);}
             if(ty[0]!='*'){push[ZTBind](&flow.*.locals,ZTBind{.name=l.name,.ty=ty});}
-            if(zt_agg_type_is_value(ty,decls)==1){if(zt_in_names(flow.*.containers,l.name)==0){push[[]u8](&flow.*.containers,l.name);}if(l.has_init==1){errors=errors+zt_agg_assign_value(flow,zt_agg_root_path(l.name),l.expr,sums,context,arena);}}
-            else if(l.has_init==1&&(zt_agg_expr_stored_root(l.expr,flow.*.prov,1,arena).len>0||zt_agg_expr_stored_root(l.expr,flow.*.prov,2,arena).len>0)){errors=errors+zt_agg_assign_value(flow,zt_agg_root_path(l.name),l.expr,sums,context,arena);}
+            if(zt_agg_type_is_value(ty,decls)==1){if(zt_in_names(flow.*.containers,l.name)==0){push[[]u8](&flow.*.containers,l.name);}if(l.has_init==1){errors=errors+zt_agg_assign_value(flow,zt_agg_root_path(l.name),l.expr,decls,sums,context,arena);}}
+            else if(l.has_init==1&&(zt_agg_expr_stored_root(l.expr,flow.*.prov,1,arena).len>0||zt_agg_expr_stored_root(l.expr,flow.*.prov,2,arena).len>0)){errors=errors+zt_agg_assign_value(flow,zt_agg_root_path(l.name),l.expr,decls,sums,context,arena);}
             if(l.has_init==1){
-                if(zt_owned_acquire_name(l.expr,sums).len>0){if(zt_in_names(flow.*.owners,l.name)==0){push[[]u8](&flow.*.owners,l.name);}zt_alias_set(&flow.*.owner_aliases,l.name,l.name);}
+                if(zt_agg_acquires_owner(l.expr,ty,decls,sums)==1){if(zt_in_names(flow.*.owners,l.name)==0){push[[]u8](&flow.*.owners,l.name);}zt_alias_set(&flow.*.owner_aliases,l.name,l.name);}
                 else{let source:[]u8=zt_expr_transparent_id(l.expr);if(source.len>0){zt_alias_set(&flow.*.owner_aliases,l.name,zt_alias_root(flow.*.owner_aliases,source));}}
                 zt_alias_set(&flow.*.stack_aliases,l.name,zt_stack_direct_address_root(l.expr,flow.*.locals,flow.*.stack_aliases));
             }
@@ -2076,14 +2668,14 @@ fn zt_agg_check_body(body:ArrayList[*Node],flow:*ZTAggFlow,decls:ArrayList[*Node
             errors=errors+zt_agg_check_freed_expr(a.expr,flow.*,context,arena)+zt_agg_check_calls(a.expr,flow,decls,context,arena);
             let target:ZTAggPath=zt_agg_expr_path(a.target,arena);
             errors=errors+zt_agg_nonlocal_store(a.expr,target,flow.*,context,arena);
-            if(target.name.len>0&&zt_in_names(flow.*.containers,target.name)==1){errors=errors+zt_agg_assign_value(flow,target,a.expr,sums,context,arena);}
+            if(target.name.len>0&&zt_in_names(flow.*.containers,target.name)==1){errors=errors+zt_agg_assign_value(flow,target,a.expr,decls,sums,context,arena);}
             let direct:[]u8=zt_expr_transparent_id(a.target);
             if(direct.len>0){
                 if(zt_in_names(flow.*.containers,direct)==0){
-                    if(zt_agg_expr_stored_root(a.expr,flow.*.prov,1,arena).len>0||zt_agg_expr_stored_root(a.expr,flow.*.prov,2,arena).len>0){errors=errors+zt_agg_assign_value(flow,zt_agg_root_path(direct),a.expr,sums,context,arena);}
+                    if(zt_agg_expr_stored_root(a.expr,flow.*.prov,1,arena).len>0||zt_agg_expr_stored_root(a.expr,flow.*.prov,2,arena).len>0){errors=errors+zt_agg_assign_value(flow,zt_agg_root_path(direct),a.expr,decls,sums,context,arena);}
                     else{zt_agg_prov_clear(&flow.*.prov,zt_agg_root_path(direct),arena.*);}
                 }
-                if(zt_owned_acquire_name(a.expr,sums).len>0){if(zt_in_names(flow.*.owners,direct)==0){push[[]u8](&flow.*.owners,direct);}zt_alias_set(&flow.*.owner_aliases,direct,direct);}
+                if(zt_agg_acquires_owner(a.expr,zt_env_get(flow.*.env,direct),decls,sums)==1){if(zt_in_names(flow.*.owners,direct)==0){push[[]u8](&flow.*.owners,direct);}zt_alias_set(&flow.*.owner_aliases,direct,direct);}
                 else{let source:[]u8=zt_expr_transparent_id(a.expr);if(source.len>0){zt_alias_set(&flow.*.owner_aliases,direct,zt_alias_root(flow.*.owner_aliases,source));}}
                 zt_alias_set(&flow.*.stack_aliases,direct,zt_stack_direct_address_root(a.expr,flow.*.locals,flow.*.stack_aliases));
             }
@@ -2091,6 +2683,11 @@ fn zt_agg_check_body(body:ArrayList[*Node],flow:*ZTAggFlow,decls:ArrayList[*Node
         .ret=>|r|{if(r.has_expr==1){
             errors=errors+zt_agg_check_freed_expr(r.expr,flow.*,context,arena)+zt_agg_check_calls(r.expr,flow,decls,context,arena);
             let owner:[]u8=zt_agg_expr_stored_root(r.expr,flow.*.prov,1,arena);if(owner.len>0){errors=errors+zt_machine_error(_zag_str_concat("owned allocation stored in an aggregate escapes through return (root `",_zag_str_concat(owner,"`)")),context);}
+            // A direct named owner may cross this function boundary, but an
+            // aggregate value cannot: its field path is the ownership record.
+            // Remove only the direct root so aggregate returns remain
+            // fail-closed and aggregate terminal accounting can report leaks.
+            if(owner.len==0){let direct:[]u8=zt_owned_expr_root(r.expr,flow.*.owners,flow.*.owner_aliases);if(direct.len>0){zt_names_remove(&flow.*.owners,direct);}}
             let stack:[]u8=zt_agg_expr_stored_root(r.expr,flow.*.prov,2,arena);if(stack.len>0){errors=errors+zt_machine_error(_zag_str_concat("address of local `",_zag_str_concat(stack,"` escapes through return")),context);}
         }}
         .estmt=>|e|{errors=errors+zt_agg_check_freed_expr(e.expr,flow.*,context,arena)+zt_agg_check_calls(e.expr,flow,decls,context,arena);}
@@ -2124,8 +2721,12 @@ fn zt_check_v2_aggregate_provenance(decls:ArrayList[*Node],file:[]u8)i32{
     let sums:ArrayList[ZTOwnSummary]=zt_build_owner_summaries(decls);let errors:i32=0;let i:i32=0;
     while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(f.is_extern==0){
         let flow:ZTAggFlow=zt_agg_flow_new(f.params.len+8);let arena:ArrayList[ZTAggPathNode]=make[ZTAggPathNode](16);let pi:i32=0;while(pi<f.params.len){let p:Param=f.params.data[pi];push[ZTBind](&flow.env,ZTBind{.name=p.name,.ty=p.pty});pi=pi+1;}
-        if(zt_fn_has_annot(decls,f.name,"@consumes")==1&&f.params.len>0){let root:[]u8=f.params.data[0].name;push[[]u8](&flow.owners,root);zt_alias_set(&flow.owner_aliases,root,root);}
+        if(zt_fn_has_annot(decls,f.name,"@consumes")==1){let pi:i32=0;while(pi<f.params.len){let p:Param=f.params.data[pi];if(zt_owner_param_type(p.pty)==1){push[[]u8](&flow.owners,p.name);zt_alias_set(&flow.owner_aliases,p.name,p.name);}pi=pi+1;}}
         errors=errors+zt_agg_check_body(f.body,&flow,decls,sums,_zag_str_concat("function ",f.name),&arena);
+        // This is the terminal half of aggregate ownership transfer.  A root
+        // deliberately leaves the name-only checker once stored in a value
+        // aggregate; it must therefore be discharged here on every path.
+        let oi:i32=0;while(oi<flow.owners.len){let root:[]u8=flow.owners.data[oi];let aliases:ArrayList[ZTOwnAlias]=make[ZTOwnAlias](4);let aggregate_owned:i32=zt_body_stores_owner_in_aggregate(f.body,root,&aliases);free[ZTOwnAlias](&aliases);if(aggregate_owned==1){if(zt_fn_has_annot(decls,f.name,"@consumes")==1&&zt_consumes_owner_named(decls,f.name,root)==1){errors=errors+zt_machine_error(_zag_str_concat("@consumes parameter `",_zag_str_concat(root,"` is not released or transferred on every control-flow path")),_zag_str_concat("function ",f.name));}else{errors=errors+zt_machine_error(_zag_str_concat("owned allocation `",_zag_str_concat(root,"` is neither released nor returned through aggregate provenance")),_zag_str_concat("function ",f.name));}}oi=oi+1;}
         zt_agg_flow_free(&flow);free[ZTAggPathNode](&arena);
     }}else=>{}}i=i+1;}
     free[ZTOwnSummary](&sums);
@@ -2158,7 +2759,14 @@ fn zt_borrow_alias_mode(borrows:ArrayList[ZTBorrowAlias],name:[]u8)i32{let i:i32
 fn zt_borrow_alias_root(borrows:ArrayList[ZTBorrowAlias],name:[]u8)[]u8{let i:i32=0;while(i<borrows.len){if(@strEq(borrows.data[i].name,name)){return borrows.data[i].root;}i=i+1;}return name;}
 fn zt_borrow_set(borrows:*ArrayList[ZTBorrowAlias],name:[]u8,root:[]u8,mode:i32)void{let i:i32=0;while(i<borrows.*.len){if(@strEq(borrows.*.data[i].name,name)){borrows.*.data[i]=ZTBorrowAlias{.name=name,.root=root,.mode=mode};return;}i=i+1;}push[ZTBorrowAlias](borrows,ZTBorrowAlias{.name=name,.root=root,.mode=mode});}
 fn zt_borrow_clone(borrows:ArrayList[ZTBorrowAlias])ArrayList[ZTBorrowAlias]{let out:ArrayList[ZTBorrowAlias]=make[ZTBorrowAlias](borrows.len+1);let i:i32=0;while(i<borrows.len){push[ZTBorrowAlias](&out,borrows.data[i]);i=i+1;}return out;}
-fn zt_borrow_agree(a:ArrayList[ZTBorrowAlias],b:ArrayList[ZTBorrowAlias])ArrayList[ZTBorrowAlias]{let out:ArrayList[ZTBorrowAlias]=make[ZTBorrowAlias](a.len+b.len+1);let i:i32=0;while(i<a.len){let x:ZTBorrowAlias=a.data[i];if(zt_borrow_alias_mode(b,x.name)==x.mode&&@strEq(zt_borrow_alias_root(b,x.name),x.root)){zt_borrow_set(&out,x.name,x.root,x.mode);}i=i+1;}i=0;while(i<b.len){let x:ZTBorrowAlias=b.data[i];if(zt_borrow_alias_mode(a,x.name)==x.mode&&@strEq(zt_borrow_alias_root(a,x.name),x.root)){zt_borrow_set(&out,x.name,x.root,x.mode);}i=i+1;}return out;}
+// A borrow which is active on any control-flow path is still active after the
+// join. This is a may-analysis: forgetting a one-sided borrow would permit a
+// later owner release/use while that path still retains the borrowed value.
+// Preserve conflicting bindings as separate records so root availability also
+// remains conservative; ordinary name lookup may use the first record, but no
+// possible borrowed root is dropped from owner-side checks.
+fn zt_borrow_may_add(out:*ArrayList[ZTBorrowAlias],x:ZTBorrowAlias)void{let i:i32=0;while(i<out.*.len){let y:ZTBorrowAlias=out.*.data[i];if(@strEq(y.name,x.name)&&@strEq(y.root,x.root)&&y.mode==x.mode){return;}i=i+1;}push[ZTBorrowAlias](out,x);}
+fn zt_borrow_may_join(a:ArrayList[ZTBorrowAlias],b:ArrayList[ZTBorrowAlias])ArrayList[ZTBorrowAlias]{let out:ArrayList[ZTBorrowAlias]=make[ZTBorrowAlias](a.len+b.len+1);let i:i32=0;while(i<a.len){zt_borrow_may_add(&out,a.data[i]);i=i+1;}i=0;while(i<b.len){zt_borrow_may_add(&out,b.data[i]);i=i+1;}return out;}
 fn zt_borrow_root_has(borrows:ArrayList[ZTBorrowAlias],root:[]u8,mode:i32)i32{let i:i32=0;while(i<borrows.len){if(borrows.data[i].mode==mode&&@strEq(borrows.data[i].root,root)){return 1;}i=i+1;}return 0;}
 fn zt_borrow_expr_root(n:*Node,aliases:ArrayList[ZTOwnAlias],borrows:ArrayList[ZTBorrowAlias])[]u8{let name:[]u8=zt_expr_transparent_id(n);if(name.len==0){return "";}let b:[]u8=zt_borrow_alias_root(borrows,name);return zt_alias_root(aliases,b);}
 fn zt_borrowed_expr_root(n:*Node,decls:ArrayList[*Node],aliases:ArrayList[ZTOwnAlias],borrows:ArrayList[ZTBorrowAlias])[]u8{
@@ -2178,15 +2786,18 @@ fn zt_borrowed_expr_root(n:*Node,decls:ArrayList[*Node],aliases:ArrayList[ZTOwnA
 }
 fn zt_check_active_borrow_expr(n:*Node,aliases:ArrayList[ZTOwnAlias],borrows:ArrayList[ZTBorrowAlias],context:[]u8)i32{switch(n.*){.id=>|x|{let root:[]u8=zt_alias_root(aliases,zt_borrow_alias_root(borrows,x.name));if(zt_borrow_root_has(borrows,root,2)==1&&zt_borrow_alias_mode(borrows,x.name)!=2){return zt_machine_error(_zag_str_concat("owner `",_zag_str_concat(root,"` is unavailable while an exclusive mutable borrow is active")),context);}}.bin=>|x|{return zt_check_active_borrow_expr(x.l,aliases,borrows,context)+zt_check_active_borrow_expr(x.r,aliases,borrows,context);}.un=>|x|{return zt_check_active_borrow_expr(x.e,aliases,borrows,context);}.call=>|x|{let errors:i32=zt_check_active_borrow_expr(x.callee,aliases,borrows,context);let i:i32=0;while(i<x.args.len){errors=errors+zt_check_active_borrow_expr(x.args.data[i],aliases,borrows,context);i=i+1;}return errors;}.idx=>|x|{return zt_check_active_borrow_expr(x.base,aliases,borrows,context)+zt_check_active_borrow_expr(x.idx,aliases,borrows,context);}.fld=>|x|{return zt_check_active_borrow_expr(x.base,aliases,borrows,context);}.cast_=>|x|{return zt_check_active_borrow_expr(x.expr,aliases,borrows,context);}.slice_=>|x|{return zt_check_active_borrow_expr(x.base,aliases,borrows,context)+zt_check_active_borrow_expr(x.lo,aliases,borrows,context)+zt_check_active_borrow_expr(x.hi,aliases,borrows,context);}.slit_=>|x|{let errors:i32=0;let i:i32=0;while(i<x.fields.len){errors=errors+zt_check_active_borrow_expr(x.fields.data[i].val,aliases,borrows,context);i=i+1;}return errors;}else=>{}}return 0;}
 fn zt_check_borrow_write(n:*Node,aliases:ArrayList[ZTOwnAlias],borrows:ArrayList[ZTBorrowAlias],context:[]u8)i32{switch(n.*){.id=>|x|{let root:[]u8=zt_alias_root(aliases,zt_borrow_alias_root(borrows,x.name));let mode:i32=zt_borrow_alias_mode(borrows,x.name);if(mode==1){return zt_machine_error("cannot mutate through a shared borrow",context);}if(zt_borrow_root_has(borrows,root,2)==1&&mode!=2){return zt_machine_error(_zag_str_concat("cannot mutate owner `",_zag_str_concat(root,"` while an exclusive mutable borrow is active")),context);}if(zt_borrow_root_has(borrows,root,1)==1&&mode!=2){return zt_machine_error(_zag_str_concat("cannot mutate owner `",_zag_str_concat(root,"` while a shared borrow is active")),context);}}.fld=>|x|{return zt_check_borrow_write(x.base,aliases,borrows,context);}.idx=>|x|{return zt_check_borrow_write(x.base,aliases,borrows,context);}.un=>|x|{return zt_check_borrow_write(x.e,aliases,borrows,context);}else=>{}}return 0;}
-fn zt_call_borrow_mode(n:*Node,decls:ArrayList[*Node])i32{switch(n.*){.call=>|c|{return zt_borrow_mode(decls,zt_direct_name(c.callee));}.cast_=>|c|{return zt_call_borrow_mode(c.expr,decls);}else=>{}}return 0;}
-fn zt_call_borrow_root(n:*Node,decls:ArrayList[*Node],aliases:ArrayList[ZTOwnAlias],borrows:ArrayList[ZTBorrowAlias])[]u8{switch(n.*){.call=>|c|{if(zt_borrow_mode(decls,zt_direct_name(c.callee))>0&&c.args.len>0){return zt_borrow_expr_root(c.args.data[0],aliases,borrows);}}.cast_=>|c|{return zt_call_borrow_root(c.expr,decls,aliases,borrows);}else=>{}}return "";}
+// `try` preserves the returned value's
+// borrow identity.  Dropping that identity here let a fallible borrow-return
+// be rebound as an ordinary value and could then permit release of its owner.
+fn zt_call_borrow_mode(n:*Node,decls:ArrayList[*Node])i32{switch(n.*){.call=>|c|{return zt_borrow_mode(decls,zt_direct_name(c.callee));}.cast_=>|c|{return zt_call_borrow_mode(c.expr,decls);}.un=>|u|{if(@strEq(u.op,"try")){return zt_call_borrow_mode(u.e,decls);}}else=>{}}return 0;}
+fn zt_call_borrow_root(n:*Node,decls:ArrayList[*Node],aliases:ArrayList[ZTOwnAlias],borrows:ArrayList[ZTBorrowAlias])[]u8{switch(n.*){.call=>|c|{if(zt_borrow_mode(decls,zt_direct_name(c.callee))>0&&c.args.len>0){return zt_borrow_expr_root(c.args.data[0],aliases,borrows);}}.cast_=>|c|{return zt_call_borrow_root(c.expr,decls,aliases,borrows);}.un=>|u|{if(@strEq(u.op,"try")){return zt_call_borrow_root(u.e,decls,aliases,borrows);}}else=>{}}return "";}
 fn zt_check_borrow_call(n:*Node,decls:ArrayList[*Node],aliases:ArrayList[ZTOwnAlias],borrows:ArrayList[ZTBorrowAlias],context:[]u8)i32{
     let errors:i32=0;
     switch(n.*){
         .call=>|c|{
             let ai:i32=0;while(ai<c.args.len){errors=errors+zt_check_borrow_call(c.args.data[ai],decls,aliases,borrows,context);ai=ai+1;}
             let name:[]u8=zt_direct_name(c.callee);let mode:i32=zt_borrow_mode(decls,name);let argi:i32=0;
-            while(argi<c.args.len){let root:[]u8=zt_borrowed_expr_root(c.args.data[argi],decls,aliases,borrows);if(root.len>0){if(zt_fn_has_annot(decls,name,"@consumes")==1||zt_owned_release_name(name)==1){errors=errors+zt_machine_error(_zag_str_concat("cannot pass a borrow to a consuming call (root `",_zag_str_concat(root,"`)")),context);}else if(mode==0&&zt_compiler_nonretaining_call(name)==0){let shown:[]u8=name;if(shown.len==0){shown="<indirect>";}errors=errors+zt_machine_error(_zag_str_concat("borrowed value `",_zag_str_concat(root,_zag_str_concat("` escapes through uncontracted call `",_zag_str_concat(shown,"`")))),context);}}argi=argi+1;}
+            while(argi<c.args.len){let root:[]u8=zt_borrowed_expr_root(c.args.data[argi],decls,aliases,borrows);if(root.len>0){if((zt_owned_release_name(name)==1&&argi==0)||zt_consumes_param(decls,name,argi)==1){errors=errors+zt_machine_error(_zag_str_concat("cannot pass a borrow to a consuming call (root `",_zag_str_concat(root,"`)")),context);}else if(mode==0&&zt_compiler_nonretaining_call(name)==0){let shown:[]u8=name;if(shown.len==0){shown="<indirect>";}errors=errors+zt_machine_error(_zag_str_concat("borrowed value `",_zag_str_concat(root,_zag_str_concat("` escapes through uncontracted call `",_zag_str_concat(shown,"`")))),context);}}argi=argi+1;}
             if(mode>0){if(c.args.len<1){errors=errors+zt_machine_error("borrow contract requires a first named owner argument",context);}else{let arg:[]u8=zt_expr_transparent_id(c.args.data[0]);if(arg.len==0){errors=errors+zt_machine_error("borrow contract requires a named owner argument",context);}else{let root:[]u8=zt_borrow_expr_root(c.args.data[0],aliases,borrows);let existing:i32=zt_borrow_alias_mode(borrows,arg);if(mode==2&&(existing==1||zt_borrow_root_has(borrows,root,1)==1)){errors=errors+zt_machine_error("cannot create an exclusive mutable borrow while a shared borrow is active",context);}if(mode==2&&zt_borrow_root_has(borrows,root,2)==1&&existing!=2){errors=errors+zt_machine_error("cannot create a second exclusive mutable borrow while one is active",context);}}}}
         }
         .bin=>|x|{errors=errors+zt_check_borrow_call(x.l,decls,aliases,borrows,context)+zt_check_borrow_call(x.r,decls,aliases,borrows,context);}
@@ -2207,15 +2818,22 @@ fn zt_check_borrow_body(body:ArrayList[*Node],aliases:*ArrayList[ZTOwnAlias],bor
         .let_=>|l|{if(l.has_init==1){
             errors=errors+zt_check_active_borrow_expr(l.expr,aliases.*,borrows.*,context)+zt_check_borrow_call(l.expr,decls,aliases.*,borrows.*,context);
             let source:[]u8=zt_expr_transparent_id(l.expr);
+            let call_mode:i32=zt_call_borrow_mode(l.expr,decls);
+            // A direct borrow result and a named alias retain identity below.
+            // An aggregate/computed expression containing a borrow has no
+            // field-sensitive borrow representation yet, so accepting it
+            // would lose the owner relation and permit a later release.
+            let embedded_root:[]u8=zt_borrowed_expr_root(l.expr,decls,aliases.*,borrows.*);
+            if(embedded_root.len>0&&source.len==0&&call_mode==0){errors=errors+zt_machine_error(_zag_str_concat("borrowed value `",_zag_str_concat(embedded_root,"` cannot be stored in an aggregate or computed value without a borrow contract")),context);}
             // A local copy of a borrow is still that same borrow.  Recording
             // this prevents an alias from laundering a borrowed value into an
             // @consumes call or release operation.
             if(source.len>0){let root:[]u8=zt_alias_root(aliases.*,zt_borrow_alias_root(borrows.*,source));zt_alias_set(aliases,l.name,root);let copied_mode:i32=zt_borrow_alias_mode(borrows.*,source);if(copied_mode>0){zt_borrow_set(borrows,l.name,root,copied_mode);}}
-            let mode:i32=zt_call_borrow_mode(l.expr,decls);
+            let mode:i32=call_mode;
             if(mode>0){let root:[]u8=zt_call_borrow_root(l.expr,decls,aliases.*,borrows.*);if(root.len>0){zt_borrow_set(borrows,l.name,root,mode);zt_alias_set(aliases,l.name,root);}}
         }}
         .ret=>|r|{if(r.has_expr==1){errors=errors+zt_check_active_borrow_expr(r.expr,aliases.*,borrows.*,context)+zt_check_borrow_call(r.expr,decls,aliases.*,borrows.*,context);}}
-        .assign=>|a|{errors=errors+zt_check_active_borrow_expr(a.expr,aliases.*,borrows.*,context)+zt_check_borrow_call(a.expr,decls,aliases.*,borrows.*,context)+zt_check_borrow_write(a.target,aliases.*,borrows.*,context);let target:[]u8=zt_expr_transparent_id(a.target);if(target.len>0){let source:[]u8=zt_expr_transparent_id(a.expr);if(source.len>0){let root:[]u8=zt_alias_root(aliases.*,zt_borrow_alias_root(borrows.*,source));zt_alias_set(aliases,target,root);zt_borrow_set(borrows,target,root,zt_borrow_alias_mode(borrows.*,source));}let mode:i32=zt_call_borrow_mode(a.expr,decls);if(mode>0){let root:[]u8=zt_call_borrow_root(a.expr,decls,aliases.*,borrows.*);if(root.len>0){zt_borrow_set(borrows,target,root,mode);zt_alias_set(aliases,target,root);}}}}
+        .assign=>|a|{errors=errors+zt_check_active_borrow_expr(a.expr,aliases.*,borrows.*,context)+zt_check_borrow_call(a.expr,decls,aliases.*,borrows.*,context)+zt_check_borrow_write(a.target,aliases.*,borrows.*,context);let target:[]u8=zt_expr_transparent_id(a.target);let source:[]u8=zt_expr_transparent_id(a.expr);let mode:i32=zt_call_borrow_mode(a.expr,decls);let embedded_root:[]u8=zt_borrowed_expr_root(a.expr,decls,aliases.*,borrows.*);if(embedded_root.len>0&&((target.len==0)||(source.len==0&&mode==0))){errors=errors+zt_machine_error(_zag_str_concat("borrowed value `",_zag_str_concat(embedded_root,"` cannot be stored in an aggregate or computed value without a borrow contract")),context);}if(target.len>0){if(source.len>0){let root:[]u8=zt_alias_root(aliases.*,zt_borrow_alias_root(borrows.*,source));zt_alias_set(aliases,target,root);zt_borrow_set(borrows,target,root,zt_borrow_alias_mode(borrows.*,source));}if(mode>0){let root:[]u8=zt_call_borrow_root(a.expr,decls,aliases.*,borrows.*);if(root.len>0){zt_borrow_set(borrows,target,root,mode);zt_alias_set(aliases,target,root);}}}}
         .estmt=>|e|{errors=errors+zt_check_active_borrow_expr(e.expr,aliases.*,borrows.*,context)+zt_check_borrow_call(e.expr,decls,aliases.*,borrows.*,context);switch(e.expr.*){.call=>|c|{let name:[]u8=zt_direct_name(c.callee);if(zt_owned_release_name(name)==1&&c.args.len==1){if(zt_borrow_alias_mode(borrows.*,zt_expr_transparent_id(c.args.data[0]))>0){errors=errors+zt_machine_error("cannot release through a borrow",context);}else{errors=errors+zt_check_borrow_write(c.args.data[0],aliases.*,borrows.*,context);}}}else=>{}}}
         .unsafe_=>|u|{errors=errors+zt_check_borrow_body(u.body,aliases,borrows,decls,context);}
         .if_=>|x|{
@@ -2225,7 +2843,7 @@ fn zt_check_borrow_body(body:ArrayList[*Node],aliases:*ArrayList[ZTOwnAlias],bor
             errors=errors+zt_check_borrow_body(x.then_body,&ta,&tb,decls,context);
             let ea:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);let eb:ArrayList[ZTBorrowAlias]=zt_borrow_clone(baseb);
             if(x.has_els==1){errors=errors+zt_check_borrow_body(x.els_body,&ea,&eb,decls,context);}
-            let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(ta,ea);let next_borrows:ArrayList[ZTBorrowAlias]=zt_borrow_agree(tb,eb);
+            let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(ta,ea);let next_borrows:ArrayList[ZTBorrowAlias]=zt_borrow_may_join(tb,eb);
             free[ZTOwnAlias](&basea);free[ZTBorrowAlias](&baseb);free[ZTOwnAlias](&ta);free[ZTBorrowAlias](&tb);free[ZTOwnAlias](&ea);free[ZTBorrowAlias](&eb);
             zt_alias_replace(aliases,next_aliases);zt_borrow_replace(borrows,next_borrows);
         }
@@ -2234,7 +2852,7 @@ fn zt_check_borrow_body(body:ArrayList[*Node],aliases:*ArrayList[ZTOwnAlias],bor
             let basea:ArrayList[ZTOwnAlias]=zt_alias_clone(aliases.*);let baseb:ArrayList[ZTBorrowAlias]=zt_borrow_clone(borrows.*);
             let wa:ArrayList[ZTOwnAlias]=zt_alias_clone(basea);let wb:ArrayList[ZTBorrowAlias]=zt_borrow_clone(baseb);
             errors=errors+zt_check_borrow_body(x.body,&wa,&wb,decls,context);
-            let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(basea,wa);let next_borrows:ArrayList[ZTBorrowAlias]=zt_borrow_agree(baseb,wb);
+            let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(basea,wa);let next_borrows:ArrayList[ZTBorrowAlias]=zt_borrow_may_join(baseb,wb);
             free[ZTOwnAlias](&basea);free[ZTBorrowAlias](&baseb);free[ZTOwnAlias](&wa);free[ZTBorrowAlias](&wb);
             zt_alias_replace(aliases,next_aliases);zt_borrow_replace(borrows,next_borrows);
         }
@@ -2249,7 +2867,7 @@ fn zt_check_borrow_body(body:ArrayList[*Node],aliases:*ArrayList[ZTOwnAlias],bor
                 if(have==0){free[ZTOwnAlias](&ja);ja=aa;free[ZTBorrowAlias](&jb);jb=ab;have=1;}
                 else{
                     let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(ja,aa);free[ZTOwnAlias](&ja);free[ZTOwnAlias](&aa);ja=next_aliases;
-                    let next_borrows:ArrayList[ZTBorrowAlias]=zt_borrow_agree(jb,ab);free[ZTBorrowAlias](&jb);free[ZTBorrowAlias](&ab);jb=next_borrows;
+                    let next_borrows:ArrayList[ZTBorrowAlias]=zt_borrow_may_join(jb,ab);free[ZTBorrowAlias](&jb);free[ZTBorrowAlias](&ab);jb=next_borrows;
                 }
                 ai=ai+1;
             }
@@ -2258,7 +2876,7 @@ fn zt_check_borrow_body(body:ArrayList[*Node],aliases:*ArrayList[ZTOwnAlias],bor
             if(have==0){free[ZTOwnAlias](&ja);ja=ea;free[ZTBorrowAlias](&jb);jb=eb;}
             else{
                 let next_aliases:ArrayList[ZTOwnAlias]=zt_alias_agree(ja,ea);free[ZTOwnAlias](&ja);free[ZTOwnAlias](&ea);ja=next_aliases;
-                let next_borrows:ArrayList[ZTBorrowAlias]=zt_borrow_agree(jb,eb);free[ZTBorrowAlias](&jb);free[ZTBorrowAlias](&eb);jb=next_borrows;
+                let next_borrows:ArrayList[ZTBorrowAlias]=zt_borrow_may_join(jb,eb);free[ZTBorrowAlias](&jb);free[ZTBorrowAlias](&eb);jb=next_borrows;
             }
             free[ZTOwnAlias](&basea);free[ZTBorrowAlias](&baseb);
             zt_alias_replace(aliases,ja);zt_borrow_replace(borrows,jb);
@@ -2279,7 +2897,16 @@ fn zt_check_v2_borrow_contracts(decls:ArrayList[*Node],file:[]u8)i32{
                 if(f.params.len<1){errors=errors+zt_machine_error("borrow contract requires a first owner parameter",context);}
                 else{
                     let pi:i32=1;
-                    while(pi<f.params.len){if(zt_borrow_aux_scalar_type(f.params.data[pi].pty)==0){errors=errors+zt_machine_error("borrow contract auxiliary parameters must be builtin scalars",context);}pi=pi+1;}
+                    while(pi<f.params.len){
+                        let aux:[]u8=f.params.data[pi].pty;
+                        // A declared C callback is a one-word code pointer, not
+                        // a Zag closure value. Permit it as an auxiliary only
+                        // on an explicit @cabi extern borrow contract; ordinary
+                        // aggregate/callback auxiliaries remain fail-closed.
+                        let cabi_callback:i32=((f.is_extern==1&&zt_fn_has_annot(decls,f.name,"@cabi")==1&&zt_cabi_callback_type_ok(aux)==1) as i32);
+                        if(zt_borrow_aux_scalar_type(aux)==0&&cabi_callback==0){errors=errors+zt_machine_error("borrow contract auxiliary parameters must be builtin scalars or declared scalar C callbacks",context);}
+                        pi=pi+1;
+                    }
                     let param:[]u8=zt_contract_param_name(f);zt_borrow_set(&borrows,param,param,mode);zt_alias_set(&aliases,param,param);
                 }
             }
@@ -2316,6 +2943,7 @@ fn typed_check_program(decls0: ArrayList[*Node], file: []u8) i32 {
                 let context: []u8 = _zag_str_concat("struct ", s.name);
                 let fi: i32 = 0;
                 while (fi < len[Param](s.fields)) {
+                    if(zt_atomic_i64_forbidden_type(get[Param](s.fields,fi).pty)==1){errors=errors+zt_machine_error("AtomicI64 cannot be embedded in structs",context);}
                     errors = errors + zt_validate_type(get[Param](s.fields, fi).pty, decls, s.tparams, context);
                     fi = fi + 1;
                 }
@@ -2325,6 +2953,7 @@ fn typed_check_program(decls0: ArrayList[*Node], file: []u8) i32 {
                 let none: ArrayList[[]u8] = make[[]u8](1);
                 let fi: i32 = 0;
                 while (fi < len[Param](u.fields)) {
+                    if(zt_atomic_i64_forbidden_type(get[Param](u.fields,fi).pty)==1){errors=errors+zt_machine_error("AtomicI64 cannot be embedded in unions",context);}
                     errors = errors + zt_validate_type(get[Param](u.fields, fi).pty, decls, none, context);
                     fi = fi + 1;
                 }
@@ -2334,9 +2963,11 @@ fn typed_check_program(decls0: ArrayList[*Node], file: []u8) i32 {
                 let context: []u8 = _zag_str_concat("function ", f.name);
                 let pi: i32 = 0;
                 while (pi < len[Param](f.params)) {
+                    if(zt_atomic_i64_forbidden_type(get[Param](f.params,pi).pty)==1){errors=errors+zt_machine_error("AtomicI64 cannot be a function parameter",context);}
                     errors = errors + zt_validate_type(get[Param](f.params, pi).pty, decls, f.tparams, context);
                     pi = pi + 1;
                 }
+                if(zt_atomic_i64_forbidden_type(f.ret)==1){errors=errors+zt_machine_error("AtomicI64 cannot be a function return type",context);}
                 errors = errors + zt_validate_type(f.ret, decls, f.tparams, context);
                 errors = errors + zt_check_body(f.body, decls, f.tparams, context);
             }
@@ -2346,9 +2977,11 @@ fn typed_check_program(decls0: ArrayList[*Node], file: []u8) i32 {
     }
     errors = errors + zt_check_globals(decls0, file);
     errors = errors + zt_check_v2_cabi_declarations(decls0, file);
+    errors = errors + zt_check_v2_cabi_exports(decls0, file);
     errors = errors + zt_check_expressions(decls0);
     errors = errors + zt_check_machine_control(decls0);
     errors = errors + zt_check_v2_direct_frees(decls0, file);
+    errors = errors + zt_check_v2_retained_regions(decls0, file);
     errors = errors + zt_check_v2_stack_address_escapes(decls0, file);
     errors = errors + zt_check_v2_aggregate_provenance(decls0, file);
     errors = errors + zt_check_v2_borrow_contracts(decls0, file);

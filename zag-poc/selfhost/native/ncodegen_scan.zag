@@ -1,0 +1,961 @@
+// selfhost/native/ncodegen_scan.zag — FRAME SIZING & SCAN for the native codegen.
+// Extracted from ncodegen.zag for modularity.
+//
+// Contains: slot pre-scan (worst-case frame word count), declared-type map for
+// the pre-scan, expression/statement scanning, frame size resolution/patching,
+// comparison op helpers, and native-runtime extern classification. These depend
+// on the Cg struct (for cg.decls), layout helpers (cg_type_is_agg, cg_agg_words,
+// etc.), env helpers (cg_is_clos_name, cg_ptr_method_name, cg_is_desugared_const),
+// and generics helpers (cg_slit_sname, cg_mangle_generic_norm) from other modules.
+
+@import("isa.zag")
+@import("../parse.zag")   // AST (Node/Param/Bin/Call/FnDecl/...) + ArrayList + @strEq + iface_method_count
+@import("ncodegen_types.zag")   // cg_norm_type, cg_is_rns_ty, cg_is_fn_type
+@import("ncodegen_layout.zag")  // cg_type_is_agg, cg_agg_words, cg_type_is_slice, cg_slice_is_word, cg_slice_elem, cg_find_struct, cg_type_is_opt
+@import("ncodegen_env.zag")     // cg_is_clos_name, cg_ptr_method_name, cg_is_desugared_const, FnSym
+@import("ncodegen_generics.zag")  // cg_slit_sname, cg_mangle_generic_norm
+
+// ── slot pre-scan ────────────────────────────────────────────────────────────
+// To fix frame_size before emitting the prologue we count the worst-case number
+// of 8-byte WORDS the function's locals need: its params (1 word each) plus
+// every distinct `let` (1 word for a scalar, N words for a struct-typed let,
+// N = field count). Names are deduped so a re-`let` of a name shares its slot.
+// `seen` collects distinct names; `words` accumulates the running word total.
+fn cg_scan_seen(seen: *ArrayList[[]u8], name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[[]u8](seen.*)) {
+        if (@strEq(get[[]u8](seen.*, i), name)) { return 1; }   // already counted
+        i = i + 1;
+    }
+    push[[]u8](seen, name);
+    return 0;
+}
+
+// Word size of a declared type: an aggregate (struct → field count, []u8 → 2),
+// else 1 (scalar).
+fn cg_type_words(cg: *Cg, ty: []u8) i32 {
+    if (cg_type_is_agg(cg, ty) == 1) { return cg_agg_words(cg, ty); }
+    return 1;
+}
+
+// ── declared-type map for the pre-scan ───────────────────────────────────────
+// The frame must reserve SCRATCH words for aggregate (struct / []u8) values that
+// flow through CALLS: each by-value aggregate ARGUMENT needs an N-word caller
+// copy, and each aggregate-by-value RETURN needs an N-word result block (sret).
+// To know whether an argument or a call's result is an aggregate, the pre-scan
+// needs the static types of names — which the env will hold later but isn't
+// built yet. So we build a parallel, AST-only name→type map here (params + `let`
+// declared/inferred types), mirroring exactly what cg_expr_type will report,
+// plus a function name→return-type map (`fnames`/`frets`).
+struct ScanCtx {
+    seen:    *ArrayList[[]u8],   // distinct local names already sized
+    words:   *i32,               // running frame word count
+    names:   ArrayList[[]u8],    // local name → declared type (parallel)
+    types:   ArrayList[[]u8],
+    fnames:  ArrayList[[]u8],    // function name → return type (parallel)
+    frets:   ArrayList[[]u8],
+}
+
+fn cg_scan_rectype(sc: *ScanCtx, name: []u8, ty: []u8) void {
+    // Mirror lowering's slot shadowing (cg_slot_alloc_br): if `name` is already
+    // recorded, REFRESH its type in place rather than appending. cg_scan_typeof
+    // returns the FIRST match (as cg_slot_type does), so when a switch reuses a
+    // capture name across arms with DIFFERENT payload types (e.g. `.slice_ => |s|`
+    // then `.slit_ => |s|`), the in-place refresh keeps the current arm's type
+    // visible. Appending instead would leave the stale first binding winning,
+    // mis-sizing an aggregate field arg (`s.fields`) → under-reserved frame.
+    let i: i32 = 0;
+    while (i < len[[]u8](sc.*.names)) {
+        if (@strEq(get[[]u8](sc.*.names, i), name)) {
+            set[[]u8](&sc.*.types, i, ty);
+            return;
+        }
+        i = i + 1;
+    }
+    push[[]u8](&sc.*.names, name);
+    push[[]u8](&sc.*.types, ty);
+}
+
+// Static type of an expression using ONLY the AST + the scan's name/fn maps
+// (no env, but WITH cg for struct layouts). Conservative: returns "" (scalar)
+// when it cannot tell. Mirrors the aggregate-relevant cases of cg_expr_type so
+// the reserved scratch EXACTLY matches what lowering allocates — including field
+// (`p.*.toks`), index, and slice bases, whose aggregate-ness must be seen by the
+// scan or the per-call argument-copy reservation under-counts and the frame
+// overruns (→ corruption when an aggregate field is passed by value).
+fn cg_scan_typeof(sc: *ScanCtx, cg: *Cg, n: *Node) []u8 {
+    switch (n.*) {
+        .id => |x| {
+            if (cg_is_clos_name(x.name) == 1) { return "fat_fn"; }
+            let i: i32 = 0;
+            while (i < len[[]u8](sc.*.names)) {
+                if (@strEq(get[[]u8](sc.*.names, i), x.name)) { return get[[]u8](sc.*.types, i); }
+                i = i + 1;
+            }
+            let gty: []u8 = cg_global_type(cg, x.name);
+            if (gty.len > 0) { return gty; }
+            // Plain function name used as a value → fat_fn.
+            let j: i32 = 0;
+            while (j < len[[]u8](sc.*.fnames)) {
+                if (@strEq(get[[]u8](sc.*.fnames, j), x.name)) {
+                    if (cg_is_desugared_const(cg, x.name) == 1) { return get[[]u8](sc.*.frets, j); }
+                    return "fat_fn";
+                }
+                j = j + 1;
+            }
+            return "";
+        }
+        .slit_ => |s| { return cg_norm_type(cg_slit_sname(s)); }
+        .slit  => |_s| { return "[]u8"; }   // a string literal IS a []u8 slice value
+        .embed => |_e| { return "[]u8"; }   // #embed yields a []u8 slice value
+        .cast_ => |c2| { return cg_norm_type(c2.target); }
+        .slice_ => |sl| {
+            let bt: []u8 = cg_scan_typeof(sc, cg, sl.base);
+            if (cg_slice_is_word(bt) == 1) { return bt; }   // []i32, []sat_i16, etc.
+            if (cg_type_is_slice(cg, bt) == 1) { return "[]u8"; }
+            switch (sl.base.*) { .slit => |_s| { return "[]u8"; } else => { } }
+            if (@strEq(bt, "*u8") || @strEq(bt, "*i8")) { return "[]u8"; }
+            return "";
+        }
+        .idx => |ix| {
+            let bt: []u8 = cg_scan_typeof(sc, cg, ix.base);
+            // A word-stride numeric slice ([]i32, []sat_i16, etc.) yields its element
+            // type; a byte slice ([]u8/[]i8) yields "u8".
+            if (cg_slice_is_word(bt) == 1) { return cg_slice_elem(bt); }
+            if (cg_type_is_slice(cg, bt) == 1) { return "u8"; }
+            if (bt.len > 1) { if (bt[0] == '*') { return bt[1..]; } }
+            return "";
+        }
+        .fld => |f| {
+            // p.* — pointee type (strip leading '*').
+            if (@strEq(f.fname, "*")) {
+                let bt0: []u8 = cg_scan_typeof(sc, cg, f.base);
+                if (bt0.len > 1 && bt0[0] == '*') { return bt0[1..]; }
+                return "";
+            }
+            // optional .has/.val/.?
+            let obt0: []u8 = cg_scan_typeof(sc, cg, f.base);
+            let obt1: []u8 = obt0;
+            if (obt1.len > 1 && obt1[0] == '*') { obt1 = obt1[1..]; }
+            if (cg_type_is_opt(cg, obt1) == 1) {
+                if (@strEq(f.fname, "has")) { return "i32"; }
+                if (@strEq(f.fname, "val")) { return cg_norm_type(obt1[1..]); }
+                if (@strEq(f.fname, "?")) { return cg_norm_type(obt1[1..]); }  // force-unwrap
+                return "";
+            }
+            // struct field: peel a leading '*' (p.*.field collapses *S → S).
+            let sname: []u8 = obt0;
+            if (sname.len > 1) { if (sname[0] == '*') { sname = sname[1..]; } }
+            let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1), .tparams = make[[]u8](1), .origin = "<root>" };
+            if (cg_find_struct(cg, sname, &sd) == 1) {
+                let i: i32 = 0;
+                while (i < len[Param](sd.fields)) {
+                    if (@strEq(get[Param](sd.fields, i).name, f.fname)) {
+                        return cg_norm_type(get[Param](sd.fields, i).pty);
+                    }
+                    i = i + 1;
+                }
+            }
+            return "";
+        }
+        .call  => |c| {
+            switch (c.callee.*) {
+                .id => |cid| {
+                    // ROUND 3: quire builtins carry an aggregate/p32 result type so
+                    // a `let q: quire = @quireZero()` is sized as an aggregate here.
+                    if (cid.name.len > 0) { if (cid.name[0] == '@') {
+                        if (@strEq(cid.name,"@allocationCreate") || @strEq(cid.name,"@allocationRegionDeinit")) { return "Allocation"; }
+                        if (@strEq(cid.name,"@allocationLen") || @strEq(cid.name,"@allocationAllocatorId")) { return "i64"; }
+                        if (@strEq(cid.name,"@allocationReadU8")) { return "u8"; }
+                        let qr: []u8 = cg_quire_builtin_ret(cid.name[1..]);
+                        if (qr.len > 0) { return cg_norm_type(qr); }
+                        return "";
+                    } }
+                    // native-runtime externs (_zag_*) → their syscall return type.
+                    if (cg_is_native_rt(cid.name) == 1) { return cg_native_rt_ret(cid.name); }
+                    // zalloc/zalloc_i → typed slice.
+                    if (@strEq(cid.name, "zalloc")) { return "[]f32"; }
+                    if (@strEq(cid.name, "zalloc_i")) { return "[]i32"; }
+                    // scalar math builtins.
+                    if (@strEq(cid.name, "sinf") || @strEq(cid.name, "sin") || @strEq(cid.name, "sinl")) { return "f64"; }
+                    if (@strEq(cid.name, "cosf") || @strEq(cid.name, "cos") || @strEq(cid.name, "cosl")) { return "f64"; }
+                    if (@strEq(cid.name, "sqrtf") || @strEq(cid.name, "sqrt") || @strEq(cid.name, "sqrtl")) { return "f64"; }
+                    // generic call foo[T](..) → look up the mangled instance ret.
+                    let fn2: []u8 = cid.name;
+                    if (len[[]u8](c.targs) > 0) { fn2 = cg_mangle_generic_norm(cid.name, c.targs); }
+                    let i: i32 = 0;
+                    while (i < len[[]u8](sc.*.fnames)) {
+                        if (@strEq(get[[]u8](sc.*.fnames, i), fn2)) { return get[[]u8](sc.*.frets, i); }
+                        i = i + 1;
+                    }
+                    return "";
+                }
+                .fld => |mf| {
+                    // method call: recv.method(args) → RecvType_method return type.
+                    // Mirrors cg_expr_type's method case so the pre-scan sizes
+                    // aggregate method RESULTS (sret blocks, agg-arg copies,
+                    // agg `let` storage) exactly like lowering will.
+                    if (!@strEq(mf.fname, "*") && !@strEq(mf.fname, "?") && !@strEq(mf.fname, "has") && !@strEq(mf.fname, "val")) {
+                        let mrty: []u8 = cg_scan_typeof(sc, cg, mf.base);
+                        if (mrty.len > 1 && mrty[0] == '*') { mrty = mrty[1..]; }
+                        if (mrty.len > 0) {
+                            let mmname: []u8 = _zag_str_concat(_zag_str_concat(mrty, "_"), mf.fname);
+                            if (len[[]u8](c.targs) > 0) { mmname = cg_mangle_generic_norm(mmname, c.targs); }
+                            // pointer-receiver method registers as *T_m — try that first.
+                            let mmname_p: []u8 = cg_ptr_method_name(mrty, mf.fname);
+                            let mip: i32 = 0;
+                            while (mip < len[[]u8](sc.*.fnames)) {
+                                if (@strEq(get[[]u8](sc.*.fnames, mip), mmname_p)) { return get[[]u8](sc.*.frets, mip); }
+                                mip = mip + 1;
+                            }
+                            let mi: i32 = 0;
+                            while (mi < len[[]u8](sc.*.fnames)) {
+                                if (@strEq(get[[]u8](sc.*.fnames, mi), mmname)) { return get[[]u8](sc.*.frets, mi); }
+                                mi = mi + 1;
+                            }
+                        }
+                    }
+                    return "";
+                }
+                else => { return ""; }
+            }
+        }
+        .bin => |b| {
+            // ROUND 3: an rns_3 (ZnrtRns) operand propagates the aggregate type so
+            // a `let s: rns_3 = a + b` is sized as an aggregate. Other bins → "".
+            let lt: []u8 = cg_scan_typeof(sc, cg, b.l);
+            if (cg_is_rns_ty(lt) == 1) { return cg_norm_type(lt); }
+            let rt: []u8 = cg_scan_typeof(sc, cg, b.r);
+            if (cg_is_rns_ty(rt) == 1) { return cg_norm_type(rt); }
+            return "";
+        }
+        else => { return ""; }
+    }
+}
+
+// Reserve scratch words for one call expression: by-value aggregate ARGS each
+// need an N-word caller copy, and an aggregate-by-value RETURN needs an N-word
+// result block. `new(StructLit)` is NOT counted here (its block is the heap, not
+// the frame). print builtins take no aggregate by-value args we copy. The same
+// per-call worst case is reserved by lowering, so the frame never overruns.
+fn cg_scan_call(cg: *Cg, sc: *ScanCtx, c: Call) void {
+    // callee name — detect and resolve method calls (recv.method → RecvType_method)
+    let fname: []u8 = "";
+    switch (c.callee.*) {
+        .id => |x| { fname = x.name; }
+        .fld => |f| {
+            if (!@strEq(f.fname, "*") && !@strEq(f.fname, "?") && !@strEq(f.fname, "has") && !@strEq(f.fname, "val")) {
+                let rty2: []u8 = cg_scan_typeof(sc, cg, f.base);
+                if (rty2.len > 1 && rty2[0] == '*') { rty2 = rty2[1..]; }
+                if (rty2.len > 0) {
+                    // Interface dispatch: receiver is an interface type.
+                    // Reserve fn_slot(1) + data_slot(1) + one slot per extra arg.
+                    if (iface_method_count(cg.*.decls, rty2) > 0) {
+                        sc.*.words.* = sc.*.words.* + 2 + len[*Node](c.args);
+                    }
+                    let mname2: []u8 = _zag_str_concat(_zag_str_concat(rty2, "_"), f.fname);
+                    // check if this is a method OR a fn-typed field call
+                    let fty2: []u8 = cg_scan_typeof(sc, cg, new(Node{ .fld = f }));
+                    if (cg_is_fn_type(fty2) == 1 || @strEq(fty2, "fat_fn")) {
+                        // fn-field call: reserve fb3(2) + env_slot(1) + per-arg slot(1 each)
+                        sc.*.words.* = sc.*.words.* + 3 + len[*Node](c.args);
+                    }
+                    // TRUE METHOD: lowering rewrites recv.method(a..) into
+                    // RecvType_method(recv, a..), PREPENDING the receiver as
+                    // arg 0. The receiver therefore needs the same scratch a
+                    // normal argument gets — one 8-byte spill slot, plus an
+                    // agg_words copy block when the receiver is an aggregate
+                    // passed by value. Missing this under-reserved the frame
+                    // and every later cg_slot_scratch_n write landed BELOW
+                    // rsp (clobbered by the next call/push → segfaults in
+                    // struct-returning fns that call methods).
+                    let mn2: []u8 = mname2;
+                    if (len[[]u8](c.targs) > 0) { mn2 = cg_mangle_generic_norm(mname2, c.targs); }
+                    let is_meth: i32 = 0;
+                    let mfi: i32 = 0;
+                    while (mfi < len[[]u8](sc.*.fnames)) {
+                        if (@strEq(get[[]u8](sc.*.fnames, mfi), mn2)) { is_meth = 1; }
+                        mfi = mfi + 1;
+                    }
+                    if (is_meth == 1) {
+                        sc.*.words.* = sc.*.words.* + 1;   // receiver arg spill slot
+                        if (cg_type_is_agg(cg, rty2) == 1) {
+                            sc.*.words.* = sc.*.words.* + cg_agg_words(cg, rty2);
+                        }
+                    }
+                    // The receiver expression itself is evaluated by lowering
+                    // (as arg 0 / fn-field base / iface recv) — walk it so any
+                    // scratch IT needs (nested calls, literals, …) is reserved.
+                    cg_scan_expr(cg, sc, f.base);
+                    fname = mname2;
+                }
+            }
+        }
+        else => { }
+    }
+    // @-builtins reserve no aggregate scratch (no by-value agg args/returns here)
+    // — EXCEPT the ROUND 3 quire builtins, which LOWER to a znrt_quire_* call with
+    // a by-value aggregate quire arg and/or an aggregate sret result. Reserve their
+    // worst case: sret(quire) + each arg's copy (quire=9 words, p32=1) + aslots.
+    if (fname.len > 0) {
+        if (fname[0] == '@') {
+            let qbf: []u8 = cg_quire_builtin_fn(fname[1..]);
+            if (qbf.len > 0) {
+                let qw: i32 = cg_agg_words(cg, "ZnrtQuire");
+                // sret result block (quireZero/quireFMA return a quire; quireToPosit
+                // returns a p32 scalar — reserving the quire block for all is a safe
+                // over-reservation).
+                sc.*.words.* = sc.*.words.* + qw;
+                let ai: i32 = 0;
+                while (ai < len[*Node](c.args)) {
+                    let at: []u8 = cg_scan_typeof(sc, cg, get[*Node](c.args, ai));
+                    if (cg_type_is_agg(cg, at) == 1) { sc.*.words.* = sc.*.words.* + cg_agg_words(cg, at); }
+                    sc.*.words.* = sc.*.words.* + 1;   // aslot spill word
+                    ai = ai + 1;
+                }
+            }
+            // @cacheAlignedAlloc builds a 2-word {ptr,n} block in the frame.
+            if (@strEq(fname[1..], "cacheAlignedAlloc")) { sc.*.words.* = sc.*.words.* + 2; }
+            // Allocation creation materializes its opaque five-word ABI value
+            // directly in the caller frame; byte operations retain three
+            // scalar temporaries across validation and the checked access.
+            if (@strEq(fname[1..], "allocationCreate")) { sc.*.words.* = sc.*.words.* + 5; }
+            if (@strEq(fname[1..], "allocationRegionDeinit")) { sc.*.words.* = sc.*.words.* + 5; }
+            if (@strEq(fname[1..], "allocationReadU8")) { sc.*.words.* = sc.*.words.* + 3; }
+            if (@strEq(fname[1..], "allocationWriteU8")) { sc.*.words.* = sc.*.words.* + 3; }
+            // Compiler-lowered thread operations retain their opaque handle and
+            // (for spawn) stack mapping across raw syscalls in parent-frame
+            // scratch. The child branch never reads these frame slots.
+            // handle/stack/argument scratch for the affine Linux thread boundary.
+            if (@strEq(fname[1..], "threadSpawn")) { sc.*.words.* = sc.*.words.* + 3; }
+            if (@strEq(fname[1..], "threadJoin")) { sc.*.words.* = sc.*.words.* + 1; }
+            return;
+        }
+    }
+    // __catch/__catchc: evaluate expr (may have agg scratch), plus 1 err-slot.
+    if (@strEq(fname, "__catch") || @strEq(fname, "__catchc")) {
+        sc.*.words.* = sc.*.words.* + 1;
+        let ai2: i32 = 0;
+        while (ai2 < len[*Node](c.args)) { cg_scan_expr(cg, sc, get[*Node](c.args, ai2)); ai2 = ai2 + 1; }
+        return;
+    }
+    // Native-runtime externs (_zag_*) take slice args by their EXISTING block
+    // pointer (no caller copy) and return a pointer in rax (no frame result
+    // block), so they reserve no aggregate scratch here. The mem/heap trio
+    // (_zag_malloc/_zag_realloc/_zag_free) likewise takes/returns scalars.
+    if (cg_is_native_rt(fname) == 1) { return; }
+    if (@strEq(fname, "_zag_malloc")) { return; }
+    if (@strEq(fname, "_zag_realloc")) { return; }
+    if (@strEq(fname, "_zag_free")) { return; }
+    // zalloc/zfree: typed slice alloc/free — zalloc builds a 2-word {ptr,n} block.
+    if (@strEq(fname, "zalloc") || @strEq(fname, "zalloc_i")) { sc.*.words.* = sc.*.words.* + 2; return; }
+    if (@strEq(fname, "zfree") || @strEq(fname, "zfree_i")) { return; }
+    // generic call foo[T](..) → its mangled instance name for ret lookup below.
+    if (len[[]u8](c.targs) > 0) { fname = cg_mangle_generic_norm(fname, c.targs); }
+    // `new(...)` allocates the STRUCT on the heap, but its lowering
+    // (cg_lower_new) still consumes ONE frame word: the `pslot` scratch that
+    // stashes the returned pointer across the per-field stores so the field
+    // value-expressions can't clobber it. That word MUST be reserved here or the
+    // frame overruns (two `new`s in one fn overran the aligned frame and
+    // corrupted the saved rbp/return address → segfault). We also walk the
+    // struct-literal's field VALUE expressions so any scratch THEY need (e.g. a
+    // nested call) is reserved; cg_scan_expr's generic walk does not descend into
+    // a `.slit_` node, so we descend explicitly here.
+    if (@strEq(fname, "new") || @strEq(fname, "_zag_script_new")) {
+        sc.*.words.* = sc.*.words.* + 1;   // pslot for the returned heap pointer
+        let new_arg_index: i32 = 0; if (@strEq(fname, "_zag_script_new")) { new_arg_index = 1; }
+        if (len[*Node](c.args) == new_arg_index + 1) {
+            let narg: *Node = get[*Node](c.args, new_arg_index);
+            switch (narg.*) {
+                .slit_ => |s| {
+                    let fi: i32 = 0;
+                    while (fi < len[FieldInit](s.fields)) {
+                        cg_scan_expr(cg, sc, get[FieldInit](s.fields, fi).val);
+                        fi = fi + 1;
+                    }
+                }
+                else => { }
+            }
+        }
+        return;
+    }
+    // by-value aggregate arguments → one caller copy each. A string-LITERAL arg
+    // is NOT counted here: its 2-word {ptr,len} block is materialized fresh per
+    // use (counted by cg_scan_expr's `.slit` case) and passed directly, so no
+    // separate copy block is allocated for it.
+    let ai: i32 = 0;
+    while (ai < len[*Node](c.args)) {
+        let arg: *Node = get[*Node](c.args, ai);
+        let is_slit: i32 = 0;
+        switch (arg.*) { .slit => |_s| { is_slit = 1; } else => { } }
+        if (is_slit == 0) {
+            let at: []u8 = cg_scan_typeof(sc, cg, arg);
+            if (cg_type_is_agg(cg, at) == 1) {
+                sc.*.words.* = sc.*.words.* + cg_agg_words(cg, at);
+            }
+        }
+        ai = ai + 1;
+    }
+    // Interface coercion: each concrete→interface arg builds an M+1 word fat ptr
+    // in a scratch slot.  Reserve M+1 words per such arg.
+    let icci: i32 = 0;
+    while (icci < len[*Node](c.args)) {
+        let pt: []u8 = cg_fn_param_type(cg, fname, icci);
+        if (iface_method_count(cg.*.decls, pt) > 0) {
+            let at2: []u8 = cg_scan_typeof(sc, cg, get[*Node](c.args, icci));
+            if (iface_method_count(cg.*.decls, at2) == 0) {
+                sc.*.words.* = sc.*.words.* + iface_method_count(cg.*.decls, pt) + 1;
+            }
+        }
+        // Optional coercion: a scalar/null arg wrapped into a ?T param builds an
+        // agg_words(pt) block + 1 pslot word at lowering time — reserve them.
+        if (pt.len > 1) {
+            if (pt[0] == '?') {
+                sc.*.words.* = sc.*.words.* + cg_agg_words(cg, pt) + 1;
+            }
+        }
+        icci = icci + 1;
+    }
+    // ARGUMENT SPILL SLOTS: each call spills every arg's 8-byte payload into a
+    // dedicated frame word first (so it can then be placed in a reg or pushed as
+    // a stack arg for the System V >6-arg path). Reserve one word per arg.
+    sc.*.words.* = sc.*.words.* + len[*Node](c.args);
+    // aggregate-by-value return → one result block (sret).
+    let rt: []u8 = "";
+    let i: i32 = 0;
+    while (i < len[[]u8](sc.*.fnames)) {
+        if (@strEq(get[[]u8](sc.*.fnames, i), fname)) { rt = get[[]u8](sc.*.frets, i); }
+        i = i + 1;
+    }
+    if (cg_type_is_agg(cg, rt) == 1) {
+        sc.*.words.* = sc.*.words.* + cg_agg_words(cg, rt);
+    }
+}
+
+// Word count to reserve for a switch SUBJECT scratch block (mirrors
+// cg_switch_subject_words at lowering time). A union subject occupies its FULL
+// size (tag + inline payload); we find the union via the first arm's first tag
+// exactly like cg_switch_kind. Enum/scalar/value switches use 1 word; we return
+// at least 2 (matching the old reservation) for safety.
+fn cg_scan_switch_subject_words(cg: *Cg, sw: Switch) i32 {
+    if (len[SwitchArm](sw.arms) == 0) { return 2; }
+    let a0: SwitchArm = get[SwitchArm](sw.arms, 0);
+    if (len[[]u8](a0.tags) == 0) { return 2; }
+    let tag0: []u8 = get[[]u8](a0.tags, 0);
+    let un: []u8 = cg_union_name_for_tag(cg, tag0);
+    if (un.len > 0) {
+        let w: i32 = cg_agg_words(cg, un);
+        if (w < 2) { return 2; }
+        return w;
+    }
+    return 2;
+}
+
+// Walk an expression, reserving call scratch for every nested call.
+fn cg_scan_expr(cg: *Cg, sc: *ScanCtx, n: *Node) void {
+    switch (n.*) {
+        .call => |c| {
+            cg_scan_call(cg, sc, c);
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) { cg_scan_expr(cg, sc, get[*Node](c.args, i)); i = i + 1; }
+        }
+        .slit => |_s| {
+            // A bare string-literal VALUE materializes a fresh 2-word {ptr,len}
+            // block in the frame (see the `.slit` case of cg_lower_expr). Reserve
+            // those 2 words here so the frame never overruns. (A `.slit` consumed
+            // by print_str(...) or a []u8 `let` initializer is handled WITHOUT a
+            // scratch and is not walked here, so no over-reservation occurs.)
+            sc.*.words.* = sc.*.words.* + 2;
+        }
+        .embed => |_e| {
+            // #embed materializes a 2-word {ptr,len} slice just like .slit.
+            sc.*.words.* = sc.*.words.* + 2;
+        }
+        .slit_ => |s| {
+            // A struct/union literal used as a VALUE (call arg, nested value, …)
+            // materializes a fresh block + a pslot in the frame (cg_lower_struct_lit).
+            // Reserve block words + 1 pslot, then recurse into field VALUES (a
+            // nested literal field is materialized inline, but reserving its own
+            // block here is a safe OVER-reservation). The frame need only be big
+            // enough, never exact, so over-reservation is always sound.
+            let lty: []u8 = cg_norm_type(cg_slit_sname(s));
+            let w: i32 = 1;
+            if (cg_type_is_agg(cg, lty) == 1) { w = cg_agg_words(cg, lty); }
+            sc.*.words.* = sc.*.words.* + w + 1;
+            let fi: i32 = 0;
+            while (fi < len[FieldInit](s.fields)) {
+                cg_scan_expr(cg, sc, get[FieldInit](s.fields, fi).val);
+                fi = fi + 1;
+            }
+        }
+        .bin  => |b| {
+            // `orelse` materializes the optional into a scratch block + pslot.
+            // Size to the optional (floor 4): aggregate inners are rejected at
+            // lowering, but nested ?? optionals still exceed the old fixed 4.
+            if (@strEq(b.op, "orelse")) {
+                let olt: []u8 = cg_scan_typeof(sc, cg, b.l);
+                let ow2: i32 = 4;
+                if (olt.len > 1) {
+                    if (olt[0] == '?') {
+                        let cw2: i32 = cg_agg_words(cg, olt) + 1;
+                        if (cw2 > ow2) { ow2 = cw2; }
+                    }
+                }
+                sc.*.words.* = sc.*.words.* + ow2;
+            }
+            // ROUND 3: an rns_3 op lowers to a znrt_rns_<op>(l,r) CALL (lowering),
+            // which needs sret + 2 by-value arg copies + 2 aslot spill words. The
+            // pre-scan never sees that synthesized call, so reserve its worst case
+            // here. ZnrtRns is 3 words → 3 (sret) + 2*3 (arg copies) + 2 (aslots).
+            let blt: []u8 = cg_scan_typeof(sc, cg, b.l);
+            let brt: []u8 = cg_scan_typeof(sc, cg, b.r);
+            if (cg_is_rns_ty(blt) == 1 || cg_is_rns_ty(brt) == 1) {
+                let rw: i32 = cg_agg_words(cg, "ZnrtRns");
+                sc.*.words.* = sc.*.words.* + rw + rw + rw + 2;
+            }
+            cg_scan_expr(cg, sc, b.l); cg_scan_expr(cg, sc, b.r);
+        }
+        .un   => |u| { cg_scan_expr(cg, sc, u.e); }
+        .fld  => |f| {
+            // force-unwrap `.?` materializes the optional into a scratch block +
+            // pslot — sized to the optional (floor 4); a *?T base peels to ?T.
+            if (@strEq(f.fname, "?")) {
+                let obt: []u8 = cg_scan_typeof(sc, cg, f.base);
+                if (obt.len > 1) { if (obt[0] == '*') { obt = obt[1..]; } }
+                let ow3: i32 = 4;
+                if (obt.len > 1) {
+                    if (obt[0] == '?') {
+                        let cw3: i32 = cg_agg_words(cg, obt) + 1;
+                        if (cw3 > ow3) { ow3 = cw3; }
+                    }
+                }
+                sc.*.words.* = sc.*.words.* + ow3;
+            }
+            cg_scan_expr(cg, sc, f.base);
+        }
+        .idx  => |x| { cg_scan_expr(cg, sc, x.base); cg_scan_expr(cg, sc, x.idx); }
+        .cast_=> |c2| { cg_scan_expr(cg, sc, c2.expr); }
+        .slice_ => |s2| {
+            // base[lo..hi] materializes: src{ptr,len}=2 + lo=1 + hi=1 + res{ptr,len}=2.
+            sc.*.words.* = sc.*.words.* + 6;
+            cg_scan_expr(cg, sc, s2.base);
+            cg_scan_expr(cg, sc, s2.lo);
+            if (s2.has_hi == 1) { cg_scan_expr(cg, sc, s2.hi); }
+        }
+        .switch_ => |sw| {
+            // expression switch: subject scratch (full union size) + 1-word result
+            // slot + one capture word per capturing arm. Record union-arm capture
+            // types so aggregate-of-capture args are sized correctly (see the
+            // statement-switch scan for the rationale).
+            let sw_uname2: []u8 = "";
+            let sw_kind2: i32 = cg_switch_kind(cg, sw, &sw_uname2);
+            sc.*.words.* = sc.*.words.* + cg_scan_switch_subject_words(cg, sw) + 1;
+            cg_scan_expr(cg, sc, sw.subject);
+            let ai: i32 = 0;
+            while (ai < len[SwitchArm](sw.arms)) {
+                let arm: SwitchArm = get[SwitchArm](sw.arms, ai);
+                if (arm.has_cap == 1) {
+                    sc.*.words.* = sc.*.words.* + 1;
+                    if (sw_kind2 == 2 && len[[]u8](arm.tags) > 0) {
+                        let payty2: []u8 = cg_union_payload_type(cg, sw_uname2, get[[]u8](arm.tags, 0));
+                        let norm2: []u8 = cg_norm_type(payty2);
+                        if (cg_type_is_agg(cg, norm2) == 1) {
+                            cg_scan_rectype(sc, arm.cap, _zag_str_concat("*", norm2));
+                        } else {
+                            cg_scan_rectype(sc, arm.cap, norm2);
+                        }
+                    }
+                }
+                cg_scan_body(cg, sc, arm.body);
+                ai = ai + 1;
+            }
+            if (sw.has_els == 1) { cg_scan_body(cg, sc, sw.els_body); }
+        }
+        .id => |x| {
+            if (cg_is_desugared_const(cg, x.name) == 1) {
+                // A const identifier lowers as a nullary call. Scan the same
+                // synthetic call so aggregate returns reserve their sret frame.
+                let const_args: ArrayList[*Node] = make[*Node](1);
+                let const_targs: ArrayList[[]u8] = make[[]u8](1);
+                cg_scan_call(cg, sc, Call{ .callee = mk_ident(x.name), .args = const_args, .targs = const_targs });
+                free[*Node](&const_args);
+                free[[]u8](&const_targs);
+            } else if (cg_is_clos_name(x.name) == 1) {
+                sc.*.words.* = sc.*.words.* + 2;   // fat_fn block: {code_ptr, env_ptr}
+                // For closures with captures, reserve 1 extra word to save rsi during
+                // per-aggregate malloc/memcpy (harmless if all captures are scalar).
+                let cdi3: i32 = 0;
+                while (cdi3 < len[*Node](cg.*.decls)) {
+                    switch (get[*Node](cg.*.decls, cdi3).*) {
+                        .fn_decl => |fdc| {
+                            if (@strEq(fdc.name, x.name) && fdc.cap_names.len > 0) {
+                                sc.*.words.* = sc.*.words.* + 1;
+                            }
+                        }
+                        else => { }
+                    }
+                    cdi3 = cdi3 + 1;
+                }
+            }
+            // Plain function used as a value → also needs a 2-word fat_fn block.
+            if (cg_is_desugared_const(cg, x.name) == 0) {
+                let j: i32 = 0;
+                while (j < len[[]u8](sc.*.fnames)) {
+                    if (@strEq(get[[]u8](sc.*.fnames, j), x.name)) {
+                        sc.*.words.* = sc.*.words.* + 2;
+                    }
+                    j = j + 1;
+                }
+            }
+        }
+        else => { }
+    }
+}
+
+fn cg_scan_body(cg: *Cg, sc: *ScanCtx, body: ArrayList[*Node]) void {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        let s: *Node = get[*Node](body, i);
+        switch (s.*) {
+            .let_   => |l| {
+                // record the local's static type for later arg/return sizing.
+                let lty: []u8 = "";
+                if (l.has_dty == 1) { lty = cg_norm_type(l.dty); }
+                else { lty = cg_scan_typeof(sc, cg, l.expr); }
+                // fn-typed let → fat_fn (same normalization as fn-typed params).
+                if (cg_is_fn_type(lty) == 1) { lty = "fat_fn"; }
+                cg_scan_rectype(sc, l.name, lty);
+                // Reserve storage for every declaration. Same-name bindings in
+                // nested blocks occupy distinct slots so the outer value can be
+                // restored when the inner lexical scope ends. This may
+                // conservatively over-reserve for a same-block re-let, but never
+                // under-reserves the frame.
+                let _seen_local: i32 = cg_scan_seen(sc.*.seen, l.name);
+                sc.*.words.* = sc.*.words.* + cg_type_words(cg, lty);
+                // an aggregate/optional let materializes via a pslot (1 word).
+                if (cg_type_is_agg(cg, lty) == 1) { sc.*.words.* = sc.*.words.* + 1; }
+                // ROUND 3: `let x: rns_3 = <int>` LOWERS to a synthesized
+                // znrt_rns_from_i64(int) CALL (returns ZnrtRns by sret). The pre-scan
+                // never sees that call, so reserve its sret block + 1 arg copy slot
+                // (the int arg is a scalar → 1 aslot, no by-value copy block).
+                if (cg_is_rns_ty(lty) == 1) {
+                    let rt0: []u8 = cg_scan_typeof(sc, cg, l.expr);
+                    if (cg_type_is_agg(cg, rt0) == 0) {
+                        sc.*.words.* = sc.*.words.* + cg_agg_words(cg, "ZnrtRns") + 1;
+                    }
+                }
+                cg_scan_expr(cg, sc, l.expr);
+            }
+            .assign => |a| {
+                switch (a.target.*) {
+                    .id => |x| {
+                        if (cg_scan_seen(sc.*.seen, x.name) == 0) { sc.*.words.* = sc.*.words.* + 1; }
+                    }
+                    else => { }
+                }
+                cg_scan_expr(cg, sc, a.target);
+                cg_scan_expr(cg, sc, a.expr);
+            }
+            .ret    => |r| { if (r.has_expr == 1) { cg_scan_expr(cg, sc, r.expr); } }
+            .estmt  => |e| { cg_scan_expr(cg, sc, e.expr); }
+            .if_    => |iff| {
+                cg_scan_expr(cg, sc, iff.cond);
+                if (iff.has_cap == 1) {
+                    // if-let: scratch optional block (sized to the optional — a big
+                    // ?Struct block is 1+agg_words(T) words; floor at the old 4-word
+                    // minimum) + pslot + capture slot. The emitter consumes exactly
+                    // onf (cg_slot_scratch_n) + 1 (cg_pslot_for_frame) + 1 (capture).
+                    let ct: []u8 = cg_scan_typeof(sc, cg, iff.cond);
+                    let ow: i32 = 4;
+                    if (ct.len > 1) {
+                        if (ct[0] == '?') {
+                            let cw: i32 = cg_agg_words(cg, ct);
+                            if (cw > ow) { ow = cw; }
+                        }
+                    }
+                    sc.*.words.* = sc.*.words.* + ow + 1;  // scratch optional block + pslot
+                    sc.*.words.* = sc.*.words.* + 1;  // capture slot (scalar value or pointer)
+                    if (ct.len > 1) {
+                        if (ct[0] == '?') {
+                            let inner: []u8 = ct[1..];
+                            let ninner: []u8 = cg_norm_type(inner);
+                            if (cg_type_is_slice(cg, ninner) == 1) {
+                                // slice payload binds as []u8 (byref) — see lowering
+                                cg_scan_rectype(sc, iff.cap, ninner);
+                            } else if (cg_type_is_agg(cg, ninner) == 1) {
+                                cg_scan_rectype(sc, iff.cap, _zag_str_concat("*", inner));
+                            } else {
+                                cg_scan_rectype(sc, iff.cap, inner);
+                            }
+                        }
+                    }
+                }
+                cg_scan_body(cg, sc, iff.then_body);
+                if (iff.has_els == 1) { cg_scan_body(cg, sc, iff.els_body); }
+            }
+            .while_ => |w2| {
+                cg_scan_expr(cg, sc, w2.cond);
+                if (w2.has_cap == 1) {
+                    // while-let: scratch optional block (sized like if-let) + pslot
+                    // + capture slot.
+                    let ct: []u8 = cg_scan_typeof(sc, cg, w2.cond);
+                    let ow: i32 = 4;
+                    if (ct.len > 1) {
+                        if (ct[0] == '?') {
+                            let cw: i32 = cg_agg_words(cg, ct);
+                            if (cw > ow) { ow = cw; }
+                        }
+                    }
+                    sc.*.words.* = sc.*.words.* + ow + 1;  // scratch optional block + pslot
+                    sc.*.words.* = sc.*.words.* + 1;  // capture slot
+                    if (ct.len > 1) {
+                        if (ct[0] == '?') {
+                            let inner: []u8 = ct[1..];
+                            let ninner: []u8 = cg_norm_type(inner);
+                            if (cg_type_is_slice(cg, ninner) == 1) {
+                                cg_scan_rectype(sc, w2.cap, ninner);
+                            } else if (cg_type_is_agg(cg, ninner) == 1) {
+                                cg_scan_rectype(sc, w2.cap, _zag_str_concat("*", inner));
+                            } else {
+                                cg_scan_rectype(sc, w2.cap, inner);
+                            }
+                        }
+                    }
+                }
+                cg_scan_body(cg, sc, w2.body);
+            }
+            .unsafe_ => |u| { cg_scan_body(cg, sc, u.body); }
+            .switch_ => |sw| {
+                // A switch lowers the subject to a scratch block sized to the
+                // subject (a UNION subject is its FULL {tag, inline payload} block;
+                // a scalar/enum fits one word), plus ONE capture word per
+                // capturing arm. Reserve those, then walk subject + arm bodies. For
+                // a UNION arm with a `|cap|` capture we RECORD the capture's type
+                // in the scan's name map — exactly as cg_bind_capture types it at
+                // lowering: scalar payloads bind as T (value), aggregate payloads as
+                // *T (pointer to blk+8) so `cap.*.field` reaches inline struct/slice
+                // fields. Without this the scan under-reserves arg-copy blocks and
+                // the frame overruns.
+                let sw_uname: []u8 = "";
+                let sw_kind: i32 = cg_switch_kind(cg, sw, &sw_uname);
+                sc.*.words.* = sc.*.words.* + cg_scan_switch_subject_words(cg, sw);
+                cg_scan_expr(cg, sc, sw.subject);
+                let ai: i32 = 0;
+                while (ai < len[SwitchArm](sw.arms)) {
+                    let arm: SwitchArm = get[SwitchArm](sw.arms, ai);
+                    if (arm.has_cap == 1) {
+                        sc.*.words.* = sc.*.words.* + 1;
+                        if (sw_kind == 2 && len[[]u8](arm.tags) > 0) {
+                            let payty: []u8 = cg_union_payload_type(cg, sw_uname, get[[]u8](arm.tags, 0));
+                            let norm: []u8 = cg_norm_type(payty);
+                            if (cg_type_is_agg(cg, norm) == 1) {
+                                cg_scan_rectype(sc, arm.cap, _zag_str_concat("*", norm));
+                            } else {
+                                cg_scan_rectype(sc, arm.cap, norm);
+                            }
+                        }
+                    }
+                    cg_scan_body(cg, sc, arm.body);
+                    ai = ai + 1;
+                }
+                if (sw.has_els == 1) { cg_scan_body(cg, sc, sw.els_body); }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+}
+
+// round n up to a multiple of 16
+fn cg_align16(n: i32) i32 {
+    let r: i32 = n % 16;
+    if (r == 0) { return n; }
+    return n + (16 - r);
+}
+
+// Resolve the stack-frame reservation from both codegen passes.  The scan is a
+// useful estimate, but lowering is authoritative: it visits every emitted path
+// and frame_words is a monotonic high-water mark.  Keeping the larger value
+// makes a missed scan case safe instead of turning it into a write below rsp.
+fn cg_resolve_frame_size(scanned_bytes: i32, lowered_words: i32) i32 {
+    let lowered_bytes: i32 = cg_align16(8 * lowered_words);
+    if (lowered_bytes > scanned_bytes) { return lowered_bytes; }
+    return scanned_bytes;
+}
+
+fn cg_patch_frame_size(out: *ArrayList[Instr], sub_idx: i32, scanned_bytes: i32, lowered_words: i32) void {
+    out.*.data[sub_idx].imm = cg_resolve_frame_size(scanned_bytes, lowered_words) as i64;
+}
+
+// ── operator dispatch helpers ────────────────────────────────────────────────
+fn cg_is_cmp_op(op: []u8) i32 {
+    if (@strEq(op, "<"))  { return 1; }
+    if (@strEq(op, "<=")) { return 1; }
+    if (@strEq(op, ">"))  { return 1; }
+    if (@strEq(op, ">=")) { return 1; }
+    if (@strEq(op, "==")) { return 1; }
+    if (@strEq(op, "!=")) { return 1; }
+    return 0;
+}
+
+fn cg_cmp_cc(op: []u8) i32 {
+    if (@strEq(op, "<"))  { return CC_L(); }
+    if (@strEq(op, "<=")) { return CC_LE(); }
+    if (@strEq(op, ">"))  { return CC_G(); }
+    if (@strEq(op, ">=")) { return CC_GE(); }
+    if (@strEq(op, "==")) { return CC_E(); }
+    return CC_NE();   // "!="
+}
+
+// ── native-runtime extern recognition ────────────────────────────────────────
+// The `_zag_*` externs are implemented as native syscall support routines (see
+// the RT_* section). For type-inference (let/arg/return aggregate handling), we
+// need their RETURN type. Returns the type string for a recognized runtime
+// extern, or "" if `name` is not one. A `[]u8`-returning runtime fn is an
+// AGGREGATE — its result is a pointer to a fresh {ptr,len} block, treated exactly
+// like any aggregate value downstream (so `let s: []u8 = _zag_str_concat(..)`
+// binds that pointer). The mem/heap helpers (_zag_malloc/_zag_realloc/_zag_free)
+// are intercepted by cg_lower_runtime and return scalars (*i8 ≈ "").
+fn cg_native_rt_ret(name: []u8) []u8 {
+    // []u8-returning (aggregate result = &{ptr,len}).
+    if (@strEq(name, "_zag_str_concat"))      { return "[]u8"; }
+    if (@strEq(name, "_zag_strdup"))          { return "[]u8"; }
+    if (@strEq(name, "_zag_i64_to_str"))      { return "[]u8"; }
+    if (@strEq(name, "_zag_u64_to_str"))      { return "[]u8"; }
+    if (@strEq(name, "_zag_read_file"))       { return "[]u8"; }
+    if (@strEq(name, "_zag_arg"))             { return "[]u8"; }
+    if (@strEq(name, "_zag_getenv"))          { return "[]u8"; }
+    if (@strEq(name, "_zag_script_env_get"))  { return "[]u8"; }
+    if (@strEq(name, "_zag_exec_capture"))    { return "[]u8"; }
+    if (@strEq(name, "_zag_process_result_output")) { return "[]u8"; }
+    // scalar-returning (i32/i64 in rax).
+    if (@strEq(name, "_zag_strlen"))          { return "i32"; }
+    if (@strEq(name, "_zag_str_len"))         { return "i32"; }
+    if (@strEq(name, "_zag_strcmp"))          { return "i32"; }
+    if (@strEq(name, "_zag_str_eq"))          { return "i32"; }
+    if (@strEq(name, "_zag_strcmp_ord"))      { return "i32"; }
+    if (@strEq(name, "_zag_str_index_of_byte")) { return "i32"; }
+    if (@strEq(name, "_zag_str_to_i64"))      { return "i64"; }
+    if (@strEq(name, "_zag_write_file"))      { return "i32"; }
+    if (@strEq(name, "_zag_write_exec"))      { return "i32"; }
+    if (@strEq(name, "_zag_file_exists"))     { return "i32"; }
+    if (@strEq(name, "_zag_argc"))            { return "i32"; }
+    if (@strEq(name, "_zag_exec_cmd"))        { return "i32"; }
+    if (@strEq(name, "_zag_memcmp"))          { return "i32"; }
+    if (@strEq(name, "_zag_print"))           { return ""; }
+    if (@strEq(name, "_zag_println"))         { return ""; }
+    if (@strEq(name, "_zag_eprintln"))        { return ""; }
+    if (@strEq(name, "_zag_flush"))           { return ""; }
+    if (@strEq(name, "_zag_exit"))            { return ""; }
+    if (@strEq(name, "_zag_memcpy"))          { return ""; }
+    if (@strEq(name, "_zag_read_fd"))         { return "i64"; }
+    if (@strEq(name, "_zag_script_file_size")) { return "i64"; }
+    if (@strEq(name, "_zag_script_read_file_into")) { return "i64"; }
+    if (@strEq(name, "_zag_slice_ptr"))       { return "*i8"; }
+    if (@strEq(name, "_zag_clock_monotonic_ms")) { return "i64"; }
+    if (@strEq(name, "_zag_script_context_init")) { return "*opaque"; }
+    if (@strEq(name, "_zag_script_context_shutdown")) { return ""; }
+    if (@strEq(name, "_zag_script_alloc")) { return "*i8"; }
+    if (@strEq(name, "_zag_script_alloc_used")) { return "i64"; }
+    if (@strEq(name, "_zag_allocator_allocation_count")) { return "i64"; }
+    if (@strEq(name, "_zag_allocator_live_bytes")) { return "i64"; }
+    if (@strEq(name, "_zag_allocator_peak_live_bytes")) { return "i64"; }
+    if (@strEq(name, "_zag_process_result_abi_new")) { return "*opaque"; }
+    if (@strEq(name, "_zag_script_process_result_abi_new")) { return "*opaque"; }
+    if (@strEq(name, "_zag_process_result_status")) { return "i32"; }
+    if (@strEq(name, "_zag_process_result_state")) { return "i32"; }
+    if (@strEq(name, "_zag_inb"))                    { return "i32"; }
+    if (@strEq(name, "_zag_inw"))                    { return "i32"; }
+    if (@strEq(name, "_zag_inl"))                    { return "i32"; }
+    if (@strEq(name, "_zag_rdmsr"))                  { return "i64"; }
+    if (@strEq(name, "_zag_read_cr0"))               { return "i64"; }
+    if (@strEq(name, "_zag_read_cr2"))               { return "i64"; }
+    if (@strEq(name, "_zag_read_cr3"))               { return "i64"; }
+    if (@strEq(name, "_zag_read_cr4"))               { return "i64"; }
+    if (@strEq(name, "_zag_raw_syscall"))     { return "i64"; }
+    if (@strEq(name, "_zag_x86_cpuid_eax") || @strEq(name, "_zag_x86_cpuid_ebx") ||
+        @strEq(name, "_zag_x86_cpuid_ecx") || @strEq(name, "_zag_x86_cpuid_edx") ||
+        @strEq(name, "_zag_x86_xgetbv")) { return "i64"; }
+    if(@strEq(name,"popcount")||@strEq(name,"trailing_zeros")||@strEq(name,"leading_zeros")||@strEq(name,"byte_swap64")){return "i64";}
+    return "";
+}
+
+// True if `name` is a native-runtime extern WE lower at the call site (so it is
+// NOT looked up in the user-fn symbol table). Covers the syscall routines plus
+// the void ones; the mem/heap trio is handled separately by cg_lower_runtime.
+fn cg_is_native_rt(name: []u8) i32 {
+    if (@strEq(name, "_zag_str_concat"))      { return 1; }
+    if (@strEq(name, "_zag_strdup"))          { return 1; }
+    if (@strEq(name, "_zag_i64_to_str"))      { return 1; }
+    if (@strEq(name, "_zag_u64_to_str"))      { return 1; }
+    if (@strEq(name, "_zag_read_file"))       { return 1; }
+    if (@strEq(name, "_zag_arg"))             { return 1; }
+    if (@strEq(name, "_zag_getenv"))          { return 1; }
+    if (@strEq(name, "_zag_script_env_get"))  { return 1; }
+    if (@strEq(name, "_zag_exec_capture"))    { return 1; }
+    if (@strEq(name, "_zag_process_result_output")) { return 1; }
+    if (@strEq(name, "_zag_strlen"))          { return 1; }
+    if (@strEq(name, "_zag_str_len"))         { return 1; }
+    if (@strEq(name, "_zag_strcmp"))          { return 1; }
+    if (@strEq(name, "_zag_str_eq"))          { return 1; }
+    if (@strEq(name, "_zag_strcmp_ord"))      { return 1; }
+    if (@strEq(name, "_zag_str_index_of_byte")) { return 1; }
+    if (@strEq(name, "_zag_str_to_i64"))      { return 1; }
+    if (@strEq(name, "_zag_write_file"))      { return 1; }
+    if (@strEq(name, "_zag_write_exec"))      { return 1; }
+    if (@strEq(name, "_zag_file_exists"))     { return 1; }
+    if (@strEq(name, "_zag_argc"))            { return 1; }
+    if (@strEq(name, "_zag_exec_cmd"))        { return 1; }
+    if (@strEq(name, "_zag_memcmp"))          { return 1; }
+    if (@strEq(name, "_zag_print"))           { return 1; }
+    if (@strEq(name, "_zag_println"))         { return 1; }
+    if (@strEq(name, "_zag_eprintln"))        { return 1; }
+    if (@strEq(name, "_zag_flush"))           { return 1; }
+    if (@strEq(name, "_zag_exit"))            { return 1; }
+    if (@strEq(name, "_zag_memcpy"))          { return 1; }
+    if (@strEq(name, "_zag_read_fd"))         { return 1; }
+    if (@strEq(name, "_zag_script_file_size")) { return 1; }
+    if (@strEq(name, "_zag_script_read_file_into")) { return 1; }
+    if (@strEq(name, "_zag_slice_ptr"))       { return 1; }
+    if (@strEq(name, "_zag_clock_monotonic_ms")) { return 1; }
+    if (@strEq(name, "_zag_script_context_init")) { return 1; }
+    if (@strEq(name, "_zag_script_context_shutdown")) { return 1; }
+    if (@strEq(name, "_zag_script_alloc")) { return 1; }
+    if (@strEq(name, "_zag_script_alloc_used")) { return 1; }
+    if (@strEq(name, "_zag_allocator_allocation_count")) { return 1; }
+    if (@strEq(name, "_zag_allocator_live_bytes")) { return 1; }
+    if (@strEq(name, "_zag_allocator_peak_live_bytes")) { return 1; }
+    if (@strEq(name, "_zag_process_result_abi_new")) { return 1; }
+    if (@strEq(name, "_zag_script_process_result_abi_new")) { return 1; }
+    if (@strEq(name, "_zag_process_result_status")) { return 1; }
+    if (@strEq(name, "_zag_process_result_state")) { return 1; }
+    if (@strEq(name, "_zag_outb"))                   { return 1; }
+    if (@strEq(name, "_zag_outw"))                   { return 1; }
+    if (@strEq(name, "_zag_outl"))                   { return 1; }
+    if (@strEq(name, "_zag_inb"))                    { return 1; }
+    if (@strEq(name, "_zag_inw"))                    { return 1; }
+    if (@strEq(name, "_zag_inl"))                    { return 1; }
+    if (@strEq(name, "_zag_rdmsr"))                  { return 1; }
+    if (@strEq(name, "_zag_wrmsr"))                  { return 1; }
+    if (@strEq(name, "_zag_read_cr0"))               { return 1; }
+    if (@strEq(name, "_zag_read_cr2"))               { return 1; }
+    if (@strEq(name, "_zag_read_cr3"))               { return 1; }
+    if (@strEq(name, "_zag_read_cr4"))               { return 1; }
+    if (@strEq(name, "_zag_write_cr0"))              { return 1; }
+    if (@strEq(name, "_zag_write_cr3"))              { return 1; }
+    if (@strEq(name, "_zag_write_cr4"))              { return 1; }
+    if (@strEq(name, "_zag_lgdt"))                   { return 1; }
+    if (@strEq(name, "_zag_lidt"))                   { return 1; }
+    if (@strEq(name, "_zag_ltr"))                    { return 1; }
+    if (@strEq(name, "_zag_invlpg"))                 { return 1; }
+    if (@strEq(name, "_zag_hlt"))                    { return 1; }
+    if (@strEq(name, "_zag_cli"))                    { return 1; }
+    if (@strEq(name, "_zag_sti"))                    { return 1; }
+    if (@strEq(name, "_zag_pause"))                  { return 1; }
+    if (@strEq(name, "_zag_wbinvd"))                 { return 1; }
+    if (@strEq(name, "_zag_raw_syscall"))     { return 1; }
+    if (@strEq(name, "_zag_x86_cpuid_eax") || @strEq(name, "_zag_x86_cpuid_ebx") ||
+        @strEq(name, "_zag_x86_cpuid_ecx") || @strEq(name, "_zag_x86_cpuid_edx") ||
+        @strEq(name, "_zag_x86_xgetbv")) { return 1; }
+    return 0;
+}

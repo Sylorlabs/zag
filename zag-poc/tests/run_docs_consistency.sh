@@ -40,7 +40,10 @@ fi
 if [ -f docs/V2_SAFETY_TOOLING.md ] && \
    rg -q 'partial `--sanitize=memory` mode are' docs/V2_SAFETY_TOOLING.md && \
    rg -q 'Other sanitizer modes remain rejected' docs/V2_SAFETY_TOOLING.md && \
-   rg -q 'does not yet provide red zones' docs/V2_SAFETY_TOOLING.md && \
+   rg -q '16-byte trailing red zone' docs/V2_SAFETY_TOOLING.md && \
+   rg -q 'does not yet provide leading red zones' docs/V2_SAFETY_TOOLING.md && \
+   rg -q 'tombstoned address' docs/V2_SAFETY_TOOLING.md && \
+   rg -q 'cumulative checked-lifetime budget' docs/V2_SAFETY_TOOLING.md && \
    rg -q '`--sanitize=undefined` is not implemented and is rejected' docs/V2_SAFETY_TOOLING.md && \
    rg -q '`--sanitize=thread` is not implemented and is rejected' docs/V2_SAFETY_TOOLING.md && \
    rg -q '`--safety=release` is not implemented and is rejected' docs/V2_SAFETY_TOOLING.md && \
@@ -85,10 +88,12 @@ fi
 
 if [ -f docs/V2_GPU_GUIDE.md ] && [ -f docs/V2_CPU_CONTROL_GUIDE.md ] && \
    rg -q 'does not currently execute a GPU kernel' docs/V2_GPU_GUIDE.md && \
+   rg -q 'direct Linux AMDGPU DRM' docs/V2_GPU_GUIDE.md && \
+   rg -q 'direct Linux AMDGPU DRM' docs/V2_GPU_MODEL.md && \
    rg -q 'not implemented in v2' docs/V2_CPU_CONTROL_GUIDE.md; then
-  ok "GPU and CPU-control guides distinguish plans from implementation"
+  ok "GPU and CPU-control guides distinguish plans from implementation and retain the direct-DRM boundary"
 else
-  bad "GPU or CPU-control guide is missing or overclaims support"
+  bad "GPU or CPU-control guide is missing, overclaims support, or contradicts the direct-DRM boundary"
 fi
 
 if [ -f docs/V2_TARGET_SUPPORT.md ] && \

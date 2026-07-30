@@ -1,0 +1,200 @@
+// selfhost/cuda_ptx.zag — Zag → NVIDIA PTX ISA encoder for CUDA compat.
+//
+// This is the compatibility-tier encoder for cuda-compat. It takes Zag @kernel
+// source and emits PTX (Parallel Thread Execution) text that can be loaded by
+// the CUDA runtime via cuModuleLoadData. It is NOT a native GPU backend — it
+// is a non-certified fallback path that uses the system's CUDA runtime.
+//
+// Like the other compat encoders, this starts with a narrow, fully validated
+// kernel subset (the canonical fill kernel) and rejects every other AST shape.
+//
+// The fill kernel maps to PTX as:
+//   .version 6.5
+//   .target sm_70
+//   .address_size 64
+//   .visible .entry fillKernel(
+//       .param .u64 out,
+//       .param .u64 value,
+//       .param .u64 count
+//   ) {
+//       .reg .u64 %rd<3>;
+//       .reg .u32 %r<4>;
+//       .reg .pred %p<2>;
+//       mov.u64 %rd0, out;
+//       mov.u32 %r0, %ctaid.x;
+//       mov.u32 %r1, %ntid.x;
+//       mov.u32 %r2, %tid.x;
+//       mad.lo.s32 %r3, %r0, %r1, %r2;
+//       setp.lt.s32 %p0, %r3, count;
+//       @%p0 st.global.s32 [%rd0 + %r3 * 4], value;
+//       ret;
+//   }
+
+@import("parse.zag")
+
+// ── kernel validation (mirrors spirv.zag/msl.zag/glsl.zag) ──────────────────
+fn ptx_is_id(n: *Node, want: []u8) bool {
+    return switch (n.*) {
+        .id => |x| @strEq(x.name, want),
+        else => false,
+    };
+}
+
+fn ptx_is_zero(n: *Node) bool {
+    return switch (n.*) {
+        .ilit => |x| @strEq(x.text, "0"),
+        else => false,
+    };
+}
+
+fn ptx_is_builtin_dim(n: *Node, name: []u8) bool {
+    let ok: bool = false;
+    switch (n.*) {
+        .call => |c| {
+            if (!ptx_is_id(c.callee, name) || len[*Node](c.args) != 1) { return false; }
+            ok = ptx_is_zero(get[*Node](c.args, 0));
+        }
+        else => { }
+    }
+    return ok;
+}
+
+fn ptx_is_global_index(n: *Node) bool {
+    let ok: bool = false;
+    switch (n.*) {
+        .bin => |add| {
+            if (!@strEq(add.op, "+") || !ptx_is_builtin_dim(add.r, "@gpuThreadIdx")) { return false; }
+            switch (add.l.*) {
+                .bin => |mul| {
+                    ok = @strEq(mul.op, "*") &&
+                        ptx_is_builtin_dim(mul.l, "@gpuBlockIdx") &&
+                        ptx_is_builtin_dim(mul.r, "@gpuBlockDim");
+                }
+                else => { }
+            }
+        }
+        else => { }
+    }
+    return ok;
+}
+
+fn ptx_has_annot(f: FnDecl, want: []u8) bool {
+    let i: i32 = 0;
+    while (i < len[[]u8](f.annots)) {
+        if (@strEq(get[[]u8](f.annots, i), want)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn ptx_is_fill_kernel(f: FnDecl) bool {
+    if (!ptx_has_annot(f, "@kernel") || len[Param](f.params) != 3 ||
+        !@strEq(f.ret, "void") || len[*Node](f.body) != 2) { return false; }
+    let p_out: Param = get[Param](f.params, 0);
+    let p_val: Param = get[Param](f.params, 1);
+    let p_cnt: Param = get[Param](f.params, 2);
+    if (!@strEq(p_out.pty, "[]i32") || !@strEq(p_val.pty, "i32") ||
+        !@strEq(p_cnt.pty, "i32")) { return false; }
+    let idx_name: []u8 = "";
+    switch (get[*Node](f.body, 0).*) {
+        .let_ => |l| {
+            if (l.has_init == 0 || !ptx_is_global_index(l.expr)) { return false; }
+            idx_name = l.name;
+        }
+        else => { return false; }
+    }
+    let valid: bool = false;
+    switch (get[*Node](f.body, 1).*) {
+        .if_ => |x| {
+            if (x.has_els != 0 || len[*Node](x.then_body) != 1) { return false; }
+            let cond_ok: bool = switch (x.cond.*) {
+                .bin => |b| @strEq(b.op, "<") && ptx_is_id(b.l, idx_name) && ptx_is_id(b.r, p_cnt.name),
+                else => false,
+            };
+            if (!cond_ok) { return false; }
+            switch (get[*Node](x.then_body, 0).*) {
+                .assign => |a| {
+                    if (!ptx_is_id(a.expr, p_val.name)) { return false; }
+                    valid = switch (a.target.*) {
+                        .idx => |ix| ptx_is_id(ix.base, p_out.name) && ptx_is_id(ix.idx, idx_name),
+                        else => false,
+                    };
+                }
+                else => { }
+            }
+        }
+        else => { }
+    }
+    return valid;
+}
+
+fn ptx_find_profile(decls: ArrayList[*Node]) i32 {
+    let found: i32 = 0;
+    let kernels: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .fn_decl => |f| {
+                if (ptx_has_annot(f, "@kernel") || ptx_has_annot(f, "@device")) {
+                    kernels = kernels + 1;
+                    if (ptx_is_fill_kernel(f)) { found = 1; }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    if (kernels != 1) { return 0; }
+    return found;
+}
+
+// ── PTX text emission for the fill kernel ───────────────────────────────────
+// Default PTX version is 6.5 for broad driver compatibility (driver >= 390.x).
+// PTX 7.5 requires driver >= 425.25 which not all systems have.
+fn ptx_version_string() []u8 { return ".version 6.5\n"; }
+fn ptx_target_string() []u8 { return ".target sm_70\n"; }
+
+fn ptx_emit_fill(out: *ArrayList[u8]) void {
+    let src: []u8 = ".version 6.5\n.target sm_70\n.address_size 64\n\n.visible .entry fillKernel(\n    .param .u64 out,\n    .param .u32 value,\n    .param .u32 count\n) {\n    .reg .u64 %rd<1>;\n    .reg .u32 %r<4>;\n    .reg .pred %p<1>;\n\n    ld.param.u64 %rd0, [out];\n    mov.u32 %r0, %ctaid.x;\n    mov.u32 %r1, %ntid.x;\n    mov.u32 %r2, %tid.x;\n    mad.lo.s32 %r3, %r0, %r1, %r2;\n    setp.lt.s32 %p0, %r3, count;\n    @%p0 st.global.s32 [%rd0 + %r3 * 4], value;\n    ret;\n}\n";
+    let i: i32 = 0;
+    while (i < src.len) { push[u8](out, src[i]); i = i + 1; }
+}
+
+// ── public entry point ──────────────────────────────────────────────────────
+fn emit_ptx(src: []u8, errors: *i32) ArrayList[u8] {
+    let decls: ArrayList[*Node] = parse_program(src);
+    let out: ArrayList[u8] = make[u8](256);
+    let profile: i32 = ptx_find_profile(decls);
+    if (profile == 0) {
+        _zag_println("znc[ptx]: unsupported kernel: require exactly one reviewed bounded fill @kernel; loops, host effects, unsafe pointers, and unknown forms are rejected");
+        errors.* = errors.* + 1;
+        return out;
+    }
+    if (profile == 1) {
+        ptx_emit_fill(&out);
+    } else {
+        _zag_println("znc[ptx]: only the fill profile is implemented for PTX emission");
+        errors.* = errors.* + 1;
+        return out;
+    }
+    return out;
+}
+
+fn emit_ptx_dir(src: []u8, base_dir: []u8, errors: *i32) ArrayList[u8] {
+    let decls: ArrayList[*Node] = parse_program_dir(src, base_dir);
+    let out: ArrayList[u8] = make[u8](256);
+    let profile: i32 = ptx_find_profile(decls);
+    if (profile == 0) {
+        _zag_println("znc[ptx]: unsupported kernel: require exactly one reviewed bounded fill @kernel; loops, host effects, unsafe pointers, and unknown forms are rejected");
+        errors.* = errors.* + 1;
+        return out;
+    }
+    if (profile == 1) {
+        ptx_emit_fill(&out);
+    } else {
+        _zag_println("znc[ptx]: only the fill profile is implemented for PTX emission");
+        errors.* = errors.* + 1;
+        return out;
+    }
+    return out;
+}

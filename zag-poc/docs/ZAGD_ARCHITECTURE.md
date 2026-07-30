@@ -296,9 +296,9 @@ ignored.
 Profile-backed backend records currently select only the optional instructions
 the native backend already implements and differentially tests: POPCNT and
 BMI1 ANDN, and only when the resolved target feature set permits them. A packed
-SIMD request is recorded as unsupported and never selected because this encoder
-does not yet implement packed SIMD. GPU and kernel tuning are not profile
-candidates in this release.
+SIMD request is recorded as unsupported and never selected: the bounded SSE2
+`i32x4` intrinsic is not a general profile-selectable SIMD contract. GPU and
+kernel tuning are not profile candidates in this release.
 
 Every suggestion identifies evidence, confidence, estimated benefit/cost,
 rejected alternatives and invalidation conditions. Automatic script choices

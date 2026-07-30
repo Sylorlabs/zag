@@ -354,6 +354,9 @@ dispatch or readback proof. See
 [`zag-poc/docs/V2_FINAL_VERIFICATION.md`](zag-poc/docs/V2_FINAL_VERIFICATION.md)
 and [`zag-poc/docs/GPU_COMPILER_DRIVER_BOUNDARY.md`](zag-poc/docs/GPU_COMPILER_DRIVER_BOUNDARY.md).
 
+C interoperability is an incremental-replacement bridge, not a Zag-to-C
+translation path: Zag source is compiled directly by Zag's native compiler.
+
 | Area | Current supported status |
 |---|---|
 | Call-graph effect proofs (`@realtime`, `@noalloc`, `@pure`) | Yes |
