@@ -38,7 +38,12 @@ handle. The same transition is proven for a precisely tracked local aggregate
 field: insertion moves the capability out of the original name, aggregate
 copies reject, `deallocate(box.block)` consumes the identity, and successful
 `resize(box.block, ...)` produces one live replacement while retiring the old
-field path. Helpers and non-local aliases are outside this current source proof.
+field path. A non-extern helper annotated `@consumes @returns_owner` may also
+transfer one exact `Allocation` parameter, including a precisely tracked local
+aggregate field, when every terminal path returns that parameter. The caller
+receives one live replacement name and the old field path is retired.
+Annotations that return a fresh, different, ambiguous, or unproven owner
+reject. Non-local aliases remain outside this current source proof.
 Ordinary direct local `Allocation` copies, uncontracted assignments, structural
 literals, descriptor-field inspection, and casts reject before code
 generation. Aggregate carrier fields are usable only through the proven

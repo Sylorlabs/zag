@@ -49,12 +49,13 @@ unsupported. Fixed unsafe i64 atomics, raw Linux `@atomicWait32`/`@atomicWake32`
 futex building blocks, and a literal-validated load/store/RMW/CAS memory-order
 subset are implemented, but atomic storage, typed fence order selection,
 threads, and a complete concurrency model remain
-unsupported. The only packed-SIMD operation is unsafe four-lane `i32` addition
-through raw pointers on native x86-64; vector value types, wider SIMD, and
-target-selected ISA variants remain unsupported. Inline `asm` remains
+unsupported. The only packed-SIMD operations are unsafe four-lane `i32`
+addition, subtraction, AND, OR, and XOR through raw pointers on native x86-64;
+vector value types, wider SIMD, and target-selected ISA variants remain
+unsupported. Inline `asm` remains
 fail-closed. Pointer provenance identity, bounds and alignment
-instrumentation, source-span audit records, indirect
-function-value/callback/generic/FFI propagation, and the complete
+instrumentation, source-span audit records, the complete device capability
+model, and the complete
 unsafe-operation inventory are not yet implemented.
 
 ## Error policy

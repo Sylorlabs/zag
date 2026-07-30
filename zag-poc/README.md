@@ -121,14 +121,19 @@ release. Its matrix and executable gate are in
 that gate failing until their implementation and execution evidence exist. The
 release gate is intentionally fail-closed while required capability rows
 remain unsupported; it is not a C replacement or a production-v2 claim yet.
-The latest authoritative local run (2026-07-29) completed all 37 executable
-rows and then failed the 10 required unsupported rows. That is strong
+The latest authoritative local run (2026-07-29) completed all 38 executable
+rows and then failed the 9 required unsupported rows. That is strong
 development evidence, not a production release result.
 The passing slices include
 checked native word and byte volatile transactions, fixed unsafe i64 atomic
 load/store/exchange/compare-exchange/fetch-add/sub/and/or/xor operations, bounded Linux futex wait/wake building blocks, a guarded direct-worker Linux spawn/join boundary, scalar plus bounded `f64` `@cabi` dynamic imports, validated x86
-POPCNT/ANDN/trailing-zero intrinsics, bounded SSE2 four-lane integer add/subtract,
-and bounded native memory sanitizer coverage. General atomics/concurrency,
+POPCNT/ANDN/trailing-zero intrinsics, bounded SSE2 four-lane integer
+add/subtract/and/or/xor operations,
+and bounded native memory sanitizer coverage with checked 16-byte trailing
+red zones for small ordinary allocations. Checked execution also quarantines
+retired small blocks and rejects ordinary allocator address reuse, preventing
+raw stale aliases from reviving as successor objects within its bounded
+provenance table. General atomics/concurrency,
 pointer/allocator lifetime, full C ABI, portable SIMD/checked inline assembly,
 and physical GPU execution remain explicitly fail-closed; unsupported
 native object, static, and shared-object requests also fail closed rather than
@@ -145,7 +150,10 @@ handles. `Allocation` is compiler-opaque and affine: insertion into a local
 aggregate moves the capability, the original binding becomes unavailable,
 aggregate copies cannot duplicate it, and consuming an aggregate field
 invalidates every alias to the same identity. A successful aggregate-field
-`resize` applies the same transition and mints one live replacement. Bounded retained
+`resize` applies the same transition and mints one live replacement. A
+non-extern `@consumes @returns_owner` helper may make the same transfer only
+when every terminal path returns its one exact `Allocation` parameter; the
+annotation cannot authorize a fresh or ambiguous owner. Bounded retained
 `fixed_buffer_allocator(...)` and `arena_allocator(...)` regions implement
 checked byte access, generation-invalidating reset, and explicit `deinit`;
 they do not establish a general allocator or heap-graph lifetime model. Legacy

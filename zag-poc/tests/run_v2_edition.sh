@@ -342,6 +342,45 @@ elif grep -q 'use after consumed SystemAllocator handle' "$tmp/v2-system-allocat
 else
   echo "  XX  aggregate resize stale-path diagnostic missing"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-resize-stale/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-system-allocator-aggregate-owner-transfer"
+printf 'name = "v2systemallocatoraggregateownertransfer"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-aggregate-owner-transfer/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-aggregate-owner-transfer/std"
+printf '@import("std/allocator.zag") struct Box { block:Allocation } fn forward(block:Allocation) Allocation @consumes @returns_owner { return block; } fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let box:Box=Box{.block=block}; let replacement:Allocation=forward(box.block); try allocation_write_u8(replacement,23,42); let value:u8=try allocation_read_u8(replacement,23); try allocator.deallocate(replacement); return value as i32; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-aggregate-owner-transfer/main.zag"
+if (cd "$tmp/v2-system-allocator-aggregate-owner-transfer" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-aggregate-owner-transfer/log" 2>&1 && [ -x "$tmp/v2-system-allocator-aggregate-owner-transfer/out" ]; then
+  set +e
+  "$tmp/v2-system-allocator-aggregate-owner-transfer/out"
+  aggregate_owner_transfer_rc=$?
+  set -e
+  if [ "$aggregate_owner_transfer_rc" -eq 42 ]; then
+    echo "  ok  verified helper transfers an aggregate Allocation field"; pass=$((pass + 1))
+  else
+    echo "  XX  aggregate Allocation helper transfer execution (exit=$aggregate_owner_transfer_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  aggregate Allocation helper transfer"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-owner-transfer/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-system-allocator-aggregate-owner-transfer-stale"
+printf 'name = "v2systemallocatoraggregateownertransferstale"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-aggregate-owner-transfer-stale/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-aggregate-owner-transfer-stale/std"
+printf '@import("std/allocator.zag") struct Box { block:Allocation } fn forward(block:Allocation) Allocation @consumes @returns_owner { return block; } fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let box:Box=Box{.block=block}; let replacement:Allocation=forward(box.block); try allocator.deallocate(box.block); try allocator.deallocate(replacement); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-aggregate-owner-transfer-stale/main.zag"
+if (cd "$tmp/v2-system-allocator-aggregate-owner-transfer-stale" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-aggregate-owner-transfer-stale/log" 2>&1 || [ -e "$tmp/v2-system-allocator-aggregate-owner-transfer-stale/out" ]; then
+  echo "  XX  verified helper transfer must retire the aggregate field"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-owner-transfer-stale/log"; fail=$((fail + 1))
+elif grep -q 'use after consumed SystemAllocator handle' "$tmp/v2-system-allocator-aggregate-owner-transfer-stale/log"; then
+  echo "  ok  verified helper transfer rejects the stale aggregate field"; pass=$((pass + 1))
+else
+  echo "  XX  aggregate helper stale-field diagnostic missing"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-owner-transfer-stale/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-system-allocator-owner-transfer-invalid"
+printf 'name = "v2systemallocatorownertransferinvalid"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-owner-transfer-invalid/zag.mod"
+ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-owner-transfer-invalid/std"
+printf '@import("std/allocator.zag") fn bad(block:Allocation,allocator:SystemAllocator) !Allocation @consumes @returns_owner { return try allocator.allocate(24,8); } fn main() i32 { return 0; }\n' >"$tmp/v2-system-allocator-owner-transfer-invalid/main.zag"
+if (cd "$tmp/v2-system-allocator-owner-transfer-invalid" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-owner-transfer-invalid/log" 2>&1 || [ -e "$tmp/v2-system-allocator-owner-transfer-invalid/out" ]; then
+  echo "  XX  Allocation transfer annotation must not mint unrelated ownership"; sed -n '1,16p' "$tmp/v2-system-allocator-owner-transfer-invalid/log"; fail=$((fail + 1))
+elif grep -q '@returns_owner requires every owned return to be the same @consumes owner parameter' "$tmp/v2-system-allocator-owner-transfer-invalid/log"; then
+  echo "  ok  Allocation transfer annotation cannot authorize a fresh owner"; pass=$((pass + 1))
+else
+  echo "  XX  invalid Allocation owner-transfer diagnostic missing"; sed -n '1,16p' "$tmp/v2-system-allocator-owner-transfer-invalid/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-system-allocator-stale"
 printf 'name = "v2systemallocatorstale"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-system-allocator-stale/zag.mod"
 ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-stale/std"
@@ -729,6 +768,54 @@ if (cd "$tmp/v2-checked-heap-uaf" && "$ZNC" main.zag -o out --safety=checked) >"
 else
   echo "  XX  checked safety heap UAF program did not compile"; sed -n '1,8p' "$tmp/v2-checked-heap-uaf/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-checked-heap-aba"
+printf 'name = "v2checkedheapaba"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-heap-aba/zag.mod"
+printf 'fn main() i32 { unsafe { let p:*i8=_zag_malloc(16) as *i8; let stale_address:i64=(p as i64)+0; _zag_free(p); let successor:*i8=_zag_malloc(16) as *i8; successor.*=42; let stale:*i8=stale_address as *i8; let observed:i32=stale.* as i32; _zag_free(successor); return observed; } }\n' >"$tmp/v2-checked-heap-aba/main.zag"
+if (cd "$tmp/v2-checked-heap-aba" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-checked-heap-aba/log" 2>&1 && [ -x "$tmp/v2-checked-heap-aba/out" ]; then
+  set +e
+  "$tmp/v2-checked-heap-aba/out" >"$tmp/v2-checked-heap-aba/out.log" 2>"$tmp/v2-checked-heap-aba/err.log"
+  checked_heap_aba_rc=$?
+  set -e
+  if [ "$checked_heap_aba_rc" -ne 0 ] && grep -q 'zag safety: use after free of allocator pointer' "$tmp/v2-checked-heap-aba/err.log"; then
+    echo "  ok  checked safety quarantine prevents small-allocation ABA revival"; pass=$((pass + 1))
+  else
+    echo "  XX  checked safety small-allocation ABA quarantine (exit=$checked_heap_aba_rc)"; sed -n '1,8p' "$tmp/v2-checked-heap-aba/err.log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  checked safety small-allocation ABA program did not compile"; sed -n '1,8p' "$tmp/v2-checked-heap-aba/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-checked-large-aba"
+printf 'name = "v2checkedlargeaba"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-large-aba/zag.mod"
+# Linux normally reissues the just-unmapped top-down virtual range for this
+# identical dedicated mapping. Checked mode must reject it before publishing a
+# successor pointer rather than reviving the old raw address.
+printf 'fn main() i32 { unsafe { let p:*i8=_zag_malloc(600000) as *i8; let stale_address:i64=(p as i64)+0; _zag_free(p); let successor:*i8=_zag_malloc(600000) as *i8; successor.*=42; _zag_free(successor); return 7; } }\n' >"$tmp/v2-checked-large-aba/main.zag"
+if (cd "$tmp/v2-checked-large-aba" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-checked-large-aba/log" 2>&1 && [ -x "$tmp/v2-checked-large-aba/out" ]; then
+  set +e
+  "$tmp/v2-checked-large-aba/out" >"$tmp/v2-checked-large-aba/out.log" 2>"$tmp/v2-checked-large-aba/err.log"
+  checked_large_aba_rc=$?
+  set -e
+  if [ "$checked_large_aba_rc" -ne 0 ] && grep -q 'zag safety: allocator address reuse violates checked quarantine' "$tmp/v2-checked-large-aba/err.log"; then
+    echo "  ok  checked safety rejects a kernel-reissued large allocation address"; pass=$((pass + 1))
+  else
+    echo "  XX  checked safety large-allocation ABA quarantine (exit=$checked_large_aba_rc)"; sed -n '1,8p' "$tmp/v2-checked-large-aba/err.log"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  checked safety large-allocation ABA program did not compile"; sed -n '1,8p' "$tmp/v2-checked-large-aba/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-release-heap-reuse"
+printf 'name = "v2releaseheapreuse"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-release-heap-reuse/zag.mod"
+printf 'fn main() i32 { unsafe { let p:*i8=_zag_malloc(16) as *i8; let first:i64=(p as i64)+0; _zag_free(p); let successor:*i8=_zag_malloc(16) as *i8; let same:i32=((successor as i64)==first) as i32; _zag_free(successor); if(same==1){return 42;} return 1; } }\n' >"$tmp/v2-release-heap-reuse/main.zag"
+if (cd "$tmp/v2-release-heap-reuse" && "$ZNC" main.zag -o out) >"$tmp/v2-release-heap-reuse/log" 2>&1 && [ -x "$tmp/v2-release-heap-reuse/out" ]; then
+  set +e; "$tmp/v2-release-heap-reuse/out"; release_heap_reuse_rc=$?; set -e
+  if [ "$release_heap_reuse_rc" -eq 42 ]; then
+    echo "  ok  default unchecked allocator retains ordinary small-block reuse"; pass=$((pass + 1))
+  else
+    echo "  XX  default unchecked allocator small-block reuse (exit=$release_heap_reuse_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  default unchecked allocator reuse program did not compile"; sed -n '1,8p' "$tmp/v2-release-heap-reuse/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-checked-realloc-uaf"
 printf 'name = "v2checkedreallocuaf"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-realloc-uaf/zag.mod"
 printf 'fn main() i32 { unsafe { let p:*i8=_zag_malloc(16) as *i8; p.*=7; let saved:i64=(p as i64)+0; let q:*i8=_zag_realloc(p,32) as *i8; q.*=42; _zag_free(q); let stale:*i8=saved as *i8; return stale.* as i32; } }\n' >"$tmp/v2-checked-realloc-uaf/main.zag"
@@ -1110,6 +1197,24 @@ if (cd "$tmp/v2-sanitize-memory" && "$ZNC" main.zag -o out --sanitize=memory) >"
 else
   echo "  XX  memory sanitizer compiles released-allocation witness"; sed -n '1,10p' "$tmp/v2-sanitize-memory/log"; fail=$((fail + 1))
 fi
+mkdir -p "$tmp/v2-sanitize-memory-small-redzone"
+printf 'name = "v2sanitizememorysmallredzone"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-sanitize-memory-small-redzone/zag.mod"
+# libc performs this write outside Zag's compiler-inserted raw-access checks.
+# The small allocator's physical trailing canary must detect it at release.
+printf 'extern fn memset(dst:*u8,value:i32,count:i64)*u8 @cabi; extern fn _zag_malloc(n:i64)*u8; extern fn _zag_free(p:*u8)void; fn main() i32 { unsafe { let p:*u8=_zag_malloc(16); let redzone:*u8=((p as i64)+16) as *u8; let ignored:*u8=memset(redzone,0,1); _zag_free(p); return 42; } }\n' >"$tmp/v2-sanitize-memory-small-redzone/main.zag"
+if (cd "$tmp/v2-sanitize-memory-small-redzone" && "$ZNC" main.zag -o out --sanitize=memory --dynamic --needed libc.so.6) >"$tmp/v2-sanitize-memory-small-redzone/log" 2>&1 && [ -x "$tmp/v2-sanitize-memory-small-redzone/out" ]; then
+  set +e
+  "$tmp/v2-sanitize-memory-small-redzone/out" >"$tmp/v2-sanitize-memory-small-redzone/out.log" 2>"$tmp/v2-sanitize-memory-small-redzone/err.log"
+  sanitize_memory_small_redzone_rc=$?
+  set -e
+  if [ "$sanitize_memory_small_redzone_rc" -ne 0 ] && grep -q 'zag sanitizer: small allocation trailing red zone corrupted' "$tmp/v2-sanitize-memory-small-redzone/err.log"; then
+    echo "  ok  memory sanitizer detects foreign writes into small-allocation red zone"; pass=$((pass + 1))
+  else
+    echo "  XX  memory sanitizer small red-zone witness (exit=$sanitize_memory_small_redzone_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  memory sanitizer compiles small red-zone witness"; sed -n '1,10p' "$tmp/v2-sanitize-memory-small-redzone/log"; fail=$((fail + 1))
+fi
 mkdir -p "$tmp/v2-sanitize-memory-large-guard"
 printf 'name = "v2sanitizememorylargeguard"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-sanitize-memory-large-guard/zag.mod"
 # 600000 exceeds the arena allocator's 512 KiB maximum, so this exercises the
@@ -1149,14 +1254,14 @@ else
 fi
 mkdir -p "$tmp/v2-sanitize-memory-poison"
 printf 'name = "v2sanitizememorypoison"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-sanitize-memory-poison/zag.mod"
-printf 'fn main() i32 { unsafe { let p:*i8 = _zag_malloc(16) as *i8; p[8] = 7; _zag_free(p); let q:*i8 = _zag_malloc(16) as *i8; let marker:i32 = q[8] as i32; _zag_free(q); return marker; } }\n' >"$tmp/v2-sanitize-memory-poison/main.zag"
-if (cd "$tmp/v2-sanitize-memory-poison" && "$ZNC" main.zag -o out --sanitize=memory) >"$tmp/v2-sanitize-memory-poison/log" 2>&1 && [ -x "$tmp/v2-sanitize-memory-poison/out" ]; then
+printf 'extern fn memchr(src:*const u8,value:i32,count:i64)*u8 @cabi @borrows; fn main() i32 { unsafe { let p:*i8=_zag_malloc(16) as *i8; p[8]=7; let stale_address:i64=(p as i64)+0; _zag_free(p); let stale:*const u8=stale_address as *const u8; let found:*u8=memchr(stale,165,16); if(found==null as *u8){return 1;} return 42; } }\n' >"$tmp/v2-sanitize-memory-poison/main.zag"
+if (cd "$tmp/v2-sanitize-memory-poison" && "$ZNC" main.zag -o out --sanitize=memory --dynamic --needed libc.so.6) >"$tmp/v2-sanitize-memory-poison/log" 2>&1 && [ -x "$tmp/v2-sanitize-memory-poison/out" ]; then
   set +e
   "$tmp/v2-sanitize-memory-poison/out"
   sanitize_memory_poison_rc=$?
   set -e
-  if [ "$sanitize_memory_poison_rc" -eq 165 ] || [ "$sanitize_memory_poison_rc" -eq -91 ]; then
-    echo "  ok  memory sanitizer poisons reused freed payload"; pass=$((pass + 1))
+  if [ "$sanitize_memory_poison_rc" -eq 42 ]; then
+    echo "  ok  memory sanitizer poisons quarantined freed payload"; pass=$((pass + 1))
   else
     echo "  XX  memory sanitizer poison witness (exit=$sanitize_memory_poison_rc)"; fail=$((fail + 1))
   fi

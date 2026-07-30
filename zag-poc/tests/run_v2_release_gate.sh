@@ -67,16 +67,16 @@ run_gate "validated x86 volatile MMIO widths" bash tests/run_x86_volatile_widths
 run_gate "bounded MMIO-region authority" bash tests/run_mmio_region.sh
 run_gate "validated x86 SSE2 SIMD add" bash tests/run_x86_simd_add_i32x4.sh
 run_gate "validated x86 SSE2 SIMD subtract" bash tests/run_x86_simd_sub_i32x4.sh
+run_gate "validated x86 SSE2 SIMD bitwise" bash tests/run_x86_simd_bitwise_i32x4.sh
 
-unsupported "pointer and memory model" "raw pointer categories and lexical checks exist, but provenance/alignment/lifetime instrumentation is incomplete"
+unsupported "pointer and memory model" "checked ordinary allocations quarantine address reuse and raw pointer categories plus lexical checks exist, but identity-carrying provenance, untracked allocator coverage, and general reference lifetimes remain incomplete"
 unsupported "allocator and reclamation" "opaque checked SystemAllocator capabilities and bounded retained fixed-buffer/arena regions exist, but custom/debug allocators and a general lifetime model are incomplete"
 unsupported "volatile/MMIO" "checked native 8/16/32-bit and word transactions plus bounded byte MmioRegion access exist, but physical device validation, opaque hardware authority, and the complete MMIO contract are incomplete"
 unsupported "atomics and concurrency" "compiler-reserved unsafe AtomicI64 receiver operations, raw Linux i32 futex wait/wake, literal-validated load/store/RMW/CAS/fence orders, and a direct captureless join-only Linux thread slice with one copied i64 worker argument exist, but language-wide fence semantics, general thread arguments/detach, litmus evidence, and a v2 concurrency model remain incomplete"
 unsupported "C ABI and dynamic linking" "checked v2 @cabi scalar plus bounded f64 dynamic imports, a direct captureless scalar/pointer callback, and scalar @cabi_export ET_REL objects with self-contained output or direct PLT32 import relocations exist, but general bidirectional ABI, relocation/static archive/shared-object conformance, and unload/lifetime contracts are incomplete"
-unsupported "CPU intrinsics/SIMD/inline assembly" "validated x86 scalar intrinsics and bounded unsafe SSE2 i32x4 add/subtract exist, but vector types/ABI, additional SIMD, inline-assembly constraints/clobbers, and full target-feature/effect checking are incomplete"
-unsupported "effect adversarial suite" "opaque aggregate/computed indirect calls and host effects in @kernel now fail closed, but verified aggregate rows, device-helper propagation, and distinct Atomic/FFI/GPU effect models remain incomplete"
+unsupported "CPU intrinsics/SIMD/inline assembly" "validated x86 scalar intrinsics and bounded unsafe SSE2 i32x4 arithmetic/bitwise operations exist, but vector types/ABI, broader SIMD, inline-assembly constraints/clobbers, and full target-feature/effect checking are incomplete"
 unsupported "physical GPU execution" "no runtime enumerate/allocate/dispatch/readback path"
-unsupported "sanitizers" "bounded native --sanitize=memory has exact requested-length bounds, deterministic free poisoning, and a coarse trailing guard page for dedicated large allocations, but red zones, allocation-site reports, and custom allocator coverage are incomplete"
+unsupported "sanitizers" "bounded native --sanitize=memory has exact requested-length bounds, 16-byte checked trailing red zones for small allocations, deterministic free poisoning, and a coarse guard page for dedicated large allocations, but allocation-site reports, stack/global instrumentation, and custom allocator coverage are incomplete"
 unsupported "documentation verification map" "verification matrix exists but records incomplete required capabilities"
 
 echo "════ v2-release pass=$pass fail=$fail ════"

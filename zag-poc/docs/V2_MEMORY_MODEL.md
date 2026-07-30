@@ -76,7 +76,10 @@ that every owned return is the same declared consuming parameter; the caller's
 direct named argument is invalidated and the bound result becomes the sole
 live owner. A precisely tracked field of a local value aggregate may make the
 same transfer: its field provenance is discharged and the bound result becomes
-the sole owner. Ambiguous, copied, or untracked field paths reject. The
+the sole owner. This now includes an opaque `Allocation` field when the helper
+is non-extern, has one exact `Allocation` owner parameter, and every terminal
+path returns that same parameter. Ambiguous, copied, fresh, or untracked field
+paths reject. The
 annotation is not authority by itself: mixed, fresh, indirect, computed, or
 unproven returns reject, as do calls without this explicit contract. A
 success-path `try helper(owner)` preserves this same identity; error paths
@@ -122,8 +125,13 @@ ordinary-allocation table
 also validates null/alignment plus access width and freed-state for
 `_zag_malloc`/`new`/`_zag_realloc` regions. That runtime table deliberately
 passes through stack/static/foreign and untracked allocator-family pointers;
-it cannot defeat raw-address forgery or same-address reuse, so it is not a
-general use-after-free proof. Paths deeper than the bounded
+it cannot defeat raw-address forgery. Checked-mode small frees are quarantined
+instead of recycled, and the table rejects any later ordinary allocation at a
+tombstoned address, so a stale ordinary raw address cannot be revived by
+allocator ABA. This consumes one of the bounded rows for every distinct
+checked allocation lifetime and fails closed on exhaustion; default unchecked
+free-list reuse is unchanged. Untracked allocator families can still reuse
+addresses, so this is not a general use-after-free proof. Paths deeper than the bounded
 field proof retain an uncertain provenance marker and fail closed until a
 proven prefix or whole container is overwritten. This establishes only named
 local aggregate provenance within the checked function, not general aggregate
@@ -259,9 +267,11 @@ lifetime paths rather than ambient unsafe behavior. The narrow raw-pointer
 global cell above is an exception with no initializer or destructor protocol;
 it is not a general pointer-bearing global object model.
 
-The native x86-64 allocator also marks a small allocation's size header as
-freed before it links that allocation into a free list, and restores the live
-mark when reusing it. A repeated runtime `delete`/`_zag_free` of such a block
+The native x86-64 default unchecked allocator marks a small allocation's size
+header as freed before linking that allocation into a free list, and restores the live
+mark when reusing it. Checked and sanitizer builds instead mark and quarantine
+the block for the process lifetime; they never publish its address as a new
+ordinary allocation. A repeated runtime `delete`/`_zag_free` of such a block
 therefore prints `zag runtime: invalid or double free` and exits nonzero rather
 than corrupting the allocator. `_zag_realloc` validates the same live mark and
 rejects a stale/freed input with `zag runtime: realloc of invalid or freed
@@ -275,19 +285,15 @@ freed tombstone produces the same deterministic diagnostic rather than an
 unmapped-memory fault. The entry changes to a tombstone only after `munmap`
 succeeds, so a failed unmap does not corrupt allocation telemetry. The table
 never allocates metadata dynamically: exhaustion terminates the process with
-`zag runtime: large allocation provenance registry exhausted`. A tombstone is
-discarded when the allocator acquires a later large or small object at that
-exact user address. Small-arena acquisition must participate because Linux may
-reuse part of an unmapped large range for an arena; retaining the old tombstone
-would falsely reject the new object's valid free. Because the ABI carries only
-a raw pointer, an old alias cannot be distinguished from a later live
-allocation at that identical address. This is allocator-integrity
-instrumentation, not general provenance or use-after-free instrumentation. A
+`zag runtime: large allocation provenance registry exhausted`. The default
+unchecked path may discard a tombstone when Linux later reissues the address. Checked and
+sanitizer mode additionally retain the ordinary-allocation tombstone and
+terminate with `zag safety: allocator address reuse violates checked
+quarantine` before returning any successor object at that address. This is
+bounded fail-closed instrumentation, not identity-carrying raw pointers. A
 stale dereference of a dedicated large mapping does trap at the operating
 system's unmapped-page boundary; the allocator lifetime gate exercises that
-behavior. It is not a typed diagnostic, does not cover small arena allocations,
-and cannot distinguish an old alias from a later allocation at the same
-address. Arbitrary forged addresses and the remaining unsafe dereference cases
+behavior. Arbitrary forged addresses, untracked allocation families, and the remaining unsafe dereference cases
 still require the unsafe programmer to uphold their contract.
 
 ## Pointer categories and lifetime
