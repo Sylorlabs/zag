@@ -10,6 +10,11 @@
 @import("../std/list.zag")
 
 extern fn _zag_raw_syscall(num: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) i64
+extern fn _zag_darwin_syscall(num: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) i64
+extern fn open(path: *i8, flags: i32) i32
+extern fn unlink(path: *i8) i32
+extern fn kqueue() i32
+extern fn kevent(kq: i32, changelist: *ZmdKevent, nchanges: i32, eventlist: *ZmdKevent, nevents: i32, timeout: *ZmdTimespec) i32
 extern fn _zag_darwin_fork() i64
 extern fn _zag_argc() i32
 extern fn _zag_arg(i: i32) []u8
@@ -20,38 +25,114 @@ extern fn _zag_exec_cmd(command: []u8) i32
 extern fn _zag_slice_ptr(s: []u8) *i8
 
 struct ZmdTimespec { sec: i64, nsec: i64 }
-// Exact Darwin `struct kevent` layout on 64-bit arm64: the SDK applies
-// `#pragma pack(4)`, leaving the six fields at offsets 0, 8, 10, 12, 16, 24.
-struct ZmdKevent { ident: i64, filter: i16, flags: u16, fflags: u32, data: i64, udata: i64 }
+struct ZmdWatch { fd: i64, path: []u8 }
+// ABI-exact Darwin `struct kevent` layout on arm64 (32 bytes).  Zag scalar
+// struct fields are word-aligned, so the filter/flags/fflags region is stored
+// as one packed i64 rather than three independently-declared fields.
+struct ZmdKevent { ident: i64, filter_flags: i64, data: i64, udata: i64 }
 
-fn zmd_kqueue() i64 { return _zag_raw_syscall(362, 0, 0, 0, 0, 0, 0); }
+fn zmd_kqueue() i64 { return kqueue() as i64; }
 
 fn zmd_open_event_dir(path: []u8) i64 {
+    // libSystem is the stable macOS ABI boundary for pathname handling.  The
+    // returned descriptor is native and is passed directly to kqueue.
     let cpath: ArrayList[u8] = zmd_cstr(path);
-    // Darwin open(2), O_EVTONLY. A directory descriptor is sufficient for
-    // EVFILT_VNODE; unlike Linux inotify it has no translated syscall ABI.
-    return _zag_raw_syscall(5, _zag_slice_ptr(cpath.data[0..cpath.len]) as i64,
-        32768, 0, 0, 0, 0);
+    return open(_zag_slice_ptr(cpath.data[0..cpath.len]),32768) as i64;
 }
 
-fn zmd_close(fd: i64) void { let _rc: i64 = _zag_raw_syscall(6, fd, 0, 0, 0, 0, 0); }
+fn zmd_open_read_dir(path: []u8) i64 {
+    // getdirentries64 needs a readable descriptor; keep this separate from
+    // the O_EVTONLY descriptor used by the event filter.
+    let cpath: ArrayList[u8] = zmd_cstr(path);
+    return open(_zag_slice_ptr(cpath.data[0..cpath.len]),0) as i64;
+}
+
+fn zmd_close(fd: i64) void { let _rc: i64 = _zag_darwin_syscall(6, fd, 0, 0, 0, 0, 0); }
 
 fn zmd_kqueue_watch(kq: i64, dirfd: i64) i64 {
-    let change: ZmdKevent = ZmdKevent{.ident=dirfd,.filter=(-4) as i16,
-        .flags=33 as u16,.fflags=127 as u32,.data=0,.udata=0};
+    // low16=EVFILT_VNODE(-4), bits16..31=EV_ADD|EV_CLEAR(33),
+    // bits32..63=NOTE_WRITE|DELETE|EXTEND|ATTRIB|LINK|RENAME|REVOKE(127).
+    let change: ZmdKevent = ZmdKevent{.ident=dirfd,.filter_flags=545463074812,.data=0,.udata=0};
     let timeout: ZmdTimespec = ZmdTimespec{.sec=0,.nsec=0};
-    // Darwin kevent(2): install EVFILT_VNODE | EV_ADD | EV_CLEAR. The SDK ABI
-    // is six arguments after the syscall number, exactly matching the raw
-    // runtime escape hatch.
-    return _zag_raw_syscall(363, kq, (&change) as i64, 1, 0, 0,
-        (&timeout) as i64);
+    // libSystem's kevent ABI is the native public interface for the packed
+    // Darwin structure and preserves all vnode-filter semantics.
+    return kevent(kq as i32, &change, 1, null as *ZmdKevent, 0, &timeout) as i64;
 }
 
 fn zmd_kqueue_wait(kq: i64) i64 {
-    let event: ZmdKevent = ZmdKevent{.ident=0,.filter=0,.flags=0,.fflags=0,.data=0,.udata=0};
+    let event: ZmdKevent = ZmdKevent{.ident=0,.filter_flags=0,.data=0,.udata=0};
     let timeout: ZmdTimespec = ZmdTimespec{.sec=0,.nsec=250000000};
-    return _zag_raw_syscall(363, kq, 0, 0, (&event) as i64, 1,
-        (&timeout) as i64);
+    return kevent(kq as i32, null as *ZmdKevent, 0, &event, 1, &timeout) as i64;
+}
+
+fn zmd_u16(data: []u8, off: i32) i32 {
+    return (data[off] as i32) + (data[off + 1] as i32) * 256;
+}
+
+fn zmd_name(data: []u8, off: i32, count: i32) []u8 {
+    let n: i32 = 0;
+    while (n < count && data[off + n] != 0) { n = n + 1; }
+    return data[off..off + n];
+}
+
+fn zmd_ignored_dir(name: []u8) i32 {
+    if (@strEq(name, ".") || @strEq(name, "..")) { return 1; }
+    if (@strEq(name, ".zag-cache") || @strEq(name, ".git")) { return 1; }
+    return 0;
+}
+
+fn zmd_watch_known(watches: ArrayList[ZmdWatch], path: []u8) i32 {
+    let i: i32 = 0;
+    while (i < watches.len) { if (@strEq(watches.data[i].path, path)) { return 1; } i = i + 1; }
+    return 0;
+}
+
+fn zmd_add_watch(kq: i64, path: []u8, watches: *ArrayList[ZmdWatch]) i32 {
+    if (path.len == 0 || watches.*.len >= 512 || zmd_watch_known(watches.*,path) == 1) { return 0; }
+    let fd: i64 = zmd_open_event_dir(path);
+    if (fd < 0 || zmd_kqueue_watch(kq,fd) < 0) { if (fd >= 0) { zmd_close(fd); } return 0; }
+    push[ZmdWatch](watches,ZmdWatch{.fd=fd,.path=path});
+    return 1;
+}
+
+// `getdirentries64(2)` uses the documented 64-bit Darwin dirent layout:
+// ino@0, seekoff@8, reclen@16, namlen@18, type@20, name@21.  Every project
+// directory gets its own EVFILT_VNODE fd; this is actual recursive coverage,
+// not a root-only kqueue approximation.
+fn zmd_watch_tree(kq: i64, path: []u8, watches: *ArrayList[ZmdWatch]) void {
+    let _added: i32 = zmd_add_watch(kq,path,watches);
+    let fd: i64 = zmd_open_read_dir(path);
+    if (fd < 0 || watches.*.len >= 512) { if (fd >= 0) { zmd_close(fd); } return; }
+    let entries: ArrayList[u8] = make[u8](4096);
+    while (entries.len < 4096) { push[u8](&entries,0 as u8); }
+    while (1 == 1) {
+        let base: i64 = 0;
+        let nread: i64 = _zag_darwin_syscall(344,fd,_zag_slice_ptr(entries.data[0..entries.len]) as i64,
+            entries.len,(&base) as i64,0,0);
+        if (nread <= 0) { break; }
+        let off: i32 = 0;
+        while (off + 21 <= nread) {
+            let reclen: i32 = zmd_u16(entries.data[0..nread as i32],off + 16);
+            let namlen: i32 = zmd_u16(entries.data[0..nread as i32],off + 18);
+            if (reclen < 21 || off + reclen > nread || namlen > reclen - 21) { off = nread as i32; }
+            else {
+                let dtype: i32 = entries.data[off + 20] as i32;
+                let name: []u8 = zmd_name(entries.data[0..nread as i32],off + 21,namlen);
+                if (dtype == 4 && zmd_ignored_dir(name) == 0) {
+                    let child: []u8 = zmd_join(path,name);
+                    zmd_watch_tree(kq,child,watches);
+                }
+                off = off + reclen;
+            }
+        }
+    }
+    free[u8](&entries); zmd_close(fd);
+}
+
+fn zmd_close_watches(watches: *ArrayList[ZmdWatch]) void {
+    let i: i32 = 0;
+    while (i < watches.*.len) { zmd_close(watches.*.data[i].fd); i = i + 1; }
+    free[ZmdWatch](watches);
 }
 
 fn zmd_sleep_ms(ms: i64) void {
@@ -61,10 +142,10 @@ fn zmd_sleep_ms(ms: i64) void {
         .nsec=(wait % 1000) * 1000000};
     // Darwin arm64 nanosleep(2), with the Darwin syscall number carried by
     // the macOS-only raw-syscall adapter.
-    let _rc: i64 = _zag_raw_syscall(240, (&ts) as i64, 0, 0, 0, 0, 0);
+    let _rc: i64 = _zag_darwin_syscall(240, (&ts) as i64, 0, 0, 0, 0, 0);
 }
 
-fn zmd_pid() i64 { return _zag_raw_syscall(20, 0, 0, 0, 0, 0, 0); }
+fn zmd_pid() i64 { return _zag_darwin_syscall(20, 0, 0, 0, 0, 0, 0); }
 fn zmd_fork() i64 { return _zag_darwin_fork(); }
 
 fn zmd_cstr(value: []u8) ArrayList[u8] {
@@ -77,9 +158,7 @@ fn zmd_cstr(value: []u8) ArrayList[u8] {
 
 fn zmd_unlink(path: []u8) void {
     let cpath: ArrayList[u8] = zmd_cstr(path);
-    // Darwin unlink(2).
-    let _rc: i64 = _zag_raw_syscall(10, _zag_slice_ptr(cpath.data[0..cpath.len]) as i64,
-        0, 0, 0, 0, 0);
+    let _rc: i32 = unlink(_zag_slice_ptr(cpath.data[0..cpath.len]));
 }
 
 fn zmd_join(root: []u8, leaf: []u8) []u8 {
@@ -107,14 +186,15 @@ fn zmd_dir(path: []u8) []u8 {
     return path[0..last];
 }
 
-fn zmd_status(root: []u8, pid: i64, mode: []u8, state: []u8, events: i64, native_events: i32) void {
+fn zmd_status(root: []u8, pid: i64, mode: []u8, state: []u8, events: i64, native_events: i32, watch_dirs: i32) void {
     let watcher: []u8 = "watcher=polling-root-module\n";
-    if (native_events == 1) { watcher = "watcher=kqueue-root\n"; }
+    if (native_events == 1) { watcher = "watcher=kqueue-recursive\n"; }
     let text: []u8 = _zag_str_concat("advisory=true\nexecutable_authority=false\ntarget=macos-arm64\n", watcher);
     text = _zag_str_concat(text, _zag_str_concat("pid=", _zag_i64_to_str(pid)));
     text = _zag_str_concat(text, _zag_str_concat("\nmode=", mode));
     text = _zag_str_concat(text, _zag_str_concat("\nstate=", state));
     text = _zag_str_concat(text, _zag_str_concat("\nevents=", _zag_i64_to_str(events)));
+    text = _zag_str_concat(text, _zag_str_concat("\nwatch_directories=", _zag_i64_to_str(watch_dirs as i64)));
     let _rc: i32 = _zag_write_file(zmd_join(root, ".zagd.status"), _zag_str_concat(text, "\n"));
 }
 
@@ -147,7 +227,7 @@ fn main() i32 {
     if (@strEq(mode, "off")) {
         let _stop: i32 = _zag_write_file(stop, "stop\n");
         zmd_unlink(lock);
-        zmd_status(root, 0, mode, "stopped", 0, 0);
+        zmd_status(root, 0, mode, "stopped", 0, 0, 0);
         return 0;
     }
 
@@ -162,40 +242,46 @@ fn main() i32 {
 
     zmd_unlink(stop);
     let kq: i64 = zmd_kqueue();
-    let event_dir: i64 = zmd_open_event_dir(root);
-    // Watch the root source separately as well as the project directory.  A
-    // kqueue vnode watch is descriptor-scoped (not recursive like inotify),
-    // so this preserves prompt native notification when the entry module is
-    // nested below the project root.
-    let event_source: i64 = zmd_open_event_dir(source);
-    let native_events: i32 = (kq >= 0 && event_dir >= 0 && zmd_kqueue_watch(kq, event_dir) >= 0) as i32;
-    if (native_events == 1 && event_source >= 0) { let _source_watch: i64 = zmd_kqueue_watch(kq, event_source); }
-    if (native_events == 0) { if (event_dir >= 0) { zmd_close(event_dir); } if (event_source >= 0) { zmd_close(event_source); } if (kq >= 0) { zmd_close(kq); } }
+    let watches: ArrayList[ZmdWatch] = make[ZmdWatch](32);
+    // Preserve the direct, previously verified root setup, then expand that
+    // root recursively. Subsequent traversal only adds unknown descendants.
+    let root_fd: i64 = zmd_open_event_dir(root);
+    let native_events: i32 = (kq >= 0 && root_fd >= 0 && zmd_kqueue_watch(kq,root_fd) >= 0) as i32;
+    if (native_events == 1) {
+        push[ZmdWatch](&watches,ZmdWatch{.fd=root_fd,.path=root});
+        zmd_watch_tree(kq,root,&watches);
+        let _source: i32 = zmd_add_watch(kq,source,&watches);
+    } else { if (root_fd >= 0) { zmd_close(root_fd); } }
+    if (native_events == 0 && kq >= 0) { zmd_close(kq); }
     let pid: i64 = zmd_pid();
     let _lock: i32 = _zag_write_file(lock, _zag_str_concat(_zag_i64_to_str(pid), "\n"));
     let prior: []u8 = _zag_read_file(source);
     let prior_hash: ZagdHash = zagd_content_hash(prior);
     let events: i64 = 0;
-    zmd_status(root, pid, mode, "idle", events, native_events);
+    zmd_status(root, pid, mode, "idle", events, native_events, watches.len);
 
     while (_zag_file_exists(stop) == 0) {
         let changed: i32 = 1;
         if (native_events == 1) { changed = (zmd_kqueue_wait(kq) > 0) as i32; }
         else { zmd_sleep_ms(250); }
         if (changed == 1) {
+            // VNODE events on a parent report child creation/rename. Rescan
+            // the tree before checking source content so new nested folders
+            // gain descriptors immediately and without polling.
+            if (native_events == 1) { zmd_watch_tree(kq,root,&watches); }
             let current: []u8 = _zag_read_file(source);
             let current_hash: ZagdHash = zagd_content_hash(current);
             if (zagd_hash_equal(prior_hash, current_hash) == 0) {
             prior_hash = current_hash;
             events = events + 1;
-            zmd_status(root, pid, mode, "checking", events, native_events);
+            zmd_status(root, pid, mode, "checking", events, native_events, watches.len);
             zmd_check(root, source);
-            zmd_status(root, pid, mode, "idle", events, native_events);
+            zmd_status(root, pid, mode, "idle", events, native_events, watches.len);
             }
         }
     }
-    if (native_events == 1) { zmd_close(event_dir); if (event_source >= 0) { zmd_close(event_source); } zmd_close(kq); }
+    if (native_events == 1) { zmd_close_watches(&watches); zmd_close(kq); }
     zmd_unlink(stop); zmd_unlink(lock);
-    zmd_status(root, pid, mode, "stopped", events, native_events);
+    zmd_status(root, pid, mode, "stopped", events, native_events, watches.len);
     return 0;
 }

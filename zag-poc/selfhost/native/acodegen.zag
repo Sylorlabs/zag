@@ -83,6 +83,26 @@ fn ac_is_int_text(s: []u8) i32 {
     return 1;
 }
 
+// Linux-numbered raw syscalls occur in a few portable runtime modules.  They
+// are not the same namespace as the backend's normal AK_SYSCALL identifiers:
+// for example Linux 57 is fork there but close in the AArch64 ABI table.
+// Translate only the audited process/runtime subset when producing Mach-O.
+fn ac_darwin_raw_linux_num(n: i32) i32 {
+    if (n == 0) { return 3; }     // read
+    if (n == 3) { return 6; }     // close
+    if (n == 20) { return 20; }   // getpid
+    if (n == 25) { return 92; }   // fcntl
+    if (n == 33) { return 90; }   // dup2
+    if (n == 35) { return 93; }   // nanosleep -> select timeout
+    if (n == 57) { return 2; }    // fork
+    if (n == 59) { return 59; }   // execve
+    if (n == 61) { return 7; }    // wait4
+    if (n == 62) { return 37; }   // kill
+    if (n == 109) { return 82; }  // setpgid
+    if (n == 293) { return 42; }  // pipe2 -> pipe
+    return 0 - 1;
+}
+
 // 'x' / '\n' single-char literal → value, or -1 if not a char literal.
 fn ac_char_lit_val(s: []u8) i64 {
     if (s.len < 3) { return 0 - 1; }
@@ -112,12 +132,27 @@ fn ac_decode_str(text: []u8, out: *ArrayList[u8]) void {
         let c: u8 = text[i];
         if (c == 92 && i + 1 < j) {
             let e: u8 = text[i + 1];
-            if (e == 'n') { push[u8](out, 10); }
-            else if (e == 't') { push[u8](out, 9); }
-            else if (e == 'r') { push[u8](out, 13); }
-            else if (e == '0') { push[u8](out, 0); }
-            else { push[u8](out, e); }
-            i = i + 2;
+            if (e == 'x' && i + 3 < j) {
+                let h0: u8 = text[i + 2];
+                let h1: u8 = text[i + 3];
+                let v0: i32 = 0;
+                let v1: i32 = 0;
+                if (h0 >= '0' && h0 <= '9') { v0 = (h0 as i32) - 48; }
+                else if (h0 >= 'a' && h0 <= 'f') { v0 = (h0 as i32) - 87; }
+                else if (h0 >= 'A' && h0 <= 'F') { v0 = (h0 as i32) - 55; }
+                if (h1 >= '0' && h1 <= '9') { v1 = (h1 as i32) - 48; }
+                else if (h1 >= 'a' && h1 <= 'f') { v1 = (h1 as i32) - 87; }
+                else if (h1 >= 'A' && h1 <= 'F') { v1 = (h1 as i32) - 55; }
+                push[u8](out, (v0 * 16 + v1) as u8);
+                i = i + 4;
+            } else {
+                if (e == 'n') { push[u8](out, 10); }
+                else if (e == 't') { push[u8](out, 9); }
+                else if (e == 'r') { push[u8](out, 13); }
+                else if (e == '0') { push[u8](out, 0); }
+                else { push[u8](out, e); }
+                i = i + 2;
+            }
         } else {
             push[u8](out, c);
             i = i + 1;
@@ -150,6 +185,7 @@ struct ACg {
     next: i32,
     err: i32,
     target_os: i32,    // 0 = Linux ELF, 1 = macOS Mach-O
+    safety_checked: i32, // guarded raw-pointer lowering (macOS v2 port)
     data: *ArrayList[u8],
     pi_lbl: i32,
     ps_lbl: i32,
@@ -191,6 +227,7 @@ struct ACg {
     use_s2: i32,
     frame_words: i32,
     epilogue: i32,
+    current_lbl: i32, // function being lowered; native code-address anchor
     sret_disp: i32,     // frame disp of the saved x8 sret pointer (0 = none)
     sret_words: i32,    // words of the aggregate being returned (0 = scalar)
     ret_ty: []u8,       // current fn's return type
@@ -664,6 +701,48 @@ fn ac_emit_div0(out: *ArrayList[AInstr], lbl: i32, cg: *ACg) void {
     push[AInstr](out, ai_ret());
 }
 
+// Checked raw-pointer accesses must fail before a hardware fault.  This is the
+// first ARM64 checked-mode primitive: later slices add alignment, allocation
+// provenance, bounds, and freed-region checks ahead of this common trap.
+fn ac_emit_checked_nonnull(out: *ArrayList[AInstr], ptr: i32, cg: *ACg) void {
+    if (cg.*.safety_checked == 0) { return; }
+    let l_ok: i32 = ac_fresh(cg);
+    push[AInstr](out, ai_cmp_imm(ptr, 0));
+    push[AInstr](out, ai_jne(l_ok));
+    let off: i32 = ac_intern_str(cg, "zag safety: null raw pointer access", 1);
+    push[AInstr](out, ai_mov_imm(A_X0(), 2));
+    push[AInstr](out, ai_data_addr(A_X1(), off));
+    push[AInstr](out, ai_mov_imm(A_X2(), 36));
+    push[AInstr](out, ai_syscall(64));
+    push[AInstr](out, ai_mov_imm(A_X0(), 134));
+    push[AInstr](out, ai_syscall(93));
+    push[AInstr](out, ai_label(l_ok));
+}
+
+fn ac_checked_alignment(ty: []u8) i32 {
+    if (@strEq(ty, "i8") || @strEq(ty, "u8") || @strEq(ty, "bool")) { return 1; }
+    if (@strEq(ty, "i16") || @strEq(ty, "u16")) { return 2; }
+    if (@strEq(ty, "i32") || @strEq(ty, "u32") || @strEq(ty, "f32")) { return 4; }
+    return 8;
+}
+
+fn ac_emit_checked_alignment(out: *ArrayList[AInstr], ptr: i32, align: i32, cg: *ACg) void {
+    if (cg.*.safety_checked == 0 || align <= 1) { return; }
+    let l_ok: i32 = ac_fresh(cg);
+    push[AInstr](out, ai_mov_rr(A_X9(), ptr));
+    push[AInstr](out, ai_and_imm(A_X9(), (align - 1) as i64));
+    push[AInstr](out, ai_cmp_imm(A_X9(), 0));
+    push[AInstr](out, ai_je(l_ok));
+    let off: i32 = ac_intern_str(cg, "zag safety: misaligned raw pointer access", 1);
+    push[AInstr](out, ai_mov_imm(A_X0(), 2));
+    push[AInstr](out, ai_data_addr(A_X1(), off));
+    push[AInstr](out, ai_mov_imm(A_X2(), 42));
+    push[AInstr](out, ai_syscall(64));
+    push[AInstr](out, ai_mov_imm(A_X0(), 134));
+    push[AInstr](out, ai_syscall(93));
+    push[AInstr](out, ai_label(l_ok));
+}
+
 // ── expression type inference (best-effort; "" = unknown scalar) ────────────
 
 fn ac_expr_type(n: *Node, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) []u8 {
@@ -737,7 +816,7 @@ fn ac_expr_type(n: *Node, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) []u8 {
                     if (@strEq(fnid.name, "_zag_malloc") || @strEq(fnid.name, "_zag_realloc") || @strEq(fnid.name, "_zag_script_context_init") || @strEq(fnid.name, "_zag_script_alloc") || @strEq(fnid.name, "_zag_process_result_abi_new") || @strEq(fnid.name, "_zag_script_process_result_abi_new")) { return "*opaque"; }
                     if (@strEq(fnid.name, "_zag_str_to_i64")) { return "i64"; }
                     if (@strEq(fnid.name, "_zag_slice_ptr")) { return "*i8"; }
-                    if (@strEq(fnid.name, "_zag_raw_syscall") || @strEq(fnid.name, "_zag_darwin_fork") || @strEq(fnid.name, "_zag_x86_cpuid_eax") ||
+                    if (@strEq(fnid.name, "_zag_raw_syscall") || @strEq(fnid.name, "_zag_darwin_syscall") || @strEq(fnid.name, "_zag_darwin_open") || @strEq(fnid.name, "_zag_darwin_fork") || @strEq(fnid.name, "_zag_code_anchor") || @strEq(fnid.name, "_zag_x86_cpuid_eax") ||
                         @strEq(fnid.name, "_zag_x86_cpuid_ebx") || @strEq(fnid.name, "_zag_x86_cpuid_ecx") ||
                         @strEq(fnid.name, "_zag_x86_cpuid_edx") || @strEq(fnid.name, "_zag_x86_xgetbv")) { return "i64"; }
                     if (@strEq(fnid.name, "__catch") || @strEq(fnid.name, "__catchc")) {
@@ -932,6 +1011,12 @@ fn ac_lower_addr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
             if (@strEq(f.fname, "*")) {
                 // address of p.* is the pointer value itself
                 ac_lower_expr(out, f.base, env, syms, cg);
+                if (bt.len > 1 && bt[0] == '*') {
+                    push[AInstr](out, ai_pop(A_X0()));
+                    ac_emit_checked_nonnull(out, A_X0(), cg);
+                    ac_emit_checked_alignment(out, A_X0(), ac_checked_alignment(bt[1..]), cg);
+                    push[AInstr](out, ai_push(A_X0()));
+                }
                 return;
             }
             if (ac_type_is_slice(bt) == 1 && @strEq(f.fname, "len")) {
@@ -973,6 +1058,7 @@ fn ac_lower_addr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
             ac_lower_expr(out, ix.idx, env, syms, cg);
             push[AInstr](out, ai_pop(A_X1()));
             push[AInstr](out, ai_pop(A_X0()));
+            if (is_slice == 0) { ac_emit_checked_nonnull(out, A_X0(), cg); ac_emit_checked_alignment(out, A_X0(), ac_checked_alignment(elem), cg); }
             if (stride != 1) {
                 push[AInstr](out, ai_mov_imm(A_X9(), stride as i64));
                 push[AInstr](out, ai_mul(A_X1(), A_X1(), A_X9()));
@@ -1434,8 +1520,10 @@ fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
                 let elem: []u8 = "";
                 if (bt.len > 1 && bt[0] == '*') { elem = bt[1..]; }
                 ac_lower_expr(out, f.base, env, syms, cg);   // pointer value
-                if (ac_is_aggregate(cg, elem) == 1) { return; }  // address IS the value
                 push[AInstr](out, ai_pop(A_X10()));
+                ac_emit_checked_nonnull(out, A_X10(), cg);
+                ac_emit_checked_alignment(out, A_X10(), ac_checked_alignment(elem), cg);
+                if (ac_is_aggregate(cg, elem) == 1) { push[AInstr](out, ai_push(A_X10())); return; }  // address IS the value
                 push[AInstr](out, ai_load(A_X0(), A_X10(), 0));
                 push[AInstr](out, ai_push(A_X0()));
                 return;
@@ -2377,6 +2465,15 @@ fn ac_lower_builtin(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv, s
         push[AInstr](out, ai_push(A_X0()));
         return 1;
     }
+    // ── _zag_code_anchor() → current function's executable address ──────────
+    // Mach-O is PIE: a preferred VM address is not the mapped code address.
+    // ADR to this function's label gives Darwin runtimes an ASLR-safe anchor.
+    if (@strEq(fname, "_zag_code_anchor")) {
+        if (nargs != 0) { ac_err(cg, "arm64: _zag_code_anchor expects no arguments"); }
+        push[AInstr](out, ai_lea_lbl(A_X0(), cg.*.current_lbl));
+        push[AInstr](out, ai_push(A_X0()));
+        return 1;
+    }
     // ── Darwin adapter lifecycle primitive ───────────────────────────────────
     // The Darwin fork syscall has a distinct child-result convention.  Reuse
     // the static Linux-clone identifier so the Mach-O encoder applies its
@@ -2398,6 +2495,66 @@ fn ac_lower_builtin(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv, s
     // back safely when the arm64 syscall of that number returns an error.)
     if (@strEq(fname, "_zag_raw_syscall")) {
         if (nargs != 7) { ac_err(cg, "arm64: _zag_raw_syscall expects 7 arguments (num, a1..a6)"); push[AInstr](out, ai_mov_imm(A_X0(), 0 - 1)); push[AInstr](out, ai_push(A_X0())); return 1; }
+        // This legacy escape hatch is specified in Linux AArch64 numbers.
+        // On Mach-O, never feed those values directly to the Darwin trap:
+        // doing so can select an unrelated host syscall. Require its number
+        // to be known here so the established Linux→Darwin mapper handles it.
+        if (cg.*.target_os == AC_OS_MACOS()) {
+            let raw_num: i32 = 0 - 1;
+            switch (get[*Node](c.args,0).*) { .ilit => |lit| { if (ac_is_int_text(lit.text) == 1) { raw_num = ac_parse_i64(lit.text) as i32; } } else => { } }
+            // Linux-only helper code may carry a computed syscall number even
+            // when it is unreachable in a Mach-O program (for example, the
+            // compiler's Linux cache implementation). Never translate an
+            // unknown value into an arbitrary Darwin trap; make that legacy
+            // path fail closed while explicit Darwin adapters remain usable.
+            if (raw_num < 0) { push[AInstr](out,ai_mov_imm(A_X0(),0-78)); push[AInstr](out,ai_push(A_X0())); return 1; }
+            let darwin_num: i32 = ac_darwin_raw_linux_num(raw_num);
+            if (darwin_num < 0) { push[AInstr](out,ai_mov_imm(A_X0(),0-78)); push[AInstr](out,ai_push(A_X0())); return 1; }
+            let mai: i32 = 1;
+            while (mai < 7) { ac_lower_expr(out,get[*Node](c.args,mai),env,syms,cg); mai = mai + 1; }
+            push[AInstr](out,ai_pop(A_X5())); push[AInstr](out,ai_pop(A_X4())); push[AInstr](out,ai_pop(A_X3()));
+            push[AInstr](out,ai_pop(A_X2())); push[AInstr](out,ai_pop(A_X1())); push[AInstr](out,ai_pop(A_X0()));
+            // The source uses Linux O_NONBLOCK (2048) with F_SETFL. Darwin
+            // uses bit 4; the command code itself is shared.
+            if (raw_num == 25) { push[AInstr](out,ai_mov_imm(A_X2(),4)); }
+            // XNU does not expose Linux nanosleep as this raw ABI.  select(2)
+            // with no descriptor sets is the native timeout primitive.  The
+            // portable source stores {seconds,nanoseconds}; timeval needs
+            // {seconds,microseconds} in the same two-word storage.
+            if (raw_num == 35) {
+                push[AInstr](out,ai_load(A_X9(),A_X0(),8)); push[AInstr](out,ai_mov_rr(A_X6(),A_X9())); push[AInstr](out,ai_mov_imm(A_X10(),1000));
+                push[AInstr](out,ai_sdiv(A_X9(),A_X9(),A_X10())); push[AInstr](out,ai_store(A_X0(),8,A_X9()));
+                push[AInstr](out,ai_mov_rr(A_X4(),A_X0())); push[AInstr](out,ai_mov_imm(A_X0(),0));
+                push[AInstr](out,ai_mov_imm(A_X1(),0)); push[AInstr](out,ai_mov_imm(A_X2(),0)); push[AInstr](out,ai_mov_imm(A_X3(),0));
+            }
+            // Darwin's kernel pipe syscall returns its two descriptors in
+            // x0/x1, while Linux pipe2 writes packed i32 descriptors through
+            // its first argument. Preserve the portable source contract.
+            if (raw_num == 293) { push[AInstr](out,ai_mov_rr(A_X6(),A_X0())); }
+            push[AInstr](out,ai_darwin_syscall(darwin_num));
+            if (raw_num == 293) {
+                let pipe_done:i32=ac_fresh(cg);
+                push[AInstr](out,ai_cmp_imm(A_X0(),0)); push[AInstr](out,ai_jl(pipe_done));
+                push[AInstr](out,ai_mov_imm(A_X9(),32)); push[AInstr](out,ai_shl(A_X1(),A_X9()));
+                push[AInstr](out,ai_or(A_X0(),A_X1())); push[AInstr](out,ai_store(A_X6(),0,A_X0()));
+                push[AInstr](out,ai_label(pipe_done));
+            }
+            // XNU fork returns {child_pid, 0} to the parent and
+            // {parent_pid, 1} to the child.  The portable raw contract is the
+            // usual {child_pid, 0} parent / {0} child result.
+            if (raw_num == 57) {
+                let fork_done:i32=ac_fresh(cg); let fork_parent:i32=ac_fresh(cg);
+                push[AInstr](out,ai_cmp_imm(A_X0(),0)); push[AInstr](out,ai_jl(fork_done));
+                push[AInstr](out,ai_cmp_imm(A_X1(),0)); push[AInstr](out,ai_je(fork_parent));
+                push[AInstr](out,ai_mov_imm(A_X0(),0)); push[AInstr](out,ai_label(fork_parent));
+                push[AInstr](out,ai_label(fork_done));
+            }
+            // select(2) updates timeval to the unslept remainder.  The
+            // portable caller intentionally reuses its timespec on every
+            // polling iteration, so restore its original nanoseconds.
+            if (raw_num == 35) { push[AInstr](out,ai_store(A_X4(),8,A_X6())); }
+            push[AInstr](out,ai_push(A_X0())); return 1;
+        }
         let sai: i32 = 0;
         while (sai < 7) {
             ac_lower_expr(out, get[*Node](c.args, sai), env, syms, cg);
@@ -2413,6 +2570,43 @@ fn ac_lower_builtin(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv, s
         push[AInstr](out, ai_syscall_reg(A_X8()));
         push[AInstr](out, ai_push(A_X0()));
         return 1;
+    }
+    // ── _zag_darwin_syscall(const_num, a1..a6) → x0 ────────────────────────
+    // Native macOS adapters use fixed Darwin syscall identities. Keeping that
+    // number immediate produces the same call sequence as the proven runtime
+    // file-I/O lowering and avoids treating Darwin IDs as Linux identifiers.
+    if (@strEq(fname, "_zag_darwin_syscall")) {
+        if (nargs != 7) { ac_err(cg, "arm64: _zag_darwin_syscall expects 7 arguments"); push[AInstr](out, ai_mov_imm(A_X0(), 0 - 1)); push[AInstr](out, ai_push(A_X0())); return 1; }
+        let num: i32 = 0 - 1;
+        switch (get[*Node](c.args,0).*) { .ilit => |lit| { if (ac_is_int_text(lit.text) == 1) { num = ac_parse_i64(lit.text) as i32; } } else => { } }
+        if (num < 0) { ac_err(cg, "arm64: _zag_darwin_syscall requires a non-negative integer literal number"); push[AInstr](out, ai_mov_imm(A_X0(), 0 - 1)); push[AInstr](out, ai_push(A_X0())); return 1; }
+        let dai: i32 = 1;
+        while (dai < 7) { ac_lower_expr(out, get[*Node](c.args,dai), env, syms, cg); dai = dai + 1; }
+        push[AInstr](out, ai_pop(A_X5())); push[AInstr](out, ai_pop(A_X4())); push[AInstr](out, ai_pop(A_X3()));
+        push[AInstr](out, ai_pop(A_X2())); push[AInstr](out, ai_pop(A_X1())); push[AInstr](out, ai_pop(A_X0()));
+        push[AInstr](out, ai_darwin_syscall(num)); push[AInstr](out, ai_push(A_X0())); return 1;
+    }
+    // ── _zag_darwin_open(path, flags) → fd / -errno ─────────────────────────
+    // This is a path-specific Darwin primitive, not a libc fallback. It shares
+    // the fixed openat lowering used by the verified native file runtime:
+    // construct a NUL-terminated path, then issue SYS_openat directly.
+    if (@strEq(fname, "_zag_darwin_open")) {
+        if (nargs != 2) { ac_err(cg, "arm64: _zag_darwin_open expects path and flags"); push[AInstr](out, ai_mov_imm(A_X0(),0-1)); push[AInstr](out,ai_push(A_X0())); return 1; }
+        let flags: i64 = 0 - 1;
+        switch (get[*Node](c.args,1).*) { .ilit => |lit| { if (ac_is_int_text(lit.text) == 1) { flags = ac_parse_i64(lit.text); } } else => { } }
+        if (flags < 0) { ac_err(cg, "arm64: _zag_darwin_open requires a non-negative integer literal flags value"); push[AInstr](out,ai_mov_imm(A_X0(),0-1)); push[AInstr](out,ai_push(A_X0())); return 1; }
+        ac_lower_expr(out,get[*Node](c.args,0),env,syms,cg);
+        push[AInstr](out,ai_pop(A_X0()));
+        // Native watch flags are compile-time ABI constants; load them only
+        // after the helper returns.
+        // __pathbuf allocates the NUL-terminated copy through __alloc.  Mark
+        // both helpers live; otherwise a watcher-only program can call an
+        // un-emitted allocator label and silently fall back from kqueue.
+        cg.*.use_al=1; cg.*.use_pb=1; push[AInstr](out,ai_call(cg.*.pb_lbl));
+        push[AInstr](out,ai_mov_rr(A_X1(),A_X0())); push[AInstr](out,ai_mov_imm(A_X0(),0-2));
+        push[AInstr](out,ai_mov_imm(A_X2(),flags));
+        push[AInstr](out,ai_mov_imm(A_X3(),0)); push[AInstr](out,ai_syscall(56));
+        push[AInstr](out,ai_push(A_X0())); return 1;
     }
     // ── x86 CPU feature discovery intrinsics ─────────────────────────────────
     // CPUID/XGETBV do not exist on AArch64. Native x86 feature detection is
@@ -2436,6 +2630,64 @@ fn ac_lower_builtin(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv, s
 }
 
 // @-builtins (leading '@'): @sizeOf, @len/@strLen, @strEq, @intCast/@truncate.
+fn ac_atomic_order_literal(n: *Node) i64 {
+    switch (n.*) {
+        .ilit => |x| {
+            if (@strEq(x.text,"0")) { return 0; }
+            if (@strEq(x.text,"1")) { return 1; }
+            if (@strEq(x.text,"2")) { return 2; }
+            if (@strEq(x.text,"3")) { return 3; }
+            if (@strEq(x.text,"4")) { return 4; }
+        }
+        else => { }
+    }
+    return 0 - 1;
+}
+
+// Emit a baseline ARMv8 LL/SC RMW.  The address and operand are evaluated
+// exactly once before the retry loop; every public RMW is acquire/release and
+// seq_cst adds conservative full fences around the transaction.
+fn ac_emit_atomic_rmw(out: *ArrayList[AInstr], c: Call, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg, op: i32, ordered: i32, order: i64) void {
+    let ptr_slot: i32 = ac_slot_scratch(cg, 1);
+    let val_slot: i32 = ac_slot_scratch(cg, 1);
+    ac_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+    push[AInstr](out, ai_pop(A_X10()));
+    ac_emit_checked_nonnull(out, A_X10(), cg); ac_emit_checked_alignment(out, A_X10(), 8, cg);
+    push[AInstr](out, ai_store(A_X29(), ptr_slot, A_X10()));
+    ac_lower_expr(out, get[*Node](c.args, 1), env, syms, cg);
+    push[AInstr](out, ai_pop(A_X12()));
+    if (op == 2) { push[AInstr](out, ai_neg(A_X12(), A_X12())); }
+    push[AInstr](out, ai_store(A_X29(), val_slot, A_X12()));
+    if (ordered == 1 && order == 4) { push[AInstr](out, ai_dmb()); }
+    let retry: i32 = ac_fresh(cg);
+    push[AInstr](out, ai_label(retry));
+    push[AInstr](out, ai_load(A_X10(), A_X29(), ptr_slot));
+    push[AInstr](out, ai_ldaxr(A_X11(), A_X10()));
+    push[AInstr](out, ai_load(A_X12(), A_X29(), val_slot));
+    if (op == 0) { push[AInstr](out, ai_mov_rr(A_X13(), A_X12())); }
+    else {
+        push[AInstr](out, ai_mov_rr(A_X13(), A_X11()));
+        if (op == 1 || op == 2) { push[AInstr](out, ai_add(A_X13(), A_X12())); }
+        else if (op == 3) { push[AInstr](out, ai_andr(A_X13(), A_X12())); }
+        else if (op == 4) { push[AInstr](out, ai_or(A_X13(), A_X12())); }
+        else { push[AInstr](out, ai_xor(A_X13(), A_X12())); }
+    }
+    push[AInstr](out, ai_stlxr(A_X14(), A_X13(), A_X10()));
+    push[AInstr](out, ai_cmp_imm(A_X14(), 0)); push[AInstr](out, ai_jne(retry));
+    if (ordered == 1 && order == 4) { push[AInstr](out, ai_dmb()); }
+    push[AInstr](out, ai_push(A_X11()));
+}
+
+// Compare-exchange returns the observed old value.  A failed comparison never
+// issues STXR; a failed reservation retries with a fresh exclusive load.
+fn ac_emit_atomic_cas(out: *ArrayList[AInstr], c: Call, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg, ordered: i32, success: i64) void {
+    let ptr_slot:i32=ac_slot_scratch(cg,1);let expected_slot:i32=ac_slot_scratch(cg,1);let desired_slot:i32=ac_slot_scratch(cg,1);
+    ac_lower_expr(out,get[*Node](c.args,0),env,syms,cg);push[AInstr](out,ai_pop(A_X10()));ac_emit_checked_nonnull(out,A_X10(),cg);ac_emit_checked_alignment(out,A_X10(),8,cg);push[AInstr](out,ai_store(A_X29(),ptr_slot,A_X10()));
+    ac_lower_expr(out,get[*Node](c.args,1),env,syms,cg);push[AInstr](out,ai_pop(A_X11()));push[AInstr](out,ai_store(A_X29(),expected_slot,A_X11()));
+    ac_lower_expr(out,get[*Node](c.args,2),env,syms,cg);push[AInstr](out,ai_pop(A_X12()));push[AInstr](out,ai_store(A_X29(),desired_slot,A_X12()));
+    if(ordered==1&&success==4){push[AInstr](out,ai_dmb());}let retry:i32=ac_fresh(cg);let done:i32=ac_fresh(cg);push[AInstr](out,ai_label(retry));push[AInstr](out,ai_load(A_X10(),A_X29(),ptr_slot));push[AInstr](out,ai_ldaxr(A_X11(),A_X10()));push[AInstr](out,ai_load(A_X12(),A_X29(),expected_slot));push[AInstr](out,ai_cmp(A_X11(),A_X12()));push[AInstr](out,ai_jne(done));push[AInstr](out,ai_load(A_X12(),A_X29(),desired_slot));push[AInstr](out,ai_stlxr(A_X13(),A_X12(),A_X10()));push[AInstr](out,ai_cmp_imm(A_X13(),0));push[AInstr](out,ai_jne(retry));push[AInstr](out,ai_label(done));if(ordered==1&&success==4){push[AInstr](out,ai_dmb());}push[AInstr](out,ai_push(A_X11()));
+}
+
 fn ac_lower_at_builtin(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) void {
     let b: []u8 = fname[1..];
     let nargs: i32 = len[*Node](c.args);
@@ -2447,6 +2699,32 @@ fn ac_lower_at_builtin(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv
     if (nfn.len > 0) {
         ac_lower_call(out, Call{ .callee = mk_ident(nfn), .args = c.args, .targs = make[[]u8](1) }, env, syms, cg);
         return;
+    }
+    // Native ARM64 atomic i64 operations. Loads/stores use the architectural
+    // acquire/release instructions; RMW uses LL/SC rather than optional LSE.
+    if (@strEq(b,"atomicLoad64") || @strEq(b,"atomicLoad64Order")) {
+        let ordered:i32=(@strEq(b,"atomicLoad64Order") as i32); let need:i32=1; if(ordered==1){need=2;}
+        if(nargs!=need){ac_err(cg,"arm64: atomic load expects pointer and optional literal order");push[AInstr](out,ai_mov_imm(A_X0(),0));push[AInstr](out,ai_push(A_X0()));return;}
+        let order:i64=0;if(ordered==1){order=ac_atomic_order_literal(get[*Node](c.args,1));}
+        if(order<0||order==2||order==3){ac_err(cg,"arm64: invalid atomic load order");push[AInstr](out,ai_mov_imm(A_X0(),0));push[AInstr](out,ai_push(A_X0()));return;}
+        ac_lower_expr(out,get[*Node](c.args,0),env,syms,cg);push[AInstr](out,ai_pop(A_X10()));ac_emit_checked_nonnull(out,A_X10(),cg);ac_emit_checked_alignment(out,A_X10(),8,cg);
+        if(order==0){push[AInstr](out,ai_load(A_X0(),A_X10(),0));}else{if(order==4){push[AInstr](out,ai_dmb());}push[AInstr](out,ai_ldar(A_X0(),A_X10()));if(order==4){push[AInstr](out,ai_dmb());}}
+        push[AInstr](out,ai_push(A_X0()));return;
+    }
+    if (@strEq(b,"atomicStore64") || @strEq(b,"atomicStore64Order")) {
+        let ordered:i32=(@strEq(b,"atomicStore64Order") as i32);let need:i32=2;if(ordered==1){need=3;}
+        if(nargs!=need){ac_err(cg,"arm64: atomic store expects pointer, value, and optional literal order");push[AInstr](out,ai_mov_imm(A_X0(),0));push[AInstr](out,ai_push(A_X0()));return;}
+        let order:i64=0;if(ordered==1){order=ac_atomic_order_literal(get[*Node](c.args,2));}
+        if(order<0||order==1||order==3){ac_err(cg,"arm64: invalid atomic store order");push[AInstr](out,ai_mov_imm(A_X0(),0));push[AInstr](out,ai_push(A_X0()));return;}
+        let slot:i32=ac_slot_scratch(cg,1);ac_lower_expr(out,get[*Node](c.args,0),env,syms,cg);push[AInstr](out,ai_pop(A_X10()));ac_emit_checked_nonnull(out,A_X10(),cg);ac_emit_checked_alignment(out,A_X10(),8,cg);push[AInstr](out,ai_store(A_X29(),slot,A_X10()));ac_lower_expr(out,get[*Node](c.args,1),env,syms,cg);push[AInstr](out,ai_pop(A_X11()));push[AInstr](out,ai_load(A_X10(),A_X29(),slot));
+        if(order==0){push[AInstr](out,ai_store(A_X10(),0,A_X11()));}else{if(order==4){push[AInstr](out,ai_dmb());}push[AInstr](out,ai_stlr(A_X10(),A_X11()));if(order==4){push[AInstr](out,ai_dmb());}}push[AInstr](out,ai_mov_imm(A_X0(),0));push[AInstr](out,ai_push(A_X0()));return;
+    }
+    if (@strEq(b,"atomicExchange64") || @strEq(b,"atomicFetchAdd64") || @strEq(b,"atomicFetchSub64") || @strEq(b,"atomicFetchAnd64") || @strEq(b,"atomicFetchOr64") || @strEq(b,"atomicFetchXor64") || @strEq(b,"atomicExchange64Order") || @strEq(b,"atomicFetchAdd64Order") || @strEq(b,"atomicFetchSub64Order") || @strEq(b,"atomicFetchAnd64Order") || @strEq(b,"atomicFetchOr64Order") || @strEq(b,"atomicFetchXor64Order")) {
+        let ordered:i32=0;if(b.len>5&&@strEq(b[b.len-5..],"Order")){ordered=1;}let need:i32=2;if(ordered==1){need=3;}if(nargs!=need){ac_err(cg,"arm64: atomic RMW has wrong arity");push[AInstr](out,ai_mov_imm(A_X0(),0));push[AInstr](out,ai_push(A_X0()));return;}let order:i64=0;if(ordered==1){order=ac_atomic_order_literal(get[*Node](c.args,2));}if(order<0){ac_err(cg,"arm64: atomic memory order must be literal 0..4");push[AInstr](out,ai_mov_imm(A_X0(),0));push[AInstr](out,ai_push(A_X0()));return;}
+        let op:i32=5;if(@strEq(b,"atomicExchange64")||@strEq(b,"atomicExchange64Order")){op=0;}else if(@strEq(b,"atomicFetchAdd64")||@strEq(b,"atomicFetchAdd64Order")){op=1;}else if(@strEq(b,"atomicFetchSub64")||@strEq(b,"atomicFetchSub64Order")){op=2;}else if(@strEq(b,"atomicFetchAnd64")||@strEq(b,"atomicFetchAnd64Order")){op=3;}else if(@strEq(b,"atomicFetchOr64")||@strEq(b,"atomicFetchOr64Order")){op=4;}ac_emit_atomic_rmw(out,c,env,syms,cg,op,ordered,order);return;
+    }
+    if(@strEq(b,"atomicCompareExchange64")||@strEq(b,"atomicCompareExchange64Order")){
+        let ordered:i32=(@strEq(b,"atomicCompareExchange64Order") as i32);let need:i32=3;if(ordered==1){need=5;}if(nargs!=need){ac_err(cg,"arm64: atomic compare-exchange has wrong arity");push[AInstr](out,ai_mov_imm(A_X0(),0));push[AInstr](out,ai_push(A_X0()));return;}let success:i64=0;let failure:i64=0;if(ordered==1){success=ac_atomic_order_literal(get[*Node](c.args,3));failure=ac_atomic_order_literal(get[*Node](c.args,4));}if(success<0||failure<0||failure==2||failure==3||(failure==1&&success==0)||(failure==4&&success!=4)){ac_err(cg,"arm64: invalid atomic compare-exchange orders");push[AInstr](out,ai_mov_imm(A_X0(),0));push[AInstr](out,ai_push(A_X0()));return;}ac_emit_atomic_cas(out,c,env,syms,cg,ordered,success);return;
     }
     if (@strEq(b, "atomicFence")) {
         if (nargs != 1) { ac_err(cg, "arm64: @atomicFence expects one literal order"); push[AInstr](out, ai_mov_imm(A_X0(), 0)); push[AInstr](out, ai_push(A_X0())); return; }
@@ -3021,6 +3299,7 @@ fn ac_lower_fn(out: *ArrayList[AInstr], f: FnDecl, lbl: i32, syms: ArrayList[AFn
 
     let epi: i32 = ac_fresh(cg);
     cg.*.epilogue = epi;
+    cg.*.current_lbl = lbl;
     cg.*.frame_words = 0;
     cg.*.sret_disp = 0;
     cg.*.sret_words = 0;
@@ -4177,7 +4456,7 @@ fn ac_emit_print_f64(out: *ArrayList[AInstr], lbl: i32, cg: *ACg) void {
     push[AInstr](out, ai_ret());
 }
 
-fn aload_program_target(decls0: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8], target_os: i32) ArrayList[AInstr] {
+fn aload_program_target(decls0: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8], target_os: i32, safety_checked: i32) ArrayList[AInstr] {
     let out: ArrayList[AInstr] = make[AInstr](128);
     let top_err: i32 = 0;
 
@@ -4288,6 +4567,7 @@ fn aload_program_target(decls0: ArrayList[*Node], errout: *i32, dataout: *ArrayL
         .next = next_id + 19,
         .err = top_err,
         .target_os = target_os,
+        .safety_checked = safety_checked,
         .data = dataout,
         .pi_lbl = pi_lbl,
         .ps_lbl = ps_lbl,
@@ -4329,6 +4609,7 @@ fn aload_program_target(decls0: ArrayList[*Node], errout: *i32, dataout: *ArrayL
         .use_s2 = 0,
         .frame_words = 0,
         .epilogue = 0,
+        .current_lbl = 0,
         .sret_disp = 0,
         .sret_words = 0,
         .ret_ty = "",
@@ -4406,9 +4687,13 @@ fn aload_program_target(decls0: ArrayList[*Node], errout: *i32, dataout: *ArrayL
 }
 
 fn aload_program(decls0: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8]) ArrayList[AInstr] {
-    return aload_program_target(decls0, errout, dataout, AC_OS_LINUX());
+    return aload_program_target(decls0, errout, dataout, AC_OS_LINUX(), 0);
 }
 
 fn aload_program_macos(decls0: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8]) ArrayList[AInstr] {
-    return aload_program_target(decls0, errout, dataout, AC_OS_MACOS());
+    return aload_program_target(decls0, errout, dataout, AC_OS_MACOS(), 0);
+}
+
+fn aload_program_macos_checked(decls0: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8]) ArrayList[AInstr] {
+    return aload_program_target(decls0, errout, dataout, AC_OS_MACOS(), 1);
 }

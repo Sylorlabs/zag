@@ -278,14 +278,43 @@ fn write_macho_arm64_data(path: []u8, text: ArrayList[u8], entry_off: i32, data:
 // native Mach-O mechanism: dyld writes resolved libSystem addresses into our
 // writable slots before LC_MAIN runs.  No ELF PLT/GOT or compatibility loader
 // is involved.
-fn mo_bind_stream(names: ArrayList[[]u8], data_len: i32) ArrayList[u8] {
+fn mo_has_prefix(value: []u8, prefix: []u8) i32 {
+    if (value.len < prefix.len) { return 0; }
+    let i: i32 = 0; while (i < prefix.len) { if (value[i] != prefix[i]) { return 0; } i = i + 1; }
+    return 1;
+}
+
+// dylib ordinal 1 is libSystem, 2 is Metal.framework, and 3 is libobjc.
+// Keep this mapping narrow and explicit: a symbol never falls through from a
+// framework to libSystem merely because an import name happens to be unknown.
+fn mo_import_ordinal(name: []u8) i32 {
+    if (mo_has_prefix(name,"MTL") == 1) { return 2; }
+    if (mo_has_prefix(name,"objc_") == 1 || mo_has_prefix(name,"sel_") == 1) { return 3; }
+    return 1;
+}
+
+// Zag source may declare ABI-specialized Objective-C send entry points (for
+// example, one whose trailing parameters are MTLSize values).  They all bind
+// to libobjc's single objc_msgSend symbol; the suffix exists only to give the
+// source type checker a distinct, accurate call signature.
+fn mo_bind_symbol(name: []u8) []u8 {
+    if (mo_has_prefix(name,"objc_msgSend_") == 1) { return "objc_msgSend"; }
+    return name;
+}
+
+fn mo_bind_stream(names: ArrayList[[]u8], data_len: i32, needs_metal:i32) ArrayList[u8] {
     let out: ArrayList[u8] = make[u8](names.len * 24 + 8);
     let i: i32 = 0;
     while (i < names.len) {
-        mo_b(&out, 17);                         // SET_DYLIB_ORDINAL_IMM(1): libSystem
+        let ordinal:i32=mo_import_ordinal(names.data[i]);
+        // Metal is optional, so libobjc occupies ordinal 2 in a pure ObjC
+        // image and ordinal 3 only when Metal.framework was emitted first.
+        if(ordinal==3){ordinal=2+needs_metal;}
+        mo_b(&out, 16 + ordinal); // SET_DYLIB_ORDINAL_IMM
         mo_b(&out, 64);                         // SET_SYMBOL_TRAILING_FLAGS_IMM(0)
-        if (names.data[i].len > 0 && names.data[i][0] == '_') { mo_bytes(&out,names.data[i]); }
-        else { mo_b(&out,95); mo_bytes(&out,names.data[i]); } // Darwin C ABI leading '_'
+        let symbol:[]u8=mo_bind_symbol(names.data[i]);
+        if (symbol.len > 0 && symbol[0] == '_') { mo_bytes(&out,symbol); }
+        else { mo_b(&out,95); mo_bytes(&out,symbol); } // Darwin C ABI leading '_'
         mo_b(&out,0);
         mo_b(&out,81);                          // SET_TYPE_IMM(BIND_TYPE_POINTER)
         mo_b(&out,114);                         // SET_SEGMENT_AND_OFFSET_ULEB(__DATA)
@@ -302,6 +331,15 @@ fn mo_bind_stream(names: ArrayList[[]u8], data_len: i32) ArrayList[u8] {
     return out;
 }
 
+fn mo_need_metal(names: ArrayList[[]u8]) i32 { let i:i32=0;while(i<names.len){if(mo_import_ordinal(names.data[i])==2){return 1;}i=i+1;}return 0; }
+fn mo_need_objc(names: ArrayList[[]u8]) i32 { let i:i32=0;while(i<names.len){if(mo_import_ordinal(names.data[i])==3){return 1;}i=i+1;}return 0; }
+fn mo_dylib_cmd_size(path: []u8) i32 { return macho_align((24 + path.len + 1) as i64,8) as i32; }
+fn mo_load_dylib(buf: *ArrayList[u8], path: []u8) void {
+    let size:i32=mo_dylib_cmd_size(path);
+    mo_le(buf,12,4);mo_le(buf,size,4);mo_le(buf,24,4);mo_le(buf,2,4);mo_le(buf,0,4);mo_le(buf,65536,4);
+    mo_bytes(buf,path);mo_b(buf,0);while((buf.*.len%8)!=0){mo_b(buf,0);}
+}
+
 fn write_macho_arm64_dynamic(path: []u8, text: ArrayList[u8], entry_off: i32,
                               data: ArrayList[u8], imports: ArrayList[[]u8]) i32 {
     if (imports.len == 0) { return write_macho_arm64_data(path,text,entry_off,data); }
@@ -309,7 +347,13 @@ fn write_macho_arm64_dynamic(path: []u8, text: ArrayList[u8], entry_off: i32,
     let data_off: i64 = macho_data_fileoff(text.len);
     let import_bytes: i32 = imports.len * 8;
     let data_len: i32 = data.len + import_bytes;
-    let bind: ArrayList[u8] = mo_bind_stream(imports,data.len);
+    let needs_metal:i32=mo_need_metal(imports);
+    let needs_objc:i32=mo_need_objc(imports);
+    let bind: ArrayList[u8] = mo_bind_stream(imports,data.len,needs_metal);
+    let libsystem:[]u8="/usr/lib/libSystem.B.dylib";
+    let metal:[]u8="/System/Library/Frameworks/Metal.framework/Versions/A/Metal";
+    let libobjc:[]u8="/usr/lib/libobjc.A.dylib";
+    let dylib_bytes:i32=mo_dylib_cmd_size(libsystem)+needs_metal*mo_dylib_cmd_size(metal)+needs_objc*mo_dylib_cmd_size(libobjc);
     // Link-edit data has its own page-aligned file/VM mapping.  Keeping the
     // dyld stream in the post-__DATA padding leaves a conventional contiguous
     // __LINKEDIT mapping for the loader instead of a mismatched file/VM pair.
@@ -326,7 +370,7 @@ fn write_macho_arm64_dynamic(path: []u8, text: ArrayList[u8], entry_off: i32,
     let uuid_hash: ArrayList[u8] = macho_sha256(uuid_source.data[0..uuid_source.len]);
 
     mo_le(&buf,4277009103,4); mo_le(&buf,16777228,4); mo_le(&buf,0,4); mo_le(&buf,2,4);
-    mo_le(&buf,11,4); mo_le(&buf,672,4); mo_le(&buf,2097285,4); mo_le(&buf,0,4);
+    mo_le(&buf,11+needs_metal+needs_objc,4); mo_le(&buf,616+dylib_bytes,4); mo_le(&buf,2097285,4); mo_le(&buf,0,4);
     mo_segment(&buf,"__PAGEZERO",0,MACHO_BASE(),0,0,0,0);
     mo_segment(&buf,"__TEXT",MACHO_BASE(),text_size,0,text_size,5,1);
     mo_section(&buf,"__text","__TEXT",MACHO_BASE()+code_off,text.len,code_off,2,2147484672);
@@ -339,8 +383,9 @@ fn write_macho_arm64_dynamic(path: []u8, text: ArrayList[u8], entry_off: i32,
     mo_le(&buf,27,4); mo_le(&buf,24,4);
     let ui: i32 = 0; while (ui < 16) { mo_b(&buf,get[u8](uuid_hash,ui) as i64); ui = ui + 1; }
     mo_le(&buf,2147483688,4); mo_le(&buf,24,4); mo_le(&buf,code_off + (entry_off as i64),8); mo_le(&buf,0,8);
-    mo_le(&buf,12,4); mo_le(&buf,56,4); mo_le(&buf,24,4); mo_le(&buf,2,4); mo_le(&buf,0,4); mo_le(&buf,65536,4);
-    mo_bytes(&buf,"/usr/lib/libSystem.B.dylib"); mo_b(&buf,0); while ((buf.len % 8) != 0) { mo_b(&buf,0); }
+    mo_load_dylib(&buf,libsystem);
+    if(needs_metal==1){mo_load_dylib(&buf,metal);}
+    if(needs_objc==1){mo_load_dylib(&buf,libobjc);}
     // LC_DYLD_INFO_ONLY: rebase, weak-bind and lazy-bind streams are empty;
     // bind is the regular import stream located in __LINKEDIT.
     mo_le(&buf,2147483682,4); mo_le(&buf,48,4);

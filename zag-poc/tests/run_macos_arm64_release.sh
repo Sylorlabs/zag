@@ -109,8 +109,7 @@ dwarfdump "$tmpdir/debug" | grep -q 'DW_TAG_compile_unit'
 echo "  ok  Mach-O native DWARF debug segment"; pass=$((pass + 1))
 
 # GPU policy must preserve the platform boundary on macOS: Metal is identified
-# explicitly, while physical execution stays unavailable until the native
-# Metal compiler/queue/readback path exists. It must never select Linux DRM.
+# explicitly and native physical execution must never select Linux DRM.
 "$tmpdir/znc-gen1" tests/gpu_platform.zag --target macos-arm64 --no-zagd --no-analyze -o "$tmpdir/gpu-platform"
 require_macho_arm64 "$tmpdir/gpu-platform"
 require_signed "$tmpdir/gpu-platform"
@@ -121,6 +120,56 @@ if ( cd "$tmpdir" && "$tmpdir/znc-gen1" "$repo_root/tests/gpu_platform.zag" --ta
 fi
 test ! -e "$tmpdir/gpu_platform.mlir"
 echo "  ok  Apple Silicon GPU policy: explicit Metal, no DRM fallback"; pass=$((pass + 1))
+
+# Physical Metal witnesses cross the public C/Objective-C ABI into
+# Metal.framework and libobjc, then execute on the machine's actual GPU.  The
+# final readback test submits a compute command and verifies that GPU-written
+# shared-buffer data reaches the CPU.  An exit status of 42 is the fixture's
+# success sentinel, not a generic process-success substitute.
+for metal_test in macos_metal_device macos_metal_queue macos_metal_shader macos_metal_readback; do
+    "$tmpdir/znc-gen1" "$repo_root/tests/$metal_test.zag" --target macos-arm64 --dynamic --no-zagd --no-analyze -o "$tmpdir/$metal_test"
+    require_macho_arm64 "$tmpdir/$metal_test"
+    require_signed "$tmpdir/$metal_test"
+    set +e
+    "$tmpdir/$metal_test"
+    metal_status=$?
+    set -e
+    if [ "$metal_status" -ne 42 ]; then
+        echo "XX  physical Metal witness failed: $metal_test (exit $metal_status)" >&2
+        exit 1
+    fi
+done
+echo "  ok  physical Metal: device, queue, shader, compute/readback"; pass=$((pass + 1))
+
+# Edition-2027 unsafe atomic fences lower directly to ARM64 DMB. This is a
+# native memory-order witness, separate from Linux futex/thread adapters.
+"$tmpdir/znc-gen1" "$repo_root/tests/macos_v2/atomic_fence.zag" --target macos-arm64 --no-zagd --no-analyze -o "$tmpdir/atomic-fence"
+require_macho_arm64 "$tmpdir/atomic-fence"
+require_signed "$tmpdir/atomic-fence"
+set +e
+"$tmpdir/atomic-fence"
+atomic_status=$?
+set -e
+[ "$atomic_status" -eq 42 ]
+otool -tvV "$tmpdir/atomic-fence" | grep -q 'dmb'
+echo "  ok  ARM64 native atomic and memory fences"; pass=$((pass + 1))
+
+# RMW uses ARMv8 baseline LL/SC (not optional LSE): exchange, arithmetic,
+# bitwise, CAS, ordered load/store, and seq_cst DMB boundaries all execute.
+"$tmpdir/znc-gen1" "$repo_root/tests/macos_v2/atomic_rmw.zag" --target macos-arm64 --no-zagd --no-analyze -o "$tmpdir/atomic-rmw"
+require_macho_arm64 "$tmpdir/atomic-rmw"
+require_signed "$tmpdir/atomic-rmw"
+set +e
+"$tmpdir/atomic-rmw"
+atomic_rmw_status=$?
+set -e
+[ "$atomic_rmw_status" -eq 42 ]
+atomic_rmw_disasm="$(otool -tvV "$tmpdir/atomic-rmw")"
+printf '%s\n' "$atomic_rmw_disasm" | grep -q 'ldaxr'
+printf '%s\n' "$atomic_rmw_disasm" | grep -q 'stlxr'
+printf '%s\n' "$atomic_rmw_disasm" | grep -q 'ldar'
+printf '%s\n' "$atomic_rmw_disasm" | grep -q 'stlr'
+echo "  ok  ARM64 native atomic RMW/CAS (LL/SC)"; pass=$((pass + 1))
 
 # This fixture covers Darwin entry arguments, PIE data addresses, heap,
 # write/read/exists, process execution, stdout, and exit status.

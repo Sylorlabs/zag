@@ -8,14 +8,14 @@ v2 support unless all required v2 categories are green.
 |---|---|---|
 | x86-64 Linux static native | self-hosting bootstrap plus native v1 execution; 38 bounded v2 release-gate checks execute, including checked allocation, raw-pointer, MMIO, atomic/futex, C-ABI, and SSE2 slices | v1 supported; bounded v2 machine-control slices execute, but v2 is **not a supported release target** while required memory-model, concurrency, ABI, sanitizer, and verification rows remain partial or unsupported |
 | ARM64 Linux native | ELF lowering, qemu/native regression tests, and self-host fixpoint | v1 supported; not yet a v2 machine-control target |
-| Apple Silicon macOS native | signed PIE Mach-O, native runtime acceptance, and byte-identical self-host fixpoint | v1 supported; not yet a v2 machine-control target |
+| Apple Silicon macOS native | signed PIE Mach-O, native runtime acceptance, byte-identical self-host fixpoint, physical Metal readback, and ARMv8 LL/SC atomic RMW/CAS runtime/disassembly witnesses | v1 supported; not yet a v2 machine-control target — atomics now have a bounded native slice, while threads, allocator/provenance, full checked safety/sanitizer, ABI, SIMD/MMIO, and whole-target verification remain incomplete |
 | WebAssembly | v1 emission/execution regression gate | not a v2 supported target |
 | GPU MLIR / gfx bundle | frontend output validation only | not a GPU execution backend |
 | Vulkan compute (compat) | SPIR-V passes spirv-val; C runtime test verified on AMD RX 5700 XT (RADV) | **runtime-verified** — kernel launched, output checked |
 | OpenGL compute (compat) | GLSL 430 structural checks; C runtime test verified on AMD RX 5700 XT (Mesa) | **runtime-verified** — kernel launched, output checked |
 | OpenCL compute (compat) | SPIR-V passes spirv-val opencl2.0; loader code written but `available()` returns false | **not verified** — needs contributor with OpenCL hardware |
 | CUDA compute (compat) | PTX structural checks; loader code written but `available()` returns false | **not verified** — needs contributor with NVIDIA GPU |
-| Metal compute (compat) | MSL structural checks; loader dispatch is a stub (returns -201) | **not verified** — needs contributor with macOS/Metal |
+| Metal compute (compat) | Native Apple-Silicon Mach-O witnesses bind Metal.framework/libobjc, create a device and queue, compile MSL, submit a compute command, and verify CPU readback; `tests/run_macos_arm64_release.sh` requires all four | **runtime-verified** — direct Zag native FFI path; the legacy `std/metal_loader.zag` compatibility adapter remains non-certified |
 | ROCm/HIP | no runtime implementation | unsupported |
 | RISC-V | no executable backend evidence in this tree | unsupported |
 
@@ -25,8 +25,9 @@ tests.  Cross-compilation alone is not execution support.
 
 ## Contributing: GPU backends needing hardware
 
-Vulkan and OpenGL compute are **runtime-verified** on an AMD RX 5700 XT.
-The remaining three GPU backends have encoder and loader code written but
+Vulkan and OpenGL compute are **runtime-verified** on an AMD RX 5700 XT, and
+Metal is runtime-verified on native Apple Silicon.  The remaining two GPU
+backends have encoder and loader code written but
 **cannot be tested on the current developer's machine** (Linux, AMD GPU only).
 
 We are asking for contributors with the right hardware to help verify these:
@@ -35,7 +36,6 @@ We are asking for contributors with the right hardware to help verify these:
 |---|---|---|---|
 | **OpenCL** | SPIR-V encoder passes spirv-val; loader FFI + dispatch logic written | Write C test harness, hook up `available()` to probe `libOpenCL.so.1`, run kernel, verify output | Any machine with a working OpenCL ICD (AMD ROCm, Intel NEO, or NVIDIA) |
 | **CUDA** | PTX encoder passes structural checks; loader FFI + dispatch logic written | Write C test harness, hook up `available()` to probe `libcuda.so.1`, run kernel, verify output | NVIDIA GPU + CUDA toolkit |
-| **Metal** | MSL encoder passes structural checks; loader has stub dispatch (returns -201) | Implement real Objective-C dispatch, run `tests/run_metal_mac.sh`, verify output | Mac (M-series or Intel) with Metal framework |
 
 The Vulkan backend (`tests/vulkan_runtime_test.c` + `tests/run_gpu_runtime.sh`)
 is the reference for what a verified backend looks like. If you have one of

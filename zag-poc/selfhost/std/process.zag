@@ -52,9 +52,11 @@ fn process_result_new(context: *opaque, scripted: i32, status: i32, state: i32, 
     return _zag_process_result_abi_new(status, state, output);
 }
 
-// Run `/bin/sh -c command` with a monotonic deadline and a hard stdout cap.
-// Linux x86-64 raw syscalls only; no libc, linker, polling thread, or external
-// timeout program. State 0=exited, 1=timed out, 2=output cap, 3=runtime error.
+// Run `/bin/sh -c command` with a native sleep-tick deadline and a hard stdout cap.
+// Native raw process primitives.  The AArch64 Mach-O backend translates the
+// audited Linux-numbered operations below to their Darwin equivalents; no
+// libc process wrapper, polling thread, or external timeout program is used.
+// State 0=exited, 1=timed out, 2=output cap, 3=runtime error.
 fn process_run_bounded_internal(context: *opaque, scripted: i32, command: []u8, timeout_ms: i64, max_output: i64) ProcessResult {
     // This implementation owns raw syscall buffers and performs explicit raw
     // pointer conversions. Keep that authority lexical so the public process
@@ -71,6 +73,13 @@ fn process_run_bounded_internal(context: *opaque, scripted: i32, command: []u8, 
     let packed: i64 = pair[0];
     let read_fd: i64 = packed & 4294967295;
     let write_fd: i64 = packed >> 32;
+    // Darwin's pipe(2) has no flags argument.  Set the read end nonblocking
+    // explicitly; on Linux this is harmlessly equivalent to pipe2's flag.
+    if (_zag_raw_syscall(25, read_fd, 4, 2048, 0, 0, 0) < 0) {
+        let _close_pipe_read: i64 = _zag_raw_syscall(3, read_fd, 0, 0, 0, 0, 0);
+        let _close_pipe_write: i64 = _zag_raw_syscall(3, write_fd, 0, 0, 0, 0, 0);
+        return ProcessResult{ .handle = process_result_new(context, scripted, 0 - 1, process_state_runtime_error(), "") };
+    }
     if (command.len < 0) {
         let _close_invalid_read: i64 = _zag_raw_syscall(3, read_fd, 0, 0, 0, 0, 0);
         let _close_invalid_write: i64 = _zag_raw_syscall(3, write_fd, 0, 0, 0, 0, 0);
@@ -125,7 +134,7 @@ fn process_run_bounded_internal(context: *opaque, scripted: i32, command: []u8, 
         return ProcessResult{ .handle = null as *opaque };
     }
     sleep_ts[0] = 0; sleep_ts[1] = 1000000; // 1ms
-    let start: i64 = _zag_clock_monotonic_ms();
+    let remaining_ms: i64 = timeout_ms;
     let total: i64 = 0;
     let state: i32 = process_state_exited();
     let done: i32 = 0;
@@ -138,7 +147,10 @@ fn process_run_bounded_internal(context: *opaque, scripted: i32, command: []u8, 
                 (max_output + 1) - total, 0, 0, 0);
             if (nr > 0) { total = total + nr; }
             else if (nr == 0) { eof = 1; }
-            else if (nr != 0 - 11 && nr != 0 - 4) { state = process_state_runtime_error(); done = 1; }
+            // Linux EAGAIN is 11; Darwin's EWOULDBLOCK is 35.  Both mean a
+            // nonblocking pipe has no bytes yet and the deadline loop should
+            // continue rather than classify the supervisor as broken.
+            else if (nr != 0 - 11 && nr != 0 - 35 && nr != 0 - 4) { state = process_state_runtime_error(); done = 1; }
         }
         if (done == 0 && reaped == 0) {
             let waited: i64 = _zag_raw_syscall(61, pid, statusp as i64, 1, 0, 0, 0); // WNOHANG
@@ -146,9 +158,11 @@ fn process_run_bounded_internal(context: *opaque, scripted: i32, command: []u8, 
             else if (waited < 0 && waited != 0 - 4) { state = process_state_runtime_error(); done = 1; }
         }
         if (done == 0 && eof == 1 && reaped == 1) { done = 1; }
-        let now: i64 = _zag_clock_monotonic_ms();
-        if (done == 0 && (now < 0 || now - start >= timeout_ms)) { state = process_state_timed_out(); done = 1; }
-        if (done == 0) { let _nap: i64 = _zag_raw_syscall(35, sleep_ts as i64, 0, 0, 0, 0, 0); }
+        if (done == 0 && remaining_ms <= 0) { state = process_state_timed_out(); done = 1; }
+        if (done == 0) {
+            let _nap: i64 = _zag_raw_syscall(35, sleep_ts as i64, 0, 0, 0, 0, 0);
+            remaining_ms = remaining_ms - 1;
+        }
     }
     if (state != process_state_exited()) {
         let _kill: i64 = _zag_raw_syscall(62, 0 - pid, 9, 0, 0, 0, 0); // whole process group
