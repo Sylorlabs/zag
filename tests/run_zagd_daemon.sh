@@ -26,7 +26,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-./znc tests/zagd_linux_test.zag -o "$tmp/linux-test" --no-analyze >/dev/null
+./znc tests/zagd/zagd_linux_test.zag -o "$tmp/linux-test" --no-analyze >/dev/null
 "$tmp/linux-test"
 ./znc selfhost/zagd_daemon.zag -o "$tmp/zagd" --no-analyze >/dev/null
 # `zagd_semantic_check` intentionally resolves its compiler beside the daemon
@@ -34,7 +34,7 @@ trap cleanup EXIT
 # event can republish a complete semantic graph rather than fail closed solely
 # because the test omitted the sibling compiler.
 cp ./znc "$tmp/znc"
-./znc tests/zagd_semantic_fixture.zag -o "$tmp/semantic-fixture" --no-analyze >/dev/null
+./znc tests/zagd/zagd_semantic_fixture.zag -o "$tmp/semantic-fixture" --no-analyze >/dev/null
 
 mkdir "$tmp/project"
 mkdir -p "$tmp/project/.zag-cache/zagd"

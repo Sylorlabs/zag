@@ -65,7 +65,7 @@ esac
 echo "  ok  compiler identity: $version"
 
 for alias in i686 x86 linux-i686; do
-    "$ZNC" tests/i686_literal.zag --target "$alias" -o "$tmp/$alias" --no-analyze --no-zagd >/dev/null
+    "$ZNC" tests/i686/i686_literal.zag --target "$alias" -o "$tmp/$alias" --no-analyze --no-zagd >/dev/null
     elf_identity "$tmp/$alias" 1 "3 0"
     set +e
     i686_exec "$tmp/$alias"
@@ -75,11 +75,11 @@ for alias in i686 x86 linux-i686; do
 done
 echo "  ok  i686/x86/linux-i686 select executable ELF32 EM_386"
 
-"$ZNC" tests/i686_literal.zag --target x86_64 -o "$tmp/x86_64" --no-analyze --no-zagd >/dev/null
+"$ZNC" tests/i686/i686_literal.zag --target x86_64 -o "$tmp/x86_64" --no-analyze --no-zagd >/dev/null
 elf_identity "$tmp/x86_64" 2 "62 0"
 echo "  ok  x86_64 remains distinct ELF64 EM_X86_64"
 
-if "$ZNC" tests/i686_literal.zag --target unsupported-host-alias -o "$tmp/unknown" --no-analyze --no-zagd >"$tmp/unknown.log" 2>&1; then
+if "$ZNC" tests/i686/i686_literal.zag --target unsupported-host-alias -o "$tmp/unknown" --no-analyze --no-zagd >"$tmp/unknown.log" 2>&1; then
     fail "unknown target unexpectedly compiled"
 fi
 test ! -e "$tmp/unknown" || fail "unknown target left an output artifact"
@@ -100,12 +100,12 @@ ZAG_I686_REFERENCE_TOOLS=0 ZNC_REAL="$ZNC" ZNC=tests/i686_znc_no_zagd.sh \
 echo
 echo "── [4/4] bounded small-register model and artifact-negative target limits"
 reject_without_artifact \
-    tests/i686_reject_call_area_limit.zag \
+    tests/i686/i686_reject_call_area_limit.zag \
     "$tmp/call-area.o" \
     'i386 call argument area exceeds the bounded 64 KiB stack-spill limit'
 echo "  ok  outgoing i386 call area fails closed above 64 KiB"
 reject_without_artifact \
-    tests/i686_reject_frame_limit.zag \
+    tests/i686/i686_reject_frame_limit.zag \
     "$tmp/frame.o" \
     'i386 local spill frame exceeds the bounded 1 MiB limit'
 echo "  ok  local i386 spill frame fails closed above 1 MiB"

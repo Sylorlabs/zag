@@ -9,7 +9,7 @@ trap 'rm -rf "$tmp"' EXIT
 
 mkdir -p "$tmp/valid"
 printf 'name = "simdvalid"\nversion = "0"\nedition = "2027"\n' > "$tmp/valid/zag.mod"
-cp tests/x86_simd_add_i32x4.zag "$tmp/valid/main.zag"
+cp tests/x86/x86_simd_add_i32x4.zag "$tmp/valid/main.zag"
 (cd "$tmp/valid" && "$ZNC" main.zag --cpu=generic --safety=checked -o app --no-zagd --no-analyze >/dev/null)
 "$tmp/valid/app"
 

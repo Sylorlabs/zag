@@ -11,10 +11,10 @@ else
     ./znc selfhost/zagd_daemon.zag -o "$tmp/bin/zagd" --no-zagd --no-analyze >/dev/null
 fi
 cp ./znc "$tmp/bin/znc"
-./znc tests/zagd_finalist_witness.zag -o "$tmp/reference" --no-zagd --no-analyze >/dev/null
+./znc tests/zagd/zagd_finalist_witness.zag -o "$tmp/reference" --no-zagd --no-analyze >/dev/null
 cp "$tmp/reference" "$tmp/equivalent"
-./znc tests/zagd_finalist_mismatch.zag -o "$tmp/mismatch" --no-zagd --no-analyze >/dev/null
-./znc tests/zagd_finalist_delay.zag -o "$tmp/delay" --no-zagd --no-analyze >/dev/null
+./znc tests/zagd/zagd_finalist_mismatch.zag -o "$tmp/mismatch" --no-zagd --no-analyze >/dev/null
+./znc tests/zagd/zagd_finalist_delay.zag -o "$tmp/delay" --no-zagd --no-analyze >/dev/null
 
 prepare() {
     project=$1 reference=$2 finalist=$3

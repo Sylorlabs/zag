@@ -9,7 +9,7 @@ trap 'rc=$?; if [ "$rc" -ne 0 ] && [ -f "$tmp/project/.zagd.status" ]; then echo
 compiler=${ZNC:-"$(pwd)/znc"}
 case "$compiler" in /*) ;; *) compiler="$(pwd)/${compiler#./}" ;; esac
 
-"$compiler" tests/zagd_linux_test.zag -o "$tmp/linux-test" --no-zagd --no-analyze >/dev/null
+"$compiler" tests/zagd/zagd_linux_test.zag -o "$tmp/linux-test" --no-zagd --no-analyze >/dev/null
 "$tmp/linux-test"
 "$compiler" selfhost/zagd_daemon.zag -o "$tmp/zagd" --no-zagd --no-analyze >/dev/null
 ln -s "$compiler" "$tmp/znc"

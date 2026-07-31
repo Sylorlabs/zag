@@ -7,7 +7,7 @@ tmp=$(mktemp -d /tmp/zag-volatile-widths.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/project"
 printf '%s\n' 'name = "x86volatilewidths"' 'version = "0"' 'edition = "2027"' >"$tmp/project/zag.mod"
-cp tests/x86_volatile_widths.zag "$tmp/project/main.zag"
+cp tests/x86/x86_volatile_widths.zag "$tmp/project/main.zag"
 "$compiler" "$tmp/project/main.zag" -o "$tmp/app" --cpu=generic --safety=checked --no-zagd --no-analyze >/dev/null
 set +e; "$tmp/app"; rc=$?; set -e
 if [ "$rc" -ne 42 ]; then echo "x86 volatile width execution failed: $rc" >&2; exit 1; fi

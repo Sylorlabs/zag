@@ -14,7 +14,7 @@ i686_exec(){
   return "$rc"
 }
 
-"$ZNC" tests/i686_link_driver.zag -o "$tmp/link-driver" --no-analyze --no-zagd >/dev/null
+"$ZNC" tests/i686/i686_link_driver.zag -o "$tmp/link-driver" --no-analyze --no-zagd >/dev/null
 "$tmp/link-driver" --fixtures \
     "$tmp/entry.o" \
     "$tmp/helper.o" \
@@ -163,8 +163,8 @@ grep -q 'section alignment exceeds the supported 4096-byte limit' "$tmp/over-ali
 test ! -e "$tmp/over-aligned"
 echo "  ok  over-aligned ET_REL input rejects before output allocation"
 
-"$ZNC" tests/i686_compiler_entry.zag --target i686 --emit-obj -o "$tmp/compiler-entry.o" --no-analyze --no-zagd >/dev/null
-"$ZNC" tests/i686_compiler_helper.zag --target i686 --emit-obj -o "$tmp/compiler-helper.o" --no-analyze --no-zagd >/dev/null
+"$ZNC" tests/i686/i686_compiler_entry.zag --target i686 --emit-obj -o "$tmp/compiler-entry.o" --no-analyze --no-zagd >/dev/null
+"$ZNC" tests/i686/i686_compiler_helper.zag --target i686 --emit-obj -o "$tmp/compiler-helper.o" --no-analyze --no-zagd >/dev/null
 
 if [ "$I686_REFERENCE_TOOLS" = 1 ] && command -v readelf >/dev/null 2>&1; then
     readelf -rW "$tmp/compiler-entry.o" >"$tmp/compiler-entry-relocs"
@@ -183,8 +183,8 @@ set +e; i686_exec "$tmp/compiler-linked"; rc=$?; set -e
 test "$rc" -eq 42
 echo "  ok  compiler-produced objects link and execute across a function boundary"
 
-"$ZNC" tests/i686_compiler_abi_entry.zag --target i686 --emit-obj -o "$tmp/compiler-abi-entry.o" --no-analyze --no-zagd >/dev/null
-"$ZNC" tests/i686_compiler_abi_helper.zag --target i686 --emit-obj -o "$tmp/compiler-abi-helper.o" --no-analyze --no-zagd >/dev/null
+"$ZNC" tests/i686/i686_compiler_abi_entry.zag --target i686 --emit-obj -o "$tmp/compiler-abi-entry.o" --no-analyze --no-zagd >/dev/null
+"$ZNC" tests/i686/i686_compiler_abi_helper.zag --target i686 --emit-obj -o "$tmp/compiler-abi-helper.o" --no-analyze --no-zagd >/dev/null
 "$ZNC" "$tmp/compiler-abi-entry.o" "$tmp/compiler-abi-helper.o" --target i686 --link-i686 -o "$tmp/compiler-abi-linked" --no-analyze --no-zagd >/dev/null
 set +e; i686_exec "$tmp/compiler-abi-linked"; rc=$?; set -e
 test "$rc" -eq 42
@@ -194,8 +194,8 @@ if [ "$I686_REFERENCE_TOOLS" = 1 ] && command -v readelf >/dev/null 2>&1; then
 fi
 echo "  ok  compiler-produced objects preserve six-word cdecl calls across an external boundary"
 
-"$ZNC" tests/i686_narrow_abi_entry.zag --target i686 --emit-obj -o "$tmp/narrow-entry.o" --no-analyze --no-zagd >/dev/null
-"$ZNC" tests/i686_narrow_abi_helper.zag --target i686 --emit-obj -o "$tmp/narrow-helper.o" --no-analyze --no-zagd >/dev/null
+"$ZNC" tests/i686/i686_narrow_abi_entry.zag --target i686 --emit-obj -o "$tmp/narrow-entry.o" --no-analyze --no-zagd >/dev/null
+"$ZNC" tests/i686/i686_narrow_abi_helper.zag --target i686 --emit-obj -o "$tmp/narrow-helper.o" --no-analyze --no-zagd >/dev/null
 "$ZNC" "$tmp/narrow-entry.o" "$tmp/narrow-helper.o" --target i686 --link-i686 -o "$tmp/narrow-linked" --no-analyze --no-zagd >/dev/null
 set +e; i686_exec "$tmp/narrow-linked"; rc=$?; set -e
 test "$rc" -eq 42
@@ -216,8 +216,8 @@ if [ "$I686_REFERENCE_TOOLS" = 1 ] && command -v objdump >/dev/null 2>&1; then
 fi
 echo "  ok  compiler objects normalize i8/u8/i16/u16/bool cdecl arguments, parameter views, storage, and EAX returns"
 
-"$ZNC" tests/i686_narrow_struct_abi_entry.zag --target i686 --emit-obj -o "$tmp/narrow-struct-entry.o" --no-analyze --no-zagd >/dev/null
-"$ZNC" tests/i686_narrow_struct_abi_helper.zag --target i686 --emit-obj -o "$tmp/narrow-struct-helper.o" --no-analyze --no-zagd >/dev/null
+"$ZNC" tests/i686/i686_narrow_struct_abi_entry.zag --target i686 --emit-obj -o "$tmp/narrow-struct-entry.o" --no-analyze --no-zagd >/dev/null
+"$ZNC" tests/i686/i686_narrow_struct_abi_helper.zag --target i686 --emit-obj -o "$tmp/narrow-struct-helper.o" --no-analyze --no-zagd >/dev/null
 "$ZNC" "$tmp/narrow-struct-entry.o" "$tmp/narrow-struct-helper.o" --target i686 --link-i686 -o "$tmp/narrow-struct-linked" --no-analyze --no-zagd >/dev/null
 set +e; i686_exec "$tmp/narrow-struct-linked"; rc=$?; set -e
 test "$rc" -eq 42
@@ -238,8 +238,8 @@ if [ "$I686_REFERENCE_TOOLS" = 1 ] && command -v objdump >/dev/null 2>&1; then
 fi
 echo "  ok  flat narrow-field structs normalize local copies, cdecl words, field views, and hidden-sret output across objects"
 
-"$ZNC" tests/i686_float_struct_abi_entry.zag --target i686 --emit-obj -o "$tmp/float-struct-entry.o" --no-analyze --no-zagd >/dev/null
-"$ZNC" tests/i686_float_struct_abi_helper.zag --target i686 --emit-obj -o "$tmp/float-struct-helper.o" --no-analyze --no-zagd >/dev/null
+"$ZNC" tests/i686/i686_float_struct_abi_entry.zag --target i686 --emit-obj -o "$tmp/float-struct-entry.o" --no-analyze --no-zagd >/dev/null
+"$ZNC" tests/i686/i686_float_struct_abi_helper.zag --target i686 --emit-obj -o "$tmp/float-struct-helper.o" --no-analyze --no-zagd >/dev/null
 "$ZNC" "$tmp/float-struct-entry.o" "$tmp/float-struct-helper.o" --target i686 --link-i686 -o "$tmp/float-struct-linked" --no-analyze --no-zagd >/dev/null
 set +e; i686_exec "$tmp/float-struct-linked"; rc=$?; set -e
 test "$rc" -eq 42
@@ -257,8 +257,8 @@ if [ "$I686_REFERENCE_TOOLS" = 1 ] && command -v objdump >/dev/null 2>&1; then
 fi
 echo "  ok  mixed f32/f64 structs preserve 4-byte i386 alignment, 20-byte cdecl transport, field operations, and hidden-sret output"
 
-"$ZNC" tests/i686_nested_struct_abi_entry.zag --target i686 --emit-obj -o "$tmp/nested-struct-entry.o" --no-analyze --no-zagd >/dev/null
-"$ZNC" tests/i686_nested_struct_abi_helper.zag --target i686 --emit-obj -o "$tmp/nested-struct-helper.o" --no-analyze --no-zagd >/dev/null
+"$ZNC" tests/i686/i686_nested_struct_abi_entry.zag --target i686 --emit-obj -o "$tmp/nested-struct-entry.o" --no-analyze --no-zagd >/dev/null
+"$ZNC" tests/i686/i686_nested_struct_abi_helper.zag --target i686 --emit-obj -o "$tmp/nested-struct-helper.o" --no-analyze --no-zagd >/dev/null
 "$ZNC" "$tmp/nested-struct-entry.o" "$tmp/nested-struct-helper.o" --target i686 --link-i686 -o "$tmp/nested-struct-linked" --no-analyze --no-zagd >/dev/null
 set +e; i686_exec "$tmp/nested-struct-linked"; rc=$?; set -e
 test "$rc" -eq 42
@@ -274,8 +274,8 @@ if [ "$I686_REFERENCE_TOOLS" = 1 ] && command -v objdump >/dev/null 2>&1; then
 fi
 echo "  ok  acyclic nested sequential structs flatten 12 checked words across cdecl arguments, field paths, copies, and hidden-sret"
 
-"$ZNC" tests/i686_i64_abi_entry.zag --target i686 --emit-obj -o "$tmp/i64-entry.o" --no-analyze --no-zagd >/dev/null
-"$ZNC" tests/i686_i64_abi_helper.zag --target i686 --emit-obj -o "$tmp/i64-helper.o" --no-analyze --no-zagd >/dev/null
+"$ZNC" tests/i686/i686_i64_abi_entry.zag --target i686 --emit-obj -o "$tmp/i64-entry.o" --no-analyze --no-zagd >/dev/null
+"$ZNC" tests/i686/i686_i64_abi_helper.zag --target i686 --emit-obj -o "$tmp/i64-helper.o" --no-analyze --no-zagd >/dev/null
 "$ZNC" "$tmp/i64-entry.o" "$tmp/i64-helper.o" --target i686 --link-i686 -o "$tmp/i64-linked" --no-analyze --no-zagd >/dev/null
 set +e; i686_exec "$tmp/i64-linked"; rc=$?; set -e
 test "$rc" -eq 42
@@ -295,21 +295,21 @@ if [ "$I686_REFERENCE_TOOLS" = 1 ] && command -v objdump >/dev/null 2>&1; then
 fi
 echo "  ok  i64/u64 use two-word cdecl arguments, EDX:EAX results, full arithmetic, struct leaves, and hidden-sret across objects"
 
-if "$ZNC" tests/i686_reject_recursive_struct.zag --target i686 -o "$tmp/bad-recursive-struct" --no-analyze --no-zagd >"$tmp/bad-recursive-struct.log" 2>&1; then
+if "$ZNC" tests/i686/i686_reject_recursive_struct.zag --target i686 -o "$tmp/bad-recursive-struct" --no-analyze --no-zagd >"$tmp/bad-recursive-struct.log" 2>&1; then
     echo "  XX  recursive by-value aggregate unexpectedly acquired a finite layout"; exit 1
 fi
 test ! -e "$tmp/bad-recursive-struct"
 grep -q 'aggregate returns require 32-bit scalar fields' "$tmp/bad-recursive-struct.log"
 echo "  ok  direct or mutual by-value aggregate cycles remain fail-closed before artifact output"
 
-if "$ZNC" tests/i686_reject_narrow_literal.zag --target i686 -o "$tmp/bad-narrow-literal" --no-analyze --no-zagd >"$tmp/bad-narrow-literal.log" 2>&1; then
+if "$ZNC" tests/i686/i686_reject_narrow_literal.zag --target i686 -o "$tmp/bad-narrow-literal" --no-analyze --no-zagd >"$tmp/bad-narrow-literal.log" 2>&1; then
     echo "  XX  out-of-range contextual i8 literal was accepted"; exit 1
 fi
 test ! -e "$tmp/bad-narrow-literal"
 grep -q 'i8 literal exceeds the signed 8-bit target range' "$tmp/bad-narrow-literal.log"
 echo "  ok  contextual narrow literals reject truncation unless the source uses an explicit cast"
 
-if "$ZNC" tests/i686_compiler_entry.zag --target i686 -o "$tmp/unresolved-direct" --no-analyze --no-zagd >"$tmp/unresolved-direct.log" 2>&1; then
+if "$ZNC" tests/i686/i686_compiler_entry.zag --target i686 -o "$tmp/unresolved-direct" --no-analyze --no-zagd >"$tmp/unresolved-direct.log" 2>&1; then
     echo "  XX  direct executable accepted an unresolved extern"; exit 1
 fi
 test ! -e "$tmp/unresolved-direct"

@@ -75,7 +75,7 @@ echo "  ok  Apple Silicon CPU policy: native baseline and x86 rejection"; pass=$
 # A real libSystem call verifies LC_DYLD_INFO_ONLY, the dyld bind stream, the
 # ARM64 import stub, and the externally resolved C ABI rather than merely
 # accepting `--dynamic` as a command-line option.
-"$tmpdir/znc-gen1" tests/macos_dyld_getpid.zag --target macos-arm64 --dynamic --no-zagd --no-analyze -o "$tmpdir/dyld-getpid"
+"$tmpdir/znc-gen1" tests/macos/macos_dyld_getpid.zag --target macos-arm64 --dynamic --no-zagd --no-analyze -o "$tmpdir/dyld-getpid"
 require_macho_arm64 "$tmpdir/dyld-getpid"
 require_signed "$tmpdir/dyld-getpid"
 otool -l "$tmpdir/dyld-getpid" | grep -q 'LC_DYLD_INFO_ONLY'
@@ -110,11 +110,11 @@ echo "  ok  Mach-O native DWARF debug segment"; pass=$((pass + 1))
 
 # GPU policy must preserve the platform boundary on macOS: Metal is identified
 # explicitly and native physical execution must never select Linux DRM.
-"$tmpdir/znc-gen1" tests/gpu_platform.zag --target macos-arm64 --no-zagd --no-analyze -o "$tmpdir/gpu-platform"
+"$tmpdir/znc-gen1" tests/gpu/gpu_platform.zag --target macos-arm64 --no-zagd --no-analyze -o "$tmpdir/gpu-platform"
 require_macho_arm64 "$tmpdir/gpu-platform"
 require_signed "$tmpdir/gpu-platform"
 "$tmpdir/gpu-platform" | grep -q 'GPU PLATFORM: ALL PASS'
-if ( cd "$tmpdir" && "$tmpdir/znc-gen1" "$repo_root/tests/gpu_platform.zag" --target gpu-metal --no-zagd --no-analyze ) >/dev/null 2>&1; then
+if ( cd "$tmpdir" && "$tmpdir/znc-gen1" "$repo_root/tests/gpu/gpu_platform.zag" --target gpu-metal --no-zagd --no-analyze ) >/dev/null 2>&1; then
     echo "XX  gpu-metal unexpectedly emitted a non-Metal artifact" >&2
     exit 1
 fi
@@ -143,7 +143,7 @@ echo "  ok  physical Metal: device, queue, shader, compute/readback"; pass=$((pa
 
 # Edition-2027 unsafe atomic fences lower directly to ARM64 DMB. This is a
 # native memory-order witness, separate from Linux futex/thread adapters.
-"$tmpdir/znc-gen1" "$repo_root/tests/macos_v2/atomic_fence.zag" --target macos-arm64 --no-zagd --no-analyze -o "$tmpdir/atomic-fence"
+"$tmpdir/znc-gen1" "$repo_root/tests/macos/v2/atomic_fence.zag" --target macos-arm64 --no-zagd --no-analyze -o "$tmpdir/atomic-fence"
 require_macho_arm64 "$tmpdir/atomic-fence"
 require_signed "$tmpdir/atomic-fence"
 set +e
@@ -156,7 +156,7 @@ echo "  ok  ARM64 native atomic and memory fences"; pass=$((pass + 1))
 
 # RMW uses ARMv8 baseline LL/SC (not optional LSE): exchange, arithmetic,
 # bitwise, CAS, ordered load/store, and seq_cst DMB boundaries all execute.
-"$tmpdir/znc-gen1" "$repo_root/tests/macos_v2/atomic_rmw.zag" --target macos-arm64 --no-zagd --no-analyze -o "$tmpdir/atomic-rmw"
+"$tmpdir/znc-gen1" "$repo_root/tests/macos/v2/atomic_rmw.zag" --target macos-arm64 --no-zagd --no-analyze -o "$tmpdir/atomic-rmw"
 require_macho_arm64 "$tmpdir/atomic-rmw"
 require_signed "$tmpdir/atomic-rmw"
 set +e
@@ -173,7 +173,7 @@ echo "  ok  ARM64 native atomic RMW/CAS (LL/SC)"; pass=$((pass + 1))
 
 # This fixture covers Darwin entry arguments, PIE data addresses, heap,
 # write/read/exists, process execution, stdout, and exit status.
-"$tmpdir/znc-gen1" tests/macos_arm64_runtime.zag --target macos-arm64 --no-zagd --no-analyze -o "$tmpdir/runtime"
+"$tmpdir/znc-gen1" tests/macos/macos_arm64_runtime.zag --target macos-arm64 --no-zagd --no-analyze -o "$tmpdir/runtime"
 require_macho_arm64 "$tmpdir/runtime"
 require_signed "$tmpdir/runtime"
 output="$("$tmpdir/runtime" alpha beta)"

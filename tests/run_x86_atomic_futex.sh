@@ -13,7 +13,7 @@ trap 'rm -rf "$tmp"' EXIT
 
 mkdir -p "$tmp/valid"
 printf 'name = "futexvalid"\nversion = "0"\nedition = "2027"\n' >"$tmp/valid/zag.mod"
-cp tests/x86_atomic_futex.zag "$tmp/valid/main.zag"
+cp tests/x86/x86_atomic_futex.zag "$tmp/valid/main.zag"
 (cd "$tmp/valid" && "$ZNC" main.zag --safety=checked --no-zagd --no-analyze --no-foreground-cache -o app >log 2>&1)
 set +e
 strace -qq -e trace=futex -o "$tmp/valid/futex.log" "$tmp/valid/app"

@@ -17,7 +17,7 @@ project() {
 }
 
 project valid
-cp tests/x86_thread_spawn.zag "$tmp/valid/main.zag"
+cp tests/x86/x86_thread_spawn.zag "$tmp/valid/main.zag"
 (cd "$tmp/valid" && "$ZNC" main.zag --safety=checked --no-zagd --no-analyze --no-foreground-cache -o app >log 2>&1)
 set +e
 timeout 5 strace -f -qq -e trace=clone,futex,mprotect -o "$tmp/valid/thread.log" "$tmp/valid/app"

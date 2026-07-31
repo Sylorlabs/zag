@@ -13,7 +13,7 @@ test -x "$compiler"
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/zag-macos-dyld.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 
-"$compiler" tests/macos_dyld_getpid.zag --target macos-arm64 --dynamic \
+"$compiler" tests/macos/macos_dyld_getpid.zag --target macos-arm64 --dynamic \
     --no-zagd --no-analyze --no-foreground-cache -o "$tmp/getpid"
 file "$tmp/getpid" | grep -q 'Mach-O 64-bit executable arm64'
 codesign --verify --deep --strict "$tmp/getpid"
