@@ -3,7 +3,7 @@
 # and that arm64 compiler (run natively on aarch64, else via qemu-user) must
 # reproduce ITSELF byte-identically and emit binaries byte-identical to the
 # x86-hosted compiler's output for both targets.
-cd "$(dirname "$0")/.."    # zag-poc root
+cd "$(dirname "$0")/.."    # repo root
 pass=0; fail=0
 
 if [ "$(uname -m)" = "aarch64" ]; then

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # AArch64 Linux backend suite: compile Zag to static EM_AARCH64 ELF, run via
 # qemu-user — or natively when the host is already aarch64 (real-hardware CI).
-cd "$(dirname "$0")/.."    # zag-poc root
+cd "$(dirname "$0")/.."    # repo root
 pass=0; fail=0
 WORK="/tmp/zag_native_arm64_$$"
 SRC="nt_src_arm64_$$.zag"

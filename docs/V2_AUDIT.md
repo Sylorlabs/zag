@@ -148,7 +148,7 @@ semantic behavior.
 
 All logs are preserved in repository-root `artifacts/baseline/`.
 
-| Command (from `zag-poc`) | Result |
+| Command (from `.`) | Result |
 |---|---|
 | `./bootstrap.sh` | PASS after 29 analyzer warnings; see `bootstrap.log`. |
 | `bash tests/run_native_authority.sh` | PASS, 7 pass / 0 fail. |
@@ -160,7 +160,7 @@ All logs are preserved in repository-root `artifacts/baseline/`.
 | `bash run_tests.sh` | Not run: file is absent.  Recorded as explicit unsupported, not pass. |
 
 The requested commands were named from repository root, but the executable
-project root is `zag-poc/`; this document records the actual working directory
+project root is ``; this document records the actual working directory
 for reproducibility.
 
 ## 9. Dependency graph

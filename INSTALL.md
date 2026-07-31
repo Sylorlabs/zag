@@ -17,7 +17,7 @@ The committed `./znc` is the Linux bootstrap seed. Apple Silicon uses the
 
 ```sh
 git clone https://github.com/Sylorlabs/zag zag
-cd zag/zag-poc
+cd zag
 chmod +x znc bootstrap.sh tests/*.sh
 ```
 

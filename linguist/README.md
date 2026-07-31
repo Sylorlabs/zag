@@ -28,7 +28,7 @@ Grammar repository: https://github.com/Sylorlabs/zag-grammar
    script/add-grammar https://github.com/Sylorlabs/zag
    ```
    (or vendor `editors/vscode/syntaxes/zag.tmLanguage.json` manually).
-4. Copy two samples from `zag-poc/examples/` into `samples/Zag/`.
+4. Copy two samples from `examples/` into `samples/Zag/`.
 5. Run `script/update-ids` and open a PR linking GitHub code search for `extension:zag`.
 
 Linguist requires broad public usage (~2000 indexed `.zag` files). The upstream

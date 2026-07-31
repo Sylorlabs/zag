@@ -11,7 +11,7 @@
 #   - Swift 5.9+ (for the test harness)
 #
 # Usage:
-#   cd zag-poc
+#   cd .
 #   bash tests/run_metal_mac.sh
 #
 # If znc is not built on this machine, build it first:

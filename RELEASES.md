@@ -202,7 +202,7 @@ The announcement must cover:
 ## Post-Release
 
 - Bump `selfhost/version.zag` back to `"2026.07.0-dev"` on the main branch.
-- Update `zag-poc/zag.mod` to `version = "2026.07.0-dev"`.
+- Update `zag.mod` to `version = "2026.07.0-dev"`.
 - Commit: `git commit -m "post-release: start 2026.07.0-dev cycle"`.
 
 ---

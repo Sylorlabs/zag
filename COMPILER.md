@@ -1,4 +1,4 @@
-# Zag compiler (`zag-poc`)
+# Zag compiler (`zag`)
 
 The supported compiler is `znc`. It writes static Linux ELF binaries, signed
 Apple Silicon Mach-O binaries (`--target macos-arm64`), WebAssembly
@@ -179,8 +179,8 @@ oracle suites are intentionally absent from this tree. They must not be
 restored as a fallback. Use Git history if you need to study them:
 
 ```sh
-git log --all -- zag-poc/selfhost/zagc.zag zag-poc/selfhost/codegen.zag
-git show <commit>:zag-poc/selfhost/codegen.zag
+git log --all -- selfhost/zagc.zag selfhost/codegen.zag
+git show <commit>:selfhost/codegen.zag
 ```
 
 The supported compiler is self-hosted `./znc`; x86-64 and ARM64 machine code,

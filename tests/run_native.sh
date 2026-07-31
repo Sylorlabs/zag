@@ -2,7 +2,7 @@
 # Native x86-64 backend suite: compiles Zag STRAIGHT to a runnable ELF with
 # zero external tools — no cc, no as, no ld, no libc. The whole pipeline
 # (parse → ncodegen → x86 encode → ELF) is Zag (selfhost/native/*.zag).
-cd "$(dirname "$0")/.."    # zag-poc root
+cd "$(dirname "$0")/.."    # repo root
 pass=0; fail=0
 WORK="/tmp/zag_native_x86_$$"
 SRC="nt_src_x86_$$.zag"

@@ -9,7 +9,7 @@ VS Code 1.85 or later, and the Zag LSP binary on your PATH.
 Build it from the compiler tree:
 
 ```sh
-cd zag-poc
+cd .
 ./znc selfhost/lsp/zag-lsp.zag -o zag-lsp
 cp zag-lsp ~/.local/bin/
 ```

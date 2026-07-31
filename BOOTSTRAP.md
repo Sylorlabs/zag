@@ -45,11 +45,11 @@ historical inspection:
 
 ```sh
 # read a file from the bootstrap without changing your tree:
-git show v0.0-zig-bootstrap:zag-poc/src/main.zig
+git show v0.0-zig-bootstrap:src/main.zig
 
 # inspect the retired C emitter without restoring it:
-git log --all -- zag-poc/selfhost/zagc.zag zag-poc/selfhost/codegen.zag
-git show <commit>:zag-poc/selfhost/codegen.zag
+git log --all -- selfhost/zagc.zag selfhost/codegen.zag
+git show <commit>:selfhost/codegen.zag
 ```
 
 ## Supported v1 bootstrap — native only

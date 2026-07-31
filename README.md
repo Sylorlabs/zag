@@ -58,7 +58,7 @@ Apple Silicon uses the `znc-macos-arm64` release/CI artifact.
 
 ```bash
 git clone https://github.com/Sylorlabs/zag.git
-cd zag/zag-poc
+cd zag
 chmod +x znc bootstrap.sh
 ./bootstrap.sh    # optional: self-rebuild ./znc from the committed seed
 ./znc examples/numeric.zag -o numeric --run
@@ -75,7 +75,7 @@ chmod +x znc-macos-arm64
 `./znc` is the supported v1 compiler: it lexes, parses, type-checks, proves capabilities,
 optimizes, and emits static Linux ELF or signed Apple Silicon Mach-O binaries with
 no external tools. See
-[`zag-poc/INSTALL.md`](zag-poc/INSTALL.md) and [`zag-poc/BOOTSTRAP.md`](zag-poc/BOOTSTRAP.md).
+[`INSTALL.md`](INSTALL.md) and [`BOOTSTRAP.md`](BOOTSTRAP.md).
 
 No C-emitting compiler or external prover is required for the supported path.
 The retired bootstrap/oracle implementations are available only through Git
@@ -97,7 +97,7 @@ site will show the Zag name and blue color. Local editors use the Zag grammar in
 ## Quick start
 
 ```bash
-cd zag/zag-poc
+cd zag
 
 # Prove this function's effects are clean, build it, and run it
 ./znc examples/audio_render.zag -o audio_render --run
@@ -147,7 +147,7 @@ The compiler found the chain (`gain` calls `reverbScratch` which calls `zalloc`)
     └── native codegen ──► static x86-64 ELF (./znc)
 ```
 
-The supported compiler is a self-hosted Zag program in `zag-poc/selfhost/native/`
+The supported compiler is a self-hosted Zag program in `selfhost/native/`
 (`znc.zag`). The Python prototype, Zig bootstrap, and C-emitting `zagc` path
 live only in Git history. The supported tree emits x86-64 and experimental
 ARM64 machine code, WASM output, and bounded GPU frontend/bundle artifacts
@@ -278,7 +278,7 @@ MLIR. Pure-Zag userspace runtimes consume them through the existing Linux
 AMDGPU driver UAPI. Future portable targets use custom Zag SPIR-V or PTX
 generators over installed Vulkan/CUDA drivers; Zag does not rewrite privileged
 kernel drivers or firmware. The executable contract is `std:gpu_platform`; see
-`zag-poc/docs/GPU_COMPILER_DRIVER_BOUNDARY.md`.
+`docs/GPU_COMPILER_DRIVER_BOUNDARY.md`.
 
 ---
 
@@ -351,8 +351,8 @@ provenance/alignment/lifetime model, public atomics and volatile/MMIO, complete
 C ABI and dynamic-library interoperability, sanitizers, and physical GPU
 execution. GPU MLIR and ZGK1/VM evidence must not be described as device
 dispatch or readback proof. See
-[`zag-poc/docs/V2_FINAL_VERIFICATION.md`](zag-poc/docs/V2_FINAL_VERIFICATION.md)
-and [`zag-poc/docs/GPU_COMPILER_DRIVER_BOUNDARY.md`](zag-poc/docs/GPU_COMPILER_DRIVER_BOUNDARY.md).
+[`docs/V2_FINAL_VERIFICATION.md`](docs/V2_FINAL_VERIFICATION.md)
+and [`docs/GPU_COMPILER_DRIVER_BOUNDARY.md`](docs/GPU_COMPILER_DRIVER_BOUNDARY.md).
 
 C interoperability is an incremental-replacement bridge, not a Zag-to-C
 translation path: Zag source is compiled directly by Zag's native compiler.
@@ -371,7 +371,7 @@ translation path: Zag source is compiled directly by Zag's native compiler.
 Release gates:
 
 ```bash
-cd zag-poc
+cd .
 bash tests/run_native_authority.sh
 bash tests/run_native.sh
 bash tests/run_native_gpu.sh
@@ -396,7 +396,7 @@ archival comparison; it is not a supported compiler path or a release gate.
 
 ```
 README.md                          project overview (this file)
-zag-poc/
+
   INSTALL.md                       install and test instructions
   BOOTSTRAP.md                       bootstrap history and seed chain
   docs/V1_LANGUAGE_SPEC.md         frozen v1 language boundary

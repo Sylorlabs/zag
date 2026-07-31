@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Native backend edge-case battery: unions, effects, errors, numerics, generics,
 # modules, forward-decl / mutual-recursion stress. Runs alongside run_native.sh.
-cd "$(dirname "$0")/.."    # zag-poc root
+cd "$(dirname "$0")/.."    # repo root
 pass=0; fail=0
 
 ZNC=${ZNC:-}
