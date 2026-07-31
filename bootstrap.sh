@@ -19,7 +19,17 @@ if [ ! -x ./bootstrap/znc ]; then
     exit 1
 fi
 
-echo "== native bootstrap: Zag -> x86-64 ELF (no cc/as/ld/libc) =="
+# Select the native target so the compiler lowers platform-correct syscalls.
+# The seed defaults to x86-64 ELF; on macOS ARM64 we must target macos-arm64
+# so the Darwin-specific lowering paths (_zag_darwin_syscall, etc.) are used.
+bootstrap_target=""
+bootstrap_arch="x86-64 ELF"
+if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then
+    bootstrap_target="--target macos-arm64"
+    bootstrap_arch="macOS ARM64 Mach-O"
+fi
+
+echo "== native bootstrap: Zag -> $bootstrap_arch (no cc/as/ld/libc) =="
 bootstrap_tmp=$(mktemp -d "${TMPDIR:-/tmp}/zag-bootstrap.XXXXXX")
 trap 'rm -rf "$bootstrap_tmp"' EXIT HUP INT TERM
 
@@ -81,11 +91,11 @@ bootstrap_compile() {
 # byte-identical before replacing the trusted seed. This keeps `bootstrap.sh`
 # itself a fixpoint gate instead of installing an unproven stage-1 compiler.
 bootstrap_compile ./bootstrap/znc selfhost/native/znc.zag -o "$bootstrap_tmp/znc-stage1" \
-    --no-analyze --no-foreground-cache --no-zagd
+    $bootstrap_target --no-analyze --no-foreground-cache --no-zagd
 bootstrap_compile "$bootstrap_tmp/znc-stage1" selfhost/native/znc.zag \
-    -o "$bootstrap_tmp/znc-stage2" --no-analyze --no-foreground-cache --no-zagd
+    -o "$bootstrap_tmp/znc-stage2" $bootstrap_target --no-analyze --no-foreground-cache --no-zagd
 bootstrap_compile "$bootstrap_tmp/znc-stage2" selfhost/native/znc.zag \
-    -o "$bootstrap_tmp/znc-stage3" --no-analyze --no-foreground-cache --no-zagd
+    -o "$bootstrap_tmp/znc-stage3" $bootstrap_target --no-analyze --no-foreground-cache --no-zagd
 if ! cmp -s "$bootstrap_tmp/znc-stage2" "$bootstrap_tmp/znc-stage3"; then
     echo "bootstrap: self-hosting did not reach a byte-identical fixpoint" >&2
     exit 1
@@ -98,7 +108,7 @@ if [ "$(uname -s)" = Darwin ] && [ "$(uname -m)" = arm64 ]; then
     zagd_source=selfhost/zagd_macos_daemon.zag
 fi
 bootstrap_compile ./znc "$zagd_source" -o "$bootstrap_tmp/zagd" \
-    --no-analyze --no-zagd --no-foreground-cache
+    $bootstrap_target --no-analyze --no-zagd --no-foreground-cache
 chmod +x "$bootstrap_tmp/zagd"
 mv -f "$bootstrap_tmp/zagd" zagd
 echo "   ./zagd built from $zagd_source with the fixed-point compiler"
