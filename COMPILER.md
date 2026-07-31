@@ -71,7 +71,7 @@ silently writing an ordinary executable.
 Build the language server:
 
 ```sh
-./znc selfhost/lsp/zag-lsp.zag -o zag-lsp
+./bootstrap/znc selfhost/lsp/zag-lsp.zag -o zag-lsp
 ```
 
 The VS Code client is in `../editors/vscode/`.

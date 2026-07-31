@@ -10,7 +10,7 @@ Build it from the compiler tree:
 
 ```sh
 cd .
-./znc selfhost/lsp/zag-lsp.zag -o zag-lsp
+./bootstrap/znc selfhost/lsp/zag-lsp.zag -o zag-lsp
 cp zag-lsp ~/.local/bin/
 ```
 

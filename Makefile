@@ -1,12 +1,12 @@
 # Zag compiler Makefile
 #
-# Primary compiler: ./znc  (Linux ELF or Apple Silicon Mach-O, zero cc/as/ld/libc)
+# Primary compiler: ./znc (built by bootstrap.sh from bootstrap/znc seed) or Apple Silicon Mach-O, zero cc/as/ld/libc)
 #
 # Supported workflow:
-#   make           — rebuild znc from seed (= bootstrap)
+#   make           — rebuild znc from seed (bootstrap/)
 #   make test      — run the authoritative v1 test suite
 #   make install   — install znc to /usr/local/bin
-#   make clean     — remove generated artifacts (keeps the znc seed)
+#   make clean     — remove generated artifacts (keeps the bootstrap/ seed)
 
 .PHONY: all bootstrap znc zagd test test-zagscript-release test-zagscript-master test-v1-compat test-zagd-product test-zagd-launchd-service test-macho-debug-writer test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-analyzer test-hot-reload test-dynamic-abi test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-std-namespace \
         test-diagnostics test-tooling test-programs test-native test-abi-layout test-arm64 \
@@ -166,7 +166,7 @@ install: znc zagd
 	@echo "Installed znc + zagd + service control → /usr/local/bin, std → /usr/local/lib/zag/std, policy template → /usr/local/share/zag"
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
-# Removes generated artifacts. Does NOT remove the znc seed binary.
+# Removes generated artifacts. Does NOT remove the bootstrap/ seed binaries.
 clean:
 	@echo "── removing generated outputs ──"
 	find . -name '*.zag.out' -delete 2>/dev/null || true
@@ -198,4 +198,4 @@ clean:
 	rm -f examples/total_guarded examples/total_nonzero
 	rm -f examples/interfaces examples/hot_demo
 	rm -f examples/*.mlir
-	@echo "clean done (znc seed preserved)"
+	@echo "clean done (bootstrap/ seed preserved)"

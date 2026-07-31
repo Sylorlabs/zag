@@ -9,7 +9,7 @@ release tag is pushed. Steps marked **BLOCKING** abort the release if they fail.
 
 - You are on the `native-self-hosting-no-zig` branch (or a release branch cut
   from it).
-- `./znc` is the committed seed binary. No Python, C, or Zig compiler path is
+- `./bootstrap/znc` is the committed seed binary. No Python, C, or Zig compiler path is
   present or accepted as a fallback.
 - `./znc` is the native x86-64 compiler (lexer through ELF emission) with
   integrated GPU MLIR (`--target gpu-*`) and WASM (`--target wasm`) backends.
@@ -122,7 +122,7 @@ Or use the dedicated script:
 ```
 
 A non-zero diff on `./znc` is a release blocker. Optionally run
-`./tests/check_native_target_repro.sh` if you rebuilt `znc-target` for
+`./tests/check_native_target_repro.sh` if you rebuilt `bootstrap/znc-target` for
 differential checks.
 
 ### 7. Update CHANGELOG.md
@@ -142,11 +142,11 @@ git commit -m "changelog: add release date for 2026.06.0"
 
 ### 8. Build and commit seed binaries
 
-Rebuild the seed binary from source and commit it. `./znc` is the release
+Rebuild the seed binary from source and commit it. `./bootstrap/znc` is the release
 artifact for native ELF, GPU MLIR, and WASM.
 
 ```sh
-./bootstrap.sh          # produces ./znc
+./bootstrap.sh          # produces ./znc from bootstrap/znc seed
 git add znc             # REQUIRED: supported seed binary
 git commit -m "release: update seed binaries for 2026.06.0"
 ```

@@ -13,8 +13,8 @@
 set -e
 cd "$(dirname "$0")"
 
-if [ ! -x ./znc ]; then
-    echo "bootstrap: native seed ./znc is missing; restore the committed seed." >&2
+if [ ! -x ./bootstrap/znc ]; then
+    echo "bootstrap: native seed ./bootstrap/znc is missing; restore the committed seed." >&2
     echo "bootstrap: no non-Zag fallback exists; restore the committed znc seed." >&2
     exit 1
 fi
@@ -80,7 +80,7 @@ bootstrap_compile() {
 # through two generated compilers and require the last two outputs to be
 # byte-identical before replacing the trusted seed. This keeps `bootstrap.sh`
 # itself a fixpoint gate instead of installing an unproven stage-1 compiler.
-bootstrap_compile ./znc selfhost/native/znc.zag -o "$bootstrap_tmp/znc-stage1" \
+bootstrap_compile ./bootstrap/znc selfhost/native/znc.zag -o "$bootstrap_tmp/znc-stage1" \
     --no-analyze --no-foreground-cache --no-zagd
 bootstrap_compile "$bootstrap_tmp/znc-stage1" selfhost/native/znc.zag \
     -o "$bootstrap_tmp/znc-stage2" --no-analyze --no-foreground-cache --no-zagd

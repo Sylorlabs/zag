@@ -2,7 +2,7 @@
 # tests/test_lsp.sh — basic LSP protocol smoke tests for zag-lsp
 #
 # Build zag-lsp first:
-#   ./znc selfhost/lsp/zag-lsp.zag -o zag-lsp
+#   ./bootstrap/znc selfhost/lsp/zag-lsp.zag -o zag-lsp
 #
 # Run:
 #   bash tests/test_lsp.sh
@@ -10,7 +10,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ZAG_LSP="${ZAG_LSP:-./zag-lsp}"
+ZAG_LSP="${ZAG_LSP:-./bootstrap/zag-lsp}"
 PASS=0
 FAIL=0
 
@@ -43,7 +43,7 @@ echo "── LSP smoke tests ─────────────────
 # Build the LSP binary if not present
 if [[ ! -x "$ZAG_LSP" ]]; then
     echo "Building zag-lsp..."
-    ./znc selfhost/lsp/zag-lsp.zag -o zag-lsp
+    ./bootstrap/znc selfhost/lsp/zag-lsp.zag -o zag-lsp
 fi
 
 # ── Test 1: initialize ─────────────────────────────────────────────────────────
