@@ -884,6 +884,7 @@ fn cg_expr_type(n: *Node, env: *Env, syms: ArrayList[FnSym], cg: *Cg) []u8 {
             if (bt3.len > 1) { if (bt3[0] == '*') { return bt3[1..]; } }
             return "";
         }
+        .switch_ => |sw| { return cg_switch_expr_type(sw, env, syms, cg); }
         .cast_ => |cst| { return cg_norm_type(cst.target); }
         .slit  => |_s| { return "[]u8"; }   // a string literal is a []u8 slice value
         .embed => |_e| { return "[]u8"; }   // #embed yields a []u8 slice value
@@ -6087,10 +6088,18 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
 // backend's `switch (__sw.tag)` lowering but with explicit compares + jumps.
 // ════════════════════════════════════════════════════════════════════════════
 
-// Classify a switch by its first arm's first tag:
+// Classify a switch by its subject's static type, with tag discovery only as a
+// fallback for older/unknown expression forms. Subject typing is authoritative:
+// different enums commonly reuse member names such as `start`, `end`, and
+// `baseline`, so global first-tag discovery can silently select the wrong enum.
 //   2 = union (tag matches a union variant), 1 = enum (matches an enum member),
 //   0 = plain value switch. The union name / enum name is returned via *uname.
-fn cg_switch_kind(cg: *Cg, sw: Switch, uname: *[]u8) i32 {
+fn cg_switch_kind(cg: *Cg, sw: Switch, subject_ty0: []u8, uname: *[]u8) i32 {
+    let subject_ty: []u8 = cg_norm_type(subject_ty0);
+    if (subject_ty.len > 1 && subject_ty[0] == '*') { subject_ty = subject_ty[1..]; }
+    if (cg_type_is_union(cg, subject_ty) == 1) { uname.* = subject_ty; return 2; }
+    let subject_enum: EnumDecl = EnumDecl{ .name = "", .members = make[[]u8](1) };
+    if (cg_find_enum(cg, subject_ty, &subject_enum) == 1) { uname.* = subject_ty; return 1; }
     if (len[SwitchArm](sw.arms) == 0) { uname.* = ""; return 0; }
     let a0: SwitchArm = get[SwitchArm](sw.arms, 0);
     if (len[[]u8](a0.tags) == 0) { uname.* = ""; return 0; }
@@ -6171,7 +6180,7 @@ fn cg_bind_capture(out: *ArrayList[Instr], cap: []u8, payty: []u8, blk: i32, env
 // Lower a switch STATEMENT: dispatch to per-arm bodies, with an else fallback.
 fn cg_lower_switch_stmt(out: *ArrayList[Instr], sw: Switch, env: *Env, syms: ArrayList[FnSym], cg: *Cg) void {
     let uname: []u8 = "";
-    let kind: i32 = cg_switch_kind(cg, sw, &uname);
+    let kind: i32 = cg_switch_kind(cg, sw, cg_expr_type(sw.subject, env, syms, cg), &uname);
     let blk: i32 = cg_switch_materialize(out, sw, kind, uname, env, syms, cg);
     let end_lbl: i32 = cg_fresh(cg);
 
@@ -6210,13 +6219,67 @@ fn cg_lower_switch_stmt(out: *ArrayList[Instr], sw: Switch, env: *Env, syms: Arr
     push[Instr](out, i_label(end_lbl));
 }
 
+// Coarse result type for a switch-expression arm. Prefix statements do not
+// contribute a value; the final expression does. This feeds aggregate result
+// storage without guessing from the switch subject type.
+fn cg_switch_arm_type(body: ArrayList[*Node], env: *Env, syms: ArrayList[FnSym], cg: *Cg) []u8 {
+    if (len[*Node](body) == 0) { return ""; }
+    let last: *Node = get[*Node](body, len[*Node](body) - 1);
+    switch (last.*) {
+        .estmt => |e| { return cg_expr_type(e.expr, env, syms, cg); }
+        .ret => |r| { if (r.has_expr == 1) { return cg_expr_type(r.expr, env, syms, cg); } return ""; }
+        else => { return cg_expr_type(last, env, syms, cg); }
+    }
+    return "";
+}
+
+fn cg_switch_expr_type(sw: Switch, env: *Env, syms: ArrayList[FnSym], cg: *Cg) []u8 {
+    let result: []u8 = "";
+    let i: i32 = 0;
+    while (i < len[SwitchArm](sw.arms)) {
+        let arm_ty: []u8 = cg_switch_arm_type(get[SwitchArm](sw.arms, i).body, env, syms, cg);
+        if (arm_ty.len > 0) {
+            if (result.len == 0) { result = arm_ty; }
+            else if (cg_types_compatible(result, arm_ty, cg) == 0) { return ""; }
+        }
+        i = i + 1;
+    }
+    if (sw.has_els == 1) {
+        let else_ty: []u8 = cg_switch_arm_type(sw.els_body, env, syms, cg);
+        if (else_ty.len > 0) {
+            if (result.len == 0) { result = else_ty; }
+            else if (cg_types_compatible(result, else_ty, cg) == 0) { return ""; }
+        }
+    }
+    return result;
+}
+
+fn cg_store_switch_result(out: *ArrayList[Instr], result_base: i32, result_words: i32, aggregate: i32) void {
+    if (aggregate == 0) {
+        push[Instr](out, i_pop(R_RAX()));
+        push[Instr](out, i_store(R_RBP(), result_base, R_RAX()));
+        return;
+    }
+    push[Instr](out, i_pop(R_RSI()));
+    let word: i32 = 0;
+    while (word < result_words) {
+        push[Instr](out, i_load(R_RAX(), R_RSI(), 8 * word));
+        push[Instr](out, i_store(R_RBP(), result_base + 8 * word, R_RAX()));
+        word = word + 1;
+    }
+}
+
 // Lower a switch EXPRESSION: each arm's body yields a value (its last/only expr);
 // the chosen value is left PUSHED. Implemented as branch chain into a result slot.
 fn cg_lower_switch_expr(out: *ArrayList[Instr], sw: Switch, env: *Env, syms: ArrayList[FnSym], cg: *Cg) void {
     let uname: []u8 = "";
-    let kind: i32 = cg_switch_kind(cg, sw, &uname);
+    let kind: i32 = cg_switch_kind(cg, sw, cg_expr_type(sw.subject, env, syms, cg), &uname);
     let blk: i32 = cg_switch_materialize(out, sw, kind, uname, env, syms, cg);
-    let res: i32 = cg_slot_scratch(env);   // result slot
+    let result_ty: []u8 = cg_switch_expr_type(sw, env, syms, cg);
+    let aggregate: i32 = cg_type_is_agg(cg, result_ty);
+    let result_words: i32 = 1;
+    if (aggregate == 1) { result_words = cg_agg_words(cg, result_ty); }
+    let res: i32 = cg_slot_scratch_n(env, result_words);
     let end_lbl: i32 = cg_fresh(cg);
 
     let na: i32 = len[SwitchArm](sw.arms);
@@ -6242,22 +6305,25 @@ fn cg_lower_switch_expr(out: *ArrayList[Instr], sw: Switch, env: *Env, syms: Arr
         }
         cg_lower_arm_value(out, arm.body, env, syms, cg);   // pushes arm value
         cg_scope_end(env, arm_scope);
-        push[Instr](out, i_pop(R_RAX()));
-        push[Instr](out, i_store(R_RBP(), res, R_RAX()));
+        cg_store_switch_result(out, res, result_words, aggregate);
         push[Instr](out, i_jmp(end_lbl));
         push[Instr](out, i_label(next_lbl));
         ai = ai + 1;
     }
     if (sw.has_els == 1) {
         cg_lower_arm_value(out, sw.els_body, env, syms, cg);
-        push[Instr](out, i_pop(R_RAX()));
-        push[Instr](out, i_store(R_RBP(), res, R_RAX()));
+        cg_store_switch_result(out, res, result_words, aggregate);
     } else {
-        push[Instr](out, i_mov_imm(R_RAX(), 0));
-        push[Instr](out, i_store(R_RBP(), res, R_RAX()));
+        let word: i32 = 0;
+        while (word < result_words) {
+            push[Instr](out, i_mov_imm(R_RAX(), 0));
+            push[Instr](out, i_store(R_RBP(), res + 8 * word, R_RAX()));
+            word = word + 1;
+        }
     }
     push[Instr](out, i_label(end_lbl));
-    push[Instr](out, i_load(R_RAX(), R_RBP(), res));
+    if (aggregate == 1) { push[Instr](out, i_lea(R_RAX(), R_RBP(), res)); }
+    else { push[Instr](out, i_load(R_RAX(), R_RBP(), res)); }
     push[Instr](out, i_push(R_RAX()));
 }
 
