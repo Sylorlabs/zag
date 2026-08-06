@@ -1,0 +1,485 @@
+@import("list.zag")
+@import("checksum.zag")
+
+enum ZlibInflateError {
+    none,
+    invalid_limit,
+    truncated,
+    invalid_header,
+    preset_dictionary,
+    invalid_block_type,
+    invalid_stored_length,
+    invalid_huffman_tree,
+    invalid_huffman_symbol,
+    invalid_back_reference,
+    output_limit,
+    checksum_mismatch,
+    trailing_data,
+}
+
+struct ZlibInflateResult {
+    bytes: ArrayList[u8],
+    error: ZlibInflateError,
+    error_offset: i64,
+}
+
+struct InflateBits {
+    input: []u8,
+    bit_position: i64,
+    bit_limit: i64,
+    error: i32,
+}
+
+struct InflateHuffman {
+    symbols: ArrayList[i32],
+    lengths: ArrayList[i32],
+    max_bits: i32,
+    valid: i32,
+}
+
+fn zlib_inflate_hard_limit() i64 { return 268435456; }
+
+fn inflate_bits(input: []u8) InflateBits {
+    return InflateBits{
+        .input = input,
+        .bit_position = 16,
+        .bit_limit = ((input.len - 4) as i64) * 8,
+        .error = 0,
+    };
+}
+
+fn inflate_read_bits(reader: *InflateBits, count: i32) i64 {
+    if (count < 0 || count > 16 ||
+        reader.*.bit_position + count as i64 > reader.*.bit_limit) {
+        reader.*.error = 1;
+        return 0;
+    }
+    let value: i64 = 0;
+    let i: i32 = 0;
+    while (i < count) {
+        let position: i64 = reader.*.bit_position + i as i64;
+        let byte_index: i32 = (position / 8) as i32;
+        let bit_index: i32 = (position % 8) as i32;
+        value = value | ((((reader.*.input[byte_index] as i64) >> bit_index) & 1) << i);
+        i = i + 1;
+    }
+    reader.*.bit_position = reader.*.bit_position + count as i64;
+    return value;
+}
+
+fn inflate_peek_bits(reader: InflateBits, count: i32) i64 {
+    let value: i64 = 0;
+    let i: i32 = 0;
+    while (i < count) {
+        let position: i64 = reader.bit_position + i as i64;
+        if (position < reader.bit_limit) {
+            let byte_index: i32 = (position / 8) as i32;
+            let bit_index: i32 = (position % 8) as i32;
+            value = value | ((((reader.input[byte_index] as i64) >> bit_index) & 1) << i);
+        }
+        i = i + 1;
+    }
+    return value;
+}
+
+fn inflate_align_byte(reader: *InflateBits) void {
+    let remainder: i64 = reader.*.bit_position % 8;
+    if (remainder != 0) { reader.*.bit_position = reader.*.bit_position + 8 - remainder; }
+    if (reader.*.bit_position > reader.*.bit_limit) { reader.*.error = 1; }
+}
+
+fn inflate_reverse_bits(value: i32, length: i32) i32 {
+    let reversed: i32 = 0;
+    let i: i32 = 0;
+    while (i < length) {
+        reversed = (reversed << 1) | ((value >> i) & 1);
+        i = i + 1;
+    }
+    return reversed;
+}
+
+fn inflate_huffman_invalid() InflateHuffman {
+    return InflateHuffman{
+        .symbols = make[i32](1), .lengths = make[i32](1),
+        .max_bits = 0, .valid = 0,
+    };
+}
+
+fn inflate_huffman_free(tree: *InflateHuffman) void {
+    free[i32](&tree.*.symbols);
+    free[i32](&tree.*.lengths);
+}
+
+fn inflate_huffman_build(code_lengths: ArrayList[i32]) InflateHuffman {
+    let counts: ArrayList[i32] = make[i32](16);
+    let next_code: ArrayList[i32] = make[i32](16);
+    let i: i32 = 0;
+    while (i < 16) { push[i32](&counts, 0); push[i32](&next_code, 0); i = i + 1; }
+    let max_bits: i32 = 0;
+    let symbol: i32 = 0;
+    while (symbol < code_lengths.len) {
+        let length: i32 = code_lengths.data[symbol];
+        if (length < 0 || length > 15) {
+            free[i32](&counts); free[i32](&next_code);
+            return inflate_huffman_invalid();
+        }
+        if (length > 0) {
+            counts.data[length] = counts.data[length] + 1;
+            if (length > max_bits) { max_bits = length; }
+        }
+        symbol = symbol + 1;
+    }
+    if (max_bits == 0) {
+        free[i32](&counts); free[i32](&next_code);
+        return inflate_huffman_invalid();
+    }
+    let remaining: i32 = 1;
+    i = 1;
+    while (i <= 15) {
+        remaining = remaining * 2 - counts.data[i];
+        if (remaining < 0) {
+            free[i32](&counts); free[i32](&next_code);
+            return inflate_huffman_invalid();
+        }
+        i = i + 1;
+    }
+    let code: i32 = 0;
+    i = 1;
+    while (i <= 15) {
+        code = (code + counts.data[i - 1]) << 1;
+        next_code.data[i] = code;
+        i = i + 1;
+    }
+    let table_size: i32 = 1 << max_bits;
+    let tree: InflateHuffman = InflateHuffman{
+        .symbols = make[i32](table_size),
+        .lengths = make[i32](table_size),
+        .max_bits = max_bits,
+        .valid = 1,
+    };
+    i = 0;
+    while (i < table_size) {
+        push[i32](&tree.symbols, 0 - 1);
+        push[i32](&tree.lengths, 0);
+        i = i + 1;
+    }
+    symbol = 0;
+    while (symbol < code_lengths.len) {
+        let length: i32 = code_lengths.data[symbol];
+        if (length > 0) {
+            let canonical: i32 = next_code.data[length];
+            next_code.data[length] = canonical + 1;
+            let reversed: i32 = inflate_reverse_bits(canonical, length);
+            let index: i32 = reversed;
+            let step: i32 = 1 << length;
+            while (index < table_size) {
+                if (tree.lengths.data[index] != 0) { tree.valid = 0; }
+                tree.symbols.data[index] = symbol;
+                tree.lengths.data[index] = length;
+                index = index + step;
+            }
+        }
+        symbol = symbol + 1;
+    }
+    free[i32](&counts); free[i32](&next_code);
+    if (tree.valid == 0) {
+        inflate_huffman_free(&tree);
+        return inflate_huffman_invalid();
+    }
+    return tree;
+}
+
+fn inflate_huffman_decode(reader: *InflateBits, tree: InflateHuffman) i32 {
+    if (tree.valid == 0 || reader.*.bit_position >= reader.*.bit_limit) {
+        reader.*.error = 1;
+        return 0 - 1;
+    }
+    let index: i32 = inflate_peek_bits(reader.*, tree.max_bits) as i32;
+    let length: i32 = tree.lengths.data[index];
+    if (length <= 0 || reader.*.bit_position + length as i64 > reader.*.bit_limit) {
+        reader.*.error = 1;
+        return 0 - 1;
+    }
+    reader.*.bit_position = reader.*.bit_position + length as i64;
+    return tree.symbols.data[index];
+}
+
+fn inflate_fixed_lit_lengths() ArrayList[i32] {
+    let lengths: ArrayList[i32] = make[i32](288);
+    let i: i32 = 0;
+    while (i < 288) {
+        let length: i32 = 8;
+        if (i >= 144 && i <= 255) { length = 9; }
+        if (i >= 256 && i <= 279) { length = 7; }
+        push[i32](&lengths, length);
+        i = i + 1;
+    }
+    return lengths;
+}
+
+fn inflate_fixed_distance_lengths() ArrayList[i32] {
+    let lengths: ArrayList[i32] = make[i32](32);
+    let i: i32 = 0;
+    while (i < 32) { push[i32](&lengths, 5); i = i + 1; }
+    return lengths;
+}
+
+fn inflate_dynamic_trees(reader: *InflateBits,
+    lit_tree: *InflateHuffman, distance_tree: *InflateHuffman) i32 {
+    let literal_count: i32 = inflate_read_bits(reader, 5) as i32 + 257;
+    let distance_count: i32 = inflate_read_bits(reader, 5) as i32 + 1;
+    let code_count: i32 = inflate_read_bits(reader, 4) as i32 + 4;
+    if (reader.*.error != 0 || literal_count > 286 || distance_count > 32) { return 0; }
+    let order: ArrayList[i32] = make[i32](19);
+    push[i32](&order, 16); push[i32](&order, 17); push[i32](&order, 18);
+    push[i32](&order, 0); push[i32](&order, 8); push[i32](&order, 7);
+    push[i32](&order, 9); push[i32](&order, 6); push[i32](&order, 10);
+    push[i32](&order, 5); push[i32](&order, 11); push[i32](&order, 4);
+    push[i32](&order, 12); push[i32](&order, 3); push[i32](&order, 13);
+    push[i32](&order, 2); push[i32](&order, 14); push[i32](&order, 1);
+    push[i32](&order, 15);
+    let code_lengths: ArrayList[i32] = make[i32](19);
+    let i: i32 = 0;
+    while (i < 19) { push[i32](&code_lengths, 0); i = i + 1; }
+    i = 0;
+    while (i < code_count) {
+        code_lengths.data[order.data[i]] = inflate_read_bits(reader, 3) as i32;
+        i = i + 1;
+    }
+    free[i32](&order);
+    if (reader.*.error != 0) { free[i32](&code_lengths); return 0; }
+    let code_tree: InflateHuffman = inflate_huffman_build(code_lengths);
+    free[i32](&code_lengths);
+    if (code_tree.valid == 0) { inflate_huffman_free(&code_tree); return 0; }
+    let all_lengths: ArrayList[i32] = make[i32](literal_count + distance_count);
+    while (all_lengths.len < literal_count + distance_count) {
+        let value: i32 = inflate_huffman_decode(reader, code_tree);
+        if (reader.*.error != 0 || value < 0) {
+            inflate_huffman_free(&code_tree); free[i32](&all_lengths); return 0;
+        }
+        if (value <= 15) {
+            push[i32](&all_lengths, value);
+        } else {
+            let repeat: i32 = 0;
+            let repeated_value: i32 = 0;
+            if (value == 16) {
+                if (all_lengths.len == 0) {
+                    inflate_huffman_free(&code_tree); free[i32](&all_lengths); return 0;
+                }
+                repeat = inflate_read_bits(reader, 2) as i32 + 3;
+                repeated_value = all_lengths.data[all_lengths.len - 1];
+            } else if (value == 17) {
+                repeat = inflate_read_bits(reader, 3) as i32 + 3;
+            } else if (value == 18) {
+                repeat = inflate_read_bits(reader, 7) as i32 + 11;
+            } else {
+                inflate_huffman_free(&code_tree); free[i32](&all_lengths); return 0;
+            }
+            if (reader.*.error != 0 || all_lengths.len + repeat > literal_count + distance_count) {
+                inflate_huffman_free(&code_tree); free[i32](&all_lengths); return 0;
+            }
+            let j: i32 = 0;
+            while (j < repeat) { push[i32](&all_lengths, repeated_value); j = j + 1; }
+        }
+    }
+    inflate_huffman_free(&code_tree);
+    let literal_lengths: ArrayList[i32] = make[i32](literal_count);
+    let distance_lengths: ArrayList[i32] = make[i32](distance_count);
+    i = 0;
+    while (i < literal_count) { push[i32](&literal_lengths, all_lengths.data[i]); i = i + 1; }
+    while (i < literal_count + distance_count) {
+        push[i32](&distance_lengths, all_lengths.data[i]); i = i + 1;
+    }
+    free[i32](&all_lengths);
+    if (literal_lengths.data[256] == 0) {
+        free[i32](&literal_lengths); free[i32](&distance_lengths);
+        return 0;
+    }
+    let built_lit_tree: InflateHuffman = inflate_huffman_build(literal_lengths);
+    let built_distance_tree: InflateHuffman = inflate_huffman_build(distance_lengths);
+    free[i32](&literal_lengths); free[i32](&distance_lengths);
+    if (built_lit_tree.valid == 0 || built_distance_tree.valid == 0) {
+        inflate_huffman_free(&built_lit_tree);
+        inflate_huffman_free(&built_distance_tree);
+        return 0;
+    }
+    inflate_huffman_free(lit_tree);
+    inflate_huffman_free(distance_tree);
+    lit_tree.* = built_lit_tree;
+    distance_tree.* = built_distance_tree;
+    return 1;
+}
+
+fn inflate_length_base(symbol: i32) i32 {
+    if (symbol == 285) { return 258; }
+    if (symbol <= 264) { return symbol - 254; }
+    let extra: i32 = inflate_length_extra(symbol);
+    let first_symbol: i32 = 261 + extra * 4;
+    return (1 << (extra + 2)) + 3 +
+        (symbol - first_symbol) * (1 << extra);
+}
+
+fn inflate_length_extra(symbol: i32) i32 {
+    if (symbol <= 264 || symbol == 285) { return 0; }
+    return ((symbol - 261) / 4);
+}
+
+fn inflate_distance_base(symbol: i32) i32 {
+    if (symbol < 4) { return symbol + 1; }
+    let extra: i32 = symbol / 2 - 1;
+    return ((2 + (symbol & 1)) << extra) + 1;
+}
+
+fn inflate_distance_extra(symbol: i32) i32 {
+    if (symbol < 4) { return 0; }
+    return symbol / 2 - 1;
+}
+
+fn inflate_compressed_block(reader: *InflateBits, output: *ArrayList[u8],
+    max_output: i64, lit_tree: InflateHuffman, distance_tree: InflateHuffman) ZlibInflateError {
+    // znc:allow B0102
+    while (1 == 1) {
+        let symbol: i32 = inflate_huffman_decode(reader, lit_tree);
+        if (reader.*.error != 0 || symbol < 0) { return ZlibInflateError.invalid_huffman_symbol; }
+        if (symbol < 256) {
+            if (output.*.len as i64 >= max_output) { return ZlibInflateError.output_limit; }
+            push[u8](output, symbol as u8);
+        } else if (symbol == 256) {
+            return ZlibInflateError.none;
+        } else {
+            if (symbol < 257 || symbol > 285) { return ZlibInflateError.invalid_huffman_symbol; }
+            let length: i32 = inflate_length_base(symbol);
+            let length_extra: i32 = inflate_length_extra(symbol);
+            if (length_extra > 0) { length = length + inflate_read_bits(reader, length_extra) as i32; }
+            let distance_symbol: i32 = inflate_huffman_decode(reader, distance_tree);
+            if (reader.*.error != 0 || distance_symbol < 0 || distance_symbol > 29) {
+                return ZlibInflateError.invalid_huffman_symbol;
+            }
+            let distance: i32 = inflate_distance_base(distance_symbol);
+            let distance_extra: i32 = inflate_distance_extra(distance_symbol);
+            if (distance_extra > 0) {
+                distance = distance + inflate_read_bits(reader, distance_extra) as i32;
+            }
+            if (reader.*.error != 0 || distance <= 0 || distance > output.*.len) {
+                return ZlibInflateError.invalid_back_reference;
+            }
+            if (output.*.len as i64 + length as i64 > max_output) {
+                return ZlibInflateError.output_limit;
+            }
+            let i: i32 = 0;
+            while (i < length) {
+                push[u8](output, output.*.data[output.*.len - distance]);
+                i = i + 1;
+            }
+        }
+    }
+}
+
+fn zlib_inflate_fail(output: ArrayList[u8], error: ZlibInflateError,
+    offset: i64) ZlibInflateResult {
+    return ZlibInflateResult{ .bytes = output, .error = error, .error_offset = offset };
+}
+
+fn zlib_inflate(input: []u8, max_output: i64) ZlibInflateResult {
+    let output: ArrayList[u8] = make[u8](256);
+    if (max_output <= 0 || max_output > zlib_inflate_hard_limit()) {
+        return zlib_inflate_fail(output, ZlibInflateError.invalid_limit, 0);
+    }
+    if (input.len < 6) { return zlib_inflate_fail(output, ZlibInflateError.truncated, input.len as i64); }
+    let cmf: i32 = input[0] as i32;
+    let flg: i32 = input[1] as i32;
+    if ((cmf & 15) != 8 || (cmf >> 4) > 7 || ((cmf * 256 + flg) % 31) != 0) {
+        return zlib_inflate_fail(output, ZlibInflateError.invalid_header, 0);
+    }
+    if ((flg & 32) != 0) {
+        return zlib_inflate_fail(output, ZlibInflateError.preset_dictionary, 1);
+    }
+    let reader: InflateBits = inflate_bits(input);
+    let final_block: i32 = 0;
+    while (final_block == 0) {
+        final_block = inflate_read_bits(&reader, 1) as i32;
+        let block_type: i32 = inflate_read_bits(&reader, 2) as i32;
+        if (reader.error != 0) {
+            return zlib_inflate_fail(output, ZlibInflateError.truncated,
+                reader.bit_position / 8);
+        }
+        if (block_type == 0) {
+            inflate_align_byte(&reader);
+            let offset: i32 = (reader.bit_position / 8) as i32;
+            if (reader.error != 0 || offset + 4 > input.len - 4) {
+                return zlib_inflate_fail(output, ZlibInflateError.truncated, offset as i64);
+            }
+            let length: i32 = (input[offset] as i32) | ((input[offset + 1] as i32) << 8);
+            let inverted: i32 = (input[offset + 2] as i32) | ((input[offset + 3] as i32) << 8);
+            if ((length ^ inverted) != 65535) {
+                return zlib_inflate_fail(output, ZlibInflateError.invalid_stored_length,
+                    offset as i64);
+            }
+            if (offset + 4 + length > input.len - 4) {
+                return zlib_inflate_fail(output, ZlibInflateError.truncated, input.len as i64);
+            }
+            if (output.len as i64 + length as i64 > max_output) {
+                return zlib_inflate_fail(output, ZlibInflateError.output_limit, offset as i64);
+            }
+            let i: i32 = 0;
+            while (i < length) { push[u8](&output, input[offset + 4 + i]); i = i + 1; }
+            reader.bit_position = ((offset + 4 + length) as i64) * 8;
+        } else if (block_type == 1 || block_type == 2) {
+            let lit_tree: InflateHuffman = inflate_huffman_invalid();
+            let distance_tree: InflateHuffman = inflate_huffman_invalid();
+            if (block_type == 1) {
+                let lit_lengths: ArrayList[i32] = inflate_fixed_lit_lengths();
+                let distance_lengths: ArrayList[i32] = inflate_fixed_distance_lengths();
+                inflate_huffman_free(&lit_tree); inflate_huffman_free(&distance_tree);
+                lit_tree = inflate_huffman_build(lit_lengths);
+                distance_tree = inflate_huffman_build(distance_lengths);
+                free[i32](&lit_lengths); free[i32](&distance_lengths);
+            } else {
+                inflate_huffman_free(&lit_tree); inflate_huffman_free(&distance_tree);
+                lit_tree = inflate_huffman_invalid(); distance_tree = inflate_huffman_invalid();
+                if (inflate_dynamic_trees(&reader, &lit_tree, &distance_tree) == 0) {
+                    inflate_huffman_free(&lit_tree); inflate_huffman_free(&distance_tree);
+                    return zlib_inflate_fail(output, ZlibInflateError.invalid_huffman_tree,
+                        reader.bit_position / 8);
+                }
+            }
+            if (lit_tree.valid == 0 || distance_tree.valid == 0) {
+                inflate_huffman_free(&lit_tree); inflate_huffman_free(&distance_tree);
+                return zlib_inflate_fail(output, ZlibInflateError.invalid_huffman_tree,
+                    reader.bit_position / 8);
+            }
+            let block_error: ZlibInflateError = inflate_compressed_block(
+                &reader, &output, max_output, lit_tree, distance_tree
+            );
+            inflate_huffman_free(&lit_tree); inflate_huffman_free(&distance_tree);
+            if (block_error != ZlibInflateError.none) {
+                return zlib_inflate_fail(output, block_error, reader.bit_position / 8);
+            }
+        } else {
+            return zlib_inflate_fail(output, ZlibInflateError.invalid_block_type,
+                reader.bit_position / 8);
+        }
+    }
+    inflate_align_byte(&reader);
+    let trailer_offset: i32 = (reader.bit_position / 8) as i32;
+    if (reader.error != 0 || trailer_offset + 4 > input.len) {
+        return zlib_inflate_fail(output, ZlibInflateError.truncated, trailer_offset as i64);
+    }
+    if (trailer_offset + 4 != input.len) {
+        return zlib_inflate_fail(output, ZlibInflateError.trailing_data, trailer_offset as i64);
+    }
+    let stored_adler: i64 = ((input[trailer_offset] as i64) << 24) |
+        ((input[trailer_offset + 1] as i64) << 16) |
+        ((input[trailer_offset + 2] as i64) << 8) |
+        (input[trailer_offset + 3] as i64);
+    if (stored_adler != checksum_adler32(output.data[0..output.len])) {
+        return zlib_inflate_fail(output, ZlibInflateError.checksum_mismatch,
+            trailer_offset as i64);
+    }
+    return ZlibInflateResult{ .bytes = output, .error = ZlibInflateError.none,
+        .error_offset = 0 - 1 };
+}
+
+fn zlib_inflate_free(result: *ZlibInflateResult) void {
+    free[u8](&result.*.bytes);
+}
