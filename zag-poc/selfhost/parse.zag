@@ -21,6 +21,8 @@ struct Parser {
     pipe_op: i32,               // allow `|` as an operator when parsing expressions
     origin:   []u8,                // module currently being parsed
     base_dir: []u8,              // directory of the current file (for #embed path resolution)
+    source:   []u8,              // normalized source for structured diagnostics
+    resources: *ArrayList[ResolvedResource], // shared compilation resource identity
 }
 
 // ── cursor helpers ──────────────────────────────────────────────────────────
@@ -400,6 +402,11 @@ fn parse_closure(p: *Parser) *Node {
     return mk_ident(name);
 }
 
+fn embed_error(p:*Parser,t:Token,msg:[]u8,note:[]u8,hint:[]u8)void{
+    diag_emit("E0017",msg,p.*.origin,t.line,t.col,t.val.len,note,hint,p.*.source);
+    _zag_exit(1);
+}
+
 fn parse_primary(p: *Parser) *Node {
     if (at_k(p, Tk.KwFn)) { return parse_closure(p); }      // closure literal (expression)
     if (at_k(p, Tk.KwSwitch)) { return parse_switch(p); }   // switch as an expression
@@ -407,26 +414,34 @@ fn parse_primary(p: *Parser) *Node {
         // #embed("file.bin") — compile-time binary file inclusion.
         // Reads the file at parse time and produces an EmbedLit node
         // whose data is the raw file contents (a []u8 slice at runtime).
-        let _hash: Token = adv(p);               // #
-        let name: []u8 = adv(p).val;              // embed
-        if (!@strEq(name, "embed")) {
-            _zag_print("zag: error: unknown # directive: #");
-            _zag_println(name);
-            _zag_exit(1);
+        let hash: Token = adv(p);                 // #
+        if(!at_k(p,Tk.Ident)){embed_error(p,hash,"expected `embed` after `#`","resource embedding uses exactly `#embed(\"relative/path\")`","replace the directive with a valid #embed expression");}
+        let nametok:Token=adv(p);
+        if (!@strEq(nametok.val, "embed")) {
+            embed_error(p,nametok,_zag_str_concat("unknown resource directive `#",_zag_str_concat(nametok.val,"`")),"only #embed is defined","use `#embed(\"relative/path\")`");
         }
-        let _lp: Token = adv(p);                  // (
-        let pathtok: Token = adv(p);              // "path"
-        let _rp: Token = adv(p);                  // )
+        if(!at_k(p,Tk.Lp)){embed_error(p,cur(p),"expected `(` after `#embed`","resource embedding accepts exactly one string literal","use `#embed(\"relative/path\")`");}
+        let _lp: Token = adv(p);
+        if(!at_k(p,Tk.Str)){embed_error(p,cur(p),"#embed path must be a string literal","computed and environment-dependent resource paths are not reproducible","use a non-empty relative string literal");}
+        let pathtok: Token = adv(p);
+        if(!at_k(p,Tk.Rp)){embed_error(p,cur(p),"expected `)` after #embed path","#embed accepts exactly one path","remove extra arguments or add the closing parenthesis");}
+        let _rp: Token = adv(p);
         let relpath: []u8 = strip_quotes(pathtok.val);
-        let resolved: []u8 = resolve_import_path(relpath, p.*.base_dir);
+        if(relpath.len==0){embed_error(p,pathtok,"#embed path cannot be empty","empty paths have no stable resource identity","name a source-relative resource file");}
+        if(relpath[0]=='/'){embed_error(p,pathtok,"#embed path must be relative","absolute paths make builds machine-dependent","place the resource in the project and use a source-relative path");}
+        // The formatter parses expressions without a file origin. Preserve the
+        // exact literal there without touching the filesystem.
+        if(p.*.origin.len==0){return mk_embed(pathtok.val,"","");}
+        // Unlike @import, an embedded asset never searches a sibling lib/
+        // directory. The source-relative spelling is the complete contract.
+        let resolved: []u8 = canon_path(join_path(p.*.base_dir, relpath));
         let data: []u8 = _zag_read_file(resolved);
         if (data.len < 0) {
-            _zag_print("zag: error: #embed cannot read '");
-            _zag_print(resolved);
-            _zag_println("'");
-            _zag_exit(1);
+            embed_error(p,pathtok,_zag_str_concat("#embed cannot read `",_zag_str_concat(resolved,"`")),"resources resolve relative to the source file and do not use import search paths","add the file or correct the relative path");
         }
-        return mk_embed(resolved, data);
+        if(data.len>67108864){embed_error(p,pathtok,"#embed resource exceeds the 64 MiB limit","bounded resources protect compiler memory and reproducibility","split or compress the resource, or use a runtime asset contract");}
+        push[ResolvedResource](p.*.resources,ResolvedResource{.path=resolved,.data=data});
+        return mk_embed(pathtok.val,resolved,data);
     }
     if (at_k(p, Tk.Int))   { return mk_int(adv(p).val); }
     if (at_k(p, Tk.Float)) { return mk_int(adv(p).val); }
@@ -1853,7 +1868,7 @@ fn canon_path(p: []u8) []u8 {
 // references, so a module imported `as name` lives in its own namespace.
 // `loading` tracks the current import stack for circular dependency detection.
 fn resolved_module_has(modules:ArrayList[ResolvedModule],path:[]u8)i32{let i:i32=0;while(i<len[ResolvedModule](modules)){if(@strEq(get[ResolvedModule](modules,i).path,path)){return 1;}i=i+1;}return 0;}
-fn load_module(path0: []u8, qual: []u8, has_qual: i32, seen: *ArrayList[[]u8], out: *ArrayList[*Node], aliases: *ArrayList[[]u8], loading: *ArrayList[[]u8], modules:*ArrayList[ResolvedModule], imports:*ArrayList[ResolvedImport]) void {
+fn load_module(path0: []u8, qual: []u8, has_qual: i32, seen: *ArrayList[[]u8], out: *ArrayList[*Node], aliases: *ArrayList[[]u8], loading: *ArrayList[[]u8], modules:*ArrayList[ResolvedModule], imports:*ArrayList[ResolvedImport], resources:*ArrayList[ResolvedResource]) void {
     let path: []u8 = canon_path(path0);
     // Circular import detection must come first (before seen dedup).
     // If path is on the loading stack it is currently being parsed — that is a cycle.
@@ -1891,11 +1906,11 @@ fn load_module(path0: []u8, qual: []u8, has_qual: i32, seen: *ArrayList[[]u8], o
         // Qualified: resolve into a private list, then prefix + splice.
         let inner: ArrayList[*Node] = make[*Node](8);
         let imported_profile: i32 = 0;
-        resolve_src(src, mod_dir, seen, &inner, aliases, loading, 0, &imported_profile,path,modules,imports);
+        resolve_src(src, mod_dir, seen, &inner, aliases, loading, 0, &imported_profile,path,modules,imports,resources);
         qualify_into(inner, qual, out);
     } else {
         let imported_profile: i32 = 0;
-        resolve_src(src, mod_dir, seen, out, aliases, loading, 0, &imported_profile,path,modules,imports);
+        resolve_src(src, mod_dir, seen, out, aliases, loading, 0, &imported_profile,path,modules,imports,resources);
     }
     let _dropped: []u8 = pop[[]u8](loading);   // pop from in-progress stack
 }
@@ -2132,10 +2147,10 @@ fn script_try_operation_body(body:ArrayList[*Node])[]u8{let i:i32=0;while(i<body
 // are accumulated GLOBALLY in `aliases`, so `alias.member` rewriting is
 // applied once over all declarations afterward.
 // `loading` is the current in-progress import stack for circular detection.
-fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayList[*Node], aliases: *ArrayList[[]u8], loading: *ArrayList[[]u8], is_root: i32, root_profile: *i32, current_path:[]u8, modules:*ArrayList[ResolvedModule], imports:*ArrayList[ResolvedImport]) void {
+fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayList[*Node], aliases: *ArrayList[[]u8], loading: *ArrayList[[]u8], is_root: i32, root_profile: *i32, current_path:[]u8, modules:*ArrayList[ResolvedModule], imports:*ArrayList[ResolvedImport], resources:*ArrayList[ResolvedResource]) void {
     let parse_src:[]u8=script_syntax_normalize(src);
     let toks: ArrayList[Token] = lex(parse_src);
-    let p: Parser = Parser{ .toks = toks, .i = 0, .closures = make[*Node](2), .cctr = 0, .fn_eff = "", .consts = make[[]u8](4), .unsafe_next = 0, .pipe_op = 1, .origin = current_path, .base_dir = base_dir };
+    let p: Parser = Parser{ .toks = toks, .i = 0, .closures = make[*Node](2), .cctr = 0, .fn_eff = "", .consts = make[[]u8](4), .unsafe_next = 0, .pipe_op = 1, .origin = current_path, .base_dir = base_dir, .source = parse_src, .resources = resources };
     let script_seen: i32 = 0;
     let executable_seen: i32 = 0;
     let script_body: ArrayList[*Node] = make[*Node](8);
@@ -2173,7 +2188,7 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
             }
             let resolved: []u8 = resolve_import_path(relpath, base_dir);
             let canonical:[]u8=canon_path(resolved);push[ResolvedImport](imports,ResolvedImport{.importer=current_path,.imported=canonical});
-            load_module(canonical, qual, has_qual, seen, out, aliases, loading,modules,imports);
+            load_module(canonical, qual, has_qual, seen, out, aliases, loading,modules,imports,resources);
         } else if (at_k(&p, Tk.Annot) && @strEq(cur(&p).val, "@link")) {
             let _lnk: Token = adv(&p);       // @link
             let _lp2: Token = adv(&p);        // (
@@ -2310,7 +2325,7 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
             }
             if (wants_process == 1) {
                 load_module(resolve_import_path("std:process", base_dir), "", 0,
-                    seen, out, aliases, loading, modules, imports);
+                    seen, out, aliases, loading, modules, imports, resources);
             }
         }
         if (script_has_user_fn(out.*, "read_file") == 0) {
@@ -2323,7 +2338,7 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
             }
             if (wants_read == 1) {
                 load_module(resolve_import_path("std:script_io", base_dir), "", 0,
-                    seen, out, aliases, loading, modules, imports);
+                    seen, out, aliases, loading, modules, imports, resources);
             }
         }
         if (script_has_user_fn(out.*, "string_builder") == 0) {
@@ -2336,13 +2351,13 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
             }
             if (wants_builder == 1) {
                 load_module(resolve_import_path("std:script_string_builder", base_dir), "", 0,
-                    seen, out, aliases, loading, modules, imports);
+                    seen, out, aliases, loading, modules, imports, resources);
             }
         }
         if (script_has_user_fn(out.*, "input") == 0) {
             let wants_input:i32=0;let input_i:i32=0;let input_needle:[]u8="input(";
             while(input_i+input_needle.len<=src.len&&wants_input==0){if(@strEq(src[input_i..input_i+input_needle.len],input_needle)){wants_input=1;}input_i=input_i+1;}
-            if(wants_input==1){load_module(resolve_import_path("std:script_input",base_dir),"",0,seen,out,aliases,loading,modules,imports);}
+            if(wants_input==1){load_module(resolve_import_path("std:script_input",base_dir),"",0,seen,out,aliases,loading,modules,imports,resources);}
         }
         if (script_has_user_fn(out.*, "list") == 0) {
             let wants_list: i32 = 0;
@@ -2372,17 +2387,17 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
             }
             if (wants_list == 1) {
                 load_module(resolve_import_path("std:script_list", base_dir), "", 0,
-                    seen, out, aliases, loading, modules, imports);
+                    seen, out, aliases, loading, modules, imports, resources);
             }
         }
         if (script_has_user_fn(out.*, "args") == 0) {
             let wants_args:i32=0;let ai:i32=0;let args_needle:[]u8="args(";
             while(ai+args_needle.len<=src.len&&wants_args==0){if(@strEq(src[ai..ai+args_needle.len],args_needle)){wants_args=1;}ai=ai+1;}
-            if(wants_args==1){load_module(resolve_import_path("std:script_list",base_dir),"",0,seen,out,aliases,loading,modules,imports);}
+            if(wants_args==1){load_module(resolve_import_path("std:script_list",base_dir),"",0,seen,out,aliases,loading,modules,imports,resources);}
         }
         let wants_path:i32=0;let path_i:i32=0;
         while(path_i+5<=src.len&&wants_path==0){if(@strEq(src[path_i..path_i+5],"path_")){wants_path=1;}path_i=path_i+1;}
-        if(wants_path==1){load_module(resolve_import_path("std:script_path",base_dir),"",0,seen,out,aliases,loading,modules,imports);}
+        if(wants_path==1){load_module(resolve_import_path("std:script_path",base_dir),"",0,seen,out,aliases,loading,modules,imports,resources);}
         if (script_has_user_fn(out.*, "string_concat") == 0) {
             let wants_concat: i32 = 0;
             let sci: i32 = 0;
@@ -2393,7 +2408,7 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
             }
             if (wants_concat == 1) {
                 load_module(resolve_import_path("std:script_string", base_dir), "", 0,
-                    seen, out, aliases, loading, modules, imports);
+                    seen, out, aliases, loading, modules, imports, resources);
             }
         }
         // Keep user top-level control flow inside a hidden function. This makes
@@ -2496,17 +2511,17 @@ fn parse_compilation_unit_dir(src: []u8, base_dir: []u8) CompilationUnit {
     let decls: ArrayList[*Node] = make[*Node](8);
     let aliases: ArrayList[[]u8] = make[[]u8](4);
     let loading: ArrayList[[]u8] = make[[]u8](8);
-    let modules:ArrayList[ResolvedModule]=make[ResolvedModule](8);let imports:ArrayList[ResolvedImport]=make[ResolvedImport](8);push[ResolvedModule](&modules,ResolvedModule{.path="<root>",.source=src});
+    let modules:ArrayList[ResolvedModule]=make[ResolvedModule](8);let imports:ArrayList[ResolvedImport]=make[ResolvedImport](8);let resources:ArrayList[ResolvedResource]=make[ResolvedResource](8);push[ResolvedModule](&modules,ResolvedModule{.path="<root>",.source=src});
     // Validate zag.mod deps before compiling
     check_zag_mod(base_dir);
     let profile_code: i32 = 0;
-    resolve_src(src, base_dir, &seen, &decls, &aliases, &loading, 1, &profile_code,"<root>",&modules,&imports);
+    resolve_src(src, base_dir, &seen, &decls, &aliases, &loading, 1, &profile_code,"<root>",&modules,&imports,&resources);
     // Global alias pass: collapse every `alias.member` → `alias__member` across
     // all decls (aliases propagate through flat re-imports).
     rewrite_decls(decls, aliases);
     let profile: ModuleProfile = ModuleProfile.strict;
     if (profile_code == 1) { profile = ModuleProfile.script; }
-    return CompilationUnit{ .profile = profile, .decls = decls, .modules=modules, .imports=imports };
+    return CompilationUnit{ .profile = profile, .decls = decls, .modules=modules, .imports=imports, .resources=resources };
 }
 
 fn script_default_memory_limit() i64 { return 67108864; }

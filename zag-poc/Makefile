@@ -8,7 +8,7 @@
 #   make install   — install znc to /usr/local/bin
 #   make clean     — remove generated artifacts (keeps the znc seed)
 
-.PHONY: all bootstrap znc zagd test test-zagscript-release test-zagscript-master test-v1-compat test-zagd-product test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-analyzer test-hot-reload test-dynamic-abi test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-std-namespace \
+.PHONY: all bootstrap znc zagd test test-zagscript-release test-zagscript-master test-v1-compat test-zagd-product test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-analyzer test-hot-reload test-dynamic-abi test-resource-embed test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-std-namespace \
         test-diagnostics test-tooling test-programs test-native test-abi-layout test-arm64 \
         test-differential-backends test-arm64-selfhost clean install
 
@@ -128,8 +128,12 @@ test-dynamic-abi:
 	@echo "── explicit dynamic system ABI gate ──"
 	bash tests/run_dynamic_abi.sh
 
+test-resource-embed:
+	@echo "── deterministic resource embedding gate ──"
+	bash tests/run_resource_embed.sh
+
 # Default `make test`: runs the v1 release gates.
-test: znc test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-diagnostics test-tooling test-analyzer test-hot-reload test-dynamic-abi test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-std-namespace test-programs test-native test-abi-layout test-arm64 test-differential-backends test-arm64-selfhost
+test: znc test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-diagnostics test-tooling test-analyzer test-hot-reload test-dynamic-abi test-resource-embed test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-std-namespace test-programs test-native test-abi-layout test-arm64 test-differential-backends test-arm64-selfhost
 	@echo "════ all v1 release gates passed ════"
 
 # ── Install ───────────────────────────────────────────────────────────────────
