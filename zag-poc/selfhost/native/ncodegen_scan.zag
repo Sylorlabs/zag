@@ -117,6 +117,7 @@ fn cg_scan_typeof(sc: *ScanCtx, cg: *Cg, n: *Node) []u8 {
             if (@strEq(bt, "*u8") || @strEq(bt, "*i8")) { return "[]u8"; }
             return "";
         }
+        .switch_ => |sw| { return cg_scan_switch_expr_type(sc, cg, sw); }
         .idx => |ix| {
             let bt: []u8 = cg_scan_typeof(sc, cg, ix.base);
             // A word-stride numeric slice ([]i32, []sat_i16, etc.) yields its element
@@ -433,22 +434,57 @@ fn cg_scan_call(cg: *Cg, sc: *ScanCtx, c: Call) void {
 }
 
 // Word count to reserve for a switch SUBJECT scratch block (mirrors
-// cg_switch_subject_words at lowering time). A union subject occupies its FULL
-// size (tag + inline payload); we find the union via the first arm's first tag
-// exactly like cg_switch_kind. Enum/scalar/value switches use 1 word; we return
-// at least 2 (matching the old reservation) for safety.
-fn cg_scan_switch_subject_words(cg: *Cg, sw: Switch) i32 {
-    if (len[SwitchArm](sw.arms) == 0) { return 2; }
-    let a0: SwitchArm = get[SwitchArm](sw.arms, 0);
-    if (len[[]u8](a0.tags) == 0) { return 2; }
-    let tag0: []u8 = get[[]u8](a0.tags, 0);
-    let un: []u8 = cg_union_name_for_tag(cg, tag0);
-    if (un.len > 0) {
+// cg_switch_subject_words at lowering time). Use the subject's static type so
+// unions with shared variant names cannot be confused during the pre-scan.
+fn cg_scan_switch_subject_words(sc: *ScanCtx, cg: *Cg, sw: Switch) i32 {
+    let un: []u8 = "";
+    let kind: i32 = cg_switch_kind(cg, sw, cg_scan_typeof(sc, cg, sw.subject), &un);
+    if (kind == 2) {
         let w: i32 = cg_agg_words(cg, un);
         if (w < 2) { return 2; }
         return w;
     }
     return 2;
+}
+
+// Static result type of a switch-expression arm. The scan cannot use the
+// lowering environment yet, so mirror cg_switch_arm_type with cg_scan_typeof.
+fn cg_scan_switch_arm_type(sc: *ScanCtx, cg: *Cg, body: ArrayList[*Node]) []u8 {
+    if (len[*Node](body) == 0) { return ""; }
+    let last: *Node = get[*Node](body, len[*Node](body) - 1);
+    switch (last.*) {
+        .estmt => |e| { return cg_scan_typeof(sc, cg, e.expr); }
+        .ret => |r| { if (r.has_expr == 1) { return cg_scan_typeof(sc, cg, r.expr); } return ""; }
+        else => { return cg_scan_typeof(sc, cg, last); }
+    }
+    return "";
+}
+
+fn cg_scan_switch_expr_type(sc: *ScanCtx, cg: *Cg, sw: Switch) []u8 {
+    let result: []u8 = "";
+    let i: i32 = 0;
+    while (i < len[SwitchArm](sw.arms)) {
+        let arm_ty: []u8 = cg_scan_switch_arm_type(sc, cg, get[SwitchArm](sw.arms, i).body);
+        if (arm_ty.len > 0) {
+            if (result.len == 0) { result = arm_ty; }
+            else if (cg_types_compatible(result, arm_ty, cg) == 0) { return ""; }
+        }
+        i = i + 1;
+    }
+    if (sw.has_els == 1) {
+        let else_ty: []u8 = cg_scan_switch_arm_type(sc, cg, sw.els_body);
+        if (else_ty.len > 0) {
+            if (result.len == 0) { result = else_ty; }
+            else if (cg_types_compatible(result, else_ty, cg) == 0) { return ""; }
+        }
+    }
+    return result;
+}
+
+fn cg_scan_switch_result_words(sc: *ScanCtx, cg: *Cg, sw: Switch) i32 {
+    let ty: []u8 = cg_scan_switch_expr_type(sc, cg, sw);
+    if (cg_type_is_agg(cg, ty) == 1) { return cg_agg_words(cg, ty); }
+    return 1;
 }
 
 // Walk an expression, reserving call scratch for every nested call.
@@ -543,13 +579,13 @@ fn cg_scan_expr(cg: *Cg, sc: *ScanCtx, n: *Node) void {
             if (s2.has_hi == 1) { cg_scan_expr(cg, sc, s2.hi); }
         }
         .switch_ => |sw| {
-            // expression switch: subject scratch (full union size) + 1-word result
+            // expression switch: subject scratch (full union size) + result
             // slot + one capture word per capturing arm. Record union-arm capture
             // types so aggregate-of-capture args are sized correctly (see the
             // statement-switch scan for the rationale).
             let sw_uname2: []u8 = "";
-            let sw_kind2: i32 = cg_switch_kind(cg, sw, &sw_uname2);
-            sc.*.words.* = sc.*.words.* + cg_scan_switch_subject_words(cg, sw) + 1;
+            let sw_kind2: i32 = cg_switch_kind(cg, sw, cg_scan_typeof(sc, cg, sw.subject), &sw_uname2);
+            sc.*.words.* = sc.*.words.* + cg_scan_switch_subject_words(sc, cg, sw) + cg_scan_switch_result_words(sc, cg, sw);
             cg_scan_expr(cg, sc, sw.subject);
             let ai: i32 = 0;
             while (ai < len[SwitchArm](sw.arms)) {
@@ -737,8 +773,8 @@ fn cg_scan_body(cg: *Cg, sc: *ScanCtx, body: ArrayList[*Node]) void {
                 // fields. Without this the scan under-reserves arg-copy blocks and
                 // the frame overruns.
                 let sw_uname: []u8 = "";
-                let sw_kind: i32 = cg_switch_kind(cg, sw, &sw_uname);
-                sc.*.words.* = sc.*.words.* + cg_scan_switch_subject_words(cg, sw);
+                let sw_kind: i32 = cg_switch_kind(cg, sw, cg_scan_typeof(sc, cg, sw.subject), &sw_uname);
+                sc.*.words.* = sc.*.words.* + cg_scan_switch_subject_words(sc, cg, sw);
                 cg_scan_expr(cg, sc, sw.subject);
                 let ai: i32 = 0;
                 while (ai < len[SwitchArm](sw.arms)) {

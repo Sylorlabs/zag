@@ -76,22 +76,37 @@ bootstrap_compile() {
     fi
 }
 
-# A backend edit changes the compiler that performs the next rebuild. Build
-# through two generated compilers and require the last two outputs to be
-# byte-identical before replacing the trusted seed. This keeps `bootstrap.sh`
-# itself a fixpoint gate instead of installing an unproven stage-1 compiler.
+# A backend edit changes the compiler that performs the next rebuild. Build at
+# least through two generated compilers, then continue for a bounded number of
+# generations until two successive outputs are byte-identical. Semantic fixes
+# can legitimately take an extra generation when the compiler source itself
+# contains the construct being repaired. The bound keeps nondeterminism and
+# non-converging miscompilations fail-closed.
 bootstrap_compile ./znc selfhost/native/znc.zag -o "$bootstrap_tmp/znc-stage1" \
     --no-analyze --no-foreground-cache --no-zagd
 bootstrap_compile "$bootstrap_tmp/znc-stage1" selfhost/native/znc.zag \
     -o "$bootstrap_tmp/znc-stage2" --no-analyze --no-foreground-cache --no-zagd
-bootstrap_compile "$bootstrap_tmp/znc-stage2" selfhost/native/znc.zag \
-    -o "$bootstrap_tmp/znc-stage3" --no-analyze --no-foreground-cache --no-zagd
-if ! cmp -s "$bootstrap_tmp/znc-stage2" "$bootstrap_tmp/znc-stage3"; then
+bootstrap_prev="$bootstrap_tmp/znc-stage2"
+bootstrap_fixed=""
+bootstrap_stage=3
+while [ "$bootstrap_stage" -le 6 ]; do
+    bootstrap_next="$bootstrap_tmp/znc-stage$bootstrap_stage"
+    bootstrap_compile "$bootstrap_prev" selfhost/native/znc.zag \
+        -o "$bootstrap_next" --no-analyze --no-foreground-cache --no-zagd
+    if cmp -s "$bootstrap_prev" "$bootstrap_next"; then
+        bootstrap_fixed="$bootstrap_next"
+        break
+    fi
+    echo "   stage $((bootstrap_stage - 1)) and stage $bootstrap_stage differ; continuing toward fixpoint"
+    bootstrap_prev="$bootstrap_next"
+    bootstrap_stage=$((bootstrap_stage + 1))
+done
+if [ -z "$bootstrap_fixed" ]; then
     echo "bootstrap: self-hosting did not reach a byte-identical fixpoint" >&2
     exit 1
 fi
-mv -f "$bootstrap_tmp/znc-stage3" znc
-echo "   ./znc rebuilt itself and reached a byte-identical fixpoint"
+mv -f "$bootstrap_fixed" znc
+echo "   ./znc rebuilt itself and reached a byte-identical fixpoint at stage $bootstrap_stage"
 
 bootstrap_compile ./znc selfhost/zagd_daemon.zag -o "$bootstrap_tmp/zagd" \
     --no-analyze --no-zagd --no-foreground-cache
