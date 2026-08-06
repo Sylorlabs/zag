@@ -168,6 +168,13 @@ bash tests/run_native_arm64.sh
 bash tests/run_arm64_selfhost.sh
 ```
 
+Compiler-owned binary resources use `#embed("relative/path")` and evaluate to
+`[]u8`. Exact bytes, including NUL and non-UTF-8 data, are supported by the
+x86-64 and ARM64 executable backends. Paths are source-relative and are part of
+the foreground cache identity; malformed, absolute, missing, and oversized
+resources fail closed. See [the resource embedding contract](docs/RESOURCE_EMBEDDING.md)
+and run `make test-resource-embed` for the focused conformance gate.
+
 ## Retired C-emitting compiler
 
 The old `zagc` C-emitting compiler, its runtime, generated C files, and its
