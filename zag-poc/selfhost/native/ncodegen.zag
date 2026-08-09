@@ -592,12 +592,44 @@ fn cg_dynamic_scalar_abi_type_ok(t0: []u8) i32 {
     if (@strEq(t, "i32") || @strEq(t, "u32") || @strEq(t, "i64") || @strEq(t, "u64")) { return 1; }
     return 0;
 }
-fn cg_dynamic_import_type_ok(t0: []u8) i32 {
+// Named aggregate parameters are currently supported only when SysV classifies
+// them as MEMORY: more than two eightbytes, made solely from naturally aligned
+// 64-bit scalar/pointer fields. Smaller aggregates require full INTEGER/SSE
+// eightbyte classification; accepting them as a pointer would be an ABI lie.
+fn cg_dynamic_named_memory_aggregate_ok(decls: ArrayList[*Node], t0: []u8) i32 {
+    let t: []u8 = cg_norm_type(t0);
+    if (t.len == 0 || t[0] == '*') { return 0; }
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .struct_ => |s| {
+                if (@strEq(s.name, t)) {
+                    if (len[Param](s.fields) < 3) { return 0; }
+                    let field_index: i32 = 0;
+                    while (field_index < len[Param](s.fields)) {
+                        let field_type: []u8 = cg_norm_type(get[Param](s.fields, field_index).pty);
+                        let field_ok: i32 = 0;
+                        if (field_type.len > 0 && field_type[0] == '*') { field_ok = 1; }
+                        if (@strEq(field_type, "i64") || @strEq(field_type, "u64")) { field_ok = 1; }
+                        if (field_ok == 0) { return 0; }
+                        field_index = field_index + 1;
+                    }
+                    return 1;
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+fn cg_dynamic_import_type_ok(decls: ArrayList[*Node], t0: []u8) i32 {
     let t: []u8 = cg_norm_type(t0);
     if (cg_dynamic_callback_type_ok(t0) == 1 || cg_dynamic_scalar_abi_type_ok(t) == 1) { return 1; }
-    return (@strEq(t, "f64") as i32);
+    if (cg_dynamic_named_memory_aggregate_ok(decls, t) == 1 || @strEq(t, "f64")) { return 1; }
+    return 0;
 }
-fn cg_dynamic_gpr_arg_index(cg:*Cg,fname:[]u8,idx:i32)i32{let count:i32=0;let i:i32=0;while(i<idx){if(@strEq(cg_norm_type(cg_fn_param_type(cg,fname,i)),"f64")==0){count=count+1;}i=i+1;}return count;}
+fn cg_dynamic_gpr_arg_index(cg:*Cg,fname:[]u8,idx:i32)i32{let count:i32=0;let i:i32=0;while(i<idx){let pt:[]u8=cg_norm_type(cg_fn_param_type(cg,fname,i));if(@strEq(pt,"f64")==0&&cg_dynamic_named_memory_aggregate_ok(cg.*.decls,pt)==0){count=count+1;}i=i+1;}return count;}
 fn cg_dynamic_f64_arg_index(cg:*Cg,fname:[]u8,idx:i32)i32{let count:i32=0;let i:i32=0;while(i<idx){if(@strEq(cg_norm_type(cg_fn_param_type(cg,fname,i)),"f64")==1){count=count+1;}i=i+1;}return count;}
 fn cg_dynamic_xmm_arg(index:i32)i32{if(index==0){return R_XMM0();}if(index==1){return R_XMM1();}if(index==2){return R_XMM2();}return R_XMM3();}
 
@@ -6007,6 +6039,24 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
         i = i + 1;
     }
 
+    // A foreign call can appear while another expression value is still live
+    // on Zag's evaluation stack (for example `host.display = XOpenDisplay(0)`).
+    // In that case rsp is eight bytes off the function-frame alignment even
+    // though the prologue itself is aligned. Internal Zag callees happened to
+    // tolerate this; System V libraries are entitled to use aligned stack
+    // operations and can fault. Save the exact expression-stack pointer in a
+    // frame slot, align down BEFORE placing any C stack arguments, and restore
+    // it after the call. Aligning before the argument pushes preserves the ABI
+    // location of argument seven and later.
+    let dynamic_rsp_slot: i32 = cg_not_found();
+    if (dynamic_call == 1) {
+        dynamic_rsp_slot = cg_slot_scratch(env);
+        push[Instr](out, i_mov_rr(R_R11(), R_RSP()));
+        push[Instr](out, i_store(R_RBP(), dynamic_rsp_slot, R_R11()));
+        push[Instr](out, i_mov_imm(R_R11(), 0 - 16));
+        push[Instr](out, i_and(R_RSP(), R_R11()));
+    }
+
     // STEP 2: System V argument placement. Args 0..5 go in rdi,rsi,rdx,rcx,r8,r9;
     // args 6.. are PUSHED on the CPU stack in REVERSE (so arg6 ends lowest, at
     // [rsp] when the callee reads it). To keep rsp 16-aligned at the `call` (the
@@ -6014,8 +6064,18 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
     // of stack args is ODD we push one padding word first.
     let nstack: i32 = 0;
     if (dynamic_call == 1) {
-        let gpr_args:i32=0;let ai:i32=0;while(ai<nargs){if(@strEq(cg_norm_type(cg_fn_param_type(cg,fname,ai)),"f64")==0){gpr_args=gpr_args+1;}ai=ai+1;}
-        if(gpr_args>6){nstack=gpr_args-6;}
+        let gpr_args: i32 = 0;
+        let ai: i32 = 0;
+        while (ai < nargs) {
+            let abi_type: []u8 = cg_norm_type(cg_fn_param_type(cg, fname, ai));
+            if (cg_dynamic_named_memory_aggregate_ok(cg.*.decls, abi_type) == 1) {
+                nstack = nstack + cg_agg_words(cg, abi_type);
+            } else if (@strEq(abi_type, "f64") == 0) {
+                if (gpr_args >= 6) { nstack = nstack + 1; }
+                gpr_args = gpr_args + 1;
+            }
+            ai = ai + 1;
+        }
     } else if (nargs > 6) { nstack = nargs - 6; }
     let pushed: i32 = nstack;
     if (nstack % 2 == 1) {
@@ -6026,16 +6086,35 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
     // push stack args in reverse: arg n-1 first … arg 6 last (→ arg6 at [rsp]).
     let s: i32 = nargs - 1;
     while (s >= 0) {
-        let stack_arg:i32=0;
-        if(dynamic_call==1){let pty:[]u8=cg_norm_type(cg_fn_param_type(cg,fname,s));if(@strEq(pty,"f64")==0&&cg_dynamic_gpr_arg_index(cg,fname,s)>=6){stack_arg=1;}}
-        else if(s>=6){stack_arg=1;}
-        if(stack_arg==1){push[Instr](out, i_load(R_RAX(), R_RBP(), get[i32](aslot, s)));push[Instr](out, i_push(R_RAX()));}
+        let stack_arg: i32 = 0;
+        let stack_aggregate: i32 = 0;
+        let stack_words: i32 = 0;
+        if (dynamic_call == 1) {
+            let pty: []u8 = cg_norm_type(cg_fn_param_type(cg, fname, s));
+            if (cg_dynamic_named_memory_aggregate_ok(cg.*.decls, pty) == 1) {
+                stack_aggregate = 1;
+                stack_words = cg_agg_words(cg, pty);
+            } else if (@strEq(pty, "f64") == 0 &&
+                cg_dynamic_gpr_arg_index(cg, fname, s) >= 6) { stack_arg = 1; }
+        } else if (s >= 6) { stack_arg = 1; }
+        if (stack_aggregate == 1) {
+            push[Instr](out, i_load(R_R10(), R_RBP(), get[i32](aslot, s)));
+            let aggregate_word: i32 = stack_words - 1;
+            while (aggregate_word >= 0) {
+                push[Instr](out, i_load(R_RAX(), R_R10(), aggregate_word * 8));
+                push[Instr](out, i_push(R_RAX()));
+                aggregate_word = aggregate_word - 1;
+            }
+        } else if (stack_arg == 1) {
+            push[Instr](out, i_load(R_RAX(), R_RBP(), get[i32](aslot, s)));
+            push[Instr](out, i_push(R_RAX()));
+        }
         s=s-1;
     }
     // Dynamic C calls classify integer and f64 registers independently under
     // SysV AMD64. Ordinary Zag calls retain their existing all-GPR convention.
     if(dynamic_call==1){
-        let r:i32=0;while(r<nargs){let pty:[]u8=cg_norm_type(cg_fn_param_type(cg,fname,r));if(@strEq(pty,"f64")==1){let xi:i32=cg_dynamic_f64_arg_index(cg,fname,r);if(xi>=4){cg_err(cg,"native: v2 f64 dynamic import supports at most four f64 arguments");}else{push[Instr](out,i_load(R_RAX(),R_RBP(),get[i32](aslot,r)));push[Instr](out,i_fmovq_gx(cg_dynamic_xmm_arg(xi),R_RAX()));}}else{let gi:i32=cg_dynamic_gpr_arg_index(cg,fname,r);if(gi<6){push[Instr](out,i_load(arg_reg(gi),R_RBP(),get[i32](aslot,r)));}}r=r+1;}
+        let r:i32=0;while(r<nargs){let pty:[]u8=cg_norm_type(cg_fn_param_type(cg,fname,r));if(@strEq(pty,"f64")==1){let xi:i32=cg_dynamic_f64_arg_index(cg,fname,r);if(xi>=4){cg_err(cg,"native: v2 f64 dynamic import supports at most four f64 arguments");}else{push[Instr](out,i_load(R_RAX(),R_RBP(),get[i32](aslot,r)));push[Instr](out,i_fmovq_gx(cg_dynamic_xmm_arg(xi),R_RAX()));}}else if(cg_dynamic_named_memory_aggregate_ok(cg.*.decls,pty)==0){let gi:i32=cg_dynamic_gpr_arg_index(cg,fname,r);if(gi<6){push[Instr](out,i_load(arg_reg(gi),R_RBP(),get[i32](aslot,r)));}}r=r+1;}
     }else{
         let r: i32 = 0;
         let nreg: i32 = nargs;
@@ -6074,7 +6153,9 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
     }
     if(dynamic_index>=0&&@strEq(cg_norm_type(rt),"f64")==1){push[Instr](out,i_fmovq_xg(R_RAX(),R_XMM0()));}
     // reclaim the stack args + padding we pushed (rsp += 8*pushed).
-    if (pushed > 0) {
+    if (dynamic_call == 1) {
+        push[Instr](out, i_load(R_RSP(), R_RBP(), dynamic_rsp_slot));
+    } else if (pushed > 0) {
         push[Instr](out, i_add_imm(R_RSP(), (8 * pushed) as i64));
     }
     push[Instr](out, i_push(R_RAX()));   // result (scalar value, or sret block addr)
@@ -10837,13 +10918,17 @@ fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *Ar
                         top_err = top_err + 1;
                     } else if ((dynamic_mode == 1 || object_mode == 1) && cg_starts_with(f.name, "_zag_") == 0 && (v2_edition == 0 || cg_fn_has_annot(f, "@cabi") == 1)) {
                         let abi_ok: i32 = cg_dynamic_scalar_abi_type_ok(f.ret);
-                        if (v2_edition == 1 && dynamic_mode == 1) { abi_ok = cg_dynamic_import_type_ok(f.ret); }
+                        if (v2_edition == 1 && dynamic_mode == 1) {
+                            abi_ok = (cg_dynamic_callback_type_ok(f.ret) == 1 ||
+                                cg_dynamic_scalar_abi_type_ok(f.ret) == 1 ||
+                                @strEq(cg_norm_type(f.ret), "f64")) as i32;
+                        }
                         let fp_args:i32=0;
                         let ap: i32 = 0;
                         while (ap < len[Param](f.params)) {
                             let pty:[]u8=get[Param](f.params,ap).pty;
                             let param_ok:i32=cg_dynamic_scalar_abi_type_ok(pty);
-                            if(v2_edition==1&&dynamic_mode==1){param_ok=cg_dynamic_import_type_ok(pty);}
+                            if(v2_edition==1&&dynamic_mode==1){param_ok=cg_dynamic_import_type_ok(decls, pty);}
                             if (param_ok == 0) { abi_ok = 0; }
                             if(@strEq(cg_norm_type(pty),"f64")){fp_args=fp_args+1;}
                             ap = ap + 1;
