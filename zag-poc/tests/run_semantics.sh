@@ -70,6 +70,7 @@ ok nested-block-shadow scoping_block_shadow.zag 41
 ok capture-shadow scoping_capture_shadow.zag 42
 ok numeric-types-casts types_numeric.zag 42
 ok error-propagation errors_propagation.zag 42
+ok error-union-struct-storage error_union_struct_storage.zag 42
 ok generic-monomorphization generics_monomorphization.zag 42
 ok memory-value-pointer memory_value_pointer.zag 42
 ok edge-control-values edge_control_values.zag 42
@@ -79,6 +80,7 @@ ok_strict imported-const-qualified import_const_qualified.zag 42
 echo "-- v1 core: required rejection --"
 reject unknown-name reject_unknown_name.zag
 reject try-outside-error-function reject_try_non_error.zag
+reject dropped-error-value reject_dropped_error.zag
 reject mixed-posit-arithmetic reject_mixed_posit.zag
 ok hexadecimal-literal accept_hex_literal.zag 42
 reject escaping-capturing-closure reject_closure_escape.zag
