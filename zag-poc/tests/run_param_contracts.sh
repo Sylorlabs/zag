@@ -92,6 +92,14 @@ project borrowed_escape 2027
 printf '%s\n' 'fn retain(value:*u8)void { } fn bad(value:@borrows *u8)void { retain(value); } fn main()i32{return 0;}' >"$WORK/borrowed_escape/main.zag"
 check_reject borrowed_escape "parameter-local borrow cannot escape through an uncontracted callee" 'escapes through uncontracted call `retain`'
 
+project owned_print_free 2027
+printf '%s\n' 'fn main()i32 { let text:[]u8=_zag_i64_to_str(42); _zag_print(text); _zag_str_free(text); return 0; }' >"$WORK/owned_print_free/main.zag"
+check_ok owned_print_free "synchronous _zag_print permits an owned helper result to be freed"
+
+project unknown_zag_escape 2027
+printf '%s\n' 'fn _zag_unknown_sink(value:[]u8)void { } fn main()i32 { let text:[]u8=_zag_i64_to_str(42); _zag_unknown_sink(text); _zag_str_free(text); return 0; }' >"$WORK/unknown_zag_escape/main.zag"
+check_reject unknown_zag_escape "unknown _zag bridges remain fail-closed" 'escapes through uncontracted call `_zag_unknown_sink`'
+
 project legacy_mix 2027
 printf '%s\n' 'fn bad(left:@borrows *u8,right:*u8)void @borrows { } fn main()i32{return 0;}' >"$WORK/legacy_mix/main.zag"
 check_reject legacy_mix "legacy and parameter-local contracts cannot mix" 'cannot be mixed with legacy function-level'
@@ -104,9 +112,27 @@ project old_edition 2026
 printf '%s\n' 'fn bad(value:@borrows *u8)void { } fn main()i32{return 0;}' >"$WORK/old_edition/main.zag"
 check_reject old_edition "parameter contracts are edition-2027-only" 'require edition 2027'
 
+project old_edition_import 2026
+printf '%s\n' 'pub fn inspect(value:@borrows *u8)void { }' >"$WORK/old_edition_import/plain.zag"
+printf '%s\n' 'pub fn mutate(value:@borrows_mut *u8)void { }' >"$WORK/old_edition_import/qualified.zag"
+printf '%s\n' \
+  '@import("plain.zag")' \
+  '@import("qualified.zag") as contracts' \
+  'fn main()i32{return 0;}' \
+  >"$WORK/old_edition_import/main.zag"
+check_ok old_edition_import "edition-2026 roots accept inactive imported lifetime metadata"
+
 project duplicate 2027
 printf '%s\n' 'fn bad(value:@borrows @consumes *u8)void { } fn main()i32{return 0;}' >"$WORK/duplicate/main.zag"
 check_reject duplicate "duplicate parameter contracts fail closed" 'only one lifetime contract'
+
+project declaration_conflict 2027
+printf '%s\n' \
+  'extern fn touch(value:@borrows *u8)void @cabi;' \
+  'extern fn touch(value:@consumes *u8)void @cabi;' \
+  'fn main()i32{return 0;}' \
+  >"$WORK/declaration_conflict/main.zag"
+check_reject declaration_conflict "conflicting contracts across duplicate declarations fail closed" 'conflicting parameter lifetime contracts'
 
 project cabi_multi 2027
 printf '%s\n' \
@@ -131,6 +157,107 @@ if (cd "$WORK/cabi_null" && "$ZNC_BIN" main.zag --dynamic --needed libc.so.6 --n
 else
     bad "parameter-local C borrow builds with an untracked null pointer"; sed -n '1,16p' "$WORK/cabi_null/log"
 fi
+
+project imported_contracts 2027
+printf '%s\n' \
+  'pub struct Cell { value:i32, pointer:*u8 }' \
+  'pub fn read_cell(cell:@borrows *Cell)i32 { return cell.*.value; }' \
+  'pub fn read_generic[T](cell:@borrows *T)i32 { return 42; }' \
+  'extern fn imported_inspect(value:@borrows *u8)void @cabi;' \
+  >"$WORK/imported_contracts/contracts.zag"
+printf '%s\n' \
+  '@import("contracts.zag") as contracts' \
+  'struct Host { pointer:*u8 }' \
+  'fn forward(host:@borrows *Host)void { unsafe { imported_inspect(host.*.pointer); } }' \
+  'fn main()i32 { unsafe { let cell:*contracts.Cell=_zag_malloc(16) as *contracts.Cell; cell.*.value=42; cell.*.pointer=null as *u8; let a:i32=contracts.read_cell(cell); let b:i32=contracts.read_generic[contracts.Cell](cell); forward(cell as *Host); _zag_free(cell as *u8); return a+b-42; } }' \
+  >"$WORK/imported_contracts/main.zag"
+check_ok imported_contracts "imported C, qualified, and generic parameter contracts survive resolution"
+
+project scalar_projection 2027
+printf '%s\n' \
+  'enum Kind { ready }' \
+  'struct Source { kind:Kind, x:i32, y:i32, pointer:*u8 }' \
+  'struct Snapshot { kind:Kind, x:i32, y:i32 }' \
+  'fn scalar(source:@borrows *Source)i32 { return source.*.x; }' \
+  'fn snapshot(source:@borrows *Source)Snapshot { return Snapshot{.kind=source.*.kind,.x=source.*.x,.y=source.*.y}; }' \
+  'fn write_snapshot(out:@borrows_mut *Snapshot,source:@borrows *Source)void { out.*.x=source.*.x; out.*.y=source.*.y; }' \
+  'fn main()i32{return 0;}' \
+  >"$WORK/scalar_projection/main.zag"
+check_ok scalar_projection "borrowed-pointee scalar reads and pointer-free value snapshots do not escape"
+
+project borrowed_scalar_discard 2027
+printf '%s\n' \
+  'struct Tree { count:i32 }' \
+  'fn borrowed_mut_helper(tree:@borrows_mut *Tree)i32 { tree.*.count=tree.*.count+1; return tree.*.count; }' \
+  'fn main()i32 { let local:Tree=Tree{.count=0}; _=borrowed_mut_helper(&local); return local.count; }' \
+  >"$WORK/borrowed_scalar_discard/main.zag"
+check_ok borrowed_scalar_discard "scalar call results do not propagate borrowed aggregate provenance into discard"
+
+project retained_pointer_discard 2027
+printf '%s\n' \
+  'struct Tree { count:i32 }' \
+  'fn retained(tree:*Tree)*Tree @borrows { return tree; }' \
+  'fn main()i32 { let local:Tree=Tree{.count=0}; _=retained(&local); return 0; }' \
+  >"$WORK/retained_pointer_discard/main.zag"
+check_reject retained_pointer_discard "pointer-bearing call results retain borrowed aggregate provenance" 'escapes through non-local aggregate store'
+
+project stored_backing_elements 2027
+printf '%s\n' \
+  'struct Buffer { data:*u8, len:i32 } struct PointerBuffer { data:**u8, len:i32 } struct PointerSnapshot { pointer:*u8 }' \
+  'fn grow(source:@borrows_mut *Buffer)void { unsafe { source.*.data=_zag_realloc(source.*.data as *i8,16) as *u8; } }' \
+  'fn pop(source:@borrows_mut *Buffer)u8 { let last:i32=source.*.len-1; return source.*.data[last]; }' \
+  'fn pop_pointer(source:@borrows_mut *PointerBuffer)*u8 { let last:i32=source.*.len-1; return source.*.data[last]; }' \
+  'fn main()i32{return 0;}' \
+  >"$WORK/stored_backing_elements/main.zag"
+check_ok stored_backing_elements "mutable backing-pointer replacement and element loads preserve container lifetime"
+
+project shared_realloc_reassign 2027
+printf '%s\n' \
+  'struct Buffer { data:*u8 }' \
+  'fn bad(source:@borrows *Buffer)void { unsafe { source.*.data=_zag_realloc(source.*.data as *i8,16) as *u8; } }' \
+  'fn main()i32{return 0;}' \
+  >"$WORK/shared_realloc_reassign/main.zag"
+check_reject shared_realloc_reassign "shared borrows cannot replace backing storage" 'uncontracted call `_zag_realloc`'
+
+project mismatched_realloc_reassign 2027
+printf '%s\n' \
+  'struct Buffers { left:*u8, right:*u8 }' \
+  'fn bad(source:@borrows_mut *Buffers)void { unsafe { source.*.right=_zag_realloc(source.*.left as *i8,16) as *u8; } }' \
+  'fn main()i32{return 0;}' \
+  >"$WORK/mismatched_realloc_reassign/main.zag"
+check_reject mismatched_realloc_reassign "backing replacement must return to the exact source field" 'uncontracted call `_zag_realloc`'
+
+project returned_realloc 2027
+printf '%s\n' \
+  'struct Buffer { data:*u8 }' \
+  'fn bad(source:@borrows_mut *Buffer)*u8 { unsafe { return _zag_realloc(source.*.data as *i8,16) as *u8; } }' \
+  'fn main()i32{return 0;}' \
+  >"$WORK/returned_realloc/main.zag"
+check_reject returned_realloc "backing realloc cannot escape directly through return" 'uncontracted call `_zag_realloc`'
+
+project pointer_projection_return 2027
+printf '%s\n' \
+  'struct Source { pointer:*u8 } struct PointerSnapshot { pointer:*u8 }' \
+  'fn bad(source:@borrows *Source)PointerSnapshot { return PointerSnapshot{.pointer=source.*.pointer}; }' \
+  'fn main()i32{return 0;}' \
+  >"$WORK/pointer_projection_return/main.zag"
+check_reject pointer_projection_return "direct pointer-field snapshots retain borrowed identity" 'cannot escape through return'
+
+project pointer_projection_store 2027
+printf '%s\n' \
+  'struct Source { pointer:*u8 } struct Sink { pointer:*u8 }' \
+  'fn bad(out:@borrows_mut *Sink,source:@borrows *Source)void { out.*.pointer=source.*.pointer; }' \
+  'fn main()i32{return 0;}' \
+  >"$WORK/pointer_projection_store/main.zag"
+check_reject pointer_projection_store "direct pointer fields cannot escape through non-local aggregate stores" 'cannot be stored in a non-local aggregate'
+
+project address_projection_return 2027
+printf '%s\n' \
+  'struct Source { value:i32 }' \
+  'fn bad(source:@borrows *Source)*i32 { return &source.*.value; }' \
+  'fn main()i32{return 0;}' \
+  >"$WORK/address_projection_return/main.zag"
+check_reject address_projection_return "address-of a borrowed field remains tied to the container" 'cannot escape through return'
 
 echo "param contracts: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

@@ -96,6 +96,13 @@ contracts cannot mix with the legacy function-level spelling. Unannotated
 pointer arguments remain uncontracted, so an owned allocation passed there is
 rejected even when a neighboring pointer parameter is explicitly borrowed.
 
+An edition-2026 root still rejects parameter-local contracts written in its
+own declarations. Contract metadata carried by an imported module is retained
+but inactive for that compilation, including qualified imports. This lets an
+older root consume a newer standard-library signature without silently opting
+its own source into edition-2027 lifetime rules; body and call enforcement
+starts only when the root project selects edition 2027.
+
 The legacy function-level forms remain source compatible: `@borrows` and
 `@borrows_mut` still describe parameter zero and admit only scalar or declared
 C-callback auxiliaries; `@consumes` still describes every direct owner
@@ -103,6 +110,18 @@ parameter. A function-level borrow may relate a returned pointer to parameter
 zero. A parameter-local borrow deliberately does not imply a returned
 lifetime, and returning it is rejected until an explicit return-borrow
 contract exists.
+
+Borrow propagation is representation-aware. Generic aggregate fields are
+resolved through their concrete type arguments, so builtin scalar and enum
+fields produce ordinary values and may be returned or assembled into a
+pointer-free aggregate. Loading an element through a stored backing pointer is
+also a value load, not an address into the container. Direct pointer-field
+projection and explicit address-of projections remain tied to the source
+borrow. A mutable container may replace one exact backing-pointer field with
+the result of `_zag_realloc` on that same field; shared borrows, mismatched
+fields, and direct realloc returns remain rejected. An exact `@borrows_mut`
+parameter permits field writes through that parameter; a shared `@borrows`
+parameter does not.
 
 These contracts do not model foreign retention. In particular, a C function
 that stores a backing pointer inside a different returned handle cannot be
