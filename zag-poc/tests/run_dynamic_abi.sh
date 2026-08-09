@@ -115,6 +115,72 @@ else
     sed -n '1,16p' "$WORK/v2-cabi/stack.log"
 fi
 
+# Validate named struct-by-value arguments. We use a temporary C library with
+# `libaggcabi.so.1` exporting `Pair3 add_pair3(Pair3)`; this exercises the C-ABI
+# aggregate path in checker + lowering while remaining a minimal symbol contract.
+cat >"$WORK/v2-cabi/agg_lib.c" <<'C'
+#include <stdint.h>
+struct Pair3 { int64_t x; int64_t y; int64_t z; };
+struct Pair3 add_pair3(struct Pair3 p) {
+    struct Pair3 q;
+    q.x = p.x + 1;
+    q.y = p.y + 2;
+    q.z = p.z + 3;
+    return q;
+}
+long consume_pair3(struct Pair3 p) {
+    struct Pair3 q = add_pair3(p);
+    return q.x + q.y + q.z;
+}
+C
+if gcc -fPIC -shared -Wl,-soname,libaggcabi.so.1 -o "$WORK/v2-cabi/libaggcabi.so.1" "$WORK/v2-cabi/agg_lib.c"; then
+    ln -sf libaggcabi.so.1 "$WORK/v2-cabi/libaggcabi.so"
+    printf 'struct Pair3 { x: i64, y: i64, z: i64 }\n' >"$WORK/v2-cabi/main.zag"
+    printf 'extern fn consume_pair3(p: Pair3) i64 @cabi; fn main() i32 { let p:Pair3=Pair3{.x=10,.y=20,.z=6}; unsafe { let value:i64=consume_pair3(p); if (value == 42) { return 42; } } return 1; }\n' >>"$WORK/v2-cabi/main.zag"
+    if (cd "$WORK/v2-cabi" && LD_LIBRARY_PATH="$WORK/v2-cabi" "$ZNC_BIN" main.zag --dynamic --needed libaggcabi.so.1 --no-zagd --no-analyze -o agg3) >"$WORK/v2-cabi/agg3.log" 2>&1 && [ -x "$WORK/v2-cabi/agg3" ]; then
+        if (cd "$WORK/v2-cabi" && LD_LIBRARY_PATH="$WORK/v2-cabi" ./agg3); then rc=$?; else rc=$?; fi
+        [ "$rc" = 42 ] && ok "v2 @cabi struct-by-value import executes" || bad "v2 @cabi struct import exit=$rc"
+    else
+        bad "v2 @cabi struct-by-value import build"
+        sed -n '1,24p' "$WORK/v2-cabi/agg3.log"
+    fi
+else
+    bad "v2 @cabi struct-by-value library build"
+    sed -n '1,24p' "$WORK/v2-cabi/agg_lib.c"
+fi
+
+# Foreign calls can be nested under an assignment while the destination base
+# remains on Zag's evaluation stack. The lowering must realign rsp before the
+# C call and restore that exact expression-stack pointer afterwards.
+cat >"$WORK/v2-cabi/alignment_lib.c" <<'C'
+#include <stdint.h>
+__attribute__((naked)) int64_t cabi_entry_stack_mod16(int64_t ignored) {
+    __asm__("mov %rsp, %rax; and $15, %rax; ret");
+}
+int64_t cabi_nine(int64_t a, int64_t b, int64_t c, int64_t d,
+                  int64_t e, int64_t f, int64_t g, int64_t h, int64_t i) {
+    return a + b * 10 + c * 100 + d * 1000 + e * 10000 +
+        f * 100000 + g * 1000000 + h * 10000000 + i * 100000000;
+}
+C
+if gcc -fPIC -shared -Wl,-soname,libcabialign.so.1 -o "$WORK/v2-cabi/libcabialign.so.1" "$WORK/v2-cabi/alignment_lib.c"; then
+    printf 'struct AlignBox { entry_mod: i64, nine: i64, guard: i64 }\n' >"$WORK/v2-cabi/main.zag"
+    printf 'extern fn cabi_entry_stack_mod16(ignored:i64)i64 @cabi; extern fn cabi_nine(a:i64,b:i64,c:i64,d:i64,e:i64,f:i64,g:i64,h:i64,i:i64)i64 @cabi; fn make_box() AlignBox { let box:AlignBox=AlignBox{.entry_mod=0,.nine=0,.guard=42}; unsafe { box.entry_mod=cabi_entry_stack_mod16(0); box.nine=cabi_nine(1,2,3,4,5,6,7,8,9); } return box; } fn main()i32 { let box:AlignBox=make_box(); if(box.entry_mod==8&&box.nine==987654321&&box.guard==42){return 42;} return 1; }\n' >>"$WORK/v2-cabi/main.zag"
+    if (cd "$WORK/v2-cabi" && LD_LIBRARY_PATH="$WORK/v2-cabi" "$ZNC_BIN" main.zag --dynamic --needed libcabialign.so.1 --no-zagd --no-analyze -o align-call) >"$WORK/v2-cabi/align-call.log" 2>&1 && [ -x "$WORK/v2-cabi/align-call" ]; then
+        if (cd "$WORK/v2-cabi" && LD_LIBRARY_PATH="$WORK/v2-cabi" ./align-call); then
+            rc=$?
+        else
+            rc=$?
+        fi
+        [ "$rc" = 42 ] && ok "nested v2 C calls preserve SysV alignment, stack args, and expression stack" || bad "nested C call alignment/stack-arg exit=$rc"
+    else
+        bad "nested C call alignment build"
+        sed -n '1,20p' "$WORK/v2-cabi/align-call.log"
+    fi
+else
+    bad "nested C call alignment library build"
+fi
+
 # A bounded bidirectional ABI witness: libc `qsort` calls a direct named Zag
 # comparator. The callback is passed as one SysV code pointer, not Zag's normal
 # `{code, environment}` function-value representation. Its scalar/pointer
