@@ -355,6 +355,23 @@ rm -f $WORK/nt_ep
 # ── module system: pub/private, circular imports, zag.mod dep validation ──────
 echo "── module system: pub/private · circular detection · zag.mod deps ──"
 
+# An unqualified import may contribute aggregate-returning free functions and
+# methods to a compilation unit whose callers also return aggregates. The frame
+# scan must reserve receiver copies and a distinct sret block at every call;
+# otherwise the imported method call overwrites the outer hidden destination.
+"$ZNC" tests/native_sret_import_graph.zag -o "$WORK/nt_bin" >"$WORK/nt_out" 2>&1
+if [ -x "$WORK/nt_bin" ]; then
+    "$WORK/nt_bin"; import_sret_exit=$?
+    if [ "$import_sret_exit" = "42" ]; then
+        echo "  ok  imported methods preserve nested aggregate returns"; pass=$((pass+1))
+    else
+        echo "  XX  imported aggregate return graph (got $import_sret_exit, want 42)"; fail=$((fail+1))
+    fi
+else
+    echo "  XX  imported aggregate return graph (compile failed)"; sed -n '1,8p' "$WORK/nt_out"; fail=$((fail+1))
+fi
+rm -f "$WORK/nt_bin"
+
 # 1. Qualified import: pub fn is accessible, prints correct result.
 rm -f $WORK/nt_bin
 "$ZNC" tests/module_system/main.zag -o $WORK/nt_bin >$WORK/nt_out 2>&1
