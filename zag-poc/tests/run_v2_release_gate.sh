@@ -57,6 +57,7 @@ run_gate "WASM emission regression (no runtime)" bash tests/run_native_wasm.sh
 run_gate "GPU frontend validation (not execution)" bash tests/run_native_gpu.sh
 run_gate "dynamic ELF ABI boundary" bash tests/run_dynamic_abi.sh
 run_gate "x86-64 C ABI object export boundary" bash tests/run_x86_64_cabi_object.sh
+run_gate "x86-64 explicit C struct representation" bash tests/run_repr_c_layout.sh
 run_gate "validated x86 POPCNT intrinsic" bash tests/run_x86_popcount.sh
 run_gate "validated x86 BMI1 ANDN intrinsic" bash tests/run_x86_andn.sh
 run_gate "validated x86 trailing-zeros intrinsic" bash tests/run_x86_trailing_zeros.sh

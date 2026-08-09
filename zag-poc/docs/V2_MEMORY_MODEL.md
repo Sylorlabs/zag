@@ -343,11 +343,21 @@ ordinary safe operations instead reject or trap.
 ## Layout, representation, and byte order
 
 The default representation is portable only at the level promised by the v2
-language specification.  `repr(C)`, `repr(packed(N))`, and explicit alignment
+language specification.  `@repr(C)`, `@repr(packed(N))`, and explicit alignment
 are target/ABI commitments and may be used only where their target restrictions
 are met.  `offset_of` is available only for a named field whose representation
 is fixed.  Reading a packed field is lowered as an unaligned byte operation or
 requires unsafe; it is never silently emitted as an invalid aligned load.
+
+The current executable subset is edition-2027 `@repr(C) struct` on Linux
+x86-64 for integer, boolean, and raw-pointer leaves. It applies System V AMD64
+natural field alignment and tail padding; `@sizeOf`, pointer stride, address-of
+field offsets, and exact-width field loads/stores agree. Ordinary Zag structs
+retain the established word layout. `tests/run_repr_c_layout.sh` is the native
+byte/offset authority. The current aggregate contract is pointer-only: direct
+by-value literals, locals, assignments, arguments, and results fail closed.
+Packed layout, general `offset_of` syntax, nested or generic C-layout
+aggregates, floats, and other targets remain unavailable.
 
 Exact-width integers use two's-complement representation.  Endian conversion
 is explicit (`to_le`, `from_be`, and equivalents); native byte order may not be
