@@ -1,0 +1,323 @@
+// Local package import resolution shared by every compiler backend through
+// parse.zag. The first contract is deliberately small and reproducible:
+//
+//   [deps]
+//   zagkit = { path = "../zagkit" }
+//
+//   @import("pkg:zagkit/src/zagkit.zag") as zagkit
+//
+// Dependency paths are resolved relative to the nearest ancestor zag.mod.
+// There is no environment search path, registry lookup, download, version
+// solving, or implicit entry-point convention in this layer.
+
+enum PackageImportError {
+    none,
+    invalid_specifier,
+    manifest_not_found,
+    invalid_manifest,
+    dependency_not_found,
+    duplicate_dependency,
+    invalid_dependency_path,
+    module_not_found,
+}
+
+struct PackageImportResolution {
+    matched: i32,
+    path: []u8,
+    manifest: []u8,
+    dependency: []u8,
+    specifier: []u8,
+    error: PackageImportError,
+}
+
+struct PackageManifestDependency {
+    path: []u8,
+    count: i32,
+    valid: i32,
+}
+
+fn package_import_result(specifier: []u8) PackageImportResolution {
+    return PackageImportResolution{
+        .matched = 0, .path = "", .manifest = "", .dependency = "",
+        .specifier = specifier, .error = PackageImportError.none,
+    };
+}
+
+fn package_import_starts_with(text: []u8, prefix: []u8) i32 {
+    if (text.len < prefix.len) { return 0; }
+    let i: i32 = 0;
+    while (i < prefix.len) {
+        if (text[i] != prefix[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn package_import_dir(path: []u8) []u8 {
+    let last: i32 = 0 - 1;
+    let i: i32 = 0;
+    while (i < path.len) {
+        if (path[i] == '/') { last = i; }
+        i = i + 1;
+    }
+    if (last < 0) { return ""; }
+    if (last == 0) { return "/"; }
+    return path[0..last];
+}
+
+fn package_import_join(base: []u8, child: []u8) []u8 {
+    if (child.len > 0 && child[0] == '/') { return child; }
+    if (base.len == 0 || @strEq(base, ".")) {
+        return _zag_str_concat("./", child);
+    }
+    if (@strEq(base, "/")) { return _zag_str_concat("/", child); }
+    let prefix: []u8 = _zag_str_concat(base, "/");
+    let joined: []u8 = _zag_str_concat(prefix, child);
+    _zag_str_free(prefix);
+    return joined;
+}
+
+fn package_import_trim(text: []u8) []u8 {
+    let start: i32 = 0;
+    while (start < text.len && (text[start] == ' ' || text[start] == '\t')) {
+        start = start + 1;
+    }
+    let end: i32 = text.len;
+    while (end > start && (text[end - 1] == ' ' || text[end - 1] == '\t' ||
+        text[end - 1] == '\r')) {
+        end = end - 1;
+    }
+    return text[start..end];
+}
+
+fn package_import_unquote(text: []u8) []u8 {
+    let value: []u8 = package_import_trim(text);
+    if (value.len < 2 || value[0] != '"' || value[value.len - 1] != '"') {
+        return "";
+    }
+    return value[1..value.len - 1];
+}
+
+fn package_import_safe_name(name: []u8) i32 {
+    if (name.len == 0 || name.len > 64) { return 0; }
+    let i: i32 = 0;
+    while (i < name.len) {
+        let c: u8 = name[i];
+        let safe: i32 = ((c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            c == '_' || c == '-') as i32;
+        if (safe == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn package_import_safe_segment(segment: []u8) i32 {
+    return (segment.len > 0 && !@strEq(segment, ".") &&
+        !@strEq(segment, "..")) as i32;
+}
+
+fn package_import_module_safe(module: []u8) i32 {
+    if (module.len < 5 || module.len > 1024 || module[0] == '/' ||
+        module[module.len - 1] == '/') { return 0; }
+    if (module[module.len - 4] != '.' || module[module.len - 3] != 'z' ||
+        module[module.len - 2] != 'a' || module[module.len - 1] != 'g') { return 0; }
+    let segment_start: i32 = 0;
+    let i: i32 = 0;
+    while (i < module.len) {
+        if (module[i] == '/') {
+            let segment: []u8 = module[segment_start..i];
+            if (package_import_safe_segment(segment) == 0) { return 0; }
+            segment_start = i + 1;
+        } else {
+            let c: u8 = module[i];
+            let safe: i32 = ((c >= 'a' && c <= 'z') ||
+                (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                c == '_' || c == '-' || c == '.') as i32;
+            if (safe == 0) { return 0; }
+        }
+        i = i + 1;
+    }
+    return package_import_safe_segment(module[segment_start..module.len]);
+}
+
+fn package_import_local_path_safe(path: []u8) i32 {
+    if (path.len == 0 || path.len > 4096) { return 0; }
+    let i: i32 = 0;
+    while (i < path.len) {
+        let c: u8 = path[i];
+        if (c == 0 || c == '\n' || c == '\r') { return 0; }
+        if (i + 2 < path.len && path[i] == ':' &&
+            path[i + 1] == '/' && path[i + 2] == '/') { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn package_import_manifest(base_dir: []u8) []u8 {
+    let current: []u8 = base_dir;
+    if (current.len == 0) { current = "."; }
+    let depth: i32 = 0;
+    while (depth < 64) {
+        let candidate: []u8 = package_import_join(current, "zag.mod");
+        if (_zag_file_exists(candidate) == 1) { return candidate; }
+        let parent: []u8 = package_import_dir(current);
+        if (parent.len == 0) {
+            if (@strEq(current, ".")) { return ""; }
+            current = ".";
+        } else {
+            if (@strEq(parent, current)) { return ""; }
+            current = parent;
+        }
+        depth = depth + 1;
+    }
+    return "";
+}
+
+fn package_import_field(table: []u8, field: []u8) []u8 {
+    let i: i32 = 0;
+    while (i + field.len <= table.len) {
+        let boundary_before: i32 = (i == 0 || table[i - 1] == '{' ||
+            table[i - 1] == ',' || table[i - 1] == ' ' || table[i - 1] == '\t') as i32;
+        let match_: i32 = boundary_before;
+        let j: i32 = 0;
+        while (j < field.len && match_ != 0) {
+            if (table[i + j] != field[j]) { match_ = 0; }
+            j = j + 1;
+        }
+        if (match_ != 0) {
+            let cursor: i32 = i + field.len;
+            while (cursor < table.len && (table[cursor] == ' ' || table[cursor] == '\t')) {
+                cursor = cursor + 1;
+            }
+            if (cursor < table.len && table[cursor] == '=') {
+                cursor = cursor + 1;
+                while (cursor < table.len && (table[cursor] == ' ' || table[cursor] == '\t')) {
+                    cursor = cursor + 1;
+                }
+                if (cursor >= table.len || table[cursor] != '"') { return ""; }
+                let end: i32 = cursor + 1;
+                while (end < table.len && table[end] != '"') { end = end + 1; }
+                if (end >= table.len) { return ""; }
+                return table[cursor + 1..end];
+            }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn package_manifest_dependency(source: []u8,
+    dependency: []u8) PackageManifestDependency {
+    let result: PackageManifestDependency = PackageManifestDependency{
+        .path = "", .count = 0, .valid = 1,
+    };
+    if (source.len < 0 || source.len > 1048576) {
+        result.valid = 0; return result;
+    }
+    let in_deps: i32 = 0;
+    let position: i32 = 0;
+    while (position <= source.len) {
+        let end: i32 = position;
+        while (end < source.len && source[end] != '\n') { end = end + 1; }
+        let line: []u8 = package_import_trim(source[position..end]);
+        if (line.len > 0 && line[0] != '#') {
+            if (line[0] == '[') {
+                let close: i32 = 1;
+                while (close < line.len && line[close] != ']') { close = close + 1; }
+                if (close >= line.len) { result.valid = 0; return result; }
+                in_deps = @strEq(package_import_trim(line[1..close]), "deps") as i32;
+            } else if (in_deps != 0) {
+                let equals: i32 = 0;
+                while (equals < line.len && line[equals] != '=') { equals = equals + 1; }
+                if (equals >= line.len) { result.valid = 0; return result; }
+                let key: []u8 = package_import_trim(line[0..equals]);
+                if (@strEq(key, dependency)) {
+                    let raw: []u8 = package_import_trim(line[equals + 1..line.len]);
+                    let path: []u8 = "";
+                    if (raw.len > 0 && raw[0] == '{') {
+                        path = package_import_field(raw, "path");
+                    } else {
+                        path = package_import_unquote(raw);
+                    }
+                    result.count = result.count + 1;
+                    if (path.len == 0) { result.valid = 0; }
+                    result.path = path;
+                }
+            }
+        }
+        if (end >= source.len) { position = source.len + 1; }
+        else { position = end + 1; }
+    }
+    return result;
+}
+
+fn package_import_resolve(specifier: []u8,
+    base_dir: []u8) PackageImportResolution {
+    let result: PackageImportResolution = package_import_result(specifier);
+    if (package_import_starts_with(specifier, "pkg:") == 0) { return result; }
+    result.matched = 1;
+    let slash: i32 = 4;
+    while (slash < specifier.len && specifier[slash] != '/') { slash = slash + 1; }
+    if (slash >= specifier.len) {
+        result.error = PackageImportError.invalid_specifier; return result;
+    }
+    result.dependency = specifier[4..slash];
+    let module: []u8 = specifier[slash + 1..specifier.len];
+    if (package_import_safe_name(result.dependency) == 0 ||
+        package_import_module_safe(module) == 0) {
+        result.error = PackageImportError.invalid_specifier; return result;
+    }
+    result.manifest = package_import_manifest(base_dir);
+    if (result.manifest.len == 0) {
+        result.error = PackageImportError.manifest_not_found; return result;
+    }
+    let source: []u8 = _zag_read_file(result.manifest);
+    let declared: PackageManifestDependency =
+        package_manifest_dependency(source, result.dependency);
+    if (declared.valid == 0) {
+        result.error = PackageImportError.invalid_manifest; return result;
+    }
+    if (declared.count == 0) {
+        result.error = PackageImportError.dependency_not_found; return result;
+    }
+    if (declared.count != 1) {
+        result.error = PackageImportError.duplicate_dependency; return result;
+    }
+    if (package_import_local_path_safe(declared.path) == 0) {
+        result.error = PackageImportError.invalid_dependency_path; return result;
+    }
+    let dependency_root: []u8 = package_import_join(
+        package_import_dir(result.manifest), declared.path);
+    result.path = package_import_join(dependency_root, module);
+    if (_zag_file_exists(result.path) == 0) {
+        result.error = PackageImportError.module_not_found; return result;
+    }
+    return result;
+}
+
+fn package_import_report(result: PackageImportResolution) void {
+    _zag_print("zag: error: package import '");
+    _zag_print(result.specifier);
+    _zag_print("': ");
+    if (result.error == PackageImportError.invalid_specifier) {
+        _zag_println("expected pkg:<dependency>/<relative-module.zag> without traversal");
+    } else if (result.error == PackageImportError.manifest_not_found) {
+        _zag_println("no ancestor zag.mod declares local dependencies");
+    } else if (result.error == PackageImportError.invalid_manifest) {
+        _zag_print("invalid or missing path entry for dependency '");
+        _zag_print(result.dependency); _zag_print("' in "); _zag_println(result.manifest);
+    } else if (result.error == PackageImportError.dependency_not_found) {
+        _zag_print("dependency '"); _zag_print(result.dependency);
+        _zag_print("' is not declared in "); _zag_println(result.manifest);
+    } else if (result.error == PackageImportError.duplicate_dependency) {
+        _zag_print("dependency '"); _zag_print(result.dependency);
+        _zag_print("' is declared more than once in "); _zag_println(result.manifest);
+    } else if (result.error == PackageImportError.invalid_dependency_path) {
+        _zag_println("dependency path must be a bounded local filesystem path");
+    } else if (result.error == PackageImportError.module_not_found) {
+        _zag_print("resolved module does not exist at "); _zag_println(result.path);
+    } else {
+        _zag_println("resolution failed");
+    }
+}
