@@ -42,9 +42,12 @@ foundation for explicitly declared local dependency graphs without a global
 search path.
 
 Resolution fails closed for missing manifests, undeclared or duplicate aliases,
-missing modules, network-like dependency paths, malformed entries, and module
-paths containing `.` or `..` segments. Package names and module paths are
-bounded, and module paths must name a `.zag` file.
+missing modules, malformed entries, and module paths containing `.` or `..`
+segments. Dependency roots must be bounded relative paths using `/`; absolute,
+home-expanded, backslash, colon, URL, and scp-like forms are rejected. Parent
+segments remain valid in dependency roots so sibling declarations such as
+`../zagkit` work. Package names and module paths are bounded, and module paths
+must name a `.zag` file.
 
 ## Current boundary
 
