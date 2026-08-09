@@ -34,6 +34,25 @@ check_format() {
     cmp -s "$tmp/once.zag" "$tmp/input.zag"
 }
 
+check_format_prefix_annotations() {
+    mkdir "$tmp/annotations-project" || return 1
+    printf 'name = "annotation-test"\nversion = "0.0.0"\nedition = "2027"\n' >"$tmp/annotations-project/zag.mod" || return 1
+    printf '@hot\npub struct Sensor[T] { value: T, }\n@sealed\n@repr(C)\npub struct CSensor { value: i32, }\npub @hot enum Mode { Idle, Active }\n@photonic\nfn read_sensor(s: Sensor[i32]) i32 { return s.value; }\nextern @ffi fn _zag_unused_probe() i32;\n@hot\nunsafe fn raw_probe() i32 { return 0; }\nfn main() i32 { let s: Sensor[i32] = Sensor[i32]{ .value = 42 }; unsafe { if (read_sensor(s) == 42 && raw_probe() == 0) { return 0; } } return 1; }\n' >"$tmp/annotations-project/main.zag" || return 1
+    "$ZNC" fmt --in-place "$tmp/annotations-project/main.zag" >/dev/null || return 1
+    cp "$tmp/annotations-project/main.zag" "$tmp/annotations.once.zag" || return 1
+    "$ZNC" fmt --in-place "$tmp/annotations-project/main.zag" >/dev/null || return 1
+    cmp -s "$tmp/annotations.once.zag" "$tmp/annotations-project/main.zag" || return 1
+    [ "$(grep -c '^@hot$' "$tmp/annotations-project/main.zag")" -eq 2 ] || return 1
+    grep -q '^pub struct Sensor\[T\]' "$tmp/annotations-project/main.zag" || return 1
+    grep -q '^pub @repr(C) struct CSensor' "$tmp/annotations-project/main.zag" || return 1
+    grep -q '^pub enum Mode' "$tmp/annotations-project/main.zag" || return 1
+    grep -q 'fn read_sensor(s: Sensor\[i32\]) i32 @photonic' "$tmp/annotations-project/main.zag" || return 1
+    grep -q 'extern fn _zag_unused_probe() i32 @ffi;' "$tmp/annotations-project/main.zag" || return 1
+    grep -q 'unsafe fn raw_probe() i32 @hot' "$tmp/annotations-project/main.zag" || return 1
+    "$ZNC" "$tmp/annotations-project/main.zag" -o "$tmp/annotations-program" --no-zagd --no-analyze >/dev/null || return 1
+    "$tmp/annotations-program"
+}
+
 check_init() {
     (cd "$tmp" && "$ZNC" init >/dev/null)
     grep -q '^edition = "2026"$' "$tmp/zag.mod"
@@ -51,6 +70,7 @@ check_lsp() {
 
 check "version command" check_version
 check "formatter idempotence" check_format
+check "formatter preserves prefix declaration annotations" check_format_prefix_annotations
 check "project initialization" check_init
 check "DWARF emission" check_dwarf
 check "LSP build and protocol" check_lsp
