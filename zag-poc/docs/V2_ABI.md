@@ -90,6 +90,13 @@ and callback ownership/unload contracts remain rejected or unimplemented.
 Any pointer argument given to such an import still requires an explicit
 `@borrows`/`@borrows_mut`/`@consumes` lifetime contract; the qsort witness uses
 `@borrows_mut` for its in-place buffer.
+Multi-pointer imports may put the contract on each pointer parameter, for
+example `left: @borrows *u8` and `right: @borrows *u8`. Authorization is exact
+per argument: a contract on one parameter never blesses a neighboring owner.
+These qualifiers change source ownership checking and semantic identities but
+do not change register assignment or the C ABI. They describe call-duration
+borrowing or exact ownership transfer only; retained-pointer-to-returned-handle
+relationships remain unsupported and must not be labeled as borrows.
 Executable evidence covers both a no-argument integer import, a six-register
 mixed integer/pointer `mmap` import followed by pointer-return `munmap`, a
 one/two/mixed-register `f64` libm import, and a
