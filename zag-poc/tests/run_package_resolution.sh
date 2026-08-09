@@ -84,5 +84,31 @@ else
     fail=$((fail + 1))
 fi
 
+expect_invalid_dependency_path() {
+    case_name=$1
+    case_label=$2
+    case_source="$work/workspace/$case_name/src/main.zag"
+    case_binary="$work/$case_name"
+    case_output="$work/$case_name.out"
+    if "$znc" "$case_source" --no-zagd --no-foreground-cache \
+        -o "$case_binary" >"$case_output" 2>&1; then
+        printf 'FAIL %s dependency path compiled\n' "$case_label"
+        fail=$((fail + 1))
+    elif grep -q "dependency path must be relative and use '/'" "$case_output" &&
+        [ ! -e "$case_binary" ]; then
+        printf 'ok  %s dependency path fails closed\n' "$case_label"
+        pass=$((pass + 1))
+    else
+        printf 'FAIL %s dependency path diagnostic\n' "$case_label"
+        sed -n '1,12p' "$case_output"
+        fail=$((fail + 1))
+    fi
+}
+
+expect_invalid_dependency_path unsafe_absolute absolute
+expect_invalid_dependency_path unsafe_home home-expanded
+expect_invalid_dependency_path unsafe_scp scp-like
+expect_invalid_dependency_path unsafe_backslash backslash
+
 printf 'Package resolution: pass=%s fail=%s\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
