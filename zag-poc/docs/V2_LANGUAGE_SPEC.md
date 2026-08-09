@@ -34,6 +34,14 @@ addition is rejected in edition 2026 with a diagnostic naming the required
 edition.  Detailed normative rules live in the memory, unsafe, ABI,
 concurrency, GPU, effect, and safety-tooling documents.
 
+The implemented explicit-layout spelling is `@repr(C) struct Name { ... }`
+(or `pub @repr(C) struct ...`). It is edition-2027-only and currently lowers
+only integer/boolean/raw-pointer leaves for pointer access on Linux x86-64.
+Direct by-value aggregate literals, locals, assignments, arguments, and results,
+other representations, field categories, and targets reject before artifact
+output; an ordinary `struct` does not inherit C layout. The exact boundary and
+native evidence are specified in `V2_ABI.md`.
+
 The current vertical slice implements dedicated lexical `unsafe { ... }` AST
 nodes, direct `unsafe fn` declarations/calls, and the raw-pointer qualifier
 forms `*const`, `*mut`, `*opaque`, `*device`, `*workgroup`, and `*host`. Raw

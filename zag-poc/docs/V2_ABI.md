@@ -30,9 +30,35 @@ after conformance tests pass.
 Each import names its library/symbol and calling convention; each export names
 its public symbol and visibility.  The Zag ABI is never silently treated as C.
 Every FFI boundary declares integer widths, pointer mutability, nullability,
-ownership, and aggregate representation.  `repr(C)` does not make a language
+ownership, and aggregate representation.  `@repr(C)` does not make a language
 enum, optional, slice, or error union C compatible unless that representation
 is selected explicitly.
+
+### Implemented x86-64 C-layout struct slice
+
+Edition 2027 accepts `@repr(C) struct Name { ... }` and
+`pub @repr(C) struct Name { ... }` on Linux x86-64. This is an explicit
+representation choice; an ordinary `struct` keeps Zag's word-oriented layout.
+The implemented fields are `bool`, exact-width 8/16/32/64-bit integers,
+`isize`/`usize`, and raw pointers. Fields follow declaration order, System V
+AMD64 natural alignment, inter-field padding, maximum-field struct alignment,
+and final tail padding. `@sizeOf[T]()` and `*T` pointer stride use that exact
+size. Field reads sign- or zero-extend from their declared width, and field
+writes touch only that width.
+
+`tests/run_repr_c_layout.sh` executes a live-shaped Xlib `XButtonEvent`: it
+proves offsets 64 (`x`), 68 (`y`), 84 (`button`), total size/stride 96, reads
+known foreign byte patterns, and places sentinels around narrow writes to catch
+accidental eight-byte stores. It also proves qualified imports preserve the
+representation and ordinary Zag structs do not change.
+
+This slice is a pointer-only layout bridge, not general by-value aggregate or C
+calling-convention support. Direct aggregate literals, locals, assignments,
+arguments, and results reject before lowering; access through `*T` is the
+implemented contract. Nested/generic structs, floats, enums, unions, slices,
+optionals, error unions, packed/bitfield/explicit-alignment forms, i686,
+AArch64, and non-Linux targets fail closed or remain unavailable. `@repr(C)`
+alone does not add `@cabi` to a function.
 
 Callbacks carry a calling convention and an unsafe lifetime contract.  The
 callback and any user-data pointer must remain valid while the foreign side may
