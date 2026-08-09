@@ -70,6 +70,47 @@ parameter as an owner: every such parameter must be released or transferred
 on every path. Scalars remain ordinary values. Aggregates, callbacks, slices,
 optionals, and error unions remain rejected because they could carry an
 untracked lifetime.
+
+Edition 2027 also supports exact parameter-local contracts, written between
+the colon and the type:
+
+```zag
+extern fn compare_bytes(
+    left: @borrows *const u8,
+    right: @borrows *const u8,
+    count: i64,
+) i32 @cabi;
+
+extern fn read_event(
+    display: @borrows *u8,
+    event: @borrows_mut *u8,
+) i32 @cabi;
+```
+
+`@borrows` is a shared, non-retaining call-duration contract for that exact
+argument; `@borrows_mut` additionally permits the callee to mutate through
+that argument; `@consumes` transfers that exact raw-pointer or `Allocation`
+owner and invalidates the caller's named argument. Distinct parameters may
+mix these modes. One parameter cannot carry two modes, and parameter-local
+contracts cannot mix with the legacy function-level spelling. Unannotated
+pointer arguments remain uncontracted, so an owned allocation passed there is
+rejected even when a neighboring pointer parameter is explicitly borrowed.
+
+The legacy function-level forms remain source compatible: `@borrows` and
+`@borrows_mut` still describe parameter zero and admit only scalar or declared
+C-callback auxiliaries; `@consumes` still describes every direct owner
+parameter. A function-level borrow may relate a returned pointer to parameter
+zero. A parameter-local borrow deliberately does not imply a returned
+lifetime, and returning it is rejected until an explicit return-borrow
+contract exists.
+
+These contracts do not model foreign retention. In particular, a C function
+that stores a backing pointer inside a different returned handle cannot be
+declared `@borrows`: the pointer outlives the call. Zag still needs a retained
+resource relation tying that backing owner to the returned handle and its
+destructor, including nullable/failure behavior and an explicit end-borrow or
+detach transition. Until then such APIs remain fail-closed rather than being
+misdescribed as synchronous borrows.
 An `@consumes @returns_owner` helper may instead return one exact consumed
 owner as a value. This is accepted only when compiler summary analysis proves
 that every owned return is the same declared consuming parameter; the caller's
