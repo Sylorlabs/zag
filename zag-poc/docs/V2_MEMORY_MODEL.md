@@ -67,9 +67,10 @@ inspectable instead of implicit. A borrow contract tracks only its first owner
 parameter and may take later builtin scalar parameters such as a length or
 count. A consume contract tracks every explicit raw-pointer or `Allocation`
 parameter as an owner: every such parameter must be released or transferred
-on every path. Scalars remain ordinary values. Aggregates, callbacks, slices,
+on every path. Scalars remain ordinary values. Aggregates, callbacks,
 optionals, and error unions remain rejected because they could carry an
-untracked lifetime.
+untracked lifetime. Slices remain rejected for ownership transfer, while the
+exact call-duration slice-borrow contract is defined below.
 
 Edition 2027 also supports exact parameter-local contracts, written between
 the colon and the type:
@@ -85,14 +86,27 @@ extern fn read_event(
     display: @borrows *u8,
     event: @borrows_mut *u8,
 ) i32 @cabi;
+
+fn has_bytes(data: @borrows []u8) bool { return data.len > 0; }
+fn clear_first(data: @borrows_mut []u8) void {
+    if (data.len > 0) { data[0] = 0; }
+}
 ```
 
 `@borrows` is a shared, non-retaining call-duration contract for that exact
 argument; `@borrows_mut` additionally permits the callee to mutate through
-that argument; `@consumes` transfers that exact raw-pointer or `Allocation`
-owner and invalidates the caller's named argument. Distinct parameters may
-mix these modes. One parameter cannot carry two modes, and parameter-local
-contracts cannot mix with the legacy function-level spelling. Unannotated
+that argument. These two parameter-local modes admit raw pointers,
+`Allocation`, and slices. A slice borrow covers its pointer-length descriptor
+and backing storage only for the call: shared borrows may read elements,
+mutable borrows may update elements, and the caller may release the owner after
+the call completes. The slice `.len` projection is an ordinary scalar and does
+not carry backing-storage provenance. Returning the slice, returning its
+`_zag_slice_ptr`, passing it to an uncontracted callee, or storing it in a
+non-local field is rejected. `@consumes` transfers that exact raw-pointer or
+`Allocation` owner and invalidates the caller's named argument; slices remain
+views and cannot claim ownership transfer. Distinct parameters may mix these modes. One
+parameter cannot carry two modes, and parameter-local contracts cannot mix
+with the legacy function-level spelling. Unannotated
 pointer arguments remain uncontracted, so an owned allocation passed there is
 rejected even when a neighboring pointer parameter is explicitly borrowed.
 

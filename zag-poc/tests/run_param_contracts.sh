@@ -37,12 +37,13 @@ check_reject() {
 }
 
 project format 2027
-printf '%s\n' 'extern fn inspect(left:@borrows *u8,right:@borrows_mut *u8)void @cabi;' 'fn main()i32{return 0;}' >"$WORK/format/main.zag"
+printf '%s\n' 'extern fn inspect(left:@borrows *u8,right:@borrows_mut *u8)void @cabi;' 'fn inspect_slices(data:@borrows []u8,out:@borrows_mut []u8)void { }' 'fn main()i32{return 0;}' >"$WORK/format/main.zag"
 if (cd "$WORK/format" && "$ZNC_BIN" fmt --in-place main.zag) >"$WORK/format/log" 2>&1 &&
-   grep -q 'left: @borrows \*u8, right: @borrows_mut \*u8' "$WORK/format/main.zag"; then
-    ok "formatter preserves parameter lifetime contracts"
+   grep -q 'left: @borrows \*u8, right: @borrows_mut \*u8' "$WORK/format/main.zag" &&
+   grep -q 'data: @borrows \[\]u8, out: @borrows_mut \[\]u8' "$WORK/format/main.zag"; then
+    ok "formatter preserves pointer and slice parameter lifetime contracts"
 else
-    bad "formatter preserves parameter lifetime contracts"; sed -n '1,12p' "$WORK/format/log"
+    bad "formatter preserves pointer and slice parameter lifetime contracts"; sed -n '1,12p' "$WORK/format/log"
 fi
 
 project multipointer 2027
@@ -62,6 +63,61 @@ check_ok mutable "parameter-local mutable borrow permits mutation"
 project shared_write 2027
 printf '%s\n' 'fn bad(value:@borrows *u8)void { unsafe { value[0]=1; } } fn main()i32{return 0;}' >"$WORK/shared_write/main.zag"
 check_reject shared_write "shared parameter borrow rejects mutation" 'cannot mutate through a shared borrow'
+
+project slice_runtime 2027
+printf '%s\n' \
+  'struct SliceSnapshot { length:i32, first:u8 }' \
+  'fn checksum(data:@borrows []u8)i32 { let total:i32=0; let i:i32=0; while(i<data.len){total=total+(data[i] as i32);i=i+1;} return total; }' \
+  'fn snapshot(data:@borrows []u8)SliceSnapshot { return SliceSnapshot{.length=data.len,.first=data[0]}; }' \
+  'fn stamp(data:@borrows_mut []u8)void { data[0]=42; }' \
+  'fn main()i32 { let bytes:[]u8=_zag_strdup("***"); let before:i32=checksum(bytes); let copy:SliceSnapshot=snapshot(bytes); stamp(bytes); let value:i32=bytes[0] as i32; _zag_str_free(bytes); if(before==126&&copy.length==3&&copy.first==42){return value;} return 1; }' \
+  >"$WORK/slice_runtime/main.zag"
+if (cd "$WORK/slice_runtime" && "$ZNC_BIN" main.zag --no-zagd --no-analyze -o out) >"$WORK/slice_runtime/log" 2>&1 && [ -x "$WORK/slice_runtime/out" ]; then
+    "$WORK/slice_runtime/out"; rc=$?
+    [ "$rc" = 42 ] && ok "shared and mutable slice borrows execute and the owner may be freed after each call" || bad "slice borrow native execution exit=$rc"
+else
+    bad "slice borrow native execution builds"; sed -n '1,16p' "$WORK/slice_runtime/log"
+fi
+
+project slice_shared_write 2027
+printf '%s\n' 'fn bad(data:@borrows []u8)void { data[0]=1; } fn main()i32{return 0;}' >"$WORK/slice_shared_write/main.zag"
+check_reject slice_shared_write "shared slice borrow rejects element mutation" 'cannot mutate through a shared borrow'
+
+project slice_return 2027
+printf '%s\n' 'fn bad(data:@borrows []u8)[]u8 { return data; } fn main()i32{return 0;}' >"$WORK/slice_return/main.zag"
+check_reject slice_return "borrowed slice cannot escape through return" 'without an explicit return-borrow contract'
+
+project slice_pointer_return 2027
+printf '%s\n' \
+  'extern fn _zag_slice_ptr(data:[]u8)*i8' \
+  'fn bad(data:@borrows []u8)*u8 { return _zag_slice_ptr(data) as *u8; }' \
+  'fn main()i32{return 0;}' \
+  >"$WORK/slice_pointer_return/main.zag"
+check_reject slice_pointer_return "pointer projected from a borrowed slice cannot escape through return" 'without an explicit return-borrow contract'
+
+project slice_store 2027
+printf '%s\n' \
+  'struct Sink { retained:[]u8 }' \
+  'fn bad(out:@borrows_mut *Sink,data:@borrows []u8)void { out.*.retained=data; }' \
+  'fn main()i32{return 0;}' \
+  >"$WORK/slice_store/main.zag"
+check_reject slice_store "borrowed slice cannot be retained in a non-local field" 'cannot be stored in a non-local aggregate'
+
+project slice_field_return 2027
+printf '%s\n' \
+  'struct Sink { retained:[]u8 }' \
+  'fn bad(data:@borrows []u8)Sink { return Sink{.retained=data}; }' \
+  'fn main()i32{return 0;}' \
+  >"$WORK/slice_field_return/main.zag"
+check_reject slice_field_return "borrowed slice cannot escape inside a returned field" 'without an explicit return-borrow contract'
+
+project slice_escape 2027
+printf '%s\n' \
+  'fn retain(data:[]u8)void { }' \
+  'fn bad(data:@borrows []u8)void { retain(data); }' \
+  'fn main()i32{return 0;}' \
+  >"$WORK/slice_escape/main.zag"
+check_reject slice_escape "borrowed slice cannot escape through an uncontracted callee" 'escapes through uncontracted call `retain`'
 
 project exact_argument 2027
 printf '%s\n' \
@@ -106,7 +162,11 @@ check_reject legacy_mix "legacy and parameter-local contracts cannot mix" 'canno
 
 project scalar_contract 2027
 printf '%s\n' 'fn bad(count:@borrows i64)void { } fn main()i32{return 0;}' >"$WORK/scalar_contract/main.zag"
-check_reject scalar_contract "lifetime contracts reject scalar parameters" 'require a raw-pointer or Allocation parameter'
+check_reject scalar_contract "lifetime contracts reject scalar parameters" 'require a raw-pointer, Allocation, or slice parameter'
+
+project slice_consume 2027
+printf '%s\n' 'fn bad(data:@consumes []u8)void { } fn main()i32{return 0;}' >"$WORK/slice_consume/main.zag"
+check_reject slice_consume "slice views cannot claim ownership transfer" 'consume contracts require a raw-pointer or Allocation parameter'
 
 project old_edition 2026
 printf '%s\n' 'fn bad(value:@borrows *u8)void { } fn main()i32{return 0;}' >"$WORK/old_edition/main.zag"
@@ -114,13 +174,25 @@ check_reject old_edition "parameter contracts are edition-2027-only" 'require ed
 
 project old_edition_import 2026
 printf '%s\n' 'pub fn inspect(value:@borrows *u8)void { }' >"$WORK/old_edition_import/plain.zag"
-printf '%s\n' 'pub fn mutate(value:@borrows_mut *u8)void { }' >"$WORK/old_edition_import/qualified.zag"
+printf '%s\n' 'pub fn mutate(value:@borrows_mut *u8)void { }' 'pub fn inspect_bytes(data:@borrows []u8)i32 { return data.len; }' >"$WORK/old_edition_import/qualified.zag"
 printf '%s\n' \
   '@import("plain.zag")' \
   '@import("qualified.zag") as contracts' \
   'fn main()i32{return 0;}' \
   >"$WORK/old_edition_import/main.zag"
 check_ok old_edition_import "edition-2026 roots accept inactive imported lifetime metadata"
+
+project slice_old_edition 2026
+printf '%s\n' 'fn bad(data:@borrows []u8)void { } fn main()i32{return 0;}' >"$WORK/slice_old_edition/main.zag"
+check_reject slice_old_edition "slice parameter contracts are edition-2027-only" 'require edition 2027'
+
+project slice_imported_contract 2027
+printf '%s\n' 'pub fn inspect(data:@borrows []u8)i32 { return data.len; }' >"$WORK/slice_imported_contract/contracts.zag"
+printf '%s\n' \
+  '@import("contracts.zag") as contracts' \
+  'fn main()i32 { let bytes:[]u8=_zag_strdup("zag"); let count:i32=contracts.inspect(bytes); _zag_str_free(bytes); return count-3; }' \
+  >"$WORK/slice_imported_contract/main.zag"
+check_ok slice_imported_contract "imported slice borrow metadata authorizes synchronous use before owner release"
 
 project duplicate 2027
 printf '%s\n' 'fn bad(value:@borrows @consumes *u8)void { } fn main()i32{return 0;}' >"$WORK/duplicate/main.zag"
