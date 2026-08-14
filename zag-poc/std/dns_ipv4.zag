@@ -1,0 +1,392 @@
+// std/dns_ipv4.zag — bounded DNS wire codec for IPv4 A queries/responses.
+//
+// The encoder creates one recursive A/IN query.  The decoder validates one
+// question and every resource-record envelope, follows bounded compression
+// pointers with loop detection, and returns the first A/IN answer.  It performs
+// no network I/O; callers can transport the packet with std:net_ipv4 UDP.
+//
+// This is a wire-format foundation, not a system resolver: no search domains,
+// hosts file, cache, DNSSEC, TCP fallback, IDNA, or IPv6/AAAA behavior is
+// claimed.  Input names are ASCII host labels.
+
+@import("list.zag")
+
+struct DnsPacket {
+    bytes: ArrayList[u8],
+    open: i32,
+}
+
+struct DnsPacketResult {
+    ok: i32,
+    code: i64,
+    value: DnsPacket,
+}
+
+struct DnsAResult {
+    ok: i32,
+    code: i64,
+    address: i64,
+    ttl_seconds: i64,
+    answer_count: i32,
+}
+
+struct DnsNameSkipResult {
+    ok: i32,
+    code: i64,
+    next: i32,
+}
+
+fn dns_status_ok() i64 { return 0; }
+fn dns_status_invalid_argument() i64 { return 0 - 7101; }
+fn dns_status_invalid_name() i64 { return 0 - 7102; }
+fn dns_status_limit() i64 { return 0 - 7103; }
+fn dns_status_truncated() i64 { return 0 - 7104; }
+fn dns_status_malformed() i64 { return 0 - 7105; }
+fn dns_status_compression_loop() i64 { return 0 - 7106; }
+fn dns_status_id_mismatch() i64 { return 0 - 7107; }
+fn dns_status_response_error() i64 { return 0 - 7108; }
+fn dns_status_no_a_answer() i64 { return 0 - 7109; }
+fn dns_status_invalid_state() i64 { return 0 - 7110; }
+
+fn dns_empty_bytes() ArrayList[u8] {
+    return ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 };
+}
+
+fn dns_invalid_packet() DnsPacket {
+    return DnsPacket{ .bytes = dns_empty_bytes(), .open = 0 };
+}
+
+fn dns_packet_take(result: *DnsPacketResult) DnsPacket {
+    if (result.*.ok == 0 || result.*.value.open == 0) {
+        return dns_invalid_packet();
+    }
+    let value: DnsPacket = result.*.value;
+    result.*.value = dns_invalid_packet();
+    result.*.ok = 0;
+    result.*.code = dns_status_invalid_state();
+    return value;
+}
+
+fn dns_packet_failure(code: i64) DnsPacketResult {
+    return DnsPacketResult{ .ok = 0, .code = code, .value = dns_invalid_packet() };
+}
+
+fn dns_a_failure(code: i64, answer_count: i32) DnsAResult {
+    return DnsAResult{
+        .ok = 0, .code = code, .address = 0, .ttl_seconds = 0,
+        .answer_count = answer_count,
+    };
+}
+
+fn dns_ascii_alphanumeric(byte: u8) i32 {
+    if (byte >= 48 && byte <= 57) { return 1; }
+    if (byte >= 65 && byte <= 90) { return 1; }
+    if (byte >= 97 && byte <= 122) { return 1; }
+    return 0;
+}
+
+fn dns_name_valid(name: []u8) i32 {
+    if (name.len < 1 || name.len > 253) { return 0; }
+    let label_length: i32 = 0;
+    let label_first: u8 = 0;
+    let label_last: u8 = 0;
+    let i: i32 = 0;
+    while (i < name.len) {
+        let byte: u8 = name[i];
+        if (byte == 46) {
+            if (label_length < 1 || label_length > 63 || label_first == 45 ||
+                label_last == 45) { return 0; }
+            label_length = 0;
+            label_first = 0;
+            label_last = 0;
+        } else {
+            if (dns_ascii_alphanumeric(byte) == 0 && byte != 45) { return 0; }
+            if (label_length == 0) { label_first = byte; }
+            label_last = byte;
+            label_length = label_length + 1;
+            if (label_length > 63) { return 0; }
+        }
+        i = i + 1;
+    }
+    if (label_length < 1 || label_first == 45 || label_last == 45) { return 0; }
+    return 1;
+}
+
+fn dns_push_u16(bytes: *ArrayList[u8], value: i32) void {
+    push[u8](bytes, ((value >> 8) & 255) as u8);
+    push[u8](bytes, (value & 255) as u8);
+}
+
+fn dns_push_name(bytes: *ArrayList[u8], name: []u8) void {
+    let start: i32 = 0;
+    let i: i32 = 0;
+    while (i <= name.len) {
+        if (i == name.len || name[i] == 46) {
+            push[u8](bytes, (i - start) as u8);
+            let j: i32 = start;
+            while (j < i) {
+                push[u8](bytes, name[j]);
+                j = j + 1;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    push[u8](bytes, 0);
+}
+
+fn dns_encode_a_query_bounded(name: []u8, identifier: i32,
+                              max_output_bytes: i32) DnsPacketResult {
+    if (identifier < 0 || identifier > 65535 || max_output_bytes < 1 ||
+        max_output_bytes > 4096) {
+        return dns_packet_failure(dns_status_invalid_argument());
+    }
+    if (dns_name_valid(name) == 0) {
+        return dns_packet_failure(dns_status_invalid_name());
+    }
+    // Header (12) + encoded qname (name bytes + two) + QTYPE/QCLASS (4).
+    let needed: i32 = name.len + 18;
+    if (needed > max_output_bytes) {
+        return dns_packet_failure(dns_status_limit());
+    }
+    let bytes: ArrayList[u8] = make[u8](needed);
+    dns_push_u16(&bytes, identifier);
+    dns_push_u16(&bytes, 256); // recursion desired
+    dns_push_u16(&bytes, 1);   // one question
+    dns_push_u16(&bytes, 0);
+    dns_push_u16(&bytes, 0);
+    dns_push_u16(&bytes, 0);
+    dns_push_name(&bytes, name);
+    dns_push_u16(&bytes, 1); // A
+    dns_push_u16(&bytes, 1); // IN
+    return DnsPacketResult{
+        .ok = 1, .code = dns_status_ok(),
+        .value = DnsPacket{ .bytes = bytes, .open = 1 },
+    };
+}
+
+fn dns_encode_a_query(name: []u8, identifier: i32) DnsPacketResult {
+    return dns_encode_a_query_bounded(name, identifier, 512);
+}
+
+fn dns_packet_slice(packet: *DnsPacket) []u8 {
+    if (packet.*.open == 0) { return ""; }
+    return packet.*.bytes.data[0..packet.*.bytes.len];
+}
+
+fn dns_packet_close(packet: *DnsPacket) i64 {
+    if (packet.*.open == 0) { return dns_status_invalid_state(); }
+    packet.*.open = 0;
+    free[u8](&packet.*.bytes);
+    return dns_status_ok();
+}
+
+fn dns_read_u16(bytes: []u8, offset: i32) i32 {
+    return ((bytes[offset] as i32) << 8) | (bytes[offset + 1] as i32);
+}
+
+fn dns_read_u32(bytes: []u8, offset: i32) i64 {
+    return ((bytes[offset] as i64) << 24) |
+        ((bytes[offset + 1] as i64) << 16) |
+        ((bytes[offset + 2] as i64) << 8) |
+        (bytes[offset + 3] as i64);
+}
+
+fn dns_seen_offset(seen: ArrayList[i32], offset: i32) i32 {
+    let i: i32 = 0;
+    while (i < seen.len) {
+        if (seen.data[i] == offset) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn dns_skip_name(bytes: []u8, start: i32,
+                 max_compression_jumps: i32) DnsNameSkipResult {
+    if (start < 0 || start >= bytes.len || max_compression_jumps < 1 ||
+        max_compression_jumps > 32) {
+        return DnsNameSkipResult{
+            .ok = 0, .code = dns_status_invalid_argument(), .next = start,
+        };
+    }
+    let seen: ArrayList[i32] = make[i32](4);
+    let cursor: i32 = start;
+    let next: i32 = start;
+    let jumped: i32 = 0;
+    let jumps: i32 = 0;
+    let expanded_bytes: i32 = 0;
+    let steps: i32 = 0;
+    while (steps <= bytes.len + max_compression_jumps) {
+        steps = steps + 1;
+        if (cursor < 0 || cursor >= bytes.len) {
+            free[i32](&seen);
+            return DnsNameSkipResult{
+                .ok = 0, .code = dns_status_truncated(), .next = next,
+            };
+        }
+        let header: i32 = bytes[cursor] as i32;
+        if (header == 0) {
+            if (jumped == 0) { next = cursor + 1; }
+            free[i32](&seen);
+            return DnsNameSkipResult{
+                .ok = 1, .code = dns_status_ok(), .next = next,
+            };
+        }
+        if ((header & 192) == 192) {
+            if (cursor + 1 >= bytes.len) {
+                free[i32](&seen);
+                return DnsNameSkipResult{
+                    .ok = 0, .code = dns_status_truncated(), .next = next,
+                };
+            }
+            let target: i32 = ((header & 63) << 8) |
+                (bytes[cursor + 1] as i32);
+            if (jumped == 0) { next = cursor + 2; }
+            if (target < 0 || target >= bytes.len) {
+                free[i32](&seen);
+                return DnsNameSkipResult{
+                    .ok = 0, .code = dns_status_malformed(), .next = next,
+                };
+            }
+            if (dns_seen_offset(seen, target) != 0 ||
+                jumps >= max_compression_jumps) {
+                free[i32](&seen);
+                return DnsNameSkipResult{
+                    .ok = 0, .code = dns_status_compression_loop(), .next = next,
+                };
+            }
+            push[i32](&seen, target);
+            jumps = jumps + 1;
+            jumped = 1;
+            cursor = target;
+        } else {
+            if ((header & 192) != 0 || header > 63) {
+                free[i32](&seen);
+                return DnsNameSkipResult{
+                    .ok = 0, .code = dns_status_malformed(), .next = next,
+                };
+            }
+            if (cursor + 1 + header > bytes.len) {
+                free[i32](&seen);
+                return DnsNameSkipResult{
+                    .ok = 0, .code = dns_status_truncated(), .next = next,
+                };
+            }
+            expanded_bytes = expanded_bytes + header + 1;
+            if (expanded_bytes > 255) {
+                free[i32](&seen);
+                return DnsNameSkipResult{
+                    .ok = 0, .code = dns_status_malformed(), .next = next,
+                };
+            }
+            cursor = cursor + 1 + header;
+            if (jumped == 0) { next = cursor; }
+        }
+    }
+    free[i32](&seen);
+    return DnsNameSkipResult{
+        .ok = 0, .code = dns_status_compression_loop(), .next = next,
+    };
+}
+
+fn dns_decode_a_response_bounded(bytes: []u8, expected_identifier: i32,
+                                 max_packet_bytes: i32, max_records: i32,
+                                 max_compression_jumps: i32) DnsAResult {
+    if (expected_identifier < 0 || expected_identifier > 65535 ||
+        max_packet_bytes < 12 || max_packet_bytes > 4096 ||
+        max_records < 1 || max_records > 256 ||
+        max_compression_jumps < 1 || max_compression_jumps > 32) {
+        return dns_a_failure(dns_status_invalid_argument(), 0);
+    }
+    if (bytes.len > max_packet_bytes) { return dns_a_failure(dns_status_limit(), 0); }
+    if (bytes.len < 12) { return dns_a_failure(dns_status_truncated(), 0); }
+    if (dns_read_u16(bytes, 0) != expected_identifier) {
+        return dns_a_failure(dns_status_id_mismatch(), 0);
+    }
+    let flags_high: i32 = bytes[2] as i32;
+    let flags_low: i32 = bytes[3] as i32;
+    if ((flags_high & 128) == 0 || (flags_high & 120) != 0) {
+        return dns_a_failure(dns_status_malformed(), 0);
+    }
+    if ((flags_high & 2) != 0) { return dns_a_failure(dns_status_truncated(), 0); }
+    if ((flags_low & 15) != 0) {
+        return dns_a_failure(dns_status_response_error(), 0);
+    }
+    let question_count: i32 = dns_read_u16(bytes, 4);
+    let answer_count: i32 = dns_read_u16(bytes, 6);
+    let authority_count: i32 = dns_read_u16(bytes, 8);
+    let additional_count: i32 = dns_read_u16(bytes, 10);
+    if (question_count != 1) {
+        return dns_a_failure(dns_status_malformed(), answer_count);
+    }
+    let total_records: i32 = answer_count + authority_count + additional_count;
+    if (total_records < 1 || total_records > max_records) {
+        return dns_a_failure(dns_status_limit(), answer_count);
+    }
+    let position: i32 = 12;
+    let question_name: DnsNameSkipResult = dns_skip_name(
+        bytes, position, max_compression_jumps
+    );
+    if (question_name.ok == 0) {
+        return dns_a_failure(question_name.code, answer_count);
+    }
+    position = question_name.next;
+    if (position + 4 > bytes.len) {
+        return dns_a_failure(dns_status_truncated(), answer_count);
+    }
+    if (dns_read_u16(bytes, position) != 1 ||
+        dns_read_u16(bytes, position + 2) != 1) {
+        return dns_a_failure(dns_status_malformed(), answer_count);
+    }
+    position = position + 4;
+    let found: i32 = 0;
+    let found_address: i64 = 0;
+    let found_ttl: i64 = 0;
+    let record_index: i32 = 0;
+    while (record_index < total_records) {
+        if (position >= bytes.len) {
+            return dns_a_failure(dns_status_truncated(), answer_count);
+        }
+        let owner_name: DnsNameSkipResult = dns_skip_name(
+            bytes, position, max_compression_jumps
+        );
+        if (owner_name.ok == 0) {
+            return dns_a_failure(owner_name.code, answer_count);
+        }
+        position = owner_name.next;
+        if (position + 10 > bytes.len) {
+            return dns_a_failure(dns_status_truncated(), answer_count);
+        }
+        let record_type: i32 = dns_read_u16(bytes, position);
+        let record_class: i32 = dns_read_u16(bytes, position + 2);
+        let ttl: i64 = dns_read_u32(bytes, position + 4);
+        let data_length: i32 = dns_read_u16(bytes, position + 8);
+        position = position + 10;
+        if (position + data_length > bytes.len) {
+            return dns_a_failure(dns_status_truncated(), answer_count);
+        }
+        if (record_index < answer_count && found == 0 && record_type == 1 &&
+            record_class == 1 && data_length == 4) {
+            found_address = dns_read_u32(bytes, position);
+            found_ttl = ttl;
+            found = 1;
+        }
+        position = position + data_length;
+        record_index = record_index + 1;
+    }
+    if (position != bytes.len) {
+        return dns_a_failure(dns_status_malformed(), answer_count);
+    }
+    if (found == 0) {
+        return dns_a_failure(dns_status_no_a_answer(), answer_count);
+    }
+    return DnsAResult{
+        .ok = 1, .code = dns_status_ok(), .address = found_address,
+        .ttl_seconds = found_ttl, .answer_count = answer_count,
+    };
+}
+
+fn dns_decode_a_response(bytes: []u8,
+                         expected_identifier: i32) DnsAResult {
+    return dns_decode_a_response_bounded(bytes, expected_identifier, 4096, 64, 16);
+}

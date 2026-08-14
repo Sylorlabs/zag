@@ -1,0 +1,586 @@
+// std/tnn_store.zag -- narrow, bounded Linux durable-store capability for TNN.
+//
+// Operator code supplies one root directory during construction. Afterwards
+// the capability can access only four fixed direct children: the writer lock,
+// journal, checkpoint, and checkpoint staging file. No learned procedure sees
+// this type, a path, a descriptor, or a syscall number.
+
+@import("rt.zag")
+
+enum TnnStoreFile {
+    lock,
+    journal,
+    checkpoint,
+    checkpoint_temporary,
+}
+
+struct TnnStoreStatFs {
+    filesystem_type: i64,
+    block_size: i64,
+    blocks: u64,
+    blocks_free: u64,
+    blocks_available: u64,
+    files: u64,
+    files_free: u64,
+    filesystem_id: i64,
+    name_length: i64,
+    fragment_size: i64,
+    mount_flags: i64,
+    spare_zero: i64,
+    spare_one: i64,
+    spare_two: i64,
+    spare_three: i64,
+}
+
+struct TnnStoreCapability {
+    root_fd: i64,
+    lock_fd: i64,
+    journal_fd: i64,
+    open: i32,
+}
+
+struct TnnStoreOpenResult {
+    ok: i32,
+    code: i64,
+    value: TnnStoreCapability,
+    available_bytes: i64,
+}
+
+struct TnnStoreIoResult {
+    ok: i32,
+    code: i64,
+    bytes: i64,
+    calls: i32,
+}
+
+struct TnnStoreTelemetry {
+    ok: i32,
+    code: i64,
+    journal_bytes: i64,
+    available_bytes: i64,
+    reserve_bytes: i64,
+}
+
+fn tnn_store_status_ok() i64 { return 0; }
+fn tnn_store_status_invalid_argument() i64 { return 0 - 7401; }
+fn tnn_store_status_invalid_state() i64 { return 0 - 7402; }
+fn tnn_store_status_limit() i64 { return 0 - 7403; }
+fn tnn_store_status_wrong_filesystem() i64 { return 0 - 7404; }
+fn tnn_store_status_insufficient_space() i64 { return 0 - 7405; }
+fn tnn_store_status_second_writer() i64 { return 0 - 7406; }
+fn tnn_store_status_incomplete() i64 { return 0 - 7407; }
+fn tnn_store_status_not_found() i64 { return 0 - 7408; }
+
+fn tnn_store_max_bytes() i64 { return 53687091200; }
+fn tnn_store_required_available_bytes() i64 { return 80530636800; }
+fn tnn_store_reserve_bytes() i64 { return 21474836480; }
+fn tnn_store_max_record_bytes() i64 { return 67108864; }
+fn tnn_store_ext4_magic() i64 { return 61267; }
+
+fn tnn_store_invalid() TnnStoreCapability {
+    return TnnStoreCapability{
+        .root_fd = 0 - 1, .lock_fd = 0 - 1, .journal_fd = 0 - 1,
+        .open = 0,
+    };
+}
+
+fn tnn_store_io_failure(code: i64, bytes: i64,
+                        calls: i32) TnnStoreIoResult {
+    return TnnStoreIoResult{
+        .ok = 0, .code = code, .bytes = bytes, .calls = calls,
+    };
+}
+
+fn tnn_store_path_has_parent(path: []u8) i32 {
+    let start: i32 = 0;
+    let i: i32 = 0;
+    while (i <= path.len) {
+        if (i == path.len || path[i] == '/') {
+            if (i - start == 2 && path[start] == '.' && path[start + 1] == '.') {
+                return 1;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn tnn_store_path_valid(path: []u8) i32 {
+    if (path.len <= 0 || path.len > 4095 ||
+        tnn_store_path_has_parent(path) != 0) { return 0; }
+    let i: i32 = 0;
+    while (i < path.len) {
+        if (path[i] == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn tnn_store_c_string(value: []u8) *u8 {
+    if (value.len < 1 || value.len > 4095) { return null as *u8; }
+    let address: i64 = _zag_raw_syscall(9, 0, 4096, 3, 34, 0 - 1, 0);
+    if (address < 0) { return null as *u8; }
+    let output: *u8 = address as *u8;
+    let i: i32 = 0;
+    while (i < value.len) { output[i] = value[i]; i = i + 1; }
+    output[value.len] = 0;
+    return output;
+}
+
+fn tnn_store_c_string_free(value: *u8) i64 {
+    if (value == null as *u8) { return tnn_store_status_invalid_argument(); }
+    return _zag_raw_syscall(11, value as i64, 4096, 0, 0, 0, 0);
+}
+
+fn tnn_store_file_name(file: TnnStoreFile) []u8 {
+    switch (file) {
+        .lock => { return "writer.lock"; }
+        .journal => { return "journal.tnn"; }
+        .checkpoint => { return "checkpoint.tnn"; }
+        .checkpoint_temporary => { return ".checkpoint.tmp"; }
+    }
+}
+
+fn tnn_store_open_child(root_fd: i64, file: TnnStoreFile,
+                        flags: i64, mode: i64) i64 {
+    let name: *u8 = tnn_store_c_string(tnn_store_file_name(file));
+    if (name == null as *u8) { return 0 - 12; }
+    let fd: i64 = _zag_raw_syscall(257, root_fd, name as i64,
+        flags, mode, 0, 0);
+    let unmap: i64 = tnn_store_c_string_free(name);
+    if (unmap < 0 && fd >= 0) {
+        let _close: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+        return unmap;
+    }
+    return fd;
+}
+
+fn tnn_store_unlink_child(root_fd: i64, file: TnnStoreFile) i64 {
+    let name: *u8 = tnn_store_c_string(tnn_store_file_name(file));
+    if (name == null as *u8) { return 0 - 12; }
+    let rc: i64 = _zag_raw_syscall(263, root_fd, name as i64, 0, 0, 0, 0);
+    let unmap: i64 = tnn_store_c_string_free(name);
+    if (rc < 0 && rc != (0 - 2)) { return rc; }
+    if (unmap < 0) { return unmap; }
+    return 0;
+}
+
+fn tnn_store_available(root_fd: i64) i64 {
+    let status: TnnStoreStatFs = TnnStoreStatFs{
+        .filesystem_type=0,.block_size=0,.blocks=0,.blocks_free=0,
+        .blocks_available=0,.files=0,.files_free=0,
+        .filesystem_id=0,.name_length=0,
+        .fragment_size=0,.mount_flags=0,.spare_zero=0,.spare_one=0,
+        .spare_two=0,.spare_three=0,
+    };
+    let rc: i64 = _zag_raw_syscall(138, root_fd, (&status) as i64,
+        0, 0, 0, 0);
+    if (rc < 0) { return rc; }
+    if (status.filesystem_type != tnn_store_ext4_magic()) {
+        return tnn_store_status_wrong_filesystem();
+    }
+    let unit: i64 = status.fragment_size;
+    if (unit <= 0) { unit = status.block_size; }
+    if (unit <= 0 || status.blocks_available >
+        (9223372036854775807 / unit) as u64) {
+        return tnn_store_status_limit();
+    }
+    return (status.blocks_available as i64) * unit;
+}
+
+fn tnn_store_open_mode(root: []u8,
+                       required_available: i64) TnnStoreOpenResult {
+    let failed: TnnStoreOpenResult = TnnStoreOpenResult{
+        .ok = 0, .code = tnn_store_status_invalid_argument(),
+        .value = tnn_store_invalid(), .available_bytes = 0,
+    };
+    if (tnn_store_path_valid(root) == 0) { return failed; }
+    let path: *u8 = tnn_store_c_string(root);
+    if (path == null as *u8) { failed.code = 0 - 12; return failed; }
+    // O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC.
+    let root_fd: i64 = _zag_raw_syscall(257, 0 - 100, path as i64,
+        720896, 0, 0, 0);
+    let unmap: i64 = tnn_store_c_string_free(path);
+    if (root_fd < 0) { failed.code = root_fd; return failed; }
+    if (unmap < 0) {
+        let _close: i64 = _zag_raw_syscall(3, root_fd, 0, 0, 0, 0, 0);
+        failed.code = unmap;
+        return failed;
+    }
+    let available: i64 = tnn_store_available(root_fd);
+    if (available >= 0) { failed.available_bytes = available; }
+    if (available < 0 || available < required_available) {
+        let _close: i64 = _zag_raw_syscall(3, root_fd, 0, 0, 0, 0, 0);
+        failed.code = available;
+        if (available >= 0) {
+            failed.code = tnn_store_status_insufficient_space();
+        }
+        return failed;
+    }
+    // O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, mode 0600.
+    let lock_fd: i64 = tnn_store_open_child(root_fd, TnnStoreFile.lock,
+        655426, 384);
+    if (lock_fd < 0) {
+        let _close: i64 = _zag_raw_syscall(3, root_fd, 0, 0, 0, 0, 0);
+        failed.code = lock_fd;
+        return failed;
+    }
+    // LOCK_EX | LOCK_NB.
+    let locked: i64 = _zag_raw_syscall(73, lock_fd, 6, 0, 0, 0, 0);
+    if (locked < 0) {
+        let _lock_close: i64 = _zag_raw_syscall(3, lock_fd, 0, 0, 0, 0, 0);
+        let _root_close: i64 = _zag_raw_syscall(3, root_fd, 0, 0, 0, 0, 0);
+        failed.code = tnn_store_status_second_writer();
+        return failed;
+    }
+    // O_RDWR | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, mode 0600.
+    let journal_fd: i64 = tnn_store_open_child(root_fd, TnnStoreFile.journal,
+        656450, 384);
+    if (journal_fd < 0) {
+        let _unlock: i64 = _zag_raw_syscall(73, lock_fd, 8, 0, 0, 0, 0);
+        let _lock_close: i64 = _zag_raw_syscall(3, lock_fd, 0, 0, 0, 0, 0);
+        let _root_close: i64 = _zag_raw_syscall(3, root_fd, 0, 0, 0, 0, 0);
+        failed.code = journal_fd;
+        return failed;
+    }
+    return TnnStoreOpenResult{
+        .ok = 1, .code = tnn_store_status_ok(),
+        .value = TnnStoreCapability{
+            .root_fd = root_fd, .lock_fd = lock_fd,
+            .journal_fd = journal_fd, .open = 1,
+        },
+        .available_bytes = available,
+    };
+}
+
+fn tnn_store_open(root: []u8) TnnStoreOpenResult {
+    return tnn_store_open_mode(root, tnn_store_required_available_bytes());
+}
+
+fn tnn_store_resume(root: []u8) TnnStoreOpenResult {
+    return tnn_store_open_mode(root, tnn_store_reserve_bytes());
+}
+
+fn tnn_store_take(opened: *TnnStoreOpenResult) TnnStoreCapability {
+    if (opened.*.ok == 0 || opened.*.value.open == 0) {
+        return tnn_store_invalid();
+    }
+    let value: TnnStoreCapability = opened.*.value;
+    opened.*.ok = 0;
+    opened.*.code = tnn_store_status_invalid_state();
+    opened.*.value = tnn_store_invalid();
+    return value;
+}
+
+fn tnn_store_journal_size(store: TnnStoreCapability) i64 {
+    if (store.open == 0 || store.journal_fd < 0) {
+        return tnn_store_status_invalid_state();
+    }
+    return _zag_raw_syscall(8, store.journal_fd, 0, 2, 0, 0, 0);
+}
+
+fn tnn_store_telemetry(store: TnnStoreCapability) TnnStoreTelemetry {
+    let size: i64 = tnn_store_journal_size(store);
+    let available: i64 = tnn_store_status_invalid_state();
+    if (store.open != 0 && store.root_fd >= 0) {
+        available = tnn_store_available(store.root_fd);
+    }
+    let code: i64 = available;
+    let journal_bytes: i64 = size;
+    let available_bytes: i64 = available;
+    if (size < 0) { code = size; journal_bytes = 0; }
+    if (available < 0) { available_bytes = 0; }
+    return TnnStoreTelemetry{
+        .ok = (size >= 0 && available >= 0) as i32,
+        .code = code,
+        .journal_bytes = journal_bytes,
+        .available_bytes = available_bytes,
+        .reserve_bytes = tnn_store_reserve_bytes(),
+    };
+}
+
+fn tnn_store_write_all(fd: i64, bytes: @borrows []u8) TnnStoreIoResult {
+    let base: *i8 = _zag_slice_ptr(bytes);
+    if (fd < 0 || bytes.len < 0 || (bytes.len > 0 && base == null as *i8)) {
+        return tnn_store_io_failure(tnn_store_status_invalid_argument(), 0, 0);
+    }
+    let total: i64 = 0;
+    let calls: i32 = 0;
+    while (total < bytes.len && calls < 65536) {
+        let rc: i64 = _zag_raw_syscall(1, fd, (base as i64) + total,
+            (bytes.len as i64) - total, 0, 0, 0);
+        calls = calls + 1;
+        if (rc == (0 - 4)) { }
+        else if (rc <= 0 || rc > (bytes.len as i64) - total) {
+            if (rc >= 0) { rc = tnn_store_status_incomplete(); }
+            return tnn_store_io_failure(rc, total, calls);
+        } else { total = total + rc; }
+    }
+    if (total != bytes.len) {
+        return tnn_store_io_failure(tnn_store_status_limit(), total, calls);
+    }
+    return TnnStoreIoResult{
+        .ok = 1, .code = tnn_store_status_ok(),
+        .bytes = total, .calls = calls,
+    };
+}
+
+fn tnn_store_append(store: @borrows_mut *TnnStoreCapability,
+                    bytes: @borrows []u8,
+                    sync_now: i32) TnnStoreIoResult {
+    if (store.*.open == 0 || store.*.journal_fd < 0 || bytes.len <= 0 ||
+        bytes.len > tnn_store_max_record_bytes()) {
+        return tnn_store_io_failure(tnn_store_status_invalid_argument(), 0, 0);
+    }
+    let current: i64 = tnn_store_journal_size(store.*);
+    let available: i64 = tnn_store_available(store.*.root_fd);
+    if (current < 0) { return tnn_store_io_failure(current, 0, 0); }
+    if (available < 0) { return tnn_store_io_failure(available, 0, 0); }
+    if (current > tnn_store_max_bytes() - bytes.len ||
+        available < tnn_store_reserve_bytes() + bytes.len) {
+        return tnn_store_io_failure(tnn_store_status_limit(), 0, 0);
+    }
+    let written: TnnStoreIoResult = tnn_store_write_all(
+        store.*.journal_fd, bytes);
+    if (written.ok == 0 || sync_now == 0) { return written; }
+    let synced: i64 = _zag_raw_syscall(74, store.*.journal_fd,
+        0, 0, 0, 0, 0);
+    if (synced < 0) {
+        return tnn_store_io_failure(synced, written.bytes, written.calls);
+    }
+    return written;
+}
+
+fn tnn_store_read_journal(store: @borrows_mut *TnnStoreCapability,
+                          output: @borrows_mut []u8) TnnStoreIoResult {
+    if (store.*.open == 0 || output.len < 0) {
+        return tnn_store_io_failure(tnn_store_status_invalid_state(), 0, 0);
+    }
+    let size: i64 = tnn_store_journal_size(store.*);
+    if (size < 0) { return tnn_store_io_failure(size, 0, 0); }
+    if (size > output.len) {
+        return tnn_store_io_failure(tnn_store_status_limit(), 0, 0);
+    }
+    let seek: i64 = _zag_raw_syscall(8, store.*.journal_fd, 0, 0, 0, 0, 0);
+    if (seek != 0) { return tnn_store_io_failure(seek, 0, 0); }
+    let base: *i8 = _zag_slice_ptr(output);
+    let total: i64 = 0;
+    let calls: i32 = 0;
+    while (total < size && calls < 65536) {
+        let rc: i64 = _zag_raw_syscall(0, store.*.journal_fd,
+            (base as i64) + total, size - total, 0, 0, 0);
+        calls = calls + 1;
+        if (rc == (0 - 4)) { }
+        else if (rc <= 0 || rc > size - total) {
+            if (rc >= 0) { rc = tnn_store_status_incomplete(); }
+            return tnn_store_io_failure(rc, total, calls);
+        } else { total = total + rc; }
+    }
+    if (total != size) {
+        return tnn_store_io_failure(tnn_store_status_incomplete(), total, calls);
+    }
+    return TnnStoreIoResult{
+        .ok = 1, .code = tnn_store_status_ok(), .bytes = total, .calls = calls,
+    };
+}
+
+// Read one bounded journal range without granting callers a path or file
+// descriptor. Persistence uses this to replay stores up to the 50 GiB ceiling
+// with a fixed-size record buffer instead of allocating the whole journal.
+// A range that reaches EOF succeeds with the number of bytes actually read.
+fn tnn_store_read_journal_at(store: @borrows_mut *TnnStoreCapability, offset: i64,
+                             output: @borrows_mut []u8) TnnStoreIoResult {
+    if (store.*.open == 0 || store.*.journal_fd < 0 || offset < 0 ||
+        output.len < 0 || output.len > tnn_store_max_record_bytes()) {
+        return tnn_store_io_failure(tnn_store_status_invalid_argument(), 0, 0);
+    }
+    let size: i64 = tnn_store_journal_size(store.*);
+    if (size < 0) { return tnn_store_io_failure(size, 0, 0); }
+    if (offset > size) {
+        return tnn_store_io_failure(tnn_store_status_invalid_argument(), 0, 0);
+    }
+    let wanted: i64 = output.len as i64;
+    if (wanted > size - offset) { wanted = size - offset; }
+    let seek: i64 = _zag_raw_syscall(8, store.*.journal_fd, offset,
+        0, 0, 0, 0);
+    if (seek != offset) {
+        let code: i64 = seek;
+        if (seek >= 0) { code = tnn_store_status_incomplete(); }
+        return tnn_store_io_failure(code, 0, 0);
+    }
+    if (wanted == 0) {
+        return TnnStoreIoResult{
+            .ok = 1, .code = tnn_store_status_ok(), .bytes = 0, .calls = 0,
+        };
+    }
+    let base: *i8 = _zag_slice_ptr(output);
+    if (base == null as *i8) {
+        return tnn_store_io_failure(tnn_store_status_invalid_argument(), 0, 0);
+    }
+    let total: i64 = 0;
+    let calls: i32 = 0;
+    while (total < wanted && calls < 65536) {
+        let rc: i64 = _zag_raw_syscall(0, store.*.journal_fd,
+            (base as i64) + total, wanted - total, 0, 0, 0);
+        calls = calls + 1;
+        if (rc == (0 - 4)) { }
+        else if (rc <= 0 || rc > wanted - total) {
+            if (rc >= 0) { rc = tnn_store_status_incomplete(); }
+            return tnn_store_io_failure(rc, total, calls);
+        } else { total = total + rc; }
+    }
+    if (total != wanted) {
+        return tnn_store_io_failure(tnn_store_status_incomplete(), total, calls);
+    }
+    return TnnStoreIoResult{
+        .ok = 1, .code = tnn_store_status_ok(), .bytes = total, .calls = calls,
+    };
+}
+
+fn tnn_store_truncate_journal(store: @borrows_mut *TnnStoreCapability,
+                              valid_bytes: i64) i64 {
+    if (store.*.open == 0 || valid_bytes < 0) {
+        return tnn_store_status_invalid_state();
+    }
+    let size: i64 = tnn_store_journal_size(store.*);
+    if (size < 0) { return size; }
+    if (valid_bytes > size) { return tnn_store_status_invalid_argument(); }
+    let truncated: i64 = _zag_raw_syscall(77, store.*.journal_fd,
+        valid_bytes, 0, 0, 0, 0);
+    if (truncated < 0) { return truncated; }
+    return _zag_raw_syscall(74, store.*.journal_fd, 0, 0, 0, 0, 0);
+}
+
+fn tnn_store_checkpoint(store: @borrows_mut *TnnStoreCapability,
+                        bytes: @borrows []u8) TnnStoreIoResult {
+    if (store.*.open == 0 || bytes.len <= 0 ||
+        bytes.len > tnn_store_max_record_bytes()) {
+        return tnn_store_io_failure(tnn_store_status_invalid_argument(), 0, 0);
+    }
+    let available: i64 = tnn_store_available(store.*.root_fd);
+    if (available < 0) { return tnn_store_io_failure(available, 0, 0); }
+    if (available < tnn_store_reserve_bytes() + bytes.len) {
+        return tnn_store_io_failure(tnn_store_status_insufficient_space(), 0, 0);
+    }
+    let stale: i64 = tnn_store_unlink_child(store.*.root_fd,
+        TnnStoreFile.checkpoint_temporary);
+    if (stale < 0) { return tnn_store_io_failure(stale, 0, 0); }
+    // O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode 0600.
+    let temporary: i64 = tnn_store_open_child(store.*.root_fd,
+        TnnStoreFile.checkpoint_temporary, 655553, 384);
+    if (temporary < 0) { return tnn_store_io_failure(temporary, 0, 0); }
+    let written: TnnStoreIoResult = tnn_store_write_all(temporary, bytes);
+    let synced: i64 = written.code;
+    if (written.ok == 1) {
+        synced = _zag_raw_syscall(74, temporary, 0, 0, 0, 0, 0);
+    }
+    let closed: i64 = _zag_raw_syscall(3, temporary, 0, 0, 0, 0, 0);
+    if (written.ok == 0 || synced < 0 || closed < 0) {
+        let _cleanup: i64 = tnn_store_unlink_child(store.*.root_fd,
+            TnnStoreFile.checkpoint_temporary);
+        if (written.ok == 0) { return written; }
+        let code: i64 = closed;
+        if (synced < 0) { code = synced; }
+        return tnn_store_io_failure(code, written.bytes, written.calls);
+    }
+    let from: *u8 = tnn_store_c_string(tnn_store_file_name(
+        TnnStoreFile.checkpoint_temporary));
+    let to: *u8 = tnn_store_c_string(tnn_store_file_name(
+        TnnStoreFile.checkpoint));
+    if (from == null as *u8 || to == null as *u8) {
+        if (from != null as *u8) { let _a: i64 = tnn_store_c_string_free(from); }
+        if (to != null as *u8) { let _b: i64 = tnn_store_c_string_free(to); }
+        let _cleanup: i64 = tnn_store_unlink_child(store.*.root_fd,
+            TnnStoreFile.checkpoint_temporary);
+        return tnn_store_io_failure(0 - 12, written.bytes, written.calls);
+    }
+    let renamed: i64 = _zag_raw_syscall(264, store.*.root_fd, from as i64,
+        store.*.root_fd, to as i64, 0, 0);
+    let from_unmap: i64 = tnn_store_c_string_free(from);
+    let to_unmap: i64 = tnn_store_c_string_free(to);
+    if (renamed < 0 || from_unmap < 0 || to_unmap < 0) {
+        let _cleanup: i64 = tnn_store_unlink_child(store.*.root_fd,
+            TnnStoreFile.checkpoint_temporary);
+        let code: i64 = renamed;
+        if (code >= 0) {
+            code = to_unmap;
+            if (from_unmap < 0) { code = from_unmap; }
+        }
+        return tnn_store_io_failure(code, written.bytes, written.calls);
+    }
+    let directory_synced: i64 = _zag_raw_syscall(74, store.*.root_fd,
+        0, 0, 0, 0, 0);
+    if (directory_synced < 0) {
+        return tnn_store_io_failure(directory_synced, written.bytes,
+            written.calls);
+    }
+    return written;
+}
+
+fn tnn_store_read_checkpoint(store: @borrows_mut *TnnStoreCapability,
+                             output: @borrows_mut []u8) TnnStoreIoResult {
+    if (store.*.open == 0) {
+        return tnn_store_io_failure(tnn_store_status_invalid_state(), 0, 0);
+    }
+    // O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC.
+    let fd: i64 = tnn_store_open_child(store.*.root_fd,
+        TnnStoreFile.checkpoint, 657408, 0);
+    if (fd == (0 - 2)) {
+        return tnn_store_io_failure(tnn_store_status_not_found(), 0, 0);
+    }
+    if (fd < 0) { return tnn_store_io_failure(fd, 0, 0); }
+    let size: i64 = _zag_raw_syscall(8, fd, 0, 2, 0, 0, 0);
+    if (size < 0 || size > output.len) {
+        let _close: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+        let code: i64 = tnn_store_status_limit();
+        if (size < 0) { code = size; }
+        return tnn_store_io_failure(code, 0, 0);
+    }
+    let seek: i64 = _zag_raw_syscall(8, fd, 0, 0, 0, 0, 0);
+    if (seek != 0) {
+        let _close: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+        return tnn_store_io_failure(seek, 0, 0);
+    }
+    let base: *i8 = _zag_slice_ptr(output);
+    let total: i64 = 0;
+    let calls: i32 = 0;
+    while (total < size && calls < 65536) {
+        let rc: i64 = _zag_raw_syscall(0, fd, (base as i64) + total,
+            size - total, 0, 0, 0);
+        calls = calls + 1;
+        if (rc == (0 - 4)) { }
+        else if (rc <= 0 || rc > size - total) {
+            let _close: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+            if (rc >= 0) { rc = tnn_store_status_incomplete(); }
+            return tnn_store_io_failure(rc, total, calls);
+        } else { total = total + rc; }
+    }
+    let close_rc: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+    if (total != size || close_rc < 0) {
+        let code: i64 = tnn_store_status_incomplete();
+        if (close_rc < 0) { code = close_rc; }
+        return tnn_store_io_failure(code, total, calls);
+    }
+    return TnnStoreIoResult{
+        .ok = 1, .code = tnn_store_status_ok(), .bytes = total, .calls = calls,
+    };
+}
+
+fn tnn_store_close(store: @borrows_mut *TnnStoreCapability) i64 {
+    if (store.*.open == 0) { return tnn_store_status_invalid_state(); }
+    let root_fd: i64 = store.*.root_fd;
+    let lock_fd: i64 = store.*.lock_fd;
+    let journal_fd: i64 = store.*.journal_fd;
+    store.* = tnn_store_invalid();
+    let status: i64 = _zag_raw_syscall(74, journal_fd, 0, 0, 0, 0, 0);
+    let journal_close: i64 = _zag_raw_syscall(3, journal_fd, 0, 0, 0, 0, 0);
+    let unlock: i64 = _zag_raw_syscall(73, lock_fd, 8, 0, 0, 0, 0);
+    let lock_close: i64 = _zag_raw_syscall(3, lock_fd, 0, 0, 0, 0, 0);
+    let root_close: i64 = _zag_raw_syscall(3, root_fd, 0, 0, 0, 0, 0);
+    if (status < 0) { return status; }
+    if (journal_close < 0) { return journal_close; }
+    if (unlock < 0) { return unlock; }
+    if (lock_close < 0) { return lock_close; }
+    return root_close;
+}

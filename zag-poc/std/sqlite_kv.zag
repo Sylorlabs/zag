@@ -1,0 +1,246 @@
+// std/sqlite_kv.zag -- bounded Linux SQLite i64 key/value adapter.
+//
+// This adapter deliberately exposes no path-taking API.  It opens SQLite's
+// `:memory:` database, uses one table, accepts scalar i64 keys/values only, and
+// depends on the exact system SONAME `libsqlite3.so.0`.  Build consumers with:
+//
+//   znc app.zag --dynamic --needed libsqlite3.so.0 -o app
+//
+// The edition-2026 dynamic @io ABI is the boundary.  There is no static or
+// fallback implementation hidden behind this module.
+
+@import("rt.zag")
+@import("database_kv.zag")
+
+extern fn sqlite3_open(filename: *u8, database: **u8) i32 @io;
+extern fn sqlite3_close(database: *u8) i32 @io;
+extern fn sqlite3_prepare_v2(database: *u8, sql: *u8, bytes: i32,
+    statement: **u8, tail: **u8) i32 @io;
+extern fn sqlite3_bind_int64(statement: *u8, index: i32, value: i64) i32 @io;
+extern fn sqlite3_step(statement: *u8) i32 @io;
+extern fn sqlite3_column_int64(statement: *u8, column: i32) i64 @io;
+extern fn sqlite3_finalize(statement: *u8) i32 @io;
+extern fn sqlite3_changes(database: *u8) i32 @io;
+
+fn sqlite_kv_code_ok() i32 { return 0; }
+fn sqlite_kv_code_row() i32 { return 100; }
+fn sqlite_kv_code_done() i32 { return 101; }
+
+struct SqliteKv {
+    database: *u8,
+    capacity: i32,
+    count: i32,
+    open: i32,
+    status: i32,
+}
+
+struct SqliteKvPrepared {
+    statement: *u8,
+    status: i32,
+}
+
+fn sqlite_kv_empty(status: i32) SqliteKv {
+    return SqliteKv{
+        .database = null as *u8,
+        .capacity = 0,
+        .count = 0,
+        .open = 0,
+        .status = status,
+    };
+}
+
+fn sqlite_kv_c_string(text: []u8) *u8 {
+    let out: *u8 = _zag_malloc(text.len + 1) as *u8;
+    let i: i32 = 0;
+    while (i < text.len) {
+        out[i] = text[i];
+        i = i + 1;
+    }
+    out[text.len] = 0;
+    return out;
+}
+
+fn sqlite_kv_prepare(database: *u8, sql: []u8) SqliteKvPrepared {
+    // Keep C out-parameters in heap words. This is the validated pointer-to-
+    // pointer representation for the edition-2026 dynamic ABI; it also avoids
+    // exposing a Zag frame address to a foreign implementation.
+    let statement_out: **u8 = _zag_malloc(8) as **u8;
+    let tail_out: **u8 = _zag_malloc(8) as **u8;
+    statement_out.* = null as *u8;
+    tail_out.* = null as *u8;
+    let c_sql: *u8 = sqlite_kv_c_string(sql);
+    let rc: i32 = sqlite3_prepare_v2(database, c_sql, 0 - 1,
+        statement_out, tail_out);
+    let statement: *u8 = statement_out.*;
+    _zag_free(c_sql as *i8);
+    _zag_free(tail_out as *i8);
+    _zag_free(statement_out as *i8);
+    if (rc != sqlite_kv_code_ok()) {
+        if (statement != null as *u8) { sqlite3_finalize(statement); }
+        return SqliteKvPrepared{
+            .statement = null as *u8,
+            .status = database_kv_backend_error(),
+        };
+    }
+    return SqliteKvPrepared{
+        .statement = statement,
+        .status = database_kv_ok(),
+    };
+}
+
+fn sqlite_kv_finish_done(statement: *u8) i32 {
+    let step_status: i32 = sqlite3_step(statement);
+    let finalize_status: i32 = sqlite3_finalize(statement);
+    if (step_status != sqlite_kv_code_done() ||
+        finalize_status != sqlite_kv_code_ok()) {
+        return database_kv_backend_error();
+    }
+    return database_kv_ok();
+}
+
+fn sqlite_kv_open(capacity: i32) SqliteKv {
+    if (!database_kv_capacity_valid(capacity)) {
+        return sqlite_kv_empty(database_kv_invalid());
+    }
+    let database_out: **u8 = _zag_malloc(8) as **u8;
+    database_out.* = null as *u8;
+    let filename: *u8 = sqlite_kv_c_string(":memory:");
+    let open_status: i32 = sqlite3_open(filename, database_out);
+    let database: *u8 = database_out.*;
+    _zag_free(filename as *i8);
+    _zag_free(database_out as *i8);
+    if (open_status != sqlite_kv_code_ok() || database == null as *u8) {
+        if (database != null as *u8) { sqlite3_close(database); }
+        return sqlite_kv_empty(database_kv_backend_error());
+    }
+    let prepared: SqliteKvPrepared = sqlite_kv_prepare(database,
+        "CREATE TABLE zag_kv(k INTEGER PRIMARY KEY, v INTEGER NOT NULL)");
+    if (prepared.status != database_kv_ok()) {
+        sqlite3_close(database);
+        return sqlite_kv_empty(database_kv_backend_error());
+    }
+    if (sqlite_kv_finish_done(prepared.statement) != database_kv_ok()) {
+        sqlite3_close(database);
+        return sqlite_kv_empty(database_kv_backend_error());
+    }
+    return SqliteKv{
+        .database = database,
+        .capacity = capacity,
+        .count = 0,
+        .open = 1,
+        .status = database_kv_ok(),
+    };
+}
+
+fn sqlite_kv_get(database: *SqliteKv, key: i64, value: *i64) i32 {
+    value.* = 0;
+    if (database.*.open == 0) { return database_kv_invalid(); }
+    let prepared: SqliteKvPrepared = sqlite_kv_prepare(database.*.database,
+        "SELECT v FROM zag_kv WHERE k=?1");
+    if (prepared.status != database_kv_ok()) {
+        return database_kv_backend_error();
+    }
+    if (sqlite3_bind_int64(prepared.statement, 1, key) != sqlite_kv_code_ok()) {
+        sqlite3_finalize(prepared.statement);
+        return database_kv_backend_error();
+    }
+    let step_status: i32 = sqlite3_step(prepared.statement);
+    if (step_status == sqlite_kv_code_row()) {
+        value.* = sqlite3_column_int64(prepared.statement, 0);
+        if (sqlite3_finalize(prepared.statement) != sqlite_kv_code_ok()) {
+            value.* = 0;
+            return database_kv_backend_error();
+        }
+        return database_kv_ok();
+    }
+    let finalize_status: i32 = sqlite3_finalize(prepared.statement);
+    if (step_status == sqlite_kv_code_done() &&
+        finalize_status == sqlite_kv_code_ok()) {
+        return database_kv_missing();
+    }
+    return database_kv_backend_error();
+}
+
+fn sqlite_kv_write(database: *SqliteKv, sql: []u8,
+    key: i64, value: i64) i32 {
+    let prepared: SqliteKvPrepared = sqlite_kv_prepare(database.*.database, sql);
+    if (prepared.status != database_kv_ok()) {
+        return database_kv_backend_error();
+    }
+    let key_status: i32 = sqlite3_bind_int64(prepared.statement, 1, key);
+    let value_status: i32 = sqlite3_bind_int64(prepared.statement, 2, value);
+    if (key_status != sqlite_kv_code_ok() ||
+        value_status != sqlite_kv_code_ok()) {
+        sqlite3_finalize(prepared.statement);
+        return database_kv_backend_error();
+    }
+    return sqlite_kv_finish_done(prepared.statement);
+}
+
+fn sqlite_kv_put(database: *SqliteKv, key: i64, value: i64) i32 {
+    if (database.*.open == 0) { return database_kv_invalid(); }
+    let old_value: i64 = 0;
+    let lookup: i32 = sqlite_kv_get(database, key, &old_value);
+    if (lookup == database_kv_ok()) {
+        return sqlite_kv_write(database,
+            "UPDATE zag_kv SET v=?2 WHERE k=?1", key, value);
+    }
+    if (lookup != database_kv_missing()) { return lookup; }
+    if (database.*.count >= database.*.capacity) {
+        return database_kv_limit();
+    }
+    let status: i32 = sqlite_kv_write(database,
+        "INSERT INTO zag_kv(k,v) VALUES(?1,?2)", key, value);
+    if (status == database_kv_ok()) {
+        database.*.count = database.*.count + 1;
+    }
+    return status;
+}
+
+fn sqlite_kv_delete(database: *SqliteKv, key: i64) i32 {
+    if (database.*.open == 0) { return database_kv_invalid(); }
+    let prepared: SqliteKvPrepared = sqlite_kv_prepare(database.*.database,
+        "DELETE FROM zag_kv WHERE k=?1");
+    if (prepared.status != database_kv_ok()) {
+        return database_kv_backend_error();
+    }
+    if (sqlite3_bind_int64(prepared.statement, 1, key) != sqlite_kv_code_ok()) {
+        sqlite3_finalize(prepared.statement);
+        return database_kv_backend_error();
+    }
+    let step_status: i32 = sqlite3_step(prepared.statement);
+    let changes: i32 = sqlite3_changes(database.*.database);
+    let finalize_status: i32 = sqlite3_finalize(prepared.statement);
+    if (step_status != sqlite_kv_code_done() ||
+        finalize_status != sqlite_kv_code_ok()) {
+        return database_kv_backend_error();
+    }
+    if (changes == 0) { return database_kv_missing(); }
+    if (changes != 1 || database.*.count <= 0) {
+        return database_kv_backend_error();
+    }
+    database.*.count = database.*.count - 1;
+    return database_kv_ok();
+}
+
+fn sqlite_kv_count(database: *SqliteKv, count: *i32) i32 {
+    count.* = 0;
+    if (database.*.open == 0) { return database_kv_invalid(); }
+    count.* = database.*.count;
+    return database_kv_ok();
+}
+
+fn sqlite_kv_close(database: *SqliteKv) i32 {
+    if (database.*.open == 0) { return database_kv_invalid(); }
+    // sqlite3_close returns non-zero while any prepared statement is still
+    // live, so success here is also the adapter's statement-cleanup witness.
+    if (sqlite3_close(database.*.database) != sqlite_kv_code_ok()) {
+        return database_kv_backend_error();
+    }
+    database.*.database = null as *u8;
+    database.*.capacity = 0;
+    database.*.count = 0;
+    database.*.open = 0;
+    database.*.status = database_kv_invalid();
+    return database_kv_ok();
+}
