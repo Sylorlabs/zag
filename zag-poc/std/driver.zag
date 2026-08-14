@@ -1,0 +1,1843 @@
+// std:driver -- the common pure-Zag driver contract.
+//
+// This module is deliberately an authority boundary.  The token fields are
+// compiler-private implementation details; callers obtain a value only from
+// an acquisition function and release it through the matching typed lifecycle
+// operation.  Platform adapters may supply an owned opaque token, but they do
+// not get to construct the public handle aggregate themselves.
+//
+// The contract is shared by userspace and kernel adapters.  This file contains
+// no Linux syscall, libc, C, or device-specific logic.  Those belong behind the
+// adapter boundary and are selected by explicit target/kernel metadata.
+
+// ── named contract values ──────────────────────────────────────────────────
+
+pub fn context_userspace() i32 { return 1; }
+pub fn context_kernel() i32 { return 2; }
+pub fn context_irq() i32 { return 3; }
+pub fn context_threaded() i32 { return 4; }
+pub fn context_driver_init() i32 { return 5; }
+pub fn context_driver_control() i32 { return 6; }
+pub fn context_driver_teardown() i32 { return 7; }
+
+pub fn endian_native() i32 { return 0; }
+pub fn endian_little() i32 { return 1; }
+pub fn endian_big() i32 { return 2; }
+
+pub fn mmio_read_only() i32 { return 1; }
+pub fn mmio_write_only() i32 { return 2; }
+pub fn mmio_read_write() i32 { return 3; }
+pub fn mmio_width_8() i32 { return 8; }
+pub fn mmio_width_16() i32 { return 16; }
+pub fn mmio_width_32() i32 { return 32; }
+pub fn mmio_width_64() i32 { return 64; }
+pub fn mmio_barrier_compiler() i32 { return 1; }
+pub fn mmio_barrier_device() i32 { return 2; }
+pub fn mmio_barrier_full() i32 { return 3; }
+pub fn register_field_width_valid(width: i32) i32 {
+    return (width == mmio_width_8() || width == mmio_width_16() ||
+        width == mmio_width_32() || width == mmio_width_64()) as i32;
+}
+
+pub fn dma_to_device() i32 { return 1; }
+pub fn dma_from_device() i32 { return 2; }
+pub fn dma_bidirectional() i32 { return 3; }
+pub fn dma_coherent() i32 { return 1; }
+pub fn dma_streaming() i32 { return 2; }
+pub fn dma_sync_cpu() i32 { return 1; }
+pub fn dma_sync_device() i32 { return 2; }
+pub fn dma_sync_none() i32 { return 0; }
+
+pub fn order_relaxed() i32 { return 0; }
+pub fn order_acquire() i32 { return 1; }
+pub fn order_release() i32 { return 2; }
+pub fn order_acq_rel() i32 { return 3; }
+pub fn order_seq_cst() i32 { return 4; }
+
+pub fn irq_shared() i32 { return 1; }
+pub fn irq_exclusive() i32 { return 2; }
+pub fn irq_threaded() i32 { return 3; }
+
+pub fn driver_ok() i32 { return 0; }
+pub fn driver_invalid_argument() i32 { return 1; }
+pub fn driver_unsupported() i32 { return 2; }
+pub fn driver_busy() i32 { return 3; }
+pub fn driver_stale_handle() i32 { return 4; }
+pub fn driver_out_of_range() i32 { return 5; }
+pub fn driver_quiescing() i32 { return 6; }
+pub fn driver_phase_new() i32 { return 1; }
+pub fn driver_phase_probed() i32 { return 2; }
+pub fn driver_phase_ready() i32 { return 3; }
+pub fn driver_phase_quiescing() i32 { return 4; }
+pub fn driver_phase_dead() i32 { return 5; }
+
+pub fn driver_target_x86_64() i32 { return 1; }
+pub fn driver_target_arm64() i32 { return 2; }
+pub fn driver_target_i686() i32 { return 3; }
+
+// ── stable scalar/result records ───────────────────────────────────────────
+
+// These records are deliberately ordinary portable Zag values in the common
+// core.  An adapter may expose a separately checked @repr(C) wire record when
+// its target ABI supports it; the core must not acquire an x86-only ABI merely
+// by importing std:driver.
+pub struct DriverStatus {
+    code: i32,
+    detail: i64,
+}
+
+pub struct DriverSupport {
+    target: i32,
+    kernel_series: i32,
+    userspace: i32,
+    kernel_module: i32,
+    emulator: i32,
+    physical_device: i32,
+}
+
+// ── opaque affine handles ──────────────────────────────────────────────────
+
+// Every public handle is an @resource with exactly one owned opaque token.
+// `@driver_handle` is stronger than a normal resource: the compiler rejects
+// direct literals, field projections, pointer/address casts, and ordinary
+// value copies outside this module.  Ownership transfer remains explicit via
+// @consumes APIs.
+
+@resource @driver_handle(Device) pub struct Device {
+    token: @owned(_zag_free) *opaque,
+    identity: i64,
+    adapter: i32,
+}
+
+@resource @driver_handle(MmioRegion) pub struct MmioRegion {
+    token: @owned(_zag_free) *opaque,
+    bytes: i64,
+    endian: i32,
+}
+
+// A register is a typed view over one region offset. The token is distinct
+// from the region token so a register cannot outlive or be fabricated without
+// an adapter-checked acquisition boundary.
+@resource @driver_handle(MmioRegister) pub struct MmioRegister[T] {
+    token: @owned(_zag_free) *opaque,
+    offset: i64,
+    width: i32,
+    policy: i32,
+    endian: i32,
+    barrier: i32,
+    emulated: i32,
+    value: u64,
+}
+
+// MMIO results keep the status separate from the exact-width payload.  The
+// common contract never reads the token as ordinary memory: until a selected
+// adapter supplies the target MMIO lowering, these operations return
+// driver_unsupported() after validating their declared width and policy.
+pub struct MmioRead8 { status: i32, value: u8 }
+pub struct MmioRead16 { status: i32, value: u16 }
+pub struct MmioRead32 { status: i32, value: u32 }
+pub struct MmioRead64 { status: i32, value: u64 }
+
+// A register field is a checked declaration over one exact-width register.
+// It is intentionally a value with no pointer or host-layout escape: masks
+// and shifts are derived from the declaration, and accessors reject a value
+// that cannot fit instead of truncating it silently.
+pub struct RegisterField {
+    register_width: i32,
+    shift: i32,
+    bits: i32,
+    mask: u64,
+    endian: i32,
+}
+
+pub fn register_field_valid(register_width: i32, shift: i32, bits: i32,
+                             endian: i32) i32 @driver_control {
+    return (register_field_width_valid(register_width) != 0 && shift >= 0 &&
+        bits > 0 && bits <= register_width && shift + bits <= register_width &&
+        mmio_endian_valid(endian) != 0) as i32;
+}
+
+pub fn register_field_new(register_width: i32, shift: i32, bits: i32,
+                           endian: i32) RegisterField @driver_init {
+    let valid: i32 = register_field_valid(register_width, shift, bits, endian);
+    let mask: u64 = 0;
+    let bit: i32 = 0;
+    if (valid != 0) {
+        while (bit < bits) {
+            mask = mask | ((1 as u64) << (shift + bit));
+            bit = bit + 1;
+        }
+    }
+    return RegisterField{ .register_width = register_width, .shift = shift,
+        .bits = bits, .mask = mask, .endian = endian };
+}
+
+pub fn register_field_mask(field: @borrows *RegisterField) u64 @driver_control {
+    return field.*.mask;
+}
+
+pub fn register_field_extract(field: @borrows *RegisterField, value: u64) u64 @driver_control {
+    if (field.*.mask == 0) { return 0; }
+    // Field positions are declared in the register's logical CPU value.  A
+    // big-endian MMIO image must be normalized before applying that position;
+    // otherwise a field crossing byte boundaries would be decoded from the
+    // bus byte order rather than from the declared register value.
+    let logical: u64 = mmio_swap_value(value, field.*.register_width,
+        field.*.endian);
+    return (logical & field.*.mask) >> field.*.shift;
+}
+
+pub fn register_field_insert(field: @borrows *RegisterField,
+                             current: u64, value: u64) u64 @driver_control {
+    if (field.*.mask == 0) { return current; }
+    let limit: u64 = 1;
+    let bit: i32 = 0;
+    while (bit < field.*.bits) {
+        limit = limit << 1;
+        bit = bit + 1;
+    }
+    if (value >= limit) { return current; }
+    // Build the complement explicitly. This keeps the operation target
+    // defined even on backends whose integer complement lowering is not yet
+    // part of the driver-safe subset.
+    let keep: u64 = 0;
+    bit = 0;
+    while (bit < field.*.register_width) {
+        if (bit < field.*.shift || bit >= field.*.shift + field.*.bits) {
+            keep = keep | ((1 as u64) << bit);
+        }
+        bit = bit + 1;
+    }
+    // `current` is the logical CPU value.  Only the returned register image
+    // crosses the endian boundary; swapping the input as well would treat a
+    // caller's logical value as already-encoded bus bytes and corrupt fields
+    // in big-endian registers.
+    let logical: u64 = current;
+    let updated: u64 = (logical & keep) |
+        ((value << field.*.shift) & field.*.mask);
+    return mmio_swap_value(updated, field.*.register_width, field.*.endian);
+}
+
+// A descriptor field is a byte-addressed scalar inside a fixed-size wire
+// descriptor.  Unlike a raw pointer plus offset, the declaration carries the
+// descriptor extent, exact transaction width, alignment, and byte order.  An
+// adapter may discover these values at probe time, but it cannot bypass the
+// same validation or reinterpret the bus image as a host-native integer.
+pub struct DescriptorField {
+    descriptor_bytes: i64,
+    offset: i64,
+    width: i32,
+    endian: i32,
+    valid: i32,
+}
+
+pub fn descriptor_field_width_bytes(width: i32) i64 @driver_control {
+    if (width == mmio_width_8()) { return 1; }
+    if (width == mmio_width_16()) { return 2; }
+    if (width == mmio_width_32()) { return 4; }
+    if (width == mmio_width_64()) { return 8; }
+    return 0;
+}
+
+pub fn descriptor_field_valid(descriptor_bytes: i64, offset: i64,
+                              width: i32, endian: i32) i32 @driver_control {
+    let bytes: i64 = descriptor_field_width_bytes(width);
+    return (descriptor_bytes > 0 && bytes > 0 && offset >= 0 &&
+        offset % bytes == 0 && offset + bytes <= descriptor_bytes &&
+        mmio_endian_valid(endian) != 0) as i32;
+}
+
+pub fn descriptor_field_new(descriptor_bytes: i64, offset: i64,
+                            width: i32, endian: i32) DescriptorField @driver_init {
+    let valid: i32 = descriptor_field_valid(descriptor_bytes, offset, width, endian);
+    return DescriptorField{ .descriptor_bytes = descriptor_bytes,
+        .offset = offset, .width = width, .endian = endian, .valid = valid };
+}
+
+pub fn descriptor_field_is_valid(field: @borrows *DescriptorField) i32 @driver_control {
+    return (field.*.valid != 0 && descriptor_field_valid(field.*.descriptor_bytes,
+        field.*.offset, field.*.width, field.*.endian) != 0) as i32;
+}
+
+pub fn descriptor_field_encode(field: @borrows *DescriptorField,
+                               value: u64) u64 @driver_control {
+    if (descriptor_field_is_valid(field) == 0) { return 0; }
+    if (value > mmio_value_mask(field.*.width)) { return 0; }
+    return mmio_swap_value(value, field.*.width, field.*.endian);
+}
+
+pub fn descriptor_field_decode(field: @borrows *DescriptorField,
+                               bus_value: u64) u64 @driver_control {
+    if (descriptor_field_is_valid(field) == 0) { return 0; }
+    return mmio_swap_value(bus_value, field.*.width, field.*.endian);
+}
+
+pub struct AtomicRead8 { status: i32, value: u8 }
+pub struct AtomicRead16 { status: i32, value: u16 }
+pub struct AtomicRead32 { status: i32, value: u32 }
+pub struct AtomicRead64 { status: i32, value: u64 }
+
+// Compare-exchange reports the observed value separately from the exchange
+// decision.  This avoids treating a failed compare as an exceptional path and
+// keeps the exact scalar width visible to the caller.
+pub struct AtomicCompare8 { status: i32, observed: u8, exchanged: i32 }
+pub struct AtomicCompare16 { status: i32, observed: u16, exchanged: i32 }
+pub struct AtomicCompare32 { status: i32, observed: u32, exchanged: i32 }
+pub struct AtomicCompare64 { status: i32, observed: u64, exchanged: i32 }
+
+@resource @driver_handle(DmaDomain) pub struct DmaDomain {
+    token: @owned(_zag_free) *opaque,
+    identity: i64,
+    alignment: i64,
+    max_segments: i64,
+    coherent: i32,
+    valid: i32,
+}
+
+@resource @driver_handle(DmaBuffer) pub struct DmaBuffer[T] {
+    token: @owned(_zag_free) *opaque,
+    domain_identity: i64,
+    elements: i64,
+    alignment: i64,
+    direction: i32,
+    mode: i32,
+    mapped: i32,
+    sync_state: i32,
+    segments: i32,
+    emulated: i32,
+    valid: i32,
+}
+
+@resource @driver_handle(BusAddress) pub struct BusAddress {
+    token: @owned(_zag_free) *opaque,
+    value: u64,
+    domain_identity: i64,
+    valid: i32,
+}
+
+@resource @driver_handle(IrqHandle) pub struct IrqHandle {
+    token: @owned(_zag_free) *opaque,
+    vector: i32,
+    mode: i32,
+    registered: i32,
+    deferred: i32,
+    quiesced: i32,
+    emulated: i32,
+}
+
+@resource @driver_handle(DriverState) pub struct DriverState {
+    token: @owned(_zag_free) *opaque,
+    phase: i32,
+    quiescing: i32,
+    generation: i64,
+}
+
+// Atomic[T] is a typed identity-bearing capability, not a numeric value.  The
+// compiler accepts only the scalar widths covered by the selected target
+// adapter; the common source surface remains generic.
+@resource @driver_handle(Atomic) pub struct Atomic[T] {
+    token: @owned(_zag_free) *opaque,
+    width: i32,
+    lock_free: i32,
+    emulated: i32,
+    value: u64,
+}
+
+// A mutex is deliberately a separate capability from Atomic[T].  `try_lock`
+// is IRQ-safe and bounded; `lock` is explicitly blocking and therefore cannot
+// be called from @realtime or @irq code.  The adapter reports whether the
+// selected implementation is IRQ-safe instead of the common core assuming
+// that a userspace mutex and a kernel spinlock are interchangeable.
+@resource @driver_handle(DriverMutex) pub struct DriverMutex {
+    token: @owned(_zag_free) *opaque,
+    irq_safe: i32,
+    held: i32,
+    emulated: i32,
+}
+
+// ── token lifecycle ────────────────────────────────────────────────────────
+
+// This is intentionally not public.  Only the std:driver module may see the
+// token field needed to call it.  Adapters hand an owned token to one of the
+// acquisition functions below after proving the platform mapping contract.
+fn driver_release_token(p: @consumes *opaque) void {
+    unsafe { _zag_free(p as *i8); }
+}
+
+// ── acquisition ────────────────────────────────────────────────────────────
+
+@returns_owner
+pub unsafe fn device_from_owned_token(token: @consumes *opaque,
+                                      identity: i64, adapter: i32) Device @driver_init {
+    return Device{ .token = token, .identity = identity, .adapter = adapter };
+}
+
+pub unsafe fn device_new_emulated(identity: i64) Device @driver_init {
+    let token: *opaque = _zag_malloc(8) as *opaque;
+    return Device{ .token = token, .identity = identity, .adapter = 1 };
+}
+
+pub fn device_identity(device: @borrows *Device) i64 @driver_control {
+    return device.*.identity;
+}
+
+pub fn device_adapter(device: @borrows *Device) i32 @driver_control {
+    return device.*.adapter;
+}
+
+pub fn device_release(device: @consumes Device) void @driver_teardown {
+    unsafe { _zag_free(device.token as *i8); }
+}
+
+@returns_owner
+pub unsafe fn mmio_region_from_owned_token(token: @consumes *opaque,
+                                           bytes: i64, endian: i32) MmioRegion @driver_init {
+    return MmioRegion{ .token = token, .bytes = bytes, .endian = endian };
+}
+
+pub unsafe fn mmio_region_new_emulated(bytes: i64, endian: i32) MmioRegion @driver_init {
+    let token: *opaque = _zag_malloc(bytes) as *opaque;
+    return MmioRegion{ .token = token, .bytes = bytes, .endian = endian };
+}
+
+pub fn mmio_region_bytes(region: @borrows *MmioRegion) i64 @driver_control {
+    return region.*.bytes;
+}
+
+pub fn mmio_region_endian(region: @borrows *MmioRegion) i32 @driver_control {
+    return region.*.endian;
+}
+
+@returns_owner
+pub unsafe fn mmio_register_from_owned_token[T](token: @consumes *opaque,
+                                                offset: i64, width: i32,
+                                                policy: i32, endian: i32,
+                                                barrier: i32) MmioRegister[T] @driver_init {
+    return MmioRegister[T]{ .token = token, .offset = offset, .width = width,
+        .policy = policy, .endian = endian, .barrier = barrier,
+        .emulated = 0, .value = 0 };
+}
+
+pub unsafe fn mmio_register_new_emulated[T](offset: i64, width: i32,
+                                            policy: i32, endian: i32,
+                                            barrier: i32) MmioRegister[T] @driver_init {
+    let token: *opaque = _zag_malloc(8) as *opaque;
+    return MmioRegister[T]{ .token = token, .offset = offset, .width = width,
+        .policy = policy, .endian = endian, .barrier = barrier,
+        .emulated = 1, .value = 0 };
+}
+
+pub fn mmio_register_valid(width: i32, policy: i32) i32 @driver_control {
+    let width_ok: i32 = (width == mmio_width_8() || width == mmio_width_16() ||
+        width == mmio_width_32() || width == mmio_width_64()) as i32;
+    let policy_ok: i32 = (policy == mmio_read_only() || policy == mmio_write_only() ||
+        policy == mmio_read_write()) as i32;
+    return (width_ok && policy_ok) as i32;
+}
+
+pub fn mmio_endian_valid(endian: i32) i32 @driver_control {
+    return (endian == endian_native() || endian == endian_little() ||
+        endian == endian_big()) as i32;
+}
+
+pub fn mmio_barrier_valid(barrier: i32) i32 @driver_control {
+    return (barrier == mmio_barrier_compiler() ||
+        barrier == mmio_barrier_device() || barrier == mmio_barrier_full()) as i32;
+}
+
+pub fn mmio_register_layout_valid(offset: i64, width: i32, region_bytes: i64,
+                                  endian: i32, barrier: i32) i32 @driver_control {
+    if (mmio_register_valid(width, mmio_read_write()) == 0 ||
+        mmio_endian_valid(endian) == 0 || mmio_barrier_valid(barrier) == 0 ||
+        offset < 0 || region_bytes < 0) { return 0; }
+    let bytes: i64 = (width / 8) as i64;
+    if (bytes <= 0 || offset % bytes != 0 || offset + bytes > region_bytes) { return 0; }
+    return 1;
+}
+
+pub fn mmio_register_offset[T](register: @borrows *MmioRegister[T]) i64 @driver_control {
+    return register.*.offset;
+}
+
+pub fn mmio_register_width[T](register: @borrows *MmioRegister[T]) i32 @driver_control {
+    return register.*.width;
+}
+
+pub fn mmio_register_policy[T](register: @borrows *MmioRegister[T]) i32 @driver_control {
+    return register.*.policy;
+}
+
+pub fn mmio_register_endian[T](register: @borrows *MmioRegister[T]) i32 @driver_control {
+    return register.*.endian;
+}
+
+pub fn mmio_register_barrier[T](register: @borrows *MmioRegister[T]) i32 @driver_control {
+    return register.*.barrier;
+}
+
+// Barrier emission is adapter-owned just like the actual MMIO load/store.
+// The common layer validates the declared barrier and refuses to turn it into
+// an ordinary compiler fence or host memory access.
+pub fn mmio_barrier[T](register: @borrows *MmioRegister[T]) DriverStatus @driver_control {
+    if (mmio_barrier_valid(register.*.barrier) == 0) {
+        return DriverStatus{ .code = driver_invalid_argument(), .detail = 0 };
+    }
+    return DriverStatus{ .code = driver_unsupported(), .detail = register.*.barrier as i64 };
+}
+
+pub fn mmio_swap_value(value: u64, width: i32, endian: i32) u64 {
+    if (endian != endian_big() || width == mmio_width_8()) { return value; }
+    let bytes: i32 = width / 8;
+    let remaining: u64 = value;
+    let result: u64 = 0;
+    let i: i32 = 0;
+    while (i < bytes) {
+        result = (result << 8) | (remaining & 255);
+        remaining = remaining >> 8;
+        i = i + 1;
+    }
+    return result;
+}
+
+pub fn mmio_value_mask(width: i32) u64 {
+    if (width == mmio_width_8()) { return 255; }
+    if (width == mmio_width_16()) { return 65535; }
+    if (width == mmio_width_32()) { return 4294967295; }
+    return 18446744073709551615;
+}
+
+pub fn mmio_register_release[T](register: @consumes MmioRegister[T]) void @driver_teardown {
+    unsafe { _zag_free(register.token as *i8); }
+}
+
+pub fn mmio_region_release(region: @consumes MmioRegion) void @driver_teardown {
+    unsafe { _zag_free(region.token as *i8); }
+}
+
+// Typed access entry points.  The exact generic register type is part of the
+// function signature, and the compiler's driver-call pass checks the width at
+// every call site.  The policy check remains runtime metadata because an
+// adapter may discover a device register's access policy during probe.
+pub fn mmio_read8(register: @borrows *MmioRegister[u8]) MmioRead8 @driver_control {
+    if (register.*.width != mmio_width_8() || register.*.policy == mmio_write_only() ||
+        mmio_endian_valid(register.*.endian) == 0 ||
+        mmio_barrier_valid(register.*.barrier) == 0) {
+        return MmioRead8{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (register.*.emulated != 0) {
+        return MmioRead8{ .status = driver_ok(),
+            .value = mmio_swap_value(register.*.value, register.*.width,
+                                      register.*.endian) as u8 };
+    }
+    return MmioRead8{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn mmio_read16(register: @borrows *MmioRegister[u16]) MmioRead16 @driver_control {
+    if (register.*.width != mmio_width_16() || register.*.policy == mmio_write_only() ||
+        mmio_endian_valid(register.*.endian) == 0 ||
+        mmio_barrier_valid(register.*.barrier) == 0) {
+        return MmioRead16{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (register.*.emulated != 0) {
+        return MmioRead16{ .status = driver_ok(),
+            .value = mmio_swap_value(register.*.value, register.*.width,
+                                      register.*.endian) as u16 };
+    }
+    return MmioRead16{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn mmio_read32(register: @borrows *MmioRegister[u32]) MmioRead32 @driver_control {
+    if (register.*.width != mmio_width_32() || register.*.policy == mmio_write_only() ||
+        mmio_endian_valid(register.*.endian) == 0 ||
+        mmio_barrier_valid(register.*.barrier) == 0) {
+        return MmioRead32{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (register.*.emulated != 0) {
+        return MmioRead32{ .status = driver_ok(),
+            .value = mmio_swap_value(register.*.value, register.*.width,
+                                      register.*.endian) as u32 };
+    }
+    return MmioRead32{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn mmio_read64(register: @borrows *MmioRegister[u64]) MmioRead64 @driver_control {
+    if (register.*.width != mmio_width_64() || register.*.policy == mmio_write_only() ||
+        mmio_endian_valid(register.*.endian) == 0 ||
+        mmio_barrier_valid(register.*.barrier) == 0) {
+        return MmioRead64{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (register.*.emulated != 0) {
+        return MmioRead64{ .status = driver_ok(),
+            .value = mmio_swap_value(register.*.value, register.*.width,
+                                      register.*.endian) as u64 };
+    }
+    return MmioRead64{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn mmio_read16_value(register: @borrows *MmioRegister[u16]) u16 @driver_control {
+    let result: MmioRead16 = mmio_read16(register);
+    return result.value;
+}
+
+pub fn mmio_write8(register: @borrows_mut *MmioRegister[u8], value: u8) DriverStatus @driver_control {
+    if (register.*.width != mmio_width_8() || register.*.policy == mmio_read_only() ||
+        mmio_endian_valid(register.*.endian) == 0 ||
+        mmio_barrier_valid(register.*.barrier) == 0) {
+        return DriverStatus{ .code = driver_invalid_argument(), .detail = value as i64 };
+    }
+    if (register.*.emulated != 0) {
+        register.*.value = mmio_swap_value(value as u64, register.*.width,
+                                            register.*.endian);
+        return DriverStatus{ .code = driver_ok(), .detail = value as i64 };
+    }
+    return DriverStatus{ .code = driver_unsupported(), .detail = value as i64 };
+}
+
+pub fn mmio_write16(register: @borrows_mut *MmioRegister[u16], value: u16) DriverStatus @driver_control {
+    if (register.*.width != mmio_width_16() || register.*.policy == mmio_read_only() ||
+        mmio_endian_valid(register.*.endian) == 0 ||
+        mmio_barrier_valid(register.*.barrier) == 0) {
+        return DriverStatus{ .code = driver_invalid_argument(), .detail = value as i64 };
+    }
+    if (register.*.emulated != 0) {
+        register.*.value = mmio_swap_value(value as u64, register.*.width,
+                                            register.*.endian);
+        return DriverStatus{ .code = driver_ok(), .detail = value as i64 };
+    }
+    return DriverStatus{ .code = driver_unsupported(), .detail = value as i64 };
+}
+
+pub fn mmio_write32(register: @borrows_mut *MmioRegister[u32], value: u32) DriverStatus @driver_control {
+    if (register.*.width != mmio_width_32() || register.*.policy == mmio_read_only() ||
+        mmio_endian_valid(register.*.endian) == 0 ||
+        mmio_barrier_valid(register.*.barrier) == 0) {
+        return DriverStatus{ .code = driver_invalid_argument(), .detail = value as i64 };
+    }
+    if (register.*.emulated != 0) {
+        register.*.value = mmio_swap_value(value as u64, register.*.width,
+                                            register.*.endian);
+        return DriverStatus{ .code = driver_ok(), .detail = value as i64 };
+    }
+    return DriverStatus{ .code = driver_unsupported(), .detail = value as i64 };
+}
+
+pub fn mmio_write64(register: @borrows_mut *MmioRegister[u64], value: u64) DriverStatus @driver_control {
+    if (register.*.width != mmio_width_64() || register.*.policy == mmio_read_only() ||
+        mmio_endian_valid(register.*.endian) == 0 ||
+        mmio_barrier_valid(register.*.barrier) == 0) {
+        return DriverStatus{ .code = driver_invalid_argument(), .detail = value as i64 };
+    }
+    if (register.*.emulated != 0) {
+        register.*.value = mmio_swap_value(value, register.*.width,
+                                            register.*.endian);
+        return DriverStatus{ .code = driver_ok(), .detail = value as i64 };
+    }
+    return DriverStatus{ .code = driver_unsupported(), .detail = value as i64 };
+}
+
+pub fn mmio_rmw8(register: @borrows_mut *MmioRegister[u8], mask: u8,
+                 value: u8) DriverStatus @driver_control {
+    if (register.*.width != mmio_width_8() || register.*.policy != mmio_read_write() ||
+        mmio_endian_valid(register.*.endian) == 0 ||
+        mmio_barrier_valid(register.*.barrier) == 0) {
+        return DriverStatus{ .code = driver_invalid_argument(), .detail = mask as i64 };
+    }
+    if (register.*.emulated != 0) {
+        let current: u64 = mmio_swap_value(register.*.value, register.*.width,
+                                            register.*.endian);
+        let full: u64 = mmio_value_mask(register.*.width);
+        let next: u64 = (current & (full ^ (mask as u64))) |
+            ((value as u64) & (mask as u64));
+        register.*.value = mmio_swap_value(next, register.*.width,
+                                            register.*.endian);
+        return DriverStatus{ .code = driver_ok(), .detail = next as i64 };
+    }
+    return DriverStatus{ .code = driver_unsupported(), .detail = value as i64 };
+}
+
+pub fn mmio_rmw16(register: @borrows_mut *MmioRegister[u16], mask: u16,
+                  value: u16) DriverStatus @driver_control {
+    if (register.*.width != mmio_width_16() || register.*.policy != mmio_read_write() ||
+        mmio_endian_valid(register.*.endian) == 0 ||
+        mmio_barrier_valid(register.*.barrier) == 0) {
+        return DriverStatus{ .code = driver_invalid_argument(), .detail = mask as i64 };
+    }
+    if (register.*.emulated != 0) {
+        let current: u64 = mmio_swap_value(register.*.value, register.*.width,
+                                            register.*.endian);
+        let full: u64 = mmio_value_mask(register.*.width);
+        let next: u64 = (current & (full ^ (mask as u64))) |
+            ((value as u64) & (mask as u64));
+        register.*.value = mmio_swap_value(next, register.*.width,
+                                            register.*.endian);
+        return DriverStatus{ .code = driver_ok(), .detail = next as i64 };
+    }
+    return DriverStatus{ .code = driver_unsupported(), .detail = value as i64 };
+}
+
+pub fn mmio_rmw32(register: @borrows_mut *MmioRegister[u32], mask: u32,
+                  value: u32) DriverStatus @driver_control {
+    if (register.*.width != mmio_width_32() || register.*.policy != mmio_read_write() ||
+        mmio_endian_valid(register.*.endian) == 0 ||
+        mmio_barrier_valid(register.*.barrier) == 0) {
+        return DriverStatus{ .code = driver_invalid_argument(), .detail = mask as i64 };
+    }
+    if (register.*.emulated != 0) {
+        let current: u64 = mmio_swap_value(register.*.value, register.*.width,
+                                            register.*.endian);
+        let full: u64 = mmio_value_mask(register.*.width);
+        let next: u64 = (current & (full ^ (mask as u64))) |
+            ((value as u64) & (mask as u64));
+        register.*.value = mmio_swap_value(next, register.*.width,
+                                            register.*.endian);
+        return DriverStatus{ .code = driver_ok(), .detail = next as i64 };
+    }
+    return DriverStatus{ .code = driver_unsupported(), .detail = value as i64 };
+}
+
+pub fn mmio_rmw64(register: @borrows_mut *MmioRegister[u64], mask: u64,
+                  value: u64) DriverStatus @driver_control {
+    if (register.*.width != mmio_width_64() || register.*.policy != mmio_read_write() ||
+        mmio_endian_valid(register.*.endian) == 0 ||
+        mmio_barrier_valid(register.*.barrier) == 0) {
+        return DriverStatus{ .code = driver_invalid_argument(), .detail = mask as i64 };
+    }
+    if (register.*.emulated != 0) {
+        let current: u64 = mmio_swap_value(register.*.value, register.*.width,
+                                            register.*.endian);
+        let full: u64 = mmio_value_mask(register.*.width);
+        let next: u64 = (current & (full ^ mask)) | (value & mask);
+        register.*.value = mmio_swap_value(next, register.*.width,
+                                            register.*.endian);
+        return DriverStatus{ .code = driver_ok(), .detail = next as i64 };
+    }
+    return DriverStatus{ .code = driver_unsupported(), .detail = value as i64 };
+}
+
+@returns_owner
+pub unsafe fn dma_domain_from_owned_token(token: @consumes *opaque,
+                                          alignment: i64, max_segments: i64,
+                                          coherent: i32) DmaDomain @driver_init {
+    return DmaDomain{ .token = token, .identity = 0, .alignment = alignment,
+        .max_segments = max_segments, .coherent = coherent,
+        .valid = (alignment > 0 && max_segments > 0 &&
+            (coherent == 0 || coherent == 1)) as i32 };
+}
+
+@returns_owner
+pub unsafe fn dma_domain_from_owned_token_with_identity(token: @consumes *opaque,
+                                                        identity: i64,
+                                                        alignment: i64,
+                                                        max_segments: i64,
+                                                        coherent: i32) DmaDomain @driver_init {
+    return DmaDomain{ .token = token, .identity = identity, .alignment = alignment,
+        .max_segments = max_segments, .coherent = coherent,
+        .valid = (alignment > 0 && max_segments > 0 &&
+            (coherent == 0 || coherent == 1)) as i32 };
+}
+
+pub unsafe fn dma_domain_new_emulated(alignment: i64, max_segments: i64,
+                                      coherent: i32) DmaDomain @driver_init {
+    let token: *opaque = _zag_malloc(8) as *opaque;
+    let valid: i32 = (alignment > 0 && max_segments > 0 &&
+        (coherent == 0 || coherent == 1)) as i32;
+    return DmaDomain{ .token = token, .identity = valid as i64, .alignment = alignment,
+        .max_segments = max_segments, .coherent = coherent, .valid = valid };
+}
+
+pub fn dma_domain_identity(domain: @borrows *DmaDomain) i64 @driver_control {
+    return domain.*.identity;
+}
+
+pub fn dma_domain_alignment(domain: @borrows *DmaDomain) i64 @driver_control {
+    return domain.*.alignment;
+}
+
+pub fn dma_domain_max_segments(domain: @borrows *DmaDomain) i64 @driver_control {
+    return domain.*.max_segments;
+}
+
+pub fn dma_domain_is_coherent(domain: @borrows *DmaDomain) i32 @driver_control {
+    return domain.*.coherent;
+}
+
+pub fn dma_domain_is_valid(domain: @borrows *DmaDomain) i32 @driver_control {
+    return domain.*.valid;
+}
+
+pub fn dma_direction_valid(direction: i32) i32 @driver_control {
+    return (direction == dma_to_device() || direction == dma_from_device() ||
+        direction == dma_bidirectional()) as i32;
+}
+
+pub fn dma_mode_valid(mode: i32) i32 @driver_control {
+    return (mode == dma_coherent() || mode == dma_streaming()) as i32;
+}
+
+pub fn dma_mapping_constraints_valid(alignment: i64, max_segments: i64,
+                                     direction: i32, mode: i32) i32 @driver_control {
+    return (alignment > 0 && max_segments > 0 && dma_direction_valid(direction) != 0 &&
+        dma_mode_valid(mode) != 0) as i32;
+}
+
+pub fn dma_domain_release(domain: @consumes DmaDomain) void @driver_teardown {
+    unsafe { _zag_free(domain.token as *i8); }
+}
+
+@returns_owner
+pub unsafe fn dma_buffer_from_owned_token[T](token: @consumes *opaque,
+                                             elements: i64, alignment: i64,
+                                             direction: i32, mode: i32,
+                                             mapped: i32) DmaBuffer[T] @driver_init {
+    let valid: i32 = (elements > 0 && dma_mapping_constraints_valid(alignment, 1,
+        direction, mode) != 0 &&
+        (mapped == 0 || mapped == 1)) as i32;
+    return DmaBuffer[T]{ .token = token, .domain_identity = 0, .elements = elements,
+        .alignment = alignment, .direction = direction, .mode = mode,
+        .mapped = mapped, .sync_state = dma_sync_none(), .segments = 0,
+        .emulated = 0, .valid = valid };
+}
+
+@returns_owner
+pub unsafe fn dma_buffer_from_owned_token_with_domain[T](token: @consumes *opaque,
+                                                         domain_identity: i64,
+                                                         elements: i64, alignment: i64,
+                                                         direction: i32, mode: i32,
+                                                         mapped: i32) DmaBuffer[T] @driver_init {
+    let valid: i32 = (elements > 0 && dma_mapping_constraints_valid(alignment, 1,
+        direction, mode) != 0 &&
+        (mapped == 0 || mapped == 1)) as i32;
+    return DmaBuffer[T]{ .token = token, .domain_identity = domain_identity,
+        .elements = elements, .alignment = alignment, .direction = direction,
+        .mode = mode, .mapped = mapped, .sync_state = dma_sync_none(), .segments = 0,
+        .emulated = 0, .valid = valid };
+}
+
+pub unsafe fn dma_buffer_new_emulated[T](elements: i64, alignment: i64,
+                                         direction: i32, mode: i32) DmaBuffer[T] @driver_init {
+    let element_size: i64 = @sizeOf[T]();
+    let metadata_valid: i32 = (elements > 0 && dma_mapping_constraints_valid(
+        alignment, 1, direction, mode) != 0) as i32;
+    let bytes: i64 = 0;
+    let allocation: i64 = 8;
+    if (metadata_valid != 0 && element_size > 0 &&
+        elements <= 9223372036854775807 / element_size) {
+        bytes = elements * element_size;
+        if (bytes > 0) { allocation = bytes; }
+    }
+    let valid: i32 = (metadata_valid != 0 && bytes > 0) as i32;
+    let token: *opaque = _zag_malloc(allocation) as *opaque;
+    return DmaBuffer[T]{ .token = token, .domain_identity = valid as i64, .elements = elements,
+        .alignment = alignment, .direction = direction, .mode = mode,
+        .mapped = 0, .sync_state = dma_sync_none(), .segments = 0, .emulated = 1,
+        .valid = valid };
+}
+
+pub fn dma_buffer_elements[T](buffer: @borrows *DmaBuffer[T]) i64 @driver_control {
+    return buffer.*.elements;
+}
+
+pub fn dma_buffer_alignment[T](buffer: @borrows *DmaBuffer[T]) i64 @driver_control {
+    return buffer.*.alignment;
+}
+
+pub fn dma_buffer_direction[T](buffer: @borrows *DmaBuffer[T]) i32 @driver_control {
+    return buffer.*.direction;
+}
+
+pub fn dma_buffer_mode[T](buffer: @borrows *DmaBuffer[T]) i32 @driver_control {
+    return buffer.*.mode;
+}
+
+pub fn dma_buffer_is_mapped[T](buffer: @borrows *DmaBuffer[T]) i32 @driver_control {
+    return buffer.*.mapped;
+}
+
+pub fn dma_buffer_is_valid[T](buffer: @borrows *DmaBuffer[T]) i32 @driver_control {
+    return buffer.*.valid;
+}
+
+pub fn dma_buffer_domain_identity[T](buffer: @borrows *DmaBuffer[T]) i64 @driver_control {
+    return buffer.*.domain_identity;
+}
+
+pub fn dma_buffer_sync_state[T](buffer: @borrows *DmaBuffer[T]) i32 @driver_control {
+    return buffer.*.sync_state;
+}
+
+pub fn dma_buffer_segments[T](buffer: @borrows *DmaBuffer[T]) i32 @driver_control {
+    return buffer.*.segments;
+}
+
+pub fn dma_buffer_handoff_valid[T](buffer: @borrows *DmaBuffer[T]) i32 @driver_control {
+    return (buffer.*.valid != 0 && buffer.*.mapped != 0 &&
+        dma_direction_valid(buffer.*.direction) != 0 &&
+        dma_mode_valid(buffer.*.mode) != 0 && buffer.*.sync_state == dma_sync_device()) as i32;
+}
+
+// An adapter supplies the owned bus-address token after it has completed the
+// target-specific IOMMU/cache mapping. The common layer records ownership and
+// refuses an invalid handoff; it never turns the token into a heap address.
+@returns_owner
+pub unsafe fn dma_buffer_map_with_owned_token[T](buffer: @borrows_mut *DmaBuffer[T],
+                                                 domain: @borrows *DmaDomain,
+                                                 address_token: @consumes *opaque,
+                                                 bus_value: u64, segments: i32) BusAddress @driver_init {
+    let domain_id: i64 = domain.*.identity;
+    let valid: i32 = (buffer.*.valid != 0 && domain.*.valid != 0 &&
+        buffer.*.mapped == 0 &&
+        buffer.*.alignment >= domain.*.alignment &&
+        dma_direction_valid(buffer.*.direction) != 0 &&
+        dma_mode_valid(buffer.*.mode) != 0 && segments > 0 &&
+        (segments as i64) <= domain.*.max_segments) as i32;
+    if (valid == 0) {
+        return BusAddress{ .token = address_token, .value = 0,
+            .domain_identity = domain_id, .valid = 0 };
+    }
+    buffer.*.mapped = 1;
+    buffer.*.domain_identity = domain_id;
+    buffer.*.sync_state = dma_sync_none();
+    buffer.*.segments = segments;
+    return BusAddress{ .token = address_token, .value = bus_value,
+        .domain_identity = domain_id, .valid = 1 };
+}
+
+pub unsafe fn dma_buffer_map_emulated[T](buffer: @borrows_mut *DmaBuffer[T],
+                                         domain: @borrows *DmaDomain,
+                                         bus_value: u64, segments: i32) BusAddress @driver_init {
+    let address_token: *opaque = _zag_malloc(8) as *opaque;
+    let domain_id: i64 = domain.*.identity;
+    let valid: i32 = (buffer.*.valid != 0 && domain.*.valid != 0 &&
+        buffer.*.mapped == 0 &&
+        buffer.*.alignment >= domain.*.alignment &&
+        dma_direction_valid(buffer.*.direction) != 0 &&
+        dma_mode_valid(buffer.*.mode) != 0 && segments > 0 &&
+        (segments as i64) <= domain.*.max_segments) as i32;
+    if (valid == 0) {
+        return BusAddress{ .token = address_token, .value = 0,
+            .domain_identity = domain_id, .valid = 0 };
+    }
+    buffer.*.mapped = 1;
+    buffer.*.domain_identity = domain_id;
+    buffer.*.sync_state = dma_sync_none();
+    buffer.*.segments = segments;
+    return BusAddress{ .token = address_token, .value = bus_value,
+        .domain_identity = domain_id, .valid = 1 };
+}
+
+pub fn dma_buffer_sync_for_device[T](buffer: @borrows_mut *DmaBuffer[T]) DriverStatus @driver_control {
+    if (buffer.*.valid == 0 || buffer.*.mapped == 0) {
+        return DriverStatus{ .code = driver_stale_handle(), .detail = 0 };
+    }
+    if (buffer.*.emulated != 0) {
+        buffer.*.sync_state = dma_sync_device();
+        return DriverStatus{ .code = driver_ok(), .detail = buffer.*.segments as i64 };
+    }
+    // Cache/IOMMU maintenance is adapter-owned. A common-core call cannot
+    // claim that a target instruction was emitted, and must not advance the
+    // ownership state as if the device handoff were complete.
+        return DriverStatus{ .code = driver_unsupported(), .detail = buffer.*.segments as i64 };
+}
+
+pub fn dma_buffer_sync_for_cpu[T](buffer: @borrows_mut *DmaBuffer[T]) DriverStatus @driver_control {
+    if (buffer.*.valid == 0 || buffer.*.mapped == 0) {
+        return DriverStatus{ .code = driver_stale_handle(), .detail = 0 };
+    }
+    if (buffer.*.emulated != 0) {
+        buffer.*.sync_state = dma_sync_cpu();
+        return DriverStatus{ .code = driver_ok(), .detail = buffer.*.segments as i64 };
+    }
+    // As above, an unavailable cache/IOMMU backend cannot claim that CPU
+    // ownership was restored.
+        return DriverStatus{ .code = driver_unsupported(), .detail = buffer.*.segments as i64 };
+}
+
+pub fn dma_buffer_unmap[T](buffer: @borrows_mut *DmaBuffer[T],
+                           address: @consumes BusAddress) DriverStatus @driver_teardown {
+    let bus_value: u64 = address.value;
+    let valid: i32 = (buffer.*.valid != 0 && address.valid != 0 &&
+        buffer.*.mapped != 0 &&
+        address.domain_identity == buffer.*.domain_identity) as i32;
+    unsafe { _zag_free(address.token as *i8); }
+    if (valid == 0) {
+        return DriverStatus{ .code = driver_stale_handle(), .detail = bus_value as i64 };
+    }
+    if (buffer.*.emulated != 0) {
+        buffer.*.mapped = 0;
+        buffer.*.sync_state = dma_sync_none();
+        buffer.*.segments = 0;
+        return DriverStatus{ .code = driver_ok(), .detail = bus_value as i64 };
+    }
+    // Consuming the address token is still required at this ownership
+    // boundary, but an unavailable native backend must not claim that the
+    // device mapping was actually torn down.  Keep the buffer mapped so a
+    // selected adapter can perform the real unmap or fail the whole teardown
+    // explicitly; the common layer never presents a partially-successful
+    // native DMA transition as complete.
+    return DriverStatus{ .code = driver_unsupported(), .detail = bus_value as i64 };
+}
+
+pub fn dma_buffer_release[T](buffer: @consumes DmaBuffer[T]) void @driver_teardown {
+    unsafe { _zag_free(buffer.token as *i8); }
+}
+
+@returns_owner
+pub unsafe fn bus_address_from_owned_token(token: @consumes *opaque,
+                                           value: u64, domain_identity: i64) BusAddress @driver_control {
+    return BusAddress{ .token = token, .value = value,
+        .domain_identity = domain_identity, .valid = 1 };
+}
+
+pub unsafe fn bus_address_new_emulated(value: u64, domain_identity: i64) BusAddress @driver_control {
+    let token: *opaque = _zag_malloc(8) as *opaque;
+    return BusAddress{ .token = token, .value = value,
+        .domain_identity = domain_identity, .valid = 1 };
+}
+
+pub fn bus_address_is_valid(address: @borrows *BusAddress) i32 @driver_control {
+    return address.*.valid;
+}
+
+pub fn bus_address_value(address: @borrows *BusAddress) u64 @driver_control {
+    return address.*.value;
+}
+
+pub fn bus_address_domain(address: @borrows *BusAddress) i64 @driver_control {
+    return address.*.domain_identity;
+}
+
+pub fn bus_address_release(address: @consumes BusAddress) void @driver_teardown {
+    unsafe { _zag_free(address.token as *i8); }
+}
+
+@returns_owner
+pub unsafe fn irq_from_owned_token(token: @consumes *opaque, vector: i32,
+                                   mode: i32) IrqHandle @driver_init {
+    return IrqHandle{ .token = token, .vector = vector, .mode = mode,
+        .registered = 0, .deferred = 0, .quiesced = 0, .emulated = 0 };
+}
+
+pub unsafe fn irq_new_emulated(vector: i32, mode: i32) IrqHandle @driver_init {
+    let token: *opaque = _zag_malloc(8) as *opaque;
+    return IrqHandle{ .token = token, .vector = vector, .mode = mode,
+        .registered = 0, .deferred = 0, .quiesced = 0, .emulated = 1 };
+}
+
+pub fn irq_vector(irq: @borrows *IrqHandle) i32 @driver_control {
+    return irq.*.vector;
+}
+
+pub fn irq_mode(irq: @borrows *IrqHandle) i32 @driver_control {
+    return irq.*.mode;
+}
+
+pub fn irq_is_registered(irq: @borrows *IrqHandle) i32 @driver_control {
+    return irq.*.registered;
+}
+
+pub fn irq_is_deferred(irq: @borrows *IrqHandle) i32 @driver_control {
+    return irq.*.deferred;
+}
+
+pub fn irq_is_quiesced(irq: @borrows *IrqHandle) i32 @driver_control {
+    return irq.*.quiesced;
+}
+
+pub fn irq_register(irq: @borrows_mut *IrqHandle) DriverStatus @driver_init {
+    if (irq.*.registered != 0) {
+        return DriverStatus{ .code = driver_busy(), .detail = irq.*.vector as i64 };
+    }
+    irq.*.registered = 1;
+    irq.*.deferred = 0;
+    irq.*.quiesced = 0;
+    return DriverStatus{ .code = driver_ok(), .detail = irq.*.vector as i64 };
+}
+
+pub fn irq_unregister(irq: @borrows_mut *IrqHandle) DriverStatus @driver_teardown {
+    if (irq.*.registered == 0) {
+        return DriverStatus{ .code = driver_stale_handle(), .detail = irq.*.vector as i64 };
+    }
+    irq.*.quiesced = 1;
+    if (irq.*.deferred != 0) {
+        return DriverStatus{ .code = driver_busy(), .detail = irq.*.vector as i64 };
+    }
+    irq.*.registered = 0;
+    return DriverStatus{ .code = driver_ok(), .detail = irq.*.vector as i64 };
+}
+
+pub fn irq_acknowledge(irq: @borrows *IrqHandle) DriverStatus @irq {
+    if (irq.*.registered == 0 || irq.*.quiesced != 0) {
+        return DriverStatus{ .code = driver_stale_handle(), .detail = irq.*.vector as i64 };
+    }
+    return DriverStatus{ .code = driver_ok(), .detail = irq.*.vector as i64 };
+}
+
+// This handler-side operation only records bounded deferred work. It does not
+// allocate, block, or invoke an arbitrary callback. A threaded adapter drains
+// the bit later under its explicitly broader context.
+pub fn irq_defer_work(irq: @borrows_mut *IrqHandle) DriverStatus @irq {
+    if (irq.*.registered == 0 || irq.*.quiesced != 0) {
+        return DriverStatus{ .code = driver_stale_handle(), .detail = irq.*.vector as i64 };
+    }
+    irq.*.deferred = 1;
+    return DriverStatus{ .code = driver_ok(), .detail = irq.*.vector as i64 };
+}
+
+pub fn irq_run_deferred(irq: @borrows_mut *IrqHandle) DriverStatus @driver_control {
+    if (irq.*.registered == 0) {
+        return DriverStatus{ .code = driver_stale_handle(), .detail = irq.*.vector as i64 };
+    }
+    if (irq.*.deferred == 0) {
+        return DriverStatus{ .code = driver_ok(), .detail = 0 };
+    }
+    if (irq.*.emulated != 0) {
+        irq.*.deferred = 0;
+        return DriverStatus{ .code = driver_ok(), .detail = irq.*.vector as i64 };
+    }
+    // A native threaded backend owns the actual work queue. Preserve the
+    // pending bit until that adapter reports quiescence; unsupported common
+    // code must not make teardown believe the work was drained.
+    return DriverStatus{ .code = driver_unsupported(), .detail = irq.*.vector as i64 };
+}
+
+pub fn irq_release(irq: @consumes IrqHandle) void @driver_teardown {
+    unsafe { _zag_free(irq.token as *i8); }
+}
+
+@returns_owner
+pub unsafe fn driver_state_from_owned_token(token: @consumes *opaque,
+                                            phase: i32) DriverState @driver_init {
+    return DriverState{ .token = token, .phase = phase, .quiescing = 0, .generation = 1 };
+}
+
+pub unsafe fn driver_state_new_emulated(phase: i32) DriverState @driver_init {
+    let token: *opaque = _zag_malloc(8) as *opaque;
+    return DriverState{ .token = token, .phase = phase, .quiescing = 0, .generation = 1 };
+}
+
+pub fn driver_state_phase(state: @borrows *DriverState) i32 @driver_control {
+    return state.*.phase;
+}
+
+pub fn driver_state_is_quiescing(state: @borrows *DriverState) i32 @driver_control {
+    return state.*.quiescing;
+}
+
+pub fn driver_state_generation(state: @borrows *DriverState) i64 @driver_control {
+    return state.*.generation;
+}
+
+pub fn driver_state_can_control(state: @borrows *DriverState) i32 @driver_control {
+    return (state.*.phase == driver_phase_ready() && state.*.quiescing == 0) as i32;
+}
+
+pub fn driver_state_probe_complete(state: @borrows_mut *DriverState) DriverStatus @driver_init {
+    if (state.*.phase != driver_phase_new()) {
+        return DriverStatus{ .code = driver_busy(), .detail = state.*.phase as i64 };
+    }
+    state.*.phase = driver_phase_probed();
+    return DriverStatus{ .code = driver_ok(), .detail = state.*.phase as i64 };
+}
+
+pub fn driver_state_initialize_complete(state: @borrows_mut *DriverState) DriverStatus @driver_init {
+    if (state.*.phase != driver_phase_probed()) {
+        return DriverStatus{ .code = driver_busy(), .detail = state.*.phase as i64 };
+    }
+    state.*.phase = driver_phase_ready();
+    return DriverStatus{ .code = driver_ok(), .detail = state.*.phase as i64 };
+}
+
+pub fn driver_state_reset_complete(state: @borrows_mut *DriverState) DriverStatus @driver_control {
+    if (state.*.quiescing != 0) {
+        return DriverStatus{ .code = driver_quiescing(), .detail = state.*.phase as i64 };
+    }
+    state.*.generation = state.*.generation + 1;
+    if (state.*.generation <= 0) { state.*.generation = 1; }
+    return DriverStatus{ .code = driver_ok(), .detail = state.*.generation as i64 };
+}
+
+pub fn driver_state_begin_teardown(state: @borrows_mut *DriverState) DriverStatus @driver_teardown {
+    if (state.*.quiescing != 0) {
+        return DriverStatus{ .code = driver_busy(), .detail = state.*.phase as i64 };
+    }
+    state.*.quiescing = 1;
+    state.*.phase = driver_phase_quiescing();
+    return DriverStatus{ .code = driver_ok(), .detail = state.*.phase as i64 };
+}
+
+pub fn driver_state_finish_teardown(state: @borrows_mut *DriverState) DriverStatus @driver_teardown {
+    if (state.*.quiescing == 0) {
+        return DriverStatus{ .code = driver_busy(), .detail = state.*.phase as i64 };
+    }
+    state.*.phase = driver_phase_dead();
+    state.*.generation = state.*.generation + 1;
+    return DriverStatus{ .code = driver_ok(), .detail = state.*.phase as i64 };
+}
+
+pub fn driver_state_release(state: @consumes DriverState) void @driver_teardown {
+    unsafe { _zag_free(state.token as *i8); }
+}
+
+@returns_owner
+pub unsafe fn atomic_from_owned_token[T](token: @consumes *opaque,
+                                         width: i32, lock_free: i32) Atomic[T] @driver_init {
+    return Atomic[T]{ .token = token, .width = width, .lock_free = lock_free,
+        .emulated = 0, .value = 0 };
+}
+
+pub unsafe fn atomic_new_emulated[T](width: i32, lock_free: i32) Atomic[T] @driver_init {
+    let token: *opaque = _zag_malloc(8) as *opaque;
+    return Atomic[T]{ .token = token, .width = width, .lock_free = lock_free,
+        .emulated = 1, .value = 0 };
+}
+
+pub fn atomic_width[T](atomic: @borrows *Atomic[T]) i32 @driver_control {
+    return atomic.*.width;
+}
+
+pub fn atomic_is_lock_free[T](atomic: @borrows *Atomic[T]) i32 @driver_control {
+    return atomic.*.lock_free;
+}
+
+pub fn atomic_width_8() i32 { return 8; }
+pub fn atomic_width_16() i32 { return 16; }
+pub fn atomic_width_32() i32 { return 32; }
+pub fn atomic_width_64() i32 { return 64; }
+
+pub fn atomic_order_valid(order: i32) i32 @driver_control {
+    return (order == order_relaxed() || order == order_acquire() ||
+        order == order_release() || order == order_acq_rel() ||
+        order == order_seq_cst()) as i32;
+}
+
+pub fn atomic_failure_order_valid(order: i32) i32 @driver_control {
+    return (order == order_relaxed() || order == order_acquire() ||
+        order == order_seq_cst()) as i32;
+}
+
+pub fn atomic_compare_orders_valid(success: i32, failure: i32) i32 @driver_control {
+    if (atomic_order_valid(success) == 0 || atomic_failure_order_valid(failure) == 0) { return 0; }
+    if (failure == order_relaxed()) { return 1; }
+    if (failure == order_acquire()) { return (success == order_acquire() ||
+        success == order_acq_rel() || success == order_seq_cst()) as i32; }
+    return (success == order_seq_cst()) as i32;
+}
+
+pub fn atomic_load_order_valid(order: i32) i32 @driver_control {
+    return (order == order_relaxed() || order == order_acquire() ||
+        order == order_seq_cst()) as i32;
+}
+
+pub fn atomic_store_order_valid(order: i32) i32 @driver_control {
+    return (order == order_relaxed() || order == order_release() ||
+        order == order_seq_cst()) as i32;
+}
+
+pub fn atomic_width_supported(width: i32) i32 @driver_control {
+    return (width == atomic_width_8() || width == atomic_width_16() ||
+        width == atomic_width_32() || width == atomic_width_64()) as i32;
+}
+
+// The adapter reports lock-free capability after target discovery. The common
+// contract validates the width and preserves the report; it does not infer a
+// hardware guarantee from the host running the compiler.
+pub fn atomic_lock_free_report(width: i32, target: i32, reported: i32) i32 @driver_control {
+    if (atomic_width_supported(width) == 0 ||
+        (target != driver_target_x86_64() && target != driver_target_arm64() &&
+         target != driver_target_i686())) { return 0; }
+    return (reported != 0) as i32;
+}
+
+pub fn atomic_fence(order: i32) DriverStatus @irq {
+    if (atomic_order_valid(order) == 0) {
+        return DriverStatus{ .code = driver_invalid_argument(), .detail = order as i64 };
+    }
+    return DriverStatus{ .code = driver_unsupported(), .detail = order as i64 };
+}
+
+pub fn atomic_load8(atomic: @borrows *Atomic[u8], order: i32) AtomicRead8 @irq {
+    if (atomic.*.width != atomic_width_8() || atomic_load_order_valid(order) == 0) {
+        return AtomicRead8{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        return AtomicRead8{ .status = driver_ok(), .value = atomic.*.value as u8 };
+    }
+    return AtomicRead8{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_load16(atomic: @borrows *Atomic[u16], order: i32) AtomicRead16 @irq {
+    if (atomic.*.width != atomic_width_16() || atomic_load_order_valid(order) == 0) {
+        return AtomicRead16{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        return AtomicRead16{ .status = driver_ok(), .value = atomic.*.value as u16 };
+    }
+    return AtomicRead16{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_load32(atomic: @borrows *Atomic[u32], order: i32) AtomicRead32 @irq {
+    if (atomic.*.width != atomic_width_32() || atomic_load_order_valid(order) == 0) {
+        return AtomicRead32{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        return AtomicRead32{ .status = driver_ok(), .value = atomic.*.value as u32 };
+    }
+    return AtomicRead32{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_load64(atomic: @borrows *Atomic[u64], order: i32) AtomicRead64 @irq {
+    if (atomic.*.width != atomic_width_64() || atomic_load_order_valid(order) == 0) {
+        return AtomicRead64{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        return AtomicRead64{ .status = driver_ok(), .value = atomic.*.value };
+    }
+    return AtomicRead64{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_load32_value(atomic: @borrows *Atomic[u32], order: i32) u32 @irq {
+    let result: AtomicRead32 = atomic_load32(atomic, order);
+    return result.value;
+}
+
+pub fn atomic_store8(atomic: @borrows_mut *Atomic[u8], value: u8, order: i32) DriverStatus @irq {
+    if (atomic.*.width != atomic_width_8() || atomic_store_order_valid(order) == 0) {
+        return DriverStatus{ .code = driver_invalid_argument(), .detail = value as i64 };
+    }
+    if (atomic.*.emulated != 0) {
+        atomic.*.value = value as u64;
+        return DriverStatus{ .code = driver_ok(), .detail = value as i64 };
+    }
+    return DriverStatus{ .code = driver_unsupported(), .detail = value as i64 };
+}
+
+pub fn atomic_store16(atomic: @borrows_mut *Atomic[u16], value: u16, order: i32) DriverStatus @irq {
+    if (atomic.*.width != atomic_width_16() || atomic_store_order_valid(order) == 0) {
+        return DriverStatus{ .code = driver_invalid_argument(), .detail = value as i64 };
+    }
+    if (atomic.*.emulated != 0) {
+        atomic.*.value = value as u64;
+        return DriverStatus{ .code = driver_ok(), .detail = value as i64 };
+    }
+    return DriverStatus{ .code = driver_unsupported(), .detail = value as i64 };
+}
+
+pub fn atomic_store32(atomic: @borrows_mut *Atomic[u32], value: u32, order: i32) DriverStatus @irq {
+    if (atomic.*.width != atomic_width_32() || atomic_store_order_valid(order) == 0) {
+        return DriverStatus{ .code = driver_invalid_argument(), .detail = value as i64 };
+    }
+    if (atomic.*.emulated != 0) {
+        atomic.*.value = value as u64;
+        return DriverStatus{ .code = driver_ok(), .detail = value as i64 };
+    }
+    return DriverStatus{ .code = driver_unsupported(), .detail = value as i64 };
+}
+
+pub fn atomic_store64(atomic: @borrows_mut *Atomic[u64], value: u64, order: i32) DriverStatus @irq {
+    if (atomic.*.width != atomic_width_64() || atomic_store_order_valid(order) == 0) {
+        return DriverStatus{ .code = driver_invalid_argument(), .detail = value as i64 };
+    }
+    if (atomic.*.emulated != 0) {
+        atomic.*.value = value;
+        return DriverStatus{ .code = driver_ok(), .detail = value as i64 };
+    }
+    return DriverStatus{ .code = driver_unsupported(), .detail = value as i64 };
+}
+
+pub fn atomic_release[T](atomic: @consumes Atomic[T]) void @driver_teardown {
+    unsafe { _zag_free(atomic.token as *i8); }
+}
+
+// ── typed atomic read-modify-write operations ───────────────────────────────
+// The common emulator uses these helpers to model the operation atomically in
+// its deterministic state machine.  A non-emulated handle never falls back to
+// an ordinary load/store: the selected target adapter must provide the native
+// lowering or the operation returns driver_unsupported().
+
+pub fn atomic_exchange8(atomic: @borrows_mut *Atomic[u8], value: u8,
+                        order: i32) AtomicRead8 @irq {
+    if (atomic.*.width != atomic_width_8() || atomic_order_valid(order) == 0) {
+        return AtomicRead8{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (value as u64) & mmio_value_mask(atomic.*.width);
+        return AtomicRead8{ .status = driver_ok(),
+            .value = old as u8 };
+    }
+    return AtomicRead8{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_exchange16(atomic: @borrows_mut *Atomic[u16], value: u16,
+                         order: i32) AtomicRead16 @irq {
+    if (atomic.*.width != atomic_width_16() || atomic_order_valid(order) == 0) {
+        return AtomicRead16{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (value as u64) & mmio_value_mask(atomic.*.width);
+        return AtomicRead16{ .status = driver_ok(),
+            .value = old as u16 };
+    }
+    return AtomicRead16{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_exchange32(atomic: @borrows_mut *Atomic[u32], value: u32,
+                         order: i32) AtomicRead32 @irq {
+    if (atomic.*.width != atomic_width_32() || atomic_order_valid(order) == 0) {
+        return AtomicRead32{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (value as u64) & mmio_value_mask(atomic.*.width);
+        return AtomicRead32{ .status = driver_ok(),
+            .value = old as u32 };
+    }
+    return AtomicRead32{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_exchange64(atomic: @borrows_mut *Atomic[u64], value: u64,
+                         order: i32) AtomicRead64 @irq {
+    if (atomic.*.width != atomic_width_64() || atomic_order_valid(order) == 0) {
+        return AtomicRead64{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = value & mmio_value_mask(atomic.*.width);
+        return AtomicRead64{ .status = driver_ok(),
+            .value = old };
+    }
+    return AtomicRead64{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_fetch_add8(atomic: @borrows_mut *Atomic[u8], value: u8,
+                         order: i32) AtomicRead8 @irq {
+    if (atomic.*.width != atomic_width_8() || atomic_order_valid(order) == 0) {
+        return AtomicRead8{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (old + value as u64) & mmio_value_mask(atomic.*.width);
+        return AtomicRead8{ .status = driver_ok(),
+            .value = old as u8 };
+    }
+    return AtomicRead8{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_fetch_add16(atomic: @borrows_mut *Atomic[u16], value: u16,
+                          order: i32) AtomicRead16 @irq {
+    if (atomic.*.width != atomic_width_16() || atomic_order_valid(order) == 0) {
+        return AtomicRead16{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (old + value as u64) & mmio_value_mask(atomic.*.width);
+        return AtomicRead16{ .status = driver_ok(),
+            .value = old as u16 };
+    }
+    return AtomicRead16{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_fetch_add32(atomic: @borrows_mut *Atomic[u32], value: u32,
+                          order: i32) AtomicRead32 @irq {
+    if (atomic.*.width != atomic_width_32() || atomic_order_valid(order) == 0) {
+        return AtomicRead32{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (old + value as u64) & mmio_value_mask(atomic.*.width);
+        return AtomicRead32{ .status = driver_ok(),
+            .value = old as u32 };
+    }
+    return AtomicRead32{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_fetch_add64(atomic: @borrows_mut *Atomic[u64], value: u64,
+                          order: i32) AtomicRead64 @irq {
+    if (atomic.*.width != atomic_width_64() || atomic_order_valid(order) == 0) {
+        return AtomicRead64{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (old + value) & mmio_value_mask(atomic.*.width);
+        return AtomicRead64{ .status = driver_ok(),
+            .value = old };
+    }
+    return AtomicRead64{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_fetch_sub8(atomic: @borrows_mut *Atomic[u8], value: u8,
+                         order: i32) AtomicRead8 @irq {
+    if (atomic.*.width != atomic_width_8() || atomic_order_valid(order) == 0) {
+        return AtomicRead8{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (old - value as u64) & mmio_value_mask(atomic.*.width);
+        return AtomicRead8{ .status = driver_ok(),
+            .value = old as u8 };
+    }
+    return AtomicRead8{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_fetch_sub16(atomic: @borrows_mut *Atomic[u16], value: u16,
+                          order: i32) AtomicRead16 @irq {
+    if (atomic.*.width != atomic_width_16() || atomic_order_valid(order) == 0) {
+        return AtomicRead16{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (old - value as u64) & mmio_value_mask(atomic.*.width);
+        return AtomicRead16{ .status = driver_ok(),
+            .value = old as u16 };
+    }
+    return AtomicRead16{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_fetch_sub32(atomic: @borrows_mut *Atomic[u32], value: u32,
+                          order: i32) AtomicRead32 @irq {
+    if (atomic.*.width != atomic_width_32() || atomic_order_valid(order) == 0) {
+        return AtomicRead32{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (old - value as u64) & mmio_value_mask(atomic.*.width);
+        return AtomicRead32{ .status = driver_ok(),
+            .value = old as u32 };
+    }
+    return AtomicRead32{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_fetch_sub64(atomic: @borrows_mut *Atomic[u64], value: u64,
+                          order: i32) AtomicRead64 @irq {
+    if (atomic.*.width != atomic_width_64() || atomic_order_valid(order) == 0) {
+        return AtomicRead64{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (old - value) & mmio_value_mask(atomic.*.width);
+        return AtomicRead64{ .status = driver_ok(),
+            .value = old };
+    }
+    return AtomicRead64{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_fetch_and8(atomic: @borrows_mut *Atomic[u8], value: u8,
+                         order: i32) AtomicRead8 @irq {
+    if (atomic.*.width != atomic_width_8() || atomic_order_valid(order) == 0) {
+        return AtomicRead8{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (old & value as u64) & mmio_value_mask(atomic.*.width);
+        return AtomicRead8{ .status = driver_ok(),
+            .value = old as u8 };
+    }
+    return AtomicRead8{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_fetch_and16(atomic: @borrows_mut *Atomic[u16], value: u16,
+                          order: i32) AtomicRead16 @irq {
+    if (atomic.*.width != atomic_width_16() || atomic_order_valid(order) == 0) {
+        return AtomicRead16{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (old & value as u64) & mmio_value_mask(atomic.*.width);
+        return AtomicRead16{ .status = driver_ok(),
+            .value = old as u16 };
+    }
+    return AtomicRead16{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_fetch_and32(atomic: @borrows_mut *Atomic[u32], value: u32,
+                          order: i32) AtomicRead32 @irq {
+    if (atomic.*.width != atomic_width_32() || atomic_order_valid(order) == 0) {
+        return AtomicRead32{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (old & value as u64) & mmio_value_mask(atomic.*.width);
+        return AtomicRead32{ .status = driver_ok(),
+            .value = old as u32 };
+    }
+    return AtomicRead32{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_fetch_and64(atomic: @borrows_mut *Atomic[u64], value: u64,
+                          order: i32) AtomicRead64 @irq {
+    if (atomic.*.width != atomic_width_64() || atomic_order_valid(order) == 0) {
+        return AtomicRead64{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = old & value & mmio_value_mask(atomic.*.width);
+        return AtomicRead64{ .status = driver_ok(),
+            .value = old };
+    }
+    return AtomicRead64{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_fetch_or8(atomic: @borrows_mut *Atomic[u8], value: u8,
+                        order: i32) AtomicRead8 @irq {
+    if (atomic.*.width != atomic_width_8() || atomic_order_valid(order) == 0) {
+        return AtomicRead8{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (old | value as u64) & mmio_value_mask(atomic.*.width);
+        return AtomicRead8{ .status = driver_ok(),
+            .value = old as u8 };
+    }
+    return AtomicRead8{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_fetch_or16(atomic: @borrows_mut *Atomic[u16], value: u16,
+                         order: i32) AtomicRead16 @irq {
+    if (atomic.*.width != atomic_width_16() || atomic_order_valid(order) == 0) {
+        return AtomicRead16{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (old | value as u64) & mmio_value_mask(atomic.*.width);
+        return AtomicRead16{ .status = driver_ok(),
+            .value = old as u16 };
+    }
+    return AtomicRead16{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_fetch_or32(atomic: @borrows_mut *Atomic[u32], value: u32,
+                         order: i32) AtomicRead32 @irq {
+    if (atomic.*.width != atomic_width_32() || atomic_order_valid(order) == 0) {
+        return AtomicRead32{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (old | value as u64) & mmio_value_mask(atomic.*.width);
+        return AtomicRead32{ .status = driver_ok(),
+            .value = old as u32 };
+    }
+    return AtomicRead32{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_fetch_or64(atomic: @borrows_mut *Atomic[u64], value: u64,
+                         order: i32) AtomicRead64 @irq {
+    if (atomic.*.width != atomic_width_64() || atomic_order_valid(order) == 0) {
+        return AtomicRead64{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (old | value) & mmio_value_mask(atomic.*.width);
+        return AtomicRead64{ .status = driver_ok(),
+            .value = old };
+    }
+    return AtomicRead64{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_fetch_xor8(atomic: @borrows_mut *Atomic[u8], value: u8,
+                         order: i32) AtomicRead8 @irq {
+    if (atomic.*.width != atomic_width_8() || atomic_order_valid(order) == 0) {
+        return AtomicRead8{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (old ^ value as u64) & mmio_value_mask(atomic.*.width);
+        return AtomicRead8{ .status = driver_ok(),
+            .value = old as u8 };
+    }
+    return AtomicRead8{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_fetch_xor16(atomic: @borrows_mut *Atomic[u16], value: u16,
+                          order: i32) AtomicRead16 @irq {
+    if (atomic.*.width != atomic_width_16() || atomic_order_valid(order) == 0) {
+        return AtomicRead16{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (old ^ value as u64) & mmio_value_mask(atomic.*.width);
+        return AtomicRead16{ .status = driver_ok(),
+            .value = old as u16 };
+    }
+    return AtomicRead16{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_fetch_xor32(atomic: @borrows_mut *Atomic[u32], value: u32,
+                          order: i32) AtomicRead32 @irq {
+    if (atomic.*.width != atomic_width_32() || atomic_order_valid(order) == 0) {
+        return AtomicRead32{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (old ^ value as u64) & mmio_value_mask(atomic.*.width);
+        return AtomicRead32{ .status = driver_ok(),
+            .value = old as u32 };
+    }
+    return AtomicRead32{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_fetch_xor64(atomic: @borrows_mut *Atomic[u64], value: u64,
+                          order: i32) AtomicRead64 @irq {
+    if (atomic.*.width != atomic_width_64() || atomic_order_valid(order) == 0) {
+        return AtomicRead64{ .status = driver_invalid_argument(), .value = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        atomic.*.value = (old ^ value) & mmio_value_mask(atomic.*.width);
+        return AtomicRead64{ .status = driver_ok(),
+            .value = old };
+    }
+    return AtomicRead64{ .status = driver_unsupported(), .value = 0 };
+}
+
+pub fn atomic_compare_exchange8(atomic: @borrows_mut *Atomic[u8], expected: u8,
+                                desired: u8, success: i32, failure: i32) AtomicCompare8 @irq {
+    if (atomic.*.width != atomic_width_8() ||
+        atomic_compare_orders_valid(success, failure) == 0) {
+        return AtomicCompare8{ .status = driver_invalid_argument(), .observed = 0, .exchanged = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let exchanged: i32 = 0;
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        if (old == (expected as u64 & mmio_value_mask(atomic.*.width))) {
+            atomic.*.value = desired as u64 & mmio_value_mask(atomic.*.width);
+            exchanged = 1;
+        }
+        return AtomicCompare8{ .status = driver_ok(), .observed = old as u8,
+            .exchanged = exchanged };
+    }
+    return AtomicCompare8{ .status = driver_unsupported(), .observed = 0, .exchanged = 0 };
+}
+
+pub fn atomic_compare_exchange16(atomic: @borrows_mut *Atomic[u16], expected: u16,
+                                 desired: u16, success: i32, failure: i32) AtomicCompare16 @irq {
+    if (atomic.*.width != atomic_width_16() ||
+        atomic_compare_orders_valid(success, failure) == 0) {
+        return AtomicCompare16{ .status = driver_invalid_argument(), .observed = 0, .exchanged = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let exchanged: i32 = 0;
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        if (old == (expected as u64 & mmio_value_mask(atomic.*.width))) {
+            atomic.*.value = desired as u64 & mmio_value_mask(atomic.*.width);
+            exchanged = 1;
+        }
+        return AtomicCompare16{ .status = driver_ok(), .observed = old as u16,
+            .exchanged = exchanged };
+    }
+    return AtomicCompare16{ .status = driver_unsupported(), .observed = 0, .exchanged = 0 };
+}
+
+pub fn atomic_compare_exchange32(atomic: @borrows_mut *Atomic[u32], expected: u32,
+                                 desired: u32, success: i32, failure: i32) AtomicCompare32 @irq {
+    if (atomic.*.width != atomic_width_32() ||
+        atomic_compare_orders_valid(success, failure) == 0) {
+        return AtomicCompare32{ .status = driver_invalid_argument(), .observed = 0, .exchanged = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let exchanged: i32 = 0;
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        if (old == (expected as u64 & mmio_value_mask(atomic.*.width))) {
+            atomic.*.value = desired as u64 & mmio_value_mask(atomic.*.width);
+            exchanged = 1;
+        }
+        return AtomicCompare32{ .status = driver_ok(), .observed = old as u32,
+            .exchanged = exchanged };
+    }
+    return AtomicCompare32{ .status = driver_unsupported(), .observed = 0, .exchanged = 0 };
+}
+
+pub fn atomic_compare_exchange64(atomic: @borrows_mut *Atomic[u64], expected: u64,
+                                 desired: u64, success: i32, failure: i32) AtomicCompare64 @irq {
+    if (atomic.*.width != atomic_width_64() ||
+        atomic_compare_orders_valid(success, failure) == 0) {
+        return AtomicCompare64{ .status = driver_invalid_argument(), .observed = 0, .exchanged = 0 };
+    }
+    if (atomic.*.emulated != 0) {
+        let exchanged: i32 = 0;
+        let old: u64 = atomic.*.value & mmio_value_mask(atomic.*.width);
+        if (old == (expected & mmio_value_mask(atomic.*.width))) {
+            atomic.*.value = desired & mmio_value_mask(atomic.*.width);
+            exchanged = 1;
+        }
+        return AtomicCompare64{ .status = driver_ok(), .observed = old,
+            .exchanged = exchanged };
+    }
+    return AtomicCompare64{ .status = driver_unsupported(), .observed = 0, .exchanged = 0 };
+}
+
+// ── explicit synchronization capabilities ──────────────────────────────────
+
+pub unsafe fn driver_mutex_new_emulated(irq_safe: i32) DriverMutex @driver_init {
+    let token: *opaque = _zag_malloc(8) as *opaque;
+    return DriverMutex{ .token = token, .irq_safe = (irq_safe != 0) as i32,
+        .held = 0, .emulated = 1 };
+}
+
+pub fn driver_mutex_is_irq_safe(lock: @borrows *DriverMutex) i32 @driver_control {
+    return lock.*.irq_safe;
+}
+
+pub fn driver_mutex_try_lock(lock: @borrows_mut *DriverMutex) DriverStatus @irq {
+    if (lock.*.irq_safe == 0 || lock.*.emulated == 0) {
+        return DriverStatus{ .code = driver_unsupported(), .detail = 0 };
+    }
+    if (lock.*.held != 0) {
+        return DriverStatus{ .code = driver_busy(), .detail = 1 };
+    }
+    lock.*.held = 1;
+    return DriverStatus{ .code = driver_ok(), .detail = 0 };
+}
+
+// A target adapter may supply an owned lock token after proving its
+// implementation's IRQ-safety property.
+pub unsafe fn driver_mutex_from_owned_token(token: @consumes *opaque,
+                                            irq_safe: i32) DriverMutex @driver_init {
+    return DriverMutex{ .token = token, .irq_safe = (irq_safe != 0) as i32,
+        .held = 0, .emulated = 0 };
+}
+
+// This operation is intentionally marked @blocking.  An adapter may wait for
+// ownership, but the deterministic emulator returns busy rather than spinning
+// or allocating in the common core.
+pub fn driver_mutex_lock(lock: @borrows_mut *DriverMutex) DriverStatus @driver_control @blocking {
+    if (lock.*.emulated == 0) {
+        return DriverStatus{ .code = driver_unsupported(), .detail = 0 };
+    }
+    if (lock.*.held != 0) {
+        return DriverStatus{ .code = driver_busy(), .detail = 1 };
+    }
+    lock.*.held = 1;
+    return DriverStatus{ .code = driver_ok(), .detail = 0 };
+}
+
+pub fn driver_mutex_unlock(lock: @borrows_mut *DriverMutex) DriverStatus @driver_control {
+    if (lock.*.held == 0) {
+        return DriverStatus{ .code = driver_stale_handle(), .detail = 0 };
+    }
+    lock.*.held = 0;
+    return DriverStatus{ .code = driver_ok(), .detail = 0 };
+}
+
+pub fn driver_mutex_release(lock: @consumes DriverMutex) void @driver_teardown {
+    unsafe { _zag_free(lock.token as *i8); }
+}
+
+// These declarations describe the typed adapter surface.  The common core
+// calls them only through a selected userspace/kernel adapter; an adapter must
+// provide the target-specific lowering and cannot silently substitute ordinary
+// loads, stores, heap memory, or blocking work.
+pub struct DriverAdapter {
+    probe: fn() DriverStatus @driver_init,
+    reset: fn() DriverStatus @driver_control,
+    quiesce: fn() DriverStatus @driver_teardown,
+}
+
+pub struct DriverProfile {
+    target: i32,
+    kernel_series: i32,
+    context: i32,
+    effects: i32,
+    supports_dma: i32,
+    supports_irq: i32,
+}
