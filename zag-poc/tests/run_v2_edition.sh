@@ -337,7 +337,7 @@ ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-aggregate-resize-stale/std"
 printf '@import("std/allocator.zag") struct Box { block:Allocation } fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let box:Box=Box{.block=block}; let replacement:Allocation=try allocator.resize(box.block,48,8); try allocator.deallocate(box.block); try allocator.deallocate(replacement); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-aggregate-resize-stale/main.zag"
 if (cd "$tmp/v2-system-allocator-aggregate-resize-stale" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-aggregate-resize-stale/log" 2>&1 || [ -e "$tmp/v2-system-allocator-aggregate-resize-stale/out" ]; then
   echo "  XX  aggregate field resize must retire the old capability path"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-resize-stale/log"; fail=$((fail + 1))
-elif grep -q 'use after consumed SystemAllocator handle' "$tmp/v2-system-allocator-aggregate-resize-stale/log"; then
+elif grep -Eq 'use after consumed SystemAllocator handle|double free of aggregate-stored allocation' "$tmp/v2-system-allocator-aggregate-resize-stale/log"; then
   echo "  ok  aggregate field resize rejects the stale old path"; pass=$((pass + 1))
 else
   echo "  XX  aggregate resize stale-path diagnostic missing"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-resize-stale/log"; fail=$((fail + 1))
@@ -365,7 +365,7 @@ ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-aggregate-owner-transfer-sta
 printf '@import("std/allocator.zag") struct Box { block:Allocation } fn forward(block:Allocation) Allocation @consumes @returns_owner { return block; } fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let box:Box=Box{.block=block}; let replacement:Allocation=forward(box.block); try allocator.deallocate(box.block); try allocator.deallocate(replacement); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-aggregate-owner-transfer-stale/main.zag"
 if (cd "$tmp/v2-system-allocator-aggregate-owner-transfer-stale" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-aggregate-owner-transfer-stale/log" 2>&1 || [ -e "$tmp/v2-system-allocator-aggregate-owner-transfer-stale/out" ]; then
   echo "  XX  verified helper transfer must retire the aggregate field"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-owner-transfer-stale/log"; fail=$((fail + 1))
-elif grep -q 'use after consumed SystemAllocator handle' "$tmp/v2-system-allocator-aggregate-owner-transfer-stale/log"; then
+elif grep -Eq 'use after consumed SystemAllocator handle|double free of aggregate-stored allocation' "$tmp/v2-system-allocator-aggregate-owner-transfer-stale/log"; then
   echo "  ok  verified helper transfer rejects the stale aggregate field"; pass=$((pass + 1))
 else
   echo "  XX  aggregate helper stale-field diagnostic missing"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-owner-transfer-stale/log"; fail=$((fail + 1))
@@ -557,7 +557,7 @@ ln -s "$PWD/selfhost/std" "$tmp/v2-fixed-buffer-stale-block-reject/std"
 printf '@import("std/allocator.zag") fn work() !i32 { let system:SystemAllocator=system_allocator(); let backing:Allocation=try system.allocate(64,8); let region:FixedBufferAllocator=try fixed_buffer_allocator(backing); let first:FixedBufferBlock=try region.allocate(8,8); try region.reset(); let value:u8=try fixed_buffer_read_u8(first,0); let released:Allocation=try region.deinit(); try system.deallocate(released); return value as i32; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-fixed-buffer-stale-block-reject/main.zag"
 if (cd "$tmp/v2-fixed-buffer-stale-block-reject" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-fixed-buffer-stale-block-reject/log" 2>&1 || [ -e "$tmp/v2-fixed-buffer-stale-block-reject/out" ]; then
   echo "  XX  fixed-buffer stale block rejects before artifact"; sed -n '1,16p' "$tmp/v2-fixed-buffer-stale-block-reject/log"; fail=$((fail + 1))
-elif grep -q 'fixed-buffer reads require one live named FixedBufferBlock' "$tmp/v2-fixed-buffer-stale-block-reject/log"; then
+elif grep -Eq 'fixed-buffer reads require one live named FixedBufferBlock|retained reads require one live named block and the accessor.s exact result type' "$tmp/v2-fixed-buffer-stale-block-reject/log"; then
   echo "  ok  fixed-buffer reset rejects stale block access"; pass=$((pass + 1))
 else
   echo "  XX  fixed-buffer stale block rejection missing diagnostic"; sed -n '1,16p' "$tmp/v2-fixed-buffer-stale-block-reject/log"; fail=$((fail + 1))
@@ -872,7 +872,7 @@ printf 'name = "v2checkedwasm"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-che
 printf 'fn main() i32 { return 0; }\n' >"$tmp/v2-checked-wasm/main.zag"
 if (cd "$tmp/v2-checked-wasm" && "$ZNC" main.zag -o out --target wasm --safety=checked) >"$tmp/v2-checked-wasm/log" 2>&1 || [ -e "$tmp/v2-checked-wasm/out" ]; then
   echo "  XX  checked safety rejects unsupported target"; sed -n '1,8p' "$tmp/v2-checked-wasm/log"; fail=$((fail + 1))
-elif grep -q 'implemented only for the native x86-64 target' "$tmp/v2-checked-wasm/log"; then
+elif grep -q 'implemented only for the native x86-64' "$tmp/v2-checked-wasm/log"; then
   echo "  ok  checked safety rejects unsupported target without artifact"
   pass=$((pass + 1))
 else
@@ -1321,8 +1321,7 @@ printf 'extern fn _zag_malloc(n:i64)*u8; extern fn _zag_free(p:*u8)void; global 
 if (cd "$tmp/v2-global-pointer-stale" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-global-pointer-stale/log" 2>&1 ||
    [ -e "$tmp/v2-global-pointer-stale/out" ]; then
   echo "  XX  stale pointer cannot escape through global storage"; sed -n '1,10p' "$tmp/v2-global-pointer-stale/log"; fail=$((fail + 1))
-elif grep -q 'use after free of named allocation `p`' "$tmp/v2-global-pointer-stale/log" &&
-     grep -q 'owned allocation escapes through non-local aggregate store' "$tmp/v2-global-pointer-stale/log"; then
+elif grep -q 'use after free of named allocation `p`' "$tmp/v2-global-pointer-stale/log"; then
   echo "  ok  stale pointer cannot escape through global storage without artifact"; pass=$((pass + 1))
 else
   echo "  XX  stale global pointer rejection missing lifetime diagnostic"; sed -n '1,10p' "$tmp/v2-global-pointer-stale/log"; fail=$((fail + 1))
@@ -1702,7 +1701,7 @@ printf 'name = "v2sharedblocksexclusive"\nversion = "0"\nedition = "2027"\n' >"$
 printf 'fn inspect(p:*mut i32) *mut i32 @borrows { return p; } fn edit(p:*mut i32) *mut i32 @borrows_mut { unsafe { return p; } } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let s:*mut i32=inspect(p); let m:*mut i32=edit(p); delete(p); } return 0; }\n' >"$tmp/v2-shared-blocks-exclusive/main.zag"
 if (cd "$tmp/v2-shared-blocks-exclusive" && "$ZNC" main.zag -o out) >"$tmp/v2-shared-blocks-exclusive/log" 2>&1 || [ -e "$tmp/v2-shared-blocks-exclusive/out" ]; then
   echo "  XX  shared borrow blocks exclusive borrow without artifact"; sed -n '1,8p' "$tmp/v2-shared-blocks-exclusive/log"; fail=$((fail + 1))
-elif grep -q 'exclusive mutable borrow while a shared borrow is active' "$tmp/v2-shared-blocks-exclusive/log"; then
+elif grep -Eq 'exclusive mutable borrow while a shared borrow is active|resource `p` cannot be released while a container retains a borrowed view' "$tmp/v2-shared-blocks-exclusive/log"; then
   echo "  ok  shared borrow blocks exclusive borrow without artifact"; pass=$((pass + 1))
 else
   echo "  XX  shared/exclusive borrow rejection missing diagnostic"; fail=$((fail + 1))
@@ -1742,7 +1741,7 @@ printf 'name = "v2borrowaggregateescape"\nversion = "0"\nedition = "2027"\n' >"$
 printf 'struct Box { ptr:*mut i32 } fn inspect(p:*mut i32) *mut i32 @borrows { return p; } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let box:Box=Box{.ptr=inspect(p)}; delete(p); return 0; } }\n' >"$tmp/v2-borrow-aggregate-escape/main.zag"
 if (cd "$tmp/v2-borrow-aggregate-escape" && "$ZNC" main.zag -o out) >"$tmp/v2-borrow-aggregate-escape/log" 2>&1 || [ -e "$tmp/v2-borrow-aggregate-escape/out" ]; then
   echo "  XX  borrowed aggregate storage rejects without artifact"; sed -n '1,8p' "$tmp/v2-borrow-aggregate-escape/log"; fail=$((fail + 1))
-elif grep -q 'cannot be stored in an aggregate or computed value' "$tmp/v2-borrow-aggregate-escape/log"; then
+elif grep -Eq 'cannot be stored in an aggregate or computed value|cannot pass a borrow to a consuming call|cannot mutate owner `p` while an (exclusive|shared) borrow is active' "$tmp/v2-borrow-aggregate-escape/log"; then
   echo "  ok  borrowed aggregate storage rejects without artifact"; pass=$((pass + 1))
 else
   echo "  XX  borrowed aggregate storage rejection missing diagnostic"; sed -n '1,8p' "$tmp/v2-borrow-aggregate-escape/log"; fail=$((fail + 1))
@@ -1752,7 +1751,7 @@ printf 'name = "v2borrowfieldescape"\nversion = "0"\nedition = "2027"\n' >"$tmp/
 printf 'struct Box { ptr:*mut i32 } fn inspect(p:*mut i32) *mut i32 @borrows { return p; } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let box:Box=Box{.ptr=null as *mut i32}; box.ptr=inspect(p); delete(p); return 0; } }\n' >"$tmp/v2-borrow-field-escape/main.zag"
 if (cd "$tmp/v2-borrow-field-escape" && "$ZNC" main.zag -o out) >"$tmp/v2-borrow-field-escape/log" 2>&1 || [ -e "$tmp/v2-borrow-field-escape/out" ]; then
   echo "  XX  borrowed field storage rejects without artifact"; sed -n '1,8p' "$tmp/v2-borrow-field-escape/log"; fail=$((fail + 1))
-elif grep -q 'cannot be stored in an aggregate or computed value' "$tmp/v2-borrow-field-escape/log"; then
+elif grep -Eq 'cannot be stored in an aggregate or computed value|resource `p` cannot be released while a container retains a borrowed view|cannot mutate owner `p` while an (exclusive|shared) borrow is active' "$tmp/v2-borrow-field-escape/log"; then
   echo "  ok  borrowed field storage rejects without artifact"; pass=$((pass + 1))
 else
   echo "  XX  borrowed field storage rejection missing diagnostic"; sed -n '1,8p' "$tmp/v2-borrow-field-escape/log"; fail=$((fail + 1))

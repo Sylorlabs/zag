@@ -38,13 +38,67 @@ wait_for_mode() {
 # A source command from a nested directory finds zag.mod and auto-starts.
 (cd "$tmp/project/src/deep" && "$tmp/bin/znc" main.zag -o app --no-analyze >/dev/null)
 test -f "$tmp/project/.zagd.lock"
-wait_for_mode light
+wait_for_mode adaptive
 first_pid=$(sed -n 's/^pid=//p' "$tmp/project/.zagd.status")
 test "$first_pid" -gt 1
+grep -q '^idle_deep=true$' "$tmp/project/.zagd.status"
+grep -q '^difficulty=simple$' "$tmp/project/.zagd.status"
+grep -q '^script_optimization=automatic$' "$tmp/project/.zagd.status"
+grep -q '^regular_optimization=review$' "$tmp/project/.zagd.status"
+grep -q '^objective=runtime$' "$tmp/project/.zagd.status"
+grep -q '^trust_mode=stable$' "$tmp/project/.zagd.status"
 
 # Repeated builds are idempotent: the singleton remains the same process.
 (cd "$tmp/project/src/deep" && "$tmp/bin/znc" check main.zag --no-analyze >/dev/null)
 test "$(sed -n 's/^pid=//p' "$tmp/project/.zagd.status")" = "$first_pid"
+
+# Every foreground policy field is transported to the daemon. A same-mode
+# policy edit replaces the singleton instead of leaving stale active policy.
+cat > "$tmp/project/.zagd.conf" <<'EOF'
+mode=adaptive
+idle_deep=false
+difficulty=native
+script_optimization=review
+regular_optimization=automatic
+objective=runtime
+trust_mode=autonomous
+cpu=native
+stability_window_ms=31
+max_memory_bytes=1073741824
+max_cache_bytes=104857600
+max_workers=1
+notifications=errors_only
+EOF
+(cd "$tmp/project/src/deep" && "$tmp/bin/znc" check main.zag --no-analyze >/dev/null)
+for _ in $(seq 1 500); do
+    grep -q '^trust_mode=autonomous$' "$tmp/project/.zagd.status" 2>/dev/null &&
+        grep -q '^state=idle$' "$tmp/project/.zagd.status" 2>/dev/null && break
+    sleep 0.01
+done
+policy_pid=$(sed -n 's/^pid=//p' "$tmp/project/.zagd.status")
+test "$policy_pid" != "$first_pid"
+first_pid=$policy_pid
+grep -q '^idle_deep=false$' "$tmp/project/.zagd.status"
+grep -q '^difficulty=native$' "$tmp/project/.zagd.status"
+grep -q '^script_optimization=review$' "$tmp/project/.zagd.status"
+grep -q '^regular_optimization=automatic$' "$tmp/project/.zagd.status"
+grep -q '^objective=runtime$' "$tmp/project/.zagd.status"
+grep -q '^trust_mode=autonomous$' "$tmp/project/.zagd.status"
+grep -q '^cpu=native$' "$tmp/project/.zagd.status"
+grep -q '^stability_window_ms=31$' "$tmp/project/.zagd.status"
+grep -q '^max_memory_bytes=1073741824$' "$tmp/project/.zagd.status"
+grep -q '^max_cache_bytes=104857600$' "$tmp/project/.zagd.status"
+grep -q '^max_workers=1$' "$tmp/project/.zagd.status"
+grep -q '^notifications=errors_only$' "$tmp/project/.zagd.status"
+grep -q '^trust_mode_scope=policy-only$' "$tmp/project/.zagd.status"
+grep -q '^optimizer_generation=unimplemented$' "$tmp/project/.zagd.status"
+
+# With no explicit --mode, watch uses project policy instead of a hidden light
+# fallback. Explicit --mode tests below retain higher precedence.
+(cd "$tmp/project/src" && "$tmp/bin/znc" watch >/dev/null)
+wait_for_mode adaptive
+grep -q '^mode=adaptive$' "$tmp/project/.zagd.status"
+first_pid=$(sed -n 's/^pid=//p' "$tmp/project/.zagd.status")
 
 (cd "$tmp/project/src" && "$tmp/bin/znc" status --format json) | grep -q '"running":true'
 status_text=$(cd "$tmp/project/src" && "$tmp/bin/znc" status)
@@ -124,9 +178,9 @@ if printf '%s\n' "$quiet_notice" | grep -q '^znc: advisory:'; then
     echo "errors_only unexpectedly emitted an advisory notification" >&2; exit 1
 fi
 
-# Every documented watch form is a real foreground control surface. The
-# default is light; each explicit mode replaces the singleton cleanly; off
-# shuts it down without making later builds depend on daemon state.
+# Every documented watch form is a real foreground control surface. This
+# fixture has selected light in project policy; each explicit mode replaces the
+# singleton cleanly, and off never makes later builds depend on daemon state.
 (cd "$tmp/project/src" && "$tmp/bin/znc" watch >/dev/null)
 wait_for_mode light
 grep -q '^mode=light$' "$tmp/project/.zagd.status"

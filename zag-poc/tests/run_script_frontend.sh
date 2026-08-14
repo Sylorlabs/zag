@@ -82,4 +82,21 @@ if "$znc_bin" tests/script_frontend/reserved_symbol.zag -o "$tmp_dir/reserved" -
 fi
 grep -q 'compiler-owned script symbol' "$tmp_dir/reserved.out"
 
+# `async` and `await` are reserved future syntax, not ordinary identifiers.
+# Keep both declaration and expression spellings fail-closed so adding a later
+# lowering cannot silently change an existing program's meaning.
+printf '%s\n' 'async fn main() i32 { return 0; }' >"$tmp_dir/async-decl.zag"
+if "$znc_bin" "$tmp_dir/async-decl.zag" -o "$tmp_dir/async-decl" --no-analyze >"$tmp_dir/async-decl.out" 2>&1; then
+    echo "async declaration unexpectedly compiled" >&2
+    exit 1
+fi
+grep -q 'async.*syntax is not available' "$tmp_dir/async-decl.out"
+
+printf '%s\n' 'fn main() i32 { return await(1); }' >"$tmp_dir/await-expr.zag"
+if "$znc_bin" "$tmp_dir/await-expr.zag" -o "$tmp_dir/await-expr" --no-analyze >"$tmp_dir/await-expr.out" 2>&1; then
+    echo "await expression unexpectedly compiled" >&2
+    exit 1
+fi
+grep -q 'await.*syntax is not available' "$tmp_dir/await-expr.out"
+
 echo "script frontend: PASS"

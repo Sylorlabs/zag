@@ -55,6 +55,11 @@ reject_script mixed_collection 'script; let xs = [1, "two"]; say(xs)'
 reject_script bad_try 'script; let value = try; say(value)'
 reject_script bad_python_block 'script; if true:\n    say("missing real newline")'
 reject_script generated_name_collision 'script; fn __zag_compiler_script_body_7f3a() i32 { return 0; }'
+# Future concurrency spellings are reserved at the lexer boundary.  Keep them
+# in the malformed-input corpus so an older parser cannot silently accept an
+# ordinary identifier/call and change the meaning of a later language edition.
+reject_script async_surface 'async fn main() i32 { return 0; }'
+reject_script await_surface 'fn main() i32 { return await(1); }'
 
 printf '\377script;\nshow("bad")\n' > "$tmp/invalid_utf8.zag"
 printf 'script;\nshow("bad")\000\n' > "$tmp/nul_byte.zag"

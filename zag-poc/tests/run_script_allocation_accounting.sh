@@ -3,7 +3,10 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 znc_bin=${ZNC:-./znc}
-znc_bin=$(realpath "$znc_bin")
+case "$znc_bin" in
+    /*) ;;
+    *) znc_bin="$PWD/${znc_bin#./}" ;;
+esac
 tmp_dir=$(mktemp -d /tmp/zag-script-accounting.XXXXXX)
 trap 'rm -rf "$tmp_dir"' EXIT
 

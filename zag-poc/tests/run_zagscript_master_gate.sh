@@ -15,6 +15,11 @@ echo "Heavy work is sequential; no compiler stages run concurrently."
 echo "MemorySwapMax=${ZAG_SELFHOST_SWAP_MAX_BYTES:-0} bytes for self-host proof stages."
 
 echo
+echo "── preflight: frozen ZagScript 1.0 matrix authority"
+bash tests/run_zagscript_1_0_matrix_selftest.sh
+bash tests/run_zagscript_1_0_matrix.sh --release
+
+echo
 echo "── [1/7] fixed-point self-host bootstrap"
 /usr/bin/time -f 'bootstrap elapsed=%E peak_rss_kib=%M' bash bootstrap.sh
 

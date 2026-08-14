@@ -46,7 +46,7 @@ make_case arena_stale
 printf '%s\n' '@import("std/allocator.zag") fn work() !i32 { let system:SystemAllocator=system_allocator(); let backing:Allocation=try system.allocate(64,8); let arena:ArenaAllocator=try arena_allocator(backing); let first:ArenaBlock=try arena.allocate(8,8); try arena.reset(); let value:u8=try arena_read_u8(first,0); let released:Allocation=try arena.deinit(); try system.deallocate(released); return value as i32; } fn main() i32 { return work() catch 9; }' >"$tmp/arena_stale/main.zag"
 if (cd "$tmp/arena_stale" && "$ZNC" main.zag -o out --safety=checked --no-zagd) >"$tmp/arena_stale/log" 2>&1 || [ -e "$tmp/arena_stale/out" ]; then
   echo '  XX  stale retained ArenaBlock compiled or left an artifact'; sed -n '1,18p' "$tmp/arena_stale/log"; exit 1
-elif grep -q 'fixed-buffer reads require one live named FixedBufferBlock' "$tmp/arena_stale/log"; then
+elif grep -q 'retained reads require one live named block' "$tmp/arena_stale/log"; then
   echo '  ok  retained arena reset rejects stale blocks without an artifact'
 else
   echo '  XX  stale retained arena block rejection lacked lifecycle diagnostic'; sed -n '1,18p' "$tmp/arena_stale/log"; exit 1

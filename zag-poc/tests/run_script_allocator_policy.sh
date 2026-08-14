@@ -8,7 +8,7 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/zag-script-allocator-policy.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 
 mkdir -p "$tmp/project"
-printf '%s\n' 'name = "script-allocator-policy"' >"$tmp/project/zag.mod"
+printf '%s\n' 'name = "script-allocator-policy"' 'edition = "2027"' >"$tmp/project/zag.mod"
 cat >"$tmp/project/policy.zag" <<'ZAG'
 script;
 extern fn _zag_allocator_live_bytes() i64

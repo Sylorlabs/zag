@@ -162,11 +162,11 @@ check_reject legacy_mix "legacy and parameter-local contracts cannot mix" 'canno
 
 project scalar_contract 2027
 printf '%s\n' 'fn bad(count:@borrows i64)void { } fn main()i32{return 0;}' >"$WORK/scalar_contract/main.zag"
-check_reject scalar_contract "lifetime contracts reject scalar parameters" 'require a raw-pointer, Allocation, or slice parameter'
+check_reject scalar_contract "lifetime contracts reject scalar parameters" 'raw-pointer, Allocation, slice'
 
 project slice_consume 2027
 printf '%s\n' 'fn bad(data:@consumes []u8)void { } fn main()i32{return 0;}' >"$WORK/slice_consume/main.zag"
-check_reject slice_consume "slice views cannot claim ownership transfer" 'consume contracts require a raw-pointer or Allocation parameter'
+check_reject slice_consume "slice views cannot claim ownership transfer" 'parameter consume contracts require a raw-pointer, Allocation'
 
 project old_edition 2026
 printf '%s\n' 'fn bad(value:@borrows *u8)void { } fn main()i32{return 0;}' >"$WORK/old_edition/main.zag"
@@ -196,7 +196,7 @@ check_ok slice_imported_contract "imported slice borrow metadata authorizes sync
 
 project duplicate 2027
 printf '%s\n' 'fn bad(value:@borrows @consumes *u8)void { } fn main()i32{return 0;}' >"$WORK/duplicate/main.zag"
-check_reject duplicate "duplicate parameter contracts fail closed" 'only one lifetime contract'
+check_reject duplicate "duplicate parameter contracts fail closed" 'only one lifetime/resource contract'
 
 project declaration_conflict 2027
 printf '%s\n' \
@@ -256,6 +256,14 @@ printf '%s\n' \
   'fn main()i32{return 0;}' \
   >"$WORK/scalar_projection/main.zag"
 check_ok scalar_projection "borrowed-pointee scalar reads and pointer-free value snapshots do not escape"
+
+project fresh_pointer_aggregate 2027
+printf '%s\n' \
+  'struct Box { pointer:*u8, length:i32 }' \
+  'fn fresh(source:@borrows *Box)Box { return Box{.pointer=null as *u8,.length=source.*.length}; }' \
+  'fn main()i32 { unsafe { let pointer:*u8=_zag_malloc(8); let source:Box=Box{.pointer=pointer,.length=42}; let copy:Box=fresh(&source); _zag_free(source.pointer); if(copy.length==42){return 0;} return 1; } }' \
+  >"$WORK/fresh_pointer_aggregate/main.zag"
+check_ok fresh_pointer_aggregate "parameter-local borrow permits a fresh pointer-bearing aggregate result"
 
 project borrowed_scalar_discard 2027
 printf '%s\n' \
@@ -330,6 +338,14 @@ printf '%s\n' \
   'fn main()i32{return 0;}' \
   >"$WORK/address_projection_return/main.zag"
 check_reject address_projection_return "address-of a borrowed field remains tied to the container" 'cannot escape through return'
+
+project address_index_return 2027
+printf '%s\n' \
+  'struct Buffer { data:**u8, len:i32 }' \
+  'fn bad(source:@borrows *Buffer)*u8 { let last:i32=source.*.len-1; return &source.*.data[last]; }' \
+  'fn main()i32{return 0;}' \
+  >"$WORK/address_index_return/main.zag"
+check_reject address_index_return "address-of an indexed borrowed field remains tied to the container" 'cannot escape through return'
 
 echo "param contracts: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

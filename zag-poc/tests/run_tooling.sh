@@ -54,17 +54,67 @@ check_format_prefix_annotations() {
 }
 
 check_init() {
-    (cd "$tmp" && "$ZNC" init >/dev/null)
-    grep -q '^edition = "2026"$' "$tmp/zag.mod"
+    mkdir "$tmp/project"
+    (cd "$tmp/project" && "$ZNC" init --name tooling-example >"$tmp/init.out")
+    grep -q 'Run:  znc src/main.zag -o app --run' "$tmp/init.out"
+    grep -q 'Note: early systems language' "$tmp/init.out"
+    grep -q '^name = "tooling-example"$' "$tmp/project/zag.mod"
+    grep -q '^edition = "2026"$' "$tmp/project/zag.mod"
+    grep -q '^script;$' "$tmp/project/src/main.zag"
+    grep -q '^script;$' "$tmp/project/tests/smoke.zag"
+    grep -q 'no package registry' "$tmp/project/deps/README.md"
+    grep -q 'znc src/main.zag -o app --run' "$tmp/project/README.md"
+    grep -q 'Early systems language' "$tmp/project/README.md"
+    grep -q 'RAII/destructors, async/await, and full' "$tmp/project/README.md"
+    grep -q 'docs/SUPPORT.md' "$tmp/project/README.md"
+    (cd "$tmp/project" && "$ZNC" src/main.zag -o app --run --no-zagd >"$tmp/init-run.out" 2>"$tmp/init-run.err")
+    grep -q '^Hello from Zag$' "$tmp/init-run.out"
+    [ ! -s "$tmp/init-run.err" ]
+    (cd "$tmp/project" && "$ZNC" tests/smoke.zag -o smoke --run --no-zagd >"$tmp/init-test.out" 2>"$tmp/init-test.err")
+    grep -q '^smoke: ok$' "$tmp/init-test.out"
+    [ ! -s "$tmp/init-test.err" ]
+    cp tests/tooling/vendor_math.zag "$tmp/project/deps/math.zag"
+    cp tests/tooling/vendor_main.zag "$tmp/project/src/vendor_main.zag"
+    (cd "$tmp/project" && "$ZNC" src/vendor_main.zag -o vendor-check --run --no-zagd >"$tmp/vendor.out" 2>"$tmp/vendor.err")
+    [ ! -s "$tmp/vendor.err" ]
+}
+
+check_help() {
+    "$ZNC" --help >"$tmp/help.out" 2>"$tmp/help.err"
+    grep -q 'znc init \[--name project-name\]' "$tmp/help.out"
+    grep -q 'start: znc init' "$tmp/help.out"
+    grep -q 'no package registry or network resolver' "$tmp/help.out"
+    [ ! -s "$tmp/help.err" ]
+}
+
+check_no_args_help() {
+    "$ZNC" >"$tmp/no-args.out" 2>"$tmp/no-args.err"
+    grep -q '^usage: znc ' "$tmp/no-args.out"
+    [ ! -s "$tmp/no-args.err" ]
+}
+
+check_script_analyzer_clean() {
+    "$ZNC" script examples/script_hello.zag -o "$tmp/script-hello" --no-zagd >"$tmp/script.out" 2>"$tmp/script.err"
+    [ ! -s "$tmp/script.err" ]
+}
+
+check_whitespace_line() {
+    "$ZNC" tests/tooling/whitespace_line.zag -o "$tmp/whitespace" --no-zagd --no-analyze >/dev/null
+    "$tmp/whitespace" || [ "$?" -eq 42 ]
+}
+
+check_lsp_clean() {
+    "$ZNC" selfhost/lsp/zag-lsp.zag -o "$tmp/zag-lsp-clean" --no-zagd >"$tmp/lsp-build.out" 2>"$tmp/lsp-build.err"
+    [ ! -s "$tmp/lsp-build.err" ]
 }
 
 check_dwarf() {
-    "$ZNC" "$tmp/once.zag" -o "$tmp/debug-bin" --debug >/dev/null
+    "$ZNC" "$tmp/once.zag" -o "$tmp/debug-bin" --debug --no-zagd >/dev/null
     readelf -S "$tmp/debug-bin" | grep -q '\.debug_info'
 }
 
 check_lsp() {
-    "$ZNC" selfhost/lsp/zag-lsp.zag -o "$tmp/zag-lsp" >/dev/null
+    "$ZNC" selfhost/lsp/zag-lsp.zag -o "$tmp/zag-lsp" --no-zagd >/dev/null
     ZAG_LSP="$tmp/zag-lsp" bash tests/test_lsp.sh >/dev/null
 }
 
@@ -72,6 +122,11 @@ check "version command" check_version
 check "formatter idempotence" check_format
 check "formatter preserves prefix declaration annotations" check_format_prefix_annotations
 check "project initialization" check_init
+check "global help" check_help
+check "no-argument help" check_no_args_help
+check "script analyzer ignores generated wrappers" check_script_analyzer_clean
+check "whitespace-only source line" check_whitespace_line
+check "LSP build has clean diagnostics" check_lsp_clean
 check "DWARF emission" check_dwarf
 check "LSP build and protocol" check_lsp
 

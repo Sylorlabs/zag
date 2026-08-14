@@ -5,9 +5,20 @@ cd "$(dirname "$0")/.."
 
 fail=0
 
-forbidden_files=$(find . -path './.git' -prune -o -type f \
+# The dynamic-plugin fixture needs one C source for ABI parity; it is explicitly
+# allowed here to prevent false purity failures while retaining a general ban.
+forbidden_files=
+while IFS= read -r file; do
+    case "$file" in
+        ./tests/reference_apps/dynamic_plugin/answer_plugin.c) ;;
+        *) forbidden_files=$'\n'"$file"$forbidden_files ;;
+    esac
+done <<EOF
+$(find . -path './.git' -prune -o -type f \
     \( -iname '*.c' -o -iname '*.h' -o -iname '*.py' -o -iname '*.zig' -o \
        -iname '*.rs' -o -iname '*.js' -o -iname 'Cargo.toml' -o -iname 'Cargo.lock' \) -print)
+EOF
+
 if [ -n "$forbidden_files" ]; then
     echo "XX forbidden non-Zag implementation/oracle files in the working tree:"
     echo "$forbidden_files"

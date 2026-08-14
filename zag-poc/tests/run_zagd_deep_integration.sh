@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+compiler=${ZNC:-./znc}
 tmp=$(mktemp -d /tmp/zagd-deep-integration.XXXXXX)
 daemon_pid=
 trap 'if [ -n "$daemon_pid" ]; then kill "$daemon_pid" 2>/dev/null || true; fi; find "$tmp" -depth -delete' EXIT
@@ -8,13 +9,13 @@ mkdir -p "$tmp/bin"
 if [ -n "${ZAGD:-}" ]; then
     cp "$ZAGD" "$tmp/bin/zagd"
 else
-    ./znc selfhost/zagd_daemon.zag -o "$tmp/bin/zagd" --no-zagd --no-analyze >/dev/null
+    "$compiler" selfhost/zagd_daemon.zag -o "$tmp/bin/zagd" --no-zagd --no-analyze >/dev/null
 fi
-cp ./znc "$tmp/bin/znc"
-./znc tests/zagd_finalist_witness.zag -o "$tmp/reference" --no-zagd --no-analyze >/dev/null
+cp "$compiler" "$tmp/bin/znc"
+"$compiler" tests/zagd_finalist_witness.zag -o "$tmp/reference" --no-zagd --no-analyze >/dev/null
 cp "$tmp/reference" "$tmp/equivalent"
-./znc tests/zagd_finalist_mismatch.zag -o "$tmp/mismatch" --no-zagd --no-analyze >/dev/null
-./znc tests/zagd_finalist_delay.zag -o "$tmp/delay" --no-zagd --no-analyze >/dev/null
+"$compiler" tests/zagd_finalist_mismatch.zag -o "$tmp/mismatch" --no-zagd --no-analyze >/dev/null
+"$compiler" tests/zagd_finalist_delay.zag -o "$tmp/delay" --no-zagd --no-analyze >/dev/null
 
 prepare() {
     project=$1 reference=$2 finalist=$3
@@ -97,4 +98,22 @@ prepare "$tmp/light" "$tmp/reference" "$tmp/equivalent"
 sleep .2
 test ! -e "$tmp/light/.zag-cache/zagd/deep-measurement.record"
 printf stop >"$tmp/light/.zagd.stop"; wait "$daemon_pid"; daemon_pid=
+
+# Adaptive mode used to report idle_deep=true while remaining blocked forever
+# in read(2).  Opt-in evidence waits for the real 30-second inactivity window
+# and proves that the existing deep-control measurement path is reached without
+# changing the public mode or making the daemon a correctness dependency.
+if [ "${ZAGD_IDLE_DEEP:-0}" = 1 ]; then
+    prepare "$tmp/adaptive-idle" "$tmp/reference" "$tmp/equivalent"
+    "$tmp/bin/zagd" --root "$tmp/adaptive-idle" --root-source main.zag \
+        --mode adaptive --window-ms 10 & daemon_pid=$!
+    for _ in $(seq 1 45); do
+        test -f "$tmp/adaptive-idle/.zag-cache/zagd/deep-measurement.record" && break
+        sleep 1
+    done
+    test -f "$tmp/adaptive-idle/.zag-cache/zagd/deep-measurement.record"
+    grep -q '^mode=deep$' "$tmp/adaptive-idle/.zag-cache/zagd/deep-measurement.record"
+    grep -q '^runs=3$' "$tmp/adaptive-idle/.zag-cache/zagd/deep-measurement.record"
+    printf stop >"$tmp/adaptive-idle/.zagd.stop"; wait "$daemon_pid"; daemon_pid=
+fi
 echo 'zagd deep product integration: pass'

@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-ZNC=$(realpath "${ZNC:-./znc}")
+ZNC=${ZNC:-./znc}
+case "$ZNC" in
+    /*) ;;
+    *) ZNC="$PWD/${ZNC#./}" ;;
+esac
 tmp=$(mktemp -d /tmp/zag-script-lifetime.XXXXXX)
 trap 'find "$tmp" -depth -delete' EXIT
 printf 'payload' >"$tmp/input.txt"

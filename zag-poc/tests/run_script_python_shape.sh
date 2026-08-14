@@ -48,9 +48,10 @@ grep -q '"candidate_compilable":false' "$tmp/harden.json"
 test ! -e "$tmp/hardened.zag"
 if "$compiler" harden "$tmp/program.zs" --apply \
     --test-command true --no-zagd >"$tmp/apply.log" 2>&1; then
-    echo "unsupported harden candidate unexpectedly applied" >&2
+    echo "removed harden --apply mode unexpectedly succeeded" >&2
     exit 1
 fi
-grep -q 'apply refused: no semantics-preserving strict candidate is available' "$tmp/apply.log"
+grep -q 'harden: --apply is no longer supported' "$tmp/apply.log"
+test ! -e "$tmp/program.zs.harden.bak"
 
 echo "python-shaped Zag Script: PASS"

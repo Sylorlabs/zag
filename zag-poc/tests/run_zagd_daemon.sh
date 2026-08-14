@@ -2,6 +2,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Permit a freshly built compiler to exercise the current daemon source
+# without replacing the checked-in product binary.  The default remains the
+# repository product used by the ordinary release gate.
+compiler=${ZNC:-./znc}
+
 tmp=$(mktemp -d /tmp/zagd-daemon.XXXXXX)
 cleanup_pid() {
     local pid="${1:-}"
@@ -26,24 +31,35 @@ cleanup() {
 }
 trap cleanup EXIT
 
-./znc tests/zagd_linux_test.zag -o "$tmp/linux-test" --no-analyze >/dev/null
+"$compiler" tests/zagd_linux_test.zag -o "$tmp/linux-test" --no-analyze >/dev/null
 "$tmp/linux-test"
-./znc selfhost/zagd_daemon.zag -o "$tmp/zagd" --no-analyze >/dev/null
+"$compiler" selfhost/zagd_daemon.zag -o "$tmp/zagd" --no-analyze >/dev/null
 # `zagd_semantic_check` intentionally resolves its compiler beside the daemon
 # executable.  Keep this fixture layout faithful to the installed pair so an
 # event can republish a complete semantic graph rather than fail closed solely
 # because the test omitted the sibling compiler.
-cp ./znc "$tmp/znc"
-./znc tests/zagd_semantic_fixture.zag -o "$tmp/semantic-fixture" --no-analyze >/dev/null
+cp "$compiler" "$tmp/znc"
+"$compiler" tests/zagd_semantic_fixture.zag -o "$tmp/semantic-fixture" --no-analyze >/dev/null
 
 mkdir "$tmp/project"
 mkdir -p "$tmp/project/.zag-cache/zagd"
+# Mark the fixture as its own project.  The compiler walks ancestor
+# directories when locating zag.mod/.zagd.conf; a shared /tmp/zag.mod from
+# another test lane must not redirect semantic publication outside this
+# watched root.
+printf 'mode=light\n' > "$tmp/project/.zagd.conf"
 printf 'pub fn api(x:i32) i32 { return x; }\n' > "$tmp/project/app.zag"
 "$tmp/semantic-fixture" "$tmp/project/app.zag" "$tmp/project/.zag-cache/zagd/semantic.record"
 printf '999999999\n' > "$tmp/project/.zagd.lock"
 "$tmp/zagd" --root "$tmp/project" --mode off
 test ! -e "$tmp/project/.zagd.lock"
-"$tmp/zagd" --root "$tmp/project" --mode light &
+"$tmp/zagd" --root "$tmp/project" --mode light \
+    --idle-deep false --difficulty native \
+    --script-optimization review --regular-optimization automatic \
+    --objective runtime --trust-mode autonomous --cpu generic \
+    --window-ms 31 --max-memory-bytes 1073741824 \
+    --max-cache-bytes 104857600 --max-workers 1 \
+    --notifications errors_only &
 daemon_pid=$!
 
 for _ in $(seq 1 200); do
@@ -54,6 +70,20 @@ for _ in $(seq 1 200); do
 done
 grep -q '^state=idle$' "$tmp/project/.zagd.status"
 grep -q '^mode=light$' "$tmp/project/.zagd.status"
+grep -q '^idle_deep=false$' "$tmp/project/.zagd.status"
+grep -q '^difficulty=native$' "$tmp/project/.zagd.status"
+grep -q '^script_optimization=review$' "$tmp/project/.zagd.status"
+grep -q '^regular_optimization=automatic$' "$tmp/project/.zagd.status"
+grep -q '^objective=runtime$' "$tmp/project/.zagd.status"
+grep -q '^trust_mode=autonomous$' "$tmp/project/.zagd.status"
+grep -q '^cpu=generic$' "$tmp/project/.zagd.status"
+grep -q '^stability_window_ms=31$' "$tmp/project/.zagd.status"
+grep -q '^max_memory_bytes=1073741824$' "$tmp/project/.zagd.status"
+grep -q '^max_cache_bytes=104857600$' "$tmp/project/.zagd.status"
+grep -q '^max_workers=1$' "$tmp/project/.zagd.status"
+grep -q '^notifications=errors_only$' "$tmp/project/.zagd.status"
+grep -q '^trust_mode_scope=policy-only$' "$tmp/project/.zagd.status"
+grep -q '^optimizer_generation=unimplemented$' "$tmp/project/.zagd.status"
 grep -q '^network=false$' "$tmp/project/.zagd.status"
 grep -q '^gpu_background=false$' "$tmp/project/.zagd.status"
 grep -q '^watcher=inotify$' "$tmp/project/.zagd.status"
@@ -178,6 +208,28 @@ if "$tmp/zagd" --root "$tmp/project" --max-cache-bytes 100 >/dev/null 2>&1; then
     echo "invalid cache limit unexpectedly accepted" >&2
     exit 1
 fi
+assert_usage_rc4() {
+    local label=$1
+    shift
+    set +e
+    "$tmp/zagd" --root "$tmp/project" "$@" >"$tmp/$label.out" 2>&1
+    local rc=$?
+    set -e
+    if [[ $rc -ne 4 ]]; then
+        printf '%s returned %s instead of fail-closed usage status 4\n' \
+            "$label" "$rc" >&2
+        return 1
+    fi
+}
+assert_usage_rc4 invalid-trust-mode --trust-mode unsafe
+grep -q 'trust_mode must be stable, reviewed, or autonomous' \
+    "$tmp/invalid-trust-mode.out"
+assert_usage_rc4 incomplete-policy-argument --difficulty
+grep -q 'unknown or incomplete argument: --difficulty' \
+    "$tmp/incomplete-policy-argument.out"
+assert_usage_rc4 unknown-policy-argument --unknown-policy value
+grep -q 'unknown or incomplete argument: --unknown-policy' \
+    "$tmp/unknown-policy-argument.out"
 
 # Foreground machine payloads share the daemon's configured project cache
 # ceiling. A sparse oversized payload must be sized with stat and evicted as a
@@ -273,22 +325,24 @@ printf stop > "$tmp/script-planner-project/.zagd.stop"
 wait "$daemon_pid"
 daemon_pid=
 
-# A configuration/default target mismatch must not be upgraded into a Script
-# selection merely because the daemon itself happens to be healthy.
-printf 'cpu=native\n' > "$tmp/script-planner-project/.zagd.conf"
-"$tmp/zagd" --root "$tmp/script-planner-project" --mode deep --window-ms 20 &
+# Direct daemon policy is argv-only: znc is the authority that parses project
+# configuration and transports it. Prove a transported native CPU overrides a
+# stale on-disk generic value instead of the daemon silently rereading config.
+"$tmp/zagd" --root "$tmp/script-planner-project" --mode deep --window-ms 20 \
+    --cpu native &
 daemon_pid=$!
 for _ in $(seq 1 100); do
     test -f "$tmp/script-planner-project/.zag-cache/zagd/candidates.record" &&
-        grep -q '^selection=unsupported-roadmap-alternatives$' "$tmp/script-planner-project/.zag-cache/zagd/candidates.record" 2>/dev/null &&
+        grep -q '^selection=script-default-cpu$' "$tmp/script-planner-project/.zag-cache/zagd/candidates.record" 2>/dev/null &&
         grep -q '^state=idle$' "$tmp/script-planner-project/.zagd.status" 2>/dev/null &&
         grep -q "^pid=$daemon_pid$" "$tmp/script-planner-project/.zagd.status" 2>/dev/null && break
     sleep 0.01
 done
 grep -q '^state=idle$' "$tmp/script-planner-project/.zagd.status"
 grep -q "^pid=$daemon_pid$" "$tmp/script-planner-project/.zagd.status"
-grep -q '^selection=unsupported-roadmap-alternatives$' "$tmp/script-planner-project/.zag-cache/zagd/candidates.record"
-grep -q $'^candidate=51\tautomatic=0\tsupported=0\tequivalent=0\tprovenance=unknown\tevidence_basis=unknown\tvalidity=no executable validity conditions established\trejected_reason=project Script CPU default does not match the daemon target identity\truntime_ns=-1\tmemory_bytes=-1$' "$tmp/script-planner-project/.zag-cache/zagd/candidates.record"
+grep -q '^cpu=native$' "$tmp/script-planner-project/.zagd.status"
+grep -q '^selection=script-default-cpu$' "$tmp/script-planner-project/.zag-cache/zagd/candidates.record"
+grep -q $'^candidate=51\tautomatic=1\tsupported=1\tequivalent=1\tprovenance=derived\tevidence_basis=derived\tvalidity=Script root; no foreground --cpu override; project CPU default matches active target; znc validates it before lowering\trejected_reason=\truntime_ns=0\tmemory_bytes=0$' "$tmp/script-planner-project/.zag-cache/zagd/candidates.record"
 printf stop > "$tmp/script-planner-project/.zagd.stop"
 wait "$daemon_pid"
 daemon_pid=
@@ -362,6 +416,10 @@ grep -q '^cache_reused=false$' "$tmp/project/.zagd.status"
 printf 'pub fn api(x:i32) i32 { return x; }\n' > "$tmp/project/reuse.zag"
 for _ in $(seq 1 100); do
     grep -q 'last_file=.*/reuse.zag$' "$tmp/project/.zagd.status" 2>/dev/null && break
+    sleep 0.01
+done
+for _ in $(seq 1 200); do
+    grep -q '^semantic_graph_complete=1$' "$tmp/project/.zagd.status" 2>/dev/null && break
     sleep 0.01
 done
 grep -q '^semantic_graph_complete=1$' "$tmp/project/.zagd.status"

@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+script_dir=$(cd "$(dirname "$0")/.." && pwd)
+caller_dir=$(pwd)
+cd "$script_dir"
 znc_bin=${ZNC:-./znc}
-case "$znc_bin" in /*) ;; *) znc_bin="$(pwd)/${znc_bin#./}" ;; esac
+case "$znc_bin" in
+    /*) ;;
+    *) znc_bin="$caller_dir/${znc_bin#./}" ;;
+esac
 tmp_dir=$(mktemp -d /tmp/zag-script-cli.XXXXXX)
 trap 'rm -rf "$tmp_dir"' EXIT
 
@@ -42,6 +47,25 @@ grep -q 'effect_basis=sema' "$tmp_dir/explain.json"
 grep -q 'expression types/effects: typed frontend and sema witnesses' "$tmp_dir/explain.txt"
 grep -q 'hidden copies:' "$tmp_dir/explain.txt"
 grep -q 'expr_fact=' "$tmp_dir/explain.txt"
+
+"$znc_bin" view tests/script_frontend/basic.zag --level explicit \
+    --output "$tmp_dir/view-explicit.zag" --no-zagd >"$tmp_dir/view-explicit.log"
+grep -q 'harden status: preview' "$tmp_dir/view-explicit.log"
+grep -q 'fn main() i32' "$tmp_dir/view-explicit.zag"
+grep -q 'extern fn _zag_script_context_init' "$tmp_dir/view-explicit.zag"
+grep -q 'fn __zag_hardened_status_boundary' "$tmp_dir/view-explicit.zag"
+"$znc_bin" "$tmp_dir/view-explicit.zag" -o "$tmp_dir/view-explicit-bin" --no-analyze --no-zagd >/dev/null
+test -x "$tmp_dir/view-explicit-bin"
+"$znc_bin" view tests/script_frontend/basic.zag --level explicit --format json \
+    --output "$tmp_dir/view-explicit-json.zag" --no-zagd >"$tmp_dir/view-explicit.json"
+grep -q '"status":"preview"' "$tmp_dir/view-explicit.json"
+grep -q '"candidate_compilable":true' "$tmp_dir/view-explicit.json"
+test -s "$tmp_dir/view-explicit-json.zag"
+cmp "$tmp_dir/view-explicit-json.zag" "$tmp_dir/view-explicit.zag"
+
+"$znc_bin" expand tests/script_frontend/basic.zag --to explicit --no-zagd \
+    --output "$tmp_dir/expand-explicit.zag" > "$tmp_dir/expand-explicit.log"
+cmp "$tmp_dir/view-explicit.zag" "$tmp_dir/expand-explicit.zag"
 
 # Explain witnesses are emitted from the already-bound Script root AST. They
 # name only facts the runtime implementation proves, distinguish zero from
@@ -114,6 +138,24 @@ hardened_status=$?
 set -e
 test "$hardened_status" -eq 7
 
+# AST rendering must preserve structured loop control rather than replacing
+# break/continue nodes with formatter placeholders.
+cat >"$tmp_dir/harden-loop.zag" <<'EOF'
+script;
+let i: i32 = 0;
+while (i < 4) {
+    i = i + 1;
+    if (i == 2) { continue; }
+    if (i == 3) { break; }
+}
+return i;
+EOF
+"$znc_bin" harden "$tmp_dir/harden-loop.zag" \
+    --output "$tmp_dir/harden-loop-output.zag" --no-zagd >/dev/null
+grep -q 'continue;' "$tmp_dir/harden-loop-output.zag"
+grep -q 'break;' "$tmp_dir/harden-loop-output.zag"
+"$znc_bin" check "$tmp_dir/harden-loop-output.zag" --no-zagd >/dev/null
+
 "$znc_bin" harden tests/script_frontend/harden_declarations.zag \
     --output "$tmp_dir/hardened-declarations.zag" >/dev/null
 "$znc_bin" "$tmp_dir/hardened-declarations.zag" -o "$tmp_dir/hardened-declarations" --no-analyze --no-zagd >/dev/null
@@ -130,49 +172,77 @@ grep -q '"candidate_compilable":true' "$tmp_dir/harden.json"
 grep -q '"parity_tests"' "$tmp_dir/harden.json"
 grep -q '"unsupported"' "$tmp_dir/harden.json"
 
+# `harden` remains a compatibility alias only; the alias is explicit in stderr.
+"$znc_bin" harden tests/script_frontend/basic.zag --format json --no-zagd \
+    > "$tmp_dir/harden-alias.json" 2> "$tmp_dir/harden-alias.err"
+grep -q 'warning: `harden` is deprecated' "$tmp_dir/harden-alias.err"
+grep -q '"status":"preview"' "$tmp_dir/harden-alias.json"
+
 # A compiler-bound Script prelude call has an implicit context/capability
-# contract. Harden must report that boundary honestly, produce no candidate,
-# and never create the requested output file.
+# contract. The bound AST is rendered into strict Zag, with the required
+# compiler-owned modules made explicit and the context handle renamed at the
+# strict boundary.
 cat >"$tmp_dir/harden-prelude.zag" <<'EOF'
 script;
 let contents = read_file("input.txt");
 return 0;
 EOF
+printf 'hello from the Script context\n' >"$tmp_dir/input.txt"
 "$znc_bin" harden "$tmp_dir/harden-prelude.zag" --format json \
     --output "$tmp_dir/harden-prelude-output.zag" --no-zagd >"$tmp_dir/harden-prelude.json"
-grep -q '"status":"unsupported"' "$tmp_dir/harden-prelude.json"
-grep -q '"candidate_compilable":false' "$tmp_dir/harden-prelude.json"
-grep -q '"kind":"script_prelude"' "$tmp_dir/harden-prelude.json"
-test ! -e "$tmp_dir/harden-prelude-output.zag"
+grep -q '"status":"preview"' "$tmp_dir/harden-prelude.json"
+grep -q '"candidate_compilable":true' "$tmp_dir/harden-prelude.json"
+! grep -q '"kind":"script_prelude"' "$tmp_dir/harden-prelude.json"
+test -s "$tmp_dir/harden-prelude-output.zag"
+grep -q '@import("std:script_io")' "$tmp_dir/harden-prelude-output.zag"
+! grep -q '@import("std:process")' "$tmp_dir/harden-prelude-output.zag"
+! grep -q '@import("std:script_list")' "$tmp_dir/harden-prelude-output.zag"
+grep -q 'script_read_file' "$tmp_dir/harden-prelude-output.zag"
+"$znc_bin" check "$tmp_dir/harden-prelude-output.zag" --no-zagd >/dev/null
+"$znc_bin" "$tmp_dir/harden-prelude-output.zag" -o "$tmp_dir/harden-prelude" --no-analyze --no-zagd >/dev/null
+(cd "$tmp_dir" && ./harden-prelude)
 
-# --output is a sibling-temp atomic publish. An existing temp is treated as a
-# recovery signal rather than silently overwritten.
-printf 'interrupted candidate\n' >"$tmp_dir/atomic-output.zag.harden.tmp"
+# The bounded process helper still depends on the edition-2027 affine list;
+# default-edition expansion refuses it rather than importing an invalid module
+# graph or manufacturing a weaker ownership contract.
+cat >"$tmp_dir/harden-process.zag" <<'EOF'
+script;
+let result = process_run_timeout("true", 1000, 64);
+return 0;
+EOF
+"$znc_bin" harden "$tmp_dir/harden-process.zag" --format json \
+    --output "$tmp_dir/harden-process-output.zag" --no-zagd >"$tmp_dir/harden-process.json"
+grep -q '"status":"unsupported"' "$tmp_dir/harden-process.json"
+grep -q '"kind":"script_prelude"' "$tmp_dir/harden-process.json"
+test ! -e "$tmp_dir/harden-process-output.zag"
+
+# --output publishes through an exclusive sibling staging file and a
+# create-only final rename. A human-owned final path is never overwritten.
+printf 'human-owned output\n' >"$tmp_dir/atomic-output.zag"
 if "$znc_bin" harden tests/script_frontend/basic.zag \
     --output "$tmp_dir/atomic-output.zag" --no-zagd >/dev/null 2>&1; then
-    echo "harden unexpectedly overwrote an existing atomic temporary" >&2
+    echo "harden unexpectedly overwrote an existing output" >&2
     exit 1
 fi
-test ! -e "$tmp_dir/atomic-output.zag"
+test "$(cat "$tmp_dir/atomic-output.zag")" = "human-owned output"
 
-mkdir "$tmp_dir/apply"
-cp tests/script_frontend/basic.zag "$tmp_dir/apply/app.zag"
-(cd "$tmp_dir/apply" && "$znc_bin" harden app.zag --apply \
-    --test-command "$znc_bin app.zag -o applied --no-zagd --no-analyze" \
-    --format json --no-zagd) > "$tmp_dir/apply-report.json"
-grep -q '"status":"applied"' "$tmp_dir/apply-report.json"
-test -f "$tmp_dir/apply/app.zag.harden.bak"
-grep -q 'fn main() i32' "$tmp_dir/apply/app.zag"
-
-mkdir "$tmp_dir/rollback"
-cp tests/script_frontend/basic.zag "$tmp_dir/rollback/app.zag"
-if (cd "$tmp_dir/rollback" && "$znc_bin" harden app.zag --apply \
-    --test-command false --no-zagd >/dev/null 2>&1); then
-    echo "failing harden parity command unexpectedly applied" >&2
+# `harden` is a source-preserving compatibility alias. The removed legacy
+# apply mode must reject before candidate publication or execution of the
+# caller-supplied command, leaving no rollback file or other side effect.
+mkdir "$tmp_dir/apply-refused"
+cp tests/script_frontend/basic.zag "$tmp_dir/apply-refused/app.zag"
+cp "$tmp_dir/apply-refused/app.zag" "$tmp_dir/apply-refused/expected.zag"
+if (cd "$tmp_dir/apply-refused" && "$znc_bin" harden app.zag --apply \
+    --output derived.zag --test-command 'touch parity-command-ran' \
+    --format json --no-zagd > report.json 2> report.err); then
+    echo "removed harden --apply mode unexpectedly succeeded" >&2
     exit 1
 fi
-grep -q '^script;' "$tmp_dir/rollback/app.zag"
-cmp "$tmp_dir/rollback/app.zag" "$tmp_dir/rollback/app.zag.harden.bak"
+grep -q 'harden: --apply is no longer supported' "$tmp_dir/apply-refused/report.err"
+cmp "$tmp_dir/apply-refused/app.zag" "$tmp_dir/apply-refused/expected.zag"
+test ! -e "$tmp_dir/apply-refused/app.zag.harden.bak"
+test ! -e "$tmp_dir/apply-refused/derived.zag"
+test ! -e "$tmp_dir/apply-refused/parity-command-ran"
 
 # Project Script defaults reach foreground code generation. Explicit CLI CPU
 # selection wins; regular Zag remains independent of Script defaults.

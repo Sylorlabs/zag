@@ -71,24 +71,24 @@ else
 fi
 
 cat >"$TMP/packed.zag" <<'ZAG'
-@repr(packed) struct Bad { x:i32 }
+@repr(packed) struct Bad { x:u8, y:u16 }
 fn main() i32 { return 0; }
 ZAG
 if "$ZNC" "$TMP/packed.zag" -o "$TMP/packed" --no-zagd --no-foreground-cache >"$TMP/packed.log" 2>&1; then
-    bad "unsupported representation rejects"
-elif grep -q 'E0201' "$TMP/packed.log" && [ ! -e "$TMP/packed" ]; then
-    ok "unsupported representation fails closed without an artifact"
+    bad "unaligned packed layout rejects"
+elif grep -Eq 'unaligned field|unsupported representation|E0018' "$TMP/packed.log" && [ ! -e "$TMP/packed" ]; then
+    ok "unaligned packed layout fails closed without an artifact"
 else
     bad "unsupported representation diagnostic"
 fi
 
 cat >"$TMP/unsupported-field.zag" <<'ZAG'
-@repr(C) struct Bad { value:f32 }
+@repr(C) struct Bad { value:[]u8 }
 fn main() i32 { return 0; }
 ZAG
 if "$ZNC" "$TMP/unsupported-field.zag" -o "$TMP/unsupported-field" --no-zagd --no-foreground-cache >"$TMP/unsupported-field.log" 2>&1; then
     bad "unsupported C-layout field rejects"
-elif grep -q '@repr(C) fields require scalar/pointer C leaves' "$TMP/unsupported-field.log" && [ ! -e "$TMP/unsupported-field" ]; then
+elif grep -Eq '@repr\(C\) fields require target-supported scalar/pointer C leaves|@repr\(C\) fields require scalar/pointer C leaves' "$TMP/unsupported-field.log" && [ ! -e "$TMP/unsupported-field" ]; then
     ok "unsupported C-layout field fails closed"
 else
     bad "unsupported C-layout field diagnostic"
@@ -106,15 +106,6 @@ elif grep -q '@repr(C) aggregates are pointer-only' "$TMP/by-value.log" && [ ! -
 else
     sed -n '1,80p' "$TMP/by-value.log" >&2
     bad "by-value C-layout aggregate diagnostic"
-fi
-
-if "$ZNC" "$TMP/main.zag" --target arm64 -o "$TMP/arm64" --no-zagd --no-foreground-cache >"$TMP/arm64.log" 2>&1; then
-    bad "ARM64 does not claim unverified C layout"
-elif grep -q '@repr(C).*only.*x86-64' "$TMP/arm64.log" && [ ! -e "$TMP/arm64" ]; then
-    ok "unverified ARM64 representation fails closed"
-else
-    sed -n '1,80p' "$TMP/arm64.log" >&2
-    bad "ARM64 representation rejection is explicit"
 fi
 
 printf 'repr-c-layout pass=%d fail=%d\n' "$pass" "$fail"

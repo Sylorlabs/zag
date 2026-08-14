@@ -73,6 +73,10 @@ nt  "struct fields"  'struct P { x: i32, y: i32 } fn main() i32 { let p: P = P{ 
 nt  "string .len"    'fn main() i32 { return "hello".len; }' 5
 echo "── structs by-value · slices · heap (new) ──"
 nt  "struct byval return" 'struct P { x: i32, y: i32 } fn mk(a: i32, b: i32) P { return P{ .x = a, .y = b }; } fn main() i32 { let p: P = mk(30, 12); return p.x + p.y; }' 42
+# Every aggregate-returning callee needs its own caller-frame result block.
+# The caller's saved incoming sret pointer must survive this nested call; using
+# the incoming destination for the child corrupts the outer return publication.
+nt  "nested aggregate return preserves outer sret" 'struct P { a: i32, b: i32, c: i32 } struct Box { tag: i32, value: P, tail: i32 } fn make_p(x: i32) P { return P{ .a = x, .b = x + 1, .c = x + 2 }; } fn make_box(x: i32) Box { let box: Box = Box{ .tag = 3, .value = P{ .a = 0, .b = 0, .c = 0 }, .tail = 11 }; box.value = make_p(x); return box; } fn wrap_box(x: i32) Box { let box: Box = make_box(x); box.tag = box.tag + 1; return box; } fn main() i32 { let box: Box = wrap_box(8); return box.tag + box.value.a + box.value.b + box.value.c + box.tail; }' 42
 nt  "struct byval arg iso" 'struct P { x: i32 } fn wr(p: P) i32 { p.x = 999; return p.x; } fn main() i32 { let q: P = P{ .x = 5 }; let z: i32 = wr(q); return q.x; }' 5
 nt  "slice value len"     'fn slen(s: []u8) i32 { return s.len; } fn main() i32 { let s: []u8 = "hello"; return slen(s); }' 5
 nt  "slice index"         'fn main() i32 { let s: []u8 = "hello"; return s[1]; }' 101
@@ -335,6 +339,7 @@ nto "exponent float literals" 'fn main() i32 { print_f64(2.5e-9); print_f64(1e3)
 nt "capture-less closure"  'fn main() i32 { let f: fn(i32) i32 = fn[](x: i32) i32 { return x + 40; }; return f(2); }' 42
 nt "closure shadows fn"    'fn add(a: i32, b: i32) i32 { return a + b; } fn main() i32 { let add: fn(i32) i32 = fn[](x: i32) i32 { return x; }; return add(1) + 41; }' 42
 nt "capturing closure"     'fn main() i32 { let g: i32 = 3; let f: fn(i32) i32 = fn[g](x: i32) i32 { return x * g; }; return f(14); }' 42
+nt "capturing closure returns field access" 'struct T { a: i32, b: i32 } fn main() i32 { let t: T = T{ .a = 12, .b = 2 }; let f: fn() i32 = fn[t]() i32 { return t.a; }; return f(); }' 12
 
 # Run the full error-propagation integration test.
 "$ZNC" tests/error_propagation.zag -o $WORK/nt_ep >$WORK/nt_ep_out 2>&1
