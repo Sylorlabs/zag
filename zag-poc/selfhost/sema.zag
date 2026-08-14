@@ -84,6 +84,7 @@ fn stmt_uses_try(n: *Node) i32 {
             return stmts_use_try(w.body);
         }
         .unsafe_ => |u| { return stmts_use_try(u.body); }
+        .defer_ => |d| { return expr_uses_try(d.expr); }
         .assign => |a| {
             if (expr_uses_try(a.target) == 1) { return 1; }
             return expr_uses_try(a.expr);
@@ -240,11 +241,15 @@ fn builtin_eff(name: []u8) i32 {
 }
 
 // effect an annotation DECLARES (on fn declarations): @alloc/@panic/@io/@lock
+// and @blocking.  Blocking is intentionally represented by Lock so the
+// existing transitive effect lattice rejects it from @realtime and @irq while
+// still leaving the source annotation explicit at the API boundary.
 fn annot_eff(a: []u8) i32 {
     if (@strEq(a, "@alloc")) { return 1; }
     if (@strEq(a, "@panic")) { return 2; }
     if (@strEq(a, "@io"))    { return 4; }
     if (@strEq(a, "@lock"))  { return 8; }
+    if (@strEq(a, "@blocking")) { return 8; }
     if (@strEq(a, "@unsafe")) { return 32; }
     // A v2 C-ABI import crosses a foreign implementation boundary. Its body
     // and transitive behavior are outside the Zag proof, so propagate Unsafe
@@ -257,6 +262,11 @@ fn annot_eff(a: []u8) i32 {
 fn forbidden_bits(a: []u8) i32 {
     if (@strEq(a, "@realtime")) { return 1005; } // Alloc+IO+Lock+Unsafe+Atomic+FFI+Device+GPUHost
     if (@strEq(a, "@pure"))     { return 1005; }
+    // An IRQ handler may observe device state and use a proved atomic, but it
+    // may not allocate, block, raise, enter an untrusted/unsafe primitive, or
+    // cross an unknown foreign boundary.  The body checker separately rejects
+    // unbounded loops in this profile.
+    if (@strEq(a, "@irq"))      { return 701; } // Alloc+IO+Lock+Raises+Unsafe+FFI+GPUHost
     // Kernels are a frontend-only device subset until a typed GPU runtime and
     // effect model exist.  Reject every implemented host effect here rather
     // than allowing IO, FFI, atomics, allocation, or unsafe machine control
@@ -606,6 +616,7 @@ fn total_unsafe_stmt(n: *Node, nz: *ArrayList[[]u8], eff: map.StringMap[i32]) i3
             return cu + wu;
         }
         .unsafe_ => |u| { return total_unsafe_body(u.body, nz, eff); }
+        .defer_ => |d| { return total_unsafe_expr(d.expr, nz.*, eff); }
         .assign => |a| {
             return total_unsafe_expr(a.target, nz.*, eff) + total_unsafe_expr(a.expr, nz.*, eff);
         }
@@ -686,6 +697,7 @@ fn stmt_eff(n: *Node, eff: map.StringMap[i32]) i32 {
         .if_    => |x| bor(bor(expr_eff(x.cond, eff), body_eff(x.then_body, eff)), body_eff(x.els_body, eff)),
         .while_ => |w| bor(expr_eff(w.cond, eff), body_eff(w.body, eff)),
         .unsafe_ => |u| bor(32, body_eff(u.body, eff)),
+        .defer_  => |d| expr_eff(d.expr, eff),
         .assign => |a| bor(expr_eff(a.target, eff), expr_eff(a.expr, eff)),
         .switch_ => |sw| bor(expr_eff(sw.subject, eff), switch_arms_eff(sw, eff)),
         .estmt  => |e| expr_eff(e.expr, eff),
@@ -720,7 +732,13 @@ fn seed_extern(d: *Node, eff: *map.StringMap[i32]) void {
     switch (d.*) {
         .fn_decl => |f| {
             if (f.is_extern == 1) {
-                map.put[i32](eff, f.name, declared_eff(f.annots));
+                let declared:i32=declared_eff(f.annots);
+                // An unannotated foreign declaration is opaque to the Zag
+                // proof. Treat it as FFI rather than silently allowing it in
+                // @realtime/@irq code; an explicit @cabi/@alloc/@io row can
+                // refine the boundary as usual.
+                if(declared==0){map.put[i32](eff,f.name,128);}
+                else{map.put[i32](eff,f.name,declared);}
             }
         }
         else => { }
@@ -1014,6 +1032,7 @@ fn le_stmt(n: *Node, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map
         .if_     => |x| bor(bor(le_expr(x.cond, env, decls, eff, depth), le_body(x.then_body, env, decls, eff, depth)), le_body(x.els_body, env, decls, eff, depth)),
         .while_  => |w| bor(le_expr(w.cond, env, decls, eff, depth), le_body(w.body, env, decls, eff, depth)),
         .unsafe_ => |u| bor(32, le_body(u.body, env, decls, eff, depth)),
+        .defer_  => |d| le_expr(d.expr, env, decls, eff, depth),
         .assign  => |a| le_assign(a, env, decls, eff, depth),
         .switch_ => |sw| bor(le_expr(sw.subject, env, decls, eff, depth), le_switch(sw, env, decls, eff, depth)),
         .estmt   => |e| le_expr(e.expr, env, decls, eff, depth),
@@ -1161,6 +1180,344 @@ fn fn_violation_mask(f: FnDecl, decls: ArrayList[*Node], eff: map.StringMap[i32]
     let env: map.StringMap[i32] = map.make[i32](16);
     return fn_latent(f, &env, decls, eff, 0);
 }
+
+// ── rendered effect witnesses ──────────────────────────────────────────────
+//
+// The proof above deliberately reduces every callable to a bitmask. That is
+// ideal for the fixpoint, but it used to discard the information a person
+// needs when a capability is rejected. This second walk is diagnostic-only:
+// it follows the same source tree while retaining the concrete function value
+// supplied for a callback parameter or local. One witness is rendered for
+// every forbidden effect bit. A stack (rather than a global visited set) makes
+// recursive and mutually-recursive graphs terminate without hiding a sibling
+// path that reaches the effect source.
+fn effect_name(bit: i32) []u8 {
+    if (bit == 1)   { return "Alloc"; }
+    if (bit == 2)   { return "Panic"; }
+    if (bit == 4)   { return "IO"; }
+    if (bit == 8)   { return "Lock"; }
+    if (bit == 16)  { return "Raises"; }
+    if (bit == 32)  { return "Unsafe"; }
+    if (bit == 64)  { return "Atomic"; }
+    if (bit == 128) { return "FFI"; }
+    if (bit == 256) { return "Device"; }
+    if (bit == 512) { return "GPUHost"; }
+    return "Effect";
+}
+
+fn trace_has(stack: ArrayList[[]u8], name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[[]u8](stack)) {
+        if (@strEq(get[[]u8](stack, i), name)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn trace_starts(s: []u8, prefix: []u8) i32 {
+    if (s.len < prefix.len) { return 0; }
+    let i: i32 = 0;
+    while (i < prefix.len) {
+        if (s[i] != prefix[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn trace_fn_label(f: FnDecl, root_origin: []u8) []u8 {
+    let label: []u8 = f.name;
+    if (trace_starts(f.name, "__clos_") == 1) { label = "closure"; }
+    // Imported helpers retain their resolver path, so equal spellings from
+    // different modules cannot produce an ambiguous diagnostic.
+    if (f.origin.len > 0 && !@strEq(f.origin, "<root>") && !@strEq(f.origin, root_origin)) {
+        return _zag_str_concat(label, _zag_str_concat(" [", _zag_str_concat(f.origin,
+            _zag_str_concat(":", _zag_str_concat(_zag_i64_to_str(f.line as i64), "]")))));
+    }
+    if (trace_starts(f.name, "__clos_") == 1) {
+        return _zag_str_concat(label, _zag_str_concat("@", _zag_i64_to_str(f.line as i64)));
+    }
+    return label;
+}
+
+fn trace_terminal(name: []u8, bit: i32, declared: i32) []u8 {
+    let why: []u8 = "";
+    if (declared == 1) { why = " declared"; }
+    return _zag_str_concat(name, _zag_str_concat("() [", _zag_str_concat(effect_name(bit),
+        _zag_str_concat(why, "]"))));
+}
+
+fn trace_join(head: []u8, tail: []u8) []u8 {
+    if (tail.len == 0) { return head; }
+    return _zag_str_concat(head, _zag_str_concat(" -> ", tail));
+}
+
+struct TraceBinding { name: []u8, target: []u8 }
+
+fn trace_binding_get(bindings: ArrayList[TraceBinding], name: []u8) []u8 {
+    let i: i32 = len[TraceBinding](bindings) - 1;
+    while (i >= 0) {
+        let b: TraceBinding = get[TraceBinding](bindings, i);
+        if (@strEq(b.name, name)) { return b.target; }
+        i = i - 1;
+    }
+    return "";
+}
+fn trace_binding_put(bindings: *ArrayList[TraceBinding], name: []u8, target: []u8) void {
+    push[TraceBinding](bindings, TraceBinding{ .name = name, .target = target });
+}
+
+fn trace_value_name(n: *Node, bindings: *ArrayList[TraceBinding]) []u8 {
+    return switch (n.*) {
+        .id => |x| { let bound: []u8 = trace_binding_get(bindings.*, x.name); if (bound.len > 0) { return bound; } return x.name; }
+        .cast_ => |c| trace_value_name(c.expr, bindings),
+        else => "",
+    };
+}
+
+fn trace_expr(n: *Node, bindings: *ArrayList[TraceBinding], decls: ArrayList[*Node],
+              eff: map.StringMap[i32], bit: i32, stack: *ArrayList[[]u8],
+              root_origin: []u8) []u8;
+fn trace_body(body: ArrayList[*Node], bindings: *ArrayList[TraceBinding], decls: ArrayList[*Node],
+              eff: map.StringMap[i32], bit: i32, stack: *ArrayList[[]u8],
+              root_origin: []u8) []u8;
+
+fn trace_fields(fields: ArrayList[FieldInit], bindings: *ArrayList[TraceBinding],
+                decls: ArrayList[*Node], eff: map.StringMap[i32], bit: i32,
+                stack: *ArrayList[[]u8], root_origin: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[FieldInit](fields)) {
+        let p: []u8 = trace_expr(get[FieldInit](fields, i).val, bindings, decls, eff, bit, stack, root_origin);
+        if (p.len > 0) { return p; }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn trace_fn_node(d: *Node, bindings: *ArrayList[TraceBinding], decls: ArrayList[*Node],
+                 eff: map.StringMap[i32], bit: i32, stack: *ArrayList[[]u8],
+                 root_origin: []u8) []u8 {
+    return switch (d.*) {
+        .fn_decl => |f| trace_fn_effect(f, bindings, decls, eff, bit, stack, root_origin),
+        else => "",
+    };
+}
+
+fn trace_fn_effect(f: FnDecl, bindings: *ArrayList[TraceBinding], decls: ArrayList[*Node],
+                   eff: map.StringMap[i32], bit: i32, stack: *ArrayList[[]u8],
+                   root_origin: []u8) []u8 {
+    if (trace_has(stack.*, f.name) == 1) { return ""; }
+    push[[]u8](stack, f.name);
+    let inner: []u8 = trace_body(f.body, bindings, decls, eff, bit, stack, root_origin);
+    let _removed: []u8 = pop[[]u8](stack);
+    let label: []u8 = trace_fn_label(f, root_origin);
+    if (inner.len > 0) { return trace_join(label, inner); }
+    if ((declared_eff(f.annots) & bit) != 0) {
+        return trace_join(label, trace_terminal(f.name, bit, 1));
+    }
+    return "";
+}
+
+fn trace_call(c: Call, bindings: *ArrayList[TraceBinding], decls: ArrayList[*Node],
+              eff: map.StringMap[i32], bit: i32, stack: *ArrayList[[]u8],
+              root_origin: []u8) []u8 {
+    // Argument evaluation is part of the caller's path and happens before the
+    // callee runs.
+    let ai: i32 = 0;
+    while (ai < len[*Node](c.args)) {
+        let ap: []u8 = trace_expr(get[*Node](c.args, ai), bindings, decls, eff, bit, stack, root_origin);
+        if (ap.len > 0) { return ap; }
+        ai = ai + 1;
+    }
+    if (callee_is_direct_id(c.callee) == 0) {
+        return _zag_str_concat("indirect call [", _zag_str_concat(effect_name(bit), ", conservative]"));
+    }
+    let cn: []u8 = callee_name(c.callee);
+    if ((@strEq(cn, "new") && (bit == 1 || bit == 2)) ||
+        (@strEq(cn, "delete") && bit == 1)) { return trace_terminal(cn, bit, 0); }
+    if ((builtin_eff(cn) & bit) != 0) { return trace_terminal(cn, bit, 0); }
+
+    // Resolve an effect-polymorphic parameter/local back to the concrete named
+    // function or hoisted closure supplied at this call site.
+    let target: []u8 = trace_binding_get(bindings.*, cn);
+    if (target.len > 0) {
+        let ti: i32 = find_fn(decls, target);
+        if (ti >= 0) {
+            let child_bindings: ArrayList[TraceBinding] = make[TraceBinding](8);
+            let child: []u8 = trace_fn_node(get[*Node](decls, ti), &child_bindings, decls, eff, bit, stack, root_origin);
+            if (child.len > 0) {
+                return trace_join(_zag_str_concat(cn, _zag_str_concat(" (callback=", _zag_str_concat(trace_fn_label_from_node(get[*Node](decls, ti), root_origin), ")"))), child);
+            }
+        }
+        return _zag_str_concat(cn, _zag_str_concat("() [", _zag_str_concat(effect_name(bit), ", effect row]")));
+    }
+
+    let fi: i32 = find_fn(decls, cn);
+    if (fi >= 0) {
+        // A recursive edge contributes no new label by itself. Skip it and let
+        // the enclosing body continue searching its remaining branches and
+        // statements for the concrete source operation.
+        if (trace_has(stack.*, cn) == 1) { return ""; }
+        let child_bindings: ArrayList[TraceBinding] = make[TraceBinding](8);
+        trace_bind_call(get[*Node](decls, fi), c, bindings, &child_bindings);
+        let child: []u8 = trace_fn_node(get[*Node](decls, fi), &child_bindings, decls, eff, bit, stack, root_origin);
+        if (child.len > 0) { return child; }
+        // An extern or body-less declaration is itself the source boundary.
+        let known: i32 = map.get[i32](eff, cn) orelse 0;
+        if ((known & bit) != 0) { return trace_terminal(cn, bit, 1); }
+    }
+    let known: i32 = map.get[i32](eff, cn) orelse 0;
+    if ((known & bit) != 0) { return trace_terminal(cn, bit, 1); }
+    return "";
+}
+
+fn trace_fn_label_from_node(d: *Node, root_origin: []u8) []u8 {
+    return switch (d.*) { .fn_decl => |f| trace_fn_label(f, root_origin), else => "callable" };
+}
+
+fn trace_bind_call(d: *Node, c: Call, outer: *ArrayList[TraceBinding], inner: *ArrayList[TraceBinding]) void {
+    switch (d.*) {
+        .fn_decl => |f| {
+            let i: i32 = 0;
+            while (i < len[Param](f.params) && i < len[*Node](c.args)) {
+                let p: Param = get[Param](f.params, i);
+                if (is_fn_pty(p.pty) == 1) {
+                    let actual: []u8 = trace_value_name(get[*Node](c.args, i), outer);
+                    if (actual.len > 0) { trace_binding_put(inner, p.name, actual); }
+                }
+                i = i + 1;
+            }
+        }
+        else => { }
+    }
+}
+
+fn trace_expr(n: *Node, bindings: *ArrayList[TraceBinding], decls: ArrayList[*Node],
+              eff: map.StringMap[i32], bit: i32, stack: *ArrayList[[]u8],
+              root_origin: []u8) []u8 {
+    return switch (n.*) {
+        .call => |c| trace_call(c, bindings, decls, eff, bit, stack, root_origin),
+        .bin => |b| {
+            let p: []u8 = trace_expr(b.l, bindings, decls, eff, bit, stack, root_origin);
+            if (p.len > 0) { return p; }
+            p = trace_expr(b.r, bindings, decls, eff, bit, stack, root_origin);
+            if (p.len > 0) { return p; }
+            if (bit == 2 && div_eff(b) != 0) { return _zag_str_concat("operator `", _zag_str_concat(b.op, "` [Panic]")); }
+            return "";
+        }
+        .un => |u| trace_expr(u.e, bindings, decls, eff, bit, stack, root_origin),
+        .idx => |x| {
+            let p: []u8 = trace_expr(x.base, bindings, decls, eff, bit, stack, root_origin);
+            if (p.len > 0) { return p; }
+            return trace_expr(x.idx, bindings, decls, eff, bit, stack, root_origin);
+        }
+        .fld => |x| trace_expr(x.base, bindings, decls, eff, bit, stack, root_origin),
+        .slit_ => |s| trace_fields(s.fields, bindings, decls, eff, bit, stack, root_origin),
+        .slice_ => |s| {
+            let p: []u8 = trace_expr(s.base, bindings, decls, eff, bit, stack, root_origin);
+            if (p.len > 0) { return p; }
+            p = trace_expr(s.lo, bindings, decls, eff, bit, stack, root_origin);
+            if (p.len > 0) { return p; }
+            return trace_expr(s.hi, bindings, decls, eff, bit, stack, root_origin);
+        }
+        .cast_ => |c| trace_expr(c.expr, bindings, decls, eff, bit, stack, root_origin),
+        else => "",
+    };
+}
+
+fn trace_switch(sw: Switch, bindings: *ArrayList[TraceBinding], decls: ArrayList[*Node],
+                eff: map.StringMap[i32], bit: i32, stack: *ArrayList[[]u8],
+                root_origin: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[SwitchArm](sw.arms)) {
+        let p: []u8 = trace_body(get[SwitchArm](sw.arms, i).body, bindings, decls, eff, bit, stack, root_origin);
+        if (p.len > 0) { return p; }
+        i = i + 1;
+    }
+    if (sw.has_els == 1) { return trace_body(sw.els_body, bindings, decls, eff, bit, stack, root_origin); }
+    return "";
+}
+
+fn trace_stmt(n: *Node, bindings: *ArrayList[TraceBinding], decls: ArrayList[*Node],
+              eff: map.StringMap[i32], bit: i32, stack: *ArrayList[[]u8],
+              root_origin: []u8) []u8 {
+    return switch (n.*) {
+        .let_ => |l| {
+            let p: []u8 = trace_expr(l.expr, bindings, decls, eff, bit, stack, root_origin);
+            if (is_fn_pty(l.dty) == 1) {
+                let actual: []u8 = trace_value_name(l.expr, bindings);
+                if (actual.len > 0) { trace_binding_put(bindings, l.name, actual); }
+            }
+            return p;
+        }
+        .ret => |r| { if (r.has_expr == 1) { return trace_expr(r.expr, bindings, decls, eff, bit, stack, root_origin); } return ""; }
+        .if_ => |x| {
+            let p: []u8 = trace_expr(x.cond, bindings, decls, eff, bit, stack, root_origin);
+            if (p.len > 0) { return p; }
+            p = trace_body(x.then_body, bindings, decls, eff, bit, stack, root_origin);
+            if (p.len > 0) { return p; }
+            return trace_body(x.els_body, bindings, decls, eff, bit, stack, root_origin);
+        }
+        .while_ => |w| {
+            let p: []u8 = trace_expr(w.cond, bindings, decls, eff, bit, stack, root_origin);
+            if (p.len > 0) { return p; }
+            return trace_body(w.body, bindings, decls, eff, bit, stack, root_origin);
+        }
+        .unsafe_ => |u| {
+            if (bit == 32) { return "unsafe block [Unsafe]"; }
+            return trace_body(u.body, bindings, decls, eff, bit, stack, root_origin);
+        }
+        .defer_ => |d| trace_expr(d.expr, bindings, decls, eff, bit, stack, root_origin),
+        .assign => |a| {
+            let p: []u8 = trace_expr(a.target, bindings, decls, eff, bit, stack, root_origin);
+            if (p.len > 0) { return p; }
+            p = trace_expr(a.expr, bindings, decls, eff, bit, stack, root_origin);
+            switch (a.target.*) { .id => |x| { if (trace_binding_get(bindings.*, x.name).len > 0) { let actual: []u8 = trace_value_name(a.expr, bindings); if (actual.len > 0) { trace_binding_put(bindings, x.name, actual); } } } else => { } }
+            return p;
+        }
+        .switch_ => |sw| {
+            let p: []u8 = trace_expr(sw.subject, bindings, decls, eff, bit, stack, root_origin);
+            if (p.len > 0) { return p; }
+            return trace_switch(sw, bindings, decls, eff, bit, stack, root_origin);
+        }
+        .estmt => |e| trace_expr(e.expr, bindings, decls, eff, bit, stack, root_origin),
+        else => "",
+    };
+}
+
+fn trace_body(body: ArrayList[*Node], bindings: *ArrayList[TraceBinding], decls: ArrayList[*Node],
+              eff: map.StringMap[i32], bit: i32, stack: *ArrayList[[]u8],
+              root_origin: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        let p: []u8 = trace_stmt(get[*Node](body, i), bindings, decls, eff, bit, stack, root_origin);
+        if (p.len > 0) { return p; }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn effect_witness(f: FnDecl, decls: ArrayList[*Node], eff: map.StringMap[i32], bit: i32) []u8 {
+    let bindings: ArrayList[TraceBinding] = make[TraceBinding](8);
+    let stack: ArrayList[[]u8] = make[[]u8](8);
+    return trace_fn_effect(f, &bindings, decls, eff, bit, &stack, f.origin);
+}
+
+fn witness_notes(f: FnDecl, decls: ArrayList[*Node], eff: map.StringMap[i32], violated: i32) []u8 {
+    let out: []u8 = "";
+    let bit: i32 = 1;
+    while (bit <= 512) {
+        if ((violated & bit) != 0) {
+            let path: []u8 = effect_witness(f, decls, eff, bit);
+            if (path.len > 0) {
+                if (out.len > 0) { out = _zag_str_concat(out, "\n"); }
+                out = _zag_str_concat(out, _zag_str_concat("   = effect path [", _zag_str_concat(effect_name(bit), _zag_str_concat("]: ", path))));
+            }
+        }
+        bit = bit * 2;
+    }
+    return out;
+}
+
 fn report_fn(f: FnDecl, decls: ArrayList[*Node], eff: map.StringMap[i32], src: []u8, file: []u8) i32 {
     if (f.is_extern == 1) { return 0; }
     let count: i32 = 0;
@@ -1190,10 +1547,14 @@ fn report_fn(f: FnDecl, decls: ArrayList[*Node], eff: map.StringMap[i32], src: [
                 if (@strEq(a, "@total") && fn_total_safe(f, eff) == 1) {
                     i = i + 1;
                 } else {
+                    let violated: i32 = myeff & forb;
+                    let witnesses: []u8 = witness_notes(f, decls, eff, violated);
+                    let note: []u8 = annot_note(a);
+                    if (witnesses.len > 0) { note = _zag_str_concat(note, _zag_str_concat("\n", witnesses)); }
                     diag_emit("E0002",
                         _zag_str_concat("capability violation — `", _zag_str_concat(a, _zag_str_concat("` constraint broken in function `", _zag_str_concat(f.name, "`")))),
                         file, f.line, 1, f.name.len,
-                        annot_note(a),
+                        note,
                         annot_hint(a),
                         src);
                     count = count + 1;
@@ -1268,6 +1629,7 @@ fn store_stmt(n: *Node, env: *map.StringMap[i32], f: FnDecl, decls: ArrayList[*N
         .if_     => |x| store_body(x.then_body, env, f, decls, eff, src, file) + store_body(x.els_body, env, f, decls, eff, src, file),
         .while_  => |w| store_body(w.body, env, f, decls, eff, src, file),
         .unsafe_ => |u| store_body(u.body, env, f, decls, eff, src, file),
+        .defer_  => |d| store_expr(d.expr, env, decls, eff, src, file),
         .switch_ => |sw| store_switch(sw, env, f, decls, eff, src, file),
         else     => 0,
     };
@@ -1481,6 +1843,12 @@ fn check_eu_stmt(fn_name: []u8, n: *Node, decls: ArrayList[*Node], src: []u8, fi
             // Only flag when there is an explicit non-!T type annotation AND an
             // initialiser that is a bare call to a Raises-effect function.
             if (l.has_init == 0) { return 0; }
+            if (l.has_dty == 1 && is_eu_ret(l.dty) == 1) {
+                // The typed pass has already proved that this destination
+                // accepts the complete !T value. This is storage, not an
+                // ignored error result.
+                return 0;
+            }
             if (l.has_dty == 1 && is_eu_ret(l.dty) == 0) {
                 let callee: []u8 = eu_bare_callee(l.expr, decls);
                 if (callee.len > 0) {
@@ -1517,6 +1885,7 @@ fn check_eu_stmt(fn_name: []u8, n: *Node, decls: ArrayList[*Node], src: []u8, fi
             return acc;
         }
         .unsafe_ => |u| { return check_eu_stmts(fn_name, u.body, decls, src, file); }
+        .defer_ => |d| { return check_eu_expr(fn_name, d.expr, decls, src, file); }
         .switch_ => |sw| {
             let acc: i32 = check_eu_expr(fn_name, sw.subject, decls, src, file);
             let si: i32 = 0;

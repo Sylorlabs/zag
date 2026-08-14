@@ -15,6 +15,7 @@
 
 @import("aisa.zag")
 @import("../parse.zag")
+@import("../vsa_type.zag")
 
 fn ac_parse_i64(s: []u8) i64 {
     let i: i32 = 0;
@@ -157,6 +158,9 @@ struct AEnv {
     byref: ArrayList[i32],
     break_lbls: ArrayList[i32],
     continue_lbls: ArrayList[i32],
+    defer_exprs: ArrayList[*Node],
+    errdefer_exprs: ArrayList[*Node],
+    is_err_slot: i32,
 }
 
 struct ACg {
@@ -201,11 +205,19 @@ struct ACg {
     use_s2: i32,
     frame_words: i32,
     epilogue: i32,
+    pre_epilogue: i32,
     sret_disp: i32,     // frame disp of the saved x8 sret pointer (0 = none)
     sret_words: i32,    // words of the aggregate being returned (0 = scalar)
     ret_ty: []u8,       // current fn's return type
     nl_off: i32,        // data offset of the interned "\n" (-1 = not yet)
     decls: ArrayList[*Node],
+    v2_edition: i32,    // 1 when the project is edition 2027 (v2 ownership rules)
+    safety_checked: i32, // emit edition-2027 raw-pointer null/alignment guards
+    sanitize_memory: i32, // checked provenance plus exit-time leak failure
+    object_mode: i32,   // ET_REL mode; direct foreign calls become relocations
+    dynamic_mode: i32,  // explicit shared-library ABI mode (never implicit)
+    dynamic_names: *ArrayList[[]u8], // GOT slots, in declaration order
+    globals: *ArrayList[GlobalSym], // explicit zero-initialized v2 scalar globals
 }
 
 fn ac_fresh(cg: *ACg) i32 {
@@ -217,6 +229,69 @@ fn ac_fresh(cg: *ACg) i32 {
 fn ac_err(cg: *ACg, msg: []u8) void {
     _zag_eprintln(msg);
     cg.*.err = cg.*.err + 1;
+}
+
+// ── v2 global symbol helpers (mirror cg_global_* but for ACg) ──────────────
+fn ac_global_find(cg: *ACg, name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < cg.*.globals.*.len) {
+        if (@strEq(get[GlobalSym](cg.*.globals.*, i).name, name)) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn ac_global_addr(cg: *ACg, name: []u8) i64 {
+    let i: i32 = ac_global_find(cg, name);
+    if (i < 0) { return 0; }
+    return get[GlobalSym](cg.*.globals.*, i).addr;
+}
+
+// ── dynamic/object mode helpers ────────────────────────────────────────────
+fn ac_dynamic_got_vaddr() i64 { return 150994944; } // 0x9000000 (matches x86 GOT)
+
+fn ac_dynamic_index(cg: *ACg, name: []u8) i32 {
+    if (cg.*.dynamic_mode == 0 && cg.*.object_mode == 0) { return 0 - 1; }
+    let i: i32 = 0;
+    while (i < cg.*.dynamic_names.*.len) {
+        if (@strEq(get[[]u8](cg.*.dynamic_names.*, i), name)) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Collect v2 global symbols into the ACg globals list (mirrors cg_collect_globals
+// but uses ACg's ac_is_aggregate / ac_err).
+fn ac_collect_globals(decls: ArrayList[*Node], cg: *ACg, out: *ArrayList[GlobalSym]) void {
+    let i: i32 = 0;
+    while (i < decls.len) {
+        switch (decls.data[i].*) {
+            .let_ => |l| {
+                if (l.is_global == 1) {
+                    let ty: []u8 = cg_norm_type(l.dty);
+                    if (l.has_dty == 0 || ty.len == 0 ||
+                        ac_is_aggregate(cg, ty) == 1 || cg_is_fn_type(ty) == 1) {
+                        ac_err(cg, "arm64: global storage currently supports only explicitly typed scalar values");
+                    } else if (cg_global_zero_initializer(l) == 0) {
+                        ac_err(cg, "arm64: global storage currently requires zero initialization");
+                    } else if (out.*.len >= CG_GLOBAL_CAP()) {
+                        ac_err(cg, "arm64: global storage capacity exhausted");
+                    } else {
+                        let gi: i32 = 0;
+                        let duplicate: i32 = 0;
+                        while (gi < out.*.len) {
+                            if (@strEq(out.*.data[gi].name, l.name)) { duplicate = 1; }
+                            gi = gi + 1;
+                        }
+                        if (duplicate == 1) { ac_err(cg, "arm64: duplicate global declaration"); }
+                        else { push[GlobalSym](out, GlobalSym{ .name = l.name, .ty = ty, .addr = CG_GLOBAL_BASE() + ((out.*.len as i64) * 8) }); }
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
 }
 
 fn ac_align16(n: i32) i32 {
@@ -231,6 +306,13 @@ fn ac_round8(n: i32) i32 {
     return n + (8 - r);
 }
 
+fn ac_align_up(n: i32, alignment: i32) i32 {
+    if (alignment <= 1) { return n; }
+    let r: i32 = n % alignment;
+    if (r == 0) { return n; }
+    return n + (alignment - r);
+}
+
 fn ac_env_new() AEnv {
     return AEnv{
         .names = make[[]u8](8),
@@ -239,6 +321,9 @@ fn ac_env_new() AEnv {
         .byref = make[i32](8),
         .break_lbls = make[i32](4),
         .continue_lbls = make[i32](4),
+        .defer_exprs = make[*Node](4),
+        .errdefer_exprs = make[*Node](4),
+        .is_err_slot = 0,
     };
 }
 
@@ -340,6 +425,7 @@ fn ac_type_size(cg: *ACg, ty0: []u8) i32 {
     let ty: []u8 = cg_norm_type(ty0);
     if (ty.len == 0) { return 8; }
     if (ty[0] == '*') { return 8; }
+    if (vsa_type_valid(ty) == 1) { return vsa_type_words(ty) * 8; }
     if (ac_type_is_slice(ty) == 1) { return 16; }
     if (@strEq(ty, "fat_fn")) { return 16; }        // {code_ptr, env_ptr}
     if (cg_is_fn_type(ty) == 1) { return 16; }
@@ -347,6 +433,33 @@ fn ac_type_size(cg: *ACg, ty0: []u8) i32 {
     if (ty[0] == '?') { return 8 + ac_round8(ac_type_size(cg, ty[1..])); }
     let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1), .tparams = make[[]u8](1), .is_pub = 0, .origin = "<root>" };
     if (ac_find_struct(cg, ty, &sd) == 1) {
+        if (sd.repr_c == 1) {
+            let total_c: i32 = 0;
+            let max_align: i32 = 1;
+            let ci: i32 = 0;
+            while (ci < sd.fields.len) {
+                let cp: Param = sd.fields.data[ci];
+                let ca: i32 = ac_c_leaf_alignment(cp.pty);
+                if (ca > max_align) { max_align = ca; }
+                total_c = ac_align_up(total_c, ca);
+                total_c = total_c + ac_c_leaf_size(cp.pty);
+                ci = ci + 1;
+            }
+            let explicit_c: i32 = ac_struct_explicit_align(sd);
+            if (explicit_c > max_align) { max_align = explicit_c; }
+            return ac_align_up(total_c, max_align);
+        }
+        if (ac_struct_layout_annot(sd, "@repr(packed)") == 1) {
+            let packed_size: i32 = 0;
+            let pi: i32 = 0;
+            while (pi < sd.fields.len) {
+                packed_size = packed_size + ac_c_leaf_size(sd.fields.data[pi].pty);
+                pi = pi + 1;
+            }
+            let pa: i32 = ac_struct_explicit_align(sd);
+            if (pa > 1) { return ac_align_up(packed_size, pa); }
+            return packed_size;
+        }
         let total: i32 = 0;
         let i: i32 = 0;
         while (i < len[Param](sd.fields)) {
@@ -354,6 +467,8 @@ fn ac_type_size(cg: *ACg, ty0: []u8) i32 {
             i = i + 1;
         }
         if (total == 0) { return 8; }
+        let explicit: i32 = ac_struct_explicit_align(sd);
+        if (explicit > 1) { return ac_align_up(total, explicit); }
         return total;
     }
     let ud: UnionDecl = UnionDecl{ .name = "", .fields = make[Param](1) };
@@ -374,6 +489,52 @@ fn ac_type_size(cg: *ACg, ty0: []u8) i32 {
     return 8;
 }
 
+fn ac_struct_layout_annot(sd: StructDecl, wanted: []u8) i32 {
+    let i: i32 = 0;
+    while (i < sd.annots.len) {
+        if (@strEq(sd.annots.data[i], wanted)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn ac_struct_explicit_align(sd: StructDecl) i32 {
+    let result: i32 = 0;
+    let i: i32 = 0;
+    while (i < sd.annots.len) {
+        let a: []u8 = sd.annots.data[i];
+        if (a.len >= 9 && a[0] == '@' && @strEq(a[0..7], "@align(") && a[a.len - 1] == ')') {
+            result = _zag_str_to_i64(a[7..a.len - 1]) as i32;
+        }
+        i = i + 1;
+    }
+    return result;
+}
+fn ac_layout_scalar_size(ty: []u8) i32 {
+    if (@strEq(ty, "bool") || @strEq(ty, "i8") || @strEq(ty, "u8")) { return 1; }
+    if (@strEq(ty, "i16") || @strEq(ty, "u16")) { return 2; }
+    if (@strEq(ty, "i32") || @strEq(ty, "u32") || @strEq(ty, "f32")) { return 4; }
+    if (@strEq(ty, "i64") || @strEq(ty, "u64") || @strEq(ty, "isize") ||
+        @strEq(ty, "usize") || @strEq(ty, "f64")) { return 8; }
+    if (ty.len > 0 && ty[0] == '*') { return 8; }
+    return 0;
+}
+
+// AArch64 Linux C leaves use their natural byte width. Keep this separate
+// from the ordinary Zag word representation: @repr(C) aggregates are laid
+// out in bytes, while normal compiler frames remain eight-byte slots.
+fn ac_c_leaf_size(ty0: []u8) i32 {
+    let ty: []u8 = cg_norm_type(ty0);
+    if (ty.len > 0 && ty[0] == '*') { return 8; }
+    if (@strEq(ty, "bool") || @strEq(ty, "i8") || @strEq(ty, "u8")) { return 1; }
+    if (@strEq(ty, "i16") || @strEq(ty, "u16")) { return 2; }
+    if (@strEq(ty, "i32") || @strEq(ty, "u32") || @strEq(ty, "f32")) { return 4; }
+    if (@strEq(ty, "i64") || @strEq(ty, "u64") || @strEq(ty, "isize") ||
+        @strEq(ty, "usize") || @strEq(ty, "f64")) { return 8; }
+    return 0;
+}
+
+fn ac_c_leaf_alignment(ty: []u8) i32 { return ac_c_leaf_size(ty); }
+
 fn ac_type_words(cg: *ACg, ty: []u8) i32 {
     return ac_round8(ac_type_size(cg, ty)) / 8;
 }
@@ -383,10 +544,49 @@ fn ac_elem_stride(cg: *ACg, ty: []u8) i32 {
     return ac_round8(ac_type_size(cg, ty));
 }
 
+fn ac_type_width(cg: *ACg, ty: []u8) i32 {
+    return ac_elem_stride(cg, ty);
+}
+
+fn ac_type_alignment(cg: *ACg, ty: []u8) i32 {
+    let n: []u8 = cg_norm_type(ty);
+    if (n.len == 0) { return 1; }
+    if (n[0] == '*') { return 8; }
+    if (vsa_type_valid(n) == 1) { return 8; }
+    if (@strEq(n, "i64") || @strEq(n, "u64") || @strEq(n, "f64")) { return 8; }
+    if (@strEq(n, "i32") || @strEq(n, "u32") || @strEq(n, "f32")) { return 4; }
+    if (@strEq(n, "i16") || @strEq(n, "u16")) { return 2; }
+    if (@strEq(n, "i8") || @strEq(n, "u8") || @strEq(n, "bool")) { return 1; }
+    let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1), .tparams = make[[]u8](1), .is_pub = 0, .origin = "<root>" };
+    if (ac_find_struct(cg, n, &sd) == 1) {
+        if (sd.repr_c == 1) {
+            let ca: i32 = 1;
+            let ci: i32 = 0;
+            while (ci < sd.fields.len) {
+                let fa: i32 = ac_c_leaf_alignment(sd.fields.data[ci].pty);
+                if (fa > ca) { ca = fa; }
+                ci = ci + 1;
+            }
+            let explicit_c: i32 = ac_struct_explicit_align(sd);
+            if (explicit_c > ca) { return explicit_c; }
+            return ca;
+        }
+        if (ac_struct_layout_annot(sd, "@repr(packed)") == 1) {
+            let packed: i32 = ac_struct_explicit_align(sd);
+            if (packed > 1) { return packed; }
+            return 1;
+        }
+        let explicit: i32 = ac_struct_explicit_align(sd);
+        if (explicit > 8) { return explicit; }
+    }
+    return ac_elem_stride(cg, ty);
+}
+
 fn ac_is_aggregate(cg: *ACg, ty0: []u8) i32 {
     let ty: []u8 = cg_norm_type(ty0);
     if (ty.len == 0) { return 0; }
     if (ty[0] == '*') { return 0; }
+    if (vsa_type_valid(ty) == 1) { return 1; }
     if (ac_type_is_slice(ty) == 1) { return 1; }
     if (@strEq(ty, "fat_fn")) { return 1; }
     if (cg_is_fn_type(ty) == 1) { return 1; }
@@ -453,11 +653,22 @@ fn ac_field_offset(cg: *ACg, sname0: []u8, fname: []u8) i32 {
     let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1), .tparams = make[[]u8](1), .is_pub = 0, .origin = "<root>" };
     if (ac_find_struct(cg, sname, &sd) == 0) { return 0 - 1; }
     let off: i32 = 0;
+    let repr_c: i32 = sd.repr_c;
+    let packed: i32 = ac_struct_layout_annot(sd, "@repr(packed)");
     let i: i32 = 0;
     while (i < len[Param](sd.fields)) {
         let p: Param = get[Param](sd.fields, i);
-        if (@strEq(p.name, fname)) { return off; }
-        off = off + ac_round8(ac_type_size(cg, p.pty));
+        if (repr_c == 1) {
+            off = ac_align_up(off, ac_c_leaf_alignment(p.pty));
+            if (@strEq(p.name, fname)) { return off; }
+            off = off + ac_c_leaf_size(p.pty);
+        } else if (packed == 1) {
+            if (@strEq(p.name, fname)) { return off; }
+            off = off + ac_c_leaf_size(p.pty);
+        } else {
+            if (@strEq(p.name, fname)) { return off; }
+            off = off + ac_round8(ac_type_size(cg, p.pty));
+        }
         i = i + 1;
     }
     return 0 - 1;
@@ -474,6 +685,34 @@ fn ac_field_type(cg: *ACg, sname0: []u8, fname: []u8) []u8 {
         i = i + 1;
     }
     return "";
+}
+
+// Non-zero only for the byte-exact fields whose declaration controls the
+// aggregate layout. Ordinary Zag fields continue to use one eight-byte word.
+fn ac_layout_field_width(cg: *ACg, sname0: []u8, fname: []u8) i32 {
+    let sname: []u8 = cg_norm_type(sname0);
+    let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1), .tparams = make[[]u8](1), .is_pub = 0, .origin = "<root>" };
+    if (ac_find_struct(cg, sname, &sd) == 0) { return 0; }
+    if (sd.repr_c == 0 && ac_struct_layout_annot(sd, "@repr(packed)") == 0) { return 0; }
+    return ac_c_leaf_size(ac_field_type(cg, sname, fname));
+}
+
+fn ac_emit_load_layout(out: *ArrayList[AInstr], base: i32, off: i32, width: i32, ty0: []u8) void {
+    let ty: []u8 = cg_norm_type(ty0);
+    if (width == 1) { push[AInstr](out, ai_loadb(A_X0(), base, off)); }
+    else if (width == 2) { push[AInstr](out, ai_loadh(A_X0(), base, off)); }
+    else if (width == 4) { push[AInstr](out, ai_loadw(A_X0(), base, off)); }
+    else { push[AInstr](out, ai_load(A_X0(), base, off)); }
+    if (@strEq(ty, "i8")) { push[AInstr](out, ai_sxtb(A_X0(), A_X0())); }
+    else if (@strEq(ty, "i16")) { push[AInstr](out, ai_sxth(A_X0(), A_X0())); }
+    else if (@strEq(ty, "i32")) { push[AInstr](out, ai_sxtw(A_X0(), A_X0())); }
+}
+
+fn ac_emit_store_layout(out: *ArrayList[AInstr], base: i32, off: i32, width: i32, src: i32) void {
+    if (width == 1) { push[AInstr](out, ai_storeb(base, off, src)); }
+    else if (width == 2) { push[AInstr](out, ai_storeh(base, off, src)); }
+    else if (width == 4) { push[AInstr](out, ai_storew(base, off, src)); }
+    else { push[AInstr](out, ai_store(base, off, src)); }
 }
 
 // ── slots ────────────────────────────────────────────────────────────────────
@@ -622,6 +861,62 @@ fn ac_emit_copy(out: *ArrayList[AInstr], words: i32) void {
     }
 }
 
+fn ac_vsa_mask_last(out: *ArrayList[AInstr], ty: []u8, reg: i32) void {
+    if (vsa_type_final_bits(ty) != 64) {
+        push[AInstr](out, ai_mov_imm(A_X15(), vsa_type_final_mask(ty)));
+        push[AInstr](out, ai_andr(reg, A_X15()));
+    }
+}
+
+// A VSA expression evaluates to the address of a packed immutable aggregate.
+// Full 128-bit pairs use mandatory AArch64 Advanced SIMD; odd and masked tail
+// words use the same scalar authority, keeping every dimension bit-identical.
+fn ac_lower_vsa_bin(out: *ArrayList[AInstr], b: Bin, lty: []u8, rty: []u8,
+                    env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) void {
+    if (vsa_type_valid(lty) == 0 || !@strEq(lty, rty)) {
+        ac_err(cg, "arm64: VSA operands require the same valid vsa_b<N> type");
+        push[AInstr](out, ai_mov_imm(A_X0(), 0));
+        push[AInstr](out, ai_push(A_X0()));
+        return;
+    }
+    if (!@strEq(b.op, "^") && !@strEq(b.op, "&") && !@strEq(b.op, "|")) {
+        ac_err(cg, "arm64: vsa_b<N> supports only ^, &, and | operators");
+        push[AInstr](out, ai_mov_imm(A_X0(), 0));
+        push[AInstr](out, ai_push(A_X0()));
+        return;
+    }
+    let words: i32 = vsa_type_words(lty);
+    let result: i32 = ac_slot_scratch(cg, words);
+    ac_lower_expr(out, b.l, env, syms, cg);
+    ac_lower_expr(out, b.r, env, syms, cg);
+    push[AInstr](out, ai_pop(A_X11()));
+    push[AInstr](out, ai_pop(A_X10()));
+    let wi: i32 = 0;
+    let vector_words: i32 = words;
+    if (vsa_type_final_bits(lty) != 64) { vector_words = vector_words - 1; }
+    while (wi + 1 < vector_words) {
+        push[AInstr](out, ai_vloadq(0, A_X10(), wi * 8));
+        push[AInstr](out, ai_vloadq(1, A_X11(), wi * 8));
+        if (@strEq(b.op, "^")) { push[AInstr](out, ai_veor(0, 1)); }
+        else if (@strEq(b.op, "&")) { push[AInstr](out, ai_vand(0, 1)); }
+        else { push[AInstr](out, ai_vorr(0, 1)); }
+        push[AInstr](out, ai_vstoreq(A_X29(), result + wi * 8, 0));
+        wi = wi + 2;
+    }
+    while (wi < words) {
+        push[AInstr](out, ai_load(A_X0(), A_X10(), wi * 8));
+        push[AInstr](out, ai_load(A_X1(), A_X11(), wi * 8));
+        if (@strEq(b.op, "^")) { push[AInstr](out, ai_xor(A_X0(), A_X1())); }
+        else if (@strEq(b.op, "&")) { push[AInstr](out, ai_andr(A_X0(), A_X1())); }
+        else { push[AInstr](out, ai_or(A_X0(), A_X1())); }
+        if (wi + 1 == words) { ac_vsa_mask_last(out, lty, A_X0()); }
+        push[AInstr](out, ai_store(A_X29(), result + wi * 8, A_X0()));
+        wi = wi + 1;
+    }
+    ac_emit_lea(out, A_X0(), result);
+    push[AInstr](out, ai_push(A_X0()));
+}
+
 // branch over a __div0 call when the divisor (x1) is nonzero
 fn ac_emit_div0_guard(out: *ArrayList[AInstr], cg: *ACg) void {
     let l_ok: i32 = ac_fresh(cg);
@@ -719,13 +1014,25 @@ fn ac_expr_type(n: *Node, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) []u8 {
                     if (@strEq(fnid.name, "_zag_argc") || @strEq(fnid.name, "_zag_exec_cmd") || @strEq(fnid.name, "_zag_write_file") || @strEq(fnid.name, "_zag_write_exec") || @strEq(fnid.name, "_zag_file_exists")) { return "i32"; }
                     if (@strEq(fnid.name, "_zag_str_to_i64")) { return "i64"; }
                     if (@strEq(fnid.name, "_zag_slice_ptr")) { return "*i8"; }
-                    if (@strEq(fnid.name, "_zag_raw_syscall") || @strEq(fnid.name, "_zag_x86_cpuid_eax") ||
+                    if (@strEq(fnid.name, "_zag_read_fd") ||
+                        @strEq(fnid.name, "_zag_raw_syscall") || @strEq(fnid.name, "_zag_x86_cpuid_eax") ||
                         @strEq(fnid.name, "_zag_x86_cpuid_ebx") || @strEq(fnid.name, "_zag_x86_cpuid_ecx") ||
                         @strEq(fnid.name, "_zag_x86_cpuid_edx") || @strEq(fnid.name, "_zag_x86_xgetbv")) { return "i64"; }
                     if (@strEq(fnid.name, "__catch") || @strEq(fnid.name, "__catchc")) {
                         let cty0: []u8 = ac_expr_type(get[*Node](c.args, 0), env, syms, cg);
                         if (cty0.len > 1 && cty0[0] == '!') { return cty0[1..]; }
                         return cty0;
+                    }
+                    if (@strEq(fnid.name, "@vsaZero") || @strEq(fnid.name, "@vsaFromWords") ||
+                        @strEq(fnid.name, "@vsaMajority3")) {
+                        if (len[[]u8](c.targs) == 1 && vsa_type_valid(get[[]u8](c.targs, 0)) == 1) {
+                            return get[[]u8](c.targs, 0);
+                        }
+                        return "";
+                    }
+                    if (@strEq(fnid.name, "@vsaWord") || @strEq(fnid.name, "@vsaHamming") ||
+                        @strEq(fnid.name, "@vsaDimension") || @strEq(fnid.name, "@vsaWordCount")) {
+                        return "i64";
                     }
                     if (fnid.name.len > 0 && fnid.name[0] == '@') { return ""; }
                     if (len[[]u8](c.targs) > 0) {
@@ -889,6 +1196,12 @@ fn ac_materialize_fat_fn(out: *ArrayList[AInstr], name: []u8, lbl: i32, env: *AE
 fn ac_lower_addr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) void {
     switch (n.*) {
         .id => |x| {
+            let gaddr: i64 = ac_global_addr(cg, x.name);
+            if (gaddr != 0) {
+                push[AInstr](out, ai_mov_imm(A_X0(), gaddr));
+                push[AInstr](out, ai_push(A_X0()));
+                return;
+            }
             let disp: i32 = ac_slot_find(env, x.name);
             if (disp == 0) {
                 ac_err(cg, _zag_str_concat("arm64: address of unknown identifier: ", x.name));
@@ -949,11 +1262,7 @@ fn ac_lower_addr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
             ac_lower_expr(out, ix.idx, env, syms, cg);
             push[AInstr](out, ai_pop(A_X1()));
             push[AInstr](out, ai_pop(A_X0()));
-            if (stride != 1) {
-                push[AInstr](out, ai_mov_imm(A_X9(), stride as i64));
-                push[AInstr](out, ai_mul(A_X1(), A_X1(), A_X9()));
-            }
-            push[AInstr](out, ai_add(A_X0(), A_X1()));
+            ac_emit_raw_index_address(out, cg, stride);
             push[AInstr](out, ai_push(A_X0()));
         }
         else => {
@@ -998,6 +1307,14 @@ fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
             }
             if (@strEq(x.name, "false") || @strEq(x.name, "null")) {
                 push[AInstr](out, ai_mov_imm(A_X0(), 0));
+                push[AInstr](out, ai_push(A_X0()));
+                return;
+            }
+            // v2 global scalar: load from the BSS global cell
+            let gaddr: i64 = ac_global_addr(cg, x.name);
+            if (gaddr != 0) {
+                push[AInstr](out, ai_mov_imm(A_X0(), gaddr));
+                push[AInstr](out, ai_load(A_X0(), A_X0(), 0));
                 push[AInstr](out, ai_push(A_X0()));
                 return;
             }
@@ -1070,7 +1387,10 @@ fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
                 } else {
                     ac_err(cg, "arm64: try in a fn that does not return !T");
                 }
-                push[AInstr](out, ai_jmp(cg.*.epilogue));
+                // try error propagation: set is_err=1 for errdefer, jump to cleanup.
+                push[AInstr](out, ai_mov_imm(A_X9(), 1));
+                push[AInstr](out, ai_store(A_X29(), env.*.is_err_slot, A_X9()));
+                push[AInstr](out, ai_jmp(cg.*.pre_epilogue));
                 push[AInstr](out, ai_label(l_ok));
                 push[AInstr](out, ai_load(A_X0(), A_X10(), 8));
                 push[AInstr](out, ai_push(A_X0()));
@@ -1136,6 +1456,12 @@ fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
                 push[AInstr](out, ai_push(A_X0()));
                 return;
             }
+            let lty_vsa: []u8 = ac_expr_type(b.l, env, syms, cg);
+            let rty_vsa: []u8 = ac_expr_type(b.r, env, syms, cg);
+            if (vsa_type_valid(lty_vsa) == 1 || vsa_type_valid(rty_vsa) == 1) {
+                ac_lower_vsa_bin(out, b, lty_vsa, rty_vsa, env, syms, cg);
+                return;
+            }
             let flt: i32 = ac_is_float(ac_expr_type(b.l, env, syms, cg));
             let frt: i32 = ac_is_float(ac_expr_type(b.r, env, syms, cg));
             if (flt == 1 || frt == 1) {
@@ -1169,6 +1495,136 @@ fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
                 push[AInstr](out, ai_fmov_xd(A_X0(), 0));
                 push[AInstr](out, ai_push(A_X0()));
                 return;
+            }
+            // ── posit types: arithmetic via runtime calls ──────────────────────
+            // Posit binary ops (+,-,*,/) call znrt_<ptype>_<op>(x0=a, x1=b) → x0.
+            // Comparisons fall through to integer compare (bit-pattern ordering).
+            let lty_p: []u8 = ac_expr_type(b.l, env, syms, cg);
+            let rty_p: []u8 = ac_expr_type(b.r, env, syms, cg);
+            let lp: i32 = cg_is_posit_ty(lty_p);
+            let rp: i32 = cg_is_posit_ty(rty_p);
+            if (lp == 1 || rp == 1) {
+                let pty: []u8 = lty_p;
+                if (lp == 0) { pty = rty_p; }
+                if (ac_cmp_cc(b.op) >= 0) {
+                    // comparisons: use integer compare on bit patterns
+                    ac_lower_expr(out, b.l, env, syms, cg);
+                    ac_lower_expr(out, b.r, env, syms, cg);
+                    push[AInstr](out, ai_pop(A_X1()));
+                    push[AInstr](out, ai_pop(A_X0()));
+                    push[AInstr](out, ai_cmp(A_X0(), A_X1()));
+                    let l0: i32 = ac_fresh(cg);
+                    let l1: i32 = ac_fresh(cg);
+                    ac_push_jcc_false(out, b.op, l0);
+                    push[AInstr](out, ai_mov_imm(A_X0(), 1));
+                    push[AInstr](out, ai_jmp(l1));
+                    push[AInstr](out, ai_label(l0));
+                    push[AInstr](out, ai_mov_imm(A_X0(), 0));
+                    push[AInstr](out, ai_label(l1));
+                    push[AInstr](out, ai_push(A_X0()));
+                    return;
+                }
+                let opfn: []u8 = cg_posit_op_fn(pty, b.op);
+                if (opfn.len > 0) {
+                    let opl: i32 = ac_find_fn(syms, opfn);
+                    if (opl < 0) { ac_err(cg, "arm64: posit runtime fn not found"); }
+                    ac_lower_expr(out, b.l, env, syms, cg);
+                    ac_lower_expr(out, b.r, env, syms, cg);
+                    push[AInstr](out, ai_pop(A_X1()));
+                    push[AInstr](out, ai_pop(A_X0()));
+                    push[AInstr](out, ai_call(opl));
+                    push[AInstr](out, ai_push(A_X0()));
+                    return;
+                }
+                ac_err(cg, "arm64: unsupported posit operator");
+                push[AInstr](out, ai_mov_imm(A_X0(), 0));
+                push[AInstr](out, ai_push(A_X0()));
+                return;
+            }
+            // ── RNS types: arithmetic via runtime calls (aggregate sret) ────────
+            let lr: i32 = cg_is_rns_ty(lty_p);
+            let rr: i32 = cg_is_rns_ty(rty_p);
+            if (lr == 1 || rr == 1) {
+                let rfn: []u8 = cg_rns_op_fn(b.op);
+                if (rfn.len > 0) {
+                    let rargs: ArrayList[*Node] = make[*Node](2);
+                    push[*Node](&rargs, b.l);
+                    push[*Node](&rargs, b.r);
+                    ac_lower_call(out, Call{ .callee = mk_ident(rfn), .args = rargs, .targs = make[[]u8](1) }, env, syms, cg);
+                    return;
+                }
+                ac_err(cg, "arm64: unsupported RNS operator");
+                push[AInstr](out, ai_mov_imm(A_X0(), 0));
+                push[AInstr](out, ai_push(A_X0()));
+                return;
+            }
+            // ── saturated arithmetic: via runtime calls ────────────────────────
+            // Sat +,-,* call znrt_sat_<base>_<op>(x0=a, x1=b) → x0.
+            let lsf: i32 = cg_is_satfixarb_ty(lty_p);
+            let rsf: i32 = cg_is_satfixarb_ty(rty_p);
+            if (lsf == 1 || rsf == 1) {
+                let nty: []u8 = lty_p;
+                if (lsf == 0) { nty = rty_p; }
+                // Saturated arithmetic
+                if (cg_is_sat_ty(nty) == 1) {
+                    let opfn: []u8 = cg_sat_op_fn(nty, b.op);
+                    if (opfn.len > 0) {
+                        let opl: i32 = ac_find_fn(syms, opfn);
+                        if (opl < 0) { ac_err(cg, "arm64: sat runtime fn not found"); }
+                        ac_lower_expr(out, b.l, env, syms, cg);
+                        ac_lower_expr(out, b.r, env, syms, cg);
+                        push[AInstr](out, ai_pop(A_X1()));
+                        push[AInstr](out, ai_pop(A_X0()));
+                        push[AInstr](out, ai_call(opl));
+                        push[AInstr](out, ai_push(A_X0()));
+                        return;
+                    }
+                    // division/comparisons: fall through to native integer path
+                }
+                // Fixed-point: only * uses runtime; +,-,/,% are native integer
+                if (cg_is_fixed_ty(nty) == 1) {
+                    if (@strEq(b.op, "*")) {
+                        let fl: i32 = ac_find_fn(syms, "znrt_fixed_mul");
+                        let fbits: i64 = cg_fixed_frac_bits(nty);
+                        if (fl < 0) { ac_err(cg, "arm64: fixed_mul runtime fn not found"); }
+                        ac_lower_expr(out, b.l, env, syms, cg);
+                        ac_lower_expr(out, b.r, env, syms, cg);
+                        push[AInstr](out, ai_pop(A_X1()));
+                        push[AInstr](out, ai_pop(A_X0()));
+                        push[AInstr](out, ai_mov_imm(A_X2(), fbits));
+                        push[AInstr](out, ai_call(fl));
+                        push[AInstr](out, ai_push(A_X0()));
+                        return;
+                    }
+                    // +,-,/,% : native int ops — fall through
+                }
+                // Arbitrary-width unsigned integers: inline masking
+                if (cg_is_arb_int_ty(nty) == 1 && cg_arb_int_signed(nty) == 0) {
+                    let is_mask_op: i32 = 0;
+                    if (@strEq(b.op, "+") || @strEq(b.op, "-") || @strEq(b.op, "*")
+                        || @strEq(b.op, "&") || @strEq(b.op, "^") || @strEq(b.op, "|")) { is_mask_op = 1; }
+                    if (is_mask_op == 1) {
+                        let nbits: i64 = cg_arb_int_bits(nty);
+                        ac_lower_expr(out, b.l, env, syms, cg);
+                        ac_lower_expr(out, b.r, env, syms, cg);
+                        push[AInstr](out, ai_pop(A_X1()));
+                        push[AInstr](out, ai_pop(A_X0()));
+                        if (@strEq(b.op, "+")) { push[AInstr](out, ai_add(A_X0(), A_X1())); }
+                        else if (@strEq(b.op, "-")) { push[AInstr](out, ai_sub(A_X0(), A_X1())); }
+                        else if (@strEq(b.op, "*")) { push[AInstr](out, ai_mul(A_X0(), A_X0(), A_X1())); }
+                        else if (@strEq(b.op, "&")) { push[AInstr](out, ai_andr(A_X0(), A_X1())); }
+                        else if (@strEq(b.op, "^")) { push[AInstr](out, ai_xor(A_X0(), A_X1())); }
+                        else if (@strEq(b.op, "|")) { push[AInstr](out, ai_or(A_X0(), A_X1())); }
+                        // mask to the low N bits: x0 = x0 & (2^N - 1)
+                        let mask: i64 = cg_arb_mask(nbits);
+                        push[AInstr](out, ai_mov_imm(A_X9(), mask));
+                        push[AInstr](out, ai_andr(A_X0(), A_X9()));
+                        push[AInstr](out, ai_push(A_X0()));
+                        return;
+                    }
+                    // /,%, comparisons: fall through to native integer path
+                }
+                // Signed arb-int: fall through to native integer path
             }
             ac_lower_expr(out, b.l, env, syms, cg);
             ac_lower_expr(out, b.r, env, syms, cg);
@@ -1291,6 +1747,7 @@ fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
                     ac_err(cg, _zag_str_concat("arm64: unknown struct field: ", fi.name));
                 } else {
                     let fty: []u8 = ac_field_type(cg, lit_sname, fi.name);
+                    let layout_width: i32 = ac_layout_field_width(cg, lit_sname, fi.name);
                     if (ac_is_optional(cg_norm_type(fty)) == 1 && ac_is_null_node(fi.val) == 1) {
                         // ?T field = null → {has=0}
                         push[AInstr](out, ai_mov_imm(A_X0(), 0));
@@ -1318,7 +1775,8 @@ fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
                             ac_emit_copy(out, ac_type_words(cg, fty));
                         } else {
                             push[AInstr](out, ai_pop(A_X0()));
-                            push[AInstr](out, ai_store(A_X29(), base + off, A_X0()));
+                            if (layout_width > 0) { ac_emit_store_layout(out, A_X29(), base + off, layout_width, A_X0()); }
+                            else { push[AInstr](out, ai_store(A_X29(), base + off, A_X0())); }
                         }
                     }
                 }
@@ -1354,8 +1812,11 @@ fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
                 if (bt.len > 1 && bt[0] == '*') { elem = bt[1..]; }
                 ac_lower_expr(out, f.base, env, syms, cg);   // pointer value
                 if (ac_is_aggregate(cg, elem) == 1) { return; }  // address IS the value
-                push[AInstr](out, ai_pop(A_X10()));
-                push[AInstr](out, ai_load(A_X0(), A_X10(), 0));
+                push[AInstr](out, ai_pop(A_X0()));
+                let width: i32 = ac_type_width(cg, elem);
+                let align: i32 = ac_type_alignment(cg, elem);
+                ac_emit_checked_raw_access(out, cg, align, width);
+                push[AInstr](out, ai_load(A_X0(), A_X0(), 0));
                 push[AInstr](out, ai_push(A_X0()));
                 return;
             }
@@ -1398,13 +1859,15 @@ fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
                 return;
             }
             let fty: []u8 = ac_field_type(cg, sname, f.fname);
+            let layout_width: i32 = ac_layout_field_width(cg, sname, f.fname);
             ac_lower_expr(out, f.base, env, syms, cg);
             push[AInstr](out, ai_pop(A_X10()));
             if (ac_is_aggregate(cg, fty) == 1) {
                 if (off > 0) { push[AInstr](out, ai_add_imm(A_X10(), off as i64)); }
                 push[AInstr](out, ai_push(A_X10()));
             } else {
-                push[AInstr](out, ai_load(A_X0(), A_X10(), off));
+                if (layout_width > 0) { ac_emit_load_layout(out, A_X10(), off, layout_width, fty); }
+                else { push[AInstr](out, ai_load(A_X0(), A_X10(), off)); }
                 push[AInstr](out, ai_push(A_X0()));
             }
         }
@@ -1695,6 +2158,222 @@ fn ac_lower_indirect_call(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *A
     push[AInstr](out, ai_push(A_X0()));
 }
 
+// ── x86-64 → AArch64 syscall translation ──────────────────────────────────
+// Zag source code uses Linux x86-64 syscall numbers everywhere.  AArch64 Linux
+// uses the asm-generic syscall table, which has different numbers and lacks
+// open/mkdir/unlink/rmdir/rename/dup2/fork (replaced by *at variants).  This
+// function emits a compare-and-remap sequence that translates the x86-64
+// number in x8 to the correct ARM64 number, rearranging x0..x5 where needed,
+// before the svc instruction. Unknown numbers fail closed with -ENOSYS.
+//
+// AT_FDCWD = -100 (the "relative to cwd" dirfd used by all *at syscalls).
+// AT_REMOVEDIR = 512 (flag for unlinkat to remove a directory).
+// SIGCHLD = 17 (clone flags for fork-equivalent behaviour).
+//
+// Linux also exposes architecture-specific open-flag values. In particular,
+// x86-64 assigns DIRECT/LARGEFILE/DIRECTORY/NOFOLLOW to bits 14..17 while
+// AArch64 assigns DIRECTORY/NOFOLLOW/DIRECT/LARGEFILE to those same bits.
+// Rotate those four bits by two positions and preserve every common flag.
+fn ac_emit_open_flags_xlate(out: *ArrayList[AInstr]) void {
+    // ai_and_imm materializes its mask through x9, so x9 cannot retain the
+    // original flags across this sequence. x13 is outside the syscall
+    // argument set and remains untouched by every operation below.
+    push[AInstr](out, ai_mov_rr(A_X13(), A_X2()));
+    push[AInstr](out, ai_mov_rr(A_X10(), A_X13()));
+    push[AInstr](out, ai_and_imm(A_X10(), 49152));       // x86 bits 14..15
+    push[AInstr](out, ai_lsl_imm(A_X10(), A_X10(), 2));
+    push[AInstr](out, ai_mov_rr(A_X11(), A_X13()));
+    push[AInstr](out, ai_and_imm(A_X11(), 196608));      // x86 bits 16..17
+    push[AInstr](out, ai_mov_imm(A_X12(), 2));
+    push[AInstr](out, ai_shr(A_X11(), A_X12()));
+    push[AInstr](out, ai_mov_rr(A_X2(), A_X13()));
+    push[AInstr](out, ai_and_imm(A_X2(), 0 - 245761));   // clear bits 14..17
+    push[AInstr](out, ai_or(A_X2(), A_X10()));
+    push[AInstr](out, ai_or(A_X2(), A_X11()));
+}
+
+fn ac_emit_syscall_xlate(out: *ArrayList[AInstr], cg: *ACg) void {
+    // 33 indexed simple remaps plus nine named remaps and seven
+    // argument-rearrangement cases.
+    let n_remaps: i32 = 40;
+    let l_svc: i32 = ac_fresh(cg);
+    let l_clock_gettime: i32 = ac_fresh(cg);
+    let l_openat: i32 = ac_fresh(cg);
+    let l_getrandom: i32 = ac_fresh(cg);
+    let l_lseek: i32 = ac_fresh(cg);
+    let l_flock: i32 = ac_fresh(cg);
+    let l_ftruncate: i32 = ac_fresh(cg);
+    let l_fstatfs: i32 = ac_fresh(cg);
+    let l_unlinkat: i32 = ac_fresh(cg);
+    let l_renameat: i32 = ac_fresh(cg);
+    let rl: ArrayList[i32] = make[i32](n_remaps);
+    let ri: i32 = 0;
+    while (ri < n_remaps) {
+        rl.data[ri] = ac_fresh(cg);
+        ri = ri + 1;
+    }
+
+    // ── compare chain ──
+    push[AInstr](out, ai_cmp_imm(A_X8(), 0));   push[AInstr](out, ai_je(rl.data[0]));   // read
+    push[AInstr](out, ai_cmp_imm(A_X8(), 1));   push[AInstr](out, ai_je(rl.data[1]));   // write
+    push[AInstr](out, ai_cmp_imm(A_X8(), 3));   push[AInstr](out, ai_je(rl.data[2]));   // close
+    push[AInstr](out, ai_cmp_imm(A_X8(), 5));   push[AInstr](out, ai_je(rl.data[3]));   // fstat
+    push[AInstr](out, ai_cmp_imm(A_X8(), 9));   push[AInstr](out, ai_je(rl.data[4]));   // mmap
+    push[AInstr](out, ai_cmp_imm(A_X8(), 10));  push[AInstr](out, ai_je(rl.data[5]));   // mprotect
+    push[AInstr](out, ai_cmp_imm(A_X8(), 11));  push[AInstr](out, ai_je(rl.data[6]));   // munmap
+    push[AInstr](out, ai_cmp_imm(A_X8(), 13));  push[AInstr](out, ai_je(rl.data[7]));   // rt_sigaction
+    push[AInstr](out, ai_cmp_imm(A_X8(), 14));  push[AInstr](out, ai_je(rl.data[8]));   // rt_sigprocmask
+    push[AInstr](out, ai_cmp_imm(A_X8(), 24));  push[AInstr](out, ai_je(rl.data[9]));   // sched_yield
+    push[AInstr](out, ai_cmp_imm(A_X8(), 35));  push[AInstr](out, ai_je(rl.data[10]));  // nanosleep
+    push[AInstr](out, ai_cmp_imm(A_X8(), 39));  push[AInstr](out, ai_je(rl.data[11]));  // getpid
+    push[AInstr](out, ai_cmp_imm(A_X8(), 41));  push[AInstr](out, ai_je(rl.data[12]));  // socket
+    push[AInstr](out, ai_cmp_imm(A_X8(), 42));  push[AInstr](out, ai_je(rl.data[13]));  // connect
+    push[AInstr](out, ai_cmp_imm(A_X8(), 43));  push[AInstr](out, ai_je(rl.data[14]));  // accept
+    push[AInstr](out, ai_cmp_imm(A_X8(), 44));  push[AInstr](out, ai_je(rl.data[15]));  // sendto
+    push[AInstr](out, ai_cmp_imm(A_X8(), 45));  push[AInstr](out, ai_je(rl.data[16]));  // recvfrom
+    push[AInstr](out, ai_cmp_imm(A_X8(), 49));  push[AInstr](out, ai_je(rl.data[17]));  // bind
+    push[AInstr](out, ai_cmp_imm(A_X8(), 50));  push[AInstr](out, ai_je(rl.data[18]));  // listen
+    push[AInstr](out, ai_cmp_imm(A_X8(), 54));  push[AInstr](out, ai_je(rl.data[19]));  // setsockopt
+    push[AInstr](out, ai_cmp_imm(A_X8(), 56));  push[AInstr](out, ai_je(rl.data[20]));  // clone
+    push[AInstr](out, ai_cmp_imm(A_X8(), 59));  push[AInstr](out, ai_je(rl.data[21]));  // execve
+    push[AInstr](out, ai_cmp_imm(A_X8(), 60));  push[AInstr](out, ai_je(rl.data[22]));  // exit
+    push[AInstr](out, ai_cmp_imm(A_X8(), 61));  push[AInstr](out, ai_je(rl.data[23]));  // wait4
+    push[AInstr](out, ai_cmp_imm(A_X8(), 62));  push[AInstr](out, ai_je(rl.data[24]));  // kill
+    push[AInstr](out, ai_cmp_imm(A_X8(), 74));  push[AInstr](out, ai_je(rl.data[25]));  // fsync
+    push[AInstr](out, ai_cmp_imm(A_X8(), 79));  push[AInstr](out, ai_je(rl.data[26]));  // getcwd
+    push[AInstr](out, ai_cmp_imm(A_X8(), 109)); push[AInstr](out, ai_je(rl.data[27]));  // setpgid
+    push[AInstr](out, ai_cmp_imm(A_X8(), 141)); push[AInstr](out, ai_je(rl.data[28]));  // setpriority
+    push[AInstr](out, ai_cmp_imm(A_X8(), 160)); push[AInstr](out, ai_je(rl.data[29]));  // setrlimit
+    push[AInstr](out, ai_cmp_imm(A_X8(), 202)); push[AInstr](out, ai_je(rl.data[30]));  // futex
+    push[AInstr](out, ai_cmp_imm(A_X8(), 217)); push[AInstr](out, ai_je(rl.data[31]));  // getdents64
+    push[AInstr](out, ai_cmp_imm(A_X8(), 293)); push[AInstr](out, ai_je(rl.data[32]));  // pipe2
+    push[AInstr](out, ai_cmp_imm(A_X8(), 228)); push[AInstr](out, ai_je(l_clock_gettime)); // clock_gettime
+    push[AInstr](out, ai_cmp_imm(A_X8(), 257)); push[AInstr](out, ai_je(l_openat));        // openat
+    push[AInstr](out, ai_cmp_imm(A_X8(), 318)); push[AInstr](out, ai_je(l_getrandom));     // getrandom
+    push[AInstr](out, ai_cmp_imm(A_X8(), 8));   push[AInstr](out, ai_je(l_lseek));         // lseek
+    push[AInstr](out, ai_cmp_imm(A_X8(), 73));  push[AInstr](out, ai_je(l_flock));         // flock
+    push[AInstr](out, ai_cmp_imm(A_X8(), 77));  push[AInstr](out, ai_je(l_ftruncate));     // ftruncate
+    push[AInstr](out, ai_cmp_imm(A_X8(), 138)); push[AInstr](out, ai_je(l_fstatfs));       // fstatfs
+    push[AInstr](out, ai_cmp_imm(A_X8(), 263)); push[AInstr](out, ai_je(l_unlinkat));      // unlinkat
+    push[AInstr](out, ai_cmp_imm(A_X8(), 264)); push[AInstr](out, ai_je(l_renameat));      // renameat
+    push[AInstr](out, ai_cmp_imm(A_X8(), 2));   push[AInstr](out, ai_je(rl.data[33]));  // open → openat
+    push[AInstr](out, ai_cmp_imm(A_X8(), 33));  push[AInstr](out, ai_je(rl.data[34]));  // dup2 → dup3
+    push[AInstr](out, ai_cmp_imm(A_X8(), 57));  push[AInstr](out, ai_je(rl.data[35]));  // fork → clone
+    push[AInstr](out, ai_cmp_imm(A_X8(), 82));  push[AInstr](out, ai_je(rl.data[36]));  // rename → renameat
+    push[AInstr](out, ai_cmp_imm(A_X8(), 83));  push[AInstr](out, ai_je(rl.data[37]));  // mkdir → mkdirat
+    push[AInstr](out, ai_cmp_imm(A_X8(), 84));  push[AInstr](out, ai_je(rl.data[38]));  // rmdir → unlinkat(AT_REMOVEDIR)
+    push[AInstr](out, ai_cmp_imm(A_X8(), 87));  push[AInstr](out, ai_je(rl.data[39]));  // unlink → unlinkat(0)
+    // An x86 syscall number that is not explicitly audited above must never be
+    // interpreted as an unrelated AArch64 syscall. Use an impossible number so
+    // the kernel returns -ENOSYS without performing an operation.
+    push[AInstr](out, ai_mov_imm(A_X8(), 2147483647));
+    push[AInstr](out, ai_jmp(l_svc));
+
+    // ── simple remap labels (just change x8) ──
+    push[AInstr](out, ai_label(rl.data[0]));  push[AInstr](out, ai_mov_imm(A_X8(), 63));  push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[1]));  push[AInstr](out, ai_mov_imm(A_X8(), 64));  push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[2]));  push[AInstr](out, ai_mov_imm(A_X8(), 57));  push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[3]));  push[AInstr](out, ai_mov_imm(A_X8(), 80));  push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[4]));  push[AInstr](out, ai_mov_imm(A_X8(), 222)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[5]));  push[AInstr](out, ai_mov_imm(A_X8(), 226)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[6]));  push[AInstr](out, ai_mov_imm(A_X8(), 215)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[7]));  push[AInstr](out, ai_mov_imm(A_X8(), 134)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[8]));  push[AInstr](out, ai_mov_imm(A_X8(), 135)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[9]));  push[AInstr](out, ai_mov_imm(A_X8(), 124)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[10])); push[AInstr](out, ai_mov_imm(A_X8(), 101)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[11])); push[AInstr](out, ai_mov_imm(A_X8(), 172)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[12])); push[AInstr](out, ai_mov_imm(A_X8(), 198)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[13])); push[AInstr](out, ai_mov_imm(A_X8(), 203)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[14])); push[AInstr](out, ai_mov_imm(A_X8(), 202)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[15])); push[AInstr](out, ai_mov_imm(A_X8(), 206)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[16])); push[AInstr](out, ai_mov_imm(A_X8(), 207)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[17])); push[AInstr](out, ai_mov_imm(A_X8(), 200)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[18])); push[AInstr](out, ai_mov_imm(A_X8(), 201)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[19])); push[AInstr](out, ai_mov_imm(A_X8(), 208)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[20])); push[AInstr](out, ai_mov_imm(A_X8(), 220)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[21])); push[AInstr](out, ai_mov_imm(A_X8(), 221)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[22])); push[AInstr](out, ai_mov_imm(A_X8(), 93));  push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[23])); push[AInstr](out, ai_mov_imm(A_X8(), 260)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[24])); push[AInstr](out, ai_mov_imm(A_X8(), 129)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[25])); push[AInstr](out, ai_mov_imm(A_X8(), 82));  push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[26])); push[AInstr](out, ai_mov_imm(A_X8(), 17));  push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[27])); push[AInstr](out, ai_mov_imm(A_X8(), 154)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[28])); push[AInstr](out, ai_mov_imm(A_X8(), 140)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[29])); push[AInstr](out, ai_mov_imm(A_X8(), 164)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[30])); push[AInstr](out, ai_mov_imm(A_X8(), 98));  push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[31])); push[AInstr](out, ai_mov_imm(A_X8(), 61));  push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(rl.data[32])); push[AInstr](out, ai_mov_imm(A_X8(), 59));  push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(l_clock_gettime)); push[AInstr](out, ai_mov_imm(A_X8(), 113)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(l_openat));
+    ac_emit_open_flags_xlate(out);
+    push[AInstr](out, ai_mov_imm(A_X8(), 56)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(l_getrandom)); push[AInstr](out, ai_mov_imm(A_X8(), 278)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(l_lseek)); push[AInstr](out, ai_mov_imm(A_X8(), 62)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(l_flock)); push[AInstr](out, ai_mov_imm(A_X8(), 32)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(l_ftruncate)); push[AInstr](out, ai_mov_imm(A_X8(), 46)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(l_fstatfs)); push[AInstr](out, ai_mov_imm(A_X8(), 44)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(l_unlinkat)); push[AInstr](out, ai_mov_imm(A_X8(), 35)); push[AInstr](out, ai_jmp(l_svc));
+    push[AInstr](out, ai_label(l_renameat)); push[AInstr](out, ai_mov_imm(A_X8(), 38)); push[AInstr](out, ai_jmp(l_svc));
+
+    // ── arg-rearrangement labels ──
+    // open(path, flags, mode) → openat(AT_FDCWD, path, flags, mode)
+    push[AInstr](out, ai_label(rl.data[33]));
+    push[AInstr](out, ai_mov_rr(A_X9(), A_X0()));
+    push[AInstr](out, ai_mov_imm(A_X0(), 0 - 100));
+    push[AInstr](out, ai_mov_rr(A_X3(), A_X2()));
+    push[AInstr](out, ai_mov_rr(A_X2(), A_X1()));
+    push[AInstr](out, ai_mov_rr(A_X1(), A_X9()));
+    ac_emit_open_flags_xlate(out);
+    push[AInstr](out, ai_mov_imm(A_X8(), 56));
+    push[AInstr](out, ai_jmp(l_svc));
+    // dup2(oldfd, newfd) → dup3(oldfd, newfd, 0)
+    push[AInstr](out, ai_label(rl.data[34]));
+    push[AInstr](out, ai_mov_imm(A_X2(), 0));
+    push[AInstr](out, ai_mov_imm(A_X8(), 24));
+    push[AInstr](out, ai_jmp(l_svc));
+    // fork() → clone(SIGCHLD, 0, 0, 0, 0)
+    push[AInstr](out, ai_label(rl.data[35]));
+    push[AInstr](out, ai_mov_imm(A_X0(), 17));
+    push[AInstr](out, ai_mov_imm(A_X1(), 0));
+    push[AInstr](out, ai_mov_imm(A_X8(), 220));
+    push[AInstr](out, ai_jmp(l_svc));
+    // rename(old, new) → renameat(AT_FDCWD, old, AT_FDCWD, new)
+    push[AInstr](out, ai_label(rl.data[36]));
+    push[AInstr](out, ai_mov_rr(A_X9(), A_X0()));
+    push[AInstr](out, ai_mov_rr(A_X3(), A_X1()));
+    push[AInstr](out, ai_mov_imm(A_X2(), 0 - 100));
+    push[AInstr](out, ai_mov_rr(A_X1(), A_X9()));
+    push[AInstr](out, ai_mov_imm(A_X0(), 0 - 100));
+    push[AInstr](out, ai_mov_imm(A_X8(), 38));
+    push[AInstr](out, ai_jmp(l_svc));
+    // mkdir(path, mode) → mkdirat(AT_FDCWD, path, mode)
+    push[AInstr](out, ai_label(rl.data[37]));
+    push[AInstr](out, ai_mov_rr(A_X9(), A_X0()));
+    push[AInstr](out, ai_mov_rr(A_X2(), A_X1()));
+    push[AInstr](out, ai_mov_imm(A_X0(), 0 - 100));
+    push[AInstr](out, ai_mov_rr(A_X1(), A_X9()));
+    push[AInstr](out, ai_mov_imm(A_X8(), 34));
+    push[AInstr](out, ai_jmp(l_svc));
+    // rmdir(path) → unlinkat(AT_FDCWD, path, AT_REMOVEDIR)
+    push[AInstr](out, ai_label(rl.data[38]));
+    push[AInstr](out, ai_mov_rr(A_X9(), A_X0()));
+    push[AInstr](out, ai_mov_imm(A_X0(), 0 - 100));
+    push[AInstr](out, ai_mov_rr(A_X1(), A_X9()));
+    push[AInstr](out, ai_mov_imm(A_X2(), 512));
+    push[AInstr](out, ai_mov_imm(A_X8(), 35));
+    push[AInstr](out, ai_jmp(l_svc));
+    // unlink(path) → unlinkat(AT_FDCWD, path, 0)
+    push[AInstr](out, ai_label(rl.data[39]));
+    push[AInstr](out, ai_mov_rr(A_X9(), A_X0()));
+    push[AInstr](out, ai_mov_imm(A_X0(), 0 - 100));
+    push[AInstr](out, ai_mov_rr(A_X1(), A_X9()));
+    push[AInstr](out, ai_mov_imm(A_X2(), 0));
+    push[AInstr](out, ai_mov_imm(A_X8(), 35));
+    push[AInstr](out, ai_jmp(l_svc));
+
+    push[AInstr](out, ai_label(l_svc));
+}
+
 fn ac_lower_call(out: *ArrayList[AInstr], c: Call, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) void {
     switch (c.callee.*) {
         .fld => |mf| {
@@ -1734,7 +2413,17 @@ fn ac_lower_call(out: *ArrayList[AInstr], c: Call, env: *AEnv, syms: ArrayList[A
                 return;
             }
             let cname: []u8 = fnid.name;
-            if (len[[]u8](c.targs) > 0) { cname = cg_mangle_generic_norm(fnid.name, c.targs); }
+            if (len[[]u8](c.targs) > 0) {
+                cname = cg_mangle_generic_norm(fnid.name, c.targs);
+            } else {
+                // If callee is a known generic fn and targs is STILL empty, type
+                // inference failed — emit loud error rather than silently calling
+                // the wrong symbol.
+                let gcheck: FnDecl = FnDecl{ .name = "", .tparams = make[[]u8](1), .params = make[Param](1), .ret = "", .annots = make[[]u8](1), .body = make[*Node](1), .is_extern = 0, .ret_eff = "", .caps = 0, .cap_names = "", .cap_types = "", .line = 0, .is_pub = 0 };
+                if (cg_find_generic_fn(cg.*.decls, cname, &gcheck) == 1) {
+                    ac_err(cg, "arm64: could not infer type arguments for generic call (provide them explicitly as foo[T](...))");
+                }
+            }
             if (ac_lower_builtin(out, cname, c, env, syms, cg) == 1) { return; }
             if (ac_slot_find(env, cname) != 0 && @strEq(ac_slot_type(env, cname), "fat_fn")) {
                 ac_lower_indirect_call(out, cname, c, env, syms, cg);
@@ -1821,7 +2510,20 @@ fn ac_lower_call(out: *ArrayList[AInstr], c: Call, env: *AEnv, syms: ArrayList[A
                 let rbase: i32 = ac_slot_scratch(cg, rw);
                 ac_emit_lea(out, A_X8(), rbase);
             }
-            push[AInstr](out, ai_call(lbl));
+            // Dynamic/object mode: extern calls go through GOT or relocations.
+            let dynamic_index: i32 = ac_dynamic_index(cg, cname);
+            if (dynamic_index >= 0) {
+                if (cg.*.object_mode == 1) {
+                    push[AInstr](out, ai_call_ext(dynamic_index));
+                } else {
+                    // GOT indirect call: load slot from GOT, blr x0
+                    push[AInstr](out, ai_mov_imm(A_X0(), ac_dynamic_got_vaddr() + ((dynamic_index as i64) * 8)));
+                    push[AInstr](out, ai_load(A_X0(), A_X0(), 0));
+                    push[AInstr](out, ai_call_reg(A_X0()));
+                }
+            } else {
+                push[AInstr](out, ai_call(lbl));
+            }
             if (nstk > 0) { push[AInstr](out, ai_add_imm(A_SP(), stkbytes as i64)); }
             push[AInstr](out, ai_push(A_X0()));
         }
@@ -1950,6 +2652,10 @@ fn ac_lower_builtin(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv, s
         if (nargs == 1) {
             ac_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
             push[AInstr](out, ai_pop(A_X0()));
+            // In safety mode, retire the allocation in the provenance registry
+            if (cg.*.safety_checked == 1) {
+                ac_emit_alloc_access_release(out, cg);
+            }
         }
         push[AInstr](out, ai_mov_imm(A_X0(), 0));
         push[AInstr](out, ai_push(A_X0()));
@@ -1972,7 +2678,14 @@ fn ac_lower_builtin(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv, s
         ac_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
         push[AInstr](out, ai_pop(A_X0()));
         cg.*.use_al = 1;
-        push[AInstr](out, ai_call(cg.*.al_lbl));
+        // In safety mode, save the size for the acquire probe
+        if (cg.*.safety_checked == 1) {
+            push[AInstr](out, ai_mov_rr(A_X1(), A_X0()));   // x1 = size
+            push[AInstr](out, ai_call(cg.*.al_lbl));         // x0 = pointer
+            ac_emit_alloc_access_acquire(out, cg);
+        } else {
+            push[AInstr](out, ai_call(cg.*.al_lbl));
+        }
         push[AInstr](out, ai_push(A_X0()));
         return 1;
     }
@@ -2185,14 +2898,46 @@ fn ac_lower_builtin(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv, s
         push[AInstr](out, ai_push(A_X0()));
         return 1;
     }
+    // ── _zag_read_fd(fd, buf, count) → x0 = bytes read ──────────────────────
+    // The source runtime uses the Linux x86-64 syscall number 0. AArch64
+    // uses the asm-generic read number 63; this narrow bridge is lowered
+    // directly so checked borrowed buffers never fall through to an
+    // untrusted/unknown foreign symbol.
+    if (@strEq(fname, "_zag_read_fd")) {
+        if (nargs != 3) {
+            ac_err(cg, "arm64: _zag_read_fd expects 3 arguments");
+            push[AInstr](out, ai_mov_imm(A_X0(), 0 - 1));
+            push[AInstr](out, ai_push(A_X0()));
+            return 1;
+        }
+        let read_i: i32 = 0;
+        while (read_i < 3) {
+            ac_lower_expr(out, get[*Node](c.args, read_i), env, syms, cg);
+            read_i = read_i + 1;
+        }
+        push[AInstr](out, ai_pop(A_X2())); // count
+        push[AInstr](out, ai_pop(A_X1())); // buffer
+        push[AInstr](out, ai_pop(A_X0())); // fd
+        push[AInstr](out, ai_mov_imm(A_X8(), 63)); // __NR_read
+        push[AInstr](out, ai_svc());
+        push[AInstr](out, ai_push(A_X0()));
+        return 1;
+    }
     // ── _zag_raw_syscall(num, a1..a6) → x0 ───────────────────────────────────
     // AArch64 Linux convention: number in x8, args a1..a6 in x0..x5, `svc #0`,
     // result in x0. Args are evaluated left-to-right onto the CPU stack, then
-    // popped in reverse so nested calls inside arguments stay balanced. (The
-    // syscall NUMBERS baked into the runtime escape hatch are Linux x86-64
-    // numbers; the compile path only relies on graceful degradation of the two
-    // sites it reaches — getcwd and a liveness kill-probe — both of which fall
-    // back safely when the arm64 syscall of that number returns an error.)
+    // popped in reverse so nested calls inside arguments stay balanced.
+    //
+    // The syscall NUMBERS in Zag source are Linux x86-64 numbers.  On AArch64
+    // the asm-generic syscall table uses different numbers, and several x86-64
+    // syscalls (open, mkdir, unlink, rmdir, rename, dup2, fork) do not exist at
+    // all — they must be rewritten to their *at equivalents with AT_FDCWD.
+    //
+    // ac_emit_syscall_xlate emits a compare-and-remap sequence that translates
+    // the x86-64 number in x8 to the correct ARM64 number, rearranging args
+    // where needed, before the svc instruction. Unknown numbers are replaced
+    // with an impossible syscall number and therefore fail closed with -ENOSYS;
+    // passing an x86 number through could invoke an unrelated AArch64 operation.
     if (@strEq(fname, "_zag_raw_syscall")) {
         if (nargs != 7) { ac_err(cg, "arm64: _zag_raw_syscall expects 7 arguments (num, a1..a6)"); push[AInstr](out, ai_mov_imm(A_X0(), 0 - 1)); push[AInstr](out, ai_push(A_X0())); return 1; }
         let sai: i32 = 0;
@@ -2207,6 +2952,7 @@ fn ac_lower_builtin(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv, s
         push[AInstr](out, ai_pop(A_X1()));   // a2
         push[AInstr](out, ai_pop(A_X0()));   // a1
         push[AInstr](out, ai_pop(A_X8()));   // syscall number
+        ac_emit_syscall_xlate(out, cg);
         push[AInstr](out, ai_svc());
         push[AInstr](out, ai_push(A_X0()));
         return 1;
@@ -2236,6 +2982,179 @@ fn ac_lower_builtin(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv, s
 fn ac_lower_at_builtin(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) void {
     let b: []u8 = fname[1..];
     let nargs: i32 = len[*Node](c.args);
+    let vsa_ty: []u8 = "";
+    if (len[[]u8](c.targs) == 1 && vsa_type_valid(get[[]u8](c.targs, 0)) == 1) {
+        vsa_ty = get[[]u8](c.targs, 0);
+    }
+    if (@strEq(b, "vsaDimension") || @strEq(b, "vsaWordCount")) {
+        if (vsa_ty.len == 0 || nargs != 0) {
+            ac_err(cg, "arm64: VSA dimension builtin requires one vsa_b<N> type and no values");
+            push[AInstr](out, ai_mov_imm(A_X0(), 0)); push[AInstr](out, ai_push(A_X0())); return;
+        }
+        let value: i32 = vsa_type_dimension(vsa_ty);
+        if (@strEq(b, "vsaWordCount")) { value = vsa_type_words(vsa_ty); }
+        push[AInstr](out, ai_mov_imm(A_X0(), value as i64)); push[AInstr](out, ai_push(A_X0())); return;
+    }
+    if (@strEq(b, "vsaZero")) {
+        if (vsa_ty.len == 0 || nargs != 0) {
+            ac_err(cg, "arm64: @vsaZero[vsa_b<N>]() expects no values");
+            push[AInstr](out, ai_mov_imm(A_X0(), 0)); push[AInstr](out, ai_push(A_X0())); return;
+        }
+        let words: i32 = vsa_type_words(vsa_ty);
+        let result: i32 = ac_slot_scratch(cg, words);
+        push[AInstr](out, ai_mov_imm(A_X0(), 0));
+        let wi: i32 = 0;
+        while (wi < words) {
+            push[AInstr](out, ai_store(A_X29(), result + wi * 8, A_X0()));
+            wi = wi + 1;
+        }
+        ac_emit_lea(out, A_X0(), result); push[AInstr](out, ai_push(A_X0())); return;
+    }
+    if (@strEq(b, "vsaFromWords")) {
+        if (vsa_ty.len == 0 || nargs != 1) {
+            ac_err(cg, "arm64: @vsaFromWords[vsa_b<N>](words) expects one exact word slice");
+            push[AInstr](out, ai_mov_imm(A_X0(), 0)); push[AInstr](out, ai_push(A_X0())); return;
+        }
+        let aty: []u8 = ac_expr_type(get[*Node](c.args, 0), env, syms, cg);
+        if (!@strEq(aty, "[]i64") && !@strEq(aty, "[]u64")) {
+            ac_err(cg, "arm64: @vsaFromWords input must be []i64 or []u64");
+            push[AInstr](out, ai_mov_imm(A_X0(), 0)); push[AInstr](out, ai_push(A_X0())); return;
+        }
+        let words: i32 = vsa_type_words(vsa_ty);
+        let result: i32 = ac_slot_scratch(cg, words);
+        ac_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+        push[AInstr](out, ai_pop(A_X10()));
+        push[AInstr](out, ai_load(A_X11(), A_X10(), 8));
+        push[AInstr](out, ai_cmp_imm(A_X11(), words as i64));
+        let length_ok: i32 = ac_fresh(cg);
+        push[AInstr](out, ai_je(length_ok));
+        ac_emit_panic(out, "zag VSA: imported word count does not match dimension", length_ok, cg);
+        push[AInstr](out, ai_load(A_X10(), A_X10(), 0));
+        let wi: i32 = 0;
+        while (wi < words) {
+            push[AInstr](out, ai_load(A_X0(), A_X10(), wi * 8));
+            if (wi + 1 == words) { ac_vsa_mask_last(out, vsa_ty, A_X0()); }
+            push[AInstr](out, ai_store(A_X29(), result + wi * 8, A_X0()));
+            wi = wi + 1;
+        }
+        ac_emit_lea(out, A_X0(), result); push[AInstr](out, ai_push(A_X0())); return;
+    }
+    if (@strEq(b, "vsaWord")) {
+        if (nargs != 2) {
+            ac_err(cg, "arm64: @vsaWord expects a vector and word index");
+            push[AInstr](out, ai_mov_imm(A_X0(), 0)); push[AInstr](out, ai_push(A_X0())); return;
+        }
+        let ty: []u8 = ac_expr_type(get[*Node](c.args, 0), env, syms, cg);
+        if (vsa_type_valid(ty) == 0) {
+            ac_err(cg, "arm64: @vsaWord first argument must be vsa_b<N>");
+            push[AInstr](out, ai_mov_imm(A_X0(), 0)); push[AInstr](out, ai_push(A_X0())); return;
+        }
+        let base_slot: i32 = ac_slot_scratch(cg, 1);
+        ac_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+        push[AInstr](out, ai_pop(A_X0())); push[AInstr](out, ai_store(A_X29(), base_slot, A_X0()));
+        ac_lower_expr(out, get[*Node](c.args, 1), env, syms, cg);
+        push[AInstr](out, ai_pop(A_X1()));
+        let nonnegative: i32 = ac_fresh(cg);
+        push[AInstr](out, ai_cmp_imm(A_X1(), 0)); push[AInstr](out, ai_jge(nonnegative));
+        ac_emit_panic(out, "zag VSA: negative word index", nonnegative, cg);
+        let in_bounds: i32 = ac_fresh(cg);
+        push[AInstr](out, ai_cmp_imm(A_X1(), vsa_type_words(ty) as i64)); push[AInstr](out, ai_jl(in_bounds));
+        ac_emit_panic(out, "zag VSA: word index out of bounds", in_bounds, cg);
+        push[AInstr](out, ai_mov_imm(A_X9(), 8)); push[AInstr](out, ai_mul(A_X1(), A_X1(), A_X9()));
+        push[AInstr](out, ai_load(A_X10(), A_X29(), base_slot)); push[AInstr](out, ai_add(A_X10(), A_X1()));
+        push[AInstr](out, ai_load(A_X0(), A_X10(), 0)); push[AInstr](out, ai_push(A_X0())); return;
+    }
+    if (@strEq(b, "vsaHamming")) {
+        if (nargs != 2) {
+            ac_err(cg, "arm64: @vsaHamming expects two vectors");
+            push[AInstr](out, ai_mov_imm(A_X0(), 0)); push[AInstr](out, ai_push(A_X0())); return;
+        }
+        let lty: []u8 = ac_expr_type(get[*Node](c.args, 0), env, syms, cg);
+        let rty: []u8 = ac_expr_type(get[*Node](c.args, 1), env, syms, cg);
+        if (vsa_type_valid(lty) == 0 || !@strEq(lty, rty)) {
+            ac_err(cg, "arm64: @vsaHamming operands must have the same vsa_b<N> type");
+            push[AInstr](out, ai_mov_imm(A_X0(), 0)); push[AInstr](out, ai_push(A_X0())); return;
+        }
+        ac_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+        ac_lower_expr(out, get[*Node](c.args, 1), env, syms, cg);
+        push[AInstr](out, ai_pop(A_X11())); push[AInstr](out, ai_pop(A_X10()));
+        push[AInstr](out, ai_mov_imm(A_X8(), 0));
+        let wi: i32 = 0;
+        let vector_words: i32 = vsa_type_words(lty);
+        if (vsa_type_final_bits(lty) != 64) { vector_words = vector_words - 1; }
+        while (wi + 1 < vector_words) {
+            push[AInstr](out, ai_vloadq(0, A_X10(), wi * 8));
+            push[AInstr](out, ai_vloadq(1, A_X11(), wi * 8));
+            push[AInstr](out, ai_veor(0, 1));
+            push[AInstr](out, ai_vcnt(0, 0));
+            push[AInstr](out, ai_vaddv_b(0, 0));
+            push[AInstr](out, ai_vumov_b(A_X9(), 0));
+            push[AInstr](out, ai_add(A_X8(), A_X9()));
+            wi = wi + 2;
+        }
+        while (wi < vsa_type_words(lty)) {
+            push[AInstr](out, ai_load(A_X0(), A_X10(), wi * 8));
+            push[AInstr](out, ai_load(A_X1(), A_X11(), wi * 8)); push[AInstr](out, ai_xor(A_X0(), A_X1()));
+            if (wi + 1 == vsa_type_words(lty)) { ac_vsa_mask_last(out, lty, A_X0()); }
+            let count_loop: i32 = ac_fresh(cg);
+            let count_done: i32 = ac_fresh(cg);
+            push[AInstr](out, ai_label(count_loop)); push[AInstr](out, ai_cmp_imm(A_X0(), 0)); push[AInstr](out, ai_je(count_done));
+            push[AInstr](out, ai_mov_rr(A_X9(), A_X0())); push[AInstr](out, ai_sub_imm(A_X9(), 1));
+            push[AInstr](out, ai_andr(A_X0(), A_X9())); push[AInstr](out, ai_add_imm(A_X8(), 1));
+            push[AInstr](out, ai_jmp(count_loop)); push[AInstr](out, ai_label(count_done));
+            wi = wi + 1;
+        }
+        push[AInstr](out, ai_mov_rr(A_X0(), A_X8())); push[AInstr](out, ai_push(A_X0())); return;
+    }
+    if (@strEq(b, "vsaMajority3")) {
+        if (vsa_ty.len == 0 || nargs != 3) {
+            ac_err(cg, "arm64: @vsaMajority3[vsa_b<N>] expects three vectors");
+            push[AInstr](out, ai_mov_imm(A_X0(), 0)); push[AInstr](out, ai_push(A_X0())); return;
+        }
+        let a_ty: []u8 = ac_expr_type(get[*Node](c.args, 0), env, syms, cg);
+        let b_ty: []u8 = ac_expr_type(get[*Node](c.args, 1), env, syms, cg);
+        let c_ty: []u8 = ac_expr_type(get[*Node](c.args, 2), env, syms, cg);
+        if (!@strEq(a_ty, vsa_ty) || !@strEq(b_ty, vsa_ty) || !@strEq(c_ty, vsa_ty)) {
+            ac_err(cg, "arm64: @vsaMajority3 operands must match its vsa_b<N> type");
+            push[AInstr](out, ai_mov_imm(A_X0(), 0)); push[AInstr](out, ai_push(A_X0())); return;
+        }
+        let words: i32 = vsa_type_words(vsa_ty);
+        let result: i32 = ac_slot_scratch(cg, words);
+        ac_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+        ac_lower_expr(out, get[*Node](c.args, 1), env, syms, cg);
+        ac_lower_expr(out, get[*Node](c.args, 2), env, syms, cg);
+        push[AInstr](out, ai_pop(A_X12())); push[AInstr](out, ai_pop(A_X11())); push[AInstr](out, ai_pop(A_X10()));
+        let wi: i32 = 0;
+        let vector_words: i32 = words;
+        if (vsa_type_final_bits(vsa_ty) != 64) {
+            vector_words = vector_words - 1;
+        }
+        while (wi + 1 < vector_words) {
+            push[AInstr](out, ai_vloadq(0, A_X10(), wi * 8));
+            push[AInstr](out, ai_vloadq(1, A_X11(), wi * 8));
+            push[AInstr](out, ai_vloadq(2, A_X12(), wi * 8));
+            push[AInstr](out, ai_vloadq(3, A_X10(), wi * 8));
+            push[AInstr](out, ai_vand(0, 1));
+            push[AInstr](out, ai_vand(3, 2));
+            push[AInstr](out, ai_vand(1, 2));
+            push[AInstr](out, ai_vorr(0, 3));
+            push[AInstr](out, ai_vorr(0, 1));
+            push[AInstr](out, ai_vstoreq(A_X29(), result + wi * 8, 0));
+            wi = wi + 2;
+        }
+        while (wi < words) {
+            push[AInstr](out, ai_load(A_X0(), A_X10(), wi * 8));
+            push[AInstr](out, ai_load(A_X1(), A_X11(), wi * 8));
+            push[AInstr](out, ai_load(A_X2(), A_X12(), wi * 8));
+            push[AInstr](out, ai_mov_rr(A_X9(), A_X0())); push[AInstr](out, ai_andr(A_X9(), A_X1()));
+            push[AInstr](out, ai_mov_rr(A_X13(), A_X0())); push[AInstr](out, ai_andr(A_X13(), A_X2()));
+            push[AInstr](out, ai_andr(A_X1(), A_X2())); push[AInstr](out, ai_or(A_X9(), A_X13())); push[AInstr](out, ai_or(A_X9(), A_X1()));
+            if (wi + 1 == words) { ac_vsa_mask_last(out, vsa_ty, A_X9()); }
+            push[AInstr](out, ai_store(A_X29(), result + wi * 8, A_X9()));
+            wi = wi + 1;
+        }
+        ac_emit_lea(out, A_X0(), result); push[AInstr](out, ai_push(A_X0())); return;
+    }
     if (@strEq(b, "atomicFence")) {
         if (nargs != 1) { ac_err(cg, "arm64: @atomicFence expects one literal order"); push[AInstr](out, ai_mov_imm(A_X0(), 0)); push[AInstr](out, ai_push(A_X0())); return; }
         let order:i64=-1;
@@ -2255,6 +3174,31 @@ fn ac_lower_at_builtin(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv
         let t: []u8 = "i32";
         if (len[[]u8](c.targs) > 0) { t = get[[]u8](c.targs, 0); }
         push[AInstr](out, ai_mov_imm(A_X0(), ac_type_size(cg, t) as i64));
+        push[AInstr](out, ai_push(A_X0()));
+        return;
+    }
+    if (@strEq(b, "alignOf")) {
+        if (len[[]u8](c.targs) != 1 || nargs != 0) {
+            ac_err(cg, "arm64: @alignOf expects one type argument and no values");
+            push[AInstr](out, ai_mov_imm(A_X0(), 0)); push[AInstr](out, ai_push(A_X0())); return;
+        }
+        push[AInstr](out, ai_mov_imm(A_X0(), ac_type_alignment(cg, get[[]u8](c.targs, 0)) as i64));
+        push[AInstr](out, ai_push(A_X0()));
+        return;
+    }
+    if (@strEq(b, "offsetOf")) {
+        if (len[[]u8](c.targs) != 1 || nargs != 1) {
+            ac_err(cg, "arm64: @offsetOf expects one type argument and one field string");
+            push[AInstr](out, ai_mov_imm(A_X0(), 0)); push[AInstr](out, ai_push(A_X0())); return;
+        }
+        let field: []u8 = "";
+        switch (get[*Node](c.args, 0).*) {
+            .slit => |s| { if (s.text.len >= 2) { field = s.text[1..s.text.len - 1]; } }
+            else => { }
+        }
+        let off: i32 = ac_field_offset(cg, get[[]u8](c.targs, 0), field);
+        if (off < 0) { ac_err(cg, "arm64: @offsetOf names an unknown field"); off = 0; }
+        push[AInstr](out, ai_mov_imm(A_X0(), off as i64));
         push[AInstr](out, ai_push(A_X0()));
         return;
     }
@@ -2280,6 +3224,25 @@ fn ac_lower_at_builtin(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv
     if (@strEq(b, "intCast") || @strEq(b, "truncate") || @strEq(b, "floatCast")) {
         if (nargs != 1) { ac_err(cg, "arm64: cast builtin expects one argument"); push[AInstr](out, ai_mov_imm(A_X0(), 0)); push[AInstr](out, ai_push(A_X0())); return; }
         ac_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+        return;
+    }
+    // ── posit conversion builtins: @intToPosit/@floatToPosit/@positToFloat/@positToBits
+    // Rewrite to znrt_* runtime call. Single scalar arg in x0, result in x0.
+    let pbf: []u8 = cg_posit_builtin_fn(b);
+    if (pbf.len > 0) {
+        if (nargs != 1) { ac_err(cg, "arm64: posit conversion builtin expects one argument"); push[AInstr](out, ai_mov_imm(A_X0(), 0)); push[AInstr](out, ai_push(A_X0())); return; }
+        let plbl: i32 = ac_find_fn(syms, pbf);
+        if (plbl < 0) { ac_err(cg, "arm64: posit runtime not linked (missing znrt_ conversion)"); push[AInstr](out, ai_mov_imm(A_X0(), 0)); push[AInstr](out, ai_push(A_X0())); return; }
+        ac_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+        push[AInstr](out, ai_pop(A_X0()));
+        push[AInstr](out, ai_call(plbl));
+        push[AInstr](out, ai_push(A_X0()));
+        return;
+    }
+    // ── quire builtins: @quireZero/@quireFMA/@quireToPosit → runtime call (sret)
+    let qbf: []u8 = cg_quire_builtin_fn(b);
+    if (qbf.len > 0) {
+        ac_lower_call(out, Call{ .callee = mk_ident(qbf), .args = c.args, .targs = make[[]u8](1) }, env, syms, cg);
         return;
     }
     ac_err(cg, _zag_str_concat("arm64: unsupported builtin: ", fname));
@@ -2408,8 +3371,15 @@ fn ac_lower_stmt(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
                 return;
             }
             let is_byte: i32 = 0;
+            let layout_width: i32 = 0;
             switch (a.target.*) {
                 .idx => |_ix| { if (ac_elem_is_byte(tty) == 1) { is_byte = 1; } }
+                .fld => |ef| {
+                    let ebt: []u8 = ac_expr_type(ef.base, env, syms, cg);
+                    let esn: []u8 = ebt;
+                    if (ebt.len > 1 && ebt[0] == '*') { esn = ebt[1..]; }
+                    layout_width = ac_layout_field_width(cg, esn, ef.fname);
+                }
                 else => { }
             }
             ac_lower_addr(out, a.target, env, syms, cg);
@@ -2421,7 +3391,8 @@ fn ac_lower_stmt(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
             } else {
                 push[AInstr](out, ai_pop(A_X0()));
                 push[AInstr](out, ai_pop(A_X10()));
-                if (is_byte == 1) { push[AInstr](out, ai_storeb(A_X10(), 0, A_X0())); }
+                if (layout_width > 0) { ac_emit_store_layout(out, A_X10(), 0, layout_width, A_X0()); }
+                else if (is_byte == 1) { push[AInstr](out, ai_storeb(A_X10(), 0, A_X0())); }
                 else { push[AInstr](out, ai_store(A_X10(), 0, A_X0())); }
             }
         }
@@ -2452,7 +3423,9 @@ fn ac_lower_stmt(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
                         push[AInstr](out, ai_store(A_X10(), 0, A_X9()));
                     }
                     push[AInstr](out, ai_mov_rr(A_X0(), A_X10()));
-                    push[AInstr](out, ai_jmp(cg.*.epilogue));
+                    push[AInstr](out, ai_mov_imm(A_X9(), is_err_ret as i64));
+                    push[AInstr](out, ai_store(A_X29(), env.*.is_err_slot, A_X9()));
+                    push[AInstr](out, ai_jmp(cg.*.pre_epilogue));
                     return;
                 }
                 if (cg.*.sret_words > 0 && ac_is_optional(cg.*.ret_ty) == 1 && ac_is_null_node(r.expr) == 1) {
@@ -2460,7 +3433,9 @@ fn ac_lower_stmt(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
                     push[AInstr](out, ai_mov_imm(A_X9(), 0));
                     push[AInstr](out, ai_store(A_X10(), 0, A_X9()));
                     push[AInstr](out, ai_mov_rr(A_X0(), A_X10()));
-                    push[AInstr](out, ai_jmp(cg.*.epilogue));
+                    push[AInstr](out, ai_mov_imm(A_X9(), 0));
+                    push[AInstr](out, ai_store(A_X29(), env.*.is_err_slot, A_X9()));
+                    push[AInstr](out, ai_jmp(cg.*.pre_epilogue));
                     return;
                 }
                 if (cg.*.sret_words > 0 && ac_is_optional(cg.*.ret_ty) == 1 && ac_is_optional(ac_expr_type(r.expr, env, syms, cg)) == 0) {
@@ -2480,7 +3455,9 @@ fn ac_lower_stmt(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
                         push[AInstr](out, ai_store(A_X10(), 8, A_X0()));
                     }
                     push[AInstr](out, ai_mov_rr(A_X0(), A_X10()));
-                    push[AInstr](out, ai_jmp(cg.*.epilogue));
+                    push[AInstr](out, ai_mov_imm(A_X9(), 0));
+                    push[AInstr](out, ai_store(A_X29(), env.*.is_err_slot, A_X9()));
+                    push[AInstr](out, ai_jmp(cg.*.pre_epilogue));
                     return;
                 }
                 ac_lower_expr(out, r.expr, env, syms, cg);
@@ -2495,7 +3472,22 @@ fn ac_lower_stmt(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
             } else {
                 push[AInstr](out, ai_mov_imm(A_X0(), 0));
             }
-            push[AInstr](out, ai_jmp(cg.*.epilogue));
+            // Detect error return for errdefer: return error.X from a !T function.
+            let non_sret_err: i32 = 0;
+            if (r.has_expr == 1) {
+                switch (r.expr.*) {
+                    .fld => |ef| {
+                        switch (ef.base.*) {
+                            .id => |eid2| { if (@strEq(eid2.name, "error") && ac_slot_find(env, eid2.name) == 0) { non_sret_err = 1; } }
+                            else => { }
+                        }
+                    }
+                    else => { }
+                }
+            }
+            push[AInstr](out, ai_mov_imm(A_X9(), non_sret_err as i64));
+            push[AInstr](out, ai_store(A_X29(), env.*.is_err_slot, A_X9()));
+            push[AInstr](out, ai_jmp(cg.*.pre_epilogue));
         }
         .if_ => |x| {
             let l_else: i32 = ac_fresh(cg);
@@ -2559,6 +3551,14 @@ fn ac_lower_stmt(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
         .estmt => |e| {
             ac_lower_expr(out, e.expr, env, syms, cg);
             push[AInstr](out, ai_pop(A_X0()));
+        }
+        .defer_ => |d| {
+            // Collect the deferred expression; it will be lowered at pre_epilogue.
+            if (d.is_err == 0) {
+                push[*Node](&env.*.defer_exprs, d.expr);
+            } else {
+                push[*Node](&env.*.errdefer_exprs, d.expr);
+            }
         }
         else => { ac_err(cg, "arm64: unsupported statement"); }
     }
@@ -2673,6 +3673,7 @@ fn ac_lower_arm_value(out: *ArrayList[AInstr], body: ArrayList[*Node], env: *AEn
     let last: *Node = get[*Node](body, len[*Node](body) - 1);
     switch (last.*) {
         .estmt => |e| { ac_lower_expr(out, e.expr, env, syms, cg); }
+        .defer_ => |d| { push[*Node](&env.*.defer_exprs, d.expr); }
         .ret => |_r| {
             ac_lower_stmt(out, last, env, syms, cg);
             push[AInstr](out, ai_mov_imm(A_X0(), 0));
@@ -2853,13 +3854,20 @@ fn ac_lower_fn(out: *ArrayList[AInstr], f: FnDecl, lbl: i32, syms: ArrayList[AFn
     }
 
     let epi: i32 = ac_fresh(cg);
+    let pre_epi: i32 = ac_fresh(cg);
     cg.*.epilogue = epi;
+    cg.*.pre_epilogue = pre_epi;
     cg.*.frame_words = 0;
     cg.*.sret_disp = 0;
     cg.*.sret_words = 0;
     cg.*.ret_ty = ret;
 
     let env: AEnv = ac_env_new();
+    // Keep the binding-time displacement for each parameter. Body lowering can
+    // legally introduce a same-named local; looking the parameter up again
+    // after lowering would then find the shadow and store the incoming ABI
+    // register into the wrong frame slot.
+    let param_disps: ArrayList[i32] = make[i32](len[Param](params));
 
     // capturing closure: hidden env ptr arrives FIRST (x0); user args shift by 1
     let is_clos: i32 = 0;
@@ -2877,17 +3885,22 @@ fn ac_lower_fn(out: *ArrayList[AInstr], f: FnDecl, lbl: i32, syms: ArrayList[AFn
         let p: Param = get[Param](params, pi);
         let pty: []u8 = p.pty;
         if (cg_is_fn_type(cg_norm_type(pty)) == 1) { pty = "fat_fn"; }
+        let pdisp: i32 = 0;
         if (ac_is_aggregate(cg, pty) == 1) {
-            let _d1: i32 = ac_slot_alloc_br(&env, cg, p.name, pty, 1, 1);
+            pdisp = ac_slot_alloc_br(&env, cg, p.name, pty, 1, 1);
         } else {
-            let _d2: i32 = ac_slot_alloc_br(&env, cg, p.name, pty, 1, 0);
+            pdisp = ac_slot_alloc_br(&env, cg, p.name, pty, 1, 0);
         }
+        push[i32](&param_disps, pdisp);
         pi = pi + 1;
     }
     if (ac_is_aggregate(cg, ret) == 1) {
         cg.*.sret_words = ac_type_words(cg, ret);
         cg.*.sret_disp = ac_slot_scratch(cg, 1);
     }
+
+    // Allocate the error-return flag slot for defer/errdefer.
+    env.is_err_slot = ac_slot_scratch(cg, 1);
 
     // closure captures: bind each capture to a frame slot NOW (the prologue
     // loads them from the env block after the params are stored).
@@ -2906,6 +3919,9 @@ fn ac_lower_fn(out: *ArrayList[AInstr], f: FnDecl, lbl: i32, syms: ArrayList[AFn
             if (cname.len > 0 && cname[0] == '*') {
                 cd = ac_slot_alloc_br(&env, cg, real_cn, cty, 1, 0);
             } else if (cty.len > 0 && ac_is_aggregate(cg, cty) == 1) {
+                if (cg.*.v2_edition == 1) {
+                    ac_err(cg, "arm64: captured aggregate closures require a destruction protocol");
+                }
                 cd = ac_slot_alloc_br(&env, cg, cname, cty, 1, 1);
             } else {
                 cd = ac_slot_alloc_br(&env, cg, cname, cty, 1, 0);
@@ -2920,15 +3936,65 @@ fn ac_lower_fn(out: *ArrayList[AInstr], f: FnDecl, lbl: i32, syms: ArrayList[AFn
     let bodyins: ArrayList[AInstr] = make[AInstr](64);
     ac_lower_block(&bodyins, body, &env, syms, cg);
 
+    // Lower defer/errdefer expressions into a scratch list too, so their
+    // scratch slots (string literals, etc.) are counted in frame_words and
+    // their expression-stack depth is included in the frame sizing.
+    let deferins: ArrayList[AInstr] = make[AInstr](32);
+    let di_pre: i32 = len[*Node](&env.defer_exprs) - 1;
+    while (di_pre >= 0) {
+        let dexpr: *Node = get[*Node](&env.defer_exprs, di_pre);
+        ac_lower_expr(&deferins, dexpr, &env, syms, cg);
+        push[AInstr](&deferins, ai_pop(A_X0()));
+        di_pre = di_pre - 1;
+    }
+    let errdeferins: ArrayList[AInstr] = make[AInstr](32);
+    if (len[*Node](&env.errdefer_exprs) > 0) {
+        let ei_pre: i32 = len[*Node](&env.errdefer_exprs) - 1;
+        while (ei_pre >= 0) {
+            let eexpr: *Node = get[*Node](&env.errdefer_exprs, ei_pre);
+            ac_lower_expr(&errdeferins, eexpr, &env, syms, cg);
+            push[AInstr](&errdeferins, ai_pop(A_X0()));
+            ei_pre = ei_pre - 1;
+        }
+    }
+
     // Frame: [SP .. SP+expr) expression stack, [X29-8*words .. X29) slots.
     // The expr region is sized from the MEASURED maximum push depth of the
     // lowered body (deep nested expressions exceed any fixed budget), with
-    // AC_EXPR_WORDS as the floor and +8 words of headroom.
+    // AC_EXPR_WORDS as the floor and +8 words of headroom.  The defer and
+    // errdefer scratch lists are included in the depth scan so the expression
+    // stack never overflows during the pre-epilogue cleanup chain.
     let depth: i32 = 0;
     let maxdepth: i32 = 0;
     let sk: i32 = 0;
     while (sk < len[AInstr](bodyins)) {
         let ik: i32 = get[AInstr](bodyins, sk).kind;
+        if (ik == AK_PUSH()) {
+            depth = depth + 1;
+            if (depth > maxdepth) { maxdepth = depth; }
+        } else if (ik == AK_POP()) {
+            depth = depth - 1;
+        }
+        sk = sk + 1;
+    }
+    // The pre-epilogue starts with one push (saving the return value), so
+    // measure the defer/errdefer lists from depth=1.
+    depth = 1;
+    sk = 0;
+    while (sk < len[AInstr](deferins)) {
+        let ik: i32 = get[AInstr](deferins, sk).kind;
+        if (ik == AK_PUSH()) {
+            depth = depth + 1;
+            if (depth > maxdepth) { maxdepth = depth; }
+        } else if (ik == AK_POP()) {
+            depth = depth - 1;
+        }
+        sk = sk + 1;
+    }
+    depth = 1;
+    sk = 0;
+    while (sk < len[AInstr](errdeferins)) {
+        let ik: i32 = get[AInstr](errdeferins, sk).kind;
         if (ik == AK_PUSH()) {
             depth = depth + 1;
             if (depth > maxdepth) { maxdepth = depth; }
@@ -2954,8 +4020,7 @@ fn ac_lower_fn(out: *ArrayList[AInstr], f: FnDecl, lbl: i32, syms: ArrayList[AFn
 
     let pj: i32 = 0;
     while (pj < len[Param](params)) {
-        let pname: []u8 = get[Param](params, pj).name;
-        let pdisp: i32 = ac_slot_find(&env, pname);
+        let pdisp: i32 = get[i32](param_disps, pj);
         let reg: i32 = a_arg_reg(pj + shift);
         if (reg >= 0) {
             push[AInstr](out, ai_store(A_X29(), pdisp, reg));
@@ -2979,12 +4044,49 @@ fn ac_lower_fn(out: *ArrayList[AInstr], f: FnDecl, lbl: i32, syms: ArrayList[AFn
     if (cg.*.sret_words > 0) {
         push[AInstr](out, ai_store(A_X29(), cg.*.sret_disp, A_X8()));
     }
+    // Initialize the error-return flag to 0 (success) for defer/errdefer.
+    push[AInstr](out, ai_mov_imm(A_X9(), 0));
+    push[AInstr](out, ai_store(A_X29(), env.is_err_slot, A_X9()));
 
     let bi: i32 = 0;
     while (bi < len[AInstr](bodyins)) {
         push[AInstr](out, get[AInstr](bodyins, bi));
         bi = bi + 1;
     }
+
+    // Fall-through: success return → set is_err=0, jump to pre_epilogue cleanup.
+    push[AInstr](out, ai_mov_imm(A_X9(), 0));
+    push[AInstr](out, ai_store(A_X29(), env.is_err_slot, A_X9()));
+    push[AInstr](out, ai_jmp(pre_epi));
+
+    // ── pre_epilogue: defer/errdefer cleanup chain ──
+    // All return paths jump here. X0 holds the return value (scalar) or sret
+    // pointer (aggregate). Save it, run defers, conditionally run errdefers,
+    // restore it, then fall through to the real epilogue.
+    push[AInstr](out, ai_label(pre_epi));
+    // Save return value on the expression stack.
+    push[AInstr](out, ai_push(A_X0()));
+    // Run all defer expressions (unconditional), LIFO order.
+    let di_copy: i32 = 0;
+    while (di_copy < len[AInstr](deferins)) {
+        push[AInstr](out, get[AInstr](deferins, di_copy));
+        di_copy = di_copy + 1;
+    }
+    // Run errdefer expressions only if is_err_slot != 0.
+    if (len[*Node](&env.errdefer_exprs) > 0) {
+        let skip_err: i32 = ac_fresh(cg);
+        push[AInstr](out, ai_load(A_X9(), A_X29(), env.is_err_slot));
+        push[AInstr](out, ai_cmp_imm(A_X9(), 0));
+        push[AInstr](out, ai_je(skip_err));
+        let ei_copy: i32 = 0;
+        while (ei_copy < len[AInstr](errdeferins)) {
+            push[AInstr](out, get[AInstr](errdeferins, ei_copy));
+            ei_copy = ei_copy + 1;
+        }
+        push[AInstr](out, ai_label(skip_err));
+    }
+    // Restore return value.
+    push[AInstr](out, ai_pop(A_X0()));
 
     push[AInstr](out, ai_label(epi));
     push[AInstr](out, ai_mov_rr(A_SP(), A_X29()));
@@ -3101,6 +4203,299 @@ fn ac_emit_print_str(out: *ArrayList[AInstr], lbl: i32) void {
 // (4 KiB minimum) is what made the arm64 self-compile exceed memory under
 // qemu-user. Returns base+8 with n stored in the 8-byte header at [ret-8] so
 // __realloc can recover the old size. Two i64 globals live in the writable data
+// ── safety checks (edition-2027 --safety=checked / --sanitize=memory) ──────
+// Print msg to stderr (fd=2) then exit(1). Mirrors cg_emit_panic but for AArch64.
+fn ac_emit_panic(out: *ArrayList[AInstr], msg: []u8, lbl_past: i32, cg: *ACg) void {
+    let off: i32 = len[u8](cg.*.data.*);
+    let mi: i32 = 0;
+    while (mi < msg.len) { push[u8](cg.*.data, msg[mi]); mi = mi + 1; }
+    push[u8](cg.*.data, 10);   // '\n'
+    let mlen: i32 = len[u8](cg.*.data.*) - off;
+    // write(2, A_DATA_VBASE+off, mlen) — AArch64 syscall 64
+    push[AInstr](out, ai_mov_imm(A_X8(), 64));
+    push[AInstr](out, ai_mov_imm(A_X0(), 2));
+    push[AInstr](out, ai_mov_imm(A_X1(), A_DATA_VBASE() + (off as i64)));
+    push[AInstr](out, ai_mov_imm(A_X2(), mlen as i64));
+    push[AInstr](out, ai_svc());
+    // exit(1) — AArch64 syscall 93
+    push[AInstr](out, ai_mov_imm(A_X8(), 93));
+    push[AInstr](out, ai_mov_imm(A_X0(), 1));
+    push[AInstr](out, ai_svc());
+    push[AInstr](out, ai_label(lbl_past));   // unreachable, but keeps structure
+}
+
+// ALLOC_ACCESS_REGISTRY constants (shared with x86 backend via ncodegen.zag)
+fn ac_alloc_access_registry() i64 { return BSS_VBASE() + 66560; }
+fn ac_alloc_access_registry_cap() i32 { return 3072; }
+fn ac_alloc_live() i64 { return BSS_VBASE() + 152; }
+
+// Probe the allocation access registry for [rax, rax+rsi).
+// Input: x0=pointer, x1=access width. Output: x8=1 (valid), -1 (freed), -2 (OOB).
+// Mirrors cg_emit_alloc_access_probe but uses AArch64 registers.
+fn ac_emit_alloc_access_probe(out: *ArrayList[AInstr], cg: *ACg) void {
+    let loop: i32 = ac_fresh(cg);
+    let next: i32 = ac_fresh(cg);
+    let nonzero: i32 = ac_fresh(cg);
+    let have_base: i32 = ac_fresh(cg);
+    let contains: i32 = ac_fresh(cg);
+    let freed: i32 = ac_fresh(cg);
+    let bounds: i32 = ac_fresh(cg);
+    let valid: i32 = ac_fresh(cg);
+    let done: i32 = ac_fresh(cg);
+    push[AInstr](out, ai_mov_imm(A_X8(), 0));
+    push[AInstr](out, ai_mov_imm(A_X9(), 0));
+    push[AInstr](out, ai_label(loop));
+    push[AInstr](out, ai_cmp_imm(A_X9(), ac_alloc_access_registry_cap()));
+    push[AInstr](out, ai_jge(done));
+    // x10 = &registry[rcx] = registry_base + rcx * 16
+    push[AInstr](out, ai_mov_rr(A_X10(), A_X9()));
+    push[AInstr](out, ai_lsl_imm(A_X10(), A_X10(), 4));  // *16
+    push[AInstr](out, ai_mov_imm(A_X11(), ac_alloc_access_registry()));
+    push[AInstr](out, ai_add(A_X10(), A_X11()));
+    // x11 = registry[rcx].ptr
+    push[AInstr](out, ai_load(A_X11(), A_X10(), 0));
+    push[AInstr](out, ai_cmp_imm(A_X11(), 0));
+    push[AInstr](out, ai_jne(nonzero));
+    push[AInstr](out, ai_jmp(next));
+    push[AInstr](out, ai_label(nonzero));
+    // x12 = |x11| (abs value, handle freed tombstone)
+    push[AInstr](out, ai_mov_rr(A_X12(), A_X11()));
+    push[AInstr](out, ai_cmp_imm(A_X12(), 0));
+    push[AInstr](out, ai_jge(have_base));
+    push[AInstr](out, ai_neg(A_X12(), A_X12()));
+    push[AInstr](out, ai_label(have_base));
+    // if rdi < x12: skip (pointer is before this allocation)
+    // Note: x86 uses RDI as provenance root. On AArch64 we use x0 as the pointer.
+    // For the probe, x0 is the access pointer and x1 is the width.
+    push[AInstr](out, ai_cmp(A_X0(), A_X12()));
+    push[AInstr](out, ai_jl(next));
+    // x13 = registry[rcx].size
+    push[AInstr](out, ai_load(A_X13(), A_X10(), 8));
+    // offset = x0 - x12
+    push[AInstr](out, ai_mov_rr(A_X8(), A_X0()));
+    push[AInstr](out, ai_sub(A_X8(), A_X12()));
+    // if offset >= size: skip
+    push[AInstr](out, ai_cmp(A_X8(), A_X13()));
+    push[AInstr](out, ai_jl(contains));
+    push[AInstr](out, ai_jmp(next));
+    push[AInstr](out, ai_label(contains));
+    // Check if freed (x11 < 0)
+    push[AInstr](out, ai_cmp_imm(A_X11(), 0));
+    push[AInstr](out, ai_jl(freed));
+    // Check bounds: size - width >= 0 AND offset + width <= size
+    push[AInstr](out, ai_sub(A_X13(), A_X1()));
+    push[AInstr](out, ai_cmp_imm(A_X13(), 0));
+    push[AInstr](out, ai_jl(bounds));
+    push[AInstr](out, ai_cmp(A_X0(), A_X12()));
+    push[AInstr](out, ai_jl(bounds));
+    push[AInstr](out, ai_mov_rr(A_X8(), A_X0()));
+    push[AInstr](out, ai_sub(A_X8(), A_X12()));
+    push[AInstr](out, ai_cmp(A_X8(), A_X13()));
+    push[AInstr](out, ai_jle(valid));
+    push[AInstr](out, ai_jmp(bounds));
+    push[AInstr](out, ai_label(freed));
+    push[AInstr](out, ai_mov_imm(A_X8(), 0 - 1));
+    push[AInstr](out, ai_jmp(done));
+    push[AInstr](out, ai_label(bounds));
+    push[AInstr](out, ai_mov_imm(A_X8(), 0 - 2));
+    push[AInstr](out, ai_jmp(done));
+    push[AInstr](out, ai_label(valid));
+    push[AInstr](out, ai_mov_imm(A_X8(), 1));
+    push[AInstr](out, ai_jmp(done));
+    push[AInstr](out, ai_label(next));
+    push[AInstr](out, ai_add_imm(A_X9(), 1));
+    push[AInstr](out, ai_jmp(loop));
+    push[AInstr](out, ai_label(done));
+}
+
+// Checked raw pointer access: null, alignment, provenance/OOB.
+// Input: x0=pointer, x1=access width (set by caller). Output: x0 unchanged.
+fn ac_emit_checked_raw_access(out: *ArrayList[AInstr], cg: *ACg, align: i32, width: i32) void {
+    if (cg.*.safety_checked == 0) { return; }
+    let nonnull: i32 = ac_fresh(cg);
+    let after_null: i32 = ac_fresh(cg);
+    push[AInstr](out, ai_cmp_imm(A_X0(), 0));
+    push[AInstr](out, ai_jne(nonnull));
+    ac_emit_panic(out, "zag safety: null raw pointer access", after_null, cg);
+    push[AInstr](out, ai_label(nonnull));
+    if (align > 1) {
+        let aligned: i32 = ac_fresh(cg);
+        let after_align: i32 = ac_fresh(cg);
+        push[AInstr](out, ai_mov_rr(A_X8(), A_X0()));
+        push[AInstr](out, ai_and_imm(A_X8(), (align - 1) as i64));
+        push[AInstr](out, ai_cmp_imm(A_X8(), 0));
+        push[AInstr](out, ai_je(aligned));
+        ac_emit_panic(out, "zag safety: misaligned raw pointer access", after_align, cg);
+        push[AInstr](out, ai_label(aligned));
+    }
+    let access_ok: i32 = ac_fresh(cg);
+    let after_freed: i32 = ac_fresh(cg);
+    let after_bounds: i32 = ac_fresh(cg);
+    push[AInstr](out, ai_mov_imm(A_X1(), width as i64));
+    ac_emit_alloc_access_probe(out, cg);
+    push[AInstr](out, ai_cmp_imm(A_X8(), 0 - 1));
+    push[AInstr](out, ai_jne(access_ok));
+    ac_emit_panic(out, "zag safety: use after free of allocator pointer", after_freed, cg);
+    push[AInstr](out, ai_label(access_ok));
+    push[AInstr](out, ai_cmp_imm(A_X8(), 0 - 2));
+    let bounds_ok: i32 = ac_fresh(cg);
+    push[AInstr](out, ai_jne(bounds_ok));
+    ac_emit_panic(out, "zag safety: allocator pointer access out of bounds", after_bounds, cg);
+    push[AInstr](out, ai_label(bounds_ok));
+}
+
+// Register a new allocation in the provenance registry.
+// Input: x0=user pointer, x1=size. Does not clobber inputs.
+fn ac_emit_alloc_access_acquire(out: *ArrayList[AInstr], cg: *ACg) void {
+    let loop: i32 = ac_fresh(cg);
+    let insert: i32 = ac_fresh(cg);
+    let next: i32 = ac_fresh(cg);
+    let reused: i32 = ac_fresh(cg);
+    let after_reused: i32 = ac_fresh(cg);
+    let full: i32 = ac_fresh(cg);
+    let after_full: i32 = ac_fresh(cg);
+    let done: i32 = ac_fresh(cg);
+    push[AInstr](out, ai_mov_imm(A_X9(), 0));
+    push[AInstr](out, ai_label(loop));
+    push[AInstr](out, ai_cmp_imm(A_X9(), ac_alloc_access_registry_cap()));
+    push[AInstr](out, ai_jge(full));
+    // x10 = &registry[x9]
+    push[AInstr](out, ai_mov_rr(A_X10(), A_X9()));
+    push[AInstr](out, ai_lsl_imm(A_X10(), A_X10(), 4));
+    push[AInstr](out, ai_mov_imm(A_X11(), ac_alloc_access_registry()));
+    push[AInstr](out, ai_add(A_X10(), A_X11()));
+    push[AInstr](out, ai_load(A_X8(), A_X10(), 0));
+    push[AInstr](out, ai_cmp_imm(A_X8(), 0));
+    push[AInstr](out, ai_je(insert));
+    push[AInstr](out, ai_jg(next));
+    // Freed tombstone — check for address reuse
+    push[AInstr](out, ai_neg(A_X8(), A_X8()));
+    push[AInstr](out, ai_cmp(A_X8(), A_X0()));
+    push[AInstr](out, ai_jne(next));
+    push[AInstr](out, ai_jmp(reused));
+    push[AInstr](out, ai_label(insert));
+    push[AInstr](out, ai_store(A_X10(), 0, A_X0()));
+    push[AInstr](out, ai_store(A_X10(), 8, A_X1()));
+    push[AInstr](out, ai_jmp(done));
+    push[AInstr](out, ai_label(next));
+    push[AInstr](out, ai_add_imm(A_X9(), 1));
+    push[AInstr](out, ai_jmp(loop));
+    push[AInstr](out, ai_label(reused));
+    ac_emit_panic(out, "zag safety: allocator address reuse violates checked quarantine", after_reused, cg);
+    push[AInstr](out, ai_jmp(done));
+    push[AInstr](out, ai_label(full));
+    ac_emit_panic(out, "zag runtime: checked allocation provenance registry exhausted", after_full, cg);
+    push[AInstr](out, ai_label(done));
+}
+
+// Retire an allocation from the provenance registry.
+// Input: x0=user pointer.
+fn ac_emit_alloc_access_release(out: *ArrayList[AInstr], cg: *ACg) void {
+    let loop: i32 = ac_fresh(cg);
+    let next: i32 = ac_fresh(cg);
+    let found: i32 = ac_fresh(cg);
+    let done: i32 = ac_fresh(cg);
+    push[AInstr](out, ai_mov_imm(A_X9(), 0));
+    push[AInstr](out, ai_label(loop));
+    push[AInstr](out, ai_cmp_imm(A_X9(), ac_alloc_access_registry_cap()));
+    push[AInstr](out, ai_jge(done));
+    push[AInstr](out, ai_mov_rr(A_X10(), A_X9()));
+    push[AInstr](out, ai_lsl_imm(A_X10(), A_X10(), 4));
+    push[AInstr](out, ai_mov_imm(A_X11(), ac_alloc_access_registry()));
+    push[AInstr](out, ai_add(A_X10(), A_X11()));
+    push[AInstr](out, ai_load(A_X8(), A_X10(), 0));
+    push[AInstr](out, ai_cmp_imm(A_X8(), 0));
+    push[AInstr](out, ai_je(next));
+    push[AInstr](out, ai_jg(found));
+    // Freed — skip
+    push[AInstr](out, ai_jmp(next));
+    push[AInstr](out, ai_label(found));
+    push[AInstr](out, ai_cmp(A_X8(), A_X0()));
+    push[AInstr](out, ai_jne(next));
+    // Mark as freed (negate the pointer)
+    push[AInstr](out, ai_neg(A_X8(), A_X8()));
+    push[AInstr](out, ai_store(A_X10(), 0, A_X8()));
+    push[AInstr](out, ai_jmp(done));
+    push[AInstr](out, ai_label(next));
+    push[AInstr](out, ai_add_imm(A_X9(), 1));
+    push[AInstr](out, ai_jmp(loop));
+    push[AInstr](out, ai_label(done));
+}
+
+// Exit-time leak detection: scan the registry for any live (positive) entries.
+// Called from _start before exit(0). Only active under --sanitize=memory.
+fn ac_emit_leak_check(out: *ArrayList[AInstr], cg: *ACg) void {
+    if (cg.*.sanitize_memory == 0) { return; }
+    let loop: i32 = ac_fresh(cg);
+    let done: i32 = ac_fresh(cg);
+    let leak: i32 = ac_fresh(cg);
+    let after_leak: i32 = ac_fresh(cg);
+    push[AInstr](out, ai_mov_imm(A_X9(), 0));
+    push[AInstr](out, ai_label(loop));
+    push[AInstr](out, ai_cmp_imm(A_X9(), ac_alloc_access_registry_cap()));
+    push[AInstr](out, ai_jge(done));
+    push[AInstr](out, ai_mov_rr(A_X10(), A_X9()));
+    push[AInstr](out, ai_lsl_imm(A_X10(), A_X10(), 4));
+    push[AInstr](out, ai_mov_imm(A_X11(), ac_alloc_access_registry()));
+    push[AInstr](out, ai_add(A_X10(), A_X11()));
+    push[AInstr](out, ai_load(A_X8(), A_X10(), 0));
+    push[AInstr](out, ai_cmp_imm(A_X8(), 0));
+    push[AInstr](out, ai_jg(leak));
+    push[AInstr](out, ai_add_imm(A_X9(), 1));
+    push[AInstr](out, ai_jmp(loop));
+    push[AInstr](out, ai_label(leak));
+    ac_emit_panic(out, "zag safety: memory leak detected at exit", after_leak, cg);
+    push[AInstr](out, ai_label(done));
+}
+
+// Form base + index*stride for a raw-pointer index with overflow checks.
+// Input: x0=base, x1=index. Output: x0=address.
+fn ac_emit_raw_index_address(out: *ArrayList[AInstr], cg: *ACg, stride: i32) void {
+    if (cg.*.safety_checked == 0) {
+        if (stride != 1) {
+            push[AInstr](out, ai_mov_imm(A_X9(), stride as i64));
+            push[AInstr](out, ai_mul(A_X1(), A_X1(), A_X9()));
+        }
+        push[AInstr](out, ai_add(A_X0(), A_X1()));
+        return;
+    }
+    let overflow: i32 = ac_fresh(cg);
+    let after_overflow: i32 = ac_fresh(cg);
+    let product_ok: i32 = ac_fresh(cg);
+    let nonnegative: i32 = ac_fresh(cg);
+    let add_ok: i32 = ac_fresh(cg);
+    // Save original base and index
+    push[AInstr](out, ai_mov_rr(A_X8(), A_X0()));   // x8 = base
+    push[AInstr](out, ai_mov_rr(A_X9(), A_X1()));   // x9 = index
+    if (stride != 1) {
+        push[AInstr](out, ai_mov_imm(A_X10(), stride as i64));
+        push[AInstr](out, ai_mul(A_X1(), A_X1(), A_X10()));
+        // Check: (x1 / stride) == x9?
+        push[AInstr](out, ai_sdiv(A_X0(), A_X1(), A_X10()));
+        push[AInstr](out, ai_cmp(A_X0(), A_X9()));
+        push[AInstr](out, ai_je(product_ok));
+        push[AInstr](out, ai_jmp(overflow));
+        push[AInstr](out, ai_label(product_ok));
+    }
+    // Restore base, check index sign
+    push[AInstr](out, ai_mov_rr(A_X0(), A_X8()));
+    push[AInstr](out, ai_cmp_imm(A_X1(), 0));
+    push[AInstr](out, ai_jge(nonnegative));
+    // Negative index: base + index should be < base
+    push[AInstr](out, ai_add(A_X0(), A_X1()));
+    push[AInstr](out, ai_cmp(A_X0(), A_X8()));
+    push[AInstr](out, ai_jle(add_ok));
+    push[AInstr](out, ai_jmp(overflow));
+    push[AInstr](out, ai_label(nonnegative));
+    // Non-negative index: base + index should be >= base
+    push[AInstr](out, ai_add(A_X0(), A_X1()));
+    push[AInstr](out, ai_cmp(A_X0(), A_X8()));
+    push[AInstr](out, ai_jge(add_ok));
+    push[AInstr](out, ai_label(overflow));
+    ac_emit_panic(out, "zag safety: raw pointer index arithmetic overflow", after_overflow, cg);
+    push[AInstr](out, ai_label(add_ok));
+}
+
 // segment: g_cursor at A_DATA_VBASE()+0, g_end at A_DATA_VBASE()+8 (both start
 // zero, so the first call takes the grow path). AArch64 Linux: mmap = 222;
 // PROT_READ|PROT_WRITE = 3; MAP_PRIVATE|MAP_ANON = 34. The kernel preserves
@@ -4016,7 +5411,7 @@ fn ac_emit_print_f64(out: *ArrayList[AInstr], lbl: i32, cg: *ACg) void {
     push[AInstr](out, ai_ret());
 }
 
-fn aload_program(decls0: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8]) ArrayList[AInstr] {
+fn aload_program(decls0: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8], v2_edition: i32, safety_checked: i32, sanitize_memory: i32, object_mode: i32, dynamic_mode: i32) ArrayList[AInstr] {
     let out: ArrayList[AInstr] = make[AInstr](128);
     let top_err: i32 = 0;
 
@@ -4029,11 +5424,50 @@ fn aload_program(decls0: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8]
     let grsv: i32 = 0;
     while (grsv < 16) { push[u8](dataout, 0); grsv = grsv + 1; }
 
+    // ── AUTO-INCLUDE the numeric runtimes (shared with x86 backend) ──────────
+    // The posit/quire, sat/fixed, and RNS runtimes are pure portable Zag
+    // (integer arithmetic only — no shifts, no bitwise ops, no inline asm).
+    // They are prepended to the AST and compiled natively like any other
+    // fn. Non-numeric programs skip this (no extra decls → byte-identical).
+    let decls0rt: ArrayList[*Node] = decls0;
+    if (cg_decls_use_posit(decls0) == 1) {
+        let rtdecls: ArrayList[*Node] = parse_program_dir(cg_numeric_rt_src(), "");
+        let merged: ArrayList[*Node] = make[*Node](len[*Node](rtdecls) + len[*Node](decls0rt) + 1);
+        let ri: i32 = 0;
+        while (ri < len[*Node](rtdecls)) { push[*Node](&merged, get[*Node](rtdecls, ri)); ri = ri + 1; }
+        let ui: i32 = 0;
+        while (ui < len[*Node](decls0rt)) { push[*Node](&merged, get[*Node](decls0rt, ui)); ui = ui + 1; }
+        decls0rt = merged;
+    }
+    if (cg_decls_use_satfixed(decls0) == 1) {
+        let rt2decls: ArrayList[*Node] = parse_program_dir(cg_numeric_rt2_src(), "");
+        let merged2: ArrayList[*Node] = make[*Node](len[*Node](rt2decls) + len[*Node](decls0rt) + 1);
+        let ri2: i32 = 0;
+        while (ri2 < len[*Node](rt2decls)) { push[*Node](&merged2, get[*Node](rt2decls, ri2)); ri2 = ri2 + 1; }
+        let ui2: i32 = 0;
+        while (ui2 < len[*Node](decls0rt)) { push[*Node](&merged2, get[*Node](decls0rt, ui2)); ui2 = ui2 + 1; }
+        decls0rt = merged2;
+    }
+    if (cg_decls_use_rns(decls0) == 1) {
+        let rt3decls: ArrayList[*Node] = parse_program_dir(cg_numeric_rt3_src(), "");
+        let merged3: ArrayList[*Node] = make[*Node](len[*Node](rt3decls) + len[*Node](decls0rt) + 1);
+        let ri3: i32 = 0;
+        while (ri3 < len[*Node](rt3decls)) { push[*Node](&merged3, get[*Node](rt3decls, ri3)); ri3 = ri3 + 1; }
+        let ui3: i32 = 0;
+        while (ui3 < len[*Node](decls0rt)) { push[*Node](&merged3, get[*Node](decls0rt, ui3)); ui3 = ui3 + 1; }
+        decls0rt = merged3;
+    }
+
     // Monomorphize using the x86 backend's target-independent AST passes:
     // infer generic targs, then expand every instantiation to a concrete
     // mangled decl. The ARM lowering only ever sees concrete names.
-    cg_ginfer_pass(decls0);
-    let decls: ArrayList[*Node] = cg_expand_generics(decls0);
+    cg_ginfer_pass(decls0rt);
+    let decls: ArrayList[*Node] = cg_expand_generics(decls0rt);
+
+    // Declare dynamic_names and globals early — the decl collection loop below
+    // populates dynamic_names, and the ACg struct literal references both.
+    let dynamic_names: ArrayList[[]u8] = make[[]u8](8);
+    let globals: ArrayList[GlobalSym] = make[GlobalSym](8);
 
     let syms: ArrayList[AFnSym] = make[AFnSym](8);
     let next_id: i32 = 1;
@@ -4042,7 +5476,34 @@ fn aload_program(decls0: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8]
         switch (get[*Node](decls, di).*) {
             .fn_decl => |f| {
                 if (len[[]u8](f.tparams) > 0) { }
-                else if (f.is_extern == 1) { }
+                else if (f.is_extern == 1) {
+                    // Collect dynamic extern symbols for GOT (dynamic mode) or
+                    // relocations (object mode).  Skip _zag_* runtime intrinsics.
+                    if ((dynamic_mode == 1 || object_mode == 1) && cg_starts_with(f.name, "_zag_") == 0 && (v2_edition == 0 || cg_fn_has_annot(f, "@cabi") == 1)) {
+                        let abi_ok: i32 = cg_dynamic_scalar_abi_type_ok(f.ret);
+                        let ap: i32 = 0;
+                        while (ap < len[Param](f.params)) {
+                            if (cg_dynamic_scalar_abi_type_ok(get[Param](f.params, ap).pty) == 0) { abi_ok = 0; }
+                            ap = ap + 1;
+                        }
+                        if (abi_ok == 0) {
+                            _zag_eprintln("arm64: dynamic extern ABI supports scalar integers, bool, pointers, and void");
+                            top_err = top_err + 1;
+                        } else {
+                            let already: i32 = 0;
+                            let exi: i32 = 0;
+                            while (exi < dynamic_names.len) {
+                                if (@strEq(get[[]u8](dynamic_names, exi), f.name)) { already = 1; }
+                                exi = exi + 1;
+                            }
+                            if (already == 0) {
+                                push[[]u8](&dynamic_names, f.name);
+                                push[AFnSym](&syms, AFnSym{ .name = f.name, .lbl = next_id, .nparams = len[Param](f.params), .ret = cg_norm_type(f.ret) });
+                                next_id = next_id + 1;
+                            }
+                        }
+                    }
+                }
                 else if (len[*Node](f.body) == 0) { }
                 else {
                     let si: i32 = 0;
@@ -4060,6 +5521,7 @@ fn aload_program(decls0: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8]
             .struct_ => |_s| { }
             .enum_ => |_e| { }
             .union_ => |_u| { }
+            .let_ => |_l| { }   // v2 `global let` decls are collected by ac_collect_globals
             else => {
                 _zag_eprintln("arm64: skipping unsupported top-level decl");
                 top_err = top_err + 1;
@@ -4128,12 +5590,25 @@ fn aload_program(decls0: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8]
         .use_s2 = 0,
         .frame_words = 0,
         .epilogue = 0,
+        .pre_epilogue = 0,
         .sret_disp = 0,
         .sret_words = 0,
         .ret_ty = "",
         .nl_off = 0 - 1,
         .decls = decls,
+        .v2_edition = v2_edition,
+        .safety_checked = safety_checked,
+        .sanitize_memory = sanitize_memory,
+        .object_mode = object_mode,
+        .dynamic_mode = dynamic_mode,
+        .dynamic_names = &dynamic_names,
+        .globals = &globals,
     };
+
+    // Collect v2 edition global symbols (zero-initialized scalar cells in BSS)
+    if (v2_edition == 1) {
+        ac_collect_globals(decls, &cg, &globals);
+    }
 
     let main_lbl: i32 = ac_find_fn(syms, "main");
     if (main_lbl < 0) {
@@ -4152,6 +5627,8 @@ fn aload_program(decls0: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8]
     // every function repurposes as its expression-stack base.
     push[AInstr](&out, ai_mov_rr(A_X27(), A_SP()));
     push[AInstr](&out, ai_call(main_lbl));
+    // Exit-time leak detection (only under --sanitize=memory)
+    ac_emit_leak_check(&out, &cg);
     push[AInstr](&out, ai_mov_imm(A_X8(), 93));
     push[AInstr](&out, ai_svc());
 

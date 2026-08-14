@@ -4,8 +4,12 @@
 @import("../../std/rt.zag")
 
 fn AVBASE() i64 { return 4194304; }
-fn AHDRS2() i64 { return 176; }
+fn AHDRS2() i64 { return 232; }
 fn ADVBASE() i64 { return 67108864; }
+fn ABSS_VBASE() i64 { return 134217728; }   // 0x8000000 (matches x86 BSS_VBASE)
+// BSS memsz: must cover every fixed runtime registry + user globals. Matches
+// the x86 backend's BSS_MEMSZ (262144 bytes) so CG_GLOBAL_BASE addresses line up.
+fn ABSS_MEMSZ() i64 { return 262144; }
 // 64 KiB, not 4096: arm64 kernels run with 4K, 16K, or 64K pages, and execve
 // requires p_offset ≡ p_vaddr (mod PAGE_SIZE) for every PT_LOAD. Aligning the
 // data segment's file offset to 64K keeps the binary loadable under all three
@@ -62,7 +66,7 @@ fn write_elf_arm64_data(path: []u8, text: ArrayList[u8], entry_off: i32, data: A
     aelf_emit_le(&buf, 0, 4);
     aelf_emit_le(&buf, 64, 2);
     aelf_emit_le(&buf, 56, 2);
-    aelf_emit_le(&buf, 2, 2);
+    aelf_emit_le(&buf, 3, 2);            // e_phnum = 3 (code, data, bss)
     aelf_emit_le(&buf, 0, 2);
     aelf_emit_le(&buf, 0, 2);
     aelf_emit_le(&buf, 0, 2);
@@ -85,6 +89,23 @@ fn write_elf_arm64_data(path: []u8, text: ArrayList[u8], entry_off: i32, data: A
     aelf_emit_le(&buf, dlen, 8);
     aelf_emit_le(&buf, APAGE(), 8);
 
+    // BSS segment: zero-initialized by the loader, no file content.
+    // Used for v2 edition global symbols and (future) memory-safety registries.
+    // p_offset must satisfy p_offset ≡ p_vaddr (mod PAGE_SIZE). Since BSS_VBASE
+    // is page-aligned and p_filesz=0, set p_offset to the page-aligned end of
+    // the data segment to avoid overlapping file content.
+    let data_end: i64 = data_file_off + dlen;
+    let bss_pad: i64 = (APAGE() - (data_end % APAGE())) % APAGE();
+    let bss_file_off: i64 = data_end + bss_pad;
+    aelf_emit_le(&buf, 1, 4);
+    aelf_emit_le(&buf, 6, 4);            // PF_R|PF_W
+    aelf_emit_le(&buf, bss_file_off, 8); // p_offset (no file content, but page-aligned)
+    aelf_emit_le(&buf, ABSS_VBASE(), 8);
+    aelf_emit_le(&buf, ABSS_VBASE(), 8);
+    aelf_emit_le(&buf, 0, 8);           // p_filesz = 0
+    aelf_emit_le(&buf, ABSS_MEMSZ(), 8); // p_memsz = BSS size
+    aelf_emit_le(&buf, APAGE(), 8);
+
     let i: i32 = 0;
     while (i < text.len) {
         aelf_eb(&buf, get[u8](text, i) as i32);
@@ -98,4 +119,159 @@ fn write_elf_arm64_data(path: []u8, text: ArrayList[u8], entry_off: i32, data: A
         d = d + 1;
     }
     return _zag_write_exec(path, buf.data[0..buf.len]);
+}
+
+// ── object mode (ET_REL) ────────────────────────────────────────────────────
+// The Elf64Object* structs are defined in elf.zag and shared between backends.
+// R_AARCH64_CALL26 = 283: the linker patches the BL imm26 field.
+// Addend = 0: AArch64 BL computes target = PC + (imm26 << 2), so the addend
+// is implicit in the instruction encoding (unlike x86 PLT32 which needs -4).
+
+fn aelf_align(buf: *ArrayList[u8], align: i32) void {
+    while ((buf.*.len % align) != 0) { aelf_eb(buf, 0); }
+}
+
+fn aelf_cstr(buf: *ArrayList[u8], s: []u8) void {
+    let i: i32 = 0;
+    while (i < s.len) { aelf_eb(buf, s[i] as i32); i = i + 1; }
+    aelf_eb(buf, 0);
+}
+
+fn aelf64_sym(buf: *ArrayList[u8], name: i32, info: i32, shndx: i32, value: i64, size: i64) void {
+    aelf_emit_le(buf, name as i64, 4);
+    aelf_eb(buf, info);
+    aelf_eb(buf, 0);
+    aelf_emit_le(buf, shndx as i64, 2);
+    aelf_emit_le(buf, value, 8);
+    aelf_emit_le(buf, size, 8);
+}
+
+fn aelf64_sh(buf: *ArrayList[u8], name: i32, typ: i32, flags: i64, off: i64, size: i64, link: i32, info: i32, align: i64, entsize: i64) void {
+    aelf_emit_le(buf, name as i64, 4);
+    aelf_emit_le(buf, typ as i64, 4);
+    aelf_emit_le(buf, flags, 8);
+    aelf_emit_le(buf, 0, 8);
+    aelf_emit_le(buf, off, 8);
+    aelf_emit_le(buf, size, 8);
+    aelf_emit_le(buf, link as i64, 4);
+    aelf_emit_le(buf, info as i64, 4);
+    aelf_emit_le(buf, align, 8);
+    aelf_emit_le(buf, entsize, 8);
+}
+
+fn write_elf_arm64_object_reloc(path: []u8, text: ArrayList[u8], symbols: ArrayList[Elf64ObjectSymbol], imports: ArrayList[Elf64ObjectImport], relocs: ArrayList[Elf64ObjectReloc]) i32 {
+    let i: i32 = 0;
+    while (i < symbols.len) {
+        let s: Elf64ObjectSymbol = get[Elf64ObjectSymbol](symbols, i);
+        if (s.name.len == 0 || s.offset < 0 || s.size < 0 || s.offset > text.len || s.size > text.len - s.offset) { return 1; }
+        let j: i32 = i + 1;
+        while (j < symbols.len) { if (s.name == get[Elf64ObjectSymbol](symbols, j).name) { return 1; } j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < imports.len) {
+        let im: Elf64ObjectImport = get[Elf64ObjectImport](imports, i);
+        if (im.name.len == 0) { return 1; }
+        let j: i32 = 0;
+        while (j < symbols.len) { if (im.name == get[Elf64ObjectSymbol](symbols, j).name) { return 1; } j = j + 1; }
+        j = i + 1;
+        while (j < imports.len) { if (im.name == get[Elf64ObjectImport](imports, j).name) { return 1; } j = j + 1; }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < relocs.len) {
+        let r: Elf64ObjectReloc = get[Elf64ObjectReloc](relocs, i);
+        // R_AARCH64_CALL26 = 283.  Reject all other relocation types.
+        if (r.typ != 283 || r.addend != 0 || r.import_index < 0 || r.import_index >= imports.len || r.offset < 0 || r.offset > text.len - 4) { return 1; }
+        i = i + 1;
+    }
+
+    let buf: ArrayList[u8] = make[u8](text.len + (symbols.len + imports.len) * 48 + relocs.len * 24 + 960);
+    // ELF64 header, ET_REL / EM_AARCH64, with .rela.text at section 2.
+    aelf_eb(&buf, 127); aelf_eb(&buf, 69); aelf_eb(&buf, 76); aelf_eb(&buf, 70); aelf_eb(&buf, 2); aelf_eb(&buf, 1); aelf_eb(&buf, 1); aelf_eb(&buf, 0);
+    let pi: i32 = 0;
+    while (pi < 8) { aelf_eb(&buf, 0); pi = pi + 1; }
+    aelf_emit_le(&buf, 1, 2);       // e_type = ET_REL
+    aelf_emit_le(&buf, 183, 2);     // e_machine = EM_AARCH64
+    aelf_emit_le(&buf, 1, 4);       // e_version
+    aelf_emit_le(&buf, 0, 8);       // e_entry
+    aelf_emit_le(&buf, 0, 8);       // e_phoff
+    let shoff_pos: i32 = buf.len;
+    aelf_emit_le(&buf, 0, 8);       // e_shoff (patched later)
+    aelf_emit_le(&buf, 0, 4);       // e_flags
+    aelf_emit_le(&buf, 64, 2);      // e_ehsize
+    aelf_emit_le(&buf, 0, 2);       // e_phentsize
+    aelf_emit_le(&buf, 0, 2);       // e_phnum
+    aelf_emit_le(&buf, 64, 2);      // e_shentsize
+    aelf_emit_le(&buf, 6, 2);       // e_shnum = 6 sections
+    aelf_emit_le(&buf, 3, 2);       // e_shstrndx = section 3
+
+    aelf_align(&buf, 16);
+    let text_off: i32 = buf.len;
+    i = 0;
+    while (i < text.len) { aelf_eb(&buf, get[u8](text, i) as i32); i = i + 1; }
+    let text_size: i32 = buf.len - text_off;
+
+    let shstr_off: i32 = buf.len;
+    aelf_eb(&buf, 0);
+    aelf_cstr(&buf, ".text");
+    aelf_cstr(&buf, ".rela.text");
+    aelf_cstr(&buf, ".shstrtab");
+    aelf_cstr(&buf, ".strtab");
+    aelf_cstr(&buf, ".symtab");
+    let shstr_size: i32 = buf.len - shstr_off;
+
+    let str_off: i32 = buf.len;
+    let name_offs: ArrayList[i32] = make[i32](symbols.len + imports.len + 1);
+    aelf_eb(&buf, 0);
+    i = 0;
+    while (i < symbols.len) { push[i32](&name_offs, buf.len - str_off); aelf_cstr(&buf, get[Elf64ObjectSymbol](symbols, i).name); i = i + 1; }
+    i = 0;
+    while (i < imports.len) { push[i32](&name_offs, buf.len - str_off); aelf_cstr(&buf, get[Elf64ObjectImport](imports, i).name); i = i + 1; }
+    let str_size: i32 = buf.len - str_off;
+
+    aelf_align(&buf, 8);
+    let sym_off: i32 = buf.len;
+    aelf64_sym(&buf, 0, 0, 0, 0, 0);                    // NULL symbol
+    aelf64_sym(&buf, 0, 3, 1, 0, 0);                    // SECTION symbol for .text
+    i = 0;
+    while (i < symbols.len) {
+        let s: Elf64ObjectSymbol = get[Elf64ObjectSymbol](symbols, i);
+        aelf64_sym(&buf, get[i32](name_offs, i), 18, 1, s.offset as i64, s.size as i64);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < imports.len) {
+        aelf64_sym(&buf, get[i32](name_offs, symbols.len + i), 18, 0, 0, 0);
+        i = i + 1;
+    }
+    let sym_size: i32 = buf.len - sym_off;
+
+    aelf_align(&buf, 8);
+    let rela_off: i32 = buf.len;
+    i = 0;
+    while (i < relocs.len) {
+        let r: Elf64ObjectReloc = get[Elf64ObjectReloc](relocs, i);
+        let sym_index: i64 = (2 + symbols.len + r.import_index) as i64;
+        aelf_emit_le(&buf, r.offset as i64, 8);
+        aelf_emit_le(&buf, sym_index * 4294967296 + r.typ as i64, 8);
+        aelf_emit_le(&buf, r.addend, 8);
+        i = i + 1;
+    }
+    let rela_size: i32 = buf.len - rela_off;
+
+    aelf_align(&buf, 8);
+    let shoff: i32 = buf.len;
+    aelf64_sh(&buf, 0, 0, 0, 0, 0, 0, 0, 0, 0);                                    // section 0: NULL
+    aelf64_sh(&buf, 1, 1, 6, text_off as i64, text_size as i64, 0, 0, 16, 0);      // section 1: .text
+    aelf64_sh(&buf, 7, 4, 0, rela_off as i64, rela_size as i64, 5, 1, 8, 24);      // section 2: .rela.text
+    aelf64_sh(&buf, 18, 3, 0, shstr_off as i64, shstr_size as i64, 0, 0, 1, 0);    // section 3: .shstrtab
+    aelf64_sh(&buf, 28, 3, 0, str_off as i64, str_size as i64, 0, 0, 1, 0);        // section 4: .strtab
+    aelf64_sh(&buf, 36, 2, 0, sym_off as i64, sym_size as i64, 4, 2, 8, 24);       // section 5: .symtab
+
+    // Patch e_shoff.
+    let sv: i64 = shoff as i64;
+    let k: i32 = 0;
+    while (k < 8) { set[u8](&buf, shoff_pos + k, (sv & 255) as u8); sv = (sv - (sv & 255)) / 256; k = k + 1; }
+    return _zag_write_file(path, buf.data[0..buf.len]);
 }

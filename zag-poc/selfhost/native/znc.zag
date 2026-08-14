@@ -32,6 +32,9 @@
 @import("../version.zag") // zag_version / zag_edition
 @import("../smt.zag")     // @total SMT discharge (kept out of sema.zag for lean bootstrap)
 @import("../mlir.zag")    // GPU MLIR emitter (lean — no codegen.zag dependency)
+@import("../zir.zag")     // versioned production IR contract and native migration bridge
+@import("../script_projection.zag") // fail-closed promoted-edit projection
+@import("../derivation_ledger.zag") // portable fail-closed promotion provenance
 @import("../gfx1010.zag") // deterministic validated RDNA1 kernel bundles
 @import("../spirv.zag")   // SPIR-V binary encoder for Vulkan/OpenCL compat tier
 @import("../msl.zag")     // Metal Shading Language encoder for Metal compat tier
@@ -46,6 +49,8 @@
 
 @import("aarch64.zag")   // AArch64 instruction encoder
 @import("elf_arm64.zag")  // ELF64 AArch64 writer
+@import("elf_dynamic_arm64.zag") // AArch64 dynamic executable writer
+@import("driver_elf.zag")  // Linux kernel-module ET_REL writer
 @import("x86_cpu_profile.zag") // explicit Linux x86-64 baseline/native policy
 @import("foreground_cache.zag") // revalidated whole-program machine-code reuse
 
@@ -147,6 +152,7 @@ fn lo_stmt(n: *Node, env: *ArrayList[LoEnv], dl: ArrayList[*Node]) void {
         .if_    => |x| { lo_expr(x.cond, env.*, dl); lo_block(x.then_body, env, dl); lo_block(x.els_body, env, dl); }
         .while_ => |w| { lo_expr(w.cond, env.*, dl); lo_block(w.body, env, dl); }
         .unsafe_ => |u| { lo_block(u.body, env, dl); }
+        .defer_ => |d| { lo_expr(d.expr, env.*, dl); }
         .assign => |a| { lo_expr(a.target, env.*, dl); lo_expr(a.expr, env.*, dl); }
         .switch_ => |sw| {
             lo_expr(sw.subject, env.*, dl);
@@ -304,7 +310,14 @@ struct ZncObjectExport { name:[]u8, label:i32 }
 fn znc_x86_object_exports(decls:ArrayList[*Node])ArrayList[ZncObjectExport]{
     let out:ArrayList[ZncObjectExport]=make[ZncObjectExport](4);let label:i32=1;let i:i32=0;
     while(i<len[*Node](decls)){switch(get[*Node](decls,i).*){.fn_decl=>|f|{
-        if(f.is_extern==0&&len[[]u8](f.tparams)==0&&len[*Node](f.body)>0&&starts_with(f.name,"__iface_")==0){
+        // Object-mode lowering assigns labels to eligible @cabi imports before
+        // it assigns labels to definitions.  Keep the ELF export mirror in
+        // that same sequence; otherwise an extern declaration such as the
+        // kernel's `schedule` shifts init_module/cleanup_module onto the
+        // preceding private function.
+        if(f.is_extern==1&&starts_with(f.name,"_zag_")==0&&znc_fn_has_annot(f,"@cabi")==1){
+            label=label+1;
+        } else if(f.is_extern==0&&len[[]u8](f.tparams)==0&&len[*Node](f.body)>0&&starts_with(f.name,"__iface_")==0){
             if(znc_fn_has_annot(f,"@cabi_export")==1){push[ZncObjectExport](&out,ZncObjectExport{.name=f.name,.label=label});}
             label=label+1;
         }
@@ -350,6 +363,236 @@ fn znc_object_externs_ok(decls:ArrayList[*Node])i32{
     }
     return 1;
 }
+
+// Driver-module output is a separate artifact mode. It never falls through to
+// the executable or narrow C-ABI writers, and it requires the kernel's two
+// loader entry points to be explicit source declarations.
+fn znc_driver_module_mode() i32 {
+    return (has_flag("--emit-driver-module") == 1 || has_flag("--driver-module") == 1) as i32;
+}
+
+fn znc_driver_kernel_series() i32 {
+    let value: []u8 = flag_value("--driver-kernel");
+    let inline: []u8 = "";
+    let i: i32 = 0;
+    while (i < _zag_argc()) {
+        let arg: []u8 = _zag_arg(i);
+        if (starts_with(arg, "--driver-kernel=") == 1) { inline = arg[16..]; }
+        i = i + 1;
+    }
+    let selected: []u8 = value;
+    if (inline.len > 0) { selected = inline; }
+    if (@strEq(selected, "6.1") || @strEq(selected, "6_1") || @strEq(selected, "61")) { return 61; }
+    if (@strEq(selected, "6.6") || @strEq(selected, "6_6") || @strEq(selected, "66")) { return 66; }
+    return 0;
+}
+
+fn znc_driver_target_tag(target: []u8) []u8 {
+    if (target.len == 0 || @strEq(target, "x86_64") || @strEq(target, "x86-64") || @strEq(target, "linux-x86_64")) { return "x86_64"; }
+    if (@strEq(target, "arm64") || @strEq(target, "aarch64")) { return "arm64"; }
+    if (@strEq(target, "i686") || @strEq(target, "x86") || @strEq(target, "linux-i686")) { return "i686"; }
+    return "";
+}
+
+fn znc_driver_modinfo(series: i32, target: []u8) ArrayList[u8] {
+    let out: ArrayList[u8] = make[u8](128);
+    // Kbuild/kernel-owned module generation supplies the real vermagic.  A
+    // pure-Zag ET_REL must never invent one and thereby masquerade as a
+    // loadable module.  Keep only an explicit provenance tag for the selected
+    // binding series; the final .ko is the authority for actual vermagic.
+    if (series == 61) { driver_elf_cstr(&out, "zag_kernel_series=6.1"); }
+    else { driver_elf_cstr(&out, "zag_kernel_series=6.6"); }
+    driver_elf_cstr(&out, _zag_str_concat("name=zag_driver_", target));
+    driver_elf_cstr(&out, "license=GPL");
+    driver_elf_cstr(&out, "description=Pure-Zag Linux driver module");
+    driver_elf_cstr(&out, _zag_str_concat("zag_target=", target));
+    driver_elf_cstr(&out, "depends=");
+    return out;
+}
+
+fn znc_driver_entries_ok(decls: ArrayList[*Node], file: []u8) i32 {
+    if (@strEq(v2_project_edition(file), "2027") == 0) { return 0; }
+    let init_ok: i32 = 0;
+    let exit_ok: i32 = 0;
+    let i: i32 = 0;
+    while (i < decls.len) {
+        switch (decls.data[i].*) {
+            .fn_decl => |f| {
+                if (@strEq(f.name, "init_module") && f.is_pub == 1 && f.is_extern == 0 &&
+                    znc_fn_has_annot(f, "@cabi_export") == 1 &&
+                    znc_fn_has_annot(f, "@driver_init") == 1 &&
+                    f.params.len == 0 && @strEq(f.ret, "i32")) { init_ok = 1; }
+                if (@strEq(f.name, "cleanup_module") && f.is_pub == 1 && f.is_extern == 0 &&
+                    znc_fn_has_annot(f, "@cabi_export") == 1 &&
+                    znc_fn_has_annot(f, "@driver_teardown") == 1 &&
+                    f.params.len == 0 && @strEq(f.ret, "void")) { exit_ok = 1; }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    if (init_ok == 0 || exit_ok == 0) {
+        _zag_eprintln("znc: driver module requires pub @cabi_export @driver_init init_module() i32 and pub @cabi_export @driver_teardown cleanup_module() void");
+        return 0;
+    }
+    if (znc_object_externs_ok(decls) == 0) {
+        _zag_eprintln("znc: driver module foreign declarations require explicit edition-2027 @cabi imports");
+        return 0;
+    }
+    return 1;
+}
+
+fn znc_driver_debug(path: []u8, decls: ArrayList[*Node]) DwarfSections {
+    let builder: DwarfBuilder = dwarf_new(path);
+    dwarf_build_abbrev(&builder);
+    dwarf_emit_compile_unit(&builder);
+    let i: i32 = 0;
+    while (i < decls.len) {
+        switch (decls.data[i].*) {
+            .fn_decl => |f| { dwarf_emit_function(&builder, f.name, f.line); }
+            else => { }
+        }
+        i = i + 1;
+    }
+    dwarf_finish(&builder);
+    dwarf_emit_line_program(&builder);
+    return dwarf_build(&builder);
+}
+
+fn znc_driver_export_index(exports: ArrayList[ZncObjectExport], name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < exports.len) {
+        if (@strEq(exports.data[i].name, name)) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn znc_driver_mod_symbols(exports: ArrayList[ZncObjectExport], labels: ArrayList[i32],
+                          text_len: i32) ArrayList[DriverElfSymbol] {
+    let out: ArrayList[DriverElfSymbol] = make[DriverElfSymbol](exports.len);
+    let i: i32 = 0;
+    while (i < exports.len) {
+        let entry: ZncObjectExport = exports.data[i];
+        if (entry.label < 0 || entry.label >= labels.len) { return make[DriverElfSymbol](0); }
+        push[DriverElfSymbol](&out, DriverElfSymbol{
+            .name = entry.name, .offset = labels.data[entry.label], .size = 0,
+            .defined = 1, .section = 1, .bind = 1, .type_ = 2 });
+        i = i + 1;
+    }
+    // Size each function by the next exported entry or the end of text. This
+    // is deterministic and preserves a useful symbol boundary for modpost and
+    // DWARF consumers without guessing hidden internal function extents.
+    i = 0;
+    while (i < out.len) {
+        let next: i32 = text_len;
+        let j: i32 = i + 1;
+        while (j < out.len) { if (out.data[j].offset > out.data[i].offset && out.data[j].offset < next) { next = out.data[j].offset; } j = j + 1; }
+        out.data[i].size = next - out.data[i].offset;
+        i = i + 1;
+    }
+    return out;
+}
+
+fn znc_driver_data_anchor() ArrayList[u8] {
+    // A relocatable module always carries one typed entry-reference cell. The
+    // backend's data relocation points this cell at init_module; Kbuild may
+    // resolve it while final-linking the module, and no host address is baked
+    // into the object.
+    let out: ArrayList[u8] = make[u8](8);
+    let i: i32 = 0; while (i < 8) { push[u8](&out, 0); i = i + 1; }
+    return out;
+}
+
+fn znc_driver_imports_from_x86(imports: ArrayList[[]u8]) ArrayList[[]u8] {
+    let out: ArrayList[[]u8] = make[[]u8](imports.len);
+    let i: i32 = 0;
+    while (i < imports.len) { push[[]u8](&out, imports.data[i]); i = i + 1; }
+    return out;
+}
+
+fn znc_driver_data_anchor32() ArrayList[u8] {
+    let out: ArrayList[u8] = make[u8](4);
+    let i: i32 = 0; while (i < 4) { push[u8](&out, 0); i = i + 1; }
+    return out;
+}
+
+fn znc_driver_module_data(anchor: ArrayList[u8], source: ArrayList[u8]) ArrayList[u8] {
+    // The executable data ABI starts at DATA_VBASE(); driver code instead
+    // addresses the same bytes through the relocatable .data section. Keep
+    // the synthetic entry cell first, then preserve every compiler-owned
+    // source byte at a stable offset for target text relocations.
+    let out: ArrayList[u8] = make[u8](anchor.len + source.len);
+    let i: i32 = 0;
+    while (i < anchor.len) { push[u8](&out, anchor.data[i]); i = i + 1; }
+    i = 0;
+    while (i < source.len) { push[u8](&out, source.data[i]); i = i + 1; }
+    return out;
+}
+
+fn znc_driver_i686_symbol(code: I686ObjectCode, name: []u8) I686CodeSymbol {
+    let i: i32 = 0;
+    while (i < code.symbols.len) {
+        if (@strEq(code.symbols.data[i].name, name)) { return code.symbols.data[i]; }
+        i = i + 1;
+    }
+    return I686CodeSymbol{.name="",.offset=-1,.size=0,.defined=0};
+}
+
+fn znc_driver_i686_symbols(exports: ArrayList[ZncObjectExport], code: I686ObjectCode,
+                            text_len: i32) ArrayList[DriverElfSymbol] {
+    let out: ArrayList[DriverElfSymbol] = make[DriverElfSymbol](exports.len);
+    let i: i32 = 0;
+    while (i < exports.len) {
+        let source: I686CodeSymbol = znc_driver_i686_symbol(code, exports.data[i].name);
+        if (source.defined == 0 || source.offset < 0 || source.offset > text_len) { return make[DriverElfSymbol](0); }
+        push[DriverElfSymbol](&out, DriverElfSymbol{.name=source.name,.offset=source.offset,.size=source.size,.defined=1,.section=1,.bind=1,.type_=2});
+        i = i + 1;
+    }
+    i = 0;
+    while (i < out.len) {
+        if (out.data[i].size == 0) {
+            let next: i32 = text_len; let j: i32 = 0;
+            while (j < out.len) { if (j != i && out.data[j].offset > out.data[i].offset && out.data[j].offset < next) { next = out.data[j].offset; } j = j + 1; }
+            out.data[i].size = next - out.data[i].offset;
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn znc_driver_i686_import_index(imports: ArrayList[[]u8], name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < imports.len) { if (@strEq(imports.data[i], name)) { return i; } i = i + 1; }
+    return -1;
+}
+
+fn znc_driver_i686_imports(code: I686ObjectCode) ArrayList[[]u8] {
+    let out: ArrayList[[]u8] = make[[]u8](4);
+    let i: i32 = 0;
+    while (i < code.relocs.len) {
+        let name: []u8 = code.relocs.data[i].name;
+        if (znc_driver_i686_import_index(out, name) < 0) { push[[]u8](&out, name); }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn znc_driver_i686_text_relocs(code: I686ObjectCode,
+                               exports: ArrayList[ZncObjectExport],
+                               imports: ArrayList[[]u8]) ArrayList[DriverElfReloc] {
+    let out: ArrayList[DriverElfReloc] = make[DriverElfReloc](code.relocs.len);
+    let i: i32 = 0;
+    while (i < code.relocs.len) {
+        let reloc: I686CodeReloc = code.relocs.data[i];
+        let import_index: i32 = znc_driver_i686_import_index(imports, reloc.name);
+        if (import_index < 0 || reloc.typ != 2) { return make[DriverElfReloc](0); }
+        push[DriverElfReloc](&out, DriverElfReloc{.offset=reloc.offset,.symbol=4+exports.len+import_index,.typ=2,.addend=0});
+        i = i + 1;
+    }
+    return out;
+}
+
 
 fn znc_needed_name_ok(s: []u8) i32 {
     if (s.len == 0 || s.len > 128) { return 0; }
@@ -641,7 +884,11 @@ fn znc_reject_v2_cabi_non_native(path: []u8) i32 {
     if (src.len < 0) { return 0; } // target builder reports an ordinary read error
     let unit: CompilationUnit = parse_compilation_unit_dir(src, dir_of(path));
     if (znc_decls_have_cabi(unit.decls) == 1) {
-        _zag_eprintln("znc: v2 @cabi imports are currently supported only for native x86-64 --dynamic output");
+        // ARM64 now supports @cabi imports in --emit-obj and --dynamic modes.
+        if ((arm64_target() == 1 || i686_target() == 1) && (has_flag("--emit-obj") == 1 || has_flag("--dynamic") == 1 || znc_driver_module_mode() == 1)) {
+            return 0;
+        }
+        _zag_eprintln("znc: v2 @cabi imports are currently supported only for native x86-64 --dynamic output or arm64 --emit-obj/--dynamic");
         _zag_eprintln("note: no v2 C ABI object, archive, WASM, ARM64, or GPU artifact was emitted");
         return 1;
     }
@@ -651,6 +898,13 @@ fn znc_reject_v2_cabi_non_native(path: []u8) i32 {
 fn build_i686_minimal(path: []u8) i32 {
     let src:[]u8=_zag_read_file(path);
     if (src.len < 0) { _zag_eprintln("znc i686: cannot read source"); return 1; }
+    let driver_mode:i32=znc_driver_module_mode();
+    if(driver_mode==1){
+        if(has_flag("--link-i686")==1){_zag_eprintln("znc i686: --emit-driver-module cannot be combined with --link-i686");return 1;}
+        if(znc_driver_kernel_series()==0){_zag_eprintln("znc: --emit-driver-module requires --driver-kernel 6.1 or 6.6");return 1;}
+        let requested_target:[]u8=flag_value("--target");
+        if(@strEq(requested_target,"i686")==0&&@strEq(requested_target,"x86")==0&&@strEq(requested_target,"linux-i686")==0){_zag_eprintln("znc: i686 driver module requires --target i686");return 1;}
+    }
     if(has_flag("--link-i686")==1){let linked:[]u8=out_flag();if(linked.len==0){linked=default_out(path);}let inputs:ArrayList[[]u8]=make[[]u8](4);push[[]u8](&inputs,src);let ai:i32=2;while(ai<_zag_argc()){let a:[]u8=_zag_arg(ai);if(@strEq(a,"-o")||@strEq(a,"--target")){ai=ai+2;}else if(a.len>0&&a[0]=='-'){ai=ai+1;}else{let extra:[]u8=_zag_read_file(a);if(extra.len<0){_zag_eprintln(_zag_str_concat("znc i686: cannot read link input: ",a));return 1;}push[[]u8](&inputs,extra);ai=ai+1;}}if(write_i686_linked_objects(linked,inputs)!=0){return 1;}_zag_println(_zag_str_concat("znc: linked ELF32/i386 executable ",linked));return 0;}
     // Target selection must not bypass the language authorities shared by the
     // normal native, ARM64, WASM, and GPU paths.  Keep this before lowering and
@@ -668,13 +922,44 @@ fn build_i686_minimal(path: []u8) i32 {
     let eff:map__StringMap[i32]=analyze(decls);
     let viols:i32=report_violations(decls,eff,src,path);
     if(viols>0){_zag_println("znc: capability check FAILED");return 1;}
-    let object_mode:i32=((has_flag("--emit-obj")==1||has_flag("--emit-static")==1) as i32);
-    let lower:I386Lower=I386Lower{.ir=make[I32IR](32),.locals=make[I386Local](8),.funcs=make[I386Fn](8),.structs=make[StructDecl](4),.strings=make[[]u8](4),.object_relocs=make[I686CodeReloc](4),.failed=0,.next_label=0,.next_slot=0,.break_label=-1,.continue_label=-1,.current_error_fn=0,.expected_ty="",.current_ret_ty="",.sret_target=-1,.object_mode=object_mode};
+    // The i686 backend consumes the same post-sema AST contract as the normal
+    // native backends.  Expand generic driver handles and accessors before the
+    // deliberately small integer IR sees them; otherwise a valid
+    // `DmaBuffer[u8]`/`MmioRegister[u16]` call is mistaken for an unknown i32
+    // function and the target silently loses the shared driver core.
+    cg_ginfer_pass(decls);
+    decls = cg_expand_generics(decls);
+    let object_mode:i32=((has_flag("--emit-obj")==1||has_flag("--emit-static")==1||driver_mode==1) as i32);
+    let lower:I386Lower=I386Lower{.ir=make[I32IR](32),.locals=make[I386Local](8),.funcs=make[I386Fn](8),.structs=make[StructDecl](4),.strings=make[[]u8](4),.object_relocs=make[I686CodeReloc](4),.failed=0,.next_label=0,.next_slot=0,.break_label=-1,.continue_label=-1,.current_error_fn=0,.expected_ty="",.current_ret_ty="",.current_fn_name="",.sret_target=-1,.object_mode=object_mode};
     if(lower_i386_i32_program(decls,&lower)!=0) { return 1; }
     let text:ArrayList[u8]=encode_i386_i32(&lower);
     let out:[]u8=out_flag();
     if (out.len==0) { out=default_out(path); }
-    if(object_mode==1){let code:I686ObjectCode=i386_object_code(&lower,text);if(has_flag("--emit-obj")==1){if(write_i686_object_code(out,code)!=0){_zag_eprintln("znc i686: failed to write ELF32 object");return 1;}_zag_println(_zag_str_concat("znc: wrote ELF32/i386 object ",out));return 0;}if(write_i686_archive_code(out,code)!=0){_zag_eprintln("znc i686: failed to write static archive");return 1;}_zag_println(_zag_str_concat("znc: wrote ELF32/i386 archive ",out));return 0;}
+    if(object_mode==1){
+        let code:I686ObjectCode=i386_object_code(&lower,text);
+        if(driver_mode==1){
+            if(znc_driver_entries_ok(decls,path)==0){return 1;}
+            if(code.relocs.len==0){_zag_eprintln("znc: driver module requires at least one explicit kernel @cabi import relocation");return 1;}
+            let exports:ArrayList[ZncObjectExport]=znc_x86_object_exports(decls);
+            if(exports.len<2){_zag_eprintln("znc: driver module requires both init_module and cleanup_module exports");return 1;}
+            let symbols:ArrayList[DriverElfSymbol]=znc_driver_i686_symbols(exports,code,text.len);
+            if(symbols.len!=exports.len){_zag_eprintln("znc: driver module export symbols were not encoded for i686");return 1;}
+            let imports:ArrayList[[]u8]=znc_driver_i686_imports(code);
+            let text_relocs:ArrayList[DriverElfReloc]=znc_driver_i686_text_relocs(code,exports,imports);
+            if(text_relocs.len==0){_zag_eprintln("znc: driver module i686 relocation set is unsupported");return 1;}
+            let module_data:ArrayList[u8]=znc_driver_data_anchor32();
+            let data_relocs:ArrayList[DriverElfReloc]=make[DriverElfReloc](1);
+            let init_index:i32=znc_driver_export_index(exports,"init_module");
+            if(init_index<0){_zag_eprintln("znc: driver module init_module export disappeared before i686 object emission");return 1;}
+            push[DriverElfReloc](&data_relocs,DriverElfReloc{.offset=0,.symbol=4+init_index,.typ=1,.addend=0});
+            let debug:DwarfSections=znc_driver_debug(path,decls);
+            let spec_target:[]u8="i686";
+            if(write_driver_elf32(out,text,module_data,znc_driver_modinfo(znc_driver_kernel_series(),spec_target),symbols,imports,text_relocs,data_relocs,debug.abbrev,debug.info,debug.line_)!=0){_zag_eprintln("znc: failed to write deterministic i686 Zag driver ET_REL");return 1;}
+            _zag_println(_zag_str_concat("znc: wrote i686 Zag Linux driver ET_REL ",out));
+            return 0;
+        }
+        if(has_flag("--emit-obj")==1){if(write_i686_object_code(out,code)!=0){_zag_eprintln("znc i686: failed to write ELF32 object");return 1;}_zag_println(_zag_str_concat("znc: wrote ELF32/i386 object ",out));return 0;}if(write_i686_archive_code(out,code)!=0){_zag_eprintln("znc i686: failed to write static archive");return 1;}_zag_println(_zag_str_concat("znc: wrote ELF32/i386 archive ",out));return 0;
+    }
     if (write_i686_text(out,text)!=0) { _zag_eprintln("znc i686: failed to write ELF32 executable"); return 1; }
     _zag_println(_zag_str_concat("znc: wrote ELF32/i386 i32 binary ",out));
     return 0;
@@ -845,6 +1130,7 @@ fn znc_arity_block(body: ArrayList[*Node], fname: []u8, locals: ArrayList[[]u8],
                 znc_arity_block(w.body, fname, locals, decls, errs);
             }
             .unsafe_ => |u| { znc_arity_block(u.body, fname, locals, decls, errs); }
+            .defer_ => |d| { znc_arity_expr(d.expr, fname, locals, decls, errs); }
             .switch_ => |sw| {
                 znc_arity_expr(sw.subject, fname, locals, decls, errs);
                 let ai: i32 = 0;
@@ -1100,15 +1386,134 @@ fn build_arm64(path: []u8) i32 {
 
     let nerr: i32 = 0;
     let data: ArrayList[u8] = make[u8](16);
-    let prog: ArrayList[AInstr] = aload_program(code_decls, &nerr, &data);
+    let v2_edition: i32 = @strEq(v2_project_edition(path), "2027") as i32;
+    let sanitize_memory: i32 = has_flag("--sanitize=memory");
+    let safety_checked: i32 = has_flag("--safety=checked") | sanitize_memory;
+    let arm_driver_mode: i32 = znc_driver_module_mode();
+    let arm_object_mode: i32 = ((has_flag("--emit-obj") == 1 || arm_driver_mode == 1) as i32);
+    let arm_dynamic_mode: i32 = has_flag("--dynamic");
+    if (arm_object_mode == 1 && v2_edition == 0) { _zag_eprintln("znc: native arm64 object and driver-module output require edition-2027 @cabi_export declarations"); return 1; }
+    if (arm_driver_mode == 1) {
+        if (znc_driver_kernel_series() == 0) { _zag_eprintln("znc: --emit-driver-module requires --driver-kernel 6.1 or 6.6"); return 1; }
+        if (@strEq(flag_value("--target"), "arm64") == 0 && @strEq(flag_value("--target"), "aarch64") == 0) { _zag_eprintln("znc: arm64 driver module requires --target arm64"); return 1; }
+        if (znc_driver_entries_ok(code_decls, path) == 0) { return 1; }
+    }
+    if (arm_dynamic_mode == 1 && v2_edition == 0) { _zag_eprintln("znc: native arm64 --dynamic is implemented only for edition-2027 @cabi imports"); return 1; }
+    let needed_libs: ArrayList[[]u8] = znc_needed_libs();
+    if (arm_dynamic_mode == 0 && needed_libs.len > 0) {
+        _zag_eprintln("znc: --needed requires explicit --dynamic mode");
+        return 1;
+    }
+    if (arm_dynamic_mode == 1 && needed_libs.len == 0) {
+        _zag_eprintln("znc: --dynamic requires at least one --needed SONAME");
+        return 1;
+    }
+    if (arm_dynamic_mode == 1 && link_libs.len > 0) {
+        _zag_eprintln("znc: dynamic and static archive linking cannot be mixed yet");
+        return 1;
+    }
+    let prog: ArrayList[AInstr] = aload_program(code_decls, &nerr, &data, v2_edition, safety_checked, sanitize_memory, arm_object_mode, arm_dynamic_mode);
     if (nerr > 0) {
         _zag_println("znc: build aborted — unsupported constructs (see messages above)");
         return 1;
     }
-    let code: ArrayList[u8] = aencode(prog);
 
     let out: []u8 = out_flag();
     if (out.len == 0) { out = default_out(path); }
+
+    // Object mode: emit ET_REL with symbols and relocations.
+    if (arm_driver_mode == 1) {
+        if (arm_dynamic_mode == 1 || needed_libs.len > 0 || link_libs.len > 0) { _zag_eprintln("znc: driver module output does not support dynamic linking or archives"); return 1; }
+        let exports: ArrayList[ZncObjectExport] = znc_x86_object_exports(code_decls);
+        if (exports.len < 2) { _zag_eprintln("znc: driver module requires both init_module and cleanup_module exports"); return 1; }
+        let encoded: AEncoded = aencode_with_labels_mode(prog, 1);
+        if (encoded.relocs.len == 0) { _zag_eprintln("znc: driver module requires at least one explicit kernel @cabi import relocation"); return 1; }
+        let symbols: ArrayList[DriverElfSymbol] = znc_driver_mod_symbols(exports, encoded.labels, encoded.text.len);
+        if (symbols.len != exports.len) { _zag_eprintln("znc: driver module export labels were not encoded"); return 1; }
+        let imports: ArrayList[[]u8] = znc_dynamic_extern_syms(code_decls, v2_edition);
+        let text_relocs: ArrayList[DriverElfReloc] = make[DriverElfReloc](encoded.relocs.len);
+        let ri: i32 = 0;
+        while (ri < encoded.relocs.len) {
+            let reloc: AObjectReloc = encoded.relocs.data[ri];
+            if (reloc.kind == 1) {
+                if (reloc.data_offset < 0 || reloc.data_offset >= data.len) { _zag_eprintln("znc: driver module data relocation is outside the compiler-owned data section"); return 1; }
+                push[DriverElfReloc](&text_relocs, DriverElfReloc{.offset=reloc.offset,.symbol=2,.typ=257,.addend=8+(reloc.data_offset as i64)});
+            } else {
+                if (reloc.import < 0 || reloc.import >= imports.len) { _zag_eprintln("znc: driver module external relocation is not a declared kernel import"); return 1; }
+                push[DriverElfReloc](&text_relocs, DriverElfReloc{.offset=reloc.offset,.symbol=4+exports.len+reloc.import,.typ=283,.addend=0});
+            }
+            ri = ri + 1;
+        }
+        let module_data: ArrayList[u8] = znc_driver_module_data(znc_driver_data_anchor(), data);
+        let data_relocs: ArrayList[DriverElfReloc] = make[DriverElfReloc](1);
+        let init_index: i32 = znc_driver_export_index(exports, "init_module");
+        if (init_index < 0) { _zag_eprintln("znc: driver module init_module export disappeared before object emission"); return 1; }
+        push[DriverElfReloc](&data_relocs, DriverElfReloc{.offset=0,.symbol=4+init_index,.typ=257,.addend=0});
+        let debug: DwarfSections = znc_driver_debug(path, code_decls);
+        let spec: DriverElfSpec = DriverElfSpec{.machine=183,.word_size=8,.text=encoded.text,.data=module_data,.modinfo=znc_driver_modinfo(znc_driver_kernel_series(), "arm64"),.symbols=symbols,.imports=imports,.text_relocs=text_relocs,.data_relocs=data_relocs,.debug_abbrev=debug.abbrev,.debug_info=debug.info,.debug_line=debug.line_};
+        if (write_driver_elf64(out, spec) != 0) { _zag_eprintln("znc: failed to write deterministic arm64 Zag driver ET_REL"); return 1; }
+        _zag_println(_zag_str_concat("znc: wrote arm64 Zag Linux driver ET_REL ", out));
+        return 0;
+    }
+
+    if (arm_object_mode == 1) {
+        let exports: ArrayList[ZncObjectExport] = znc_x86_object_exports(code_decls);
+        if (exports.len == 0) { _zag_eprintln("znc: arm64 --emit-obj requires at least one pub fn annotated @cabi_export"); return 1; }
+        if (znc_object_externs_ok(code_decls) == 0) { _zag_eprintln("znc: arm64 --emit-obj requires all extern declarations to be @cabi"); return 1; }
+        let encoded: AEncoded = aencode_with_labels(prog);
+        let syms: ArrayList[Elf64ObjectSymbol] = make[Elf64ObjectSymbol](exports.len);
+        let ei: i32 = 0;
+        while (ei < exports.len) {
+            let e: ZncObjectExport = get[ZncObjectExport](exports, ei);
+            if (e.label < 0 || e.label >= encoded.labels.len) { _zag_eprintln("znc: internal error: @cabi_export label was not encoded"); return 1; }
+            push[Elf64ObjectSymbol](&syms, Elf64ObjectSymbol{ .name = e.name, .offset = get[i32](encoded.labels, e.label), .size = 0 });
+            ei = ei + 1;
+        }
+        let externs: ArrayList[[]u8] = znc_dynamic_extern_syms(code_decls, v2_edition);
+        if (encoded.relocs.len == 0) {
+            if (write_elf_arm64_object_reloc(out, encoded.text, syms, make[Elf64ObjectImport](1), make[Elf64ObjectReloc](1)) != 0) {
+                _zag_eprintln("znc: failed to write arm64 ELF object"); return 1;
+            }
+            _zag_println(_zag_str_concat("znc: wrote ELF64/arm64 relocation-free C ABI object ", out));
+            return 0;
+        }
+        let imports: ArrayList[Elf64ObjectImport] = make[Elf64ObjectImport](externs.len);
+        let xi: i32 = 0;
+        while (xi < externs.len) { push[Elf64ObjectImport](&imports, Elf64ObjectImport{ .name = get[[]u8](externs, xi) }); xi = xi + 1; }
+        let relocs: ArrayList[Elf64ObjectReloc] = make[Elf64ObjectReloc](encoded.relocs.len);
+        let ri: i32 = 0;
+        while (ri < encoded.relocs.len) {
+            let r: AObjectReloc = get[AObjectReloc](encoded.relocs, ri);
+            if (r.import < 0 || r.import >= imports.len) { _zag_eprintln("znc: internal error: external-call relocation import was not declared"); return 1; }
+            push[Elf64ObjectReloc](&relocs, Elf64ObjectReloc{ .offset = r.offset, .import_index = r.import, .typ = 283, .addend = 0 });
+            ri = ri + 1;
+        }
+        if (write_elf_arm64_object_reloc(out, encoded.text, syms, imports, relocs) != 0) {
+            _zag_eprintln("znc: failed to write arm64 ELF relocation object"); return 1;
+        }
+        _zag_println(_zag_str_concat("znc: wrote ELF64/arm64 C ABI object with direct call relocations ", out));
+        return 0;
+    }
+
+    // Dynamic mode: emit dynamic executable with GOT and PT_INTERP.
+    if (arm_dynamic_mode == 1) {
+        let dynamic_syms: ArrayList[[]u8] = znc_dynamic_extern_syms(code_decls, v2_edition);
+        if (dynamic_syms.len == 0) {
+            _zag_eprintln("znc: --dynamic program declares no non-runtime extern symbols");
+            return 1;
+        }
+        let code: ArrayList[u8] = aencode(prog);
+        let drc: i32 = write_elf_dynamic_arm64(out, code, 0, data, dynamic_syms, needed_libs);
+        if (drc != 0) { _zag_eprintln("znc: failed to write dynamic arm64 executable"); return 1; }
+        _zag_print("znc: [arm64] wrote dynamic native binary ");
+        _zag_print(out);
+        _zag_print(" (");
+        _zag_print(_zag_i64_to_str(dynamic_syms.len as i64));
+        _zag_println(" explicit system ABI symbol(s), 0 external tools)");
+        return 0;
+    }
+
+    let code: ArrayList[u8] = aencode(prog);
 
     let rc: i32 = write_elf_arm64_data(out, code, 0, data);
     if (rc != 0) { _zag_println("znc: failed to write executable"); return 1; }
@@ -1195,8 +1600,10 @@ fn src_arg() []u8 {
         let a: []u8 = _zag_arg(i);
         if (@strEq(a, "-o") || @strEq(a, "-l") || @strEq(a, "-L") ||
             @strEq(a, "--cpu") || @strEq(a, "--target") || @strEq(a, "--needed") ||
+            @strEq(a, "--driver-kernel") ||
             @strEq(a, "--format") || @strEq(a, "--output") ||
-            @strEq(a, "--analyze-str-consumer")) {
+            @strEq(a, "--analyze-str-consumer") ||
+            @strEq(a, "--foreground-transform")) {
             i = i + 2;
             continue;
         }
@@ -1262,6 +1669,39 @@ fn flag_value(name: []u8) []u8 {
         i = i + 1;
     }
     return "";
+}
+
+// A single explicit foreground transform is currently exposed.  It is not a
+// daemon choice: the value is read only from this invocation's CLI and the
+// source/policy checker must still produce an eligible candidate.
+fn foreground_transform_value() []u8 {
+    let paired: []u8 = flag_value("--foreground-transform");
+    if (paired.len > 0) { return paired; }
+    let i: i32 = 1;
+    while (i < _zag_argc()) {
+        let arg: []u8 = _zag_arg(i);
+        if (v2_starts_with(arg, "--foreground-transform=") == 1) {
+            return arg[23..];
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn foreground_transform_requested() i32 {
+    return (@strEq(foreground_transform_value(), "const-i32-add-v1")) as i32;
+}
+
+fn foreground_transform_policy(path: []u8, safety_checked: i32,
+    sanitize_memory: i32) ZirTransformPolicy {
+    return ZirTransformPolicy{.target=zir_transform_target_linux_x86_64(),
+        .edition=v2_project_edition(path),
+        .arithmetic=zir_transform_arithmetic_i32_wrap(),
+        .safety_checked=safety_checked,.sanitize_memory=sanitize_memory,
+        // This certificate bit admits the rule domain; it does not make
+        // daemon/zagd selection automatic.  This helper is reachable only
+        // through the explicit foreground CLI switch above.
+        .automatic_selection=1};
 }
 
 fn cpu_flag_value() []u8 {
@@ -1426,9 +1866,7 @@ fn znc_script_alloc_call(name:[]u8)i32{
        @strEq(name,"script_path_dirname")||@strEq(name,"script_path_extension")||
        @strEq(name,"script_list_new")||@strEq(name,"script_list1")||
        @strEq(name,"script_list2")||@strEq(name,"script_list3")||
-       @strEq(name,"script_list4")||@strEq(name,"script_list_append")||
-       @strEq(name,"script_list_len")||@strEq(name,"script_list_get")||
-       @strEq(name,"script_list_failed")){return 1;}
+       @strEq(name,"script_list4")||@strEq(name,"script_list_get")){return 1;}
     return 0;
 }
 struct ZScriptLifeSummary{name:[]u8,returns_script:i32,escapes_script:i32}
@@ -1519,12 +1957,21 @@ fn znc_script_foreign_free(name:[]u8)i32{return (@strEq(name,"delete")||@strEq(n
 fn znc_script_env_has(env:ArrayList[ZTBind],name:[]u8)i32{let i:i32=0;while(i<env.len){if(@strEq(env.data[i].name,name)){return 1;}i=i+1;}return 0;}
 fn znc_script_env_tainted(env:ArrayList[ZTBind],name:[]u8)i32{let i:i32=0;while(i<env.len){if(@strEq(env.data[i].name,name)&&@strEq(env.data[i].ty,"script-lifetime")){return 1;}i=i+1;}return 0;}
 fn znc_script_env_mark(env:*ArrayList[ZTBind],name:[]u8)void{let i:i32=0;while(i<env.*.len){if(@strEq(env.*.data[i].name,name)){env.*.data[i].ty="script-lifetime";return;}i=i+1;}push[ZTBind](env,ZTBind{.name=name,.ty="script-lifetime"});}
+// Only reference-capable or unresolved types can carry Script-context address
+// provenance. Scalar content (including a capacity, index, or length copied
+// from a Script value) is not an address alias. Unknown/generic types remain
+// conservative and tainted until concrete substitution proves otherwise.
+fn znc_script_type_may_hold_address(ty:[]u8)i32{
+    if(ty.len==0){return 1;}
+    if(@strEq(ty,"bool")||@strEq(ty,"void")||@strEq(ty,"i8")||@strEq(ty,"i16")||@strEq(ty,"i32")||@strEq(ty,"i64")||@strEq(ty,"u8")||@strEq(ty,"u16")||@strEq(ty,"u32")||@strEq(ty,"u64")||@strEq(ty,"f32")||@strEq(ty,"f64")){return 0;}
+    return 1;
+}
 fn znc_script_arm_value_tainted(body:ArrayList[*Node],env:ArrayList[ZTBind],sums:ArrayList[ZScriptLifeSummary])i32{if(body.len==0){return 0;}let last:*Node=body.data[body.len-1];switch(last.*){.estmt=>|x|{return znc_script_tainted(x.expr,env,sums);}.ret=>|x|{if(x.has_expr==1){return znc_script_tainted(x.expr,env,sums);}}else=>{}}return 0;}
 fn znc_script_tainted(n:*Node,env:ArrayList[ZTBind],sums:ArrayList[ZScriptLifeSummary])i32{switch(n.*){.id=>|x|{return znc_script_env_tainted(env,x.name);}.call=>|x|{let name:[]u8=callee_name(x.callee);if(znc_script_alloc_call(name)==1){return 1;}let s:ZScriptLifeSummary=znc_script_summary(sums,name);if(s.name.len>0&&s.returns_script==1){let i:i32=0;while(i<x.args.len){if(znc_script_tainted(x.args.data[i],env,sums)==1){return 1;}i=i+1;}return 1;}}.bin=>|x|{return znc_script_tainted(x.l,env,sums)|znc_script_tainted(x.r,env,sums);}.un=>|x|{return znc_script_tainted(x.e,env,sums);}.fld=>|x|{return znc_script_tainted(x.base,env,sums);}.idx=>|x|{return znc_script_tainted(x.base,env,sums);}.cast_=>|x|{return znc_script_tainted(x.expr,env,sums);}.slice_=>|x|{return znc_script_tainted(x.base,env,sums);}.slit_=>|x|{let i:i32=0;while(i<len[FieldInit](x.fields)){if(znc_script_tainted(get[FieldInit](x.fields,i).val,env,sums)==1){return 1;}i=i+1;}}.switch_=>|x|{let i:i32=0;while(i<len[SwitchArm](x.arms)){if(znc_script_arm_value_tainted(get[SwitchArm](x.arms,i).body,env,sums)==1){return 1;}i=i+1;}if(x.has_els==1){return znc_script_arm_value_tainted(x.els_body,env,sums);}}else=>{}}return 0;}
 fn znc_script_escape_body(body:ArrayList[*Node],env:ArrayList[ZTBind],decls:ArrayList[*Node],sums:ArrayList[ZScriptLifeSummary],report:i32)i32{let failures:i32=0;let i:i32=0;while(i<body.len){switch(body.data[i].*){.let_=>|x|{if(x.has_init==1){failures=failures+znc_script_call_escape(x.expr,env,decls,sums,report);}}.ret=>|x|{if(x.has_expr==1){failures=failures+znc_script_call_escape(x.expr,env,decls,sums,report);}}.estmt=>|x|{failures=failures+znc_script_call_escape(x.expr,env,decls,sums,report);}.assign=>|x|{failures=failures+znc_script_call_escape(x.target,env,decls,sums,report)+znc_script_call_escape(x.expr,env,decls,sums,report);}.if_=>|x|{failures=failures+znc_script_call_escape(x.cond,env,decls,sums,report)+znc_script_escape_body(x.then_body,env,decls,sums,report)+znc_script_escape_body(x.els_body,env,decls,sums,report);}.while_=>|x|{failures=failures+znc_script_call_escape(x.cond,env,decls,sums,report)+znc_script_escape_body(x.body,env,decls,sums,report);}.unsafe_=>|x|{failures=failures+znc_script_escape_body(x.body,env,decls,sums,report);}.switch_=>|x|{failures=failures+znc_script_call_escape(x.subject,env,decls,sums,report);let ai:i32=0;while(ai<len[SwitchArm](x.arms)){failures=failures+znc_script_escape_body(get[SwitchArm](x.arms,ai).body,env,decls,sums,report);ai=ai+1;}failures=failures+znc_script_escape_body(x.els_body,env,decls,sums,report);}else=>{}}i=i+1;}return failures;}
 fn znc_script_call_escape(n:*Node,env:ArrayList[ZTBind],decls:ArrayList[*Node],sums:ArrayList[ZScriptLifeSummary],report:i32)i32{let failures:i32=0;switch(n.*){.call=>|c|{let name:[]u8=callee_name(c.callee);let may_escape:i32=0;if(znc_script_safe_consumer(decls,name)==0){if(znc_script_known_fn(decls,name)==0){may_escape=1;}else if(znc_script_summary(sums,name).escapes_script==1){may_escape=1;}}let j:i32=0;while(j<c.args.len){if(znc_script_tainted(c.args.data[j],env,sums)==1){if(znc_script_foreign_free(name)==1){if(report==1){_zag_eprintln(_zag_str_concat("znc script lifetime: `",_zag_str_concat(name,"` cannot deallocate a Script-context value; it is reclaimed only at generated Script shutdown")));}failures=failures+1;}else if(may_escape==1){if(report==1){_zag_eprintln(_zag_str_concat("znc script lifetime: Script-context value may escape through helper, extern, or unknown call to `",_zag_str_concat(name,"`")));}failures=failures+1;}}failures=failures+znc_script_call_escape(c.args.data[j],env,decls,sums,report);j=j+1;}}.bin=>|x|{failures=failures+znc_script_call_escape(x.l,env,decls,sums,report)+znc_script_call_escape(x.r,env,decls,sums,report);}.un=>|x|{failures=failures+znc_script_call_escape(x.e,env,decls,sums,report);}.fld=>|x|{failures=failures+znc_script_call_escape(x.base,env,decls,sums,report);}.idx=>|x|{failures=failures+znc_script_call_escape(x.base,env,decls,sums,report)+znc_script_call_escape(x.idx,env,decls,sums,report);}.cast_=>|x|{failures=failures+znc_script_call_escape(x.expr,env,decls,sums,report);}.slice_=>|x|{failures=failures+znc_script_call_escape(x.base,env,decls,sums,report);}.slit_=>|x|{let i:i32=0;while(i<len[FieldInit](x.fields)){failures=failures+znc_script_call_escape(get[FieldInit](x.fields,i).val,env,decls,sums,report);i=i+1;}}.switch_=>|x|{failures=failures+znc_script_call_escape(x.subject,env,decls,sums,report);let ai:i32=0;while(ai<len[SwitchArm](x.arms)){failures=failures+znc_script_escape_body(get[SwitchArm](x.arms,ai).body,env,decls,sums,report);ai=ai+1;}failures=failures+znc_script_escape_body(x.els_body,env,decls,sums,report);}else=>{}}return failures;}
 fn znc_script_lifetime_body(body:ArrayList[*Node],env:*ArrayList[ZTBind],decls:ArrayList[*Node],sums:ArrayList[ZScriptLifeSummary],report:i32,returns:*i32)i32{let failures:i32=0;let i:i32=0;while(i<body.len){let n:*Node=body.data[i];switch(n.*){.let_=>|x|{if(znc_script_env_has(env.*,x.name)==0){push[ZTBind](env,ZTBind{.name=x.name,.ty=""});}if(x.has_init==1){failures=failures+znc_script_call_escape(x.expr,env.*,decls,sums,report);if(znc_script_tainted(x.expr,env.*,sums)==1){znc_script_env_mark(env,x.name);}}}.ret=>|x|{if(x.has_expr==1){failures=failures+znc_script_call_escape(x.expr,env.*,decls,sums,report);if(znc_script_tainted(x.expr,env.*,sums)==1){returns.*=1;}}}.assign=>|x|{failures=failures+znc_script_call_escape(x.expr,env.*,decls,sums,report);if(znc_script_tainted(x.expr,env.*,sums)==1){let local:i32=0;let local_name:[]u8="";switch(x.target.*){.id=>|id|{local=znc_script_env_has(env.*,id.name);local_name=id.name;}else=>{}}if(local==0){if(report==1){_zag_eprintln("znc script lifetime: Script-context value stored through a field, pointer, or nonlocal target");}failures=failures+1;}else{znc_script_env_mark(env,local_name);}}}.estmt=>|x|{failures=failures+znc_script_call_escape(x.expr,env.*,decls,sums,report);}.if_=>|x|{failures=failures+znc_script_call_escape(x.cond,env.*,decls,sums,report)+znc_script_lifetime_body(x.then_body,env,decls,sums,report,returns)+znc_script_lifetime_body(x.els_body,env,decls,sums,report,returns);}.while_=>|x|{failures=failures+znc_script_call_escape(x.cond,env.*,decls,sums,report)+znc_script_lifetime_body(x.body,env,decls,sums,report,returns);}.unsafe_=>|x|{failures=failures+znc_script_lifetime_body(x.body,env,decls,sums,report,returns);}.switch_=>|x|{failures=failures+znc_script_call_escape(x.subject,env.*,decls,sums,report);let ai:i32=0;while(ai<len[SwitchArm](x.arms)){failures=failures+znc_script_lifetime_body(get[SwitchArm](x.arms,ai).body,env,decls,sums,report,returns);ai=ai+1;}failures=failures+znc_script_lifetime_body(x.els_body,env,decls,sums,report,returns);}else=>{}}i=i+1;}return failures;}
-fn znc_script_lifetime_check(decls:ArrayList[*Node])i32{let sums:ArrayList[ZScriptLifeSummary]=make[ZScriptLifeSummary](16);let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(f.is_extern==0){push[ZScriptLifeSummary](&sums,ZScriptLifeSummary{.name=f.name,.returns_script=0,.escapes_script=0});}}else=>{}}i=i+1;}let pass:i32=0;while(pass<=sums.len){i=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(f.is_extern==0){let env:ArrayList[ZTBind]=make[ZTBind](f.params.len+8);let pi:i32=0;while(pi<f.params.len){push[ZTBind](&env,ZTBind{.name=f.params.data[pi].name,.ty="script-lifetime"});pi=pi+1;}let ret:i32=0;let escapes:i32=znc_script_lifetime_body(f.body,&env,decls,sums,0,&ret);let si:i32=0;while(si<sums.len){if(@strEq(sums.data[si].name,f.name)){if(ret==1){sums.data[si].returns_script=1;}if(escapes>0){sums.data[si].escapes_script=1;}}si=si+1;}}}else=>{}}i=i+1;}pass=pass+1;}i=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(@strEq(f.name,"__zag_compiler_script_body_7f3a")){let env:ArrayList[ZTBind]=make[ZTBind](8);let ret:i32=0;return znc_script_lifetime_body(f.body,&env,decls,sums,1,&ret);}}else=>{}}i=i+1;}return 0;}
+fn znc_script_lifetime_check(decls:ArrayList[*Node])i32{let sums:ArrayList[ZScriptLifeSummary]=make[ZScriptLifeSummary](16);let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(f.is_extern==0){push[ZScriptLifeSummary](&sums,ZScriptLifeSummary{.name=f.name,.returns_script=0,.escapes_script=0});}}else=>{}}i=i+1;}let pass:i32=0;while(pass<=sums.len){i=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(f.is_extern==0){let env:ArrayList[ZTBind]=make[ZTBind](f.params.len+8);let pi:i32=0;while(pi<f.params.len){let p:Param=f.params.data[pi];let provenance:[]u8="";if(znc_script_type_may_hold_address(p.pty)==1){provenance="script-lifetime";}push[ZTBind](&env,ZTBind{.name=p.name,.ty=provenance});pi=pi+1;}let ret:i32=0;let escapes:i32=znc_script_lifetime_body(f.body,&env,decls,sums,0,&ret);let si:i32=0;while(si<sums.len){if(@strEq(sums.data[si].name,f.name)){if(ret==1){sums.data[si].returns_script=1;}if(escapes>0){sums.data[si].escapes_script=1;}}si=si+1;}}}else=>{}}i=i+1;}pass=pass+1;}i=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(@strEq(f.name,"__zag_compiler_script_body_7f3a")){let env:ArrayList[ZTBind]=make[ZTBind](8);let ret:i32=0;return znc_script_lifetime_body(f.body,&env,decls,sums,1,&ret);}}else=>{}}i=i+1;}return 0;}
 fn znc_ast_has_call_expr(n:*Node,name:[]u8)i32{switch(n.*){.call=>|x|{if(@strEq(callee_name(x.callee),name)){return 1;}let i:i32=0;while(i<x.args.len){if(znc_ast_has_call_expr(x.args.data[i],name)==1){return 1;}i=i+1;}}.bin=>|x|{return znc_ast_has_call_expr(x.l,name)|znc_ast_has_call_expr(x.r,name);}.un=>|x|{return znc_ast_has_call_expr(x.e,name);}.fld=>|x|{return znc_ast_has_call_expr(x.base,name);}.idx=>|x|{return znc_ast_has_call_expr(x.base,name)|znc_ast_has_call_expr(x.idx,name);}.cast_=>|x|{return znc_ast_has_call_expr(x.expr,name);}.slice_=>|x|{return znc_ast_has_call_expr(x.base,name)|znc_ast_has_call_expr(x.lo,name);}.slit_=>|x|{let i:i32=0;while(i<len[FieldInit](x.fields)){if(znc_ast_has_call_expr(get[FieldInit](x.fields,i).val,name)==1){return 1;}i=i+1;}}else=>{}}return 0;}
 fn znc_ast_body_has_call(body:ArrayList[*Node],name:[]u8)i32{let i:i32=0;while(i<body.len){switch(body.data[i].*){.let_=>|x|{if(x.has_init==1&&znc_ast_has_call_expr(x.expr,name)==1){return 1;}}.ret=>|x|{if(x.has_expr==1&&znc_ast_has_call_expr(x.expr,name)==1){return 1;}}.estmt=>|x|{if(znc_ast_has_call_expr(x.expr,name)==1){return 1;}}.assign=>|x|{if(znc_ast_has_call_expr(x.expr,name)==1){return 1;}}.if_=>|x|{if(znc_ast_has_call_expr(x.cond,name)==1||znc_ast_body_has_call(x.then_body,name)==1||znc_ast_body_has_call(x.els_body,name)==1){return 1;}}.while_=>|x|{if(znc_ast_has_call_expr(x.cond,name)==1||znc_ast_body_has_call(x.body,name)==1){return 1;}}.unsafe_=>|x|{if(znc_ast_body_has_call(x.body,name)==1){return 1;}}.switch_=>|x|{if(znc_ast_has_call_expr(x.subject,name)==1){return 1;}let ai:i32=0;while(ai<len[SwitchArm](x.arms)){if(znc_ast_body_has_call(get[SwitchArm](x.arms,ai).body,name)==1){return 1;}ai=ai+1;}if(znc_ast_body_has_call(x.els_body,name)==1){return 1;}}else=>{}}i=i+1;}return 0;}
 // Root executable statements are rewritten by script_bind_expr: `new` becomes
@@ -1640,7 +2087,7 @@ fn znc_script_compiler_std_call(decls:ArrayList[*Node],name:[]u8)i32{
     return 0;
 }
 fn znc_script_std_runtime_call(kind:i32,owner:[]u8,name:[]u8)i32{
-    if(@strEq(name,"@sizeOf")||@strEq(name,"@strEq")){return 1;}
+    if(@strEq(name,"@sizeOf")||@strEq(name,"@alignOf")||@strEq(name,"@offsetOf")||@strEq(name,"@strEq")){return 1;}
     if(@strEq(name,"_zag_eprintln")){return 1;}
     if(@strEq(name,"_zag_script_alloc")){
         if(kind==3||kind==4||kind==5||kind==6||kind==7){return 1;}
@@ -1999,6 +2446,7 @@ fn znc_explain_operations_body(body: ArrayList[*Node], state: *ZExplainOperation
             .if_ => |x| { znc_explain_operations_expr(x.cond,state);znc_explain_operations_body(x.then_body,state);znc_explain_operations_body(x.els_body,state); }
             .while_ => |x| { znc_explain_operations_expr(x.cond,state);znc_explain_operations_body(x.body,state); }
             .unsafe_ => |x| { znc_explain_operations_body(x.body,state); }
+            .defer_ => |d| { znc_explain_operations_expr(d.expr,state); }
             .switch_ => |x| { znc_explain_operations_expr(x.subject,state);let ai:i32=0;while(ai<x.arms.len){znc_explain_operations_body(x.arms.data[ai].body,state);ai=ai+1;}znc_explain_operations_body(x.els_body,state); }
             else => { }
         }
@@ -2012,6 +2460,7 @@ fn znc_explain_script_operations(decls: ArrayList[*Node], state: *ZExplainOperat
 
 fn znc_explain(path: []u8) i32 {
     if (path.len == 0) { _zag_eprintln("znc explain: no source file"); return 1; }
+    if(znc_invalid_project_config(znc_project_root(dir_of(path)),"explain")==1){return 1;}
     let src: []u8 = _zag_read_file(path);
     if (src.len < 0) { _zag_eprintln("znc explain: cannot read source file"); return 1; }
     src=znc_activate_script_source(path,src,0);
@@ -2040,7 +2489,10 @@ fn znc_explain(path: []u8) i32 {
     if(planner_input.allocator_explicit==1){allocator_basis="explicit";}
     let semantic_decls:ArrayList[*Node]=unit.decls;lo_operators(semantic_decls);
     let semantic_effects:map__StringMap[i32]=analyze(semantic_decls);
-    let semantic_text:[]u8=smp_bounded_manifest(path,src,unit,semantic_effects);
+    let explain_root:[]u8=znc_project_root(dir_of(path));
+    let explain_module:[]u8=znc_project_relative(explain_root,path);
+    let semantic_text:[]u8=smp_bounded_manifest(explain_root,explain_module,src,
+        unit,semantic_effects);
     let semantic_detail:[]u8=smf_value(semantic_text,"detail_level");
     let semantic_witnesses:i32=(1-(@strEq(semantic_detail,"compact") as i32));
     let format: []u8 = flag_value("--format");
@@ -2271,19 +2723,123 @@ fn znc_harden_body_has_try(body:ArrayList[*Node]) i32 {
         .if_ => |x| { if(znc_harden_expr_has_try(x.cond)==1||znc_harden_body_has_try(x.then_body)==1||znc_harden_body_has_try(x.els_body)==1){return 1;} }
         .while_ => |x| { if(znc_harden_expr_has_try(x.cond)==1||znc_harden_body_has_try(x.body)==1){return 1;} }
         .unsafe_ => |x| { if(znc_harden_body_has_try(x.body)==1){return 1;} }
+        .defer_ => |d| { if(znc_harden_expr_has_try(d.expr)==1){return 1;} }
         .switch_ => |x| { if(znc_harden_expr_has_try(x.subject)==1){return 1;}let ai:i32=0;while(ai<x.arms.len){if(znc_harden_body_has_try(x.arms.data[ai].body)==1){return 1;}ai=ai+1;}if(znc_harden_body_has_try(x.els_body)==1){return 1;} }
         else => { }
     }i=i+1;}return 0;
+}
+
+// Render the already-bound Script root body. This deliberately consumes the
+// parser's AST rather than reparsing or rewriting compact text: compiler-owned
+// context arguments and strict helper names are therefore preserved exactly as
+// the foreground Script compiler sees them.
+fn znc_harden_render_bound_body(decls:ArrayList[*Node])[]u8 {
+    let out:ArrayList[u8]=make[u8](256);
+    let i:i32=0;
+    while(i<decls.len){
+        switch(decls.data[i].*){
+            .fn_decl=>|f|{
+                if(@strEq(f.name,"__zag_compiler_script_body_7f3a")){
+                    let si:i32=0;
+                    while(si<f.body.len){fmt_stmt(&out,f.body.data[si],0);si=si+1;}
+                    return out.data[0..out.len];
+                }
+            }
+            else=>{}
+        }
+        i=i+1;
+    }
+    return out.data[0..out.len];
+}
+
+fn znc_harden_root_has_call(decls:ArrayList[*Node],name:[]u8)i32 {
+    let i:i32=0;
+    while(i<decls.len){
+        switch(decls.data[i].*){
+            .fn_decl=>|f|{
+                if(@strEq(f.name,"__zag_compiler_script_body_7f3a")){return znc_ast_body_has_call(f.body,name);}
+            }
+            else=>{}
+        }
+        i=i+1;
+    }
+    return 0;
+}
+
+fn znc_harden_import_if(body:ArrayList[*Node],current:[]u8,
+    call:[]u8,module:[]u8)[]u8 {
+    if(znc_ast_body_has_call(body,call)==1){
+        return _zag_str_concat(current,_zag_str_concat("@import(\"std:",
+            _zag_str_concat(module,"\")\n")));
+    }
+    return current;
+}
+
+fn znc_harden_prelude_imports(decls:ArrayList[*Node])[]u8 {
+    let out:[]u8="@import(\"std:rt\")\n";
+    let i:i32=0;let found:i32=0;
+    while(i<decls.len){
+        switch(decls.data[i].*){
+            .fn_decl=>|f|{
+                if(@strEq(f.name,"__zag_compiler_script_body_7f3a")){
+                    if(znc_ast_body_has_call(f.body,"script_read_file")==1){out=znc_harden_import_if(f.body,out,"script_read_file","script_io");}
+                    if(znc_ast_body_has_call(f.body,"script_input")==1){out=znc_harden_import_if(f.body,out,"script_input","script_input");}
+                    if(znc_ast_body_has_call(f.body,"script_string_concat")==1){out=znc_harden_import_if(f.body,out,"script_string_concat","script_string");}
+                    if(znc_ast_body_has_call(f.body,"script_string_builder_new")==1||
+                       znc_ast_body_has_call(f.body,"string_builder_append")==1){out=znc_harden_import_if(f.body,out,"script_string_builder_new","script_string_builder");}
+                    if(znc_ast_body_has_call(f.body,"script_list_new")==1||
+                       znc_ast_body_has_call(f.body,"script_list1")==1||
+                       znc_ast_body_has_call(f.body,"script_list2")==1||
+                       znc_ast_body_has_call(f.body,"script_list3")==1||
+                       znc_ast_body_has_call(f.body,"script_list4")==1||
+                       znc_ast_body_has_call(f.body,"script_list_append")==1||
+                       znc_ast_body_has_call(f.body,"script_list_len")==1||
+                       znc_ast_body_has_call(f.body,"script_list_get")==1||
+                       znc_ast_body_has_call(f.body,"script_args")==1){out=znc_harden_import_if(f.body,out,"script_list_new","script_list");}
+                    if(znc_ast_body_has_call(f.body,"script_path_join")==1||
+                       znc_ast_body_has_call(f.body,"script_path_basename")==1||
+                       znc_ast_body_has_call(f.body,"script_path_dirname")==1||
+                       znc_ast_body_has_call(f.body,"script_path_extension")==1){out=znc_harden_import_if(f.body,out,"script_path_join","script_path");}
+                    if(znc_ast_body_has_call(f.body,"process_run_bounded_script")==1){out=znc_harden_import_if(f.body,out,"process_run_bounded_script","process");}
+                    found=1;
+                }
+            }
+            else=>{}
+        }
+        i=i+1;
+    }
+    if(found==0){return "";}
+    return _zag_str_concat(out,"\n");
 }
 
 fn znc_harden_root_facts(decls:ArrayList[*Node], prelude:*i32, has_try:*i32) void {
     let i:i32=0;while(i<decls.len){switch(decls.data[i].*){.fn_decl=>|f|{if(@strEq(f.name,"__zag_compiler_script_body_7f3a")){if(znc_harden_body_has_try(f.body)==1){has_try.*=1;}let names:ArrayList[[]u8]=make[[]u8](29);push[[]u8](&names,"_zag_print");push[[]u8](&names,"_zag_println");push[[]u8](&names,"_zag_write_file");push[[]u8](&names,"_zag_argc");push[[]u8](&names,"_zag_arg");push[[]u8](&names,"_zag_script_alloc");push[[]u8](&names,"_zag_script_alloc_used");push[[]u8](&names,"_zag_script_env_get");push[[]u8](&names,"script_input");push[[]u8](&names,"script_read_file");push[[]u8](&names,"script_string_concat");push[[]u8](&names,"script_string_builder_new");push[[]u8](&names,"process_run_bounded_script");push[[]u8](&names,"_zag_script_new");push[[]u8](&names,"script_args");push[[]u8](&names,"script_path_join");push[[]u8](&names,"script_path_basename");push[[]u8](&names,"script_path_dirname");push[[]u8](&names,"script_path_extension");push[[]u8](&names,"script_list1");push[[]u8](&names,"script_list2");push[[]u8](&names,"script_list3");push[[]u8](&names,"script_list4");push[[]u8](&names,"script_list_new");push[[]u8](&names,"script_list_append");push[[]u8](&names,"string_builder_append");let ni:i32=0;while(ni<names.len){if(znc_ast_body_has_call(f.body,names.data[ni])==1){prelude.*=1;}ni=ni+1;}return;}}else=>{}}i=i+1;}
 }
 
+// The two collection conveniences below are lowered after the original name
+// scan's bounded table was frozen. Keep the extra authority in this helper so
+// the table size itself cannot silently make expansion claim a strict body
+// that still references a Script context.
+fn znc_harden_root_extra_prelude(decls:ArrayList[*Node]) i32 {
+    let i:i32=0;
+    while(i<decls.len){
+        switch(decls.data[i].*){
+            .fn_decl=>|f|{
+                if(@strEq(f.name,"__zag_compiler_script_body_7f3a")){
+                    if(znc_ast_body_has_call(f.body,"script_list_len")==1||
+                       znc_ast_body_has_call(f.body,"script_list_get")==1){return 1;}
+                    return 0;
+                }
+            }
+            else=>{}
+        }
+        i=i+1;
+    }
+    return 0;
+}
+
 fn znc_harden_bit(value:i32)[]u8 { if(value==1){return "1";}return "0"; }
-fn znc_harden_explicit_header(config:PlannerConfig)[]u8 {
-    let resolved:PlannerResolution = planner_resolve(1, "", config,
-        znc_script_explicit_choices(), 0);
+fn znc_harden_explicit_header(config:PlannerConfig,resolved:PlannerResolution)[]u8 {
     let capability_bits:i64 = znc_script_capability_bits(config);
     let execution_policy:i64 = znc_script_execution_policy(resolved);
     let header:[]u8="\n// Generated by znc harden. These declarations make the former Script runtime policy explicit.\nconst __zag_hardened_script_memory_limit: i64 = ";
@@ -2303,28 +2859,156 @@ fn znc_harden_explicit_header(config:PlannerConfig)[]u8 {
             resolved.choices.allocator) as i64)));
     header=_zag_str_concat(header,_zag_str_concat(";\nconst __zag_hardened_execution_policy: i64 = ",
         _zag_i64_to_str(execution_policy)));
-    // The public hardened candidate stays valid in frozen edition 2026. Its
-    // context handle is an opaque byte pointer at the ABI boundary; `*opaque`
-    // is reserved for edition-2027 raw-pointer syntax.
+    // The bound Script helpers all share the compiler-owned opaque context ABI.
+    // Keep that exact type at the explicit boundary so imported helpers do not
+    // need an unchecked pointer coercion.
     header=_zag_str_concat(header,
-        ";\nextern fn _zag_script_context_init(limit:i64, capabilities:i64, execution_policy:i64) *u8\nextern fn _zag_script_context_shutdown(context:*u8) void\n\nfn __zag_hardened_status_boundary(status:i32) i32 {\n    // No propagated Script error operation was present in this candidate.\n    return status;\n}\n\nfn __zag_hardened_script_body(__zag_hardened_context:*u8) i32 {\n");
+        ";\nextern fn _zag_script_context_init(limit:i64, capabilities:i64, execution_policy:i64) *opaque\nextern fn _zag_script_context_shutdown(context:*opaque) void\n\nfn __zag_hardened_status_boundary(status:i32) i32 {\n    // No propagated Script error operation was present in this candidate.\n    return status;\n}\n\nfn __zag_hardened_script_body(__zag_script_context:*opaque) i32 {\n");
     return header;
 }
 
+fn znc_harden_wrapper()[]u8 {
+    return "\n}\n\nfn main() i32 {\n    let __zag_script_context:*opaque = _zag_script_context_init(__zag_hardened_script_memory_limit, __zag_hardened_capability_bits, __zag_hardened_execution_policy);\n    let __zag_hardened_status:i32 = __zag_hardened_script_body(__zag_script_context);\n    _zag_script_context_shutdown(__zag_script_context);\n    return __zag_hardened_status_boundary(__zag_hardened_status);\n}\n";
+}
+
+// One immutable foreground snapshot is the authority for both explicit output
+// and promotion provenance.  Callers must never reparse the source to construct
+// a ledger after this result has produced a candidate.
+struct ZHardenPrepared {
+    valid:i32,
+    source_snapshot:[]u8,
+    active:[]u8,
+    normalized:ZsNormalized,
+    unit:CompilationUnit,
+    config:PlannerConfig,
+    input:PlannerChoices,
+    resolution:PlannerResolution,
+    marker:ZHardenScriptMarker,
+    body_start:i32,
+    declarations_len:i32,
+    header_start:i32,
+    header_end:i32,
+    body_derived_start:i32,
+    wrapper_start:i32,
+    active_prefix:i32,
+    candidate:[]u8,
+    bound_body:[]u8,
+    supported:i32,
+    candidate_valid:i32,
+    unresolved_prelude:i32,
+    root_try:i32,
+    late_declaration:i32,
+    reserved_conflict:i32,
+}
+
+fn znc_harden_prepared_bad(snapshot:[]u8)ZHardenPrepared {
+    let normalized:ZsNormalized=script_syntax_normalize_with_origins("");
+    let unit:CompilationUnit=CompilationUnit{.profile=ModuleProfile.strict,
+        .decls=make[*Node](1),.modules=make[ResolvedModule](1),
+        .imports=make[ResolvedImport](1),.resources=make[ResolvedResource](1),
+        .origins=make[NodeOrigin](1)};
+    let config:PlannerConfig=planner_default_config();let input:PlannerChoices=planner_empty_choices();
+    let resolution:PlannerResolution=planner_resolve(0,"",config,input,0);
+    return ZHardenPrepared{.valid=0,.source_snapshot=snapshot,.active="",
+        .normalized=normalized,.unit=unit,.config=config,.input=input,
+        .resolution=resolution,.marker=ZHardenScriptMarker{.start=-1,.end=-1,.valid=0},
+        .body_start=0,.declarations_len=0,.header_start=0,.header_end=0,
+        .body_derived_start=0,.wrapper_start=0,.active_prefix=0,.candidate="",.bound_body="",
+        .supported=0,.candidate_valid=0,.unresolved_prelude=0,.root_try=0,
+        .late_declaration=0,.reserved_conflict=0};
+}
+
+fn znc_harden_prepare(path:[]u8,source_snapshot:[]u8)ZHardenPrepared {
+    let bad:ZHardenPrepared=znc_harden_prepared_bad(source_snapshot);
+    let active:[]u8=znc_activate_script_source(path,source_snapshot,0);
+    let normalized:ZsNormalized=script_syntax_normalize_with_origins(active);
+    // Parse the activated compact bytes so CompilationUnit origins remain in
+    // the resolver's raw module coordinate space. The separately prepared CST
+    // projection is the sole normalized source used to materialize the view.
+    let src:[]u8=normalized.source;let unit:CompilationUnit=parse_compilation_unit_dir(active,dir_of(path));
+    if(unit.profile!=ModuleProfile.script){_zag_eprintln("znc harden: source is already regular Zag; no script profile to expand");return bad;}
+    if(znc_validate_script_defaults(path,unit)!=0||znc_configure_script_unit(&unit,path)!=0||znc_validate_script_capabilities(path,unit)!=0){return bad;}
+    // Promotion is not an alternate route around foreground Script authority.
+    // The strict derived candidate cannot express these profile-only guards, so
+    // reject the compact snapshot before any derivation or publication.
+    if(znc_script_std_body_check(unit.decls)!=0||
+       znc_script_lifetime_check(unit.decls)!=0||
+       znc_script_unaccounted_root_make(unit.decls)!=0){return bad;}
+    let config:PlannerConfig=znc_project_config(znc_project_root(dir_of(path)),0);
+    let input:PlannerChoices=znc_script_explicit_choices();
+    let resolution:PlannerResolution=planner_resolve(1,"",config,input,0);
+    let marker:ZHardenScriptMarker=znc_harden_script_marker(src);
+    if(marker.valid==0){_zag_eprintln("znc harden: script marker not found");return bad;}
+    let cursor:i32=marker.end;let declarations:[]u8="";let body_start:i32=cursor;let scanning:i32=1;
+    while(scanning==1){let decl_start:i32=znc_harden_space(src,cursor);
+        if(decl_start<src.len&&znc_harden_decl_start(src,decl_start)==1){let decl_end:i32=znc_harden_decl_end(src,decl_start);if(decl_end<0){_zag_eprintln("znc harden: unterminated declaration");return bad;}declarations=_zag_str_concat(declarations,src[cursor..decl_end]);cursor=decl_end;body_start=cursor;}
+        else{body_start=cursor;scanning=0;}}
+    let later:i32=znc_harden_space(src,body_start);let late_declaration:i32=0;let line:i32=later;
+    while(line<src.len){if((line==0||src[line-1]=='\n')&&znc_harden_decl_start(src,znc_harden_space(src,line))==1){late_declaration=1;}while(line<src.len&&src[line]!='\n'){line=line+1;}if(line<src.len){line=line+1;}}
+    let unresolved_prelude:i32=0;let root_try:i32=0;znc_harden_root_facts(unit.decls,&unresolved_prelude,&root_try);
+    if(znc_harden_root_extra_prelude(unit.decls)==1){unresolved_prelude=1;}
+    // The bounded process helper currently imports the edition-2027 resource
+    // list. Do not make a default edition-2026 explicit candidate depend on a
+    // module whose ownership contract is unavailable in that edition.
+    let process_prelude:i32=znc_harden_root_has_call(unit.decls,"process_run_bounded_script");
+    let process_edition_ok:i32=1;
+    if(process_prelude==1&&@strEq(v2_project_edition(path),"2027")==0){process_edition_ok=0;}
+    let reserved_conflict:i32=contains_text(src,"__zag_hardened_");
+    let bound_body:[]u8=znc_harden_render_bound_body(unit.decls);
+    let supported:i32=((bound_body.len>0&&root_try==0&&late_declaration==0&&reserved_conflict==0&&process_edition_ok==1) as i32);
+    let candidate:[]u8="";let header_start:i32=0;let header_end:i32=0;let body_derived_start:i32=0;let wrapper_start:i32=0;
+    let imports:[]u8="";if(unresolved_prelude==1){imports=znc_harden_prelude_imports(unit.decls);}
+    let rendered:[]u8=bound_body;
+    if(supported==1){let header:[]u8=znc_harden_explicit_header(config,resolution);header_start=marker.start+declarations.len+imports.len;header_end=header_start+header.len;body_derived_start=header_end;wrapper_start=body_derived_start+rendered.len;candidate=_zag_str_concat(src[0..marker.start],imports);candidate=_zag_str_concat(candidate,declarations);candidate=_zag_str_concat(candidate,header);candidate=_zag_str_concat(candidate,rendered);candidate=_zag_str_concat(candidate,znc_harden_wrapper());}
+    let candidate_valid:i32=supported;if(candidate_valid==1&&znc_check_src(path,candidate)!=0){candidate_valid=0;}
+    return ZHardenPrepared{.valid=1,.source_snapshot=source_snapshot,.active=active,
+        .normalized=normalized,.unit=unit,.config=config,.input=input,
+        .resolution=resolution,.marker=marker,.body_start=body_start,
+        .declarations_len=declarations.len,.header_start=header_start,
+        .header_end=header_end,.body_derived_start=body_derived_start,
+        .wrapper_start=wrapper_start,.active_prefix=active.len-source_snapshot.len,
+        .candidate=candidate,.supported=supported,.candidate_valid=candidate_valid,
+        .bound_body=bound_body,
+        .unresolved_prelude=unresolved_prelude,.root_try=root_try,
+        .late_declaration=late_declaration,.reserved_conflict=reserved_conflict};
+}
+
+// Human-owned view outputs are create-only. The O_EXCL/O_NOFOLLOW staging open
+// protects the temporary inode, and renameat2(RENAME_NOREPLACE) closes the
+// final check-to-rename race without changing foreground-cache overwrite rules.
+fn znc_write_new_staging(path:[]u8,text:[]u8)i32 {
+    let cpath:ArrayList[u8]=fc_cstring(path);
+    let fd:i64=_zag_raw_syscall(2,_zag_slice_ptr(cpath.data[0..cpath.len]) as i64,
+        655553,384,0,0,0); // O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC, 0600
+    free[u8](&cpath);if(fd<0){return 0;}
+    let off:i32=0;let ok:i32=1;
+    while(off<text.len){let wrote:i64=_zag_raw_syscall(1,fd,
+        _zag_slice_ptr(text[off..text.len]) as i64,text.len-off,0,0,0);
+        if(wrote==(0-4)){continue;}if(wrote<=0){ok=0;break;}off=off+(wrote as i32);}
+    if(ok==1&&_zag_raw_syscall(74,fd,0,0,0,0,0)!=0){ok=0;}
+    let _close:i64=_zag_raw_syscall(3,fd,0,0,0,0,0);
+    if(ok==0){let _remove:i32=fc_unlink(path);}return ok;
+}
+
+fn znc_publish_new_file(output:[]u8,text:[]u8)i32 {
+    let temp:[]u8=fc_temp_path(output);
+    if(znc_path_absent_nofollow(temp)==0||znc_write_new_staging(temp,text)==0){return 0;}
+    let from:ArrayList[u8]=fc_cstring(temp);let to:ArrayList[u8]=fc_cstring(output);
+    let renamed:i64=_zag_raw_syscall(316,0-100,
+        _zag_slice_ptr(from.data[0..from.len]) as i64,0-100,
+        _zag_slice_ptr(to.data[0..to.len]) as i64,1,0); // RENAME_NOREPLACE
+    free[u8](&from);free[u8](&to);
+    if(renamed!=0){let _remove:i32=fc_unlink(temp);return 0;}return 1;
+}
+
 fn znc_harden_atomic_output(output:[]u8,text:[]u8) i32 {
-    let temp:[]u8=_zag_str_concat(output,".harden.tmp");
-    if(_zag_file_exists(temp)==1){_zag_eprintln(_zag_str_concat("znc harden: temporary output already exists: ",temp));return 0;}
-    if(_zag_write_file(temp,text)!=0){return 0;}
-    let a:ArrayList[u8]=make[u8](temp.len+1);let b:ArrayList[u8]=make[u8](output.len+1);let i:i32=0;while(i<temp.len){push[u8](&a,temp[i]);i=i+1;}push[u8](&a,0 as u8);i=0;while(i<output.len){push[u8](&b,output[i]);i=i+1;}push[u8](&b,0 as u8);
-    let renamed:i64=_zag_raw_syscall(82,_zag_slice_ptr(a.data[0..a.len]) as i64,_zag_slice_ptr(b.data[0..b.len]) as i64,0,0,0,0);
-    if(renamed!=0){let _cleanup:i64=_zag_raw_syscall(87,_zag_slice_ptr(a.data[0..a.len]) as i64,0,0,0,0,0);return 0;}
-    return 1;
+    return znc_publish_new_file(output,text);
 }
 
 fn znc_harden_unsupported_items(prelude:i32, root_try:i32, late:i32, reserved:i32, invalid:i32)[]u8 {
     let out:[]u8="[";
     let first:i32=1;
-    if(prelude==1){out=_zag_str_concat(out,"{\"kind\":\"script_prelude\",\"basis\":\"proven\",\"reason\":\"compiler-bound prelude call needs explicit API and policy translation\"}");first=0;}
+    if(prelude==1){out=_zag_str_concat(out,"{\"kind\":\"script_prelude\",\"basis\":\"proven\",\"reason\":\"compiler-bound prelude materialization failed strict validation\"}");first=0;}
     if(root_try==1){if(first==0){out=_zag_str_concat(out,",");}out=_zag_str_concat(out,"{\"kind\":\"error_boundary\",\"basis\":\"proven\",\"reason\":\"root try propagation needs an explicit strict error model\"}");first=0;}
     if(late==1){if(first==0){out=_zag_str_concat(out,",");}out=_zag_str_concat(out,"{\"kind\":\"declaration_order\",\"basis\":\"proven\",\"reason\":\"declaration follows executable top-level statement\"}");first=0;}
     if(reserved==1){if(first==0){out=_zag_str_concat(out,",");}out=_zag_str_concat(out,"{\"kind\":\"private_name_collision\",\"basis\":\"proven\",\"reason\":\"source uses reserved hardened wrapper prefix\"}");first=0;}
@@ -2333,95 +3017,50 @@ fn znc_harden_unsupported_items(prelude:i32, root_try:i32, late:i32, reserved:i3
 }
 
 fn znc_harden_text_unsupported(prelude:i32, root_try:i32, late:i32, reserved:i32, invalid:i32)void {
-    if(prelude==1){_zag_println("unsupported: script_prelude [proven] compiler-bound prelude call needs explicit API and policy translation");}
+    if(prelude==1){_zag_println("unsupported: script_prelude [proven] compiler-bound prelude materialization failed strict validation");}
     if(root_try==1){_zag_println("unsupported: error_boundary [proven] root try propagation needs an explicit strict error model");}
     if(late==1){_zag_println("unsupported: declaration_order [proven] declaration follows executable top-level statement");}
     if(reserved==1){_zag_println("unsupported: private_name_collision [proven] source uses reserved hardened wrapper prefix");}
     if(invalid==1){_zag_println("unsupported: candidate_validation [proven] generated strict candidate failed compiler validation");}
 }
 
+// `harden` is retained for one edition cycle only as the source-preserving
+// compatibility spelling of explicit expansion.  The old apply path replaced
+// compact source and attempted a path-based rollback after running arbitrary
+// caller code.  That cannot preserve source ownership if the command replaces
+// the inode, so reject it before daemon setup, source loading, or publication.
+fn znc_harden_legacy_apply_refused() i32 {
+    if(has_flag("--apply")==0){return 0;}
+    _zag_eprintln("znc harden: --apply is no longer supported; compact source is never replaced by harden; use `znc promote <source> --to explicit --output <path> --test-command <command>` for provenance-backed human-owned source");
+    return 1;
+}
+
 fn znc_harden(path: []u8) i32 {
+    if(znc_harden_legacy_apply_refused()==1){return 2;}
     if (path.len == 0) { _zag_eprintln("znc harden: no source file"); return 1; }
+    if(foreground_transform_requested()==1){_zag_eprintln("znc harden: --foreground-transform is not an expansion option");return 1;}
+    if(znc_invalid_project_config(znc_project_root(dir_of(path)),"promotion")==1){return 1;}
     let source_snapshot: []u8 = _zag_read_file(path);
     if (source_snapshot.len < 0) { _zag_eprintln("znc harden: cannot read source file"); return 1; }
-    let src:[]u8=script_syntax_normalize(znc_activate_script_source(path,source_snapshot,0));
-    let unit: CompilationUnit = parse_compilation_unit_dir(src, dir_of(path));
-    if (unit.profile != ModuleProfile.script) {
-        _zag_eprintln("znc harden: source is already regular Zag; no script profile to expand");
-        return 1;
-    }
-    if(znc_validate_script_defaults(path,unit)!=0){return 1;}
-    if(znc_configure_script_unit(&unit,path)!=0){return 1;}
-    if(znc_validate_script_capabilities(path,unit)!=0){return 1;}
-    let config:PlannerConfig=znc_project_config(znc_project_root(dir_of(path)),0);
-    let harden_input:PlannerChoices=znc_script_explicit_choices();
-    let harden_resolution:PlannerResolution=planner_resolve(1,"",config,
-        harden_input,0);
-    let marker:ZHardenScriptMarker=znc_harden_script_marker(src);
-    if (marker.valid == 0) { _zag_eprintln("znc harden: script marker not found"); return 1; }
-    let cursor: i32 = marker.end;
-    let declarations: []u8 = "";
-    let body_start: i32 = cursor;
-    let scanning: i32 = 1;
-    while (scanning == 1) {
-        let decl_start: i32 = znc_harden_space(src, cursor);
-        if (decl_start < src.len && znc_harden_decl_start(src, decl_start) == 1) {
-            let decl_end: i32 = znc_harden_decl_end(src, decl_start);
-            if (decl_end < 0) { _zag_eprintln("znc harden: unterminated declaration"); return 1; }
-            declarations = _zag_str_concat(declarations, src[cursor..decl_end]);
-            cursor = decl_end; body_start = cursor;
-        } else { body_start = cursor; scanning = 0; }
-    }
-    // Moving declarations that occur after execution could reorder observable
-    // initialization. Reject them instead of guessing.
-    let later: i32 = znc_harden_space(src, body_start);
-    let late_declaration:i32=0;
-    let line: i32 = later;
-    while (line < src.len) {
-        if ((line == 0 || src[line - 1] == '\n') && znc_harden_decl_start(src, znc_harden_space(src, line)) == 1) {
-            late_declaration=1;
-        }
-        while (line < src.len && src[line] != '\n') { line = line + 1; }
-        if (line < src.len) { line = line + 1; }
-    }
-    let unresolved_prelude:i32=0;
-    let root_try:i32=0;
-    znc_harden_root_facts(unit.decls,&unresolved_prelude,&root_try);
-    // Names in this reserved private prefix would make the generated wrapper
-    // ambiguous. Do not rename user symbols or silently take ownership of them.
-    let reserved_conflict:i32=contains_text(src,"__zag_hardened_");
-    let supported:i32=((unresolved_prelude==0&&root_try==0&&late_declaration==0&&reserved_conflict==0) as i32);
-    let candidate:[]u8="";
-    if(supported==1){
-        let header:[]u8=znc_harden_explicit_header(config);
-        candidate=_zag_str_concat(src[0..marker.start],declarations);
-        candidate=_zag_str_concat(candidate,header);
-        candidate=_zag_str_concat(candidate,src[body_start..src.len]);
-        candidate=_zag_str_concat(candidate,"\n}\n\nfn main() i32 {\n    let __zag_hardened_context:*u8 = _zag_script_context_init(__zag_hardened_script_memory_limit, __zag_hardened_capability_bits, __zag_hardened_execution_policy) as *u8;\n    let __zag_hardened_status:i32 = __zag_hardened_script_body(__zag_hardened_context);\n    _zag_script_context_shutdown(__zag_hardened_context);\n    return __zag_hardened_status_boundary(__zag_hardened_status);\n}\n");
-    }
+    let prepared:ZHardenPrepared=znc_harden_prepare(path,source_snapshot);
+    if(prepared.valid==0){return 1;}
+    let config:PlannerConfig=prepared.config;
+    let harden_input:PlannerChoices=prepared.input;
+    let harden_resolution:PlannerResolution=prepared.resolution;
+    let unresolved_prelude:i32=prepared.unresolved_prelude;
+    let root_try:i32=prepared.root_try;
+    let late_declaration:i32=prepared.late_declaration;
+    let reserved_conflict:i32=prepared.reserved_conflict;
+    let supported:i32=prepared.supported;
+    let candidate:[]u8=prepared.candidate;
     let output: []u8 = flag_value("--output");
     let report_format:[]u8=flag_value("--format");
     if (report_format.len>0&&znc_format_text(report_format)==0&&znc_format_json(report_format)==0){_zag_eprintln("znc harden: --format must be text or json");return 1;}
     if(output.len>0&&@strEq(output,path)){_zag_eprintln("znc harden: --output must not name the source file");return 1;}
-    let candidate_valid:i32=supported;
-    if(candidate_valid==1&&znc_check_src(path,candidate)!=0){candidate_valid=0;}
-    if (has_flag("--apply")==1) {
-        if(candidate_valid==0){_zag_eprintln("znc harden: apply refused: no semantics-preserving strict candidate is available; inspect the structured unsupported report");return 1;}
-        let test_command:[]u8=flag_value("--test-command");
-        if(test_command.len==0){_zag_eprintln("znc harden: --apply requires --test-command so behavioral parity is tested");return 1;}
-        let current:[]u8=_zag_read_file(path);
-        if(current.len<0||@strEq(current,source_snapshot)==0){_zag_eprintln("znc harden: source changed after snapshot; refusing apply");return 1;}
-        let backup:[]u8=_zag_str_concat(path,".harden.bak");
-        if(_zag_file_exists(backup)==1){_zag_eprintln(_zag_str_concat("znc harden: rollback file already exists: ",backup));return 1;}
-        if(znc_check_src(path,candidate)!=0){_zag_eprintln("znc harden: generated candidate failed strict semantic checking");return 1;}
-        if(_zag_write_file(backup,source_snapshot)!=0){_zag_eprintln("znc harden: failed to create rollback copy");return 1;}
-        if(_zag_write_file(path,candidate)!=0){let _restore:i32=_zag_write_file(path,source_snapshot);_zag_eprintln("znc harden: apply write failed; source restored");return 1;}
-        let test_rc:i32=_zag_exec_cmd(test_command);
-        if(test_rc!=0){let restored:i32=_zag_write_file(path,source_snapshot);if(restored!=0){_zag_eprintln("znc harden: parity tests failed and automatic rollback failed");return 1;}_zag_eprintln("znc harden: parity tests failed; source restored from snapshot");return 1;}
-        if(znc_format_json(report_format)==1){_zag_println(_zag_str_concat("{\"schema_version\":1,\"status\":\"applied\",\"source_modified\":true,\"rollback\":\"",_zag_str_concat(znc_json_escape(backup),"\",\"tests\":\"passed\"}")));}else{_zag_println(_zag_str_concat("harden applied; rollback copy: ",backup));}
-        return 0;
-    }
+    if(output.len>0&&znc_path_absent_nofollow(output)==0){_zag_eprintln("znc harden: output already exists or is not safe");return 1;}
+    let candidate_valid:i32=prepared.candidate_valid;
     if (output.len > 0 && candidate_valid==1) {
+        if(znc_harden_snapshot_current(path,prepared)==0){_zag_eprintln("znc harden: source graph changed after snapshot; refusing output publication");return 1;}
         if (znc_harden_atomic_output(output, candidate) == 0) { _zag_eprintln("znc harden: failed to atomically write candidate"); return 1; }
         if (znc_format_json(report_format)==0){_zag_println(_zag_str_concat("harden candidate written: ", output));}
     } else if (output.len==0 && candidate_valid==1 && znc_format_json(report_format)==0) {
@@ -2430,7 +3069,8 @@ fn znc_harden(path: []u8) i32 {
     if (znc_format_json(report_format)==1){
         let rendered:[]u8="";if(output.len==0&&candidate_valid==1){rendered=znc_json_escape(candidate);}
         let status:[]u8="unsupported";if(candidate_valid==1){status="preview";}
-        let unsupported:[]u8=znc_harden_unsupported_items(unresolved_prelude,root_try,late_declaration,reserved_conflict,(supported==1&&candidate_valid==0) as i32);
+        let unsupported_prelude:i32=((unresolved_prelude==1&&candidate_valid==0) as i32);
+        let unsupported:[]u8=znc_harden_unsupported_items(unsupported_prelude,root_try,late_declaration,reserved_conflict,(supported==1&&candidate_valid==0) as i32);
         _zag_print("{\"schema_version\":2,\"status\":\"");_zag_print(status);
         _zag_print("\",\"candidate_compilable\":");_zag_print(znc_json_bool(candidate_valid));
         _zag_print(",\"candidate_checked\":");_zag_print(znc_json_bool(candidate_valid));
@@ -2451,7 +3091,8 @@ fn znc_harden(path: []u8) i32 {
     }
     if(candidate_valid==0){
         _zag_println("harden status: unsupported; no strict candidate was written");
-        znc_harden_text_unsupported(unresolved_prelude,root_try,late_declaration,reserved_conflict,(supported==1&&candidate_valid==0) as i32);
+        let unsupported_prelude:i32=((unresolved_prelude==1&&candidate_valid==0) as i32);
+        znc_harden_text_unsupported(unsupported_prelude,root_try,late_declaration,reserved_conflict,(supported==1&&candidate_valid==0) as i32);
     }else{
         _zag_println("harden status: preview; explicit strict-Zag candidate passed compiler validation");
         _zag_println("harden report: conservative explicit context/allocator/capability expansion");
@@ -2471,16 +3112,444 @@ fn znc_harden(path: []u8) i32 {
     return 0;
 }
 
+// ── ZagScript reversible views and promotion provenance ─────────────────────
+//
+// Compact source remains canonical.  `view` and output-less `expand` are
+// read-only.  `promote` is the only command in this family that publishes a
+// human-owned explicit file, and it writes a portable sidecar containing the
+// exact compact bytes. V2 also binds the resolver graph, AST/CST origins,
+// resolved policy, deterministic transform chain, and the linked foreground
+// verifier. Its structural projection claim remains deliberately bounded.
+
+struct ZLedgerDerivedMap { items:ArrayList[ZdlDerivedSegmentEvidence], valid:i32 }
+
+fn znc_ledger_runtime_enabled()i32{return 1;}
+
+// Build the ledger from the same prepared snapshot that produced the strict
+// candidate.  The arrays contain only borrowed graph/source slices; the array
+// storage itself is owned here and released after encoding.  This keeps the
+// codec independent from parser allocation lifetimes and avoids the old
+// reparse-after-harden TOCTOU.
+fn znc_derivation_ledger_v2(path:[]u8,prepared:ZHardenPrepared,
+    test_command:[]u8)[]u8 {
+    if(prepared.valid==0||prepared.candidate_valid==0||test_command.len==0){return "";}
+    let image:[]u8=_zag_read_file("/proc/self/exe");
+    if(image.len<=0){return "";}
+    // Bind the ledger to the same prepared unit/effects graph used by the
+    // foreground candidate.  A module hash list alone is only freshness
+    // evidence; it is not the semantic graph identity consumed by the daemon
+    // or the foreground cache.  Refuse promotion provenance if that exact
+    // manifest cannot be decoded as complete.
+    let semantic_decls:ArrayList[*Node]=prepared.unit.decls;
+    lo_operators(semantic_decls);
+    let semantic_effects:map__StringMap[i32]=analyze(semantic_decls);
+    let semantic_root:[]u8=znc_project_root(dir_of(path));
+    let semantic_module:[]u8=znc_project_relative(semantic_root,path);
+    let semantic_manifest:[]u8=smp_bounded_manifest(semantic_root,semantic_module,
+        prepared.active,prepared.unit,semantic_effects);
+    let semantic_view:SemanticManifestView=semantic_manifest_decode(semantic_manifest);
+    if(semantic_view.valid==0||semantic_view.graph_complete==0||semantic_manifest.len==0){if(semantic_manifest.len>0){_zag_str_free(semantic_manifest);}return "";}
+    let compact_hash:ZagdHash=zagd_content_hash(prepared.source_snapshot);
+    let derived_hash:ZagdHash=zagd_content_hash(prepared.candidate);
+    let modules:ArrayList[ZdlModuleEvidence]=make[ZdlModuleEvidence](prepared.unit.modules.len);
+    let imports:ArrayList[ZdlImportEvidence]=make[ZdlImportEvidence](prepared.unit.imports.len);
+    let resources:ArrayList[ZdlResourceEvidence]=make[ZdlResourceEvidence](prepared.unit.resources.len);
+    let origins:ArrayList[ZdlAstOriginEvidence]=make[ZdlAstOriginEvidence](prepared.unit.origins.len);
+    let segments:ArrayList[ZdlDerivedSegmentEvidence]=make[ZdlDerivedSegmentEvidence](1);
+    let choices:ArrayList[ZdlChoiceEvidence]=make[ZdlChoiceEvidence](10);
+    let transforms:ArrayList[ZdlTransformEvidence]=make[ZdlTransformEvidence](3);
+    let compilers:ArrayList[ZdlCompilerEvidence]=make[ZdlCompilerEvidence](1);
+    let verifiers:ArrayList[ZdlVerifierEvidence]=make[ZdlVerifierEvidence](1);
+    let i:i32=0;
+    while(i<prepared.unit.modules.len){let m:ResolvedModule=prepared.unit.modules.data[i];push[ZdlModuleEvidence](&modules,ZdlModuleEvidence{.path=m.path,.source=m.source});i=i+1;}
+    i=0;while(i<prepared.unit.imports.len){let x:ResolvedImport=prepared.unit.imports.data[i];push[ZdlImportEvidence](&imports,ZdlImportEvidence{.importer=x.importer,.imported=x.imported});i=i+1;}
+    if(prepared.unresolved_prelude==1){
+        push[ZdlImportEvidence](&imports,ZdlImportEvidence{.importer="<root>",.imported="compiler-bound-prelude-imports-v1"});
+    }
+    i=0;while(i<prepared.unit.resources.len){let x:ResolvedResource=prepared.unit.resources.data[i];push[ZdlResourceEvidence](&resources,ZdlResourceEvidence{.path=x.path,.data=x.data});i=i+1;}
+    i=0;while(i<prepared.unit.origins.len){let x:NodeOrigin=prepared.unit.origins.data[i];push[ZdlAstOriginEvidence](&origins,ZdlAstOriginEvidence{.module=x.module,.stable_id=x.stable_id,.node_kind=node_code(x.node),.line=x.line,.col=x.col,.byte_start=x.byte_start,.byte_end=x.byte_end,.exact=x.exact});i=i+1;}
+    // Generated prelude imports are a separate provenance segment. Both
+    // segments are non-exact and together cover the candidate contiguously;
+    // the compact snapshot remains the only exact inverse authority.
+    if(prepared.unresolved_prelude==1){
+        let split:i32=prepared.candidate.len/2;
+        if(prepared.header_start>0&&prepared.header_start<prepared.candidate.len){split=prepared.header_start;}
+        push[ZdlDerivedSegmentEvidence](&segments,ZdlDerivedSegmentEvidence{.derived_start=0,.derived_end=split,.module="<root>",.source=compact_hash,.source_start=0,.source_end=prepared.source_snapshot.len,.origin_id=0,.origin_domain="compiler-bound-prelude-v1",.exact=0,.generated=1,.basis="compiler-bound-prelude-imports-v1"});
+        push[ZdlDerivedSegmentEvidence](&segments,ZdlDerivedSegmentEvidence{.derived_start=split,.derived_end=prepared.candidate.len,.module="<root>",.source=compact_hash,.source_start=0,.source_end=prepared.source_snapshot.len,.origin_id=0,.origin_domain="compact-root-envelope-v1",.exact=0,.generated=1,.basis="prepared-candidate-v1"});
+    }else{
+        push[ZdlDerivedSegmentEvidence](&segments,ZdlDerivedSegmentEvidence{.derived_start=0,.derived_end=prepared.candidate.len,.module="<root>",.source=compact_hash,.source_start=0,.source_end=prepared.source_snapshot.len,.origin_id=0,.origin_domain="compact-root-envelope-v1",.exact=0,.generated=1,.basis="prepared-candidate-v1"});
+    }
+    let c:PlannerChoices=prepared.resolution.choices;let cfg:PlannerConfig=prepared.config;
+    let memory_text:[]u8=_zag_i64_to_str(cfg.script_memory_bytes);let capability_text:[]u8=_zag_i64_to_str(znc_script_capability_bits(cfg));let execution_text:[]u8=_zag_i64_to_str(znc_script_execution_policy(prepared.resolution));let automatic_text:[]u8=_zag_i64_to_str(prepared.resolution.automatic_count);let unresolved_text:[]u8=_zag_i64_to_str(prepared.resolution.unresolved_count);
+    push[ZdlChoiceEvidence](&choices,ZdlChoiceEvidence{.name="allocator",.value=c.allocator,.basis="cli-explicit-or-project-config-v1"});
+    push[ZdlChoiceEvidence](&choices,ZdlChoiceEvidence{.name="device",.value=c.device,.basis="cli-explicit-or-project-config-v1"});
+    push[ZdlChoiceEvidence](&choices,ZdlChoiceEvidence{.name="layout",.value=c.layout,.basis="cli-explicit-or-project-config-v1"});
+    push[ZdlChoiceEvidence](&choices,ZdlChoiceEvidence{.name="cpu",.value=c.cpu,.basis="cli-explicit-or-project-config-v1"});
+    push[ZdlChoiceEvidence](&choices,ZdlChoiceEvidence{.name="script_memory_bytes",.value=memory_text,.basis="project-config-v1"});
+    push[ZdlChoiceEvidence](&choices,ZdlChoiceEvidence{.name="capability_bits",.value=capability_text,.basis="resolved-policy-v1"});
+    push[ZdlChoiceEvidence](&choices,ZdlChoiceEvidence{.name="execution_policy",.value=execution_text,.basis="resolved-policy-v1"});
+    push[ZdlChoiceEvidence](&choices,ZdlChoiceEvidence{.name="automatic_count",.value=automatic_text,.basis="planner-resolution-v1"});
+    push[ZdlChoiceEvidence](&choices,ZdlChoiceEvidence{.name="unresolved_count",.value=unresolved_text,.basis="planner-resolution-v1"});
+    push[ZdlChoiceEvidence](&choices,ZdlChoiceEvidence{.name="provenance",.value=prepared.resolution.provenance,.basis="planner-resolution-v1"});
+    push[ZdlTransformEvidence](&transforms,ZdlTransformEvidence{.name="script-profile-activation-v1",.input=compact_hash,.output=compact_hash,.inverse="embedded-compact-snapshot-v1",.proof="same-prepared-snapshot-v1"});
+    push[ZdlTransformEvidence](&transforms,ZdlTransformEvidence{.name="script-syntax-normalization-v1",.input=compact_hash,.output=zagd_content_hash(prepared.normalized.source),.inverse="embedded-compact-snapshot-v1",.proof="normalized-origin-envelope-v1"});
+    push[ZdlTransformEvidence](&transforms,ZdlTransformEvidence{.name="explicit-policy-materialization-v1",.input=zagd_content_hash(prepared.normalized.source),.output=derived_hash,.inverse="embedded-compact-snapshot-v1",.proof="strict-compiler-check-plus-user-command-v1"});
+    let generation:[]u8=zag_version();
+    // Bind the compiler/verifier image by content hash, not by embedding the
+    // executable itself.  The ledger is portable provenance; executable bytes
+    // belong in the product artifact, while the compact hash is sufficient to
+    // detect a different linked image and keeps unexpand bounded and fast.
+    let image_binding:[]u8=zdl_hash_text(zagd_content_hash(image));
+    push[ZdlCompilerEvidence](&compilers,ZdlCompilerEvidence{.generation=generation,.image=image_binding});
+    push[ZdlVerifierEvidence](&verifiers,ZdlVerifierEvidence{.generation=generation,.image=image_binding,.independent=0});
+    let evidence:ZdlPreparedEvidence=ZdlPreparedEvidence{.compact_path=path,.compact=prepared.source_snapshot,.derived=prepared.candidate,.semantic_manifest=semantic_manifest,.semantic_graph=semantic_view.graph_identity,.semantic_graph_complete=semantic_view.graph_complete,.compiler_checked=1,.parity_command=test_command,.parity_exit_zero=1,.modules=modules,.imports=imports,.resources=resources,.ast_origins=origins,.derived_segments=segments,.choices=choices,.transforms=transforms,.compilers=compilers,.verifiers=verifiers};
+    let record:[]u8=zdl_encode_v2(evidence);
+    free[ZdlModuleEvidence](&modules);free[ZdlImportEvidence](&imports);free[ZdlResourceEvidence](&resources);free[ZdlAstOriginEvidence](&origins);free[ZdlDerivedSegmentEvidence](&segments);free[ZdlChoiceEvidence](&choices);free[ZdlTransformEvidence](&transforms);free[ZdlCompilerEvidence](&compilers);free[ZdlVerifierEvidence](&verifiers);_zag_free(_zag_slice_ptr(memory_text));_zag_free(_zag_slice_ptr(capability_text));_zag_free(_zag_slice_ptr(execution_text));_zag_free(_zag_slice_ptr(automatic_text));_zag_free(_zag_slice_ptr(unresolved_text));_zag_free(_zag_slice_ptr(image_binding));_zag_free(_zag_slice_ptr(image));_zag_str_free(semantic_manifest);
+    return record;
+}
+fn znc_free_ledger_view(view:*ZdlLedgerView)void{
+    if(view.*.valid==0){return;}
+    _zag_free(_zag_slice_ptr(view.*.compact));_zag_free(_zag_slice_ptr(view.*.derived));_zag_free(_zag_slice_ptr(view.*.compact_path));
+}
+fn znc_harden_snapshot_current(path:[]u8,prepared:ZHardenPrepared)i32 {
+    let root:ForegroundBoundedRead=fc_read_bounded(path,prepared.source_snapshot.len as i64);
+    if(root.ok==0){free[u8](&root.bytes);return 0;}
+    let current:[]u8=root.bytes.data[0..root.bytes.len];
+    let valid:i32=@strEq(current,prepared.source_snapshot) as i32;
+    if(valid==1&&!@strEq(znc_activate_script_source(path,current,0),prepared.active)){valid=0;}
+    free[u8](&root.bytes);if(valid==0){return 0;}
+    let i:i32=0;while(i<prepared.unit.modules.len){let module:ResolvedModule=prepared.unit.modules.data[i];
+        if(@strEq(module.path,"<root>")){if(!@strEq(module.source,prepared.active)){return 0;}}
+        else{let read:ForegroundBoundedRead=fc_read_bounded(module.path,module.source.len as i64);
+            if(read.ok==0){free[u8](&read.bytes);return 0;}let same:i32=@strEq(
+                read.bytes.data[0..read.bytes.len],module.source) as i32;free[u8](&read.bytes);
+            if(same==0){return 0;}}
+        i=i+1;}
+    i=0;while(i<prepared.unit.resources.len){let resource:ResolvedResource=prepared.unit.resources.data[i];
+        let read:ForegroundBoundedRead=fc_read_bounded(resource.path,resource.data.len as i64);
+        if(read.ok==0){free[u8](&read.bytes);return 0;}let same:i32=@strEq(
+            read.bytes.data[0..read.bytes.len],resource.data) as i32;free[u8](&read.bytes);
+        if(same==0){return 0;}i=i+1;}
+    return 1;
+}
+
+fn znc_bounded_file_equal(path:[]u8,expected:[]u8)i32 {
+    let read:ForegroundBoundedRead=fc_read_bounded(path,expected.len as i64);
+    if(read.ok==0){free[u8](&read.bytes);return 0;}
+    let same:i32=@strEq(read.bytes.data[0..read.bytes.len],expected) as i32;
+    free[u8](&read.bytes);return same;
+}
+
+// Existence checks used for human-owned publication must not follow symlinks.
+// newfstatat(AT_FDCWD, path, ..., AT_SYMLINK_NOFOLLOW) returns -ENOENT only
+// when no directory entry exists. Every object and every other error is unsafe.
+fn znc_path_absent_nofollow(path:[]u8)i32 {
+    let cpath:ArrayList[u8]=fc_cstring(path);let stat:ArrayList[u8]=make[u8](144);
+    stat.len=144;let rc:i64=_zag_raw_syscall(262,0-100,
+        _zag_slice_ptr(cpath.data[0..cpath.len]) as i64,
+        _zag_slice_ptr(stat.data[0..stat.len]) as i64,256,0,0);
+    free[u8](&cpath);free[u8](&stat);return (rc==(0-2)) as i32;
+}
+
+fn znc_hex_digit(v:i32)u8 {
+    if(v<10){return ('0' as i32+v) as u8;}
+    return ('a' as i32+v-10) as u8;
+}
+
+fn znc_hex_encode(bytes:[]u8)[]u8 {
+    let out:ArrayList[u8]=make[u8](bytes.len*2+1);
+    let i:i32=0;
+    while(i<bytes.len){
+        push[u8](&out,znc_hex_digit((bytes[i] as i32)/16));
+        push[u8](&out,znc_hex_digit((bytes[i] as i32)%16));
+        i=i+1;
+    }
+    return out.data[0..out.len];
+}
+
+fn znc_native_instr_name(kind:i32)[]u8 {
+    if(kind==0){return "label";}if(kind==1){return "mov_imm";}
+    if(kind==2){return "mov_rr";}if(kind==3){return "add";}
+    if(kind==4){return "sub";}if(kind==5){return "imul";}
+    if(kind==6){return "cmp";}if(kind==7){return "push";}
+    if(kind==8){return "pop";}if(kind==9){return "call";}
+    if(kind==10){return "jmp";}if(kind==11){return "je";}
+    if(kind==12){return "jne";}if(kind==13){return "jl";}
+    if(kind==14){return "jle";}if(kind==15){return "jg";}
+    if(kind==16){return "jge";}if(kind==17){return "ret";}
+    if(kind==18){return "syscall";}if(kind==19){return "idiv";}
+    if(kind==20){return "and";}if(kind==21){return "or";}
+    if(kind==22){return "xor";}if(kind==23){return "load64";}
+    if(kind==24){return "store64";}if(kind==25){return "lea";}
+    if(kind==26){return "add_imm";}if(kind==27){return "sub_imm";}
+    if(kind==28){return "cmp_imm";}if(kind==29){return "setcc";}
+    if(kind==30){return "neg";}if(kind==31){return "movq_gpr_to_xmm";}
+    if(kind==32){return "movq_xmm_to_gpr";}if(kind==33){return "addsd";}
+    if(kind==34){return "subsd";}if(kind==35){return "mulsd";}
+    if(kind==36){return "divsd";}if(kind==37){return "ucomisd";}
+    if(kind==38){return "cvtsi2sd";}if(kind==39){return "cvttsd2si";}
+    if(kind==40){return "cvtsd2ss";}if(kind==41){return "cvtss2sd";}
+    if(kind==42){return "xorps";}if(kind==43){return "call_reg";}
+    if(kind==44){return "lea_label";}if(kind==45){return "sqrtsd";}
+    if(kind==46){return "x87_load";}if(kind==47){return "x87_store";}
+    if(kind==48){return "fsin";}if(kind==49){return "fcos";}
+    if(kind==50){return "fsqrt";}if(kind==51){return "shl_cl";}
+    if(kind==52){return "sar_cl";}if(kind==53){return "rep_movsb";}
+    if(kind==54){return "outb";}if(kind==55){return "inb";}
+    if(kind==56){return "outw";}if(kind==57){return "inw";}
+    if(kind==58){return "outl";}if(kind==59){return "inl";}
+    if(kind==60){return "rdmsr";}if(kind==61){return "wrmsr";}
+    if(kind==62){return "rdcr0";}if(kind==63){return "wrcr0";}
+    if(kind==64){return "rdcr2";}if(kind==65){return "rdcr3";}
+    if(kind==66){return "wrcr3";}if(kind==67){return "rdcr4";}
+    if(kind==68){return "wrcr4";}if(kind==69){return "lgdt";}
+    if(kind==70){return "lidt";}if(kind==71){return "ltr";}
+    if(kind==72){return "invlpg";}if(kind==73){return "hlt";}
+    if(kind==74){return "cli";}if(kind==75){return "sti";}
+    if(kind==76){return "pause";}if(kind==77){return "wbinvd";}
+    if(kind==78){return "shr_cl";}if(kind==79){return "load8";}
+    if(kind==80){return "store8";}if(kind==81){return "mfence";}
+    if(kind==82){return "cpuid";}if(kind==83){return "xgetbv";}
+    if(kind==84){return "popcnt";}if(kind==85){return "andn";}
+    if(kind==86){return "movdqu_load";}if(kind==87){return "movdqu_store";}
+    if(kind==88){return "tzcnt";}if(kind==89){return "xchg_mem";}
+    if(kind==90){return "xadd_mem";}if(kind==91){return "cmpxchg_mem";}
+    if(kind==92){return "bswap";}if(kind==93){return "bsr";}
+    if(kind==94){return "prefetcht0";}if(kind==95){return "load16";}
+    if(kind==96){return "store16";}if(kind==97){return "load32";}
+    if(kind==98){return "store32";}if(kind==99){return "paddd";}
+    if(kind==100){return "call_ext";}if(kind==101){return "psubd";}
+    if(kind==102){return "pand";}if(kind==103){return "por";}
+    if(kind==104){return "pxor";}return "unknown";
+}
+
+fn znc_native_print_instr(ins:Instr,index:i32)void {
+    _zag_print("// x86[");_zag_print(_zag_i64_to_str(index as i64));
+    _zag_print("] ");_zag_print(znc_native_instr_name(ins.kind));
+    _zag_print(" kind=");_zag_print(_zag_i64_to_str(ins.kind as i64));
+    _zag_print(" dst=");_zag_print(_zag_i64_to_str(ins.dst as i64));
+    _zag_print(" src=");_zag_print(_zag_i64_to_str(ins.src as i64));
+    _zag_print(" imm=");_zag_print(_zag_i64_to_str(ins.imm));
+    _zag_print(" disp=");_zag_print(_zag_i64_to_str(ins.disp as i64));
+    _zag_print(" label=");_zag_println(_zag_i64_to_str(ins.lbl as i64));
+}
+
+// Render the same verified IR and baseline x86 lowering used by foreground
+// compilation.  The view writes no executable and consumes no daemon result.
+// It reports the explicit bridge route until every operation lowers directly
+// from ZIR, then prints the selected instruction stream and exact encoded bytes.
+fn znc_native_view(path:[]u8,source:[]u8,operation:[]u8)i32 {
+    if(v2_validate_options()!=0){return 1;}
+    if(znc_invalid_project_config(znc_project_root(dir_of(path)),operation)==1){return 1;}
+    let active:[]u8=znc_activate_script_source(path,source,0);
+    if(v2_validate_source(path,active)!=0){return 1;}
+    if(validate_x86_target_flag()!=0||validate_x86_cpu_flag()!=0){return 1;}
+    let unit:CompilationUnit=parse_compilation_unit_dir(active,dir_of(path));
+    if(znc_validate_script_defaults(path,unit)!=0||
+       znc_configure_script_unit(&unit,path)!=0||
+       znc_validate_script_capabilities(path,unit)!=0){return 1;}
+    if(unit.profile==ModuleProfile.script&&
+       (znc_script_std_body_check(unit.decls)!=0||
+        znc_script_lifetime_check(unit.decls)!=0||
+        znc_script_unaccounted_root_make(unit.decls)!=0)){return 1;}
+    let decls:ArrayList[*Node]=unit.decls;lo_operators(decls);
+    if(znc_check_arity(decls)>0||znc_check_dups(decls)>0||
+       typed_check_program(decls,path)>0){return 1;}
+    let eff:map__StringMap[i32]=analyze(decls);
+    if(report_violations(decls,eff,active,path)>0){return 1;}
+    if(run_analyzer(decls,path)!=0){return 1;}
+    let links:ArrayList[[]u8]=make[[]u8](1);
+    let code_decls:ArrayList[*Node]=znc_collect_links(decls,&links);
+    let view_sanitize_memory:i32=has_flag("--sanitize=memory");
+    let view_safety_checked:i32=has_flag("--safety=checked")|view_sanitize_memory;
+    let view_transform:i32=foreground_transform_requested();
+    let authority:ZirAuthority=zir_prepare_production_with_origins(
+        code_decls,eff,unit.origins);
+    if(view_transform==1){
+        if(unit.profile==ModuleProfile.script||view_safety_checked==1||
+           @strEq(v2_project_edition(path),"2027")){
+            _zag_eprintln("znc view: const-i32-add-v1 requires regular unsanitized x86-64 Zag");
+            return 1;
+        }
+        authority=zir_prepare_const_i32_add_source_policy_with_origins(
+            code_decls,eff,unit.origins,
+            foreground_transform_policy(path,view_safety_checked,view_sanitize_memory));
+        if(authority.transform_count!=1){
+            _zag_eprintln("znc view: requested const-i32-add-v1 had no checked source match");
+            return 1;
+        }
+    }
+    if(authority.valid==0){
+        _zag_eprintln(_zag_str_concat("znc view: Zag IR verification failed; errors=",
+            _zag_i64_to_str(authority.verify_errors as i64)));return 1;
+    }
+    let selected:X86CpuProfile=parse_x86_cpu_profile(znc_effective_cpu(path,
+        (unit.profile==ModuleProfile.script) as i32));
+    if(selected.valid==0){_zag_eprintln(selected.diagnostic);return 1;}
+    let data:ArrayList[u8]=make[u8](16);let errors:i32=0;let route:i32=0;
+    let raw:ArrayList[Instr]=lower_zir_program_mode_cpu_with_route(authority,
+        &errors,&data,0,selected.features.popcnt,selected.features.bmi1,
+        view_safety_checked,view_sanitize_memory,
+        (@strEq(v2_project_edition(path),"2027")) as i32,0,&route);
+    if(errors>0){_zag_eprintln("znc view: native lowering failed");return 1;}
+    let allocated:ArrayList[Instr]=regalloc(raw);
+    let optimized:ArrayList[Instr]=optimize(allocated);
+    let selected_instrs:ArrayList[Instr]=peephole(optimized);
+    let bytes:ArrayList[u8]=encode(selected_instrs);
+    let rendered:ArrayList[u8]=print_mlir(authority.module);
+    _zag_print(rendered.data[0..rendered.len]);
+    _zag_print("// native-target=linux-x86_64 cpu=");_zag_print(selected.canonical);
+    _zag_print(" lowering=");if(route==1){_zag_print("zir-direct");}
+    else{_zag_print("verified-ast-bridge");}
+    _zag_print(" ir-verifier=");_zag_print(zir_ir_verifier_name());
+    _zag_print(" artifact_ir_consumed=");_zag_println(_zag_i64_to_str(route as i64));
+    _zag_print("// semantic-transform-status=");_zag_print(authority.transform_status);
+    _zag_print(" rule=");_zag_print(authority.transform_rule);
+    _zag_print(" checker=");_zag_print(authority.transform_checker);
+    _zag_print(" transform_count=");_zag_print(_zag_i64_to_str(authority.transform_count as i64));
+    _zag_print(" artifact_transform_consumed=");_zag_println(_zag_i64_to_str(
+        ((route==1&&authority.transform_count==1) as i32) as i64));
+    _zag_print("// machine-pipeline=regalloc,optimize,peephole raw-instructions=");
+    _zag_print(_zag_i64_to_str(raw.len as i64));_zag_print(" selected-instructions=");
+    _zag_print(_zag_i64_to_str(selected_instrs.len as i64));
+    _zag_print(" machine-code-bytes=");_zag_println(_zag_i64_to_str(bytes.len as i64));
+    let i:i32=0;while(i<selected_instrs.len){
+        znc_native_print_instr(selected_instrs.data[i],i);i=i+1;
+    }
+    _zag_print("// machine-code-hex=");
+    _zag_println(znc_hex_encode(bytes.data[0..bytes.len]));
+    return 0;
+}
+
+fn znc_view(path:[]u8) i32 {
+    if(path.len==0){_zag_eprintln("znc view: no source file");return 1;}
+    if(v2_validate_options()!=0){return 1;}
+    let level:[]u8=flag_value("--level");
+    if(level.len==0){_zag_eprintln("znc view: --level simple|explained|explicit|native is required");return 1;}
+    if(foreground_transform_requested()==1&&!@strEq(level,"native")){
+        _zag_eprintln("znc view: --foreground-transform is supported only with --level native");return 1;
+    }
+    if(@strEq(level,"simple")){
+        let source:[]u8=_zag_read_file(path);if(source.len<0){_zag_eprintln("znc view: cannot read source file");return 1;}_zag_print(source);return 0;
+    }
+    if(@strEq(level,"explained")){return znc_explain(path);}
+    if(@strEq(level,"explicit")){return znc_harden(path);}
+    if(@strEq(level,"native")){
+        let source:[]u8=_zag_read_file(path);if(source.len<0){_zag_eprintln("znc view: cannot read source file");return 1;}
+        return znc_native_view(path,source,"view");
+    }
+    _zag_eprintln("znc view: --level must be simple, explained, explicit, or native");return 1;
+}
+
+fn znc_expand(path:[]u8)i32 {
+    let to:[]u8=flag_value("--to");
+    if(to.len==0){_zag_eprintln("znc expand: --to simple|explained|explicit|native is required");return 1;}
+    if(foreground_transform_requested()==1&&!@strEq(to,"native")){
+        _zag_eprintln("znc expand: --foreground-transform is supported only with --to native");return 1;
+    }
+    if(@strEq(to,"explicit")){return znc_harden(path);}
+    // The remaining levels are projections, not promotable strict source.
+    // Reuse the view renderer; `--output` is intentionally rejected here so
+    // only promotion creates a human-owned expanded source in generation 1.
+    if(flag_value("--output").len>0){_zag_eprintln("znc expand: --output is currently supported only with --to explicit; use promote for human-owned source");return 1;}
+    if(@strEq(to,"simple")){
+        let source:[]u8=_zag_read_file(path);if(source.len<0){_zag_eprintln("znc expand: cannot read source file");return 1;}_zag_print(source);return 0;
+    }
+    if(@strEq(to,"explained")){return znc_explain(path);}
+    if(@strEq(to,"native")){
+        let source:[]u8=_zag_read_file(path);if(source.len<0){_zag_eprintln("znc expand: cannot read source file");return 1;}
+        return znc_native_view(path,source,"expand");
+    }
+    _zag_eprintln("znc expand: --to must be simple, explained, explicit, or native");return 1;
+}
+
+fn znc_promote(path:[]u8)i32 {
+    if(znc_ledger_runtime_enabled()==0){_zag_eprintln("znc promote: reversible ledger runtime integration is not release-enabled; no files changed");return 1;}
+    if(path.len==0){_zag_eprintln("znc promote: source path is required");return 1;}
+    let output:[]u8=flag_value("--output");let command:[]u8=flag_value("--test-command");
+    if(output.len==0||command.len==0){_zag_eprintln("znc promote: --output and --test-command are required");return 1;}
+    if(@strEq(output,path)||znc_path_absent_nofollow(output)==0){_zag_eprintln("znc promote: output already exists or is not safe");return 1;}
+    // A pre-existing provenance entry is human-owned too. Reject it before
+    // publishing the candidate so a failed sidecar publication never leaves
+    // a compiler-created output beside a foreign ledger/symlink.
+    let sidecar_preflight:[]u8=_zag_str_concat(output,".zsledger");
+    if(znc_path_absent_nofollow(sidecar_preflight)==0){_zag_free(_zag_slice_ptr(sidecar_preflight));_zag_eprintln("znc promote: sidecar already exists or is not safe");return 1;}
+    _zag_free(_zag_slice_ptr(sidecar_preflight));
+    let source_read:ForegroundBoundedRead=fc_read_bounded(path,zdl_max_source_bytes());
+    if(source_read.ok==0){free[u8](&source_read.bytes);_zag_eprintln("znc promote: source is missing, unsafe, or exceeds portable ledger bound");return 1;}
+    let source_snapshot:[]u8=source_read.bytes.data[0..source_read.bytes.len];
+    let prepared:ZHardenPrepared=znc_harden_prepare(path,source_snapshot);
+    if(prepared.valid==0||prepared.candidate_valid==0){_zag_eprintln("znc promote: no strict candidate is available");return 1;}
+    if(znc_harden_snapshot_current(path,prepared)==0){_zag_eprintln("znc promote: source graph changed after snapshot; no files changed");return 1;}
+    if(znc_harden_atomic_output(output,prepared.candidate)==0){_zag_eprintln("znc promote: failed to publish explicit candidate without replacing an existing entry");return 1;}
+    let parity:i32=_zag_exec_cmd(command);
+    if(parity!=0){_zag_eprintln("znc promote: parity tests failed; uncertain output left in place as ownership-uncertain");return 1;}
+    if(znc_harden_snapshot_current(path,prepared)==0){_zag_eprintln("znc promote: source graph changed after parity; output left in place");return 1;}
+    let ledger:[]u8=znc_derivation_ledger_v2(path,prepared,command);
+    if(ledger.len==0){_zag_eprintln("znc promote: prepared-evidence ledger is unavailable; output left in place");return 1;}
+    let sidecar:[]u8=_zag_str_concat(output,".zsledger");
+    if(znc_path_absent_nofollow(sidecar)==0){_zag_free(_zag_slice_ptr(ledger));_zag_free(_zag_slice_ptr(sidecar));_zag_eprintln("znc promote: foreign sidecar preserved; output left in place");return 1;}
+    let side_ok:i32=znc_harden_atomic_output(sidecar,ledger);_zag_free(_zag_slice_ptr(ledger));_zag_free(_zag_slice_ptr(sidecar));
+    if(side_ok==0){_zag_eprintln("znc promote: failed to publish provenance without replacing an existing entry; output left in place");return 1;}
+    _zag_println(_zag_str_concat("znc promote: published ",output));return 0;
+}
+
+fn znc_unexpand(path:[]u8)i32 {
+    if(znc_ledger_runtime_enabled()==0){_zag_eprintln("znc unexpand: reversible ledger runtime integration is not release-enabled");return 1;}
+    if(path.len==0){_zag_eprintln("znc unexpand: promoted source path is required");return 1;}
+    let sidecar:[]u8=_zag_str_concat(path,".zsledger");let raw:ForegroundBoundedRead=fc_read_bounded(sidecar,67108864);_zag_free(_zag_slice_ptr(sidecar));
+    if(raw.ok==0){free[u8](&raw.bytes);_zag_eprintln("znc unexpand: sidecar is unavailable");return 1;}
+    let view:ZdlLedgerView=zdl_decode(raw.bytes.data[0..raw.bytes.len]);free[u8](&raw.bytes);
+    if(view.valid==0||(view.version!=1&&view.version!=2)){_zag_eprintln("znc unexpand: sidecar failed bounded validation");return 1;}
+    let promoted:ForegroundBoundedRead=fc_read_bounded(path,view.derived.len as i64);
+    if(promoted.ok==0||@strEq(promoted.bytes.data[0..promoted.bytes.len],view.derived)==0){free[u8](&promoted.bytes);znc_free_ledger_view(&view);_zag_eprintln("znc unexpand: edited projection is unavailable or ambiguous");return 1;}
+    let output:[]u8=flag_value("--output");let target:[]u8=output;
+    if(target.len==0){target=_zag_str_concat(path,".unexpanded.zs");}
+    if(znc_path_absent_nofollow(target)==0){free[u8](&promoted.bytes);znc_free_ledger_view(&view);_zag_eprintln("znc unexpand: output already exists or is not safe");return 1;}
+    let ok:i32=znc_harden_atomic_output(target,view.compact);free[u8](&promoted.bytes);znc_free_ledger_view(&view);
+    if(ok==0){_zag_eprintln("znc unexpand: failed to publish compact source");return 1;}
+    _zag_println(_zag_str_concat("znc unexpand: restored ",target));return 0;
+}
+
 fn znc_init() i32 {
     let modpath: []u8 = "zag.mod";
     if (_zag_file_exists(modpath) != 0) {
-        _zag_println("znc init: zag.mod already exists");
+        _zag_eprintln("znc init: zag.mod already exists; no files changed");
         return 1;
     }
-    let content: []u8 = "name = \"myproject\"\nversion = \"2026.07.0-dev\"\nedition = \"2026\"\n";
+    if (_zag_file_exists("src/main.zag") != 0 || _zag_file_exists("tests/smoke.zag") != 0 ||
+        _zag_file_exists("deps/README.md") != 0 ||
+        _zag_file_exists("README.md") != 0 || _zag_file_exists(".gitignore") != 0) {
+        _zag_eprintln("znc init: a scaffold target already exists; no files changed");
+        return 1;
+    }
+    let project_name: []u8 = flag_value("--name");
+    if (project_name.len == 0) { project_name = stem_of(znc_cwd()); }
+    if (project_name.len == 0) { project_name = "myproject"; }
+    if (fc_mkdir("src") == 0 || fc_mkdir("tests") == 0 || fc_mkdir("deps") == 0) {
+        _zag_eprintln("znc init: could not create src/, tests/, and deps/");
+        return 1;
+    }
+    let content: []u8 = _zag_str_concat("name = \"", _zag_str_concat(project_name,
+        "\"\nversion = \"0.1.0\"\nedition = \"2026\"\n"));
+    let main_source: []u8 = "script;\n\nprintln(\"Hello from Zag\");\nreturn 0;\n";
+    let smoke_source: []u8 = "script;\n\nif (2 + 2 != 4) { return 1; }\nprintln(\"smoke: ok\");\nreturn 0;\n";
+    let readme: []u8 = _zag_str_concat("# ", _zag_str_concat(project_name,
+        "\n\nRun the app:\n\n```sh\nznc src/main.zag -o app --run\n```\n\nRun the starter smoke test:\n\n```sh\nznc tests/smoke.zag -o smoke --run\n```\n\nUseful commands:\n\n```sh\nznc check src/main.zag\nznc fmt --in-place src/main.zag\nznc --help\n```\n\n## Early systems language\n\nZag is an early systems language. Local and vendored dependencies work, but\nthere is no package registry yet. RAII/destructors, async/await, and full\nmemory safety are not available yet. See `docs/SUPPORT.md` in the Zag\ndistribution for the exact target and language boundaries.\n"));
     let wrc: i32 = _zag_write_file(modpath, content);
-    if (wrc != 0) { _zag_println("znc init: failed to write zag.mod"); return 1; }
-    _zag_println("znc init: created zag.mod");
+    if (wrc != 0 || _zag_write_file("src/main.zag", main_source) != 0 ||
+        _zag_write_file("tests/smoke.zag", smoke_source) != 0 ||
+        _zag_write_file("deps/README.md", "# Vendored dependencies\n\nZag has no package registry or network resolver yet. Vendor reviewed `.zag` source here, pin it with version control, and import it with an explicit relative path. See the compiler support contract for the exact dependency boundary.\n") != 0 ||
+        _zag_write_file("README.md", readme) != 0 ||
+        _zag_write_file(".gitignore", ".zag-cache/\napp\nsmoke\n") != 0) {
+        _zag_eprintln("znc init: failed while writing the project scaffold");
+        return 1;
+    }
+    _zag_println(_zag_str_concat("Initialized Zag project `", _zag_str_concat(project_name, "`.")));
+    _zag_println("  Run:  znc src/main.zag -o app --run");
+    _zag_println("  Test: znc tests/smoke.zag -o smoke --run");
+    _zag_println("  Help: znc --help");
+    _zag_println("  Note: early systems language - see README.md and docs/SUPPORT.md for boundaries");
     return 0;
 }
 
@@ -2524,7 +3593,13 @@ fn znc_project_root(start: []u8) []u8 {
     let fallback: []u8 = cur;
     let steps: i32 = 0;
     while (steps < 64) {
-        if (_zag_file_exists(_zag_str_concat(cur, "/zag.mod")) == 1) { return cur; }
+        // A standalone source may intentionally omit a manifest while still
+        // carrying an authoritative project policy. Treat the nearest
+        // `.zagd.conf` as a project boundary too; otherwise Script builds
+        // silently fall back to the 64 MiB default and ignore explicit
+        // memory/capability limits.
+        if (_zag_file_exists(_zag_str_concat(cur, "/zag.mod")) == 1 ||
+            _zag_file_exists(_zag_str_concat(cur, "/.zagd.conf")) == 1) { return cur; }
         let parent: []u8 = znc_parent_dir(cur);
         if (@strEq(parent, cur)) { return fallback; }
         cur = parent;
@@ -2556,10 +3631,28 @@ fn znc_contains(haystack: []u8, needle: []u8) i32 {
     return 0;
 }
 
+fn znc_project_config_authoritative(root: []u8) PlannerConfig {
+    let path:[]u8=_zag_str_concat(root, "/.zagd.conf");
+    if (_zag_file_exists(path) == 0) { return planner_default_config(); }
+    let cfg: []u8 = _zag_read_file(path);
+    if (cfg.len < 0) {
+        let unreadable:PlannerConfig=planner_default_config();
+        unreadable.valid=0;unreadable.diagnostic="planner config: .zagd.conf exists but could not be read";
+        return unreadable;
+    }
+    return planner_parse_config(cfg);
+}
+
+fn znc_invalid_project_config(root:[]u8,operation:[]u8)i32 {
+    let parsed:PlannerConfig=znc_project_config_authoritative(root);
+    if(parsed.valid==1){return 0;}
+    _zag_eprintln(_zag_str_concat("znc ",_zag_str_concat(operation,
+        _zag_str_concat(": invalid .zagd.conf: ",parsed.diagnostic))));
+    return 1;
+}
+
 fn znc_project_config(root: []u8, warn_invalid: i32) PlannerConfig {
-    let cfg: []u8 = _zag_read_file(_zag_str_concat(root, "/.zagd.conf"));
-    if (cfg.len < 0) { return planner_default_config(); }
-    let parsed: PlannerConfig = planner_parse_config(cfg);
+    let parsed: PlannerConfig = znc_project_config_authoritative(root);
     if (parsed.valid == 0) {
         if (warn_invalid == 1) {
             _zag_eprintln(_zag_str_concat("znc: warning: ", _zag_str_concat(parsed.diagnostic, "; using documented defaults")));
@@ -2824,7 +3917,7 @@ fn znc_mode_arg() []u8 {
         }
         i = i + 1;
     }
-    return "light";
+    return "";
 }
 
 fn znc_valid_zagd_mode(mode: []u8) i32 {
@@ -2833,6 +3926,8 @@ fn znc_valid_zagd_mode(mode: []u8) i32 {
     return 0;
 }
 
+fn znc_bool_arg(value:i32)[]u8 { if(value==1){return "true";}return "false"; }
+
 fn znc_zagd_exec_config(root: []u8, root_source:[]u8, mode: []u8, cfg: PlannerConfig, daemonize: i32) i32 {
     let binary: []u8 = znc_sibling_zagd();
     if (_zag_file_exists(binary) == 0) { return 127; }
@@ -2840,6 +3935,13 @@ fn znc_zagd_exec_config(root: []u8, root_source:[]u8, mode: []u8, cfg: PlannerCo
     command=_zag_str_concat(command,_zag_str_concat(" --root ",znc_shell_quote(root)));
     if(root_source.len>0){command=_zag_str_concat(command,_zag_str_concat(" --root-source ",znc_shell_quote(root_source)));}
     command=_zag_str_concat(command,_zag_str_concat(" --mode ",znc_shell_quote(mode)));
+    command=_zag_str_concat(command,_zag_str_concat(" --idle-deep ",znc_bool_arg(cfg.idle_deep)));
+    command=_zag_str_concat(command,_zag_str_concat(" --difficulty ",znc_shell_quote(cfg.difficulty)));
+    command=_zag_str_concat(command,_zag_str_concat(" --script-optimization ",znc_shell_quote(cfg.script_optimization)));
+    command=_zag_str_concat(command,_zag_str_concat(" --regular-optimization ",znc_shell_quote(cfg.regular_optimization)));
+    command=_zag_str_concat(command,_zag_str_concat(" --objective ",znc_shell_quote(cfg.objective)));
+    command=_zag_str_concat(command,_zag_str_concat(" --trust-mode ",znc_shell_quote(cfg.trust_mode)));
+    command=_zag_str_concat(command,_zag_str_concat(" --cpu ",znc_shell_quote(cfg.default_cpu)));
     command=_zag_str_concat(command,_zag_str_concat(" --window-ms ",_zag_i64_to_str(cfg.stability_window_ms)));
     command=_zag_str_concat(command,_zag_str_concat(" --max-memory-bytes ",_zag_i64_to_str(cfg.max_memory_bytes)));
     command=_zag_str_concat(command,_zag_str_concat(" --max-cache-bytes ",_zag_i64_to_str(cfg.max_cache_bytes)));
@@ -2847,6 +3949,23 @@ fn znc_zagd_exec_config(root: []u8, root_source:[]u8, mode: []u8, cfg: PlannerCo
     command=_zag_str_concat(command,_zag_str_concat(" --notifications ",znc_shell_quote(cfg.notifications)));
     if (daemonize == 1) { command = _zag_str_concat(command, " --daemonize >/dev/null 2>/dev/null"); }
     return _zag_exec_cmd(command);
+}
+
+fn znc_zagd_status_matches_config(status:[]u8,mode:[]u8,cfg:PlannerConfig)i32 {
+    if(znc_contains(status,_zag_str_concat("mode=",_zag_str_concat(mode,"\n")))==0){return 0;}
+    if(znc_contains(status,_zag_str_concat("idle_deep=",_zag_str_concat(znc_bool_arg(cfg.idle_deep),"\n")))==0){return 0;}
+    if(znc_contains(status,_zag_str_concat("difficulty=",_zag_str_concat(cfg.difficulty,"\n")))==0){return 0;}
+    if(znc_contains(status,_zag_str_concat("script_optimization=",_zag_str_concat(cfg.script_optimization,"\n")))==0){return 0;}
+    if(znc_contains(status,_zag_str_concat("regular_optimization=",_zag_str_concat(cfg.regular_optimization,"\n")))==0){return 0;}
+    if(znc_contains(status,_zag_str_concat("objective=",_zag_str_concat(cfg.objective,"\n")))==0){return 0;}
+    if(znc_contains(status,_zag_str_concat("trust_mode=",_zag_str_concat(cfg.trust_mode,"\n")))==0){return 0;}
+    if(znc_contains(status,_zag_str_concat("cpu=",_zag_str_concat(cfg.default_cpu,"\n")))==0){return 0;}
+    if(znc_contains(status,_zag_str_concat("stability_window_ms=",_zag_str_concat(_zag_i64_to_str(cfg.stability_window_ms),"\n")))==0){return 0;}
+    if(znc_contains(status,_zag_str_concat("max_memory_bytes=",_zag_str_concat(_zag_i64_to_str(cfg.max_memory_bytes),"\n")))==0){return 0;}
+    if(znc_contains(status,_zag_str_concat("max_cache_bytes=",_zag_str_concat(_zag_i64_to_str(cfg.max_cache_bytes),"\n")))==0){return 0;}
+    if(znc_contains(status,_zag_str_concat("max_workers=",_zag_str_concat(_zag_i64_to_str(cfg.max_workers as i64),"\n")))==0){return 0;}
+    if(znc_contains(status,_zag_str_concat("notifications=",_zag_str_concat(cfg.notifications,"\n")))==0){return 0;}
+    return 1;
 }
 
 fn znc_zagd_exec(root: []u8, mode: []u8, window_ms: i64, daemonize: i32) i32 {
@@ -2882,13 +4001,13 @@ fn znc_cache_purge(root: []u8) void {
     let rescan: []u8 = _zag_str_concat(root, "/.zagd.rescan");
     let profile: []u8 = _zag_str_concat(root, "/.zagd.profile");
     let root_src: []u8 = _zag_str_concat(root, "/.zagd.root-source");
-    _zag_raw_syscall(87, _zag_slice_ptr(lock) as i64, 0, 0, 0, 0, 0);
-    _zag_raw_syscall(87, _zag_slice_ptr(status) as i64, 0, 0, 0, 0, 0);
-    _zag_raw_syscall(87, _zag_slice_ptr(stop) as i64, 0, 0, 0, 0, 0);
-    _zag_raw_syscall(87, _zag_slice_ptr(ready) as i64, 0, 0, 0, 0, 0);
-    _zag_raw_syscall(87, _zag_slice_ptr(rescan) as i64, 0, 0, 0, 0, 0);
-    _zag_raw_syscall(87, _zag_slice_ptr(profile) as i64, 0, 0, 0, 0, 0);
-    _zag_raw_syscall(87, _zag_slice_ptr(root_src) as i64, 0, 0, 0, 0, 0);
+    let c_lock: ArrayList[u8] = fc_cstring(lock); _zag_raw_syscall(87, _zag_slice_ptr(c_lock.data[0..c_lock.len]) as i64, 0, 0, 0, 0, 0); free[u8](&c_lock);
+    let c_status: ArrayList[u8] = fc_cstring(status); _zag_raw_syscall(87, _zag_slice_ptr(c_status.data[0..c_status.len]) as i64, 0, 0, 0, 0, 0); free[u8](&c_status);
+    let c_stop: ArrayList[u8] = fc_cstring(stop); _zag_raw_syscall(87, _zag_slice_ptr(c_stop.data[0..c_stop.len]) as i64, 0, 0, 0, 0, 0); free[u8](&c_stop);
+    let c_ready: ArrayList[u8] = fc_cstring(ready); _zag_raw_syscall(87, _zag_slice_ptr(c_ready.data[0..c_ready.len]) as i64, 0, 0, 0, 0, 0); free[u8](&c_ready);
+    let c_rescan: ArrayList[u8] = fc_cstring(rescan); _zag_raw_syscall(87, _zag_slice_ptr(c_rescan.data[0..c_rescan.len]) as i64, 0, 0, 0, 0, 0); free[u8](&c_rescan);
+    let c_profile: ArrayList[u8] = fc_cstring(profile); _zag_raw_syscall(87, _zag_slice_ptr(c_profile.data[0..c_profile.len]) as i64, 0, 0, 0, 0, 0); free[u8](&c_profile);
+    let c_root_src: ArrayList[u8] = fc_cstring(root_src); _zag_raw_syscall(87, _zag_slice_ptr(c_root_src.data[0..c_root_src.len]) as i64, 0, 0, 0, 0, 0); free[u8](&c_root_src);
 }
 
 // Remove a directory tree by unlinking all files within it.  We use getdents64
@@ -2897,40 +4016,53 @@ fn znc_cache_purge(root: []u8) void {
 // the cache validation logic will reject it by checksum.
 fn znc_unlink_tree(dir: []u8) void {
     let cdir: ArrayList[u8] = fc_cstring(dir);
-    // O_DIRECTORY|O_CLOEXEC|O_RDONLY = 65536|524288|0 = 589824
-    let fd: i64 = _zag_raw_syscall(257, _zag_slice_ptr(cdir.data[0..cdir.len]) as i64, 589824, 0, 0, 0, 0);
+    // open(path, O_DIRECTORY|O_CLOEXEC|O_RDONLY) — syscall 2 on x86-64
+    // O_DIRECTORY=65536|O_CLOEXEC=524288|O_RDONLY=0 = 589824
+    let fd: i64 = _zag_raw_syscall(2, _zag_slice_ptr(cdir.data[0..cdir.len]) as i64, 589824, 0, 0, 0, 0);
     free[u8](&cdir);
     if (fd < 0) { return; }
     let buf: ArrayList[u8] = make[u8](4096);
     let running: i32 = 1;
     while (running == 1) {
-        let n: i64 = _zag_raw_syscall(217, fd, _zag_slice_ptr(buf.data[0..buf.len]) as i64, buf.len, 0, 0, 0);
+        // getdents64(fd, buf, count) — syscall 217 on x86-64
+        let n: i64 = _zag_raw_syscall(217, fd, _zag_slice_ptr(buf.data[0..buf.cap]) as i64, buf.cap, 0, 0, 0);
         if (n <= 0) { running = 0; break; }
         let off: i32 = 0;
         while (off < n) {
-            let reclen: i64 = fc_u32_at(buf.data[0..buf.len], off + 16);
             // getdents64 struct: ino(8), off(8), reclen(2), type(1), name[]
+            // d_reclen is unsigned short (2 bytes) at offset 16, little-endian.
+            let reclen: i32 = (buf.data[off + 16] as i32) | ((buf.data[off + 17] as i32) << 8);
+            // d_type is 1 byte at offset 18: DT_REG=8 (file), DT_DIR=4 (dir), DT_LNK=10 (symlink)
+            let dtype: i32 = buf.data[off + 18] as i32;
             let name_start: i32 = off + 19;
             // Extract null-terminated name
             let name_end: i32 = name_start;
-            while (name_end < off + (reclen as i32) && buf.data[name_end] != 0) { name_end = name_end + 1; }
+            while (name_end < off + reclen && buf.data[name_end] != 0) { name_end = name_end + 1; }
             let name: []u8 = buf.data[name_start..name_end];
             // Skip "." and ".."
-            if (name.len == 1 && name[0] == '.') { off = off + (reclen as i32); continue; }
-            if (name.len == 2 && name[0] == '.' && name[1] == '.') { off = off + (reclen as i32); continue; }
+            if (name.len == 1 && name[0] == '.') { off = off + reclen; continue; }
+            if (name.len == 2 && name[0] == '.' && name[1] == '.') { off = off + reclen; continue; }
             if (name.len > 0) {
                 let full: []u8 = _zag_str_concat(_zag_str_concat(dir, "/"), name);
-                let cfull: ArrayList[u8] = fc_cstring(full);
-                _zag_raw_syscall(87, _zag_slice_ptr(cfull.data[0..cfull.len]) as i64, 0, 0, 0, 0, 0);
-                free[u8](&cfull);
+                if (dtype == 4) {
+                    // Subdirectory — recurse to remove its contents first.
+                    znc_unlink_tree(full);
+                } else {
+                    // File or symlink — unlink directly.
+                    let cfull: ArrayList[u8] = fc_cstring(full);
+                    // unlink(path) — syscall 87 on x86-64
+                    _zag_raw_syscall(87, _zag_slice_ptr(cfull.data[0..cfull.len]) as i64, 0, 0, 0, 0, 0);
+                    free[u8](&cfull);
+                }
                 _zag_str_free(full);
             }
-            off = off + (reclen as i32);
+            off = off + reclen;
         }
     }
     free[u8](&buf);
+    // close(fd) — syscall 3
     let _close: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
-    // rmdir the now-empty directory
+    // rmdir(path) — syscall 84 on x86-64
     let cdir2: ArrayList[u8] = fc_cstring(dir);
     _zag_raw_syscall(84, _zag_slice_ptr(cdir2.data[0..cdir2.len]) as i64, 0, 0, 0, 0, 0);
     free[u8](&cdir2);
@@ -2958,11 +4090,15 @@ fn znc_cache_version_check(root: []u8) void {
     _zag_str_free(stamp_path);
 }
 
-fn znc_zagd_ensure(root: []u8, root_source:[]u8) void {
+fn znc_zagd_ensure(root: []u8, root_source:[]u8, operation:[]u8) i32 {
+    // Project policy is foreground input even when the advisory daemon is
+    // disabled or absent. An existing malformed file must never become an
+    // implicit request for defaults; only an actually missing file does.
+    if(znc_invalid_project_config(root,operation)==1){return 2;}
     // Foreground correctness and release-authority checks can opt out for one
     // invocation. Project policy remains unchanged and the next normal source
     // command resumes automatic monitoring.
-    if (has_flag("--no-zagd") == 1) { return; }
+    if (has_flag("--no-zagd") == 1) { return 0; }
     // A running daemon keeps the root source selected at its own launch.
     // Foreground commands must not mutate that authority through a shared
     // control file, or a small watched project can be redirected into a
@@ -2979,21 +4115,22 @@ fn znc_zagd_ensure(root: []u8, root_source:[]u8) void {
                 _zag_eprintln("znc: warning: could not stop zagd requested by mode=off; foreground compilation continues");
             }
         }
-        return;
+        return 0;
     }
     if (alive == 1) {
         let status: []u8 = _zag_read_file(_zag_str_concat(root, "/.zagd.status"));
-        if (znc_contains(status, _zag_str_concat("mode=", _zag_str_concat(mode, "\n")))) { return; }
+        if (znc_zagd_status_matches_config(status,mode,config)==1) { return 0; }
         let stopped: i32 = znc_zagd_exec(root, "off", config.stability_window_ms, 0);
         if (stopped != 0) {
             _zag_eprintln("znc: warning: could not change zagd mode; foreground compilation continues");
-            return;
+            return 0;
         }
     }
     let rc: i32 = znc_zagd_exec_config(root, root_source, mode, config, 1);
     if (rc != 0 && rc != 6) {
         _zag_eprintln("znc: warning: zagd unavailable; foreground compilation continues without background planning");
     }
+    return 0;
 }
 
 fn znc_output_format() i32 {
@@ -3034,13 +4171,15 @@ fn znc_watch() i32 {
     }
     let root_base:[]u8=".";if(root_source.len>0){root_base=dir_of(root_source);}
     let root: []u8 = znc_project_root(root_base);
+    if(znc_invalid_project_config(root,"watch")==1){return 2;}
     if(root_source.len==0){if(_zag_file_exists(_zag_str_concat(root,"/main.zag"))==1){root_source="main.zag";}else if(_zag_file_exists(_zag_str_concat(root,"/app.zag"))==1){root_source="app.zag";}}
+    let config: PlannerConfig = znc_project_config(root, 1);
     let mode: []u8 = znc_mode_arg();
+    if(mode.len==0){mode=config.mode;if(@strEq(mode,"advisory")){mode="light";}}
     if (znc_valid_zagd_mode(mode) == 0) {
         _zag_eprintln("znc watch: --mode must be off, light, adaptive, or deep");
         return 2;
     }
-    let config: PlannerConfig = znc_project_config(root, 1);
     if (@strEq(mode, "off")) { return znc_zagd_exec(root, "off", config.stability_window_ms, 0); }
     // A mode change is explicit and deterministic: stop the old singleton,
     // then start one replacement. No source is rewritten.
@@ -3129,34 +4268,12 @@ fn znc_manifest_modules_current(root:[]u8,text:[]u8)i32{
 // Exact module-source matching closes the race between a parsed foreground
 // unit and the transactionally published semantic record. A concurrently
 // published manifest for another root/import state is an optimization miss.
-fn znc_profile_manifest_module_count(text:[]u8,name:[]u8,want:ZagdHash)i32{
-    let matches:i32=0;let start:i32=0;let i:i32=0;
-    while(i<=text.len){
-        if(i==text.len||text[i]=='\n'){
-            let line:[]u8=text[start..i];
-            if(line.len>12&&@strEq(line[0..12],"module_node=")){
-                let node:[]u8=line[12..];let tab:i32=0;while(tab<node.len&&node[tab]!='\t'){tab=tab+1;}
-                if(tab<node.len&&@strEq(node[0..tab],name)&&zagd_hash_equal(smf_hash(node[tab+1..]),want)==1){matches=matches+1;}
-            }
-            start=i+1;
-        }
-        i=i+1;
-    }
-    return matches;
-}
-fn znc_profile_manifest_matches_unit(text:[]u8,src:[]u8,modules:ArrayList[ResolvedModule])i32{
-    let view:SemanticManifestView=semantic_manifest_decode(text);
-    if(view.valid==0||view.graph_complete!=1||zagd_hash_equal(view.source,zagd_content_hash(src))==0){return 0;}
-    let node_count:i32=0;let start:i32=0;let i:i32=0;
-    while(i<=text.len){if(i==text.len||text[i]=='\n'){let line:[]u8=text[start..i];if(line.len>12&&@strEq(line[0..12],"module_node=")){node_count=node_count+1;}start=i+1;}i=i+1;}
-    if(node_count!=modules.len){return 0;}
-    i=0;while(i<modules.len){
-        let module:ResolvedModule=modules.data[i];let name:[]u8=module.path;
-        if(@strEq(name,"<root>")){name=view.module;}
-        if(znc_profile_manifest_module_count(text,name,zagd_content_hash(module.source))!=1){return 0;}
-        i=i+1;
-    }
-    return 1;
+fn znc_profile_manifest_matches_unit(root:[]u8,text:[]u8,src:[]u8,
+        modules:ArrayList[ResolvedModule])i32{
+    let compiler_cwd:[]u8=smp_cwd();
+    let matches:i32=semantic_manifest_matches_unit_inputs(root,compiler_cwd,
+        text,src,modules);
+    if(compiler_cwd.len>0){_zag_str_free(compiler_cwd);}return matches;
 }
 struct ZncForegroundCacheSemantic { graph:ZagdHash, valid:i32 }
 // Executable cache authority binds to the foreground compiler's just-published
@@ -3167,7 +4284,7 @@ struct ZncForegroundCacheSemantic { graph:ZagdHash, valid:i32 }
 fn znc_foreground_cache_semantic(root:[]u8,src:[]u8,modules:ArrayList[ResolvedModule],published:i32)ZncForegroundCacheSemantic{
     let bad:ZncForegroundCacheSemantic=ZncForegroundCacheSemantic{.graph=zagd_hash_empty(),.valid=0};if(published!=1){return bad;}
     let path:[]u8=_zag_str_concat(root,"/.zag-cache/zagd/semantic.record");let record:ForegroundBoundedRead=fc_read_bounded(path,8388608);if(record.ok==0){free[u8](&record.bytes);return bad;}
-    let text:[]u8=record.bytes.data[0..record.bytes.len];let view:SemanticManifestView=semantic_manifest_decode(text);if(view.valid==0||view.graph_complete!=1||znc_profile_manifest_matches_unit(text,src,modules)==0){free[u8](&record.bytes);return bad;}
+    let text:[]u8=record.bytes.data[0..record.bytes.len];let view:SemanticManifestView=semantic_manifest_decode(text);if(view.valid==0||view.graph_complete!=1||znc_profile_manifest_matches_unit(root,text,src,modules)==0){free[u8](&record.bytes);return bad;}
     let out:ZncForegroundCacheSemantic=ZncForegroundCacheSemantic{.graph=view.graph_identity,.valid=1};free[u8](&record.bytes);return out;
 }
 fn znc_foreground_profile_use(root:[]u8,src:[]u8,modules:ArrayList[ResolvedModule],
@@ -3176,7 +4293,7 @@ fn znc_foreground_profile_use(root:[]u8,src:[]u8,modules:ArrayList[ResolvedModul
     if(compiler_bytes.len<=0||cpu.valid==0){return zpf_bad("foreground-input-unavailable");}
     let semantic_text:[]u8=_zag_read_file(_zag_str_concat(root,"/.zag-cache/zagd/semantic.record"));
     if(semantic_text.len<=0){if(semantic_text.len>=0){_zag_free(_zag_slice_ptr(semantic_text));}return zpf_bad("missing-semantic-record");}
-    if(znc_profile_manifest_matches_unit(semantic_text,src,modules)==0){
+    if(znc_profile_manifest_matches_unit(root,semantic_text,src,modules)==0){
         _zag_free(_zag_slice_ptr(semantic_text));return zpf_bad("semantic-record-not-current-compilation");
     }
     let plan_text:[]u8=_zag_read_file(_zag_str_concat(root,"/.zag-cache/zagd/profile-plan.record"));
@@ -3270,11 +4387,145 @@ fn znc_optimize_preview() i32 {
     // Preserve valid JSON as a single machine-readable object. Text gains a
     // short boundary statement before the existing suggestion rendering.
     if (json == 0) { _zag_println("znc optimize preview: read-only advisory; source_changes=false"); }
-    return znc_zagd_suggest();
+    return znc_zagd_suggest("optimize");
 }
 
-fn znc_zagd_suggest() i32 {
+// ── bounded vendored package-lock generator ────────────────────────────────
+// This command creates only the explicit module-granular entries already
+// present in the parsed `pkg:` graph.  It never overwrites a lock, invents
+// ordinary source-relative edges, fetches a registry, or resolves versions.
+fn znc_package_lock_entry_less(a:PackageLockGeneratedEntry,
+    b:PackageLockGeneratedEntry)i32{
+    let order:i32=package_lock_compare(a.alias,b.alias);
+    if(order!=0){return (order<0) as i32;}
+    order=package_lock_compare(a.root,b.root);
+    if(order!=0){return (order<0) as i32;}
+    return (package_lock_compare(a.module,b.module)<0) as i32;
+}
+fn znc_package_lock_entry_same(a:PackageLockGeneratedEntry,
+    b:PackageLockGeneratedEntry)i32{
+    return (@strEq(a.alias,b.alias)&&@strEq(a.root,b.root)&&
+        @strEq(a.module,b.module)) as i32;
+}
+fn znc_package_lock_entries_release(entries:*ArrayList[PackageLockGeneratedEntry])void{
+    let i:i32=0;
+    while(i<entries.*.len){package_lock_generated_release(&entries.*.data[i]);i=i+1;}
+    free[PackageLockGeneratedEntry](entries);
+}
+fn znc_package_lock_append_owned(base:*[]u8,piece:[]u8)void{
+    let prefix:[]u8="";
+    if(base.*.len>0){prefix=base.*;}
+    let next:[]u8=_zag_str_concat(prefix,piece);
+    if(base.*.len>0){_zag_str_free(base.*);}
+    base.*=next;
+}
+fn znc_package_lock_entry_line(entry:PackageLockGeneratedEntry)[]u8{
+    let line:[]u8="";
+    znc_package_lock_append_owned(&line,"entry=");
+    znc_package_lock_append_owned(&line,entry.alias);
+    znc_package_lock_append_owned(&line,"\t");
+    znc_package_lock_append_owned(&line,entry.root);
+    znc_package_lock_append_owned(&line,"\t");
+    znc_package_lock_append_owned(&line,entry.module);
+    znc_package_lock_append_owned(&line,"\t");
+    let first:[]u8=_zag_i64_to_str(entry.checksum.first);
+    let second:[]u8=_zag_i64_to_str(entry.checksum.second);
+    let bytes:[]u8=_zag_i64_to_str(entry.checksum.bytes);
+    znc_package_lock_append_owned(&line,first);_zag_str_free(first);
+    znc_package_lock_append_owned(&line,",");
+    znc_package_lock_append_owned(&line,second);_zag_str_free(second);
+    znc_package_lock_append_owned(&line,",");
+    znc_package_lock_append_owned(&line,bytes);_zag_str_free(bytes);
+    znc_package_lock_append_owned(&line,"\n");
+    return line;
+}
+fn znc_package_lock_render(entries:ArrayList[PackageLockGeneratedEntry])[]u8{
+    let out:[]u8="";
+    znc_package_lock_append_owned(&out,"format=zag-local-lock-v1\n");
+    let i:i32=0;
+    while(i<entries.len){
+        let best:i32=i;let j:i32=i+1;
+        while(j<entries.len){
+            if(znc_package_lock_entry_less(entries.data[j],entries.data[best])==1){best=j;}
+            j=j+1;
+        }
+        if(best!=i){let swap:PackageLockGeneratedEntry=entries.data[i];entries.data[i]=entries.data[best];entries.data[best]=swap;}
+        i=i+1;
+    }
+    i=0;
+    while(i<entries.len){
+        let line:[]u8=znc_package_lock_entry_line(entries.data[i]);
+        znc_package_lock_append_owned(&out,line);_zag_str_free(line);i=i+1;
+    }
+    return out;
+}
+fn znc_package_lock_source_arg()[]u8{
+    let i:i32=3;
+    while(i<_zag_argc()){
+        let arg:[]u8=_zag_arg(i);
+        if(@strEq(arg,"--output")||@strEq(arg,"-o")){i=i+2;}
+        else if(arg.len>0&&arg[0]=='-'){i=i+1;}
+        else{return arg;}
+    }
+    return "";
+}
+fn znc_package_lock()i32{
+    let path:[]u8=znc_package_lock_source_arg();
+    if(path.len==0){_zag_eprintln("znc package lock: source.zag is required");return 2;}
+    let source:[]u8=_zag_read_file(path);
+    if(source.len<0){_zag_eprintln("znc package lock: cannot read source");return 1;}
+    let unit:CompilationUnit=parse_compilation_unit_dir(source,dir_of(path));
+    let entries:ArrayList[PackageLockGeneratedEntry]=make[PackageLockGeneratedEntry](8);
+    let total_bytes:i64=0;
+    let i:i32=0;
+    while(i<unit.imports.len){
+        let edge:ResolvedImport=unit.imports.data[i];
+        if(package_import_starts_with(edge.specifier,"pkg:")==1){
+            let entry:PackageLockGeneratedEntry=package_lock_generated_entry(edge.specifier,edge.importer);
+            if(entry.valid==0){
+                _zag_eprintln(_zag_str_concat("znc package lock: cannot collect vendored import `",_zag_str_concat(edge.specifier,"` (dependency must be mode=vendor and module bytes must exist)")));
+                package_lock_generated_release(&entry);znc_package_lock_entries_release(&entries);package_import_free_read(source);return 1;
+            }
+            if(entries.len>=256||total_bytes+entry.checksum.bytes>67108864){
+                _zag_eprintln("znc package lock: generated graph exceeds the canonical 256-entry/64-MiB bound");
+                package_lock_generated_release(&entry);znc_package_lock_entries_release(&entries);package_import_free_read(source);return 1;
+            }
+            let duplicate:i32=0;let j:i32=0;
+            while(j<entries.len){
+                if(znc_package_lock_entry_same(entries.data[j],entry)==1){
+                    if(package_raw_checksum_equal(entries.data[j].checksum,entry.checksum)==0){
+                        _zag_eprintln("znc package lock: one package tuple resolved to different raw module bytes");
+                        package_lock_generated_release(&entry);znc_package_lock_entries_release(&entries);package_import_free_read(source);return 1;
+                    }
+                    duplicate=1;
+                }
+                j=j+1;
+            }
+            if(duplicate==0){push[PackageLockGeneratedEntry](&entries,entry);total_bytes=total_bytes+entry.checksum.bytes;}
+            else{package_lock_generated_release(&entry);}
+        }
+        i=i+1;
+    }
+    if(entries.len==0){_zag_eprintln("znc package lock: source graph contains no explicit pkg: imports");znc_package_lock_entries_release(&entries);package_import_free_read(source);return 1;}
+    let output:[]u8=flag_value("--output");
+    let target:[]u8="";
+    if(output.len>0){target=output;}
+    else{
+        let manifest:[]u8=package_import_manifest(dir_of(path));
+        if(manifest.len==0){_zag_eprintln("znc package lock: no ancestor zag.mod");znc_package_lock_entries_release(&entries);package_import_free_read(source);return 1;}
+        target=package_import_join(package_import_dir(manifest),"zag.lock");_zag_str_free(manifest);
+    }
+    if(znc_path_absent_nofollow(target)==0){_zag_eprintln(_zag_str_concat("znc package lock: refusing to replace existing lock `",_zag_str_concat(target,"`")));if(output.len==0){_zag_str_free(target);}znc_package_lock_entries_release(&entries);package_import_free_read(source);return 1;}
+    let lock:[]u8=znc_package_lock_render(entries);
+    let published:i32=znc_publish_new_file(target,lock);
+    _zag_str_free(lock);if(output.len==0){_zag_str_free(target);}znc_package_lock_entries_release(&entries);package_import_free_read(source);
+    if(published==0){_zag_eprintln("znc package lock: failed to publish create-only lock");return 1;}
+    _zag_println("znc package lock: canonical vendored entries written");return 0;
+}
+
+fn znc_zagd_suggest(operation:[]u8) i32 {
     let root: []u8 = znc_project_root(".");
+    if(znc_invalid_project_config(root,operation)==1){return 2;}
     let status: []u8 = _zag_read_file(_zag_str_concat(root, "/.zagd.status"));
     let manifest_text:[]u8=_zag_read_file(_zag_str_concat(root,"/.zag-cache/zagd/semantic.record"));
     let manifest:SemanticManifestView=semantic_manifest_decode(manifest_text);
@@ -3326,18 +4577,91 @@ fn znc_write_hotlen(clen: i32, dlen: i32) void {
 // `.zag_hotpatch` for the running process to memcpy over its live code.
 fn znc_hot_patch(path: []u8) i32 {
     if (path.len == 0) { _zag_println("znc hot-patch: no source file"); return 1; }
+    if (v2_validate_options() != 0) { return 1; }
+    if(foreground_transform_requested()==1){_zag_eprintln("znc hot-patch: --foreground-transform is not supported for live text patches");return 1;}
+    // A staged hot patch is raw native `.text`, not an ELF/object/link step.
+    // Reject every target or output mode whose final bytes require a different
+    // backend or a linker instead of silently lowering it as host x86-64.
+    if (i686_target() == 1 || validate_x86_target_flag() != 0 ||
+        validate_x86_cpu_flag() != 0) { return 1; }
+    if (has_flag("--dynamic") == 1 || has_flag("--emit-obj") == 1 ||
+        has_flag("--emit-static") == 1) {
+        _zag_eprintln("znc hot-patch: dynamic, object, and archive output modes cannot be staged as a live native text patch");
+        return 1;
+    }
+    if (znc_invalid_project_config(znc_project_root(dir_of(path)),
+        "hot-patch") == 1) { return 1; }
+
     let src: []u8 = _zag_read_file(path);
     if (src.len < 0) { _zag_print("znc hot-patch: cannot read "); _zag_println(path); return 1; }
 
-    // Same front-end + codegen pipeline as the build path so that every
-    // unchanged function assembles to byte-identical code at the same offset.
-    let decls: ArrayList[*Node] = parse_program_dir(src, dir_of(path));
+    // Enter the same foreground authority as an ordinary native build.  Hot
+    // patching deliberately skips the machine-code cache so the edited source
+    // is always parsed, checked, represented in verified Zag IR, and lowered.
+    src = znc_activate_script_source(path, src, 0);
+    if (v2_validate_source(path, src) != 0) { return 1; }
+    let unit: CompilationUnit = parse_compilation_unit_dir(src, dir_of(path));
+    if (znc_validate_script_defaults(path, unit) != 0 ||
+        znc_configure_script_unit(&unit, path) != 0 ||
+        znc_validate_script_capabilities(path, unit) != 0) { return 1; }
+    if (unit.profile == ModuleProfile.script &&
+        (znc_script_std_body_check(unit.decls) != 0 ||
+         znc_script_lifetime_check(unit.decls) != 0 ||
+         znc_script_unaccounted_root_make(unit.decls) != 0)) { return 1; }
+    let decls: ArrayList[*Node] = unit.decls;
     lo_operators(decls);
+
+    if (znc_check_arity(decls) > 0) {
+        _zag_println("znc: arity check FAILED");
+        return 1;
+    }
+    if (znc_check_dups(decls) > 0) {
+        _zag_println("znc: duplicate-definition check FAILED");
+        return 1;
+    }
+    if (typed_check_program(decls, path) > 0) { return 1; }
+    let eff: map__StringMap[i32] = analyze(decls);
+    if (report_violations(decls, eff, src, path) > 0) {
+        znc_emit_total_cex(decls, eff);
+        _zag_println("znc: capability check FAILED");
+        return 1;
+    }
+    smt_report_proofs(decls, eff);
+    if (run_analyzer(decls, path) != 0) { return 1; }
+
     let link_libs: ArrayList[[]u8] = make[[]u8](4);
+    let lib_paths: ArrayList[[]u8] = make[[]u8](4);
     let code_decls: ArrayList[*Node] = znc_collect_links(decls, &link_libs);
+    znc_argv_links(&link_libs);
+    znc_argv_paths(&lib_paths);
+    znc_load_zagmod(dir_of(path), &link_libs, &lib_paths);
+    if (link_libs.len > 0) {
+        _zag_eprintln("znc hot-patch: static archive linking is not supported by raw live text patches");
+        return 1;
+    }
+
+    let hot_zir_authority: ZirAuthority =
+        zir_prepare_production_with_origins(code_decls, eff, unit.origins);
+    if (hot_zir_authority.valid == 0) {
+        _zag_eprintln(_zag_str_concat("znc hot-patch: Zag IR verification failed; errors=",
+            _zag_i64_to_str(hot_zir_authority.verify_errors as i64)));
+        return 1;
+    }
+    let selected_cpu: X86CpuProfile = parse_x86_cpu_profile(znc_effective_cpu(
+        path, (unit.profile == ModuleProfile.script) as i32));
+    if (selected_cpu.valid == 0) {
+        _zag_eprintln(_zag_str_concat("znc: ", selected_cpu.diagnostic));
+        return 1;
+    }
+    let sanitize_memory: i32 = has_flag("--sanitize=memory");
+    let safety_checked: i32 = has_flag("--safety=checked") | sanitize_memory;
+    let v2_edition: i32 = @strEq(v2_project_edition(path), "2027") as i32;
     let nerr: i32 = 0;
     let data: ArrayList[u8] = make[u8](16);
-    let prog: ArrayList[Instr] = lower_program(code_decls, &nerr, &data);
+    let prog: ArrayList[Instr] = lower_zir_program_mode_cpu(hot_zir_authority,
+        &nerr, &data, 0, selected_cpu.features.popcnt,
+        selected_cpu.features.bmi1, safety_checked, sanitize_memory,
+        v2_edition, 0);
     if (nerr > 0) { _zag_println("znc hot-patch: build failed — unsupported constructs (see messages above)"); return 1; }
     let hp_prog2: ArrayList[Instr] = regalloc(prog);
     let hp_prog3: ArrayList[Instr] = optimize(hp_prog2);
@@ -3375,18 +4699,23 @@ fn znc_hot_patch(path: []u8) i32 {
     return 0;
 }
 
-fn main() i32 {
-    if (_zag_argc() < 2) {
+fn znc_print_help() void {
         _zag_println("usage: znc <source.zag> [-o out] [-l lib] [-L path] [--run] [--debug]");
         _zag_println("       znc <source.zag> --dynamic --needed libNAME.so.N [-o out] [--run]");
         _zag_println("       znc <source.zag> --target gpu-nvidia|gpu-amd|gpu-vulkan|amdgpu-gfx1010");
         _zag_println("       znc <source.zag> --target vulkan-compat|opencl-compat|metal-compat|opengl-compat|cuda-compat");
         _zag_println("       znc <source.zag> --target wasm [-o out.wasm] [--run]");
         _zag_println("       znc <source.zag> --target arm64 [-o out] [--run]");
+        _zag_println("       znc <driver.zag> --emit-driver-module --driver-kernel 6.1|6.6 --target x86_64|arm64|i686 -o driver.o");
         _zag_println("       znc script <source.zag> [-o out] [--run]");
         _zag_println("         [--script-allocator script_process_arena|script_bounded_heap]");
         _zag_println("       znc explain <source.zag> [--format text|json]");
-        _zag_println("       znc harden <source.zag> [--output candidate.zag]");
+        _zag_println("       znc harden <source.zag> [--output candidate.zag]   # deprecated: compatibility alias for explicit expansion");
+        _zag_println("       znc view <source.zs> --level simple|explained|explicit|native");
+        _zag_println("       znc expand <source.zs> --to simple|explained|explicit|native [--output path]");
+        _zag_println("       znc promote <source.zs> --to explicit --output path --test-command command");
+        _zag_println("       znc unexpand <derived.zag> [--output compact.zs]");
+        _zag_println("       znc package lock <source.zag> [--output zag.lock]   # create-only explicit vendor graph");
         _zag_println("       znc check <source.zag> [--strict]");
         _zag_println("       znc watch [--mode off|light|adaptive|deep]");
         _zag_println("       znc status | shutdown | suggest");
@@ -3395,24 +4724,52 @@ fn main() i32 {
         _zag_println("       znc [build] --hot <source.zag> [-o out]   (hot-reloadable build)");
         _zag_println("       znc hot-patch <source.zag>                (stage a live code patch)");
         _zag_println("       znc fmt [--in-place] <source.zag>");
-        _zag_println("       znc init");
+        _zag_println("       znc init [--name project-name]");
         _zag_println("       znc version");
-        _zag_println("  analyzer (leak + efficiency lints) runs by default:");
+        _zag_println("  analyzer (leak + efficiency + bloat + agent-bug lints) runs by default:");
         _zag_println("    --no-analyze        disable the analyzer");
         _zag_println("    --no-zagd           skip background planning for this invocation");
         _zag_println("    --no-zagd-profile   skip advisory foreground profile metadata");
         _zag_println("    --profile-report    report profile metadata hit/miss and authority");
         _zag_println("    --no-foreground-cache force fresh backend lowering (recovery/testing)");
         _zag_println("    --cache-report      report validated hit/miss, lowering count, and substitution");
+        _zag_println("    --foreground-transform const-i32-add-v1  explicitly opt into the checked i32-add rule");
         _zag_println("    --analyze-strict    treat analyzer findings as errors");
-        _zag_println("    --analyze-pedantic  also emit strength-reduction hints");
+        _zag_println("    --analyze-pedantic  also emit strength-reduction and tier-2 bloat/agent hints");
         _zag_println("    --analyze-str-consumer NAME  register an app helper that frees its");
         _zag_println("                        string args (repeatable; e.g. append_ff)");
+        _zag_println("    --analyze-bloat=off disable bloat lints (B0xxx: dead code, verbose patterns)");
+        _zag_println("    --analyze-agent=off disable agent-bug lints (A0xxx: off-by-one, ignored return)");
+        _zag_println("    --analyze-deps      include imported dependency source in analyzer output");
+        _zag_println("    --analyze-complexity=N  set B0115 complexity threshold (default 15)");
+        _zag_println("    // znc:allow CODE   suppress a lint on this line (or znc:allow-file for file)");
         _zag_println("  compiles Zag to native x86-64 ELF — dynamic mode still uses no cc/as/ld");
-        return 1;
+        _zag_println("  start: znc init && znc src/main.zag -o app --run");
+        _zag_println("  deps: explicit local/vendored @import paths; no package registry or network resolver");
+        _zag_println("  support: docs/SUPPORT.md in the Zag distribution defines exact target and language boundaries");
+}
+
+// A source path is the implicit build command in `znc app.zag ...`; it does
+// not have a literal `build` argv word. Keep the foreground-transform guard
+// aligned with that public form while still rejecting the option on commands
+// that only inspect or mutate source text.
+fn znc_source_path_command(cmd: []u8) i32 {
+    if (cmd.len > 3 && @strEq(cmd[cmd.len - 4..cmd.len], ".zag")) { return 1; }
+    if (cmd.len > 2 && @strEq(cmd[cmd.len - 3..cmd.len], ".zs")) { return 1; }
+    return 0;
+}
+
+fn main() i32 {
+    if (_zag_argc() < 2) {
+        znc_print_help();
+        return 0;
     }
 
     let cmd: []u8 = _zag_arg(1);
+    if (@strEq(cmd, "help") || @strEq(cmd, "--help") || @strEq(cmd, "-h")) {
+        znc_print_help();
+        return 0;
+    }
     if (@strEq(cmd, "version") || @strEq(cmd, "--version") || @strEq(cmd, "-v")) {
         _zag_print("znc ");
         _zag_print(zag_version());
@@ -3420,6 +4777,16 @@ fn main() i32 {
         _zag_print(zag_edition());
         _zag_println(")");
         return 0;
+    }
+    // The transform flag is an explicit foreground build/view choice.  Do not
+    // let commands that only inspect, format, promote, or stage source accept
+    // it and silently continue on the raw path.
+    if(foreground_transform_requested()==1&&
+        !@strEq(cmd,"view")&&!@strEq(cmd,"expand")&&
+        !@strEq(cmd,"check")&&!@strEq(cmd,"script")&&!@strEq(cmd,"build")&&
+        znc_source_path_command(cmd)==0){
+        _zag_eprintln("znc: --foreground-transform is supported only for native foreground builds and native views/expansions");
+        return 1;
     }
     if (@strEq(cmd, "fmt")) {
         let in_place: i32 = has_flag("--in-place");
@@ -3437,13 +4804,24 @@ fn main() i32 {
     if (@strEq(cmd, "watch")) { return znc_watch(); }
     if (@strEq(cmd, "status")) { return znc_zagd_status(); }
     if (@strEq(cmd, "shutdown")) { return znc_zagd_shutdown(); }
-    if (@strEq(cmd, "suggest")) { return znc_zagd_suggest(); }
+    if (@strEq(cmd, "suggest")) { return znc_zagd_suggest("suggest"); }
     if (@strEq(cmd, "optimize")) { return znc_optimize_preview(); }
+    if (@strEq(cmd, "view")) { return znc_view(first_nonflag_from(2)); }
+    if (@strEq(cmd, "expand")) { return znc_expand(first_nonflag_from(2)); }
+    if (@strEq(cmd, "promote")) { return znc_promote(first_nonflag_from(2)); }
+    if (@strEq(cmd, "unexpand")) { return znc_unexpand(first_nonflag_from(2)); }
+    if (@strEq(cmd, "package")) {
+        if (_zag_argc() < 3 || !@strEq(_zag_arg(2), "lock")) {
+            _zag_eprintln("znc package: only `znc package lock <source.zag>` is supported");
+            return 2;
+        }
+        return znc_package_lock();
+    }
     if (@strEq(cmd, "hot-patch")) { return znc_hot_patch(first_nonflag_from(2)); }
     if (@strEq(cmd, "clean-cache")) {
         let cpath: []u8 = first_nonflag_from(2);
         if (cpath.len == 0) { cpath = "."; }
-        let root: []u8 = znc_project_root(dir_of(cpath));
+        let root: []u8 = znc_project_root(cpath);
         znc_cache_purge(root);
         // Also stop any running daemon so it doesn't recreate stale files.
         let _stopped: i32 = znc_zagd_exec(root, "off", 100, 0);
@@ -3452,19 +4830,22 @@ fn main() i32 {
     }
     if (@strEq(cmd, "explain")) {
         let epath: []u8 = first_nonflag_from(2);
-        if (epath.len > 0) { znc_zagd_ensure(znc_project_root(dir_of(epath)),epath); }
+        if (epath.len > 0 && znc_zagd_ensure(znc_project_root(dir_of(epath)),epath,"explain")!=0) { return 1; }
         return znc_explain(epath);
     }
     if (@strEq(cmd, "harden")) {
         let hpath: []u8 = first_nonflag_from(2);
-        if (hpath.len > 0) { znc_zagd_ensure(znc_project_root(dir_of(hpath)),hpath); }
+        _zag_eprintln("warning: `harden` is deprecated; use `znc view/expand --to explicit` for compatibility-stable source expansion");
+        if(znc_harden_legacy_apply_refused()==1){return 2;}
+        if (hpath.len > 0 && znc_zagd_ensure(znc_project_root(dir_of(hpath)),hpath,"promotion")!=0) { return 1; }
         return znc_harden(hpath);
     }
     if (@strEq(cmd, "check")) {
+        if(foreground_transform_requested()==1){_zag_eprintln("znc check: --foreground-transform is a build/view option, not a check option");return 1;}
         if (v2_validate_options() != 0) { return 1; }
         let cpath: []u8 = "";
         if (_zag_argc() >= 3) { cpath = _zag_arg(2); }
-        if (cpath.len > 0) { znc_zagd_ensure(znc_project_root(dir_of(cpath)),cpath); }
+        if (cpath.len > 0 && znc_zagd_ensure(znc_project_root(dir_of(cpath)),cpath,"source")!=0) { return 1; }
         return znc_check(cpath);
     }
 
@@ -3474,14 +4855,14 @@ fn main() i32 {
     if (path.len == 0) { _zag_println("znc: no source file"); return 1; }
 
     znc_cache_version_check(znc_project_root(dir_of(path)));
-    znc_zagd_ensure(znc_project_root(dir_of(path)),path);
+    if(znc_zagd_ensure(znc_project_root(dir_of(path)),path,"source")!=0){return 1;}
 
     let gtarget: []u8 = gpu_target();
     let ctarget: []u8 = compat_target();
     if ((has_flag("--safety=checked") == 1 || has_flag("--sanitize=memory") == 1) &&
         (gtarget.len > 0 || gfx1010_target() == 1 || wasm_target() == 1 ||
-         arm64_target() == 1 || i686_target() == 1 || ctarget.len > 0)) {
-        _zag_eprintln("E0202: checked safety and --sanitize=memory are implemented only for the native x86-64 target");
+         i686_target() == 1 || ctarget.len > 0)) {
+        _zag_eprintln("E0202: checked safety and --sanitize=memory are implemented only for the native x86-64 and arm64 targets");
         _zag_eprintln("note: the requested target has no checked raw-pointer or memory-sanitizer lowering; no executable was emitted");
         return 1;
     }
@@ -3564,6 +4945,32 @@ fn main() i32 {
     let link_libs: ArrayList[[]u8] = make[[]u8](4);
     let lib_paths: ArrayList[[]u8] = make[[]u8](4);
     let code_decls: ArrayList[*Node] = znc_collect_links(decls, &link_libs);
+    // Every production x86 build constructs and verifies the versioned Zag IR
+    // contract. Until operation coverage is complete the backend consumes its
+    // explicit AST bridge; a malformed IR contract is never allowed to lower.
+    let sanitize_memory: i32 = has_flag("--sanitize=memory");
+    let safety_checked: i32 = has_flag("--safety=checked") | sanitize_memory;
+    let v2_edition: i32 = @strEq(v2_project_edition(path), "2027") as i32;
+    let foreground_transform:i32=foreground_transform_requested();
+    let zir_authority:ZirAuthority=zir_prepare_production_with_origins(code_decls,eff,unit.origins);
+    if(foreground_transform==1){
+        if(unit.profile==ModuleProfile.script||safety_checked==1||v2_edition==1){
+            _zag_eprintln("znc: const-i32-add-v1 requires regular unsanitized x86-64 Zag");
+            return 1;
+        }
+        zir_authority=zir_prepare_const_i32_add_source_policy_with_origins(
+            code_decls,eff,unit.origins,
+            foreground_transform_policy(path,safety_checked,sanitize_memory));
+        if(zir_authority.transform_count!=1){
+            _zag_eprintln("znc: requested const-i32-add-v1 had no checked source match; no artifact was emitted");
+            return 1;
+        }
+    }
+    if(zir_authority.valid==0){
+        _zag_eprintln(_zag_str_concat("znc: Zag IR verification failed; errors=",
+            _zag_i64_to_str(zir_authority.verify_errors as i64)));
+        return 1;
+    }
 
     // Also accept -l/-L flags and zag.mod deps.
     znc_argv_links(&link_libs);
@@ -3573,14 +4980,16 @@ fn main() i32 {
     // Collect `extern fn` names — the symbols we need from static libraries.
     let extern_syms: ArrayList[[]u8] = collect_extern_syms(code_decls);
     let dynamic_mode: i32 = has_flag("--dynamic");
-    let sanitize_memory: i32 = has_flag("--sanitize=memory");
-    let safety_checked: i32 = has_flag("--safety=checked") | sanitize_memory;
     // Edition 2027 (v2) enables ownership rules the x86 backend enforces
     // (e.g. failing closed on aggregate closure captures). Regular Zag
     // (edition 2026) stays source-preserving and matches the arm64 backend.
-    let v2_edition: i32 = @strEq(v2_project_edition(path), "2027") as i32;
-    let x86_object_mode:i32=has_flag("--emit-obj");
-    if(x86_object_mode==1&&v2_edition==0){_zag_eprintln("znc: native x86-64 --emit-obj is implemented only for edition-2027 @cabi_export objects");return 1;}
+    let driver_module_mode:i32=znc_driver_module_mode();
+    let x86_object_mode:i32=((has_flag("--emit-obj")==1||driver_module_mode==1) as i32);
+    if(x86_object_mode==1&&v2_edition==0){_zag_eprintln("znc: native x86-64 object and driver-module output require edition-2027 @cabi_export declarations");return 1;}
+    if(driver_module_mode==1){
+        if(znc_driver_kernel_series()==0){_zag_eprintln("znc: --emit-driver-module requires --driver-kernel 6.1 or 6.6");return 1;}
+        if(flag_value("--target").len==0||znc_driver_target_tag(flag_value("--target")).len==0){_zag_eprintln("znc: driver module requires an explicit target: x86-64, arm64, or i686");return 1;}
+    }
     let needed_libs: ArrayList[[]u8] = znc_needed_libs();
     if (dynamic_mode == 0 && needed_libs.len > 0) {
         _zag_eprintln("znc: --needed requires explicit --dynamic mode");
@@ -3634,7 +5043,7 @@ fn main() i32 {
     // always an optimization, never an authority for self-hosting.
     // Checked safety instrumentation changes emitted code. Keep it outside the
     // existing foreground-cache identity until that identity carries the mode.
-    if(compiler_available==1&&cache_semantic.valid==1&&has_flag("--no-foreground-cache")==0&&safety_checked==0&&x86_object_mode==0){
+    if(compiler_available==1&&cache_semantic.valid==1&&has_flag("--no-foreground-cache")==0&&safety_checked==0&&x86_object_mode==0&&foreground_transform==0){
         let profile_text:[]u8="strict";if(unit.profile==ModuleProfile.script){profile_text="script";}
         let cache_config:PlannerConfig=znc_project_config(project_root,0);
         // CLI Script choices override project defaults and alter generated
@@ -3661,7 +5070,7 @@ fn main() i32 {
         // after writing a fresh ELF, and --hot only records current blob sizes.
         // Neither is allowed to make cached code/data authoritative for those
         // later steps.
-        let abi_text:[]u8="sysv-x86_64-zag-abi-v2|pipeline=ncodegen-regalloc-optimize-peephole-encode";
+        let abi_text:[]u8="sysv-x86_64-zag-abi-v2|pipeline=zag-ir-v1-bridge-ncodegen-regalloc-optimize-peephole-encode";
         abi_text=_zag_str_concat(abi_text,"|dynamic=");
         abi_text=_zag_str_concat(abi_text,_zag_i64_to_str(dynamic_mode));
         let policy_text:[]u8=_zag_str_concat("profile=",profile_text);
@@ -3672,13 +5081,13 @@ fn main() i32 {
         let cached:ForegroundCacheResult=foreground_cache_load(project_root,cache_key,cache_config.max_cache_bytes);
         if(cached.hit==1){free[u8](&code);free[u8](&data);code=cached.code;data=cached.data;cache_expected_code=zagd_content_hash(code.data[0..code.len]);cache_expected_data=zagd_content_hash(data.data[0..data.len]);cache_hit=1;}
         else{
-            free[u8](&cached.code);free[u8](&cached.data);let nerr:i32=0;lower_calls=lower_calls+1;let prog:ArrayList[Instr]=lower_program_mode_cpu(code_decls,&nerr,&data,dynamic_mode,selected_cpu.features.popcnt,selected_cpu.features.bmi1,safety_checked,sanitize_memory,v2_edition,x86_object_mode);
+            free[u8](&cached.code);free[u8](&cached.data);let nerr:i32=0;lower_calls=lower_calls+1;let prog:ArrayList[Instr]=lower_zir_program_mode_cpu(zir_authority,&nerr,&data,dynamic_mode,selected_cpu.features.popcnt,selected_cpu.features.bmi1,safety_checked,sanitize_memory,v2_edition,x86_object_mode);
             if(nerr>0){_zag_println("znc: build aborted — unsupported constructs (see messages above)");return 1;}
             let prog2:ArrayList[Instr]=regalloc(prog);let prog3:ArrayList[Instr]=optimize(prog2);let opt:ArrayList[Instr]=peephole(prog3);free[u8](&code);code=encode(opt);free[Instr](&prog);free[Instr](&prog2);free[Instr](&prog3);free[Instr](&opt);
             cache_stored=foreground_cache_store(project_root,cache_key,code,data,cache_config.max_cache_bytes);
         }
     }else{
-        let nerr:i32=0;lower_calls=lower_calls+1;let prog:ArrayList[Instr]=lower_program_mode_cpu(code_decls,&nerr,&data,dynamic_mode,selected_cpu.features.popcnt,selected_cpu.features.bmi1,safety_checked,sanitize_memory,v2_edition,x86_object_mode);if(nerr>0){_zag_println("znc: build aborted — unsupported constructs (see messages above)");return 1;}let prog2:ArrayList[Instr]=regalloc(prog);let prog3:ArrayList[Instr]=optimize(prog2);let opt:ArrayList[Instr]=peephole(prog3);free[u8](&code);if(x86_object_mode==1){let encoded:X86Encoded=encode_with_labels(opt);code=encoded.text;object_labels=encoded.labels;object_relocs=encoded.relocs;}else{code=encode(opt);}free[Instr](&prog);free[Instr](&prog2);free[Instr](&prog3);free[Instr](&opt);
+        let nerr:i32=0;lower_calls=lower_calls+1;let prog:ArrayList[Instr]=lower_zir_program_mode_cpu(zir_authority,&nerr,&data,dynamic_mode,selected_cpu.features.popcnt,selected_cpu.features.bmi1,safety_checked,sanitize_memory,v2_edition,x86_object_mode);if(nerr>0){_zag_println("znc: build aborted — unsupported constructs (see messages above)");return 1;}let prog2:ArrayList[Instr]=regalloc(prog);let prog3:ArrayList[Instr]=optimize(prog2);let opt:ArrayList[Instr]=peephole(prog3);free[u8](&code);if(x86_object_mode==1){let encoded:X86Encoded=encode_with_labels_mode(opt,driver_module_mode);code=encoded.text;object_labels=encoded.labels;object_relocs=encoded.relocs;}else{code=encode(opt);}free[Instr](&prog);free[Instr](&prog2);free[Instr](&prog3);free[Instr](&opt);
     }
     if(cache_hit==1&&(lower_calls!=0||zagd_hash_equal(cache_expected_code,zagd_content_hash(code.data[0..code.len]))==0||zagd_hash_equal(cache_expected_data,zagd_content_hash(data.data[0..data.len]))==0)){_zag_eprintln("znc: internal error: foreground cache hit did not preserve the validated code/data substitution boundary");return 1;}
     if(cache_hit==0&&lower_calls!=1){_zag_eprintln("znc: internal error: foreground cache miss did not execute exactly one authoritative lowering");return 1;}
@@ -3697,6 +5106,32 @@ fn main() i32 {
 
     let out: []u8 = out_flag();
     if (out.len == 0) { out = default_out(path); }
+
+    if(driver_module_mode==1){
+        if(znc_driver_entries_ok(code_decls,path)==0){return 1;}
+        if(dynamic_mode==1||needed_libs.len>0||link_libs.len>0){
+            _zag_eprintln("znc: driver module output does not support dynamic linking or archives");return 1;
+        }
+        let exports:ArrayList[ZncObjectExport]=znc_x86_object_exports(code_decls);
+        if(exports.len<2){_zag_eprintln("znc: driver module requires both init_module and cleanup_module exports");return 1;}
+        if(object_relocs.len==0){_zag_eprintln("znc: driver module requires at least one explicit kernel @cabi import relocation");return 1;}
+        let symbols:ArrayList[DriverElfSymbol]=znc_driver_mod_symbols(exports,object_labels,code.len);
+        if(symbols.len!=exports.len){_zag_eprintln("znc: driver module export labels were not encoded");return 1;}
+        let imports:ArrayList[[]u8]=znc_dynamic_extern_syms(code_decls,v2_edition);
+        let text_relocs:ArrayList[DriverElfReloc]=make[DriverElfReloc](object_relocs.len);
+        let oi:i32=0;
+        while(oi<object_relocs.len){let r:X86ObjectReloc=object_relocs.data[oi];if(r.kind==1){if(r.data_offset<0||r.data_offset>=data.len){_zag_eprintln("znc: driver module data relocation is outside the compiler-owned data section");return 1;}push[DriverElfReloc](&text_relocs,DriverElfReloc{.offset=r.offset,.symbol=2,.typ=1,.addend=8+(r.data_offset as i64)});}else{if(r.import<0||r.import>=imports.len){_zag_eprintln("znc: driver module external relocation is not a declared kernel import");return 1;}push[DriverElfReloc](&text_relocs,DriverElfReloc{.offset=r.offset,.symbol=4+exports.len+r.import,.typ=4,.addend=0-4});}oi=oi+1;}
+        let module_data:ArrayList[u8]=znc_driver_module_data(znc_driver_data_anchor(),data);
+        let data_relocs:ArrayList[DriverElfReloc]=make[DriverElfReloc](1);
+        let init_index:i32=znc_driver_export_index(exports,"init_module");
+        if(init_index<0){_zag_eprintln("znc: driver module init_module export disappeared before object emission");return 1;}
+        push[DriverElfReloc](&data_relocs,DriverElfReloc{.offset=0,.symbol=4+init_index,.typ=1,.addend=0});
+        let debug:DwarfSections=znc_driver_debug(path,code_decls);
+        let spec:DriverElfSpec=DriverElfSpec{.machine=62,.word_size=8,.text=code,.data=module_data,.modinfo=znc_driver_modinfo(znc_driver_kernel_series(),"x86_64"),.symbols=symbols,.imports=imports,.text_relocs=text_relocs,.data_relocs=data_relocs,.debug_abbrev=debug.abbrev,.debug_info=debug.info,.debug_line=debug.line_};
+        if(write_driver_elf64(out,spec)!=0){_zag_eprintln("znc: failed to write deterministic x86-64 Zag driver ET_REL");return 1;}
+        _zag_println(_zag_str_concat("znc: wrote x86-64 Zag Linux driver ET_REL ",out));
+        return 0;
+    }
 
     if(x86_object_mode==1){
         // ET_REL supports one deliberately narrow foreign boundary: direct

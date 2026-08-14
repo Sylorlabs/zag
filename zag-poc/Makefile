@@ -8,7 +8,7 @@
 #   make install   — install znc to /usr/local/bin
 #   make clean     — remove generated artifacts (keeps the znc seed)
 
-.PHONY: all bootstrap znc zagd test test-zagscript-release test-zagscript-master test-v1-compat test-zagd-product test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-analyzer test-hot-reload test-dynamic-abi test-resource-embed test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-std-namespace \
+.PHONY: all bootstrap znc zagd zag-lsp test test-driver-foundation test-zagscript-release test-zagscript-master test-v1-compat test-zagd-product test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-analyzer test-hot-reload test-dynamic-abi test-resource-embed test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-gpu-compat test-gpu-runtime test-gpu-zag-runtime test-linux-drm test-std-namespace test-docs-truth test-effect-witness \
         test-diagnostics test-tooling test-programs test-native test-abi-layout test-arm64 \
         test-differential-backends test-arm64-selfhost clean install
 
@@ -25,6 +25,11 @@ bootstrap: selfhost/native/znc.zag selfhost/zagd_daemon.zag
 znc: bootstrap
 
 zagd: bootstrap
+
+# Build the editor server users actually install. Analyzer output remains on:
+# a warning here is a release-quality problem, not packaging noise.
+zag-lsp: znc selfhost/lsp/zag-lsp.zag
+	./znc selfhost/lsp/zag-lsp.zag -o zag-lsp --no-zagd
 
 # ── Test targets ─────────────────────────────────────────────────────────────
 
@@ -51,6 +56,12 @@ test-diagnostics:
 
 test-tooling:
 	bash tests/run_tooling.sh
+
+test-docs-truth:
+	bash tests/run_docs_truth.sh
+
+test-effect-witness:
+	bash tests/run_effect_witness.sh
 
 # Static analyzer (analyze.zag): leak (L00xx) + efficiency (E01xx) lints.
 test-analyzer:
@@ -80,6 +91,33 @@ test-gpu-platform:
 	@echo "── GPU compiler/runtime/driver boundary suite ──"
 	bash tests/run_gpu_platform.sh
 
+# Compat-tier artifact, loader, and bounded runtime gate. Physical dispatch is
+# still opt-in inside run_gpu_runtime.sh via ZAG_RUN_PHYSICAL_GPU=1.
+test-gpu-compat:
+	@echo "── GPU compatibility-tier suite ──"
+	bash tests/run_compat_vulkan.sh
+	bash tests/run_compat_opengl.sh
+	bash tests/run_compat_opencl.sh
+	bash tests/run_compat_cuda.sh
+	bash tests/run_compat_metal.sh
+	bash tests/run_gpu_runtime.sh
+	bash tests/run_gpu_zag_runtime.sh
+
+test-gpu-runtime:
+	@echo "── GPU bounded runtime gate ──"
+	bash tests/run_gpu_runtime.sh
+
+test-gpu-zag-runtime:
+	@echo "── pure-Zag Vulkan/OpenGL/OpenCL runtime gate ──"
+	bash tests/run_gpu_zag_runtime.sh
+
+# Hardware-specific, read-only AMDGPU DRM boundary. This target is separate
+# from the portable compatibility gate because it expects a live AMD render
+# node and records the display-bound opt-in policy explicitly.
+test-linux-drm:
+	@echo "── Linux AMDGPU DRM discovery and native preflight gate ──"
+	bash tests/run_linux_drm.sh
+
 # Compiler-owned, non-shadowable standard-library import namespace.
 test-std-namespace:
 	@echo "── std namespace suite ──"
@@ -94,6 +132,9 @@ test-zagd-product: znc zagd
 test-zagscript-release:
 	bash tests/run_zagscript_release_gate.sh
 
+# Deliberately manual and sequential: this workstation evidence gate requires
+# a user cgroup, active earlyoom, the i686 boundary, and 30-run benchmarks. It
+# is not a dependency of `test`, CI, or release packaging.
 test-zagscript-master:
 	bash tests/run_zagscript_master_gate.sh
 
@@ -132,14 +173,24 @@ test-resource-embed:
 	@echo "── deterministic resource embedding gate ──"
 	bash tests/run_resource_embed.sh
 
-# Default `make test`: runs the v1 release gates.
-test: znc test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-diagnostics test-tooling test-analyzer test-hot-reload test-dynamic-abi test-resource-embed test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-std-namespace test-programs test-native test-abi-layout test-arm64 test-differential-backends test-arm64-selfhost
+# Unified pure-Zag driver foundation release gate. This stays separate from
+# the broad v1 suite because its six Linux-series/architecture QEMU matrix is
+# an explicit support claim and must fail closed when images or module evidence
+# are absent.
+test-driver-foundation: znc
+	@echo "── pure-Zag driver foundation release gate ──"
+	bash tests/run_driver_foundation.sh
+
+# Default `make test`: runs the v1 release gates. The intentionally
+# fail-closed ZagScript 1.0 authority remains `make test-zagscript-release`.
+test: znc test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-diagnostics test-effect-witness test-tooling test-docs-truth test-analyzer test-hot-reload test-dynamic-abi test-resource-embed test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-gpu-compat test-std-namespace test-programs test-native test-abi-layout test-arm64 test-differential-backends test-arm64-selfhost
 	@echo "════ all v1 release gates passed ════"
 
 # ── Install ───────────────────────────────────────────────────────────────────
-install: znc zagd
+install: znc zagd zag-lsp
 	install -m755 znc /usr/local/bin/znc
 	install -m755 zagd /usr/local/bin/zagd
+	install -m755 zag-lsp /usr/local/bin/zag-lsp
 	install -m755 tools/zagd-user-service.sh /usr/local/bin/zagd-user-service
 	install -d /usr/local/lib/zag/std
 	install -d /usr/local/share/zag
@@ -152,7 +203,7 @@ install: znc zagd
 	install -m644 selfhost/std/script_list.zag /usr/local/lib/zag/std/script_list.zag
 	install -m644 selfhost/std/script_string.zag /usr/local/lib/zag/std/script_string.zag
 	install -m644 selfhost/std/script_path.zag /usr/local/lib/zag/std/script_path.zag
-	@echo "Installed znc + zagd + service control → /usr/local/bin, std → /usr/local/lib/zag/std, policy template → /usr/local/share/zag"
+	@echo "Installed znc + zagd + zag-lsp + service control → /usr/local/bin, std → /usr/local/lib/zag/std, policy template → /usr/local/share/zag"
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
 # Removes generated artifacts. Does NOT remove the znc seed binary.

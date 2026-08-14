@@ -7,8 +7,11 @@
 //   @import("pkg:zagkit/src/zagkit.zag") as zagkit
 //
 // Dependency paths are resolved relative to the nearest ancestor zag.mod.
-// There is no environment search path, registry lookup, download, version
-// solving, or implicit entry-point convention in this layer.
+// An explicit `mode = "vendor"` dependency additionally requires a canonical
+// zag.lock beside that manifest.  The lock binds the dependency alias, declared
+// vendor root, explicit module path, and the module's raw bytes.  There is no
+// environment search path, registry lookup, download, version solving, or
+// implicit entry-point convention in this layer.
 
 enum PackageImportError {
     none,
@@ -19,27 +22,95 @@ enum PackageImportError {
     duplicate_dependency,
     invalid_dependency_path,
     module_not_found,
+    invalid_vendor_dependency,
+    lockfile_not_found,
+    invalid_lockfile,
+    lock_entry_not_found,
+    checksum_mismatch,
+    dependency_input_changed,
+}
+
+// Two bounded modular accumulators avoid target-dependent overflow semantics.
+// This is a deterministic raw-byte checksum, not a signature or a
+// cryptographic authenticity claim.
+struct PackageRawChecksum {
+    first: i64,
+    second: i64,
+    bytes: i64,
 }
 
 struct PackageImportResolution {
     matched: i32,
     path: []u8,
     manifest: []u8,
+    manifest_source: []u8,
+    manifest_source_owned: i32,
     dependency: []u8,
     specifier: []u8,
+    lockfile: []u8,
+    lockfile_source: []u8,
+    lockfile_source_owned: i32,
+    locked: i32,
+    checksum: PackageRawChecksum,
     error: PackageImportError,
 }
 
 struct PackageManifestDependency {
     path: []u8,
+    mode: []u8,
     count: i32,
     valid: i32,
 }
 
+struct PackageChecksumParse {
+    checksum: PackageRawChecksum,
+    valid: i32,
+}
+
+struct PackageLockCheck {
+    checksum: PackageRawChecksum,
+    found: i32,
+    mismatch: i32,
+    valid: i32,
+}
+
+// A generator entry is deliberately separate from PackageLockCheck.  The
+// validator consumes an existing lock and therefore requires the lockfile to
+// exist; the bounded `znc package lock` command collects the same exact
+// manifest/dependency/module tuple before a lock exists.  All text fields are
+// owned by the returned entry and must be released by the caller.
+struct PackageLockGeneratedEntry {
+    alias: []u8,
+    root: []u8,
+    module: []u8,
+    checksum: PackageRawChecksum,
+    valid: i32,
+}
+
+fn package_lock_generated_bad() PackageLockGeneratedEntry {
+    return PackageLockGeneratedEntry{
+        .alias = "", .root = "", .module = "",
+        .checksum = PackageRawChecksum{ .first = 0, .second = 0, .bytes = 0 },
+        .valid = 0,
+    };
+}
+
+fn package_lock_generated_release(entry: *PackageLockGeneratedEntry) void {
+    if (entry.*.alias.len > 0) { _zag_str_free(entry.*.alias); }
+    if (entry.*.root.len > 0) { _zag_str_free(entry.*.root); }
+    if (entry.*.module.len > 0) { _zag_str_free(entry.*.module); }
+    entry.*.alias = ""; entry.*.root = ""; entry.*.module = "";
+    entry.*.valid = 0;
+}
+
 fn package_import_result(specifier: []u8) PackageImportResolution {
     return PackageImportResolution{
-        .matched = 0, .path = "", .manifest = "", .dependency = "",
-        .specifier = specifier, .error = PackageImportError.none,
+        .matched = 0, .path = "", .manifest = "", .manifest_source = "",
+        .manifest_source_owned = 0,
+        .dependency = "", .specifier = specifier, .lockfile = "",
+        .lockfile_source = "", .lockfile_source_owned = 0, .locked = 0,
+        .checksum = PackageRawChecksum{ .first = 0, .second = 0, .bytes = 0 },
+        .error = PackageImportError.none,
     };
 }
 
@@ -155,6 +226,207 @@ fn package_import_local_path_safe(path: []u8) i32 {
     return 1;
 }
 
+fn package_import_vendor_path_safe(path: []u8) i32 {
+    if (package_import_starts_with(path, "vendor/") == 0 ||
+        package_import_local_path_safe(path) == 0) { return 0; }
+    let segment_start: i32 = 0;
+    let i: i32 = 0;
+    while (i < path.len) {
+        if (path[i] == '/') {
+            let segment: []u8 = path[segment_start..i];
+            if (package_import_safe_segment(segment) == 0) { return 0; }
+            let j: i32 = 0;
+            while (j < segment.len) {
+                let c: u8 = segment[j];
+                let safe: i32 = ((c >= 'a' && c <= 'z') ||
+                    (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                    c == '_' || c == '-' || c == '.') as i32;
+                if (safe == 0) { return 0; }
+                j = j + 1;
+            }
+            segment_start = i + 1;
+        }
+        i = i + 1;
+    }
+    let final_segment: []u8 = path[segment_start..path.len];
+    if (package_import_safe_segment(final_segment) == 0) { return 0; }
+    let j: i32 = 0;
+    while (j < final_segment.len) {
+        let c: u8 = final_segment[j];
+        let safe: i32 = ((c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            c == '_' || c == '-' || c == '.') as i32;
+        if (safe == 0) { return 0; }
+        j = j + 1;
+    }
+    return 1;
+}
+
+fn package_import_field_mentioned(table: []u8, field: []u8) i32 {
+    let i: i32 = 0;
+    while (i + field.len <= table.len) {
+        let before: i32 = (i == 0 || table[i - 1] == '{' ||
+            table[i - 1] == ',' || table[i - 1] == ' ' ||
+            table[i - 1] == '\t') as i32;
+        let matched: i32 = before;
+        let j: i32 = 0;
+        while (j < field.len && matched != 0) {
+            if (table[i + j] != field[j]) { matched = 0; }
+            j = j + 1;
+        }
+        if (matched != 0) {
+            let after: i32 = i + field.len;
+            if (after == table.len || table[after] == '=' ||
+                table[after] == ' ' || table[after] == '\t') { return 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Vendor declarations intentionally use a tiny strict inline-table grammar.
+// Exactly one quoted `path` and one quoted `mode = "vendor"` are accepted;
+// duplicate, unknown, or malformed fields fail closed.
+fn package_import_vendor_table_valid(raw: []u8) i32 {
+    let table: []u8 = package_import_trim(raw);
+    if (table.len < 5 || table[0] != '{' ||
+        table[table.len - 1] != '}') { return 0; }
+    let body: []u8 = package_import_trim(table[1..table.len - 1]);
+    if (body.len == 0) { return 0; }
+    let path_count: i32 = 0;
+    let mode_count: i32 = 0;
+    let pair_count: i32 = 0;
+    let position: i32 = 0;
+    while (position <= body.len) {
+        let end: i32 = position;
+        while (end < body.len && body[end] != ',') { end = end + 1; }
+        let pair: []u8 = package_import_trim(body[position..end]);
+        if (pair.len == 0) { return 0; }
+        let equals: i32 = 0 - 1;
+        let equals_count: i32 = 0;
+        let i: i32 = 0;
+        while (i < pair.len) {
+            if (pair[i] == '=') { equals = i; equals_count = equals_count + 1; }
+            i = i + 1;
+        }
+        if (equals_count != 1 || equals <= 0) { return 0; }
+        let key: []u8 = package_import_trim(pair[0..equals]);
+        let value: []u8 = package_import_unquote(pair[equals + 1..pair.len]);
+        if (value.len == 0) { return 0; }
+        if (@strEq(key, "path")) {
+            path_count = path_count + 1;
+        } else if (@strEq(key, "mode")) {
+            mode_count = mode_count + 1;
+            if (!@strEq(value, "vendor")) { return 0; }
+        } else {
+            return 0;
+        }
+        pair_count = pair_count + 1;
+        if (end >= body.len) { position = body.len + 1; }
+        else { position = end + 1; }
+    }
+    return (pair_count == 2 && path_count == 1 && mode_count == 1) as i32;
+}
+
+fn package_raw_checksum(data: []u8) PackageRawChecksum {
+    let a: i64 = 216613626;
+    let b: i64 = 131542391;
+    let i: i32 = 0;
+    while (i < data.len) {
+        let byte: i64 = data[i] as i64;
+        a = (a * 257 + byte + 1) % 1000000007;
+        b = (b * 263 + byte + 1) % 1000000009;
+        i = i + 1;
+    }
+    return PackageRawChecksum{ .first = a, .second = b, .bytes = data.len };
+}
+
+fn package_raw_checksum_equal(a: PackageRawChecksum,
+    b: PackageRawChecksum) i32 {
+    return (a.first == b.first && a.second == b.second &&
+        a.bytes == b.bytes) as i32;
+}
+
+fn package_lock_part(text: []u8, want: i32, separator: u8) []u8 {
+    let field: i32 = 0;
+    let start: i32 = 0;
+    let i: i32 = 0;
+    while (i < text.len) {
+        if (text[i] == separator) {
+            if (field == want) { return text[start..i]; }
+            field = field + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (field == want) { return text[start..text.len]; }
+    return "";
+}
+
+fn package_lock_parts_exact(text: []u8, count: i32, separator: u8) i32 {
+    if (count <= 0) { return 0; }
+    let fields: i32 = 1;
+    let i: i32 = 0;
+    while (i < text.len) {
+        if (text[i] == separator) { fields = fields + 1; }
+        i = i + 1;
+    }
+    return (fields == count) as i32;
+}
+
+fn package_lock_uint(text: []u8, maximum: i64) i64 {
+    if (text.len == 0 || (text.len > 1 && text[0] == '0')) { return 0 - 1; }
+    let value: i64 = 0;
+    let i: i32 = 0;
+    while (i < text.len) {
+        if (text[i] < '0' || text[i] > '9') { return 0 - 1; }
+        let digit: i64 = (text[i] as i64) - 48;
+        if (value > (maximum - digit) / 10) { return 0 - 1; }
+        value = value * 10 + digit;
+        i = i + 1;
+    }
+    return value;
+}
+
+fn package_lock_checksum(text: []u8) PackageChecksumParse {
+    let bad: PackageChecksumParse = PackageChecksumParse{
+        .checksum = PackageRawChecksum{ .first = 0, .second = 0, .bytes = 0 },
+        .valid = 0,
+    };
+    if (package_lock_parts_exact(text, 3, ',') == 0) { return bad; }
+    let first: i64 = package_lock_uint(package_lock_part(text, 0, ','), 1000000006);
+    let second: i64 = package_lock_uint(package_lock_part(text, 1, ','), 1000000008);
+    let bytes: i64 = package_lock_uint(package_lock_part(text, 2, ','), 8388608);
+    if (first < 0 || second < 0 || bytes < 0) { return bad; }
+    return PackageChecksumParse{
+        .checksum = PackageRawChecksum{ .first = first, .second = second, .bytes = bytes },
+        .valid = 1,
+    };
+}
+
+fn package_lock_compare(a: []u8, b: []u8) i32 {
+    let common: i32 = a.len;
+    if (b.len < common) { common = b.len; }
+    let i: i32 = 0;
+    while (i < common) {
+        if (a[i] < b[i]) { return 0 - 1; }
+        if (a[i] > b[i]) { return 1; }
+        i = i + 1;
+    }
+    if (a.len < b.len) { return 0 - 1; }
+    if (a.len > b.len) { return 1; }
+    return 0;
+}
+
+fn package_lock_tuple_after(alias: []u8, root: []u8, module: []u8,
+    previous_alias: []u8, previous_root: []u8, previous_module: []u8) i32 {
+    let order: i32 = package_lock_compare(alias, previous_alias);
+    if (order != 0) { return (order > 0) as i32; }
+    order = package_lock_compare(root, previous_root);
+    if (order != 0) { return (order > 0) as i32; }
+    return (package_lock_compare(module, previous_module) > 0) as i32;
+}
+
 fn package_import_manifest(base_dir: []u8) []u8 {
     let current: []u8 = base_dir;
     if (current.len == 0) { current = "."; }
@@ -162,6 +434,7 @@ fn package_import_manifest(base_dir: []u8) []u8 {
     while (depth < 64) {
         let candidate: []u8 = package_import_join(current, "zag.mod");
         if (_zag_file_exists(candidate) == 1) { return candidate; }
+        _zag_str_free(candidate);
         let parent: []u8 = package_import_dir(current);
         if (parent.len == 0) {
             if (@strEq(current, ".")) { return ""; }
@@ -211,7 +484,7 @@ fn package_import_field(table: []u8, field: []u8) []u8 {
 fn package_manifest_dependency(source: []u8,
     dependency: []u8) PackageManifestDependency {
     let result: PackageManifestDependency = PackageManifestDependency{
-        .path = "", .count = 0, .valid = 1,
+        .path = "", .mode = "", .count = 0, .valid = 1,
     };
     if (source.len < 0 || source.len > 1048576) {
         result.valid = 0; return result;
@@ -236,14 +509,21 @@ fn package_manifest_dependency(source: []u8,
                 if (@strEq(key, dependency)) {
                     let raw: []u8 = package_import_trim(line[equals + 1..line.len]);
                     let path: []u8 = "";
+                    let mode: []u8 = "";
                     if (raw.len > 0 && raw[0] == '{') {
                         path = package_import_field(raw, "path");
+                        mode = package_import_field(raw, "mode");
+                        if (package_import_field_mentioned(raw, "mode") != 0 &&
+                            package_import_vendor_table_valid(raw) == 0) {
+                            result.valid = 0;
+                        }
                     } else {
                         path = package_import_unquote(raw);
                     }
                     result.count = result.count + 1;
                     if (path.len == 0) { result.valid = 0; }
                     result.path = path;
+                    result.mode = mode;
                 }
             }
         }
@@ -251,6 +531,151 @@ fn package_manifest_dependency(source: []u8,
         else { position = end + 1; }
     }
     return result;
+}
+
+fn package_lock_validate(lock: []u8, manifest_source: []u8,
+    manifest_path: []u8, requested_alias: []u8, requested_root: []u8,
+    requested_module: []u8) PackageLockCheck {
+    let bad: PackageLockCheck = PackageLockCheck{
+        .checksum = PackageRawChecksum{ .first = 0, .second = 0, .bytes = 0 },
+        .found = 0, .mismatch = 0, .valid = 0,
+    };
+    let result: PackageLockCheck = bad;
+    if (lock.len <= 0 || lock.len > 1048576 || lock[lock.len - 1] != '\n') {
+        return bad;
+    }
+    let header_end: i32 = 0;
+    while (header_end < lock.len && lock[header_end] != '\n') {
+        header_end = header_end + 1;
+    }
+    if (header_end >= lock.len ||
+        !@strEq(lock[0..header_end], "format=zag-local-lock-v1")) { return bad; }
+
+    let previous_alias: []u8 = "";
+    let previous_root: []u8 = "";
+    let previous_module: []u8 = "";
+    let entries: i32 = 0;
+    let total_bytes: i64 = 0;
+    let position: i32 = header_end + 1;
+    while (position < lock.len) {
+        let end: i32 = position;
+        while (end < lock.len && lock[end] != '\n') { end = end + 1; }
+        if (end >= lock.len) { return bad; }
+        let line: []u8 = lock[position..end];
+        // Comments are provenance bytes, not records. Requiring one space and
+        // printable ASCII keeps their spelling canonical while allowing a
+        // comment-only lock edit to remain a valid, identity-changing input.
+        if (line.len >= 2 && line[0] == '#' && line[1] == ' ') {
+            let ci: i32 = 2;
+            while (ci < line.len) {
+                if (line[ci] < 32 || line[ci] > 126) { return bad; }
+                ci = ci + 1;
+            }
+        } else {
+            if (line.len <= 6 || !@strEq(line[0..6], "entry=")) { return bad; }
+            let fields: []u8 = line[6..line.len];
+            if (package_lock_parts_exact(fields, 4, '\t') == 0) { return bad; }
+            let alias: []u8 = package_lock_part(fields, 0, '\t');
+            let root: []u8 = package_lock_part(fields, 1, '\t');
+            let module: []u8 = package_lock_part(fields, 2, '\t');
+            let parsed: PackageChecksumParse = package_lock_checksum(
+                package_lock_part(fields, 3, '\t'));
+            if (package_import_safe_name(alias) == 0 ||
+                package_import_vendor_path_safe(root) == 0 ||
+                package_import_module_safe(module) == 0 || parsed.valid == 0) {
+                return bad;
+            }
+            if (entries > 0 && package_lock_tuple_after(alias, root, module,
+                previous_alias, previous_root, previous_module) == 0) { return bad; }
+            previous_alias = alias;
+            previous_root = root;
+            previous_module = module;
+            entries = entries + 1;
+            if (entries > 256) { return bad; }
+
+            let declared: PackageManifestDependency = package_manifest_dependency(
+                manifest_source, alias);
+            if (declared.valid == 0 || declared.count != 1 ||
+                !@strEq(declared.mode, "vendor") || !@strEq(declared.path, root)) {
+                return bad;
+            }
+
+            let dependency_root: []u8 = package_import_join(
+                package_import_dir(manifest_path), root);
+            let module_path: []u8 = package_import_join(dependency_root, module);
+            _zag_str_free(dependency_root);
+            if (_zag_file_exists(module_path) == 0) {
+                _zag_str_free(module_path);
+                return bad;
+            }
+            let bytes: []u8 = _zag_read_file(module_path);
+            _zag_str_free(module_path);
+            if (bytes.len < 0 || bytes.len > 8388608) {
+                if (bytes.len >= 0) { _zag_free(_zag_slice_ptr(bytes)); }
+                return bad;
+            }
+            total_bytes = total_bytes + bytes.len;
+            if (total_bytes > 67108864) {
+                _zag_free(_zag_slice_ptr(bytes));
+                return bad;
+            }
+            let actual: PackageRawChecksum = package_raw_checksum(bytes);
+            _zag_free(_zag_slice_ptr(bytes));
+            if (package_raw_checksum_equal(actual, parsed.checksum) == 0) {
+                result.mismatch = 1;
+            }
+            if (@strEq(alias, requested_alias) && @strEq(root, requested_root) &&
+                @strEq(module, requested_module)) {
+                result.found = result.found + 1;
+                result.checksum = parsed.checksum;
+            }
+        }
+        position = end + 1;
+    }
+    result.valid = 1;
+    return result;
+}
+
+fn package_import_free_read(bytes: []u8) void {
+    if (bytes.len >= 0) { _zag_free(_zag_slice_ptr(bytes)); }
+}
+
+// Resolution paths and successful manifest/lock snapshots are owned by the
+// result; specifier/dependency slices are borrowed from the caller. The parser
+// may transfer successful snapshot buffers into CompilationUnit.resources;
+// direct-library and error callers release everything here.
+fn package_import_resolution_release(result: *PackageImportResolution) void {
+    if (result.*.path.len > 0) { _zag_str_free(result.*.path); }
+    if (result.*.manifest.len > 0) { _zag_str_free(result.*.manifest); }
+    if (result.*.lockfile.len > 0) { _zag_str_free(result.*.lockfile); }
+    if (result.*.manifest_source_owned != 0) {
+        package_import_free_read(result.*.manifest_source);
+    }
+    if (result.*.lockfile_source_owned != 0) {
+        package_import_free_read(result.*.lockfile_source);
+    }
+    result.*.path = "";
+    result.*.manifest = "";
+    result.*.manifest_source = "";
+    result.*.manifest_source_owned = 0;
+    result.*.lockfile = "";
+    result.*.lockfile_source = "";
+    result.*.lockfile_source_owned = 0;
+}
+
+// The command-line lock generator must be able to parse the exact vendored
+// graph before its first zag.lock exists.  This private mode is enabled only
+// by the `znc package lock` dispatcher; ordinary foreground compilation never
+// bypasses a vendor lock validation.
+fn package_import_lock_generation_mode() i32 {
+    let i: i32 = 0;
+    while (i < _zag_argc()) {
+        if (@strEq(_zag_arg(i), "--package-lock")) { return 1; }
+        i = i + 1;
+    }
+    if (_zag_argc() >= 3 && @strEq(_zag_arg(1), "package") &&
+        @strEq(_zag_arg(2), "lock")) { return 1; }
+    return 0;
 }
 
 fn package_import_resolve(specifier: []u8,
@@ -277,24 +702,150 @@ fn package_import_resolve(specifier: []u8,
     let declared: PackageManifestDependency =
         package_manifest_dependency(source, result.dependency);
     if (declared.valid == 0) {
+        package_import_free_read(source);
         result.error = PackageImportError.invalid_manifest; return result;
     }
     if (declared.count == 0) {
+        package_import_free_read(source);
         result.error = PackageImportError.dependency_not_found; return result;
     }
     if (declared.count != 1) {
+        package_import_free_read(source);
         result.error = PackageImportError.duplicate_dependency; return result;
     }
     if (package_import_local_path_safe(declared.path) == 0) {
+        package_import_free_read(source);
         result.error = PackageImportError.invalid_dependency_path; return result;
+    }
+    if (declared.mode.len > 0 && !@strEq(declared.mode, "vendor")) {
+        package_import_free_read(source);
+        result.error = PackageImportError.invalid_manifest; return result;
+    }
+    if (@strEq(declared.mode, "vendor") &&
+        package_import_vendor_path_safe(declared.path) == 0) {
+        package_import_free_read(source);
+        result.error = PackageImportError.invalid_vendor_dependency; return result;
     }
     let dependency_root: []u8 = package_import_join(
         package_import_dir(result.manifest), declared.path);
     result.path = package_import_join(dependency_root, module);
+    _zag_str_free(dependency_root);
     if (_zag_file_exists(result.path) == 0) {
+        package_import_free_read(source);
         result.error = PackageImportError.module_not_found; return result;
     }
+    if (@strEq(declared.mode, "vendor")) {
+        result.lockfile = package_import_join(
+            package_import_dir(result.manifest), "zag.lock");
+        if (package_import_lock_generation_mode() == 1) {
+            result.manifest_source = source;
+            result.manifest_source_owned = 1;
+            return result;
+        }
+        if (_zag_file_exists(result.lockfile) == 0) {
+            package_import_free_read(source);
+            result.error = PackageImportError.lockfile_not_found; return result;
+        }
+        let lock: []u8 = _zag_read_file(result.lockfile);
+        if (lock.len < 0) {
+            package_import_free_read(source);
+            result.error = PackageImportError.invalid_lockfile; return result;
+        }
+        let checked: PackageLockCheck = package_lock_validate(lock, source,
+            result.manifest, result.dependency, declared.path, module);
+        if (checked.valid == 0) {
+            package_import_free_read(lock);
+            package_import_free_read(source);
+            result.error = PackageImportError.invalid_lockfile; return result;
+        }
+        if (checked.found != 1) {
+            package_import_free_read(lock);
+            package_import_free_read(source);
+            result.error = PackageImportError.lock_entry_not_found; return result;
+        }
+        if (checked.mismatch != 0) {
+            package_import_free_read(lock);
+            package_import_free_read(source);
+            result.error = PackageImportError.checksum_mismatch; return result;
+        }
+        result.locked = 1;
+        result.checksum = checked.checksum;
+        result.lockfile_source = lock;
+        result.lockfile_source_owned = 1;
+    }
+    result.manifest_source = source;
+    result.manifest_source_owned = 1;
     return result;
+}
+
+// Collect one canonical lock entry without reading an existing zag.lock.
+// This is intentionally limited to explicit `pkg:` imports whose declared
+// dependency is already `mode = "vendor"`; ordinary sibling imports and
+// non-Zag assets remain outside this module-granular generator contract.
+fn package_lock_generated_entry(specifier: []u8,
+    importer: []u8) PackageLockGeneratedEntry {
+    let bad: PackageLockGeneratedEntry = package_lock_generated_bad();
+    if (package_import_starts_with(specifier, "pkg:") == 0) { return bad; }
+    let slash: i32 = 4;
+    while (slash < specifier.len && specifier[slash] != '/') { slash = slash + 1; }
+    if (slash >= specifier.len) { return bad; }
+    let alias: []u8 = specifier[4..slash];
+    let module: []u8 = specifier[slash + 1..specifier.len];
+    if (package_import_safe_name(alias) == 0 ||
+        package_import_module_safe(module) == 0) { return bad; }
+
+    let base_dir: []u8 = package_import_dir(importer);
+    let manifest: []u8 = package_import_manifest(base_dir);
+    if (manifest.len == 0) { return bad; }
+    let source: []u8 = _zag_read_file(manifest);
+    if (source.len < 0) {
+        _zag_str_free(manifest);
+        return bad;
+    }
+    let declared: PackageManifestDependency = package_manifest_dependency(source, alias);
+    if (declared.valid == 0 || declared.count != 1 ||
+        !@strEq(declared.mode, "vendor") ||
+        package_import_vendor_path_safe(declared.path) == 0) {
+        package_import_free_read(source); _zag_str_free(manifest);
+        return bad;
+    }
+    let root_copy: []u8 = _zag_str_concat("", declared.path);
+    let dependency_root: []u8 = package_import_join(
+        package_import_dir(manifest), declared.path);
+    let module_path: []u8 = package_import_join(dependency_root, module);
+    _zag_str_free(dependency_root);
+    if (_zag_file_exists(module_path) == 0) {
+        _zag_str_free(module_path); _zag_str_free(root_copy);
+        package_import_free_read(source);
+        _zag_str_free(manifest); return bad;
+    }
+    let bytes: []u8 = _zag_read_file(module_path);
+    _zag_str_free(module_path); package_import_free_read(source);
+    _zag_str_free(manifest);
+    if (bytes.len < 0 || bytes.len > 8388608) {
+        if (bytes.len >= 0) { package_import_free_read(bytes); }
+        _zag_str_free(root_copy);
+        return bad;
+    }
+    let result: PackageLockGeneratedEntry = PackageLockGeneratedEntry{
+        .alias = _zag_str_concat("", alias),
+        .root = root_copy,
+        .module = _zag_str_concat("", module),
+        .checksum = package_raw_checksum(bytes),
+        .valid = 1,
+    };
+    package_import_free_read(bytes);
+    return result;
+}
+
+// The resolver checks the path's bytes before load.  The parser calls this
+// again on the exact source slice it retained for compilation, closing the
+// check/read race without transferring source ownership into the resolver.
+fn package_import_locked_bytes_match(result: PackageImportResolution,
+    source: []u8) i32 {
+    if (result.locked == 0) { return 1; }
+    return package_raw_checksum_equal(package_raw_checksum(source),
+        result.checksum);
 }
 
 fn package_import_report(result: PackageImportResolution) void {
@@ -318,6 +869,21 @@ fn package_import_report(result: PackageImportResolution) void {
         _zag_println("dependency path must be relative and use '/' without '~', ':', or backslash");
     } else if (result.error == PackageImportError.module_not_found) {
         _zag_print("resolved module does not exist at "); _zag_println(result.path);
+    } else if (result.error == PackageImportError.invalid_vendor_dependency) {
+        _zag_println("vendor dependency path must be a traversal-free vendor/<name> root");
+    } else if (result.error == PackageImportError.lockfile_not_found) {
+        _zag_print("vendor dependency requires canonical lockfile ");
+        _zag_println(result.lockfile);
+    } else if (result.error == PackageImportError.invalid_lockfile) {
+        _zag_print("invalid canonical vendor lockfile "); _zag_println(result.lockfile);
+    } else if (result.error == PackageImportError.lock_entry_not_found) {
+        _zag_print("canonical vendor lockfile has no exact alias/root/module entry in ");
+        _zag_println(result.lockfile);
+    } else if (result.error == PackageImportError.checksum_mismatch) {
+        _zag_print("vendor module raw checksum mismatch under ");
+        _zag_println(result.lockfile);
+    } else if (result.error == PackageImportError.dependency_input_changed) {
+        _zag_println("manifest or lock bytes changed during this compilation");
     } else {
         _zag_println("resolution failed");
     }

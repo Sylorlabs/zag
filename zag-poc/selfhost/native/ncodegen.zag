@@ -39,6 +39,7 @@
 @import("ncodegen_layout.zag")    // struct/union/enum layout, sizing, offsets
 @import("ncodegen_env.zag")       // FnSym, Env, scope, slots, break/continue
 @import("ncodegen_scan.zag")      // frame pre-scan, type inference, runtime classification
+@import("../zir_contract.zag")    // shared typed IR contract; producer stays out of backend
 
 // ── decimal integer-literal parser ───────────────────────────────────────────
 // We parse IntLit text ourselves (a small base-10 scanner) rather than calling
@@ -730,6 +731,45 @@ fn cg_expr_type(n: *Node, env: *Env, syms: ArrayList[FnSym], cg: *Cg) []u8 {
                 if (cg_is_desugared_const(cg, x.name) == 1) { return cg_fn_ret(syms, x.name); }
                 return "fat_fn";
             }
+            // For closure bodies, recover captured names from the active
+            // closure declaration when this symbol is not otherwise visible.
+            if (cg.*.cur_fn.len > 0 && cg_is_clos_name(cg.*.cur_fn) == 1 && cg.*.cur_cap_names.len > 0) {
+                let dyi: i32 = 0;
+                let hit: i32 = 0;
+                let cap_types: []u8 = "";
+                while (dyi < len[*Node](cg.*.decls)) {
+                    switch (get[*Node](cg.*.decls, dyi).*) {
+                        .fn_decl => |fd| {
+                            if (hit == 0 && @strEq(fd.name, cg.*.cur_fn)) {
+                                let cns: ArrayList[[]u8] = split_args(fd.cap_names);
+                                let cts: ArrayList[[]u8] = split_args(fd.cap_types);
+                                let ci: i32 = 0;
+                                while (ci < len[[]u8](cns)) {
+                                    let cn: []u8 = get[[]u8](cns, ci);
+                                    let rcn: []u8 = cn;
+                                    if (rcn.len > 0 && rcn[0] == '*') { rcn = rcn[1..rcn.len]; }
+                                    if (@strEq(rcn, x.name)) {
+                                        if (ci < len[[]u8](cts) && get[[]u8](cts, ci).len > 0) {
+                                            cap_types = get[[]u8](cts, ci);
+                                        } else {
+                                            cap_types = cg_slot_type(env.*, x.name);
+                                        }
+                                        hit = 1;
+                                        break;
+                                    }
+                                    ci = ci + 1;
+                                }
+                                free[[]u8](&cns);
+                                free[[]u8](&cts);
+                            }
+                        }
+                        else => {}
+                    }
+                            if (hit == 1) { break; }
+                            dyi = dyi + 1;
+                        }
+                if (cap_types.len > 0) { return cap_types; }
+            }
             return "";
         }
         .slit_ => |s| {
@@ -797,6 +837,15 @@ fn cg_expr_type(n: *Node, env: *Env, syms: ArrayList[FnSym], cg: *Cg) []u8 {
                         // (→ ZnrtQuire after norm); @quireToPosit → p32.
                         let qr: []u8 = cg_quire_builtin_ret(cid.name[1..]);
                         if (qr.len > 0) { return cg_norm_type(qr); }
+                        if (@strEq(cid.name, "@vsaZero") || @strEq(cid.name, "@vsaFromWords") ||
+                            @strEq(cid.name, "@vsaMajority3")) {
+                            if (len[[]u8](c.targs) == 1 && vsa_type_valid(get[[]u8](c.targs, 0)) == 1) {
+                                return get[[]u8](c.targs, 0);
+                            }
+                            return "";
+                        }
+                        if (@strEq(cid.name, "@vsaWord") || @strEq(cid.name, "@vsaHamming") ||
+                            @strEq(cid.name, "@vsaDimension") || @strEq(cid.name, "@vsaWordCount")) { return "i64"; }
                         // cache builtins that return a slice type.
                         if (@strEq(cid.name[1..], "cacheAlignedAlloc")) { return "[]f32"; }
                         return "";
@@ -1174,6 +1223,13 @@ fn cg_lower_addr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                     push[Instr](out, i_push(R_RAX()));
                     return;
                 }
+                let fn_lbl: i32 = cg_find_fn(syms, x.name);
+                if (fn_lbl >= 0 || cg_is_clos_name(x.name) == 1) {
+                    // function names / __clos_N closures are lowered as expressions
+                    // in value position, so reuse that behavior for address-of.
+                    cg_lower_expr(out, n, env, syms, cg);
+                    return;
+                }
                 cg_err(cg, "native: unknown identifier (address-of)");
                 push[Instr](out, i_mov_imm(R_RAX(), 0));
                 push[Instr](out, i_push(R_RAX()));
@@ -1422,28 +1478,29 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                         di = di + 1;
                     }
                     if (caps.len > 0) {
-                        // Build cap_types string from env and record in fn_decl.
-                        let cnames0: ArrayList[[]u8] = split_args(caps);
-                        let tys: []u8 = "";
-                        let ti: i32 = 0;
-                        while (ti < len[[]u8](cnames0)) {
-                            let cn: []u8 = get[[]u8](cnames0, ti);
-                            if (ti > 0) { tys = _zag_str_concat(tys, ","); }
-                            // Pointer capture: cn starts with '*', look up real name
-                            if (cn.len > 0 && cn[0] == '*') {
-                                let real_cn: []u8 = cn[1..cn.len];
-                                let base_ty: []u8 = cg_slot_type(env.*, real_cn);
-                                tys = _zag_str_concat(tys, _zag_str_concat("*", base_ty));
-                            } else {
-                                tys = _zag_str_concat(tys, cg_slot_type(env.*, cn));
+                            // Build cap_types string from env and record in fn_decl.
+                            let cnames0: ArrayList[[]u8] = split_args(caps);
+                            let tys: []u8 = "";
+                            let ti: i32 = 0;
+                            while (ti < len[[]u8](cnames0)) {
+                                let cn: []u8 = get[[]u8](cnames0, ti);
+                                if (ti > 0) { tys = _zag_str_concat(tys, ","); }
+                                // Pointer capture: cn starts with '*', look up real name
+                                if (cn.len > 0 && cn[0] == '*') {
+                                    let real_cn: []u8 = cn[1..cn.len];
+                                    let base_ty: []u8 = cg_slot_type(env.*, real_cn);
+                                    tys = _zag_str_concat(tys, _zag_str_concat("*", base_ty));
+                                } else {
+                                    let capture_ty: []u8 = cg_slot_type(env.*, cn);
+                                    tys = _zag_str_concat(tys, capture_ty);
+                                }
+                                ti = ti + 1;
                             }
-                            ti = ti + 1;
-                        }
-                        let di2: i32 = 0;
-                        while (di2 < len[*Node](cg.*.decls)) {
-                            let dn: *Node = get[*Node](cg.*.decls, di2);
-                            switch (dn.*) {
-                                .fn_decl => |fd2| {
+                            let di2: i32 = 0;
+                            while (di2 < len[*Node](cg.*.decls)) {
+                                let dn: *Node = get[*Node](cg.*.decls, di2);
+                                switch (dn.*) {
+                                    .fn_decl => |fd2| {
                                     if (@strEq(fd2.name, x.name) && fd2.cap_types.len == 0) {
                                         dn.* = Node{ .fn_decl = FnDecl{
                                             .name = fd2.name, .tparams = fd2.tparams,
@@ -1616,7 +1673,10 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                     }
                     push[Instr](out, i_load(R_RAX(), R_RBP(), env.*.sret_disp));
                 }
-                push[Instr](out, i_jmp(env.*.epilogue));
+                // try error propagation: set is_err=1 for errdefer, jump to cleanup
+                push[Instr](out, i_mov_imm(R_R11(), 1));
+                push[Instr](out, i_store(R_RBP(), env.*.is_err_slot, R_R11()));
+                push[Instr](out, i_jmp(env.*.pre_epilogue));
                 push[Instr](out, i_label(l_ok3));
                 let try_ty: []u8 = cg_expr_type(u.e, env, syms, cg);
                 let payload_ty: []u8 = try_ty[1..];
@@ -2260,7 +2320,16 @@ fn cg_materialize_struct_into(out: *ArrayList[Instr], pslot: i32, off: i32, s: S
             cg_err(cg, "native: struct literal sets unknown field");
         } else {
             let fty: []u8 = cg_field_type(cg, sn, fi.name);
-            cg_materialize_into(out, pslot, off + foff, fi.val, fty, env, syms, cg);
+            let narrow_layout: i32 = (cg_struct_repr_c(cg, sn) == 1 ||
+                cg_struct_is_packed(cg, sn) == 1) as i32;
+            if (narrow_layout == 1 && cg_type_is_agg(cg, fty) == 0) {
+                cg_lower_expr(out, fi.val, env, syms, cg);
+                push[Instr](out, i_pop(R_RAX()));
+                cg_emit_store_scalar_width_at(out, pslot, off + foff,
+                    cg_c_leaf_size(fty), R_RAX());
+            } else {
+                cg_materialize_into(out, pslot, off + foff, fi.val, fty, env, syms, cg);
+            }
         }
         i = i + 1;
     }
@@ -2518,10 +2587,18 @@ fn cg_emit_store_scalar_width(out: *ArrayList[Instr], base: i32, width: i32, src
     else { push[Instr](out, i_store(base, 0, src)); }
 }
 
+fn cg_emit_store_scalar_width_at(out: *ArrayList[Instr], pslot: i32, off: i32, width: i32, src: i32) void {
+    push[Instr](out, i_load(R_RCX(), R_RBP(), pslot));
+    if (width == 1) { push[Instr](out, i_store8(R_RCX(), off, src)); }
+    else if (width == 2) { push[Instr](out, i_store16(R_RCX(), off, src)); }
+    else if (width == 4) { push[Instr](out, i_store32(R_RCX(), off, src)); }
+    else { push[Instr](out, i_store(R_RCX(), off, src)); }
+}
+
 fn cg_repr_c_field_width(f: Field, env: *Env, syms: ArrayList[FnSym], cg: *Cg) i32 {
     let base_ty: []u8 = cg_norm_type(cg_expr_type(f.base, env, syms, cg));
     if (base_ty.len > 1 && base_ty[0] == '*') { base_ty = cg_norm_type(base_ty[1..]); }
-    if (cg_struct_repr_c(cg, base_ty) == 0) { return 0; }
+    if (cg_struct_repr_c(cg, base_ty) == 0 && cg_struct_is_packed(cg, base_ty) == 0) { return 0; }
     return cg_c_leaf_size(cg_field_type(cg, base_ty, f.fname));
 }
 
@@ -2585,6 +2662,64 @@ fn cg_lower_bin_float(out: *ArrayList[Instr], bb: Bin, lf: i32, rf: i32, env: *E
     push[Instr](out, i_push(R_RAX()));
 }
 
+// Binary VSA values are packed little-endian into ceil(N/64) frame words.
+// Every operation materializes a fresh immutable aggregate and masks padding in
+// the final word. A resolved native POPCNT profile also enables 128-bit SSE2
+// pairs; generic builds retain the scalar authority for differential parity.
+fn cg_lower_vsa_bin(out: *ArrayList[Instr], bb: Bin, lty: []u8, rty: []u8,
+                    env: *Env, syms: ArrayList[FnSym], cg: *Cg) void {
+    if (vsa_type_valid(lty) == 0 || !@strEq(lty, rty)) {
+        cg_err(cg, "native: VSA operands require the same valid vsa_b<N> type");
+        push[Instr](out, i_mov_imm(R_RAX(), 0));
+        push[Instr](out, i_push(R_RAX()));
+        return;
+    }
+    if (!@strEq(bb.op, "^") && !@strEq(bb.op, "&") && !@strEq(bb.op, "|")) {
+        cg_err(cg, "native: vsa_b<N> supports only ^, &, and | operators");
+        push[Instr](out, i_mov_imm(R_RAX(), 0));
+        push[Instr](out, i_push(R_RAX()));
+        return;
+    }
+    let words: i32 = vsa_type_words(lty);
+    let result: i32 = cg_slot_scratch_n(env, words);
+    cg_lower_expr(out, bb.l, env, syms, cg);
+    cg_lower_expr(out, bb.r, env, syms, cg);
+    push[Instr](out, i_pop(R_RSI()));
+    push[Instr](out, i_pop(R_RDI()));
+    let wi: i32 = 0;
+    let vector_words: i32 = words;
+    if (vsa_type_final_bits(lty) != 64) { vector_words = vector_words - 1; }
+    if (cg.*.allow_popcnt == 1) {
+        while (wi + 1 < vector_words) {
+            push[Instr](out, i_movdqu_load(R_XMM0(), R_RDI(), wi * 8));
+            push[Instr](out, i_movdqu_load(R_XMM1(), R_RSI(), wi * 8));
+            if (@strEq(bb.op, "^")) {
+                push[Instr](out, i_pxor(R_XMM0(), R_XMM1()));
+            } else if (@strEq(bb.op, "&")) {
+                push[Instr](out, i_pand(R_XMM0(), R_XMM1()));
+            } else { push[Instr](out, i_por(R_XMM0(), R_XMM1())); }
+            push[Instr](out, i_movdqu_store(R_RBP(), result + wi * 8,
+                R_XMM0()));
+            wi = wi + 2;
+        }
+    }
+    while (wi < words) {
+        push[Instr](out, i_load(R_RAX(), R_RDI(), wi * 8));
+        push[Instr](out, i_load(R_RCX(), R_RSI(), wi * 8));
+        if (@strEq(bb.op, "^")) { push[Instr](out, i_xor(R_RAX(), R_RCX())); }
+        else if (@strEq(bb.op, "&")) { push[Instr](out, i_and(R_RAX(), R_RCX())); }
+        else { push[Instr](out, i_or(R_RAX(), R_RCX())); }
+        if (wi + 1 == words && vsa_type_final_bits(lty) != 64) {
+            push[Instr](out, i_mov_imm(R_RCX(), vsa_type_final_mask(lty)));
+            push[Instr](out, i_and(R_RAX(), R_RCX()));
+        }
+        push[Instr](out, i_store(R_RBP(), result + wi * 8, R_RAX()));
+        wi = wi + 1;
+    }
+    push[Instr](out, i_lea(R_RAX(), R_RBP(), result));
+    push[Instr](out, i_push(R_RAX()));
+}
+
 // ── binary operators (incl. short-circuit && / ||, optional orelse) ──────────
 fn cg_lower_bin(out: *ArrayList[Instr], bb: Bin, env: *Env, syms: ArrayList[FnSym], cg: *Cg) void {
     // `opt orelse default` — unwrap the optional or take the default.
@@ -2643,6 +2778,11 @@ fn cg_lower_bin(out: *ArrayList[Instr], bb: Bin, env: *Env, syms: ArrayList[FnSy
     let rf: i32 = cg_is_float_ty(rty);
     if (lf == 1 || rf == 1) {
         cg_lower_bin_float(out, bb, lf, rf, env, syms, cg);
+        return;
+    }
+
+    if (vsa_type_valid(lty) == 1 || vsa_type_valid(rty) == 1) {
+        cg_lower_vsa_bin(out, bb, lty, rty, env, syms, cg);
         return;
     }
 
@@ -3407,6 +3547,20 @@ fn cg_sizeof_type(cg: *Cg, t0: []u8) i32 {
     return cg_type_size(cg, t0);
 }
 
+fn cg_vsa_builtin_type(c: Call) []u8 {
+    if (len[[]u8](c.targs) != 1) { return ""; }
+    let ty: []u8 = get[[]u8](c.targs, 0);
+    if (vsa_type_valid(ty) == 0) { return ""; }
+    return ty;
+}
+
+fn cg_vsa_mask_last(out: *ArrayList[Instr], ty: []u8, reg: i32) void {
+    if (vsa_type_final_bits(ty) != 64) {
+        push[Instr](out, i_mov_imm(R_RCX(), vsa_type_final_mask(ty)));
+        push[Instr](out, i_and(reg, R_RCX()));
+    }
+}
+
 fn cg_atomic_order_literal(n: *Node) i64 {
     switch (n.*) {
         .ilit => |x| {
@@ -3432,6 +3586,188 @@ fn cg_atomic_cas_orders_ok(success: i64, failure: i64) i32 {
 fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, syms: ArrayList[FnSym], cg: *Cg) void {
     let b: []u8 = fname[1..];   // strip '@'
     let nargs: i32 = len[*Node](c.args);
+
+    if (@strEq(b, "vsaDimension") || @strEq(b, "vsaWordCount")) {
+        let ty: []u8 = cg_vsa_builtin_type(c);
+        if (ty.len == 0 || nargs != 0) {
+            cg_err(cg, "native: VSA dimension builtin requires one vsa_b<N> type and no values");
+            push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return;
+        }
+        let value: i32 = vsa_type_dimension(ty);
+        if (@strEq(b, "vsaWordCount")) { value = vsa_type_words(ty); }
+        push[Instr](out, i_mov_imm(R_RAX(), value as i64));
+        push[Instr](out, i_push(R_RAX()));
+        return;
+    }
+
+    if (@strEq(b, "vsaZero")) {
+        let ty: []u8 = cg_vsa_builtin_type(c);
+        if (ty.len == 0 || nargs != 0) {
+            cg_err(cg, "native: @vsaZero[vsa_b<N>]() expects no values");
+            push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return;
+        }
+        let words: i32 = vsa_type_words(ty);
+        let result: i32 = cg_slot_scratch_n(env, words);
+        push[Instr](out, i_mov_imm(R_RAX(), 0));
+        let wi: i32 = 0;
+        while (wi < words) { push[Instr](out, i_store(R_RBP(), result + wi * 8, R_RAX())); wi = wi + 1; }
+        push[Instr](out, i_lea(R_RAX(), R_RBP(), result));
+        push[Instr](out, i_push(R_RAX()));
+        return;
+    }
+
+    if (@strEq(b, "vsaFromWords")) {
+        let ty: []u8 = cg_vsa_builtin_type(c);
+        if (ty.len == 0 || nargs != 1) {
+            cg_err(cg, "native: @vsaFromWords[vsa_b<N>](words) expects one exact word slice");
+            push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return;
+        }
+        let aty: []u8 = cg_expr_type(get[*Node](c.args, 0), env, syms, cg);
+        if (!@strEq(aty, "[]i64") && !@strEq(aty, "[]u64")) {
+            cg_err(cg, "native: @vsaFromWords input must be []i64 or []u64");
+            push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return;
+        }
+        let words: i32 = vsa_type_words(ty);
+        let result: i32 = cg_slot_scratch_n(env, words);
+        cg_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+        push[Instr](out, i_pop(R_R10()));
+        push[Instr](out, i_load(R_RDX(), R_R10(), 8));
+        push[Instr](out, i_cmp_imm(R_RDX(), words as i64));
+        let length_ok: i32 = cg_fresh(cg);
+        push[Instr](out, i_je(length_ok));
+        cg_emit_panic(out, "zag VSA: imported word count does not match dimension", length_ok, cg);
+        push[Instr](out, i_load(R_RSI(), R_R10(), 0));
+        let wi: i32 = 0;
+        while (wi < words) {
+            push[Instr](out, i_load(R_RAX(), R_RSI(), wi * 8));
+            if (wi + 1 == words) { cg_vsa_mask_last(out, ty, R_RAX()); }
+            push[Instr](out, i_store(R_RBP(), result + wi * 8, R_RAX()));
+            wi = wi + 1;
+        }
+        push[Instr](out, i_lea(R_RAX(), R_RBP(), result));
+        push[Instr](out, i_push(R_RAX()));
+        return;
+    }
+
+    if (@strEq(b, "vsaWord")) {
+        if (nargs != 2) {
+            cg_err(cg, "native: @vsaWord expects a vector and word index");
+            push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return;
+        }
+        let ty: []u8 = cg_expr_type(get[*Node](c.args, 0), env, syms, cg);
+        if (vsa_type_valid(ty) == 0) {
+            cg_err(cg, "native: @vsaWord first argument must be vsa_b<N>");
+            push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return;
+        }
+        let base_slot: i32 = cg_slot_scratch(env);
+        cg_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+        push[Instr](out, i_pop(R_RAX())); push[Instr](out, i_store(R_RBP(), base_slot, R_RAX()));
+        cg_lower_expr(out, get[*Node](c.args, 1), env, syms, cg);
+        push[Instr](out, i_pop(R_RCX()));
+        let nonnegative: i32 = cg_fresh(cg);
+        push[Instr](out, i_cmp_imm(R_RCX(), 0)); push[Instr](out, i_jge(nonnegative));
+        cg_emit_panic(out, "zag VSA: negative word index", nonnegative, cg);
+        let in_bounds: i32 = cg_fresh(cg);
+        push[Instr](out, i_cmp_imm(R_RCX(), vsa_type_words(ty) as i64)); push[Instr](out, i_jl(in_bounds));
+        cg_emit_panic(out, "zag VSA: word index out of bounds", in_bounds, cg);
+        push[Instr](out, i_mov_rr(R_RAX(), R_RCX()));
+        push[Instr](out, i_mov_imm(R_RDX(), 8)); push[Instr](out, i_imul(R_RAX(), R_RDX()));
+        push[Instr](out, i_load(R_RDX(), R_RBP(), base_slot)); push[Instr](out, i_add(R_RDX(), R_RAX()));
+        push[Instr](out, i_load(R_RAX(), R_RDX(), 0)); push[Instr](out, i_push(R_RAX()));
+        return;
+    }
+
+    if (@strEq(b, "vsaHamming")) {
+        if (nargs != 2) {
+            cg_err(cg, "native: @vsaHamming expects two vectors");
+            push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return;
+        }
+        let lty: []u8 = cg_expr_type(get[*Node](c.args, 0), env, syms, cg);
+        let rty: []u8 = cg_expr_type(get[*Node](c.args, 1), env, syms, cg);
+        if (vsa_type_valid(lty) == 0 || !@strEq(lty, rty)) {
+            cg_err(cg, "native: @vsaHamming operands must have the same vsa_b<N> type");
+            push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return;
+        }
+        cg_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+        cg_lower_expr(out, get[*Node](c.args, 1), env, syms, cg);
+        push[Instr](out, i_pop(R_RSI())); push[Instr](out, i_pop(R_RDI()));
+        push[Instr](out, i_mov_imm(R_R8(), 0));
+        let wi: i32 = 0;
+        while (wi < vsa_type_words(lty)) {
+            push[Instr](out, i_load(R_RAX(), R_RDI(), wi * 8));
+            push[Instr](out, i_load(R_RCX(), R_RSI(), wi * 8));
+            push[Instr](out, i_xor(R_RAX(), R_RCX()));
+            if (wi + 1 == vsa_type_words(lty)) { cg_vsa_mask_last(out, lty, R_RAX()); }
+            if (cg.*.allow_popcnt == 1) {
+                push[Instr](out, i_popcnt(R_RAX(), R_RAX()));
+                push[Instr](out, i_add(R_R8(), R_RAX()));
+            } else {
+                let count_loop: i32 = cg_fresh(cg);
+                let count_done: i32 = cg_fresh(cg);
+                push[Instr](out, i_label(count_loop)); push[Instr](out, i_cmp_imm(R_RAX(), 0)); push[Instr](out, i_je(count_done));
+                push[Instr](out, i_mov_rr(R_RDX(), R_RAX())); push[Instr](out, i_sub_imm(R_RDX(), 1));
+                push[Instr](out, i_and(R_RAX(), R_RDX())); push[Instr](out, i_add_imm(R_R8(), 1));
+                push[Instr](out, i_jmp(count_loop)); push[Instr](out, i_label(count_done));
+            }
+            wi = wi + 1;
+        }
+        push[Instr](out, i_mov_rr(R_RAX(), R_R8())); push[Instr](out, i_push(R_RAX()));
+        return;
+    }
+
+    if (@strEq(b, "vsaMajority3")) {
+        let ty: []u8 = cg_vsa_builtin_type(c);
+        if (ty.len == 0 || nargs != 3) {
+            cg_err(cg, "native: @vsaMajority3[vsa_b<N>] expects three vectors");
+            push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return;
+        }
+        let a_ty: []u8 = cg_expr_type(get[*Node](c.args, 0), env, syms, cg);
+        let b_ty: []u8 = cg_expr_type(get[*Node](c.args, 1), env, syms, cg);
+        let c_ty: []u8 = cg_expr_type(get[*Node](c.args, 2), env, syms, cg);
+        if (!@strEq(a_ty, ty) || !@strEq(b_ty, ty) || !@strEq(c_ty, ty)) {
+            cg_err(cg, "native: @vsaMajority3 operands must match its vsa_b<N> type");
+            push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return;
+        }
+        let words: i32 = vsa_type_words(ty);
+        let result: i32 = cg_slot_scratch_n(env, words);
+        cg_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+        cg_lower_expr(out, get[*Node](c.args, 1), env, syms, cg);
+        cg_lower_expr(out, get[*Node](c.args, 2), env, syms, cg);
+        push[Instr](out, i_pop(R_RDX())); push[Instr](out, i_pop(R_RSI())); push[Instr](out, i_pop(R_RDI()));
+        let wi: i32 = 0;
+        let vector_words: i32 = words;
+        if (vsa_type_final_bits(ty) != 64) { vector_words = vector_words - 1; }
+        if (cg.*.allow_popcnt == 1) {
+            while (wi + 1 < vector_words) {
+                push[Instr](out, i_movdqu_load(R_XMM0(), R_RDI(), wi * 8));
+                push[Instr](out, i_movdqu_load(R_XMM1(), R_RSI(), wi * 8));
+                push[Instr](out, i_movdqu_load(R_XMM2(), R_RDX(), wi * 8));
+                push[Instr](out, i_movdqu_load(R_XMM3(), R_RDI(), wi * 8));
+                push[Instr](out, i_pand(R_XMM0(), R_XMM1()));
+                push[Instr](out, i_pand(R_XMM3(), R_XMM2()));
+                push[Instr](out, i_pand(R_XMM1(), R_XMM2()));
+                push[Instr](out, i_por(R_XMM0(), R_XMM3()));
+                push[Instr](out, i_por(R_XMM0(), R_XMM1()));
+                push[Instr](out, i_movdqu_store(R_RBP(), result + wi * 8,
+                    R_XMM0()));
+                wi = wi + 2;
+            }
+        }
+        while (wi < words) {
+            push[Instr](out, i_load(R_RAX(), R_RDI(), wi * 8));
+            push[Instr](out, i_load(R_RCX(), R_RSI(), wi * 8));
+            push[Instr](out, i_load(R_R8(), R_RDX(), wi * 8));
+            push[Instr](out, i_mov_rr(R_R9(), R_RAX())); push[Instr](out, i_and(R_R9(), R_RCX()));
+            push[Instr](out, i_mov_rr(R_R10(), R_RAX())); push[Instr](out, i_and(R_R10(), R_R8()));
+            push[Instr](out, i_and(R_RCX(), R_R8())); push[Instr](out, i_or(R_R9(), R_R10())); push[Instr](out, i_or(R_R9(), R_RCX()));
+            push[Instr](out, i_mov_rr(R_RAX(), R_R9()));
+            if (wi + 1 == words) { cg_vsa_mask_last(out, ty, R_RAX()); }
+            push[Instr](out, i_store(R_RBP(), result + wi * 8, R_RAX()));
+            wi = wi + 1;
+        }
+        push[Instr](out, i_lea(R_RAX(), R_RBP(), result)); push[Instr](out, i_push(R_RAX()));
+        return;
+    }
 
     // Selectable memory-order load/store slice.  The order is a compile-time
     // literal: 0=relaxed, 1=acquire, 2=release, 3=acq_rel, 4=seq_cst.  On
@@ -4191,6 +4527,35 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
         return;
     }
 
+    // Layout queries are constants from the same source layout registry used
+    // by field lowering.  Unknown fields are a backend error, never a host ABI
+    // fallback.
+    if (@strEq(b, "alignOf")) {
+        if (len[[]u8](c.targs) != 1 || nargs != 0) {
+            cg_err(cg, "native: @alignOf expects one type argument and no values");
+            push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return;
+        }
+        push[Instr](out, i_mov_imm(R_RAX(), cg_type_alignment(cg, get[[]u8](c.targs, 0)) as i64));
+        push[Instr](out, i_push(R_RAX()));
+        return;
+    }
+    if (@strEq(b, "offsetOf")) {
+        if (len[[]u8](c.targs) != 1 || nargs != 1) {
+            cg_err(cg, "native: @offsetOf expects one type argument and one field string");
+            push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return;
+        }
+        let field: []u8 = "";
+        switch (get[*Node](c.args, 0).*) {
+            .slit => |s| { if (s.text.len >= 2) { field = s.text[1..s.text.len - 1]; } }
+            else => { }
+        }
+        let off: i32 = cg_field_offset(cg, get[[]u8](c.targs, 0), field);
+        if (off < 0) { cg_err(cg, "native: @offsetOf names an unknown field"); off = 0; }
+        push[Instr](out, i_mov_imm(R_RAX(), off as i64));
+        push[Instr](out, i_push(R_RAX()));
+        return;
+    }
+
     // @len(x) / @strLen(x) → the slice length word [block+8]. x must be a slice
     // value (a []u8); a string literal's length is a compile-time constant.
     if (@strEq(b, "len") || @strEq(b, "strLen")) {
@@ -4474,6 +4839,26 @@ fn cg_lower_runtime(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
         if (nargs != 1) { cg_err(cg,"native: _zag_fixed_buffer_reset expects token");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return 1; }
         if (cg.*.safety_checked == 0) { cg_err(cg,"native: fixed-buffer allocator requires --safety=checked");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return 1; }
         cg_lower_expr(out,get[*Node](c.args,0),env,syms,cg);push[Instr](out,i_pop(R_RDI()));cg_emit_fixed_region_reset(out,cg);push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return 1;
+    }
+    if (@strEq(fname, "_zag_fixed_buffer_capacity") ||
+        @strEq(fname, "_zag_fixed_buffer_used") ||
+        @strEq(fname, "_zag_fixed_buffer_remaining") ||
+        @strEq(fname, "_zag_fixed_buffer_high_water") ||
+        @strEq(fname, "_zag_fixed_buffer_generation")) {
+        if (nargs != 1) { cg_err(cg,"native: fixed-buffer telemetry expects one region token");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return 1; }
+        if (cg.*.safety_checked == 0) { cg_err(cg,"native: fixed-buffer allocator requires --safety=checked");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return 1; }
+        cg_lower_expr(out,get[*Node](c.args,0),env,syms,cg);push[Instr](out,i_pop(R_RDI()));
+        let metric:i32=0;
+        if(@strEq(fname,"_zag_fixed_buffer_used")){metric=1;}
+        else if(@strEq(fname,"_zag_fixed_buffer_remaining")){metric=2;}
+        else if(@strEq(fname,"_zag_fixed_buffer_high_water")){metric=3;}
+        else if(@strEq(fname,"_zag_fixed_buffer_generation")){metric=4;}
+        cg_emit_fixed_region_metric(out,cg,metric);push[Instr](out,i_push(R_RAX()));return 1;
+    }
+    if (@strEq(fname, "_zag_fixed_buffer_block_len")) {
+        if (nargs != 1) { cg_err(cg,"native: fixed-buffer block length expects one block token");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return 1; }
+        if (cg.*.safety_checked == 0) { cg_err(cg,"native: fixed-buffer allocator requires --safety=checked");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return 1; }
+        cg_lower_expr(out,get[*Node](c.args,0),env,syms,cg);push[Instr](out,i_pop(R_RDI()));cg_emit_fixed_block_len(out,cg);push[Instr](out,i_push(R_RAX()));return 1;
     }
     if (@strEq(fname, "_zag_fixed_buffer_read_u8")) {
         if (nargs != 2) { cg_err(cg,"native: _zag_fixed_buffer_read_u8 expects block token and index");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return 1; }
@@ -5697,6 +6082,14 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
         push[Instr](out, i_push(R_RAX()));
         return;
     }
+    // An unaliased `@import("rt.zag")` is flattened by the front end with an
+    // `rt__` owner prefix, while the native runtime table is intentionally
+    // keyed by the canonical `_zag_*` spelling. Normalize only that exact
+    // compiler-generated prefix; user-defined functions remain untouched.
+    if (fname.len > 4 && @strEq(fname[0..4], "rt__") &&
+        fname.len > 7 && @strEq(fname[4..8], "_zag")) {
+        fname = fname[4..fname.len];
+    }
     // @-builtins (@sizeOf, @len, @strEq, @intCast, ...) are intercepted first.
     if (fname.len > 0) {
         if (fname[0] == '@') { cg_lower_builtin(out, fname, c, env, syms, cg); return; }
@@ -6228,7 +6621,8 @@ fn cg_switch_kind(cg: *Cg, sw: Switch, subject_ty0: []u8, uname: *[]u8) i32 {
     let subject_ty: []u8 = cg_norm_type(subject_ty0);
     if (subject_ty.len > 1 && subject_ty[0] == '*') { subject_ty = subject_ty[1..]; }
     if (cg_type_is_union(cg, subject_ty) == 1) { uname.* = subject_ty; return 2; }
-    let subject_enum: EnumDecl = EnumDecl{ .name = "", .members = make[[]u8](1) };
+    let subject_enum: EnumDecl = EnumDecl{ .name = "", .members = make[[]u8](1),
+        .annots = make[[]u8](1), .is_pub = 0 };
     if (cg_find_enum(cg, subject_ty, &subject_enum) == 1) { uname.* = subject_ty; return 1; }
     if (len[SwitchArm](sw.arms) == 0) { uname.* = ""; return 0; }
     let a0: SwitchArm = get[SwitchArm](sw.arms, 0);
@@ -6821,12 +7215,14 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                         zi = zi + 1;
                     }
                     push[Instr](out, i_load(R_RAX(), R_RBP(), sps));
-                    push[Instr](out, i_jmp(env.*.epilogue));
+                    push[Instr](out, i_mov_imm(R_R11(), 0));
+                    push[Instr](out, i_store(R_RBP(), env.*.is_err_slot, R_R11()));
+                    push[Instr](out, i_jmp(env.*.pre_epilogue));
                     return;
                 }
                 if (r.has_expr == 0) {
                     cg_err(cg, "native: aggregate-returning fn must return a value");
-                    push[Instr](out, i_jmp(env.*.epilogue));
+                    push[Instr](out, i_jmp(env.*.pre_epilogue));
                     return;
                 }
                 if (rty.len > 1 && rty[0] == '!') {
@@ -6875,7 +7271,9 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                         push[Instr](out, i_store(R_RCX(), 0, R_RAX()));  // err = 0
                     }
                     push[Instr](out, i_load(R_RAX(), R_RBP(), sps));
-                    push[Instr](out, i_jmp(env.*.epilogue));
+                    push[Instr](out, i_mov_imm(R_R11(), is_err_ret as i64));
+                    push[Instr](out, i_store(R_RBP(), env.*.is_err_slot, R_R11()));
+                    push[Instr](out, i_jmp(env.*.pre_epilogue));
                     return;
                 } else if (cg_type_is_opt(cg, rty) == 1) {
                     // wrap into the ?T result block (null / value / optional).
@@ -6901,7 +7299,9 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                     }
                 }
                 push[Instr](out, i_load(R_RAX(), R_RBP(), env.*.sret_disp));  // rax = dest
-                push[Instr](out, i_jmp(env.*.epilogue));
+                push[Instr](out, i_mov_imm(R_R11(), 0));
+                push[Instr](out, i_store(R_RBP(), env.*.is_err_slot, R_R11()));
+                push[Instr](out, i_jmp(env.*.pre_epilogue));
                 return;
             }
             if (r.has_expr == 1) {
@@ -6910,7 +7310,22 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
             } else {
                 push[Instr](out, i_mov_imm(R_RAX(), 0));
             }
-            push[Instr](out, i_jmp(env.*.epilogue));
+            // Detect error return for errdefer: return error.X from a !T function.
+            let non_sret_err: i32 = 0;
+            if (r.has_expr == 1) {
+                switch (r.expr.*) {
+                    .fld => |ef| {
+                        switch (ef.base.*) {
+                            .id => |eid2| { if (@strEq(eid2.name, "error") && cg_slot_find(env.*, eid2.name) == cg_not_found()) { non_sret_err = 1; } }
+                            else => { }
+                        }
+                    }
+                    else => { }
+                }
+            }
+            push[Instr](out, i_mov_imm(R_R11(), non_sret_err as i64));
+            push[Instr](out, i_store(R_RBP(), env.*.is_err_slot, R_R11()));
+            push[Instr](out, i_jmp(env.*.pre_epilogue));
         }
         .if_ => |iff| {
             let else_lbl: i32 = cg_fresh(cg);
@@ -7053,6 +7468,15 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
             }
         }
         .unsafe_ => |u| { cg_lower_scoped_block(out, u.body, env, syms, cg); }
+        .defer_ => |d| {
+            // Collect the deferred expression; it will be lowered at pre_epilogue.
+            // defer runs at all exits; errdefer runs only on error exits.
+            if (d.is_err == 0) {
+                push[*Node](&env.*.defer_exprs, d.expr);
+            } else {
+                push[*Node](&env.*.errdefer_exprs, d.expr);
+            }
+        }
         .break_ => |_b| {
             let tgt: i32 = cg_break_top(env);
             if (tgt < 0) {
@@ -7155,7 +7579,9 @@ fn cg_lower_fn(out: *ArrayList[Instr], f: FnDecl, lbl: i32, syms: ArrayList[FnSy
     free[[]u8](&seen);
 
     let epilogue: i32 = cg_fresh(cg);
+    let pre_epilogue: i32 = cg_fresh(cg);
     let env: Env = cg_env_new(epilogue);
+    env.pre_epilogue = pre_epilogue;
 
     // ── prologue ──
     push[Instr](out, i_label(lbl));
@@ -7175,6 +7601,13 @@ fn cg_lower_fn(out: *ArrayList[Instr], f: FnDecl, lbl: i32, syms: ArrayList[FnSy
         env.sret_type = fret;
         push[Instr](out, i_store(R_RBP(), sd, R_R10()));
     }
+
+    // ── allocate the error-return flag slot for defer/errdefer ──
+    // This single word stores 1 for error returns, 0 for success returns.
+    // The pre_epilogue cleanup chain reads it to decide whether to run errdefers.
+    env.is_err_slot = cg_slot_scratch(&env);
+    push[Instr](out, i_mov_imm(R_RAX(), 0));
+    push[Instr](out, i_store(R_RBP(), env.is_err_slot, R_RAX()));
 
     // ── closure: spill hidden env ptr (rdi) + shift user params ──
     // ONLY capturing closures receive the hidden env arg: the call site picks
@@ -7267,10 +7700,45 @@ fn cg_lower_fn(out: *ArrayList[Instr], f: FnDecl, lbl: i32, syms: ArrayList[FnSy
     // produce stack corruption or nondeterministic compiler behavior.
     cg_patch_frame_size(out, frame_sub_idx, scanned_frame_size, env.frame_words);
 
+    // ── fall-through: success return → pre_epilogue ──
+    // A void/no-explicit-return function falls through here. Set is_err=0 (success)
+    // and jump to the cleanup chain. RAX holds whatever the body left (0 for void).
+    push[Instr](out, i_mov_imm(R_RAX(), 0));
+    push[Instr](out, i_store(R_RBP(), env.is_err_slot, R_RAX()));
+    push[Instr](out, i_jmp(pre_epilogue));
+
+    // ── pre_epilogue: defer/errdefer cleanup chain ──
+    // All return paths jump here. RAX holds the return value (scalar) or sret
+    // pointer (aggregate). Save it, run defers, conditionally run errdefers,
+    // restore it, then fall through to the real epilogue.
+    push[Instr](out, i_label(pre_epilogue));
+    push[Instr](out, i_push(R_RAX()));   // save return value
+    // Run all defer expressions (unconditional), in reverse registration order (LIFO).
+    let di: i32 = len[*Node](&env.defer_exprs) - 1;
+    while (di >= 0) {
+        let dexpr: *Node = get[*Node](&env.defer_exprs, di);
+        cg_lower_expr(out, dexpr, &env, syms, cg);
+        push[Instr](out, i_pop(R_RAX()));   // discard expression result
+        di = di - 1;
+    }
+    // Run errdefer expressions only if is_err_slot != 0.
+    if (len[*Node](&env.errdefer_exprs) > 0) {
+        let skip_err: i32 = cg_fresh(cg);
+        push[Instr](out, i_load(R_RAX(), R_RBP(), env.is_err_slot));
+        push[Instr](out, i_cmp_imm(R_RAX(), 0));
+        push[Instr](out, i_je(skip_err));
+        let ei: i32 = len[*Node](&env.errdefer_exprs) - 1;
+        while (ei >= 0) {
+            let eexpr: *Node = get[*Node](&env.errdefer_exprs, ei);
+            cg_lower_expr(out, eexpr, &env, syms, cg);
+            push[Instr](out, i_pop(R_RAX()));   // discard expression result
+            ei = ei - 1;
+        }
+        push[Instr](out, i_label(skip_err));
+    }
+    push[Instr](out, i_pop(R_RAX()));   // restore return value
+
     // ── epilogue ──
-    // A void/no-explicit-return function falls through here with rax = whatever;
-    // for an i32 main without a final return that's still well-defined (callers
-    // of our acceptance set always return explicitly).
     push[Instr](out, i_label(epilogue));
     push[Instr](out, i_mov_rr(R_RSP(), R_RBP()));
     push[Instr](out, i_pop(R_RBP()));
@@ -7898,12 +8366,12 @@ fn ALLOC_HANDLE_NEXT_GENERATION() i64 { return BSS_VBASE() + 156672; }
 // an allocator operation is in progress.
 fn FIXED_REGION_REGISTRY() i64 { return BSS_VBASE() + 156688; }
 fn FIXED_REGION_REGISTRY_CAP() i64 { return 128; }
-fn FIXED_REGION_STRIDE() i64 { return 72; }
-fn FIXED_REGION_NEXT_TOKEN() i64 { return BSS_VBASE() + 165904; }
-fn FIXED_BLOCK_REGISTRY() i64 { return BSS_VBASE() + 165912; }
+fn FIXED_REGION_STRIDE() i64 { return 80; }
+fn FIXED_REGION_NEXT_TOKEN() i64 { return BSS_VBASE() + 166928; }
+fn FIXED_BLOCK_REGISTRY() i64 { return BSS_VBASE() + 166936; }
 fn FIXED_BLOCK_REGISTRY_CAP() i64 { return 1024; }
 fn FIXED_BLOCK_STRIDE() i64 { return 40; }
-fn FIXED_BLOCK_NEXT_TOKEN() i64 { return BSS_VBASE() + 206872; }
+fn FIXED_BLOCK_NEXT_TOKEN() i64 { return BSS_VBASE() + 207896; }
 fn ALLOC_MAX_SMALL() i64 { return 524288; }     // 16 << 15
 fn ALLOC_ARENA() i64 { return 1048576; }        // 1 MiB arenas
 fn ALLOC_PAGE_SIZE() i64 { return 4096; }
@@ -8164,7 +8632,7 @@ fn cg_emit_fixed_region_init(out:*ArrayList[Instr],cg:*Cg)void{
     push[Instr](out,i_label(next));push[Instr](out,i_add_imm(R_RCX(),1));push[Instr](out,i_jmp(loop));
     push[Instr](out,i_label(insert));push[Instr](out,i_pop(R_R8()));push[Instr](out,i_pop(R_RCX()));push[Instr](out,i_pop(R_RDX()));push[Instr](out,i_pop(R_RSI()));push[Instr](out,i_pop(R_RDI()));
     push[Instr](out,i_mov_imm(R_R9(),FIXED_REGION_NEXT_TOKEN()));push[Instr](out,i_load(R_RAX(),R_R9(),0));push[Instr](out,i_add_imm(R_RAX(),1));let nonzero:i32=cg_fresh(cg);push[Instr](out,i_cmp_imm(R_RAX(),0));push[Instr](out,i_jne(nonzero));push[Instr](out,i_mov_imm(R_RAX(),1));push[Instr](out,i_label(nonzero));push[Instr](out,i_store(R_R9(),0,R_RAX()));
-    push[Instr](out,i_store(R_R10(),0,R_RAX()));push[Instr](out,i_store(R_R10(),8,R_RDI()));push[Instr](out,i_store(R_R10(),16,R_RSI()));push[Instr](out,i_store(R_R10(),24,R_RDX()));push[Instr](out,i_store(R_R10(),32,R_RCX()));push[Instr](out,i_store(R_R10(),40,R_R8()));push[Instr](out,i_mov_imm(R_R9(),0));push[Instr](out,i_store(R_R10(),48,R_R9()));push[Instr](out,i_mov_imm(R_R9(),1));push[Instr](out,i_store(R_R10(),56,R_R9()));push[Instr](out,i_store(R_R10(),64,R_R9()));push[Instr](out,i_jmp(done));
+    push[Instr](out,i_store(R_R10(),0,R_RAX()));push[Instr](out,i_store(R_R10(),8,R_RDI()));push[Instr](out,i_store(R_R10(),16,R_RSI()));push[Instr](out,i_store(R_R10(),24,R_RDX()));push[Instr](out,i_store(R_R10(),32,R_RCX()));push[Instr](out,i_store(R_R10(),40,R_R8()));push[Instr](out,i_mov_imm(R_R9(),0));push[Instr](out,i_store(R_R10(),48,R_R9()));push[Instr](out,i_store(R_R10(),72,R_R9()));push[Instr](out,i_mov_imm(R_R9(),1));push[Instr](out,i_store(R_R10(),56,R_R9()));push[Instr](out,i_store(R_R10(),64,R_R9()));push[Instr](out,i_jmp(done));
     push[Instr](out,i_label(duplicate));cg_emit_panic(out,"zag allocator: backing Allocation already has a live fixed-buffer region",duplicate_after,cg);
     push[Instr](out,i_label(full));push[Instr](out,i_pop(R_R8()));push[Instr](out,i_pop(R_RCX()));push[Instr](out,i_pop(R_RDX()));push[Instr](out,i_pop(R_RSI()));push[Instr](out,i_pop(R_RDI()));push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_label(done));
 }
@@ -8189,7 +8657,7 @@ fn cg_emit_fixed_block_allocate(out:*ArrayList[Instr],cg:*Cg)void{
     // later capacity comparison.
     push[Instr](out,i_load(R_RAX(),R_R10(),48));push[Instr](out,i_mov_rr(R_R9(),R_RDX()));push[Instr](out,i_sub_imm(R_R9(),1));push[Instr](out,i_add(R_RAX(),R_R9()));push[Instr](out,i_cmp_imm(R_RAX(),0));push[Instr](out,i_jl(exhausted));push[Instr](out,i_mov_rr(R_R9(),R_RDX()));push[Instr](out,i_neg(R_R9()));push[Instr](out,i_and(R_RAX(),R_R9()));push[Instr](out,i_load(R_R9(),R_R10(),16));push[Instr](out,i_cmp(R_RAX(),R_R9()));push[Instr](out,i_jg(exhausted));push[Instr](out,i_sub(R_R9(),R_RAX()));push[Instr](out,i_cmp(R_RSI(),R_R9()));push[Instr](out,i_jle(capacity));push[Instr](out,i_label(exhausted));push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_jmp(done));push[Instr](out,i_label(capacity));
     push[Instr](out,i_push(R_R10()));push[Instr](out,i_push(R_RAX()));push[Instr](out,i_mov_imm(R_RCX(),0));push[Instr](out,i_label(scan));push[Instr](out,i_cmp_imm(R_RCX(),FIXED_BLOCK_REGISTRY_CAP()));push[Instr](out,i_jge(full));push[Instr](out,i_mov_rr(R_R10(),R_RCX()));push[Instr](out,i_mov_imm(R_R9(),FIXED_BLOCK_STRIDE()));push[Instr](out,i_imul(R_R10(),R_R9()));push[Instr](out,i_add_imm(R_R10(),FIXED_BLOCK_REGISTRY()));push[Instr](out,i_load(R_R9(),R_R10(),0));push[Instr](out,i_cmp_imm(R_R9(),0));push[Instr](out,i_je(insert));push[Instr](out,i_label(next));push[Instr](out,i_add_imm(R_RCX(),1));push[Instr](out,i_jmp(scan));
-    push[Instr](out,i_label(insert));push[Instr](out,i_pop(R_RAX()));push[Instr](out,i_pop(R_RDI()));push[Instr](out,i_mov_imm(R_R9(),FIXED_BLOCK_NEXT_TOKEN()));push[Instr](out,i_load(R_R8(),R_R9(),0));push[Instr](out,i_add_imm(R_R8(),1));let nonzero:i32=cg_fresh(cg);push[Instr](out,i_cmp_imm(R_R8(),0));push[Instr](out,i_jne(nonzero));push[Instr](out,i_mov_imm(R_R8(),1));push[Instr](out,i_label(nonzero));push[Instr](out,i_store(R_R9(),0,R_R8()));push[Instr](out,i_store(R_R10(),0,R_R8()));push[Instr](out,i_load(R_R9(),R_RDI(),0));push[Instr](out,i_store(R_R10(),8,R_R9()));push[Instr](out,i_load(R_R9(),R_RDI(),56));push[Instr](out,i_store(R_R10(),16,R_R9()));push[Instr](out,i_store(R_R10(),24,R_RAX()));push[Instr](out,i_store(R_R10(),32,R_RSI()));push[Instr](out,i_mov_rr(R_R8(),R_RAX()));push[Instr](out,i_add(R_R8(),R_RSI()));push[Instr](out,i_store(R_RDI(),48,R_R8()));push[Instr](out,i_load(R_RAX(),R_R10(),0));push[Instr](out,i_jmp(done));
+    push[Instr](out,i_label(insert));push[Instr](out,i_pop(R_RAX()));push[Instr](out,i_pop(R_RDI()));push[Instr](out,i_mov_imm(R_R9(),FIXED_BLOCK_NEXT_TOKEN()));push[Instr](out,i_load(R_R8(),R_R9(),0));push[Instr](out,i_add_imm(R_R8(),1));let nonzero:i32=cg_fresh(cg);push[Instr](out,i_cmp_imm(R_R8(),0));push[Instr](out,i_jne(nonzero));push[Instr](out,i_mov_imm(R_R8(),1));push[Instr](out,i_label(nonzero));push[Instr](out,i_store(R_R9(),0,R_R8()));push[Instr](out,i_store(R_R10(),0,R_R8()));push[Instr](out,i_load(R_R9(),R_RDI(),0));push[Instr](out,i_store(R_R10(),8,R_R9()));push[Instr](out,i_load(R_R9(),R_RDI(),56));push[Instr](out,i_store(R_R10(),16,R_R9()));push[Instr](out,i_store(R_R10(),24,R_RAX()));push[Instr](out,i_store(R_R10(),32,R_RSI()));push[Instr](out,i_mov_rr(R_R8(),R_RAX()));push[Instr](out,i_add(R_R8(),R_RSI()));push[Instr](out,i_store(R_RDI(),48,R_R8()));push[Instr](out,i_load(R_R9(),R_RDI(),72));let high_water_done:i32=cg_fresh(cg);push[Instr](out,i_cmp(R_R8(),R_R9()));push[Instr](out,i_jle(high_water_done));push[Instr](out,i_store(R_RDI(),72,R_R8()));push[Instr](out,i_label(high_water_done));push[Instr](out,i_load(R_RAX(),R_R10(),0));push[Instr](out,i_jmp(done));
     push[Instr](out,i_label(full));push[Instr](out,i_pop(R_RAX()));push[Instr](out,i_pop(R_R10()));push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_label(done));
 }
 
@@ -8198,6 +8666,37 @@ fn cg_emit_fixed_block_allocate(out:*ArrayList[Instr],cg:*Cg)void{
 // stale rather than becoming aliases of a later allocation.
 fn cg_emit_fixed_region_reset(out:*ArrayList[Instr],cg:*Cg)void{
     let found:i32=cg_fresh(cg);let done:i32=cg_fresh(cg);push[Instr](out,i_push(R_RDI()));cg_emit_fixed_region_find(out,cg);push[Instr](out,i_cmp_imm(R_R8(),1));push[Instr](out,i_je(found));cg_emit_panic(out,"zag allocator: inactive fixed-buffer region",found,cg);push[Instr](out,i_label(found));push[Instr](out,i_push(R_R10()));cg_emit_fixed_block_retire_region(out,cg);push[Instr](out,i_pop(R_R10()));push[Instr](out,i_load(R_R9(),R_R10(),56));push[Instr](out,i_add_imm(R_R9(),1));let nonzero:i32=cg_fresh(cg);push[Instr](out,i_cmp_imm(R_R9(),0));push[Instr](out,i_jne(nonzero));push[Instr](out,i_mov_imm(R_R9(),1));push[Instr](out,i_label(nonzero));push[Instr](out,i_store(R_R10(),56,R_R9()));push[Instr](out,i_mov_imm(R_R9(),0));push[Instr](out,i_store(R_R10(),48,R_R9()));push[Instr](out,i_pop(R_RDI()));push[Instr](out,i_label(done));
+}
+
+// Read one scalar telemetry field from an active retained region. Metric:
+// 0=capacity, 1=used, 2=remaining, 3=lifetime high-water, 4=generation.
+// No allocation or cursor mutation occurs on this path.
+fn cg_emit_fixed_region_metric(out:*ArrayList[Instr],cg:*Cg,metric:i32)void{
+    let found:i32=cg_fresh(cg);
+    push[Instr](out,i_push(R_RDI()));cg_emit_fixed_region_find(out,cg);
+    push[Instr](out,i_cmp_imm(R_R8(),1));push[Instr](out,i_je(found));
+    cg_emit_panic(out,"zag allocator: inactive fixed-buffer region",found,cg);
+    push[Instr](out,i_pop(R_RDI()));
+    if(metric==0){push[Instr](out,i_load(R_RAX(),R_R10(),16));}
+    else if(metric==1){push[Instr](out,i_load(R_RAX(),R_R10(),48));}
+    else if(metric==2){push[Instr](out,i_load(R_RAX(),R_R10(),16));push[Instr](out,i_load(R_R9(),R_R10(),48));push[Instr](out,i_sub(R_RAX(),R_R9()));}
+    else if(metric==3){push[Instr](out,i_load(R_RAX(),R_R10(),72));}
+    else{push[Instr](out,i_load(R_RAX(),R_R10(),56));}
+}
+
+// Return a live block's exact requested length. Stale generations fail before
+// the scalar is exposed, matching byte access even though no address is formed.
+fn cg_emit_fixed_block_len(out:*ArrayList[Instr],cg:*Cg)void{
+    let have_block:i32=cg_fresh(cg);let have_region:i32=cg_fresh(cg);let generation:i32=cg_fresh(cg);
+    cg_emit_fixed_block_find(out,cg);push[Instr](out,i_cmp_imm(R_R8(),1));push[Instr](out,i_je(have_block));
+    cg_emit_panic(out,"zag allocator: unknown fixed-buffer block",have_block,cg);
+    push[Instr](out,i_push(R_R10()));push[Instr](out,i_load(R_RDI(),R_R10(),8));cg_emit_fixed_region_find(out,cg);
+    push[Instr](out,i_cmp_imm(R_R8(),1));push[Instr](out,i_je(have_region));
+    cg_emit_panic(out,"zag allocator: fixed-buffer block belongs to inactive region",have_region,cg);
+    push[Instr](out,i_pop(R_RDI()));push[Instr](out,i_load(R_R9(),R_RDI(),16));push[Instr](out,i_load(R_R8(),R_R10(),56));
+    push[Instr](out,i_cmp(R_R9(),R_R8()));push[Instr](out,i_je(generation));
+    cg_emit_panic(out,"zag allocator: stale fixed-buffer block generation",generation,cg);
+    push[Instr](out,i_load(R_RAX(),R_RDI(),32));
 }
 
 // Resolve one byte address through a FixedBufferBlock token.  Inputs: rdi
@@ -11205,3 +11704,431 @@ fn lower_program_cpu(decls0in:ArrayList[*Node],errout:*i32,dataout:*ArrayList[u8
 // exactly once before authoritative lowering.
 fn lower_program_mode_cpu_counted(decls0in:ArrayList[*Node],errout:*i32,dataout:*ArrayList[u8],dynamic_mode:i32,allow_popcnt:i32,allow_bmi1:i32,witness:*i64)ArrayList[Instr]{witness.*=witness.*+1;return lower_program_mode_cpu(decls0in,errout,dataout,dynamic_mode,allow_popcnt,allow_bmi1,0,0,0,0);}
 fn lower_program_mode_cpu_counted_safety(decls0in:ArrayList[*Node],errout:*i32,dataout:*ArrayList[u8],dynamic_mode:i32,allow_popcnt:i32,allow_bmi1:i32,safety_checked:i32,sanitize_memory:i32,witness:*i64)ArrayList[Instr]{witness.*=witness.*+1;return lower_program_mode_cpu(decls0in,errout,dataout,dynamic_mode,allow_popcnt,allow_bmi1,safety_checked,sanitize_memory,0,0);}
+
+// ── verified ZIR scalar lowering ─────────────────────────────────────────────
+// This is the first production path that consumes ZIR operations directly.
+// It accepts only conservatively checked bool/i32 functions, including SSA locals,
+// mutable stack slots, calls, returns, defined signed division/remainder,
+// if/while, break/continue, and integer switch. Anything outside that semantic
+// subset stays on the mature AST oracle.
+// Values use rbp-relative slots, so regalloc/optimizer/encoder remain shared.
+struct ZirNativeBind { name:[]u8, disp:i32 }
+struct ZirNativeFn { name:[]u8, lbl:i32, ret:[]u8, params:ArrayList[ZVal] }
+
+fn zir_native_scalar_ty(ty:[]u8)i32{
+    // Narrow and unsigned overflow/comparison semantics stay on the oracle
+    // until ZIR carries the required extension/truncation predicates.
+    if(@strEq(ty,"bool")||@strEq(ty,"i32")){return 1;}
+    return 0;
+}
+fn zir_native_ret_ty(ty:[]u8)i32{
+    // Void functions can be compiled directly if all other constraints pass.
+    if(@strEq(ty,"void")==1){return 1;}
+    return zir_native_scalar_ty(ty);
+}
+fn zir_native_fn_label(fs:ArrayList[ZirNativeFn],name:[]u8)i32{
+    let i:i32=0;while(i<fs.len){if(@strEq(fs.data[i].name,name)){return fs.data[i].lbl;}i=i+1;}return 0-1;
+}
+fn zir_native_fn_index(fs:ArrayList[ZirNativeFn],name:[]u8)i32{
+    let i:i32=0;while(i<fs.len){if(@strEq(fs.data[i].name,name)){return i;}i=i+1;}return 0-1;
+}
+fn zir_native_disp(bs:ArrayList[ZirNativeBind],name:[]u8)i32{
+    let i:i32=bs.len-1;while(i>=0){if(@strEq(bs.data[i].name,name)){return bs.data[i].disp;}i=i-1;}return 0;
+}
+fn zir_native_i32_magnitude(text:[]u8,limit:i64)i32{
+    if(text.len==0||text[0]=='+'||text[0]=='-'||(text[0]=='0'&&text.len!=1)){return 0;}
+    let value:i64=0;let i:i32=0;while(i<text.len){if(text[i]<'0'||text[i]>'9'){return 0;}
+        let digit:i64=(text[i] as i64)-48;if(value>(limit-digit)/10){return 0;}
+        value=value*10+digit;i=i+1;}return 1;
+}
+fn zir_native_i32_text(text:[]u8)i32{
+    if(text.len==0||text[0]=='+'){return 0;}if(text[0]=='-'){
+        if(text.len==1||text[1]=='0'){return 0;}
+        return zir_native_i32_magnitude(text[1..text.len],2147483648);
+    }
+    return zir_native_i32_magnitude(text,2147483647);
+}
+fn zir_native_memref_exact(ty:[]u8,elem:[]u8)i32{
+    if(ty.len!=elem.len+8||ty.len<9||!@strEq(ty[0..7],"memref<")||ty[ty.len-1]!='>'){
+        return 0;}
+    return @strEq(ty[7..ty.len-1],elem) as i32;
+}
+fn zir_native_predicate_exact(value:[]u8)i32{
+    return (@strEq(value,"eq")||@strEq(value,"ne")||@strEq(value,"slt")||
+        @strEq(value,"sle")||@strEq(value,"sgt")||@strEq(value,"sge")) as i32;
+}
+fn zir_native_block_supported(blk:ZBlock,fs:ArrayList[ZirNativeFn],ret_ty:[]u8)i32;
+fn zir_native_op_supported(o:ZOp,fs:ArrayList[ZirNativeFn],ret_ty:[]u8)i32{
+    if(@strEq(o.name,"scf.if")){
+        if(o.operands.len!=1||!@strEq(o.operands.data[0].ty,"bool")||
+           o.results.len!=0||o.regions.len<1||o.regions.len>2){return 0;}
+        let r:i32=0;while(r<o.regions.len){let region:ZRegion=o.regions.data[r];
+            if(region.blocks.len!=1||zir_native_block_supported(region.blocks.data[0],fs,ret_ty)==0){return 0;}r=r+1;}return 1;
+    }
+    if(@strEq(o.name,"scf.while")){
+        if(o.operands.len!=0||o.results.len!=0||o.regions.len!=2){return 0;}
+        let r:i32=0;while(r<2){let region:ZRegion=o.regions.data[r];
+            if(region.blocks.len!=1||zir_native_block_supported(region.blocks.data[0],fs,ret_ty)==0){return 0;}r=r+1;}return 1;
+    }
+    if(@strEq(o.name,"zag.switch")){
+        if(o.operands.len!=1||!@strEq(o.operands.data[0].ty,"i32")||
+           o.results.len!=0||o.regions.len==0){return 0;}
+        let defaults:i32=0;let r:i32=0;while(r<o.regions.len){let region:ZRegion=o.regions.data[r];
+            if(region.blocks.len!=1||region.blocks.data[0].ops.len==0||
+               zir_native_block_supported(region.blocks.data[0],fs,ret_ty)==0){return 0;}
+            let marker:ZOp=region.blocks.data[0].ops.data[0];
+            if(@strEq(marker.name,"zag.default")){defaults=defaults+1;}
+            else if(!@strEq(marker.name,"zag.case")){return 0;}r=r+1;}
+        return (defaults<=1) as i32;
+    }
+    if(o.regions.len!=0){return 0;}
+    if(@strEq(o.name,"arith.constant")){
+        if(o.results.len!=1||o.operands.len!=0||o.attrs.len!=1||
+           !@strEq(o.attrs.data[0].key,"value")){return 0;}
+        if(@strEq(o.results.data[0].ty,"bool")){
+            return (@strEq(o.attrs.data[0].val,"0")||@strEq(o.attrs.data[0].val,"1")) as i32;}
+        return (@strEq(o.results.data[0].ty,"i32")&&zir_native_i32_text(o.attrs.data[0].val)==1) as i32;
+    }
+    if(@strEq(o.name,"memref.alloca")){
+        return (o.results.len==1&&zir_native_scalar_ty(attr_val(o,"elem"))==1&&
+            zir_native_memref_exact(o.results.data[0].ty,attr_val(o,"elem"))==1) as i32;
+    }
+    if(@strEq(o.name,"memref.load")){
+        return (o.results.len==1&&o.operands.len==1&&zir_native_scalar_ty(attr_val(o,"elem"))==1&&
+            @strEq(o.results.data[0].ty,attr_val(o,"elem"))&&
+            zir_native_memref_exact(o.operands.data[0].ty,attr_val(o,"elem"))==1) as i32;
+    }
+    if(@strEq(o.name,"memref.store")){
+        return (o.results.len==0&&o.operands.len==2&&zir_native_scalar_ty(attr_val(o,"elem"))==1&&
+            @strEq(o.operands.data[0].ty,attr_val(o,"elem"))&&
+            zir_native_memref_exact(o.operands.data[1].ty,attr_val(o,"elem"))==1) as i32;
+    }
+    if(@strEq(o.name,"arith.addi")||@strEq(o.name,"arith.subi")||
+       @strEq(o.name,"arith.muli")||@strEq(o.name,"arith.divsi")||
+       @strEq(o.name,"arith.remsi")){
+        return (o.results.len==1&&o.operands.len==2&&@strEq(o.results.data[0].ty,"i32")&&
+            @strEq(o.operands.data[0].ty,"i32")&&@strEq(o.operands.data[1].ty,"i32")) as i32;
+    }
+    if(@strEq(o.name,"arith.cmpi")){
+        return (o.results.len==1&&o.operands.len==2&&@strEq(o.results.data[0].ty,"bool")&&
+            @strEq(o.operands.data[0].ty,"i32")&&@strEq(o.operands.data[1].ty,"i32")&&
+            o.attrs.len==1&&@strEq(o.attrs.data[0].key,"predicate")&&
+            zir_native_predicate_exact(o.attrs.data[0].val)==1) as i32;
+    }
+    if(@strEq(o.name,"func.call")){
+        if(o.attrs.len!=1||!@strEq(o.attrs.data[0].key,"callee")){return 0;}
+        let fi:i32=zir_native_fn_index(fs,o.attrs.data[0].val);if(fi<0){return 0;}
+        let callee:ZirNativeFn=fs.data[fi];if(o.operands.len!=callee.params.len){return 0;}
+        let p:i32=0;while(p<o.operands.len){if(!@strEq(o.operands.data[p].ty,callee.params.data[p].ty)){return 0;}p=p+1;}
+        if(@strEq(callee.ret,"void")){return (o.results.len==0) as i32;}
+        return (o.results.len==1&&@strEq(o.results.data[0].ty,callee.ret)) as i32;
+    }
+    if(@strEq(o.name,"func.return")){
+        if(@strEq(ret_ty,"void")){return (o.operands.len==0) as i32;}
+        return (o.operands.len==1&&@strEq(o.operands.data[0].ty,ret_ty)) as i32;
+    }
+    if(@strEq(o.name,"scf.condition")){return (o.operands.len==1&&
+        @strEq(o.operands.data[0].ty,"bool")&&o.results.len==0) as i32;}
+    if(@strEq(o.name,"scf.yield")){return (o.operands.len==0&&o.results.len==0) as i32;}
+    if(@strEq(o.name,"scf.break")||@strEq(o.name,"scf.continue")){
+        return (o.operands.len==0&&o.results.len==0) as i32;}
+    if(@strEq(o.name,"zag.case")){return (o.operands.len==0&&o.results.len==0&&attr_val(o,"patterns").len>0) as i32;}
+    if(@strEq(o.name,"zag.default")){return (o.operands.len==0&&o.results.len==0) as i32;}
+    return 0;
+}
+fn zir_native_block_supported(blk:ZBlock,fs:ArrayList[ZirNativeFn],ret_ty:[]u8)i32{
+    let i:i32=0;while(i<blk.ops.len){if(zir_native_op_supported(blk.ops.data[i],fs,ret_ty)==0){return 0;}i=i+1;}return 1;
+}
+fn zir_native_control_valid(blk:ZBlock,in_loop:i32)i32{
+    let i:i32=0;while(i<blk.ops.len){let o:ZOp=blk.ops.data[i];
+        if((@strEq(o.name,"scf.break")||@strEq(o.name,"scf.continue"))&&in_loop==0){return 0;}
+        let r:i32=0;while(r<o.regions.len){let nested_loop:i32=in_loop;
+            if(@strEq(o.name,"scf.while")&&r==1){nested_loop=1;}
+            if(@strEq(o.name,"scf.while")&&r==0){nested_loop=0;}
+            let reg:ZRegion=o.regions.data[r];let b:i32=0;while(b<reg.blocks.len){
+                if(zir_native_control_valid(reg.blocks.data[b],nested_loop)==0){return 0;}b=b+1;}r=r+1;}i=i+1;}
+    return 1;
+}
+fn zir_native_ast_expr(n:*Node)i32{
+    switch(n.*){
+        .ilit=>|x|{return zir_native_i32_magnitude(x.text,2147483647);}
+        .id=>|_x|{return 1;}
+        .un=>|u|{if(!@strEq(u.op,"-")){return 0;}switch(u.e.*){
+            .ilit=>|x|{return (x.text.len>0&&!@strEq(x.text,"0")&&
+                zir_native_i32_magnitude(x.text,2147483648)==1) as i32;}
+            else=>{return zir_native_ast_expr(u.e);}}
+        }
+        .bin=>|b|{let op_ok:i32=(@strEq(b.op,"+")||@strEq(b.op,"-")||
+            @strEq(b.op,"*")||@strEq(b.op,"/")||@strEq(b.op,"%")||
+            @strEq(b.op,"==")||@strEq(b.op,"!=")||
+            @strEq(b.op,"<")||@strEq(b.op,"<=")||@strEq(b.op,">")||
+            @strEq(b.op,">=")) as i32;
+            return (op_ok==1&&zir_native_ast_expr(b.l)==1&&zir_native_ast_expr(b.r)==1) as i32;}
+        .call=>|c|{switch(c.callee.*){.id=>|_id|{}else=>{return 0;}}
+            let i:i32=0;while(i<c.args.len){if(zir_native_ast_expr(c.args.data[i])==0){return 0;}i=i+1;}return 1;}
+        else=>{return 0;}
+    }
+}
+fn zir_native_int_tag(s:[]u8)i32{
+    return zir_native_i32_text(s);
+}
+fn zir_native_ast_body_mode(body:ArrayList[*Node],allow_let:i32,in_loop:i32,ret_ty:[]u8)i32{
+    let i:i32=0;while(i<body.len){switch(body.data[i].*){
+        .let_=>|l|{if(allow_let==0||l.is_global==1||l.has_init==0||l.has_dty!=1||
+            zir_native_scalar_ty(l.dty)==0||zir_native_ast_expr(l.expr)==0){return 0;}}
+        .assign=>|a|{switch(a.target.*){.id=>|_id|{}else=>{return 0;}}
+            if(zir_native_ast_expr(a.expr)==0){return 0;}}
+        .ret=>|r|{
+            if(@strEq(ret_ty,"void")==1){
+                if(r.has_expr==1){return 0;}
+            } else {
+                if(r.has_expr==0||zir_native_ast_expr(r.expr)==0){return 0;}
+            }
+        }
+        .estmt=>|e|{if(zir_native_ast_expr(e.expr)==0){return 0;}}
+        .if_=>|x|{if(x.has_cap==1||zir_native_ast_expr(x.cond)==0||
+            zir_native_ast_body_mode(x.then_body,0,in_loop,ret_ty)==0){return 0;}
+            if(x.has_els==1&&zir_native_ast_body_mode(x.els_body,0,in_loop,ret_ty)==0){return 0;}}
+        .while_=>|w|{if(w.has_cap==1||zir_native_ast_expr(w.cond)==0||
+            zir_native_ast_body_mode(w.body,0,1,ret_ty)==0){return 0;}}
+        .switch_=>|sw|{if(zir_native_ast_expr(sw.subject)==0){return 0;}let a:i32=0;
+            while(a<sw.arms.len){let arm:SwitchArm=sw.arms.data[a];if(arm.has_cap==1||arm.tags.len==0||
+                zir_native_ast_body_mode(arm.body,0,in_loop,ret_ty)==0){return 0;}let t:i32=0;
+                while(t<arm.tags.len){if(zir_native_int_tag(arm.tags.data[t])==0){return 0;}t=t+1;}a=a+1;}
+            if(sw.has_els==1&&zir_native_ast_body_mode(sw.els_body,0,in_loop,ret_ty)==0){return 0;}}
+        .break_=>|_b|{if(in_loop==0){return 0;}}
+        .continue_=>|_c|{if(in_loop==0){return 0;}}
+        else=>{return 0;}
+    }i=i+1;}return 1;
+}
+fn zir_native_ast_body(body:ArrayList[*Node],ret_ty:[]u8)i32{return zir_native_ast_body_mode(body,1,0,ret_ty);}
+// ZIR does not yet retain every numeric surface distinction (notably sat/fixed,
+// RNS, and arbitrary-width coercions). Require a second, conservative syntax
+// proof so direct selection cannot bypass their specialized AST validation.
+fn zir_native_ast_subset(decls:ArrayList[*Node])i32{
+    let i:i32=0;while(i<decls.len){switch(decls.data[i].*){
+        .fn_decl=>|f|{
+            // Captured environments are not represented by the direct ZIR ABI.
+            if(f.is_extern==1||f.caps!=0||f.cap_names.len!=0||f.tparams.len!=0||zir_native_ret_ty(f.ret)==0||
+               f.body.len==0||zir_native_ast_body(f.body,f.ret)==0){return 0;}
+            let p:i32=0;while(p<f.params.len){if(zir_native_scalar_ty(f.params.data[p].pty)==0){return 0;}p=p+1;}
+        }
+        else=>{return 0;}
+    }i=i+1;}return 1;
+}
+// A transformed authority is consumable only when the source/policy checker,
+// rather than the structural test selector, authorized exactly the bounded
+// const-i32-add rule. Raw and rejected-candidate authorities retain the normal
+// direct/fallback eligibility path.
+fn zir_native_transform_selection_supported(ir:ZirAuthority)i32{
+    if(ir.transform_count==0){return 1;}
+    if(ir.transform_count!=1||
+       !@strEq(ir.transform_status,"foreground_source_policy_checked")||
+       !@strEq(ir.transform_rule,zir_transform_rule_const_i32_add())||
+       !@strEq(ir.transform_checker,zir_transform_checker_const_i32_add())){return 0;}
+    let c:ZirTransformCertificate=ir.certificate;
+    if(c.valid!=1||c.transform_count!=1||
+       !@strEq(c.format,zir_transform_cert_format())||
+       !@strEq(c.identity_schema,zir_transform_identity_schema())||
+       !@strEq(c.rule,zir_transform_rule_const_i32_add())||
+       !@strEq(c.checker,zir_transform_checker_const_i32_add())||
+       !@strEq(c.ir_verifier,zir_ir_verifier_name())||
+       !@strEq(c.source_context,zir_transform_source_context_const_i32_add())||
+       !@strEq(c.policy_target,zir_transform_target_linux_x86_64())||
+       !@strEq(c.policy_edition,zir_transform_edition_regular())||
+       !@strEq(c.arithmetic_policy,zir_transform_arithmetic_i32_wrap())||
+       c.safety_checked!=0||c.sanitize_memory!=0||c.automatic_selection!=1||
+       zir_identity_equal(c.after,zir_semantic_identity(ir.module))==0){return 0;}
+    return 1;
+}
+fn zir_native_subset_supported(ir:ZirAuthority)i32{
+    if(ir.valid==0||ir.coverage_complete==0||ir.module.funcs.len==0||
+       zir_native_ast_subset(ir.ast_bridge)==0||
+       zir_native_transform_selection_supported(ir)==0){return 0;}
+    let fs:ArrayList[ZirNativeFn]=make[ZirNativeFn](ir.module.funcs.len+1);
+    let i:i32=0;let have_main:i32=0;
+    while(i<ir.module.funcs.len){let f:ZFunc=ir.module.funcs.data[i];
+        if(@strEq(f.name,"main")){have_main=1;if(f.params.len!=0||zir_native_scalar_ty(f.ret)==0){free[ZirNativeFn](&fs);return 0;}}
+        // Panic (bit 1 / value 2) is admitted only because the AST and ZIR
+        // operation whitelists below restrict this route to defined / and %.
+        // Allocation, I/O, locking, async, and every other effect stay fallback.
+        if((f.effects!=0&&f.effects!=2)||f.params.len>6||zir_native_ret_ty(f.ret)==0){free[ZirNativeFn](&fs);return 0;}
+        let p:i32=0;while(p<f.params.len){if(zir_native_scalar_ty(f.params.data[p].ty)==0){free[ZirNativeFn](&fs);return 0;}p=p+1;}
+        push[ZirNativeFn](&fs,ZirNativeFn{.name=f.name,.lbl=i+1,.ret=f.ret,.params=f.params});i=i+1;
+    }
+    if(have_main==0){free[ZirNativeFn](&fs);return 0;}
+    i=0;while(i<ir.module.funcs.len){if(zir_native_block_supported(ir.module.funcs.data[i].body,fs,
+        ir.module.funcs.data[i].ret)==0||
+        zir_native_control_valid(ir.module.funcs.data[i].body,0)==0){
+        free[ZirNativeFn](&fs);return 0;}i=i+1;
+    }
+    free[ZirNativeFn](&fs);return 1;
+}
+fn zir_native_pred_cc(pred:[]u8)i32{
+    if(@strEq(pred,"eq")){return CC_E();}if(@strEq(pred,"ne")){return CC_NE();}
+    if(@strEq(pred,"slt")){return CC_L();}if(@strEq(pred,"sle")){return CC_LE();}
+    if(@strEq(pred,"sgt")){return CC_G();}return CC_GE();
+}
+fn zir_native_collect_block_slots(blk:ZBlock,bs:*ArrayList[ZirNativeBind],words:*i32)void{
+    let i:i32=0;while(i<blk.ops.len){let o:ZOp=blk.ops.data[i];let r:i32=0;
+        while(r<o.results.len){words.*=words.*+1;push[ZirNativeBind](bs,
+            ZirNativeBind{.name=o.results.data[r].name,.disp=0-8*words.*});r=r+1;}
+        let ri:i32=0;while(ri<o.regions.len){let region:ZRegion=o.regions.data[ri];let bi:i32=0;
+            while(bi<region.blocks.len){zir_native_collect_block_slots(region.blocks.data[bi],bs,words);bi=bi+1;}ri=ri+1;}i=i+1;}
+}
+fn zir_native_block_has_div(blk:ZBlock)i32{
+    let i:i32=0;while(i<blk.ops.len){let o:ZOp=blk.ops.data[i];
+        if(@strEq(o.name,"arith.divsi")||@strEq(o.name,"arith.remsi")){return 1;}
+        let r:i32=0;while(r<o.regions.len){let region:ZRegion=o.regions.data[r];let b:i32=0;
+            while(b<region.blocks.len){if(zir_native_block_has_div(region.blocks.data[b])==1){return 1;}b=b+1;}r=r+1;}i=i+1;}
+    return 0;
+}
+fn zir_native_intern_div0(data:*ArrayList[u8])i32{
+    let msg:[]u8="panic: division by zero";let off:i32=data.*.len;let i:i32=0;
+    while(i<msg.len){push[u8](data,msg[i]);i=i+1;}push[u8](data,'\n');return off;
+}
+fn zir_native_emit_div0(out:*ArrayList[Instr],lbl:i32,off:i32)void{
+    push[Instr](out,i_label(lbl));push[Instr](out,i_mov_imm(R_RAX(),1));
+    push[Instr](out,i_mov_imm(R_RDI(),2));push[Instr](out,i_mov_imm(R_RSI(),DATA_VBASE()+(off as i64)));
+    push[Instr](out,i_mov_imm(R_RDX(),24));push[Instr](out,i_syscall());
+    push[Instr](out,i_mov_imm(R_RAX(),60));push[Instr](out,i_mov_imm(R_RDI(),134));
+    push[Instr](out,i_syscall());push[Instr](out,i_ret());
+}
+fn zir_native_emit_block(out:*ArrayList[Instr],blk:ZBlock,bs:ArrayList[ZirNativeBind],
+    fs:ArrayList[ZirNativeFn],epilogue:i32,loop_head:i32,loop_done:i32,
+    div0_lbl:i32,next:*i32)void{
+    let i:i32=0;while(i<blk.ops.len){let o:ZOp=blk.ops.data[i];
+        if(@strEq(o.name,"scf.if")){
+            let else_lbl:i32=next.*;next.*=next.*+1;let done_lbl:i32=next.*;next.*=next.*+1;
+            push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(bs,o.operands.data[0].name)));
+            push[Instr](out,i_cmp_imm(R_RAX(),0));push[Instr](out,i_je(else_lbl));
+            zir_native_emit_block(out,o.regions.data[0].blocks.data[0],bs,fs,epilogue,loop_head,loop_done,div0_lbl,next);
+            push[Instr](out,i_jmp(done_lbl));push[Instr](out,i_label(else_lbl));
+            if(o.regions.len==2){zir_native_emit_block(out,o.regions.data[1].blocks.data[0],bs,fs,epilogue,loop_head,loop_done,div0_lbl,next);}
+            push[Instr](out,i_label(done_lbl));
+        }else if(@strEq(o.name,"scf.while")){
+            let head:i32=next.*;next.*=next.*+1;let done:i32=next.*;next.*=next.*+1;
+            push[Instr](out,i_label(head));zir_native_emit_block(out,
+                o.regions.data[0].blocks.data[0],bs,fs,epilogue,head,done,div0_lbl,next);
+            zir_native_emit_block(out,o.regions.data[1].blocks.data[0],bs,fs,epilogue,head,done,div0_lbl,next);
+            push[Instr](out,i_jmp(head));push[Instr](out,i_label(done));
+        }else if(@strEq(o.name,"zag.switch")){
+            let done:i32=next.*;next.*=next.*+1;let labels:ArrayList[i32]=make[i32](o.regions.len+1);
+            let default_lbl:i32=done;let r:i32=0;while(r<o.regions.len){let lbl:i32=next.*;next.*=next.*+1;
+                push[i32](&labels,lbl);let marker:ZOp=o.regions.data[r].blocks.data[0].ops.data[0];
+                if(@strEq(marker.name,"zag.default")){default_lbl=lbl;}else{let tags:ArrayList[[]u8]=split_args(attr_val(marker,"patterns"));
+                    let t:i32=0;while(t<tags.len){push[Instr](out,i_load(R_RAX(),R_RBP(),
+                        zir_native_disp(bs,o.operands.data[0].name)));push[Instr](out,i_cmp_imm(R_RAX(),cg_parse_i64(tags.data[t])));
+                        push[Instr](out,i_je(lbl));t=t+1;}free[[]u8](&tags);}r=r+1;}
+            push[Instr](out,i_jmp(default_lbl));r=0;while(r<o.regions.len){push[Instr](out,i_label(labels.data[r]));
+                zir_native_emit_block(out,o.regions.data[r].blocks.data[0],bs,fs,epilogue,loop_head,loop_done,div0_lbl,next);
+                push[Instr](out,i_jmp(done));r=r+1;}push[Instr](out,i_label(done));free[i32](&labels);
+        }else if(@strEq(o.name,"arith.constant")){
+            push[Instr](out,i_mov_imm(R_RAX(),cg_parse_i64(attr_val(o,"value"))));
+            push[Instr](out,i_store(R_RBP(),zir_native_disp(bs,o.results.data[0].name),R_RAX()));
+        }else if(@strEq(o.name,"arith.addi")||@strEq(o.name,"arith.subi")||
+                 @strEq(o.name,"arith.muli")||@strEq(o.name,"arith.divsi")||
+                 @strEq(o.name,"arith.remsi")||@strEq(o.name,"arith.cmpi")){
+            push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(bs,o.operands.data[0].name)));
+            push[Instr](out,i_load(R_RCX(),R_RBP(),zir_native_disp(bs,o.operands.data[1].name)));
+            if(@strEq(o.name,"arith.addi")){push[Instr](out,i_add(R_RAX(),R_RCX()));}
+            else if(@strEq(o.name,"arith.subi")){push[Instr](out,i_sub(R_RAX(),R_RCX()));}
+            else if(@strEq(o.name,"arith.muli")){push[Instr](out,i_imul(R_RAX(),R_RCX()));}
+            else if(@strEq(o.name,"arith.divsi")||@strEq(o.name,"arith.remsi")){
+                let nonzero:i32=next.*;next.*=next.*+1;let normal:i32=next.*;next.*=next.*+1;
+                let done:i32=next.*;next.*=next.*+1;push[Instr](out,i_cmp_imm(R_RCX(),0));
+                push[Instr](out,i_jne(nonzero));push[Instr](out,i_call(div0_lbl));push[Instr](out,i_label(nonzero));
+                push[Instr](out,i_cmp_imm(R_RCX(),0-1));push[Instr](out,i_jne(normal));
+                if(@strEq(o.name,"arith.divsi")){push[Instr](out,i_neg(R_RAX()));}
+                else{push[Instr](out,i_mov_imm(R_RAX(),0));}
+                push[Instr](out,i_jmp(done));push[Instr](out,i_label(normal));push[Instr](out,i_idiv(R_RCX()));
+                if(@strEq(o.name,"arith.remsi")){push[Instr](out,i_mov_rr(R_RAX(),R_RDX()));}
+                push[Instr](out,i_label(done));
+            }
+            else{push[Instr](out,i_cmp(R_RAX(),R_RCX()));push[Instr](out,i_setcc(R_RAX(),zir_native_pred_cc(attr_val(o,"predicate"))));}
+            if(!@strEq(o.name,"arith.cmpi")){cg_emit_norm_scalar_for_ty(out,o.results.data[0].ty,R_RAX());}
+            push[Instr](out,i_store(R_RBP(),zir_native_disp(bs,o.results.data[0].name),R_RAX()));
+        }else if(@strEq(o.name,"func.call")){
+            let a:i32=0;while(a<o.operands.len){push[Instr](out,i_load(arg_reg(a),R_RBP(),zir_native_disp(bs,o.operands.data[a].name)));a=a+1;}
+            push[Instr](out,i_call(zir_native_fn_label(fs,attr_val(o,"callee"))));
+            if(o.results.len==1){push[Instr](out,i_store(R_RBP(),zir_native_disp(bs,o.results.data[0].name),R_RAX()));}
+        }else if(@strEq(o.name,"func.return")){
+            if(o.operands.len==1){push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(bs,o.operands.data[0].name)));}
+            else{push[Instr](out,i_mov_imm(R_RAX(),0));}push[Instr](out,i_jmp(epilogue));
+        }else if(@strEq(o.name,"memref.alloca")){
+            push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,
+                i_store(R_RBP(),zir_native_disp(bs,o.results.data[0].name),R_RAX()));
+        }else if(@strEq(o.name,"memref.load")){
+            push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(bs,o.operands.data[0].name)));
+            push[Instr](out,i_store(R_RBP(),zir_native_disp(bs,o.results.data[0].name),R_RAX()));
+        }else if(@strEq(o.name,"memref.store")){
+            push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(bs,o.operands.data[0].name)));
+            push[Instr](out,i_store(R_RBP(),zir_native_disp(bs,o.operands.data[1].name),R_RAX()));
+        }else if(@strEq(o.name,"scf.condition")){
+            push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(bs,o.operands.data[0].name)));
+            push[Instr](out,i_cmp_imm(R_RAX(),0));push[Instr](out,i_je(loop_done));
+        }else if(@strEq(o.name,"scf.yield")){
+        }else if(@strEq(o.name,"scf.break")){
+            push[Instr](out,i_jmp(loop_done));
+        }else if(@strEq(o.name,"scf.continue")){
+            push[Instr](out,i_jmp(loop_head));
+        }else if(@strEq(o.name,"zag.case")||@strEq(o.name,"zag.default")){
+        }i=i+1;
+    }
+}
+fn zir_native_emit_fn(out:*ArrayList[Instr],f:ZFunc,lbl:i32,fs:ArrayList[ZirNativeFn],div0_lbl:i32,next:*i32)void{
+    let bs:ArrayList[ZirNativeBind]=make[ZirNativeBind](f.body.ops.len+f.params.len+1);
+    let words:i32=0;let p:i32=0;while(p<f.params.len){words=words+1;
+        push[ZirNativeBind](&bs,ZirNativeBind{.name=f.params.data[p].name,.disp=0-8*words});p=p+1;}
+    zir_native_collect_block_slots(f.body,&bs,&words);let frame:i32=cg_align16(8*words);
+    let epilogue:i32=next.*;next.*=next.*+1;
+    push[Instr](out,i_label(lbl));push[Instr](out,i_push(R_RBP()));
+    push[Instr](out,i_mov_rr(R_RBP(),R_RSP()));push[Instr](out,i_sub_imm(R_RSP(),frame as i64));
+    p=0;while(p<f.params.len){push[Instr](out,i_store(R_RBP(),zir_native_disp(bs,f.params.data[p].name),arg_reg(p)));p=p+1;}
+    zir_native_emit_block(out,f.body,bs,fs,epilogue,0-1,0-1,div0_lbl,next);push[Instr](out,i_mov_imm(R_RAX(),0));
+    push[Instr](out,i_label(epilogue));
+    push[Instr](out,i_mov_rr(R_RSP(),R_RBP()));push[Instr](out,i_pop(R_RBP()));push[Instr](out,i_ret());
+    free[ZirNativeBind](&bs);
+}
+fn lower_zir_scalar_program(ir:ZirAuthority,dataout:*ArrayList[u8],route:*i32)ArrayList[Instr]{
+    let out:ArrayList[Instr]=make[Instr](128);let fs:ArrayList[ZirNativeFn]=make[ZirNativeFn](ir.module.funcs.len+1);
+    let i:i32=0;while(i<ir.module.funcs.len){let f:ZFunc=ir.module.funcs.data[i];
+        push[ZirNativeFn](&fs,ZirNativeFn{.name=f.name,.lbl=i+1,.ret=f.ret,.params=f.params});i=i+1;}
+    let main_lbl:i32=zir_native_fn_label(fs,"main");push[Instr](&out,i_mov_rr(15,R_RSP()));
+    push[Instr](&out,i_call(main_lbl));push[Instr](&out,i_mov_rr(R_RDI(),R_RAX()));
+    push[Instr](&out,i_mov_imm(R_RAX(),60));push[Instr](&out,i_syscall());
+    let next:i32=ir.module.funcs.len+1;let need_div0:i32=0;i=0;
+    while(i<ir.module.funcs.len){if(zir_native_block_has_div(ir.module.funcs.data[i].body)==1){need_div0=1;}i=i+1;}
+    let div0_lbl:i32=0-1;let div0_off:i32=0;if(need_div0==1){div0_lbl=next;next=next+1;div0_off=zir_native_intern_div0(dataout);}
+    i=0;while(i<ir.module.funcs.len){zir_native_emit_fn(&out,ir.module.funcs.data[i],i+1,fs,div0_lbl,&next);i=i+1;}
+    if(need_div0==1){zir_native_emit_div0(&out,div0_lbl,div0_off);}
+    free[ZirNativeFn](&fs);route.*=1;return out;
+}
+
+// Production entry: foreground compilation must construct and verify Zag IR
+// before x86 lowering. The AST bridge remains explicit while the module's
+// `coverage_complete` flag or backend subset check is false; direct AST entry
+// points above are retained as migration/differential oracles and tests.
+// route: 1 = direct ZIR scalar backend, 0 = checked AST oracle/fallback.
+fn lower_zir_program_mode_cpu_with_route(ir:ZirAuthority,errout:*i32,dataout:*ArrayList[u8],
+    dynamic_mode:i32,allow_popcnt:i32,allow_bmi1:i32,safety_checked:i32,
+    sanitize_memory:i32,v2_edition:i32,object_mode:i32,route:*i32)ArrayList[Instr]{
+    route.*=0;
+    if(ir.valid==0){errout.*=errout.*+1;
+        _zag_eprintln("native: verified Zag IR authority is invalid; lowering refused");
+        return make[Instr](1);
+    }
+    if(dynamic_mode==0&&safety_checked==0&&sanitize_memory==0&&v2_edition==0&&
+       object_mode==0&&zir_native_subset_supported(ir)==1){
+        return lower_zir_scalar_program(ir,dataout,route);
+    }
+    return lower_program_mode_cpu(ir.ast_bridge,errout,dataout,dynamic_mode,
+        allow_popcnt,allow_bmi1,safety_checked,sanitize_memory,v2_edition,object_mode);
+}
+fn lower_zir_program_mode_cpu(ir:ZirAuthority,errout:*i32,dataout:*ArrayList[u8],
+    dynamic_mode:i32,allow_popcnt:i32,allow_bmi1:i32,safety_checked:i32,
+    sanitize_memory:i32,v2_edition:i32,object_mode:i32)ArrayList[Instr]{
+    let route:i32=0;return lower_zir_program_mode_cpu_with_route(ir,errout,dataout,
+        dynamic_mode,allow_popcnt,allow_bmi1,safety_checked,sanitize_memory,
+        v2_edition,object_mode,&route);
+}

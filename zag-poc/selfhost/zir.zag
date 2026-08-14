@@ -5,68 +5,99 @@
 // attributes, and nested Regions/Blocks — as Zag's own in-memory middle-end.
 // There is NO dependency on libMLIR/LLVM: ~one file of Zag.
 //
-//   AST  ──build──▶  ZIR  ──verify/fold (passes)──▶  print
-//                                                      ├─ MLIR text (interop)
-//                                                      └─ C       (CPU backend)
+//   AST  ──build──▶  raw ZIR  ──verify──▶  print/lower
+//                                             ├─ MLIR text (interop)
+//                                             └─ native/C backends
 //
-// The same IR feeds two backends, and optimization passes (constant folding)
-// and the SSA verifier run once, on structured IR, instead of being re-derived
-// per backend. MLIR text becomes one *output* of ZIR, not a dependency.
+// Production verifies and selects raw structured IR. One deliberately narrow
+// rule (`const-i32-add-v1`) has a separately coded producer/checker test
+// contract, but automatic selection is disabled until contextual typed evidence
+// and arithmetic policy are independently bound. The older general constant
+// folder remains experimental and excluded. MLIR text is one *output* of ZIR,
+// not a dependency.
 //
-// Scope of this core: scalar integer/float arithmetic, comparisons, mutable
-// locals (memref.alloca + load/store), `if`, calls, and return — enough to
-// lower real recursive functions end-to-end (AST→ZIR→C→cc→run). `while` and
-// the aggregate/GPU dialects are the documented next increments.
+// Current representational coverage includes scalar arithmetic, comparisons, mutable
+// locals, calls, returns, structured if/while/switch/defer regions, strings,
+// embeds, casts, struct values, fields, indexes, and slices. Unknown types,
+// unbound contextual types, captures, mutation targets, and backend-only
+// operations remain fail-closed.
 
 @import("parse.zag")   // AST (Node/...) + ArrayList + string helpers
-
-// ── IR data structures (MLIR-shaped: Op / Region / Block / Value) ────────────
-struct ZVal  { name: []u8, ty: []u8 }            // an SSA value:  %name : ty
-struct ZAttr { key: []u8, val: []u8 }            // a named attribute
-struct ZOp {
-    name:     []u8,                  // "arith.addi", "scf.if", "func.return", ...
-    results:  ArrayList[ZVal],
-    operands: ArrayList[ZVal],
-    attrs:    ArrayList[ZAttr],
-    regions:  ArrayList[ZRegion],
-}
-struct ZBlock  { ops: ArrayList[ZOp] }
-struct ZRegion { blocks: ArrayList[ZBlock] }
-struct ZFunc   { name: []u8, params: ArrayList[ZVal], ret: []u8, body: ZBlock }
-struct ZModule { funcs: ArrayList[ZFunc] }
+@import("sema.zag")    // authoritative effect fixpoint used by ZIR contracts
+@import("../std/map.zag") as map
+@import("zir_contract.zag") // shared IR schema, identity, and certificate types
 
 // ── builder ──────────────────────────────────────────────────────────────────
-struct ZB { ctr: i32 }
+struct ZB { ctr: i32, origin: ZOrigin, effects: i32, coverage_errors: i32,
+    current_ret:[]u8, expected_type:[]u8, origins:ArrayList[NodeOrigin] }
+
+fn zir_function_origin(f:FnDecl) ZOrigin {
+    return ZOrigin{ .module=f.origin, .line=f.line, .byte_start=0,
+        .byte_end=0, .stable_id=0, .complete=0,.exact=0 };
+}
+
+fn zir_node_origin(origins:ArrayList[NodeOrigin],n:*Node)ZOrigin{
+    let o:NodeOrigin=node_origin_find(origins,n);if(o.stable_id==0){return zir_unknown_origin();}
+    return ZOrigin{.module=o.module,.line=o.line,.byte_start=o.byte_start,
+        .byte_end=o.byte_end,.stable_id=o.stable_id,.complete=1,.exact=o.exact};
+}
+
+fn zir_value(name:[]u8,ty:[]u8,ownership:[]u8,alias_region:[]u8,
+    lifetime:[]u8,layout:[]u8,origin:ZOrigin) ZVal {
+    return ZVal{ .name=name, .ty=ty, .ownership=ownership,
+        .alias_region=alias_region, .lifetime=lifetime, .layout=layout,
+        .origin=origin };
+}
 
 fn zfresh(b: *ZB, ty: []u8) ZVal {
     b.*.ctr = b.*.ctr + 1;
-    return ZVal{ .name = _zag_str_concat("%v", _zag_i64_to_str(b.*.ctr as i64)), .ty = ty };
+    return zir_value(_zag_str_concat("%v", _zag_i64_to_str(b.*.ctr as i64)),
+        ty,"ssa","none","function","target-default",b.*.origin);
 }
 
 fn mk_op(name: []u8) ZOp {
     return ZOp{ .name = name, .results = make[ZVal](1), .operands = make[ZVal](2),
-                .attrs = make[ZAttr](1), .regions = make[ZRegion](1) };
+                .attrs = make[ZAttr](1), .regions = make[ZRegion](1),
+                .effects=0, .reads="none", .writes="none",
+                .origin=zir_unknown_origin() };
+}
+fn mk_op_at(b:*ZB,name:[]u8) ZOp {
+    let o:ZOp=mk_op(name);o.origin=b.*.origin;o.effects=b.*.effects;return o;
 }
 fn one_block() ZBlock { return ZBlock{ .ops = make[ZOp](8) }; }
 fn region_of(blk: ZBlock) ZRegion { let r: ZRegion = ZRegion{ .blocks = make[ZBlock](1) }; push[ZBlock](&r.blocks, blk); return r; }
 
 // ── locals environment (name → value or alloca slot) ─────────────────────────
-struct ZBind { name: []u8, val: ZVal, is_alloca: i32 }
+struct ZBind { name: []u8, val: ZVal, is_alloca: i32, initialized: i32 }
 
 fn env_find(env: ArrayList[ZBind], name: []u8) ZBind {
     let i: i32 = len[ZBind](env) - 1;
     while (i >= 0) {
         let b: ZBind = get[ZBind](env, i);
-        if (@strEq(b.name, name)) { return b; }
+        // Mutable-local stack slots are reserved at function entry but are not
+        // source-visible until their declaration initializer has completed.
+        if (b.initialized == 1 && @strEq(b.name, name)) { return b; }
         i = i - 1;
     }
-    return ZBind{ .name = "", .val = ZVal{ .name = "%undef", .ty = "i32" }, .is_alloca = 0 };
+    return ZBind{ .name = "", .val = zir_value("%undef","i32","unknown",
+        "unknown","unknown","unknown",zir_unknown_origin()), .is_alloca = 0,
+        .initialized = 0 };
+}
+
+fn env_pending_index(env: ArrayList[ZBind], name: []u8) i32 {
+    // Preallocation follows declaration order, so the first still-pending
+    // matching entry is the exact declaration currently being lowered.
+    let i:i32=0;while(i<env.len){let b:ZBind=env.data[i];
+        if(b.initialized==0&&b.is_alloca==1&&@strEq(b.name,name)){return i;}
+        i=i+1;
+    }
+    return 0-1;
 }
 
 // ── op constructors (emit into a block's op list, return the result value) ───
 fn op_const(b: *ZB, blk: *ZBlock, text: []u8, ty: []u8) ZVal {
     let r: ZVal = zfresh(b, ty);
-    let o: ZOp = mk_op("arith.constant");
+    let o: ZOp = mk_op_at(b,"arith.constant");
     push[ZVal](&o.results, r);
     push[ZAttr](&o.attrs, ZAttr{ .key = "value", .val = text });
     push[ZOp](&blk.*.ops, o);
@@ -106,12 +137,26 @@ fn zir_is_float_ty(t: []u8) i32 {
     return 0;
 }
 
+fn zir_literal_context_type(t: []u8) i32 {
+    if (@strEq(t, "i8") || @strEq(t, "u8") || @strEq(t, "i16") ||
+        @strEq(t, "u16") || @strEq(t, "i32") || @strEq(t, "u32") ||
+        @strEq(t, "i64") || @strEq(t, "u64") || @strEq(t, "isize") ||
+        @strEq(t, "usize") || @strEq(t, "f32") || @strEq(t, "f64")) {
+        return 1;
+    }
+    return 0;
+}
+
 fn op_bin(b: *ZB, blk: *ZBlock, op: []u8, l: ZVal, r: ZVal) ZVal {
+    // Literal widening and other contextual coercions are not yet materialized
+    // in ZIR. Preserve the structural expression, but make the module ineligible
+    // for semantic authority when its operand types do not already agree.
+    if (!@strEq(l.ty, r.ty)) { b.*.coverage_errors=b.*.coverage_errors+1; }
     if (is_cmp(op) == 1) {
         let res: ZVal = zfresh(b, "bool");
         let cn: []u8 = "arith.cmpi";
         if (zir_is_float_ty(l.ty) == 1) { cn = "arith.cmpf"; }
-        let o: ZOp = mk_op(cn);
+        let o: ZOp = mk_op_at(b,cn);
         push[ZVal](&o.results, res);
         push[ZVal](&o.operands, l);
         push[ZVal](&o.operands, r);
@@ -122,7 +167,7 @@ fn op_bin(b: *ZB, blk: *ZBlock, op: []u8, l: ZVal, r: ZVal) ZVal {
     let res: ZVal = zfresh(b, l.ty);
     let nm: []u8 = int_arith_name(op);
     if (zir_is_float_ty(l.ty) == 1) { nm = float_arith_name(op); }
-    let o: ZOp = mk_op(nm);
+    let o: ZOp = mk_op_at(b,nm);
     push[ZVal](&o.results, res);
     push[ZVal](&o.operands, l);
     push[ZVal](&o.operands, r);
@@ -132,15 +177,17 @@ fn op_bin(b: *ZB, blk: *ZBlock, op: []u8, l: ZVal, r: ZVal) ZVal {
 
 fn op_alloca(b: *ZB, blk: *ZBlock, ty: []u8) ZVal {
     let slot: ZVal = zfresh(b, _zag_str_concat(_zag_str_concat("memref<", ty), ">"));
-    let o: ZOp = mk_op("memref.alloca");
-    push[ZVal](&o.results, slot);
+    let o: ZOp = mk_op_at(b,"memref.alloca");o.writes="stack";
+    let owned:ZVal=zir_value(slot.name,slot.ty,"owned","stack","function",
+        "target-default",slot.origin);push[ZVal](&o.results,owned);
+    // `owned` replaces the generic SSA ownership assigned by zfresh.
     push[ZAttr](&o.attrs, ZAttr{ .key = "elem", .val = ty });
     push[ZOp](&blk.*.ops, o);
-    return slot;
+    return owned;
 }
 fn op_load(b: *ZB, blk: *ZBlock, slot: ZVal, ty: []u8) ZVal {
     let r: ZVal = zfresh(b, ty);
-    let o: ZOp = mk_op("memref.load");
+    let o: ZOp = mk_op_at(b,"memref.load");o.reads=slot.alias_region;
     push[ZVal](&o.results, r);
     push[ZVal](&o.operands, slot);
     push[ZAttr](&o.attrs, ZAttr{ .key = "elem", .val = ty });
@@ -148,7 +195,7 @@ fn op_load(b: *ZB, blk: *ZBlock, slot: ZVal, ty: []u8) ZVal {
     return r;
 }
 fn op_store(b: *ZB, blk: *ZBlock, v: ZVal, slot: ZVal, ty: []u8) void {
-    let o: ZOp = mk_op("memref.store");
+    let o: ZOp = mk_op_at(b,"memref.store");o.writes=slot.alias_region;
     push[ZVal](&o.operands, v);
     push[ZVal](&o.operands, slot);
     push[ZAttr](&o.attrs, ZAttr{ .key = "elem", .val = ty });
@@ -188,37 +235,126 @@ fn assigned_in(body: ArrayList[*Node], name: []u8) i32 {
     return 0;
 }
 
+fn zir_struct_field_type(dl:ArrayList[*Node],ty:[]u8,name:[]u8)[]u8{
+    if(@strEq(name,"len")&&ty.len>=2&&ty[0]=='['){return "i64";}
+    let base:[]u8=ty;if(base.len>0&&base[0]=='*'){base=base[1..base.len];}
+    let i:i32=0;while(i<dl.len){switch(dl.data[i].*){.struct_=>|s|{if(@strEq(s.name,base)){
+        let fi:i32=0;while(fi<s.fields.len){let field:Param=s.fields.data[fi];if(@strEq(field.name,name)){return field.pty;}fi=fi+1;}}}else=>{}}i=i+1;}
+    return "";
+}
+
+fn zir_index_type(ty:[]u8)[]u8{
+    if(ty.len>=3&&ty[0]=='['&&ty[1]==']'){return ty[2..ty.len];}
+    if(ty.len>=2&&ty[0]=='*'){return ty[1..ty.len];}
+    if(ty.len>=3&&ty[0]=='['){let i:i32=1;while(i<ty.len&&ty[i]!=']'){i=i+1;}
+        if(i+1<ty.len){return ty[i+1..ty.len];}}
+    return "";
+}
+
+fn zir_value_op(b:*ZB,blk:*ZBlock,name:[]u8,operands:ArrayList[ZVal],ty:[]u8)ZVal{
+    let o:ZOp=mk_op_at(b,name);let i:i32=0;while(i<operands.len){push[ZVal](&o.operands,operands.data[i]);i=i+1;}
+    let r:ZVal=zfresh(b,ty);push[ZVal](&o.results,r);push[ZOp](&blk.*.ops,o);return r;
+}
+
 fn lower_expr(b: *ZB, blk: *ZBlock, n: *Node, env: *ArrayList[ZBind], dl: ArrayList[*Node]) ZVal {
+    let own:ZOrigin=zir_node_origin(b.*.origins,n);b.*.origin=own;
     switch (n.*) {
         .ilit => |x| {
             let ty: []u8 = "i32";
-            if (has_dot(x.text) == 1) { ty = "f32"; }
-            return op_const(b, blk, x.text, ty);
+            if (b.*.expected_type.len > 0 &&
+                zir_literal_context_type(b.*.expected_type) == 1) {
+                ty = b.*.expected_type;
+            } else if (has_dot(x.text) == 1) { ty = "f32"; }
+            b.*.origin=own;return op_const(b, blk, x.text, ty);
+        }
+        .slit => |x| {
+            let args:ArrayList[ZVal]=make[ZVal](1);b.*.origin=own;
+            let r:ZVal=zir_value_op(b,blk,"zag.string.constant",args,"[]u8");
+            let oi:i32=blk.*.ops.len-1;push[ZAttr](&blk.*.ops.data[oi].attrs,
+                ZAttr{.key="value",.val=x.text});return r;
+        }
+        .embed => |x| {
+            let args:ArrayList[ZVal]=make[ZVal](1);b.*.origin=own;
+            let r:ZVal=zir_value_op(b,blk,"zag.embed.constant",args,"[]u8");
+            let oi:i32=blk.*.ops.len-1;push[ZAttr](&blk.*.ops.data[oi].attrs,
+                ZAttr{.key="path",.val=x.path});return r;
         }
         .id => |x| {
+            if(@strEq(x.name,"true")){b.*.origin=own;return op_const(b,blk,"1","bool");}
+            if(@strEq(x.name,"false")){b.*.origin=own;return op_const(b,blk,"0","bool");}
+            if(@strEq(x.name,"null")){let args:ArrayList[ZVal]=make[ZVal](1);b.*.origin=own;
+                return zir_value_op(b,blk,"zag.null",args,"*opaque");}
             let bd: ZBind = env_find(env.*, x.name);
+            if (@strEq(bd.val.name,"%undef")) {
+                // Function/global/field resolution is outside the current SSA
+                // subset. Mark coverage incomplete and use a defined opaque
+                // placeholder so the verifier checks real SSA structure rather
+                // than reporting a fabricated def-before-use failure.
+                b.*.coverage_errors=b.*.coverage_errors+1;
+                b.*.origin=own;return op_const(b,blk,"0","i32");
+            }
             if (bd.is_alloca == 1) {
-                return op_load(b, blk, bd.val, memref_elem(bd.val.ty));
+                b.*.origin=own;return op_load(b, blk, bd.val, memref_elem(bd.val.ty));
             }
             return bd.val;
         }
         .bin => |bb| {
+            // Once the left operand has a concrete source type, literals and
+            // other context-sensitive right operands must be lowered in that
+            // same type.  This is especially important for `wide > 0` and
+            // mixed-width arithmetic: preserving only the outer let/return
+            // context still leaves the comparison's literal as i32.
+            let previous:[]u8=b.*.expected_type;
             let l: ZVal = lower_expr(b, blk, bb.l, env, dl);
+            b.*.expected_type=l.ty;
             let r: ZVal = lower_expr(b, blk, bb.r, env, dl);
-            return op_bin(b, blk, bb.op, l, r);
+            b.*.expected_type=previous;
+            b.*.origin=own;return op_bin(b, blk, bb.op, l, r);
         }
         .un => |u| {
             let v: ZVal = lower_expr(b, blk, u.e, env, dl);
             if (@strEq(u.op, "-")) {
                 let z: ZVal = op_const(b, blk, "0", v.ty);
-                return op_bin(b, blk, "-", z, v);
+                b.*.origin=own;return op_bin(b, blk, "-", z, v);
             }
             return v;
         }
-        .call => |c| { return lower_call(b, blk, c, env, dl); }
+        .call => |c| { return lower_call(b, blk, c, env, dl,own); }
+        .cast_ => |c| {
+            let v:ZVal=lower_expr(b,blk,c.expr,env,dl);let args:ArrayList[ZVal]=make[ZVal](1);
+            push[ZVal](&args,v);b.*.origin=own;return zir_value_op(b,blk,"zag.cast",args,c.target);
+        }
+        .slit_ => |s| {
+            let args:ArrayList[ZVal]=make[ZVal](s.fields.len);let i:i32=0;
+            while(i<s.fields.len){push[ZVal](&args,lower_expr(b,blk,s.fields.data[i].val,env,dl));i=i+1;}
+            b.*.origin=own;let r:ZVal=zir_value_op(b,blk,"zag.struct.constant",args,s.sname);
+            let oi:i32=blk.*.ops.len-1;i=0;while(i<s.fields.len){push[ZAttr](&blk.*.ops.data[oi].attrs,
+                ZAttr{.key=_zag_str_concat("field.",_zag_i64_to_str(i as i64)),.val=s.fields.data[i].name});i=i+1;}
+            return r;
+        }
+        .fld => |f| {
+            let base:ZVal=lower_expr(b,blk,f.base,env,dl);let ty:[]u8=zir_struct_field_type(dl,base.ty,f.fname);
+            if(ty.len==0){b.*.coverage_errors=b.*.coverage_errors+1;ty="i32";}
+            let args:ArrayList[ZVal]=make[ZVal](1);push[ZVal](&args,base);b.*.origin=own;
+            let r:ZVal=zir_value_op(b,blk,"zag.field",args,ty);let oi:i32=blk.*.ops.len-1;
+            push[ZAttr](&blk.*.ops.data[oi].attrs,ZAttr{.key="field",.val=f.fname});return r;
+        }
+        .idx => |x| {
+            let base:ZVal=lower_expr(b,blk,x.base,env,dl);let index:ZVal=lower_expr(b,blk,x.idx,env,dl);
+            let ty:[]u8=zir_index_type(base.ty);if(ty.len==0){b.*.coverage_errors=b.*.coverage_errors+1;ty="i32";}
+            let args:ArrayList[ZVal]=make[ZVal](2);push[ZVal](&args,base);push[ZVal](&args,index);b.*.origin=own;
+            return zir_value_op(b,blk,"zag.index",args,ty);
+        }
+        .slice_ => |x| {
+            let base:ZVal=lower_expr(b,blk,x.base,env,dl);let lo:ZVal=lower_expr(b,blk,x.lo,env,dl);
+            let args:ArrayList[ZVal]=make[ZVal](3);push[ZVal](&args,base);push[ZVal](&args,lo);
+            if(x.has_hi==1){push[ZVal](&args,lower_expr(b,blk,x.hi,env,dl));}b.*.origin=own;
+            return zir_value_op(b,blk,"zag.slice",args,base.ty);
+        }
         else => { }
     }
-    return op_const(b, blk, "0", "i32");
+    b.*.coverage_errors=b.*.coverage_errors+1;
+    b.*.origin=own;return op_const(b, blk, "0", "i32");
 }
 
 fn memref_elem(t: []u8) []u8 {
@@ -227,22 +363,30 @@ fn memref_elem(t: []u8) []u8 {
     return t;
 }
 
-fn lower_call(b: *ZB, blk: *ZBlock, c: Call, env: *ArrayList[ZBind], dl: ArrayList[*Node]) ZVal {
+fn lower_call(b: *ZB, blk: *ZBlock, c: Call, env: *ArrayList[ZBind], dl: ArrayList[*Node],own:ZOrigin) ZVal {
     let cn: []u8 = ident_name(c.callee);
     let argvals: ArrayList[ZVal] = make[ZVal](2);
     let i: i32 = 0;
     while (i < len[*Node](c.args)) {
-        push[ZVal](&argvals, lower_expr(b, blk, get[*Node](c.args, i), env, dl));
+        let expected:[]u8=zir_fn_param_type(dl,cn,i);
+        let previous:[]u8=b.*.expected_type;b.*.expected_type=expected;
+        let arg:ZVal=lower_expr(b, blk, get[*Node](c.args, i), env, dl);
+        b.*.expected_type=previous;
+        if(expected.len>0&&!@strEq(expected,arg.ty)){
+            b.*.coverage_errors=b.*.coverage_errors+1;
+        }
+        push[ZVal](&argvals,arg);
         i = i + 1;
     }
     let rty: []u8 = zir_fn_ret_type(dl, cn);
-    let o: ZOp = mk_op("func.call");
+    b.*.origin=own;
+    let o: ZOp = mk_op_at(b,"func.call");
     push[ZAttr](&o.attrs, ZAttr{ .key = "callee", .val = cn });
     let k: i32 = 0;
     while (k < len[ZVal](argvals)) { push[ZVal](&o.operands, get[ZVal](argvals, k)); k = k + 1; }
     if (@strEq(rty, "void")) {
         push[ZOp](&blk.*.ops, o);
-        return ZVal{ .name = "", .ty = "void" };
+        return zir_value("","void","none","none","statement","none",b.*.origin);
     }
     let r: ZVal = zfresh(b, rty);
     push[ZVal](&o.results, r);
@@ -263,6 +407,16 @@ fn zir_fn_ret_type(dl: ArrayList[*Node], name: []u8) []u8 {
     return "i32";   // unknown callee → assume i32-returning
 }
 
+fn zir_fn_param_type(dl:ArrayList[*Node],name:[]u8,index:i32)[]u8{
+    let i:i32=0;while(i<dl.len){switch(dl.data[i].*){
+        .fn_decl=>|f|{if(@strEq(f.name,name)&&index>=0&&index<f.params.len){
+            return f.params.data[index].pty;
+        }}
+        else=>{}
+    }i=i+1;}
+    return "";
+}
+
 fn lower_block(b: *ZB, blk: *ZBlock, body: ArrayList[*Node], env: *ArrayList[ZBind], dl: ArrayList[*Node]) void {
     let i: i32 = 0;
     while (i < len[*Node](body)) {
@@ -271,30 +425,65 @@ fn lower_block(b: *ZB, blk: *ZBlock, body: ArrayList[*Node], env: *ArrayList[ZBi
     }
 }
 
+fn zir_switch_tags(tags:ArrayList[[]u8])[]u8{
+    let out:[]u8="";let i:i32=0;while(i<tags.len){if(i>0){out=_zag_str_concat(out,",");}
+        out=_zag_str_concat(out,tags.data[i]);i=i+1;}return out;
+}
+
 fn lower_stmt(b: *ZB, blk: *ZBlock, n: *Node, env: *ArrayList[ZBind], dl: ArrayList[*Node]) void {
+    let own:ZOrigin=zir_node_origin(b.*.origins,n);b.*.origin=own;
     switch (n.*) {
         .let_ => |l| {
+            let previous:[]u8=b.*.expected_type;
+            if(l.has_dty==1){b.*.expected_type=l.dty;}else{b.*.expected_type="";}
             let v: ZVal = lower_expr(b, blk, l.expr, env, dl);
-            let bd: ZBind = env_find(env.*, l.name);
-            if (bd.is_alloca == 1) {
+            b.*.expected_type=previous;
+            if(l.has_dty==0||!@strEq(l.dty,v.ty)){
+                b.*.coverage_errors=b.*.coverage_errors+1;
+            }
+            let pending:i32=env_pending_index(env.*,l.name);
+            b.*.origin=own;
+            if (pending >= 0) {
+                let bd:ZBind=env.*.data[pending];
                 op_store(b, blk, v, bd.val, memref_elem(bd.val.ty));
+                env.*.data[pending].initialized=1;
             } else {
-                push[ZBind](env, ZBind{ .name = l.name, .val = v, .is_alloca = 0 });
+                push[ZBind](env, ZBind{ .name = l.name, .val = v,
+                    .is_alloca = 0,.initialized=1 });
             }
         }
         .assign => |a| {
+            let target_name:[]u8=ident_name(a.target);
+            let target_bind:ZBind=env_find(env.*,target_name);
+            let previous:[]u8=b.*.expected_type;
+            if(target_bind.is_alloca==1){b.*.expected_type=memref_elem(target_bind.val.ty);}else{b.*.expected_type="";}
             let v: ZVal = lower_expr(b, blk, a.expr, env, dl);
-            let bd: ZBind = env_find(env.*, ident_name(a.target));
-            op_store(b, blk, v, bd.val, memref_elem(bd.val.ty));
+            b.*.expected_type=previous;
+            let bd: ZBind = target_bind;
+            b.*.origin=own;
+            if(@strEq(bd.val.name,"%undef")||bd.is_alloca!=1){
+                b.*.coverage_errors=b.*.coverage_errors+1;
+            }else{let elem:[]u8=memref_elem(bd.val.ty);
+                if(!@strEq(v.ty,elem)){b.*.coverage_errors=b.*.coverage_errors+1;}
+                op_store(b, blk, v, bd.val, elem);}
         }
         .ret => |r| {
-            let o: ZOp = mk_op("func.return");
-            if (r.has_expr == 1) { push[ZVal](&o.operands, lower_expr(b, blk, r.expr, env, dl)); }
+            let rv:ZVal=zir_value("","void","none","none","statement","none",own);
+            if(r.has_expr==1){let previous:[]u8=b.*.expected_type;b.*.expected_type=b.*.current_ret;
+                rv=lower_expr(b,blk,r.expr,env,dl);b.*.expected_type=previous;}b.*.origin=own;
+            if((r.has_expr==0&&!@strEq(b.*.current_ret,"void"))||
+               (r.has_expr==1&&(!@strEq(rv.ty,b.*.current_ret)||
+                @strEq(b.*.current_ret,"void")))){
+                b.*.coverage_errors=b.*.coverage_errors+1;
+            }
+            let o: ZOp = mk_op_at(b,"func.return");
+            if (r.has_expr == 1) { push[ZVal](&o.operands,rv); }
             push[ZOp](&blk.*.ops, o);
         }
         .if_ => |iff| {
             let c: ZVal = lower_expr(b, blk, iff.cond, env, dl);
-            let o: ZOp = mk_op("scf.if");
+            b.*.origin=own;
+            let o: ZOp = mk_op_at(b,"scf.if");
             push[ZVal](&o.operands, c);
             let tb: ZBlock = one_block();
             lower_block(b, &tb, iff.then_body, env, dl);
@@ -304,23 +493,63 @@ fn lower_stmt(b: *ZB, blk: *ZBlock, n: *Node, env: *ArrayList[ZBind], dl: ArrayL
                 lower_block(b, &eb, iff.els_body, env, dl);
                 push[ZRegion](&o.regions, region_of(eb));
             }
+            o.origin=own;
             push[ZOp](&blk.*.ops, o);
         }
+        .while_ => |w| {
+            // The condition is a region, not a precomputed operand: mutable
+            // alloca-backed locals must be reloaded on every iteration.
+            b.*.origin=own;let o:ZOp=mk_op_at(b,"scf.while");
+            let cb:ZBlock=one_block();
+            let cond:ZVal=lower_expr(b,&cb,w.cond,env,dl);
+            let condition:ZOp=mk_op_at(b,"scf.condition");
+            push[ZVal](&condition.operands,cond);push[ZOp](&cb.ops,condition);
+            push[ZRegion](&o.regions,region_of(cb));
+            let wb:ZBlock=one_block();lower_block(b,&wb,w.body,env,dl);
+            let yield_op:ZOp=mk_op_at(b,"scf.yield");push[ZOp](&wb.ops,yield_op);
+            push[ZRegion](&o.regions,region_of(wb));o.origin=own;push[ZOp](&blk.*.ops,o);
+        }
+        .break_ => |_| { b.*.origin=own;let o:ZOp=mk_op_at(b,"scf.break");push[ZOp](&blk.*.ops,o); }
+        .continue_ => |_| { b.*.origin=own;let o:ZOp=mk_op_at(b,"scf.continue");push[ZOp](&blk.*.ops,o); }
         .unsafe_ => |u| { lower_block(b, blk, u.body, env, dl); }
+        .defer_ => |d| {
+            b.*.origin=own;let o:ZOp=mk_op_at(b,"zag.defer");push[ZAttr](&o.attrs,
+                ZAttr{.key="on_error",.val=_zag_i64_to_str(d.is_err as i64)});
+            let db:ZBlock=one_block();let _v:ZVal=lower_expr(b,&db,d.expr,env,dl);b.*.origin=own;
+            let yield_op:ZOp=mk_op_at(b,"zag.yield");push[ZOp](&db.ops,yield_op);
+            push[ZRegion](&o.regions,region_of(db));push[ZOp](&blk.*.ops,o);
+        }
+        .switch_ => |sw| {
+            let subject:ZVal=lower_expr(b,blk,sw.subject,env,dl);b.*.origin=own;
+            let o:ZOp=mk_op_at(b,"zag.switch");push[ZVal](&o.operands,subject);
+            let ai:i32=0;while(ai<sw.arms.len){let arm:SwitchArm=sw.arms.data[ai];let ab:ZBlock=one_block();
+                let case_op:ZOp=mk_op_at(b,"zag.case");push[ZAttr](&case_op.attrs,
+                    ZAttr{.key="patterns",.val=zir_switch_tags(arm.tags)});
+                push[ZOp](&ab.ops,case_op);if(arm.has_cap==1){b.*.coverage_errors=b.*.coverage_errors+1;}
+                lower_block(b,&ab,arm.body,env,dl);push[ZRegion](&o.regions,region_of(ab));ai=ai+1;}
+            if(sw.has_els==1){let eb:ZBlock=one_block();let default_op:ZOp=mk_op_at(b,"zag.default");
+                push[ZOp](&eb.ops,default_op);lower_block(b,&eb,sw.els_body,env,dl);push[ZRegion](&o.regions,region_of(eb));}
+            o.origin=own;push[ZOp](&blk.*.ops,o);
+        }
         .estmt => |e| { let _v: ZVal = lower_expr(b, blk, e.expr, env, dl); }
-        else => { }
+        else => { b.*.coverage_errors=b.*.coverage_errors+1; }
     }
 }
 
-fn lower_fn(b: *ZB, f: FnDecl, dl: ArrayList[*Node]) ZFunc {
+fn lower_fn(b: *ZB, node:*Node,f: FnDecl, dl: ArrayList[*Node], effects:i32) ZFunc {
+    b.*.origin=zir_node_origin(b.*.origins,node);if(b.*.origin.complete==0){b.*.origin=zir_function_origin(f);}b.*.effects=effects;b.*.current_ret=f.ret;
+    let function_origin:ZOrigin=b.*.origin;
+    let coverage_start:i32=b.*.coverage_errors;
     let params: ArrayList[ZVal] = make[ZVal](2);
     let env: ArrayList[ZBind] = make[ZBind](8);
     let i: i32 = 0;
     while (i < len[Param](f.params)) {
         let p: Param = get[Param](f.params, i);
-        let pv: ZVal = ZVal{ .name = _zag_str_concat("%", p.name), .ty = p.pty };
+        let pv: ZVal = zir_value(_zag_str_concat("%", p.name),p.pty,
+            "borrowed","param","function","declared",b.*.origin);
         push[ZVal](&params, pv);
-        push[ZBind](&env, ZBind{ .name = p.name, .val = pv, .is_alloca = 0 });
+        push[ZBind](&env, ZBind{ .name = p.name, .val = pv,
+            .is_alloca = 0,.initialized=1 });
         i = i + 1;
     }
     let blk: ZBlock = one_block();
@@ -330,10 +559,12 @@ fn lower_fn(b: *ZB, f: FnDecl, dl: ArrayList[*Node]) ZFunc {
         switch (get[*Node](f.body, j).*) {
             .let_ => |l| {
                 if (assigned_in(f.body, l.name) == 1) {
+                    b.*.origin=zir_node_origin(b.*.origins,get[*Node](f.body,j));
                     let ty: []u8 = "i32";
                     if (l.has_dty == 1) { ty = l.dty; }
                     let slot: ZVal = op_alloca(b, &blk, ty);
-                    push[ZBind](&env, ZBind{ .name = l.name, .val = slot, .is_alloca = 1 });
+                    push[ZBind](&env, ZBind{ .name = l.name, .val = slot,
+                        .is_alloca = 1,.initialized=0 });
                 }
             }
             else => { }
@@ -341,16 +572,43 @@ fn lower_fn(b: *ZB, f: FnDecl, dl: ArrayList[*Node]) ZFunc {
         j = j + 1;
     }
     lower_block(b, &blk, f.body, &env, dl);
-    return ZFunc{ .name = f.name, .params = params, .ret = f.ret, .body = blk };
+    return ZFunc{ .name = f.name, .params = params, .ret = f.ret, .body = blk,
+        .effects=effects,.origin=function_origin,
+        .coverage_complete=(b.*.coverage_errors==coverage_start) as i32,
+        .coverage_errors=b.*.coverage_errors-coverage_start };
 }
 
-fn build_module(dl: ArrayList[*Node]) ZModule {
-    let b: ZB = ZB{ .ctr = 0 };
-    let m: ZModule = ZModule{ .funcs = make[ZFunc](4) };
+fn zir_block_origins_complete(blk:ZBlock)i32{
+    let i:i32=0;while(i<blk.ops.len){let op:ZOp=blk.ops.data[i];if(op.origin.complete==0){return 0;}
+        let ri:i32=0;while(ri<op.regions.len){let region:ZRegion=op.regions.data[ri];let bi:i32=0;
+            while(bi<region.blocks.len){if(zir_block_origins_complete(region.blocks.data[bi])==0){return 0;}bi=bi+1;}ri=ri+1;}i=i+1;}
+    return 1;
+}
+
+fn zir_block_origins_exact(blk:ZBlock)i32{
+    let i:i32=0;while(i<blk.ops.len){let op:ZOp=blk.ops.data[i];if(op.origin.exact==0){return 0;}
+        let ri:i32=0;while(ri<op.regions.len){let region:ZRegion=op.regions.data[ri];let bi:i32=0;
+            while(bi<region.blocks.len){if(zir_block_origins_exact(region.blocks.data[bi])==0){return 0;}bi=bi+1;}ri=ri+1;}i=i+1;}
+    return 1;
+}
+
+fn build_module(dl: ArrayList[*Node],eff:map.StringMap[i32],origins:ArrayList[NodeOrigin]) ZModule {
+    let b: ZB = ZB{ .ctr = 0,.origin=zir_unknown_origin(),.effects=0,
+        .coverage_errors=0,.current_ret="void",.expected_type="",.origins=origins };
+    let m: ZModule = ZModule{ .funcs = make[ZFunc](4),
+        .schema_version="zag-ir-v1",.transform_version="zag-transform-v1",
+        .coverage_complete=1,.coverage_errors=0,.origin_complete=1,.origin_exact=1 };
     let i: i32 = 0;
     while (i < len[*Node](dl)) {
         switch (get[*Node](dl, i).*) {
-            .fn_decl => |f| { if (f.is_extern == 0) { push[ZFunc](&m.funcs, lower_fn(&b, f, dl)); } }
+            .fn_decl => |f| { if (f.is_extern == 0) {
+                let mask:i32=map.get[i32](eff,f.name) orelse 0;
+                let zf:ZFunc=lower_fn(&b,get[*Node](dl,i),f,dl,mask);push[ZFunc](&m.funcs,zf);
+                if(zf.coverage_complete==0){m.coverage_complete=0;}
+                m.coverage_errors=m.coverage_errors+zf.coverage_errors;
+                if(zf.origin.complete==0||zir_block_origins_complete(zf.body)==0){m.origin_complete=0;}
+                if(zf.origin.exact==0||zir_block_origins_exact(zf.body)==0){m.origin_exact=0;}
+            } }
             else => { }
         }
         i = i + 1;
@@ -364,20 +622,26 @@ fn verify_module(m: ZModule) i32 {
     let i: i32 = 0;
     while (i < len[ZFunc](m.funcs)) {
         let f: ZFunc = get[ZFunc](m.funcs, i);
-        let defined: ArrayList[[]u8] = make[[]u8](16);
+        // Definitions are looked up for every operand.  Keep a bounded hash
+        // set rather than linearly scanning the complete prefix for each
+        // operand; this is still the same def-before-use rule, but avoids a
+        // quadratic verifier on large self-hosting modules.
+        let defined: map.StringMap[i32] = map.make[i32](32);
         let p: i32 = 0;
-        while (p < len[ZVal](f.params)) { push[[]u8](&defined, get[ZVal](f.params, p).name); p = p + 1; }
+        while (p < len[ZVal](f.params)) {
+            map.put[i32](&defined, get[ZVal](f.params, p).name, 1);
+            p = p + 1;
+        }
         errs = errs + verify_block(f.body, &defined);
+        map.free[i32](&defined);
         i = i + 1;
     }
     return errs;
 }
-fn name_seen(defined: ArrayList[[]u8], n: []u8) i32 {
-    let i: i32 = 0;
-    while (i < len[[]u8](defined)) { if (@strEq(get[[]u8](defined, i), n)) { return 1; } i = i + 1; }
-    return 0;
+fn name_seen(defined: map.StringMap[i32], n: []u8) i32 {
+    return map.has[i32](defined, n) as i32;
 }
-fn verify_block(blk: ZBlock, defined: *ArrayList[[]u8]) i32 {
+fn verify_block(blk: ZBlock, defined: *map.StringMap[i32]) i32 {
     let errs: i32 = 0;
     let i: i32 = 0;
     while (i < len[ZOp](blk.ops)) {
@@ -397,13 +661,625 @@ fn verify_block(blk: ZBlock, defined: *ArrayList[[]u8]) i32 {
             rg = rg + 1;
         }
         let rr: i32 = 0;
-        while (rr < len[ZVal](o.results)) { push[[]u8](defined, get[ZVal](o.results, rr).name); rr = rr + 1; }
+        while (rr < len[ZVal](o.results)) {
+            map.put[i32](defined, get[ZVal](o.results, rr).name, 1);
+            rr = rr + 1;
+        }
         i = i + 1;
     }
     return errs;
 }
 
-// ── pass: integer constant folding ───────────────────────────────────────────
+// ── test-only checked transform contract: const-i32-add-v1 ─────────────────
+// This is intentionally one bounded rule contract, not a general optimizer.
+// The public production preparation still never calls the producer. A separate
+// source/policy-bound seam can select it only after the checker re-resolves an
+// exact source context and independently supplied compiler policy; verified raw
+// ZIR remains the fallback for every rejected or absent fact.
+fn zir_transform_policy_const_i32_add_default()ZirTransformPolicy{
+    return ZirTransformPolicy{.target=zir_transform_target_linux_x86_64(),
+        .edition=zir_transform_edition_regular(),
+        .arithmetic=zir_transform_arithmetic_i32_wrap(),.safety_checked=0,
+        .sanitize_memory=0,.automatic_selection=1};
+}
+fn zir_transform_policy_none()ZirTransformPolicy{
+    return ZirTransformPolicy{.target="",.edition="",.arithmetic="",
+        .safety_checked=0,.sanitize_memory=0,.automatic_selection=0};
+}
+fn zir_transform_policy_const_i32_add_allowed(p:ZirTransformPolicy)i32{
+    return (@strEq(p.target,zir_transform_target_linux_x86_64())&&
+        @strEq(p.edition,zir_transform_edition_regular())&&
+        @strEq(p.arithmetic,zir_transform_arithmetic_i32_wrap())&&
+        p.safety_checked==0&&p.sanitize_memory==0&&p.automatic_selection==1) as i32;
+}
+
+fn zir_origin_equal(a:ZOrigin,b:ZOrigin)i32{
+    return (@strEq(a.module,b.module)&&a.line==b.line&&a.byte_start==b.byte_start&&
+        a.byte_end==b.byte_end&&a.stable_id==b.stable_id&&a.complete==b.complete&&
+        a.exact==b.exact) as i32;
+}
+fn zir_value_equal(a:ZVal,b:ZVal)i32{
+    return (@strEq(a.name,b.name)&&@strEq(a.ty,b.ty)&&@strEq(a.ownership,b.ownership)&&
+        @strEq(a.alias_region,b.alias_region)&&@strEq(a.lifetime,b.lifetime)&&
+        @strEq(a.layout,b.layout)&&zir_origin_equal(a.origin,b.origin)==1) as i32;
+}
+fn zir_attr_equal(a:ZAttr,b:ZAttr)i32{
+    return (@strEq(a.key,b.key)&&@strEq(a.val,b.val)) as i32;
+}
+fn zir_block_equal(a:ZBlock,b:ZBlock)i32{
+    if(a.ops.len!=b.ops.len){return 0;}let i:i32=0;
+    while(i<a.ops.len){if(zir_op_equal(a.ops.data[i],b.ops.data[i])==0){return 0;}i=i+1;}
+    return 1;
+}
+fn zir_region_equal(a:ZRegion,b:ZRegion)i32{
+    if(a.blocks.len!=b.blocks.len){return 0;}let i:i32=0;
+    while(i<a.blocks.len){if(zir_block_equal(a.blocks.data[i],b.blocks.data[i])==0){return 0;}i=i+1;}
+    return 1;
+}
+fn zir_op_equal(a:ZOp,b:ZOp)i32{
+    if(!@strEq(a.name,b.name)||a.effects!=b.effects||!@strEq(a.reads,b.reads)||
+       !@strEq(a.writes,b.writes)||zir_origin_equal(a.origin,b.origin)==0||
+       a.results.len!=b.results.len||a.operands.len!=b.operands.len||
+       a.attrs.len!=b.attrs.len||a.regions.len!=b.regions.len){return 0;}
+    let i:i32=0;while(i<a.results.len){if(zir_value_equal(a.results.data[i],b.results.data[i])==0){return 0;}i=i+1;}
+    i=0;while(i<a.operands.len){if(zir_value_equal(a.operands.data[i],b.operands.data[i])==0){return 0;}i=i+1;}
+    i=0;while(i<a.attrs.len){if(zir_attr_equal(a.attrs.data[i],b.attrs.data[i])==0){return 0;}i=i+1;}
+    i=0;while(i<a.regions.len){if(zir_region_equal(a.regions.data[i],b.regions.data[i])==0){return 0;}i=i+1;}
+    return 1;
+}
+fn zir_function_meta_equal(a:ZFunc,b:ZFunc)i32{
+    if(!@strEq(a.name,b.name)||!@strEq(a.ret,b.ret)||a.effects!=b.effects||
+       zir_origin_equal(a.origin,b.origin)==0||a.coverage_complete!=b.coverage_complete||
+       a.coverage_errors!=b.coverage_errors||a.params.len!=b.params.len){return 0;}
+    let i:i32=0;while(i<a.params.len){if(zir_value_equal(a.params.data[i],b.params.data[i])==0){return 0;}i=i+1;}
+    return 1;
+}
+fn zir_function_equal(a:ZFunc,b:ZFunc)i32{
+    return (zir_function_meta_equal(a,b)==1&&zir_block_equal(a.body,b.body)==1) as i32;
+}
+fn zir_module_equal(a:ZModule,b:ZModule)i32{
+    if(!@strEq(a.schema_version,b.schema_version)||!@strEq(a.transform_version,b.transform_version)||
+       a.coverage_complete!=b.coverage_complete||a.coverage_errors!=b.coverage_errors||
+       a.origin_complete!=b.origin_complete||a.origin_exact!=b.origin_exact||
+       a.funcs.len!=b.funcs.len){return 0;}
+    let i:i32=0;while(i<a.funcs.len){if(zir_function_equal(a.funcs.data[i],b.funcs.data[i])==0){return 0;}i=i+1;}
+    return 1;
+}
+fn zir_module_equal_except_top_op(a:ZModule,b:ZModule,fi:i32,oi:i32)i32{
+    if(!@strEq(a.schema_version,b.schema_version)||!@strEq(a.transform_version,b.transform_version)||
+       a.coverage_complete!=b.coverage_complete||a.coverage_errors!=b.coverage_errors||
+       a.origin_complete!=b.origin_complete||a.origin_exact!=b.origin_exact||
+       a.funcs.len!=b.funcs.len){return 0;}
+    let i:i32=0;while(i<a.funcs.len){
+        if(i!=fi){if(zir_function_equal(a.funcs.data[i],b.funcs.data[i])==0){return 0;}}
+        else{let af:ZFunc=a.funcs.data[i];let bf:ZFunc=b.funcs.data[i];
+            if(zir_function_meta_equal(af,bf)==0||af.body.ops.len!=bf.body.ops.len){return 0;}
+            let j:i32=0;while(j<af.body.ops.len){if(j!=oi&&zir_op_equal(af.body.ops.data[j],bf.body.ops.data[j])==0){return 0;}j=j+1;}}
+        i=i+1;
+    }
+    return 1;
+}
+
+// Candidate arrays and text are owned separately from raw ZIR, so corrupting a
+// proposal cannot corrupt the fallback module through shared storage.
+fn zir_clone_text(s:[]u8)[]u8{
+    if(s.len==0){return "";}let out:ArrayList[u8]=make[u8](s.len);let i:i32=0;
+    while(i<s.len){push[u8](&out,s[i]);i=i+1;}return out.data[0..out.len];
+}
+fn zir_clone_origin(o:ZOrigin)ZOrigin{return ZOrigin{.module=zir_clone_text(o.module),
+    .line=o.line,.byte_start=o.byte_start,.byte_end=o.byte_end,.stable_id=o.stable_id,
+    .complete=o.complete,.exact=o.exact};}
+fn zir_clone_value(v:ZVal)ZVal{return ZVal{.name=zir_clone_text(v.name),.ty=zir_clone_text(v.ty),
+    .ownership=zir_clone_text(v.ownership),.alias_region=zir_clone_text(v.alias_region),
+    .lifetime=zir_clone_text(v.lifetime),.layout=zir_clone_text(v.layout),.origin=zir_clone_origin(v.origin)};}
+fn zir_clone_attr(a:ZAttr)ZAttr{return ZAttr{.key=zir_clone_text(a.key),.val=zir_clone_text(a.val)};}
+fn zir_clone_block(blk:ZBlock)ZBlock{
+    let out:ZBlock=ZBlock{.ops=make[ZOp](blk.ops.len)};let i:i32=0;
+    while(i<blk.ops.len){push[ZOp](&out.ops,zir_clone_op(blk.ops.data[i]));i=i+1;}return out;
+}
+fn zir_clone_region(region:ZRegion)ZRegion{
+    let out:ZRegion=ZRegion{.blocks=make[ZBlock](region.blocks.len)};let i:i32=0;
+    while(i<region.blocks.len){push[ZBlock](&out.blocks,zir_clone_block(region.blocks.data[i]));i=i+1;}return out;
+}
+fn zir_clone_op(op:ZOp)ZOp{
+    let out:ZOp=ZOp{.name=zir_clone_text(op.name),.results=make[ZVal](op.results.len),
+        .operands=make[ZVal](op.operands.len),.attrs=make[ZAttr](op.attrs.len),
+        .regions=make[ZRegion](op.regions.len),.effects=op.effects,
+        .reads=zir_clone_text(op.reads),.writes=zir_clone_text(op.writes),
+        .origin=zir_clone_origin(op.origin)};
+    let i:i32=0;while(i<op.results.len){push[ZVal](&out.results,zir_clone_value(op.results.data[i]));i=i+1;}
+    i=0;while(i<op.operands.len){push[ZVal](&out.operands,zir_clone_value(op.operands.data[i]));i=i+1;}
+    i=0;while(i<op.attrs.len){push[ZAttr](&out.attrs,zir_clone_attr(op.attrs.data[i]));i=i+1;}
+    i=0;while(i<op.regions.len){push[ZRegion](&out.regions,zir_clone_region(op.regions.data[i]));i=i+1;}
+    return out;
+}
+fn zir_clone_function(f:ZFunc)ZFunc{
+    let params:ArrayList[ZVal]=make[ZVal](f.params.len);let i:i32=0;
+    while(i<f.params.len){push[ZVal](&params,zir_clone_value(f.params.data[i]));i=i+1;}
+    return ZFunc{.name=zir_clone_text(f.name),.params=params,.ret=zir_clone_text(f.ret),
+        .body=zir_clone_block(f.body),.effects=f.effects,.origin=zir_clone_origin(f.origin),
+        .coverage_complete=f.coverage_complete,.coverage_errors=f.coverage_errors};
+}
+fn zir_clone_module(m:ZModule)ZModule{
+    let funcs:ArrayList[ZFunc]=make[ZFunc](m.funcs.len);let i:i32=0;
+    while(i<m.funcs.len){push[ZFunc](&funcs,zir_clone_function(m.funcs.data[i]));i=i+1;}
+    return ZModule{.funcs=funcs,.schema_version=zir_clone_text(m.schema_version),
+        .transform_version=zir_clone_text(m.transform_version),
+        .coverage_complete=m.coverage_complete,.coverage_errors=m.coverage_errors,
+        .origin_complete=m.origin_complete,.origin_exact=m.origin_exact};
+}
+
+fn zir_origin_rule_usable(o:ZOrigin)i32{
+    return (o.complete==1&&o.exact==1&&o.stable_id!=0&&o.module.len>0&&o.line>0&&
+        o.byte_start>=0&&o.byte_end>=o.byte_start) as i32;
+}
+fn zir_count_ssa_block(blk:ZBlock,name:[]u8)i32{
+    let count:i32=0;let i:i32=0;while(i<blk.ops.len){let op:ZOp=blk.ops.data[i];
+        let j:i32=0;while(j<op.results.len){if(@strEq(op.results.data[j].name,name)){count=count+1;}j=j+1;}
+        let r:i32=0;while(r<op.regions.len){let b:i32=0;while(b<op.regions.data[r].blocks.len){
+            count=count+zir_count_ssa_block(op.regions.data[r].blocks.data[b],name);b=b+1;}r=r+1;}i=i+1;}
+    return count;
+}
+fn zir_count_ssa_function(f:ZFunc,name:[]u8)i32{
+    let count:i32=zir_count_ssa_block(f.body,name);let i:i32=0;
+    while(i<f.params.len){if(@strEq(f.params.data[i].name,name)){count=count+1;}i=i+1;}return count;
+}
+// Count every definition once, then check the same table.  The previous
+// implementation called zir_count_ssa_function for every result, repeatedly
+// walking the complete function and turning large self-hosting modules into
+// an accidental quadratic (or worse with nested regions) verifier workload.
+fn zir_ssa_count_block(blk:ZBlock,counts:*map.StringMap[i32]) void {
+    let i:i32=0;
+    while(i<blk.ops.len){
+        let op:ZOp=blk.ops.data[i];let r:i32=0;
+        while(r<op.results.len){
+            let name:[]u8=op.results.data[r].name;
+            let old:i32=map.get[i32](counts.*,name) orelse 0;
+            map.put[i32](counts,name,old+1);r=r+1;
+        }
+        let g:i32=0;while(g<op.regions.len){let b:i32=0;
+            while(b<op.regions.data[g].blocks.len){
+                zir_ssa_count_block(op.regions.data[g].blocks.data[b],counts);b=b+1;
+            }g=g+1;
+        }
+        i=i+1;
+    }
+}
+fn zir_ssa_check_block(blk:ZBlock,counts:map.StringMap[i32])i32{
+    let i:i32=0;while(i<blk.ops.len){
+        let op:ZOp=blk.ops.data[i];let r:i32=0;
+        while(r<op.results.len){
+            let name:[]u8=op.results.data[r].name;
+            if(name.len==0||(map.get[i32](counts,name) orelse 0)!=1){return 0;}r=r+1;
+        }
+        let g:i32=0;while(g<op.regions.len){let b:i32=0;
+            while(b<op.regions.data[g].blocks.len){
+                if(zir_ssa_check_block(op.regions.data[g].blocks.data[b],counts)==0){return 0;}b=b+1;
+            }g=g+1;
+        }
+        i=i+1;
+    }
+    return 1;
+}
+fn zir_function_ssa_unique_all(f:ZFunc)i32{
+    let counts:map.StringMap[i32]=map.make[i32](32);let i:i32=0;
+    while(i<f.params.len){
+        let name:[]u8=f.params.data[i].name;
+        if(name.len==0){map.free[i32](&counts);return 0;}
+        let old:i32=map.get[i32](counts,name) orelse 0;
+        map.put[i32](&counts,name,old+1);i=i+1;
+    }
+    zir_ssa_count_block(f.body,&counts);
+    let ok:i32=zir_ssa_check_block(f.body,counts);
+    if(ok==1){let p:i32=0;while(p<f.params.len){
+        if((map.get[i32](counts,f.params.data[p].name) orelse 0)!=1){map.free[i32](&counts);return 0;}
+        p=p+1;
+    }}
+    map.free[i32](&counts);return ok;
+}
+// Retain the block-shaped helper for focused verifier tests.  It builds one
+// count table for the containing function and checks only the requested block.
+fn zir_block_ssa_unique_all(blk:ZBlock,f:ZFunc)i32{
+    let counts:map.StringMap[i32]=map.make[i32](32);let p:i32=0;
+    while(p<f.params.len){let name:[]u8=f.params.data[p].name;
+        let old:i32=map.get[i32](counts,name) orelse 0;map.put[i32](&counts,name,old+1);p=p+1;}
+    zir_ssa_count_block(f.body,&counts);let ok:i32=zir_ssa_check_block(blk,counts);
+    map.free[i32](&counts);return ok;
+}
+fn zir_module_ssa_unique_all(m:ZModule)i32{
+    let i:i32=0;while(i<m.funcs.len){if(zir_function_ssa_unique_all(m.funcs.data[i])==0){return 0;}i=i+1;}
+    return 1;
+}
+
+struct ZirI32Literal { value:i64, valid:i32 }
+struct ZirConstMatch { index:i32, value:i64, valid:i32 }
+
+// Producer-side canonical parser. It never performs signed i64 overflow.
+fn ztp_parse_i32(text:[]u8)ZirI32Literal{
+    let bad:ZirI32Literal=ZirI32Literal{.value=0,.valid=0};if(text.len==0){return bad;}
+    let negative:i32=(text[0]=='-') as i32;let at:i32=negative;
+    if(at>=text.len||text[at]=='+'){return bad;}
+    if(text[at]=='0'&&(at+1<text.len||negative==1)){return bad;}
+    let magnitude:i64=0;while(at<text.len){let ch:u8=text[at];if(ch<'0'||ch>'9'){return bad;}
+        magnitude=magnitude*10+((ch as i64)-48);if(magnitude>2147483648){return bad;}at=at+1;}
+    if(negative==1){return ZirI32Literal{.value=0-magnitude,.valid=1};}
+    if(magnitude>2147483647){return bad;}return ZirI32Literal{.value=magnitude,.valid=1};
+}
+fn ztp_const_shape(op:ZOp,want:ZVal)ZirI32Literal{
+    let bad:ZirI32Literal=ZirI32Literal{.value=0,.valid=0};
+    if(!@strEq(op.name,"arith.constant")||op.results.len!=1||op.operands.len!=0||
+       op.attrs.len!=1||op.regions.len!=0||op.effects!=0||!@strEq(op.reads,"none")||
+       !@strEq(op.writes,"none")||!@strEq(op.attrs.data[0].key,"value")||
+       !@strEq(op.results.data[0].ty,"i32")||zir_value_equal(op.results.data[0],want)==0||
+       zir_origin_rule_usable(op.origin)==0||zir_origin_rule_usable(op.results.data[0].origin)==0){return bad;}
+    return ztp_parse_i32(op.attrs.data[0].val);
+}
+fn ztp_prior_constant(blk:ZBlock,before:i32,want:ZVal)ZirConstMatch{
+    let found:i32=0;let index:i32=0-1;let value:i64=0;let i:i32=0;
+    while(i<before){let op:ZOp=blk.ops.data[i];let r:i32=0;
+        while(r<op.results.len){if(@strEq(op.results.data[r].name,want.name)){
+            found=found+1;if(r!=0){return ZirConstMatch{.index=0-1,.value=0,.valid=0};}
+            let parsed:ZirI32Literal=ztp_const_shape(op,want);if(parsed.valid==0){return ZirConstMatch{.index=0-1,.value=0,.valid=0};}
+            index=i;value=parsed.value;}r=r+1;}i=i+1;}
+    return ZirConstMatch{.index=index,.value=value,.valid=(found==1) as i32};
+}
+fn ztp_wrap_i32_add(a:i64,b:i64)i64{
+    let sum:i64=a+b;if(sum>2147483647){return sum-4294967296;}
+    if(sum<(0-2147483648)){return sum+4294967296;}return sum;
+}
+fn zir_no_transform_proposal(raw:ZModule)ZirTransformProposal{
+    // The selector never consults a candidate when proposed=0. Keep a distinct
+    // empty sentinel instead of aliasing raw or leaking an unused full clone on
+    // every production build/view.
+    let no_funcs:ArrayList[ZFunc]=ArrayList[ZFunc]{.data=0 as *ZFunc,.len=0,.cap=0};
+    let empty:ZModule=ZModule{.funcs=no_funcs,.schema_version="",
+        .transform_version="",.coverage_complete=0,.coverage_errors=0,
+        .origin_complete=0,.origin_exact=0};
+    return ZirTransformProposal{.candidate=empty,
+        .certificate=zir_transform_certificate_none(),.proposed=0};
+}
+
+// The producer scans in stable function/op order and emits at most one proposal.
+fn zir_propose_const_i32_add(raw:ZModule)ZirTransformProposal{
+    if(verify_module(raw)!=0||zir_module_ssa_unique_all(raw)==0||!@strEq(raw.schema_version,"zag-ir-v1")||
+       !@strEq(raw.transform_version,"zag-transform-v1")||raw.coverage_complete!=1||
+       raw.coverage_errors!=0||raw.origin_complete!=1||raw.origin_exact!=1){
+        return zir_no_transform_proposal(raw);}
+    let fi:i32=0;while(fi<raw.funcs.len){let f:ZFunc=raw.funcs.data[fi];
+        if(f.effects==0&&f.coverage_complete==1&&f.coverage_errors==0&&
+           zir_origin_rule_usable(f.origin)==1){let oi:i32=0;while(oi<f.body.ops.len){
+            let add:ZOp=f.body.ops.data[oi];
+            if(@strEq(add.name,"arith.addi")&&add.results.len==1&&add.operands.len==2&&
+               add.attrs.len==0&&add.regions.len==0&&add.effects==0&&
+               @strEq(add.reads,"none")&&@strEq(add.writes,"none")&&
+               @strEq(add.results.data[0].ty,"i32")&&@strEq(add.operands.data[0].ty,"i32")&&
+               @strEq(add.operands.data[1].ty,"i32")&&zir_origin_rule_usable(add.origin)==1&&
+               zir_origin_rule_usable(add.results.data[0].origin)==1){
+                let lhs:ZirConstMatch=ztp_prior_constant(f.body,oi,add.operands.data[0]);
+                let rhs:ZirConstMatch=ztp_prior_constant(f.body,oi,add.operands.data[1]);
+                if(lhs.valid==1&&rhs.valid==1&&lhs.index!=rhs.index&&
+                   !@strEq(add.operands.data[0].name,add.operands.data[1].name)&&
+                   !@strEq(add.results.data[0].name,add.operands.data[0].name)&&
+                   !@strEq(add.results.data[0].name,add.operands.data[1].name)&&
+                   zir_count_ssa_function(f,add.operands.data[0].name)==1&&
+                   zir_count_ssa_function(f,add.operands.data[1].name)==1&&
+                   zir_count_ssa_function(f,add.results.data[0].name)==1){
+                    let candidate:ZModule=zir_clone_module(raw);
+                    let old:ZOp=candidate.funcs.data[fi].body.ops.data[oi];
+                    let result:i64=ztp_wrap_i32_add(lhs.value,rhs.value);
+                    let replacement:ZOp=ZOp{.name=zir_clone_text("arith.constant"),
+                        .results=old.results,.operands=make[ZVal](0),.attrs=make[ZAttr](1),
+                        .regions=make[ZRegion](0),.effects=old.effects,
+                        .reads=old.reads,.writes=old.writes,.origin=old.origin};
+                    push[ZAttr](&replacement.attrs,ZAttr{.key=zir_clone_text("value"),
+                        .val=_zag_i64_to_str(result)});
+                    candidate.funcs.data[fi].body.ops.data[oi]=replacement;
+                    let cert:ZirTransformCertificate=ZirTransformCertificate{
+                        .format=zir_clone_text(zir_transform_cert_format()),
+                        .identity_schema=zir_clone_text(zir_transform_identity_schema()),
+                        .rule=zir_clone_text(zir_transform_rule_const_i32_add()),
+                        .checker=zir_clone_text(zir_transform_checker_const_i32_add()),
+                        .ir_verifier=zir_clone_text(zir_ir_verifier_name()),
+                        .before=zir_semantic_identity(raw),.after=zir_semantic_identity(candidate),
+                        .function_index=fi,.op_index=oi,.lhs_def_index=lhs.index,
+                        .rhs_def_index=rhs.index,.transform_count=1,
+                        .function_name=zir_clone_text(f.name),
+                        .lhs_ssa=zir_clone_text(add.operands.data[0].name),
+                        .rhs_ssa=zir_clone_text(add.operands.data[1].name),
+                        .result_ssa=zir_clone_text(add.results.data[0].name),
+                        .result_type=zir_clone_text(add.results.data[0].ty),
+                        .source_context=zir_clone_text(zir_transform_source_context_const_i32_add()),
+                        .policy_target=zir_clone_text(zir_transform_target_linux_x86_64()),
+                        .policy_edition=zir_clone_text(zir_transform_edition_regular()),
+                        .arithmetic_policy=zir_clone_text(zir_transform_arithmetic_i32_wrap()),
+                        .safety_checked=0,.sanitize_memory=0,.automatic_selection=1,
+                        .function_origin=zir_clone_origin(f.origin),
+                        .op_origin=zir_clone_origin(add.origin),
+                        .lhs_def_origin=zir_clone_origin(f.body.ops.data[lhs.index].origin),
+                        .rhs_def_origin=zir_clone_origin(f.body.ops.data[rhs.index].origin),
+                        .lhs_origin=zir_clone_origin(add.operands.data[0].origin),
+                        .rhs_origin=zir_clone_origin(add.operands.data[1].origin),
+                        .result_origin=zir_clone_origin(add.results.data[0].origin),
+                        .lhs_value=lhs.value,.rhs_value=rhs.value,.result_value=result,.valid=1};
+                    return ZirTransformProposal{.candidate=candidate,.certificate=cert,.proposed=1};
+                }
+            }
+            oi=oi+1;}
+        }
+        fi=fi+1;
+    }
+    return zir_no_transform_proposal(raw);
+}
+
+fn ztc_reject(reason:[]u8)ZirTransformCheck{return ZirTransformCheck{.accepted=0,.reason=reason};}
+
+// Checker-side parser is deliberately independent from ztp_parse_i32.
+fn ztc_parse_i32(text:[]u8)ZirI32Literal{
+    let bad:ZirI32Literal=ZirI32Literal{.value=0,.valid=0};if(text.len<1){return bad;}
+    let start:i32=0;let negative:i32=0;if(text[0]=='-'){negative=1;start=1;}
+    if(start==text.len||text[start]=='+'){return bad;}
+    if(text[start]=='0'){if(start+1!=text.len||negative==1){return bad;}}
+    let limit:i64=2147483647;if(negative==1){limit=2147483648;}
+    let value:i64=0;let i:i32=start;while(i<text.len){
+        if(text[i]<'0'||text[i]>'9'){return bad;}let digit:i64=(text[i] as i64)-48;
+        if(value>(limit-digit)/10){return bad;}value=value*10+digit;i=i+1;}
+    if(negative==1){return ZirI32Literal{.value=0-value,.valid=1};}
+    return ZirI32Literal{.value=value,.valid=1};
+}
+fn ztc_constant_at(op:ZOp,want:ZVal)ZirI32Literal{
+    let bad:ZirI32Literal=ZirI32Literal{.value=0,.valid=0};
+    if(op.name.len!=14||!@strEq(op.name,"arith.constant")||op.results.len!=1||
+       op.operands.len!=0||op.attrs.len!=1||op.regions.len!=0||op.effects!=0||
+       !@strEq(op.reads,"none")||!@strEq(op.writes,"none")||
+       !@strEq(op.attrs.data[0].key,"value")||!@strEq(op.results.data[0].ty,"i32")||
+       zir_value_equal(op.results.data[0],want)==0||zir_origin_rule_usable(op.origin)==0||
+       zir_origin_rule_usable(op.results.data[0].origin)==0){return bad;}
+    return ztc_parse_i32(op.attrs.data[0].val);
+}
+fn ztc_prior_constant(blk:ZBlock,before:i32,want:ZVal)ZirConstMatch{
+    let hits:i32=0;let at:i32=before-1;let selected:i32=0-1;let value:i64=0;
+    while(at>=0){let op:ZOp=blk.ops.data[at];let r:i32=op.results.len-1;
+        while(r>=0){if(@strEq(op.results.data[r].name,want.name)){
+            hits=hits+1;if(r!=0){return ZirConstMatch{.index=0-1,.value=0,.valid=0};}
+            let literal:ZirI32Literal=ztc_constant_at(op,want);if(literal.valid!=1){return ZirConstMatch{.index=0-1,.value=0,.valid=0};}
+            selected=at;value=literal.value;}r=r-1;}at=at-1;}
+    if(hits!=1){return ZirConstMatch{.index=0-1,.value=0,.valid=0};}
+    return ZirConstMatch{.index=selected,.value=value,.valid=1};
+}
+fn ztc_wrap_i32_add(a:i64,b:i64)i64{
+    let ua:i64=a;let ub:i64=b;if(ua<0){ua=ua+4294967296;}if(ub<0){ub=ub+4294967296;}
+    let word:i64=(ua+ub)%4294967296;if(word>=2147483648){return word-4294967296;}return word;
+}
+fn ztc_candidate_constant(op:ZOp,raw_result:ZVal,expected:i64)i32{
+    if(!@strEq(op.name,"arith.constant")||op.results.len!=1||op.operands.len!=0||
+       op.attrs.len!=1||op.regions.len!=0||op.effects!=0||!@strEq(op.reads,"none")||
+       !@strEq(op.writes,"none")||!@strEq(op.attrs.data[0].key,"value")||
+       zir_value_equal(op.results.data[0],raw_result)==0){return 0;}
+    let parsed:ZirI32Literal=ztc_parse_i32(op.attrs.data[0].val);
+    return (parsed.valid==1&&parsed.value==expected) as i32;
+}
+
+// This checker does not call the producer or any producer precondition,
+// parsing, or arithmetic helper. Acceptance is bounded to exactly one rewrite.
+fn zir_check_const_i32_add(raw:ZModule,proposal:ZirTransformProposal)ZirTransformCheck{
+    if(proposal.proposed!=1){return ztc_reject("proposal-count");}
+    let c:ZirTransformCertificate=proposal.certificate;
+    if(c.valid!=1||!@strEq(c.format,zir_transform_cert_format())||
+       !@strEq(c.identity_schema,zir_transform_identity_schema())||
+       !@strEq(c.rule,zir_transform_rule_const_i32_add())||
+       !@strEq(c.checker,zir_transform_checker_const_i32_add())||
+       !@strEq(c.ir_verifier,zir_ir_verifier_name())||c.transform_count!=1){
+        return ztc_reject("certificate-header");}
+    if(!@strEq(c.source_context,zir_transform_source_context_const_i32_add())||
+       !@strEq(c.policy_target,zir_transform_target_linux_x86_64())||
+       !@strEq(c.policy_edition,zir_transform_edition_regular())||
+       !@strEq(c.arithmetic_policy,zir_transform_arithmetic_i32_wrap())||
+       c.safety_checked!=0||c.sanitize_memory!=0||c.automatic_selection!=1){
+        return ztc_reject("certificate-policy");}
+    if(!@strEq(raw.schema_version,"zag-ir-v1")||!@strEq(raw.transform_version,"zag-transform-v1")||
+       raw.coverage_complete!=1||raw.coverage_errors!=0||raw.origin_complete!=1||
+       raw.origin_exact!=1){return ztc_reject("raw-domain");}
+    if(verify_module(raw)!=0||verify_module(proposal.candidate)!=0||
+       zir_module_ssa_unique_all(raw)==0||zir_module_ssa_unique_all(proposal.candidate)==0){
+        return ztc_reject("ir-verifier");}
+    if(zir_identity_equal(c.before,zir_semantic_identity(raw))==0||
+       zir_identity_equal(c.after,zir_semantic_identity(proposal.candidate))==0||
+       zir_identity_equal(c.before,c.after)==1){return ztc_reject("semantic-identity");}
+    if(c.function_index<0||c.function_index>=raw.funcs.len||
+       c.function_index>=proposal.candidate.funcs.len){return ztc_reject("function-index");}
+    let rf:ZFunc=raw.funcs.data[c.function_index];let cf:ZFunc=proposal.candidate.funcs.data[c.function_index];
+    if(c.op_index<0||c.op_index>=rf.body.ops.len||c.op_index>=cf.body.ops.len||
+       c.lhs_def_index<0||c.rhs_def_index<0||c.lhs_def_index>=c.op_index||
+       c.rhs_def_index>=c.op_index||c.lhs_def_index==c.rhs_def_index){return ztc_reject("op-index");}
+    if(zir_module_equal_except_top_op(raw,proposal.candidate,c.function_index,c.op_index)==0){
+        return ztc_reject("untouched-metadata");}
+    if(rf.effects!=0||rf.coverage_complete!=1||rf.coverage_errors!=0||
+       zir_origin_rule_usable(rf.origin)==0){return ztc_reject("function-domain");}
+    let add:ZOp=rf.body.ops.data[c.op_index];
+    if(!@strEq(add.name,"arith.addi")||add.results.len!=1||add.operands.len!=2||
+       add.attrs.len!=0||add.regions.len!=0||add.effects!=0||!@strEq(add.reads,"none")||
+       !@strEq(add.writes,"none")||!@strEq(add.results.data[0].ty,"i32")||
+       !@strEq(add.operands.data[0].ty,"i32")||!@strEq(add.operands.data[1].ty,"i32")||
+       zir_origin_rule_usable(add.origin)==0||zir_origin_rule_usable(add.results.data[0].origin)==0){
+        return ztc_reject("add-domain");}
+    let lhs:ZirConstMatch=ztc_prior_constant(rf.body,c.op_index,add.operands.data[0]);
+    let rhs:ZirConstMatch=ztc_prior_constant(rf.body,c.op_index,add.operands.data[1]);
+    if(lhs.valid!=1||rhs.valid!=1||lhs.index!=c.lhs_def_index||rhs.index!=c.rhs_def_index||
+       lhs.index==rhs.index||@strEq(add.operands.data[0].name,add.operands.data[1].name)||
+       @strEq(add.results.data[0].name,add.operands.data[0].name)||
+       @strEq(add.results.data[0].name,add.operands.data[1].name)||
+       zir_count_ssa_function(rf,add.operands.data[0].name)!=1||
+       zir_count_ssa_function(rf,add.operands.data[1].name)!=1||
+       zir_count_ssa_function(rf,add.results.data[0].name)!=1||
+       zir_count_ssa_function(cf,add.operands.data[0].name)!=1||
+       zir_count_ssa_function(cf,add.operands.data[1].name)!=1||
+       zir_count_ssa_function(cf,add.results.data[0].name)!=1){return ztc_reject("ssa-domain");}
+    let expected:i64=ztc_wrap_i32_add(lhs.value,rhs.value);
+    if(ztc_candidate_constant(cf.body.ops.data[c.op_index],add.results.data[0],expected)==0||
+       zir_origin_equal(cf.body.ops.data[c.op_index].origin,add.origin)==0){
+        return ztc_reject("candidate-result");}
+    if(!@strEq(c.function_name,rf.name)||!@strEq(c.lhs_ssa,add.operands.data[0].name)||
+       !@strEq(c.rhs_ssa,add.operands.data[1].name)||!@strEq(c.result_ssa,add.results.data[0].name)||
+       !@strEq(c.result_type,"i32")||zir_origin_equal(c.function_origin,rf.origin)==0||
+       zir_origin_equal(c.op_origin,add.origin)==0||
+       zir_origin_equal(c.lhs_def_origin,rf.body.ops.data[lhs.index].origin)==0||
+       zir_origin_equal(c.rhs_def_origin,rf.body.ops.data[rhs.index].origin)==0||
+       zir_origin_equal(c.lhs_origin,add.operands.data[0].origin)==0||
+       zir_origin_equal(c.rhs_origin,add.operands.data[1].origin)==0||
+       zir_origin_equal(c.result_origin,add.results.data[0].origin)==0||
+       c.lhs_value!=lhs.value||c.rhs_value!=rhs.value||c.result_value!=expected){
+        return ztc_reject("certificate-facts");}
+    return ZirTransformCheck{.accepted=1,.reason="structural_rule_checked_test_only"};
+}
+
+// Resolve source semantics independently from the producer and from ZIR's
+// value-type strings.  The first rule admits only a direct `a + b` whose two
+// children are canonical integer literals and whose contextual i32 type is
+// explicit in source: either an annotated local initializer or an i32 return.
+// Nested, inferred, assigned, argument-coerced, and imported contexts remain
+// raw until a real typed-expression authority can bind them.
+fn ztc_source_literal_matches(n:*Node,origins:ArrayList[NodeOrigin],want:ZOrigin,
+    want_def:ZOrigin,value:i64)i32{
+    switch(n.*){
+        .ilit=>|lit|{
+            let parsed:ZirI32Literal=ztc_parse_i32(lit.text);
+            let own:ZOrigin=zir_node_origin(origins,n);
+            return (parsed.valid==1&&parsed.value==value&&
+                zir_origin_equal(own,want)==1&&zir_origin_equal(own,want_def)==1) as i32;
+        }
+        else=>{}
+    }
+    return 0;
+}
+fn ztc_source_add_matches(n:*Node,origins:ArrayList[NodeOrigin],
+    c:ZirTransformCertificate)i32{
+    let own:ZOrigin=zir_node_origin(origins,n);
+    if(zir_origin_equal(own,c.op_origin)==0||zir_origin_equal(own,c.result_origin)==0){return 0;}
+    switch(n.*){
+        .bin=>|b|{
+            if(!@strEq(b.op,"+")){return 0;}
+            return (ztc_source_literal_matches(b.l,origins,c.lhs_origin,
+                    c.lhs_def_origin,c.lhs_value)==1&&
+                ztc_source_literal_matches(b.r,origins,c.rhs_origin,
+                    c.rhs_def_origin,c.rhs_value)==1) as i32;
+        }
+        else=>{}
+    }
+    return 0;
+}
+fn ztc_source_stmt_context(stmt:*Node,f:FnDecl,origins:ArrayList[NodeOrigin],
+    c:ZirTransformCertificate)i32{
+    switch(stmt.*){
+        .let_=>|local|{
+            if(local.has_init==1&&local.has_dty==1&&@strEq(local.dty,"i32")&&
+               ztc_source_add_matches(local.expr,origins,c)==1){return 1;}
+        }
+        .ret=>|r|{
+            if(r.has_expr==1&&@strEq(f.ret,"i32")&&
+               ztc_source_add_matches(r.expr,origins,c)==1){return 1;}
+        }
+        else=>{}
+    }
+    return 0;
+}
+fn ztc_source_context_const_i32_add(decls:ArrayList[*Node],origins:ArrayList[NodeOrigin],
+    c:ZirTransformCertificate)i32{
+    let function_hits:i32=0;let context_hits:i32=0;let i:i32=0;
+    while(i<decls.len){let node:*Node=decls.data[i];switch(node.*){
+        .fn_decl=>|f|{
+            let own:ZOrigin=zir_node_origin(origins,node);
+            if(f.is_extern==0&&@strEq(f.name,c.function_name)&&
+               zir_origin_equal(own,c.function_origin)==1){
+                function_hits=function_hits+1;let s:i32=0;
+                while(s<f.body.len){context_hits=context_hits+
+                    ztc_source_stmt_context(f.body.data[s],f,origins,c);s=s+1;}
+            }
+        }
+        else=>{}
+    }i=i+1;}
+    return (function_hits==1&&context_hits==1) as i32;
+}
+
+// The source/policy checker reuses only the independently coded structural
+// checker, then binds facts that the raw ZIR cannot authoritatively supply.
+// The policy comes from the caller; the certificate must agree with it but
+// cannot grant itself a target, edition, wrapping rule, or safety exemption.
+fn zir_check_const_i32_add_source_policy(raw:ZModule,decls:ArrayList[*Node],
+    origins:ArrayList[NodeOrigin],policy:ZirTransformPolicy,
+    proposal:ZirTransformProposal)ZirTransformCheck{
+    let structural:ZirTransformCheck=zir_check_const_i32_add(raw,proposal);
+    if(structural.accepted!=1){return structural;}
+    if(zir_transform_policy_const_i32_add_allowed(policy)==0){return ztc_reject("policy-domain");}
+    let c:ZirTransformCertificate=proposal.certificate;
+    if(!@strEq(c.policy_target,policy.target)||!@strEq(c.policy_edition,policy.edition)||
+       !@strEq(c.arithmetic_policy,policy.arithmetic)||
+       c.safety_checked!=policy.safety_checked||c.sanitize_memory!=policy.sanitize_memory||
+       c.automatic_selection!=policy.automatic_selection){return ztc_reject("policy-binding");}
+    if(ztc_source_context_const_i32_add(decls,origins,c)!=1){return ztc_reject("source-context");}
+    return ZirTransformCheck{.accepted=1,.reason="foreground_source_policy_checked"};
+}
+
+fn zir_authority_selected(module:ZModule,decls:ArrayList[*Node],valid:i32,errors:i32,
+    status:[]u8,rule:[]u8,checker:[]u8,count:i32,cert:ZirTransformCertificate)ZirAuthority{
+    return ZirAuthority{.module=module,.ast_bridge=decls,.valid=valid,
+        .verify_errors=errors,.coverage_complete=module.coverage_complete,
+        .coverage_errors=module.coverage_errors,.origin_complete=module.origin_complete,
+        .origin_exact=module.origin_exact,.transform_status=status,.transform_rule=rule,
+        .transform_checker=checker,.transform_count=count,.certificate=cert};
+}
+fn zir_select_foreground_transform(raw:ZModule,decls:ArrayList[*Node],proposal:ZirTransformProposal)ZirAuthority{
+    let errors:i32=verify_module(raw);let valid:i32=(errors==0&&
+        zir_module_ssa_unique_all(raw)==1&&@strEq(raw.schema_version,"zag-ir-v1")&&
+        @strEq(raw.transform_version,"zag-transform-v1")&&
+        raw.funcs.len==zir_nonextern_function_count(decls)) as i32;
+    if(valid==0){return zir_authority_selected(raw,decls,0,errors,"raw_ir_invalid","none",
+        "not-run",0,zir_transform_certificate_none());}
+    if(proposal.proposed==0){let status:[]u8="verified_no_transform";
+        if(raw.coverage_complete!=1||raw.coverage_errors!=0){
+            status="verified_raw_ast_bridge_incomplete";}
+        return zir_authority_selected(raw,decls,1,errors,status,"none","not-run",0,
+            zir_transform_certificate_none());}
+    let checked:ZirTransformCheck=zir_check_const_i32_add(raw,proposal);
+    if(checked.accepted!=1){return zir_authority_selected(raw,decls,1,errors,
+        "candidate_rejected_raw_fallback","none",zir_transform_structural_checker_const_i32_add(),
+        0,zir_transform_certificate_none());}
+    return zir_authority_selected(proposal.candidate,decls,1,0,
+        "test_only_structural_transform",zir_transform_rule_const_i32_add(),
+        zir_transform_structural_checker_const_i32_add(),1,proposal.certificate);
+}
+
+// This is the only selector whose transformed result is eligible for a native
+// production backend. It fails back to the verified raw module for every
+// absent, malformed, source-unbound, or policy-ineligible proposal.
+fn zir_select_foreground_transform_source_policy(raw:ZModule,decls:ArrayList[*Node],
+    origins:ArrayList[NodeOrigin],policy:ZirTransformPolicy,
+    proposal:ZirTransformProposal)ZirAuthority{
+    let errors:i32=verify_module(raw);let valid:i32=(errors==0&&
+        zir_module_ssa_unique_all(raw)==1&&@strEq(raw.schema_version,"zag-ir-v1")&&
+        @strEq(raw.transform_version,"zag-transform-v1")&&
+        raw.funcs.len==zir_nonextern_function_count(decls)) as i32;
+    if(valid==0){return zir_authority_selected(raw,decls,0,errors,"raw_ir_invalid","none",
+        "not-run",0,zir_transform_certificate_none());}
+    if(proposal.proposed==0){let status:[]u8="verified_no_transform";
+        if(raw.coverage_complete!=1||raw.coverage_errors!=0){
+            status="verified_raw_ast_bridge_incomplete";}
+        return zir_authority_selected(raw,decls,1,errors,status,"none","not-run",0,
+            zir_transform_certificate_none());}
+    let checked:ZirTransformCheck=zir_check_const_i32_add_source_policy(raw,decls,
+        origins,policy,proposal);
+    if(checked.accepted!=1){return zir_authority_selected(raw,decls,1,errors,
+        "candidate_rejected_raw_fallback","none",zir_transform_checker_const_i32_add(),
+        0,zir_transform_certificate_none());}
+    return zir_authority_selected(proposal.candidate,decls,1,0,
+        "foreground_source_policy_checked",zir_transform_rule_const_i32_add(),
+        zir_transform_checker_const_i32_add(),1,proposal.certificate);
+}
+
+// ── experimental pass: integer constant folding ───────────────────────────────────
+// Retained for isolated audits only. It is not production authority: its i64
+// evaluator does not establish result-width semantics, and one ConstBind table
+// is shared through nested regions. Re-enable only behind an independently
+// checked, type-correct transformation contract.
 struct ConstBind { name: []u8, val: i64 }
 fn const_find(cs: ArrayList[ConstBind], n: []u8, found: *i32) i64 {
     let i: i32 = 0;
@@ -457,7 +1333,8 @@ fn fold_block(blk: ZBlock, cs: *ArrayList[ConstBind], folded: *i32) ZBlock {
             if (f1 == 1 && f2 == 1 && ok == 1) {
                 // rewrite to a constant
                 let res: ZVal = get[ZVal](o.results, 0);
-                let c: ZOp = mk_op("arith.constant");
+                let c: ZOp = mk_op("arith.constant");c.effects=o.effects;
+                c.reads=o.reads;c.writes=o.writes;c.origin=o.origin;
                 push[ZVal](&c.results, res);
                 push[ZAttr](&c.attrs, ZAttr{ .key = "value", .val = _zag_i64_to_str(v) });
                 push[ZOp](&out.ops, c);
@@ -480,7 +1357,9 @@ fn int_op(name: []u8) i32 {
 }
 fn fold_regions(o: ZOp, cs: *ArrayList[ConstBind], folded: *i32) ZOp {
     if (len[ZRegion](o.regions) == 0) { return o; }
-    let no: ZOp = ZOp{ .name = o.name, .results = o.results, .operands = o.operands, .attrs = o.attrs, .regions = make[ZRegion](1) };
+    let no: ZOp = ZOp{ .name = o.name, .results = o.results,
+        .operands = o.operands, .attrs = o.attrs, .regions = make[ZRegion](1),
+        .effects=o.effects,.reads=o.reads,.writes=o.writes,.origin=o.origin };
     let rg: i32 = 0;
     while (rg < len[ZRegion](o.regions)) {
         let reg: ZRegion = get[ZRegion](o.regions, rg);
@@ -493,14 +1372,20 @@ fn fold_regions(o: ZOp, cs: *ArrayList[ConstBind], folded: *i32) ZOp {
     return no;
 }
 fn fold_module(m: ZModule) ZModule {
-    let out: ZModule = ZModule{ .funcs = make[ZFunc](4) };
+    let out: ZModule = ZModule{ .funcs = make[ZFunc](4),
+        .schema_version=m.schema_version,.transform_version=m.transform_version,
+        .coverage_complete=m.coverage_complete,.coverage_errors=m.coverage_errors,
+        .origin_complete=m.origin_complete,.origin_exact=m.origin_exact };
     let i: i32 = 0;
     while (i < len[ZFunc](m.funcs)) {
         let f: ZFunc = get[ZFunc](m.funcs, i);
         let cs: ArrayList[ConstBind] = make[ConstBind](8);
         let folded: i32 = 0;
         let nb: ZBlock = fold_block(f.body, &cs, &folded);
-        push[ZFunc](&out.funcs, ZFunc{ .name = f.name, .params = f.params, .ret = f.ret, .body = nb });
+        push[ZFunc](&out.funcs, ZFunc{ .name = f.name, .params = f.params,
+            .ret = f.ret, .body = nb,.effects=f.effects,.origin=f.origin,
+            .coverage_complete=f.coverage_complete,
+            .coverage_errors=f.coverage_errors });
         i = i + 1;
     }
     return out;
@@ -513,6 +1398,12 @@ fn emit_z(buf: *ArrayList[u8], s: []u8) void { let i: i32 = 0; while (i < s.len)
 fn print_mlir(m: ZModule) ArrayList[u8] {
     let buf: ArrayList[u8] = make[u8](256);
     emit_z(&buf, "// ZIR → MLIR (func/arith/memref/scf dialects)\n");
+    emit_z(&buf, "// schema=");emit_z(&buf,m.schema_version);
+    emit_z(&buf," transform=");emit_z(&buf,m.transform_version);
+    emit_z(&buf," coverage_complete=");emit_z(&buf,_zag_i64_to_str(m.coverage_complete));
+    emit_z(&buf," coverage_errors=");emit_z(&buf,_zag_i64_to_str(m.coverage_errors));
+    emit_z(&buf," origin_complete=");emit_z(&buf,_zag_i64_to_str(m.origin_complete));
+    emit_z(&buf," origin_exact=");emit_z(&buf,_zag_i64_to_str(m.origin_exact));emit_z(&buf,"\n");
     emit_z(&buf, "module {\n");
     let i: i32 = 0;
     while (i < len[ZFunc](m.funcs)) {
@@ -527,6 +1418,10 @@ fn print_mlir(m: ZModule) ArrayList[u8] {
         }
         emit_z(&buf, ")");
         if (!@strEq(f.ret, "void")) { emit_z(&buf, " -> "); emit_z(&buf, f.ret); }
+        emit_z(&buf," attributes {zag.effects = ");emit_z(&buf,_zag_i64_to_str(f.effects));
+        emit_z(&buf,", zag.origin = \"");emit_z(&buf,f.origin.module);
+        emit_z(&buf,"\", zag.line = ");emit_z(&buf,_zag_i64_to_str(f.origin.line));
+        emit_z(&buf,", zag.coverage_complete = ");emit_z(&buf,_zag_i64_to_str(f.coverage_complete));emit_z(&buf,"}");
         emit_z(&buf, " {\n");
         print_block_mlir(&buf, f.body, 2);
         pad(&buf, 1); emit_z(&buf, "}\n");
@@ -534,11 +1429,6 @@ fn print_mlir(m: ZModule) ArrayList[u8] {
     }
     emit_z(&buf, "}\n");
     return buf;
-}
-fn attr_val(o: ZOp, key: []u8) []u8 {
-    let i: i32 = 0;
-    while (i < len[ZAttr](o.attrs)) { let a: ZAttr = get[ZAttr](o.attrs, i); if (@strEq(a.key, key)) { return a.val; } i = i + 1; }
-    return "";
 }
 fn print_block_mlir(buf: *ArrayList[u8], blk: ZBlock, ind: i32) void {
     let i: i32 = 0;
@@ -580,6 +1470,16 @@ fn print_op_mlir(buf: *ArrayList[u8], o: ZOp, ind: i32) void {
         pad(buf, ind); emit_z(buf, "}");
         if (len[ZRegion](o.regions) == 2) { emit_z(buf, " else {\n"); print_region0(buf, o, 1, ind + 1); pad(buf, ind); emit_z(buf, "}"); }
         emit_z(buf, "\n");
+    } else if (@strEq(o.name,"scf.while")) {
+        emit_z(buf,"scf.while {\n");print_region0(buf,o,0,ind+1);
+        pad(buf,ind);emit_z(buf,"} do {\n");print_region0(buf,o,1,ind+1);
+        pad(buf,ind);emit_z(buf,"}\n");
+    } else if (@strEq(o.name,"scf.condition")) {
+        emit_z(buf,"scf.condition(");emit_z(buf,get[ZVal](o.operands,0).name);
+        emit_z(buf,")\n");
+    } else if (@strEq(o.name,"scf.yield")||@strEq(o.name,"scf.break")||
+        @strEq(o.name,"scf.continue")) {
+        emit_z(buf,o.name);emit_z(buf,"\n");
     } else {
         // generic arith.* binary
         let r: ZVal = get[ZVal](o.results, 0);
@@ -669,6 +1569,18 @@ fn print_op_c(buf: *ArrayList[u8], o: ZOp, ind: i32) void {
         cpad(buf, ind); emit_z(buf, "}");
         if (len[ZRegion](o.regions) == 2) { emit_z(buf, " else {\n"); print_region0_c(buf, o, 1, ind + 1); cpad(buf, ind); emit_z(buf, "}"); }
         emit_z(buf, "\n");
+    } else if (@strEq(o.name,"scf.while")) {
+        emit_z(buf,"for (;;) {\n");print_region0_c(buf,o,0,ind+1);
+        print_region0_c(buf,o,1,ind+1);cpad(buf,ind);emit_z(buf,"}\n");
+    } else if (@strEq(o.name,"scf.condition")) {
+        emit_z(buf,"if (!(");emit_z(buf,cvar(get[ZVal](o.operands,0).name));
+        emit_z(buf,")) break;\n");
+    } else if (@strEq(o.name,"scf.yield")) {
+        emit_z(buf,"/* scf.yield */\n");
+    } else if (@strEq(o.name,"scf.break")) {
+        emit_z(buf,"break;\n");
+    } else if (@strEq(o.name,"scf.continue")) {
+        emit_z(buf,"continue;\n");
     } else {
         // binary arith / cmp → C operator
         let r: ZVal = get[ZVal](o.results, 0);
@@ -705,32 +1617,68 @@ fn print_region0_c(buf: *ArrayList[u8], o: ZOp, ri: i32, ind: i32) void {
 }
 
 // ── top-level entry points (used by the driver) ──────────────────────────────
-// Build ZIR from source, fold, verify; emit MLIR text.
+fn zir_nonextern_function_count(decls:ArrayList[*Node])i32{
+    let count:i32=0;let i:i32=0;while(i<decls.len){switch(decls.data[i].*){
+        .fn_decl=>|f|{if(f.is_extern==0){count=count+1;}}else=>{}}i=i+1;}return count;
+}
+
+// Build and verify the versioned IR contract consumed by today's production
+// driver. Raw ZIR remains the correctness fallback and this entry point must
+// not infer target/edition/safety policy or invoke a transform producer.
+fn zir_prepare_production_with_origins(decls:ArrayList[*Node],eff:map.StringMap[i32],origins:ArrayList[NodeOrigin])ZirAuthority{
+    let raw:ZModule=build_module(decls,eff,origins);
+    return zir_select_foreground_transform(raw,decls,zir_no_transform_proposal(raw));
+}
+
+// Production-capable seam for the one bounded rule. The caller must construct
+// `policy` from resolved compiler state; until the public driver does that it
+// continues to call the raw-only entry point above. The source-policy checker,
+// not the producer, decides whether the candidate may replace raw ZIR.
+fn zir_prepare_const_i32_add_source_policy_with_origins(decls:ArrayList[*Node],
+    eff:map.StringMap[i32],origins:ArrayList[NodeOrigin],
+    policy:ZirTransformPolicy)ZirAuthority{
+    let raw:ZModule=build_module(decls,eff,origins);
+    let proposal:ZirTransformProposal=zir_propose_const_i32_add(raw);
+    return zir_select_foreground_transform_source_policy(raw,decls,origins,policy,proposal);
+}
+
+fn zir_prepare_production(decls:ArrayList[*Node],eff:map.StringMap[i32])ZirAuthority{
+    return zir_prepare_production_with_origins(decls,eff,make[NodeOrigin](1));
+}
+
+// Build and verify production ZIR; emit MLIR text.
 fn zir_to_mlir(src: []u8, dir: []u8) ArrayList[u8] {
-    let decls: ArrayList[*Node] = parse_program_dir(src, dir);
-    let m: ZModule = fold_module(build_module(decls));
-    let _e: i32 = verify_module(m);
-    return print_mlir(m);
+    let unit:CompilationUnit=parse_compilation_unit_dir(src,dir);let decls:ArrayList[*Node]=unit.decls;
+    let eff:map.StringMap[i32]=analyze(decls);
+    let authority:ZirAuthority=zir_prepare_production_with_origins(decls,eff,unit.origins);
+    return print_mlir(authority.module);
 }
-// Build ZIR from source, fold, verify; emit C.
+// Build and verify production ZIR; emit C.
 fn zir_to_c(src: []u8, dir: []u8) ArrayList[u8] {
-    let decls: ArrayList[*Node] = parse_program_dir(src, dir);
-    let m: ZModule = fold_module(build_module(decls));
-    let _e: i32 = verify_module(m);
-    return print_c(m);
+    let unit:CompilationUnit=parse_compilation_unit_dir(src,dir);let decls:ArrayList[*Node]=unit.decls;
+    let eff:map.StringMap[i32]=analyze(decls);
+    let authority:ZirAuthority=zir_prepare_production_with_origins(decls,eff,unit.origins);
+    return print_c(authority.module);
 }
-// Diagnostics line: "<nfuncs> funcs, <folded> folded, <errs> verify-errors"
+// Diagnostics line: function count plus verification/coverage/origin status.
 fn zir_stats(src: []u8, dir: []u8) ArrayList[u8] {
-    let decls: ArrayList[*Node] = parse_program_dir(src, dir);
-    let raw: ZModule = build_module(decls);
-    let cs_unused: i32 = 0;
-    let m: ZModule = fold_module(raw);
-    let errs: i32 = verify_module(m);
+    let unit:CompilationUnit=parse_compilation_unit_dir(src,dir);let decls:ArrayList[*Node]=unit.decls;
+    let eff:map.StringMap[i32]=analyze(decls);
+    let authority:ZirAuthority=zir_prepare_production_with_origins(decls,eff,unit.origins);
+    let m:ZModule=authority.module;let errs:i32=authority.verify_errors;
     let buf: ArrayList[u8] = make[u8](64);
     emit_z(&buf, "zir: ");
     emit_z(&buf, _zag_i64_to_str(len[ZFunc](m.funcs) as i64));
     emit_z(&buf, " funcs, verify-errors=");
     emit_z(&buf, _zag_i64_to_str(errs as i64));
+    emit_z(&buf, ", coverage-complete=");
+    emit_z(&buf, _zag_i64_to_str(authority.coverage_complete));
+    emit_z(&buf, ", coverage-errors=");
+    emit_z(&buf, _zag_i64_to_str(authority.coverage_errors));
+    emit_z(&buf, ", origin-complete=");
+    emit_z(&buf, _zag_i64_to_str(authority.origin_complete));
+    emit_z(&buf, ", origin-exact=");
+    emit_z(&buf, _zag_i64_to_str(authority.origin_exact));
     emit_z(&buf, "\n");
     return buf;
 }

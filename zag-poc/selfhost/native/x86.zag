@@ -146,7 +146,15 @@ fn is_jcc(kind: i32) i32 {
 // zero-filled in pass 1, which is fine because lengths don't depend on it).
 // `base_off` is the offset of THIS instruction's first byte in the final image
 // (== the offset within `buf` since we always emit from offset 0).
-fn encode_one(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32], base_off: i32) void {
+fn x86_driver_data_address(v: i64) i32 {
+    // Native codegen represents compiler-owned byte data as DATA_VBASE()+off.
+    // Driver ET_REL emission replaces only that address family; arbitrary
+    // integer constants remain ordinary immediates.
+    return (v >= DATA_VBASE() && v < DATA_VBASE() + 16777216) as i32;
+}
+
+fn encode_one_mode(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32],
+                   base_off: i32, driver_mode: i32) void {
     let k: i32 = ins.kind;
 
     if (k == K_LABEL()) {
@@ -158,7 +166,20 @@ fn encode_one(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32], base_off:
     if (k == K_MOV_IMM()) {
         let d: i32 = ins.dst;
         let v: i64 = ins.imm;
-        if (v >= (0 - 2147483648) && v <= 2147483647) {
+        // A loaded kernel module is not allowed to inherit the executable
+        // linker's low fixed data address. Force an 8-byte absolute form for
+        // driver data references so R_X86_64_64 can patch the full module
+        // address at final link time. The ordinary executable keeps its
+        // compact sign-extended imm32 form.
+        if (driver_mode == 1 && x86_driver_data_address(v) == 1) {
+            rex(buf, 1, 0, 0, ext(d));
+            eb(buf, 184 + lo3(d));
+            // The relocation addend carries the .data offset.  Keep the
+            // in-place field zero so Linux's module loader can apply the
+            // R_X86_64_64 relocation exactly once; retaining the executable
+            // DATA_VBASE value makes the kernel reject a nonzero target.
+            emit_le(buf, 0, 8);
+        } else if (v >= (0 - 2147483648) && v <= 2147483647) {
             rex(buf, 1, 0, 0, ext(d));
             eb(buf, 199);                 // 0xC7
             eb(buf, 192 + lo3(d));        // ModRM mod=3 reg=/0 rm=dst
@@ -504,14 +525,21 @@ fn encode_one(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32], base_off:
     return;
 }
 
-struct X86ObjectReloc { offset:i32, import:i32 }
+fn encode_one(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32], base_off: i32) void {
+    encode_one_mode(buf, ins, labels, base_off, 0);
+}
+
+// kind=0 is a declared foreign call; kind=1 is a compiler-owned .data
+// address. Keeping both in one target record preserves the encoder's exact
+// byte offset without pattern-matching machine code in the driver writer.
+struct X86ObjectReloc { offset:i32, import:i32, kind:i32, data_offset:i32 }
 struct X86Encoded { text:ArrayList[u8], labels:ArrayList[i32], relocs:ArrayList[X86ObjectReloc] }
 
 // ── two-pass label resolution + assembly ──────────────────────────────────────
 // Object emission needs the same resolved label offsets used for branch
 // encoding. Keep them as compiler-owned metadata; the ordinary executable path
 // continues to consume `encode` below and never exposes labels as an ABI.
-fn encode_with_labels(prog: ArrayList[Instr]) X86Encoded {
+fn encode_with_labels_mode(prog: ArrayList[Instr], driver_mode: i32) X86Encoded {
     let n: i32 = len[Instr](prog);
 
     // Size the labels table to (max label id)+1.
@@ -537,7 +565,7 @@ fn encode_with_labels(prog: ArrayList[Instr]) X86Encoded {
         if (ins1.kind == K_LABEL()) {
             set[i32](&labels, ins1.lbl, here);
         }
-        encode_one(&scratch, ins1, labels, here);
+        encode_one_mode(&scratch, ins1, labels, here, driver_mode);
         i = i + 1;
     }
 
@@ -548,12 +576,23 @@ fn encode_with_labels(prog: ArrayList[Instr]) X86Encoded {
     while (i < n) {
         let ins2: Instr = get[Instr](prog, i);
         let off: i32 = out.len;
-        if (ins2.kind == K_CALL_EXT()) { push[X86ObjectReloc](&relocs,X86ObjectReloc{.offset=off+1,.import=ins2.lbl}); }
-        encode_one(&out, ins2, labels, off);
+        if (ins2.kind == K_CALL_EXT()) {
+            push[X86ObjectReloc](&relocs, X86ObjectReloc{.offset=off+1,.import=ins2.lbl,.kind=0,.data_offset=0});
+        } else if (driver_mode == 1 && ins2.kind == K_MOV_IMM() &&
+                   x86_driver_data_address(ins2.imm) == 1) {
+            // Driver mode forced the movabs form above: its imm64 starts at
+            // the instruction's two-byte REX/opcode prefix.
+            push[X86ObjectReloc](&relocs, X86ObjectReloc{.offset=off+2,.import=-1,.kind=1,.data_offset=(ins2.imm-DATA_VBASE()) as i32});
+        }
+        encode_one_mode(&out, ins2, labels, off, driver_mode);
         i = i + 1;
     }
 
     return X86Encoded{.text=out,.labels=labels,.relocs=relocs};
+}
+
+fn encode_with_labels(prog: ArrayList[Instr]) X86Encoded {
+    return encode_with_labels_mode(prog, 0);
 }
 
 fn encode(prog: ArrayList[Instr]) ArrayList[u8] {
