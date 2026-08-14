@@ -84,14 +84,38 @@ cp examples/zagd.conf .zagd.conf
 cp /usr/local/share/zag/zagd.conf.example .zagd.conf
 ```
 
-The template keeps `mode=light`, one worker, advisory normal-Zag notices,
-no background GPU/network use, and Script-only defaults. Edit the one value
-you need; an explicit compiler flag still wins, and `mode=off` is the easy
-persistent opt-out. `tests/run_zagd_config_template.sh` verifies that this
-shipped file is accepted by the foreground policy parser.
-`stability_window_ms` setting controls the daemon's stable-read delay. Adaptive
-and deep run deterministic bounded planner budgets; they are not a complete
-whole-program optimizer or an unbounded idle-time search.
+The template keeps `mode=adaptive`, `idle_deep=true`, one worker, advisory
+normal-Zag notices, no background GPU/network use, and Script-only automatic
+defaults. `script_optimization=automatic` never bypasses foreground validation;
+`regular_optimization=review` never changes regular-Zag code without explicit
+acceptance. `objective=runtime` is the only implemented objective.
+`trust_mode=stable` reserves the fixed-verifier policy; the current foreground
+validator is linked into the compiler image, and no independent generational
+verifier is claimed. Edit the one value you need; an explicit compiler flag
+still wins, and `mode=off` is the easy persistent opt-out.
+
+The checked `selfhost/zagd_generation.zag` foundation is narrower than an
+optimizer-generation implementation. Its standalone test can persist immutable,
+flat, content-addressed manifests with no payload, current/last-known-good
+pointers, a three-success canary counter, and three-crash quarantine plus
+rollback. Every record is checksum-validated, says
+`executable_authority=false` and `generation_execution=disabled`, and falls back
+to the release-linked foreground identity after missing, stale, mutated,
+truncated, or inconsistent state. The production daemon does not import this
+module or execute its records; status therefore remains
+`optimizer_generation=unimplemented`. Worker synthesis, isolated generation
+execution, verifier evolution, canary builds, and promotion are still
+unavailable, so the ZagScript capability-matrix row remains `unavailable`.
+
+`tests/run_zagd_config_template.sh` verifies both the exact shipped defaults
+and acceptance by the foreground policy parser.
+`stability_window_ms` controls the daemon's stable-read delay. Adaptive and deep
+run deterministic bounded planner budgets; the current incomplete 1.0 matrix
+does not claim equality saturation, generational self-modification, or a
+complete whole-program optimizer merely because their policy values are
+represented. Adaptive `idle_deep=true` does schedule one bounded deep
+measurement attempt after 30 seconds of quiet, but it does not automatically
+select a transformed foreground artifact.
 
 Deep finalist execution is separately explicit. Put the reviewed executable
 paths in `.zagd.deep-reference` and `.zagd.deep-finalist` (one relative-to-root
@@ -254,6 +278,7 @@ tests/run_zagd_buffer_lifetime.sh
 tests/run_zagd_background_semantics.sh
 tests/run_zagd_executor.sh
 tests/run_zagd_benchmark_policy.sh
+tests/run_zagd_generation.sh
 tests/run_zagd_deep_integration.sh
 tests/run_zagd_product.sh
 tests/run_zagd_user_service.sh
@@ -267,4 +292,7 @@ payload rejection, recursive and atomic-save events, restart reuse, stable-sourc
 background checks, invalid snapshots, singleton/PID-reuse identity, overflow
 recovery, identical rewrites, rapid patch sequences, symlink policy, repeated
 edit memory bounds, idle CPU, service policy, deep finalist equivalence, and
-recovery after a later valid edit.
+recovery after a later valid edit. The generation test is deliberately
+standalone: it covers metadata mutation/truncation, compiler staleness, bounded
+canary promotion, crash-loop quarantine, predecessor retention, and rollback
+without granting the daemon or any stored bytes execution authority.

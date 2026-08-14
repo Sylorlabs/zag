@@ -2,12 +2,16 @@
 
 ## Prerequisites
 
-- **x86-64 Linux or ARM64 Linux** — native ELF is supported on both targets;
-  x86-64 can cross-compile ARM64 and verify it through qemu-user
+- **Linux x86-64** — host for the committed compiler seed and primary release
+- **Linux AArch64** — scoped supported target and CI host; x86-64 can
+  cross-compile it and verify it through qemu-user
 - **No other build tools required** — no `cc`, no `zig`, no `llvm`, no `make`
 - Tested on: Ubuntu 22.04, Ubuntu 24.04, Fedora 40, Arch Linux (rolling)
 
 The committed `./znc` binary is the only bootstrap dependency.
+Read [`docs/SUPPORT.md`](docs/SUPPORT.md) before choosing a target; support is
+scoped by output mode and language edition rather than claimed as universal
+backend parity.
 
 ---
 
@@ -17,6 +21,18 @@ The committed `./znc` binary is the only bootstrap dependency.
 git clone https://github.com/Sylorlabs/zag zag
 cd zag/zag-poc
 chmod +x znc bootstrap.sh tests/*.sh
+sudo make install
+```
+
+`make install` builds and installs `znc`, `zagd`, and `zag-lsp`.
+
+Create a project:
+
+```sh
+mkdir my-zag-app && cd my-zag-app
+znc init --name my-zag-app
+znc src/main.zag -o app --run
+znc tests/smoke.zag -o smoke --run
 ```
 
 Compile and run a Zag program:
@@ -85,7 +101,7 @@ pure Zag and does not use Python, C, or Zig.
 
 ```sh
 sudo make install
-# Installs znc, zagd, and zagd-user-service → /usr/local/bin
+# Installs znc, zagd, zag-lsp, and zagd-user-service → /usr/local/bin
 # Installs the strict and Script standard-library modules → /usr/local/lib/zag/std
 # Installs the editable project policy template → /usr/local/share/zag/zagd.conf.example
 ```
@@ -93,7 +109,8 @@ sudo make install
 Or manually:
 
 ```sh
-sudo install -m755 znc zagd /usr/local/bin/
+./znc selfhost/lsp/zag-lsp.zag -o zag-lsp --no-zagd
+sudo install -m755 znc zagd zag-lsp /usr/local/bin/
 sudo install -m755 tools/zagd-user-service.sh /usr/local/bin/zagd-user-service
 sudo install -d /usr/local/lib/zag/std
 sudo install -m644 std/*.zag /usr/local/lib/zag/std/
@@ -127,9 +144,11 @@ template rather than editing installed files:
 cp /usr/local/share/zag/zagd.conf.example .zagd.conf
 ```
 
-The default `mode=light` keeps the daemon resident; change only `mode=off` to
-make a persistent opt-out. Explicit compiler choices still override Script
-defaults in the file, and normal Zag remains advisory-only.
+The default `mode=adaptive` keeps one bounded daemon resident and permits
+deeper analysis only under the configured policy. Change `mode=off` to make a
+persistent opt-out. Explicit compiler choices still override Script defaults,
+normal Zag remains review-only, and the capability matrix—not the policy
+setting—is the authority on which optimizer behaviors are implemented.
 
 To keep a project planner active across login and restart it after an
 unexpected exit, install its bounded systemd user service:

@@ -29,5 +29,7 @@ Ordinary builds remain static. `--needed` without `--dynamic`, an unsupported
 ABI class, an unsafe SONAME, or an empty import surface rejects the build.
 
 `tests/run_dynamic_abi.sh` proves the ELF metadata, positive Vulkan loader call,
-and negative fail-closed boundaries. This is not a claim of complete C ABI or
-complete Vulkan execution support.
+and negative fail-closed boundaries. `tests/run_gpu_runtime.sh` adds the
+separate pure-Zag loader probe and generated host harness that submits a
+bounded Vulkan shader and verifies readback on the local RADV device. This is
+still not a claim of complete general C ABI coverage or a native DRM backend.

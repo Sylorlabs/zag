@@ -108,7 +108,7 @@ The two-release rule applies from the first `2026.06.x` release onward.
 | Platform        | Status          | Notes                                           |
 |-----------------|-----------------|-------------------------------------------------|
 | x86-64 Linux    | **Supported**   | Primary target; native ELF, no libc; compiler-owned binary `#embed` with deterministic and cache-identity conformance |
-| ARM64 Linux     | **Experimental** | `--target arm64`; static AArch64 ELF, no libc. Full core-language parity includes structs/slices/enums/unions/optionals/generics/error-unions/f32+f64 (incl. %g printing)/closures/structural interfaces and raw binary `#embed`; the focused resource executable runs through qemu-user and the 6 example programs are byte-identical to x86. Not yet: sat/fixed/posit/RNS numerics, DWARF, >8-arg calls, or physical ARM64 resource evidence. |
+| ARM64 Linux     | **Supported, scoped** | `--target arm64`; static v1 output plus separately gated edition-2027 object/dynamic slices, qemu-user verification, and native ARM CI. This does not promise every x86-64 v2 feature. See `docs/SUPPORT.md`. |
 | RISC-V Linux    | Planned         | Requires RV64GC ISA + ELF backend              |
 | macOS (any)     | Not planned yet | Requires Mach-O backend                         |
 | Windows         | Not planned     | Requires PE/COFF backend                        |

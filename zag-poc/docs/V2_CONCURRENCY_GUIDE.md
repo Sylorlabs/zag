@@ -83,6 +83,13 @@ used again. `tests/run_x86_thread_spawn.sh` uses `strace -f` to observe actual
 rejecting safe-scope spawn/join, wrong worker/handle shapes, `@pure` use, and
 an unjoined handle.
 
+`async` and `await` are reserved spellings in the ZagScript 1.0 lexer and are
+rejected with a focused unsupported-surface diagnostic. They are not aliases
+for ordinary identifiers or calls, so introducing a future lowering cannot
+silently change the meaning of an existing program. The reservation does not
+claim an async runtime; the library-only cancellation/channel boundaries above
+remain the complete supported surface.
+
 This is not a general atomic or concurrency API: `AtomicI64` is only a bounded
 native storage primitive; there are no general atomic types, pointer/aggregate worker arguments or returns, detach, mutexes, condition variables, TLS,
 or race detector. The raw

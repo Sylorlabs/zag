@@ -284,7 +284,11 @@ callback, aggregate, import, or destructor contract. The compiler's
 remaining BSS is private allocator/runtime state, and top-level `const` is a
 nullary-function desugaring rather than a static object. Aggregate, callback,
 and optional globals remain rejected until initialization ordering, destruction,
-and lifetime/provenance contracts are implemented.
+and lifetime/provenance contracts are implemented. The bounded unsafe
+thread/runtime boundary may also assign a direct raw-pointer value (including
+null or an mmap-derived address) to a declared pointer cell; tracked owners,
+borrowed views, stack addresses, and aggregate values remain rejected at that
+non-local store.
 
 ## Implemented volatile/MMIO byte, halfword, dword, and word slice
 

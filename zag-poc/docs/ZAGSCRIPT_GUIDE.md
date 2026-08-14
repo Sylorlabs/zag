@@ -18,26 +18,41 @@ a user `main` are diagnosed.
 
 The implemented profile includes a managed context, a bounded default arena,
 an explicit bounded-heap alternative, uncaught-error wrapper, `znc script`,
-`explain`, conservative `harden`, and `check --strict`. Both activation forms
+four progressive `view` levels, conservative explicit `expand`/`promote`,
+and the reserved portable exact `unexpand` contract (currently unavailable),
+plus `check --strict`. Both activation forms
 are supported:
 
 - `script;` in an ordinary `.zag` file;
 - `znc script program.zag`; or
 - the optional `.zs` suffix.
 
-`znc harden` is deliberately conservative. For a root body with no
-compiler-bound Script prelude operation and no propagated `try`, it produces a
-reviewable strict-Zag candidate with explicit memory/capability policy
-constants, context init/shutdown, and a status boundary. Other Script
-conveniences are reported as structured unsupported conversions rather than
-silently rewritten. By default hardening only prints a preview; `--output`
-uses an atomic sibling-temporary publish, while `--apply` still requires an
-explicit parity-test command and preserves a rollback copy. See
+`znc harden` remains a compatibility alias for explicit expansion during the
+current edition cycle and is deliberately conservative. For a root body with
+no propagated `try`, it renders the already-bound AST into a reviewable
+strict-Zag candidate with explicit memory/capability policy constants, context
+init/shutdown, and a status boundary. Compiler-bound Script conveniences are
+materialized with explicit standard-library imports and an explicit context
+parameter; unsupported cases remain structured diagnostics rather than guessed
+rewrites. By default hardening only prints a preview; `--output`
+uses a create-only atomic sibling-temporary publish for a separate derived
+artifact. The removed legacy `--apply` mode fails before source loading or any
+publication. Use provenance-backed `promote` for human-owned expanded source. See
 `ZAGSCRIPT_HARDENING.md` for the exact supported boundary.
 
 All three select the same `ModuleProfile.script`, parser, AST, semantic
 analysis, runtime, and native backend. `.zs` is a convenience, not a second
-language or a claim that arbitrary Python files are source-compatible.
+language or a claim that arbitrary Python files are source-compatible. The
+current `.zs` frontend preserves compact bytes and bounded line-oriented
+origin records through Script normalization; it is not yet a full
+token/trivia/layout CST shared with the regular lexer. Normalized output has
+generated-range coverage back to the available compact origins. Parser nodes
+retain stable origin IDs and project through root and imported compact sources.
+Byte-identical ranges are exact; indentation rewrites use a sound enclosing
+compact range, and synthetic wrappers remain explicitly unlocated rather than
+guessed. Header grammar, mixed-indentation recovery, and broader
+Unicode/layout recovery remain in the conservative Script normalizer, so
+malformed or ambiguous layouts fail closed.
 
 The JSON form of `explain` embeds the compiler's checksummed semantic manifest
 and its explicit `detail_level`. A full manifest includes declaration
@@ -95,9 +110,77 @@ form. Inspection and promotion commands never require the daemon:
 ./znc harden app.zag
 ./znc harden app.zag --format json
 ./znc harden app.zag --output app.hardened.zag
+./znc view app.zag --level simple
+./znc view app.zag --level explained
+./znc view app.zag --level explicit
+./znc view app.zag --level native
+./znc expand app.zag --to explicit --output app.derived.zag
+./znc promote app.zag --to explicit --output app.promoted.zag \
+    --test-command 'test -s app.promoted.zag'
+./znc unexpand app.promoted.zag --output app.restored.zag
 ./znc check app.zag
 ./znc check app.zag --strict
 ```
+
+`view` and output-less `expand` do not modify source. `promote` is the path for
+human-owned expanded source: it checks the explicit candidate, requires a
+caller-selected parity command, and publishes a portable `.zsledger` sidecar.
+Both human-owned paths are create-only. A failure after parity starts publishes
+no ledger and leaves the output in place as ownership-uncertain, because the
+parity command may have replaced its inode and a path-only rollback could delete
+foreign data.
+
+Current release boundary: the bounded v2 ledger codec is installed and has a
+focused 14-check round-trip gate, including v1 read compatibility and
+checksum-valid missing, duplicate, renumbered, and noncontiguous section rejection plus semantic-manifest hash-mismatch rejection. The source-integrated adapter now binds its semantic-manifest checksum and graph identity to the same prepared unit, but foreground prepared-evidence integration remains runtime-disabled and is not release-tested. Therefore `promote` and `unexpand` fail closed and publish or
+restore no provenance; the commands and format below describe the reserved
+contract, not currently executable support. Do not treat the companion ledger
+fixture as release evidence.
+When installed, the reserved ledger restores exact compact bytes after
+verifying both files, even if `.zag-cache` has been deleted. For edited
+promotions, unique compact-source context supports localized replacement,
+insertion, and deletion. Generated wrapper edits, duplicate contexts, or
+non-aligning changes produce a localized derived-byte conflict instead of
+silently dropping work. The `native` level
+renders the versioned `zag-ir-v1` structural contract followed by the selected
+artifact instruction stream. Every foreground x86-64 build constructs and
+verifies that contract before lowering. Values expose conservative ownership,
+alias-region, lifetime, and layout metadata; functions carry effect masks and
+compact-source origins with explicit exactness. Explicit contextual integer
+widths now survive into raw ZIR, including the operand type of comparisons and
+arithmetic; those modules publish `coverage_complete=1` and
+`verified_no_transform`. Native x86 lowering still admits only the checked
+declared-i32 subset, so contextual i64 artifacts use the checked AST bridge
+(`artifact_ir_consumed=0`) until a width-complete native route is independently
+verified. Untyped-local inference remains fail-closed: it publishes
+`coverage_complete=0`, a nonzero `coverage_errors`, and
+`verified_raw_ast_bridge_incomplete` rather than presenting provisional i32
+operations as typed authority.
+
+The only foreground semantic transform currently exposed is an explicit,
+bounded opt-in: `--foreground-transform const-i32-add-v1`. It requires regular
+unsanitized Linux x86-64 Zag, binds the source context and arithmetic policy,
+and refuses to emit an artifact when the checked rule does not match. The
+default build and every daemon path remain raw/no-transform; this narrow opt-in
+does not make the general certificate or differential-validation capability
+available.
+
+Pure explicitly typed `bool`/`i32` functions with SSA locals, mutable stack
+slots, calls, returns, structured `if`/`while`, `break`/`continue`, and
+noncapturing integer `switch` lower directly from verified ZIR on Linux x86-64.
+Signed `/` and `%` also lower directly under the narrowly admitted `Panic`
+effect: divide by zero prints `panic: division by zero` and exits 134, while
+division or remainder by `-1` preserves the defined `i32` wrapping edge instead
+of taking an x86 trap. Both branch arms, mutable loop control, source-ordered
+shadow initializers, multi-pattern dispatch, normal division, overflow edges,
+and the panic path are execution-tested. The native header reports
+`artifact_ir_consumed=1` only for this direct path. When it reports `0`, the
+instructions come from the checked AST bridge and are not derived from the
+preceding structural ZIR rendering. Other effects and operations remain on that
+bridge. Structured IR coverage also includes enum/union switch and `defer`, plus
+string and aggregate operations, but the native typed-IR/instruction view stays
+partial until all displayed contextual types and artifact routes share one IR
+authority.
 
 Background planning is project-scoped and editor-independent:
 
@@ -332,21 +415,46 @@ not charged to `script_alloc_used()` and must be bounded by their explicit API
 contract. This separation prevents Script defaults from silently changing a
 library's allocator, but it does not prove that imported code is bounded.
 
-Basic JSON scalar support is available as the ordinary `std:json` module. It
-stringifies and parses strings, signed integers, and booleans, parses finite
-JSON floating-point syntax, and parses/stringifies null. Statically typed parse
-results contain `ok` and, where applicable, `value`; parse failure is explicit.
-Homogeneous integer arrays and string-to-string objects have separate statically
-typed parsers; heterogeneous dynamic JSON values are deliberately not the
-default model. Float stringification and general nested composite decoding
-remain unsupported. Unicode `\\u` escapes, including valid surrogate pairs,
-decode to UTF-8 and malformed or lone surrogates fail explicitly.
-Zag Script uses the same inspectable API as strict Zag:
+JSON is available as the ordinary `std:json` module. Its smallest typed helpers
+parse/stringify strings, signed integers, booleans, and null, parse JSON number
+syntax to `f64`, and retain the existing homogeneous-integer-array and
+string-to-string-object APIs. `JsonDocument` is the general representation for
+nested objects, arrays, strings, exact number lexemes, booleans, and null. It is
+a flat indexed tree rather than an untyped language value. The default parser
+limits input to 1 MiB, nesting to 64 containers, and values to 65,536;
+`json_parse_value_bounded` makes those limits explicit. The compact encoder has
+a 4 MiB default output limit. Object order and duplicate keys are preserved;
+`json_object_find` selects the first matching key. Strings cross this boundary
+as UTF-8 byte slices:
+all JSON escapes and valid surrogate pairs decode to UTF-8, while malformed
+UTF-8, escapes, and lone surrogates fail. `json_document_free` is required for
+both successful and failed documents because a failed partial parse retains one
+ownership ledger. `json_encode_result_free` releases encoded output.
+
+CSV is available as byte-preserving `std:csv`. `csv_parse` accepts comma fields,
+doubled quotes, embedded CR/LF in quoted fields, CRLF and LF records (plus bare
+CR as a documented extension), leading/trailing empty fields, and rejects
+unquoted quotes, unterminated quotes, or bytes after a closing quote. Defaults
+are 1 MiB input/field, 65,536 rows, and 262,144 cells; `csv_parse_bounded`
+exposes each limit. `csv_encode` emits deterministic CRLF records,
+`csv_encode_lf` selects LF, and both quote only when required. CSV does not
+infer or validate a character encoding or require uniform row widths. Call `csv_free` and
+`csv_encode_result_free` for owned results.
+
+Zag Script can import both modules and inspect their typed aggregate results:
 
 ```zag
 @import("std:json") as json
-let result: json.JsonIntResult = json.json_parse_int("42");
+let document: json.JsonDocument = json.json_parse_value("{\"ready\":true}");
 ```
+
+The current conservative Script lifetime check rejects passing an imported
+owned aggregate back to ordinary encode/free helpers because it cannot yet
+prove that the call does not retain a Script-context value. Long-lived Script
+code should put parse/use/encode/free in an ordinary strict-Zag helper with a
+scalar or otherwise non-owning result. Direct strict Zag has the full ownership
+API. The focused Script-profile fixture intentionally only parses and inspects;
+the strict fixtures prove encoding and leak-free success/failure cleanup.
 
 ## Safety boundary
 

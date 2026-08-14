@@ -1,6 +1,6 @@
 # Zag Script implementation audit
 
-Status: current architecture record, 2026-07-24. This document distinguishes
+Status: current architecture record, 2026-08-06. This document distinguishes
 implemented behavior from bounded proof slices and unsupported roadmap work.
 
 ## Baseline recorded before implementation
@@ -26,6 +26,12 @@ encodes them, and writes ELF directly. The supported bootstrap and native path
 uses Zag plus Linux syscalls; it does not require Python, a C compiler, LLVM,
 Zig, an assembler, or a linker.
 
+This describes the implementation boundary, not a current working-tree
+certification. After source edits, the checked-in `znc` may be a stale seed;
+the current-source fixpoint and native-authority gates must be rerun before a
+release claim. The capability matrix keeps those rows `partial` until that
+post-edit evidence exists.
+
 ## 1. File-level syntax
 
 `selfhost/lex.zag` produces the shared token stream.
@@ -36,8 +42,44 @@ profile. It diagnoses duplicates, ordering errors, generated-name collisions,
 and a conflicting user `main`. Comments may precede activation.
 
 CLI activation and the optional `.zs` surface inject profile activation only
-into the compiler's in-memory source. They then enter this same parser; neither
-path owns a second language implementation.
+into the compiler's in-memory source. Indentation-oriented input is represented
+first by a lossless CST with exact raw/content byte spans, indentation, line
+kind, deterministic origin IDs, bounded inconsistent/mixed-indentation and
+invalid-byte recovery records,
+and a byte-exact reconstruction path. Its
+normalized projection records complete generated-range-to-origin coverage and
+then enters this same parser; neither path owns a second language implementation.
+Parser nodes project back to compact root and imported-module byte ranges.
+Byte-identical ranges are marked exact; indentation rewrites retain a sound
+enclosing range, while synthetic wrappers remain explicitly unlocated.
+The versioned `zag-ir-v1` production contract carries those origins, function
+effects, and conservative value ownership, alias-region, lifetime, and layout
+fields. Every foreground x86-64 build constructs and verifies it. The contract
+has structured `if`, `while`, noncapturing `switch`, and `defer` regions plus
+string, embed, cast, struct, field, index, and slice operations. It publishes
+`coverage_complete` and an exact `coverage_errors` count, so captures, mutation
+targets, untyped-local inference, and other unsupported operations cannot
+masquerade as typed SSA coverage; explicit contextual widths are preserved in
+raw ZIR. Verified
+explicitly declared `i32`/`bool` functions with SSA locals,
+mutable stack slots, calls, returns, structured `if`/`while`, `break`/`continue`, noncapturing
+integer `switch`, and signed division/remainder now lower directly from this IR
+to x86-64 frame-slot instructions. Canonical signed-`i32` literal spellings are
+range checked before direct selection; `i64`, untyped-local, and other contextual
+width cases stay on the checked-AST bridge. The route admits pure functions and
+the `Panic` effect only when the operation whitelist proves it comes from defined
+`/` or `%`; division by zero preserves the foreground diagnostic and exit 134,
+and the `INT_MIN / -1` and remainder edges wrap without an x86 trap. Branch
+arms, mutable loop control, multi-pattern dispatch, ordinary arithmetic, both
+overflow edges, and the panic path have native execution witnesses. The route
+shares the established allocator, optimizer, encoder, and ELF data contract.
+Allocation/I/O/locking effects, aggregates, floating point, specialized numeric
+types, enum/union switch, `defer`, dynamic linking, safety instrumentation, and
+object emission still use the named checked-AST oracle/fallback; retiring that
+bridge remains required. Native views label `artifact_ir_consumed=1` only when
+the direct route produced the displayed instructions. A checked-AST bridge view
+uses `0`; its instruction stream is not claimed to derive from the preceding
+structural ZIR.
 
 ## 2. AST declarations and statements
 
@@ -243,12 +285,18 @@ partial/unsupported item.
 A regular source still has declaration-only file scope, requires its own
 `main`, retains explicit allocation/device/layout choices, and receives no
 Script allocator context or prelude. The daemon never rewrites source and cannot authorize
-an executable. Normal backend optimizations remain semantics-preserving and
-independent of `zagd`. Regular Zag may show a configurable, evidence-backed
+an executable. Production backend passes remain independent of `zagd`, but that
+is not a blanket semantics-preservation claim: the experimental `native/zopt.zag`
+rewrite prototype is test-only and is not imported by `znc` because its metadata,
+width, and trapping-operation contracts are incomplete. Regular Zag may show a configurable, evidence-backed
 advisory; unsupported planner scaffolding stays silent. The shipped project
 default is `notifications=advisory`, which emits at most one warning after a
 supported human-review fact exists; `notifications=errors_only` makes routine
 commands quiet. Neither setting grants automatic source or architecture authority.
+The separate `const-i32-add-v1` rule has an explicit `--foreground-transform`
+opt-in with an independently bound source/policy checker; it is not selected by
+`zagd`, and its general proof/release row remains unavailable until fresh native
+opt-in evidence is recorded.
 `--no-zagd` and a missing or corrupt daemon/cache always leave foreground
 checking and compilation usable.
 

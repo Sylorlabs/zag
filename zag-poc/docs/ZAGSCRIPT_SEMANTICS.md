@@ -23,9 +23,16 @@ redundancy in `explain`; it must not create two script bodies.
 
 The optional `.zs` suffix also selects that same profile. It may omit the
 physical `script;` marker; the compiler activates the profile in memory and
-does not rewrite the file. The indentation-oriented surface is normalized to
-ordinary Zag tokens before the existing parser. It does not introduce a second
-AST, type system, module graph, package ecosystem, or backend.
+does not rewrite the file. The indentation-oriented surface first enters a
+lossless CST that retains exact bytes, CRLF/LF choice, comments, trailing
+whitespace, indentation, byte spans, and deterministic origin IDs. A projection
+with complete generated-range coverage then emits ordinary Zag tokens for the
+existing parser. It does not introduce a second AST, type system, module graph,
+package ecosystem, or backend. Parser nodes project through that ledger into
+compact-source byte ranges across root and imported modules. Byte-identical
+segments carry `exact=1`; rewritten indentation constructs carry `exact=0` and
+a sound enclosing compact range. Compiler-synthesized wrappers remain
+explicitly unlocated rather than receiving invented source locations.
 
 `script;` may follow comments and file directives but must precede executable
 root statements. A duplicate is an error. A script root that declares a
@@ -140,12 +147,14 @@ pointer provenance or a language-wide ownership proof.
 The compiler computes bounded, monotone lifetime summaries for every defined
 helper reachable in the merged module graph. A summary records whether a helper
 returns a Script-lifetime value or may retain one through a field, pointer,
-nonlocal assignment, extern/unknown call, or another escaping helper. This
-covers helper chains, returned values, and imported source helpers. Recursion is
-handled by a declaration-count-bounded fixed point. Passing a Script value to
-an extern or unresolved function remains a conservative error. These summaries
-prove only those escape classes; they are not general ownership or borrow
-checking.
+nonlocal assignment, extern/unknown call, or another escaping helper. Scalar
+content such as a capacity, length, or index does not itself create address
+provenance; unresolved, pointer, slice, aggregate, and generic parameter types
+remain conservative. This covers helper chains, returned values, and imported
+source helpers. Recursion is handled by a declaration-count-bounded fixed point.
+Passing a Script value to an extern or unresolved function remains a conservative
+error. These summaries prove only those escape classes; they are not general
+ownership or borrow checking.
 
 Edition-2027 strict Zag additionally has an opt-in static ownership slice for
 named allocation origins and explicit `@consumes`, `@borrows`, and
@@ -235,14 +244,14 @@ imported strict libraries.
 `harden` is non-destructive by default. Its first implementation may produce a
 preview, patch, candidate source, assumptions, required parity tests and honest
 unsupported items. It must not pretend an incomplete conversion is strict Zag.
-`--output` writes a separate file. `--apply` requires an unchanged source
-snapshot, an explicit parity-test command, a rollback copy, and restores the
-original automatically when validation fails. It never silently skips the
-parity test. A clean Git worktree is still recommended but is not fabricated as
-compiler proof.
+`--output` writes a separate create-only derived artifact and never replaces
+compact source. The legacy `--apply` mode is removed and rejects before source
+loading, publication, or parity-command execution. Provenance-backed `promote`
+is the only workflow that creates human-owned expanded source and its ledger. A
+clean Git worktree is still recommended but is not fabricated as compiler proof.
 
 When Script-context prelude calls remain, the report marks the preview
-`partial` and `candidate_compilable=false`; `--apply` refuses it. This is an
+`partial` and `candidate_compilable=false`; promotion refuses it. This is an
 honest boundary until allocator and capability expansion can produce ordinary
 strict Zag without guessing policy.
 

@@ -11,17 +11,20 @@ address spaces are host, device/global, workgroup, private, and
 constant/uniform; implicit crossing is forbidden. Barriers and fences have
 specified workgroup/device scope and cannot be used to synchronize host code.
 
-The first operational backend will be an opt-in direct Linux AMDGPU DRM
-runtime for native `amdgpu-gfx1010` code. It must validate an explicitly
-selected render node, create a driver context/queue, allocate and map buffers,
-load validated target code, issue bounded dispatch, wait on a driver fence with
-a timeout, read outputs, validate CPU equivalence, and destroy all resources.
-Vulkan/MLIR paths are development frontends, not runtime APIs. On the
-display-bound RX 5700 XT, tests use tiny buffers, one conservative workgroup,
-subprocess timeouts, and never join the default release gate until physical
-validation is stable. Missing compatible hardware is an explicit skip; MLIR
-emission is reported separately from target binary, load, launch, and correct
-output.
+The first native physical backend remains an opt-in direct Linux AMDGPU DRM
+runtime for native `amdgpu-gfx1010` code. Its current boundary is a strict
+preflight: an explicitly selected render node, GFX10/IP and GPUVM discovery, a
+single 4 KiB GPUVM map/unmap, and a CPU memory roundtrip. It does not create a
+submission context, issue `DRM_IOCTL_AMDGPU_CS`, wait on a driver fence, or
+claim native execution. The display-bound RX 5700 XT requires both explicit
+override and reset-risk acknowledgement even for that preflight, and the
+preflight still reports native submission as unimplemented. The MLIR path
+remains a development frontend, not a runtime API. Vulkan, OpenGL, and OpenCL
+compat paths have bounded loader-backed runtime gates and a shared typed
+launch/readback contract; they remain separate from native DRM. On this card,
+tests use tiny buffers, external subprocess timeouts, and explicit opt-in.
+Missing compatible hardware is an explicit skip; MLIR emission is reported
+separately from target binary, load, launch, and correct output.
 
 ## Kernel and address-space contract
 
@@ -58,45 +61,43 @@ emitted, MLIR verified, target binary produced, runtime loaded, kernel launched,
 results checked, and performance measured.  Current GPU bundle/VM facilities
 are not a physical GPU runtime.
 
-### Compat tier runtime verification status (2026-07-29)
+### Compat tier runtime verification status (2026-08-04)
 
 | Target | Encoder validated | Runtime loaded | Kernel launched | Output verified | Test machine |
 |--------|:-:|:-:|:-:|:-:|---|
-| **vulkan-compat** | spirv-val vulkan1.0 | YES | YES | **YES** | AMD RX 5700 XT, RADV, Mesa 25.2.8 |
-| **opengl-compat** | structural checks | YES | YES | **YES** | AMD RX 5700 XT, Mesa 4.6 Core, EGL 1.5 |
-| **opencl-compat** | spirv-val opencl2.0 | NO | NO | NO | Needs contributor with OpenCL hardware |
+| **vulkan-compat** | spirv-val vulkan1.0; generated harness compiles | verified | verified | verified (1024/1024) | AMD RX 5700 XT, RADV, Mesa 25.2.8 |
+| **opengl-compat** | GLSL structural checks; generated EGL harness compiles | verified | verified | verified (1024/1024) | AMD RX 5700 XT, Mesa 4.6 Core, EGL 1.5 |
+| **opencl-compat** | spirv-val opencl2.0; pure-Zag source fallback and generated ICD probe compile | verified | verified | verified (1024/1024, source fallback) | AMD RX 5700 XT, ROCm OpenCL 2.1 |
 | **cuda-compat** | structural checks | NO | NO | NO | Needs contributor with NVIDIA GPU |
 | **metal-compat** | structural checks | NO | NO | NO | Needs contributor with macOS/Metal |
 
-**Vulkan and OpenGL are fully end-to-end verified on a physical GPU.** The
-`tests/run_gpu_runtime.sh` script compiles a C harness that links against
-`libvulkan.so.1` / `libEGL.so.1` + `libGL.so.1`, loads the Zag-emitted binary,
-dispatches the fill kernel with 1024 work groups, and verifies all 1024 output
-elements equal 42.
+The `tests/run_gpu_runtime.sh` gate generates transient C harnesses; the
+checked-in `tests/run_gpu_zag_runtime.sh` links the public pure-Zag loaders
+against `libvulkan.so.1`, `libEGL.so.1` + `libGL.so.1`, and `libOpenCL.so.1`.
+Both gates dispatch the bounded fill kernel with 1024 work items and verify
+every output slot equals 42; the pure-Zag gate also exercises a 17-item,
+non-default value/size for each adapter and invalid-contract rejection.
+Compilation and validation are the default for the C gate; physical
+submission there requires the explicit
+`ZAG_RUN_PHYSICAL_GPU=1` opt-in because the RX 5700 XT is display-bound. The
+pure-Zag gate is a separate direct loader proof and uses an explicit bounded
+test driver. OpenCL completion is process-scoped: the ICD's `clFinish` is used
+for ordered cleanup, while the gate's external timeout is the watchdog. Hosts
+that cannot afford worker threads after the generated Linux `exit` may call
+the explicit shutdown-process helper, which closes the context then uses
+`exit_group`.
 
-**OpenCL, CUDA, and Metal are NOT runtime-verified.** The loader code
-(`std/opencl_loader.zag`, `std/cuda_loader.zag`, `std/metal_loader.zag`)
-contains FFI declarations and dispatch logic, but:
-
-- The `available()` functions return `false` — they have not been hooked up
-  to real driver libraries.
-- No C runtime test harness exists for OpenCL or CUDA (unlike Vulkan and
-  OpenGL which have `tests/vulkan_runtime_test.c` and
-  `tests/opengl_runtime_test.c`).
-- The Metal dispatch function is a stub that returns error code -201. It
-  contains comments describing the Objective-C dispatch protocol but no
-  real implementation.
-- The loader `.zag` files use `type` aliases and `[N]T` fixed-size array
-  syntax that the current Zag parser does not accept. They are
-  documentation/reference code, not compilable Zag source.
+**Vulkan, OpenGL, and OpenCL are runtime-verified on this machine; CUDA and
+Metal are intentionally fail-closed here.** The public Vulkan, OpenGL, and
+OpenCL loader names are thin imports of their compileable `*_runtime.zag`
+adapters. CUDA and Metal remain artifact-only because this Linux machine has
+neither the required NVIDIA driver/hardware nor Apple's Metal framework.
 
 **We need contributors with the right hardware to help.** Specifically:
 
-- **OpenCL:** Someone with a machine that has a working OpenCL ICD
-  (AMD ROCm, Intel NEO, or NVIDIA CUDA driver). The task is to write a
-  C runtime test harness (like `tests/vulkan_runtime_test.c`), hook up
-  the loader's `available()` to actually probe for `libOpenCL.so.1`, and
-  verify the SPIR-V kernel runs and produces correct output.
+- **OpenCL:** The local ROCm ICD is installed and exposes the RX 5700 XT; the
+  explicit C and pure-Zag bounded gates verify source fallback and correct
+  output through the public `std/opencl_loader.zag` adapter.
 
 - **CUDA:** Someone with an NVIDIA GPU and CUDA toolkit installed. The task
   is to write a C runtime test harness, hook up the loader's `available()`
@@ -145,9 +146,9 @@ tooling is available, but several platform-level quirks affect runtime loading:
   OpenCL 3.0 driver (even on RTX 3060 Ti / 30-series) does not support
   `clCreateProgramWithIL`.  The function returns `CL_INVALID_OPERATION`.
   This is a driver-level blocker, not a spec issue — OpenCL 3.0 makes SPIR-V
-  optional.  The `std/opencl_loader.zag` adapter probes
-  `CL_DEVICE_IL_VERSION` before attempting IL upload and falls back to
-  source compilation via `clCreateProgramWithSource` if unavailable.
+  optional.  The `std/opencl_loader.zag` adapter tries IL and falls back to
+  source compilation via `clCreateProgramWithSource` if the ICD rejects IL or
+  its kernel entry point.
   The fallback OpenCL C source is emitted by `selfhost/opencl_c.zag`.
 
 * **Address bits probing.** The OpenCL loader queries
@@ -176,9 +177,9 @@ tooling is available, but several platform-level quirks affect runtime loading:
   (`tests/run_metal_mac.sh`) is provided for running on macOS with an M-series
   chip.  It compiles the emitted MSL with `xcrun -sdk macosx metal`, produces
   a `.metallib`, and runs the kernel via a Swift harness that verifies output
-  correctness on the physical GPU.  **This has not been run.** The Metal
-  loader's dispatch function is a stub that returns -201. A contributor with
-  a Mac is needed to implement the real Objective-C dispatch and run this test.
+  correctness on the physical GPU. **This Linux checkout cannot run that
+  path:** Metal remains an explicit fail-closed artifact-only target and its
+  dispatch function returns -201 until a macOS implementation is supplied.
 
 ### OpenGL (GLSL)
 

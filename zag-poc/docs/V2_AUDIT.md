@@ -45,7 +45,7 @@ complete feature.
 | Heap allocation | `cg_lower_new`, `_zag_malloc`, `_zag_realloc`, `_zag_free` paths; checked `std/allocator.zag` `SystemAllocator` | Raw allocation remains an incomplete v2 contract, but checked native `SystemAllocator` now exposes fallible allocate/zeroed/resize/deallocate handles with capacity, alignment, runtime allocator identity, and generation validation. General ownership, debug allocation, and raw-allocation safety are still incomplete. |
 | Checked slice indexing | native `cg_lower_expr` emits an OOB panic path | Existing execution tests cover ordinary slices; trap policy is not a complete target-independent memory model. |
 | Current effects | `sema.zag` bitmask: Alloc, Panic, IO, Lock, Raises | Transitive direct-call analysis exists; no formal v2 lattice for unsafe, volatile, atomics, FFI, threads, or GPU runtime actions. |
-| ARM64 | `acodegen.zag`, `aarch64.zag`, separate tests | Experimental only; source contains explicit unsupported lowering cases. |
+| ARM64 | `acodegen.zag`, `aarch64.zag`, separate tests | Supported scoped target for the rows in `SUPPORT.md`; v2 feature parity remains row-specific and fail-closed. |
 | WASM | `native/wasm.zag`, `tests/run_native_wasm.sh` | Pure-Zag binary emission exists; runtime execution is unsupported until implemented in Zag. |
 | GPU frontend | `mlir.zag`, `gfx1010.zag`, `tests/run_native_gpu.sh` | MLIR text and a deterministic restricted bundle are emitted.  No physical GPU execution was performed or implemented. |
 

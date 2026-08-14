@@ -21,6 +21,24 @@ when the corresponding CLI choice is unspecified. Foreground compilation does no
 daemon candidate or deep-measurement records; doing so remains blocked until a
 real transformation and end-to-end equivalence revalidation exist.
 
+## Stable generation metadata boundary
+
+`selfhost/zagd_generation.zag` is a standalone, checked storage/state-machine
+foundation, not part of the production daemon lifecycle. It defines strict
+checksummed records for immutable flat content-addressed manifests, current and
+last-known-good pointers, a bounded three-success canary, and three-consecutive-
+crash quarantine with rollback and predecessor retention. Manifests contain no
+payload, all records deny executable authority, and every invalid or stale state
+selects the release-linked foreground fallback.
+
+The daemon does not import the module, status continues to report
+`optimizer_generation=unimplemented`, and no stored generation is loaded or
+executed. There is no synthesized worker, isolated generation execution,
+adversarial canary build, verifier replacement, or automatic promotion. The
+standalone registry evidence therefore does not satisfy or broaden the
+capability-matrix row for sandboxed generational self-modification; that row
+remains unavailable.
+
 ## Persistent user-service boundary
 
 `tools/zagd-user-service.sh` can install a project-specific Linux systemd user
@@ -189,9 +207,12 @@ placement.
 The service states are starting, idle, stabilizing, analyzing-light,
 analyzing-adaptive, analyzing-deep, cancelling, recovering and stopped. At most
 one snapshot is current; results name their snapshot and validity conditions.
-The event loop remains blocking while idle. A stop file created in the narrow
-interval after singleton publication but before inotify setup is checked once
-before the first blocking read, so immediate shutdown is deterministic without
+Light and explicit deep modes retain a blocking inotify read while idle. In
+adaptive mode with `idle_deep=true`, the watcher uses a one-second kernel
+`poll(2)` timeout and enters the existing bounded deep-control measurement path
+once after 30 seconds with no project event; any event or stop resets/cancels
+that attempt. A stop file created in the narrow interval after singleton
+publication but before inotify setup is checked once before the first read, so immediate shutdown is deterministic without
 introducing polling.
 
 ## Cache records
@@ -206,19 +227,24 @@ recomputation. Cache deletion changes performance only.
 
 ## Resource policy
 
-Default operation is one low-priority worker, no network, no GPU, no deep
-search, advisory notifications, bounded memory and disk cache, and prompt
-cancellation. Projects may opt down to `notifications=errors_only`; normal Zag
-gets one unobtrusive warning only when a supported human-review suggestion
-exists. Rejected or unsupported planner scaffolding remains silent. The event
-loop blocks in the kernel when idle, so idle CPU should approach zero.
+Default operation is one low-priority adaptive worker, no network, no GPU,
+`idle_deep=true`, advisory notifications, bounded memory and disk cache, and
+prompt cancellation. Idle-deep scheduling reaches only the existing
+advisory/deep measurement path; it is not evidence that an unavailable
+transformation, foreground winner, or optimizer generation is implemented.
+Projects may opt down to `notifications=errors_only`; normal Zag gets one
+unobtrusive warning only when a supported human-review suggestion exists.
+Rejected or unsupported planner scaffolding remains silent. The event loop
+blocks in the kernel when no eligible work exists, so idle CPU should approach
+zero.
 Foreground builds and tests take priority. Cache eviction is content-record
 eviction, never source deletion.
 
 An initial project configuration file may set mode, stability interval,
-workers, memory/cache budgets, ignore rules, deep-search policy and notification
-level. Unsupported or malformed settings fail closed to documented quiet
-defaults and produce a diagnostic.
+workers, memory/cache budgets, progressive difficulty, Script/regular
+optimization policy, runtime objective, trust mode, deep-search policy and
+notification level. Unsupported or malformed settings produce a diagnostic and
+fail closed; only a missing file selects documented defaults.
 
 ## Commands and protocol
 

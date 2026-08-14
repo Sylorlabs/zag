@@ -7,7 +7,13 @@ intended product defaults:
 
 | Setting | Default |
 | --- | ---: |
-| mode | light |
+| mode | adaptive |
+| idle deep policy | enabled |
+| difficulty | simple |
+| ZagScript optimization | automatic |
+| regular-Zag optimization | review |
+| objective | runtime |
+| trust mode | stable |
 | workers | 1 |
 | memory limit | 512 MiB |
 | cache limit | 2 GiB |
@@ -15,11 +21,16 @@ intended product defaults:
 | background GPU | disabled |
 | network access | disabled |
 
-Configuration accepts modes `off`, `light`, `adaptive`, and `deep`, a stability
-window from 1 ms through 60 seconds, exactly one worker, a configurable cache
-budget from 1 MiB through 2 GiB, default `advisory` notifications, an
-`errors_only` override, no network, and no background GPU. Out-of-range
-worker/cache/notification values are rejected instead of silently ignored.
+Configuration accepts modes `off`, `light`, `adaptive`, and `deep`; the four
+progressive difficulty names; explicit Script/regular optimization policies;
+the stable, reviewed, and autonomous trust labels; a stability window from 1 ms
+through 60 seconds; exactly one worker; a configurable cache budget from 1 MiB
+through 2 GiB; default `advisory` notifications; an `errors_only` override; no
+network; and no background GPU. Only `objective=runtime` is implemented.
+Unsupported values and out-of-range worker/cache/notification values are
+rejected instead of silently ignored. Policy acceptance does not imply that an
+unavailable optimizer or verifier generation exists: those capability rows
+remain fail-closed in the frozen ZagScript matrix.
 `advisory` produces a normal-Zag warning only for a real supported human-review
 fact; rejected planner transformations remain quiet.
 `script_memory_bytes` accepts 1 MiB through 2 GiB and configures the Script
@@ -86,9 +97,9 @@ triplet is unlinked as a unit. Foreground loading independently revalidates its
 own size, compiler/source graph/target/configuration identity, and payload
 checksums before any codegen skip.
 
-Malformed or unsupported configuration must fail closed to a diagnostic or the
-documented quiet defaults. It must not silently enable workers, GPU, network, or
-deep search.
+Malformed or unsupported project configuration fails closed to a diagnostic;
+only an absent configuration file selects the documented defaults. It must not
+silently enable workers, GPU, network, or deep search.
 
 Explicit deep finalist execution uses direct `execve`, never a shell. Each child
 has its own process group, CPU and address-space rlimits, a monotonic deadline,
