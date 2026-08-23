@@ -219,7 +219,7 @@ if grep -E -q '^bootstrap_compile .* selfhost/native/znc\.zag ' bootstrap.sh &&
    grep -E -q 'while \[ "\$bootstrap_stage" -le 6 \]' bootstrap.sh &&
    grep -E -q 'cmp -s "\$bootstrap_prev" "\$bootstrap_next"' bootstrap.sh &&
    grep -E -q 'self-hosting did not reach a byte-identical fixpoint' bootstrap.sh &&
-   awk '/^bootstrap_compile "\\$bootstrap_fixed" selfhost\/zagd_daemon\\.zag/{daemon=NR} /^mv -f "\\$bootstrap_fixed" znc$/{install=NR} END { exit !(daemon > 0 && install > daemon) }' bootstrap.sh &&
+   awk '/^bootstrap_compile "\$bootstrap_fixed" selfhost\/zagd_daemon\.zag/{daemon=NR} /^mv -f "\$bootstrap_fixed" znc$/{install=NR} END { exit !(daemon > 0 && install > daemon) }' bootstrap.sh &&
    [ "$(grep -E -c -- '--no-analyze --no-foreground-cache --no-zagd' bootstrap.sh)" -ge 3 ] &&
    grep -E -q '^bootstrap: selfhost/native/znc\.zag selfhost/zagd_daemon\.zag$' Makefile &&
    grep -E -q '^znc: bootstrap$' Makefile &&
