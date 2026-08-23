@@ -73,6 +73,7 @@ nt  "struct fields"  'struct P { x: i32, y: i32 } fn main() i32 { let p: P = P{ 
 nt  "string .len"    'fn main() i32 { return "hello".len; }' 5
 echo "── structs by-value · slices · heap (new) ──"
 nt  "struct byval return" 'struct P { x: i32, y: i32 } fn mk(a: i32, b: i32) P { return P{ .x = a, .y = b }; } fn main() i32 { let p: P = mk(30, 12); return p.x + p.y; }' 42
+nt  "aggregate let values" 'struct P { x: i32, y: i32 } struct H { first: P, second: P } enum Side { left, right } fn mk(a: i32, b: i32) P { return P{ .x = a, .y = b }; } fn copy(raw: P) P { let value: P = raw; return value; } fn field(raw: H) P { let value: P = raw.first; return value; } fn choose(side: Side) P { let value: P = switch (side) { .left => mk(10, 20), .right => mk(40, 2), }; return value; } fn main() i32 { let direct: P = mk(5, 7); let copied: P = copy(direct); let holder: H = H{ .first = mk(8, 9), .second = mk(1, 2) }; let selected: P = choose(Side.right); let from_field: P = field(holder); if (copied.x + copied.y != 12) { return 1; } if (from_field.x + from_field.y != 17) { return 2; } return selected.x + selected.y; }' 42
 nt  "struct byval arg iso" 'struct P { x: i32 } fn wr(p: P) i32 { p.x = 999; return p.x; } fn main() i32 { let q: P = P{ .x = 5 }; let z: i32 = wr(q); return q.x; }' 5
 nt  "slice value len"     'fn slen(s: []u8) i32 { return s.len; } fn main() i32 { let s: []u8 = "hello"; return slen(s); }' 5
 nt  "slice index"         'fn main() i32 { let s: []u8 = "hello"; return s[1]; }' 101
