@@ -13,7 +13,7 @@ permissions:
 jobs:
   diagnose:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
         with:
@@ -26,30 +26,69 @@ jobs:
           file=zag-poc/selfhost/native/ncodegen.zag
           line=$(grep -n "aggregate let needs an aggregate initializer" "$file" | head -n1 | cut -d: -f1)
           echo "aggregate-let diagnostic line=$line"
-          start=$((line - 100))
-          end=$((line + 50))
+          start=$((line - 25))
+          end=$((line + 20))
           sed -n "${start},${end}p" "$file"
 
-      - name: Show switch-expression and aggregate helpers
+      - name: Patch aggregate address-producing expressions
         shell: bash
         run: |
           set -euo pipefail
-          file=zag-poc/selfhost/native/ncodegen.zag
-          echo '--- cg_lower_expr declaration ---'
-          grep -n "fn cg_lower_expr" "$file" | head -n5 || true
-          echo '--- aggregate expression-related cases ---'
-          grep -n -E "switch_expr|switch.*expression|cg_type_is_agg|\.switch" "$file" | tail -n80 || true
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('zag-poc/selfhost/native/ncodegen.zag')
+          text = path.read_text()
+          old = '''                    if (rt_agg == 0) {
+                        switch (initexpr.*) {
+                            .call => |_c| { rt_agg = 1; }
+                            .un   => |u| { if (@strEq(u.op, "try")) { rt_agg = 1; } }
+                            else => { }
+                        }
+                    }
+'''
+          new = '''                    if (rt_agg == 0) {
+                        // The declared destination type is already a proven aggregate.
+                        // These expression forms lower aggregate values as addresses even
+                        // when coarse expression typing cannot recover the exact name.
+                        switch (initexpr.*) {
+                            .id      => |_id| { rt_agg = 1; }
+                            .fld     => |_f| { rt_agg = 1; }
+                            .idx     => |_x| { rt_agg = 1; }
+                            .call    => |_c| { rt_agg = 1; }
+                            .switch_ => |_s| { rt_agg = 1; }
+                            .un      => |u| { if (@strEq(u.op, "try")) { rt_agg = 1; } }
+                            else => { }
+                        }
+                    }
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one aggregate gate, found {text.count(old)}')
+          path.write_text(text.replace(old, new))
+          PY
+          grep -n -A18 -B4 "declared destination type is already" zag-poc/selfhost/native/ncodegen.zag
 
-      - name: Reproduce aggregate values in strict native mode
+      - name: Rebuild Zag compiler to fixed point
         shell: bash
         run: |
           set -euo pipefail
           cd zag-poc
-          chmod +x ./znc
+          chmod +x ./znc ./bootstrap.sh
+          ZAG_BOOTSTRAP_MEMORY_GUARD=off ./bootstrap.sh
+
+      - name: Verify aggregate function, copy, field, index, and switch values
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd zag-poc
           cat > /tmp/aggregate-let-values.zag <<'ZAG'
           struct Pair {
               left: i64,
               right: i64,
+          }
+
+          struct Holder {
+              first: Pair,
+              second: Pair,
           }
 
           enum Side { left, right }
@@ -71,21 +110,34 @@ jobs:
               return value;
           }
 
+          fn copy_field(holder: Holder) Pair {
+              let value: Pair = holder.first;
+              return value;
+          }
+
           fn main() i32 {
               let direct: Pair = pair(1, 2);
               let copied: Pair = copy_pair(direct);
+              let holder: Holder = Holder{
+                  .first = pair(5, 6),
+                  .second = pair(7, 8),
+              };
+              let field_copy: Pair = copy_field(holder);
               let selected: Pair = choose(Side.right);
               if (copied.left != 1 || copied.right != 2) { return 1; }
-              if (selected.left != 33 || selected.right != 44) { return 2; }
+              if (field_copy.left != 5 || field_copy.right != 6) { return 2; }
+              if (selected.left != 33 || selected.right != 44) { return 3; }
               return 0;
           }
           ZAG
-          set +e
           ./znc /tmp/aggregate-let-values.zag \
             --no-zagd --analyze-strict --no-foreground-cache \
-            -o /tmp/aggregate-let-values > /tmp/aggregate-let-values.log 2>&1
-          status=$?
-          set -e
-          cat /tmp/aggregate-let-values.log
-          echo "compile_status=$status"
-          exit 0
+            -o /tmp/aggregate-let-values
+          /tmp/aggregate-let-values
+
+      - name: Preserve strict list ownership regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd zag-poc
+          ZNC=./znc bash tests/check_v2_list_named_owner.sh
