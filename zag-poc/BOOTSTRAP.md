@@ -13,14 +13,15 @@ journey so anyone can walk it — **including recovering the original bootstrap.
 ## The chain, in one line
 
 ```
-Python (zagc.py, removed)  →  Zig bootstrap (src/*.zig, removed at v0.1)
-                          →  self-hosted C-backend (selfhost/*.zag, differential oracle)
+Python prototype (removed) → Zig bootstrap (removed at v0.1)
+                           → self-hosted C emitter (removed)
                           →  native backend (selfhost/native/*.zag)
-                          →  Zig DELETED  →  numeric system in native code
+                          →  pure Zag self-hosting toolchain
 ```
 
-The Python prototype (`zagc.py`) and `gpu/*.py` middlemen are no longer in the tree.
-Recover them from git history (`git show v0.0-zig-bootstrap:zag-poc/zagc.py`) if needed.
+The Python prototype, Zig bootstrap, C emitter, C runtime, and generated C files
+are no longer in the tree. Recover historical implementations only through Git
+history; they are not valid bootstrap fallbacks.
 
 ## Walk the history by tag
 
@@ -36,19 +37,18 @@ git tag -n1 -l 'v0.*'
 | `v0.3-cc-free`         | The **whole toolchain** builds via `znc` with **zero external tools**; the native `zagc` is fully equivalent (46/46 + 28/28). |
 | `v0.4-numerics-native` | The heterogeneous numeric system (posits / 512-bit quire / saturating / RNS / bignum / fixed-point / arbitrary-width) ported into the **native machine-code** backend — numeric programs compile straight to ELF, no `cc`. |
 
-## Recovering the original Zig bootstrap
+## Inspecting retired bootstraps
 
-The Zig bootstrap (~10,500 lines) was removed at `v0.1-native-selfhost`, but git
-never forgets. To see it or build from it:
+Git retains the retired Python, Zig, and C-emitting implementations for
+historical inspection:
 
 ```sh
 # read a file from the bootstrap without changing your tree:
 git show v0.0-zig-bootstrap:zag-poc/src/main.zig
 
-# or check the whole bootstrap tree out:
-git checkout v0.0-zig-bootstrap        # full Zig bootstrap: src/*.zig + build.zig
-zig build                              # builds the bootstrap → ./zagc
-git checkout -                         # back to the latest, Zig-free tree
+# inspect the retired C emitter without restoring it:
+git log --all -- zag-poc/selfhost/zagc.zag zag-poc/selfhost/codegen.zag
+git show <commit>:zag-poc/selfhost/codegen.zag
 ```
 
 ## Supported v1 bootstrap — native only
@@ -68,10 +68,8 @@ rebuilds it directly from Zag source:
 |--------|--------|------|
 | `./znc` | `selfhost/native/znc.zag` | Native x86-64 compiler **plus** GPU MLIR and WASM backends. Default: `./znc file.zag -o program`. GPU: `--target gpu-nvidia|gpu-amd|gpu-vulkan`. WASM: `--target wasm -o out.wasm`. |
 
-`selfhost/mlir.zag` intentionally does **not** import `codegen.zag` (the full C
-backend). It duplicates only the small `emit` / `Binding` / type-helper surface
-mlir needs, so `znc.zag` can link GPU emission without blowing the self-hosting
-fixpoint budget.
+`selfhost/mlir.zag` is a native Zag implementation and does not depend on a
+Python, C, or Zig emitter.
 
 `selfhost/native/znc_target.zag` remains as an optional legacy helper (build
 with `./znc selfhost/native/znc_target.zag -o znc-target`) for differential
@@ -80,11 +78,8 @@ checks; it is not required for normal use.
 Generated x86-64 programs use Linux syscalls and have no dynamic loader or libc
 dependency.
 
-`./zagc` and `selfhost/codegen.zag` remain in the repository as historical
-bootstrap material and a differential oracle. They are not a supported build
-path, are not an acceptable bootstrap fallback, and must not be required by a
-release gate. C interoperability, when intentionally added later, is an optional
-boundary rather than an implementation dependency.
+The retired `zagc`, C emitter, runtime, and oracle suites exist only in Git
+history. Do not restore them to the current tree or use them as a fallback.
 
 ## The one permanent caveat
 
@@ -107,6 +102,6 @@ bash tests/run_native_total.sh        # @total proofs on ./znc
 ./tests/check_native_target_repro.sh     # optional: byte-identical ./znc-target fixpoint
 ```
 
-The older `run_tests.sh` and `tests/run_selfhost.sh` suites exercise the legacy
-C emitter. They remain useful for differential testing but do not define v1
-support or release readiness.
+ARM64 is cross-compiled and self-hosted from the x86-64 `znc` seed. QEMU may be
+used to execute ARM64 binaries on x86-64; it is test infrastructure, not part of
+the compiler or bootstrap chain.

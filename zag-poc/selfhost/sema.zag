@@ -6,7 +6,12 @@
 // fixpoint iteration over the call graph, then checks every constrained
 // function against its forbidden set.
 //
-// Effects are an i32 bitmask:  Alloc=1, Panic=2, IO=4, Lock=8, Raises=16.
+// Effects are an i32 bitmask: Alloc=1, Panic=2, IO=4, Lock=8, Raises=16,
+// Unsafe=32, Atomic=64, FFI=128, Device=256, GPUHost=512. Unsafe is introduced
+// by a lexical unsafe block and propagates transitively like every other
+// effect. Atomic/FFI/GPU effects remain distinct even when their current
+// operations also require Unsafe, so capability checks cannot confuse machine
+// access, foreign execution, and device execution.
 // Raises (16): function returns !T (error union) — can propagate an error to
 // its caller.  Functions using `try` inside a non-!T body are a violation.
 // (Bitwise OR is written `bor(a,b)` because `|` lexes as the capture delimiter,
@@ -78,6 +83,8 @@ fn stmt_uses_try(n: *Node) i32 {
             if (expr_uses_try(w.cond) == 1) { return 1; }
             return stmts_use_try(w.body);
         }
+        .unsafe_ => |u| { return stmts_use_try(u.body); }
+        .defer_ => |d| { return expr_uses_try(d.expr); }
         .assign => |a| {
             if (expr_uses_try(a.target) == 1) { return 1; }
             return expr_uses_try(a.expr);
@@ -93,6 +100,8 @@ fn stmt_uses_try(n: *Node) i32 {
             return 0;
         }
         .estmt  => |e| { return expr_uses_try(e.expr); }
+        .break_ => |_b| { return 0; }
+        .continue_ => |_c| { return 0; }
         else    => { return 0; }
     }
 }
@@ -110,11 +119,15 @@ fn zag_rt_eff(name: []u8) i32 {
     // [Alloc,Panic]
     if (@strEq(name, "_zag_malloc"))        { return 3; }
     if (@strEq(name, "_zag_realloc"))       { return 3; }
+    if (@strEq(name, "_zag_script_context_init")) { return 3; }
+    if (@strEq(name, "_zag_script_alloc")) { return 3; }
+    if (@strEq(name, "_zag_script_new")) { return 3; }
     // [IO]
     if (@strEq(name, "_zag_print"))         { return 4; }
     if (@strEq(name, "_zag_println"))       { return 4; }
     if (@strEq(name, "_zag_eprintln"))      { return 4; }
     if (@strEq(name, "_zag_flush"))         { return 4; }
+    if (@strEq(name, "_zag_script_context_shutdown")) { return 4; }
     if (@strEq(name, "_zag_print_i32"))     { return 4; }
     if (@strEq(name, "_zag_print_i64"))     { return 4; }
     if (@strEq(name, "_zag_print_u64"))     { return 4; }
@@ -127,7 +140,12 @@ fn zag_rt_eff(name: []u8) i32 {
     if (@strEq(name, "_zag_exit"))          { return 4; }
     if (@strEq(name, "_zag_argc"))          { return 4; }
     if (@strEq(name, "_zag_arg"))           { return 4; }
+    if (@strEq(name, "_zag_getenv"))        { return 4; }
     if (@strEq(name, "_zag_read_fd"))       { return 4; }
+    // raw Linux syscall escape hatch (net_rt/thread_rt/x11 build on this):
+    // conservatively IO — it can touch the OS in arbitrary ways, so it is
+    // barred from @pure/@realtime exactly like any other IO source.
+    if (@strEq(name, "_zag_raw_syscall"))   { return 4; }
     // [IO,Alloc]
     if (@strEq(name, "_zag_read_file"))     { return 5; }
     if (@strEq(name, "_zag_exec_capture"))  { return 5; }
@@ -135,13 +153,80 @@ fn zag_rt_eff(name: []u8) i32 {
 }
 
 fn builtin_eff(name: []u8) i32 {
+    // Volatile/MMIO intrinsics are explicitly unsafe effects.  They are not
+    // atomics and do not add synchronization; marking them Unsafe keeps them
+    // out of @pure and @realtime callers transitively.
+    if (@strEq(name, "@volatileLoad")) { return 32; }
+    if (@strEq(name, "@volatileStore")) { return 32; }
+    if (@strEq(name, "@volatileLoad8")) { return 32; }
+    if (@strEq(name, "@volatileStore8")) { return 32; }
+    if (@strEq(name, "@volatileLoad16")) { return 32; }
+    if (@strEq(name, "@volatileStore16")) { return 32; }
+    if (@strEq(name, "@volatileLoad32")) { return 32; }
+    if (@strEq(name, "@volatileStore32")) { return 32; }
+    // A legacy native fence does emit MFENCE, but it has no typed ordering or
+    // shared-lifetime model. It is still target-level machine control, so it
+    // cannot satisfy a @pure or @realtime effect contract by being untracked.
+    if (@strEq(name, "@memoryFence")) { return 96; }
+    if (@strEq(name, "@atomicFence")) { return 96; }
+    // Linux futex wait/wake are intentionally raw, unsafe building blocks.
+    // They do not create threads or establish a complete language memory model.
+    if (@strEq(name, "@atomicWait32")) { return 96; }
+    if (@strEq(name, "@atomicWake32")) { return 96; }
+    // The first public thread boundary is intentionally Linux/x86-64-specific
+    // and unsafe.  Spawn and join allocate/unmap stacks and create concurrent
+    // execution, so neither may be hidden inside @pure or @realtime code.
+    if (@strEq(name, "@threadSpawn")) { return 97; }
+    if (@strEq(name, "@threadJoin")) { return 97; }
+    // Atomic is currently a deliberately unsafe raw-pointer primitive.  Its
+    // machine atomicity is real, but it cannot establish shared-object
+    // lifetime, race freedom, or thread creation on its own.
+    if (@strEq(name, "@atomicExchange64")) { return 96; }
+    if (@strEq(name, "@atomicLoad64")) { return 96; }
+    if (@strEq(name, "@atomicStore64")) { return 96; }
+    if (@strEq(name, "@atomicCompareExchange64")) { return 96; }
+    if (@strEq(name, "@atomicFetchAdd64")) { return 96; }
+    if (@strEq(name, "@atomicFetchSub64")) { return 96; }
+    if (@strEq(name, "@atomicFetchAnd64")) { return 96; }
+    if (@strEq(name, "@atomicFetchOr64")) { return 96; }
+    if (@strEq(name, "@atomicFetchXor64")) { return 96; }
+    if (@strEq(name, "@atomicLoad64Order")) { return 96; }
+    if (@strEq(name, "@atomicStore64Order")) { return 96; }
+    if (@strEq(name, "@atomicExchange64Order")) { return 96; }
+    if (@strEq(name, "@atomicFetchAdd64Order")) { return 96; }
+    if (@strEq(name, "@atomicFetchSub64Order")) { return 96; }
+    if (@strEq(name, "@atomicFetchAnd64Order")) { return 96; }
+    if (@strEq(name, "@atomicFetchOr64Order")) { return 96; }
+    if (@strEq(name, "@atomicFetchXor64Order")) { return 96; }
+    if (@strEq(name, "@atomicCompareExchange64Order")) { return 96; }
+    // Device builtins are permitted inside @kernel bodies, but remain a
+    // distinct effect so they cannot be laundered into host @pure code.
+    if (@strEq(name, "@gpuThreadIdx") || @strEq(name, "@gpuBlockIdx") ||
+        @strEq(name, "@gpuBlockDim") || @strEq(name, "@gpuGridDim") ||
+        @strEq(name, "@gpuSyncThreads") || @strEq(name, "@gpuBlend")) { return 256; }
+    // Host-side GPU resource and launch operations are not device operations.
+    if (@strEq(name, "@gpuAlloc") || @strEq(name, "@gpuFree")) { return 545; }
+    if (@strEq(name, "@gpuLaunch")) { return 544; }
+    // The bounded SSE2 intrinsic consumes raw pointers and emits target-level
+    // machine control.  It shares the Unsafe effect boundary with atomics and
+    // volatile access so an unsafe SIMD operation cannot be laundered through
+    // a @pure or @realtime declaration.
+    if (@strEq(name, "@simdAddI32x4") || @strEq(name, "@simdSubI32x4") ||
+        @strEq(name, "@simdAndI32x4") || @strEq(name, "@simdOrI32x4") ||
+        @strEq(name, "@simdXorI32x4")) { return 32; }
+    // Prefetch consumes a raw pointer and emits target-level machine control.
+    // It is advisory, but the pointer validity/ownership contract is not
+    // represented by the v2 type system, so keep it behind Unsafe rather than
+    // allowing it in @pure or @realtime callers.
+    if (@strEq(name, "@prefetch")) { return 32; }
     if (@strEq(name, "zalloc"))     { return 1; }
     if (@strEq(name, "zfree"))      { return 1; }
     if (@strEq(name, "zalloc_i"))   { return 1; }
     if (@strEq(name, "zfree_i"))    { return 1; }
     if (@strEq(name, "lock"))       { return 8; }
     // cache-line control: the aligned allocator/deallocator genuinely touch the
-    // heap (Alloc); @prefetch / @cacheLineSize / @cacheAlign are pure hints (0).
+    // heap (Alloc); @cacheLineSize is a pure constant, while @prefetch is
+    // Unsafe because its raw-pointer validity contract is not modeled.
     if (@strEq(name, "@cacheAlignedAlloc")) { return 1; }
     if (@strEq(name, "@cacheAlignedFree"))  { return 1; }
     if (@strEq(name, "print_str"))  { return 4; }
@@ -156,18 +241,37 @@ fn builtin_eff(name: []u8) i32 {
 }
 
 // effect an annotation DECLARES (on fn declarations): @alloc/@panic/@io/@lock
+// and @blocking.  Blocking is intentionally represented by Lock so the
+// existing transitive effect lattice rejects it from @realtime and @irq while
+// still leaving the source annotation explicit at the API boundary.
 fn annot_eff(a: []u8) i32 {
     if (@strEq(a, "@alloc")) { return 1; }
     if (@strEq(a, "@panic")) { return 2; }
     if (@strEq(a, "@io"))    { return 4; }
     if (@strEq(a, "@lock"))  { return 8; }
+    if (@strEq(a, "@blocking")) { return 8; }
+    if (@strEq(a, "@unsafe")) { return 32; }
+    // A v2 C-ABI import crosses a foreign implementation boundary. Its body
+    // and transitive behavior are outside the Zag proof, so propagate Unsafe
+    // into callers rather than treating @cabi as metadata only.
+    if (@strEq(a, "@cabi")) { return 160; }
     return 0;
 }
 
 // effects an annotation FORBIDS (a capability constraint to verify)
 fn forbidden_bits(a: []u8) i32 {
-    if (@strEq(a, "@realtime")) { return 13; }  // Alloc + IO + Lock
-    if (@strEq(a, "@pure"))     { return 13; }
+    if (@strEq(a, "@realtime")) { return 1005; } // Alloc+IO+Lock+Unsafe+Atomic+FFI+Device+GPUHost
+    if (@strEq(a, "@pure"))     { return 1005; }
+    // An IRQ handler may observe device state and use a proved atomic, but it
+    // may not allocate, block, raise, enter an untrusted/unsafe primitive, or
+    // cross an unknown foreign boundary.  The body checker separately rejects
+    // unbounded loops in this profile.
+    if (@strEq(a, "@irq"))      { return 701; } // Alloc+IO+Lock+Raises+Unsafe+FFI+GPUHost
+    // Kernels are a frontend-only device subset until a typed GPU runtime and
+    // effect model exist.  Reject every implemented host effect here rather
+    // than allowing IO, FFI, atomics, allocation, or unsafe machine control
+    // to be smuggled into emitted GPU source.
+    if (@strEq(a, "@kernel"))   { return 767; } // every effect except Device
     if (@strEq(a, "@noalloc"))  { return 1; }   // Alloc
     if (@strEq(a, "@total"))    { return 2; }   // Panic
     return 0;
@@ -188,7 +292,23 @@ fn callee_name(n: *Node) []u8 {
     return switch (n.*) {
         .id  => |d| d.name,
         .fld => |f| f.fname,
+        .idx => |x| callee_name(x.base),
         else => "",
+    };
+}
+
+// Only an identifier names a statically resolved callee.  A field, index, or
+// other expression may denote a function value, but this compact effect
+// analysis does not yet carry the value's row through aggregate storage or
+// arbitrary indirection.  Such a call must therefore be conservatively
+// effectful rather than borrowing the field spelling as though it were a
+// direct, proven-pure declaration.
+fn callee_is_direct_id(n: *Node) i32 {
+    return switch (n.*) {
+        .id  => |_d| 1,
+        .fld => |_f| 0,
+        .idx => |_x| 0,
+        else => 0,
     };
 }
 
@@ -495,6 +615,8 @@ fn total_unsafe_stmt(n: *Node, nz: *ArrayList[[]u8], eff: map.StringMap[i32]) i3
             while (len[[]u8](nz.*) > prev2) { let _ignored: []u8 = pop[[]u8](nz); }
             return cu + wu;
         }
+        .unsafe_ => |u| { return total_unsafe_body(u.body, nz, eff); }
+        .defer_ => |d| { return total_unsafe_expr(d.expr, nz.*, eff); }
         .assign => |a| {
             return total_unsafe_expr(a.target, nz.*, eff) + total_unsafe_expr(a.expr, nz.*, eff);
         }
@@ -542,6 +664,10 @@ fn call_eff(c: Call, eff: map.StringMap[i32]) i32 {
         acc = bor(acc, expr_eff(get[*Node](c.args, i), eff));
         i = i + 1;
     }
+    // Preserve effects needed to evaluate an indirect callee expression
+    // (`make_holder().op()`), then fail closed for its opaque function value.
+    acc = bor(acc, expr_eff(c.callee, eff));
+    if (callee_is_direct_id(c.callee) == 0) { return bor(acc, 1023); }
     let cn: []u8 = callee_name(c.callee);
     if (@strEq(cn, "new"))    { return bor(acc, 3); }  // Alloc + Panic
     if (@strEq(cn, "delete")) { return bor(acc, 1); }  // Alloc
@@ -570,6 +696,8 @@ fn stmt_eff(n: *Node, eff: map.StringMap[i32]) i32 {
         .ret    => |r| ret_eff(r, eff),
         .if_    => |x| bor(bor(expr_eff(x.cond, eff), body_eff(x.then_body, eff)), body_eff(x.els_body, eff)),
         .while_ => |w| bor(expr_eff(w.cond, eff), body_eff(w.body, eff)),
+        .unsafe_ => |u| bor(32, body_eff(u.body, eff)),
+        .defer_  => |d| expr_eff(d.expr, eff),
         .assign => |a| bor(expr_eff(a.target, eff), expr_eff(a.expr, eff)),
         .switch_ => |sw| bor(expr_eff(sw.subject, eff), switch_arms_eff(sw, eff)),
         .estmt  => |e| expr_eff(e.expr, eff),
@@ -604,7 +732,13 @@ fn seed_extern(d: *Node, eff: *map.StringMap[i32]) void {
     switch (d.*) {
         .fn_decl => |f| {
             if (f.is_extern == 1) {
-                map.put[i32](eff, f.name, declared_eff(f.annots));
+                let declared:i32=declared_eff(f.annots);
+                // An unannotated foreign declaration is opaque to the Zag
+                // proof. Treat it as FFI rather than silently allowing it in
+                // @realtime/@irq code; an explicit @cabi/@alloc/@io row can
+                // refine the boundary as usual.
+                if(declared==0){map.put[i32](eff,f.name,128);}
+                else{map.put[i32](eff,f.name,declared);}
             }
         }
         else => { }
@@ -693,22 +827,28 @@ fn is_fn_pty(t: []u8) i32 {
 }
 
 // The effects a fn-type's row annotation FORBIDS of any value stored into it.
-//   @realtime/@pure → {Alloc,IO,Lock}=13   @noalloc → 1   @total → 2
+//   @realtime/@pure → {Alloc,IO,Lock,Unsafe}=45   @noalloc → 1   @total → 2
 //   ! pure          → all (must be pure)   ! e (effect variable) → none
+// Keep this universe in lock-step with the bitmask actually inferred above:
+// Alloc, Panic, IO, Lock, Raises, Unsafe.  The older v1 `15` mask accidentally
+// omitted Raises and Unsafe, so an @realtime callback default could become
+// negative after subtracting bit 32 and !pure function values could launder an
+// Unsafe operation through a higher-order call.
+fn effect_universe() i32 { return 1023; }
 fn row_forbidden(eff: []u8) i32 {
     if (eff.len == 0) { return 0; }
     if (eff[0] == '@') { return forbidden_bits(eff); }
-    if (@strEq(eff, "!pure")) { return 15; }
+    if (@strEq(eff, "!pure")) { return effect_universe(); }
     return 0;
 }
 
 // Worst-case latent effect of CALLING a fn value carrying this row, when no
 // more precise binding is known = all effects the row does not forbid.
 fn row_default_call(eff: []u8) i32 {
-    if (eff.len == 0) { return 15; }
-    if (eff[0] == '@') { return 15 - forbidden_bits(eff); }
+    if (eff.len == 0) { return effect_universe(); }
+    if (eff[0] == '@') { return effect_universe() - forbidden_bits(eff); }
     if (@strEq(eff, "!pure")) { return 0; }
-    return 15;
+    return effect_universe();
 }
 
 fn decl_fn_name(d: *Node) []u8 {
@@ -778,6 +918,67 @@ fn seed_params(f: FnDecl, env: *map.StringMap[i32]) void {
     }
 }
 
+// Struct identities share the latent environment using negative values.
+// Effect payloads are always non-negative, so the two domains cannot alias.
+// The declaration-list lookup is kept separate because seed_params does not
+// receive declarations; callers seed aggregate parameters after this pass.
+fn env_struct_put(env:*map.StringMap[i32],name:[]u8,si:i32)void{
+    map.put[i32](env,name,0-si-1);
+}
+fn env_struct_get(env:*map.StringMap[i32],name:[]u8)i32{
+    if(!map.has[i32](env.*,name)){return 0-1;}
+    let v:i32=map.get[i32](env.*,name) orelse 0;
+    if(v<0){return 0-v-1;}
+    return 0-1;
+}
+fn seed_struct_params(f:FnDecl,env:*map.StringMap[i32],decls:ArrayList[*Node])void{
+    let i:i32=0;while(i<len[Param](f.params)){
+        let p:Param=get[Param](f.params,i);
+        let si:i32=find_struct(decls,p.pty);
+        if(si>=0){env_struct_put(env,p.name,si);}
+        i=i+1;
+    }
+}
+fn expr_struct_index(n:*Node,env:*map.StringMap[i32],decls:ArrayList[*Node])i32{
+    return switch(n.*){
+        .id=>|x|env_struct_get(env,x.name),
+        .slit_=>|x|find_struct(decls,x.sname),
+        else=>0-1,
+    };
+}
+fn struct_field_row_at(dn:*Node,fname:[]u8)[]u8{
+    return switch(dn.*){
+        .struct_=>|s|{
+            let i:i32=0;while(i<len[Param](s.fields)){
+                let p:Param=get[Param](s.fields,i);
+                if(@strEq(p.name,fname)&&is_fn_pty(p.pty)==1){return p.eff;}
+                i=i+1;
+            }
+            return "";
+        }
+        else=>"",
+    };
+}
+fn known_effect(eff:map.StringMap[i32],name:[]u8)i32{
+    return map.get[i32](eff,name) orelse 0;
+}
+fn verified_field_call_effect(n:*Node,env:*map.StringMap[i32],decls:ArrayList[*Node],eff:map.StringMap[i32])i32{
+    return switch(n.*){
+        .fld=>|x|{
+            let si:i32=expr_struct_index(x.base,env,decls);
+            if(si<0){return 0-1;}
+            let row:[]u8=struct_field_row_at(get[*Node](decls,si),x.fname);
+            if(row.len>0){return row_default_call(row);}
+            let sname:[]u8=decl_struct_name(get[*Node](decls,si));
+            let method:[]u8=_zag_str_concat(_zag_str_concat(sname,"_"),x.fname);
+            let fi:i32=find_fn(decls,method);
+            if(fi>=0){return known_effect(eff,method);}
+            return 0-1;
+        }
+        else=>0-1,
+    };
+}
+
 // ── latent effect of a function-VALUED expression (used to bind call sites) ──
 fn val_eff(n: *Node, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map.StringMap[i32]) i32 {
     return switch (n.*) {
@@ -786,8 +987,17 @@ fn val_eff(n: *Node, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map
         else  => 0,
     };
 }
+// The storage-contract pass keeps the function value's current latent effect
+// in the low ten bits and its declared forbidden row above it.  The ordinary
+// latent-effect walk stores only the low payload, so decoding here is safe for
+// both environments and prevents assignment from forgetting a local contract.
+fn store_effect_payload(value: i32) i32 { return value % 1024; }
+fn store_effect_forbidden(value: i32) i32 { return value / 1024; }
+fn store_effect_pack(payload: i32, forbidden: i32) i32 {
+    return (payload % 1024) + ((forbidden % 1024) * 1024);
+}
 fn val_eff_id(nm: []u8, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map.StringMap[i32]) i32 {
-    if (map.has[i32](env.*, nm)) { return map.get[i32](env.*, nm) orelse 0; }
+    if (map.has[i32](env.*, nm)) { return store_effect_payload(map.get[i32](env.*, nm) orelse 0); }
     let b: i32 = builtin_eff(nm);
     if (b != 0) { return b; }
     if (find_fn(decls, nm) >= 0) { return map.get[i32](eff, nm) orelse 0; }  // named fn / hoisted closure
@@ -801,8 +1011,9 @@ fn val_eff_call(c: Call, decls: ArrayList[*Node]) i32 {
 
 // ── context-sensitive latent-effect walk over a function body ───────────────
 fn fn_latent(f: FnDecl, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map.StringMap[i32], depth: i32) i32 {
-    if (depth > 48) { return 0; }
+    if (depth > 48) { return effect_universe(); }
     seed_params(f, env);
+    seed_struct_params(f, env, decls);
     return le_body(f.body, env, decls, eff, depth);
 }
 fn le_body(body: ArrayList[*Node], env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map.StringMap[i32], depth: i32) i32 {
@@ -820,11 +1031,34 @@ fn le_stmt(n: *Node, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map
         .ret     => |r| le_ret(r, env, decls, eff, depth),
         .if_     => |x| bor(bor(le_expr(x.cond, env, decls, eff, depth), le_body(x.then_body, env, decls, eff, depth)), le_body(x.els_body, env, decls, eff, depth)),
         .while_  => |w| bor(le_expr(w.cond, env, decls, eff, depth), le_body(w.body, env, decls, eff, depth)),
-        .assign  => |a| bor(le_expr(a.target, env, decls, eff, depth), le_expr(a.expr, env, decls, eff, depth)),
+        .unsafe_ => |u| bor(32, le_body(u.body, env, decls, eff, depth)),
+        .defer_  => |d| le_expr(d.expr, env, decls, eff, depth),
+        .assign  => |a| le_assign(a, env, decls, eff, depth),
         .switch_ => |sw| bor(le_expr(sw.subject, env, decls, eff, depth), le_switch(sw, env, decls, eff, depth)),
         .estmt   => |e| le_expr(e.expr, env, decls, eff, depth),
         else     => 0,
     };
+}
+// Function-valued locals are mutable.  Preserve the latent effect of their
+// replacement so an indirect call after `op = value` cannot retain the stale
+// effect row from the initializer and launder Unsafe through @pure/@realtime.
+fn le_assign(a: Assign, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map.StringMap[i32], depth: i32) i32 {
+    let acc: i32 = bor(le_expr(a.target, env, decls, eff, depth), le_expr(a.expr, env, decls, eff, depth));
+    switch (a.target.*) {
+        .id => |id| {
+            if (map.has[i32](env.*, id.name)) {
+                let prior:i32=map.get[i32](env.*,id.name) orelse 0;
+                if(prior<0){
+                    let si:i32=expr_struct_index(a.expr,env,decls);
+                    if(si>=0){env_struct_put(env,id.name,si);}
+                }else{
+                    map.put[i32](env, id.name, val_eff(a.expr, env, decls, eff));
+                }
+            }
+        }
+        else => { }
+    }
+    return acc;
 }
 fn le_ret(r: Return, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map.StringMap[i32], depth: i32) i32 {
     if (r.has_expr == 1) { return le_expr(r.expr, env, decls, eff, depth); }
@@ -835,6 +1069,10 @@ fn le_let(l: Let, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map.St
     if (is_fn_pty(l.dty) == 1) {
         if (l.eff.len > 0) { map.put[i32](env, l.name, row_default_call(l.eff)); }   // contract bound
         else { map.put[i32](env, l.name, val_eff(l.expr, env, decls, eff)); }        // inferred from value
+    } else {
+        let si:i32=find_struct(decls,l.dty);
+        if(si>=0){env_struct_put(env,l.name,si);}
+        else { let inferred:i32=expr_struct_index(l.expr,env,decls);if(inferred>=0){env_struct_put(env,l.name,inferred);} }
     }
     return e;
 }
@@ -866,6 +1104,7 @@ fn le_expr(n: *Node, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map
         .fld    => |fexpr| le_expr(fexpr.base, env, decls, eff, depth),
         .slit_  => |s| le_flds(s.fields, env, decls, eff, depth),
         .slice_ => |s| bor(bor(le_expr(s.base, env, decls, eff, depth), le_expr(s.lo, env, decls, eff, depth)), le_expr(s.hi, env, decls, eff, depth)),
+        .cast_  => |c| le_expr(c.expr, env, decls, eff, depth),
         else    => 0,
     };
 }
@@ -875,6 +1114,17 @@ fn le_call(c: Call, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map.
     while (i < len[*Node](c.args)) {
         acc = bor(acc, le_expr(get[*Node](c.args, i), env, decls, eff, depth));
         i = i + 1;
+    }
+    // Direct locals retain their row in `env`; aggregate and computed callees
+    // do not yet.  Until rows are propagated through fields/indexes/imports,
+    // give every non-identifier call the complete implemented universe.  This
+    // prevents an indirect callback from laundering Unsafe/Atomic/FFI-like
+    // work through a field name that happens to match a harmless function.
+    acc = bor(acc, le_expr(c.callee, env, decls, eff, depth));
+    if (callee_is_direct_id(c.callee) == 0) {
+        let field_eff:i32=verified_field_call_effect(c.callee,env,decls,eff);
+        if(field_eff>=0){return bor(acc,field_eff);}
+        return bor(acc, 1023);
     }
     let cn: []u8 = callee_name(c.callee);
     if (@strEq(cn, "new"))    { return bor(acc, 3); }
@@ -903,7 +1153,12 @@ fn fn_has_fnparam(f: FnDecl) i32 {
 }
 fn call_user_fn2(f: FnDecl, c: Call, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map.StringMap[i32], depth: i32) i32 {
     // No function-valued parameter ⇒ ordinary call: context-free transitive effect.
-    if (fn_has_fnparam(f) == 0) { return map.get[i32](eff, f.name) orelse 0; }
+    if (fn_has_fnparam(f) == 0) {
+        let known:i32=map.get[i32](eff,f.name) orelse 0;
+        if(known!=effect_universe()){return known;}
+        let precise_env:map.StringMap[i32]=map.make[i32](16);
+        return fn_latent(f,&precise_env,decls,eff,depth+1);
+    }
     // Bind each fn-typed parameter to the latent effect of its actual argument,
     // then re-walk the callee body under that binding.
     let cenv: map.StringMap[i32] = map.make[i32](16);
@@ -925,6 +1180,344 @@ fn fn_violation_mask(f: FnDecl, decls: ArrayList[*Node], eff: map.StringMap[i32]
     let env: map.StringMap[i32] = map.make[i32](16);
     return fn_latent(f, &env, decls, eff, 0);
 }
+
+// ── rendered effect witnesses ──────────────────────────────────────────────
+//
+// The proof above deliberately reduces every callable to a bitmask. That is
+// ideal for the fixpoint, but it used to discard the information a person
+// needs when a capability is rejected. This second walk is diagnostic-only:
+// it follows the same source tree while retaining the concrete function value
+// supplied for a callback parameter or local. One witness is rendered for
+// every forbidden effect bit. A stack (rather than a global visited set) makes
+// recursive and mutually-recursive graphs terminate without hiding a sibling
+// path that reaches the effect source.
+fn effect_name(bit: i32) []u8 {
+    if (bit == 1)   { return "Alloc"; }
+    if (bit == 2)   { return "Panic"; }
+    if (bit == 4)   { return "IO"; }
+    if (bit == 8)   { return "Lock"; }
+    if (bit == 16)  { return "Raises"; }
+    if (bit == 32)  { return "Unsafe"; }
+    if (bit == 64)  { return "Atomic"; }
+    if (bit == 128) { return "FFI"; }
+    if (bit == 256) { return "Device"; }
+    if (bit == 512) { return "GPUHost"; }
+    return "Effect";
+}
+
+fn trace_has(stack: ArrayList[[]u8], name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[[]u8](stack)) {
+        if (@strEq(get[[]u8](stack, i), name)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn trace_starts(s: []u8, prefix: []u8) i32 {
+    if (s.len < prefix.len) { return 0; }
+    let i: i32 = 0;
+    while (i < prefix.len) {
+        if (s[i] != prefix[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn trace_fn_label(f: FnDecl, root_origin: []u8) []u8 {
+    let label: []u8 = f.name;
+    if (trace_starts(f.name, "__clos_") == 1) { label = "closure"; }
+    // Imported helpers retain their resolver path, so equal spellings from
+    // different modules cannot produce an ambiguous diagnostic.
+    if (f.origin.len > 0 && !@strEq(f.origin, "<root>") && !@strEq(f.origin, root_origin)) {
+        return _zag_str_concat(label, _zag_str_concat(" [", _zag_str_concat(f.origin,
+            _zag_str_concat(":", _zag_str_concat(_zag_i64_to_str(f.line as i64), "]")))));
+    }
+    if (trace_starts(f.name, "__clos_") == 1) {
+        return _zag_str_concat(label, _zag_str_concat("@", _zag_i64_to_str(f.line as i64)));
+    }
+    return label;
+}
+
+fn trace_terminal(name: []u8, bit: i32, declared: i32) []u8 {
+    let why: []u8 = "";
+    if (declared == 1) { why = " declared"; }
+    return _zag_str_concat(name, _zag_str_concat("() [", _zag_str_concat(effect_name(bit),
+        _zag_str_concat(why, "]"))));
+}
+
+fn trace_join(head: []u8, tail: []u8) []u8 {
+    if (tail.len == 0) { return head; }
+    return _zag_str_concat(head, _zag_str_concat(" -> ", tail));
+}
+
+struct TraceBinding { name: []u8, target: []u8 }
+
+fn trace_binding_get(bindings: ArrayList[TraceBinding], name: []u8) []u8 {
+    let i: i32 = len[TraceBinding](bindings) - 1;
+    while (i >= 0) {
+        let b: TraceBinding = get[TraceBinding](bindings, i);
+        if (@strEq(b.name, name)) { return b.target; }
+        i = i - 1;
+    }
+    return "";
+}
+fn trace_binding_put(bindings: *ArrayList[TraceBinding], name: []u8, target: []u8) void {
+    push[TraceBinding](bindings, TraceBinding{ .name = name, .target = target });
+}
+
+fn trace_value_name(n: *Node, bindings: *ArrayList[TraceBinding]) []u8 {
+    return switch (n.*) {
+        .id => |x| { let bound: []u8 = trace_binding_get(bindings.*, x.name); if (bound.len > 0) { return bound; } return x.name; }
+        .cast_ => |c| trace_value_name(c.expr, bindings),
+        else => "",
+    };
+}
+
+fn trace_expr(n: *Node, bindings: *ArrayList[TraceBinding], decls: ArrayList[*Node],
+              eff: map.StringMap[i32], bit: i32, stack: *ArrayList[[]u8],
+              root_origin: []u8) []u8;
+fn trace_body(body: ArrayList[*Node], bindings: *ArrayList[TraceBinding], decls: ArrayList[*Node],
+              eff: map.StringMap[i32], bit: i32, stack: *ArrayList[[]u8],
+              root_origin: []u8) []u8;
+
+fn trace_fields(fields: ArrayList[FieldInit], bindings: *ArrayList[TraceBinding],
+                decls: ArrayList[*Node], eff: map.StringMap[i32], bit: i32,
+                stack: *ArrayList[[]u8], root_origin: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[FieldInit](fields)) {
+        let p: []u8 = trace_expr(get[FieldInit](fields, i).val, bindings, decls, eff, bit, stack, root_origin);
+        if (p.len > 0) { return p; }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn trace_fn_node(d: *Node, bindings: *ArrayList[TraceBinding], decls: ArrayList[*Node],
+                 eff: map.StringMap[i32], bit: i32, stack: *ArrayList[[]u8],
+                 root_origin: []u8) []u8 {
+    return switch (d.*) {
+        .fn_decl => |f| trace_fn_effect(f, bindings, decls, eff, bit, stack, root_origin),
+        else => "",
+    };
+}
+
+fn trace_fn_effect(f: FnDecl, bindings: *ArrayList[TraceBinding], decls: ArrayList[*Node],
+                   eff: map.StringMap[i32], bit: i32, stack: *ArrayList[[]u8],
+                   root_origin: []u8) []u8 {
+    if (trace_has(stack.*, f.name) == 1) { return ""; }
+    push[[]u8](stack, f.name);
+    let inner: []u8 = trace_body(f.body, bindings, decls, eff, bit, stack, root_origin);
+    let _removed: []u8 = pop[[]u8](stack);
+    let label: []u8 = trace_fn_label(f, root_origin);
+    if (inner.len > 0) { return trace_join(label, inner); }
+    if ((declared_eff(f.annots) & bit) != 0) {
+        return trace_join(label, trace_terminal(f.name, bit, 1));
+    }
+    return "";
+}
+
+fn trace_call(c: Call, bindings: *ArrayList[TraceBinding], decls: ArrayList[*Node],
+              eff: map.StringMap[i32], bit: i32, stack: *ArrayList[[]u8],
+              root_origin: []u8) []u8 {
+    // Argument evaluation is part of the caller's path and happens before the
+    // callee runs.
+    let ai: i32 = 0;
+    while (ai < len[*Node](c.args)) {
+        let ap: []u8 = trace_expr(get[*Node](c.args, ai), bindings, decls, eff, bit, stack, root_origin);
+        if (ap.len > 0) { return ap; }
+        ai = ai + 1;
+    }
+    if (callee_is_direct_id(c.callee) == 0) {
+        return _zag_str_concat("indirect call [", _zag_str_concat(effect_name(bit), ", conservative]"));
+    }
+    let cn: []u8 = callee_name(c.callee);
+    if ((@strEq(cn, "new") && (bit == 1 || bit == 2)) ||
+        (@strEq(cn, "delete") && bit == 1)) { return trace_terminal(cn, bit, 0); }
+    if ((builtin_eff(cn) & bit) != 0) { return trace_terminal(cn, bit, 0); }
+
+    // Resolve an effect-polymorphic parameter/local back to the concrete named
+    // function or hoisted closure supplied at this call site.
+    let target: []u8 = trace_binding_get(bindings.*, cn);
+    if (target.len > 0) {
+        let ti: i32 = find_fn(decls, target);
+        if (ti >= 0) {
+            let child_bindings: ArrayList[TraceBinding] = make[TraceBinding](8);
+            let child: []u8 = trace_fn_node(get[*Node](decls, ti), &child_bindings, decls, eff, bit, stack, root_origin);
+            if (child.len > 0) {
+                return trace_join(_zag_str_concat(cn, _zag_str_concat(" (callback=", _zag_str_concat(trace_fn_label_from_node(get[*Node](decls, ti), root_origin), ")"))), child);
+            }
+        }
+        return _zag_str_concat(cn, _zag_str_concat("() [", _zag_str_concat(effect_name(bit), ", effect row]")));
+    }
+
+    let fi: i32 = find_fn(decls, cn);
+    if (fi >= 0) {
+        // A recursive edge contributes no new label by itself. Skip it and let
+        // the enclosing body continue searching its remaining branches and
+        // statements for the concrete source operation.
+        if (trace_has(stack.*, cn) == 1) { return ""; }
+        let child_bindings: ArrayList[TraceBinding] = make[TraceBinding](8);
+        trace_bind_call(get[*Node](decls, fi), c, bindings, &child_bindings);
+        let child: []u8 = trace_fn_node(get[*Node](decls, fi), &child_bindings, decls, eff, bit, stack, root_origin);
+        if (child.len > 0) { return child; }
+        // An extern or body-less declaration is itself the source boundary.
+        let known: i32 = map.get[i32](eff, cn) orelse 0;
+        if ((known & bit) != 0) { return trace_terminal(cn, bit, 1); }
+    }
+    let known: i32 = map.get[i32](eff, cn) orelse 0;
+    if ((known & bit) != 0) { return trace_terminal(cn, bit, 1); }
+    return "";
+}
+
+fn trace_fn_label_from_node(d: *Node, root_origin: []u8) []u8 {
+    return switch (d.*) { .fn_decl => |f| trace_fn_label(f, root_origin), else => "callable" };
+}
+
+fn trace_bind_call(d: *Node, c: Call, outer: *ArrayList[TraceBinding], inner: *ArrayList[TraceBinding]) void {
+    switch (d.*) {
+        .fn_decl => |f| {
+            let i: i32 = 0;
+            while (i < len[Param](f.params) && i < len[*Node](c.args)) {
+                let p: Param = get[Param](f.params, i);
+                if (is_fn_pty(p.pty) == 1) {
+                    let actual: []u8 = trace_value_name(get[*Node](c.args, i), outer);
+                    if (actual.len > 0) { trace_binding_put(inner, p.name, actual); }
+                }
+                i = i + 1;
+            }
+        }
+        else => { }
+    }
+}
+
+fn trace_expr(n: *Node, bindings: *ArrayList[TraceBinding], decls: ArrayList[*Node],
+              eff: map.StringMap[i32], bit: i32, stack: *ArrayList[[]u8],
+              root_origin: []u8) []u8 {
+    return switch (n.*) {
+        .call => |c| trace_call(c, bindings, decls, eff, bit, stack, root_origin),
+        .bin => |b| {
+            let p: []u8 = trace_expr(b.l, bindings, decls, eff, bit, stack, root_origin);
+            if (p.len > 0) { return p; }
+            p = trace_expr(b.r, bindings, decls, eff, bit, stack, root_origin);
+            if (p.len > 0) { return p; }
+            if (bit == 2 && div_eff(b) != 0) { return _zag_str_concat("operator `", _zag_str_concat(b.op, "` [Panic]")); }
+            return "";
+        }
+        .un => |u| trace_expr(u.e, bindings, decls, eff, bit, stack, root_origin),
+        .idx => |x| {
+            let p: []u8 = trace_expr(x.base, bindings, decls, eff, bit, stack, root_origin);
+            if (p.len > 0) { return p; }
+            return trace_expr(x.idx, bindings, decls, eff, bit, stack, root_origin);
+        }
+        .fld => |x| trace_expr(x.base, bindings, decls, eff, bit, stack, root_origin),
+        .slit_ => |s| trace_fields(s.fields, bindings, decls, eff, bit, stack, root_origin),
+        .slice_ => |s| {
+            let p: []u8 = trace_expr(s.base, bindings, decls, eff, bit, stack, root_origin);
+            if (p.len > 0) { return p; }
+            p = trace_expr(s.lo, bindings, decls, eff, bit, stack, root_origin);
+            if (p.len > 0) { return p; }
+            return trace_expr(s.hi, bindings, decls, eff, bit, stack, root_origin);
+        }
+        .cast_ => |c| trace_expr(c.expr, bindings, decls, eff, bit, stack, root_origin),
+        else => "",
+    };
+}
+
+fn trace_switch(sw: Switch, bindings: *ArrayList[TraceBinding], decls: ArrayList[*Node],
+                eff: map.StringMap[i32], bit: i32, stack: *ArrayList[[]u8],
+                root_origin: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[SwitchArm](sw.arms)) {
+        let p: []u8 = trace_body(get[SwitchArm](sw.arms, i).body, bindings, decls, eff, bit, stack, root_origin);
+        if (p.len > 0) { return p; }
+        i = i + 1;
+    }
+    if (sw.has_els == 1) { return trace_body(sw.els_body, bindings, decls, eff, bit, stack, root_origin); }
+    return "";
+}
+
+fn trace_stmt(n: *Node, bindings: *ArrayList[TraceBinding], decls: ArrayList[*Node],
+              eff: map.StringMap[i32], bit: i32, stack: *ArrayList[[]u8],
+              root_origin: []u8) []u8 {
+    return switch (n.*) {
+        .let_ => |l| {
+            let p: []u8 = trace_expr(l.expr, bindings, decls, eff, bit, stack, root_origin);
+            if (is_fn_pty(l.dty) == 1) {
+                let actual: []u8 = trace_value_name(l.expr, bindings);
+                if (actual.len > 0) { trace_binding_put(bindings, l.name, actual); }
+            }
+            return p;
+        }
+        .ret => |r| { if (r.has_expr == 1) { return trace_expr(r.expr, bindings, decls, eff, bit, stack, root_origin); } return ""; }
+        .if_ => |x| {
+            let p: []u8 = trace_expr(x.cond, bindings, decls, eff, bit, stack, root_origin);
+            if (p.len > 0) { return p; }
+            p = trace_body(x.then_body, bindings, decls, eff, bit, stack, root_origin);
+            if (p.len > 0) { return p; }
+            return trace_body(x.els_body, bindings, decls, eff, bit, stack, root_origin);
+        }
+        .while_ => |w| {
+            let p: []u8 = trace_expr(w.cond, bindings, decls, eff, bit, stack, root_origin);
+            if (p.len > 0) { return p; }
+            return trace_body(w.body, bindings, decls, eff, bit, stack, root_origin);
+        }
+        .unsafe_ => |u| {
+            if (bit == 32) { return "unsafe block [Unsafe]"; }
+            return trace_body(u.body, bindings, decls, eff, bit, stack, root_origin);
+        }
+        .defer_ => |d| trace_expr(d.expr, bindings, decls, eff, bit, stack, root_origin),
+        .assign => |a| {
+            let p: []u8 = trace_expr(a.target, bindings, decls, eff, bit, stack, root_origin);
+            if (p.len > 0) { return p; }
+            p = trace_expr(a.expr, bindings, decls, eff, bit, stack, root_origin);
+            switch (a.target.*) { .id => |x| { if (trace_binding_get(bindings.*, x.name).len > 0) { let actual: []u8 = trace_value_name(a.expr, bindings); if (actual.len > 0) { trace_binding_put(bindings, x.name, actual); } } } else => { } }
+            return p;
+        }
+        .switch_ => |sw| {
+            let p: []u8 = trace_expr(sw.subject, bindings, decls, eff, bit, stack, root_origin);
+            if (p.len > 0) { return p; }
+            return trace_switch(sw, bindings, decls, eff, bit, stack, root_origin);
+        }
+        .estmt => |e| trace_expr(e.expr, bindings, decls, eff, bit, stack, root_origin),
+        else => "",
+    };
+}
+
+fn trace_body(body: ArrayList[*Node], bindings: *ArrayList[TraceBinding], decls: ArrayList[*Node],
+              eff: map.StringMap[i32], bit: i32, stack: *ArrayList[[]u8],
+              root_origin: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        let p: []u8 = trace_stmt(get[*Node](body, i), bindings, decls, eff, bit, stack, root_origin);
+        if (p.len > 0) { return p; }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn effect_witness(f: FnDecl, decls: ArrayList[*Node], eff: map.StringMap[i32], bit: i32) []u8 {
+    let bindings: ArrayList[TraceBinding] = make[TraceBinding](8);
+    let stack: ArrayList[[]u8] = make[[]u8](8);
+    return trace_fn_effect(f, &bindings, decls, eff, bit, &stack, f.origin);
+}
+
+fn witness_notes(f: FnDecl, decls: ArrayList[*Node], eff: map.StringMap[i32], violated: i32) []u8 {
+    let out: []u8 = "";
+    let bit: i32 = 1;
+    while (bit <= 512) {
+        if ((violated & bit) != 0) {
+            let path: []u8 = effect_witness(f, decls, eff, bit);
+            if (path.len > 0) {
+                if (out.len > 0) { out = _zag_str_concat(out, "\n"); }
+                out = _zag_str_concat(out, _zag_str_concat("   = effect path [", _zag_str_concat(effect_name(bit), _zag_str_concat("]: ", path))));
+            }
+        }
+        bit = bit * 2;
+    }
+    return out;
+}
+
 fn report_fn(f: FnDecl, decls: ArrayList[*Node], eff: map.StringMap[i32], src: []u8, file: []u8) i32 {
     if (f.is_extern == 1) { return 0; }
     let count: i32 = 0;
@@ -954,10 +1547,14 @@ fn report_fn(f: FnDecl, decls: ArrayList[*Node], eff: map.StringMap[i32], src: [
                 if (@strEq(a, "@total") && fn_total_safe(f, eff) == 1) {
                     i = i + 1;
                 } else {
+                    let violated: i32 = myeff & forb;
+                    let witnesses: []u8 = witness_notes(f, decls, eff, violated);
+                    let note: []u8 = annot_note(a);
+                    if (witnesses.len > 0) { note = _zag_str_concat(note, _zag_str_concat("\n", witnesses)); }
                     diag_emit("E0002",
                         _zag_str_concat("capability violation — `", _zag_str_concat(a, _zag_str_concat("` constraint broken in function `", _zag_str_concat(f.name, "`")))),
                         file, f.line, 1, f.name.len,
-                        annot_note(a),
+                        note,
                         annot_hint(a),
                         src);
                     count = count + 1;
@@ -1011,6 +1608,7 @@ fn store_fn(f: FnDecl, decls: ArrayList[*Node], eff: map.StringMap[i32], src: []
     if (f.is_extern == 1) { return 0; }
     let env: map.StringMap[i32] = map.make[i32](16);
     seed_params(f, &env);
+    seed_struct_params(f, &env, decls);
     return store_body(f.body, &env, f, decls, eff, src, file);
 }
 fn store_body(body: ArrayList[*Node], env: *map.StringMap[i32], f: FnDecl, decls: ArrayList[*Node], eff: map.StringMap[i32], src: []u8, file: []u8) i32 {
@@ -1026,10 +1624,12 @@ fn store_stmt(n: *Node, env: *map.StringMap[i32], f: FnDecl, decls: ArrayList[*N
     return switch (n.*) {
         .let_    => |l| store_let(l, env, decls, eff, src, file),
         .ret     => |r| store_ret(r, env, f, decls, eff, src, file),
-        .assign  => |a| store_expr(a.expr, env, decls, eff, src, file),
+        .assign  => |a| store_assign(a, env, decls, eff, src, file),
         .estmt   => |e| store_expr(e.expr, env, decls, eff, src, file),
         .if_     => |x| store_body(x.then_body, env, f, decls, eff, src, file) + store_body(x.els_body, env, f, decls, eff, src, file),
         .while_  => |w| store_body(w.body, env, f, decls, eff, src, file),
+        .unsafe_ => |u| store_body(u.body, env, f, decls, eff, src, file),
+        .defer_  => |d| store_expr(d.expr, env, decls, eff, src, file),
         .switch_ => |sw| store_switch(sw, env, f, decls, eff, src, file),
         else     => 0,
     };
@@ -1051,22 +1651,61 @@ fn store_let(l: Let, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map
         if (forb != 0) {
             acc = acc + contract_check(_zag_str_concat("storing into typed local `", _zag_str_concat(l.name, "` breaks its effect contract")), forb, val_eff(l.expr, env, decls, eff), src, file);
         }
-        // track the local so later checks resolve it (bound ⇒ contract default)
-        if (l.eff.len > 0) { map.put[i32](env, l.name, row_default_call(l.eff)); }
-        else { map.put[i32](env, l.name, val_eff(l.expr, env, decls, eff)); }
+        // Retain both the current value effect and the declared row: a later
+        // assignment must be checked against the same local contract.
+        map.put[i32](env, l.name, store_effect_pack(val_eff(l.expr, env, decls, eff), forb));
+    } else {
+        let si:i32=find_struct(decls,l.dty);
+        if(si>=0){env_struct_put(env,l.name,si);}
+        else { let inferred:i32=expr_struct_index(l.expr,env,decls);if(inferred>=0){env_struct_put(env,l.name,inferred);} }
+    }
+    return acc;
+}
+fn store_assign(a: Assign, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map.StringMap[i32], src: []u8, file: []u8) i32 {
+    let acc: i32 = store_expr(a.expr, env, decls, eff, src, file);
+    switch (a.target.*) {
+        .id => |id| {
+            if (map.has[i32](env.*, id.name)) {
+                let prior: i32 = map.get[i32](env.*, id.name) orelse 0;
+                if(prior<0){
+                    let si:i32=expr_struct_index(a.expr,env,decls);
+                    if(si>=0){env_struct_put(env,id.name,si);}
+                }else{
+                    let forb: i32 = store_effect_forbidden(prior);
+                    let value: i32 = val_eff(a.expr, env, decls, eff);
+                    if (forb != 0) {
+                        acc = acc + contract_check(_zag_str_concat("assigning typed local `", _zag_str_concat(id.name, "` breaks its effect contract")), forb, value, src, file);
+                    }
+                    map.put[i32](env, id.name, store_effect_pack(value, forb));
+                }
+            }
+        }
+        .fld => |field| {
+            let si:i32=expr_struct_index(field.base,env,decls);
+            if(si>=0){
+                let row:[]u8=struct_field_row_at(get[*Node](decls,si),field.fname);
+                let forb:i32=row_forbidden(row);
+                if(forb!=0){
+                    acc=acc+contract_check(_zag_str_concat("assigning aggregate field `",_zag_str_concat(field.fname,"` breaks its effect contract")),forb,val_eff(a.expr,env,decls,eff),src,file);
+                }
+            }
+        }
+        else => { }
     }
     return acc;
 }
 fn store_ret(r: Return, env: *map.StringMap[i32], f: FnDecl, decls: ArrayList[*Node], eff: map.StringMap[i32], src: []u8, file: []u8) i32 {
     if (r.has_expr == 0) { return 0; }
     let acc: i32 = store_expr(r.expr, env, decls, eff, src, file);
-    // Escape check: returning a capturing closure would dangle (env lives on the stack).
+    // Only pointer captures retain the defining frame. Scalar captures are
+    // copied into the native heap environment and are governed by the v2
+    // ownership pass (`close`/owned return) after this capability pass.
     if (ret_escapes_capturing(r.expr, decls) == 1) {
         diag_emit("E0006",
             _zag_str_concat("capturing closure escapes function `", _zag_str_concat(f.name, "`")),
             file, f.line, 1, f.name.len,
-            "the captured environment lives on the stack; returning the closure causes a dangling reference",
-            "heap closures (Phase-1) are not yet supported — restructure to avoid returning the closure",
+            "a pointer capture retains a defining-frame address; returning the closure would dangle",
+            "capture a scalar by value or keep the pointer callback within the defining frame",
             src);
         acc = acc + 1;
     }
@@ -1086,7 +1725,16 @@ fn ret_escapes_capturing(n: *Node, decls: ArrayList[*Node]) i32 {
 fn id_caps(nm: []u8, decls: ArrayList[*Node]) i32 {
     let fi: i32 = find_fn(decls, nm);
     if (fi < 0) { return 0; }
-    if (fn_caps(get[*Node](decls, fi)) > 0) { return 1; }
+    switch (get[*Node](decls, fi).*) {
+        .fn_decl => |f| {
+            let i: i32 = 0;
+            while (i < f.cap_names.len) {
+                if (f.cap_names[i] == '*') { return 1; }
+                i = i + 1;
+            }
+        }
+        else => { }
+    }
     return 0;
 }
 fn store_expr(n: *Node, env: *map.StringMap[i32], decls: ArrayList[*Node], eff: map.StringMap[i32], src: []u8, file: []u8) i32 {
@@ -1151,39 +1799,58 @@ fn store_slit(s: StructLit, env: *map.StringMap[i32], decls: ArrayList[*Node], e
 
 // ── error-union assignment check ─────────────────────────────────────────────
 // If `n` is a direct (bare) call — not wrapped in `try` or `catch` — to a
-// function that carries the Raises effect (bit 16, i.e. returns !T), return
-// the callee name.  Otherwise return "".
-fn eu_bare_callee(n: *Node, eff: map.StringMap[i32]) []u8 {
+// function whose DECLARED return type is `!T`, return the callee name.
+// Fallibility is a declarative property of the callee signature; it must be
+// checked against the declared return type, not the transitive effect mask.
+// The fixpoint analysis propagates Raises transitively for capability contracts,
+// but that would flag every caller of a function that transitively calls a !T
+// function — even if the caller itself does not return !T.
+fn eu_bare_callee(n: *Node, decls: ArrayList[*Node]) []u8 {
     switch (n.*) {
         .call => |c| {
             let cn: []u8 = callee_name(c.callee);
-            if ((map.get[i32](eff, cn) orelse 0) & 16 != 0) { return cn; }
+            let fi: i32 = find_fn(decls, cn);
+            if (fi >= 0) {
+                let fd: *Node = get[*Node](decls, fi);
+                switch (fd.*) {
+                    .fn_decl => |f| {
+                        if (is_eu_ret(f.ret) == 1) { return cn; }
+                    }
+                    else => {}
+                }
+            }
             return "";
         }
         else => { return ""; }
     }
 }
 
-// Walk every statement in a list looking for bare !T calls assigned to non-!T
-// let bindings.  Returns the number of violations found.
-fn check_eu_stmts(fn_name: []u8, body: ArrayList[*Node], eff: map.StringMap[i32], src: []u8, file: []u8) i32 {
+// Walk every statement in a list looking for bare !T calls that are not
+// handled with `try` or `catch`.  Returns the number of violations found.
+fn check_eu_stmts(fn_name: []u8, body: ArrayList[*Node], decls: ArrayList[*Node], src: []u8, file: []u8) i32 {
     let acc: i32 = 0;
     let i: i32 = 0;
     while (i < len[*Node](body)) {
-        acc = acc + check_eu_stmt(fn_name, get[*Node](body, i), eff, src, file);
+        acc = acc + check_eu_stmt(fn_name, get[*Node](body, i), decls, src, file);
         i = i + 1;
     }
     return acc;
 }
 
-fn check_eu_stmt(fn_name: []u8, n: *Node, eff: map.StringMap[i32], src: []u8, file: []u8) i32 {
+fn check_eu_stmt(fn_name: []u8, n: *Node, decls: ArrayList[*Node], src: []u8, file: []u8) i32 {
     switch (n.*) {
         .let_ => |l| {
             // Only flag when there is an explicit non-!T type annotation AND an
             // initialiser that is a bare call to a Raises-effect function.
             if (l.has_init == 0) { return 0; }
+            if (l.has_dty == 1 && is_eu_ret(l.dty) == 1) {
+                // The typed pass has already proved that this destination
+                // accepts the complete !T value. This is storage, not an
+                // ignored error result.
+                return 0;
+            }
             if (l.has_dty == 1 && is_eu_ret(l.dty) == 0) {
-                let callee: []u8 = eu_bare_callee(l.expr, eff);
+                let callee: []u8 = eu_bare_callee(l.expr, decls);
                 if (callee.len > 0) {
                     diag_emit("E0008",
                         _zag_str_concat("`", _zag_str_concat(callee, _zag_str_concat("` returns `!T` but result assigned to `", _zag_str_concat(l.name, _zag_str_concat(": ", _zag_str_concat(l.dty, "` without `catch`")))))),
@@ -1194,36 +1861,166 @@ fn check_eu_stmt(fn_name: []u8, n: *Node, eff: map.StringMap[i32], src: []u8, fi
                     return 1;
                 }
             }
+            // For `let x = fallible()` without a type annotation, the result
+            // is silently typed !T — flag it as unhandled unless wrapped in
+            // try/catch.  check_eu_expr handles the expression walk.
+            if (l.has_init == 1) { return check_eu_expr(fn_name, l.expr, decls, src, file); }
             return 0;
         }
-        .if_ => |x| {
-            let a: i32 = check_eu_stmts(fn_name, x.then_body, eff, src, file);
-            let b: i32 = check_eu_stmts(fn_name, x.els_body, eff, src, file);
-            return a + b;
+        .ret => |r| {
+            if (r.has_expr == 1) { return check_eu_expr(fn_name, r.expr, decls, src, file); }
+            return 0;
         }
-        .while_ => |w| { return check_eu_stmts(fn_name, w.body, eff, src, file); }
+        .assign => |a| { return check_eu_expr(fn_name, a.expr, decls, src, file); }
+        .estmt => |e| { return check_eu_expr(fn_name, e.expr, decls, src, file); }
+        .if_ => |x| {
+            let acc: i32 = check_eu_expr(fn_name, x.cond, decls, src, file);
+            acc = acc + check_eu_stmts(fn_name, x.then_body, decls, src, file);
+            acc = acc + check_eu_stmts(fn_name, x.els_body, decls, src, file);
+            return acc;
+        }
+        .while_ => |w| {
+            let acc: i32 = check_eu_expr(fn_name, w.cond, decls, src, file);
+            acc = acc + check_eu_stmts(fn_name, w.body, decls, src, file);
+            return acc;
+        }
+        .unsafe_ => |u| { return check_eu_stmts(fn_name, u.body, decls, src, file); }
+        .defer_ => |d| { return check_eu_expr(fn_name, d.expr, decls, src, file); }
         .switch_ => |sw| {
-            let acc: i32 = 0;
+            let acc: i32 = check_eu_expr(fn_name, sw.subject, decls, src, file);
             let si: i32 = 0;
             while (si < len[SwitchArm](sw.arms)) {
-                acc = acc + check_eu_stmts(fn_name, get[SwitchArm](sw.arms, si).body, eff, src, file);
+                acc = acc + check_eu_stmts(fn_name, get[SwitchArm](sw.arms, si).body, decls, src, file);
                 si = si + 1;
             }
-            if (sw.has_els == 1) { acc = acc + check_eu_stmts(fn_name, sw.els_body, eff, src, file); }
+            if (sw.has_els == 1) { acc = acc + check_eu_stmts(fn_name, sw.els_body, decls, src, file); }
             return acc;
         }
         else => { return 0; }
     }
 }
 
-fn check_eu_fn(f: FnDecl, eff: map.StringMap[i32], src: []u8, file: []u8) i32 {
-    if (f.is_extern == 1) { return 0; }
-    return check_eu_stmts(f.name, f.body, eff, src, file);
+// Walk an expression tree flagging bare !T calls (calls to functions returning
+// !T) that are NOT wrapped in `try` (Un("try", ...)) or `catch` (Call to
+// __catch / __catchc).  A !T call that is an argument to __catch/__catchc is
+// handled (the catch consumes the error).  A !T call wrapped in `try` is
+// propagated (the caller must be !T, checked separately by the Raises check).
+// A !T call in any other position (bare statement, argument to a non-catching
+// call, condition, binary operand, etc.) is an unhandled error.
+fn check_eu_expr(fn_name: []u8, n: *Node, decls: ArrayList[*Node], src: []u8, file: []u8) i32 {
+    switch (n.*) {
+        .call => |c| {
+            let cn: []u8 = callee_name(c.callee);
+            // `try` and `catch` wrappers are handled calls — don't flag the
+            // wrapped expression, but DO recurse into catch's fallback branch.
+            if (@strEq(cn, "__catch") == 1 || @strEq(cn, "__catchc") == 1) {
+                // arg 0 is the fallible expression (handled by catch);
+                // recurse into the remaining args (fallback, err binding).
+                let acc: i32 = 0;
+                let i: i32 = 1;
+                while (i < len[*Node](c.args)) {
+                    acc = acc + check_eu_expr(fn_name, get[*Node](c.args, i), decls, src, file);
+                    i = i + 1;
+                }
+                return acc;
+            }
+            // Is this call itself a bare !T call?  (Not wrapped in try/catch,
+            // since those are handled above.)
+            let fi: i32 = find_fn(decls, cn);
+            if (fi >= 0) {
+                let fd: *Node = get[*Node](decls, fi);
+                switch (fd.*) {
+                    .fn_decl => |f| {
+                        if (is_eu_ret(f.ret) == 1) {
+                            diag_emit("E0008",
+                                _zag_str_concat("`", _zag_str_concat(cn, _zag_str_concat("` returns `!T` but the error is not handled", ""))),
+                                file, 0, 0, 1,
+                                _zag_str_concat("in function `", _zag_str_concat(fn_name, _zag_str_concat("`: a fallible function was called without `try` or `catch`", ""))),
+                                _zag_str_concat("wrap with `try` to propagate, or `catch` to handle: `try ", _zag_str_concat(cn, _zag_str_concat("(...)` or `", _zag_str_concat(cn, _zag_str_concat("(...) catch fallback`", ""))))),
+                                src);
+                            // Still recurse into args — they may contain more bare !T calls.
+                            let acc: i32 = 1;
+                            let i: i32 = 0;
+                            while (i < len[*Node](c.args)) {
+                                acc = acc + check_eu_expr(fn_name, get[*Node](c.args, i), decls, src, file);
+                                i = i + 1;
+                            }
+                            return acc;
+                        }
+                    }
+                    else => {}
+                }
+            }
+            // Not a !T call — recurse into arguments.
+            let acc: i32 = 0;
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) {
+                acc = acc + check_eu_expr(fn_name, get[*Node](c.args, i), decls, src, file);
+                i = i + 1;
+            }
+            return acc;
+        }
+        .un => |u| {
+            // `try expr` — the expr is propagated, not unhandled.  Don't flag
+            // the wrapped expression, but DO recurse into it for nested bare
+            // !T calls in argument positions (e.g. `try foo(bar())` where bar()
+            // is !T and unhandled).
+            if (@strEq(u.op, "try") == 1) {
+                // The try'd expression itself is handled.  But if it's a call,
+                // its arguments may contain unhandled !T calls.
+                switch (u.e.*) {
+                    .call => |c| {
+                        let acc: i32 = 0;
+                        let i: i32 = 0;
+                        while (i < len[*Node](c.args)) {
+                            acc = acc + check_eu_expr(fn_name, get[*Node](c.args, i), decls, src, file);
+                            i = i + 1;
+                        }
+                        return acc;
+                    }
+                    else => { return 0; }
+                }
+            }
+            return check_eu_expr(fn_name, u.e, decls, src, file);
+        }
+        .bin    => |b| { return check_eu_expr(fn_name, b.l, decls, src, file) + check_eu_expr(fn_name, b.r, decls, src, file); }
+        .idx    => |x| { return check_eu_expr(fn_name, x.base, decls, src, file) + check_eu_expr(fn_name, x.idx, decls, src, file); }
+        .fld    => |f| { return check_eu_expr(fn_name, f.base, decls, src, file); }
+        .slit_  => |s| {
+            let acc: i32 = 0;
+            let i: i32 = 0;
+            while (i < len[FieldInit](s.fields)) {
+                let field: FieldInit = get[FieldInit](s.fields, i);
+                let retained: []u8 = eu_bare_callee(field.val, decls);
+                // Struct field compatibility is enforced by the typed pass.
+                // A direct !T call is retained as the field value rather than
+                // discarded. Other expressions keep the ordinary recursive
+                // unhandled-error check.
+                if (retained.len == 0) {
+                    acc = acc + check_eu_expr(fn_name, field.val, decls, src, file);
+                }
+                i = i + 1;
+            }
+            return acc;
+        }
+        .slice_ => |s| {
+            return check_eu_expr(fn_name, s.base, decls, src, file)
+                 + check_eu_expr(fn_name, s.lo, decls, src, file)
+                 + check_eu_expr(fn_name, s.hi, decls, src, file);
+        }
+        .cast_  => |c| { return check_eu_expr(fn_name, c.expr, decls, src, file); }
+        else    => { return 0; }
+    }
 }
 
-fn check_eu_decl(d: *Node, eff: map.StringMap[i32], src: []u8, file: []u8) i32 {
+fn check_eu_fn(f: FnDecl, decls: ArrayList[*Node], src: []u8, file: []u8) i32 {
+    if (f.is_extern == 1) { return 0; }
+    return check_eu_stmts(f.name, f.body, decls, src, file);
+}
+
+fn check_eu_decl(d: *Node, decls: ArrayList[*Node], src: []u8, file: []u8) i32 {
     return switch (d.*) {
-        .fn_decl => |f| check_eu_fn(f, eff, src, file),
+        .fn_decl => |f| check_eu_fn(f, decls, src, file),
         else     => 0,
     };
 }
@@ -1238,7 +2035,7 @@ fn report_violations(decls: ArrayList[*Node], eff: map.StringMap[i32], src: []u8
         let d: *Node = get[*Node](decls, i);
         total = total + report_decl(d, decls, eff, src, file);
         total = total + store_decl(d, decls, eff, src, file);
-        total = total + check_eu_decl(d, eff, src, file);
+        total = total + check_eu_decl(d, decls, src, file);
         i = i + 1;
     }
     return total;

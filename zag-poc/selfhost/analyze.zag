@@ -1,0 +1,2435 @@
+// selfhost/analyze.zag — the Zag static RESOURCE analyzer ("znc analyze").
+//
+// A second, opt-outable analysis pass that runs after the effect/capability
+// checker.  Where sema.zag proves capability CONTRACTS, this module hunts for
+// two everyday classes of defect the contract system does not target: RESOURCE
+// LEAKS and MATHEMATICAL / RESOURCE INEFFICIENCY, across every kind of resource
+// a Zag program manages — RAM, GPU VRAM, and OS file descriptors / storage.
+//
+//   1. RESOURCE LEAKS — a handle obtained from an acquire primitive that is
+//      never released, returned, or handed off:
+//        L0001/L0002  heap RAM     (zalloc/_zag_malloc/_zag_realloc/@cacheAlignedAlloc → zfree/_zag_free/@cacheAlignedFree)
+//        V0001/V0002  GPU VRAM     (@gpuAlloc → @gpuFree)
+//        F0001/F0002  file descr.  (net_socket/net_accept → net_close)
+//        L0010/L0011  string buf   (_zag_str_concat/_zag_strdup/_zag_i64_to_str/_zag_u64_to_str → _zag_str_free)
+//        L0012        string buf   chained-concat inner leak — an unbound string
+//                     acquire passed straight into a non-releasing call (the
+//                     classic `_zag_str_concat(_zag_str_concat(a,b), c)` leak).
+//      Heap uses a lenient "any hand-off = handled" policy (arena-friendly, zero
+//      noise); VRAM, fds, and STRINGS use a stricter "released-or-escaped" policy
+//      because their handles are passed to many non-releasing calls (kernels,
+//      send/recv, _zag_print, draw_text).  The *01 code = a bound handle never
+//      released; the *02 code = an acquire whose result is discarded on the spot
+//      (can never be released).
+//
+//      STRING CONSUMERS: the only release the compiler hardcodes is the runtime
+//      primitive `_zag_str_free`.  An application that wraps the free in helpers
+//      (e.g. PrismStudio's `append_ff` / `agent_ok1f` which free their owned
+//      argument after use) registers them with the repeatable flag
+//          --analyze-str-consumer=NAME
+//      so the strict policy treats a call to NAME as a release of every string
+//      argument it receives.  This keeps the compiler free of app-specific
+//      names while letting any app teach the ledger its ownership conventions.
+//
+//   2. INEFFICIENCY — work the machine repeats or already knows:
+//        E0101  algebraic identity      x+0, x-0, x*1, x/1
+//        E0102  always-constant         x*0, x-x
+//        E0103  strength reduction      x*2^k → x<<k        (--analyze-pedantic)
+//        C0101  loop-invariant alloc     zalloc/@gpuAlloc in a loop, invariant args
+//        S0101  redundant storage I/O    file read/write in a loop, invariant args
+//
+// Findings are WARNINGS: printed to stderr, they never change the emitted binary
+// and never fail the build unless `--analyze-strict` is passed.  On by default;
+// `--no-analyze` silences the pass, `--analyze-pedantic` adds E0103.
+//
+// The heap ACQUIRE set intentionally EXCLUDES the arena-style constructors this
+// compiler leans on (`new`, `make[T]`) — those model short-lived / exit-time-
+// reclaimed values, so demanding an explicit free for them would be noise.
+// String buffers (`_zag_str_concat` / `_zag_strdup` / `_zag_i64_to_str` /
+// `_zag_u64_to_str`) are NOT excluded: they are class 4, tracked under the
+// strict string policy, because unbounded string churn is the single most
+// common leak class in Zag programs that build text by hand.
+
+@import("diag.zag")
+@import("parse.zag")
+
+// ── small helpers ─────────────────────────────────────────────────────────────
+fn az_or(a: i32, b: i32) i32 { if (a != 0) { return 1; } if (b != 0) { return 1; } return 0; }
+
+fn az_callee_name(n: *Node) []u8 {
+    return switch (n.*) {
+        .id  => |d| d.name,
+        .fld => |f| f.fname,
+        else => "",
+    };
+}
+
+// ── the resource ledger ───────────────────────────────────────────────────────
+// Resource class of an acquire primitive: 1 = heap RAM, 2 = GPU VRAM,
+// 3 = file descriptor / storage, 4 = string buffer.  0 = not an acquire.
+fn az_res_class(name: []u8) i32 {
+    // heap RAM (manual allocators — arena constructors excluded on purpose)
+    if (@strEq(name, "zalloc"))             { return 1; }
+    if (@strEq(name, "zalloc_i"))           { return 1; }
+    if (@strEq(name, "_zag_malloc"))        { return 1; }
+    if (@strEq(name, "_zag_realloc"))       { return 1; }
+    if (@strEq(name, "@cacheAlignedAlloc")) { return 1; }
+    // GPU VRAM
+    if (@strEq(name, "@gpuAlloc"))          { return 2; }
+    // OS file descriptor / socket (storage & network)
+    if (@strEq(name, "net_socket"))         { return 3; }
+    if (@strEq(name, "net_accept"))         { return 3; }
+    // String buffers (heap-owned []u8 from the runtime string primitives).
+    // Tracked under the STRICT string policy — see az_relpolicy / az_str_consumer.
+    if (@strEq(name, "_zag_str_concat"))    { return 4; }
+    if (@strEq(name, "_zag_strdup"))        { return 4; }
+    if (@strEq(name, "_zag_i64_to_str"))    { return 4; }
+    if (@strEq(name, "_zag_u64_to_str"))    { return 4; }
+    return 0;
+}
+// Does `name` release resources of `class`?
+fn az_release_matches(name: []u8, class: i32) i32 {
+    if (class == 1) {
+        if (@strEq(name, "zfree"))             { return 1; }
+        if (@strEq(name, "zfree_i"))           { return 1; }
+        if (@strEq(name, "_zag_free"))         { return 1; }
+        if (@strEq(name, "@cacheAlignedFree")) { return 1; }
+        return 0;
+    }
+    if (class == 2) { if (@strEq(name, "@gpuFree")) { return 1; } return 0; }
+    if (class == 3) { if (@strEq(name, "net_close")) { return 1; } return 0; }
+    if (class == 4) {
+        // The one hardcoded string release: the runtime primitive.
+        if (@strEq(name, "_zag_str_free")) { return 1; }
+        // App-registered consumers via the repeatable --analyze-str-consumer=NAME
+        // flag.  A call to a registered name releases every string argument it
+        // receives (all-args semantics).  Keeps the compiler free of app names.
+        if (az_str_consumer_registered(name) == 1) { return 1; }
+        return 0;
+    }
+    return 0;
+}
+
+// Is `name` registered as a string-consuming helper via --analyze-str-consumer?
+// Scans argv directly (same pattern as has_flag) so no global state / plumbing.
+// The flag is repeatable: pass it once per helper.
+fn az_str_consumer_registered(name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < _zag_argc()) {
+        if (@strEq(_zag_arg(i), "--analyze-str-consumer") == 1) {
+            if (i + 1 < _zag_argc()) {
+                if (@strEq(_zag_arg(i + 1), name) == 1) { return 1; }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+fn az_class_desc(class: i32) []u8 {
+    if (class == 1) { return "heap allocation"; }
+    if (class == 2) { return "GPU VRAM buffer"; }
+    if (class == 3) { return "file descriptor"; }
+    if (class == 4) { return "string buffer"; }
+    return "resource";
+}
+fn az_class_hint(class: i32) []u8 {
+    if (class == 1) { return "free it with the matching deallocator (zfree / _zag_free / @cacheAlignedFree), or return it to transfer ownership"; }
+    if (class == 2) { return "free it with @gpuFree, or return it to transfer ownership"; }
+    if (class == 3) { return "close it with net_close, or return it to transfer ownership"; }
+    if (class == 4) { return "free it with _zag_str_free (or a registered consuming helper), or return it to transfer ownership; bind intermediates to a let and free them — never nest _zag_str_concat inside _zag_str_concat"; }
+    return "release it or return it";
+}
+fn az_leak_code(class: i32) []u8 {
+    if (class == 2) { return "V0001"; }
+    if (class == 3) { return "F0001"; }
+    if (class == 4) { return "L0010"; }
+    return "L0001";
+}
+fn az_drop_code(class: i32) []u8 {
+    if (class == 2) { return "V0002"; }
+    if (class == 3) { return "F0002"; }
+    if (class == 4) { return "L0011"; }
+    return "L0002";
+}
+
+// If `n` is a direct call to an acquire primitive, return its name, else "".
+fn az_acquire_name(n: *Node) []u8 {
+    switch (n.*) {
+        .call => |c| {
+            let cn: []u8 = az_callee_name(c.callee);
+            if (az_res_class(cn) != 0) { return cn; }
+            return "";
+        }
+        else => { return ""; }
+    }
+}
+fn az_acquire_class(n: *Node) i32 {
+    let nm: []u8 = az_acquire_name(n);
+    if (nm.len == 0) { return 0; }
+    return az_res_class(nm);
+}
+
+// ── integer-literal helpers (for the algebraic lints) ─────────────────────────
+fn az_int_text(n: *Node) []u8 {
+    return switch (n.*) {
+        .ilit => |x| x.text,
+        else  => "",
+    };
+}
+// Parse a plain decimal literal to i64; -1 for anything non-decimal (hex, signs).
+fn az_parse_dec(t: []u8) i64 {
+    if (t.len == 0) { return 0 - 1; }
+    if (t[0] == '-') { return 0 - 1; }
+    let v: i64 = 0;
+    let i: i32 = 0;
+    while (i < t.len) {
+        let c: u8 = t[i];
+        if (c < '0') { return 0 - 1; }
+        if (c > '9') { return 0 - 1; }
+        v = v * 10 + ((c - '0') as i64);
+        i = i + 1;
+    }
+    return v;
+}
+// If v is a power of two >= 2, return its base-2 log (the shift amount), else -1.
+fn az_log2_exact(v: i64) i32 {
+    if (v < 2) { return 0 - 1; }
+    if ((v & (v - 1)) != 0) { return 0 - 1; }
+    let k: i32 = 0;
+    let x: i64 = v;
+    while (x > 1) { x = x / 2; k = k + 1; }
+    return k;
+}
+fn az_same_ident(a: *Node, b: *Node) i32 {
+    switch (a.*) {
+        .id => |da| {
+            switch (b.*) {
+                .id => |db| { if (@strEq(da.name, db.name)) { return 1; } return 0; }
+                else => { return 0; }
+            }
+        }
+        else => { return 0; }
+    }
+}
+
+// ── warning emitter (stderr — never touches stdout or the binary) ─────────────
+fn az_warn(code: []u8, msg: []u8, file: []u8, line: i32, note: []u8, hint: []u8) void {
+    _zag_eprintln(_zag_str_concat("warning[", _zag_str_concat(code, _zag_str_concat("]: ", msg))));
+    _zag_eprintln(_zag_str_concat("  --> ", _zag_str_concat(file, _zag_str_concat(":", _zag_i64_to_str(line as i64)))));
+    if (note.len > 0) { _zag_eprintln(_zag_str_concat("   = note: ", note)); }
+    if (hint.len > 0) { _zag_eprintln(_zag_str_concat("   = hint: ", hint)); }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  RESOURCE-LEAK ANALYSIS
+// ════════════════════════════════════════════════════════════════════════════
+
+// Does the identifier `name` occur anywhere inside expression `n`?
+fn az_expr_has_id(n: *Node, name: []u8) i32 {
+    switch (n.*) {
+        .id    => |d| { if (@strEq(d.name, name)) { return 1; } return 0; }
+        .bin   => |b| { if (az_expr_has_id(b.l, name) == 1) { return 1; } return az_expr_has_id(b.r, name); }
+        .un    => |u| { return az_expr_has_id(u.e, name); }
+        .call  => |c| {
+            if (az_expr_has_id(c.callee, name) == 1) { return 1; }
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) {
+                if (az_expr_has_id(get[*Node](c.args, i), name) == 1) { return 1; }
+                i = i + 1;
+            }
+            return 0;
+        }
+        .idx   => |x| { if (az_expr_has_id(x.base, name) == 1) { return 1; } return az_expr_has_id(x.idx, name); }
+        .fld   => |f| { return az_expr_has_id(f.base, name); }
+        .slit_ => |s| {
+            let i: i32 = 0;
+            while (i < len[FieldInit](s.fields)) {
+                if (az_expr_has_id(get[FieldInit](s.fields, i).val, name) == 1) { return 1; }
+                i = i + 1;
+            }
+            return 0;
+        }
+        .slice_ => |s| {
+            if (az_expr_has_id(s.base, name) == 1) { return 1; }
+            if (az_expr_has_id(s.lo, name) == 1) { return 1; }
+            return az_expr_has_id(s.hi, name);
+        }
+        .cast_ => |c| { return az_expr_has_id(c.expr, name); }
+        else   => { return 0; }
+    }
+}
+
+// Within expression `n`, does `name` appear in a CONSUMING position — one that
+// transfers or releases ownership so the handle is not leaked here?
+//   relclass == 0 : LENIENT (heap) — passed as ANY call argument counts.
+//   relclass  > 0 : STRICT (VRAM/fd) — only an argument to a matching RELEASE
+//                   call counts; other calls (kernels, send/recv) do not.
+// Address-of (`&name`) and storing into a struct field always count (escape).
+fn az_consumed_in_expr(n: *Node, name: []u8, relclass: i32) i32 {
+    switch (n.*) {
+        .call => |c| {
+            let cn: []u8 = az_callee_name(c.callee);
+            let counts: i32 = 0;
+            if (relclass == 0) { counts = 1; }
+            else if (az_release_matches(cn, relclass) == 1) { counts = 1; }
+            if (counts == 1) {
+                let i: i32 = 0;
+                while (i < len[*Node](c.args)) {
+                    if (az_expr_has_id(get[*Node](c.args, i), name) == 1) { return 1; }
+                    i = i + 1;
+                }
+            }
+            // recurse to find a consuming position nested inside the arguments
+            let j: i32 = 0;
+            while (j < len[*Node](c.args)) {
+                if (az_consumed_in_expr(get[*Node](c.args, j), name, relclass) == 1) { return 1; }
+                j = j + 1;
+            }
+            return az_consumed_in_expr(c.callee, name, relclass);
+        }
+        .un => |u| {
+            if (@strEq(u.op, "&")) { if (az_expr_has_id(u.e, name) == 1) { return 1; } }
+            return az_consumed_in_expr(u.e, name, relclass);
+        }
+        .bin => |b| { if (az_consumed_in_expr(b.l, name, relclass) == 1) { return 1; } return az_consumed_in_expr(b.r, name, relclass); }
+        .idx => |x| { if (az_consumed_in_expr(x.base, name, relclass) == 1) { return 1; } return az_consumed_in_expr(x.idx, name, relclass); }
+        .fld => |f| { return az_consumed_in_expr(f.base, name, relclass); }
+        .slit_ => |s| {
+            let i: i32 = 0;
+            while (i < len[FieldInit](s.fields)) {
+                if (az_expr_has_id(get[FieldInit](s.fields, i).val, name) == 1) { return 1; }
+                i = i + 1;
+            }
+            return 0;
+        }
+        .slice_ => |s| {
+            if (az_consumed_in_expr(s.base, name, relclass) == 1) { return 1; }
+            if (az_consumed_in_expr(s.lo, name, relclass) == 1) { return 1; }
+            return az_consumed_in_expr(s.hi, name, relclass);
+        }
+        .cast_ => |c| { return az_consumed_in_expr(c.expr, name, relclass); }
+        else => { return 0; }
+    }
+}
+
+// Is `name` released, returned, aliased, or otherwise handled anywhere in `body`?
+fn az_consumed_body(body: ArrayList[*Node], name: []u8, relclass: i32) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        if (az_consumed_stmt(get[*Node](body, i), name, relclass) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn az_consumed_stmt(n: *Node, name: []u8, relclass: i32) i32 {
+    switch (n.*) {
+        // `let y = ... name ...` aliases the handle (y may free/return it).
+        .let_   => |l| { if (l.has_init == 1 && az_expr_has_id(l.expr, name) == 1) { return 1; } return 0; }
+        // `return ... name ...` lets the handle escape to the caller.
+        .ret    => |r| { if (r.has_expr == 1 && az_expr_has_id(r.expr, name) == 1) { return 1; } return 0; }
+        .assign => |a| {
+            if (az_expr_has_id(a.expr, name) == 1) { return 1; }  // stored elsewhere
+            switch (a.target.*) {
+                .id => |d| { if (@strEq(d.name, name)) { return 1; } }  // variable reassigned
+                else => { }
+            }
+            return 0;
+        }
+        .estmt  => |e| { return az_consumed_in_expr(e.expr, name, relclass); }
+        .if_    => |x| {
+            if (az_consumed_in_expr(x.cond, name, relclass) == 1) { return 1; }
+            if (az_consumed_body(x.then_body, name, relclass) == 1) { return 1; }
+            return az_consumed_body(x.els_body, name, relclass);
+        }
+        .while_ => |w| {
+            if (az_consumed_in_expr(w.cond, name, relclass) == 1) { return 1; }
+            return az_consumed_body(w.body, name, relclass);
+        }
+        .unsafe_ => |u| { return az_consumed_body(u.body, name, relclass); }
+        .defer_ => |d| { return az_consumed_in_expr(d.expr, name, relclass); }
+        .switch_ => |sw| {
+            if (az_consumed_in_expr(sw.subject, name, relclass) == 1) { return 1; }
+            let i: i32 = 0;
+            while (i < len[SwitchArm](sw.arms)) {
+                if (az_consumed_body(get[SwitchArm](sw.arms, i).body, name, relclass) == 1) { return 1; }
+                i = i + 1;
+            }
+            if (sw.has_els == 1) { return az_consumed_body(sw.els_body, name, relclass); }
+            return 0;
+        }
+        else => { return 0; }
+    }
+}
+
+// Heap uses the lenient policy (relclass 0); VRAM/fd/strings use strict.
+// Strings are strict because most calls that take a string (_zag_print,
+// draw_text, _zag_str_concat itself) BORROW without freeing — a lenient "any
+// hand-off = handled" policy would mark every leaked string as consumed.
+fn az_relpolicy(class: i32) i32 {
+    if (class == 1) { return 0; }
+    return class;
+}
+
+// Walk statements (recursing into nested blocks) reporting acquired resources
+// that are never released, and acquires whose result is discarded.
+fn az_scan_leaks(stmts: ArrayList[*Node], fullbody: ArrayList[*Node], fname: []u8, fline: i32, file: []u8) i32 {
+    let count: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[*Node](stmts)) {
+        count = count + az_leak_stmt(get[*Node](stmts, i), fullbody, fname, fline, file);
+        i = i + 1;
+    }
+    return count;
+}
+fn az_leak_stmt(n: *Node, fullbody: ArrayList[*Node], fname: []u8, fline: i32, file: []u8) i32 {
+    switch (n.*) {
+        .let_ => |l| {
+            if (l.has_init == 1) {
+                let cls: i32 = az_acquire_class(l.expr);
+                if (cls != 0) {
+                    let acq: []u8 = az_acquire_name(l.expr);
+                    if (az_consumed_body(fullbody, l.name, az_relpolicy(cls)) == 0) {
+                        az_warn(az_leak_code(cls),
+                            _zag_str_concat("possible ", _zag_str_concat(az_class_desc(cls), _zag_str_concat(" leak — `", _zag_str_concat(l.name, _zag_str_concat("` from `", _zag_str_concat(acq, "` is never released or returned")))))),
+                            file, fline,
+                            _zag_str_concat("in function `", _zag_str_concat(fname, _zag_str_concat("`: the ", _zag_str_concat(az_class_desc(cls), " is not released, returned, aliased, or handed off")))),
+                            az_class_hint(cls));
+                        return 1;
+                    }
+                }
+            }
+            return 0;
+        }
+        .estmt => |e| {
+            let cls: i32 = az_acquire_class(e.expr);
+            if (cls != 0) {
+                az_warn(az_drop_code(cls),
+                    _zag_str_concat("possible ", _zag_str_concat(az_class_desc(cls), _zag_str_concat(" leak — result of `", _zag_str_concat(az_acquire_name(e.expr), "` is discarded immediately")))),
+                    file, fline,
+                    _zag_str_concat("in function `", _zag_str_concat(fname, _zag_str_concat("`: the ", _zag_str_concat(az_class_desc(cls), " handle is never bound, so it can never be released")))),
+                    "bind the result to a local and release it, or drop the call if it is unnecessary");
+                return 1;
+            }
+            return 0;
+        }
+        .if_ => |x| {
+            return az_scan_leaks(x.then_body, fullbody, fname, fline, file)
+                 + az_scan_leaks(x.els_body, fullbody, fname, fline, file);
+        }
+        .while_ => |w| { return az_scan_leaks(w.body, fullbody, fname, fline, file); }
+        .unsafe_ => |u| { return az_scan_leaks(u.body, fullbody, fname, fline, file); }
+        .defer_ => |d| {
+            let cls: i32 = az_acquire_class(d.expr);
+            if (cls != 0) {
+                az_warn(az_drop_code(cls),
+                    _zag_str_concat("possible ", _zag_str_concat(az_class_desc(cls), _zag_str_concat(" leak — result of `", _zag_str_concat(az_acquire_name(d.expr), "` is discarded immediately")))),
+                    file, fline,
+                    _zag_str_concat("in function `", _zag_str_concat(fname, _zag_str_concat("`: the ", _zag_str_concat(az_class_desc(cls), " handle is never bound, so it can never be released")))),
+                    "bind the result to a local and release it, or drop the call if it is unnecessary");
+                return 1;
+            }
+            return 0;
+        }
+        .switch_ => |sw| {
+            let acc: i32 = 0;
+            let i: i32 = 0;
+            while (i < len[SwitchArm](sw.arms)) {
+                acc = acc + az_scan_leaks(get[SwitchArm](sw.arms, i).body, fullbody, fname, fline, file);
+                i = i + 1;
+            }
+            if (sw.has_els == 1) { acc = acc + az_scan_leaks(sw.els_body, fullbody, fname, fline, file); }
+            return acc;
+        }
+        else => { return 0; }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  ALGEBRAIC / EFFICIENCY LINTS
+// ════════════════════════════════════════════════════════════════════════════
+fn az_check_bin(b: Bin, fname: []u8, fline: i32, file: []u8, pedantic: i32) i32 {
+    let rlit: []u8 = az_int_text(b.r);
+    let llit: []u8 = az_int_text(b.l);
+    if (@strEq(b.op, "+")) {
+        if (@strEq(rlit, "0") || @strEq(llit, "0")) {
+            az_warn("E0101", "adding 0 has no effect", file, fline,
+                _zag_str_concat("in function `", _zag_str_concat(fname, "`: this addition always returns the other operand unchanged")),
+                "remove the `+ 0`");
+            return 1;
+        }
+        return 0;
+    }
+    if (@strEq(b.op, "-")) {
+        if (@strEq(rlit, "0")) {
+            az_warn("E0101", "subtracting 0 has no effect", file, fline,
+                _zag_str_concat("in function `", _zag_str_concat(fname, "`: this subtraction always returns the left operand unchanged")),
+                "remove the `- 0`");
+            return 1;
+        }
+        if (az_same_ident(b.l, b.r) == 1) {
+            az_warn("E0102", "subtracting a value from itself is always 0", file, fline,
+                _zag_str_concat("in function `", _zag_str_concat(fname, "`: `x - x` computes a constant 0")),
+                "replace the expression with `0`");
+            return 1;
+        }
+        return 0;
+    }
+    if (@strEq(b.op, "*")) {
+        if (@strEq(rlit, "0") || @strEq(llit, "0")) {
+            az_warn("E0102", "multiplying by 0 is always 0", file, fline,
+                _zag_str_concat("in function `", _zag_str_concat(fname, "`: this product computes a constant 0")),
+                "replace the expression with `0`");
+            return 1;
+        }
+        if (@strEq(rlit, "1") || @strEq(llit, "1")) {
+            az_warn("E0101", "multiplying by 1 has no effect", file, fline,
+                _zag_str_concat("in function `", _zag_str_concat(fname, "`: this product always returns the other operand unchanged")),
+                "remove the `* 1`");
+            return 1;
+        }
+        if (pedantic == 1) {
+            let k: i32 = az_log2_exact(az_parse_dec(rlit));
+            if (k < 0) { k = az_log2_exact(az_parse_dec(llit)); }
+            if (k > 0) {
+                az_warn("E0103", "multiplication by a power of two can be a left shift", file, fline,
+                    _zag_str_concat("in function `", _zag_str_concat(fname, "`: shifting is cheaper than a general multiply on most targets")),
+                    _zag_str_concat("consider `<< ", _zag_str_concat(_zag_i64_to_str(k as i64), "`")));
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (@strEq(b.op, "/")) {
+        if (@strEq(rlit, "1")) {
+            az_warn("E0101", "dividing by 1 has no effect", file, fline,
+                _zag_str_concat("in function `", _zag_str_concat(fname, "`: this division always returns the left operand unchanged")),
+                "remove the `/ 1`");
+            return 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+fn az_eff_expr(n: *Node, fname: []u8, fline: i32, file: []u8, pedantic: i32) i32 {
+    switch (n.*) {
+        .bin => |b| {
+            let c: i32 = az_check_bin(b, fname, fline, file, pedantic);
+            c = c + az_eff_expr(b.l, fname, fline, file, pedantic);
+            c = c + az_eff_expr(b.r, fname, fline, file, pedantic);
+            return c;
+        }
+        .un   => |u| { return az_eff_expr(u.e, fname, fline, file, pedantic); }
+        .call => |c| {
+            let acc: i32 = 0;
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) {
+                acc = acc + az_eff_expr(get[*Node](c.args, i), fname, fline, file, pedantic);
+                i = i + 1;
+            }
+            return acc;
+        }
+        .idx  => |x| { return az_eff_expr(x.base, fname, fline, file, pedantic) + az_eff_expr(x.idx, fname, fline, file, pedantic); }
+        .fld  => |f| { return az_eff_expr(f.base, fname, fline, file, pedantic); }
+        .slit_ => |s| {
+            let acc: i32 = 0;
+            let i: i32 = 0;
+            while (i < len[FieldInit](s.fields)) {
+                acc = acc + az_eff_expr(get[FieldInit](s.fields, i).val, fname, fline, file, pedantic);
+                i = i + 1;
+            }
+            return acc;
+        }
+        .slice_ => |s| {
+            return az_eff_expr(s.base, fname, fline, file, pedantic)
+                 + az_eff_expr(s.lo, fname, fline, file, pedantic)
+                 + az_eff_expr(s.hi, fname, fline, file, pedantic);
+        }
+        .cast_ => |c| { return az_eff_expr(c.expr, fname, fline, file, pedantic); }
+        else => { return 0; }
+    }
+}
+fn az_eff_body(body: ArrayList[*Node], fname: []u8, fline: i32, file: []u8, pedantic: i32) i32 {
+    let acc: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        acc = acc + az_eff_stmt(get[*Node](body, i), fname, fline, file, pedantic);
+        i = i + 1;
+    }
+    return acc;
+}
+fn az_eff_stmt(n: *Node, fname: []u8, fline: i32, file: []u8, pedantic: i32) i32 {
+    switch (n.*) {
+        .let_   => |l| { if (l.has_init == 1) { return az_eff_expr(l.expr, fname, fline, file, pedantic); } return 0; }
+        .ret    => |r| { if (r.has_expr == 1) { return az_eff_expr(r.expr, fname, fline, file, pedantic); } return 0; }
+        .assign => |a| { return az_eff_expr(a.target, fname, fline, file, pedantic) + az_eff_expr(a.expr, fname, fline, file, pedantic); }
+        .estmt  => |e| { return az_eff_expr(e.expr, fname, fline, file, pedantic); }
+        .if_    => |x| {
+            return az_eff_expr(x.cond, fname, fline, file, pedantic)
+                 + az_eff_body(x.then_body, fname, fline, file, pedantic)
+                 + az_eff_body(x.els_body, fname, fline, file, pedantic);
+        }
+        .while_ => |w| {
+            // algebraic lints inside the loop, PLUS loop-invariant resource-op lints.
+            let a: i32 = az_eff_expr(w.cond, fname, fline, file, pedantic) + az_eff_body(w.body, fname, fline, file, pedantic);
+            return a + az_loop_check(w.body, fname, fline, file);
+        }
+        .unsafe_ => |u| { return az_eff_body(u.body, fname, fline, file, pedantic); }
+        .defer_ => |d| { return az_eff_expr(d.expr, fname, fline, file, pedantic); }
+        .switch_ => |sw| {
+            let acc: i32 = az_eff_expr(sw.subject, fname, fline, file, pedantic);
+            let i: i32 = 0;
+            while (i < len[SwitchArm](sw.arms)) {
+                acc = acc + az_eff_body(get[SwitchArm](sw.arms, i).body, fname, fline, file, pedantic);
+                i = i + 1;
+            }
+            if (sw.has_els == 1) { acc = acc + az_eff_body(sw.els_body, fname, fline, file, pedantic); }
+            return acc;
+        }
+        else => { return 0; }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  LOOP-INVARIANT RESOURCE-OP LINTS  (CPU / VRAM churn, redundant storage I/O)
+// ════════════════════════════════════════════════════════════════════════════
+// Category of a call for loop analysis: 1 = expensive allocation (heap or VRAM),
+// 2 = file/storage I/O. 0 = not tracked. (Kernel dispatch is deliberately NOT
+// flagged — relaunching a kernel each iteration over changing buffers is normal.)
+fn az_loop_cat(name: []u8) i32 {
+    if (az_res_class(name) == 1) { return 1; }   // manual heap allocator
+    if (@strEq(name, "@gpuAlloc")) { return 1; }  // VRAM allocator
+    if (@strEq(name, "_zag_read_file"))    { return 2; }
+    if (@strEq(name, "_zag_write_file"))   { return 2; }
+    if (@strEq(name, "_zag_file_exists"))  { return 2; }
+    if (@strEq(name, "_zag_exec_cmd"))     { return 2; }
+    if (@strEq(name, "_zag_exec_capture")) { return 2; }
+    return 0;
+}
+fn az_loop_code(cat: i32) []u8 {
+    if (cat == 2) { return "S0101"; }
+    return "C0101";
+}
+fn az_loop_msg(cat: i32) []u8 {
+    if (cat == 2) { return "redundant storage I/O inside a loop — the same call runs every iteration"; }
+    return "loop-invariant allocation inside a loop — the same buffer is allocated every iteration";
+}
+fn az_loop_hint(cat: i32) []u8 {
+    if (cat == 2) { return "hoist the read/write out of the loop, or vary its arguments per iteration"; }
+    return "hoist the allocation out of the loop and reuse the buffer across iterations";
+}
+
+// Collect the names WRITTEN anywhere in a loop body (let bindings + assignment
+// targets), recursing through nested blocks so an inner-loop mutation is seen.
+fn az_collect_ids(n: *Node, set: *ArrayList[[]u8]) void {
+    switch (n.*) {
+        .id    => |d| { push[[]u8](set, d.name); }
+        .bin   => |b| { az_collect_ids(b.l, set); az_collect_ids(b.r, set); }
+        .un    => |u| { az_collect_ids(u.e, set); }
+        .idx   => |x| { az_collect_ids(x.base, set); az_collect_ids(x.idx, set); }
+        .fld   => |f| { az_collect_ids(f.base, set); }
+        else   => { }
+    }
+}
+fn az_collect_mutated(body: ArrayList[*Node], set: *ArrayList[[]u8]) void {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        az_collect_mutated_stmt(get[*Node](body, i), set);
+        i = i + 1;
+    }
+}
+fn az_collect_mutated_stmt(n: *Node, set: *ArrayList[[]u8]) void {
+    switch (n.*) {
+        .let_    => |l| { push[[]u8](set, l.name); }
+        .assign  => |a| { az_collect_ids(a.target, set); }
+        .if_     => |x| { az_collect_mutated(x.then_body, set); az_collect_mutated(x.els_body, set); }
+        .while_  => |w| { az_collect_mutated(w.body, set); }
+        .unsafe_ => |u| { az_collect_mutated(u.body, set); }
+        .defer_ => |d| { }
+        .switch_ => |sw| {
+            let i: i32 = 0;
+            while (i < len[SwitchArm](sw.arms)) { az_collect_mutated(get[SwitchArm](sw.arms, i).body, set); i = i + 1; }
+            if (sw.has_els == 1) { az_collect_mutated(sw.els_body, set); }
+        }
+        else => { }
+    }
+}
+fn az_set_has(set: ArrayList[[]u8], name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[[]u8](set)) {
+        if (@strEq(get[[]u8](set, i), name)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+// Does expr reference any name in `set`?
+fn az_expr_refs_any(n: *Node, set: ArrayList[[]u8]) i32 {
+    switch (n.*) {
+        .id    => |d| { return az_set_has(set, d.name); }
+        .bin   => |b| { if (az_expr_refs_any(b.l, set) == 1) { return 1; } return az_expr_refs_any(b.r, set); }
+        .un    => |u| { return az_expr_refs_any(u.e, set); }
+        .call  => |c| {
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) { if (az_expr_refs_any(get[*Node](c.args, i), set) == 1) { return 1; } i = i + 1; }
+            return az_expr_refs_any(c.callee, set);
+        }
+        .idx   => |x| { if (az_expr_refs_any(x.base, set) == 1) { return 1; } return az_expr_refs_any(x.idx, set); }
+        .fld   => |f| { return az_expr_refs_any(f.base, set); }
+        .slice_ => |s| { if (az_expr_refs_any(s.base, set) == 1) { return 1; } if (az_expr_refs_any(s.lo, set) == 1) { return 1; } return az_expr_refs_any(s.hi, set); }
+        .cast_ => |c| { return az_expr_refs_any(c.expr, set); }
+        else   => { return 0; }
+    }
+}
+// Does expr contain a call anywhere? (A call arg cannot be proven invariant.)
+fn az_expr_has_call(n: *Node) i32 {
+    switch (n.*) {
+        .call  => |_c| { return 1; }
+        .bin   => |b| { if (az_expr_has_call(b.l) == 1) { return 1; } return az_expr_has_call(b.r); }
+        .un    => |u| { return az_expr_has_call(u.e); }
+        .idx   => |x| { if (az_expr_has_call(x.base) == 1) { return 1; } return az_expr_has_call(x.idx); }
+        .fld   => |f| { return az_expr_has_call(f.base); }
+        .slice_ => |s| { if (az_expr_has_call(s.base) == 1) { return 1; } if (az_expr_has_call(s.lo) == 1) { return 1; } return az_expr_has_call(s.hi); }
+        .cast_ => |c| { return az_expr_has_call(c.expr); }
+        else   => { return 0; }
+    }
+}
+// Every argument of `c` is loop-invariant (references no mutated name and holds
+// no nested call)? Empty arg list counts as invariant.
+fn az_all_args_invariant(c: Call, mutated: ArrayList[[]u8]) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](c.args)) {
+        let a: *Node = get[*Node](c.args, i);
+        if (az_expr_refs_any(a, mutated) == 1) { return 0; }
+        if (az_expr_has_call(a) == 1) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Scan a loop body for targeted calls with loop-invariant arguments. Descends
+// into if/switch bodies (same loop scope) but NOT into nested while loops (each
+// is analysed against its own mutated set).
+fn az_loop_check(body: ArrayList[*Node], fname: []u8, fline: i32, file: []u8) i32 {
+    let mutated: ArrayList[[]u8] = make[[]u8](8);
+    az_collect_mutated(body, &mutated);
+    return az_loop_scan_body(body, mutated, fname, fline, file);
+}
+fn az_loop_scan_body(body: ArrayList[*Node], mutated: ArrayList[[]u8], fname: []u8, fline: i32, file: []u8) i32 {
+    let acc: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        acc = acc + az_loop_scan_stmt(get[*Node](body, i), mutated, fname, fline, file);
+        i = i + 1;
+    }
+    return acc;
+}
+fn az_loop_scan_stmt(n: *Node, mutated: ArrayList[[]u8], fname: []u8, fline: i32, file: []u8) i32 {
+    switch (n.*) {
+        .let_    => |l| { if (l.has_init == 1) { return az_loop_scan_expr(l.expr, mutated, fname, fline, file); } return 0; }
+        .ret     => |r| { if (r.has_expr == 1) { return az_loop_scan_expr(r.expr, mutated, fname, fline, file); } return 0; }
+        .assign  => |a| { return az_loop_scan_expr(a.expr, mutated, fname, fline, file); }
+        .estmt   => |e| { return az_loop_scan_expr(e.expr, mutated, fname, fline, file); }
+        .if_     => |x| {
+            return az_loop_scan_expr(x.cond, mutated, fname, fline, file)
+                 + az_loop_scan_body(x.then_body, mutated, fname, fline, file)
+                 + az_loop_scan_body(x.els_body, mutated, fname, fline, file);
+        }
+        .unsafe_ => |u| { return az_loop_scan_body(u.body, mutated, fname, fline, file); }
+        .defer_ => |d| { return az_loop_scan_expr(d.expr, mutated, fname, fline, file); }
+        .switch_ => |sw| {
+            let acc: i32 = az_loop_scan_expr(sw.subject, mutated, fname, fline, file);
+            let i: i32 = 0;
+            while (i < len[SwitchArm](sw.arms)) { acc = acc + az_loop_scan_body(get[SwitchArm](sw.arms, i).body, mutated, fname, fline, file); i = i + 1; }
+            if (sw.has_els == 1) { acc = acc + az_loop_scan_body(sw.els_body, mutated, fname, fline, file); }
+            return acc;
+        }
+        // nested while: handled by its own az_loop_check via az_eff_stmt — skip here.
+        else => { return 0; }
+    }
+}
+fn az_loop_scan_expr(n: *Node, mutated: ArrayList[[]u8], fname: []u8, fline: i32, file: []u8) i32 {
+    switch (n.*) {
+        .call => |c| {
+            let acc: i32 = 0;
+            let cat: i32 = az_loop_cat(az_callee_name(c.callee));
+            if (cat != 0 && az_all_args_invariant(c, mutated) == 1) {
+                az_warn(az_loop_code(cat), az_loop_msg(cat), file, fline,
+                    _zag_str_concat("in function `", _zag_str_concat(fname, "`: this call produces the same result on every iteration")),
+                    az_loop_hint(cat));
+                acc = 1;
+            }
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) { acc = acc + az_loop_scan_expr(get[*Node](c.args, i), mutated, fname, fline, file); i = i + 1; }
+            return acc;
+        }
+        .bin  => |b| { return az_loop_scan_expr(b.l, mutated, fname, fline, file) + az_loop_scan_expr(b.r, mutated, fname, fline, file); }
+        .un   => |u| { return az_loop_scan_expr(u.e, mutated, fname, fline, file); }
+        .idx  => |x| { return az_loop_scan_expr(x.base, mutated, fname, fline, file) + az_loop_scan_expr(x.idx, mutated, fname, fline, file); }
+        .fld  => |f| { return az_loop_scan_expr(f.base, mutated, fname, fline, file); }
+        .cast_ => |c| { return az_loop_scan_expr(c.expr, mutated, fname, fline, file); }
+        else => { return 0; }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  CHAINED-CONCAT INNER LEAK  (L0012)
+// ════════════════════════════════════════════════════════════════════════════
+// The dominant string-leak pattern in Zag: a string acquire is passed UNBOUND
+// (no intervening `let`) as an argument to a call that does NOT release it.
+//   _zag_str_concat(_zag_str_concat(a, b), c)   // inner result leaks
+//   _zag_print(_zag_i64_to_str(n))              // the i64 string leaks
+//   draw_text(_zag_str_concat(prefix, name))    // the concat leaks
+// The unbound acquire can never reach a _zag_str_free, so it is a guaranteed
+// leak.  This is more precise than the bound-never-freed lint (L0010): it fires
+// at the exact call site, with no allowlist dependency, and no false positives
+// (a release call like _zag_str_free, or a registered consumer, suppresses it).
+//
+// Is `n` a direct call to a string acquire primitive (class 4)?
+fn az_is_str_acquire_call(n: *Node) i32 {
+    switch (n.*) {
+        .call => |_c| { if (az_acquire_class(n) == 4) { return 1; } return 0; }
+        else => { return 0; }
+    }
+}
+
+// Walk an expression, flagging L0012 at every call whose arguments contain a
+// direct string-acquire call when the outer call is not a string consumer.
+fn az_strleak_expr(n: *Node, fname: []u8, fline: i32, file: []u8) i32 {
+    switch (n.*) {
+        .call => |c| {
+            let acc: i32 = 0;
+            let outer: []u8 = az_callee_name(c.callee);
+            let outer_consumes: i32 = az_release_matches(outer, 4);
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) {
+                let arg: *Node = get[*Node](c.args, i);
+                // Direct unbound acquire passed to a non-releasing call: leak.
+                if (az_is_str_acquire_call(arg) == 1 && outer_consumes == 0) {
+                    let inner: []u8 = az_acquire_name(arg);
+                    az_warn("L0012",
+                        _zag_str_concat("string buffer leak — `", _zag_str_concat(inner, _zag_str_concat("` result is passed unbound to `", _zag_str_concat(outer, _zag_str_concat("`, which does not free it", ""))))),
+                        file, fline,
+                        _zag_str_concat("in function `", _zag_str_concat(fname, _zag_str_concat("`: the inner allocation is never bound to a `let`, so it can never reach _zag_str_free", ""))),
+                        _zag_str_concat("bind the inner call to a `let` and free it (or use a leak-free helper like s3/append_ff), or pass it to a releasing call", ""));
+                    acc = acc + 1;
+                }
+                // Recurse: the arg may itself contain nested unbound acquires.
+                acc = acc + az_strleak_expr(arg, fname, fline, file);
+                i = i + 1;
+            }
+            return acc + az_strleak_expr(c.callee, fname, fline, file);
+        }
+        .bin    => |b| { return az_strleak_expr(b.l, fname, fline, file) + az_strleak_expr(b.r, fname, fline, file); }
+        .un     => |u| { return az_strleak_expr(u.e, fname, fline, file); }
+        .idx    => |x| { return az_strleak_expr(x.base, fname, fline, file) + az_strleak_expr(x.idx, fname, fline, file); }
+        .fld    => |f| { return az_strleak_expr(f.base, fname, fline, file); }
+        .slit_  => |s| {
+            let acc: i32 = 0;
+            let i: i32 = 0;
+            while (i < len[FieldInit](s.fields)) { acc = acc + az_strleak_expr(get[FieldInit](s.fields, i).val, fname, fline, file); i = i + 1; }
+            return acc;
+        }
+        .slice_ => |s| { return az_strleak_expr(s.base, fname, fline, file) + az_strleak_expr(s.lo, fname, fline, file) + az_strleak_expr(s.hi, fname, fline, file); }
+        .cast_  => |c| { return az_strleak_expr(c.expr, fname, fline, file); }
+        else    => { return 0; }
+    }
+}
+fn az_strleak_body(body: ArrayList[*Node], fname: []u8, fline: i32, file: []u8) i32 {
+    let acc: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        acc = acc + az_strleak_stmt(get[*Node](body, i), fname, fline, file);
+        i = i + 1;
+    }
+    return acc;
+}
+fn az_strleak_stmt(n: *Node, fname: []u8, fline: i32, file: []u8) i32 {
+    switch (n.*) {
+        .let_    => |l| { if (l.has_init == 1) { return az_strleak_expr(l.expr, fname, fline, file); } return 0; }
+        .ret     => |r| { if (r.has_expr == 1) { return az_strleak_expr(r.expr, fname, fline, file); } return 0; }
+        .assign  => |a| { return az_strleak_expr(a.target, fname, fline, file) + az_strleak_expr(a.expr, fname, fline, file); }
+        .estmt   => |e| { return az_strleak_expr(e.expr, fname, fline, file); }
+        .if_     => |x| {
+            return az_strleak_expr(x.cond, fname, fline, file)
+                 + az_strleak_body(x.then_body, fname, fline, file)
+                 + az_strleak_body(x.els_body, fname, fline, file);
+        }
+        .while_  => |w| { return az_strleak_expr(w.cond, fname, fline, file) + az_strleak_body(w.body, fname, fline, file); }
+        .unsafe_ => |u| { return az_strleak_body(u.body, fname, fline, file); }
+        .defer_ => |d| { return az_strleak_expr(d.expr, fname, fline, file); }
+        .switch_ => |sw| {
+            let acc: i32 = az_strleak_expr(sw.subject, fname, fline, file);
+            let i: i32 = 0;
+            while (i < len[SwitchArm](sw.arms)) { acc = acc + az_strleak_body(get[SwitchArm](sw.arms, i).body, fname, fline, file); i = i + 1; }
+            if (sw.has_els == 1) { acc = acc + az_strleak_body(sw.els_body, fname, fline, file); }
+            return acc;
+        }
+        else => { return 0; }
+    }
+}
+
+
+// ════════════════════════════════════════════════════════════════════════════
+//  BLOAT + AGENT-BUG LINT INFRASTRUCTURE
+// ════════════════════════════════════════════════════════════════════════════
+// Two lint families targeting everyday defects the effect/resource analyzers
+// do not cover:
+//   B0xxx  BLOAT      — dead/redundant code, verbose patterns, duplication
+//   A0xxx  AGENT-BUG  — off-by-one, ignored result, wrong-op, uninit, petty errors
+// All findings are WARNINGS (stderr, never touch the binary).  --analyze-strict
+// upgrades to errors; --analyze-pedantic enables tier-2 lints; --analyze-bloat=off
+// and --analyze-agent=off silence a family; // znc:allow CODE suppresses per-line
+// or per-file; --analyze-complexity=N sets the B0115 threshold (default 15).
+//
+// State is threaded through a heap-allocated AzCtx pointer — Zag does not permit
+// module-level mutable globals (E0204), so every lint function takes `ctx` as
+// its first parameter.
+
+struct AzCtx {
+    fn_names:    ArrayList[[]u8],
+    fn_rets:     ArrayList[[]u8],
+    fn_lines:    ArrayList[i32],
+    allow_file:  ArrayList[[]u8],
+    allow_lines: ArrayList[i32],
+    allow_codes: ArrayList[[]u8],
+    bloat_on:    i32,
+    agent_on:    i32,
+    complexity:  i32,
+}
+
+// ── suppressed warning emitter (returns 1 if emitted, 0 if suppressed) ───────
+fn azx_warn(ctx: *AzCtx, code: []u8, msg: []u8, file: []u8, line: i32, note: []u8, hint: []u8) i32 {
+    if (azx_is_suppressed(ctx, code, line) == 1) { return 0; }
+    _zag_eprintln(_zag_str_concat("warning[", _zag_str_concat(code, _zag_str_concat("]: ", msg))));
+    _zag_eprintln(_zag_str_concat("  --> ", _zag_str_concat(file, _zag_str_concat(":", _zag_i64_to_str(line as i64)))));
+    if (note.len > 0) { _zag_eprintln(_zag_str_concat("   = note: ", note)); }
+    if (hint.len > 0) { _zag_eprintln(_zag_str_concat("   = hint: ", hint)); }
+    return 1;
+}
+
+// ── flag helpers ──────────────────────────────────────────────────────────────
+fn azx_flag_eq(name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < _zag_argc()) {
+        if (@strEq(_zag_arg(i), name)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn azx_flag_int(name: []u8, default_val: i32) i32 {
+    let i: i32 = 0;
+    while (i < _zag_argc()) {
+        let a: []u8 = _zag_arg(i);
+        if (a.len > name.len + 1) {
+            let match: i32 = 1;
+            let j: i32 = 0;
+            while (j < name.len) {
+                if (a[j] != name[j]) { match = 0; }
+                j = j + 1;
+            }
+            if (match == 1 && a[name.len] == '=') {
+                let val: i32 = 0;
+                let k: i32 = name.len + 1;
+                while (k < a.len) {
+                    if (a[k] < '0') { return default_val; }
+                    if (a[k] > '9') { return default_val; }
+                    val = val * 10 + ((a[k] - '0') as i32);
+                    k = k + 1;
+                }
+                return val;
+            }
+        }
+        i = i + 1;
+    }
+    return default_val;
+}
+
+// ── suppression ──────────────────────────────────────────────────────────────
+fn azx_list_has_str(list: ArrayList[[]u8], s: []u8) i32 {
+    if (list.data == null as *[]u8) { return 0; }
+    let i: i32 = 0;
+    while (i < len[[]u8](list)) {
+        if (@strEq(get[[]u8](list, i), s)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn azx_is_suppressed(ctx: *AzCtx, code: []u8, line: i32) i32 {
+    if (azx_list_has_str(ctx.*.allow_file, code) == 1) { return 1; }
+    if (ctx.*.allow_lines.data == null as *i32) { return 0; }
+    let i: i32 = 0;
+    while (i < len[i32](ctx.*.allow_lines)) {
+        if (get[i32](ctx.*.allow_lines, i) == line) {
+            if (@strEq(get[[]u8](ctx.*.allow_codes, i), code)) { return 1; }
+            if (@strEq(get[[]u8](ctx.*.allow_codes, i), "all")) { return 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn azx_is_code_char(c: u8) i32 {
+    if (c >= 'A' && c <= 'Z') { return 1; }
+    if (c >= 'a' && c <= 'z') { return 1; }
+    if (c >= '0' && c <= '9') { return 1; }
+    return 0;
+}
+
+fn azx_parse_codes(ctx: *AzCtx, src: []u8, start: i32, end: i32, file_level: i32, line: i32) void {
+    let i: i32 = start;
+    while (i < end) {
+        while (i < end && (src[i] == ' ' || src[i] == '\t' || src[i] == ',')) { i = i + 1; }
+        if (i >= end) { return; }
+        let cstart: i32 = i;
+        while (i < end && azx_is_code_char(src[i]) == 1) { i = i + 1; }
+        if (i > cstart) {
+            let code: []u8 = src[cstart..i];
+            if (file_level == 1) {
+                push[[]u8](&ctx.*.allow_file, code);
+            } else {
+                push[i32](&ctx.*.allow_lines, line);
+                push[[]u8](&ctx.*.allow_codes, code);
+            }
+        } else {
+            // Non-code, non-whitespace char — skip it to avoid infinite loop
+            i = i + 1;
+        }
+    }
+}
+
+fn azx_comment_starts_with(src: []u8, start: i32, end: i32, directive: []u8) i32 {
+    // Skip leading whitespace in the comment
+    let i: i32 = start;
+    while (i < end && (src[i] == ' ' || src[i] == '\t')) { i = i + 1; }
+    // Check if the directive matches at this position
+    let dlen: i32 = directive.len;
+    if (i + dlen > end) { return 0; }
+    let j: i32 = 0;
+    while (j < dlen) {
+        if (src[i + j] != directive[j]) { return 0; }
+        j = j + 1;
+    }
+    return 1;
+}
+
+fn azx_enclosing_fn_line(ctx: *AzCtx, line: i32) i32 {
+    // Find the largest function declaration line <= the given line.
+    // Returns 0 if no enclosing function is found.
+    let best: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[i32](ctx.*.fn_lines)) {
+        let fl: i32 = get[i32](ctx.*.fn_lines, i);
+        if (fl > 0 && fl <= line && fl > best) { best = fl; }
+        i = i + 1;
+    }
+    return best;
+}
+
+fn azx_parse_suppression(ctx: *AzCtx, src: []u8) void {
+    let i: i32 = 0;
+    let line: i32 = 1;
+    while (i < src.len) {
+        if (i + 1 < src.len && src[i] == '/' && src[i + 1] == '/') {
+            let cstart: i32 = i + 2;
+            let cend: i32 = cstart;
+            while (cend < src.len && src[cend] != 10) { cend = cend + 1; }
+            // Skip leading whitespace in comment
+            let ws: i32 = cstart;
+            while (ws < cend && (src[ws] == ' ' || src[ws] == '\t')) { ws = ws + 1; }
+            if (azx_comment_starts_with(src, cstart, cend, "znc:allow-file") == 1) {
+                azx_parse_codes(ctx, src, ws + 15, cend, 1, line);
+            } else if (azx_comment_starts_with(src, cstart, cend, "znc:allow") == 1) {
+                // Map the comment line to the enclosing function's declaration line,
+                // since all warnings report fline (the function declaration line).
+                let fn_line: i32 = azx_enclosing_fn_line(ctx, line);
+                let target_line: i32 = line;
+                if (fn_line > 0) { target_line = fn_line; }
+                azx_parse_codes(ctx, src, ws + 9, cend, 0, target_line);
+            }
+            i = cend;
+        }
+        if (i < src.len && src[i] == 10) { line = line + 1; }
+        i = i + 1;
+    }
+}
+
+// ── context building ─────────────────────────────────────────────────────────
+fn azx_build_ctx(decls: ArrayList[*Node]) *AzCtx {
+    let ctx: *AzCtx = new(AzCtx{
+        .fn_names = make[[]u8](8),
+        .fn_rets  = make[[]u8](8),
+        .fn_lines    = make[i32](8),
+        .allow_file  = make[[]u8](4),
+        .allow_lines = make[i32](4),
+        .allow_codes = make[[]u8](4),
+        .bloat_on = 1,
+        .agent_on = 1,
+        .complexity = 15,
+    });
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .fn_decl => |f| {
+                push[[]u8](&ctx.*.fn_names, f.name);
+                push[[]u8](&ctx.*.fn_rets, f.ret);
+                push[i32](&ctx.*.fn_lines, f.line);
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return ctx;
+}
+
+fn azx_fn_returns_void(ctx: *AzCtx, name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[[]u8](ctx.*.fn_names)) {
+        if (@strEq(get[[]u8](ctx.*.fn_names, i), name)) {
+            if (@strEq(get[[]u8](ctx.*.fn_rets, i), "void")) { return 1; }
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn azx_fn_exists(ctx: *AzCtx, name: []u8) i32 { return azx_list_has_str(ctx.*.fn_names, name); }
+
+// ── structural equality ──────────────────────────────────────────────────────
+fn azx_body_eq(a: ArrayList[*Node], b: ArrayList[*Node]) i32 {
+    if (len[*Node](a) != len[*Node](b)) { return 0; }
+    let i: i32 = 0;
+    while (i < len[*Node](a)) {
+        if (azx_node_eq(get[*Node](a, i), get[*Node](b, i)) == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn azx_node_eq(a: *Node, b: *Node) i32 {
+    if (node_code(a) != node_code(b)) { return 0; }
+    switch (a.*) {
+        .ilit => |x| { switch (b.*) { .ilit => |y| { if (@strEq(x.text, y.text)) { return 1; } return 0; } else => { return 0; } } }
+        .slit => |x| { switch (b.*) { .slit => |y| { if (@strEq(x.text, y.text)) { return 1; } return 0; } else => { return 0; } } }
+        .id   => |x| { switch (b.*) { .id   => |y| { if (@strEq(x.name, y.name)) { return 1; } return 0; } else => { return 0; } } }
+        .bin  => |x| { switch (b.*) { .bin => |y| { if (@strEq(x.op, y.op) == 0) { return 0; } if (azx_node_eq(x.l, y.l) == 0) { return 0; } return azx_node_eq(x.r, y.r); } else => { return 0; } } }
+        .un   => |x| { switch (b.*) { .un  => |y| { if (@strEq(x.op, y.op) == 0) { return 0; } return azx_node_eq(x.e, y.e); } else => { return 0; } } }
+        .call => |x| { switch (b.*) { .call => |y| {
+            if (azx_node_eq(x.callee, y.callee) == 0) { return 0; }
+            if (len[*Node](x.args) != len[*Node](y.args)) { return 0; }
+            let i: i32 = 0;
+            while (i < len[*Node](x.args)) { if (azx_node_eq(get[*Node](x.args, i), get[*Node](y.args, i)) == 0) { return 0; } i = i + 1; }
+            return 1;
+        } else => { return 0; } } }
+        .idx  => |x| { switch (b.*) { .idx => |y| { if (azx_node_eq(x.base, y.base) == 0) { return 0; } return azx_node_eq(x.idx, y.idx); } else => { return 0; } } }
+        .fld  => |x| { switch (b.*) { .fld => |y| { if (@strEq(x.fname, y.fname) == 0) { return 0; } return azx_node_eq(x.base, y.base); } else => { return 0; } } }
+        .assign => |x| { switch (b.*) { .assign => |y| { if (azx_node_eq(x.target, y.target) == 0) { return 0; } return azx_node_eq(x.expr, y.expr); } else => { return 0; } } }
+        .ret  => |x| { switch (b.*) { .ret => |y| { if (x.has_expr != y.has_expr) { return 0; } if (x.has_expr == 1) { return azx_node_eq(x.expr, y.expr); } return 1; } else => { return 0; } } }
+        .estmt => |x| { switch (b.*) { .estmt => |y| { return azx_node_eq(x.expr, y.expr); } else => { return 0; } } }
+        .let_ => |x| { switch (b.*) { .let_ => |y| { if (@strEq(x.name, y.name) == 0) { return 0; } if (x.has_init != y.has_init) { return 0; } if (x.has_init == 1) { return azx_node_eq(x.expr, y.expr); } return 1; } else => { return 0; } } }
+        .if_  => |x| { switch (b.*) { .if_ => |y| { if (x.has_els != y.has_els) { return 0; } if (azx_node_eq(x.cond, y.cond) == 0) { return 0; } if (azx_body_eq(x.then_body, y.then_body) == 0) { return 0; } return azx_body_eq(x.els_body, y.els_body); } else => { return 0; } } }
+        .while_ => |x| { switch (b.*) { .while_ => |y| { if (azx_node_eq(x.cond, y.cond) == 0) { return 0; } return azx_body_eq(x.body, y.body); } else => { return 0; } } }
+        .break_    => { return 1; }
+        .continue_ => { return 1; }
+        .cast_ => |x| { switch (b.*) { .cast_ => |y| { if (@strEq(x.target, y.target) == 0) { return 0; } return azx_node_eq(x.expr, y.expr); } else => { return 0; } } }
+        .slice_ => |x| { switch (b.*) { .slice_ => |y| { if (x.has_hi != y.has_hi) { return 0; } if (azx_node_eq(x.base, y.base) == 0) { return 0; } if (azx_node_eq(x.lo, y.lo) == 0) { return 0; } if (x.has_hi == 1) { return azx_node_eq(x.hi, y.hi); } return 1; } else => { return 0; } } }
+        else => { if (a == b) { return 1; } return 0; }
+    }
+}
+
+// ── shared helpers ───────────────────────────────────────────────────────────
+fn azx_is_terminator(n: *Node) i32 {
+    switch (n.*) {
+        .ret       => { return 1; }
+        .break_    => { return 1; }
+        .continue_ => { return 1; }
+        else       => { return 0; }
+    }
+}
+
+// B0109: recognizes only `true`/`false` as boolean literals in comparisons.
+// `1`/`0` are NOT treated as boolean here — `x == 1` is a legitimate integer
+// comparison.  (B0105's azx_bool_value does recognize 1/0 in the narrower context
+// of if/else return, where the C-style boolean pattern is unambiguous.)
+fn azx_is_bool_literal(n: *Node) i32 {
+    switch (n.*) {
+        .id => |d| { if (@strEq(d.name, "true")) { return 1; } if (@strEq(d.name, "false")) { return 1; } return 0; }
+        else => { return 0; }
+    }
+}
+
+fn azx_bool_value(n: *Node) i32 {
+    switch (n.*) {
+        .id => |d| { if (@strEq(d.name, "true")) { return 1; } if (@strEq(d.name, "false")) { return 0; } return -1; }
+        .ilit => |x| { if (@strEq(x.text, "1")) { return 1; } if (@strEq(x.text, "0")) { return 0; } return -1; }
+        else => { return -1; }
+    }
+}
+
+fn azx_is_cmp_op(op: []u8) i32 {
+    if (@strEq(op, "==")) { return 1; }
+    if (@strEq(op, "!=")) { return 1; }
+    if (@strEq(op, "<"))  { return 1; }
+    if (@strEq(op, "<=")) { return 1; }
+    if (@strEq(op, ">"))  { return 1; }
+    if (@strEq(op, ">=")) { return 1; }
+    return 0;
+}
+
+fn azx_negated_cmp(op: []u8) []u8 {
+    if (@strEq(op, "==")) { return "!="; }
+    if (@strEq(op, "!=")) { return "=="; }
+    if (@strEq(op, "<"))  { return ">="; }
+    if (@strEq(op, "<=")) { return ">"; }
+    if (@strEq(op, ">"))  { return "<="; }
+    if (@strEq(op, ">=")) { return "<"; }
+    return "";
+}
+
+fn azx_folds_true(n: *Node) i32 {
+    switch (n.*) {
+        .id => |d| { if (@strEq(d.name, "true")) { return 1; } return 0; }
+        .ilit => |x| { if (@strEq(x.text, "1")) { return 1; } return 0; }
+        .bin => |b| {
+            if (@strEq(b.op, "==") || @strEq(b.op, "<=") || @strEq(b.op, ">=")) {
+                if (az_same_ident(b.l, b.r) == 1) { return 1; }
+            }
+            return 0;
+        }
+        .un => |u| {
+            if (@strEq(u.op, "!")) { return azx_folds_false(u.e); }
+            return 0;
+        }
+        else => { return 0; }
+    }
+}
+
+fn azx_folds_false(n: *Node) i32 {
+    switch (n.*) {
+        .id => |d| { if (@strEq(d.name, "false")) { return 1; } return 0; }
+        .ilit => |x| { if (@strEq(x.text, "0")) { return 1; } return 0; }
+        .bin => |b| {
+            if (@strEq(b.op, "!=") || @strEq(b.op, "<") || @strEq(b.op, ">")) {
+                if (az_same_ident(b.l, b.r) == 1) { return 1; }
+            }
+            return 0;
+        }
+        .un => |u| {
+            if (@strEq(u.op, "!")) { return azx_folds_true(u.e); }
+            return 0;
+        }
+        else => { return 0; }
+    }
+}
+
+fn azx_block_terminates(body: ArrayList[*Node]) i32 {
+    if (len[*Node](body) == 0) { return 0; }
+    let last: *Node = get[*Node](body, len[*Node](body) - 1);
+    if (azx_is_terminator(last) == 1) { return 1; }
+    switch (last.*) {
+        .if_ => |x| {
+            if (x.has_els == 1) {
+                if (azx_block_terminates(x.then_body) == 1 && azx_block_terminates(x.els_body) == 1) { return 1; }
+            }
+            return 0;
+        }
+        else => { return 0; }
+    }
+}
+
+fn azx_complexity_count(body: ArrayList[*Node]) i32 {
+    let acc: i32 = 1;
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        acc = acc + azx_complexity_stmt(get[*Node](body, i));
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn azx_complexity_stmt(n: *Node) i32 {
+    switch (n.*) {
+        .if_ => |x| {
+            let c: i32 = 1 + azx_complexity_count(x.then_body);
+            if (x.has_els == 1) { c = c + azx_complexity_count(x.els_body); }
+            return c;
+        }
+        .while_ => |w| { return 1 + azx_complexity_count(w.body); }
+        .switch_ => |sw| {
+            let c: i32 = len[SwitchArm](sw.arms);
+            if (sw.has_els == 1) { c = c + 1; }
+            let i: i32 = 0;
+            while (i < len[SwitchArm](sw.arms)) { c = c + azx_complexity_count(get[SwitchArm](sw.arms, i).body); i = i + 1; }
+            if (sw.has_els == 1) { c = c + azx_complexity_count(sw.els_body); }
+            return c;
+        }
+        .unsafe_ => |u| { return azx_complexity_count(u.body); }
+        .assign => |a| { return azx_complexity_expr(a.expr); }
+        .estmt => |e| { return azx_complexity_expr(e.expr); }
+        .let_ => |l| { if (l.has_init == 1) { return azx_complexity_expr(l.expr); } return 0; }
+        .ret => |r| { if (r.has_expr == 1) { return azx_complexity_expr(r.expr); } return 0; }
+        .defer_ => |d| { return azx_complexity_expr(d.expr); }
+        else => { return 0; }
+    }
+}
+
+fn azx_complexity_expr(n: *Node) i32 {
+    switch (n.*) {
+        .bin => |b| {
+            if (@strEq(b.op, "&&") || @strEq(b.op, "||")) { return 1 + azx_complexity_expr(b.l) + azx_complexity_expr(b.r); }
+            return azx_complexity_expr(b.l) + azx_complexity_expr(b.r);
+        }
+        .un => |u| { return azx_complexity_expr(u.e); }
+        .call => |c| { let acc: i32 = 0; let i: i32 = 0; while (i < len[*Node](c.args)) { acc = acc + azx_complexity_expr(get[*Node](c.args, i)); i = i + 1; } return acc; }
+        .idx => |x| { return azx_complexity_expr(x.base) + azx_complexity_expr(x.idx); }
+        .fld => |f| { return azx_complexity_expr(f.base); }
+        .slice_ => |s| { return azx_complexity_expr(s.base) + azx_complexity_expr(s.lo) + azx_complexity_expr(s.hi); }
+        .cast_ => |c| { return azx_complexity_expr(c.expr); }
+        else => { return 0; }
+    }
+}
+
+// ── read-detection (for B0103 unused local) ──────────────────────────────────
+fn azx_body_has_read(body: ArrayList[*Node], name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        if (azx_stmt_has_read(get[*Node](body, i), name) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn azx_stmt_has_read(n: *Node, name: []u8) i32 {
+    switch (n.*) {
+        .let_ => |l| { if (l.has_init == 1) { return azx_expr_has_read(l.expr, name); } return 0; }
+        .ret => |r| { if (r.has_expr == 1) { return azx_expr_has_read(r.expr, name); } return 0; }
+        .assign => |a| {
+            if (azx_expr_has_read(a.expr, name) == 1) { return 1; }
+            switch (a.target.*) {
+                .id => |d| { if (@strEq(d.name, name)) { return 0; } return azx_expr_has_read(a.target, name); }
+                else => { return azx_expr_has_read(a.target, name); }
+            }
+        }
+        .estmt => |e| { return azx_expr_has_read(e.expr, name); }
+        .if_ => |x| {
+            if (azx_expr_has_read(x.cond, name) == 1) { return 1; }
+            if (azx_body_has_read(x.then_body, name) == 1) { return 1; }
+            return azx_body_has_read(x.els_body, name);
+        }
+        .while_ => |w| {
+            if (azx_expr_has_read(w.cond, name) == 1) { return 1; }
+            return azx_body_has_read(w.body, name);
+        }
+        .unsafe_ => |u| { return azx_body_has_read(u.body, name); }
+        .defer_ => |d| { return azx_expr_has_read(d.expr, name); }
+        .switch_ => |sw| {
+            if (azx_expr_has_read(sw.subject, name) == 1) { return 1; }
+            let i: i32 = 0;
+            while (i < len[SwitchArm](sw.arms)) { if (azx_body_has_read(get[SwitchArm](sw.arms, i).body, name) == 1) { return 1; } i = i + 1; }
+            if (sw.has_els == 1) { return azx_body_has_read(sw.els_body, name); }
+            return 0;
+        }
+        else => { return 0; }
+    }
+}
+
+fn azx_expr_has_read(n: *Node, name: []u8) i32 {
+    switch (n.*) {
+        .id => |d| { if (@strEq(d.name, name)) { return 1; } return 0; }
+        .bin => |b| { if (azx_expr_has_read(b.l, name) == 1) { return 1; } return azx_expr_has_read(b.r, name); }
+        .un => |u| { return azx_expr_has_read(u.e, name); }
+        .call => |c| {
+            if (azx_expr_has_read(c.callee, name) == 1) { return 1; }
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) { if (azx_expr_has_read(get[*Node](c.args, i), name) == 1) { return 1; } i = i + 1; }
+            return 0;
+        }
+        .idx => |x| { if (azx_expr_has_read(x.base, name) == 1) { return 1; } return azx_expr_has_read(x.idx, name); }
+        .fld => |f| { return azx_expr_has_read(f.base, name); }
+        .slice_ => |s| { if (azx_expr_has_read(s.base, name) == 1) { return 1; } if (azx_expr_has_read(s.lo, name) == 1) { return 1; } return azx_expr_has_read(s.hi, name); }
+        .cast_ => |c| { return azx_expr_has_read(c.expr, name); }
+        .slit_ => |s| { let i: i32 = 0; while (i < len[FieldInit](s.fields)) { if (azx_expr_has_read(get[FieldInit](s.fields, i).val, name) == 1) { return 1; } i = i + 1; } return 0; }
+        else => { return 0; }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  BLOAT LINTS
+// ════════════════════════════════════════════════════════════════════════════
+
+fn az_bloat_fn(ctx: *AzCtx, f: FnDecl, file: []u8, pedantic: i32) i32 {
+    if (ctx.*.bloat_on == 0) { return 0; }
+    let c: i32 = az_bloat_block(ctx, f.body, f.name, f.line, file, pedantic);
+    c = c + az_bloat_unused_locals(ctx, f, file, pedantic);
+    if (pedantic == 1) {
+        let cx: i32 = azx_complexity_count(f.body);
+        if (cx > ctx.*.complexity) {
+            c = c + azx_warn(ctx, "B0115", _zag_str_concat("function complexity (", _zag_str_concat(_zag_i64_to_str(cx as i64), ") exceeds threshold")), file, f.line,
+                _zag_str_concat("in function `", _zag_str_concat(f.name, _zag_str_concat("`: ", _zag_str_concat(_zag_i64_to_str(cx as i64), _zag_str_concat(" decision points (threshold ", _zag_str_concat(_zag_i64_to_str(ctx.*.complexity as i64), ")")))))), "split the function into smaller helpers, or raise the threshold with --analyze-complexity=N");
+        }
+        // B0120: repeated expression — same call expression appears 3+ times
+        c = c + az_bloat_repeated_expr(ctx, f, file);
+    }
+    return c;
+}
+
+// B0120: detect call expressions that appear 3+ times in a function body.
+// Only calls are tracked (not arbitrary expressions) to avoid false positives
+// from simple identifier repetitions.  The threshold of 3 balances signal vs noise.
+fn az_bloat_repeated_expr(ctx: *AzCtx, f: FnDecl, file: []u8) i32 {
+    let seen: ArrayList[[]u8] = make[[]u8](16);
+    let counts: ArrayList[i32] = make[i32](16);
+    az_bloat_collect_calls(f.body, &seen, &counts);
+    let acc: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[[]u8](seen)) {
+        if (get[i32](counts, i) >= 3) {
+            let cn: []u8 = get[[]u8](seen, i);
+            acc = acc + azx_warn(ctx, "B0120", _zag_str_concat("repeated expression — `", _zag_str_concat(cn, _zag_str_concat("` called ", _zag_str_concat(_zag_i64_to_str(get[i32](counts, i) as i64), " times")))), file, f.line,
+                _zag_str_concat("in function `", _zag_str_concat(f.name, _zag_str_concat("`: the same call appears multiple times", ""))),
+                "extract the call into a `let` binding, or check whether the repetition is intentional");
+        }
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn az_bloat_collect_calls(body: ArrayList[*Node], seen: *ArrayList[[]u8], counts: *ArrayList[i32]) void {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        az_bloat_collect_calls_stmt(get[*Node](body, i), seen, counts);
+        i = i + 1;
+    }
+}
+
+fn az_bloat_collect_calls_stmt(n: *Node, seen: *ArrayList[[]u8], counts: *ArrayList[i32]) void {
+    switch (n.*) {
+        .let_ => |l| { if (l.has_init == 1) { az_bloat_collect_calls_expr(l.expr, seen, counts); } }
+        .ret => |r| { if (r.has_expr == 1) { az_bloat_collect_calls_expr(r.expr, seen, counts); } }
+        .assign => |a| { az_bloat_collect_calls_expr(a.expr, seen, counts); }
+        .estmt => |e| { az_bloat_collect_calls_expr(e.expr, seen, counts); }
+        .if_ => |x| { az_bloat_collect_calls_expr(x.cond, seen, counts); az_bloat_collect_calls(x.then_body, seen, counts); az_bloat_collect_calls(x.els_body, seen, counts); }
+        .while_ => |w| { az_bloat_collect_calls_expr(w.cond, seen, counts); az_bloat_collect_calls(w.body, seen, counts); }
+        .unsafe_ => |u| { az_bloat_collect_calls(u.body, seen, counts); }
+        .defer_ => |d| { az_bloat_collect_calls_expr(d.expr, seen, counts); }
+        else => { }
+    }
+}
+
+fn az_bloat_collect_calls_expr(n: *Node, seen: *ArrayList[[]u8], counts: *ArrayList[i32]) void {
+    if (n == null as *Node) { return; }
+    switch (n.*) {
+        .call => |c| {
+            // Get the callee name (only simple name calls are tracked)
+            let cn: []u8 = az_callee_name(c.callee);
+            if (cn.len > 0) {
+                // Check if we've seen this call name before
+                let found: i32 = -1;
+                let i: i32 = 0;
+                while (i < len[[]u8](seen.*)) {
+                    if (@strEq(get[[]u8](seen.*, i), cn)) { found = i; }
+                    i = i + 1;
+                }
+                if (found >= 0) {
+                    let v: i32 = get[i32](counts.*, found);
+                    set[i32](counts, found, v + 1);
+                } else {
+                    push[[]u8](seen, cn);
+                    push[i32](counts, 1);
+                }
+            }
+            // Recurse into arguments
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) { az_bloat_collect_calls_expr(get[*Node](c.args, i), seen, counts); i = i + 1; }
+        }
+        .bin => |b| { az_bloat_collect_calls_expr(b.l, seen, counts); az_bloat_collect_calls_expr(b.r, seen, counts); }
+        .un => |u| { az_bloat_collect_calls_expr(u.e, seen, counts); }
+        .idx => |x| { az_bloat_collect_calls_expr(x.base, seen, counts); az_bloat_collect_calls_expr(x.idx, seen, counts); }
+        .fld => |f| { az_bloat_collect_calls_expr(f.base, seen, counts); }
+        .slice_ => |s| { az_bloat_collect_calls_expr(s.base, seen, counts); az_bloat_collect_calls_expr(s.lo, seen, counts); az_bloat_collect_calls_expr(s.hi, seen, counts); }
+        .cast_ => |c| { az_bloat_collect_calls_expr(c.expr, seen, counts); }
+        .slit_ => |s| { let i: i32 = 0; while (i < len[FieldInit](s.fields)) { az_bloat_collect_calls_expr(get[FieldInit](s.fields, i).val, seen, counts); i = i + 1; } }
+        else => { }
+    }
+}
+
+fn az_bloat_overwritten(ctx: *AzCtx, body: ArrayList[*Node], idx: i32, stmt: *Node, fname: []u8, fline: i32, file: []u8) i32 {
+    // Get the name assigned by this statement (if any)
+    let name: []u8 = "";
+    switch (stmt.*) {
+        .let_ => |l| { if (l.has_init == 1) { name = l.name; } }
+        .assign => |a| { switch (a.target.*) { .id => |d| { name = d.name; } else => { } } }
+        else => { }
+    }
+    if (name.len == 0) { return 0; }
+    if (name[0] == '_') { return 0; }
+    // Check the next statement: does it assign to the same name without reading it?
+    let next: *Node = get[*Node](body, idx + 1);
+    let next_name: []u8 = "";
+    switch (next.*) {
+        .let_ => |l| { if (l.has_init == 1) { next_name = l.name; } }
+        .assign => |a| { switch (a.target.*) { .id => |d| { next_name = d.name; } else => { } } }
+        else => { }
+    }
+    if (next_name.len == 0) { return 0; }
+    if (@strEq(name, next_name) == 0) { return 0; }
+    // The next statement reassigns the same variable. Check if the next statement's
+    // RHS reads the variable (e.g. `x = x + 1` is NOT overwritten-before-read).
+    let next_rhs: *Node = null as *Node;
+    switch (next.*) {
+        .let_ => |l| { if (l.has_init == 1) { next_rhs = l.expr; } }
+        .assign => |a| { next_rhs = a.expr; }
+        else => { }
+    }
+    if (next_rhs != null as *Node) {
+        if (azx_expr_has_read(next_rhs, name) == 1) { return 0; }
+    }
+    return azx_warn(ctx, "B0104", _zag_str_concat("assignment to `", _zag_str_concat(name, "` is overwritten before being read")), file, fline,
+        _zag_str_concat("in function `", _zag_str_concat(fname, _zag_str_concat("`: the value assigned here is immediately replaced", ""))),
+        "remove the first assignment, or use the value before reassigning");
+}
+
+fn az_bloat_block(ctx: *AzCtx, body: ArrayList[*Node], fname: []u8, fline: i32, file: []u8, pedantic: i32) i32 {
+    let acc: i32 = 0;
+    let i: i32 = 0;
+    let dead: i32 = 0;
+    while (i < len[*Node](body)) {
+        let stmt: *Node = get[*Node](body, i);
+        if (dead == 1) {
+            acc = acc + azx_warn(ctx, "B0101", "unreachable code after unconditional control flow", file, fline,
+                _zag_str_concat("in function `", _zag_str_concat(fname, "`: this statement can never execute")),
+                "remove the dead code, or move the return/break/continue to the correct position");
+        } else {
+            acc = acc + az_bloat_stmt(ctx, stmt, fname, fline, file, pedantic);
+            if (azx_is_terminator(stmt) == 1) { dead = 1; }
+            // B0104: assignment overwritten before read — check if this statement
+            // assigns to a variable that is reassigned by the next statement without
+            // being read in between
+            if (i + 1 < len[*Node](body) && dead == 0) {
+                acc = acc + az_bloat_overwritten(ctx, body, i, stmt, fname, fline, file);
+            }
+        }
+        // B0112: duplicated adjacent statements (pedantic)
+        if (pedantic == 1 && i + 1 < len[*Node](body) && dead == 0) {
+            if (azx_node_eq(stmt, get[*Node](body, i + 1)) == 1) {
+                acc = acc + azx_warn(ctx, "B0112", "duplicated adjacent statement", file, fline,
+                    _zag_str_concat("in function `", _zag_str_concat(fname, "`: the next statement is identical to this one")),
+                    "remove the duplicate, or check whether the repetition is intentional");
+            }
+        }
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn az_bloat_stmt(ctx: *AzCtx, n: *Node, fname: []u8, fline: i32, file: []u8, pedantic: i32) i32 {
+    switch (n.*) {
+        .let_ => |l| { if (l.has_init == 1) { return az_bloat_expr(ctx, l.expr, fname, fline, file, pedantic); } return 0; }
+        .ret => |r| { if (r.has_expr == 1) { return az_bloat_expr(ctx, r.expr, fname, fline, file, pedantic); } return 0; }
+        .assign => |a| { return az_bloat_expr(ctx, a.expr, fname, fline, file, pedantic); }
+        .estmt => |e| { return az_bloat_expr(ctx, e.expr, fname, fline, file, pedantic); }
+        .if_ => |x| {
+            let c: i32 = az_bloat_expr(ctx, x.cond, fname, fline, file, pedantic);
+            // B0102: dead branch (pedantic)
+            if (pedantic == 1) {
+                if (azx_folds_true(x.cond) == 1) {
+                    c = c + azx_warn(ctx, "B0102", "condition is always true — else branch is dead", file, fline,
+                        _zag_str_concat("in function `", _zag_str_concat(fname, "`: the condition folds to a constant")),
+                        "simplify by removing the condition and the dead else branch");
+                } else if (azx_folds_false(x.cond) == 1) {
+                    c = c + azx_warn(ctx, "B0102", "condition is always false — then branch is dead", file, fline,
+                        _zag_str_concat("in function `", _zag_str_concat(fname, "`: the condition folds to a constant")),
+                        "simplify by removing the condition and the dead then branch");
+                }
+            }
+            // B0113: if/else identical bodies
+            if (x.has_els == 1 && azx_body_eq(x.then_body, x.els_body) == 1) {
+                c = c + azx_warn(ctx, "B0113", "if/else branches are identical — one is redundant", file, fline,
+                    _zag_str_concat("in function `", _zag_str_concat(fname, "`: both branches do the same thing")),
+                    "remove the if/else and keep one copy of the body");
+            }
+            // B0105: verbose boolean return
+            c = c + az_bloat_bool_return(ctx, x, fname, fline, file);
+            // B0111: empty block (pedantic)
+            if (pedantic == 1) {
+                if (len[*Node](x.then_body) == 0) {
+                    c = c + azx_warn(ctx, "B0111", "empty if-then block", file, fline,
+                        _zag_str_concat("in function `", _zag_str_concat(fname, "`: the then block has no statements")),
+                        "remove the empty block or add the intended logic");
+                }
+                if (x.has_els == 1 && len[*Node](x.els_body) == 0) {
+                    c = c + azx_warn(ctx, "B0111", "empty else block", file, fline,
+                        _zag_str_concat("in function `", _zag_str_concat(fname, "`: the else block has no statements")),
+                        "remove the empty else clause");
+                }
+            }
+            c = c + az_bloat_block(ctx, x.then_body, fname, fline, file, pedantic);
+            c = c + az_bloat_block(ctx, x.els_body, fname, fline, file, pedantic);
+            return c;
+        }
+        .while_ => |w| {
+            let c: i32 = az_bloat_expr(ctx, w.cond, fname, fline, file, pedantic);
+            if (pedantic == 1) {
+                if (azx_folds_false(w.cond) == 1) {
+                    c = c + azx_warn(ctx, "B0102", "while condition is always false — loop body is dead", file, fline,
+                        _zag_str_concat("in function `", _zag_str_concat(fname, "`: the loop never executes")),
+                        "remove the dead loop or fix the condition");
+                }
+                if (len[*Node](w.body) == 0 && azx_folds_true(w.cond) == 0) {
+                    c = c + azx_warn(ctx, "B0111", "empty while body", file, fline,
+                        _zag_str_concat("in function `", _zag_str_concat(fname, "`: the loop body has no statements")),
+                        "remove the empty loop or add the intended logic");
+                }
+            }
+            c = c + az_bloat_block(ctx, w.body, fname, fline, file, pedantic);
+            return c;
+        }
+        .unsafe_ => |u| { return az_bloat_block(ctx, u.body, fname, fline, file, pedantic); }
+        .defer_ => |d| { return az_bloat_expr(ctx, d.expr, fname, fline, file, pedantic); }
+        .switch_ => |sw| {
+            let c: i32 = az_bloat_expr(ctx, sw.subject, fname, fline, file, pedantic);
+            // B0114: duplicated switch arms (pedantic)
+            if (pedantic == 1) {
+                let ai: i32 = 0;
+                while (ai < len[SwitchArm](sw.arms)) {
+                    let aj: i32 = ai + 1;
+                    while (aj < len[SwitchArm](sw.arms)) {
+                        if (azx_body_eq(get[SwitchArm](sw.arms, ai).body, get[SwitchArm](sw.arms, aj).body) == 1) {
+                            c = c + azx_warn(ctx, "B0114", "duplicated switch arm bodies", file, fline,
+                                _zag_str_concat("in function `", _zag_str_concat(fname, "`: two arms have identical bodies")),
+                                "merge the arm tags or extract the shared body into a helper");
+                        }
+                        aj = aj + 1;
+                    }
+                    ai = ai + 1;
+                }
+            }
+            let i: i32 = 0;
+            while (i < len[SwitchArm](sw.arms)) { c = c + az_bloat_block(ctx, get[SwitchArm](sw.arms, i).body, fname, fline, file, pedantic); i = i + 1; }
+            if (sw.has_els == 1) { c = c + az_bloat_block(ctx, sw.els_body, fname, fline, file, pedantic); }
+            return c;
+        }
+        else => { return 0; }
+    }
+}
+
+fn az_bloat_bool_return(ctx: *AzCtx, x: If, fname: []u8, fline: i32, file: []u8) i32 {
+    if (x.has_els != 1) { return 0; }
+    if (len[*Node](x.then_body) != 1 || len[*Node](x.els_body) != 1) { return 0; }
+    let t: *Node = get[*Node](x.then_body, 0);
+    let e: *Node = get[*Node](x.els_body, 0);
+    switch (t.*) {
+        .ret => |tr| {
+            if (tr.has_expr != 1) { return 0; }
+            switch (e.*) {
+                .ret => |er| {
+                    if (er.has_expr != 1) { return 0; }
+                    let tv: i32 = azx_bool_value(tr.expr);
+                    let ev: i32 = azx_bool_value(er.expr);
+                    if (tv == 1 && ev == 0) {
+                        return azx_warn(ctx, "B0105", "verbose boolean return — `if c { return true; } else { return false; }`", file, fline,
+                            _zag_str_concat("in function `", _zag_str_concat(fname, "`: the branches just return the condition's truth value")),
+                            "replace with `return <condition>;`");
+                    }
+                    if (tv == 0 && ev == 1) {
+                        return azx_warn(ctx, "B0105", "verbose boolean return — `if c { return false; } else { return true; }`", file, fline,
+                            _zag_str_concat("in function `", _zag_str_concat(fname, "`: the branches return the negated condition")),
+                            "replace with `return !<condition>;`");
+                    }
+                    return 0;
+                }
+                else => { return 0; }
+            }
+        }
+        else => { return 0; }
+    }
+}
+
+fn az_bloat_unused_locals(ctx: *AzCtx, f: FnDecl, file: []u8, pedantic: i32) i32 {
+    let acc: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[*Node](f.body)) {
+        switch (get[*Node](f.body, i).*) {
+            .let_ => |l| {
+                if (l.has_init == 1 && l.is_global == 0) {
+                    // Skip names starting with _
+                    if (l.name.len > 0 && l.name[0] == '_') { }
+                    else if (azx_body_has_read(f.body, l.name) == 0) {
+                        // If init has a call, only flag under pedantic
+                        let has_call: i32 = az_expr_has_call(l.expr);
+                        if (has_call == 0 || pedantic == 1) {
+                            acc = acc + azx_warn(ctx, "B0103", _zag_str_concat("unused local `", _zag_str_concat(l.name, "` is never read")), file, f.line,
+                                _zag_str_concat("in function `", _zag_str_concat(f.name, _zag_str_concat("`: the variable is assigned but never used", ""))),
+                                "remove the binding, or prefix the name with `_` to indicate intentional discard");
+                        }
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn az_bloat_expr(ctx: *AzCtx, n: *Node, fname: []u8, fline: i32, file: []u8, pedantic: i32) i32 {
+    switch (n.*) {
+        .bin => |b| {
+            let c: i32 = 0;
+            // B0109: redundant boolean literal (x == true / x == false)
+            if (@strEq(b.op, "==") || @strEq(b.op, "!=")) {
+                if (azx_is_bool_literal(b.l) == 1 || azx_is_bool_literal(b.r) == 1) {
+                    c = c + azx_warn(ctx, "B0109", "redundant boolean literal in comparison", file, fline,
+                        _zag_str_concat("in function `", _zag_str_concat(fname, "`: compare with `true`/`false` directly instead of using ==/!=")),
+                        "use the variable directly, or negate it with `!`");
+                }
+            }
+            // B0110: tautological self-comparison (skip != for NaN safety)
+            if (azx_is_cmp_op(b.op) == 1 && @strEq(b.op, "!=") == 0) {
+                if (az_same_ident(b.l, b.r) == 1) {
+                    c = c + azx_warn(ctx, "B0110", _zag_str_concat("tautological self-comparison `x ", _zag_str_concat(b.op, " x`")), file, fline,
+                        _zag_str_concat("in function `", _zag_str_concat(fname, "`: comparing a value to itself is always the same")),
+                        "remove the comparison and use the constant result directly");
+                }
+            }
+            // A0109: div/mod by constant 0 or mod by 1 (agent-bug lint, gated by agent_on)
+            if (ctx.*.agent_on == 1 && (@strEq(b.op, "/") || @strEq(b.op, "%"))) {
+                let rlit: []u8 = az_int_text(b.r);
+                if (@strEq(rlit, "0")) {
+                    c = c + azx_warn(ctx, "A0109", "division/modulo by zero — runtime trap", file, fline,
+                        _zag_str_concat("in function `", _zag_str_concat(fname, "`: this will panic at runtime if executed")),
+                        "guard the divisor: `if (d != 0) { ... }`");
+                } else if (@strEq(b.op, "%") && @strEq(rlit, "1") && pedantic == 1) {
+                    c = c + azx_warn(ctx, "A0109", "modulo by 1 is always 0", file, fline,
+                        _zag_str_concat("in function `", _zag_str_concat(fname, "`: `x % 1` always evaluates to 0")),
+                        "replace with `0` or remove the modulo");
+                }
+            }
+            // A0110: shift by constant >= 32 (pedantic)
+            if (pedantic == 1 && (@strEq(b.op, "<<") || @strEq(b.op, ">>"))) {
+                let rlit: []u8 = az_int_text(b.r);
+                let rv: i64 = az_parse_dec(rlit);
+                if (rv >= 32 || rv < 0) {
+                    c = c + azx_warn(ctx, "A0110", _zag_str_concat("shift by ", _zag_str_concat(_zag_i64_to_str(rv), " is 0 for 32-bit types")), file, fline,
+                        _zag_str_concat("in function `", _zag_str_concat(fname, "`: shifting by >= 32 is undefined for i32/u32")),
+                        "verify the operand width and adjust the shift amount");
+                }
+            }
+            c = c + az_bloat_expr(ctx, b.l, fname, fline, file, pedantic);
+            c = c + az_bloat_expr(ctx, b.r, fname, fline, file, pedantic);
+            return c;
+        }
+        .un => |u| {
+            // B0107: double negation !!x
+            if (@strEq(u.op, "!")) {
+                switch (u.e.*) {
+                    .un => |inner| {
+                        if (@strEq(inner.op, "!")) {
+                            return azx_warn(ctx, "B0107", "double negation `!!x` — equivalent to `x`", file, fline,
+                                _zag_str_concat("in function `", _zag_str_concat(fname, "`: `!!x` simplifies to `x`")),
+                                "remove the double negation");
+                        }
+                    }
+                    else => { }
+                }
+                // B0108: negated comparison !(a == b) → a != b (integer-only)
+                switch (u.e.*) {
+                    .bin => |b| {
+                        if (azx_is_cmp_op(b.op) == 1) {
+                            let neg: []u8 = azx_negated_cmp(b.op);
+                            if (neg.len > 0) {
+                                return azx_warn(ctx, "B0108", _zag_str_concat("negated comparison `!(", _zag_str_concat(b.op, _zag_str_concat(")` — use `", _zag_str_concat(neg, "` instead")))), file, fline,
+                                    _zag_str_concat("in function `", _zag_str_concat(fname, "`: the negated form is clearer and avoids a precedence trap")),
+                                    _zag_str_concat("replace with `", _zag_str_concat(neg, "`")));
+                            }
+                        }
+                    }
+                    else => { }
+                }
+            }
+            return az_bloat_expr(ctx, u.e, fname, fline, file, pedantic);
+        }
+        .call => |c| {
+            let acc: i32 = 0;
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) { acc = acc + az_bloat_expr(ctx, get[*Node](c.args, i), fname, fline, file, pedantic); i = i + 1; }
+            return acc;
+        }
+        .idx => |x| { return az_bloat_expr(ctx, x.base, fname, fline, file, pedantic) + az_bloat_expr(ctx, x.idx, fname, fline, file, pedantic); }
+        .fld => |f| { return az_bloat_expr(ctx, f.base, fname, fline, file, pedantic); }
+        .slice_ => |s| { return az_bloat_expr(ctx, s.base, fname, fline, file, pedantic) + az_bloat_expr(ctx, s.lo, fname, fline, file, pedantic) + az_bloat_expr(ctx, s.hi, fname, fline, file, pedantic); }
+        .cast_ => |c| { return az_bloat_expr(ctx, c.expr, fname, fline, file, pedantic); }
+        .slit_ => |s| { let acc: i32 = 0; let i: i32 = 0; while (i < len[FieldInit](s.fields)) { acc = acc + az_bloat_expr(ctx, get[FieldInit](s.fields, i).val, fname, fline, file, pedantic); i = i + 1; } return acc; }
+        else => { return 0; }
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  AGENT-BUG LINTS
+// ════════════════════════════════════════════════════════════════════════════
+
+fn az_agent_fn(ctx: *AzCtx, f: FnDecl, file: []u8, pedantic: i32) i32 {
+    if (ctx.*.agent_on == 0) { return 0; }
+    let c: i32 = az_agent_block(ctx, f.body, f.name, f.line, file, pedantic);
+    // A0104: use-before-init — a local is read before its first assignment
+    c = c + az_agent_use_before_init(ctx, f, file);
+    if (pedantic == 1) {
+        // A0111: alloc deref without null guard
+        c = c + az_agent_alloc_deref(ctx, f, file);
+    }
+    return c;
+}
+
+// A0111: detect `let p = zalloc(...); p.field` or `p[i]` without a null check.
+// Tracks locals initialized from allocation functions (az_res_class != 0).
+// If such a local is dereferenced (field access or index) before appearing in
+// a null-guarding condition (`if (p != null)`, `if (p == null) { return; }`),
+// flag it.
+fn az_agent_alloc_deref(ctx: *AzCtx, f: FnDecl, file: []u8) i32 {
+    let alloc_locals: ArrayList[[]u8] = make[[]u8](8);
+    let guarded: ArrayList[[]u8] = make[[]u8](8);
+    let acc: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[*Node](f.body)) {
+        acc = acc + az_agent_ad_stmt(ctx, get[*Node](f.body, i), &alloc_locals, &guarded, f.name, f.line, file);
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn az_agent_ad_stmt(ctx: *AzCtx, n: *Node, allocs: *ArrayList[[]u8], guarded: *ArrayList[[]u8], fname: []u8, fline: i32, file: []u8) i32 {
+    switch (n.*) {
+        .let_ => |l| {
+            if (l.has_init == 1) {
+                // Check if init is an allocation call
+                let cn: []u8 = az_callee_name(l.expr);
+                if (az_res_class(cn) != 0) {
+                    push[[]u8](allocs, l.name);
+                }
+                return 0;
+            }
+            return 0;
+        }
+        .if_ => |x| {
+            // Check if the condition guards a local against null
+            az_agent_ad_check_guard(x.cond, allocs, guarded);
+            // Check the then-body for derefs
+            let c: i32 = az_agent_ad_check_body(ctx, x.then_body, allocs, guarded, fname, fline, file);
+            // Check else-body (if the guard is `p == null`, the else branch has p != null)
+            c = c + az_agent_ad_check_body(ctx, x.els_body, allocs, guarded, fname, fline, file);
+            return c;
+        }
+        .while_ => |w| { return az_agent_ad_check_body(ctx, w.body, allocs, guarded, fname, fline, file); }
+        .unsafe_ => |u| { return az_agent_ad_check_body(ctx, u.body, allocs, guarded, fname, fline, file); }
+        .estmt => |e| { return az_agent_ad_check_expr(ctx, e.expr, allocs, guarded, fname, fline, file); }
+        .ret => |r| { if (r.has_expr == 1) { return az_agent_ad_check_expr(ctx, r.expr, allocs, guarded, fname, fline, file); } return 0; }
+        .assign => |a| { return az_agent_ad_check_expr(ctx, a.expr, allocs, guarded, fname, fline, file); }
+        .defer_ => |d| { return az_agent_ad_check_expr(ctx, d.expr, allocs, guarded, fname, fline, file); }
+        else => { return 0; }
+    }
+}
+
+fn az_agent_ad_check_guard(cond: *Node, allocs: *ArrayList[[]u8], guarded: *ArrayList[[]u8]) void {
+    // Look for `p != null` or `p == null` patterns
+    switch (cond.*) {
+        .bin => |b| {
+            if (@strEq(b.op, "!=") || @strEq(b.op, "==")) {
+                // Check if one side is an alloc local and the other is null
+                let lhs_name: []u8 = "";
+                switch (b.l.*) { .id => |d| { lhs_name = d.name; } else => { } }
+                let rhs_name: []u8 = "";
+                switch (b.r.*) { .id => |d| { rhs_name = d.name; } else => { } }
+                let lhs_null: i32 = 0;
+                switch (b.l.*) { .id => |d| { if (@strEq(d.name, "null")) { lhs_null = 1; } } else => { } }
+                let rhs_null: i32 = 0;
+                switch (b.r.*) { .id => |d| { if (@strEq(d.name, "null")) { rhs_null = 1; } } else => { } }
+                if (rhs_null == 1 && lhs_name.len > 0 && az_agent_ubi_contains(allocs, lhs_name) == 1) {
+                    push[[]u8](guarded, lhs_name);
+                }
+                if (lhs_null == 1 && rhs_name.len > 0 && az_agent_ubi_contains(allocs, rhs_name) == 1) {
+                    push[[]u8](guarded, rhs_name);
+                }
+            }
+        }
+        else => { }
+    }
+}
+
+fn az_agent_ad_check_body(ctx: *AzCtx, body: ArrayList[*Node], allocs: *ArrayList[[]u8], guarded: *ArrayList[[]u8], fname: []u8, fline: i32, file: []u8) i32 {
+    let acc: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        switch (get[*Node](body, i).*) {
+            .estmt => |e| { acc = acc + az_agent_ad_check_expr(ctx, e.expr, allocs, guarded, fname, fline, file); }
+            .ret => |r| { if (r.has_expr == 1) { acc = acc + az_agent_ad_check_expr(ctx, r.expr, allocs, guarded, fname, fline, file); } }
+            .assign => |a| { acc = acc + az_agent_ad_check_expr(ctx, a.expr, allocs, guarded, fname, fline, file); }
+            .let_ => |l| { if (l.has_init == 1) { acc = acc + az_agent_ad_check_expr(ctx, l.expr, allocs, guarded, fname, fline, file); } }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn az_agent_ad_check_expr(ctx: *AzCtx, n: *Node, allocs: *ArrayList[[]u8], guarded: *ArrayList[[]u8], fname: []u8, fline: i32, file: []u8) i32 {
+    if (n == null as *Node) { return 0; }
+    switch (n.*) {
+        .fld => |f| {
+            // Check if base is an unguarded alloc local
+            switch (f.base.*) {
+                .id => |d| {
+                    if (az_agent_ubi_contains(allocs, d.name) == 1 && az_agent_ubi_contains(guarded, d.name) == 0) {
+                        return azx_warn(ctx, "A0111", _zag_str_concat("dereference of alloc result `", _zag_str_concat(d.name, "` without null guard")), file, fline,
+                            _zag_str_concat("in function `", _zag_str_concat(fname, _zag_str_concat("`: the allocation may return null", ""))),
+                            "add a null check: `if (p != null) { ... }` before dereferencing");
+                    }
+                }
+                else => { }
+            }
+            return az_agent_ad_check_expr(ctx, f.base, allocs, guarded, fname, fline, file);
+        }
+        .idx => |x| {
+            switch (x.base.*) {
+                .id => |d| {
+                    if (az_agent_ubi_contains(allocs, d.name) == 1 && az_agent_ubi_contains(guarded, d.name) == 0) {
+                        return azx_warn(ctx, "A0111", _zag_str_concat("index of alloc result `", _zag_str_concat(d.name, "` without null guard")), file, fline,
+                            _zag_str_concat("in function `", _zag_str_concat(fname, _zag_str_concat("`: the allocation may return null", ""))),
+                            "add a null check: `if (p != null) { ... }` before indexing");
+                    }
+                }
+                else => { }
+            }
+            return az_agent_ad_check_expr(ctx, x.base, allocs, guarded, fname, fline, file) + az_agent_ad_check_expr(ctx, x.idx, allocs, guarded, fname, fline, file);
+        }
+        .bin => |b| { return az_agent_ad_check_expr(ctx, b.l, allocs, guarded, fname, fline, file) + az_agent_ad_check_expr(ctx, b.r, allocs, guarded, fname, fline, file); }
+        .un => |u| { return az_agent_ad_check_expr(ctx, u.e, allocs, guarded, fname, fline, file); }
+        .call => |c| { let acc: i32 = 0; let i: i32 = 0; while (i < len[*Node](c.args)) { acc = acc + az_agent_ad_check_expr(ctx, get[*Node](c.args, i), allocs, guarded, fname, fline, file); i = i + 1; } return acc; }
+        .slice_ => |s| { return az_agent_ad_check_expr(ctx, s.base, allocs, guarded, fname, fline, file) + az_agent_ad_check_expr(ctx, s.lo, allocs, guarded, fname, fline, file) + az_agent_ad_check_expr(ctx, s.hi, allocs, guarded, fname, fline, file); }
+        .cast_ => |c| { return az_agent_ad_check_expr(ctx, c.expr, allocs, guarded, fname, fline, file); }
+        .slit_ => |s| { let acc: i32 = 0; let i: i32 = 0; while (i < len[FieldInit](s.fields)) { acc = acc + az_agent_ad_check_expr(ctx, get[FieldInit](s.fields, i).val, allocs, guarded, fname, fline, file); i = i + 1; } return acc; }
+        else => { return 0; }
+    }
+}
+
+// A0104: scan the function body in order. Track locals that are declared without
+// an initializer (`let x: i32;` — has_init == 0). If such a local is read before
+// any subsequent assignment, flag it.
+fn az_agent_use_before_init(ctx: *AzCtx, f: FnDecl, file: []u8) i32 {
+    let uninit: ArrayList[[]u8] = make[[]u8](8);
+    let acc: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[*Node](f.body)) {
+        acc = acc + az_agent_ubi_stmt(ctx, get[*Node](f.body, i), &uninit, f.name, f.line, file);
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn az_agent_ubi_stmt(ctx: *AzCtx, n: *Node, uninit: *ArrayList[[]u8], fname: []u8, fline: i32, file: []u8) i32 {
+    switch (n.*) {
+        .let_ => |l| {
+            if (l.has_init == 0) {
+                // Declared without init — track as uninitialized
+                if (l.name.len > 0 && l.name[0] != '_') {
+                    push[[]u8](uninit, l.name);
+                }
+            } else {
+                // Has init — check if the init expression reads any uninit local
+                let c: i32 = az_agent_ubi_check_expr(ctx, l.expr, uninit, fname, fline, file);
+                // Remove from uninit (now initialized)
+                az_agent_ubi_remove(uninit, l.name);
+                return c;
+            }
+            return 0;
+        }
+        .assign => |a| {
+            // Check RHS for reads of uninit locals
+            let c: i32 = az_agent_ubi_check_expr(ctx, a.expr, uninit, fname, fline, file);
+            // Mark target as initialized
+            switch (a.target.*) {
+                .id => |d| { az_agent_ubi_remove(uninit, d.name); }
+                else => { }
+            }
+            return c;
+        }
+        .ret => |r| { if (r.has_expr == 1) { return az_agent_ubi_check_expr(ctx, r.expr, uninit, fname, fline, file); } return 0; }
+        .estmt => |e| { return az_agent_ubi_check_expr(ctx, e.expr, uninit, fname, fline, file); }
+        .if_ => |x| {
+            let c: i32 = az_agent_ubi_check_expr(ctx, x.cond, uninit, fname, fline, file);
+            // Don't track uninit across branches — both branches may or may not init
+            return c;
+        }
+        .while_ => |w| { return az_agent_ubi_check_expr(ctx, w.cond, uninit, fname, fline, file); }
+        .defer_ => |d| { return az_agent_ubi_check_expr(ctx, d.expr, uninit, fname, fline, file); }
+        else => { return 0; }
+    }
+}
+
+fn az_agent_ubi_check_expr(ctx: *AzCtx, n: *Node, uninit: *ArrayList[[]u8], fname: []u8, fline: i32, file: []u8) i32 {
+    if (n == null as *Node) { return 0; }
+    switch (n.*) {
+        .id => |d| {
+            if (az_agent_ubi_contains(uninit, d.name) == 1) {
+                return azx_warn(ctx, "A0104", _zag_str_concat("use of uninitialized local `", _zag_str_concat(d.name, "`")), file, fline,
+                    _zag_str_concat("in function `", _zag_str_concat(fname, _zag_str_concat("`: this variable is read before being assigned", ""))),
+                    "initialize the variable before using it, or add an initializer to the `let`");
+            }
+            return 0;
+        }
+        .bin => |b| { return az_agent_ubi_check_expr(ctx, b.l, uninit, fname, fline, file) + az_agent_ubi_check_expr(ctx, b.r, uninit, fname, fline, file); }
+        .un => |u| { return az_agent_ubi_check_expr(ctx, u.e, uninit, fname, fline, file); }
+        .call => |c| {
+            let acc: i32 = az_agent_ubi_check_expr(ctx, c.callee, uninit, fname, fline, file);
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) { acc = acc + az_agent_ubi_check_expr(ctx, get[*Node](c.args, i), uninit, fname, fline, file); i = i + 1; }
+            return acc;
+        }
+        .idx => |x| { return az_agent_ubi_check_expr(ctx, x.base, uninit, fname, fline, file) + az_agent_ubi_check_expr(ctx, x.idx, uninit, fname, fline, file); }
+        .fld => |f| { return az_agent_ubi_check_expr(ctx, f.base, uninit, fname, fline, file); }
+        .slice_ => |s| { return az_agent_ubi_check_expr(ctx, s.base, uninit, fname, fline, file) + az_agent_ubi_check_expr(ctx, s.lo, uninit, fname, fline, file) + az_agent_ubi_check_expr(ctx, s.hi, uninit, fname, fline, file); }
+        .cast_ => |c| { return az_agent_ubi_check_expr(ctx, c.expr, uninit, fname, fline, file); }
+        .slit_ => |s| { let acc: i32 = 0; let i: i32 = 0; while (i < len[FieldInit](s.fields)) { acc = acc + az_agent_ubi_check_expr(ctx, get[FieldInit](s.fields, i).val, uninit, fname, fline, file); i = i + 1; } return acc; }
+        else => { return 0; }
+    }
+}
+
+fn az_agent_ubi_contains(uninit: *ArrayList[[]u8], name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[[]u8](uninit.*)) {
+        if (@strEq(get[[]u8](uninit.*, i), name)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn az_agent_ubi_remove(uninit: *ArrayList[[]u8], name: []u8) void {
+    let i: i32 = 0;
+    while (i < len[[]u8](uninit.*)) {
+        if (@strEq(get[[]u8](uninit.*, i), name)) {
+            // Shift remaining elements down
+            let j: i32 = i;
+            while (j < len[[]u8](uninit.*) - 1) {
+                set[[]u8](uninit, j, get[[]u8](uninit.*, j + 1));
+                j = j + 1;
+            }
+            uninit.*.len = uninit.*.len - 1;
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+fn az_agent_block(ctx: *AzCtx, body: ArrayList[*Node], fname: []u8, fline: i32, file: []u8, pedantic: i32) i32 {
+    let acc: i32 = 0;
+    let i: i32 = 0;
+    let prev_if_cond: *Node = null as *Node;
+    let prev_if_terminates: i32 = 0;
+    while (i < len[*Node](body)) {
+        let stmt: *Node = get[*Node](body, i);
+        // A0108: duplicate condition across consecutive ifs
+        switch (stmt.*) {
+            .if_ => |x| {
+                if (prev_if_cond != null as *Node && prev_if_terminates == 1) {
+                    if (azx_node_eq(prev_if_cond, x.cond) == 1) {
+                        acc = acc + azx_warn(ctx, "A0108", "duplicate condition — second if is unreachable", file, fline,
+                            _zag_str_concat("in function `", _zag_str_concat(fname, "`: the previous if with the same condition returns, so this one is dead")),
+                            "remove the duplicate if or fix the condition");
+                    }
+                    // A0112: symmetric condition (pedantic)
+                    if (pedantic == 1 && azx_conditions_symmetric(prev_if_cond, x.cond) == 1) {
+                        acc = acc + azx_warn(ctx, "A0112", "symmetric condition — two ifs test the same relation", file, fline,
+                            _zag_str_concat("in function `", _zag_str_concat(fname, "`: the conditions are equivalent with swapped operands")),
+                            "merge the two ifs or fix the condition");
+                    }
+                }
+                prev_if_cond = x.cond;
+                prev_if_terminates = azx_block_terminates(x.then_body);
+            }
+            else => {
+                prev_if_cond = null as *Node;
+                prev_if_terminates = 0;
+            }
+        }
+        acc = acc + az_agent_stmt(ctx, stmt, fname, fline, file, pedantic);
+        i = i + 1;
+    }
+    return acc;
+}
+
+fn azx_conditions_symmetric(a: *Node, b: *Node) i32 {
+    switch (a.*) {
+        .bin => |ba| {
+            switch (b.*) {
+                .bin => |bb| {
+                    // a < b  ==  b > a
+                    let swap: i32 = 0;
+                    if (@strEq(ba.op, "<") && @strEq(bb.op, ">")) { swap = 1; }
+                    if (@strEq(ba.op, ">") && @strEq(bb.op, "<")) { swap = 1; }
+                    if (@strEq(ba.op, "<=") && @strEq(bb.op, ">=")) { swap = 1; }
+                    if (@strEq(ba.op, ">=") && @strEq(bb.op, "<=")) { swap = 1; }
+                    if (swap == 1) {
+                        if (azx_node_eq(ba.l, bb.r) == 1 && azx_node_eq(ba.r, bb.l) == 1) { return 1; }
+                    }
+                    return 0;
+                }
+                else => { return 0; }
+            }
+        }
+        else => { return 0; }
+    }
+}
+
+fn az_agent_stmt(ctx: *AzCtx, n: *Node, fname: []u8, fline: i32, file: []u8, pedantic: i32) i32 {
+    switch (n.*) {
+        .let_ => |l| { if (l.has_init == 1) { return az_agent_expr(ctx, l.expr, fname, fline, file, pedantic); } return 0; }
+        .ret => |r| { if (r.has_expr == 1) { return az_agent_expr(ctx, r.expr, fname, fline, file, pedantic); } return 0; }
+        .assign => |a| {
+            let c: i32 = 0;
+            // A0105: self-assignment
+            if (azx_node_eq(a.target, a.expr) == 1) {
+                // Exclude if target or expr contains a call (side effect)
+                if (az_expr_has_call(a.target) == 0 && az_expr_has_call(a.expr) == 0) {
+                    c = c + azx_warn(ctx, "A0105", "self-assignment — variable is assigned to itself", file, fline,
+                        _zag_str_concat("in function `", _zag_str_concat(fname, "`: this is a no-op, likely a typo")),
+                        "check whether the right-hand side should be a different variable");
+                }
+            }
+            c = c + az_agent_expr(ctx, a.expr, fname, fline, file, pedantic);
+            return c;
+        }
+        .estmt => |e| {
+            let c: i32 = 0;
+            switch (e.expr.*) {
+                .call => |call| {
+                    let cn: []u8 = az_callee_name(call.callee);
+                    // A0102: ignored return value of a non-void user function.
+                    // Skip functions that return resources (class != 0) — those are
+                    // already tracked by the L0002/L0011 leak lints, so reporting
+                    // A0102 too would be redundant noise.
+                    if (az_res_class(cn) == 0) {
+                        if (azx_fn_exists(ctx, cn) == 1 && azx_fn_returns_void(ctx, cn) == 0) {
+                            c = c + azx_warn(ctx, "A0102", _zag_str_concat("ignored return value of `", _zag_str_concat(cn, "` — result is discarded")), file, fline,
+                                _zag_str_concat("in function `", _zag_str_concat(fname, "`: this function returns a non-void value that is discarded")),
+                                "bind the result to a `let` and use it, or add `// znc:allow A0102` to suppress");
+                        }
+                    }
+                }
+                else => {
+                    // A0106: dead computation (no call inside)
+                    if (az_expr_has_call(e.expr) == 0) {
+                        c = c + azx_warn(ctx, "A0106", "dead computation — expression result is discarded", file, fline,
+                            _zag_str_concat("in function `", _zag_str_concat(fname, "`: this expression has no side effects and its value is thrown away")),
+                            "remove the statement, or assign the result to a variable");
+                    }
+                }
+            }
+            c = c + az_agent_expr(ctx, e.expr, fname, fline, file, pedantic);
+            return c;
+        }
+        .if_ => |x| {
+            let c: i32 = az_agent_expr_cond(ctx, x.cond, fname, fline, file);
+            c = c + az_agent_block(ctx, x.then_body, fname, fline, file, pedantic);
+            c = c + az_agent_block(ctx, x.els_body, fname, fline, file, pedantic);
+            return c;
+        }
+        .while_ => |w| {
+            let c: i32 = az_agent_expr_cond(ctx, w.cond, fname, fline, file);
+            // A0101: off-by-one loop bound (<= with indexing)
+            c = c + az_agent_oob_while(ctx, w, fname, fline, file);
+            // A0107: dead loop (direction mismatch)
+            c = c + az_agent_dead_loop(ctx, w, fname, fline, file);
+            c = c + az_agent_block(ctx, w.body, fname, fline, file, pedantic);
+            return c;
+        }
+        .unsafe_ => |u| { return az_agent_block(ctx, u.body, fname, fline, file, pedantic); }
+        .defer_ => |d| { return az_agent_expr(ctx, d.expr, fname, fline, file, pedantic); }
+        .switch_ => |sw| {
+            let c: i32 = az_agent_expr(ctx, sw.subject, fname, fline, file, pedantic);
+            let i: i32 = 0;
+            while (i < len[SwitchArm](sw.arms)) { c = c + az_agent_block(ctx, get[SwitchArm](sw.arms, i).body, fname, fline, file, pedantic); i = i + 1; }
+            if (sw.has_els == 1) { c = c + az_agent_block(ctx, sw.els_body, fname, fline, file, pedantic); }
+            return c;
+        }
+        else => { return 0; }
+    }
+}
+
+fn az_agent_oob_while(ctx: *AzCtx, w: While, fname: []u8, fline: i32, file: []u8) i32 {
+    // Check: while (i <= N) { ... arr[i] ... } or while (N >= i) { ... arr[i] ... }
+    switch (w.cond.*) {
+        .bin => |b| {
+            // For `i <= N`, the loop var is on the left; for `N >= i`, it's on the right.
+            let loop_var: []u8 = "";
+            if (@strEq(b.op, "<=")) {
+                switch (b.l.*) { .id => |d| { loop_var = d.name; } else => { } }
+            } else if (@strEq(b.op, ">=")) {
+                switch (b.r.*) { .id => |d| { loop_var = d.name; } else => { } }
+            } else {
+                return 0;
+            }
+            if (loop_var.len == 0) { return 0; }
+            // Check if the body indexes with the loop variable
+            if (az_agent_body_indexes_var(w.body, loop_var) == 1) {
+                return azx_warn(ctx, "A0101", _zag_str_concat("off-by-one: `", _zag_str_concat(loop_var, " <= N` with indexing — accesses one past the end")), file, fline,
+                    _zag_str_concat("in function `", _zag_str_concat(fname, _zag_str_concat("`: when ", _zag_str_concat(loop_var, " == N, the index is out of bounds")))),
+                    "change `<=` to `<` (or `>=` to `>`), or ensure the array has N+1 elements");
+            }
+            return 0;
+        }
+        else => { return 0; }
+    }
+}
+
+fn az_agent_body_indexes_var(body: ArrayList[*Node], var_name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        if (az_agent_stmt_indexes_var(get[*Node](body, i), var_name) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn az_agent_stmt_indexes_var(n: *Node, var_name: []u8) i32 {
+    switch (n.*) {
+        .assign => |a| { if (az_agent_expr_indexes_var(a.target, var_name) == 1) { return 1; } return az_agent_expr_indexes_var(a.expr, var_name); }
+        .estmt => |e| { return az_agent_expr_indexes_var(e.expr, var_name); }
+        .let_ => |l| { if (l.has_init == 1) { return az_agent_expr_indexes_var(l.expr, var_name); } return 0; }
+        .ret => |r| { if (r.has_expr == 1) { return az_agent_expr_indexes_var(r.expr, var_name); } return 0; }
+        .if_ => |x| { if (az_agent_expr_indexes_var(x.cond, var_name) == 1) { return 1; } if (az_agent_body_indexes_var(x.then_body, var_name) == 1) { return 1; } return az_agent_body_indexes_var(x.els_body, var_name); }
+        .while_ => |w| { if (az_agent_expr_indexes_var(w.cond, var_name) == 1) { return 1; } return az_agent_body_indexes_var(w.body, var_name); }
+        .unsafe_ => |u| { return az_agent_body_indexes_var(u.body, var_name); }
+        .defer_ => |d| { return az_agent_expr_indexes_var(d.expr, var_name); }
+        else => { return 0; }
+    }
+}
+
+fn az_agent_expr_indexes_var(n: *Node, var_name: []u8) i32 {
+    switch (n.*) {
+        .idx => |x| {
+            if (azx_expr_has_read(x.idx, var_name) == 1) { return 1; }
+            if (az_agent_expr_indexes_var(x.base, var_name) == 1) { return 1; }
+            return az_agent_expr_indexes_var(x.idx, var_name);
+        }
+        .bin => |b| { if (az_agent_expr_indexes_var(b.l, var_name) == 1) { return 1; } return az_agent_expr_indexes_var(b.r, var_name); }
+        .un => |u| { return az_agent_expr_indexes_var(u.e, var_name); }
+        .call => |c| { let i: i32 = 0; while (i < len[*Node](c.args)) { if (az_agent_expr_indexes_var(get[*Node](c.args, i), var_name) == 1) { return 1; } i = i + 1; } return 0; }
+        .fld => |f| { return az_agent_expr_indexes_var(f.base, var_name); }
+        .slice_ => |s| { if (az_agent_expr_indexes_var(s.base, var_name) == 1) { return 1; } if (az_agent_expr_indexes_var(s.lo, var_name) == 1) { return 1; } return az_agent_expr_indexes_var(s.hi, var_name); }
+        .cast_ => |c| { return az_agent_expr_indexes_var(c.expr, var_name); }
+        else => { return 0; }
+    }
+}
+
+fn az_agent_dead_loop(ctx: *AzCtx, w: While, fname: []u8, fline: i32, file: []u8) i32 {
+    // Check: while (i > N) { ... i = i + 1; } or while (i < N) { ... i = i - 1; }
+    // Also handles reversed operands: while (N < i) { ... i = i + 1; }
+    switch (w.cond.*) {
+        .bin => |b| {
+            // Try left side first, then right side
+            let loop_var: []u8 = "";
+            switch (b.l.*) {
+                .id => |d| { loop_var = d.name; }
+                else => { }
+            }
+            if (loop_var.len == 0) {
+                switch (b.r.*) {
+                    .id => |d| { loop_var = d.name; }
+                    else => { return 0; }
+                }
+            }
+            if (loop_var.len == 0) { return 0; }
+            let inc: i32 = az_agent_find_increment(w.body, loop_var);
+            if (inc == 0) { return 0; }
+            // Determine whether the loop var is on the left or right side
+            let var_on_left: i32 = 0;
+            switch (b.l.*) {
+                .id => |d| { if (@strEq(d.name, loop_var)) { var_on_left = 1; } }
+                else => { }
+            }
+            // For `i > N` (var on left): increment makes it more true → dead
+            // For `N < i` (var on right, op is `<`): increment makes it more true → dead
+            if (var_on_left == 1) {
+                if ((@strEq(b.op, ">") || @strEq(b.op, ">=")) && inc > 0) {
+                    return azx_warn(ctx, "A0107", "dead loop — condition uses `>`/`>=` but body increments", file, fline,
+                        _zag_str_concat("in function `", _zag_str_concat(fname, _zag_str_concat("`: the loop variable increases but the condition requires it to be greater", ""))),
+                        "fix the condition to `<`/`<=`, or fix the increment to a decrement");
+                }
+                if ((@strEq(b.op, "<") || @strEq(b.op, "<=")) && inc < 0) {
+                    return azx_warn(ctx, "A0107", "dead loop — condition uses `<`/`<=` but body decrements", file, fline,
+                        _zag_str_concat("in function `", _zag_str_concat(fname, _zag_str_concat("`: the loop variable decreases but the condition requires it to be lesser", ""))),
+                        "fix the condition to `>`/`>=`, or fix the decrement to an increment");
+                }
+            } else {
+                // Var on right side: `N > i` means i < N, `N < i` means i > N
+                if ((@strEq(b.op, "<") || @strEq(b.op, "<=")) && inc > 0) {
+                    return azx_warn(ctx, "A0107", "dead loop — condition uses `>`/`>=` (reversed) but body increments", file, fline,
+                        _zag_str_concat("in function `", _zag_str_concat(fname, _zag_str_concat("`: the loop variable increases but the condition requires it to be greater", ""))),
+                        "fix the condition to `<`/`<=`, or fix the increment to a decrement");
+                }
+                if ((@strEq(b.op, ">") || @strEq(b.op, ">=")) && inc < 0) {
+                    return azx_warn(ctx, "A0107", "dead loop — condition uses `<`/`<=` (reversed) but body decrements", file, fline,
+                        _zag_str_concat("in function `", _zag_str_concat(fname, _zag_str_concat("`: the loop variable decreases but the condition requires it to be lesser", ""))),
+                        "fix the condition to `>`/`>=`, or fix the decrement to an increment");
+                }
+            }
+            return 0;
+        }
+        else => { return 0; }
+    }
+}
+
+fn az_agent_find_increment(body: ArrayList[*Node], var_name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        let inc: i32 = az_agent_stmt_increment(get[*Node](body, i), var_name);
+        if (inc != 0) { return inc; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn az_agent_stmt_increment(n: *Node, var_name: []u8) i32 {
+    switch (n.*) {
+        .assign => |a| {
+            switch (a.target.*) {
+                .id => |d| {
+                    if (@strEq(d.name, var_name)) {
+                        // Check for i = i + 1 or i = i - 1
+                        switch (a.expr.*) {
+                            .bin => |b| {
+                                if (@strEq(b.op, "+")) {
+                                    if (azx_expr_has_read(b.l, var_name) == 1) {
+                                        let rlit: []u8 = az_int_text(b.r);
+                                        let rv: i64 = az_parse_dec(rlit);
+                                        if (rv > 0) { return 1; }
+                                        if (rv < 0) { return -1; }
+                                    }
+                                    if (azx_expr_has_read(b.r, var_name) == 1) {
+                                        let llit: []u8 = az_int_text(b.l);
+                                        let lv: i64 = az_parse_dec(llit);
+                                        if (lv > 0) { return 1; }
+                                        if (lv < 0) { return -1; }
+                                    }
+                                }
+                                if (@strEq(b.op, "-")) {
+                                    if (azx_expr_has_read(b.l, var_name) == 1) {
+                                        let rlit: []u8 = az_int_text(b.r);
+                                        let rv: i64 = az_parse_dec(rlit);
+                                        if (rv > 0) { return -1; }
+                                        if (rv < 0) { return 1; }
+                                    }
+                                }
+                            }
+                            else => { }
+                        }
+                    }
+                }
+                else => { }
+            }
+            return 0;
+        }
+        .if_ => |x| {
+            let inc: i32 = az_agent_find_increment(x.then_body, var_name);
+            if (inc != 0) { return inc; }
+            return az_agent_find_increment(x.els_body, var_name);
+        }
+        .while_ => |w| { return az_agent_find_increment(w.body, var_name); }
+        .unsafe_ => |u| { return az_agent_find_increment(u.body, var_name); }
+        else => { return 0; }
+    }
+}
+
+fn az_agent_expr_cond(ctx: *AzCtx, n: *Node, fname: []u8, fline: i32, file: []u8) i32 {
+    let c: i32 = 0;
+    // A0103: wrong-op / precedence
+    switch (n.*) {
+        .bin => |b| {
+            // Bitwise-for-logical: a & b or a | b where operands look boolean
+            if (@strEq(b.op, "&") || @strEq(b.op, "|")) {
+                if (azx_expr_is_bool_shaped(b.l) == 1 && azx_expr_is_bool_shaped(b.r) == 1) {
+                    let correct: []u8 = "&&";
+                    if (@strEq(b.op, "|")) { correct = "||"; }
+                    c = c + azx_warn(ctx, "A0103", _zag_str_concat("bitwise `", _zag_str_concat(b.op, _zag_str_concat("` on boolean operands — likely meant `", _zag_str_concat(correct, "`")))), file, fline,
+                        _zag_str_concat("in function `", _zag_str_concat(fname, "`: bitwise operators on booleans don't short-circuit")),
+                        _zag_str_concat("replace `", _zag_str_concat(b.op, _zag_str_concat("` with `", _zag_str_concat(correct, "`")))));
+                }
+            }
+        }
+        else => { }
+    }
+    c = c + az_agent_expr(ctx, n, fname, fline, file, 0);
+    return c;
+}
+
+fn azx_expr_is_bool_shaped(n: *Node) i32 {
+    switch (n.*) {
+        .bin => |b| { if (azx_is_cmp_op(b.op) == 1) { return 1; } return 0; }
+        .un => |u| { if (@strEq(u.op, "!")) { return 1; } return 0; }
+        .id => |d| { if (@strEq(d.name, "true") || @strEq(d.name, "false")) { return 1; } return 0; }
+        else => { return 0; }
+    }
+}
+
+fn az_agent_expr(ctx: *AzCtx, n: *Node, fname: []u8, fline: i32, file: []u8, pedantic: i32) i32 {
+    switch (n.*) {
+        .bin => |b| {
+            let c: i32 = 0;
+            c = c + az_agent_expr(ctx, b.l, fname, fline, file, pedantic);
+            c = c + az_agent_expr(ctx, b.r, fname, fline, file, pedantic);
+            return c;
+        }
+        .un => |u| { return az_agent_expr(ctx, u.e, fname, fline, file, pedantic); }
+        .call => |c| { let acc: i32 = 0; let i: i32 = 0; while (i < len[*Node](c.args)) { acc = acc + az_agent_expr(ctx, get[*Node](c.args, i), fname, fline, file, pedantic); i = i + 1; } return acc; }
+        .idx => |x| { return az_agent_expr(ctx, x.base, fname, fline, file, pedantic) + az_agent_expr(ctx, x.idx, fname, fline, file, pedantic); }
+        .fld => |f| { return az_agent_expr(ctx, f.base, fname, fline, file, pedantic); }
+        .slice_ => |s| { return az_agent_expr(ctx, s.base, fname, fline, file, pedantic) + az_agent_expr(ctx, s.lo, fname, fline, file, pedantic) + az_agent_expr(ctx, s.hi, fname, fline, file, pedantic); }
+        .cast_ => |c| { return az_agent_expr(ctx, c.expr, fname, fline, file, pedantic); }
+        .slit_ => |s| { let acc: i32 = 0; let i: i32 = 0; while (i < len[FieldInit](s.fields)) { acc = acc + az_agent_expr(ctx, get[FieldInit](s.fields, i).val, fname, fline, file, pedantic); i = i + 1; } return acc; }
+        else => { return 0; }
+    }
+}
+
+// ── entry point ───────────────────────────────────────────────────────────────
+fn az_analyze_fn(ctx: *AzCtx, f: FnDecl, file: []u8, pedantic: i32) i32 {
+    if (f.is_extern == 1) { return 0; }
+    // Compiler-generated wrappers have no user source span and must never
+    // produce line-0 findings. Imported modules are dependency code: keep
+    // default diagnostics focused on the invoked source, with an explicit
+    // opt-in for auditing the complete dependency graph.
+    if (f.line <= 0 || f.origin.len == 0) { return 0; }
+    if (azx_flag_eq("--analyze-deps") == 0 && !@strEq(f.origin, "<root>")) { return 0; }
+    let c: i32 = az_scan_leaks(f.body, f.body, f.name, f.line, file);
+    c = c + az_strleak_body(f.body, f.name, f.line, file);
+    c = c + az_eff_body(f.body, f.name, f.line, file, pedantic);
+    c = c + az_bloat_fn(ctx, f, file, pedantic);
+    c = c + az_agent_fn(ctx, f, file, pedantic);
+    return c;
+}
+
+// Top-level: run the analyzer over every function; return the finding count.
+// `pedantic` enables the strength-reduction lint (E0103) and tier-2 bloat/agent lints.
+fn run_analysis(decls: ArrayList[*Node], file: []u8, pedantic: i32) i32 {
+    // Build context (allocates AzCtx with defaults)
+    let ctx: *AzCtx = azx_build_ctx(decls);
+    // Read flags
+    if (azx_flag_eq("--analyze-bloat=off") == 1) { ctx.*.bloat_on = 0; }
+    if (azx_flag_eq("--analyze-agent=off") == 1) { ctx.*.agent_on = 0; }
+    ctx.*.complexity = azx_flag_int("--analyze-complexity", 15);
+    // Parse suppression comments from the source file
+    let src: []u8 = _zag_read_file(file);
+    if (src.len > 0) {
+        azx_parse_suppression(ctx, src);
+    }
+    let total: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .fn_decl => |f| { total = total + az_analyze_fn(ctx, f, file, pedantic); }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return total;
+}

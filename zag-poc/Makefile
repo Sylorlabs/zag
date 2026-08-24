@@ -1,41 +1,40 @@
 # Zag compiler Makefile
 #
 # Primary compiler: ./znc  (native x86-64 ELF, zero cc/as/ld/libc)
-# Legacy oracle:    ./zagc (C-backend differential oracle; not a supported build path)
 #
 # Supported workflow:
 #   make           — rebuild znc from seed (= bootstrap)
 #   make test      — run the authoritative v1 test suite
 #   make install   — install znc to /usr/local/bin
-#   make clean     — remove generated artifacts (keeps seed binaries zagc + znc)
+#   make clean     — remove generated artifacts (keeps the znc seed)
 
-.PHONY: all bootstrap znc zagc test test-authority test-bootstrap test-semantics \
-        test-diagnostics test-tooling test-programs test-native test-abi-layout \
-        test-differential test-selfhost clean install
+.PHONY: all bootstrap znc zagd zag-lsp test test-driver-foundation test-zagscript-release test-zagscript-master test-v1-compat test-zagd-product test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-analyzer test-hot-reload test-dynamic-abi test-resource-embed test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-gpu-compat test-gpu-runtime test-gpu-zag-runtime test-linux-drm test-std-namespace test-docs-truth test-effect-witness \
+        test-diagnostics test-tooling test-programs test-native test-abi-layout test-arm64 \
+        test-differential-backends test-arm64-selfhost clean install
 
 # ── Primary target ────────────────────────────────────────────────────────────
-all: znc
+all: bootstrap
 
 # ── Build the native compiler from seed ──────────────────────────────────────
-znc: selfhost/native/znc.zag
-	@echo "── rebuilding znc from seed (no cc/as/ld/libc) ──"
-	./znc selfhost/native/znc.zag -o znc.new
-	mv -f znc.new znc
-	@echo "   ./znc rebuilt"
+bootstrap: selfhost/native/znc.zag selfhost/zagd_daemon.zag
+	@echo "── rebuilding fixed-point znc + zagd (no cc/as/ld/libc) ──"
+	bash bootstrap.sh
 
-bootstrap: znc
-	@echo "Bootstrap complete — seed: ./znc"
+# Keep the historical target names, but route both through the fixpoint
+# bootstrap so `make znc` cannot install an unproven stage-1 compiler.
+znc: bootstrap
 
-# ── Legacy C-backend oracle (not a supported build path) ─────────────────────
-# zagc is retained for historical differential testing only.  It is NOT a
-# release artifact and NOT an acceptable bootstrap fallback.
-zagc: selfhost/zagc.zag
-	@echo "── rebuilding zagc via znc (differential oracle only) ──"
-	./znc selfhost/zagc.zag -o zagc.new
-	mv -f zagc.new zagc
-	@echo "   ./zagc rebuilt (differential oracle; not for release)"
+zagd: bootstrap
+
+# Build the editor server users actually install. Analyzer output remains on:
+# a warning here is a release-quality problem, not packaging noise.
+zag-lsp: znc selfhost/lsp/zag-lsp.zag
+	./znc selfhost/lsp/zag-lsp.zag -o zag-lsp --no-zagd
 
 # ── Test targets ─────────────────────────────────────────────────────────────
+
+test-pure-tree:
+	bash tests/check_pure_zag_tree.sh
 
 # THE authoritative release gate: poisons host C tools, self-rebuilds znc, smoke tests.
 test-authority:
@@ -49,60 +48,173 @@ test-bootstrap:
 test-semantics:
 	bash tests/run_semantics.sh
 
+test-typed-authority:
+	bash tests/run_typed_authority.sh
+
 test-diagnostics:
 	bash tests/run_diag.sh
 
 test-tooling:
 	bash tests/run_tooling.sh
 
+test-docs-truth:
+	bash tests/run_docs_truth.sh
+
+test-effect-witness:
+	bash tests/run_effect_witness.sh
+
+# Static analyzer (analyze.zag): leak (L00xx) + efficiency (E01xx) lints.
+test-analyzer:
+	@echo "── static analyzer suite ──"
+	bash tests/run_analyzer.sh
+
+# Live code hot-reload (hot_rt.zag + `znc hot-patch`): end-to-end swap test.
+test-hot-reload:
+	@echo "── hot-reload suite ──"
+	bash tests/run_hot_reload.sh
+
+# Fail-closed Linux GPU reset/fault-domain classification.
+test-gpu-isolation:
+	@echo "── GPU isolation classification suite ──"
+	bash tests/run_gpu_isolation.sh
+
+# Strict ZGK1 instruction and PM4 virtual command processor.
+test-gfx1010-vm:
+	@echo "── virtual GFX10.1 command processor suite ──"
+	bash tests/run_gfx1010_vm.sh
+
+test-gpu-std:
+	@echo "── evidence-first GPU standard library suite ──"
+	bash tests/run_gpu_std.sh
+
+test-gpu-platform:
+	@echo "── GPU compiler/runtime/driver boundary suite ──"
+	bash tests/run_gpu_platform.sh
+
+# Compat-tier artifact, loader, and bounded runtime gate. Physical dispatch is
+# still opt-in inside run_gpu_runtime.sh via ZAG_RUN_PHYSICAL_GPU=1.
+test-gpu-compat:
+	@echo "── GPU compatibility-tier suite ──"
+	bash tests/run_compat_vulkan.sh
+	bash tests/run_compat_opengl.sh
+	bash tests/run_compat_opencl.sh
+	bash tests/run_compat_cuda.sh
+	bash tests/run_compat_metal.sh
+	bash tests/run_gpu_runtime.sh
+	bash tests/run_gpu_zag_runtime.sh
+
+test-gpu-runtime:
+	@echo "── GPU bounded runtime gate ──"
+	bash tests/run_gpu_runtime.sh
+
+test-gpu-zag-runtime:
+	@echo "── pure-Zag Vulkan/OpenGL/OpenCL runtime gate ──"
+	bash tests/run_gpu_zag_runtime.sh
+
+# Hardware-specific, read-only AMDGPU DRM boundary. This target is separate
+# from the portable compatibility gate because it expects a live AMD render
+# node and records the display-bound opt-in policy explicitly.
+test-linux-drm:
+	@echo "── Linux AMDGPU DRM discovery and native preflight gate ──"
+	bash tests/run_linux_drm.sh
+
+# Compiler-owned, non-shadowable standard-library import namespace.
+test-std-namespace:
+	@echo "── std namespace suite ──"
+	bash tests/run_std_namespace.sh
+
 test-programs:
 	bash tests/run_programs.sh
+
+test-zagd-product: znc zagd
+	bash tests/run_zagd_product.sh
+
+test-zagscript-release:
+	bash tests/run_zagscript_release_gate.sh
+
+# Deliberately manual and sequential: this workstation evidence gate requires
+# a user cgroup, active earlyoom, the i686 boundary, and 30-run benchmarks. It
+# is not a dependency of `test`, CI, or release packaging.
+test-zagscript-master:
+	bash tests/run_zagscript_master_gate.sh
+
+test-v1-compat:
+	bash tests/run_v1_compatibility_gate.sh
 
 # Full native backend suite, Zag → ELF, no cc/as/ld/libc.
 test-native:
 	@echo "── native backend suite ──"
 	bash tests/run_native.sh
 
-# ABI/layout edge-case regression (informational — documents CURRENT behavior).
+# ABI/layout edge-case regression (release-blocking — documents CURRENT behavior).
 test-abi-layout:
-	@echo "── ABI/layout regression suite ──"
+	@echo "── ABI/layout regression suite (release gate) ──"
 	bash tests/run_abi_layout.sh
 
-# Differential tests against the C backend (not a release gate).
-test-differential:
-	@echo "── differential suite via zagc (informational only) ──"
-	bash run_tests.sh
+# AArch64 Linux backend (runs via qemu-user; requires qemu-aarch64-static).
+test-arm64:
+	@echo "── arm64 backend suite (qemu-user) ──"
+	bash tests/run_native_arm64.sh
 
-# Selfhost compiler-pipeline tests (informational).
-test-selfhost:
-	@echo "── self-hosted pipeline tests ──"
-	bash tests/run_selfhost.sh
+# Cross-backend differential gate: identical output on x86-64 and arm64.
+test-differential-backends:
+	@echo "── differential x86/arm64 gate ──"
+	bash tests/run_differential.sh
 
-# Default `make test`: runs the v1 release gates.
-test: znc test-authority test-bootstrap test-semantics test-diagnostics test-tooling test-programs test-native
+test-arm64-selfhost:
+	@echo "── arm64 self-hosting fixpoint ──"
+	bash tests/run_arm64_selfhost.sh
+
+test-dynamic-abi:
+	@echo "── explicit dynamic system ABI gate ──"
+	bash tests/run_dynamic_abi.sh
+
+test-resource-embed:
+	@echo "── deterministic resource embedding gate ──"
+	bash tests/run_resource_embed.sh
+
+# Unified pure-Zag driver foundation release gate. This stays separate from
+# the broad v1 suite because its six Linux-series/architecture QEMU matrix is
+# an explicit support claim and must fail closed when images or module evidence
+# are absent.
+test-driver-foundation: znc
+	@echo "── pure-Zag driver foundation release gate ──"
+	bash tests/run_driver_foundation.sh
+
+# Default `make test`: runs the v1 release gates. The intentionally
+# fail-closed ZagScript 1.0 authority remains `make test-zagscript-release`.
+test: znc test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-diagnostics test-effect-witness test-tooling test-docs-truth test-analyzer test-hot-reload test-dynamic-abi test-resource-embed test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-gpu-compat test-std-namespace test-programs test-native test-abi-layout test-arm64 test-differential-backends test-arm64-selfhost
 	@echo "════ all v1 release gates passed ════"
 
 # ── Install ───────────────────────────────────────────────────────────────────
-install: znc
+install: znc zagd zag-lsp
 	install -m755 znc /usr/local/bin/znc
-	@echo "Installed znc → /usr/local/bin/znc"
-	@echo "Optional (differential oracle):"
-	@echo "  sudo install -m755 zagc /usr/local/bin/zagc"
+	install -m755 zagd /usr/local/bin/zagd
+	install -m755 zag-lsp /usr/local/bin/zag-lsp
+	install -m755 tools/zagd-user-service.sh /usr/local/bin/zagd-user-service
+	install -d /usr/local/lib/zag/std
+	install -d /usr/local/share/zag
+	install -m644 examples/zagd.conf /usr/local/share/zag/zagd.conf.example
+	install -m644 std/*.zag /usr/local/lib/zag/std/
+	install -m644 selfhost/std/process.zag /usr/local/lib/zag/std/process.zag
+	install -m644 selfhost/std/script_io.zag /usr/local/lib/zag/std/script_io.zag
+	install -m644 selfhost/std/script_input.zag /usr/local/lib/zag/std/script_input.zag
+	install -m644 selfhost/std/script_string_builder.zag /usr/local/lib/zag/std/script_string_builder.zag
+	install -m644 selfhost/std/script_list.zag /usr/local/lib/zag/std/script_list.zag
+	install -m644 selfhost/std/script_string.zag /usr/local/lib/zag/std/script_string.zag
+	install -m644 selfhost/std/script_path.zag /usr/local/lib/zag/std/script_path.zag
+	@echo "Installed znc + zagd + zag-lsp + service control → /usr/local/bin, std → /usr/local/lib/zag/std, policy template → /usr/local/share/zag"
 
 # ── Clean ─────────────────────────────────────────────────────────────────────
-# Removes all generated artifacts.  Does NOT remove seed binaries zagc and znc.
+# Removes generated artifacts. Does NOT remove the znc seed binary.
 clean:
-	@echo "── removing generated C intermediates and ELF outputs ──"
-	find . \( -name '*.zag.c' -o -name '*.zag.out' -o -name '*.zag.zir.c' \) \
-	    ! -path './selfhost/native/znc.zag.c' \
-	    ! -path './selfhost/native/znc.zag.out' \
-	    -delete 2>/dev/null || true
+	@echo "── removing generated outputs ──"
+	find . -name '*.zag.out' -delete 2>/dev/null || true
 	rm -f nt_src.zag
 	@echo "── removing scratch and test build binaries ──"
-	rm -f zagc_new zagc_new2 zagc_new3 zagc_test2
 	rm -f znc_fp znc_fp2 znc_new znc_new2 znc_new3 znc_test
 	rm -f znc.fp2 znc.fp3 znc.new2
-	rm -f _pt.zag.c _pt.zag.out _sl2.zag.c
+	rm -f _pt.zag.out
 	rm -f test_escape_debug test_escape_debug.zag test_escape_debug.zag.out
 	rm -f test_infer test_infer.zag test_infer.zag.out
 	rm -f test_let test_let.zag test_let.zag.out
@@ -126,4 +238,4 @@ clean:
 	rm -f examples/total_guarded examples/total_nonzero
 	rm -f examples/interfaces examples/hot_demo
 	rm -f examples/*.mlir
-	@echo "clean done (seed binaries zagc + znc preserved)"
+	@echo "clean done (znc seed preserved)"

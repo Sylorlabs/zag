@@ -11,7 +11,8 @@
 //   IntMap[V]  — i32 keys (hm.int_make, hm.int_put, hm.int_get, hm.int_has)
 //   Int64Map[V] — i64 keys
 //
-// Open addressing, linear probing, 70% load factor, power-of-two capacity.
+// Open addressing, bounded linear probing, 70% active-load growth, capacity
+// clamped to at least eight. Deleted slots remain tombstones until reuse/grow.
 
 @import("rt.zag")
 
@@ -64,9 +65,8 @@ fn eq_str(a: []u8, b: []u8) bool {
     return @strEq(a, b);
 }
 
-fn hm_alloc[K,V](n: i32) *HEntry[K,V] {
-    let raw: *i8 = _zag_malloc(n * @sizeOf[HEntry[K,V]]());
-    let e: *HEntry[K,V] = raw as *HEntry[K,V];
+fn hm_alloc[K,V](n: i32) *HEntry[K,V] @alloc {
+    let e: *HEntry[K,V] = _zag_malloc(n * @sizeOf[HEntry[K,V]]()) as *HEntry[K,V];
     let i: i32 = 0;
     while (i < n) {
         e[i].used = 0;
@@ -81,7 +81,7 @@ fn make[K,V](cap: i32, hash_fn: fn(K) i32, eq_fn: fn(K,K) bool) HashMap[K,V] {
     return HashMap[K,V]{ .entries = hm_alloc[K,V](c), .cap = c, .count = 0, .hash_fn = hash_fn, .eq_fn = eq_fn };
 }
 
-fn hm_grow[K,V](m: *HashMap[K,V]) void {
+fn hm_grow[K,V](m: *HashMap[K,V]) void @borrows_mut {
     let old_cap: i32 = m.*.cap;
     let old_e: *HEntry[K,V] = m.*.entries;
     let new_cap: i32 = old_cap * 2;
@@ -91,7 +91,28 @@ fn hm_grow[K,V](m: *HashMap[K,V]) void {
     let i: i32 = 0;
     while (i < old_cap) {
         if (old_e[i].used == 1) {
-            put[K,V](m, old_e[i].key, old_e[i].val);
+            // Rehash directly instead of calling the public generic `put`:
+            // `put` stores its value argument, so it cannot honestly be
+            // classified as a borrow-only auxiliary operation for arbitrary
+            // pointer-bearing V.  The old entry is already owned by this map;
+            // this loop transfers the bits into the fresh table in place.
+            let key: K = old_e[i].key;
+            let val: V = old_e[i].val;
+            let idx: i32 = (m.*.hash_fn(key) & 2147483647) % new_cap;
+            let probes: i32 = 0;
+            while (probes < new_cap) {
+                if (m.*.entries[idx].used == 0) {
+                    m.*.entries[idx].key = key;
+                    m.*.entries[idx].val = val;
+                    m.*.entries[idx].used = 1;
+                    m.*.count = m.*.count + 1;
+                    probes = new_cap;
+                } else {
+                    idx = idx + 1;
+                    if (idx >= new_cap) { idx = 0; }
+                    probes = probes + 1;
+                }
+            }
         }
         i = i + 1;
     }
@@ -103,58 +124,90 @@ fn put[K,V](m: *HashMap[K,V], key: K, val: V) void {
         hm_grow[K,V](m);
     }
     let cap: i32 = m.*.cap;
-    let idx: i32 = m.*.hash_fn(key) % cap;
-    while (m.*.entries[idx].used == 1) {
-        if (m.*.eq_fn(m.*.entries[idx].key, key)) {
+    let idx: i32 = (m.*.hash_fn(key) & 2147483647) % cap;
+    let first_tombstone: i32 = 0 - 1;
+    let probes: i32 = 0;
+    while (probes < cap) {
+        let state: i32 = m.*.entries[idx].used;
+        if (state == 0) {
+            let target: i32 = idx;
+            if (first_tombstone >= 0) { target = first_tombstone; }
+            m.*.entries[target].key = key;
+            m.*.entries[target].val = val;
+            m.*.entries[target].used = 1;
+            m.*.count = m.*.count + 1;
+            return;
+        }
+        if (state == 1 && m.*.eq_fn(m.*.entries[idx].key, key)) {
             m.*.entries[idx].val = val;
             return;
         }
+        if (state == 2 && first_tombstone < 0) { first_tombstone = idx; }
         idx = idx + 1;
         if (idx >= cap) { idx = 0; }
+        probes = probes + 1;
     }
-    m.*.entries[idx].key = key;
-    m.*.entries[idx].val = val;
-    m.*.entries[idx].used = 1;
-    m.*.count = m.*.count + 1;
+    // A table containing only live entries and tombstones can have no virgin
+    // slot even when the active count is below the growth threshold. Reuse the
+    // first tombstone found during the complete bounded probe.
+    if (first_tombstone >= 0) {
+        m.*.entries[first_tombstone].key = key;
+        m.*.entries[first_tombstone].val = val;
+        m.*.entries[first_tombstone].used = 1;
+        m.*.count = m.*.count + 1;
+        return;
+    }
+    // The 70% active-load growth check makes this path unreachable for a valid
+    // map: a complete table must contain either a reusable tombstone or enough
+    // live entries to have grown before probing. A caller-mutated invalid map
+    // is outside this module's contract.
+    return;
 }
 
 fn get[K,V](m: HashMap[K,V], key: K) ?V {
     let cap: i32 = m.cap;
-    let idx: i32 = m.hash_fn(key) % cap;
-    while (m.entries[idx].used == 1) {
-        if (m.eq_fn(m.entries[idx].key, key)) {
+    let idx: i32 = (m.hash_fn(key) & 2147483647) % cap;
+    let probes: i32 = 0;
+    while (probes < cap && m.entries[idx].used != 0) {
+        if (m.entries[idx].used == 1 && m.eq_fn(m.entries[idx].key, key)) {
             return m.entries[idx].val;
         }
         idx = idx + 1;
         if (idx >= cap) { idx = 0; }
+        probes = probes + 1;
     }
     return null;
 }
 
 fn has[K,V](m: HashMap[K,V], key: K) bool {
     let cap: i32 = m.cap;
-    let idx: i32 = m.hash_fn(key) % cap;
-    while (m.entries[idx].used == 1) {
-        if (m.eq_fn(m.entries[idx].key, key)) {
+    let idx: i32 = (m.hash_fn(key) & 2147483647) % cap;
+    let probes: i32 = 0;
+    while (probes < cap && m.entries[idx].used != 0) {
+        if (m.entries[idx].used == 1 && m.eq_fn(m.entries[idx].key, key)) {
             return true;
         }
         idx = idx + 1;
         if (idx >= cap) { idx = 0; }
+        probes = probes + 1;
     }
     return false;
 }
 
 fn del[K,V](m: *HashMap[K,V], key: K) bool {
     let cap: i32 = m.*.cap;
-    let idx: i32 = m.*.hash_fn(key) % cap;
-    while (m.*.entries[idx].used == 1) {
-        if (m.*.eq_fn(m.*.entries[idx].key, key)) {
+    let idx: i32 = (m.*.hash_fn(key) & 2147483647) % cap;
+    let probes: i32 = 0;
+    while (probes < cap && m.*.entries[idx].used != 0) {
+        if (m.*.entries[idx].used == 1 &&
+            m.*.eq_fn(m.*.entries[idx].key, key)) {
             m.*.entries[idx].used = 2;   // tombstone
             m.*.count = m.*.count - 1;
             return true;
         }
         idx = idx + 1;
         if (idx >= cap) { idx = 0; }
+        probes = probes + 1;
     }
     return false;
 }
@@ -164,7 +217,11 @@ fn count[K,V](m: HashMap[K,V]) i32 {
 }
 
 fn free[K,V](m: *HashMap[K,V]) void {
-    _zag_free(m.*.entries as *i8);
+    // Edition 2027 ownership checking requires the released capability to be
+    // materialized as a named owner rather than a field/cast expression.
+    let backing: *i8 = m.*.entries as *i8;
+    _zag_free(backing);
+    m.*.entries = null as *HEntry[K,V];
     m.*.cap = 0;
     m.*.count = 0;
 }

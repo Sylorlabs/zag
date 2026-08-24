@@ -1,0 +1,474 @@
+// std/tls_openssl.zag -- bounded synchronous TLS 1.3 adapter for OpenSSL 3.
+//
+// Build consumers explicitly with:
+//   znc app.zag --dynamic --needed libssl.so.3 --needed libcrypto.so.3 -o app
+//
+// The caller owns the connected socket descriptor.  This adapter owns only
+// OpenSSL context/connection handles, validates an exact CA file and DNS host
+// on clients, and fixes both protocol bounds to TLS 1.3.  It is not a static
+// fallback, certificate manager, async engine, or general OpenSSL binding.
+
+@import("rt.zag")
+
+extern fn OPENSSL_init_ssl(options: u64, settings: *u8) i32 @io;
+extern fn TLS_server_method() *u8 @io;
+extern fn TLS_client_method() *u8 @io;
+extern fn SSL_CTX_new(method: *u8) *u8 @io;
+extern fn SSL_CTX_free(context: *u8) void @io;
+extern fn SSL_CTX_ctrl(context: *u8, command: i32,
+                       argument: i64, pointer: *u8) i64 @io;
+extern fn SSL_CTX_use_certificate_file(context: *u8, path: *u8,
+                                       kind: i32) i32 @io;
+extern fn SSL_CTX_use_PrivateKey_file(context: *u8, path: *u8,
+                                      kind: i32) i32 @io;
+extern fn SSL_CTX_check_private_key(context: *u8) i32 @io;
+extern fn SSL_CTX_load_verify_locations(context: *u8, file: *u8,
+                                        directory: *u8) i32 @io;
+extern fn SSL_CTX_set_verify(context: *u8, mode: i32,
+                             callback: *u8) void @io;
+extern fn SSL_new(context: *u8) *u8 @io;
+extern fn SSL_free(connection: *u8) void @io;
+extern fn SSL_set_fd(connection: *u8, fd: i32) i32 @io;
+extern fn SSL_set1_host(connection: *u8, hostname: *u8) i32 @io;
+extern fn SSL_accept(connection: *u8) i32 @io;
+extern fn SSL_connect(connection: *u8) i32 @io;
+extern fn SSL_get_verify_result(connection: *u8) i64 @io;
+extern fn SSL_version(connection: *u8) i32 @io;
+extern fn SSL_get_error(connection: *u8, result: i32) i32 @io;
+extern fn SSL_read(connection: *u8, output: *u8, bytes: i32) i32 @io;
+extern fn SSL_write(connection: *u8, input: *u8, bytes: i32) i32 @io;
+extern fn SSL_shutdown(connection: *u8) i32 @io;
+extern fn ERR_get_error() u64 @io;
+
+struct TlsOpenSslContext {
+    handle: *u8,
+    role: i32,
+    open: i32,
+}
+
+struct TlsOpenSslContextResult {
+    ok: i32,
+    code: i64,
+    native_error: u64,
+    value: TlsOpenSslContext,
+}
+
+struct TlsOpenSslConnection {
+    handle: *u8,
+    role: i32,
+    fd: i64,
+    protocol: i32,
+    open: i32,
+}
+
+struct TlsOpenSslConnectionResult {
+    ok: i32,
+    code: i64,
+    native_error: u64,
+    value: TlsOpenSslConnection,
+}
+
+struct TlsOpenSslIoResult {
+    ok: i32,
+    code: i64,
+    native_error: i64,
+    transferred: i32,
+    calls: i32,
+}
+
+fn tls_openssl_status_ok() i64 { return 0; }
+fn tls_openssl_status_invalid_argument() i64 { return 0 - 7601; }
+fn tls_openssl_status_invalid_state() i64 { return 0 - 7602; }
+fn tls_openssl_status_backend() i64 { return 0 - 7603; }
+fn tls_openssl_status_verification() i64 { return 0 - 7604; }
+fn tls_openssl_status_limit() i64 { return 0 - 7605; }
+fn tls_openssl_status_incomplete() i64 { return 0 - 7606; }
+
+fn tls_openssl_role_server() i32 { return 1; }
+fn tls_openssl_role_client() i32 { return 2; }
+fn tls_openssl_protocol_tls13() i32 { return 772; }
+fn tls_openssl_max_io_bytes() i32 { return 65536; }
+fn tls_openssl_max_io_calls() i32 { return 128; }
+
+fn tls_openssl_invalid_context() TlsOpenSslContext {
+    return TlsOpenSslContext{
+        .handle=null as *u8,.role=0,.open=0,
+    };
+}
+
+fn tls_openssl_invalid_connection() TlsOpenSslConnection {
+    return TlsOpenSslConnection{
+        .handle=null as *u8,.role=0,.fd=0-1,.protocol=0,.open=0,
+    };
+}
+
+fn tls_openssl_context_failure(code: i64,
+                               native_error: u64) TlsOpenSslContextResult {
+    return TlsOpenSslContextResult{
+        .ok=0,.code=code,.native_error=native_error,
+        .value=tls_openssl_invalid_context(),
+    };
+}
+
+fn tls_openssl_connection_failure(code: i64,
+    native_error: u64) TlsOpenSslConnectionResult {
+    return TlsOpenSslConnectionResult{
+        .ok=0,.code=code,.native_error=native_error,
+        .value=tls_openssl_invalid_connection(),
+    };
+}
+
+fn tls_openssl_io_failure(code: i64, native_error: i64,
+                          transferred: i32,
+                          calls: i32) TlsOpenSslIoResult {
+    return TlsOpenSslIoResult{
+        .ok=0,.code=code,.native_error=native_error,
+        .transferred=transferred,.calls=calls,
+    };
+}
+
+fn tls_openssl_text_valid(text: []u8, maximum: i32) i32 {
+    if (text.len <= 0 || text.len > maximum) { return 0; }
+    let i: i32 = 0;
+    while (i < text.len) {
+        if (text[i] == 0 || text[i] < 32 || text[i] > 126) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn tls_openssl_hostname_valid(hostname: []u8) i32 {
+    if (tls_openssl_text_valid(hostname, 253) == 0) { return 0; }
+    let i: i32 = 0;
+    while (i < hostname.len) {
+        let byte: u8 = hostname[i];
+        let alpha: bool = (byte >= 'a' && byte <= 'z') ||
+            (byte >= 'A' && byte <= 'Z');
+        let digit: bool = byte >= '0' && byte <= '9';
+        if (!alpha && !digit && byte != '.' && byte != '-') { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn tls_openssl_c_string(text: []u8) *u8 {
+    let output: *u8 = _zag_malloc(text.len + 1) as *u8;
+    let i: i32 = 0;
+    while (i < text.len) { output[i] = text[i]; i = i + 1; }
+    output[text.len] = 0;
+    return output;
+}
+
+fn tls_openssl_context_configure(context: *u8) i32 {
+    // SSL_CTRL_SET_MIN_PROTO_VERSION / SSL_CTRL_SET_MAX_PROTO_VERSION.
+    if (SSL_CTX_ctrl(context, 123, tls_openssl_protocol_tls13(),
+                     null as *u8) <= 0) { return 0; }
+    if (SSL_CTX_ctrl(context, 124, tls_openssl_protocol_tls13(),
+                     null as *u8) <= 0) { return 0; }
+    return 1;
+}
+
+fn tls_openssl_server_context(certificate_path: []u8,
+    private_key_path: []u8) TlsOpenSslContextResult {
+    if (tls_openssl_text_valid(certificate_path, 4095) == 0 ||
+        tls_openssl_text_valid(private_key_path, 4095) == 0) {
+        return tls_openssl_context_failure(
+            tls_openssl_status_invalid_argument(), 0
+        );
+    }
+    if (OPENSSL_init_ssl(0, null as *u8) != 1) {
+        return tls_openssl_context_failure(
+            tls_openssl_status_backend(), ERR_get_error()
+        );
+    }
+    let method: *u8 = TLS_server_method();
+    if (method == null as *u8) {
+        return tls_openssl_context_failure(
+            tls_openssl_status_backend(), ERR_get_error()
+        );
+    }
+    let context: *u8 = SSL_CTX_new(method);
+    if (context == null as *u8) {
+        return tls_openssl_context_failure(
+            tls_openssl_status_backend(), ERR_get_error()
+        );
+    }
+    if (tls_openssl_context_configure(context) == 0) {
+        let error: u64 = ERR_get_error();
+        SSL_CTX_free(context);
+        return tls_openssl_context_failure(tls_openssl_status_backend(), error);
+    }
+    let certificate: *u8 = tls_openssl_c_string(certificate_path);
+    let private_key: *u8 = tls_openssl_c_string(private_key_path);
+    let certificate_rc: i32 = SSL_CTX_use_certificate_file(
+        context, certificate, 1
+    );
+    let key_rc: i32 = SSL_CTX_use_PrivateKey_file(context, private_key, 1);
+    _zag_free(certificate as *i8);
+    _zag_free(private_key as *i8);
+    if (certificate_rc != 1 || key_rc != 1 ||
+        SSL_CTX_check_private_key(context) != 1) {
+        let error: u64 = ERR_get_error();
+        SSL_CTX_free(context);
+        return tls_openssl_context_failure(tls_openssl_status_backend(), error);
+    }
+    return TlsOpenSslContextResult{
+        .ok=1,.code=tls_openssl_status_ok(),.native_error=0,
+        .value=TlsOpenSslContext{
+            .handle=context,.role=tls_openssl_role_server(),.open=1,
+        },
+    };
+}
+
+fn tls_openssl_client_context(ca_certificate_path: []u8)
+    TlsOpenSslContextResult {
+    if (tls_openssl_text_valid(ca_certificate_path, 4095) == 0) {
+        return tls_openssl_context_failure(
+            tls_openssl_status_invalid_argument(), 0
+        );
+    }
+    if (OPENSSL_init_ssl(0, null as *u8) != 1) {
+        return tls_openssl_context_failure(
+            tls_openssl_status_backend(), ERR_get_error()
+        );
+    }
+    let method: *u8 = TLS_client_method();
+    if (method == null as *u8) {
+        return tls_openssl_context_failure(
+            tls_openssl_status_backend(), ERR_get_error()
+        );
+    }
+    let context: *u8 = SSL_CTX_new(method);
+    if (context == null as *u8) {
+        return tls_openssl_context_failure(
+            tls_openssl_status_backend(), ERR_get_error()
+        );
+    }
+    if (tls_openssl_context_configure(context) == 0) {
+        let error: u64 = ERR_get_error();
+        SSL_CTX_free(context);
+        return tls_openssl_context_failure(tls_openssl_status_backend(), error);
+    }
+    let ca: *u8 = tls_openssl_c_string(ca_certificate_path);
+    let trust_rc: i32 = SSL_CTX_load_verify_locations(
+        context, ca, null as *u8
+    );
+    _zag_free(ca as *i8);
+    if (trust_rc != 1) {
+        let error: u64 = ERR_get_error();
+        SSL_CTX_free(context);
+        return tls_openssl_context_failure(
+            tls_openssl_status_verification(), error
+        );
+    }
+    SSL_CTX_set_verify(context, 1, null as *u8);
+    return TlsOpenSslContextResult{
+        .ok=1,.code=tls_openssl_status_ok(),.native_error=0,
+        .value=TlsOpenSslContext{
+            .handle=context,.role=tls_openssl_role_client(),.open=1,
+        },
+    };
+}
+
+fn tls_openssl_context_take(result: *TlsOpenSslContextResult)
+    TlsOpenSslContext {
+    if (result.*.ok == 0 || result.*.value.open == 0) {
+        return tls_openssl_invalid_context();
+    }
+    let value: TlsOpenSslContext = result.*.value;
+    result.*.ok = 0;
+    result.*.code = tls_openssl_status_invalid_state();
+    result.*.value = tls_openssl_invalid_context();
+    return value;
+}
+
+fn tls_openssl_context_close(context: *TlsOpenSslContext) i64 {
+    if (context.*.open == 0 || context.*.handle == null as *u8) {
+        return tls_openssl_status_invalid_state();
+    }
+    let handle: *u8 = context.*.handle;
+    context.* = tls_openssl_invalid_context();
+    SSL_CTX_free(handle);
+    return tls_openssl_status_ok();
+}
+
+fn tls_openssl_server_accept(context: *TlsOpenSslContext,
+    fd: i64) TlsOpenSslConnectionResult {
+    if (context.*.open == 0 ||
+        context.*.role != tls_openssl_role_server() ||
+        fd < 0 || fd > 2147483647) {
+        return tls_openssl_connection_failure(
+            tls_openssl_status_invalid_argument(), 0
+        );
+    }
+    let connection: *u8 = SSL_new(context.*.handle);
+    if (connection == null as *u8 || SSL_set_fd(connection, fd as i32) != 1) {
+        let error: u64 = ERR_get_error();
+        if (connection != null as *u8) { SSL_free(connection); }
+        return tls_openssl_connection_failure(tls_openssl_status_backend(), error);
+    }
+    let handshake: i32 = SSL_accept(connection);
+    if (handshake != 1 || SSL_version(connection) !=
+        tls_openssl_protocol_tls13()) {
+        let error: u64 = ERR_get_error();
+        SSL_free(connection);
+        return tls_openssl_connection_failure(tls_openssl_status_backend(), error);
+    }
+    return TlsOpenSslConnectionResult{
+        .ok=1,.code=tls_openssl_status_ok(),.native_error=0,
+        .value=TlsOpenSslConnection{
+            .handle=connection,.role=tls_openssl_role_server(),.fd=fd,
+            .protocol=tls_openssl_protocol_tls13(),.open=1,
+        },
+    };
+}
+
+fn tls_openssl_client_connect(context: *TlsOpenSslContext, fd: i64,
+    hostname: []u8) TlsOpenSslConnectionResult {
+    if (context.*.open == 0 ||
+        context.*.role != tls_openssl_role_client() ||
+        fd < 0 || fd > 2147483647 ||
+        tls_openssl_hostname_valid(hostname) == 0) {
+        return tls_openssl_connection_failure(
+            tls_openssl_status_invalid_argument(), 0
+        );
+    }
+    let connection: *u8 = SSL_new(context.*.handle);
+    if (connection == null as *u8 || SSL_set_fd(connection, fd as i32) != 1) {
+        let error: u64 = ERR_get_error();
+        if (connection != null as *u8) { SSL_free(connection); }
+        return tls_openssl_connection_failure(tls_openssl_status_backend(), error);
+    }
+    let c_hostname: *u8 = tls_openssl_c_string(hostname);
+    let host_rc: i32 = SSL_set1_host(connection, c_hostname);
+    _zag_free(c_hostname as *i8);
+    if (host_rc != 1) {
+        let error: u64 = ERR_get_error();
+        SSL_free(connection);
+        return tls_openssl_connection_failure(
+            tls_openssl_status_verification(), error
+        );
+    }
+    let handshake: i32 = SSL_connect(connection);
+    if (handshake != 1 || SSL_get_verify_result(connection) != 0 ||
+        SSL_version(connection) != tls_openssl_protocol_tls13()) {
+        let error: u64 = ERR_get_error();
+        SSL_free(connection);
+        return tls_openssl_connection_failure(
+            tls_openssl_status_verification(), error
+        );
+    }
+    return TlsOpenSslConnectionResult{
+        .ok=1,.code=tls_openssl_status_ok(),.native_error=0,
+        .value=TlsOpenSslConnection{
+            .handle=connection,.role=tls_openssl_role_client(),.fd=fd,
+            .protocol=tls_openssl_protocol_tls13(),.open=1,
+        },
+    };
+}
+
+fn tls_openssl_connection_take(result: *TlsOpenSslConnectionResult)
+    TlsOpenSslConnection {
+    if (result.*.ok == 0 || result.*.value.open == 0) {
+        return tls_openssl_invalid_connection();
+    }
+    let value: TlsOpenSslConnection = result.*.value;
+    result.*.ok = 0;
+    result.*.code = tls_openssl_status_invalid_state();
+    result.*.value = tls_openssl_invalid_connection();
+    return value;
+}
+
+fn tls_openssl_write_all_bounded(connection: *TlsOpenSslConnection,
+    input: []u8, max_calls: i32) TlsOpenSslIoResult {
+    if (connection.*.open == 0) {
+        return tls_openssl_io_failure(
+            tls_openssl_status_invalid_state(), 0, 0, 0
+        );
+    }
+    if (input.len <= 0 || input.len > tls_openssl_max_io_bytes() ||
+        max_calls <= 0 || max_calls > tls_openssl_max_io_calls()) {
+        return tls_openssl_io_failure(
+            tls_openssl_status_invalid_argument(), 0, 0, 0
+        );
+    }
+    let transferred: i32 = 0;
+    let calls: i32 = 0;
+    while (transferred < input.len && calls < max_calls) {
+        let rc: i32 = SSL_write(
+            connection.*.handle,
+            ((_zag_slice_ptr(input) as i64) + transferred) as *u8,
+            input.len - transferred
+        );
+        calls = calls + 1;
+        if (rc <= 0) {
+            return tls_openssl_io_failure(
+                tls_openssl_status_backend(),
+                SSL_get_error(connection.*.handle, rc), transferred, calls
+            );
+        }
+        transferred = transferred + rc;
+    }
+    if (transferred != input.len) {
+        return tls_openssl_io_failure(
+            tls_openssl_status_incomplete(), 0, transferred, calls
+        );
+    }
+    return TlsOpenSslIoResult{
+        .ok=1,.code=tls_openssl_status_ok(),.native_error=0,
+        .transferred=transferred,.calls=calls,
+    };
+}
+
+fn tls_openssl_read_exact_bounded(connection: *TlsOpenSslConnection,
+    output: []u8, max_calls: i32) TlsOpenSslIoResult {
+    if (connection.*.open == 0) {
+        return tls_openssl_io_failure(
+            tls_openssl_status_invalid_state(), 0, 0, 0
+        );
+    }
+    if (output.len <= 0 || output.len > tls_openssl_max_io_bytes() ||
+        max_calls <= 0 || max_calls > tls_openssl_max_io_calls()) {
+        return tls_openssl_io_failure(
+            tls_openssl_status_invalid_argument(), 0, 0, 0
+        );
+    }
+    let transferred: i32 = 0;
+    let calls: i32 = 0;
+    while (transferred < output.len && calls < max_calls) {
+        let rc: i32 = SSL_read(
+            connection.*.handle,
+            ((_zag_slice_ptr(output) as i64) + transferred) as *u8,
+            output.len - transferred
+        );
+        calls = calls + 1;
+        if (rc <= 0) {
+            return tls_openssl_io_failure(
+                tls_openssl_status_backend(),
+                SSL_get_error(connection.*.handle, rc), transferred, calls
+            );
+        }
+        transferred = transferred + rc;
+    }
+    if (transferred != output.len) {
+        return tls_openssl_io_failure(
+            tls_openssl_status_incomplete(), 0, transferred, calls
+        );
+    }
+    return TlsOpenSslIoResult{
+        .ok=1,.code=tls_openssl_status_ok(),.native_error=0,
+        .transferred=transferred,.calls=calls,
+    };
+}
+
+fn tls_openssl_connection_close(connection: *TlsOpenSslConnection) i64 {
+    if (connection.*.open == 0 || connection.*.handle == null as *u8) {
+        return tls_openssl_status_invalid_state();
+    }
+    let handle: *u8 = connection.*.handle;
+    connection.* = tls_openssl_invalid_connection();
+    let shutdown_rc: i32 = SSL_shutdown(handle);
+    SSL_free(handle);
+    if (shutdown_rc < 0) { return tls_openssl_status_backend(); }
+    return tls_openssl_status_ok();
+}

@@ -1,0 +1,597 @@
+// selfhost/native/ncodegen_layout.zag — TYPE LAYOUT for the native codegen.
+// Extracted from ncodegen.zag for modularity.
+//
+// Contains: struct/union/enum lookups, type sizing, field offsets, alignment,
+// slice/optional/aggregate predicates, interface helpers, and word-count
+// computation. These depend on the Cg struct (for cg.decls), type predicates
+// from ncodegen_types.zag, and interface helpers (iface_method_count etc.)
+// from parse.zag.
+
+@import("isa.zag")
+@import("../parse.zag")   // AST (Node/Param/Bin/Call/FnDecl/...) + ArrayList + @strEq + iface_method_count + iface_method_name + iface_method_ret
+@import("ncodegen_types.zag")   // cg_norm_type, cg_is_posit_ty, cg_is_satfixarb_ty, cg_is_fn_type
+@import("../vsa_type.zag")
+
+// ── struct / aggregate layout (PROPER variable-size, round-2) ────────────────
+// LAYOUT CONTRACT (corrected from the old "8 bytes per field"):
+//   • scalar / pointer / bool / enum         → 8 bytes
+//   • []u8 (any slice)                        → 16 bytes  ({ptr@0, len@8})
+//   • ?T optional                             → 8 + size(T)  ({has@0, val@8})
+//   • struct                                  → SUM of its field sizes, each
+//                                                field ROUNDED UP to a multiple
+//                                                of 8 (so every offset is
+//                                                8-aligned and the word-based
+//                                                frame machinery still works).
+//   • tagged union                            → 8 (tag@0) + max payload size
+//                                                (payload stored INLINE @8).
+//   A struct field's OFFSET is the cumulative 8-aligned sum of the field sizes
+//   PRECEDING it (NOT 8*index). A struct's total size is that running sum.
+//   For all-scalar structs this collapses to the old layout (offset 8*idx,
+//   size 8*nfields) — backward compatible. A []u8 field is 16 bytes; a nested
+//   struct/union field is its own size. Field byte sizes are always multiples
+//   of 8, so aggregates remain a whole number of 8-byte words throughout.
+
+// Find the StructDecl for `sname` among the top-level decls. Returns 1 and
+// fills *out on success, 0 if there is no such struct.
+fn cg_find_struct(cg: *Cg, sname: []u8, out: *StructDecl) i32 {
+    let di: i32 = 0;
+    while (di < len[*Node](cg.*.decls)) {
+        let d: *Node = get[*Node](cg.*.decls, di);
+        switch (d.*) {
+            .struct_ => |s| {
+                if (@strEq(s.name, sname)) { out.* = s; return 1; }
+            }
+            else => { }
+        }
+        di = di + 1;
+    }
+    return 0;
+}
+
+// Field index of `fname` within struct `sname`, or -1 if unknown. The byte
+// offset is 8 * the returned index.
+fn cg_field_index(cg: *Cg, sname: []u8, fname: []u8) i32 {
+    let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1), .tparams = make[[]u8](1), .origin = "<root>", .repr_c = 0 };
+    if (cg_find_struct(cg, sname, &sd) == 0) { return 0 - 1; }
+    let i: i32 = 0;
+    while (i < len[Param](sd.fields)) {
+        if (@strEq(get[Param](sd.fields, i).name, fname)) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Number of fields of struct `sname`, or -1 if unknown. (NOT size/8 anymore —
+// a field can be >1 word; use cg_type_size / cg_agg_words for byte/word counts.)
+fn cg_struct_nfields(cg: *Cg, sname: []u8) i32 {
+    let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1), .tparams = make[[]u8](1), .origin = "<root>", .repr_c = 0 };
+    if (cg_find_struct(cg, sname, &sd) == 0) { return 0 - 1; }
+    return len[Param](sd.fields);
+}
+
+// round n up to a multiple of 8 (field/payload alignment).
+fn cg_round8(n: i32) i32 {
+    let r: i32 = n % 8;
+    if (r == 0) { return n; }
+    return n + (8 - r);
+}
+
+fn cg_align_up(n: i32, alignment: i32) i32 {
+    if (alignment <= 1) { return n; }
+    let r: i32 = n % alignment;
+    if (r == 0) { return n; }
+    return n + (alignment - r);
+}
+
+// Exact System V AMD64 C leaf representation implemented by @repr(C).
+// The shared typed authority rejects every other leaf before lowering.
+fn cg_c_leaf_size(ty0: []u8) i32 {
+    let ty: []u8 = cg_norm_type(ty0);
+    if (ty.len > 0 && ty[0] == '*') { return 8; }
+    if (@strEq(ty, "bool") || @strEq(ty, "i8") || @strEq(ty, "u8")) { return 1; }
+    if (@strEq(ty, "i16") || @strEq(ty, "u16")) { return 2; }
+    if (@strEq(ty, "i32") || @strEq(ty, "u32") || @strEq(ty, "f32")) { return 4; }
+    if (@strEq(ty, "i64") || @strEq(ty, "u64") ||
+        @strEq(ty, "isize") || @strEq(ty, "usize") || @strEq(ty, "f64")) { return 8; }
+    return 0;
+}
+
+fn cg_c_leaf_alignment(ty: []u8) i32 { return cg_c_leaf_size(ty); }
+
+fn cg_struct_repr_c(cg: *Cg, sname: []u8) i32 {
+    let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1),
+        .tparams = make[[]u8](1), .origin = "<root>", .repr_c = 0 };
+    if (cg_find_struct(cg, cg_norm_type(sname), &sd) == 0) { return 0; }
+    return sd.repr_c;
+}
+
+fn cg_struct_layout_annot(sd: StructDecl, wanted: []u8) i32 {
+    let i: i32 = 0;
+    while (i < sd.annots.len) {
+        if (@strEq(sd.annots.data[i], wanted)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn cg_struct_explicit_align(sd: StructDecl) i32 {
+    let result: i32 = 0;
+    let i: i32 = 0;
+    while (i < sd.annots.len) {
+        let a: []u8 = sd.annots.data[i];
+        if (a.len >= 9 && a[0] == '@' && @strEq(a[0..7], "@align(") && a[a.len - 1] == ')') {
+            result = _zag_str_to_i64(a[7..a.len - 1]) as i32;
+        }
+        i = i + 1;
+    }
+    return result;
+}
+fn cg_struct_is_packed(cg: *Cg, sname: []u8) i32 {
+    let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1),
+        .tparams = make[[]u8](1), .origin = "<root>", .repr_c = 0 };
+    if (cg_find_struct(cg, cg_norm_type(sname), &sd) == 0) { return 0; }
+    return cg_struct_layout_annot(sd, "@repr(packed)");
+}
+
+fn cg_c_struct_alignment(sd: StructDecl) i32 {
+    let alignment: i32 = 1;
+    let i: i32 = 0;
+    while (i < len[Param](sd.fields)) {
+        let a: i32 = cg_c_leaf_alignment(get[Param](sd.fields, i).pty);
+        if (a > alignment) { alignment = a; }
+        i = i + 1;
+    }
+    return alignment;
+}
+
+fn cg_c_struct_size(sd: StructDecl) i32 {
+    let off: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[Param](sd.fields)) {
+        let p: Param = get[Param](sd.fields, i);
+        let sz: i32 = cg_c_leaf_size(p.pty);
+        off = cg_align_up(off, cg_c_leaf_alignment(p.pty));
+        off = off + sz;
+        i = i + 1;
+    }
+    return cg_align_up(off, cg_c_struct_alignment(sd));
+}
+
+// BYTE size of any type under the proper variable-size layout.
+//   scalar/ptr/bool/enum → 8 ; []u8 → 16 ; ?T → 8 + round8(size(T)) ;
+//   struct → sum of round8(field size) ; union → 8 + round8(max payload size).
+// Recursion terminates because a struct/union field cannot (in this subset)
+// contain itself by value — recursive types go through a pointer (*T → 8).
+fn cg_type_size(cg: *Cg, ty0: []u8) i32 {
+    let ty: []u8 = cg_norm_type(ty0);
+    if (ty.len == 0) { return 8; }
+    if (ty[0] == '*') { return 8; }                 // pointer = scalar
+    if (vsa_type_valid(ty) == 1) { return vsa_type_words(ty) * 8; }
+    if (@strEq(ty, "fat_fn")) { return 16; }         // fat_fn = {code_ptr, env_ptr}
+    if (cg_is_fn_type(ty) == 1) { return 16; }      // fn-typed = fat_fn = 2 words
+    // !T = {err_code, inline T payload}; aggregate payloads are not truncated.
+    if (ty.len > 1 && ty[0] == '!') { return 8 + cg_round8(cg_type_size(cg, ty[1..])); }
+    if (cg_type_is_slice(cg, ty) == 1) { return 16; }  // []u8 = {ptr,len}
+    if (ty[0] == '?') {                             // optional ?T = {has, val}
+        return 8 + cg_round8(cg_type_size(cg, ty[1..]));
+    }
+    // struct: sum of 8-aligned field sizes.
+    let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1), .tparams = make[[]u8](1), .origin = "<root>", .repr_c = 0 };
+    if (cg_find_struct(cg, ty, &sd) == 1) {
+        if (sd.repr_c == 1) {
+            let csize: i32 = cg_c_struct_size(sd);
+            let ca: i32 = cg_struct_explicit_align(sd);
+            if (ca > 1) { return cg_align_up(csize, ca); }
+            return csize;
+        }
+        if (cg_struct_layout_annot(sd, "@repr(packed)") == 1) {
+            let packed_size: i32 = 0;
+            let pi: i32 = 0;
+            while (pi < sd.fields.len) {
+                packed_size = packed_size + cg_c_leaf_size(sd.fields.data[pi].pty);
+                pi = pi + 1;
+            }
+            let pa: i32 = cg_struct_explicit_align(sd);
+            if (pa > 1) { return cg_align_up(packed_size, pa); }
+            return packed_size;
+        }
+        let total: i32 = 0;
+        let i: i32 = 0;
+        while (i < len[Param](sd.fields)) {
+            total = total + cg_round8(cg_type_size(cg, get[Param](sd.fields, i).pty));
+            i = i + 1;
+        }
+        if (total == 0) { return 8; }   // empty struct: one word (defensive)
+        let explicit: i32 = cg_struct_explicit_align(sd);
+        if (explicit > 1) { return cg_align_up(total, explicit); }
+        return total;
+    }
+    // tagged union: 8 (tag) + max payload size, payload stored INLINE @8.
+    let ud: UnionDecl = UnionDecl{ .name = "", .fields = make[Param](1) };
+    if (cg_find_union(cg, ty, &ud) == 1) {
+        let maxp: i32 = 0;
+        let j: i32 = 0;
+        while (j < len[Param](ud.fields)) {
+            let ps: i32 = cg_round8(cg_type_size(cg, get[Param](ud.fields, j).pty));
+            if (ps > maxp) { maxp = ps; }
+            j = j + 1;
+        }
+        if (maxp == 0) { maxp = 8; }
+        return 8 + maxp;
+    }
+    // interface: (M+1) * 8 bytes — M fn-ptr slots + 1 data-ptr slot.
+    let iM: i32 = iface_method_count(cg.*.decls, ty);
+    if (iM > 0) { return (iM + 1) * 8; }
+    return 8;   // scalar / enum / unknown
+}
+
+// True if `ty` is a single-BYTE element type (u8 / i8). A `*u8`/`*i8` pointer
+// array (e.g. an ArrayList[u8]'s `.data`, the ELF/string byte buffers) is packed
+// at BYTE stride — unlike every other scalar, which our uniform layout pads to 8
+// bytes. Byte-packing is mandatory: those buffers are handed to the `write`
+// syscall verbatim, so a sparse 8-byte-stride layout would corrupt the output.
+fn cg_elem_is_byte(ty: []u8) i32 {
+    if (@strEq(ty, "u8")) { return 1; }
+    if (@strEq(ty, "i8")) { return 1; }
+    return 0;
+}
+
+// Pointer-arithmetic STRIDE (element byte size) for a `*T` array: 1 for a byte
+// element (u8/i8), else the full type size (8 for scalars/pointers under our
+// uniform layout, the aggregate size for a struct). This is what `p[i]` adds.
+fn cg_elem_stride(cg: *Cg, ty: []u8) i32 {
+    if (cg_elem_is_byte(ty) == 1) { return 1; }
+    return cg_type_size(cg, ty);
+}
+
+// Native layout is byte-packed only for i8/u8 buffers. Every other lowered
+// scalar, pointer, and aggregate field starts on an 8-byte boundary; aggregate
+// SIZE is not its alignment (a struct can validly occupy 24 bytes).
+fn cg_type_alignment(cg: *Cg, ty: []u8) i32 {
+    if (cg_elem_is_byte(ty) == 1) { return 1; }
+    let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1),
+        .tparams = make[[]u8](1), .origin = "<root>", .repr_c = 0 };
+    if (cg_find_struct(cg, cg_norm_type(ty), &sd) == 1) {
+        if (cg_struct_layout_annot(sd, "@repr(packed)") == 1) {
+            let packed: i32 = cg_struct_explicit_align(sd);
+            if (packed > 1) { return packed; }
+            return 1;
+        }
+        if (sd.repr_c == 1) {
+            let ca: i32 = cg_c_struct_alignment(sd);
+            let explicit: i32 = cg_struct_explicit_align(sd);
+            if (explicit > ca) { return explicit; }
+            return ca;
+        }
+        let explicit: i32 = cg_struct_explicit_align(sd);
+        if (explicit > 8) { return explicit; }
+    }
+    return 8;
+}
+
+// BYTE offset of field `fname` within struct `sname` = cumulative 8-aligned sum
+// of the sizes of all PRECEDING fields. Returns -1 if the field/struct is unknown.
+fn cg_field_offset(cg: *Cg, sname: []u8, fname: []u8) i32 {
+    let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1), .tparams = make[[]u8](1), .origin = "<root>", .repr_c = 0 };
+    if (cg_find_struct(cg, sname, &sd) == 0) { return 0 - 1; }
+    let off: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[Param](sd.fields)) {
+        let p: Param = get[Param](sd.fields, i);
+        if (cg_struct_layout_annot(sd, "@repr(packed)") == 1) {
+            // Packed fields have no inter-field padding.  The typed authority
+            // rejects a field whose native width would be unaligned, so this
+            // path never relies on the host accepting an unaligned scalar.
+        } else if (sd.repr_c == 1) { off = cg_align_up(off, cg_c_leaf_alignment(p.pty)); }
+        if (@strEq(p.name, fname)) { return off; }
+        if (cg_struct_layout_annot(sd, "@repr(packed)") == 1) { off = off + cg_c_leaf_size(p.pty); }
+        else if (sd.repr_c == 1) { off = off + cg_c_leaf_size(p.pty); }
+        else { off = off + cg_round8(cg_type_size(cg, p.pty)); }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// True if `ty` names a user struct in this program (i.e. an aggregate held
+// by-pointer, not a scalar). A leading '*' (pointer) is a SCALAR (the address),
+// never a struct-by-value.
+fn cg_type_is_struct(cg: *Cg, ty: []u8) i32 {
+    if (ty.len == 0) { return 0; }
+    if (ty[0] == '*') { return 0; }
+    let sd: StructDecl = StructDecl{ .name = "", .fields = make[Param](1), .tparams = make[[]u8](1), .origin = "<root>", .repr_c = 0 };
+    return cg_find_struct(cg, ty, &sd);
+}
+
+// Element type E of a slice type "[]E" (e.g. "[]sat_i16" → "sat_i16"). "" if the
+// argument is not a "[]..." slice string.
+fn cg_slice_elem(ty: []u8) []u8 {
+    if (ty.len < 3) { return ""; }
+    if (ty[0] != 91) { return ""; }     // '['
+    if (ty[1] != 93) { return ""; }     // ']'
+    return ty[2..];
+}
+
+// True if `ty` is a supported SLICE type, modeled as a 2-word builtin aggregate
+// {ptr@0, len@8} — 16 bytes — handled with the same by-pointer machinery as user
+// structs. Two element families are supported:
+//   • []u8 / []i8         — BYTE-packed data (handed verbatim to write()).
+//   • []<numeric scalar>  — sat_/fixed_/uN_iN/posit, WORD-stride data (8 B/elem),
+//                           matching the backend's uniform scalar layout. Indexing
+//                           keys on cg_slice_is_word to pick byte-load vs word-load.
+// Any other element type is unsupported and rejected at the lowering site.
+// A STANDARD-width integer element carried 8 bytes per element (word-stride): the
+// 16/32/64-bit ints. i8/u8 are BYTE-packed (handled separately). This lets []i64 /
+// []i32 / []u32 etc. be indexed with the same word-stride machinery as []sat_i16.
+fn cg_is_word_int_elem(e: []u8) i32 {
+    if (@strEq(e, "i16") || @strEq(e, "i32") || @strEq(e, "i64")) { return 1; }
+    if (@strEq(e, "u16") || @strEq(e, "u32") || @strEq(e, "u64")) { return 1; }
+    return 0;
+}
+fn cg_is_float_elem(e: []u8) i32 {
+    if (@strEq(e, "f32")) { return 1; }
+    if (@strEq(e, "f64")) { return 1; }
+    return 0;
+}
+
+fn cg_type_is_slice(cg: *Cg, ty: []u8) i32 {
+    let _u: i32 = cg.*.err;   // keep the signature uniform (cg unused otherwise)
+    if (@strEq(ty, "[]u8")) { return 1; }
+    if (@strEq(ty, "[]i8")) { return 1; }
+    let e: []u8 = cg_slice_elem(ty);
+    if (e.len == 0) { return 0; }
+    if (cg_is_posit_ty(e) == 1) { return 1; }
+    if (cg_is_satfixarb_ty(e) == 1) { return 1; }
+    if (cg_is_word_int_elem(e) == 1) { return 1; }
+    if (cg_is_float_elem(e) == 1) { return 1; }
+    return 0;
+}
+
+// True iff slice type `ty` has WORD-stride elements (8 bytes, loaded as a full
+// word) rather than BYTE-packed elements. []u8/[]i8 are byte; the numeric-element
+// and standard-int-element slices are word.
+fn cg_slice_is_word(ty: []u8) i32 {
+    if (@strEq(ty, "[]u8")) { return 0; }
+    if (@strEq(ty, "[]i8")) { return 0; }
+    let e: []u8 = cg_slice_elem(ty);
+    if (e.len == 0) { return 0; }
+    if (cg_is_posit_ty(e) == 1) { return 1; }
+    if (cg_is_satfixarb_ty(e) == 1) { return 1; }
+    if (cg_is_word_int_elem(e) == 1) { return 1; }
+    if (cg_is_float_elem(e) == 1) { return 1; }
+    return 0;
+}
+
+// Slice type produced by `*E[lo..hi]`. Byte pointers retain the historical
+// []u8 result; every supported word-stride numeric pointer produces []E.
+// Other pointer element families stay unsupported until their slice layout is
+// defined rather than being guessed here.
+fn cg_pointer_slice_type(cg: *Cg, ty: []u8) []u8 {
+    if (@strEq(ty, "*u8") || @strEq(ty, "*i8")) { return "[]u8"; }
+    if (ty.len < 2 || ty[0] != '*') { return ""; }
+    let candidate: []u8 = _zag_str_concat("[]", ty[1..]);
+    if (cg_slice_is_word(candidate) == 1 && cg_type_is_slice(cg, candidate) == 1) {
+        return candidate;
+    }
+    _zag_str_free(candidate);
+    return "";
+}
+
+// True if `ty` is an optional `?T` (held inline by-value as {has, val}).
+fn cg_type_is_opt(cg: *Cg, ty: []u8) i32 {
+    let _u: i32 = cg.*.err;
+    if (ty.len > 1) { if (ty[0] == '?') { return 1; } }
+    return 0;
+}
+
+// True if `ty` is ANY aggregate held INLINE by-value (addressed by a base
+// pointer): a user struct, a []u8 slice, a tagged union {tag,payload}, or an
+// optional `?T` {has,val}. A leading '*' is a scalar pointer (the address).
+fn cg_type_is_agg(cg: *Cg, ty: []u8) i32 {
+    if (vsa_type_valid(ty) == 1) { return 1; }
+    if (@strEq(ty, "fat_fn")) { return 1; }
+    if (cg_is_fn_type(ty) == 1) { return 1; }  // fn(A)B is natively a fat_fn (2 words)
+    if (ty.len > 1 && ty[0] == '!') { return 1; }  // !T error union = {err_code, val}
+    if (cg_type_is_struct(cg, ty) == 1) { return 1; }
+    if (cg_type_is_slice(cg, ty) == 1) { return 1; }
+    if (ty.len > 0) {
+        if (ty[0] != '*') { if (cg_type_is_union(cg, ty) == 1) { return 1; } }
+    }
+    if (cg_type_is_opt(cg, ty) == 1) { return 1; }
+    // interface fat ptr: M fn-ptr slots + 1 data-ptr slot = M+1 words
+    if (iface_method_count(cg.*.decls, ty) > 0) { return 1; }
+    return 0;
+}
+
+// WORD count (8-byte words) of an aggregate type = cg_type_size / 8. Every
+// aggregate is a whole number of 8-byte words by construction (all field/payload
+// sizes are 8-aligned). Callers gate this with cg_type_is_agg; returns 1
+// defensively for a non-aggregate.
+fn cg_agg_words(cg: *Cg, ty: []u8) i32 {
+    if (@strEq(ty, "fat_fn")) { return 2; }
+    if (cg_is_fn_type(ty) == 1) { return 2; }  // fn(A)B is a fat_fn, always 2 words
+    if (ty.len > 1 && ty[0] == '!') { return 1 + cg_agg_words(cg, ty[1..]); }
+    // interface fat ptr: M fn-ptr words + 1 data-ptr word
+    let iM: i32 = iface_method_count(cg.*.decls, ty);
+    if (iM > 0) { return iM + 1; }
+    if (cg_type_is_agg(cg, ty) == 0) { return 1; }
+    let sz: i32 = cg_type_size(cg, ty);
+    let w: i32 = (sz + 7) / 8;
+    if (w < 1) { return 1; }
+    return w;
+}
+
+// ── interface helpers ─────────────────────────────────────────────────────────
+// Look up the declared parameter type of fn `fname` at position `idx` in the
+// flat decl list.  Returns "" if not found or idx out of range.
+fn cg_fn_param_type(cg: *Cg, fname: []u8, idx: i32) []u8 {
+    let di: i32 = 0;
+    while (di < len[*Node](cg.*.decls)) {
+        switch (get[*Node](cg.*.decls, di).*) {
+            .fn_decl => |f| {
+                if (@strEq(f.name, fname) && idx < len[Param](f.params)) {
+                    return get[Param](f.params, idx).pty;
+                }
+            }
+            else => { }
+        }
+        di = di + 1;
+    }
+    return "";
+}
+
+// The C callback slice does not adapt a Zag closure.  It is deliberately just
+// a direct function label whose declared scalar/pointer signature exactly
+// matches the callback type written on the foreign import.
+fn cg_dynamic_callback_matches(cg: *Cg, name: []u8, expected: []u8) i32 {
+    let di: i32 = 0;
+    while (di < len[*Node](cg.*.decls)) {
+        switch (get[*Node](cg.*.decls, di).*) {
+            .fn_decl => |f| {
+                if (@strEq(f.name, name) && f.is_extern == 0 && len[[]u8](f.tparams) == 0 && cg_is_clos_name(name) == 0) {
+                    let got: []u8 = "fn(";
+                    let pi: i32 = 0;
+                    while (pi < len[Param](f.params)) {
+                        if (pi > 0) { got = _zag_str_concat(got, ","); }
+                        got = _zag_str_concat(got, get[Param](f.params, pi).pty);
+                        pi = pi + 1;
+                    }
+                    got = _zag_str_concat(_zag_str_concat(got, ")"), f.ret);
+                    if (@strEq(got, expected)) { return 1; }
+                }
+            }
+            else => { }
+        }
+        di = di + 1;
+    }
+    return 0;
+}
+
+// Return type of method `mname` on interface `iname` (searches by name).
+fn cg_iface_mret(cg: *Cg, iname: []u8, mname: []u8) []u8 {
+    let M: i32 = iface_method_count(cg.*.decls, iname);
+    let mi: i32 = 0;
+    while (mi < M) {
+        if (@strEq(iface_method_name(cg.*.decls, iname, mi), mname)) {
+            return iface_method_ret(cg.*.decls, iname, mi);
+        }
+        mi = mi + 1;
+    }
+    return "";
+}
+
+// ── tagged-union layout & lookups ────────────────────────────────────────────
+// A tagged union U is laid out as: tag (i64) at offset 0, payload at offset 8.
+// Total size = 8 + max-variant-payload (8-aligned). Every variant payload is
+// treated as one 8-byte word in this subset (scalars and pointers fit; an
+// aggregate variant payload is held by-pointer = 1 word). So every union is
+// exactly 2 words: {tag@0, payload@8}. Construction stores the variant's INDEX
+// (its position in the UnionDecl) as the tag; switch compares the loaded tag to
+// each arm's variant index. Mirrors codegen.zag's tagged-union model.
+
+// Find the UnionDecl named `uname`; fills *out, returns 1 on success.
+fn cg_find_union(cg: *Cg, uname: []u8, out: *UnionDecl) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](cg.*.decls)) {
+        switch (get[*Node](cg.*.decls, i).*) {
+            .union_ => |u| { if (@strEq(u.name, uname)) { out.* = u; return 1; } }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// True if `name` names a declared tagged union.
+fn cg_type_is_union(cg: *Cg, name: []u8) i32 {
+    let ud: UnionDecl = UnionDecl{ .name = "", .fields = make[Param](1) };
+    return cg_find_union(cg, name, &ud);
+}
+
+// Index of variant `tag` within union `uname` (the stored tag value), or -1.
+fn cg_union_variant_index(cg: *Cg, uname: []u8, tag: []u8) i32 {
+    let ud: UnionDecl = UnionDecl{ .name = "", .fields = make[Param](1) };
+    if (cg_find_union(cg, uname, &ud) == 0) { return 0 - 1; }
+    let i: i32 = 0;
+    while (i < len[Param](ud.fields)) {
+        if (@strEq(get[Param](ud.fields, i).name, tag)) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Declared payload type of variant `tag` in union `uname` (or "" if unknown).
+fn cg_union_payload_type(cg: *Cg, uname: []u8, tag: []u8) []u8 {
+    let ud: UnionDecl = UnionDecl{ .name = "", .fields = make[Param](1) };
+    if (cg_find_union(cg, uname, &ud) == 0) { return ""; }
+    let i: i32 = 0;
+    while (i < len[Param](ud.fields)) {
+        if (@strEq(get[Param](ud.fields, i).name, tag)) { return get[Param](ud.fields, i).pty; }
+        i = i + 1;
+    }
+    return "";
+}
+
+// Name of the union that declares variant `tag` (scans every union), or "".
+fn cg_union_name_for_tag(cg: *Cg, tag: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[*Node](cg.*.decls)) {
+        switch (get[*Node](cg.*.decls, i).*) {
+            .union_ => |u| {
+                let j: i32 = 0;
+                while (j < len[Param](u.fields)) {
+                    if (@strEq(get[Param](u.fields, j).name, tag)) { return u.name; }
+                    j = j + 1;
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+// ── enum layout & lookups ────────────────────────────────────────────────────
+// An enum value is a plain integer = the member's index in the EnumDecl. Member
+// access `Color.Green` evaluates to that index; switch compares an integer.
+fn cg_find_enum(cg: *Cg, ename: []u8, out: *EnumDecl) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](cg.*.decls)) {
+        switch (get[*Node](cg.*.decls, i).*) {
+            .enum_ => |en| { if (@strEq(en.name, ename)) { out.* = en; return 1; } }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Integer value (member index) of `Ename.member`, or -1 if unknown.
+fn cg_enum_member_index(cg: *Cg, ename: []u8, member: []u8) i32 {
+    let ed: EnumDecl = EnumDecl{ .name = "", .members = make[[]u8](1),
+        .annots = make[[]u8](1), .is_pub = 0 };
+    if (cg_find_enum(cg, ename, &ed) == 0) { return 0 - 1; }
+    let i: i32 = 0;
+    while (i < len[[]u8](ed.members)) {
+        if (@strEq(get[[]u8](ed.members, i), member)) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Name of the enum that declares member `m` (scans every enum), or "".
+fn cg_enum_name_for_member(cg: *Cg, m: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < len[*Node](cg.*.decls)) {
+        switch (get[*Node](cg.*.decls, i).*) {
+            .enum_ => |en| {
+                let j: i32 = 0;
+                while (j < len[[]u8](en.members)) {
+                    if (@strEq(get[[]u8](en.members, j), m)) { return en.name; }
+                    j = j + 1;
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return "";
+}

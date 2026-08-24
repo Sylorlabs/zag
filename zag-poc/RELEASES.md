@@ -9,8 +9,8 @@ release tag is pushed. Steps marked **BLOCKING** abort the release if they fail.
 
 - You are on the `native-self-hosting-no-zig` branch (or a release branch cut
   from it).
-- `./znc` is the committed seed binary. `./zagc` is present only for
-  differential testing; it is NOT a release artifact.
+- `./znc` is the committed seed binary. No Python, C, or Zig compiler path is
+  present or accepted as a fallback.
 - `./znc` is the native x86-64 compiler (lexer through ELF emission) with
   integrated GPU MLIR (`--target gpu-*`) and WASM (`--target wasm`) backends.
   `selfhost/native/znc_target.zag` remains optional for differential checks.
@@ -24,6 +24,12 @@ release tag is pushed. Steps marked **BLOCKING** abort the release if they fail.
 
 No new features after the release branch is cut. Bug fixes to release-blocking
 issues are the only permitted changes.
+
+Verify that retired implementation sources and paths are absent:
+
+```sh
+bash tests/check_pure_zag_tree.sh
+```
 
 ```sh
 git checkout -b release/2026.06.0 native-self-hosting-no-zig
@@ -75,31 +81,31 @@ Expected: all tests pass.
 
 ### 5b. Run multi-target native gates — BLOCKING
 
-These suites exercise GPU MLIR, WASM, and `@total` proofs on the supported
-`./znc` path. All three must pass before tagging.
+These suites exercise GPU MLIR, WASM, `@total` proofs, and ABI/layout
+hardening on the supported `./znc` path. All four must pass before tagging.
 
 ```sh
 bash tests/run_native_gpu.sh
 bash tests/run_native_wasm.sh
 bash tests/run_native_total.sh
-```
-
-### 5c. Run the differential test suites (informational)
-
-These suites test the legacy C-emitting backend (`zagc`) and the self-hosted
-semantic checker. They are not release gates but regressions here indicate
-parser or sema bugs that affect both backends.
-
-```sh
-./run_tests.sh
-./tests/run_selfhost.sh
-./tests/run_stdlib.sh
-./tests/run_abi_layout.sh
+bash tests/run_abi_layout.sh
 ```
 
 ABI/layout hardening (`tests/run_abi_layout.sh`) documents **current** struct,
-slice, union, `fat_fn`, and `!T` sizing per `COMPATIBILITY.md`. It is an
-informational regression gate — language v1 does **not** freeze binary layout.
+slice, union, `fat_fn`, and `!T` sizing per `COMPATIBILITY.md`. Failure is a
+release blocker — language v1 does **not** freeze binary layout; the suite
+captures documented-current behavior only.
+
+### 5c. Run cross-target native gates — BLOCKING
+
+On x86-64, qemu-user executes ARM64 binaries for validation. It is test
+infrastructure only; compilation and self-hosting remain pure Zag.
+
+```sh
+./tests/run_native_arm64.sh
+./tests/run_differential.sh
+./tests/run_arm64_selfhost.sh
+```
 
 ### 6. Verify byte-identical self-hosting fixpoint — BLOCKING
 
@@ -137,13 +143,11 @@ git commit -m "changelog: add release date for 2026.06.0"
 ### 8. Build and commit seed binaries
 
 Rebuild the seed binary from source and commit it. `./znc` is the release
-artifact for native ELF, GPU MLIR, and WASM. `zagc` is committed for
-differential-testing convenience, not as a supported binary.
+artifact for native ELF, GPU MLIR, and WASM.
 
 ```sh
 ./bootstrap.sh          # produces ./znc
 git add znc             # REQUIRED: supported seed binary
-# git add zagc          # OPTIONAL: zagc is a differential oracle only
 git commit -m "release: update seed binaries for 2026.06.0"
 ```
 
@@ -163,7 +167,7 @@ Assemble the release tarball. Only include the supported artifacts.
 ```sh
 VERSION=2026.06.0
 mkdir -p dist/zag-$VERSION
-cp znc znc-target bootstrap.sh run_tests.sh dist/zag-$VERSION/
+cp znc znc-target bootstrap.sh dist/zag-$VERSION/
 cp -r selfhost/ examples/ std/ dist/zag-$VERSION/
 cp README.md BOOTSTRAP.md VERSIONING.md CHANGELOG.md \
    COMPATIBILITY.md RELEASES.md dist/zag-$VERSION/

@@ -1,0 +1,247 @@
+// v2 native SystemAllocator: a checked, handle-based bridge to the native
+// ordinary allocator.  This is intentionally narrow: its Allocation record is
+// the ownership token, never a raw pointer plus a caller-guessed length.
+
+error { OutOfMemory, InvalidSize, InvalidAlignment, InvalidAllocator }
+
+struct Allocation {
+    ptr: *u8,
+    len: i64,
+    alignment: i64,
+    generation: i64,
+    // Runtime allocator identity is part of the checked ownership token.  It
+    // prevents a descriptor minted by one allocator family from being
+    // replayed through another family's deallocator.  The current public
+    // constructor exposes only SystemAllocator (identity 1); callers cannot
+    // make that identity valid for a different runtime registry entry.
+    allocator_id: i64,
+}
+
+struct SystemAllocator { allocator_id: i64 }
+
+// A fixed-buffer region is a checked, compiler-runtime capability over one
+// live SystemAllocator Allocation.  `token` and the block token below are
+// opaque to the source API: native hooks validate them against bounded runtime
+// registries on every operation.  In particular, this is not a bump allocator
+// that exposes a raw pointer into `backing`.
+struct FixedBufferAllocator { backing: Allocation, token: i64 }
+struct FixedBufferBlock { token: i64 }
+// ArenaAllocator is a distinct bounded bump-allocation capability. Like the
+// fixed-buffer form, it owns one checked backing Allocation and never falls
+// through to the heap. Its explicit name makes reset-oriented arena use
+// visible to the retained-owner checker rather than disguising it as a
+// SystemAllocator value.
+struct ArenaAllocator { backing: Allocation, token: i64 }
+struct ArenaBlock { token: i64 }
+
+struct ArenaTelemetry {
+    capacity: i64,
+    used: i64,
+    remaining: i64,
+    high_water: i64,
+    generation: i64,
+}
+
+// `system_allocator()` is a value constructor, not mutable global state.  Its
+// identity is carried into every Allocation descriptor and checked again at
+// deallocation; it is not a raw pointer or a caller-selected registry index.
+fn system_allocator() SystemAllocator { return SystemAllocator{ .allocator_id = 1 }; }
+
+// The native allocator has 8-byte minimum alignment and size classes.  Expose
+// the exact capacity reserved for this handle, so deallocation can validate it
+// against the runtime provenance record rather than trusting caller metadata.
+fn system_allocator_capacity(bytes: i64) !i64 {
+    if (bytes < 0) { return error.InvalidSize; }
+    let capacity: i64 = 16;
+    while (capacity < bytes) {
+        if (capacity >= 524288) { return bytes; }
+        capacity = capacity * 2;
+    }
+    return capacity;
+}
+
+fn (self: SystemAllocator) allocate(bytes: i64, alignment: i64) !Allocation {
+    // Ordinary native allocations are 8-byte aligned, so every supported
+    // power-of-two request up to 8 is satisfied and recorded exactly.
+    if (alignment != 1 && alignment != 2 && alignment != 4 && alignment != 8) { return error.InvalidAlignment; }
+    let capacity: i64 = try system_allocator_capacity(bytes);
+    let ptr: *u8 = _zag_malloc(capacity);
+    if (ptr == null as *u8) { return error.OutOfMemory; }
+    return @allocationCreate(ptr, capacity, alignment, self.allocator_id);
+}
+
+// Zeroing is performed through the just-minted checked allocation root.  The
+// loop bound is the exact recorded capacity, so it cannot write past the
+// handle's native allocation even when the caller requested a smaller value.
+fn (self: SystemAllocator) allocate_zeroed(bytes: i64, alignment: i64) !Allocation {
+    let block: Allocation = try self.allocate(bytes, alignment);
+    unsafe {
+        let i: i64 = 0;
+        while (i < @allocationLen(block)) {
+            @allocationWriteU8(block, i, 0);
+            i = i + 1;
+        }
+    }
+    return block;
+}
+
+// Allocate the replacement before consuming `block`: any fallible allocation
+// path returns its error with the original handle still live.  The old handle
+// is validated before copying, and only consumed after the overlap is copied.
+fn (self: SystemAllocator) resize(block: Allocation, bytes: i64, alignment: i64) !Allocation {
+    // A valid descriptor is bound to its minting receiver as well as to the
+    // runtime provenance table. Reject a cross-receiver replay before any
+    // validation, allocation, copy, or free can mutate the live handle.
+    if (self.allocator_id != @allocationAllocatorId(block)) { return error.InvalidAllocator; }
+    @allocationValidate(block);
+    let replacement: Allocation = try self.allocate(bytes, alignment);
+    let copy_len: i64 = @allocationLen(block);
+    if (@allocationLen(replacement) < copy_len) { copy_len = @allocationLen(replacement); }
+    unsafe {
+        let i: i64 = 0;
+        while (i < copy_len) {
+            @allocationWriteU8(replacement, i, @allocationReadU8(block, i));
+            i = i + 1;
+        }
+    }
+    try self.deallocate(block);
+    return replacement;
+}
+
+// Deallocation consumes the full handle at the source level.  The compiler
+// validates pointer, exact capacity, liveness, and SystemAllocator alignment
+// before raw free; copied, stale, shortened, or forged records fail closed.
+fn (self: SystemAllocator) deallocate(block: Allocation) !void {
+    if (self.allocator_id != @allocationAllocatorId(block)) { return error.InvalidAllocator; }
+    @allocationFree(block);
+    return;
+}
+
+// Allocation is an opaque capability. These are the public checked byte
+// operations; neither exposes a raw address or the runtime handle layout.
+fn allocation_read_u8(block: Allocation, index: i64) !u8 {
+    return @allocationReadU8(block, index);
+}
+
+fn allocation_write_u8(block: Allocation, index: i64, value: u8) !void {
+    @allocationWriteU8(block, index, value);
+    return;
+}
+
+// Construction retains `backing` until deinit returns that exact Allocation.
+// The typed retained-region pass also prevents source-level release, escape,
+// or replacement while this capability is live.
+fn fixed_buffer_allocator(backing: Allocation) !FixedBufferAllocator {
+    let token: i64 = @allocationRegionInit(backing);
+    if (token == 0) { return error.OutOfMemory; }
+    return FixedBufferAllocator{ .backing = backing, .token = token };
+}
+
+fn (self: *FixedBufferAllocator) allocate(bytes: i64, alignment: i64) !FixedBufferBlock {
+    let token: i64 = _zag_fixed_buffer_allocate(self.token, bytes, alignment);
+    if (token == 0) { return error.OutOfMemory; }
+    return FixedBufferBlock{ .token = token };
+}
+
+fn (self: *FixedBufferAllocator) reset() !void {
+    _zag_fixed_buffer_reset(self.token);
+    return;
+}
+
+// Deinit consumes the region capability and returns the original exact
+// Allocation.  The caller may then return it or call SystemAllocator.deallocate.
+fn (self: *FixedBufferAllocator) deinit() !Allocation {
+    return @allocationRegionDeinit(self.token);
+}
+
+fn fixed_buffer_read_u8(block: FixedBufferBlock, index: i64) !u8 {
+    return _zag_fixed_buffer_read_u8(block.token, index) as u8;
+}
+
+fn fixed_buffer_write_u8(block: FixedBufferBlock, index: i64, value: u8) !void {
+    _zag_fixed_buffer_write_u8(block.token, index, value as i64);
+    return;
+}
+
+// Arena operations deliberately reuse the checked retained-region runtime:
+// the runtime capability is a bounded bump cursor over exactly one live
+// Allocation, and the source type distinguishes arena intent from the
+// fixed-buffer API. Every block token is still checked against the retained
+// backing and reset generation at access time.
+fn arena_allocator(backing: Allocation) !ArenaAllocator {
+    let token: i64 = @allocationRegionInit(backing);
+    if (token == 0) { return error.OutOfMemory; }
+    return ArenaAllocator{ .backing = backing, .token = token };
+}
+
+fn (self: *ArenaAllocator) allocate(bytes: i64, alignment: i64) !ArenaBlock {
+    let token: i64 = _zag_fixed_buffer_allocate(self.token, bytes, alignment);
+    if (token == 0) { return error.OutOfMemory; }
+    return ArenaBlock{ .token = token };
+}
+
+fn (self: *ArenaAllocator) reset() !void {
+    _zag_fixed_buffer_reset(self.token);
+    return;
+}
+
+fn (self: *ArenaAllocator) telemetry() ArenaTelemetry {
+    return ArenaTelemetry{
+        .capacity = _zag_fixed_buffer_capacity(self.token),
+        .used = _zag_fixed_buffer_used(self.token),
+        .remaining = _zag_fixed_buffer_remaining(self.token),
+        .high_water = _zag_fixed_buffer_high_water(self.token),
+        .generation = _zag_fixed_buffer_generation(self.token),
+    };
+}
+
+fn (self: *ArenaAllocator) deinit() !Allocation {
+    return @allocationRegionDeinit(self.token);
+}
+
+fn arena_read_u8(block: ArenaBlock, index: i64) !u8 {
+    return _zag_fixed_buffer_read_u8(block.token, index) as u8;
+}
+
+fn arena_write_u8(block: ArenaBlock, index: i64, value: u8) !void {
+    _zag_fixed_buffer_write_u8(block.token, index, value as i64);
+    return;
+}
+
+fn arena_block_len(block: ArenaBlock) i64 {
+    return _zag_fixed_buffer_block_len(block.token);
+}
+
+// Word and bounded bulk helpers remain expressed through checked block access.
+// They allocate no storage and cannot expose an interior pointer.
+fn arena_read_u64(block: ArenaBlock, index: i64) !u64 {
+    let value: u64 = 0;
+    let i: i64 = 0;
+    while (i < 8) {
+        value = value | ((_zag_fixed_buffer_read_u8(block.token, index + i) as u8) as u64) << ((i * 8) as i32);
+        i = i + 1;
+    }
+    return value;
+}
+
+fn arena_write_u64(block: ArenaBlock, index: i64, value: u64) !void {
+    let i: i64 = 0;
+    while (i < 8) {
+        _zag_fixed_buffer_write_u8(block.token, index + i, ((value >> ((i * 8) as i32)) as u8) as i64);
+        i = i + 1;
+    }
+    return;
+}
+
+fn arena_fill_u8(block: ArenaBlock, start: i64, count: i64, value: u8) !void {
+    let length: i64 = _zag_fixed_buffer_block_len(block.token);
+    if (start < 0 || count < 0 || start > length || count > length - start) {
+        return error.InvalidSize;
+    }
+    let i: i64 = 0;
+    while (i < count) {
+        _zag_fixed_buffer_write_u8(block.token, start + i, value as i64);
+        i = i + 1;
+    }
+    return;
+}

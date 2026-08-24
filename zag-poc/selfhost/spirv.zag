@@ -1,0 +1,667 @@
+// selfhost/spirv.zag — Zag → SPIR-V binary encoder for Vulkan/OpenCL compute.
+//
+// This is the compatibility-tier encoder: it takes Zag @kernel source and
+// emits a SPIR-V binary module that can be loaded by a Vulkan compute pipeline
+// or an OpenCL 2.x program-with-IL. It is NOT a native GPU backend — it is a
+// non-certified fallback path that uses the system's Vulkan/OpenCL runtime.
+//
+// Like gfx1010.zag, this encoder starts with a narrow, fully validated kernel
+// subset (the canonical fill kernel) and rejects every other AST shape. The
+// output is a SPIR-V binary: a header followed by typed instructions. Each
+// instruction is a (word_count << 16) | opcode word followed by operands.
+//
+// The encoder validates the same fill kernel pattern as gfx1010.zag:
+//   fn fillKernel(out: []i32, value: i32, count: i32) void @kernel {
+//       let i: i32 = @gpuBlockIdx(0) * @gpuBlockDim(0) + @gpuThreadIdx(0);
+//       if (i < count) { out[i] = value; }
+//   }
+//
+// In SPIR-V, this becomes a GLCompute shader with:
+//   - Storage buffer binding 0 (the output i32 array)
+//   - Push constants { i32 value, i32 count }
+//   - LocalSize(1, 1, 1) — one invocation per workgroup
+//   - gl_GlobalInvocationID.x as the thread index
+
+@import("parse.zag")
+
+// ── SPIR-V constants ────────────────────────────────────────────────────────
+fn spv_magic() i64 { return 0x07230203; }
+fn spv_version_1_0() i64 { return 0x00010000; }
+fn spv_generator_zag() i64 { return 0; }
+fn spv_schema() i64 { return 0; }
+
+// SPIR-V opcodes
+fn spv_op_capability() i32 { return 17; }
+fn spv_op_memory_model() i32 { return 14; }
+fn spv_op_entry_point() i32 { return 15; }
+fn spv_op_execution_mode() i32 { return 16; }
+fn spv_op_type_void() i32 { return 19; }
+fn spv_op_type_bool() i32 { return 20; }
+fn spv_op_type_int() i32 { return 21; }
+fn spv_op_type_float() i32 { return 22; }
+fn spv_op_type_vector() i32 { return 23; }
+fn spv_op_type_runtime_array() i32 { return 29; }
+fn spv_op_type_struct() i32 { return 30; }
+fn spv_op_type_pointer() i32 { return 32; }
+fn spv_op_type_function() i32 { return 33; }
+fn spv_op_constant() i32 { return 43; }
+fn spv_op_function() i32 { return 54; }
+fn spv_op_function_end() i32 { return 56; }
+fn spv_op_variable() i32 { return 59; }
+fn spv_op_load() i32 { return 61; }
+fn spv_op_store() i32 { return 62; }
+fn spv_op_access_chain() i32 { return 65; }
+fn spv_op_decorate() i32 { return 71; }
+fn spv_op_member_decorate() i32 { return 72; }
+fn spv_op_bitcast() i32 { return 124; }
+fn spv_op_s_less_than() i32 { return 177; }
+fn spv_op_label() i32 { return 248; }
+fn spv_op_branch() i32 { return 249; }
+fn spv_op_branch_conditional() i32 { return 250; }
+fn spv_op_selection_merge() i32 { return 247; }
+fn spv_op_return() i32 { return 253; }
+fn spv_op_function_parameter() i32 { return 55; }
+fn spv_op_ptr_access_chain() i32 { return 67; }
+fn spv_op_s_convert() i32 { return 114; }
+
+// SPIR-V capabilities, storage classes, decorations, execution models
+fn spv_cap_shader() i32 { return 1; }
+fn spv_cap_kernel() i32 { return 6; }
+fn spv_cap_addresses() i32 { return 4; }
+fn spv_cap_int64() i32 { return 11; }
+fn spv_model_logical() i32 { return 0; }
+fn spv_model_physical64() i32 { return 2; }
+fn spv_memory_glsl450() i32 { return 1; }
+fn spv_memory_opencl() i32 { return 2; }
+fn spv_exec_glcompute() i32 { return 5; }
+fn spv_exec_kernel() i32 { return 6; }
+fn spv_mode_local_size() i32 { return 17; }
+fn spv_storage_input() i32 { return 1; }
+fn spv_storage_uniform() i32 { return 2; }
+fn spv_storage_cross_workgroup() i32 { return 5; }
+fn spv_storage_push_constant() i32 { return 9; }
+fn spv_decoration_builtin() i32 { return 11; }
+fn spv_decoration_buffer_block() i32 { return 3; }
+fn spv_decoration_block() i32 { return 2; }
+fn spv_decoration_array_stride() i32 { return 6; }
+fn spv_decoration_offset() i32 { return 35; }
+fn spv_decoration_binding() i32 { return 33; }
+fn spv_decoration_descriptor_set() i32 { return 34; }
+fn spv_builtin_global_invocation_id() i32 { return 28; }
+
+// ── word pusher ─────────────────────────────────────────────────────────────
+fn spv_push_u32(out: *ArrayList[u8], v: i64) void {
+    let n: i64 = v & 0xFFFFFFFF;
+    push[u8](out, (n & 255) as u8);
+    push[u8](out, ((n / 256) & 255) as u8);
+    push[u8](out, ((n / 65536) & 255) as u8);
+    push[u8](out, ((n / 16777216) & 255) as u8);
+}
+
+fn spv_instr(out: *ArrayList[u8], word_count: i32, opcode: i32) void {
+    spv_push_u32(out, ((word_count as i64) * 65536 + (opcode as i64)));
+}
+
+// ── kernel validation (mirrors gfx1010.zag) ─────────────────────────────────
+fn spv_is_id(n: *Node, want: []u8) bool {
+    return switch (n.*) {
+        .id => |x| @strEq(x.name, want),
+        else => false,
+    };
+}
+
+fn spv_is_zero(n: *Node) bool {
+    return switch (n.*) {
+        .ilit => |x| @strEq(x.text, "0"),
+        else => false,
+    };
+}
+
+fn spv_is_builtin_dim(n: *Node, name: []u8) bool {
+    let ok: bool = false;
+    switch (n.*) {
+        .call => |c| {
+            if (!spv_is_id(c.callee, name) || len[*Node](c.args) != 1) { return false; }
+            ok = spv_is_zero(get[*Node](c.args, 0));
+        }
+        else => { }
+    }
+    return ok;
+}
+
+fn spv_is_global_index(n: *Node) bool {
+    let ok: bool = false;
+    switch (n.*) {
+        .bin => |add| {
+            if (!@strEq(add.op, "+") || !spv_is_builtin_dim(add.r, "@gpuThreadIdx")) { return false; }
+            switch (add.l.*) {
+                .bin => |mul| {
+                    ok = @strEq(mul.op, "*") &&
+                        spv_is_builtin_dim(mul.l, "@gpuBlockIdx") &&
+                        spv_is_builtin_dim(mul.r, "@gpuBlockDim");
+                }
+                else => { }
+            }
+        }
+        else => { }
+    }
+    return ok;
+}
+
+fn spv_has_annot(f: FnDecl, want: []u8) bool {
+    let i: i32 = 0;
+    while (i < len[[]u8](f.annots)) {
+        if (@strEq(get[[]u8](f.annots, i), want)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn spv_is_fill_kernel(f: FnDecl) bool {
+    if (!spv_has_annot(f, "@kernel") || len[Param](f.params) != 3 ||
+        !@strEq(f.ret, "void") || len[*Node](f.body) != 2) { return false; }
+    let p_out: Param = get[Param](f.params, 0);
+    let p_val: Param = get[Param](f.params, 1);
+    let p_cnt: Param = get[Param](f.params, 2);
+    if (!@strEq(p_out.pty, "[]i32") || !@strEq(p_val.pty, "i32") ||
+        !@strEq(p_cnt.pty, "i32")) { return false; }
+    let idx_name: []u8 = "";
+    switch (get[*Node](f.body, 0).*) {
+        .let_ => |l| {
+            if (l.has_init == 0 || !spv_is_global_index(l.expr)) { return false; }
+            idx_name = l.name;
+        }
+        else => { return false; }
+    }
+    let valid: bool = false;
+    switch (get[*Node](f.body, 1).*) {
+        .if_ => |x| {
+            if (x.has_els != 0 || len[*Node](x.then_body) != 1) { return false; }
+            let cond_ok: bool = switch (x.cond.*) {
+                .bin => |b| @strEq(b.op, "<") && spv_is_id(b.l, idx_name) && spv_is_id(b.r, p_cnt.name),
+                else => false,
+            };
+            if (!cond_ok) { return false; }
+            switch (get[*Node](x.then_body, 0).*) {
+                .assign => |a| {
+                    if (!spv_is_id(a.expr, p_val.name)) { return false; }
+                    valid = switch (a.target.*) {
+                        .idx => |ix| spv_is_id(ix.base, p_out.name) && spv_is_id(ix.idx, idx_name),
+                        else => false,
+                    };
+                }
+                else => { }
+            }
+        }
+        else => { }
+    }
+    return valid;
+}
+
+fn spv_find_profile(decls: ArrayList[*Node]) i32 {
+    let found: i32 = 0;
+    let kernels: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .fn_decl => |f| {
+                if (spv_has_annot(f, "@kernel") || spv_has_annot(f, "@device")) {
+                    kernels = kernels + 1;
+                    if (spv_is_fill_kernel(f)) { found = 1; }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    if (kernels != 1) { return 0; }
+    return found;
+}
+
+// Extract the @kernel function name (for OpenCL entry point naming).
+fn spv_find_kernel_name(decls: ArrayList[*Node]) []u8 {
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .fn_decl => |f| {
+                if (spv_has_annot(f, "@kernel") && spv_is_fill_kernel(f)) {
+                    return f.name;
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return "fillKernel";
+}
+
+// Push a null-padded string literal (SPIR-V string encoding).
+fn spv_push_string(out: *ArrayList[u8], s: []u8) void {
+    let i: i32 = 0;
+    let buf: ArrayList[u8] = make[u8](64);
+    while (i < len[u8](s)) {
+        push[u8](&buf, get[u8](s, i));
+        i = i + 1;
+    }
+    push[u8](&buf, 0); // null terminator
+    // Pad to 4-byte boundary
+    while (len[u8](buf) % 4 != 0) { push[u8](&buf, 0); }
+    // Pack bytes into u32 words
+    let j: i32 = 0;
+    while (j < len[u8](buf)) {
+        let w: i64 = (get[u8](&buf, j) as i64) |
+            ((get[u8](&buf, j + 1) as i64) * 256) |
+            ((get[u8](&buf, j + 2) as i64) * 65536) |
+            ((get[u8](&buf, j + 3) as i64) * 16777216);
+        spv_push_u32(out, w);
+        j = j + 4;
+    }
+}
+
+// ── SPIR-V binary emission for the fill kernel ──────────────────────────────
+// ID assignments:
+//   1=void  2=bool  3=i32  4=u32  5=vec3(u32)
+//   6=ptr(Input,vec3)  7=ptr(Input,u32)
+//   8=rt_array(u32)  9=struct(rt_array)  10=ptr(Uniform,struct)  11=ptr(Uniform,u32)  12=ptr(Uniform,i32)
+//   13=struct(i32,i32) push  14=ptr(Push,struct)  15=ptr(Push,i32)
+//   16=fn()->void
+//   17=u32_0  18=i32_0  19=i32_1
+//   20=gl_GlobalInvocationID  21=out_buf  22=push_const
+//   23=main  24=entry_label
+//   25=accesschain gid.x  26=load gid.x  27=bitcast i32
+//   28=accesschain push.value  29=load value
+//   30=accesschain push.count  31=load count
+//   32=slt  33=true_label  34=false_label
+//   35=accesschain out[0][idx]
+// Bound = 36
+fn spv_bound() i64 { return 36; }
+
+fn spv_emit_fill_spirv(out: *ArrayList[u8]) void {
+    // Header
+    spv_push_u32(out, spv_magic());
+    spv_push_u32(out, spv_version_1_0());
+    spv_push_u32(out, spv_generator_zag());
+    spv_push_u32(out, spv_bound());
+    spv_push_u32(out, spv_schema());
+
+    // OpCapability(Shader)
+    spv_instr(out, 2, spv_op_capability()); spv_push_u32(out, spv_cap_shader());
+
+    // OpMemoryModel(Logical, GLSL450)
+    spv_instr(out, 3, spv_op_memory_model());
+    spv_push_u32(out, spv_model_logical()); spv_push_u32(out, spv_memory_glsl450());
+
+    // OpEntryPoint(GLCompute, %23, "main", %20)
+    // Word count = 1(opcode) + 1(exec model) + 1(entry id) + 2("main\0") + 1(interface) = 6
+    spv_instr(out, 6, spv_op_entry_point());
+    spv_push_u32(out, spv_exec_glcompute()); spv_push_u32(out, 23);
+    spv_push_u32(out, 0x6E69616D); spv_push_u32(out, 0x00000000); // "main\0"
+    spv_push_u32(out, 20); // interface: gl_GlobalInvocationID
+
+    // OpExecutionMode(%23, LocalSize, 1, 1, 1)
+    spv_instr(out, 6, spv_op_execution_mode());
+    spv_push_u32(out, 23); spv_push_u32(out, spv_mode_local_size());
+    spv_push_u32(out, 1); spv_push_u32(out, 1); spv_push_u32(out, 1);
+
+    // Decorations
+    // OpDecorate(%20, BuiltIn, GlobalInvocationID)
+    spv_instr(out, 4, spv_op_decorate());
+    spv_push_u32(out, 20); spv_push_u32(out, spv_decoration_builtin());
+    spv_push_u32(out, spv_builtin_global_invocation_id());
+
+    // OpDecorate(%9, BufferBlock)
+    spv_instr(out, 3, spv_op_decorate());
+    spv_push_u32(out, 9); spv_push_u32(out, spv_decoration_buffer_block());
+
+    // OpDecorate(%8, ArrayStride, 4) — runtime array element stride
+    spv_instr(out, 4, spv_op_decorate());
+    spv_push_u32(out, 8); spv_push_u32(out, spv_decoration_array_stride()); spv_push_u32(out, 4);
+
+    // OpMemberDecorate(%9, 0, Offset, 0)
+    spv_instr(out, 5, spv_op_member_decorate());
+    spv_push_u32(out, 9); spv_push_u32(out, 0); spv_push_u32(out, spv_decoration_offset()); spv_push_u32(out, 0);
+
+    // OpDecorate(%21, DescriptorSet, 0)
+    spv_instr(out, 4, spv_op_decorate());
+    spv_push_u32(out, 21); spv_push_u32(out, spv_decoration_descriptor_set()); spv_push_u32(out, 0);
+
+    // OpDecorate(%21, Binding, 0)
+    spv_instr(out, 4, spv_op_decorate());
+    spv_push_u32(out, 21); spv_push_u32(out, spv_decoration_binding()); spv_push_u32(out, 0);
+
+    // OpDecorate(%13, Block) — push constant struct must have Block decoration
+    spv_instr(out, 3, spv_op_decorate());
+    spv_push_u32(out, 13); spv_push_u32(out, spv_decoration_block());
+
+    // OpMemberDecorate(%13, 0, Offset, 0)
+    spv_instr(out, 5, spv_op_member_decorate());
+    spv_push_u32(out, 13); spv_push_u32(out, 0); spv_push_u32(out, spv_decoration_offset()); spv_push_u32(out, 0);
+
+    // OpMemberDecorate(%13, 1, Offset, 4)
+    spv_instr(out, 5, spv_op_member_decorate());
+    spv_push_u32(out, 13); spv_push_u32(out, 1); spv_push_u32(out, spv_decoration_offset()); spv_push_u32(out, 4);
+
+    // Types
+    spv_instr(out, 2, spv_op_type_void()); spv_push_u32(out, 1);          // %1 = void
+    spv_instr(out, 2, spv_op_type_bool()); spv_push_u32(out, 2);          // %2 = bool
+    spv_instr(out, 4, spv_op_type_int()); spv_push_u32(out, 3); spv_push_u32(out, 32); spv_push_u32(out, 1); // %3 = i32
+    spv_instr(out, 4, spv_op_type_int()); spv_push_u32(out, 4); spv_push_u32(out, 32); spv_push_u32(out, 0); // %4 = u32
+    spv_instr(out, 4, spv_op_type_vector()); spv_push_u32(out, 5); spv_push_u32(out, 4); spv_push_u32(out, 3); // %5 = vec3(u32)
+    spv_instr(out, 4, spv_op_type_pointer()); spv_push_u32(out, 6); spv_push_u32(out, spv_storage_input()); spv_push_u32(out, 5); // %6
+    spv_instr(out, 4, spv_op_type_pointer()); spv_push_u32(out, 7); spv_push_u32(out, spv_storage_input()); spv_push_u32(out, 4); // %7
+    spv_instr(out, 3, spv_op_type_runtime_array()); spv_push_u32(out, 8); spv_push_u32(out, 3); // %8 = rt_array(i32)
+    spv_instr(out, 3, spv_op_type_struct()); spv_push_u32(out, 9); spv_push_u32(out, 8); // %9
+    spv_instr(out, 4, spv_op_type_pointer()); spv_push_u32(out, 10); spv_push_u32(out, spv_storage_uniform()); spv_push_u32(out, 9); // %10
+    spv_instr(out, 4, spv_op_type_pointer()); spv_push_u32(out, 11); spv_push_u32(out, spv_storage_uniform()); spv_push_u32(out, 4); // %11
+    spv_instr(out, 4, spv_op_type_pointer()); spv_push_u32(out, 12); spv_push_u32(out, spv_storage_uniform()); spv_push_u32(out, 3); // %12
+    spv_instr(out, 4, spv_op_type_struct()); spv_push_u32(out, 13); spv_push_u32(out, 3); spv_push_u32(out, 3); // %13
+    spv_instr(out, 4, spv_op_type_pointer()); spv_push_u32(out, 14); spv_push_u32(out, spv_storage_push_constant()); spv_push_u32(out, 13); // %14
+    spv_instr(out, 4, spv_op_type_pointer()); spv_push_u32(out, 15); spv_push_u32(out, spv_storage_push_constant()); spv_push_u32(out, 3); // %15
+    spv_instr(out, 3, spv_op_type_function()); spv_push_u32(out, 16); spv_push_u32(out, 1); // %16
+
+    // Constants — OpConstant: Result Type, Result ID, value
+    spv_instr(out, 4, spv_op_constant()); spv_push_u32(out, 4); spv_push_u32(out, 17); spv_push_u32(out, 0); // %17 = u32(0)
+    spv_instr(out, 4, spv_op_constant()); spv_push_u32(out, 3); spv_push_u32(out, 18); spv_push_u32(out, 0); // %18 = i32(0)
+    spv_instr(out, 4, spv_op_constant()); spv_push_u32(out, 3); spv_push_u32(out, 19); spv_push_u32(out, 1); // %19 = i32(1)
+
+    // Variables — OpVariable: Result Type, Result ID, Storage Class
+    spv_instr(out, 4, spv_op_variable()); spv_push_u32(out, 6); spv_push_u32(out, 20); spv_push_u32(out, spv_storage_input()); // %20 = gl_GlobalInvocationID
+    spv_instr(out, 4, spv_op_variable()); spv_push_u32(out, 10); spv_push_u32(out, 21); spv_push_u32(out, spv_storage_uniform()); // %21 = out_buf
+    spv_instr(out, 4, spv_op_variable()); spv_push_u32(out, 14); spv_push_u32(out, 22); spv_push_u32(out, spv_storage_push_constant()); // %22 = push
+
+    // Function — OpFunction: Result Type, Result ID, Function Control, Function Type
+    spv_instr(out, 5, spv_op_function()); spv_push_u32(out, 1); spv_push_u32(out, 23); spv_push_u32(out, 0); spv_push_u32(out, 16); // %23 = main
+    spv_instr(out, 2, spv_op_label()); spv_push_u32(out, 24); // entry
+
+    // %25 = AccessChain(%7, %20, %17) — &gl_GlobalInvocationID.x
+    // OpAccessChain: Result Type, Result ID, Base, Indices...
+    spv_instr(out, 5, spv_op_access_chain());
+    spv_push_u32(out, 7); spv_push_u32(out, 25); spv_push_u32(out, 20); spv_push_u32(out, 17);
+
+    // %26 = Load(u32, %25)
+    // OpLoad: Result Type, Result ID, Pointer
+    spv_instr(out, 4, spv_op_load()); spv_push_u32(out, 4); spv_push_u32(out, 26); spv_push_u32(out, 25);
+
+    // %27 = Bitcast(i32, %26)
+    // OpBitcast: Result Type, Result ID, Operand
+    spv_instr(out, 4, spv_op_bitcast()); spv_push_u32(out, 3); spv_push_u32(out, 27); spv_push_u32(out, 26);
+
+    // %28 = AccessChain(%15, %22, %18) — &push.value
+    spv_instr(out, 5, spv_op_access_chain());
+    spv_push_u32(out, 15); spv_push_u32(out, 28); spv_push_u32(out, 22); spv_push_u32(out, 18);
+
+    // %29 = Load(i32, %28)
+    spv_instr(out, 4, spv_op_load()); spv_push_u32(out, 3); spv_push_u32(out, 29); spv_push_u32(out, 28);
+
+    // %30 = AccessChain(%15, %22, %19) — &push.count
+    spv_instr(out, 5, spv_op_access_chain());
+    spv_push_u32(out, 15); spv_push_u32(out, 30); spv_push_u32(out, 22); spv_push_u32(out, 19);
+
+    // %31 = Load(i32, %30)
+    spv_instr(out, 4, spv_op_load()); spv_push_u32(out, 3); spv_push_u32(out, 31); spv_push_u32(out, 30);
+
+    // %32 = SLessThan(bool, %27, %31)
+    // OpSLessThan: Result Type, Result ID, Operand1, Operand2
+    spv_instr(out, 5, spv_op_s_less_than());
+    spv_push_u32(out, 2); spv_push_u32(out, 32); spv_push_u32(out, 27); spv_push_u32(out, 31);
+
+    // OpSelectionMerge(%34, None) — required before OpBranchConditional
+    spv_instr(out, 3, spv_op_selection_merge());
+    spv_push_u32(out, 34); spv_push_u32(out, 0); // merge = false_label, control = None
+
+    // BranchConditional(%32, %33, %34)
+    spv_instr(out, 4, spv_op_branch_conditional());
+    spv_push_u32(out, 32); spv_push_u32(out, 33); spv_push_u32(out, 34);
+
+    // True label
+    spv_instr(out, 2, spv_op_label()); spv_push_u32(out, 33);
+
+    // %35 = AccessChain(%12, %21, %18, %27) — &out[0][idx]
+    spv_instr(out, 6, spv_op_access_chain());
+    spv_push_u32(out, 12); spv_push_u32(out, 35); spv_push_u32(out, 21); spv_push_u32(out, 18); spv_push_u32(out, 27);
+
+    // Store(%35, %29) — out[idx] = value
+    spv_instr(out, 3, spv_op_store()); spv_push_u32(out, 35); spv_push_u32(out, 29);
+
+    // Branch(%34)
+    spv_instr(out, 2, spv_op_branch()); spv_push_u32(out, 34);
+
+    // False label
+    spv_instr(out, 2, spv_op_label()); spv_push_u32(out, 34);
+
+    // Return
+    spv_instr(out, 1, spv_op_return());
+
+    // FunctionEnd
+    spv_instr(out, 1, spv_op_function_end());
+}
+
+// ── OpenCL SPIR-V binary emission for the fill kernel ───────────────────────
+// OpenCL SPIR-V differs from Vulkan SPIR-V:
+//   - OpCapability Kernel (not Shader), plus Addresses and Int64
+//   - OpMemoryModel Physical64 OpenCL (not Logical GLSL450)
+//   - OpEntryPoint Kernel (not GLCompute), named after the kernel function
+//   - No OpExecutionMode (OpenCL uses host-side dispatch sizing)
+//   - No descriptor sets, bindings, push constants, or BufferBlock/Block
+//   - Kernel parameters are OpFunctionParameter (not descriptor/push constant)
+//   - Output buffer is in CrossWorkgroup storage (global memory)
+//   - All OpTypeInt have Signedness=0 (OpenCL convention)
+//   - Global ID is vec3(i64) — needs OpSConvert to i32
+//   - OpPtrAccessChain for pointer arithmetic (not OpAccessChain on structs)
+//
+// ID assignments:
+//   1=void  2=bool  3=i32  4=i64  5=vec3(i64)
+//   6=ptr(Input,vec3)  7=ptr(Input,i64)  8=ptr(CrossWorkgroup,i32)
+//   9=fn(void,ptr_cwg_i32,i32,i32)
+//   10=i64(0) constant
+//   11=gl_GlobalInvocationID variable
+//   12=fillKernel function
+//   13=out param  14=value param  15=count param
+//   16=entry label
+//   17=accesschain gid.x  18=load gid.x  19=sconvert i32
+//   20=sless_than  21=false/merge label  22=true label
+//   23=ptr_accesschain out[idx]
+// Bound = 24
+fn spv_opencl_bound() i64 { return 24; }
+
+fn spv_emit_fill_spirv_opencl(out: *ArrayList[u8], kernel_name: []u8) void {
+    // Header
+    spv_push_u32(out, spv_magic());
+    spv_push_u32(out, spv_version_1_0());
+    spv_push_u32(out, spv_generator_zag());
+    spv_push_u32(out, spv_opencl_bound());
+    spv_push_u32(out, spv_schema());
+
+    // OpCapability(Kernel)
+    spv_instr(out, 2, spv_op_capability()); spv_push_u32(out, spv_cap_kernel());
+    // OpCapability(Addresses)
+    spv_instr(out, 2, spv_op_capability()); spv_push_u32(out, spv_cap_addresses());
+    // OpCapability(Int64)
+    spv_instr(out, 2, spv_op_capability()); spv_push_u32(out, spv_cap_int64());
+
+    // OpMemoryModel(Physical64, OpenCL)
+    spv_instr(out, 3, spv_op_memory_model());
+    spv_push_u32(out, spv_model_physical64()); spv_push_u32(out, spv_memory_opencl());
+
+    // OpEntryPoint(Kernel, %12, "<kernel_name>", %11)
+    // Word count = 1(opcode) + 1(exec model) + 1(entry id) + N(name words) + 1(interface)
+    // Name words: ceil((len+1) / 4)
+    let name_len: i32 = len[u8](kernel_name);
+    let name_words: i32 = (name_len + 1 + 3) / 4; // null + padding
+    let ep_wc: i32 = 4 + name_words; // opcode + exec_model + entry_id + interface + name
+    spv_instr(out, ep_wc, spv_op_entry_point());
+    spv_push_u32(out, spv_exec_kernel()); spv_push_u32(out, 12);
+    spv_push_string(out, kernel_name);
+    spv_push_u32(out, 11); // interface: gl_GlobalInvocationID
+
+    // No OpExecutionMode — OpenCL uses host-side dispatch sizing
+
+    // Decorations
+    // OpDecorate(%11, BuiltIn, GlobalInvocationId)
+    spv_instr(out, 4, spv_op_decorate());
+    spv_push_u32(out, 11); spv_push_u32(out, spv_decoration_builtin());
+    spv_push_u32(out, spv_builtin_global_invocation_id());
+
+    // Types — all OpTypeInt have Signedness=0 (OpenCL convention)
+    spv_instr(out, 2, spv_op_type_void()); spv_push_u32(out, 1);          // %1 = void
+    spv_instr(out, 2, spv_op_type_bool()); spv_push_u32(out, 2);          // %2 = bool
+    spv_instr(out, 4, spv_op_type_int()); spv_push_u32(out, 3); spv_push_u32(out, 32); spv_push_u32(out, 0); // %3 = i32
+    spv_instr(out, 4, spv_op_type_int()); spv_push_u32(out, 4); spv_push_u32(out, 64); spv_push_u32(out, 0); // %4 = i64
+    spv_instr(out, 4, spv_op_type_vector()); spv_push_u32(out, 5); spv_push_u32(out, 4); spv_push_u32(out, 3); // %5 = vec3(i64)
+    spv_instr(out, 4, spv_op_type_pointer()); spv_push_u32(out, 6); spv_push_u32(out, spv_storage_input()); spv_push_u32(out, 5); // %6 = ptr(Input, vec3)
+    spv_instr(out, 4, spv_op_type_pointer()); spv_push_u32(out, 7); spv_push_u32(out, spv_storage_input()); spv_push_u32(out, 4); // %7 = ptr(Input, i64)
+    spv_instr(out, 4, spv_op_type_pointer()); spv_push_u32(out, 8); spv_push_u32(out, spv_storage_cross_workgroup()); spv_push_u32(out, 3); // %8 = ptr(CrossWorkgroup, i32)
+
+    // OpTypeFunction: Result Type, Result ID, Return Type, Param Types...
+    // %9 = fn(void, ptr_cwg_i32, i32, i32) — wc = 2 + 4 = 6
+    spv_instr(out, 6, spv_op_type_function()); spv_push_u32(out, 9);
+    spv_push_u32(out, 1); // return: void
+    spv_push_u32(out, 8); // param: ptr_cwg_i32
+    spv_push_u32(out, 3); // param: i32
+    spv_push_u32(out, 3); // param: i32
+
+    // Constants — i64(0) needs 2 value words (64-bit literal)
+    // OpConstant: Result Type, Result ID, Value (2 words for i64)
+    spv_instr(out, 5, spv_op_constant()); spv_push_u32(out, 4); spv_push_u32(out, 10); spv_push_u32(out, 0); spv_push_u32(out, 0); // %10 = i64(0)
+
+    // Variables
+    // %11 = gl_GlobalInvocationID
+    spv_instr(out, 4, spv_op_variable()); spv_push_u32(out, 6); spv_push_u32(out, 11); spv_push_u32(out, spv_storage_input());
+
+    // Function — OpFunction: Result Type, Result ID, Function Control, Function Type
+    spv_instr(out, 5, spv_op_function()); spv_push_u32(out, 1); spv_push_u32(out, 12); spv_push_u32(out, 0); spv_push_u32(out, 9); // %12 = fillKernel
+
+    // Function parameters — OpFunctionParameter: Result Type, Result ID
+    spv_instr(out, 3, spv_op_function_parameter()); spv_push_u32(out, 8); spv_push_u32(out, 13); // %13 = out (ptr_cwg_i32)
+    spv_instr(out, 3, spv_op_function_parameter()); spv_push_u32(out, 3); spv_push_u32(out, 14); // %14 = value (i32)
+    spv_instr(out, 3, spv_op_function_parameter()); spv_push_u32(out, 3); spv_push_u32(out, 15); // %15 = count (i32)
+
+    // Entry label
+    spv_instr(out, 2, spv_op_label()); spv_push_u32(out, 16);
+
+    // %17 = AccessChain(%7, %11, %10) — &gl_GlobalInvocationID.x
+    spv_instr(out, 5, spv_op_access_chain());
+    spv_push_u32(out, 7); spv_push_u32(out, 17); spv_push_u32(out, 11); spv_push_u32(out, 10);
+
+    // %18 = Load(i64, %17)
+    spv_instr(out, 4, spv_op_load()); spv_push_u32(out, 4); spv_push_u32(out, 18); spv_push_u32(out, 17);
+
+    // %19 = SConvert(i32, %18) — truncate i64 to i32
+    // OpSConvert: Result Type, Result ID, Operand
+    spv_instr(out, 4, spv_op_s_convert()); spv_push_u32(out, 3); spv_push_u32(out, 19); spv_push_u32(out, 18);
+
+    // %20 = SLessThan(bool, %19, %15)
+    spv_instr(out, 5, spv_op_s_less_than());
+    spv_push_u32(out, 2); spv_push_u32(out, 20); spv_push_u32(out, 19); spv_push_u32(out, 15);
+
+    // OpSelectionMerge(%21, None)
+    spv_instr(out, 3, spv_op_selection_merge());
+    spv_push_u32(out, 21); spv_push_u32(out, 0);
+
+    // BranchConditional(%20, %22, %21)
+    spv_instr(out, 4, spv_op_branch_conditional());
+    spv_push_u32(out, 20); spv_push_u32(out, 22); spv_push_u32(out, 21);
+
+    // True label
+    spv_instr(out, 2, spv_op_label()); spv_push_u32(out, 22);
+
+    // %23 = PtrAccessChain(%8, %13, %19) — out + idx (pointer arithmetic)
+    // OpPtrAccessChain: Result Type, Result ID, Base, Index
+    spv_instr(out, 5, spv_op_ptr_access_chain());
+    spv_push_u32(out, 8); spv_push_u32(out, 23); spv_push_u32(out, 13); spv_push_u32(out, 19);
+
+    // Store(%23, %14) — out[idx] = value
+    spv_instr(out, 3, spv_op_store()); spv_push_u32(out, 23); spv_push_u32(out, 14);
+
+    // Branch(%21)
+    spv_instr(out, 2, spv_op_branch()); spv_push_u32(out, 21);
+
+    // False/merge label
+    spv_instr(out, 2, spv_op_label()); spv_push_u32(out, 21);
+
+    // Return
+    spv_instr(out, 1, spv_op_return());
+
+    // FunctionEnd
+    spv_instr(out, 1, spv_op_function_end());
+}
+
+// ── public entry points ─────────────────────────────────────────────────────
+fn emit_spirv(src: []u8, errors: *i32) ArrayList[u8] {
+    let decls: ArrayList[*Node] = parse_program(src);
+    let out: ArrayList[u8] = make[u8](256);
+    let profile: i32 = spv_find_profile(decls);
+    if (profile == 0) {
+        _zag_println("znc[spirv]: unsupported kernel: require exactly one reviewed bounded fill @kernel; loops, host effects, unsafe pointers, and unknown forms are rejected");
+        errors.* = errors.* + 1;
+        return out;
+    }
+    if (profile == 1) {
+        spv_emit_fill_spirv(&out);
+    } else {
+        _zag_println("znc[spirv]: only the fill profile is implemented for SPIR-V emission");
+        errors.* = errors.* + 1;
+        return out;
+    }
+    return out;
+}
+
+fn emit_spirv_dir(src: []u8, base_dir: []u8, errors: *i32) ArrayList[u8] {
+    let decls: ArrayList[*Node] = parse_program_dir(src, base_dir);
+    let out: ArrayList[u8] = make[u8](256);
+    let profile: i32 = spv_find_profile(decls);
+    if (profile == 0) {
+        _zag_println("znc[spirv]: unsupported kernel: require exactly one reviewed bounded fill @kernel; loops, host effects, unsafe pointers, and unknown forms are rejected");
+        errors.* = errors.* + 1;
+        return out;
+    }
+    if (profile == 1) {
+        spv_emit_fill_spirv(&out);
+    } else {
+        _zag_println("znc[spirv]: only the fill profile is implemented for SPIR-V emission");
+        errors.* = errors.* + 1;
+        return out;
+    }
+    return out;
+}
+
+// OpenCL-specific SPIR-V emission (Kernel capability, Physical64, OpenCL memory model)
+fn emit_spirv_opencl(src: []u8, errors: *i32) ArrayList[u8] {
+    let decls: ArrayList[*Node] = parse_program(src);
+    let out: ArrayList[u8] = make[u8](256);
+    let profile: i32 = spv_find_profile(decls);
+    if (profile == 0) {
+        _zag_println("znc[spirv/opencl]: unsupported kernel: require exactly one reviewed bounded fill @kernel; loops, host effects, unsafe pointers, and unknown forms are rejected");
+        errors.* = errors.* + 1;
+        return out;
+    }
+    if (profile == 1) {
+        let kname: []u8 = spv_find_kernel_name(decls);
+        spv_emit_fill_spirv_opencl(&out, kname);
+    } else {
+        _zag_println("znc[spirv/opencl]: only the fill profile is implemented for SPIR-V emission");
+        errors.* = errors.* + 1;
+        return out;
+    }
+    return out;
+}
+
+fn emit_spirv_opencl_dir(src: []u8, base_dir: []u8, errors: *i32) ArrayList[u8] {
+    let decls: ArrayList[*Node] = parse_program_dir(src, base_dir);
+    let out: ArrayList[u8] = make[u8](256);
+    let profile: i32 = spv_find_profile(decls);
+    if (profile == 0) {
+        _zag_println("znc[spirv/opencl]: unsupported kernel: require exactly one reviewed bounded fill @kernel; loops, host effects, unsafe pointers, and unknown forms are rejected");
+        errors.* = errors.* + 1;
+        return out;
+    }
+    if (profile == 1) {
+        let kname: []u8 = spv_find_kernel_name(decls);
+        spv_emit_fill_spirv_opencl(&out, kname);
+    } else {
+        _zag_println("znc[spirv/opencl]: only the fill profile is implemented for SPIR-V emission");
+        errors.* = errors.* + 1;
+        return out;
+    }
+    return out;
+}

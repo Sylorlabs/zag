@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# Documentation guardrails supplement executable tests; they never count as
+# GPU/runtime evidence.  They prevent known false support claims from returning
+# while the implementation matrix remains fail-closed.
+set -eu
+cd "$(dirname "$0")/.."
+pass=0 fail=0
+
+ok() { echo "  ok  $1"; pass=$((pass + 1)); }
+bad() { echo "  XX  $1"; fail=$((fail + 1)); }
+
+if [ -f docs/V2_FINAL_VERIFICATION.md ] && \
+   rg -q 'Do not release Zag v2' docs/V2_FINAL_VERIFICATION.md; then
+  ok "v2 verification matrix is present and fail-closed"
+else
+  bad "v2 verification matrix is missing or release-positive"
+fi
+
+if rg -q 'GPU MLIR output is not a GPU executable or dispatch runtime' README.md && \
+   rg -q 'GPU MLIR is not physical GPU execution' README.md; then
+  ok "public compiler documentation labels GPU output as frontend-only"
+else
+  bad "public compiler documentation lacks GPU frontend-only boundary"
+fi
+
+if ! rg -q 'real launch_func' tests/run_native_gpu.sh && \
+   rg -q 'frontend structure only; no runtime launch' tests/run_native_gpu.sh; then
+  ok "GPU frontend test does not claim a runtime launch"
+else
+  bad "GPU frontend test label overclaims execution"
+fi
+
+if rg -q 'No physical GPU execution was performed or implemented' docs/V2_AUDIT.md && \
+   rg -q 'GPU target binary and physical dispatch.*UNSUPPORTED' docs/V2_FINAL_VERIFICATION.md; then
+  ok "audit and verification matrix agree on physical GPU status"
+else
+  bad "GPU status disagrees between audit and verification matrix"
+fi
+
+if [ -f docs/V2_SAFETY_TOOLING.md ] && \
+   rg -q 'partial `--sanitize=memory` mode are' docs/V2_SAFETY_TOOLING.md && \
+   rg -q 'Other sanitizer modes remain rejected' docs/V2_SAFETY_TOOLING.md && \
+   rg -q '16-byte trailing red zone' docs/V2_SAFETY_TOOLING.md && \
+   rg -q 'does not yet provide leading red zones' docs/V2_SAFETY_TOOLING.md && \
+   rg -q 'tombstoned address' docs/V2_SAFETY_TOOLING.md && \
+   rg -q 'cumulative checked-lifetime budget' docs/V2_SAFETY_TOOLING.md && \
+   rg -q '`--sanitize=undefined` is not implemented and is rejected' docs/V2_SAFETY_TOOLING.md && \
+   rg -q '`--sanitize=thread` is not implemented and is rejected' docs/V2_SAFETY_TOOLING.md && \
+   rg -q '`--safety=release` is not implemented and is rejected' docs/V2_SAFETY_TOOLING.md && \
+   rg -q 'Current status remains unsupported' docs/V2_SAFETY_TOOLING.md; then
+  ok "safety-tooling document scopes partial memory sanitizer and unsupported modes"
+else
+  bad "safety-tooling document is missing or overclaims implementation"
+fi
+
+if rg -q 'raw-pointer BSS globals' docs/V2_IMPLEMENTATION_PLAN.md && \
+   rg -q 'raw-pointer globals' docs/V2_FINAL_VERIFICATION.md && \
+   rg -U -q 'raw-pointer\s+global cell above is an exception' docs/V2_MEMORY_MODEL.md; then
+  ok "v2 memory documents retain the narrow pointer-global boundary"
+else
+  bad "v2 memory documents are stale about supported pointer globals"
+fi
+
+if [ -f docs/V2_SUPPORT_MATRIX.generated.md ] && \
+   rg -q 'REQUIRED FAILURE: UNSUPPORTED' docs/V2_SUPPORT_MATRIX.generated.md; then
+  ok "generated support matrix retains required unsupported failures"
+else
+  bad "generated support matrix is missing or masks unsupported requirements"
+fi
+
+if [ -f docs/V2_MIGRATION.md ] && \
+   rg -q 'v1 is frozen' docs/V2_MIGRATION.md && \
+   rg -q 'intentionally blocked by E0201' docs/V2_MIGRATION.md; then
+  ok "migration guide preserves frozen-v1 and fail-closed boundary"
+else
+  bad "migration guide is missing or permits an unsupported v2 migration"
+fi
+
+if [ -f docs/V2_FFI_GUIDE.md ] && [ -f docs/V2_CONCURRENCY_GUIDE.md ] && \
+   [ -f docs/V2_ALLOCATOR_GUIDE.md ] && \
+   rg -q 'not implemented' docs/V2_FFI_GUIDE.md && \
+   rg -q '@atomicExchange64' docs/V2_CONCURRENCY_GUIDE.md && \
+   rg -q 'not yet the complete allocator model' docs/V2_ALLOCATOR_GUIDE.md; then
+  ok "low-level guides scope implemented allocator surface and unsupported APIs"
+else
+  bad "low-level guides are missing or overclaim implementation"
+fi
+
+if [ -f docs/V2_GPU_GUIDE.md ] && [ -f docs/V2_CPU_CONTROL_GUIDE.md ] && \
+   rg -q 'does not currently execute a GPU kernel' docs/V2_GPU_GUIDE.md && \
+   rg -q 'direct Linux AMDGPU DRM' docs/V2_GPU_GUIDE.md && \
+   rg -q 'direct Linux AMDGPU DRM' docs/V2_GPU_MODEL.md && \
+   rg -q 'not implemented in v2' docs/V2_CPU_CONTROL_GUIDE.md; then
+  ok "GPU and CPU-control guides distinguish plans from implementation and retain the direct-DRM boundary"
+else
+  bad "GPU or CPU-control guide is missing, overclaims support, or contradicts the direct-DRM boundary"
+fi
+
+if [ -f docs/V2_TARGET_SUPPORT.md ] && \
+   rg -q 'not a GPU execution backend' docs/V2_TARGET_SUPPORT.md && \
+   rg -q '| Vulkan compute | no runtime implementation | unsupported |' docs/V2_TARGET_SUPPORT.md; then
+  ok "target support matrix marks GPU runtime targets unsupported"
+else
+  bad "target support matrix is missing or overclaims GPU runtime support"
+fi
+
+if rg -q 'allowlist is .*`env`' docs/ZAGSCRIPT_SEMANTICS.md && \
+   rg -q '`args\(\)` materializes a typed `ScriptList\[\[\]u8\]`' docs/ZAGSCRIPT_SEMANTICS.md && \
+   ! rg -q 'materialized argument collection.*remain[s]? candidate' docs/ZAGSCRIPT_SEMANTICS.md; then
+  ok "Zag Script prelude documentation matches implemented env and args bindings"
+else
+  bad "Zag Script prelude documentation is stale or contradicts env and args implementation"
+fi
+
+if [ -x tests/run_i686_release_gate.sh ] && \
+   rg -q 'run_i686_release_gate.sh' README.md docs/X86_TARGET_POLICY.md docs/X86_FEATURES.md tests/run_zagscript_master_gate.sh && \
+   rg -q 'ZAG_I686_REFERENCE_TOOLS=0' tests/run_i686_release_gate.sh && \
+   rg -q 'Not certified: full language/public C ABI parity, dynamic/TLS linking, ARM' tests/run_i686_release_gate.sh && \
+   rg -q 'Full i686 target.*not complete' docs/X86_TARGET_POLICY.md; then
+  ok "i686 authority is wired without overclaiming parity or host-tool evidence"
+else
+  bad "i686 authority wiring or support boundary is stale"
+fi
+
+if [ -x tests/run_v1_compatibility_gate.sh ] && \
+   rg -q 'run_v1_compatibility_gate.sh' tests/run_zagscript_master_gate.sh README.md && \
+   rg -q 'run_native_arm64.sh' tests/run_v1_compatibility_gate.sh && \
+   rg -q 'run_arm64_selfhost.sh' tests/run_v1_compatibility_gate.sh && \
+   rg -q 'run_abi_layout.sh' tests/run_v1_compatibility_gate.sh; then
+  ok "master gate covers distinct existing v1 and ARM compatibility authorities"
+else
+  bad "master gate omits distinct existing v1 compatibility authority"
+fi
+
+echo "════ docs-consistency pass=$pass fail=$fail ════"
+[ "$fail" -eq 0 ]

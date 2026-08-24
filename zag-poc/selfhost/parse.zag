@@ -8,6 +8,9 @@
 @import("ast.zag")
 @import("lex.zag")
 @import("diag.zag")
+@import("script_syntax.zag")
+@import("package_resolve.zag")
+@import("vsa_type.zag")
 
 struct Parser {
     toks:     ArrayList[Token],
@@ -15,6 +18,17 @@ struct Parser {
     closures: ArrayList[*Node],   // closure literals hoisted to top-level fns
     cctr:     i32,                // unique-name counter for hoisted closures
     fn_eff:   []u8,               // effect row of the most recently parsed fn type ("" if none/non-fn)
+    consts:   ArrayList[[]u8],    // top-level `const` names → desugared to nullary fns; bare refs auto-call
+    unsafe_next: i32,              // top-level `unsafe fn` marker consumed by parse_fn
+    pipe_op: i32,               // allow `|` as an operator when parsing expressions
+    origin:   []u8,                // module currently being parsed
+    base_dir: []u8,              // directory of the current file (for #embed path resolution)
+    source:   []u8,              // normalized source for structured diagnostics
+    resources: *ArrayList[ResolvedResource], // shared compilation resource identity
+    origins: *ArrayList[NodeOrigin], // parsed-node compact provenance across modules
+    origin_projection:ArrayList[ZsOriginSegment], // normalized bytes -> compact source
+    compact_source:[]u8,
+    compact_cst:ZsCst,
 }
 
 // ── cursor helpers ──────────────────────────────────────────────────────────
@@ -24,10 +38,234 @@ fn at_k(p: *Parser, k: Tk) bool { return cur_code(p) == tk_code(k); }
 fn at_op(p: *Parser, s: []u8) bool { return at_k(p, Tk.Op) && @strEq(cur(p).val, s); }
 fn adv(p: *Parser) Token {
     let t: Token = cur(p);
+    // Every parser production consumes through this helper.  Treating EOF as
+    // a hard syntax error prevents malformed source from advancing past the
+    // sentinel token and crashing the compiler through an out-of-bounds token
+    // fetch.  Structured recovery belongs to the future typed frontend; this
+    // is the minimal fail-closed boundary for the native parser.
+    if (tk_code(t.kind) == tk_code(Tk.Eof)) {
+        _zag_eprintln("E0001: unexpected end of input while parsing source");
+        _zag_exit(1);
+    }
     p.*.i = p.*.i + 1;
     return t;
 }
 fn eat_semi(p: *Parser) void { if (at_k(p, Tk.Semi)) { let _t: Token = adv(p); } }
+
+fn annotation_error(p:*Parser,annot:Token,message:[]u8,note:[]u8,hint:[]u8)void{
+    diag_emit("E0010",message,p.*.origin,annot.line,annot.col,annot.val.len,note,hint,p.*.source);
+    _zag_exit(1);
+}
+
+// Consume one declaration annotation and retain a canonical spelling. Most
+// metadata accepts a balanced parenthesized token payload. Resource relations
+// are intentionally narrower: the release operation is one plain identifier,
+// never a string, expression, member access, or comma-separated guess.
+fn parse_annotation_value(p:*Parser)[]u8{
+    let annot:Token=adv(p);
+    if(@strEq(annot.val,"@owned")||@strEq(annot.val,"@acquires")){
+        if(!at_k(p,Tk.Lp)){
+            annotation_error(p,annot,_zag_str_concat(annot.val," requires a release-function relation"),
+                "resource relations have one explicit release function",
+                _zag_str_concat("write `",_zag_str_concat(annot.val,"(release_fn)`")));
+        }
+        let _lp:Token=adv(p);
+        if(!at_k(p,Tk.Ident)){
+            annotation_error(p,annot,_zag_str_concat(annot.val," requires one plain release-function identifier"),
+                "qualified names, strings, expressions, and empty relations are not resource contracts",
+                _zag_str_concat("write `",_zag_str_concat(annot.val,"(release_fn)`")));
+        }
+        let release:Token=adv(p);
+        if(!at_k(p,Tk.Rp)){
+            annotation_error(p,annot,_zag_str_concat(annot.val," accepts exactly one plain release-function identifier"),
+                "resource relation arguments cannot contain member access, expressions, or extra values",
+                _zag_str_concat("write `",_zag_str_concat(annot.val,"(release_fn)`")));
+        }
+        let _rp:Token=adv(p);
+        return _zag_str_concat(annot.val,_zag_str_concat("(",_zag_str_concat(release.val,")")));
+    }
+    if((@strEq(annot.val,"@resource")||@strEq(annot.val,"@retained_by_return"))&&at_k(p,Tk.Lp)){
+        annotation_error(p,annot,_zag_str_concat(annot.val," does not accept arguments"),
+            "this marker is an exact edition-2027 contract",
+            _zag_str_concat("write `",_zag_str_concat(annot.val,"` without parentheses")));
+    }
+    if(!at_k(p,Tk.Lp)){return annot.val;}
+    let value:[]u8=_zag_str_concat(annot.val,"(");
+    let _lp:Token=adv(p);let depth:i32=1;
+    while(depth>0){
+        if(at_k(p,Tk.Eof)){
+            annotation_error(p,annot,_zag_str_concat("unterminated annotation arguments for `",_zag_str_concat(annot.val,"`")),
+                "annotation argument parentheses must balance before the declaration",
+                "close every annotation argument list with `)`");
+        }
+        let part:Token=adv(p);
+        if(tk_code(part.kind)==tk_code(Tk.Lp)){depth=depth+1;value=_zag_str_concat(value,"(");}
+        else if(tk_code(part.kind)==tk_code(Tk.Rp)){depth=depth-1;value=_zag_str_concat(value,")");}
+        else{value=_zag_str_concat(value,part.val);}
+    }
+    return value;
+}
+
+// Flash and other source frontends preserve declaration metadata as leading
+// annotations. Peek through those annotations and an optional `pub` without
+// consuming the parser so top-level dispatch reaches the real declaration
+// production instead of treating an annotation token as `fn`.
+fn annotated_decl_is(p: *Parser, kind: Tk) bool {
+    let save: i32 = p.*.i;
+    let scanning: i32 = 1;
+    while (scanning == 1) {
+        if (at_k(p, Tk.Annot)) {
+            let _a: Token = adv(p);
+            // Parameterized declaration metadata is part of the prefix.
+            // Balance every annotation, not just @repr(C), so a following
+            // annotation or declaration keyword remains visible.
+            if (at_k(p, Tk.Lp)) {
+                let depth: i32 = 0;
+                while (!at_k(p, Tk.Eof)) {
+                    if (at_k(p, Tk.Lp)) { depth = depth + 1; let _lp: Token = adv(p); }
+                    else if (at_k(p, Tk.Rp)) {
+                        depth = depth - 1; let _rp: Token = adv(p);
+                        if (depth == 0) { break; }
+                    } else { let _arg: Token = adv(p); }
+                }
+            }
+        } else if (at_k(p, Tk.KwPub)) {
+            let _pub: Token = adv(p);
+        } else if (at_k(p, Tk.KwExtern) && tk_code(kind) == tk_code(Tk.KwFn)) {
+            let _extern: Token = adv(p);
+        } else if (at_k(p, Tk.Ident) && @strEq(cur(p).val, "unsafe")
+            && tk_code(kind) == tk_code(Tk.KwFn)) {
+            let _unsafe: Token = adv(p);
+        } else {
+            scanning = 0;
+        }
+    }
+    let hit: bool = at_k(p, kind);
+    p.*.i = save;
+    return hit;
+}
+
+// A dimensioned hardware type has the exact lexical form `vsa_b<Int>`.
+// Do not treat an ordinary comparison following a cast, such as
+// `(value as i64) < limit`, as a type suffix.
+fn dimensioned_hardware_type_ahead(p: *Parser, name: []u8) bool {
+    if (!@strEq(name, "vsa_b") || !at_op(p, "<")) { return false; }
+    if (p.*.i + 2 >= p.*.toks.len) { return false; }
+    let dimension: Token = p.*.toks.data[p.*.i + 1];
+    let close: Token = p.*.toks.data[p.*.i + 2];
+    return tk_code(dimension.kind) == tk_code(Tk.Int) &&
+        tk_code(close.kind) == tk_code(Tk.Op) && @strEq(close.val, ">");
+}
+
+fn node_origin_stable_id(module:[]u8,start:i32,end:i32,kind:i32)i64{
+    let h:i64=1469598103934665603;let i:i32=0;
+    while(i<module.len){h=(h ^ (module[i] as i64))*1099511628211;i=i+1;}
+    h=(h ^ (start as i64))*1099511628211;h=(h ^ (end as i64))*1099511628211;
+    h=(h ^ (kind as i64))*1099511628211;if(h<0){return 0-h;}return h;
+}
+
+struct ParserOriginSpan{start:i32,end:i32,line:i32,col:i32,exact:i32}
+
+fn parser_source_line_col(p:*Parser,pos:i32)ParserOriginSpan{
+    // CST tokens are sorted by compact-source offset.  The former byte scan
+    // made provenance marking quadratic in the source length because every
+    // parsed expression walked from byte zero to its start position.
+    let lo0:i32=0;let hi0:i32=p.*.compact_cst.tokens.len;let lo:i32=lo0;let hi:i32=hi0;
+    while(lo<hi){
+        let mid:i32=lo+(hi-lo)/2;let tok:ZsCstToken=p.*.compact_cst.tokens.data[mid];
+        if(tok.byte_end<=pos){lo=mid+1;}else{hi=mid;}
+    }
+    if(lo<p.*.compact_cst.tokens.len){
+        let tok:ZsCstToken=p.*.compact_cst.tokens.data[lo];
+        if(tok.byte_start<=pos&&pos<tok.byte_end){
+            return ParserOriginSpan{.start=pos,.end=pos,.line=tok.line,
+                .col=tok.col+(pos-tok.byte_start),.exact=0};
+        }
+        return ParserOriginSpan{.start=pos,.end=pos,.line=tok.line,.col=tok.col,.exact=0};
+    }
+    if(p.*.compact_cst.tokens.len>0){
+        let tok:ZsCstToken=p.*.compact_cst.tokens.data[p.*.compact_cst.tokens.len-1];
+        return ParserOriginSpan{.start=pos,.end=pos,.line=tok.line,.col=tok.col,.exact=0};
+    }
+    return ParserOriginSpan{.start=pos,.end=pos,.line=1,.col=1,.exact=0};
+}
+
+fn parser_project_span(p:*Parser,start:i32,end:i32)ParserOriginSpan{
+    let projected_start:i32=-1;let projected_end:i32=-1;let exact:i32=1;
+    // Origin segments are emitted in generated-source order. Find the first
+    // segment that can overlap, then inspect only the local span rather than
+    // rescanning the complete projection for every AST node.
+    let lo0:i32=0;let hi0:i32=p.*.origin_projection.len;let lo:i32=lo0;let hi:i32=hi0;
+    while(lo<hi){
+        let mid:i32=lo+(hi-lo)/2;let seg:ZsOriginSegment=p.*.origin_projection.data[mid];
+        if(seg.generated_end<=start){lo=mid+1;}else{hi=mid;}
+    }
+    let i:i32=lo;
+    while(i<p.*.origin_projection.len){let s:ZsOriginSegment=p.*.origin_projection.data[i];
+        if(s.generated_start>=end){break;}
+        if(s.generated_start<end&&s.generated_end>start){
+            let ss:i32=s.source_start;let se:i32=s.source_end;
+            // Byte-identical segments retain exact offsets. Rewritten lines
+            // map conservatively to their compact non-whitespace content.
+            if(s.exact==1){
+                let lo:i32=start;if(lo<s.generated_start){lo=s.generated_start;}
+                let hi:i32=end;if(hi>s.generated_end){hi=s.generated_end;}
+                ss=s.source_start+(lo-s.generated_start);se=s.source_start+(hi-s.generated_start);
+            }else{exact=0;
+                while(ss<se&&(p.*.compact_source[ss]==32||p.*.compact_source[ss]==9)){ss=ss+1;}
+                while(se>ss&&(p.*.compact_source[se-1]==10||p.*.compact_source[se-1]==13||
+                    p.*.compact_source[se-1]==32||p.*.compact_source[se-1]==9)){se=se-1;}
+            }
+            if(projected_start<0||ss<projected_start){projected_start=ss;}
+            if(projected_end<0||se>projected_end){projected_end=se;}
+        }
+        i=i+1;
+    }
+    if(projected_start<0){projected_start=start;projected_end=end;exact=0;}
+    let lc:ParserOriginSpan=parser_source_line_col(p,projected_start);
+    return ParserOriginSpan{.start=projected_start,.end=projected_end,.line=lc.line,.col=lc.col,.exact=exact};
+}
+
+fn parser_cst_overlaps(p:*Parser,start:i32,end:i32)i32{
+    let lo0:i32=0;let hi0:i32=p.*.compact_cst.tokens.len;let lo:i32=lo0;let hi:i32=hi0;
+    while(lo<hi){
+        let mid:i32=lo+(hi-lo)/2;let tok:ZsCstToken=p.*.compact_cst.tokens.data[mid];
+        if(tok.byte_end<=start){lo=mid+1;}else{hi=mid;}
+    }
+    if(lo<p.*.compact_cst.tokens.len){
+        let tok:ZsCstToken=p.*.compact_cst.tokens.data[lo];
+        if(tok.byte_start<end&&tok.byte_end>start){return 1;}
+    }
+    return 0;
+}
+
+fn parser_mark(p:*Parser,node:*Node,start_index:i32) *Node{
+    let n:i32=p.*.toks.len;if(n==0){return node;}
+    let si:i32=start_index;if(si<0){si=0;}if(si>=n){si=n-1;}
+    let ei:i32=p.*.i-1;if(ei<si){ei=si;}if(ei>=n){ei=n-1;}
+    let first:Token=p.*.toks.data[si];let last:Token=p.*.toks.data[ei];
+    let end:i32=last.byte_end;if(end<first.byte_start){end=first.byte_end;}
+    let span:ParserOriginSpan=parser_project_span(p,first.byte_start,end);
+    let span_exact:i32=span.exact;
+    if(parser_cst_overlaps(p,span.start,span.end)==0){span_exact=0;}
+    push[NodeOrigin](p.*.origins,NodeOrigin{.node=node,.module=p.*.origin,
+        .line=span.line,.col=span.col,.byte_start=span.start,.byte_end=span.end,
+        .stable_id=node_origin_stable_id(p.*.origin,span.start,span.end,node_code(node)),.exact=span_exact});
+    return node;
+}
+
+fn node_origin_find(origins:ArrayList[NodeOrigin],node:*Node)NodeOrigin{
+    let i:i32=origins.len-1;while(i>=0){let o:NodeOrigin=origins.data[i];
+        if(o.node==node){return o;}i=i-1;}
+    return NodeOrigin{.node=node,.module="",.line=0,.col=0,.byte_start=0,
+        .byte_end=0,.stable_id=0,.exact=0};
+}
+
+fn node_origin_clone(origins:*ArrayList[NodeOrigin],from:*Node,to:*Node)void{
+    let o:NodeOrigin=node_origin_find(origins.*,from);if(o.stable_id==0){return;}
+    push[NodeOrigin](origins,NodeOrigin{.node=to,.module=o.module,.line=o.line,
+        .col=o.col,.byte_start=o.byte_start,.byte_end=o.byte_end,.stable_id=o.stable_id,.exact=o.exact});
+}
 
 // Index of the ']' matching the '[' at index `open` (depth-aware), or -1.
 fn matching_bracket(p: *Parser, open: i32) i32 {
@@ -108,10 +346,53 @@ fn parse_fn_type(p: *Parser) []u8 {
     return s;
 }
 
+// Edition validation remains in typed.zag, but the grammar is exact here so a
+// duplicate or misspelled lifetime qualifier cannot be laundered into a type
+// name. The qualifier sits after `:` and before the type:
+// `data: @borrows *const u8`.
+fn parse_param_contract(p:*Parser)[]u8{
+    if(!at_k(p,Tk.Annot)){return "";}
+    let annot:Token=cur(p);let raw:[]u8=annot.val;
+    if(!@strEq(raw,"@borrows")&&!@strEq(raw,"@borrows_mut")&&!@strEq(raw,"@consumes")&&
+        !@strEq(raw,"@retained_by_return")&&!@strEq(raw,"@owned")){
+        diag_emit("E0010",_zag_str_concat("unknown parameter or field contract `",_zag_str_concat(raw,"`")),p.*.origin,
+            annot.line,annot.col,raw.len,"parameter and field contracts are exact and edition-gated",
+            "use @borrows, @borrows_mut, @consumes, @retained_by_return, or @owned(release_fn) before the type",p.*.source);
+        _zag_exit(1);
+    }
+    if(!@strEq(raw,"@owned")&&p.*.i+1<len[Token](p.*.toks)&&
+        tk_code(get[Token](p.*.toks,p.*.i+1).kind)==tk_code(Tk.Lp)){
+        annotation_error(p,annot,_zag_str_concat(raw," does not accept arguments"),
+            "this parameter contract is an exact edition-2027 marker",
+            _zag_str_concat("write `",_zag_str_concat(raw,"` before the type")));
+    }
+    let value:[]u8=parse_annotation_value(p);
+    if(at_k(p,Tk.Annot)){
+        diag_emit("E0010","a parameter or field may declare only one lifetime/resource contract",p.*.origin,
+            cur(p).line,cur(p).col,cur(p).val.len,"borrow, consume, retain, and ownership relations are mutually exclusive on one declaration subject",
+            "keep exactly one parameter or field contract",p.*.source);
+        _zag_exit(1);
+    }
+    return value;
+}
+
 // ── types (returns the type as a []u8 string) ───────────────────────────────
 fn parse_type(p: *Parser) []u8 {
     if (at_k(p, Tk.KwFn)) { return parse_fn_type(p); }
-    if (at_op(p, "*")) { let _t: Token = adv(p); return _zag_str_concat("*", parse_type(p)); }
+    if (at_op(p, "*")) {
+        let _t: Token = adv(p);
+        if (at_k(p, Tk.Ident) && (@strEq(cur(p).val, "const") || @strEq(cur(p).val, "mut") ||
+            @strEq(cur(p).val, "device") || @strEq(cur(p).val, "workgroup") ||
+            @strEq(cur(p).val, "host"))) {
+            let qual: []u8 = adv(p).val;
+            return _zag_str_concat(_zag_str_concat("*", _zag_str_concat(qual, " ")), parse_type(p));
+        }
+        if (at_k(p, Tk.Ident) && @strEq(cur(p).val, "opaque")) {
+            let _q: Token = adv(p);
+            return "*opaque";
+        }
+        return _zag_str_concat("*", parse_type(p));
+    }
     if (at_op(p, "?")) { let _t: Token = adv(p); return _zag_str_concat("?", parse_type(p)); }
     if (at_op(p, "!")) { let _t: Token = adv(p); return _zag_str_concat("!", parse_type(p)); }
     if (at_k(p, Tk.Lbracket)) {
@@ -125,6 +406,28 @@ fn parse_type(p: *Parser) []u8 {
     if (at_k(p, Tk.Dot)) {
         let _d: Token = adv(p);
         nm = _zag_str_concat(_zag_str_concat(nm, "__"), adv(p).val);
+    }
+    // Dimensioned hardware type application: vsa_b<10000>. This is distinct
+    // from generic type arguments because the payload is a compile-time
+    // integer dimension, not a type. Preserve one canonical spelling so every
+    // semantic/backend path sees the same type instead of stray `<`, integer,
+    // and `>` tokens leaking into following parameters.
+    if (dimensioned_hardware_type_ahead(p, nm)) {
+        let _lt: Token = adv(p);
+        let dimension_token: Token = adv(p);
+        let dimension_text: []u8 = dimension_token.val;
+        let _gt: Token = adv(p);
+        let dimensioned: []u8 = _zag_str_concat(_zag_str_concat(
+            _zag_str_concat(nm, "<"), dimension_text), ">");
+        if (vsa_type_valid(dimensioned) == 0) {
+            diag_emit("E0203", "invalid vsa_b<N> dimension", p.*.origin,
+                dimension_token.line, dimension_token.col, dimension_text.len,
+                "N must be canonical positive decimal in the supported implementation range",
+                "use vsa_b<N> with 1 <= N <= 1048576 and no sign, separators, or leading zeroes",
+                p.*.source);
+            _zag_exit(1);
+        }
+        return dimensioned;
     }
     // generic type application: Base[T1,T2]
     if (at_k(p, Tk.Lbracket)) {
@@ -150,17 +453,19 @@ fn op_prec(op: []u8) i32 {
     if (@strEq(op, "==") || @strEq(op, "!=")) { return 3; }
     if (@strEq(op, "<") || @strEq(op, ">") || @strEq(op, "<=") || @strEq(op, ">=")) { return 4; }
     if (@strEq(op, "|") || @strEq(op, "^") || @strEq(op, "&")) { return 4; }
-    if (@strEq(op, "+") || @strEq(op, "-")) { return 5; }
-    if (@strEq(op, "*") || @strEq(op, "/") || @strEq(op, "%")) { return 6; }
+    if (@strEq(op, "<<") || @strEq(op, ">>")) { return 5; }
+    if (@strEq(op, "+") || @strEq(op, "-")) { return 6; }
+    if (@strEq(op, "*") || @strEq(op, "/") || @strEq(op, "%")) { return 7; }
     return 0;
 }
 
 fn parse_expr(p: *Parser) *Node {
+    let start:i32=p.*.i;
     let e: *Node = parse_bin(p, 1);
     // `opt orelse default` — lowest precedence; modeled as Bin("orelse", ...)
     if (at_k(p, Tk.KwOrelse)) {
         let _o: Token = adv(p);
-        return mk_bin("orelse", e, parse_bin(p, 1));
+        return parser_mark(p,mk_bin("orelse", e, parse_bin(p, 1)),start);
     }
     // `result catch fallback` / `result catch |err| fallback` (error unions).
     // Lowered to a call to a codegen-recognised pseudo-builtin so no new AST node
@@ -176,28 +481,35 @@ fn parse_expr(p: *Parser) *Node {
             push[*Node](&args, e);
             push[*Node](&args, mk_ident(cap));
             push[*Node](&args, fb);
-            return mk_call(mk_ident("__catchc"), args);
+            return parser_mark(p,mk_call(mk_ident("__catchc"), args),start);
         }
         let fb: *Node = parse_bin(p, 1);
         let args: ArrayList[*Node] = make[*Node](2);
         push[*Node](&args, e);
         push[*Node](&args, fb);
-        return mk_call(mk_ident("__catch"), args);
+        return parser_mark(p,mk_call(mk_ident("__catch"), args),start);
     }
     return e;
 }
 
 fn parse_bin(p: *Parser, min: i32) *Node {
+    let start:i32=p.*.i;
     let left: *Node = parse_unary(p);
     let go: bool = true;
     while (go) {
-        if (at_k(p, Tk.Op)) {
+        // `|` lexes as Tk.Pipe (capture delimiter); in expression position it
+        // is the bitwise-or operator. Every capture context (`if (x) |v|`,
+        // `catch |e|`, switch arms, closure lists) consumes its pipes before
+        // reaching here, so this is unambiguous.
+        let is_op: bool = at_k(p, Tk.Op);
+        if (!is_op && p.*.pipe_op == 1 && at_k(p, Tk.Pipe)) { is_op = true; }
+        if (is_op) {
             let op: []u8 = cur(p).val;
             let prec: i32 = op_prec(op);
             if (prec > 0 && prec >= min) {
                 let _t: Token = adv(p);
                 let right: *Node = parse_bin(p, prec + 1);
-                left = mk_bin(op, left, right);
+                left = parser_mark(p,mk_bin(op, left, right),start);
             } else {
                 go = false;
             }
@@ -209,26 +521,28 @@ fn parse_bin(p: *Parser, min: i32) *Node {
 }
 
 fn parse_unary(p: *Parser) *Node {
+    let start:i32=p.*.i;
     // `try expr` — propagate an error union upward (lowered as Un("try", expr))
     if (at_k(p, Tk.KwTry)) {
         let _t: Token = adv(p);
-        return mk_un("try", parse_unary(p));
+        return parser_mark(p,mk_un("try", parse_unary(p)),start);
     }
     if (at_op(p, "-") || at_op(p, "!") || at_op(p, "&")) {
         let op: []u8 = adv(p).val;
-        return mk_un(op, parse_unary(p));
+        return parser_mark(p,mk_un(op, parse_unary(p)),start);
     }
     return parse_postfix(p);
 }
 
 fn parse_postfix(p: *Parser) *Node {
+    let start:i32=p.*.i;
     let e: *Node = parse_primary(p);
     let go: bool = true;
     while (go) {
         // cast: expr as Type  (`as` lexes as a plain identifier)
         if (at_k(p, Tk.Ident) && @strEq(cur(p).val, "as")) {
             let _as: Token = adv(p);
-            e = mk_cast(e, parse_type(p));
+            e = parser_mark(p,mk_cast(e, parse_type(p)),start);
         } else if (at_k(p, Tk.Lp)) {
             let _o: Token = adv(p);
             let args: ArrayList[*Node] = make[*Node](4);
@@ -237,7 +551,7 @@ fn parse_postfix(p: *Parser) *Node {
                 if (at_k(p, Tk.Comma)) { let _c: Token = adv(p); }
             }
             let _r: Token = adv(p);
-            e = mk_call(e, args);
+            e = parser_mark(p,mk_call(e, args),start);
         } else if (at_k(p, Tk.Lbracket)) {
             // Disambiguate generic call `foo[T1,T2](args)` from index `arr[i]`:
             // if the matching ']' is immediately followed by '(', it's a generic call.
@@ -257,7 +571,7 @@ fn parse_postfix(p: *Parser) *Node {
                     if (at_k(p, Tk.Comma)) { let _c: Token = adv(p); }
                 }
                 let _cp: Token = adv(p);  // )
-                e = mk_gcall(e, cargs, targs);
+                e = parser_mark(p,mk_gcall(e, cargs, targs),start);
             } else {
                 let _o: Token = adv(p);          // [
                 let lo: *Node = parse_expr(p);
@@ -268,16 +582,16 @@ fn parse_postfix(p: *Parser) *Node {
                     let has_hi: i32 = 0;
                     if (!at_k(p, Tk.Rbracket)) { hi = parse_expr(p); has_hi = 1; }
                     let _r: Token = adv(p);      // ]
-                    e = mk_slice(e, lo, hi, has_hi);
+                    e = parser_mark(p,mk_slice(e, lo, hi, has_hi),start);
                 } else {
                     let _r: Token = adv(p);      // ]
-                    e = mk_index(e, lo);
+                    e = parser_mark(p,mk_index(e, lo),start);
                 }
             }
         } else if (at_k(p, Tk.Dot)) {
             let _d: Token = adv(p);
             let fname: []u8 = adv(p).val;
-            e = mk_field(e, fname);
+            e = parser_mark(p,mk_field(e, fname),start);
         } else {
             go = false;
         }
@@ -290,6 +604,7 @@ fn parse_postfix(p: *Parser) *Node {
 // pointer). Captures are recorded but, in the plain-pointer model, only an empty
 // capture list `[]` is sound (a capturing closure needs an environment).
 fn parse_closure(p: *Parser) *Node {
+    let start:i32=p.*.i;
     let _fn: Token = adv(p);    // fn
     let _ob: Token = adv(p);    // [
     let ncaps: i32 = 0;
@@ -317,9 +632,11 @@ fn parse_closure(p: *Parser) *Node {
     while (!at_k(p, Tk.Rp)) {
         let pn: []u8 = adv(p).val;
         let _co: Token = adv(p);    // :
+        let contract: []u8 = parse_param_contract(p);
         p.*.fn_eff = "";
         let pt: []u8 = parse_type(p);
-        push[Param](&params, Param{ .name = pn, .pty = pt, .eff = p.*.fn_eff, .calign = 0 });
+        push[Param](&params, Param{ .name = pn, .pty = pt, .eff = p.*.fn_eff,
+            .contract = contract, .calign = 0 });
         if (at_k(p, Tk.Comma)) { let _c: Token = adv(p); }
     }
     let _rp: Token = adv(p);    // )
@@ -336,32 +653,90 @@ fn parse_closure(p: *Parser) *Node {
         _zag_exit(1);
     }
     let body: ArrayList[*Node] = parse_block(p);
-    let name: []u8 = _zag_str_concat("__clos_", _zag_i64_to_str(p.*.cctr as i64));
+    // Capturing closures carry an owned heap environment in native lowering.
+    // The distinct private prefix lets the v2 ownership pass require `close`
+    // without imposing it on ordinary captureless function values.
+    let clos_prefix: []u8 = "__clos_";
+    if (ncaps > 0) { clos_prefix = "__clos_cap_"; }
+    let name: []u8 = _zag_str_concat(clos_prefix, _zag_i64_to_str(p.*.cctr as i64));
     p.*.cctr = p.*.cctr + 1;
     let fd: *Node = new(Node{ .fn_decl = FnDecl{
         .name = name, .tparams = make[[]u8](1), .params = params, .ret = ret,
         .annots = make[[]u8](1), .body = body, .is_extern = 0, .ret_eff = reff, .caps = ncaps,
         .cap_names = capnames, .cap_types = "", .line = _fn.line } });
     push[*Node](&p.*.closures, fd);
-    return mk_ident(name);
+    let _marked_fd:*Node=parser_mark(p,fd,start);
+    return parser_mark(p,mk_ident(name),start);
+}
+
+fn embed_error(p:*Parser,t:Token,msg:[]u8,note:[]u8,hint:[]u8)void{
+    diag_emit("E0017",msg,p.*.origin,t.line,t.col,t.val.len,note,hint,p.*.source);
+    _zag_exit(1);
+}
+
+fn unsupported_async_surface(p:*Parser,t:Token)void{
+    diag_emit("E0030",
+        _zag_str_concat("`",_zag_str_concat(t.val,"` syntax is not available in ZagScript 1.0")),
+        p.*.origin,t.line,t.col,t.val.len,
+        "the current concurrency contract is library-only cooperative cancellation and bounded join/channel primitives",
+        "use std:cancel_token_i64 or std:channel_i64_cancel explicitly; async/await lowering is not implemented",
+        p.*.source);
+    _zag_exit(1);
 }
 
 fn parse_primary(p: *Parser) *Node {
+    let start:i32=p.*.i;
+    if (at_k(p,Tk.KwAsync)||at_k(p,Tk.KwAwait)) {
+        let t:Token=adv(p);unsupported_async_surface(p,t);
+    }
     if (at_k(p, Tk.KwFn)) { return parse_closure(p); }      // closure literal (expression)
     if (at_k(p, Tk.KwSwitch)) { return parse_switch(p); }   // switch as an expression
-    if (at_k(p, Tk.Int))   { return mk_int(adv(p).val); }
-    if (at_k(p, Tk.Float)) { return mk_int(adv(p).val); }
-    if (at_k(p, Tk.Str))   { return mk_str(adv(p).val); }
+    if (at_k(p, Tk.Hash)) {
+        // #embed("file.bin") — compile-time binary file inclusion.
+        // Reads the file at parse time and produces an EmbedLit node
+        // whose data is the raw file contents (a []u8 slice at runtime).
+        let hash: Token = adv(p);                 // #
+        if(!at_k(p,Tk.Ident)){embed_error(p,hash,"expected `embed` after `#`","resource embedding uses exactly `#embed(\"relative/path\")`","replace the directive with a valid #embed expression");}
+        let nametok:Token=adv(p);
+        if (!@strEq(nametok.val, "embed")) {
+            embed_error(p,nametok,_zag_str_concat("unknown resource directive `#",_zag_str_concat(nametok.val,"`")),"only #embed is defined","use `#embed(\"relative/path\")`");
+        }
+        if(!at_k(p,Tk.Lp)){embed_error(p,cur(p),"expected `(` after `#embed`","resource embedding accepts exactly one string literal","use `#embed(\"relative/path\")`");}
+        let _lp: Token = adv(p);
+        if(!at_k(p,Tk.Str)){embed_error(p,cur(p),"#embed path must be a string literal","computed and environment-dependent resource paths are not reproducible","use a non-empty relative string literal");}
+        let pathtok: Token = adv(p);
+        if(!at_k(p,Tk.Rp)){embed_error(p,cur(p),"expected `)` after #embed path","#embed accepts exactly one path","remove extra arguments or add the closing parenthesis");}
+        let _rp: Token = adv(p);
+        let relpath: []u8 = strip_quotes(pathtok.val);
+        if(relpath.len==0){embed_error(p,pathtok,"#embed path cannot be empty","empty paths have no stable resource identity","name a source-relative resource file");}
+        if(relpath[0]=='/'){embed_error(p,pathtok,"#embed path must be relative","absolute paths make builds machine-dependent","place the resource in the project and use a source-relative path");}
+        // The formatter parses expressions without a file origin. Preserve the
+        // exact literal there without touching the filesystem.
+        if(p.*.origin.len==0){return parser_mark(p,mk_embed(pathtok.val,"",""),start);}
+        // Unlike @import, an embedded asset never searches a sibling lib/
+        // directory. The source-relative spelling is the complete contract.
+        let resolved: []u8 = canon_path(join_path(p.*.base_dir, relpath));
+        let data: []u8 = _zag_read_file(resolved);
+        if (data.len < 0) {
+            embed_error(p,pathtok,_zag_str_concat("#embed cannot read `",_zag_str_concat(resolved,"`")),"resources resolve relative to the source file and do not use import search paths","add the file or correct the relative path");
+        }
+        if(data.len>67108864){embed_error(p,pathtok,"#embed resource exceeds the 64 MiB limit","bounded resources protect compiler memory and reproducibility","split or compress the resource, or use a runtime asset contract");}
+        push[ResolvedResource](p.*.resources,ResolvedResource{.path=resolved,.data=data});
+        return parser_mark(p,mk_embed(pathtok.val,resolved,data),start);
+    }
+    if (at_k(p, Tk.Int))   { return parser_mark(p,mk_int(adv(p).val),start); }
+    if (at_k(p, Tk.Float)) { return parser_mark(p,mk_int(adv(p).val),start); }
+    if (at_k(p, Tk.Str))   { return parser_mark(p,mk_str(adv(p).val),start); }
     if (at_k(p, Tk.Ident)) {
         let name: []u8 = adv(p).val;
         // plain struct literal:  Name{ .field = expr, ... }
-        if (at_k(p, Tk.Lbrace)) { return parse_struct_lit(p, name, make[[]u8](1)); }
+        if (at_k(p, Tk.Lbrace)) { return parse_struct_lit(p, name, make[[]u8](1),start); }
         // generic struct literal:  Name[T1,T2]{ ... }
         if (at_k(p, Tk.Lbracket)) {
             let close: i32 = matching_bracket(p, p.*.i);
             if (lbrace_at(p, close + 1)) {
                 let targs: ArrayList[[]u8] = parse_targs(p);
-                return parse_struct_lit(p, name, targs);
+                return parse_struct_lit(p, name, targs,start);
             }
         }
         // module-qualified struct literal: mod.Type{ ... } or mod.Type[T]{ ... }
@@ -371,7 +746,7 @@ fn parse_primary(p: *Parser) *Node {
             if (lbrace_at(p, p.*.i + 2)) {
                 let _d: Token = adv(p);            // .
                 let qn: []u8 = qpref(name, adv(p).val);
-                return parse_struct_lit(p, qn, make[[]u8](1));
+                return parse_struct_lit(p, qn, make[[]u8](1),start);
             }
             if (lbracket_at(p, p.*.i + 2)) {
                 let close: i32 = matching_bracket(p, p.*.i + 2);
@@ -379,20 +754,22 @@ fn parse_primary(p: *Parser) *Node {
                     let _d: Token = adv(p);        // .
                     let qn: []u8 = qpref(name, adv(p).val);
                     let targs: ArrayList[[]u8] = parse_targs(p);
-                    return parse_struct_lit(p, qn, targs);
+                    return parse_struct_lit(p, qn, targs,start);
                 }
             }
         }
-        return mk_ident(name);
+        // bare reference to a top-level `const` → auto-call its desugared nullary fn.
+        if (p_is_const(p, name)) { return parser_mark(p,mk_call(mk_ident(name), make[*Node](1)),start); }
+        return parser_mark(p,mk_ident(name),start);
     }
-    if (at_k(p, Tk.KwTrue))  { let _t: Token = adv(p); return mk_ident("true"); }
-    if (at_k(p, Tk.KwFalse)) { let _t: Token = adv(p); return mk_ident("false"); }
-    if (at_k(p, Tk.KwNull))  { let _t: Token = adv(p); return mk_ident("null"); }
+    if (at_k(p, Tk.KwTrue))  { let _t: Token = adv(p); return parser_mark(p,mk_ident("true"),start); }
+    if (at_k(p, Tk.KwFalse)) { let _t: Token = adv(p); return parser_mark(p,mk_ident("false"),start); }
+    if (at_k(p, Tk.KwNull))  { let _t: Token = adv(p); return parser_mark(p,mk_ident("null"),start); }
     // `error.Name` — postfix `.Name` turns this into Field(ident "error", Name)
-    if (at_k(p, Tk.KwError)) { let _t: Token = adv(p); return mk_ident("error"); }
+    if (at_k(p, Tk.KwError)) { let _t: Token = adv(p); return parser_mark(p,mk_ident("error"),start); }
     // @-builtin in expression position: @strEq(..), @sizeOf[T](), @len(..), ...
     // Returned as an ident; parse_postfix turns the following ( or [T]( into a call.
-    if (at_k(p, Tk.Annot))   { return mk_ident(adv(p).val); }
+    if (at_k(p, Tk.Annot))   { return parser_mark(p,mk_ident(adv(p).val),start); }
     if (at_k(p, Tk.Lp)) {
         let _o: Token = adv(p);
         let e: *Node = parse_expr(p);
@@ -400,10 +777,10 @@ fn parse_primary(p: *Parser) *Node {
         return e;
     }
     // fallback: treat unknown token as an identifier so parsing makes progress
-    return mk_ident(adv(p).val);
+    return parser_mark(p,mk_ident(adv(p).val),start);
 }
 
-fn parse_struct_lit(p: *Parser, name: []u8, targs: ArrayList[[]u8]) *Node {
+fn parse_struct_lit(p: *Parser, name: []u8, targs: ArrayList[[]u8],start:i32) *Node {
     let _o: Token = adv(p);  // {
     let fields: ArrayList[FieldInit] = make[FieldInit](4);
     while (!at_k(p, Tk.Rbrace)) {
@@ -415,32 +792,157 @@ fn parse_struct_lit(p: *Parser, name: []u8, targs: ArrayList[[]u8]) *Node {
         if (at_k(p, Tk.Comma)) { let _c: Token = adv(p); }
     }
     let _r: Token = adv(p);  // }
-    return new(Node{ .slit_ = StructLit{ .sname = name, .fields = fields, .targs = targs } });
+    return parser_mark(p,new(Node{ .slit_ = StructLit{ .sname = name, .fields = fields, .targs = targs } }),start);
 }
 
 // ── statements / blocks ─────────────────────────────────────────────────────
+// is `name` a registered top-level const? (bare refs to it auto-call the nullary fn)
+fn p_is_const(p: *Parser, name: []u8) bool {
+    let i: i32 = 0;
+    while (i < len[[]u8](p.*.consts)) {
+        if (@strEq(get[[]u8](p.*.consts, i), name)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+// Top-level `const NAME[: T] = expr;` → desugar to nullary `fn NAME() T { return expr; }`.
+// The name is registered so bare references `NAME` auto-call it (parse_primary). Type is the
+// annotation if given, else inferred from the value's leading token (Float→f32, Str→[]u8, else i32).
+fn parse_const(p: *Parser) *Node {
+    let start:i32=p.*.i;
+    let _c: Token = adv(p);          // const
+    let name: []u8 = adv(p).val;     // NAME
+    let ty: []u8 = "";
+    let has_ty: i32 = 0;
+    if (at_k(p, Tk.Colon)) { let _co: Token = adv(p); ty = parse_type(p); has_ty = 1; }
+    let _eq: Token = adv(p);         // =
+    if (has_ty == 0) {
+        if (at_k(p, Tk.Float)) { ty = "f32"; }
+        else { if (at_k(p, Tk.Str)) { ty = "[]u8"; } else { ty = "i32"; } }
+    }
+    let val: *Node = parse_expr(p);
+    if (at_k(p, Tk.Semi)) { let _s: Token = adv(p); }
+    push[[]u8](&p.*.consts, name);
+    let body: ArrayList[*Node] = make[*Node](1);
+    push[*Node](&body, mk_ret(1, val));
+    let annots: ArrayList[[]u8] = make[[]u8](1);
+    // Preserve const identity after desugaring so imported references can be
+    // lowered as nullary value calls rather than first-class function values.
+    push[[]u8](&annots, "_zag_desugared_const");
+    return parser_mark(p,new(Node{ .fn_decl = FnDecl{
+        .name = name, .tparams = make[[]u8](1), .params = make[Param](1), .ret = ty,
+        .annots = annots, .body = body, .is_extern = 0, .ret_eff = "", .caps = 0,
+        .cap_names = "", .cap_types = "", .line = _c.line } }),start);
+}
+
+// forward decl: parse_for desugars a `for` into let+while and is mutually
+// recursive with parse_block (a for body is itself a block).
+fn parse_for(p: *Parser, script_collection: i32) ArrayList[*Node];
+
 fn parse_block(p: *Parser) ArrayList[*Node] {
     let _o: Token = adv(p);  // {
     let stmts: ArrayList[*Node] = make[*Node](8);
     while (!at_k(p, Tk.Rbrace)) {
-        push[*Node](&stmts, parse_stmt(p));
+        // `for` is desugared to `let`+`while` and expands to MULTIPLE statements,
+        // so it's handled here (parse_stmt returns a single node).
+        if (at_k(p, Tk.KwFor)) {
+            let ex: ArrayList[*Node] = parse_for(p, 0);
+            let ei: i32 = 0;
+            while (ei < len[*Node](ex)) { push[*Node](&stmts, get[*Node](ex, ei)); ei = ei + 1; }
+        } else {
+            push[*Node](&stmts, parse_stmt(p));
+        }
     }
     let _c: Token = adv(p);  // }
     return stmts;
+}
+
+// Desugar `for`:
+//   for (lo..hi) |i| { B }   →   let i:i64 = lo;  while (i < hi)  { B; i = i+1; }
+//   for (xs)     |x| { B }   →   let __fiN:i64=0; while (__fiN < xs.len) { let x = xs[__fiN]; B; __fiN=__fiN+1; }
+// Returns the desugared statement list. No new AST node / no codegen change.
+fn parse_for(p: *Parser, script_collection: i32) ArrayList[*Node] {
+    let _f: Token = adv(p);   // for
+    let _o: Token = adv(p);   // (
+    let old_pipe_op: i32 = p.*.pipe_op;
+    p.*.pipe_op = 0;
+    let first: *Node = parse_expr(p);
+    p.*.pipe_op = old_pipe_op;
+    let is_range: i32 = 0;
+    let hi: *Node = first;
+    if (at_k(p, Tk.DotDot)) {
+        let _dd: Token = adv(p);   // ..
+        hi = parse_expr(p);
+        is_range = 1;
+    }
+    let _cp: Token = adv(p);  // )
+    // capture: optional |name|
+    let cap: []u8 = "";
+    let has_cap: i32 = 0;
+    if (at_k(p, Tk.Pipe)) {
+        let _p1: Token = adv(p);
+        cap = adv(p).val;
+        let _p2: Token = adv(p);
+        has_cap = 1;
+    }
+    let body: ArrayList[*Node] = parse_block(p);
+    let out: ArrayList[*Node] = make[*Node](2);
+
+    if (is_range == 1) {
+        // counter name = the capture, or a synthetic one if the index is unused.
+        let cvar: []u8 = cap;
+        if (has_cap == 0) {
+            p.*.cctr = p.*.cctr + 1;
+            cvar = _zag_str_concat("__fi_", _zag_i64_to_str(p.*.cctr as i64));
+        }
+        push[*Node](&out, mk_let(cvar, "i64", 1, 1, first));
+        push[*Node](&body, mk_assign(mk_ident(cvar), mk_bin("+", mk_ident(cvar), mk_int("1"))));
+        push[*Node](&out, mk_while(mk_bin("<", mk_ident(cvar), hi), body));
+    } else {
+        // collection iteration: synthetic index, element bound to the capture.
+        p.*.cctr = p.*.cctr + 1;
+        let idx: []u8 = _zag_str_concat("__fi_", _zag_i64_to_str(p.*.cctr as i64));
+        push[*Node](&out, mk_let(idx, "i64", 1, 1, mk_int("0")));
+        let wbody: ArrayList[*Node] = make[*Node](len[*Node](body) + 2);
+        if (has_cap == 1) {
+            if (script_collection == 1) {
+                let item_args: ArrayList[*Node] = make[*Node](2);
+                push[*Node](&item_args, first);
+                push[*Node](&item_args, mk_ident(idx));
+                push[*Node](&wbody, mk_let(cap, "", 0, 1, mk_call(mk_ident("item_at"), item_args)));
+            } else {
+                push[*Node](&wbody, mk_let(cap, "", 0, 1, mk_index(first, mk_ident(idx))));
+            }
+        }
+        let bi: i32 = 0;
+        while (bi < len[*Node](body)) { push[*Node](&wbody, get[*Node](body, bi)); bi = bi + 1; }
+        push[*Node](&wbody, mk_assign(mk_ident(idx), mk_bin("+", mk_ident(idx), mk_int("1"))));
+        if (script_collection == 1) {
+            let len_args: ArrayList[*Node] = make[*Node](1);
+            push[*Node](&len_args, first);
+            push[*Node](&out, mk_while(mk_bin("<", mk_ident(idx), mk_call(mk_ident("script_list_len"), len_args)), wbody));
+        } else {
+            push[*Node](&out, mk_while(mk_bin("<", mk_ident(idx), mk_field(first, "len")), wbody));
+        }
+    }
+    return out;
 }
 
 // Arm body: a block { ... } or a bare expression (wrapped as an estmt). A bare
 // expression arm may be followed by a comma.
 fn parse_arm_body(p: *Parser) ArrayList[*Node] {
     if (at_k(p, Tk.Lbrace)) { return parse_block(p); }
+    let start:i32=p.*.i;
     let body: ArrayList[*Node] = make[*Node](1);
-    push[*Node](&body, mk_estmt(parse_expr(p)));
+    push[*Node](&body, parser_mark(p,mk_estmt(parse_expr(p)),start));
     if (at_k(p, Tk.Comma)) { let _c: Token = adv(p); }
     return body;
 }
 
 // switch (subject) { .tag => |cap| body  ...  else => body }
 fn parse_switch(p: *Parser) *Node {
+    let start:i32=p.*.i;
     let _sw: Token = adv(p);   // switch
     let _o: Token = adv(p);    // (
     let subject: *Node = parse_expr(p);
@@ -478,11 +980,19 @@ fn parse_switch(p: *Parser) *Node {
         }
     }
     let _rb: Token = adv(p);   // }
-    return mk_switch(subject, arms, els_body, has_els);
+    return parser_mark(p,mk_switch(subject, arms, els_body, has_els),start);
 }
 
 fn parse_stmt(p: *Parser) *Node {
+    let start:i32=p.*.i;
     if (at_k(p, Tk.KwSwitch)) { return parse_switch(p); }
+    // V2 lexical unsafe block. Keep the boundary explicit so every semantic
+    // and lowering consumer must intentionally preserve or reject it.
+    if (at_k(p, Tk.Ident) && @strEq(cur(p).val, "unsafe")) {
+        let _u: Token = adv(p);
+        let body: ArrayList[*Node] = parse_block(p);
+        return parser_mark(p,mk_unsafe(body),start);
+    }
     // `@cacheAlign(N) let x: T = ...` — pin a hot local to its own cache line.
     let calign: i32 = cache_align_opt(p);
     if (at_k(p, Tk.KwLet)) {
@@ -506,7 +1016,7 @@ fn parse_stmt(p: *Parser) *Node {
             has_init = 1;
         }
         eat_semi(p);
-        return new(Node{ .let_ = Let{ .name = name, .dty = dty, .has_dty = has_dty, .has_init = has_init, .expr = e, .eff = leff, .calign = calign } });
+        return parser_mark(p,new(Node{ .let_ = Let{ .name = name, .dty = dty, .has_dty = has_dty, .has_init = has_init, .expr = e, .eff = leff, .calign = calign, .is_global = 0 } }),start);
     }
     if (at_k(p, Tk.KwReturn)) {
         let _t: Token = adv(p);
@@ -518,7 +1028,7 @@ fn parse_stmt(p: *Parser) *Node {
             e = parse_expr(p);
         }
         eat_semi(p);
-        return new(Node{ .ret = Return{ .has_expr = has_expr, .expr = e } });
+        return parser_mark(p,new(Node{ .ret = Return{ .has_expr = has_expr, .expr = e } }),start);
     }
     if (at_k(p, Tk.KwIf)) {
         let _t: Token = adv(p);
@@ -546,7 +1056,29 @@ fn parse_stmt(p: *Parser) *Node {
                 els_body = parse_block(p);
             }
         }
-        return new(Node{ .if_ = If{ .cond = cond, .then_body = then_body, .els_body = els_body, .has_els = has_els, .cap = cap, .has_cap = has_cap } });
+        return parser_mark(p,new(Node{ .if_ = If{ .cond = cond, .then_body = then_body, .els_body = els_body, .has_els = has_els, .cap = cap, .has_cap = has_cap } }),start);
+    }
+    if (at_k(p, Tk.KwBreak)) {
+        let _b: Token = adv(p);
+        eat_semi(p);
+        return parser_mark(p,mk_break(),start);
+    }
+    if (at_k(p, Tk.KwContinue)) {
+        let _c: Token = adv(p);
+        eat_semi(p);
+        return parser_mark(p,mk_continue(),start);
+    }
+    if (at_k(p, Tk.KwDefer)) {
+        let _d: Token = adv(p);
+        let e: *Node = parse_expr(p);
+        eat_semi(p);
+        return parser_mark(p,mk_defer(e, 0),start);
+    }
+    if (at_k(p, Tk.KwErrdefer)) {
+        let _d: Token = adv(p);
+        let e: *Node = parse_expr(p);
+        eat_semi(p);
+        return parser_mark(p,mk_defer(e, 1),start);
     }
     if (at_k(p, Tk.KwWhile)) {
         let _t: Token = adv(p);
@@ -562,7 +1094,7 @@ fn parse_stmt(p: *Parser) *Node {
             let _wp2: Token = adv(p);   // |
         }
         let body: ArrayList[*Node] = parse_block(p);
-        return new(Node{ .while_ = While{ .cond = cond, .body = body, .cap = wcap, .has_cap = whas_cap } });
+        return parser_mark(p,new(Node{ .while_ = While{ .cond = cond, .body = body, .cap = wcap, .has_cap = whas_cap } }),start);
     }
     // assignment or bare expression
     let e: *Node = parse_expr(p);
@@ -570,16 +1102,65 @@ fn parse_stmt(p: *Parser) *Node {
         let _eq: Token = adv(p);
         let rhs: *Node = parse_expr(p);
         eat_semi(p);
-        return mk_assign(e, rhs);
+        return parser_mark(p,mk_assign(e, rhs),start);
     }
     eat_semi(p);
-    return mk_estmt(e);
+    return parser_mark(p,mk_estmt(e),start);
+}
+
+// File-scope storage is deliberately a distinct declaration.  It is only
+// reached from parse_file's `global let` branch; ordinary `let` remains a
+// statement and strict top-level `let` continues to fail closed.
+fn parse_global_let(p: *Parser) *Node {
+    let start:i32=p.*.i;
+    let _global: Token = adv(p);
+    if (!at_k(p, Tk.KwLet)) {
+        diag_emit("E0204", "global declaration must use `global let name: Type;`", "", cur(p).line, cur(p).col, cur(p).val.len, "global storage must declare an explicit type", "write `global let name: Type;`", "");
+        _zag_exit(1);
+    }
+    let _let: Token = adv(p);
+    let name: []u8 = adv(p).val;
+    if (!at_k(p, Tk.Colon)) {
+        diag_emit("E0204", "global storage requires an explicit type", "", cur(p).line, cur(p).col, cur(p).val.len, "global inference and dynamic initialization have no v2 lifetime contract", "write `global let name: Type;`", "");
+        _zag_exit(1);
+    }
+    let _colon: Token = adv(p);
+    p.*.fn_eff = "";
+    let dty: []u8 = parse_type(p);
+    let leff: []u8 = p.*.fn_eff;
+    let has_init: i32 = 0;
+    let e: *Node = mk_ident("");
+    if (at_op(p, "=")) {
+        let _eq: Token = adv(p);
+        e = parse_expr(p);
+        has_init = 1;
+    }
+    eat_semi(p);
+    return parser_mark(p,new(Node{ .let_ = Let{ .name = name, .dty = dty, .has_dty = 1, .has_init = has_init, .expr = e, .eff = leff, .calign = 0, .is_global = 1 } }),start);
 }
 
 // ── declarations ────────────────────────────────────────────────────────────
 fn parse_fn(p: *Parser, is_pub: i32) *Node {
+    let start:i32=p.*.i;
+    let annots: ArrayList[[]u8] = make[[]u8](2);
+    let pub_flag: i32 = is_pub;
     let is_extern: i32 = 0;
-    if (at_k(p, Tk.KwExtern)) { let _e: Token = adv(p); is_extern = 1; }
+    let prefix: i32 = 1;
+    while (prefix == 1) {
+        if (at_k(p, Tk.Annot)) { push[[]u8](&annots, parse_annotation_value(p)); }
+        else if (at_k(p, Tk.KwPub)) { let _pub: Token = adv(p); pub_flag = 1; }
+        else if (at_k(p, Tk.KwExtern)) { let _e: Token = adv(p); is_extern = 1; }
+        else if (at_k(p, Tk.Ident) && @strEq(cur(p).val, "unsafe")) {
+            let _unsafe: Token = adv(p); p.*.unsafe_next = 1;
+        }
+        else { prefix = 0; }
+    }
+    if (!at_k(p, Tk.KwFn)) {
+        diag_emit("E0010", "function annotations and modifiers must precede `fn`", p.*.origin,
+            cur(p).line, cur(p).col, cur(p).val.len, "the declaration prefix did not resolve to a function",
+            "place `fn` after the declaration annotations and modifiers", p.*.source);
+        _zag_exit(1);
+    }
     let _fn: Token = adv(p);  // fn
     // method receiver: `fn (self: T) name(args) ret` — the receiver becomes the
     // first param and the C name is mangled to `T_name` (matches the bootstrap).
@@ -608,21 +1189,27 @@ fn parse_fn(p: *Parser, is_pub: i32) *Node {
     }
     let _o: Token = adv(p);  // (
     let params: ArrayList[Param] = make[Param](4);
-    if (is_method == 1) { push[Param](&params, Param{ .name = recv_name, .pty = recv_ty, .eff = "", .calign = 0 }); }
+    if (is_method == 1) { push[Param](&params, Param{ .name = recv_name, .pty = recv_ty,
+        .eff = "", .contract = "", .calign = 0 }); }
     while (!at_k(p, Tk.Rp)) {
         let pn: []u8 = adv(p).val;
         let _co: Token = adv(p);  // :
+        let contract: []u8 = parse_param_contract(p);
         p.*.fn_eff = "";
         let pt: []u8 = parse_type(p);
-        push[Param](&params, Param{ .name = pn, .pty = pt, .eff = p.*.fn_eff, .calign = 0 });
+        push[Param](&params, Param{ .name = pn, .pty = pt, .eff = p.*.fn_eff,
+            .contract = contract, .calign = 0 });
         if (at_k(p, Tk.Comma)) { let _c: Token = adv(p); }
     }
     let _r: Token = adv(p);  // )
     p.*.fn_eff = "";
     let ret: []u8 = parse_type(p);
     let reff: []u8 = p.*.fn_eff;
-    let annots: ArrayList[[]u8] = make[[]u8](2);
-    while (at_k(p, Tk.Annot)) { push[[]u8](&annots, adv(p).val); }
+    while (at_k(p, Tk.Annot)) { push[[]u8](&annots, parse_annotation_value(p)); }
+    if (p.*.unsafe_next == 1) {
+        push[[]u8](&annots, "@unsafe");
+        p.*.unsafe_next = 0;
+    }
     let body: ArrayList[*Node] = make[*Node](8);
     if (is_extern == 1) {
         eat_semi(p);
@@ -632,15 +1219,23 @@ fn parse_fn(p: *Parser, is_pub: i32) *Node {
     } else {
         body = parse_block(p);
     }
-    return new(Node{ .fn_decl = FnDecl{ .name = name, .tparams = tparams, .params = params, .ret = ret, .annots = annots, .body = body, .is_extern = is_extern, .ret_eff = reff, .caps = 0, .cap_names = "", .cap_types = "", .line = _fn.line, .is_pub = is_pub } });
+    return parser_mark(p,new(Node{ .fn_decl = FnDecl{ .name = name, .tparams = tparams, .params = params, .ret = ret, .annots = annots, .body = body, .is_extern = is_extern, .ret_eff = reff, .caps = 0, .cap_names = "", .cap_types = "", .line = _fn.line, .is_pub = pub_flag, .origin = p.*.origin } }),start);
+}
+
+fn parse_unsafe_fn(p: *Parser, is_pub: i32) *Node {
+    let start:i32=p.*.i;
+    let _unsafe: Token = adv(p);
+    p.*.unsafe_next = 1;
+    return parser_mark(p,parse_fn(p, is_pub),start);
 }
 
 // Optional `@cacheAlign(N)` prefix → N (a positive integer), else 0. Consumes
 // the `@cacheAlign ( N )` tokens when present. Pins a hot field / local to its
 // own cache line (codegen lowers to C11 `_Alignas(N)`). Pure hint, no effect.
 fn cache_align_opt(p: *Parser) i32 {
-    if (at_k(p, Tk.Annot) && @strEq(cur(p).val, "@cacheAlign")) {
-        let _a: Token = adv(p);   // @cacheAlign
+    if (at_k(p, Tk.Annot) && (@strEq(cur(p).val, "@cacheAlign") ||
+        @strEq(cur(p).val, "@align"))) {
+        let _a: Token = adv(p);   // @cacheAlign or @align
         let _o: Token = adv(p);   // (
         let n: i32 = _zag_str_to_i64(adv(p).val) as i32;   // N
         let _c: Token = adv(p);   // )
@@ -661,18 +1256,71 @@ fn parse_field_list(p: *Parser) ArrayList[Param] {
         let feff: []u8 = "";
         if (at_k(p, Tk.Colon)) {
             let _co: Token = adv(p);
+            let contract: []u8 = parse_param_contract(p);
             p.*.fn_eff = "";
             ft = parse_type(p);
             feff = p.*.fn_eff;
+            push[Param](&fields, Param{ .name = fname, .pty = ft, .eff = feff,
+                .contract = contract, .calign = cal });
+        } else {
+            push[Param](&fields, Param{ .name = fname, .pty = ft, .eff = feff,
+                .contract = "", .calign = cal });
         }
-        push[Param](&fields, Param{ .name = fname, .pty = ft, .eff = feff, .calign = cal });
         if (at_k(p, Tk.Comma)) { let _c: Token = adv(p); }
     }
     let _rb: Token = adv(p);  // }
     return fields;
 }
 
-fn parse_struct(p: *Parser, is_pub: i32) *Node {
+fn parse_struct(p: *Parser, is_pub: i32, repr_c: i32) *Node {
+    let start:i32=p.*.i;
+    let annots: ArrayList[[]u8] = make[[]u8](2);
+    let pub_flag: i32 = is_pub;
+    let repr_flag: i32 = repr_c;
+    let prefix: i32 = 1;
+    while (prefix == 1) {
+        if (at_k(p, Tk.Annot)) {
+            let annot: Token = cur(p);
+            if (@strEq(annot.val, "@repr")) {
+                let _repr:Token=adv(p);
+                if (repr_flag == 1 || !at_k(p, Tk.Lp)) {
+                    diag_emit("E0018", "expected one explicit struct representation annotation", p.*.origin,
+                        annot.line, annot.col, annot.val.len, "the representation must be C or packed",
+                        "write `@repr(C) struct Name { ... }` or `@repr(packed) struct Name { ... }`", p.*.source);
+                    _zag_exit(1);
+                }
+                let _lp: Token = adv(p);
+                let abi: Token = adv(p);
+                if ((!@strEq(abi.val, "C") && !@strEq(abi.val, "packed")) || !at_k(p, Tk.Rp)) {
+                    diag_emit("E0018", "only `@repr(C)` and `@repr(packed)` are implemented", p.*.origin,
+                        abi.line, abi.col, abi.val.len, "packed and target-specific representations remain unavailable",
+                        "use `@repr(C)` or `@repr(packed)`", p.*.source);
+                    _zag_exit(1);
+                }
+                let _rp: Token = adv(p);
+                if (@strEq(abi.val, "C")) { repr_flag = 1; }
+                else { push[[]u8](&annots, "@repr(packed)"); }
+            } else {
+                push[[]u8](&annots, parse_annotation_value(p));
+            }
+        } else if (at_k(p, Tk.KwPub)) {
+            let _pub: Token = adv(p); pub_flag = 1;
+        } else {
+            prefix = 0;
+        }
+    }
+    if (!at_k(p, Tk.KwStruct)) {
+        if (repr_flag == 1) {
+            diag_emit("E0018", "`@repr(C)` applies only to a struct declaration", p.*.origin,
+                cur(p).line, cur(p).col, cur(p).val.len, "enums, unions, functions, and aliases need separate ABI contracts",
+                "place `struct` after the declaration annotations", p.*.source);
+        } else {
+            diag_emit("E0010", "struct annotations and modifiers must precede `struct`", p.*.origin,
+                cur(p).line, cur(p).col, cur(p).val.len, "the declaration prefix did not resolve to a struct",
+                "place `struct` after the declaration annotations and modifiers", p.*.source);
+        }
+        _zag_exit(1);
+    }
     let _s: Token = adv(p);  // struct
     let name: []u8 = adv(p).val;
     let tparams: ArrayList[[]u8] = make[[]u8](2);
@@ -685,20 +1333,28 @@ fn parse_struct(p: *Parser, is_pub: i32) *Node {
         let _r: Token = adv(p);
     }
     let fields: ArrayList[Param] = parse_field_list(p);
-    return new(Node{ .struct_ = StructDecl{ .name = name, .fields = fields, .tparams = tparams, .is_pub = is_pub } });
+    return parser_mark(p,new(Node{ .struct_ = StructDecl{ .name = name, .fields = fields, .tparams = tparams, .annots = annots, .is_pub = pub_flag, .origin = p.*.origin, .repr_c = repr_flag } }),start);
+}
+
+// Parse the explicit edition-2027 C representation prefix. The lexical
+// edition gate rejects other @repr forms before this production is reached.
+fn parse_repr_c_struct(p: *Parser, is_pub: i32) *Node {
+    return parse_struct(p, is_pub, 0);
 }
 
 fn parse_union(p: *Parser) *Node {
+    let start:i32=p.*.i;
     let _u: Token = adv(p);  // union
     let name: []u8 = adv(p).val;
     let fields: ArrayList[Param] = parse_field_list(p);
-    return new(Node{ .union_ = UnionDecl{ .name = name, .fields = fields } });
+    return parser_mark(p,new(Node{ .union_ = UnionDecl{ .name = name, .fields = fields } }),start);
 }
 
 // `error { NotFound, OutOfRange, ParseFail }` — the program's error set. Modeled
 // as an EnumDecl named "__zag_errors" so no new AST node is required; codegen
 // recognises that name and emits the ZAG_OK / ZAG_ERR_* constants.
 fn parse_error_decl(p: *Parser) *Node {
+    let start:i32=p.*.i;
     let _e: Token = adv(p);   // error
     let _lb: Token = adv(p);  // {
     let members: ArrayList[[]u8] = make[[]u8](4);
@@ -707,7 +1363,8 @@ fn parse_error_decl(p: *Parser) *Node {
         if (at_k(p, Tk.Comma)) { let _c: Token = adv(p); }
     }
     let _rb: Token = adv(p);  // }
-    return new(Node{ .enum_ = EnumDecl{ .name = "__zag_errors", .members = members } });
+    return parser_mark(p,new(Node{ .enum_ = EnumDecl{ .name = "__zag_errors", .members = members,
+        .annots = make[[]u8](1), .is_pub = 0 } }),start);
 }
 
 // `operator T { + => fnAdd, - => fnSub, * => fnMul, / => fnDiv }` — an operator
@@ -716,6 +1373,7 @@ fn parse_error_decl(p: *Parser) *Node {
 // (param.name = the operator symbol, param.pty = the decode fn name). Codegen
 // and the effect checker consult it via op_contract_fn(); it emits no C itself.
 fn parse_operator(p: *Parser) *Node {
+    let start:i32=p.*.i;
     let _o: Token = adv(p);            // operator
     let tyname: []u8 = parse_type(p);  // T
     let _lb: Token = adv(p);           // {
@@ -724,15 +1382,15 @@ fn parse_operator(p: *Parser) *Node {
         let opsym: []u8 = adv(p).val;          // + - * /  (an Op token)
         let _arrow: Token = adv(p);            // =>
         let fnname: []u8 = adv(p).val;         // decode fn name
-        push[Param](&entries, Param{ .name = opsym, .pty = fnname, .eff = "", .calign = 0 });
+        push[Param](&entries, Param{ .name = opsym, .pty = fnname, .eff = "", .contract = "", .calign = 0 });
         if (at_k(p, Tk.Comma)) { let _c: Token = adv(p); }
     }
     let _rb: Token = adv(p);           // }
-    return new(Node{ .fn_decl = FnDecl{
+    return parser_mark(p,new(Node{ .fn_decl = FnDecl{
         .name = _zag_str_concat("__op_", tyname), .tparams = make[[]u8](1),
         .params = entries, .ret = "void", .annots = make[[]u8](1),
         .body = make[*Node](1), .is_extern = 0, .ret_eff = "", .caps = 0,
-        .cap_names = "", .cap_types = "", .line = 0, .is_pub = 0 } });
+        .cap_names = "", .cap_types = "", .line = 0, .is_pub = 0 } }),start);
 }
 
 // `interface Shape { fn area(self) i32; fn scaledArea(self, factor: i32) i32; }`
@@ -741,6 +1399,7 @@ fn parse_operator(p: *Parser) *Node {
 //   param.eff  = params string (comma-separated, e.g. "self,i32")
 // Codegen uses this to synthesise vtables + thunks and emit vtable dispatch.
 fn parse_interface(p: *Parser) *Node {
+    let start:i32=p.*.i;
     let _kw: Token = adv(p);           // "interface" ident
     let iname: []u8 = adv(p).val;      // Shape
     let _lb: Token = adv(p);           // {
@@ -774,14 +1433,14 @@ fn parse_interface(p: *Parser) *Node {
         let _rp: Token = adv(p);       // )
         let ret: []u8 = parse_type(p); // i32
         let _semi: Token = adv(p);     // ;
-        push[Param](&methods, Param{ .name = mname, .pty = ret, .eff = ptys, .calign = 0 });
+        push[Param](&methods, Param{ .name = mname, .pty = ret, .eff = ptys, .contract = "", .calign = 0 });
     }
     let _rb: Token = adv(p);           // }
-    return new(Node{ .fn_decl = FnDecl{
+    return parser_mark(p,new(Node{ .fn_decl = FnDecl{
         .name = _zag_str_concat("__iface_", iname), .tparams = make[[]u8](1),
         .params = methods, .ret = "void", .annots = make[[]u8](1),
         .body = make[*Node](1), .is_extern = 0, .ret_eff = "", .caps = 0,
-        .cap_names = "", .cap_types = "", .line = _kw.line, .is_pub = 0 } });
+        .cap_names = "", .cap_types = "", .line = _kw.line, .is_pub = 0 } }),start);
 }
 
 // Look up an interface declaration by name; returns the param list (methods), or empty if not found.
@@ -848,7 +1507,22 @@ fn op_contract_fn(decls: ArrayList[*Node], ty: []u8, op: []u8) []u8 {
     return "";
 }
 
-fn parse_enum(p: *Parser) *Node {
+fn parse_enum(p: *Parser, is_pub: i32) *Node {
+    let start:i32=p.*.i;
+    let annots: ArrayList[[]u8] = make[[]u8](2);
+    let pub_flag: i32 = is_pub;
+    let prefix: i32 = 1;
+    while (prefix == 1) {
+        if (at_k(p, Tk.Annot)) { push[[]u8](&annots, parse_annotation_value(p)); }
+        else if (at_k(p, Tk.KwPub)) { let _pub: Token = adv(p); pub_flag = 1; }
+        else { prefix = 0; }
+    }
+    if (!at_k(p, Tk.KwEnum)) {
+        diag_emit("E0010", "enum annotations and modifiers must precede `enum`", p.*.origin,
+            cur(p).line, cur(p).col, cur(p).val.len, "the declaration prefix did not resolve to an enum",
+            "place `enum` after the declaration annotations and modifiers", p.*.source);
+        _zag_exit(1);
+    }
     let _e: Token = adv(p);  // enum
     let name: []u8 = adv(p).val;
     let _lb: Token = adv(p);  // {
@@ -858,7 +1532,7 @@ fn parse_enum(p: *Parser) *Node {
         if (at_k(p, Tk.Comma)) { let _c: Token = adv(p); }
     }
     let _rb: Token = adv(p);  // }
-    return new(Node{ .enum_ = EnumDecl{ .name = name, .members = members } });
+    return parser_mark(p,new(Node{ .enum_ = EnumDecl{ .name = name, .members = members, .annots = annots, .is_pub = pub_flag } }),start);
 }
 
 // ── module resolution: @import ────────────────────────────────────────────────
@@ -895,6 +1569,49 @@ fn join_path(base: []u8, rel: []u8) []u8 {
     return _zag_str_concat(a, rel);
 }
 
+// Import identity must not depend on how the compiler itself was invoked.
+// In particular, `std:list` may resolve beside an absolute `argv[0]`, while a
+// sibling module reaches the same file through `../std/list.zag`.  The module
+// loader deduplicates by path text, so retain a small lexical normalizer here
+// rather than allowing those spelling variants to merge the declarations twice.
+// This is deliberately lexical: imports never follow a path outside the source
+// tree by resolving symlinks, and missing files remain missing files.
+fn normalize_import_path(path: []u8) []u8 {
+    if (path.len == 0) { return path; }
+    let absolute: i32 = (path[0] == '/') as i32;
+    let parts: ArrayList[[]u8] = make[[]u8](8);
+    let start: i32 = 0;
+    let i: i32 = 0;
+    while (i <= path.len) {
+        if (i == path.len || path[i] == '/') {
+            let part: []u8 = path[start..i];
+            if (part.len == 0 || @strEq(part, ".")) {
+                // Collapse repeated separators and explicit current-directory parts.
+            } else if (@strEq(part, "..")) {
+                if (parts.len > 0 && !@strEq(parts.data[parts.len - 1], "..")) {
+                    let _drop: []u8 = pop[[]u8](&parts);
+                } else if (absolute == 0) {
+                    push[[]u8](&parts, part);
+                }
+            } else {
+                push[[]u8](&parts, part);
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    let out: []u8 = "";
+    if (absolute == 1) { out = "/"; }
+    i = 0;
+    while (i < parts.len) {
+        if (out.len > 0 && !(absolute == 1 && i == 0)) { out = _zag_str_concat(out, "/"); }
+        out = _zag_str_concat(out, parts.data[i]);
+        i = i + 1;
+    }
+    if (out.len == 0 && absolute == 1) { return "/"; }
+    return out;
+}
+
 fn seen_has(seen: ArrayList[[]u8], p: []u8) bool {
     let i: i32 = 0;
     while (i < len[[]u8](seen)) {
@@ -908,8 +1625,8 @@ fn seen_has(seen: ArrayList[[]u8], p: []u8) bool {
 //
 // We rename the imported module's own (non-extern) decls to `qual__name`,
 // rewrite internal references to them, and on the importing side collapse
-// `alias.member` access to `alias__member`. extern fns keep their literal FFI
-// names so linkage to runtime.c is preserved.
+// `alias.member` access to `alias__member`. extern fns keep their literal
+// native runtime symbol names.
 //
 // Generic type applications Base[args] are fully supported: q_subst_type
 // descends into the argument list so that module-local names nested inside
@@ -985,20 +1702,123 @@ fn q_subst_type(t: []u8, names: ArrayList[[]u8], qual: []u8) []u8 {
     return t;
 }
 
+// Qualified imports keep private implementation declarations available to the
+// public declarations that call them, but they must not become addressable as
+// `alias.private_name` from the importing module.  Give those retained
+// declarations a compiler-owned spelling after the ordinary public namespace
+// rewrite.  The marker is deliberately outside the source-level alias member
+// spelling, so an external private access remains unresolved.
+fn qprivate(qual: []u8, name: []u8) []u8 {
+    return _zag_str_concat(_zag_str_concat(qual, "__private__"), name);
+}
+fn q_qualified_name_matches(value: []u8, qual: []u8, name: []u8) i32 {
+    // q_hidden_name runs over every expression in a qualified module. Avoid
+    // allocating a temporary `qual__name` string for every candidate; the
+    // private namespace is an import-time compiler pass, so this comparison
+    // must remain allocation-free on its ordinary miss path.
+    if (value.len != qual.len + 2 + name.len) { return 0; }
+    let i: i32 = 0;
+    while (i < qual.len) {
+        if (value[i] != qual[i]) { return 0; }
+        i = i + 1;
+    }
+    if (value[qual.len] != '_' || value[qual.len + 1] != '_') { return 0; }
+    i = 0;
+    while (i < name.len) {
+        if (value[qual.len + 2 + i] != name[i]) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+fn q_hidden_name(name: []u8, private_names: ArrayList[[]u8], qual: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < private_names.len) {
+        let original: []u8 = private_names.data[i];
+        if (q_qualified_name_matches(name, qual, original) != 0) {
+            return qprivate(qual, original);
+        }
+        i = i + 1;
+    }
+    return name;
+}
+
+// q_subst_type has already qualified a type by the time private implementation
+// declarations are selected.  Rewrite that qualified spelling recursively,
+// including nested generic arguments, without changing unrelated namespaces.
+fn q_hide_private_type(t: []u8, private_names: ArrayList[[]u8], qual: []u8) []u8 {
+    if (private_names.len == 0) { return t; }
+    if (t.len > 1 && t[0] == '*') { return _zag_str_concat("*", q_hide_private_type(t[1..], private_names, qual)); }
+    if (t.len > 1 && t[0] == '?') { return _zag_str_concat("?", q_hide_private_type(t[1..], private_names, qual)); }
+    if (t.len > 1 && t[0] == '!') { return _zag_str_concat("!", q_hide_private_type(t[1..], private_names, qual)); }
+    if (t.len > 2 && t[0] == '[' && t[1] == ']') { return _zag_str_concat("[]", q_hide_private_type(t[2..], private_names, qual)); }
+    if (is_generic_app(t)) {
+        let lb: i32 = index_of(t, '[');
+        let base: []u8 = t[0..lb];
+        let hidden_base: []u8 = q_hidden_name(base, private_names, qual);
+        let args: ArrayList[[]u8] = split_args(t[lb + 1..t.len - 1]);
+        let out: []u8 = _zag_str_concat(hidden_base, "[");
+        let i: i32 = 0;
+        while (i < args.len) {
+            if (i > 0) { out = _zag_str_concat(out, ","); }
+            out = _zag_str_concat(out, q_hide_private_type(args.data[i], private_names, qual));
+            i = i + 1;
+        }
+        return _zag_str_concat(out, "]");
+    }
+    return q_hidden_name(t, private_names, qual);
+}
+
+fn q_hide_private_relation(value: []u8, private_names: ArrayList[[]u8], qual: []u8) []u8 {
+    if (private_names.len == 0) { return value; }
+    let prefix: []u8 = "";
+    if (value.len > 8 && @strEq(value[0..7], "@owned(")) { prefix = "@owned("; }
+    else if (value.len > 11 && @strEq(value[0..10], "@acquires(")) { prefix = "@acquires("; }
+    else { return value; }
+    if (value[value.len - 1] != ')') { return value; }
+    let relation: []u8 = value[prefix.len..value.len - 1];
+    let hidden: []u8 = q_hidden_name(relation, private_names, qual);
+    if (@strEq(hidden, relation)) { return value; }
+    return _zag_str_concat(prefix, _zag_str_concat(hidden, ")"));
+}
+
 // Mutating walk: prefix references to the module's own decls inside an expr.
-fn q_rewrite_expr(n: *Node, names: ArrayList[[]u8], qual: []u8) void {
+// `locals` is the current lexical binding stack (params, `let`s, captures).
+// A locally-bound name SHADOWS a module-level decl and is not rewritten
+// (v1 spec: "A local binding shadows an imported declaration with the same
+// name"); previously a param or let named like a module fn (e.g. `cap`) was
+// wrongly renamed to `qual__cap` and failed to resolve.
+fn q_rewrite_expr(n: *Node, names: ArrayList[[]u8], qual: []u8, locals: *ArrayList[[]u8]) void {
     switch (n.*) {
         .id => |x| {
+            if (seen_has(locals.*, x.name)) { return; }
             if (seen_has(names, x.name)) {
                 n.* = Node{ .id = Ident{ .name = qpref(qual, x.name) } };
             }
         }
-        .bin => |b| { q_rewrite_expr(b.l, names, qual); q_rewrite_expr(b.r, names, qual); }
-        .un  => |u| { q_rewrite_expr(u.e, names, qual); }
+        .bin => |b| { q_rewrite_expr(b.l, names, qual, locals); q_rewrite_expr(b.r, names, qual, locals); }
+        .un  => |u| { q_rewrite_expr(u.e, names, qual, locals); }
         .call => |c| {
-            q_rewrite_expr(c.callee, names, qual);
-            let i: i32 = 0;
-            while (i < len[*Node](c.args)) { q_rewrite_expr(get[*Node](c.args, i), names, qual); i = i + 1; }
+            // `e catch |err| fb` parses to __catchc(e, err, fb): arg 1 IS the
+            // binding occurrence (not a reference — never rewrite it), and it
+            // shadows module decls inside fb (arg 2).
+            let is_catchc: i32 = 0;
+            switch (c.callee.*) {
+                .id => |ci| { if (@strEq(ci.name, "__catchc")) { is_catchc = 1; } }
+                else => { }
+            }
+            if (is_catchc == 1 && len[*Node](c.args) == 3) {
+                q_rewrite_expr(get[*Node](c.args, 0), names, qual, locals);
+                let capn: []u8 = "";
+                switch (get[*Node](c.args, 1).*) { .id => |cx| { capn = cx.name; } else => { } }
+                let save_c: i32 = len[[]u8](locals.*);
+                if (capn.len > 0) { push[[]u8](locals, capn); }
+                q_rewrite_expr(get[*Node](c.args, 2), names, qual, locals);
+                locals.*.len = save_c;
+            } else {
+                q_rewrite_expr(c.callee, names, qual, locals);
+                let i: i32 = 0;
+                while (i < len[*Node](c.args)) { q_rewrite_expr(get[*Node](c.args, i), names, qual, locals); i = i + 1; }
+            }
             // substitute type-args (e.g. @sizeOf[MapEntry[V]] → @sizeOf[qual__MapEntry[V]])
             if (len[[]u8](c.targs) > 0) {
                 let nt: ArrayList[[]u8] = make[[]u8](2);
@@ -1010,16 +1830,16 @@ fn q_rewrite_expr(n: *Node, names: ArrayList[[]u8], qual: []u8) void {
                 n.* = Node{ .call = Call{ .callee = c.callee, .args = c.args, .targs = nt } };
             }
         }
-        .fld => |f| { q_rewrite_expr(f.base, names, qual); }
-        .idx => |x| { q_rewrite_expr(x.base, names, qual); q_rewrite_expr(x.idx, names, qual); }
+        .fld => |f| { q_rewrite_expr(f.base, names, qual, locals); }
+        .idx => |x| { q_rewrite_expr(x.base, names, qual, locals); q_rewrite_expr(x.idx, names, qual, locals); }
         .cast_ => |c| {
-            q_rewrite_expr(c.expr, names, qual);
+            q_rewrite_expr(c.expr, names, qual, locals);
             n.* = Node{ .cast_ = Cast{ .expr = c.expr, .target = q_subst_type(c.target, names, qual) } };
         }
-        .slice_ => |s| { q_rewrite_expr(s.base, names, qual); q_rewrite_expr(s.lo, names, qual); q_rewrite_expr(s.hi, names, qual); }
+        .slice_ => |s| { q_rewrite_expr(s.base, names, qual, locals); q_rewrite_expr(s.lo, names, qual, locals); q_rewrite_expr(s.hi, names, qual, locals); }
         .slit_ => |s| {
             let i: i32 = 0;
-            while (i < len[FieldInit](s.fields)) { q_rewrite_expr(get[FieldInit](s.fields, i).val, names, qual); i = i + 1; }
+            while (i < len[FieldInit](s.fields)) { q_rewrite_expr(get[FieldInit](s.fields, i).val, names, qual, locals); i = i + 1; }
             let nm: []u8 = s.sname;
             if (seen_has(names, s.sname)) { nm = qpref(qual, s.sname); }
             let nt: ArrayList[[]u8] = make[[]u8](2);
@@ -1030,52 +1850,201 @@ fn q_rewrite_expr(n: *Node, names: ArrayList[[]u8], qual: []u8) void {
             }
             n.* = Node{ .slit_ = StructLit{ .sname = nm, .fields = s.fields, .targs = nt } };
         }
+        .switch_ => |sw| {
+            // expression-position switch (switch as a value): walk subject and
+            // arm bodies like the statement form, honoring |cap| shadowing.
+            // (Previously not walked at all: module refs inside expression
+            // switches in a qualified module were silently left unrenamed.)
+            q_rewrite_expr(sw.subject, names, qual, locals);
+            let ai: i32 = 0;
+            while (ai < len[SwitchArm](sw.arms)) {
+                let arm: SwitchArm = get[SwitchArm](sw.arms, ai);
+                let save_a: i32 = len[[]u8](locals.*);
+                if (arm.has_cap == 1) { push[[]u8](locals, arm.cap); }
+                q_rewrite_block(arm.body, names, qual, locals);
+                locals.*.len = save_a;
+                ai = ai + 1;
+            }
+            if (sw.has_els == 1) { q_rewrite_block(sw.els_body, names, qual, locals); }
+        }
         else => { }
     }
 }
 
-fn q_rewrite_block(body: ArrayList[*Node], names: ArrayList[[]u8], qual: []u8) void {
+fn q_rewrite_block(body: ArrayList[*Node], names: ArrayList[[]u8], qual: []u8, locals: *ArrayList[[]u8]) void {
+    let save: i32 = len[[]u8](locals.*);
     let i: i32 = 0;
-    while (i < len[*Node](body)) { q_rewrite_stmt(get[*Node](body, i), names, qual); i = i + 1; }
+    while (i < len[*Node](body)) { q_rewrite_stmt(get[*Node](body, i), names, qual, locals); i = i + 1; }
+    locals.*.len = save;   // bindings introduced in this block go out of scope
 }
 
-fn q_rewrite_stmt(n: *Node, names: ArrayList[[]u8], qual: []u8) void {
+fn q_rewrite_stmt(n: *Node, names: ArrayList[[]u8], qual: []u8, locals: *ArrayList[[]u8]) void {
     switch (n.*) {
         .let_ => |l| {
-            q_rewrite_expr(l.expr, names, qual);
-            n.* = Node{ .let_ = Let{ .name = l.name, .dty = q_subst_type(l.dty, names, qual), .has_dty = l.has_dty, .has_init = l.has_init, .expr = l.expr, .eff = l.eff, .calign = l.calign } };
+            // the initializer sees the OUTER scope; the binding starts after it.
+            q_rewrite_expr(l.expr, names, qual, locals);
+            n.* = Node{ .let_ = Let{ .name = l.name, .dty = q_subst_type(l.dty, names, qual), .has_dty = l.has_dty, .has_init = l.has_init, .expr = l.expr, .eff = l.eff, .calign = l.calign, .is_global = l.is_global } };
+            push[[]u8](locals, l.name);
         }
-        .ret => |r| { if (r.has_expr == 1) { q_rewrite_expr(r.expr, names, qual); } }
+        .ret => |r| { if (r.has_expr == 1) { q_rewrite_expr(r.expr, names, qual, locals); } }
         .if_ => |x| {
-            q_rewrite_expr(x.cond, names, qual);
-            q_rewrite_block(x.then_body, names, qual);
-            if (x.has_els == 1) { q_rewrite_block(x.els_body, names, qual); }
+            q_rewrite_expr(x.cond, names, qual, locals);
+            let save_i: i32 = len[[]u8](locals.*);
+            if (x.has_cap == 1) { push[[]u8](locals, x.cap); }   // if (opt) |cap|
+            q_rewrite_block(x.then_body, names, qual, locals);
+            locals.*.len = save_i;
+            if (x.has_els == 1) { q_rewrite_block(x.els_body, names, qual, locals); }
         }
-        .while_ => |w| { q_rewrite_expr(w.cond, names, qual); q_rewrite_block(w.body, names, qual); }
-        .assign => |a| { q_rewrite_expr(a.target, names, qual); q_rewrite_expr(a.expr, names, qual); }
+        .while_ => |w| {
+            q_rewrite_expr(w.cond, names, qual, locals);
+            let save_w: i32 = len[[]u8](locals.*);
+            if (w.has_cap == 1) { push[[]u8](locals, w.cap); }   // while (opt) |cap|
+            q_rewrite_block(w.body, names, qual, locals);
+            locals.*.len = save_w;
+        }
+        .unsafe_ => |u| { q_rewrite_block(u.body, names, qual, locals); }
+        .defer_ => |d| { q_rewrite_expr(d.expr, names, qual, locals); }
+        .assign => |a| { q_rewrite_expr(a.target, names, qual, locals); q_rewrite_expr(a.expr, names, qual, locals); }
         .switch_ => |sw| {
-            q_rewrite_expr(sw.subject, names, qual);
+            q_rewrite_expr(sw.subject, names, qual, locals);
             let ai: i32 = 0;
-            while (ai < len[SwitchArm](sw.arms)) { q_rewrite_block(get[SwitchArm](sw.arms, ai).body, names, qual); ai = ai + 1; }
-            if (sw.has_els == 1) { q_rewrite_block(sw.els_body, names, qual); }
+            while (ai < len[SwitchArm](sw.arms)) {
+                let arm: SwitchArm = get[SwitchArm](sw.arms, ai);
+                let save_s: i32 = len[[]u8](locals.*);
+                if (arm.has_cap == 1) { push[[]u8](locals, arm.cap); }
+                q_rewrite_block(arm.body, names, qual, locals);
+                locals.*.len = save_s;
+                ai = ai + 1;
+            }
+            if (sw.has_els == 1) { q_rewrite_block(sw.els_body, names, qual, locals); }
         }
-        .estmt => |e| { q_rewrite_expr(e.expr, names, qual); }
+        .estmt => |e| { q_rewrite_expr(e.expr, names, qual, locals); }
+        else => { }
+    }
+}
+
+// The public/private filter is applied after q_rewrite_block so ordinary
+// module-local references have their normal qualified spelling first.  Only
+// exact qualified references to retained private declarations are then moved
+// into the hidden implementation namespace.  This preserves local shadowing
+// and keeps `alias.private_name` unavailable to callers.
+fn q_hide_private_expr(n: *Node, private_names: ArrayList[[]u8], qual: []u8) void {
+    switch (n.*) {
+        .id => |x| {
+            let hidden: []u8 = q_hidden_name(x.name, private_names, qual);
+            if (!@strEq(hidden, x.name)) { n.* = Node{ .id = Ident{ .name = hidden } }; }
+        }
+        .bin => |x| { q_hide_private_expr(x.l, private_names, qual); q_hide_private_expr(x.r, private_names, qual); }
+        .un => |x| { q_hide_private_expr(x.e, private_names, qual); }
+        .call => |x| {
+            q_hide_private_expr(x.callee, private_names, qual);
+            let i: i32 = 0;
+            while (i < x.args.len) { q_hide_private_expr(x.args.data[i], private_names, qual); i = i + 1; }
+            i = 0;
+            while (i < x.targs.len) {
+                x.targs.data[i] = q_hide_private_type(x.targs.data[i], private_names, qual);
+                i = i + 1;
+            }
+        }
+        .fld => |x| { q_hide_private_expr(x.base, private_names, qual); }
+        .idx => |x| { q_hide_private_expr(x.base, private_names, qual); q_hide_private_expr(x.idx, private_names, qual); }
+        .cast_ => |x| {
+            q_hide_private_expr(x.expr, private_names, qual);
+            x.target = q_hide_private_type(x.target, private_names, qual);
+        }
+        .slice_ => |x| {
+            q_hide_private_expr(x.base, private_names, qual);
+            q_hide_private_expr(x.lo, private_names, qual);
+            if (x.has_hi == 1) { q_hide_private_expr(x.hi, private_names, qual); }
+        }
+        .slit_ => |x| {
+            let hidden: []u8 = q_hidden_name(x.sname, private_names, qual);
+            let i: i32 = 0;
+            while (i < x.fields.len) { q_hide_private_expr(x.fields.data[i].val, private_names, qual); i = i + 1; }
+            i = 0;
+            while (i < x.targs.len) {
+                x.targs.data[i] = q_hide_private_type(x.targs.data[i], private_names, qual);
+                i = i + 1;
+            }
+            if (!@strEq(hidden, x.sname)) {
+                n.* = Node{ .slit_ = StructLit{ .sname = hidden, .fields = x.fields, .targs = x.targs } };
+            }
+        }
+        .switch_ => |x| {
+            q_hide_private_expr(x.subject, private_names, qual);
+            let i: i32 = 0;
+            while (i < x.arms.len) { q_hide_private_block(x.arms.data[i].body, private_names, qual); i = i + 1; }
+            if (x.has_els == 1) { q_hide_private_block(x.els_body, private_names, qual); }
+        }
+        else => { }
+    }
+}
+
+fn q_hide_private_block(body: ArrayList[*Node], private_names: ArrayList[[]u8], qual: []u8) void {
+    // Most modules are legacy all-public modules and have no hidden
+    // implementation namespace.  Do not walk every expression in those
+    // modules just to discover that there is nothing to rewrite; this pass is
+    // on the compiler's own import graph and must remain linear in the actual
+    // private-name set.
+    if (private_names.len == 0) { return; }
+    let i: i32 = 0;
+    while (i < body.len) { q_hide_private_stmt(body.data[i], private_names, qual); i = i + 1; }
+}
+
+fn q_hide_private_stmt(n: *Node, private_names: ArrayList[[]u8], qual: []u8) void {
+    switch (n.*) {
+        .let_ => |x| {
+            if (x.has_init == 1) { q_hide_private_expr(x.expr, private_names, qual); }
+            x.dty = q_hide_private_type(x.dty, private_names, qual);
+        }
+        .ret => |x| { if (x.has_expr == 1) { q_hide_private_expr(x.expr, private_names, qual); } }
+        .if_ => |x| {
+            q_hide_private_expr(x.cond, private_names, qual);
+            q_hide_private_block(x.then_body, private_names, qual);
+            if (x.has_els == 1) { q_hide_private_block(x.els_body, private_names, qual); }
+        }
+        .while_ => |x| { q_hide_private_expr(x.cond, private_names, qual); q_hide_private_block(x.body, private_names, qual); }
+        .unsafe_ => |x| { q_hide_private_block(x.body, private_names, qual); }
+        .defer_ => |x| { q_hide_private_expr(x.expr, private_names, qual); }
+        .assign => |x| { q_hide_private_expr(x.target, private_names, qual); q_hide_private_expr(x.expr, private_names, qual); }
+        .switch_ => |x| {
+            q_hide_private_expr(x.subject, private_names, qual);
+            let i: i32 = 0;
+            while (i < x.arms.len) { q_hide_private_block(x.arms.data[i].body, private_names, qual); i = i + 1; }
+            if (x.has_els == 1) { q_hide_private_block(x.els_body, private_names, qual); }
+        }
+        .estmt => |x| { q_hide_private_expr(x.expr, private_names, qual); }
         else => { }
     }
 }
 
 // The set of non-extern top-level decl names in a module (these get prefixed;
 // extern names stay literal for FFI).
+// Does `s` contain a `__` module-qualifier separator? Such a name is already qualified by
+// a NESTED import (e.g. module A imported C as `c` → C's decls arrive as `c__triple`). When
+// A is itself imported qualified as `a`, those transitive decls must NOT be re-qualified to
+// `a__c__triple` — A's own body still calls them `c__triple`. Leaving both sides untouched
+// keeps them matched (and diamond-dedups correctly via `seen`). This is the transitive
+// qualified-import fix.
+fn has_dunder(s: []u8) i32 {
+    let i: i32 = 0;
+    while (i + 1 < s.len) {
+        if (s[i] == '_' && s[i + 1] == '_') { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn collect_decl_names(inner: ArrayList[*Node]) ArrayList[[]u8] {
     let names: ArrayList[[]u8] = make[[]u8](8);
     let i: i32 = 0;
     while (i < len[*Node](inner)) {
         let d: *Node = get[*Node](inner, i);
         switch (d.*) {
-            .fn_decl => |f| { if (f.is_extern == 0) { push[[]u8](&names, f.name); } }
-            .struct_ => |s| { push[[]u8](&names, s.name); }
-            .enum_   => |e| { push[[]u8](&names, e.name); }
-            .union_  => |u| { push[[]u8](&names, u.name); }
+            .fn_decl => |f| { if (f.is_extern == 0 && has_dunder(f.name) == 0) { push[[]u8](&names, f.name); } }
+            .struct_ => |s| { if (has_dunder(s.name) == 0) { push[[]u8](&names, s.name); } }
+            .enum_   => |e| { if (has_dunder(e.name) == 0) { push[[]u8](&names, e.name); } }
+            .union_  => |u| { if (has_dunder(u.name) == 0) { push[[]u8](&names, u.name); } }
             else => { }
         }
         i = i + 1;
@@ -1083,29 +2052,92 @@ fn collect_decl_names(inner: ArrayList[*Node]) ArrayList[[]u8] {
     return names;
 }
 
-fn qualify_params(params: ArrayList[Param], names: ArrayList[[]u8], qual: []u8) ArrayList[Param] {
+// The decl's own name (for the transitive re-qualification guard). "" if it has none.
+fn decl_own_name(d: *Node) []u8 {
+    switch (d.*) {
+        .fn_decl => |f| { return f.name; }
+        .struct_ => |s| { return s.name; }
+        .enum_   => |e| { return e.name; }
+        .union_  => |u| { return u.name; }
+        else => { return ""; }
+    }
+}
+
+fn q_resource_relation(value:[]u8,names:ArrayList[[]u8],qual:[]u8)[]u8{
+    let prefix:[]u8="";
+    if(value.len>8&&@strEq(value[0..7],"@owned(")){prefix="@owned(";}
+    else if(value.len>11&&@strEq(value[0..10],"@acquires(")){prefix="@acquires(";}
+    else{return value;}
+    if(value[value.len-1]!=')'){return value;}
+    let release:[]u8=value[prefix.len..value.len-1];
+    if(!seen_has(names,release)){return value;}
+    return _zag_str_concat(prefix,_zag_str_concat(qpref(qual,release),")"));
+}
+
+fn qualify_annots(annots:ArrayList[[]u8],names:ArrayList[[]u8],private_names:ArrayList[[]u8],qual:[]u8)ArrayList[[]u8]{
+    let out:ArrayList[[]u8]=make[[]u8](annots.len+1);let i:i32=0;
+    while(i<len[[]u8](annots)){let relation:[]u8=q_resource_relation(get[[]u8](annots,i),names,qual);push[[]u8](&out,q_hide_private_relation(relation,private_names,qual));i=i+1;}
+    return out;
+}
+
+fn qualify_params(params: ArrayList[Param], names: ArrayList[[]u8], private_names:ArrayList[[]u8], qual: []u8) ArrayList[Param] {
     let out: ArrayList[Param] = make[Param](4);
     let i: i32 = 0;
     while (i < len[Param](params)) {
         let p: Param = get[Param](params, i);
-        push[Param](&out, Param{ .name = p.name, .pty = q_subst_type(p.pty, names, qual), .eff = p.eff, .calign = p.calign });
+        let pty:[]u8=q_hide_private_type(q_subst_type(p.pty, names, qual),private_names,qual);
+        let contract:[]u8=q_hide_private_relation(q_resource_relation(p.contract,names,qual),private_names,qual);
+        push[Param](&out, Param{ .name = p.name, .pty = pty,
+            .eff = p.eff, .contract = contract, .calign = p.calign });
         i = i + 1;
     }
     return out;
 }
 
 // Produce a renamed copy of one decl (body rewritten in place beforehand).
-fn qualify_decl(d: *Node, names: ArrayList[[]u8], qual: []u8) *Node {
+fn qualify_decl(d: *Node, names: ArrayList[[]u8], private_names:ArrayList[[]u8], qual: []u8, is_private:i32) *Node {
     switch (d.*) {
         .fn_decl => |f| {
-            if (f.is_extern == 1) { return d; }   // keep literal FFI name + signature
-            q_rewrite_block(f.body, names, qual);
+            if (f.is_extern == 1) {
+                // Keep the literal FFI name and signature. A relation may
+                // still name a module-local Zag release helper, so preserve
+                // the declaration while qualifying only that metadata edge.
+                return new(Node{ .fn_decl = FnDecl{
+                    .name = f.name, .tparams = f.tparams, .params = f.params,
+                    .ret = f.ret, .annots = qualify_annots(f.annots,names,private_names,qual),
+                    .body = f.body, .is_extern = 1, .ret_eff = f.ret_eff,
+                    .caps = f.caps, .cap_names = f.cap_names, .cap_types = f.cap_types,
+                    .line = f.line, .is_pub = f.is_pub, .origin = f.origin } });
+            }
+            // Seed the lexical scope with the fn's own bindings: params and
+            // (for hoisted capturing closures) the comma-joined capture names.
+            // These shadow same-named module decls inside the body.
+            let locals: ArrayList[[]u8] = make[[]u8](8);
+            let qpi: i32 = 0;
+            while (qpi < len[Param](f.params)) {
+                push[[]u8](&locals, get[Param](f.params, qpi).name);
+                qpi = qpi + 1;
+            }
+            if (f.cap_names.len > 0) {
+                let cs: i32 = 0;
+                let ci2: i32 = 0;
+                while (ci2 <= f.cap_names.len) {
+                    if (ci2 == f.cap_names.len || (f.cap_names[ci2] as i32) == ',') {
+                        if (ci2 > cs) { push[[]u8](&locals, f.cap_names[cs..ci2]); }
+                        cs = ci2 + 1;
+                    }
+                    ci2 = ci2 + 1;
+                }
+            }
+            q_rewrite_block(f.body, names, qual, &locals);
+            q_hide_private_block(f.body,private_names,qual);
+            let qname:[]u8=qpref(qual,f.name);if(is_private==1){qname=qprivate(qual,f.name);}
             return new(Node{ .fn_decl = FnDecl{
-                .name = qpref(qual, f.name),
+                .name = qname,
                 .tparams = f.tparams,
-                .params = qualify_params(f.params, names, qual),
-                .ret = q_subst_type(f.ret, names, qual),
-                .annots = f.annots,
+                .params = qualify_params(f.params, names, private_names, qual),
+                .ret = q_hide_private_type(q_subst_type(f.ret, names, qual),private_names,qual),
+                .annots = qualify_annots(f.annots,names,private_names,qual),
                 .body = f.body,
                 .is_extern = 0,
                 .ret_eff = f.ret_eff,
@@ -1113,34 +2145,66 @@ fn qualify_decl(d: *Node, names: ArrayList[[]u8], qual: []u8) *Node {
                 .cap_names = f.cap_names,
                 .cap_types = f.cap_types,
                 .line = f.line,
-                .is_pub = f.is_pub } });
+                .is_pub = f.is_pub,
+                .origin = f.origin } });
         }
         .struct_ => |s| {
+            let qname:[]u8=qpref(qual,s.name);if(is_private==1){qname=qprivate(qual,s.name);}
             return new(Node{ .struct_ = StructDecl{
-                .name = qpref(qual, s.name),
-                .fields = qualify_params(s.fields, names, qual),
+                .name = qname,
+                .fields = qualify_params(s.fields, names, private_names, qual),
                 .tparams = s.tparams,
-                .is_pub = s.is_pub } });
+                .annots = qualify_annots(s.annots,names,private_names,qual),
+                .is_pub = s.is_pub,
+                .origin = s.origin,
+                .repr_c = s.repr_c } });
         }
         .enum_ => |e| {
-            return new(Node{ .enum_ = EnumDecl{ .name = qpref(qual, e.name), .members = e.members } });
+            let qname:[]u8=qpref(qual,e.name);if(is_private==1){qname=qprivate(qual,e.name);}
+            return new(Node{ .enum_ = EnumDecl{ .name = qname, .members = e.members,
+                .annots = e.annots, .is_pub = e.is_pub } });
         }
         .union_ => |u| {
-            return new(Node{ .union_ = UnionDecl{ .name = qpref(qual, u.name), .fields = qualify_params(u.fields, names, qual) } });
+            let qname:[]u8=qpref(qual,u.name);if(is_private==1){qname=qprivate(qual,u.name);}
+            return new(Node{ .union_ = UnionDecl{ .name = qname, .fields = qualify_params(u.fields, names, private_names, qual) } });
         }
         else => { return d; }
     }
 }
 
-// True if any decl in the module has `is_pub=1` (the module uses the pub keyword).
-// When false, treat all decls as public (backward compat for modules without pub).
-fn has_any_pub(inner: ArrayList[*Node]) i32 {
+fn decl_origin(d: *Node) []u8 {
+    switch (d.*) {
+        .fn_decl => |f| { return f.origin; }
+        .struct_ => |s| { return s.origin; }
+        else => { return ""; }
+    }
+}
+
+fn decl_is_from(d: *Node, module: []u8) i32 {
+    let origin: []u8 = decl_origin(d);
+    if (origin.len == 0 || module.len == 0) { return 0; }
+    return @strEq(origin, module) as i32;
+}
+
+// True if a declaration owned by this module has `is_pub=1` (the module uses
+// the pub keyword). Transitive unqualified imports are also present in
+// `inner`, but their visibility must not turn this module into a pub-filtered
+// namespace or make an imported generic participate in its private set.
+// When false, treat all declarations as public (backward compat for modules
+// without pub).
+fn has_any_pub(inner: ArrayList[*Node], module: []u8) i32 {
     let i: i32 = 0;
     while (i < len[*Node](inner)) {
-        switch (get[*Node](inner, i).*) {
-            .fn_decl => |f| { if (f.is_pub == 1) { return 1; } }
-            .struct_  => |s| { if (s.is_pub == 1) { return 1; } }
-            else => { }
+        let d: *Node = get[*Node](inner, i);
+        if (decl_is_from(d, module) == 1) {
+            switch (d.*) {
+                .fn_decl => |f| { if (f.is_pub == 1) { return 1; } }
+                .struct_ => |s| { if (s.is_pub == 1) { return 1; } }
+                // Enum/union provenance predates NodeOrigin fields. Driver
+                // private implementation declarations are functions/structs
+                // and remain origin-exact here.
+                else => { }
+            }
         }
         i = i + 1;
     }
@@ -1160,31 +2224,61 @@ fn is_auto_generated(name: []u8) i32 {
 // Qualify a module's decls under `qual__` and splice them into `out`.
 // When the module uses `pub`, only pub decls (and auto-generated support fns)
 // are exposed. Modules without any `pub` keyword expose all decls (compat).
-fn qualify_into(inner: ArrayList[*Node], qual: []u8, out: *ArrayList[*Node]) void {
+fn qualify_into(inner: ArrayList[*Node], qual: []u8, module: []u8, out: *ArrayList[*Node],origins:*ArrayList[NodeOrigin]) void {
     let names: ArrayList[[]u8] = collect_decl_names(inner);
-    let do_filter: i32 = has_any_pub(inner);
+    let do_filter: i32 = has_any_pub(inner, module);
+    // A public module may still need private implementation declarations to
+    // type-check and lower its exported bodies. Retain those declarations in
+    // a hidden namespace; the caller-facing alias rewrite never produces this
+    // spelling, so private access remains rejected.
+    let private_names:ArrayList[[]u8]=make[[]u8](8);
+    if(do_filter==1){
+        let pi:i32=0;
+        while(pi<inner.len){
+            let pd:*Node=inner.data[pi];
+            switch(pd.*){
+                .fn_decl=>|pf|{if(decl_is_from(pd,module)==1&&pf.is_pub==0&&pf.is_extern==0&&has_dunder(pf.name)==0){push[[]u8](&private_names,pf.name);}}
+                .struct_=>|ps|{if(decl_is_from(pd,module)==1&&ps.is_pub==0&&has_dunder(ps.name)==0){push[[]u8](&private_names,ps.name);}}
+                else=>{}
+            }
+            pi=pi+1;
+        }
+    }
     let i: i32 = 0;
     while (i < len[*Node](inner)) {
         let d: *Node = get[*Node](inner, i);
         let include: i32 = 1;
+        let is_private:i32=0;
         if (do_filter == 1) {
             switch (d.*) {
                 .fn_decl => |f| {
-                    if (f.is_pub == 0 && f.is_extern == 0) {
-                        // Include auto-generated support fns (closures, vtables, etc.)
-                        if (is_auto_generated(f.name) == 0) { include = 0; }
+                    if (decl_is_from(d,module) == 1 && f.is_pub == 0 && f.is_extern == 0) {
+                        // Include private implementation fns under the hidden
+                        // namespace. Auto-generated support fns already carry
+                        // a compiler-private name and retain their old path.
+                        if (is_auto_generated(f.name) == 0) { is_private=1; }
                     }
                 }
                 .struct_ => |s| {
-                    if (s.is_pub == 0) {
-                        if (is_auto_generated(s.name) == 0) { include = 0; }
+                    if (decl_is_from(d,module) == 1 && s.is_pub == 0) {
+                        if (is_auto_generated(s.name) == 0) { is_private=1; }
                     }
                 }
+                // Enum/union declarations do not yet carry compact module
+                // provenance; retain their established qualified spelling
+                // until that AST metadata is promoted.
                 else => { }
             }
         }
         if (include == 1) {
-            push[*Node](out, qualify_decl(d, names, qual));
+            // Transitively-imported decls (already `x__`-qualified by a nested import) pass
+            // through unchanged — re-qualifying them would break the importing module's own
+            // references to them. `seen` already dedups a diamond so each lands once.
+            if (has_dunder(decl_own_name(d)) == 1) {
+                push[*Node](out, d);
+            } else {
+                let q:*Node=qualify_decl(d, names, private_names, qual, is_private);node_origin_clone(origins,d,q);push[*Node](out, q);
+            }
         }
         i = i + 1;
     }
@@ -1198,52 +2292,99 @@ fn id_name_or_empty(n: *Node) []u8 {
     };
 }
 
-fn rewrite_expr(n: *Node, aliases: ArrayList[[]u8]) void {
+// `locals` tracks in-scope binding names (params + let bindings + captures). A base name that
+// is BOTH a known import alias AND a live local must NOT be rewritten to `alias__member` — the
+// local shadows the module. Without this, a fn param like `proj: *Project` (in some module) is
+// hijacked by another file's `@import(...) as proj` and `proj.tracks` mis-compiles to the
+// non-existent `proj__tracks`. Import aliases are accumulated globally, so this shadowing check
+// is what keeps them from leaking across module boundaries. (Mirror of q_rewrite_*'s handling.)
+fn rewrite_expr(n: *Node, aliases: ArrayList[[]u8], locals: *ArrayList[[]u8]) void {
     switch (n.*) {
         .fld => |f| {
-            rewrite_expr(f.base, aliases);
+            rewrite_expr(f.base, aliases, locals);
             let bn: []u8 = id_name_or_empty(f.base);
-            if (bn.len > 0 && seen_has(aliases, bn)) {
+            if (bn.len > 0 && seen_has(aliases, bn) && seen_has(locals.*, bn) == 0) {
                 n.* = Node{ .id = Ident{ .name = qpref(bn, f.fname) } };
             }
         }
-        .bin => |b| { rewrite_expr(b.l, aliases); rewrite_expr(b.r, aliases); }
-        .un  => |u| { rewrite_expr(u.e, aliases); }
+        .bin => |b| { rewrite_expr(b.l, aliases, locals); rewrite_expr(b.r, aliases, locals); }
+        .un  => |u| { rewrite_expr(u.e, aliases, locals); }
         .call => |c| {
-            rewrite_expr(c.callee, aliases);
-            let i: i32 = 0;
-            while (i < len[*Node](c.args)) { rewrite_expr(get[*Node](c.args, i), aliases); i = i + 1; }
+            // `e catch |err| fb` → __catchc(e, err, fb): arg1 is the binding, and it shadows
+            // module aliases inside fb (arg2). Bind it before descending into fb.
+            let is_catchc: i32 = 0;
+            switch (c.callee.*) {
+                .id => |ci| { if (@strEq(ci.name, "__catchc")) { is_catchc = 1; } }
+                else => { }
+            }
+            if (is_catchc == 1 && len[*Node](c.args) == 3) {
+                rewrite_expr(get[*Node](c.args, 0), aliases, locals);
+                let capn: []u8 = "";
+                switch (get[*Node](c.args, 1).*) { .id => |cx| { capn = cx.name; } else => { } }
+                let save_c: i32 = len[[]u8](locals.*);
+                if (capn.len > 0) { push[[]u8](locals, capn); }
+                rewrite_expr(get[*Node](c.args, 2), aliases, locals);
+                locals.*.len = save_c;
+            } else {
+                rewrite_expr(c.callee, aliases, locals);
+                let i: i32 = 0;
+                while (i < len[*Node](c.args)) { rewrite_expr(get[*Node](c.args, i), aliases, locals); i = i + 1; }
+            }
         }
-        .idx => |x| { rewrite_expr(x.base, aliases); rewrite_expr(x.idx, aliases); }
-        .cast_ => |c| { rewrite_expr(c.expr, aliases); }
-        .slice_ => |s| { rewrite_expr(s.base, aliases); rewrite_expr(s.lo, aliases); rewrite_expr(s.hi, aliases); }
+        .idx => |x| { rewrite_expr(x.base, aliases, locals); rewrite_expr(x.idx, aliases, locals); }
+        .cast_ => |c| { rewrite_expr(c.expr, aliases, locals); }
+        .slice_ => |s| { rewrite_expr(s.base, aliases, locals); rewrite_expr(s.lo, aliases, locals); rewrite_expr(s.hi, aliases, locals); }
         .slit_ => |s| {
             let i: i32 = 0;
-            while (i < len[FieldInit](s.fields)) { rewrite_expr(get[FieldInit](s.fields, i).val, aliases); i = i + 1; }
+            while (i < len[FieldInit](s.fields)) { rewrite_expr(get[FieldInit](s.fields, i).val, aliases, locals); i = i + 1; }
         }
         else => { }
     }
 }
 
-fn rewrite_block(body: ArrayList[*Node], aliases: ArrayList[[]u8]) void {
+fn rewrite_block(body: ArrayList[*Node], aliases: ArrayList[[]u8], locals: *ArrayList[[]u8]) void {
+    let save: i32 = len[[]u8](locals.*);
     let i: i32 = 0;
-    while (i < len[*Node](body)) { rewrite_stmt(get[*Node](body, i), aliases); i = i + 1; }
+    while (i < len[*Node](body)) { rewrite_stmt(get[*Node](body, i), aliases, locals); i = i + 1; }
+    locals.*.len = save;   // bindings introduced in this block go out of scope
 }
 
-fn rewrite_stmt(n: *Node, aliases: ArrayList[[]u8]) void {
+fn rewrite_stmt(n: *Node, aliases: ArrayList[[]u8], locals: *ArrayList[[]u8]) void {
     switch (n.*) {
-        .let_ => |l| { rewrite_expr(l.expr, aliases); }
-        .ret  => |r| { if (r.has_expr == 1) { rewrite_expr(r.expr, aliases); } }
-        .if_  => |x| { rewrite_expr(x.cond, aliases); rewrite_block(x.then_body, aliases); if (x.has_els == 1) { rewrite_block(x.els_body, aliases); } }
-        .while_ => |w| { rewrite_expr(w.cond, aliases); rewrite_block(w.body, aliases); }
-        .assign => |a| { rewrite_expr(a.target, aliases); rewrite_expr(a.expr, aliases); }
-        .switch_ => |sw| {
-            rewrite_expr(sw.subject, aliases);
-            let ai: i32 = 0;
-            while (ai < len[SwitchArm](sw.arms)) { rewrite_block(get[SwitchArm](sw.arms, ai).body, aliases); ai = ai + 1; }
-            if (sw.has_els == 1) { rewrite_block(sw.els_body, aliases); }
+        .let_ => |l| { rewrite_expr(l.expr, aliases, locals); push[[]u8](locals, l.name); }
+        .ret  => |r| { if (r.has_expr == 1) { rewrite_expr(r.expr, aliases, locals); } }
+        .if_  => |x| {
+            rewrite_expr(x.cond, aliases, locals);
+            let save_i: i32 = len[[]u8](locals.*);
+            if (x.has_cap == 1) { push[[]u8](locals, x.cap); }
+            rewrite_block(x.then_body, aliases, locals);
+            locals.*.len = save_i;
+            if (x.has_els == 1) { rewrite_block(x.els_body, aliases, locals); }
         }
-        .estmt => |e| { rewrite_expr(e.expr, aliases); }
+        .while_ => |w| {
+            rewrite_expr(w.cond, aliases, locals);
+            let save_w: i32 = len[[]u8](locals.*);
+            if (w.has_cap == 1) { push[[]u8](locals, w.cap); }
+            rewrite_block(w.body, aliases, locals);
+            locals.*.len = save_w;
+        }
+        .unsafe_ => |u| { rewrite_block(u.body, aliases, locals); }
+        .defer_ => |d| { rewrite_expr(d.expr, aliases, locals); }
+        .assign => |a| { rewrite_expr(a.target, aliases, locals); rewrite_expr(a.expr, aliases, locals); }
+        .switch_ => |sw| {
+            rewrite_expr(sw.subject, aliases, locals);
+            let ai: i32 = 0;
+            while (ai < len[SwitchArm](sw.arms)) {
+                let arm: SwitchArm = get[SwitchArm](sw.arms, ai);
+                let save_s: i32 = len[[]u8](locals.*);
+                if (arm.has_cap == 1) { push[[]u8](locals, arm.cap); }
+                rewrite_block(arm.body, aliases, locals);
+                locals.*.len = save_s;
+                ai = ai + 1;
+            }
+            if (sw.has_els == 1) { rewrite_block(sw.els_body, aliases, locals); }
+        }
+        .estmt => |e| { rewrite_expr(e.expr, aliases, locals); }
         else => { }
     }
 }
@@ -1255,42 +2396,218 @@ fn rewrite_decls(decls: ArrayList[*Node], aliases: ArrayList[[]u8]) void {
     while (i < len[*Node](decls)) {
         let d: *Node = get[*Node](decls, i);
         switch (d.*) {
-            .fn_decl => |f| { rewrite_block(f.body, aliases); }
+            .fn_decl => |f| {
+                // seed the function's parameters as locals so a param named like an import
+                // alias (e.g. `proj`) shadows the module inside this body.
+                let locals: ArrayList[[]u8] = make[[]u8](8);
+                let pi: i32 = 0;
+                while (pi < len[Param](f.params)) { push[[]u8](&locals, get[Param](f.params, pi).name); pi = pi + 1; }
+                rewrite_block(f.body, aliases, &locals);
+            }
             else => { }
         }
         i = i + 1;
     }
 }
 
-// Record the sibling `runtime.c` next to an imported module (if present) so the
-// driver can hand it to cc. Deduped against cfiles.
-fn collect_cfile(mod_dir: []u8, cfiles: *ArrayList[[]u8]) void {
-    let cpath: []u8 = join_path(mod_dir, "runtime.c");
-    if (_zag_file_exists(cpath) == 0) { return; }
-    if (seen_has(cfiles.*, cpath)) { return; }
-    push[[]u8](cfiles, cpath);
+fn std_import_name(relpath: []u8) []u8 {
+    if (relpath.len <= 4 || relpath[0] != 's' || relpath[1] != 't' ||
+        relpath[2] != 'd' || relpath[3] != ':') { return ""; }
+    let name: []u8 = relpath[4..];
+    let i: i32 = 0;
+    while (i < name.len) {
+        let c: u8 = name[i];
+        let safe: bool = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '/';
+        if (!safe || (c == '/' && (i == 0 || i + 1 == name.len))) { return ""; }
+        i = i + 1;
+    }
+    return _zag_str_concat(name, ".zag");
 }
 
-// Resolve an @import path: try relative to base_dir first, then lib/ sibling.
+// Resolve an @import path. `std:name` is compiler-owned and cannot be shadowed
+// by the project: repository builds resolve beside znc, installed builds use
+// /usr/local/lib/zag/std. Ordinary paths remain source-relative with lib/
+// fallback for compatibility.
 // Returns the first path that exists, or the relative path as a fallback.
 fn resolve_import_path(relpath: []u8, base_dir: []u8) []u8 {
-    let p1: []u8 = join_path(base_dir, relpath);
+    let package: PackageImportResolution = package_import_resolve(relpath, base_dir);
+    if (package.matched != 0) {
+        if (package.error != PackageImportError.none) {
+            package_import_report(package);
+            package_import_resolution_release(&package);
+            _zag_exit(1);
+            return "/__zag_invalid_package_import__";
+        }
+        let normalized:[]u8=normalize_import_path(package.path);
+        package_import_resolution_release(&package);
+        return normalized;
+    }
+    let std_name: []u8 = std_import_name(relpath);
+    if (std_name.len > 0) {
+        let exe_dir: []u8 = dir_of(_zag_arg(0));
+        let source_tree: []u8 = normalize_import_path(join_path("std", std_name));
+        if (_zag_file_exists(source_tree) == 1) { return source_tree; }
+        // A repository build may be invoked by an absolute path from its own
+        // checkout. Prefer the source-tree spelling in that case so it shares
+        // identity with ordinary `../std/...` imports. Installed compilers do
+        // not have that tree and fall through to their bundled standard library.
+        let bundled: []u8 = normalize_import_path(join_path(join_path(exe_dir,"std"),std_name));
+        if (_zag_file_exists(bundled) == 1) { return bundled; }
+        if (@strEq(std_name, "process.zag") || @strEq(std_name, "script_io.zag") || @strEq(std_name, "script_input.zag") || @strEq(std_name, "script_string_builder.zag") ||
+            @strEq(std_name, "script_list.zag") || @strEq(std_name, "script_string.zag") || @strEq(std_name, "script_path.zag")) {
+            let selfhost_module: []u8 = normalize_import_path(join_path(join_path(exe_dir, "selfhost/std"), std_name));
+            if (_zag_file_exists(selfhost_module) == 1) { return selfhost_module; }
+            let source_module: []u8 = normalize_import_path(join_path("selfhost/std", std_name));
+            if (_zag_file_exists(source_module) == 1) { return source_module; }
+        }
+        // A staged or relocatable installation uses <prefix>/bin/znc and
+        // <prefix>/lib/zag/std. This is checked before the conventional fixed
+        // prefix so packaging tests and alternate prefixes do not need to
+        // mutate /usr/local merely to prove that every installed Script module
+        // resolves.
+        let install_prefix: []u8 = dir_of(exe_dir);
+        let prefix_std: []u8 = normalize_import_path(join_path(join_path(install_prefix, "lib/zag/std"), std_name));
+        if (_zag_file_exists(prefix_std) == 1) { return prefix_std; }
+        let installed: []u8 = join_path("/usr/local/lib/zag/std",std_name);
+        if (_zag_file_exists(installed) == 1) { return installed; }
+        return bundled;
+    }
+    if (relpath.len >= 4 && relpath[0] == 's' && relpath[1] == 't' &&
+        relpath[2] == 'd' && relpath[3] == ':') {
+        return "/__zag_invalid_std_import__";
+    }
+    let p1: []u8 = normalize_import_path(join_path(base_dir, relpath));
     if (_zag_file_exists(p1) == 1) { return p1; }
     // Try lib/ sibling of base_dir's parent
     let parent: []u8 = dir_of(base_dir);
     if (parent.len > 0) {
-        let p2: []u8 = join_path(join_path(parent, "lib"), relpath);
+        let p2: []u8 = normalize_import_path(join_path(join_path(parent, "lib"), relpath));
         if (_zag_file_exists(p2) == 1) { return p2; }
     }
     // Fallback: return the relative path (will fail later with a clear message)
     return p1;
 }
 
+// Canonicalize a path: resolve "." and "a/.." segments so every import
+// spelling of the same file dedupes to one load (diamond imports through
+// different relative chains used to parse the module twice — duplicate
+// definitions of everything in it).
+fn canon_path(p: []u8) []u8 {
+    let segs: ArrayList[[]u8] = make[[]u8](8);
+    let i: i32 = 0;
+    let start: i32 = 0;
+    let is_abs: i32 = 0;
+    if (p.len > 0 && p[0] == '/') { is_abs = 1; }
+    while (i <= p.len) {
+        let boundary: i32 = 0;
+        if (i == p.len) { boundary = 1; }
+        else if (p[i] == '/') { boundary = 1; }
+        if (boundary == 1) {
+            if (i > start) {
+                let seg: []u8 = p[start..i];
+                if (@strEq(seg, ".")) {
+                    // skip
+                } else if (@strEq(seg, "..")) {
+                    let n: i32 = len[[]u8](segs);
+                    if (n > 0 && @strEq(get[[]u8](segs, n - 1), "..") == false) {
+                        let _t: []u8 = pop[[]u8](&segs);
+                    } else {
+                        push[[]u8](&segs, seg);
+                    }
+                } else {
+                    push[[]u8](&segs, seg);
+                }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    let out: []u8 = "";
+    if (is_abs == 1) { out = "/"; }
+    let k: i32 = 0;
+    while (k < len[[]u8](segs)) {
+        if (k > 0) { out = _zag_str_concat(out, "/"); }
+        out = _zag_str_concat(out, get[[]u8](segs, k));
+        k = k + 1;
+    }
+    if (out.len == 0) { out = "."; }
+    free[[]u8](&segs);
+    return out;
+}
+
 // Read + parse the module at `path`, splicing its decls into `out`. `qual`
 // (when has_qual==1) prefixes every decl with `qual__` and substitutes type
 // references, so a module imported `as name` lives in its own namespace.
 // `loading` tracks the current import stack for circular dependency detection.
-fn load_module(path: []u8, qual: []u8, has_qual: i32, seen: *ArrayList[[]u8], out: *ArrayList[*Node], cfiles: *ArrayList[[]u8], aliases: *ArrayList[[]u8], loading: *ArrayList[[]u8]) void {
+fn resolved_module_has(modules:ArrayList[ResolvedModule],path:[]u8)i32{let i:i32=0;while(i<len[ResolvedModule](modules)){if(@strEq(get[ResolvedModule](modules,i).path,path)){return 1;}i=i+1;}return 0;}
+fn resolved_module_index(modules:ArrayList[ResolvedModule],path:[]u8)i32{
+    let i:i32=0;while(i<len[ResolvedModule](modules)){
+        if(@strEq(get[ResolvedModule](modules,i).path,path)){return i;}i=i+1;
+    }
+    return 0-1;
+}
+fn resolved_module_package_checksum_matches(modules:ArrayList[ResolvedModule],
+    path:[]u8, package:PackageImportResolution)i32{
+    let i:i32=0;while(i<len[ResolvedModule](modules)){
+        let module:ResolvedModule=get[ResolvedModule](modules,i);
+        if(@strEq(module.path,path)){
+            return package_import_locked_bytes_match(package,module.source);
+        }
+        i=i+1;
+    }
+    return 0;
+}
+fn resolved_resource_data_equal(a:[]u8,b:[]u8)i32{
+    if(a.len!=b.len){return 0;}
+    let i:i32=0;while(i<a.len){if(a[i]!=b[i]){return 0;}i=i+1;}
+    return 1;
+}
+fn resolved_resource_index(resources:ArrayList[ResolvedResource],path:[]u8)i32{
+    let i:i32=0;while(i<len[ResolvedResource](resources)){
+        if(@strEq(get[ResolvedResource](resources,i).path,path)){return i;}i=i+1;
+    }
+    return 0-1;
+}
+fn package_resolution_resources_adopt(package:*PackageImportResolution,
+    resources:*ArrayList[ResolvedResource])i32{
+    if(package.*.manifest_source_owned==0){return 0;}
+    let manifest_path:[]u8=canon_path(package.*.manifest);
+    let manifest_index:i32=resolved_resource_index(resources.*,manifest_path);
+    if(manifest_index>=0&&resolved_resource_data_equal(
+        get[ResolvedResource](resources.*,manifest_index).data,
+        package.*.manifest_source)==0){
+        _zag_str_free(manifest_path);return 0;
+    }
+    let lock_path:[]u8="";let lock_index:i32=0-1;
+    if(package.*.locked!=0){
+        if(package.*.lockfile_source_owned==0){
+            _zag_str_free(manifest_path);return 0;
+        }
+        lock_path=canon_path(package.*.lockfile);
+        lock_index=resolved_resource_index(resources.*,lock_path);
+        if(lock_index>=0&&resolved_resource_data_equal(
+            get[ResolvedResource](resources.*,lock_index).data,
+            package.*.lockfile_source)==0){
+            _zag_str_free(manifest_path);_zag_str_free(lock_path);return 0;
+        }
+    }
+    if(manifest_index<0){
+        push[ResolvedResource](resources,ResolvedResource{
+            .path=manifest_path,.data=package.*.manifest_source});
+        package.*.manifest_source="";package.*.manifest_source_owned=0;
+    }else{_zag_str_free(manifest_path);}
+    if(package.*.locked!=0){
+        if(lock_index<0){
+            push[ResolvedResource](resources,ResolvedResource{
+                .path=lock_path,.data=package.*.lockfile_source});
+            package.*.lockfile_source="";package.*.lockfile_source_owned=0;
+        }else{_zag_str_free(lock_path);}
+    }
+    return 1;
+}
+fn load_module(path0: []u8, qual: []u8, has_qual: i32, seen: *ArrayList[[]u8], out: *ArrayList[*Node], aliases: *ArrayList[[]u8], loading: *ArrayList[[]u8], modules:*ArrayList[ResolvedModule], imports:*ArrayList[ResolvedImport], resources:*ArrayList[ResolvedResource],origins:*ArrayList[NodeOrigin]) void {
+    let path: []u8 = canon_path(path0);
     // Circular import detection must come first (before seen dedup).
     // If path is on the loading stack it is currently being parsed — that is a cycle.
     if (seen_has(loading.*, path)) {
@@ -1303,27 +2620,43 @@ fn load_module(path: []u8, qual: []u8, has_qual: i32, seen: *ArrayList[[]u8], ou
         _zag_exit(1);
         return;
     }
-    // Diamond import dedup: already fully loaded, safe to skip.
-    if (seen_has(seen.*, path)) { return; }
-    push[[]u8](seen, path);
-    push[[]u8](loading, path);   // push onto in-progress stack
-    let src: []u8 = _zag_read_file(path);
-    if (src.len < 0) {
-        _zag_print("zag: error: @import cannot read '");
-        _zag_print(path);
-        _zag_println("'");
-        let _dropped: []u8 = pop[[]u8](loading);
-        _zag_exit(1);
+    // Diamond import dedup. Key qualified imports by path+ALIAS so the SAME module imported
+    // under DIFFERENT aliases (e.g. zmath as `m` in one module and `mm` in another, both pulled
+    // into one program) is loaded once PER ALIAS — otherwise the second alias's qualified decls
+    // (`mm__sin`) never materialize and its references dangle. Unqualified imports merge into
+    // scope unprefixed, so they still dedup by path alone (a second copy would collide).
+    let seen_key: []u8 = path;
+    if (has_qual == 1) { seen_key = _zag_str_concat(path, _zag_str_concat("|", qual)); }
+    if (seen_has(seen.*, seen_key)) { return; }
+    push[[]u8](seen, seen_key);
+    push[[]u8](loading, path);   // push onto in-progress stack (circular detection is per-file)
+    // A path imported under multiple aliases must still compile from one raw
+    // source snapshot. Reusing the retained module bytes also makes the
+    // post-load package checksum witness exact for every qualified copy.
+    let existing_module:i32=resolved_module_index(modules.*,path);
+    let src: []u8 = "";
+    if(existing_module>=0){src=get[ResolvedModule](modules.*,existing_module).source;}
+    else{
+        src = _zag_read_file(path);
+        if (src.len < 0) {
+            _zag_print("zag: error: @import cannot read '");
+            _zag_print(path);
+            _zag_println("'");
+            let _dropped: []u8 = pop[[]u8](loading);
+            _zag_exit(1);
+        }
+        push[ResolvedModule](modules,ResolvedModule{.path=path,.source=src});
     }
     let mod_dir: []u8 = dir_of(path);
-    collect_cfile(mod_dir, cfiles);
     if (has_qual == 1) {
         // Qualified: resolve into a private list, then prefix + splice.
         let inner: ArrayList[*Node] = make[*Node](8);
-        resolve_src(src, mod_dir, seen, &inner, cfiles, aliases, loading);
-        qualify_into(inner, qual, out);
+        let imported_profile: i32 = 0;
+        resolve_src(src, mod_dir, seen, &inner, aliases, loading, 0, &imported_profile,path,modules,imports,resources,origins);
+        qualify_into(inner, qual, path, out,origins);
     } else {
-        resolve_src(src, mod_dir, seen, out, cfiles, aliases, loading);
+        let imported_profile: i32 = 0;
+        resolve_src(src, mod_dir, seen, out, aliases, loading, 0, &imported_profile,path,modules,imports,resources,origins);
     }
     let _dropped: []u8 = pop[[]u8](loading);   // pop from in-progress stack
 }
@@ -1376,17 +2709,222 @@ fn check_zag_mod(base_dir: []u8) void {
     check_zag_mod_deps(mod_src, base_dir);
 }
 
+// Bind the deliberately small script allocation convenience to this script's
+// hidden context. This walk is applied only to root executable statements;
+// imported strict declarations and explicit allocator calls are untouched.
+fn script_has_user_fn(decls: ArrayList[*Node], name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .fn_decl => |f| { if (@strEq(f.name, name)) { return 1; } }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn script_list_literal_class(node: *Node) i32 {
+    let result: i32 = switch (node.*) {
+        .ilit => |_value| 1,
+        .slit => |_value| 2,
+        .id => |_value| 0,
+        else => 0,
+    };
+    switch (node.*) {
+        .id => |value| {
+            if (@strEq(value.name, "true") || @strEq(value.name, "false")) { result = 3; }
+        }
+        else => { }
+    }
+    return result;
+}
+
+fn script_bind_expr(n: *Node, decls: ArrayList[*Node]) void {
+    switch (n.*) {
+        .call => |c| {
+            let bind: i32 = 0;
+            switch (c.callee.*) { .id => |id| {
+                if (@strEq(id.name, "script_alloc")) { bind = 1; }
+                if (@strEq(id.name, "script_alloc_used")) { bind = 2; }
+                if (@strEq(id.name, "print")) { bind = 3; }
+                if (@strEq(id.name, "println")) { bind = 4; }
+                // `say` is the beginner-facing spelling for one value followed
+                // by a newline. It lowers to the same ordinary runtime
+                // declaration as println, and a user-declared `say` still wins.
+                if (@strEq(id.name, "say")) { bind = 4; }
+                if (@strEq(id.name, "read_file")) { bind = 5; }
+                if (@strEq(id.name, "write_file")) { bind = 6; }
+                if (@strEq(id.name, "args_len")) { bind = 7; }
+                if (@strEq(id.name, "arg")) { bind = 8; }
+                if (@strEq(id.name, "string_concat")) { bind = 9; }
+                if (@strEq(id.name, "process_run_timeout")) { bind = 10; }
+                if (@strEq(id.name, "string_builder")) { bind = 11; }
+                if (@strEq(id.name, "list")) { bind = 12; }
+                if (@strEq(id.name, "new")) { bind = 13; }
+                if (@strEq(id.name, "args")) { bind = 14; }
+                if (@strEq(id.name, "path_join")) { bind = 15; }
+                if (@strEq(id.name, "path_basename")) { bind = 16; }
+                if (@strEq(id.name, "path_dirname")) { bind = 17; }
+                if (@strEq(id.name, "path_extension")) { bind = 18; }
+                // Beginner-facing collection names. These are Script-root
+                // conveniences only; strict Zag retains the explicit generic
+                // ScriptList APIs and ordinary user declarations still win.
+                if (@strEq(id.name, "append")) { bind = 19; }
+                if (@strEq(id.name, "length")) { bind = 20; }
+                if (@strEq(id.name, "len")) { bind = 20; }
+                if (@strEq(id.name, "item_at")) { bind = 21; }
+                if (@strEq(id.name, "input")) { bind = 22; }
+                if (@strEq(id.name, "env")) { bind = 23; }
+                if (bind > 0 && script_has_user_fn(decls, id.name) == 1) { bind = 0; }
+            } else => { } }
+            let i: i32 = 0;
+            while (i < len[*Node](c.args)) { script_bind_expr(get[*Node](c.args, i), decls); i = i + 1; }
+            if (bind > 0) {
+                let args: ArrayList[*Node] = make[*Node](len[*Node](c.args) + 1);
+                push[*Node](&args, mk_ident("__zag_script_context"));
+                let j: i32 = 0; while (j < len[*Node](c.args)) { push[*Node](&args, get[*Node](c.args, j)); j = j + 1; }
+                if (bind == 1) { n.* = mk_call(mk_ident("_zag_script_alloc"), args).*; }
+                else if (bind == 2) { n.* = mk_call(mk_ident("_zag_script_alloc_used"), args).*; }
+                else if (bind == 3) { n.* = mk_call(mk_ident("_zag_print"), c.args).*; }
+                else if (bind == 4) { n.* = mk_call(mk_ident("_zag_println"), c.args).*; }
+                else if (bind == 5) { n.* = mk_call(mk_ident("script_read_file"), args).*; }
+                else if (bind == 6) { n.* = mk_call(mk_ident("_zag_write_file"), c.args).*; }
+                else if (bind == 7) { n.* = mk_call(mk_ident("_zag_argc"), c.args).*; }
+                else if (bind == 8) { n.* = mk_call(mk_ident("_zag_arg"), c.args).*; }
+                else if (bind == 9) { n.* = mk_call(mk_ident("script_string_concat"), args).*; }
+                else if (bind == 10) { n.* = mk_call(mk_ident("process_run_bounded_script"), args).*; }
+                else if (bind == 11) { n.* = mk_call(mk_ident("script_string_builder_new"), args).*; }
+                else if (bind == 13) { n.* = mk_call(mk_ident("_zag_script_new"), args).*; }
+                else if (bind == 14) { n.* = mk_call(mk_ident("script_args"), args).*; }
+                else if (bind == 15) { n.* = mk_call(mk_ident("script_path_join"), args).*; }
+                else if (bind == 16) { n.* = mk_call(mk_ident("script_path_basename"), args).*; }
+                else if (bind == 17) { n.* = mk_call(mk_ident("script_path_dirname"), args).*; }
+                else if (bind == 18) { n.* = mk_call(mk_ident("script_path_extension"), args).*; }
+                else if (bind == 19) {
+                    if (len[*Node](c.args) != 2) { _zag_eprintln("Zag Script append expects a list and one value"); _zag_exit(1); }
+                    let append_args: ArrayList[*Node] = make[*Node](2);
+                    push[*Node](&append_args, mk_un("&", get[*Node](c.args, 0)));
+                    push[*Node](&append_args, get[*Node](c.args, 1));
+                    n.* = mk_call(mk_ident("script_list_append"), append_args).*;
+                }
+                else if (bind == 20) {
+                    if (len[*Node](c.args) != 1) { _zag_eprintln("Zag Script length expects one collection"); _zag_exit(1); }
+                    n.* = mk_call(mk_ident("script_list_len"), c.args).*;
+                }
+                else if (bind == 21) {
+                    if (len[*Node](c.args) != 2) { _zag_eprintln("Zag Script item_at expects a collection and an index"); _zag_exit(1); }
+                    n.* = mk_call(mk_ident("script_list_get"), c.args).*;
+                }
+                else if (bind == 22) {
+                    if (len[*Node](c.args) != 1) { _zag_eprintln("Zag Script input expects one prompt"); _zag_exit(1); }
+                    n.* = mk_call(mk_ident("script_input"), args).*;
+                }
+                else if (bind == 23) {
+                    if (len[*Node](c.args) != 1) { _zag_eprintln("Zag Script env expects one variable name"); _zag_exit(1); }
+                    n.* = mk_call(mk_ident("_zag_script_env_get"), args).*;
+                }
+                else {
+                    let list_arity: i32 = len[*Node](c.args);
+                    if (list_arity < 1 || list_arity > 4) {
+                        _zag_eprintln("Zag Script list expects one to four initial values");
+                        _zag_exit(1);
+                    }
+                    let literal_class: i32 = script_list_literal_class(get[*Node](c.args, 0));
+                    let list_i: i32 = 1;
+                    while (list_i < list_arity) {
+                        let next_class: i32 = script_list_literal_class(get[*Node](c.args, list_i));
+                        if (literal_class != 0 && next_class != 0 && literal_class != next_class) {
+                            _zag_eprintln("Zag Script list elements have incompatible literal types");
+                            _zag_exit(1);
+                        }
+                        list_i = list_i + 1;
+                    }
+                    let constructor: []u8 = _zag_str_concat("script_list", _zag_i64_to_str(list_arity as i64));
+                    n.* = mk_call(mk_ident(constructor), args).*;
+                }
+            } else { script_bind_expr(c.callee, decls); }
+        }
+        .bin => |b| { script_bind_expr(b.l, decls); script_bind_expr(b.r, decls); }
+        .un => |u| { script_bind_expr(u.e, decls); }
+        .fld => |f| { script_bind_expr(f.base, decls); }
+        .idx => |x| { script_bind_expr(x.base, decls); script_bind_expr(x.idx, decls); }
+        .cast_ => |c| { script_bind_expr(c.expr, decls); }
+        .slice_ => |s| { script_bind_expr(s.base, decls); script_bind_expr(s.lo, decls); script_bind_expr(s.hi, decls); }
+        .slit_ => |s| { let i: i32 = 0; while (i < len[FieldInit](s.fields)) { script_bind_expr(get[FieldInit](s.fields, i).val, decls); i = i + 1; } }
+        .switch_ => |sw| {
+            script_bind_expr(sw.subject, decls);
+            let i: i32 = 0; while (i < len[SwitchArm](sw.arms)) { script_bind_block(get[SwitchArm](sw.arms, i).body, decls); i = i + 1; }
+            script_bind_block(sw.els_body, decls);
+        }
+        else => { }
+    }
+}
+fn script_bind_stmt(n: *Node, decls: ArrayList[*Node]) void {
+    switch (n.*) {
+        .let_ => |l| { if (l.has_init == 1) { script_bind_expr(l.expr, decls); } }
+        .ret => |r| { if (r.has_expr == 1) { script_bind_expr(r.expr, decls); } }
+        .estmt => |e| { script_bind_expr(e.expr, decls); }
+        .assign => |a| { script_bind_expr(a.target, decls); script_bind_expr(a.expr, decls); }
+        .if_ => |x| { script_bind_expr(x.cond, decls); script_bind_block(x.then_body, decls); script_bind_block(x.els_body, decls); }
+        .while_ => |w| { script_bind_expr(w.cond, decls); script_bind_block(w.body, decls); }
+        .unsafe_ => |u| { script_bind_block(u.body, decls); }
+        .defer_ => |d| { script_bind_expr(d.expr, decls); }
+        .switch_ => |sw| {
+            script_bind_expr(sw.subject, decls);
+            let i: i32 = 0; while (i < len[SwitchArm](sw.arms)) { script_bind_block(get[SwitchArm](sw.arms, i).body, decls); i = i + 1; }
+            script_bind_block(sw.els_body, decls);
+        }
+        else => { }
+    }
+}
+fn script_bind_block(body: ArrayList[*Node], decls: ArrayList[*Node]) void {
+    let i: i32 = 0; while (i < len[*Node](body)) { script_bind_stmt(get[*Node](body, i), decls); i = i + 1; }
+}
+
+// Statements do not yet carry source spans, so never invent a line number.
+// The AST does preserve the callee of a propagated `try`, which is a useful
+// exact operation witness for the generated uncaught-error boundary.
+fn script_try_callee_name(n:*Node)[]u8{switch(n.*){.id=>|x|{return x.name;}.fld=>|x|{return x.fname;}else=>{}}return "";}
+fn script_try_operation_expr(n:*Node)[]u8{switch(n.*){.un=>|u|{if(@strEq(u.op,"try")){switch(u.e.*){.call=>|c|{return script_try_callee_name(c.callee);}else=>{}}}return script_try_operation_expr(u.e);}.call=>|c|{let i:i32=0;while(i<c.args.len){let found:[]u8=script_try_operation_expr(c.args.data[i]);if(found.len>0){return found;}i=i+1;}}.bin=>|b|{let found:[]u8=script_try_operation_expr(b.l);if(found.len>0){return found;}return script_try_operation_expr(b.r);}.cast_=>|c|{return script_try_operation_expr(c.expr);}else=>{}}return "";}
+fn script_try_operation_body(body:ArrayList[*Node])[]u8{let i:i32=0;while(i<body.len){let found:[]u8="";switch(body.data[i].*){.let_=>|x|{if(x.has_init==1){found=script_try_operation_expr(x.expr);}}.ret=>|x|{if(x.has_expr==1){found=script_try_operation_expr(x.expr);}}.estmt=>|x|{found=script_try_operation_expr(x.expr);}.assign=>|x|{found=script_try_operation_expr(x.expr);}.if_=>|x|{found=script_try_operation_expr(x.cond);if(found.len==0){found=script_try_operation_body(x.then_body);}if(found.len==0){found=script_try_operation_body(x.els_body);}}.while_=>|x|{found=script_try_operation_expr(x.cond);if(found.len==0){found=script_try_operation_body(x.body);}}.switch_=>|x|{found=script_try_operation_expr(x.subject);let ai:i32=0;while(found.len==0&&ai<len[SwitchArm](x.arms)){found=script_try_operation_body(get[SwitchArm](x.arms,ai).body);ai=ai+1;}if(found.len==0){found=script_try_operation_body(x.els_body);}}else=>{}}if(found.len>0){return found;}i=i+1;}return "";}
+fn script_body_ends_return(body:ArrayList[*Node])i32{if(body.len==0){return 0;}switch(body.data[body.len-1].*){.ret=>|_|{return 1;}else=>{return 0;}}}
+
 // Parse the top-level decls of one source string, resolving its @imports
 // relative to `base_dir`, appending decls to `out`. Module aliases (`as name`)
-// are accumulated GLOBALLY in `aliases` — the bootstrap propagates an alias
-// through flat re-imports (e.g. zagc.zag uses `map.` via flat-imported sema.zag),
-// so `alias.member` rewriting is applied once over all decls afterward.
+// are accumulated GLOBALLY in `aliases`, so `alias.member` rewriting is
+// applied once over all declarations afterward.
 // `loading` is the current in-progress import stack for circular detection.
-fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayList[*Node], cfiles: *ArrayList[[]u8], aliases: *ArrayList[[]u8], loading: *ArrayList[[]u8]) void {
-    let toks: ArrayList[Token] = lex(src);
-    let p: Parser = Parser{ .toks = toks, .i = 0, .closures = make[*Node](2), .cctr = 0, .fn_eff = "" };
+fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayList[*Node], aliases: *ArrayList[[]u8], loading: *ArrayList[[]u8], is_root: i32, root_profile: *i32, current_path:[]u8, modules:*ArrayList[ResolvedModule], imports:*ArrayList[ResolvedImport], resources:*ArrayList[ResolvedResource],origins:*ArrayList[NodeOrigin]) void {
+    let normalized:ZsNormalized=script_syntax_normalize_with_origins(src);
+    if(script_syntax_cst_valid(normalized.cst)==0){
+        _zag_eprintln("E0018: invalid Script CST source-span projection");_zag_exit(1);
+    }
+    let parse_src:[]u8=normalized.source;
+    let toks: ArrayList[Token] = lex(parse_src);
+    let p: Parser = Parser{ .toks = toks, .i = 0, .closures = make[*Node](2), .cctr = 0, .fn_eff = "", .consts = make[[]u8](4), .unsafe_next = 0, .pipe_op = 1, .origin = current_path, .base_dir = base_dir, .source = parse_src, .resources = resources,.origins=origins,.origin_projection=normalized.origins,.compact_source=src,.compact_cst=normalized.cst };
+    let script_seen: i32 = 0;
+    let executable_seen: i32 = 0;
+    let script_body: ArrayList[*Node] = make[*Node](8);
     while (!at_k(&p, Tk.Eof)) {
-        if (at_k(&p, Tk.Annot) && @strEq(cur(&p).val, "@import")) {
+        if (at_k(&p, Tk.Ident) && @strEq(cur(&p).val, "script")) {
+            let st: Token = adv(&p);
+            if (!at_k(&p, Tk.Semi)) {
+                diag_emit("E0012", "script profile declaration must be `script;`", "", st.line, st.col, 6, "the script declaration is a file-level marker", "add `;` after `script`", parse_src);
+                _zag_exit(1);
+            }
+            let _semi: Token = adv(&p);
+            if (script_seen == 1) {
+                diag_emit("E0013", "duplicate `script;` declaration", "", st.line, st.col, 6, "a module has exactly one compilation profile", "remove the duplicate declaration", src);
+                _zag_exit(1);
+            }
+            if (executable_seen == 1) {
+                diag_emit("E0014", "`script;` must appear before executable top-level statements", "", st.line, st.col, 6, "profile selection must precede script execution", "move `script;` to the beginning of the file", src);
+                _zag_exit(1);
+            }
+            script_seen = 1;
+            if (is_root == 1) { root_profile.* = 1; }
+        } else if (at_k(&p, Tk.Annot) && @strEq(cur(&p).val, "@import")) {
             let _imp: Token = adv(&p);     // @import
             let _lp: Token = adv(&p);      // (
             let pathtok: Token = adv(&p);  // "path"
@@ -1400,8 +2938,27 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
                 has_qual = 1;
                 if (!seen_has(aliases.*, qual)) { push[[]u8](aliases, qual); }
             }
-            let resolved: []u8 = resolve_import_path(relpath, base_dir);
-            load_module(resolved, qual, has_qual, seen, out, cfiles, aliases, loading);
+            let package:PackageImportResolution=package_import_resolve(relpath,base_dir);
+            let resolved: []u8 = "";
+            if(package.matched!=0){
+                if(package.error!=PackageImportError.none){
+                    package_import_report(package);package_import_resolution_release(&package);_zag_exit(1);
+                }
+                resolved=normalize_import_path(package.path);
+            }else{resolved=resolve_import_path(relpath, base_dir);}
+            let canonical:[]u8=canon_path(resolved);push[ResolvedImport](imports,ResolvedImport{.importer=current_path,.imported=canonical,.specifier=relpath});
+            load_module(canonical, qual, has_qual, seen, out, aliases, loading,modules,imports,resources,origins);
+            if(package.locked!=0&&resolved_module_package_checksum_matches(
+                modules.*,canonical,package)==0){
+                package.error=PackageImportError.checksum_mismatch;
+                package_import_report(package);package_import_resolution_release(&package);_zag_exit(1);
+            }
+            if(package.matched!=0&&package_resolution_resources_adopt(
+                &package,resources)==0){
+                package.error=PackageImportError.dependency_input_changed;
+                package_import_report(package);package_import_resolution_release(&package);_zag_exit(1);
+            }
+            if(package.matched!=0){package_import_resolution_release(&package);}
         } else if (at_k(&p, Tk.Annot) && @strEq(cur(&p).val, "@link")) {
             let _lnk: Token = adv(&p);       // @link
             let _lp2: Token = adv(&p);        // (
@@ -1409,32 +2966,89 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
             let _rp2: Token = adv(&p);        // )
             eat_semi(&p);
             push[*Node](out, new(Node{ .link_dir = LinkDir{ .lib = strip_quotes(libtok.val) } }));
+        } else if (at_k(&p, Tk.Annot) && @strEq(cur(&p).val, "@repr")) {
+            push[*Node](out, parse_repr_c_struct(&p, 0));
+        } else if (at_k(&p, Tk.Annot) && annotated_decl_is(&p, Tk.KwStruct)) {
+            push[*Node](out, parse_struct(&p, 0, 0));
+        } else if (at_k(&p, Tk.Annot) && annotated_decl_is(&p, Tk.KwEnum)) {
+            push[*Node](out, parse_enum(&p, 0));
         } else if (at_k(&p, Tk.KwPub)) {
             // `pub` keyword — marks the next decl as part of the public API
             let _pub: Token = adv(&p);   // pub
-            if (at_k(&p, Tk.KwStruct)) {
-                push[*Node](out, parse_struct(&p, 1));
+            if (at_k(&p, Tk.Ident) && @strEq(cur(&p).val, "unsafe")) {
+                push[*Node](out, parse_unsafe_fn(&p, 1));
+            } else if (at_k(&p, Tk.Annot) && @strEq(cur(&p).val, "@repr")) {
+                push[*Node](out, parse_repr_c_struct(&p, 1));
+            } else if (at_k(&p, Tk.KwStruct) || (at_k(&p, Tk.Annot) && annotated_decl_is(&p, Tk.KwStruct))) {
+                push[*Node](out, parse_struct(&p, 1, 0));
             } else if (at_k(&p, Tk.KwUnion)) {
                 push[*Node](out, parse_union(&p));
-            } else if (at_k(&p, Tk.KwEnum)) {
-                push[*Node](out, parse_enum(&p));
+            } else if (at_k(&p, Tk.KwEnum) || (at_k(&p, Tk.Annot) && annotated_decl_is(&p, Tk.KwEnum))) {
+                push[*Node](out, parse_enum(&p, 1));
             } else {
                 push[*Node](out, parse_fn(&p, 1));
             }
+        } else if (at_k(&p, Tk.Ident) && @strEq(cur(&p).val, "unsafe")) {
+            push[*Node](out, parse_unsafe_fn(&p, 0));
         } else if (at_k(&p, Tk.KwStruct)) {
-            push[*Node](out, parse_struct(&p, 0));
+            push[*Node](out, parse_struct(&p, 0, 0));
         } else if (at_k(&p, Tk.KwUnion)) {
             push[*Node](out, parse_union(&p));
         } else if (at_k(&p, Tk.KwEnum)) {
-            push[*Node](out, parse_enum(&p));
+            push[*Node](out, parse_enum(&p, 0));
         } else if (at_k(&p, Tk.KwError)) {
             push[*Node](out, parse_error_decl(&p));
         } else if (at_k(&p, Tk.Ident) && @strEq(cur(&p).val, "operator")) {
             push[*Node](out, parse_operator(&p));
         } else if (at_k(&p, Tk.Ident) && @strEq(cur(&p).val, "interface")) {
             push[*Node](out, parse_interface(&p));
-        } else if (at_k(&p, Tk.Annot) || at_k(&p, Tk.Ident) || at_k(&p, Tk.KwExtern) || at_k(&p, Tk.KwFn)) {
+        } else if (at_k(&p, Tk.Ident) && @strEq(cur(&p).val, "const")) {
+            push[*Node](out, parse_const(&p));
+        } else if (at_k(&p, Tk.Annot) || at_k(&p, Tk.KwExtern) || at_k(&p, Tk.KwFn)) {
             push[*Node](out, parse_fn(&p, 0));
+        } else if (at_k(&p, Tk.KwAsync) || at_k(&p, Tk.KwAwait)) {
+            let t:Token=adv(&p);unsupported_async_surface(&p,t);
+        } else if (at_k(&p, Tk.KwGlobal)) {
+            if (is_root == 0) {
+                diag_emit("E0204", "global storage is permitted only in the root compilation unit", "", cur(&p).line, cur(&p).col, cur(&p).val.len, "imported modules have no static initialization or lifetime contract", "move the global declaration to the root module", src);
+                _zag_exit(1);
+            }
+            push[*Node](out, parse_global_let(&p));
+        } else if (at_k(&p, Tk.KwLet) && script_seen == 0) {
+            // A top-level `let` would require source-level static storage,
+            // initialization ordering, and lifetime/provenance rules.  The
+            // native BSS is compiler-private runtime state, not a user global
+            // namespace, so fail closed rather than silently treating this as
+            // a local or Script statement in a strict module.
+            diag_emit("E0204",
+                "top-level mutable globals require an explicit v2 global lifetime contract",
+                "", cur(&p).line, cur(&p).col, cur(&p).val.len,
+                "strict Zag modules have no user-global storage lowering",
+                "move the value into a function or use an explicit future global API",
+                src);
+            _zag_exit(1);
+        } else if (script_seen == 1) {
+            // Imported script modules retain their ordinary declarations but
+            // never contribute executable body statements to the root.
+            executable_seen = 1;
+            // A canonical `for` expands to an index binding plus a while loop,
+            // so it cannot travel through parse_stmt's single-node result.
+            // Script top level must use the same expansion path as a function
+            // block or ownership analysis would see `for(...)` as an unknown
+            // ordinary call.
+            if (at_k(&p, Tk.KwFor)) {
+                let expanded: ArrayList[*Node] = parse_for(&p, 1);
+                if (is_root == 1) {
+                    let ei: i32 = 0;
+                    while (ei < len[*Node](expanded)) {
+                        push[*Node](&script_body, get[*Node](expanded, ei));
+                        ei = ei + 1;
+                    }
+                }
+            } else {
+                let stmt: *Node = parse_stmt(&p);
+                if (is_root == 1) { push[*Node](&script_body, stmt); }
+            }
         } else {
             diag_emit("E0010",
                 _zag_str_concat("unexpected token at top level: `", _zag_str_concat(cur(&p).val, "`")),
@@ -1451,28 +3065,402 @@ fn resolve_src(src: []u8, base_dir: []u8, seen: *ArrayList[[]u8], out: *ArrayLis
         push[*Node](out, get[*Node](p.closures, ci));
         ci = ci + 1;
     }
+    if (is_root == 1 && script_seen == 1) {
+        let di: i32 = 0;
+        while (di < len[*Node](out.*)) {
+            switch (get[*Node](out.*, di).*) {
+                .fn_decl => |f| {
+                    if (@strEq(f.name, "main")) {
+                        diag_emit("E0015", "script module conflicts with user-defined `main`", "", f.line, 1, 4, "the script profile generates the process entry point", "remove `main` or remove `script;`", src);
+                        _zag_exit(1);
+                    }
+                    if (@strEq(f.name, "__zag_compiler_script_body_7f3a") ||
+                        @strEq(f.name, "__zag_compiler_script_uncaught_7f3a") ||
+                        @strEq(f.name, "_zag_script_context_init") ||
+                        @strEq(f.name, "_zag_script_context_shutdown")) {
+                        diag_emit("E0016", "declaration conflicts with a compiler-owned script symbol", "", f.line, 1, f.name.len,
+                            "generated script runtime symbols are reserved and are not user APIs",
+                            "rename this declaration", src);
+                        _zag_exit(1);
+                    }
+                    if (@strEq(f.name, "_zag_script_alloc") || @strEq(f.name, "_zag_script_alloc_used") || @strEq(f.name, "_zag_script_new")) {
+                        diag_emit("E0016", "declaration conflicts with a compiler-owned script symbol", "", f.line, 1, f.name.len,
+                            "generated script runtime symbols are reserved and are not user APIs", "rename this declaration", src);
+                        _zag_exit(1);
+                    }
+                }
+                else => { }
+            }
+            di = di + 1;
+        }
+        // Load the ordinary strict-Zag implementation only when the root uses
+        // the bounded-process convenience and has not declared its own override.
+        if (script_has_user_fn(out.*, "process_run_timeout") == 0) {
+            let wants_process: i32 = 0;
+            let si: i32 = 0;
+            let needle: []u8 = "process_run_timeout";
+            while (si + needle.len <= src.len && wants_process == 0) {
+                if (@strEq(src[si..si + needle.len], needle)) { wants_process = 1; }
+                si = si + 1;
+            }
+            if (wants_process == 1) {
+                load_module(resolve_import_path("std:process", base_dir), "", 0,
+                    seen, out, aliases, loading, modules, imports, resources, origins);
+            }
+        }
+        if (script_has_user_fn(out.*, "read_file") == 0) {
+            let wants_read: i32 = 0;
+            let ri: i32 = 0;
+            let read_needle: []u8 = "read_file(";
+            while (ri + read_needle.len <= src.len && wants_read == 0) {
+                if (@strEq(src[ri..ri + read_needle.len], read_needle)) { wants_read = 1; }
+                ri = ri + 1;
+            }
+            if (wants_read == 1) {
+                load_module(resolve_import_path("std:script_io", base_dir), "", 0,
+                    seen, out, aliases, loading, modules, imports, resources, origins);
+            }
+        }
+        if (script_has_user_fn(out.*, "string_builder") == 0) {
+            let wants_builder: i32 = 0;
+            let bi: i32 = 0;
+            let builder_needle: []u8 = "string_builder";
+            while (bi + builder_needle.len <= src.len && wants_builder == 0) {
+                if (@strEq(src[bi..bi + builder_needle.len], builder_needle)) { wants_builder = 1; }
+                bi = bi + 1;
+            }
+            if (wants_builder == 1) {
+                load_module(resolve_import_path("std:script_string_builder", base_dir), "", 0,
+                    seen, out, aliases, loading, modules, imports, resources, origins);
+            }
+        }
+        if (script_has_user_fn(out.*, "input") == 0) {
+            let wants_input:i32=0;let input_i:i32=0;let input_needle:[]u8="input(";
+            while(input_i+input_needle.len<=src.len&&wants_input==0){if(@strEq(src[input_i..input_i+input_needle.len],input_needle)){wants_input=1;}input_i=input_i+1;}
+            if(wants_input==1){load_module(resolve_import_path("std:script_input",base_dir),"",0,seen,out,aliases,loading,modules,imports,resources,origins);}
+        }
+        if (script_has_user_fn(out.*, "list") == 0) {
+            let wants_list: i32 = 0;
+            let li: i32 = 0;
+            let list_needle: []u8 = "list(";
+            while (li + list_needle.len <= src.len && wants_list == 0) {
+                if (@strEq(src[li..li + list_needle.len], list_needle)) { wants_list = 1; }
+                li = li + 1;
+            }
+            let beginner_list_needle: []u8 = "append(";
+            li = 0;
+            while (li + beginner_list_needle.len <= src.len && wants_list == 0) {
+                if (@strEq(src[li..li + beginner_list_needle.len], beginner_list_needle)) { wants_list = 1; }
+                li = li + 1;
+            }
+            let beginner_length_needle: []u8 = "length(";
+            li = 0;
+            while (li + beginner_length_needle.len <= src.len && wants_list == 0) {
+                if (@strEq(src[li..li + beginner_length_needle.len], beginner_length_needle)) { wants_list = 1; }
+                li = li + 1;
+            }
+            let beginner_item_needle: []u8 = "item_at(";
+            li = 0;
+            while (li + beginner_item_needle.len <= src.len && wants_list == 0) {
+                if (@strEq(src[li..li + beginner_item_needle.len], beginner_item_needle)) { wants_list = 1; }
+                li = li + 1;
+            }
+            if (wants_list == 1) {
+                load_module(resolve_import_path("std:script_list", base_dir), "", 0,
+                    seen, out, aliases, loading, modules, imports, resources, origins);
+            }
+        }
+        if (script_has_user_fn(out.*, "args") == 0) {
+            let wants_args:i32=0;let ai:i32=0;let args_needle:[]u8="args(";
+            while(ai+args_needle.len<=src.len&&wants_args==0){if(@strEq(src[ai..ai+args_needle.len],args_needle)){wants_args=1;}ai=ai+1;}
+            if(wants_args==1){load_module(resolve_import_path("std:script_list",base_dir),"",0,seen,out,aliases,loading,modules,imports,resources,origins);}
+        }
+        let wants_path:i32=0;let path_i:i32=0;
+        while(path_i+5<=src.len&&wants_path==0){if(@strEq(src[path_i..path_i+5],"path_")){wants_path=1;}path_i=path_i+1;}
+        if(wants_path==1){load_module(resolve_import_path("std:script_path",base_dir),"",0,seen,out,aliases,loading,modules,imports,resources,origins);}
+        if (script_has_user_fn(out.*, "string_concat") == 0) {
+            let wants_concat: i32 = 0;
+            let sci: i32 = 0;
+            let concat_needle: []u8 = "string_concat(";
+            while (sci + concat_needle.len <= src.len && wants_concat == 0) {
+                if (@strEq(src[sci..sci + concat_needle.len], concat_needle)) { wants_concat = 1; }
+                sci = sci + 1;
+            }
+            if (wants_concat == 1) {
+                load_module(resolve_import_path("std:script_string", base_dir), "", 0,
+                    seen, out, aliases, loading, modules, imports, resources, origins);
+            }
+        }
+        // Keep user top-level control flow inside a hidden function. This makes
+        // every return flow back through the process wrapper, so deterministic
+        // shutdown cannot be bypassed by a top-level `return`.
+        // An explicit user declaration wins independently over each prelude convenience.
+        let script_try_operation:[]u8=script_try_operation_body(script_body);
+        script_bind_block(script_body, out.*);
+        if(script_body_ends_return(script_body)==0){push[*Node](&script_body, mk_ret(1, mk_int("0")));}
+        let report_params: ArrayList[Param] = make[Param](1);
+        push[Param](&report_params, Param{ .name = "code", .pty = "i32", .eff = "", .contract = "", .calign = 0 });
+        let report_body: ArrayList[*Node] = make[*Node](3);
+        // Error declarations are represented by the compiler-owned
+        // __zag_errors enum. Emit deterministic name witnesses before the
+        // numeric fallback so uncaught Script diagnostics preserve the user's
+        // declared error identity without a runtime reflection system.
+        let error_decl_i: i32 = 0;
+        while (error_decl_i < len[*Node](out.*)) {
+            switch (get[*Node](out.*, error_decl_i).*) {
+                .enum_ => |errors| {
+                    if (@strEq(errors.name, "__zag_errors")) {
+                        let error_i: i32 = 0;
+                        while (error_i < len[[]u8](errors.members)) {
+                            let named_args: ArrayList[*Node] = make[*Node](1);
+                            push[*Node](&named_args, mk_str(_zag_str_concat("uncaught Zag Script error name: ", get[[]u8](errors.members, error_i))));
+                            let named_body: ArrayList[*Node] = make[*Node](1);
+                            push[*Node](&named_body, mk_estmt(mk_call(mk_ident("_zag_eprintln"), named_args)));
+                            push[*Node](&report_body, mk_if(mk_bin("==", mk_ident("code"),
+                                mk_int(_zag_i64_to_str((error_i + 1) as i64))), named_body, make[*Node](1), 0));
+                            error_i = error_i + 1;
+                        }
+                    }
+                }
+                else => { }
+            }
+            error_decl_i = error_decl_i + 1;
+        }
+        let code_args: ArrayList[*Node] = make[*Node](1); push[*Node](&code_args, mk_ident("code"));
+        let concat_args: ArrayList[*Node] = make[*Node](2);
+        push[*Node](&concat_args, mk_str("uncaught Zag Script error code "));
+        push[*Node](&concat_args, mk_call(mk_ident("_zag_i64_to_str"), code_args));
+        let print_args: ArrayList[*Node] = make[*Node](1);
+        push[*Node](&print_args, mk_call(mk_ident("_zag_str_concat"), concat_args));
+        push[*Node](&report_body, mk_estmt(mk_call(mk_ident("_zag_eprintln"), print_args)));
+        let where_args: ArrayList[*Node] = make[*Node](1);
+        let operation_witness:[]u8="operation: root script top-level execution (exact expression witness unavailable)";
+        if(script_try_operation.len>0){operation_witness=_zag_str_concat("operation: root script top-level try call `",_zag_str_concat(script_try_operation,"`"));}
+        push[*Node](&where_args, mk_str(operation_witness));
+        push[*Node](&report_body, mk_estmt(mk_call(mk_ident("_zag_eprintln"), where_args)));
+        push[*Node](&report_body, mk_ret(1, mk_int("1")));
+        push[*Node](out, new(Node{ .fn_decl = FnDecl{
+            .name = "__zag_compiler_script_uncaught_7f3a", .tparams = make[[]u8](1), .params = report_params,
+            .ret = "i32", .annots = make[[]u8](1), .body = report_body,
+            .is_extern = 0, .ret_eff = "", .caps = 0, .cap_names = "",
+            .cap_types = "", .line = 0, .is_pub = 0, .origin = "" } }));
+        let hidden_params: ArrayList[Param] = make[Param](1);
+        push[Param](&hidden_params, Param{ .name = "__zag_script_context", .pty = "*opaque", .eff = "", .contract = "", .calign = 0 });
+        push[*Node](out, new(Node{ .fn_decl = FnDecl{
+            .name = "__zag_compiler_script_body_7f3a", .tparams = make[[]u8](1), .params = hidden_params,
+            .ret = "!i32", .annots = make[[]u8](1), .body = script_body,
+            .is_extern = 0, .ret_eff = "", .caps = 0, .cap_names = "",
+            .cap_types = "", .line = 1, .is_pub = 0, .origin = "<root>" } }));
+
+        let wrapper: ArrayList[*Node] = make[*Node](5);
+        // Compiler-only ScriptContext ABI:
+        //   memory limit, capability bits, validated execution-policy bits.
+        // The foreground driver replaces these defaults with project/CLI
+        // policy after parsing. They are never source-visible declarations.
+        let init_args: ArrayList[*Node] = make[*Node](3);
+        push[*Node](&init_args, mk_int("67108864"));
+        push[*Node](&init_args, mk_int("7"));
+        push[*Node](&init_args, mk_int("16843009"));
+        push[*Node](&wrapper, mk_let("__zag_script_context", "*opaque", 1, 1,
+            mk_call(mk_ident("_zag_script_context_init"), init_args)));
+        let body_args: ArrayList[*Node] = make[*Node](1);
+        push[*Node](&body_args, mk_ident("__zag_script_context"));
+        let caught_args: ArrayList[*Node] = make[*Node](3);
+        push[*Node](&caught_args, mk_call(mk_ident("__zag_compiler_script_body_7f3a"), body_args));
+        push[*Node](&caught_args, mk_ident("__zag_script_error_code"));
+        let report_args: ArrayList[*Node] = make[*Node](1);
+        push[*Node](&report_args, mk_ident("__zag_script_error_code"));
+        push[*Node](&caught_args, mk_call(mk_ident("__zag_compiler_script_uncaught_7f3a"), report_args));
+        push[*Node](&wrapper, mk_let("__zag_script_status", "i32", 1, 1,
+            mk_call(mk_ident("__catchc"), caught_args)));
+        let shutdown_args: ArrayList[*Node] = make[*Node](1);
+        push[*Node](&shutdown_args, mk_ident("__zag_script_context"));
+        push[*Node](&wrapper, mk_estmt(mk_call(mk_ident("_zag_script_context_shutdown"), shutdown_args)));
+        push[*Node](&wrapper, mk_ret(1, mk_ident("__zag_script_status")));
+        push[*Node](out, new(Node{ .fn_decl = FnDecl{
+            .name = "main", .tparams = make[[]u8](1), .params = make[Param](1),
+            .ret = "i32", .annots = make[[]u8](1), .body = wrapper,
+            .is_extern = 0, .ret_eff = "", .caps = 0, .cap_names = "",
+            .cap_types = "", .line = 0, .is_pub = 0, .origin = "" } }));
+    }
 }
 
-// Parse a whole program, resolving @imports relative to `base_dir`, also
-// collecting sibling runtime.c paths into `cfiles` for the driver to link.
-fn parse_program_collect(src: []u8, base_dir: []u8, cfiles: *ArrayList[[]u8]) ArrayList[*Node] {
+// Parse a whole program, resolving @imports relative to `base_dir`.
+fn parse_compilation_unit_dir(src: []u8, base_dir: []u8) CompilationUnit {
     let seen: ArrayList[[]u8] = make[[]u8](8);
     let decls: ArrayList[*Node] = make[*Node](8);
     let aliases: ArrayList[[]u8] = make[[]u8](4);
     let loading: ArrayList[[]u8] = make[[]u8](8);
+    let modules:ArrayList[ResolvedModule]=make[ResolvedModule](8);let imports:ArrayList[ResolvedImport]=make[ResolvedImport](8);let resources:ArrayList[ResolvedResource]=make[ResolvedResource](8);let origins:ArrayList[NodeOrigin]=make[NodeOrigin](64);push[ResolvedModule](&modules,ResolvedModule{.path="<root>",.source=src});
     // Validate zag.mod deps before compiling
     check_zag_mod(base_dir);
-    resolve_src(src, base_dir, &seen, &decls, cfiles, &aliases, &loading);
+    let profile_code: i32 = 0;
+    resolve_src(src, base_dir, &seen, &decls, &aliases, &loading, 1, &profile_code,"<root>",&modules,&imports,&resources,&origins);
     // Global alias pass: collapse every `alias.member` → `alias__member` across
     // all decls (aliases propagate through flat re-imports).
     rewrite_decls(decls, aliases);
-    return decls;
+    let profile: ModuleProfile = ModuleProfile.strict;
+    if (profile_code == 1) { profile = ModuleProfile.script; }
+    return CompilationUnit{ .profile = profile, .decls = decls, .modules=modules, .imports=imports, .resources=resources, .origins=origins };
 }
 
-// Parse a whole program, resolving @imports relative to `base_dir`.
+fn script_default_memory_limit() i64 { return 67108864; }
+fn script_min_memory_limit() i64 { return 1048576; }
+fn script_max_memory_limit() i64 { return 2147483648; }
+
+// Change only the compiler-generated root wrapper's context limit. Imported
+// modules have no wrapper and are never visited. Returns 0 on success, 1 for
+// an invalid range or malformed/non-script unit.
+fn compilation_unit_set_script_memory_limit(unit: *CompilationUnit, limit_bytes: i64) i32 {
+    if (limit_bytes < script_min_memory_limit() || limit_bytes > script_max_memory_limit()) { return 1; }
+    if (unit.*.profile != ModuleProfile.script) { return 1; }
+    let text: []u8 = _zag_i64_to_str(limit_bytes);
+    let i: i32 = 0;
+    while (i < len[*Node](unit.*.decls)) {
+        switch (get[*Node](unit.*.decls, i).*) {
+            .fn_decl => |f| {
+                if (@strEq(f.name, "main") && len[*Node](f.body) > 0) {
+                    switch (get[*Node](f.body, 0).*) {
+                        .let_ => |binding| { switch (binding.expr.*) {
+                            .call => |call| { switch (call.callee.*) {
+                                .id => |id| {
+                                    if (@strEq(id.name, "_zag_script_context_init") && len[*Node](call.args) == 3) {
+                                        let arg: *Node = get[*Node](call.args, 0);
+                                        arg.* = mk_int(text).*;
+                                        return 0;
+                                    }
+                                }
+                                else => { }
+                            } }
+                            else => { }
+                        } }
+                        else => { }
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Packed policy fields are byte-sized ids:
+// allocator | cpu<<8 | device<<16 | layout<<24.
+// Allocator ids 1 (one process-lifetime arena) and 2 (bounded per-allocation
+// heap with deterministic shutdown reclamation), device=CPU,
+// layout=compiler-owned, and generic/native x86 CPU policies are implementable.
+// Keeping this
+// mutation on the compiler-owned root wrapper ensures imported modules receive
+// neither hidden context nor policy changes.
+fn script_execution_policy_bits(allocator_id:i32, cpu_id:i32,
+    device_id:i32, layout_id:i32) i64 {
+    return (allocator_id as i64) + ((cpu_id as i64) * 256) +
+        ((device_id as i64) * 65536) + ((layout_id as i64) * 16777216);
+}
+
+fn script_execution_policy_supported(bits:i64) i32 {
+    if (bits == script_execution_policy_bits(1, 1, 1, 1)) { return 1; }
+    if (bits == script_execution_policy_bits(1, 2, 1, 1)) { return 1; }
+    if (bits == script_execution_policy_bits(2, 1, 1, 1)) { return 1; }
+    if (bits == script_execution_policy_bits(2, 2, 1, 1)) { return 1; }
+    return 0;
+}
+
+fn compilation_unit_set_script_runtime_policy(unit:*CompilationUnit,
+    capability_bits:i64, execution_policy_bits:i64) i32 {
+    if (unit.*.profile != ModuleProfile.script || capability_bits < 0 ||
+        capability_bits > 15 ||
+        script_execution_policy_supported(execution_policy_bits) == 0) { return 1; }
+    let i:i32 = 0;
+    while (i < len[*Node](unit.*.decls)) {
+        switch (get[*Node](unit.*.decls, i).*) {
+            .fn_decl => |f| {
+                if (@strEq(f.name, "main") && len[*Node](f.body) > 0) {
+                    switch (get[*Node](f.body, 0).*) {
+                        .let_ => |binding| { switch (binding.expr.*) {
+                            .call => |call| { switch (call.callee.*) {
+                                .id => |id| {
+                                    if (@strEq(id.name, "_zag_script_context_init") &&
+                                        len[*Node](call.args) == 3) {
+                                        let capabilities:*Node = get[*Node](call.args, 1);
+                                        capabilities.* =
+                                            mk_int(_zag_i64_to_str(capability_bits)).*;
+                                        let execution:*Node = get[*Node](call.args, 2);
+                                        execution.* =
+                                            mk_int(_zag_i64_to_str(execution_policy_bits)).*;
+                                        return 0;
+                                    }
+                                }
+                                else => { }
+                            } }
+                            else => { }
+                        } }
+                        else => { }
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn compilation_unit_set_script_source_label(unit: *CompilationUnit, path: []u8) i32 {
+    if (unit.*.profile != ModuleProfile.script) { return 1; }
+    let i: i32 = 0;
+    while (i < len[*Node](unit.*.decls)) {
+        switch (get[*Node](unit.*.decls, i).*) {
+            .fn_decl => |f| {
+                if (@strEq(f.name, "__zag_compiler_script_uncaught_7f3a")) {
+                    let j: i32 = 0;
+                    while (j < len[*Node](f.body)) {
+                        switch (get[*Node](f.body, j).*) {
+                            .estmt => |statement| { switch (statement.expr.*) {
+                                .call => |call| {
+                                    if (len[*Node](call.args) == 1) {
+                                        let arg: *Node = get[*Node](call.args, 0);
+                                        switch (arg.*) {
+                                            .slit => |literal| {
+                                                if (literal.text.len >= 22 && @strEq(literal.text[0..22], "operation: root script")) {
+                                                    arg.* = mk_str(_zag_str_concat("source: ", _zag_str_concat(path,
+                                                        _zag_str_concat("; ",literal.text)))).*;
+                                                    return 0;
+                                                }
+                                            }
+                                            else => { }
+                                        }
+                                    }
+                                }
+                                else => { }
+                            } }
+                            else => { }
+                        }
+                        j = j + 1;
+                    }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// Explicit compiler/embedding API. The supplied value is authoritative over
+// the 64 MiB default. Existing parse_compilation_unit_dir callers are unchanged.
+fn parse_compilation_unit_dir_with_script_limit(src: []u8, base_dir: []u8, limit_bytes: i64) CompilationUnit {
+    let unit: CompilationUnit = parse_compilation_unit_dir(src, base_dir);
+    if (compilation_unit_set_script_memory_limit(&unit, limit_bytes) != 0) {
+        _zag_eprintln("Zag Script memory limit must be between 1048576 and 2147483648 bytes and requires a script root");
+        _zag_exit(1);
+    }
+    return unit;
+}
+
 fn parse_program_dir(src: []u8, base_dir: []u8) ArrayList[*Node] {
-    let cfiles: ArrayList[[]u8] = make[[]u8](2);
-    return parse_program_collect(src, base_dir, &cfiles);
+    return parse_compilation_unit_dir(src, base_dir).decls;
 }
 
 // Parse a whole program (decls: struct / enum / union / fn / extern fn).

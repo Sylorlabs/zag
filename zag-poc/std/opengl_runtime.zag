@@ -1,0 +1,180 @@
+// std/opengl_runtime.zag — bounded OpenGL compute runtime for Zag.
+//
+// This adapter uses EGL's surfaceless Linux path and the desktop OpenGL 4.3
+// compute/SSBO API.  The C ABI is scalar and every variable-size C record is
+// written into a raw mmap buffer, avoiding an accidental aggregate ABI.  One
+// dispatch is bounded, synchronized with glFinish/glMemoryBarrier, copied back
+// into Zag's native eight-byte scalar slots, and fully cleaned up.
+
+@import("gpu_compat_contract.zag")
+
+extern fn mmap(addr:*u8, len:i64, prot:i32, flags:i32, fd:i32, offset:i64) *u8 @cabi;
+extern fn munmap(addr:*u8, len:i64) i32 @cabi @borrows_mut;
+
+extern fn eglGetPlatformDisplay(platform:i64, display:i64, attrs:i64) i64 @cabi;
+extern fn eglGetDisplay(display:i64) i64 @cabi;
+extern fn eglInitialize(display:i64, major:i64, minor:i64) i32 @cabi;
+extern fn eglTerminate(display:i64) i32 @cabi;
+extern fn eglBindAPI(api:i64) i32 @cabi;
+extern fn eglChooseConfig(display:i64, attrs:i64, config:i64, size:i64, count:i64) i32 @cabi;
+extern fn eglCreatePbufferSurface(display:i64, config:i64, attrs:i64) i64 @cabi;
+extern fn eglDestroySurface(display:i64, surface:i64) i32 @cabi;
+extern fn eglCreateContext(display:i64, config:i64, share:i64, attrs:i64) i64 @cabi;
+extern fn eglDestroyContext(display:i64, context:i64) i32 @cabi;
+extern fn eglMakeCurrent(display:i64, draw:i64, read:i64, context:i64) i32 @cabi;
+
+extern fn glCreateShader(kind:i64) i64 @cabi;
+extern fn glShaderSource(shader:i64, count:i64, strings:i64, lengths:i64) void @cabi;
+extern fn glCompileShader(shader:i64) void @cabi;
+extern fn glGetShaderiv(shader:i64, pname:i64, value:i64) void @cabi;
+extern fn glDeleteShader(shader:i64) void @cabi;
+extern fn glCreateProgram() i64 @cabi;
+extern fn glAttachShader(program:i64, shader:i64) void @cabi;
+extern fn glLinkProgram(program:i64) void @cabi;
+extern fn glGetProgramiv(program:i64, pname:i64, value:i64) void @cabi;
+extern fn glDeleteProgram(program:i64) void @cabi;
+extern fn glGenBuffers(count:i64, buffers:i64) void @cabi;
+extern fn glDeleteBuffers(count:i64, buffers:i64) void @cabi;
+extern fn glBindBuffer(target:i64, buffer:i64) void @cabi;
+extern fn glBufferData(target:i64, size:i64, data:i64, usage:i64) void @cabi;
+extern fn glBindBufferBase(target:i64, index:i64, buffer:i64) void @cabi;
+extern fn glUseProgram(program:i64) void @cabi;
+extern fn glGetUniformLocation(program:i64, name:i64) i64 @cabi;
+extern fn glUniform1i(location:i64, value:i64) void @cabi;
+extern fn glDispatchCompute(x:i64, y:i64, z:i64) void @cabi;
+extern fn glMemoryBarrier(bits:i64) void @cabi;
+extern fn glFinish() void @cabi;
+extern fn glGetBufferSubData(target:i64, offset:i64, size:i64, data:i64) void @cabi;
+extern fn glGetError() i64 @cabi;
+
+struct ZagOpenGLCompatContext {
+    display:i64,
+    surface:i64,
+    context:i64,
+    available:bool,
+    error_code:i32,
+}
+
+fn gl_put_i32(mem:*u8, index:i32, value:i32) void {
+    let off:i32=index*4;
+    mem[off]=(value & 255) as u8;
+    mem[off+1]=((value>>8) & 255) as u8;
+    mem[off+2]=((value>>16) & 255) as u8;
+    mem[off+3]=((value>>24) & 255) as u8;
+}
+
+fn gl_get_i32(mem:*u8) i32 {
+    let a:i32=mem[0] as i32;
+    let b:i32=mem[1] as i32;
+    let c:i32=mem[2] as i32;
+    let d:i32=mem[3] as i32;
+    return a+(b<<8)+(c<<16)+(d<<24);
+}
+
+fn gl_cstr_value() *u8 {
+    unsafe { let m:*u8=mmap(null as *u8,16,3,34,-1,0); m[0]='v';m[1]='a';m[2]='l';m[3]='u';m[4]='e';m[5]=0; return m; }
+}
+
+fn gl_cstr_count() *u8 {
+    unsafe { let m:*u8=mmap(null as *u8,16,3,34,-1,0); m[0]='c';m[1]='o';m[2]='u';m[3]='n';m[4]='t';m[5]=0; return m; }
+}
+
+fn gl_copy_source(source:*u8, size:u64) *u8 {
+    if (source==null as *u8 || size==0 || size>1048576) { return null as *u8; }
+    unsafe {
+        let out:*u8=mmap(null as *u8,(size as i64)+1,3,34,-1,0);
+        let i:u64=0;
+        while (i<size) { out[i as i32]=source[i as i32]; i=i+1; }
+        out[size as i32]=0;
+        return out;
+    }
+}
+
+fn zag_opengl_compat_open() ZagOpenGLCompatContext @compatLoad {
+    let ctx:ZagOpenGLCompatContext=ZagOpenGLCompatContext{.display=0,.surface=0,.context=0,.available=false,.error_code=0};
+    unsafe {
+        let display:i64=eglGetPlatformDisplay(12765,0,0);
+        let chosen:i64=display;
+        if (chosen==0) { chosen=eglGetDisplay(0); }
+        if (chosen==0) { ctx.error_code=-100; return ctx; }
+        let major_mem:*u8=mmap(null as *u8,8,3,34,-1,0);
+        let minor_mem:*u8=mmap(null as *u8,8,3,34,-1,0);
+        if (eglInitialize(chosen,major_mem as i64,minor_mem as i64)==0) { munmap(major_mem,8);munmap(minor_mem,8);ctx.error_code=-101;return ctx; }
+        munmap(major_mem,8);munmap(minor_mem,8);
+        if (eglBindAPI(12450)==0) { eglTerminate(chosen);ctx.error_code=-102;return ctx; }
+        let attrs:*u8=mmap(null as *u8,40,3,34,-1,0);
+        gl_put_i32(attrs,0,12339);gl_put_i32(attrs,1,1);gl_put_i32(attrs,2,12352);gl_put_i32(attrs,3,8);gl_put_i32(attrs,4,12344);
+        let config_mem:*u8=mmap(null as *u8,8,3,34,-1,0);
+        let count_mem:*u8=mmap(null as *u8,8,3,34,-1,0);
+        if (eglChooseConfig(chosen,attrs as i64,config_mem as i64,1,count_mem as i64)==0 || gl_get_i32(count_mem)==0) { munmap(attrs,40);munmap(config_mem,8);munmap(count_mem,8);eglTerminate(chosen);ctx.error_code=-103;return ctx; }
+        let config:i64=(config_mem as *i64).*;
+        munmap(attrs,40);munmap(count_mem,8);
+        let pbuf:*u8=mmap(null as *u8,20,3,34,-1,0);
+        gl_put_i32(pbuf,0,12375);gl_put_i32(pbuf,1,1);gl_put_i32(pbuf,2,12374);gl_put_i32(pbuf,3,1);gl_put_i32(pbuf,4,12344);
+        let surface:i64=eglCreatePbufferSurface(chosen,config,pbuf as i64);
+        munmap(pbuf,20);munmap(config_mem,8);
+        if (surface==0) { eglTerminate(chosen);ctx.error_code=-104;return ctx; }
+        let cattrs:*u8=mmap(null as *u8,20,3,34,-1,0);
+        gl_put_i32(cattrs,0,12440);gl_put_i32(cattrs,1,4);gl_put_i32(cattrs,2,12539);gl_put_i32(cattrs,3,3);gl_put_i32(cattrs,4,12344);
+        let context:i64=eglCreateContext(chosen,config,0,cattrs as i64);
+        munmap(cattrs,20);
+        if (context==0) { eglDestroySurface(chosen,surface);eglTerminate(chosen);ctx.error_code=-1051;return ctx; }
+        if (eglMakeCurrent(chosen,surface,surface,context)==0) { eglDestroyContext(chosen,context);eglDestroySurface(chosen,surface);eglTerminate(chosen);ctx.error_code=-1052;return ctx; }
+        ctx.display=chosen;ctx.surface=surface;ctx.context=context;ctx.available=true;return ctx;
+    }
+}
+
+fn zag_opengl_compat_close(ctx:*ZagOpenGLCompatContext) void @compatLoad {
+    unsafe {
+        if (ctx.display!=0) { eglMakeCurrent(ctx.display,0,0,0); }
+        if (ctx.context!=0) { eglDestroyContext(ctx.display,ctx.context);ctx.context=0; }
+        if (ctx.surface!=0) { eglDestroySurface(ctx.display,ctx.surface);ctx.surface=0; }
+        if (ctx.display!=0) { eglTerminate(ctx.display);ctx.display=0; }
+        ctx.available=false;
+    }
+}
+
+fn zag_opengl_compat_dispatch(ctx:*ZagOpenGLCompatContext, source:*u8, source_size:u64, output_buffer:*i32, output_count:u32, value:i32, count:i32, group_count_x:u32, group_count_y:u32, group_count_z:u32, timeout_ns:u64) i32 @compatDispatch {
+    if (!ctx.available) { return -200; }
+    let contract_rc:i32=zag_gpu_compat_validate(
+        ZagGpuCompatReadback{.output_buffer=output_buffer,.output_count=output_count},
+        ZagGpuCompatLaunch{.group_count_x=group_count_x,.group_count_y=group_count_y,.group_count_z=group_count_z,.local_work_size=1,.timeout_ns=timeout_ns});
+    if (contract_rc!=0) { return contract_rc; }
+    unsafe {
+        let shader_source:*u8=gl_copy_source(source,source_size);
+        if (shader_source==null as *u8) { return -202; }
+        let shader:i64=glCreateShader(37305);
+        if (shader==0) { munmap(shader_source,(source_size as i64)+1);return -203; }
+        let source_slot:*u8=mmap(null as *u8,8,3,34,-1,0);
+        (source_slot as *i64)[0]=shader_source as i64;
+        glShaderSource(shader,1,source_slot as i64,0);glCompileShader(shader);
+        let status_mem:*u8=mmap(null as *u8,8,3,34,-1,0);
+        glGetShaderiv(shader,35713,status_mem as i64);
+        if (gl_get_i32(status_mem)==0) { munmap(status_mem,8);munmap(source_slot,8);munmap(shader_source,(source_size as i64)+1);glDeleteShader(shader);return -204; }
+        let program:i64=glCreateProgram();
+        if (program==0) { munmap(status_mem,8);munmap(source_slot,8);munmap(shader_source,(source_size as i64)+1);glDeleteShader(shader);return -205; }
+        glAttachShader(program,shader);glLinkProgram(program);glGetProgramiv(program,35714,status_mem as i64);
+        munmap(source_slot,8);munmap(shader_source,(source_size as i64)+1);glDeleteShader(shader);
+        if (gl_get_i32(status_mem)==0) { munmap(status_mem,8);glDeleteProgram(program);return -206; }
+        let buffer_mem:*u8=mmap(null as *u8,8,3,34,-1,0);
+        glGenBuffers(1,buffer_mem as i64);let buffer:i64=(buffer_mem as *i64).*;
+        let bytes:i64=(output_count as i64)*4;
+        let zeros:*u8=mmap(null as *u8,bytes,3,34,-1,0);
+        glBindBuffer(37074,buffer);glBufferData(37074,bytes,zeros as i64,35048);munmap(zeros,bytes);
+        glBindBufferBase(37074,0,buffer);glUseProgram(program);
+        let value_name:*u8=gl_cstr_value();let count_name:*u8=gl_cstr_count();
+        let value_loc:i64=glGetUniformLocation(program,value_name as i64);let count_loc:i64=glGetUniformLocation(program,count_name as i64);
+        if (value_loc>=0) { glUniform1i(value_loc,value as i64); } if (count_loc>=0) { glUniform1i(count_loc,count as i64); }
+        glDispatchCompute(group_count_x as i64,group_count_y as i64,group_count_z as i64);glMemoryBarrier(8192);glFinish();
+        let packed:*u8=mmap(null as *u8,bytes,3,34,-1,0);glGetBufferSubData(37074,0,bytes,packed as i64);
+        let err:i64=glGetError();
+        if (err!=0) { munmap(packed,bytes);munmap(status_mem,8);munmap(value_name,16);munmap(count_name,16);glDeleteBuffers(1,buffer_mem as i64);munmap(buffer_mem,8);glDeleteProgram(program);return err as i32; }
+        let dst:*u8=output_buffer as *u8;let i:u32=0;
+        while (i<output_count) { let si:i32=(i as i32)*4;let di:i32=(i as i32)*8;dst[di]=packed[si];dst[di+1]=packed[si+1];dst[di+2]=packed[si+2];dst[di+3]=packed[si+3];dst[di+4]=0;dst[di+5]=0;dst[di+6]=0;dst[di+7]=0;i=i+1; }
+        munmap(packed,bytes);munmap(status_mem,8);munmap(value_name,16);munmap(count_name,16);glDeleteBuffers(1,buffer_mem as i64);munmap(buffer_mem,8);glDeleteProgram(program);return 0;
+    }
+}
+
+fn zag_opengl_compat_available() bool @compatLoad {
+    let ctx:ZagOpenGLCompatContext=zag_opengl_compat_open();let ok:bool=ctx.available;zag_opengl_compat_close(&ctx);return ok;
+}

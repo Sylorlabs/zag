@@ -1,0 +1,325 @@
+// linux_drm.zag — pure-Zag, read-only Linux DRM render-node discovery.
+//
+// This module calls the kernel UAPI with raw syscalls. It does not link or load
+// libdrm, Mesa, Vulkan, or any vendor userspace runtime. The current surface is
+// deliberately no-submit: it discovers the kernel driver/IP and performs only
+// one bounded GTT GPUVM map/unmap plus one CPU-visible 4 KiB memory roundtrip.
+// It creates no context, emits no command stream, waits on no GPU fence, and
+// never submits work to the display-bound card.
+
+@import("rt.zag")
+
+fn linux_sys_openat() i64 { return 257; }
+fn linux_sys_close() i64 { return 3; }
+fn linux_sys_ioctl() i64 { return 16; }
+fn linux_at_fdcwd() i64 { return 0 - 100; }
+fn linux_o_rdwr_cloexec() i64 { return 2 + 524288; }
+
+// _IOWR('d', 0x00, struct drm_version) for the Linux x86-64 UAPI.
+// The test suite checks the Zag layout against a live DRM render node.
+fn drm_ioctl_version_x86_64() i64 { return 0xC0406400; }
+
+struct LinuxDrmProbe {
+    ok: bool,
+    render_node: []u8,
+    driver_name: []u8,
+    version_major: i32,
+    version_minor: i32,
+    version_patchlevel: i32,
+    error_code: []u8,
+}
+
+fn drm_write_u64(raw:*i8,off:i32,value:i64) void {
+    let i:i32=0;
+    while(i<8){raw[off+i]=((value>>(i*8))&255) as i8;i=i+1;}
+}
+
+fn drm_write_u32(raw:*i8,off:i32,value:i64) void {
+    let i:i32=0;while(i<4){raw[off+i]=((value>>(i*8))&255) as i8;i=i+1;}
+}
+
+fn drm_read_u32(raw:*i8,off:i32) i32 {
+    return ((raw[off] as u8) as i32)+(((raw[off+1] as u8) as i32)*256)+
+        (((raw[off+2] as u8) as i32)*65536)+(((raw[off+3] as u8) as i32)*16777216);
+}
+
+fn drm_read_u64(raw:*i8,off:i32) i64 {
+    return ((raw[off] as u8) as i64)+(((raw[off+1] as u8) as i64)*256)+
+        (((raw[off+2] as u8) as i64)*65536)+(((raw[off+3] as u8) as i64)*16777216)+
+        (((raw[off+4] as u8) as i64)*4294967296)+
+        (((raw[off+5] as u8) as i64)*1099511627776)+
+        (((raw[off+6] as u8) as i64)*281474976710656)+
+        (((raw[off+7] as u8) as i64)*72057594037927936);
+}
+
+fn drm_c_path(path: []u8) *i8 {
+    let out: *i8 = _zag_malloc(path.len + 1);
+    let i: i32 = 0;
+    while (i < path.len) { out[i] = path[i] as i8; i = i + 1; }
+    out[path.len] = 0;
+    return out;
+}
+
+fn linux_drm_probe(path: []u8) LinuxDrmProbe {
+    let bad: LinuxDrmProbe = LinuxDrmProbe{.ok=false,.render_node=path,
+        .driver_name="",.version_major=0,.version_minor=0,.version_patchlevel=0,
+        .error_code="E_DRM_OPEN"};
+    if (path.len == 0 || path.len > 255) { bad.error_code="E_DRM_PATH"; return bad; }
+    let cpath: *i8 = drm_c_path(path);
+    let fd: i64 = _zag_raw_syscall(linux_sys_openat(),linux_at_fdcwd(),cpath as i64,
+        linux_o_rdwr_cloexec(),0,0,0);
+    _zag_free(cpath);
+    if (fd < 0) { return bad; }
+
+    let name_buf: *i8 = _zag_malloc(65);
+    let i: i32 = 0;
+    while (i < 65) { name_buf[i]=0; i=i+1; }
+    // Explicit x86-64 UAPI offsets avoid depending on Zag's internal struct
+    // packing: i32 versions at 0/4/8, size_t name_len at 16, pointer at 24.
+    let version_raw:*i8=_zag_malloc(64);
+    i=0;while(i<64){version_raw[i]=0;i=i+1;}
+    drm_write_u64(version_raw,16,64);
+    drm_write_u64(version_raw,24,name_buf as i64);
+    let rc: i64 = _zag_raw_syscall(linux_sys_ioctl(),fd,drm_ioctl_version_x86_64(),
+        version_raw as i64,0,0,0);
+    let _closed: i64 = _zag_raw_syscall(linux_sys_close(),fd,0,0,0,0,0);
+    let name_len:i64=drm_read_u64(version_raw,16);
+    if (rc < 0 || name_len <= 0 || name_len > 64) {
+        _zag_free(name_buf);_zag_free(version_raw);
+        bad.error_code="E_DRM_VERSION";
+        return bad;
+    }
+    let name: []u8 = name_buf[0..name_len as i32];
+    let major:i32=drm_read_u32(version_raw,0);let minor:i32=drm_read_u32(version_raw,4);
+    let patch:i32=drm_read_u32(version_raw,8);_zag_free(version_raw);
+    return LinuxDrmProbe{.ok=true,.render_node=path,.driver_name=name,
+        .version_major=major,.version_minor=minor,.version_patchlevel=patch,.error_code=""};
+}
+
+fn linux_drm_is_amdgpu(p: LinuxDrmProbe) bool {
+    return p.ok && _zag_strcmp(p.driver_name,"amdgpu")==1;
+}
+
+struct LinuxAmdgpuHwIp {
+    ok:bool,
+    ip_type:i32,
+    version_major:i32,
+    version_minor:i32,
+    capabilities:i64,
+    ib_start_alignment:i32,
+    ib_size_alignment:i32,
+    available_rings:i32,
+    discovery_version:i32,
+    error_code:[]u8,
+}
+
+fn linux_amdgpu_hw_ip(path:[]u8,ip_type:i32) LinuxAmdgpuHwIp {
+    let bad:LinuxAmdgpuHwIp=LinuxAmdgpuHwIp{.ok=false,.ip_type=ip_type,
+        .version_major=0,.version_minor=0,.capabilities=0,.ib_start_alignment=0,
+        .ib_size_alignment=0,.available_rings=0,.discovery_version=0,
+        .error_code="E_AMDGPU_INFO"};
+    if(ip_type<0||ip_type>1){bad.error_code="E_AMDGPU_IP_TYPE";return bad;}
+    let cpath:*i8=drm_c_path(path);
+    let fd:i64=_zag_raw_syscall(linux_sys_openat(),linux_at_fdcwd(),cpath as i64,
+        linux_o_rdwr_cloexec(),0,0,0);_zag_free(cpath);if(fd<0){bad.error_code="E_DRM_OPEN";return bad;}
+    let query:*i8=_zag_malloc(32);let out:*i8=_zag_malloc(40);let i:i32=0;
+    while(i<32){query[i]=0;i=i+1;}i=0;while(i<40){out[i]=0;i=i+1;}
+    drm_write_u64(query,0,out as i64);drm_write_u32(query,8,40);
+    drm_write_u32(query,12,2);drm_write_u32(query,16,ip_type);
+    // DRM_IOCTL_AMDGPU_INFO = _IOW('d', 0x45, struct drm_amdgpu_info).
+    let rc:i64=_zag_raw_syscall(linux_sys_ioctl(),fd,0x40206445,query as i64,0,0,0);
+    let _closed:i64=_zag_raw_syscall(linux_sys_close(),fd,0,0,0,0,0);
+    if(rc<0){_zag_free(query);_zag_free(out);return bad;}
+    let result:LinuxAmdgpuHwIp=LinuxAmdgpuHwIp{.ok=true,.ip_type=ip_type,
+        .version_major=drm_read_u32(out,0),.version_minor=drm_read_u32(out,4),
+        .capabilities=drm_read_u64(out,8),.ib_start_alignment=drm_read_u32(out,16),
+        .ib_size_alignment=drm_read_u32(out,20),.available_rings=drm_read_u32(out,24),
+        .discovery_version=drm_read_u32(out,28),.error_code=""};
+    _zag_free(query);_zag_free(out);return result;
+}
+
+struct LinuxAmdgpuMemoryResult {
+    ok:bool,
+    bytes:i32,
+    handle:i32,
+    exact_readback:bool,
+    gem_closed:bool,
+    error_code:[]u8,
+}
+
+struct LinuxAmdgpuGpuVmResult {
+    ok:bool,
+    gpu_va:i64,
+    handle:i32,
+    mapped:bool,
+    unmapped:bool,
+    gem_closed:bool,
+    error_code:[]u8,
+}
+
+struct LinuxAmdgpuDeviceInfo {
+    ok:bool,
+    device_id:i32,
+    family:i32,
+    shader_engines:i32,
+    active_cus:i32,
+    va_offset:i64,
+    va_max:i64,
+    va_alignment:i32,
+    gart_page_size:i32,
+    wave_size:i32,
+    error_code:[]u8,
+}
+
+// Native DRM submission is an explicit, separate risk boundary.  This
+// preflight performs only the already-reviewed discovery/GPUVM/CPU-memory
+// probes. It never emits DRM_IOCTL_AMDGPU_CS or waits on a GPU fence.
+struct LinuxAmdgpuNativeRequest {
+    render_node:[]u8,
+    shared_display_bound:bool,
+    allow_shared_display_override:bool,
+    acknowledge_reset_risk:bool,
+    workgroup_count:u32,
+    output_bytes:i32,
+}
+
+struct LinuxAmdgpuNativePreflight {
+    preflight_ok:bool,
+    discovery_ok:bool,
+    gpuvm_ok:bool,
+    memory_ok:bool,
+    submission_opt_in:bool,
+    native_submit_implemented:bool,
+    error_code:[]u8,
+}
+
+fn linux_amdgpu_native_preflight(request:LinuxAmdgpuNativeRequest) LinuxAmdgpuNativePreflight {
+    let bad:LinuxAmdgpuNativePreflight=LinuxAmdgpuNativePreflight{.preflight_ok=false,
+        .discovery_ok=false,.gpuvm_ok=false,.memory_ok=false,.submission_opt_in=false,
+        .native_submit_implemented=false,.error_code="E_AMDGPU_NATIVE_PREFLIGHT"};
+    if (request.render_node.len==0 || request.workgroup_count!=1 || request.output_bytes!=4096) {
+        bad.error_code="E_AMDGPU_NATIVE_BOUNDS"; return bad;
+    }
+    let probe:LinuxDrmProbe=linux_drm_probe(request.render_node);
+    if (!probe.ok) { bad.error_code=probe.error_code; return bad; }
+    if (!linux_drm_is_amdgpu(probe)) { bad.error_code="E_AMDGPU_DRIVER"; return bad; }
+    // A display-bound card is never armed by discovery alone. Both switches
+    // are required, and the override still only authorizes the preflight.
+    if (request.shared_display_bound &&
+        (!request.allow_shared_display_override || !request.acknowledge_reset_risk)) {
+        bad.error_code="E_AMDGPU_DISPLAY_ACK"; return bad;
+    }
+    let device:LinuxAmdgpuDeviceInfo=linux_amdgpu_device_info(request.render_node);
+    if (!device.ok) { bad.error_code=device.error_code; return bad; }
+    let gfx:LinuxAmdgpuHwIp=linux_amdgpu_hw_ip(request.render_node,0);
+    let compute:LinuxAmdgpuHwIp=linux_amdgpu_hw_ip(request.render_node,1);
+    if (!gfx.ok || !compute.ok || gfx.version_major!=10 || compute.version_major!=10) {
+        bad.error_code="E_AMDGPU_IP_PROFILE"; return bad;
+    }
+    let gpuvm:LinuxAmdgpuGpuVmResult=linux_amdgpu_gpuvm_roundtrip(request.render_node);
+    if (!gpuvm.ok) { bad.error_code=gpuvm.error_code; return bad; }
+    let memory:LinuxAmdgpuMemoryResult=linux_amdgpu_memory_roundtrip(request.render_node,request.output_bytes);
+    if (!memory.ok) { bad.error_code=memory.error_code; return bad; }
+    let opt_in:bool=request.allow_shared_display_override && request.acknowledge_reset_risk;
+    return LinuxAmdgpuNativePreflight{.preflight_ok=true,.discovery_ok=true,
+        .gpuvm_ok=true,.memory_ok=true,.submission_opt_in=opt_in,
+        .native_submit_implemented=false,.error_code="E_AMDGPU_SUBMIT_UNIMPLEMENTED"};
+}
+
+fn linux_amdgpu_device_info(path:[]u8) LinuxAmdgpuDeviceInfo {
+    let bad:LinuxAmdgpuDeviceInfo=LinuxAmdgpuDeviceInfo{.ok=false,.device_id=0,
+        .family=0,.shader_engines=0,.active_cus=0,.va_offset=0,.va_max=0,
+        .va_alignment=0,.gart_page_size=0,.wave_size=0,.error_code="E_AMDGPU_DEV_INFO"};
+    let cpath:*i8=drm_c_path(path);
+    let fd:i64=_zag_raw_syscall(linux_sys_openat(),linux_at_fdcwd(),cpath as i64,
+        linux_o_rdwr_cloexec(),0,0,0);_zag_free(cpath);if(fd<0){bad.error_code="E_DRM_OPEN";return bad;}
+    let query:*i8=_zag_malloc(32);let out:*i8=_zag_malloc(448);let i:i32=0;
+    while(i<32){query[i]=0;i=i+1;}i=0;while(i<448){out[i]=0;i=i+1;}
+    drm_write_u64(query,0,out as i64);drm_write_u32(query,8,448);drm_write_u32(query,12,0x16);
+    let rc:i64=_zag_raw_syscall(linux_sys_ioctl(),fd,0x40206445,query as i64,0,0,0);
+    let _closed:i64=_zag_raw_syscall(linux_sys_close(),fd,0,0,0,0,0);
+    if(rc<0){_zag_free(query);_zag_free(out);return bad;}
+    let result:LinuxAmdgpuDeviceInfo=LinuxAmdgpuDeviceInfo{.ok=true,
+        .device_id=drm_read_u32(out,0),.family=drm_read_u32(out,16),
+        .shader_engines=drm_read_u32(out,20),.active_cus=drm_read_u32(out,48),
+        .va_offset=drm_read_u64(out,144),.va_max=drm_read_u64(out,152),
+        .va_alignment=drm_read_u32(out,160),.gart_page_size=drm_read_u32(out,168),
+        .wave_size=drm_read_u32(out,240),.error_code=""};
+    _zag_free(query);_zag_free(out);return result;
+}
+
+fn linux_amdgpu_gpuvm_roundtrip(path:[]u8) LinuxAmdgpuGpuVmResult {
+    let bad:LinuxAmdgpuGpuVmResult=LinuxAmdgpuGpuVmResult{.ok=false,.gpu_va=0,
+        .handle=0,.mapped=false,.unmapped=false,.gem_closed=false,.error_code="E_AMDGPU_GPUVM"};
+    let device:LinuxAmdgpuDeviceInfo=linux_amdgpu_device_info(path);
+    if(!device.ok||device.va_alignment<=0){bad.error_code="E_AMDGPU_DEV_INFO";return bad;}
+    let gpu_va:i64=device.va_offset+1048576;
+    if(gpu_va%device.va_alignment!=0||gpu_va+4096>device.va_max){bad.error_code="E_AMDGPU_GPUVA_RANGE";return bad;}
+    let cpath:*i8=drm_c_path(path);
+    let fd:i64=_zag_raw_syscall(linux_sys_openat(),linux_at_fdcwd(),cpath as i64,
+        linux_o_rdwr_cloexec(),0,0,0);_zag_free(cpath);if(fd<0){bad.error_code="E_DRM_OPEN";return bad;}
+    let create:*i8=_zag_malloc(32);let i:i32=0;while(i<32){create[i]=0;i=i+1;}
+    drm_write_u64(create,0,4096);drm_write_u64(create,8,4096);
+    drm_write_u64(create,16,2);drm_write_u64(create,24,1);
+    let create_rc:i64=_zag_raw_syscall(linux_sys_ioctl(),fd,0xC0206440,create as i64,0,0,0);
+    let handle:i32=drm_read_u32(create,0);_zag_free(create);
+    if(create_rc<0||handle<=0){let _c:i64=_zag_raw_syscall(linux_sys_close(),fd,0,0,0,0,0);bad.error_code="E_AMDGPU_GEM_CREATE";return bad;}
+    let va:*i8=_zag_malloc(64);i=0;while(i<64){va[i]=0;i=i+1;}
+    drm_write_u32(va,0,handle);drm_write_u32(va,8,1);drm_write_u32(va,12,6);
+    drm_write_u64(va,16,gpu_va);drm_write_u64(va,24,0);drm_write_u64(va,32,4096);
+    let map_rc:i64=_zag_raw_syscall(linux_sys_ioctl(),fd,0x40406448,va as i64,0,0,0);
+    drm_write_u32(va,8,2);drm_write_u32(va,12,0);
+    let unmap_rc:i64=0-1;if(map_rc==0){unmap_rc=_zag_raw_syscall(linux_sys_ioctl(),fd,0x40406448,va as i64,0,0,0);}
+    _zag_free(va);
+    let close_arg:*i8=_zag_malloc(8);i=0;while(i<8){close_arg[i]=0;i=i+1;}drm_write_u32(close_arg,0,handle);
+    let close_rc:i64=_zag_raw_syscall(linux_sys_ioctl(),fd,0x40086409,close_arg as i64,0,0,0);
+    _zag_free(close_arg);let _c:i64=_zag_raw_syscall(linux_sys_close(),fd,0,0,0,0,0);
+    if(map_rc<0){bad.gpu_va=gpu_va;bad.handle=handle;bad.gem_closed=close_rc==0;bad.error_code="E_AMDGPU_GPUVA_MAP";return bad;}
+    if(unmap_rc<0||close_rc<0){bad.gpu_va=gpu_va;bad.handle=handle;bad.mapped=true;bad.gem_closed=close_rc==0;bad.error_code="E_AMDGPU_GPUVA_UNMAP";return bad;}
+    return LinuxAmdgpuGpuVmResult{.ok=true,.gpu_va=gpu_va,.handle=handle,
+        .mapped=true,.unmapped=true,.gem_closed=true,.error_code=""};
+}
+
+fn linux_amdgpu_memory_roundtrip(path:[]u8,bytes:i32) LinuxAmdgpuMemoryResult {
+    let bad:LinuxAmdgpuMemoryResult=LinuxAmdgpuMemoryResult{.ok=false,.bytes=bytes,
+        .handle=0,.exact_readback=false,.gem_closed=false,.error_code="E_AMDGPU_MEMORY"};
+    if(bytes!=4096){bad.error_code="E_AMDGPU_MEMORY_BOUNDS";return bad;}
+    let cpath:*i8=drm_c_path(path);
+    let fd:i64=_zag_raw_syscall(linux_sys_openat(),linux_at_fdcwd(),cpath as i64,
+        linux_o_rdwr_cloexec(),0,0,0);_zag_free(cpath);
+    if(fd<0){bad.error_code="E_DRM_OPEN";return bad;}
+
+    let create:*i8=_zag_malloc(32);let i:i32=0;while(i<32){create[i]=0;i=i+1;}
+    drm_write_u64(create,0,bytes as i64);drm_write_u64(create,8,4096);
+    drm_write_u64(create,16,2);drm_write_u64(create,24,1);
+    let create_rc:i64=_zag_raw_syscall(linux_sys_ioctl(),fd,0xC0206440,create as i64,0,0,0);
+    let handle:i32=drm_read_u32(create,0);_zag_free(create);
+    if(create_rc<0||handle<=0){
+        let _fd_closed:i64=_zag_raw_syscall(linux_sys_close(),fd,0,0,0,0,0);
+        bad.error_code="E_AMDGPU_GEM_CREATE";return bad;
+    }
+
+    let map_query:*i8=_zag_malloc(8);i=0;while(i<8){map_query[i]=0;i=i+1;}
+    drm_write_u32(map_query,0,handle);
+    let map_rc:i64=_zag_raw_syscall(linux_sys_ioctl(),fd,0xC0086441,map_query as i64,0,0,0);
+    let map_offset:i64=drm_read_u64(map_query,0);_zag_free(map_query);
+    let mapped:i64=0-1;
+    if(map_rc>=0){mapped=_zag_raw_syscall(9,0,bytes,3,1,fd,map_offset);}
+    let exact:bool=false;
+    if(mapped>=0){
+        let mem:*i8=mapped as *i8;i=0;
+        while(i<bytes){mem[i]=((i*37+19)&255) as i8;i=i+1;}
+        @memoryFence();i=0;exact=true;
+        while(i<bytes){if((mem[i] as u8)!=(((i*37+19)&255) as u8)){exact=false;}i=i+1;}
+        let _unmapped:i64=_zag_raw_syscall(11,mapped,bytes,0,0,0,0);
+    }
+
+    let close_arg:*i8=_zag_malloc(8);i=0;while(i<8){close_arg[i]=0;i=i+1;}
+    drm_write_u32(close_arg,0,handle);
+    let gem_close_rc:i64=_zag_raw_syscall(linux_sys_ioctl(),fd,0x40086409,close_arg as i64,0,0,0);
+    _zag_free(close_arg);let _fd_closed:i64=_zag_raw_syscall(linux_sys_close(),fd,0,0,0,0,0);
+    if(map_rc<0||mapped<0){bad.handle=handle;bad.gem_closed=gem_close_rc==0;bad.error_code="E_AMDGPU_GEM_MMAP";return bad;}
+    if(!exact||gem_close_rc<0){bad.handle=handle;bad.exact_readback=exact;bad.gem_closed=gem_close_rc==0;return bad;}
+    return LinuxAmdgpuMemoryResult{.ok=true,.bytes=bytes,.handle=handle,
+        .exact_readback=true,.gem_closed=true,.error_code=""};
+}

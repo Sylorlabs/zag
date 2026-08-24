@@ -107,6 +107,20 @@ fn sse_op(buf: *ArrayList[u8], pfx: i32, w: i32, A: i32, B: i32, op: i32) void {
     eb(buf, modrm_rr(A, B));
 }
 
+// Emit one SSE memory operation: [pfx] [REX?] 0F op ModRM/SIB/disp32.
+// `reg` is the opcode /r register field (an xmm register here); `base` is the
+// GPR base.  MOVDQU is unaligned by definition, so this remains correct for
+// every pointer the existing byte-copy runtime accepts.
+fn sse_mem(buf: *ArrayList[u8], pfx: i32, reg: i32, base: i32, disp: i32, op: i32) void {
+    if (pfx != 0) { eb(buf, pfx); }
+    let r: i32 = ext(reg);
+    let b: i32 = ext(base);
+    if (r == 1 || b == 1) { rex(buf, 0, r, 0, b); }
+    eb(buf, 15);
+    eb(buf, op);
+    mem(buf, reg, base, disp);
+}
+
 // jcc opcode (the second byte of the 0F xx rel32 form) for a jump kind.
 fn jcc_op(kind: i32) i32 {
     if (kind == K_JE())  { return 132; }  // 0x84
@@ -132,7 +146,15 @@ fn is_jcc(kind: i32) i32 {
 // zero-filled in pass 1, which is fine because lengths don't depend on it).
 // `base_off` is the offset of THIS instruction's first byte in the final image
 // (== the offset within `buf` since we always emit from offset 0).
-fn encode_one(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32], base_off: i32) void {
+fn x86_driver_data_address(v: i64) i32 {
+    // Native codegen represents compiler-owned byte data as DATA_VBASE()+off.
+    // Driver ET_REL emission replaces only that address family; arbitrary
+    // integer constants remain ordinary immediates.
+    return (v >= DATA_VBASE() && v < DATA_VBASE() + 16777216) as i32;
+}
+
+fn encode_one_mode(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32],
+                   base_off: i32, driver_mode: i32) void {
     let k: i32 = ins.kind;
 
     if (k == K_LABEL()) {
@@ -144,7 +166,20 @@ fn encode_one(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32], base_off:
     if (k == K_MOV_IMM()) {
         let d: i32 = ins.dst;
         let v: i64 = ins.imm;
-        if (v >= (0 - 2147483648) && v <= 2147483647) {
+        // A loaded kernel module is not allowed to inherit the executable
+        // linker's low fixed data address. Force an 8-byte absolute form for
+        // driver data references so R_X86_64_64 can patch the full module
+        // address at final link time. The ordinary executable keeps its
+        // compact sign-extended imm32 form.
+        if (driver_mode == 1 && x86_driver_data_address(v) == 1) {
+            rex(buf, 1, 0, 0, ext(d));
+            eb(buf, 184 + lo3(d));
+            // The relocation addend carries the .data offset.  Keep the
+            // in-place field zero so Linux's module loader can apply the
+            // R_X86_64_64 relocation exactly once; retaining the executable
+            // DATA_VBASE value makes the kernel reject a nonzero target.
+            emit_le(buf, 0, 8);
+        } else if (v >= (0 - 2147483648) && v <= 2147483647) {
             rex(buf, 1, 0, 0, ext(d));
             eb(buf, 199);                 // 0xC7
             eb(buf, 192 + lo3(d));        // ModRM mod=3 reg=/0 rm=dst
@@ -165,6 +200,8 @@ fn encode_one(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32], base_off:
     if (k == K_AND_RR()) { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 33);  eb(buf, modrm_rr(ins.src, ins.dst)); return; }  // 0x21
     if (k == K_OR_RR())  { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 9);   eb(buf, modrm_rr(ins.src, ins.dst)); return; }  // 0x09
     if (k == K_XOR_RR()) { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 49);  eb(buf, modrm_rr(ins.src, ins.dst)); return; }  // 0x31
+    if (k == K_SHL_CL()) { rex(buf, 1, 0, 0, ext(ins.dst)); eb(buf, 211); eb(buf, 224 + lo3(ins.dst)); return; }  // D3 /4
+    if (k == K_SAR_CL()) { rex(buf, 1, 0, 0, ext(ins.dst)); eb(buf, 211); eb(buf, 248 + lo3(ins.dst)); return; }  // D3 /7
 
     // ── imul dst, src : 0F AF /r with reg=dst, rm=src (operands SWAPPED) ─────
     if (k == K_IMUL_RR()) {
@@ -191,6 +228,41 @@ fn encode_one(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32], base_off:
     // ── ret / syscall ─────────────────────────────────────────────────────────
     if (k == K_RET())     { eb(buf, 195); return; }            // 0xC3
     if (k == K_SYSCALL()) { eb(buf, 15); eb(buf, 5); return; } // 0F 05
+    if (k == K_MFENCE()) { eb(buf, 15); eb(buf, 174); eb(buf, 240); return; } // 0F AE F0
+    if (k == K_CPUID()) { eb(buf, 15); eb(buf, 162); return; } // 0F A2
+    if (k == K_XGETBV()) { eb(buf, 15); eb(buf, 1); eb(buf, 208); return; } // 0F 01 D0
+    if(k==K_POPCNT()){eb(buf,243);rex(buf,1,ext(ins.dst),0,ext(ins.src));eb(buf,15);eb(buf,184);eb(buf,modrm_rr(ins.dst,ins.src));return;}
+    if(k==K_ANDN()){
+        // C4 RXB m-mmmm, W vvvv L pp. X is unused and therefore inverted=1.
+        eb(buf,196);eb(buf,(1-ext(ins.dst))*128+64+(1-ext(ins.imm as i32))*32+2);
+        eb(buf,128+((15-lo3(ins.src))*8));eb(buf,242);eb(buf,modrm_rr(ins.dst,ins.imm as i32));return;
+    }
+    if (k == K_REP_MOVSB()){ eb(buf, 243); eb(buf, 164); return; } // F3 A4 rep movsb
+    if (k == K_OUTB())  { eb(buf, 238); return; }                 // EE
+    if (k == K_INB())   { eb(buf, 236); return; }                 // EC
+    if (k == K_OUTW())  { eb(buf, 102); eb(buf, 239); return; }   // 66 EF
+    if (k == K_INW())   { eb(buf, 102); eb(buf, 237); return; }   // 66 ED
+    if (k == K_OUTL())  { eb(buf, 239); return; }                 // EF
+    if (k == K_INL())   { eb(buf, 237); return; }                 // ED
+    if (k == K_RDMSR()) { eb(buf, 15); eb(buf, 50); return; }     // 0F 32
+    if (k == K_WRMSR()) { eb(buf, 15); eb(buf, 48); return; }     // 0F 30
+    if (k == K_RDCR0()) { eb(buf, 15); eb(buf, 32); eb(buf, 192); return; }  // 0F 20 C0
+    if (k == K_WRCR0()) { eb(buf, 15); eb(buf, 34); eb(buf, 192); return; }  // 0F 22 C0
+    if (k == K_RDCR2()) { eb(buf, 15); eb(buf, 32); eb(buf, 208); return; }  // 0F 20 D0
+    if (k == K_RDCR3()) { eb(buf, 15); eb(buf, 32); eb(buf, 216); return; }  // 0F 20 D8
+    if (k == K_WRCR3()) { eb(buf, 15); eb(buf, 34); eb(buf, 216); return; }  // 0F 22 D8
+    if (k == K_RDCR4()) { eb(buf, 15); eb(buf, 32); eb(buf, 224); return; }  // 0F 20 E0
+    if (k == K_WRCR4()) { eb(buf, 15); eb(buf, 34); eb(buf, 224); return; }  // 0F 22 E0
+    if (k == K_LGDT())  { eb(buf, 15); eb(buf, 1); eb(buf, 16); return; }    // 0F 01 10 lgdt [rax]
+    if (k == K_LIDT())  { eb(buf, 15); eb(buf, 1); eb(buf, 24); return; }    // 0F 01 18 lidt [rax]
+    if (k == K_LTR())   { eb(buf, 15); eb(buf, 0); eb(buf, 216); return; }   // 0F 00 D8 ltr ax
+    if (k == K_INVLPG()){ eb(buf, 15); eb(buf, 1); eb(buf, 56); return; }    // 0F 01 38 invlpg [rax]
+    if (k == K_HLT())   { eb(buf, 244); return; }                 // F4
+    if (k == K_CLI())   { eb(buf, 250); return; }                 // FA
+    if (k == K_STI())   { eb(buf, 251); return; }                 // FB
+    if (k == K_PAUSE()) { eb(buf, 243); eb(buf, 144); return; }   // F3 90
+    if (k == K_WBINVD()){ eb(buf, 15); eb(buf, 9); return; }      // 0F 09
+    if (k == K_SHR_CL()){ rex(buf, 1, 0, 0, ext(ins.dst)); eb(buf, 211); eb(buf, 232 + lo3(ins.dst)); return; }  // REX.W D3 /5
 
     // ── neg dst : F7 /3 ───────────────────────────────────────────────────────
     if (k == K_NEG()) {
@@ -226,6 +298,102 @@ fn encode_one(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32], base_off:
         // mov [dst + disp], src : 89 /r  reg=src rm=[base=dst]
         rex(buf, 1, ext(ins.src), 0, ext(ins.dst));
         eb(buf, 137);                              // 0x89
+        mem(buf, ins.src, ins.dst, ins.disp);
+        return;
+    }
+    if (k == K_XCHG_MEM()) {
+        // xchg r/m64,r64: x86 implicitly supplies the LOCK semantics whenever
+        // one operand is memory.  The old memory word is returned in src.
+        rex(buf, 1, ext(ins.src), 0, ext(ins.dst));
+        eb(buf, 135);                              // 0x87
+        mem(buf, ins.src, ins.dst, ins.disp);
+        return;
+    }
+    if (k == K_XADD_MEM()) {
+        // LOCK XADD r/m64,r64 returns the old memory word in src.  A zero add
+        // therefore provides the fixed locked transaction used by atomic load.
+        eb(buf, 240); rex(buf, 1, ext(ins.src), 0, ext(ins.dst));
+        eb(buf, 15); eb(buf, 193);                 // F0 48 0F C1 /r
+        mem(buf, ins.src, ins.dst, ins.disp);
+        return;
+    }
+    if (k == K_CMPXCHG_MEM()) {
+        // LOCK CMPXCHG r/m64,r64 compares RAX with memory and stores the
+        // source register only on equality; RAX always receives the old word.
+        eb(buf, 240); rex(buf, 1, ext(ins.src), 0, ext(ins.dst));
+        eb(buf, 15); eb(buf, 177);                 // F0 48 0F B1 /r
+        mem(buf, ins.src, ins.dst, ins.disp);
+        return;
+    }
+    if (k == K_BSWAP()) {
+        // bswap r64: REX.W 0F C8+rd. This is baseline x86-64, not an
+        // optional SIMD or target-feature instruction.
+        rex(buf, 1, 0, 0, ext(ins.dst));
+        eb(buf, 15); eb(buf, 200 + lo3(ins.dst));
+        return;
+    }
+    if (k == K_BSR()) {
+        // bsr r64,r64: REX.W 0F BD /r. The caller guards zero because BSR
+        // leaves its destination undefined for that input.
+        rex(buf, 1, ext(ins.dst), 0, ext(ins.src));
+        eb(buf, 15); eb(buf, 189); eb(buf, modrm_rr(ins.dst, ins.src));
+        return;
+    }
+    if (k == K_PREFETCHT0()) {
+        // prefetcht0 m8: 0F 18 /1. It is advisory and has no synchronization
+        // semantics; the native lowering supplies a raw-pointer base.
+        rex(buf, 0, 0, 0, ext(ins.dst));
+        eb(buf, 15); eb(buf, 24); mem(buf, 1, ins.dst, 0);
+        return;
+    }
+    if (k == K_LOAD8()) {
+        // movzx dst, byte [src + disp] : REX.W 0F B6 /r
+        rex(buf, 1, ext(ins.dst), 0, ext(ins.src));
+        eb(buf, 15); eb(buf, 182);
+        mem(buf, ins.dst, ins.src, ins.disp);
+        return;
+    }
+    if (k == K_STORE8()) {
+        // mov byte [dst + disp], src8 : REX 88 /r. Always emit REX so
+        // rsp/rbp/rsi/rdi select spl/bpl/sil/dil instead of AH/CH/DH/BH.
+        rex(buf, 0, ext(ins.src), 0, ext(ins.dst));
+        eb(buf, 136);
+        mem(buf, ins.src, ins.dst, ins.disp);
+        return;
+    }
+    if (k == K_LOAD16()) {
+        // movzx dst, word [src + disp] : 66 REX.W 0F B7 /r
+        eb(buf, 102);                         // operand-size override
+        rex(buf, 1, ext(ins.dst), 0, ext(ins.src));
+        eb(buf, 15); eb(buf, 183);             // 0F B7
+        mem(buf, ins.dst, ins.src, ins.disp);
+        return;
+    }
+    if (k == K_STORE16()) {
+        // mov word [dst + disp], src16 : 66 REX 89 /r
+        eb(buf, 102);                         // operand-size override
+        rex(buf, 0, ext(ins.src), 0, ext(ins.dst));
+        eb(buf, 137);                          // 89
+        mem(buf, ins.src, ins.dst, ins.disp);
+        return;
+    }
+    if (k == K_LOAD32()) {
+        // mov dst32, dword [src + disp] : 8B /r.  A 32-bit write zero-extends
+        // the destination register in long mode, which is the stack scalar
+        // representation expected by the rest of the backend.
+        if (ext(ins.dst) == 1 || ext(ins.src) == 1) {
+            rex(buf, 0, ext(ins.dst), 0, ext(ins.src));
+        }
+        eb(buf, 139);                          // 8B
+        mem(buf, ins.dst, ins.src, ins.disp);
+        return;
+    }
+    if (k == K_STORE32()) {
+        // mov dword [dst + disp], src32 : 89 /r (no REX.W)
+        if (ext(ins.src) == 1 || ext(ins.dst) == 1) {
+            rex(buf, 0, ext(ins.src), 0, ext(ins.dst));
+        }
+        eb(buf, 137);                          // 89
         mem(buf, ins.src, ins.dst, ins.disp);
         return;
     }
@@ -276,6 +444,9 @@ fn encode_one(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32], base_off:
         return;
     }
 
+    if (k == K_CALL_EXT()) {
+        eb(buf, 232); emit_le(buf, 0, 4); return;
+    }
     if (k == K_CALL()) {
         let target: i32 = get[i32](labels, ins.lbl);
         eb(buf, 232);                              // 0xE8
@@ -318,6 +489,22 @@ fn encode_one(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32], base_off:
     if (k == K_FXORPS()) { sse_op(buf, 0, 0, ins.dst, ins.src, 87); return; }   // 0x57
     // sqrtsd xmm[dst], xmm[src] : F2 0F 51 /r
     if (k == K_FSQRTSD()) { sse_op(buf, 242, 0, ins.dst, ins.src, 81); return; } // 0x51
+    // SSE2 MOVDQU 128-bit unaligned loads/stores.  The only current producer is
+    // the compiler-owned memcpy runtime; no user vector ABI is exposed here.
+    if (k == K_MOVDQU_LOAD()) { sse_mem(buf, 243, ins.dst, ins.src, ins.disp, 111); return; } // 0x6F
+    if (k == K_MOVDQU_STORE()) { sse_mem(buf, 243, ins.src, ins.dst, ins.disp, 127); return; } // 0x7F
+    // SSE2 PADDD performs four independent modulo-2^32 lane additions.  Like
+    // MOVDQU, it is an x86-64 baseline instruction, not a host-selected AVX
+    // feature, and its operands are XMM registers only.
+    if (k == K_PADDD()) { sse_op(buf, 102, 0, ins.dst, ins.src, 254); return; } // 0xFE
+    // SSE2 PSUBD is the matching four-lane modulo-2^32 subtraction form.
+    if (k == K_PSUBD()) { sse_op(buf, 102, 0, ins.dst, ins.src, 250); return; } // 0xFA
+    if (k == K_PAND()) { sse_op(buf, 102, 0, ins.dst, ins.src, 219); return; } // 0xDB
+    if (k == K_POR())  { sse_op(buf, 102, 0, ins.dst, ins.src, 235); return; } // 0xEB
+    if (k == K_PXOR()) { sse_op(buf, 102, 0, ins.dst, ins.src, 239); return; } // 0xEF
+    // BMI1 TZCNT dst,src : F3 REX.W 0F BC /r.  It is emitted only from the
+    // target-gated trailing_zeros intrinsic; generic code uses its exact loop.
+    if (k == K_TZCNT()) { sse_op(buf, 243, 1, ins.dst, ins.src, 188); return; } // 0xBC
     // fldl [src+disp] : DD /0 mod/rm/disp  (x87 load 64-bit double, no REX)
     if (k == K_X87_LOAD()) {
         eb(buf, 221);                           // DD
@@ -338,8 +525,21 @@ fn encode_one(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32], base_off:
     return;
 }
 
+fn encode_one(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32], base_off: i32) void {
+    encode_one_mode(buf, ins, labels, base_off, 0);
+}
+
+// kind=0 is a declared foreign call; kind=1 is a compiler-owned .data
+// address. Keeping both in one target record preserves the encoder's exact
+// byte offset without pattern-matching machine code in the driver writer.
+struct X86ObjectReloc { offset:i32, import:i32, kind:i32, data_offset:i32 }
+struct X86Encoded { text:ArrayList[u8], labels:ArrayList[i32], relocs:ArrayList[X86ObjectReloc] }
+
 // ── two-pass label resolution + assembly ──────────────────────────────────────
-fn encode(prog: ArrayList[Instr]) ArrayList[u8] {
+// Object emission needs the same resolved label offsets used for branch
+// encoding. Keep them as compiler-owned metadata; the ordinary executable path
+// continues to consume `encode` below and never exposes labels as an ABI.
+fn encode_with_labels_mode(prog: ArrayList[Instr], driver_mode: i32) X86Encoded {
     let n: i32 = len[Instr](prog);
 
     // Size the labels table to (max label id)+1.
@@ -365,19 +565,39 @@ fn encode(prog: ArrayList[Instr]) ArrayList[u8] {
         if (ins1.kind == K_LABEL()) {
             set[i32](&labels, ins1.lbl, here);
         }
-        encode_one(&scratch, ins1, labels, here);
+        encode_one_mode(&scratch, ins1, labels, here, driver_mode);
         i = i + 1;
     }
 
     // ── pass 2: emit final bytes with resolved labels ────────────────────────
     let out: ArrayList[u8] = make[u8](scratch.len + 8);
+    let relocs:ArrayList[X86ObjectReloc]=make[X86ObjectReloc](4);
     i = 0;
     while (i < n) {
         let ins2: Instr = get[Instr](prog, i);
         let off: i32 = out.len;
-        encode_one(&out, ins2, labels, off);
+        if (ins2.kind == K_CALL_EXT()) {
+            push[X86ObjectReloc](&relocs, X86ObjectReloc{.offset=off+1,.import=ins2.lbl,.kind=0,.data_offset=0});
+        } else if (driver_mode == 1 && ins2.kind == K_MOV_IMM() &&
+                   x86_driver_data_address(ins2.imm) == 1) {
+            // Driver mode forced the movabs form above: its imm64 starts at
+            // the instruction's two-byte REX/opcode prefix.
+            push[X86ObjectReloc](&relocs, X86ObjectReloc{.offset=off+2,.import=-1,.kind=1,.data_offset=(ins2.imm-DATA_VBASE()) as i32});
+        }
+        encode_one_mode(&out, ins2, labels, off, driver_mode);
         i = i + 1;
     }
 
-    return out;
+    return X86Encoded{.text=out,.labels=labels,.relocs=relocs};
+}
+
+fn encode_with_labels(prog: ArrayList[Instr]) X86Encoded {
+    return encode_with_labels_mode(prog, 0);
+}
+
+fn encode(prog: ArrayList[Instr]) ArrayList[u8] {
+    let encoded:X86Encoded=encode_with_labels(prog);
+    free[i32](&encoded.labels);
+    free[X86ObjectReloc](&encoded.relocs);
+    return encoded.text;
 }

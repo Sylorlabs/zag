@@ -2,9 +2,9 @@
 
 **Zag is a systems language in the lineage of Zig, except the Zen of Zig stops being a convention you promise and becomes a property the compiler proves.**
 
-In Zig, when someone annotates a function `// no allocations`, you trust them. In Zag, `@realtime` is a *compiler-verified capability*. The compiler walks the entire call graph and either produces a proof that no allocation, lock, or IO can reach your audio thread, or it rejects the program and shows you exactly which call three levels deep introduced the violation.
+In Zig, when someone annotates a function `// no allocations`, you trust them. In Zag, `@realtime` is a *compiler-verified capability*. The compiler walks the call graph and either proves that no allocation, lock, or IO can reach your audio thread, or rejects the affected annotated functions with source diagnostics. Every rejected effect is accompanied by its complete rendered path from the constrained function to the source operation, including higher-order callback and closure bindings and imported source identity.
 
-That's the single idea that justifies this language's existence. Everything else (the heterogeneous numeric types, the GPU backend, the bignum overflow safety) is the same idea applied further.
+That's the single idea that justifies this language's existence. Everything else (the heterogeneous numeric types, GPU frontend emission, the bignum overflow safety) is the same idea applied further.
 
 ---
 
@@ -20,19 +20,20 @@ Zig's philosophy is "no hidden allocations, no hidden control flow." It enforces
 | Integer overflow | Wraps (undefined) or traps | `sat_i16` never wraps, `u_any` never overflows |
 | 11-bit ADC value | `u16` + manual `& 0x7FF` everywhere | `u11`, compiler inserts the mask |
 | Audio DSP sample | `i16` that silently wraps on spike | `sat_i16`, clamps to ±32767, proven |
-| GPU kernel correctness | No guarantee | `@kernel`, same effect proof as `@realtime` |
+| GPU kernel correctness | No guarantee | Bounded Vulkan/OpenGL/OpenCL compat fill dispatch/readback is verified locally; arbitrary-kernel/general GPU certification is not established |
 | Integer types | `u8`, `u16`, `u32`, `u64`, `i8`… | All of those **plus** any width from `u1` to `u127` |
 
 ### The three tiers Zig never touches
 
-**Tier 1: proven capabilities.** The compiler is not a linter. It does not warn. It either proves the claim or the program does not compile. The proof is a call-graph reachability analysis over an effect lattice (`Alloc`, `Lock`, `IO`, `Panic`). On the supported `./znc` path this covers call-graph effects today. Deeper `@total` arithmetic proofs (division by zero with guards, bounds) are on the legacy `./zagc` path via ghost_engine or Z3. A witness chain looks like:
+**Tier 1: proven capabilities.** The compiler is not a linter. It does not warn. It either proves the claim or the program does not compile. The proof is a call-graph reachability analysis over an effect lattice (`Alloc`, `Lock`, `IO`, `Panic`). On the supported `./znc` path this covers call-graph effects today. Deeper `@total` arithmetic proofs are gated separately and must be checked with the native total gate; they are not a blanket claim that every arithmetic precondition is solved.
 
 ```
 ✗ VIOLATION  renderBad @realtime
   renderBad → processBlock → fancyOp → zalloc()   [introduces Alloc]
 ```
 
-Not "possible allocation." The exact chain.
+Not a warning: a failed capability proof stops the build. The diagnostic prints
+one complete call-path witness for every forbidden effect that was reached.
 
 **Tier 2: the full numeric spectrum.** Zig has the standard integer widths and IEEE floats. The physical world has 11-bit ADCs, saturating 16-bit DSP, Q8.8 fixed-point filters, 128-bit residue arithmetic, and 8-bit microscaling floats. Zag makes all of these first-class on the native backend:
 
@@ -44,13 +45,22 @@ let budget: u_any     = items * price; // can't overflow; grows as needed; Alloc
 let poly:   rns_3     = coefficient;   // parallel mod-arithmetic over 3 coprime channels
 ```
 
-**Tier 3: GPU as another target (legacy path).** `@kernel` uses the same effect rules as `@realtime`. MLIR emission lives on the legacy `./zagc` differential path today, not on `./znc`.
+**Tier 3: GPU compat execution.** Vulkan, OpenGL, and OpenCL compatibility
+targets now have bounded C and pure-Zag runtime gates with checked readback on
+the local AMD RX 5700 XT. MLIR remains a development frontend and is not the
+runtime path; CUDA and Metal remain explicit artifact-only, fail-closed
+targets here.
+GPU MLIR output is not a GPU executable or dispatch runtime; GPU MLIR is not
+physical GPU execution.
 
 ---
 
 ## Install
 
-**Requirements:** x86-64 Linux only. No Python, Zig, `cc`, LLVM, or libc build chain.
+**Compiler host:** Linux x86-64 for the committed release seed. Linux AArch64
+is a scoped supported output target and CI host, with exact boundaries in the
+[support contract](zag-poc/docs/SUPPORT.md). No Python, Zig, `cc`, LLVM, or libc
+build chain is required for the compiler.
 
 ```bash
 git clone https://github.com/Sylorlabs/zag.git
@@ -64,18 +74,11 @@ chmod +x znc bootstrap.sh
 optimizes, and emits a static x86-64 ELF with no external tools. See
 [`zag-poc/INSTALL.md`](zag-poc/INSTALL.md) and [`zag-poc/BOOTSTRAP.md`](zag-poc/BOOTSTRAP.md).
 
-**Optional: ghost_engine / Z3** (for `@total` division-by-zero proofs on the legacy `./zagc` differential path):
-```bash
-( cd ../ghost_engine && zig build zag-verify )   # if ghost_engine is available
-bash prove.sh
-```
-Without a prover, `./znc` still proves all call-graph effects (`@realtime`, `@noalloc`, `@pure`).
-
-**Optional: MLIR toolchain** (GPU targets via `selfhost/mlir.zag` on the legacy `./zagc` path):
-```bash
-# Ubuntu / Debian
-apt install mlir-tools llvm-18
-```
+No C-emitting compiler or external prover is required for the supported path.
+The retired bootstrap/oracle implementations are available only through Git
+history. GPU MLIR targets are development/differential frontends; they are not
+physical GPU execution and do not require an MLIR installation for ordinary
+native builds.
 
 ### GitHub syntax highlighting
 
@@ -88,16 +91,26 @@ site will show the Zag name and blue color. Local editors use the Zag grammar in
 
 ---
 
-## Quick start
+## Start a project
+
+```bash
+mkdir my-zag-app && cd my-zag-app
+znc init --name my-zag-app
+znc src/main.zag -o app --run
+znc tests/smoke.zag -o smoke --run
+```
+
+The scaffold includes a runnable source file, smoke test, project README, and
+ignore rules. `znc --help` lists the compiler's supported commands.
+
+To explore Zag's capability proofs from the compiler checkout:
 
 ```bash
 cd zag/zag-poc
-
-# Prove this function's effects are clean, build it, and run it
 ./znc examples/audio_render.zag -o audio_render --run
 
-# Watch the prover reject an allocation buried 3 calls deep inside @realtime
-./znc examples/audio_render_bad.zag -o /tmp/bad   # exits non-zero with witness chain
+# Watch the prover reject a transitive allocation under @realtime
+./znc examples/audio_render_bad.zag -o /tmp/bad   # exits non-zero with E0002 diagnostics
 
 # Try the heterogeneous numeric types
 ./znc examples/embedded_sensor.zag -o embedded_sensor --run   # u11 + sat_i16 + fixed_8_8
@@ -108,14 +121,19 @@ cd zag/zag-poc
 bash tests/run_native_authority.sh
 ```
 
-**What the bad-program check output looks like:**
+**What the bad-program check reports:**
 ```
-== effect/capability report for examples/audio_render_bad.zag ==
-✗ VIOLATION  renderBad @realtime
-    renderBad → gain → reverbScratch → zalloc()   [introduces Alloc]
+error[E0002]: capability violation — `@realtime` constraint broken in function `gain`
+   = effect path [Alloc]: gain -> reverbScratch -> zalloc() [Alloc]
+error[E0002]: capability violation — `@realtime` constraint broken in function `renderBlock`
+   = effect path [Alloc]: renderBlock -> gain -> reverbScratch -> zalloc() [Alloc]
+znc: capability check FAILED
 ```
 
-The compiler found the chain (`gain` calls `reverbScratch` which calls `zalloc`) without any annotation on any intermediate function. The proof crosses the entire call graph automatically.
+The proof propagates effects through the call graph without annotations on
+intermediate functions. Generic callbacks render their call-site binding,
+closures render their source line, imported helpers render their module path,
+and recursive cycles terminate without hiding a reachable source operation.
 
 ---
 
@@ -136,12 +154,16 @@ The compiler found the chain (`gain` calls `reverbScratch` which calls `zalloc`)
   Sema           type checker + effect prover
     │             ├─ infers types for every expression
     │             ├─ walks the call graph collecting effects (Alloc/Lock/IO/Panic)
-    │             └─ checks every @annotation claim, emits witness chain on failure
+    │             └─ checks every @annotation claim, emits E0002 on failure
     │
     └── native codegen ──► static x86-64 ELF (./znc)
 ```
 
-The supported compiler is a self-hosted Zag program in `zag-poc/selfhost/native/` (`znc.zag`). The Python prototype and Zig bootstrap live only in git history at tag `v0.0-zig-bootstrap`. `./zagc` remains as a differential oracle. GPU and multi-target builds are on that legacy path.
+The supported compiler is a self-hosted Zag program in `zag-poc/selfhost/native/`
+(`znc.zag`). The Python prototype, Zig bootstrap, and C-emitting `zagc` path
+live only in Git history. The supported tree emits x86-64 and experimental
+ARM64 machine code, WASM output, and bounded GPU frontend/bundle artifacts
+without Python, C, Zig, LLVM, or a host C toolchain.
 
 ### The effect system
 
@@ -255,9 +277,20 @@ Types that map to hardware that Vulkan SPIR-V cannot represent:
 | `mx_fp4` | MX Microscaling FP4 E2M1 | `f4E2M1FN` | Extreme-density speculative decoding |
 | `vsa_b<N>` | N-dimensional binary hypervector | `vector<Nxi1>` | GPU bitwise SIMD |
 
-### GPU (legacy path)
+### GPU frontend emission (legacy path)
 
-MLIR emission for `@kernel` functions is implemented in `selfhost/mlir.zag` and exercised through the legacy `./zagc` differential path. `./znc` does not ship GPU targets today.
+MLIR emission for `@kernel` functions is implemented in `selfhost/mlir.zag` and
+exercised through a legacy differential path. It is not a production backend:
+no device is enumerated, no context/buffer is created, and no result is read
+back or checked.
+
+The supported self-hosted compiler ships the custom Zag-native
+`amdgpu-gfx1010` target. It emits validated ZGK1 RDNA1 bundles without LLVM or
+MLIR. Pure-Zag userspace runtimes consume them through the existing Linux
+AMDGPU driver UAPI. Future portable targets use custom Zag SPIR-V or PTX
+generators over installed Vulkan/CUDA drivers; Zag does not rewrite privileged
+kernel drivers or firmware. The executable contract is `std:gpu_platform`; see
+`zag-poc/docs/GPU_COMPILER_DRIVER_BOUNDARY.md`.
 
 ---
 
@@ -276,15 +309,21 @@ MLIR emission for `@kernel` functions is implemented in `selfhost/mlir.zag` and 
 
 ## Build targets
 
-The supported v1 compiler emits **x86-64 Linux ELF only**:
+The supported v1 compiler emits **x86-64 Linux ELF** as its primary target and
+supports a scoped **AArch64 Linux** target:
 
 ```bash
 ./znc file.zag -o program
 ./znc file.zag -o program --run
 ./znc file.zag -o program --debug
+./znc file.zag --target arm64 -o program
 ```
 
-Multi-arch CPU targets, wasm, RISC-V posit hardware, and GPU backends exist on the legacy `./zagc` differential path. See `zag-poc/README.md` if you need those for comparison work.
+Static AArch64 v1 output is verified through qemu-user and native ARM CI;
+edition-2027 object and dynamic output have separate bounded gates. This does
+not imply parity for every x86-64 v2 feature. WebAssembly is artifact-only and
+GPU claims are limited to their exact compatibility gates. See the
+[support contract](zag-poc/docs/SUPPORT.md).
 
 ---
 
@@ -293,7 +332,7 @@ Multi-arch CPU targets, wasm, RISC-V posit hardware, and GPU backends exist on t
 ```
 examples/
   audio_render.zag        @realtime audio render block, proven clean
-  audio_render_bad.zag    allocation 3 calls deep, rejected with witness chain
+  audio_render_bad.zag    transitive allocation rejected with E0002 diagnostics
   synth.zag               @noalloc synth + @total quantizer
   embedded_sensor.zag     u11 ADC + sat_i16 DSP + fixed_8_8 IIR
   hpc_rns.zag             rns_3 polynomial eval + fixed_16_16 dot product
@@ -303,7 +342,7 @@ examples/
   generic_map.zag         generic map[T] with effect composition
   posit_multi.zag         p8/p16/p32/p64 family arithmetic
   quire.zag               512-bit exact accumulator
-  gpu_matmul_mx.zag       MX-FP8 kernel (legacy ./zagc GPU path)
+  gpu_matmul_mx.zag       MX-FP8 kernel (development GPU frontend path)
 ```
 
 ---
@@ -312,16 +351,42 @@ examples/
 
 Zag v1 is a self-hosted native compiler (`./znc`) that boots from a committed seed, rebuilds itself without a host C toolchain, and ships a growing stdlib under `selfhost/std/`.
 
-| Area | `./znc` (supported) | Legacy `./zagc` |
-|---|---|---|
-| Call-graph effect proofs (`@realtime`, `@noalloc`, `@pure`) | Yes | Yes |
-| Witness chains, effect polymorphism, closures | Yes | Yes |
-| Posits, quire, saturating ints, `u11`, fixed-point, RNS | Yes | Yes |
-| Native stdlib, LSP, formatter, DWARF | Yes | Partial |
-| `@total` SMT proofs (in-process solver) | Gated (`run_native_total.sh`) | Yes |
-| GPU / MLIR | Yes (`--target gpu-*`; `run_native_gpu.sh`) | Yes |
-| WebAssembly | Yes (`--target wasm`; `run_native_wasm.sh`) | Yes |
-| multi-arch CPU (arm64, riscv, …) | No | Yes |
+### Readiness boundary
+
+The current evidence supports a bounded Linux/x86-64 experimental release, not
+a general C replacement. The first master-gate phase currently passes a
+three-generation pure-Zag rebuild to a byte-identical fixpoint. A complete
+release claim still requires the declared native, compatibility, Script, and
+target gates to pass on the exact release tree.
+
+The following remain explicitly outside a production-v2 claim: a complete
+provenance/alignment/lifetime model, general portable atomics and concurrency,
+complete C ABI and dynamic-library interoperability, whole-language memory
+safety, async/await, RAII/destructors, and a general native direct-DRM GPU
+backend. The compat gate is separate bounded evidence: it does
+prove device dispatch/readback for the three supported local APIs, while GPU
+MLIR and ZGK1/VM evidence must not be described as that proof. See
+[`zag-poc/docs/V2_FINAL_VERIFICATION.md`](zag-poc/docs/V2_FINAL_VERIFICATION.md)
+and [`zag-poc/docs/GPU_COMPILER_DRIVER_BOUNDARY.md`](zag-poc/docs/GPU_COMPILER_DRIVER_BOUNDARY.md).
+
+C interoperability is an incremental-replacement bridge, not a Zag-to-C
+translation path: Zag source is compiled directly by Zag's native compiler.
+
+| Area | Current supported status |
+|---|---|
+| Call-graph effect proofs (`@realtime`, `@noalloc`, `@pure`) | Yes |
+| Transitive effect rejection, effect polymorphism, closures | Yes; complete per-effect call-path witnesses are rendered |
+| Posits, quire, saturating ints, `u11`, fixed-point, RNS | Yes |
+| Native stdlib, LSP, formatter, DWARF | Yes |
+| `@total` proofs | Gated (`run_native_total.sh`); bounded, not universal arithmetic proof |
+| GPU compat execution | Vulkan/OpenGL/OpenCL bounded dispatch/readback verified on local RX 5700 XT (`run_gpu_runtime.sh`, `run_gpu_zag_runtime.sh`); native DRM remains separate |
+| WebAssembly emission | Yes (`--target wasm`; `run_native_wasm.sh`); runtime scope is bounded |
+| multi-arch CPU | AArch64: supported scoped target; i686: limited milestone; RISC-V: unsupported |
+
+The complete platform, package, ownership, concurrency, ABI, and memory-safety
+boundary is maintained in [`zag-poc/docs/SUPPORT.md`](zag-poc/docs/SUPPORT.md).
+The current local/vendored dependency workflow is documented in
+[`zag-poc/docs/DEPENDENCIES.md`](zag-poc/docs/DEPENDENCIES.md).
 
 Release gates:
 
@@ -330,11 +395,21 @@ cd zag-poc
 bash tests/run_native_authority.sh
 bash tests/run_native.sh
 bash tests/run_native_gpu.sh
+bash tests/run_gpu_runtime.sh
 bash tests/run_native_wasm.sh
 bash tests/run_native_total.sh
+bash tests/run_zagscript_release_gate.sh
 ```
 
-`bash run_tests.sh` is an older differential suite against `./zagc`. CI keeps it informational, not a release blocker.
+The authoritative v2 gate is intentionally fail-closed and remains nonzero
+while any required v2 capability is marked `UNSUPPORTED`:
+
+```bash
+bash tests/run_v2_release_gate.sh
+```
+
+`bash run_tests.sh` is a historical differential suite retained only for
+archival comparison; it is not a supported compiler path or a release gate.
 
 ---
 
@@ -352,7 +427,7 @@ zag-poc/
   tests/                           v1 release gates
   examples/                        small demonstration programs
   programs/                        larger acceptance programs + GAPS.md
-  run_tests.sh                     legacy ./zagc differential suite
+  run_tests.sh                     historical differential suite (archival)
 editors/vscode/                    VS Code extension
 linguist/                          GitHub Linguist registration notes
 ```

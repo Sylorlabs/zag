@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # ABI / layout hardening regression suite for ./znc (native x86-64 ELF).
 #
-# Documents CURRENT behavior per COMPATIBILITY.md — NOT a stable-ABI claim.
+# RELEASE-BLOCKING GATE: failure aborts a release (see RELEASES.md step 5b).
+# Documents CURRENT behavior per COMPATIBILITY.md — NOT a frozen/stable ABI.
 # Catches regressions in @sizeOf, struct padding, union tag+payload, slice and
-# fat_fn layout, arbitrary-width integers, and error-union sizing.
+# fat_fn layout, pointer alignment, arbitrary-width integers, and error-union
+# sizing.
 #
 # Usage:  bash tests/run_abi_layout.sh
 #         ZNC=./znc bash tests/run_abi_layout.sh
@@ -116,6 +118,26 @@ abi "struct holding fat_fn field" \
     'fn id(x: i32) i32 { return x; } struct H { f: fn(i32) i32 } fn main() i32 { return @sizeOf[H](); }' \
     16
 
+abi "pointer *i32 (8)" \
+    'fn main() i32 { return @sizeOf[*i32](); }' \
+    8
+
+abi "pointer *u8 (8)" \
+    'fn main() i32 { return @sizeOf[*u8](); }' \
+    8
+
+abi "union max payload (i32|3×i32 struct → 32)" \
+    'struct Trip { x: i32, y: i32, z: i32 } union U { a: i32, b: Trip } fn main() i32 { return @sizeOf[U](); }' \
+    32
+
+abi "nested struct padding (i32 + 3×i32 + i32 → 40)" \
+    'struct Mid { a: i32, b: i32, c: i32 } struct Wrap { x: i32, mid: Mid, y: i32 } fn main() i32 { return @sizeOf[Wrap](); }' \
+    40
+
+abi "optional between scalars (?i32 inline → 32)" \
+    'struct Edge { head: i32, opt: ?i32, tail: i32 } fn main() i32 { return @sizeOf[Edge](); }' \
+    32
+
 echo ""
 echo "── runtime field offsets & aggregate behavior ──"
 
@@ -129,7 +151,7 @@ else
     off_ec=$?
     set -e
     if [ "$off_ec" = 0 ]; then
-        echo "  ok  offsets.zag (8 runtime checks)"
+        echo "  ok  offsets.zag (13 runtime checks)"
         pass=$((pass + 1))
     else
         echo "  XX  offsets.zag (failed check #$off_ec)"
