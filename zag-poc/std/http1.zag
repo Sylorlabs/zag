@@ -1,0 +1,887 @@
+// std/http1.zag -- bounded, deterministic HTTP/1.1 wire codec.
+//
+// This module encodes and parses one complete request or response.  Parsed
+// fields borrow the caller's input bytes; only the header-view table is owned
+// and must be closed.  Encoded buffers are owned and must be closed.
+//
+// Deliberate limits: HTTP/1.1 only, strict CRLF, origin-form request targets,
+// and Content-Length framing.  Transfer-Encoding (including chunked), HTTP/2,
+// HTTP/3, trailers, proxy request forms, and connection management are outside
+// this codec and fail closed where observable.
+
+@import("list.zag")
+
+struct Http1Limits {
+    max_message_bytes: i32,
+    max_method_bytes: i32,
+    max_path_bytes: i32,
+    max_header_count: i32,
+    max_header_name_bytes: i32,
+    max_header_value_bytes: i32,
+    max_header_bytes: i32,
+    max_body_bytes: i32,
+}
+
+struct Http1Header {
+    name: []u8,
+    value: []u8,
+}
+
+struct Http1Buffer {
+    bytes: ArrayList[u8],
+    open: i32,
+}
+
+struct Http1BufferResult {
+    ok: i32,
+    code: i64,
+    value: Http1Buffer,
+}
+
+struct Http1Request {
+    bytes: []u8,
+    method: []u8,
+    path: []u8,
+    headers: ArrayList[Http1Header],
+    body: []u8,
+    open: i32,
+}
+
+struct Http1RequestResult {
+    ok: i32,
+    code: i64,
+    value: Http1Request,
+}
+
+struct Http1Response {
+    bytes: []u8,
+    status: i32,
+    reason: []u8,
+    headers: ArrayList[Http1Header],
+    body: []u8,
+    open: i32,
+}
+
+struct Http1ResponseResult {
+    ok: i32,
+    code: i64,
+    value: Http1Response,
+}
+
+struct Http1HeaderLookup {
+    found: i32,
+    count: i32,
+    value: []u8,
+}
+
+struct Http1MessageProbe {
+    ok: i32,
+    code: i64,
+    complete: i32,
+    total_bytes: i32,
+    header_bytes: i32,
+    body_bytes: i32,
+}
+
+struct Http1HeadResult {
+    ok: i32,
+    code: i64,
+    headers: ArrayList[Http1Header],
+    body_start: i32,
+    body_length: i32,
+}
+
+fn http1_status_ok() i64 { return 0; }
+fn http1_status_invalid_argument() i64 { return 0 - 7201; }
+fn http1_status_limit() i64 { return 0 - 7202; }
+fn http1_status_truncated() i64 { return 0 - 7203; }
+fn http1_status_malformed() i64 { return 0 - 7204; }
+fn http1_status_unsupported() i64 { return 0 - 7205; }
+fn http1_status_invalid_state() i64 { return 0 - 7206; }
+
+fn http1_default_limits() Http1Limits {
+    return Http1Limits{
+        .max_message_bytes = 65536,
+        .max_method_bytes = 16,
+        .max_path_bytes = 2048,
+        .max_header_count = 32,
+        .max_header_name_bytes = 64,
+        .max_header_value_bytes = 4096,
+        .max_header_bytes = 16384,
+        .max_body_bytes = 32768,
+    };
+}
+
+fn http1_limits_valid(limits: Http1Limits) i32 {
+    if (limits.max_message_bytes < 16 || limits.max_message_bytes > 1048576 ||
+        limits.max_method_bytes < 1 || limits.max_method_bytes > 64 ||
+        limits.max_path_bytes < 1 || limits.max_path_bytes > 16384 ||
+        limits.max_header_count < 1 || limits.max_header_count > 128 ||
+        limits.max_header_name_bytes < 1 || limits.max_header_name_bytes > 256 ||
+        limits.max_header_value_bytes < 0 || limits.max_header_value_bytes > 16384 ||
+        limits.max_header_bytes < 4 || limits.max_header_bytes > 65536 ||
+        limits.max_body_bytes < 0 || limits.max_body_bytes > 1048576 ||
+        limits.max_header_bytes > limits.max_message_bytes ||
+        limits.max_body_bytes > limits.max_message_bytes) { return 0; }
+    return 1;
+}
+
+fn http1_empty_headers() ArrayList[Http1Header] {
+    return ArrayList[Http1Header]{
+        .data = null as *Http1Header, .len = 0, .cap = 0,
+    };
+}
+
+fn http1_empty_buffer() Http1Buffer {
+    return Http1Buffer{ .bytes = ArrayList[u8]{
+        .data = null as *u8, .len = 0, .cap = 0,
+    }, .open = 0 };
+}
+
+fn http1_invalid_request() Http1Request {
+    return Http1Request{
+        .bytes = "", .method = "", .path = "",
+        .headers = http1_empty_headers(), .body = "", .open = 0,
+    };
+}
+
+fn http1_invalid_response() Http1Response {
+    return Http1Response{
+        .bytes = "", .status = 0, .reason = "",
+        .headers = http1_empty_headers(), .body = "", .open = 0,
+    };
+}
+
+fn http1_buffer_failure(code: i64) Http1BufferResult {
+    return Http1BufferResult{ .ok = 0, .code = code, .value = http1_empty_buffer() };
+}
+
+fn http1_request_failure(code: i64) Http1RequestResult {
+    return Http1RequestResult{ .ok = 0, .code = code, .value = http1_invalid_request() };
+}
+
+fn http1_response_failure(code: i64) Http1ResponseResult {
+    return Http1ResponseResult{ .ok = 0, .code = code, .value = http1_invalid_response() };
+}
+
+fn http1_buffer_take(result: *Http1BufferResult) Http1Buffer {
+    if (result.*.ok == 0 || result.*.value.open == 0) { return http1_empty_buffer(); }
+    let value: Http1Buffer = result.*.value;
+    result.*.value = http1_empty_buffer();
+    result.*.ok = 0;
+    result.*.code = http1_status_invalid_state();
+    return value;
+}
+
+fn http1_request_take(result: *Http1RequestResult) Http1Request {
+    if (result.*.ok == 0 || result.*.value.open == 0) { return http1_invalid_request(); }
+    let value: Http1Request = result.*.value;
+    result.*.value = http1_invalid_request();
+    result.*.ok = 0;
+    result.*.code = http1_status_invalid_state();
+    return value;
+}
+
+fn http1_response_take(result: *Http1ResponseResult) Http1Response {
+    if (result.*.ok == 0 || result.*.value.open == 0) { return http1_invalid_response(); }
+    let value: Http1Response = result.*.value;
+    result.*.value = http1_invalid_response();
+    result.*.ok = 0;
+    result.*.code = http1_status_invalid_state();
+    return value;
+}
+
+fn http1_buffer_slice(buffer: *Http1Buffer) []u8 {
+    if (buffer.*.open == 0) { return ""; }
+    return buffer.*.bytes.data[0..buffer.*.bytes.len];
+}
+
+fn http1_buffer_close(buffer: *Http1Buffer) i64 {
+    if (buffer.*.open == 0) { return http1_status_invalid_state(); }
+    buffer.*.open = 0;
+    free[u8](&buffer.*.bytes);
+    return http1_status_ok();
+}
+
+fn http1_request_close(request: *Http1Request) i64 {
+    if (request.*.open == 0) { return http1_status_invalid_state(); }
+    request.*.open = 0;
+    free[Http1Header](&request.*.headers);
+    request.*.bytes = "";
+    request.*.method = "";
+    request.*.path = "";
+    request.*.body = "";
+    return http1_status_ok();
+}
+
+fn http1_response_close(response: *Http1Response) i64 {
+    if (response.*.open == 0) { return http1_status_invalid_state(); }
+    response.*.open = 0;
+    free[Http1Header](&response.*.headers);
+    response.*.bytes = "";
+    response.*.reason = "";
+    response.*.body = "";
+    return http1_status_ok();
+}
+
+fn http1_ascii_lower(byte: u8) u8 {
+    if (byte >= 65 && byte <= 90) { return (byte + 32) as u8; }
+    return byte;
+}
+
+fn http1_equal_case(left: []u8, right: []u8) i32 {
+    if (left.len != right.len) { return 0; }
+    let i: i32 = 0;
+    while (i < left.len) {
+        if (http1_ascii_lower(left[i]) != http1_ascii_lower(right[i])) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn http1_tchar(byte: u8) i32 {
+    if ((byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) ||
+        (byte >= 97 && byte <= 122)) { return 1; }
+    if (byte == 33 || byte == 35 || byte == 36 || byte == 37 || byte == 38 ||
+        byte == 39 || byte == 42 || byte == 43 || byte == 45 || byte == 46 ||
+        byte == 94 || byte == 95 || byte == 96 || byte == 124 || byte == 126) {
+        return 1;
+    }
+    return 0;
+}
+
+fn http1_token_valid(value: []u8, max_bytes: i32) i32 {
+    if (value.len < 1 || value.len > max_bytes) { return 0; }
+    let i: i32 = 0;
+    while (i < value.len) {
+        if (http1_tchar(value[i]) == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn http1_path_valid(path: []u8, max_bytes: i32) i32 {
+    if (path.len < 1 || path.len > max_bytes || path[0] != 47) { return 0; }
+    let i: i32 = 0;
+    while (i < path.len) {
+        if (path[i] < 33 || path[i] > 126 || path[i] == 35) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn http1_header_value_valid(value: []u8, max_bytes: i32) i32 {
+    if (value.len > max_bytes) { return 0; }
+    let i: i32 = 0;
+    while (i < value.len) {
+        let byte: u8 = value[i];
+        if ((byte < 32 && byte != 9) || byte == 127) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn http1_host_value_valid(value: []u8, max_bytes: i32) i32 {
+    if (value.len < 1 || value.len > max_bytes) { return 0; }
+    let i: i32 = 0;
+    while (i < value.len) {
+        if (value[i] < 33 || value[i] > 126) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn http1_reason_valid(reason: []u8) i32 {
+    if (reason.len < 1 || reason.len > 128) { return 0; }
+    let i: i32 = 0;
+    while (i < reason.len) {
+        if (reason[i] < 32 || reason[i] > 126) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn http1_append_byte(output: *ArrayList[u8], byte: u8, max_bytes: i32) i32 {
+    if (output.*.len >= max_bytes) { return 0; }
+    push[u8](output, byte);
+    return 1;
+}
+
+fn http1_append(output: *ArrayList[u8], value: []u8, max_bytes: i32) i32 {
+    if (value.len > max_bytes - output.*.len) { return 0; }
+    let i: i32 = 0;
+    while (i < value.len) {
+        push[u8](output, value[i]);
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn http1_append_decimal(output: *ArrayList[u8], value: i32,
+                        max_bytes: i32) i32 {
+    if (value < 0) { return 0; }
+    if (value == 0) {
+        return http1_append_byte(output, 48, max_bytes);
+    }
+    let divisor: i32 = 1;
+    while (value / divisor >= 10) {
+        divisor = divisor * 10;
+    }
+    while (divisor > 0) {
+        let digit: i32 = (value / divisor) % 10;
+        if (http1_append_byte(output, (48 + digit) as u8, max_bytes) == 0) {
+            return 0;
+        }
+        divisor = divisor / 10;
+    }
+    return 1;
+}
+
+fn http1_custom_headers_valid(headers: ArrayList[Http1Header], extra_count: i32,
+                              limits: Http1Limits) i64 {
+    if (headers.len < 0 || extra_count < 0 ||
+        headers.len + extra_count > limits.max_header_count) {
+        return http1_status_limit();
+    }
+    let i: i32 = 0;
+    while (i < headers.len) {
+        let header: Http1Header = headers.data[i];
+        if (http1_token_valid(header.name, limits.max_header_name_bytes) == 0 ||
+            http1_header_value_valid(header.value, limits.max_header_value_bytes) == 0) {
+            return http1_status_invalid_argument();
+        }
+        if (http1_equal_case(header.name, "host") != 0 ||
+            http1_equal_case(header.name, "content-length") != 0 ||
+            http1_equal_case(header.name, "transfer-encoding") != 0) {
+            return http1_status_invalid_argument();
+        }
+        i = i + 1;
+    }
+    return http1_status_ok();
+}
+
+fn http1_append_header(output: *ArrayList[u8], header: Http1Header,
+                       limits: Http1Limits) i32 {
+    if (http1_append(output, header.name, limits.max_message_bytes) == 0 ||
+        http1_append(output, ": ", limits.max_message_bytes) == 0 ||
+        http1_append(output, header.value, limits.max_message_bytes) == 0 ||
+        http1_append(output, "\r\n", limits.max_message_bytes) == 0) { return 0; }
+    return 1;
+}
+
+fn http1_encode_request_bounded(method: []u8, path: []u8, host: []u8,
+                                headers: ArrayList[Http1Header], body: []u8,
+                                limits: Http1Limits) Http1BufferResult {
+    if (http1_limits_valid(limits) == 0 ||
+        http1_token_valid(method, limits.max_method_bytes) == 0 ||
+        http1_path_valid(path, limits.max_path_bytes) == 0 ||
+        http1_host_value_valid(host, limits.max_header_value_bytes) == 0) {
+        return http1_buffer_failure(http1_status_invalid_argument());
+    }
+    if (body.len > limits.max_body_bytes) {
+        return http1_buffer_failure(http1_status_limit());
+    }
+    let headers_rc: i64 = http1_custom_headers_valid(headers, 2, limits);
+    if (headers_rc != http1_status_ok()) { return http1_buffer_failure(headers_rc); }
+    let output: ArrayList[u8] = make[u8](128 + body.len);
+    if (http1_append(&output, method, limits.max_message_bytes) == 0 ||
+        http1_append(&output, " ", limits.max_message_bytes) == 0 ||
+        http1_append(&output, path, limits.max_message_bytes) == 0 ||
+        http1_append(&output, " HTTP/1.1\r\nHost: ", limits.max_message_bytes) == 0 ||
+        http1_append(&output, host, limits.max_message_bytes) == 0 ||
+        http1_append(&output, "\r\n", limits.max_message_bytes) == 0) {
+        free[u8](&output);
+        return http1_buffer_failure(http1_status_limit());
+    }
+    let i: i32 = 0;
+    while (i < headers.len) {
+        if (http1_append_header(&output, headers.data[i], limits) == 0) {
+            free[u8](&output);
+            return http1_buffer_failure(http1_status_limit());
+        }
+        i = i + 1;
+    }
+    if (http1_append(&output, "Content-Length: ", limits.max_message_bytes) == 0 ||
+        http1_append_decimal(&output, body.len, limits.max_message_bytes) == 0 ||
+        http1_append(&output, "\r\n\r\n", limits.max_message_bytes) == 0) {
+        free[u8](&output);
+        return http1_buffer_failure(http1_status_limit());
+    }
+    if (output.len > limits.max_header_bytes ||
+        http1_append(&output, body, limits.max_message_bytes) == 0) {
+        free[u8](&output);
+        return http1_buffer_failure(http1_status_limit());
+    }
+    return Http1BufferResult{
+        .ok = 1, .code = http1_status_ok(),
+        .value = Http1Buffer{ .bytes = output, .open = 1 },
+    };
+}
+
+fn http1_encode_request(method: []u8, path: []u8, host: []u8,
+                        headers: ArrayList[Http1Header],
+                        body: []u8) Http1BufferResult {
+    return http1_encode_request_bounded(
+        method, path, host, headers, body, http1_default_limits()
+    );
+}
+
+fn http1_encode_response_bounded(status: i32, reason: []u8,
+                                 headers: ArrayList[Http1Header], body: []u8,
+                                 limits: Http1Limits) Http1BufferResult {
+    if (http1_limits_valid(limits) == 0 || status < 100 || status > 599 ||
+        http1_reason_valid(reason) == 0) {
+        return http1_buffer_failure(http1_status_invalid_argument());
+    }
+    let body_forbidden: i32 = ((status >= 100 && status <= 199) ||
+        status == 204 || status == 304) as i32;
+    if (body.len > limits.max_body_bytes || (body_forbidden != 0 && body.len != 0)) {
+        return http1_buffer_failure(http1_status_limit());
+    }
+    let extra_count: i32 = 1;
+    if (body_forbidden != 0) { extra_count = 0; }
+    let headers_rc: i64 = http1_custom_headers_valid(headers, extra_count, limits);
+    if (headers_rc != http1_status_ok()) { return http1_buffer_failure(headers_rc); }
+    let output: ArrayList[u8] = make[u8](128 + body.len);
+    if (http1_append(&output, "HTTP/1.1 ", limits.max_message_bytes) == 0 ||
+        http1_append_decimal(&output, status, limits.max_message_bytes) == 0 ||
+        http1_append(&output, " ", limits.max_message_bytes) == 0 ||
+        http1_append(&output, reason, limits.max_message_bytes) == 0 ||
+        http1_append(&output, "\r\n", limits.max_message_bytes) == 0) {
+        free[u8](&output);
+        return http1_buffer_failure(http1_status_limit());
+    }
+    let i: i32 = 0;
+    while (i < headers.len) {
+        if (http1_append_header(&output, headers.data[i], limits) == 0) {
+            free[u8](&output);
+            return http1_buffer_failure(http1_status_limit());
+        }
+        i = i + 1;
+    }
+    if (body_forbidden == 0) {
+        if (http1_append(&output, "Content-Length: ", limits.max_message_bytes) == 0 ||
+            http1_append_decimal(&output, body.len, limits.max_message_bytes) == 0 ||
+            http1_append(&output, "\r\n\r\n", limits.max_message_bytes) == 0) {
+            free[u8](&output);
+            return http1_buffer_failure(http1_status_limit());
+        }
+    } else if (http1_append(&output, "\r\n", limits.max_message_bytes) == 0) {
+        free[u8](&output);
+        return http1_buffer_failure(http1_status_limit());
+    }
+    if (output.len > limits.max_header_bytes ||
+        http1_append(&output, body, limits.max_message_bytes) == 0) {
+        free[u8](&output);
+        return http1_buffer_failure(http1_status_limit());
+    }
+    return Http1BufferResult{
+        .ok = 1, .code = http1_status_ok(),
+        .value = Http1Buffer{ .bytes = output, .open = 1 },
+    };
+}
+
+fn http1_encode_response(status: i32, reason: []u8,
+                         headers: ArrayList[Http1Header],
+                         body: []u8) Http1BufferResult {
+    return http1_encode_response_bounded(
+        status, reason, headers, body, http1_default_limits()
+    );
+}
+
+fn http1_parse_decimal(value: []u8, max_value: i32, output: *i32) i32 {
+    if (value.len < 1 || value.len > 10) { return 0; }
+    let parsed: i64 = 0;
+    let i: i32 = 0;
+    while (i < value.len) {
+        if (value[i] < 48 || value[i] > 57) { return 0; }
+        parsed = parsed * 10 + (value[i] - 48) as i64;
+        if (parsed > max_value as i64) { return 0; }
+        i = i + 1;
+    }
+    output.* = parsed as i32;
+    return 1;
+}
+
+fn http1_probe_result(ok: i32, code: i64, complete: i32,
+                      total_bytes: i32, header_bytes: i32,
+                      body_bytes: i32) Http1MessageProbe {
+    return Http1MessageProbe{
+        .ok = ok, .code = code, .complete = complete,
+        .total_bytes = total_bytes, .header_bytes = header_bytes,
+        .body_bytes = body_bytes,
+    };
+}
+
+fn http1_find_crlf(bytes: []u8, start: i32, limit: i32) i32 {
+    let i: i32 = start;
+    while (i < limit) {
+        if (bytes[i] == 13) {
+            if (i + 1 >= limit) { return 0 - 1; }
+            if (bytes[i + 1] != 10) { return 0 - 2; }
+            return i;
+        }
+        if (bytes[i] == 10) { return 0 - 2; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// Inspect a prefix without allocating and report the exact complete-message
+// length once the header terminator and Content-Length are available.  This is
+// intended for bounded stream receivers.  A valid incomplete prefix returns
+// ok=1, complete=0, code=truncated.  Pipelined trailing bytes are rejected.
+fn http1_probe_message_bounded(bytes: []u8,
+                               limits: Http1Limits) Http1MessageProbe {
+    if (http1_limits_valid(limits) == 0) {
+        return http1_probe_result(0, http1_status_invalid_argument(), 0, 0, 0, 0);
+    }
+    if (bytes.len > limits.max_message_bytes) {
+        return http1_probe_result(0, http1_status_limit(), 0, 0, 0, 0);
+    }
+    let line_end: i32 = http1_find_crlf(bytes, 0, bytes.len);
+    if (line_end == 0 - 2) {
+        return http1_probe_result(0, http1_status_malformed(), 0, 0, 0, 0);
+    }
+    if (line_end == 0 - 1) {
+        if (bytes.len >= limits.max_header_bytes) {
+            return http1_probe_result(0, http1_status_limit(), 0, 0, 0, 0);
+        }
+        return http1_probe_result(1, http1_status_truncated(), 0, 0, 0, 0);
+    }
+    if (line_end == 0) {
+        return http1_probe_result(0, http1_status_malformed(), 0, 0, 0, 0);
+    }
+    let cursor: i32 = line_end + 2;
+    let header_count: i32 = 0;
+    let content_length: i32 = 0;
+    let content_length_count: i32 = 0;
+    while (1) {
+        if (cursor + 1 >= bytes.len) {
+            if (bytes.len >= limits.max_header_bytes) {
+                return http1_probe_result(0, http1_status_limit(), 0, 0, 0, 0);
+            }
+            return http1_probe_result(1, http1_status_truncated(), 0, 0, 0, 0);
+        }
+        if (bytes[cursor] == 13 && bytes[cursor + 1] == 10) {
+            let header_bytes: i32 = cursor + 2;
+            if (header_bytes > limits.max_header_bytes ||
+                content_length > limits.max_body_bytes ||
+                content_length > limits.max_message_bytes - header_bytes) {
+                return http1_probe_result(0, http1_status_limit(), 0, 0, 0, 0);
+            }
+            let total: i32 = header_bytes + content_length;
+            if (bytes.len < total) {
+                return http1_probe_result(
+                    1, http1_status_truncated(), 0, total,
+                    header_bytes, content_length
+                );
+            }
+            if (bytes.len > total) {
+                return http1_probe_result(
+                    0, http1_status_malformed(), 0, total,
+                    header_bytes, content_length
+                );
+            }
+            return http1_probe_result(
+                1, http1_status_ok(), 1, total, header_bytes, content_length
+            );
+        }
+        let header_end: i32 = http1_find_crlf(bytes, cursor, bytes.len);
+        if (header_end == 0 - 2) {
+            return http1_probe_result(0, http1_status_malformed(), 0, 0, 0, 0);
+        }
+        if (header_end == 0 - 1) {
+            if (bytes.len >= limits.max_header_bytes) {
+                return http1_probe_result(0, http1_status_limit(), 0, 0, 0, 0);
+            }
+            return http1_probe_result(1, http1_status_truncated(), 0, 0, 0, 0);
+        }
+        if (header_end == cursor || bytes[cursor] == 32 || bytes[cursor] == 9) {
+            return http1_probe_result(0, http1_status_malformed(), 0, 0, 0, 0);
+        }
+        let colon: i32 = cursor;
+        while (colon < header_end && bytes[colon] != 58) { colon = colon + 1; }
+        if (colon == cursor || colon >= header_end ||
+            http1_token_valid(bytes[cursor..colon], limits.max_header_name_bytes) == 0) {
+            return http1_probe_result(0, http1_status_malformed(), 0, 0, 0, 0);
+        }
+        let value_start: i32 = colon + 1;
+        while (value_start < header_end &&
+               (bytes[value_start] == 32 || bytes[value_start] == 9)) {
+            value_start = value_start + 1;
+        }
+        let value_end: i32 = header_end;
+        while (value_end > value_start &&
+               (bytes[value_end - 1] == 32 || bytes[value_end - 1] == 9)) {
+            value_end = value_end - 1;
+        }
+        let name: []u8 = bytes[cursor..colon];
+        let value: []u8 = bytes[value_start..value_end];
+        if (http1_header_value_valid(value, limits.max_header_value_bytes) == 0) {
+            return http1_probe_result(0, http1_status_malformed(), 0, 0, 0, 0);
+        }
+        header_count = header_count + 1;
+        if (header_count > limits.max_header_count) {
+            return http1_probe_result(0, http1_status_limit(), 0, 0, 0, 0);
+        }
+        if (http1_equal_case(name, "transfer-encoding") != 0) {
+            return http1_probe_result(0, http1_status_unsupported(), 0, 0, 0, 0);
+        }
+        if (http1_equal_case(name, "content-length") != 0) {
+            content_length_count = content_length_count + 1;
+            if (content_length_count != 1 ||
+                http1_parse_decimal(value, limits.max_body_bytes, &content_length) == 0) {
+                return http1_probe_result(0, http1_status_malformed(), 0, 0, 0, 0);
+            }
+        }
+        cursor = header_end + 2;
+        if (cursor > limits.max_header_bytes) {
+            return http1_probe_result(0, http1_status_limit(), 0, 0, 0, 0);
+        }
+    }
+    return http1_probe_result(0, http1_status_malformed(), 0, 0, 0, 0);
+}
+
+fn http1_probe_message(bytes: []u8) Http1MessageProbe {
+    return http1_probe_message_bounded(bytes, http1_default_limits());
+}
+
+fn http1_parse_head(bytes: []u8, start: i32,
+                    limits: Http1Limits) Http1HeadResult {
+    let headers: ArrayList[Http1Header] = make[Http1Header](limits.max_header_count);
+    let cursor: i32 = start;
+    let content_length: i32 = 0;
+    let content_length_count: i32 = 0;
+    while (cursor < bytes.len) {
+        if (cursor + 1 >= bytes.len) {
+            free[Http1Header](&headers);
+            return Http1HeadResult{ .ok = 0, .code = http1_status_truncated(),
+                .headers = http1_empty_headers(), .body_start = 0, .body_length = 0 };
+        }
+        if (bytes[cursor] == 13 && bytes[cursor + 1] == 10) {
+            let body_start: i32 = cursor + 2;
+            if (body_start > limits.max_header_bytes) {
+                free[Http1Header](&headers);
+                return Http1HeadResult{ .ok = 0, .code = http1_status_limit(),
+                    .headers = http1_empty_headers(), .body_start = 0, .body_length = 0 };
+            }
+            if (content_length_count == 0) { content_length = 0; }
+            if (content_length > limits.max_body_bytes) {
+                free[Http1Header](&headers);
+                return Http1HeadResult{ .ok = 0, .code = http1_status_limit(),
+                    .headers = http1_empty_headers(), .body_start = 0, .body_length = 0 };
+            }
+            if (bytes.len < body_start + content_length) {
+                free[Http1Header](&headers);
+                return Http1HeadResult{ .ok = 0, .code = http1_status_truncated(),
+                    .headers = http1_empty_headers(), .body_start = 0, .body_length = 0 };
+            }
+            if (bytes.len != body_start + content_length) {
+                free[Http1Header](&headers);
+                return Http1HeadResult{ .ok = 0, .code = http1_status_malformed(),
+                    .headers = http1_empty_headers(), .body_start = 0, .body_length = 0 };
+            }
+            return Http1HeadResult{ .ok = 1, .code = http1_status_ok(),
+                .headers = headers, .body_start = body_start,
+                .body_length = content_length };
+        }
+        let line_end: i32 = http1_find_crlf(bytes, cursor, bytes.len);
+        if (line_end == 0 - 1) {
+            free[Http1Header](&headers);
+            return Http1HeadResult{ .ok = 0, .code = http1_status_truncated(),
+                .headers = http1_empty_headers(), .body_start = 0, .body_length = 0 };
+        }
+        if (line_end == 0 - 2 || line_end == cursor || bytes[cursor] == 32 ||
+            bytes[cursor] == 9) {
+            free[Http1Header](&headers);
+            return Http1HeadResult{ .ok = 0, .code = http1_status_malformed(),
+                .headers = http1_empty_headers(), .body_start = 0, .body_length = 0 };
+        }
+        let colon: i32 = cursor;
+        while (colon < line_end && bytes[colon] != 58) { colon = colon + 1; }
+        if (colon == cursor || colon >= line_end) {
+            free[Http1Header](&headers);
+            return Http1HeadResult{ .ok = 0, .code = http1_status_malformed(),
+                .headers = http1_empty_headers(), .body_start = 0, .body_length = 0 };
+        }
+        let name: []u8 = bytes[cursor..colon];
+        if (http1_token_valid(name, limits.max_header_name_bytes) == 0) {
+            free[Http1Header](&headers);
+            return Http1HeadResult{ .ok = 0, .code = http1_status_malformed(),
+                .headers = http1_empty_headers(), .body_start = 0, .body_length = 0 };
+        }
+        let value_start: i32 = colon + 1;
+        while (value_start < line_end &&
+               (bytes[value_start] == 32 || bytes[value_start] == 9)) {
+            value_start = value_start + 1;
+        }
+        let value_end: i32 = line_end;
+        while (value_end > value_start &&
+               (bytes[value_end - 1] == 32 || bytes[value_end - 1] == 9)) {
+            value_end = value_end - 1;
+        }
+        let value: []u8 = bytes[value_start..value_end];
+        if (http1_header_value_valid(value, limits.max_header_value_bytes) == 0) {
+            free[Http1Header](&headers);
+            return Http1HeadResult{ .ok = 0, .code = http1_status_malformed(),
+                .headers = http1_empty_headers(), .body_start = 0, .body_length = 0 };
+        }
+        if (headers.len >= limits.max_header_count) {
+            free[Http1Header](&headers);
+            return Http1HeadResult{ .ok = 0, .code = http1_status_limit(),
+                .headers = http1_empty_headers(), .body_start = 0, .body_length = 0 };
+        }
+        if (http1_equal_case(name, "transfer-encoding") != 0) {
+            free[Http1Header](&headers);
+            return Http1HeadResult{ .ok = 0, .code = http1_status_unsupported(),
+                .headers = http1_empty_headers(), .body_start = 0, .body_length = 0 };
+        }
+        if (http1_equal_case(name, "content-length") != 0) {
+            content_length_count = content_length_count + 1;
+            if (content_length_count != 1 ||
+                http1_parse_decimal(value, limits.max_body_bytes, &content_length) == 0) {
+                free[Http1Header](&headers);
+                return Http1HeadResult{ .ok = 0, .code = http1_status_malformed(),
+                    .headers = http1_empty_headers(), .body_start = 0, .body_length = 0 };
+            }
+        }
+        push[Http1Header](&headers, Http1Header{ .name = name, .value = value });
+        cursor = line_end + 2;
+        if (cursor > limits.max_header_bytes) {
+            free[Http1Header](&headers);
+            return Http1HeadResult{ .ok = 0, .code = http1_status_limit(),
+                .headers = http1_empty_headers(), .body_start = 0, .body_length = 0 };
+        }
+    }
+    free[Http1Header](&headers);
+    return Http1HeadResult{ .ok = 0, .code = http1_status_truncated(),
+        .headers = http1_empty_headers(), .body_start = 0, .body_length = 0 };
+}
+
+fn http1_headers_lookup(headers: ArrayList[Http1Header],
+                        name: []u8) Http1HeaderLookup {
+    let result: Http1HeaderLookup = Http1HeaderLookup{
+        .found = 0, .count = 0, .value = "",
+    };
+    let i: i32 = 0;
+    while (i < headers.len) {
+        if (http1_equal_case(headers.data[i].name, name) != 0) {
+            result.found = 1;
+            result.count = result.count + 1;
+            if (result.count == 1) { result.value = headers.data[i].value; }
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+fn http1_request_header(request: *Http1Request,
+                        name: []u8) Http1HeaderLookup {
+    if (request.*.open == 0) {
+        return Http1HeaderLookup{ .found = 0, .count = 0, .value = "" };
+    }
+    return http1_headers_lookup(request.*.headers, name);
+}
+
+fn http1_response_header(response: *Http1Response,
+                         name: []u8) Http1HeaderLookup {
+    if (response.*.open == 0) {
+        return Http1HeaderLookup{ .found = 0, .count = 0, .value = "" };
+    }
+    return http1_headers_lookup(response.*.headers, name);
+}
+
+fn http1_parse_request_bounded(bytes: []u8,
+                               limits: Http1Limits) Http1RequestResult {
+    if (http1_limits_valid(limits) == 0) {
+        return http1_request_failure(http1_status_invalid_argument());
+    }
+    if (bytes.len > limits.max_message_bytes) {
+        return http1_request_failure(http1_status_limit());
+    }
+    let line_end: i32 = http1_find_crlf(bytes, 0, bytes.len);
+    if (line_end == 0 - 1) { return http1_request_failure(http1_status_truncated()); }
+    if (line_end == 0 - 2 || line_end < 14) {
+        return http1_request_failure(http1_status_malformed());
+    }
+    let first_space: i32 = 0;
+    while (first_space < line_end && bytes[first_space] != 32) {
+        first_space = first_space + 1;
+    }
+    let second_space: i32 = first_space + 1;
+    while (second_space < line_end && bytes[second_space] != 32) {
+        second_space = second_space + 1;
+    }
+    if (first_space < 1 || second_space <= first_space + 1 ||
+        second_space + 9 != line_end ||
+        @strEq(bytes[second_space + 1..line_end], "HTTP/1.1") == 0) {
+        return http1_request_failure(http1_status_malformed());
+    }
+    let method: []u8 = bytes[0..first_space];
+    let path: []u8 = bytes[first_space + 1..second_space];
+    if (http1_token_valid(method, limits.max_method_bytes) == 0 ||
+        http1_path_valid(path, limits.max_path_bytes) == 0) {
+        return http1_request_failure(http1_status_malformed());
+    }
+    let head: Http1HeadResult = http1_parse_head(bytes, line_end + 2, limits);
+    if (head.ok == 0) { return http1_request_failure(head.code); }
+    let host: Http1HeaderLookup = http1_headers_lookup(head.headers, "host");
+    if (host.count != 1 ||
+        http1_host_value_valid(host.value, limits.max_header_value_bytes) == 0) {
+        free[Http1Header](&head.headers);
+        return http1_request_failure(http1_status_malformed());
+    }
+    return Http1RequestResult{
+        .ok = 1, .code = http1_status_ok(),
+        .value = Http1Request{
+            .bytes = bytes, .method = method, .path = path,
+            .headers = head.headers,
+            .body = bytes[head.body_start..head.body_start + head.body_length],
+            .open = 1,
+        },
+    };
+}
+
+fn http1_parse_request(bytes: []u8) Http1RequestResult {
+    return http1_parse_request_bounded(bytes, http1_default_limits());
+}
+
+fn http1_parse_response_bounded(bytes: []u8,
+                                limits: Http1Limits) Http1ResponseResult {
+    if (http1_limits_valid(limits) == 0) {
+        return http1_response_failure(http1_status_invalid_argument());
+    }
+    if (bytes.len > limits.max_message_bytes) {
+        return http1_response_failure(http1_status_limit());
+    }
+    let line_end: i32 = http1_find_crlf(bytes, 0, bytes.len);
+    if (line_end == 0 - 1) { return http1_response_failure(http1_status_truncated()); }
+    if (line_end == 0 - 2 || line_end < 13 ||
+        @strEq(bytes[0..8], "HTTP/1.1") == 0 || bytes[8] != 32 ||
+        bytes[12] != 32 || bytes[9] < 49 || bytes[9] > 53 ||
+        bytes[10] < 48 || bytes[10] > 57 || bytes[11] < 48 || bytes[11] > 57) {
+        return http1_response_failure(http1_status_malformed());
+    }
+    let status: i32 = ((bytes[9] - 48) as i32) * 100 +
+        ((bytes[10] - 48) as i32) * 10 + (bytes[11] - 48) as i32;
+    let reason: []u8 = bytes[13..line_end];
+    if (http1_reason_valid(reason) == 0) {
+        return http1_response_failure(http1_status_malformed());
+    }
+    let head: Http1HeadResult = http1_parse_head(bytes, line_end + 2, limits);
+    if (head.ok == 0) { return http1_response_failure(head.code); }
+    return Http1ResponseResult{
+        .ok = 1, .code = http1_status_ok(),
+        .value = Http1Response{
+            .bytes = bytes, .status = status, .reason = reason,
+            .headers = head.headers,
+            .body = bytes[head.body_start..head.body_start + head.body_length],
+            .open = 1,
+        },
+    };
+}
+
+fn http1_parse_response(bytes: []u8) Http1ResponseResult {
+    return http1_parse_response_bounded(bytes, http1_default_limits());
+}

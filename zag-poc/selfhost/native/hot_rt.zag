@@ -1,0 +1,122 @@
+// selfhost/native/hot_rt.zag — live code hot-reload runtime for the Zag native
+// x86-64 backend.  Pure Zag, raw syscalls only, zero libc.
+//
+// HOW IT WORKS
+//   A program becomes hot-reloadable simply by importing this module and driving
+//   its loop with zag_hot_should_continue() / zag_hot_wait():
+//
+//       @import("../selfhost/native/hot_rt.zag")
+//       fn tick() i32 { return 1; }              // the swappable function
+//       fn main() void {
+//           let i = 0;
+//           while (zag_hot_should_continue()) {
+//               print_i32(tick() * 1000 + i);
+//               i = i + 1;
+//               zag_hot_wait();                  // polls for + applies patches
+//           }
+//       }
+//
+//   Build it and run it:   znc build --hot prog.zag -o prog   &&   ./prog
+//   Edit `tick` (keeping the program's compiled SIZE the same — e.g. change the
+//   returned constant), then:   znc hot-patch prog.zag
+//   The running process picks up `.zag_hotpatch` on its next zag_hot_wait() and
+//   swaps in the new machine code WITHOUT restarting — in-memory state (the loop
+//   counter `i`, the heap) survives the swap.
+//
+//   Mechanism: zag_hot_wait() polls for the patch file `.zag_hotpatch` (the raw
+//   re-assembled `.text` bytes).  When present it mprotect()s the code segment
+//   writable, memcpy()s the new bytes over the old ones IN PLACE (so every
+//   function keeps its address — return addresses on the live stack stay valid),
+//   then mprotect()s it back to R+X.  Because Zag references all data by absolute
+//   address and intra-function jumps are self-relative, an in-place overwrite of
+//   a same-size rebuild is safe.  `znc hot-patch` refuses to emit a patch whose
+//   size differs from the running image (checked against the `.zag_hotlen`
+//   sidecar written by `--hot`), so a layout-changing edit asks for a rebuild
+//   instead of corrupting the process.
+//
+// SUBSET DISCIPLINE: no `<<`/`>>`/`|`; raw syscall pointer args are i64 addresses
+// (`&local as i64`); an absolute address becomes a pointer via `addr as *i8`.
+
+// ── runtime primitives (intercepted by ncodegen — no libc) ───────────────────
+extern fn _zag_raw_syscall(num: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) i64
+extern fn _zag_slice_ptr(s: []u8) *i8
+extern fn _zag_memcpy(dst: *i8, src: *i8, n: i32) void
+extern fn _zag_read_file(path: []u8) []u8
+extern fn _zag_write_file(path: []u8, content: []u8) i32
+extern fn _zag_file_exists(path: []u8) i32
+
+// ── layout constants (must match selfhost/native/elf.zag) ────────────────────
+// The single R+X PT_LOAD maps at VBASE=0x400000; after HDRS3()=232 header bytes
+// the assembled `.text` begins, i.e. the first code byte lives at 0x400000+232.
+fn HOT_SEG_BASE()  i64 { return 4194304; }   // 0x400000  (page-aligned segment start)
+fn HOT_CODE_OFF()  i64 { return 232; }       // HDRS3() — header bytes before code
+fn HOT_CODE_VADDR() i64 { return 4194536; }  // 0x400000 + 232
+
+// Well-known filenames (in the process CWD) coordinating build ↔ patch ↔ run.
+fn HOT_PATCH_PATH() []u8 { return ".zag_hotpatch"; }
+fn HOT_STOP_PATH()  []u8 { return ".zag_hotstop"; }
+
+// Linux x86-64 syscall numbers used here.
+fn SYS_MPROTECT()  i64 { return 10; }
+fn SYS_NANOSLEEP() i64 { return 35; }
+
+// PROT bits.
+fn PROT_RWX() i64 { return 7; }   // R(1)+W(2)+X(4)
+fn PROT_RX()  i64 { return 5; }   // R(1)+X(4)
+
+struct HotTimespec { sec: i64, nsec: i64 }
+
+// Sleep for `ms` milliseconds via nanosleep(2).
+fn zag_hot_sleep_ms(ms: i64) void {
+    let ts: HotTimespec = HotTimespec{ .sec = ms / 1000, .nsec = (ms % 1000) * 1000000 };
+    let p: i64 = (&ts) as i64;
+    let _rc: i64 = _zag_raw_syscall(SYS_NANOSLEEP(), p, 0, 0, 0, 0, 0);
+}
+
+// Overwrite the live `.text` with `code` (the freshly re-assembled bytes).
+// Returns 1 on success, 0 if the code pages could not be made writable (which
+// happens when `code` is larger than the mapped text — a layout change).
+fn zag_hot_apply(code: []u8) i32 {
+    let n: i64 = code.len as i64;
+    if (n <= 0) { return 0; }
+    // Page span covering [segment base .. code start + n).
+    let span: i64 = HOT_CODE_OFF() + n;
+    let pages: i64 = ((span + 4095) / 4096) * 4096;
+    // Make the code pages writable+executable.
+    let rc: i64 = _zag_raw_syscall(SYS_MPROTECT(), HOT_SEG_BASE(), pages, PROT_RWX(), 0, 0, 0);
+    if (rc != 0) { return 0; }
+    // Copy the new machine code over the old, in place (addresses preserved).
+    let dst: *i8 = HOT_CODE_VADDR() as *i8;
+    let src: *i8 = _zag_slice_ptr(code);
+    _zag_memcpy(dst, src, n as i32);
+    // Restore R+X (the mprotect syscall also serializes the instruction stream).
+    let _r2: i64 = _zag_raw_syscall(SYS_MPROTECT(), HOT_SEG_BASE(), pages, PROT_RX(), 0, 0, 0);
+    return 1;
+}
+
+// If a patch is pending, apply it and consume it (blank the file so it applies
+// exactly once).  Returns 1 if a patch was applied this call.
+fn zag_hot_poll() i32 {
+    if (_zag_file_exists(HOT_PATCH_PATH()) == 0) { return 0; }
+    let code: []u8 = _zag_read_file(HOT_PATCH_PATH());
+    if (code.len <= 0) { return 0; }
+    let ok: i32 = zag_hot_apply(code);
+    // Consume the patch: truncate to empty so the next poll ignores it.
+    let _w: i32 = _zag_write_file(HOT_PATCH_PATH(), "");
+    return ok;
+}
+
+// ── public loop API (used by hot-reloadable programs) ────────────────────────
+// Returns true until a `.zag_hotstop` file appears in the CWD (so a supervisor
+// or test can ask the loop to exit cleanly).
+fn zag_hot_should_continue() bool {
+    if (_zag_file_exists(HOT_STOP_PATH()) == 0) { return true; }
+    return false;
+}
+
+// Called once per loop iteration: apply any pending hot-patch, then sleep briefly
+// so the swap is observable and polling is not a busy-loop.
+fn zag_hot_wait() void {
+    let _applied: i32 = zag_hot_poll();
+    zag_hot_sleep_ms(200);
+}

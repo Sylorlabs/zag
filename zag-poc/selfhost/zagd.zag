@@ -1,0 +1,401 @@
+// selfhost/zagd.zag -- pure core primitives for the file-driven Zag planner.
+//
+// This module intentionally performs no filesystem I/O and starts no worker.
+// Watchers are platform adapters; this core turns their fully-read contents and
+// timestamps into deterministic identities and conservative invalidation/cache
+// decisions.  Keeping correctness here independent of a daemon ensures a
+// foreground build never needs zagd.
+
+struct ZagdHash { first: i64, second: i64, bytes: i64 }
+
+struct ZagdConfig {
+    mode: i32,
+    idle_deep: i32,
+    difficulty: []u8,
+    script_optimization: []u8,
+    regular_optimization: []u8,
+    objective: []u8,
+    trust_mode: []u8,
+    max_workers: i32,
+    max_memory_bytes: i64,
+    max_cache_bytes: i64,
+    stability_window_ms: i64,
+    gpu_background: i32,
+    network_access: i32,
+}
+
+struct ZagdSnapshot {
+    identity: ZagdHash,
+    parent: ZagdHash,
+    root: ZagdHash,
+    // `root_module` is the identity of the canonical project-relative module
+    // name; the persisted record also retains the inspectable path itself.
+    root_module: ZagdHash,
+    root_source: ZagdHash,
+    semantic_graph: ZagdHash,
+    semantic_graph_complete: i32,
+    // Publication time is observability metadata. It is deliberately excluded
+    // from `identity`, so identical project content has one stable cache key.
+    timestamp_ms: i64,
+    file_count: i32,
+    valid: i32,
+}
+
+struct ZagdStableDecision {
+    stable: i32,
+    content_changed: i32,
+    wait_ms: i64,
+}
+
+struct ZagdCacheRecord {
+    format_version: i32,
+    compiler_identity: ZagdHash,
+    snapshot_identity: ZagdHash,
+    target_identity: ZagdHash,
+    payload_identity: ZagdHash,
+    payload_bytes: i64,
+    complete: i32,
+}
+
+// Cheap source fingerprints used by light mode. They deliberately do not
+// pretend to be a replacement for parser/sema: incomplete lexical states are
+// marked invalid and conservatively classified as unknown.
+struct ZagdSourceFacts {
+    content: ZagdHash,
+    semantic: ZagdHash,
+    public_shape: ZagdHash,
+    root_profile: ZagdHash,
+    valid: i32,
+}
+
+struct ZagdPlanFacts {
+    temporary_bytes: i64,
+    repeated_allocations: i32,
+    non_overlapping_buffers: i32,
+    cpu_loop: i32,
+    explicit_allocator: i32,
+    explicit_device: i32,
+    // These two fields describe the one compiler-applied Script CPU default
+    // that this planner is allowed to publish.  They are not guesses about a
+    // future command line: publication is conditional on the recorded
+    // validity string (in particular, no foreground --cpu override).
+    script_cpu_unspecified: i32,
+    script_cpu_target_compatible: i32,
+}
+
+struct ZagdAdvice {
+    kind: i32,
+    confidence: i32,
+    provenance: i32,
+    estimated_saved_bytes: i64,
+    automatic: i32,
+    supported: i32,
+    equivalent: i32,
+    rejected_reason: []u8,
+}
+struct ZagdPlannerRun { mode:i32, budget:i32, evaluated:i32, cancelled:i32, complete:i32, suggestions:i32 }
+struct ZagdPlanCandidate { kind:i32, valid:i32, supported:i32, equivalent:i32, setup_ns:i64, estimated_runtime_ns:i64, measured_runtime_ns:i64, memory_bytes:i64 }
+struct ZagdPlanSelection { winner_kind:i32, evaluated:i32, benchmarked:i32, basis:i32, cancelled:i32 }
+struct ZagdConcreteCandidate { kind:i32, automatic:i32, valid:i32, supported:i32, equivalent:i32, provenance:i32, setup_ns:i64, runtime_ns:i64, memory_bytes:i64, source:ZagdHash, target:ZagdHash, evidence_basis:[]u8, validity:[]u8, rejected_reason:[]u8 }
+struct ZagdMeasurement { kind:i32, source:ZagdHash, target:ZagdHash, runtime_ns:i64, runs:i32, valid:i32 }
+
+// Planner modes. Functions avoid enums so configuration decoding can reject
+// unknown integers instead of accidentally accepting a new enum representation.
+fn zagd_mode_off() i32 { return 0; }
+fn zagd_mode_light() i32 { return 1; }
+fn zagd_mode_adaptive() i32 { return 2; }
+fn zagd_mode_deep() i32 { return 3; }
+
+// Invalidation classes, ordered from least to most expensive.
+fn zagd_change_none() i32 { return 0; }
+fn zagd_change_nonsemantic() i32 { return 1; }
+fn zagd_change_private_body() i32 { return 2; }
+fn zagd_change_public_shape() i32 { return 3; }
+fn zagd_change_root_profile() i32 { return 4; }
+fn zagd_change_target_profile() i32 { return 5; }
+fn zagd_change_unknown() i32 { return 6; }
+
+fn zagd_cache_format_version() i32 { return 1; }
+
+fn zagd_advice_none() i32 { return 0; }
+fn zagd_advice_reuse_buffer() i32 { return 1; }
+fn zagd_advice_arena_temporaries() i32 { return 2; }
+fn zagd_advice_cpu_region() i32 { return 3; }
+fn zagd_candidate_buffer_reuse()i32{return 11;}fn zagd_candidate_arena()i32{return 12;}fn zagd_candidate_soa_layout()i32{return 21;}fn zagd_candidate_cpu_chunk()i32{return 31;}fn zagd_candidate_gpu_region()i32{return 41;}
+// This is deliberately separate from CPU chunking: it describes the existing
+// foreground Script default (`--cpu` omitted), not a new parallel rewrite.
+fn zagd_candidate_script_default_cpu()i32{return 51;}
+fn zagd_provenance_proven() i32 { return 0; }
+fn zagd_provenance_derived() i32 { return 1; }
+fn zagd_provenance_estimated() i32 { return 2; }
+fn zagd_provenance_measured() i32 { return 3; }
+fn zagd_provenance_unknown() i32 { return 4; }
+fn zagd_provenance_name(value:i32)[]u8{if(value==zagd_provenance_proven()){return "proven";}if(value==zagd_provenance_derived()){return "derived";}if(value==zagd_provenance_estimated()){return "estimated";}if(value==zagd_provenance_measured()){return "measured";}return "unknown";}
+fn zagd_planner_start(mode:i32,budget:i32)ZagdPlannerRun{let cap:i32=0;if(mode==zagd_mode_adaptive()){cap=64;}else if(mode==zagd_mode_deep()){cap=256;}if(budget<cap){cap=budget;}if(cap<0){cap=0;}return ZagdPlannerRun{.mode=mode,.budget=cap,.evaluated=0,.cancelled=0,.complete=(cap==0) as i32,.suggestions=0};}
+fn zagd_planner_step(run:*ZagdPlannerRun,proven_facts:i32,obsolete:i32)void{if(run.*.complete==1){return;}if(obsolete==1){run.*.cancelled=1;run.*.complete=1;return;}let remaining:i32=run.*.budget-run.*.evaluated;let take:i32=proven_facts;if(take>remaining){take=remaining;}if(take<0){take=0;}run.*.evaluated=run.*.evaluated+take;run.*.complete=1;}
+fn zagd_planner_accept_constants(run:*ZagdPlannerRun,proven_constants:i32)void{if(run.*.mode!=zagd_mode_deep()||run.*.cancelled==1){return;}let accepted:i32=proven_constants;if(accepted>run.*.evaluated){accepted=run.*.evaluated;}if(accepted<0){accepted=0;}run.*.suggestions=accepted;}
+
+// Deterministic bounded finalist selection for deep mode. Invalid,
+// unsupported, non-equivalent, and over-memory candidates are pruned before
+// scoring. A positive measured runtime is authoritative measured evidence;
+// otherwise the target-qualified analytical estimate is used. Ties choose the
+// lower stable kind id, so event order and randomness never affect a plan.
+fn zagd_deep_select(candidates:ArrayList[ZagdPlanCandidate],memory_limit:i64,budget:i32,cancelled:i32)ZagdPlanSelection{
+    let result:ZagdPlanSelection=ZagdPlanSelection{.winner_kind=0,.evaluated=0,.benchmarked=0,.basis=0,.cancelled=cancelled};
+    if(cancelled!=0||budget<1||memory_limit<0){return result;}
+    let best_cost:i64=9223372036854775807;let i:i32=0;
+    while(i<candidates.len&&result.evaluated<budget){let c:ZagdPlanCandidate=candidates.data[i];
+        if(c.valid==1&&c.supported==1&&c.equivalent==1&&c.memory_bytes>=0&&c.memory_bytes<=memory_limit&&c.setup_ns>=0&&c.estimated_runtime_ns>=0){
+            result.evaluated=result.evaluated+1;let runtime:i64=c.estimated_runtime_ns;let basis:i32=zagd_provenance_estimated();
+            if(c.measured_runtime_ns>0){runtime=c.measured_runtime_ns;basis=zagd_provenance_measured();result.benchmarked=result.benchmarked+1;}
+            if(runtime<=9223372036854775807-c.setup_ns){let cost:i64=runtime+c.setup_ns;if(cost<best_cost||(cost==best_cost&&(result.winner_kind==0||c.kind<result.winner_kind))){best_cost=cost;result.winner_kind=c.kind;result.basis=basis;}}
+        }i=i+1;
+    }
+    return result;
+}
+
+// Candidate families remain visible for an inspectable roadmap, but none of
+// these transformations has an implementation and equivalence proof yet.
+// Allocation-effect counts are not lifetime, non-overlap, byte-size, loop, or
+// device-placement facts. Keep every family rejected and non-automatic until a
+// later exact analysis supplies those facts and a tested backend consumes them.
+fn zagd_rejected_candidate(kind:i32,source:ZagdHash,target:ZagdHash,reason:[]u8)ZagdConcreteCandidate{return ZagdConcreteCandidate{.kind=kind,.automatic=0,.valid=1,.supported=0,.equivalent=0,.provenance=zagd_provenance_unknown(),.setup_ns=0-1,.runtime_ns=0-1,.memory_bytes=0-1,.source=source,.target=target,.evidence_basis="unknown",.validity="no executable validity conditions established",.rejected_reason=reason};}
+fn zagd_generate_candidates(f:ZagdPlanFacts,source:ZagdHash,target:ZagdHash,script:i32,budget:i32,cancelled:i32)ArrayList[ZagdConcreteCandidate]{
+    let out:ArrayList[ZagdConcreteCandidate]=make[ZagdConcreteCandidate](5);
+    if(cancelled!=0||budget<1){return out;}
+    // A Script root with no explicit CPU request already has a real,
+    // feature-gated foreground decision: znc validates and applies the
+    // project default before lowering.  Publishing it here is useful only
+    // when the daemon's target identity equals that default; otherwise a
+    // stale or differently-targeted daemon must not claim a selection.
+    if(script==1&&f.script_cpu_unspecified==1){
+        if(f.script_cpu_target_compatible==1){
+            push[ZagdConcreteCandidate](&out,ZagdConcreteCandidate{.kind=zagd_candidate_script_default_cpu(),.automatic=1,.valid=1,.supported=1,.equivalent=1,.provenance=zagd_provenance_derived(),.setup_ns=0,.runtime_ns=0,.memory_bytes=0,.source=source,.target=target,.evidence_basis="derived",.validity="Script root; no foreground --cpu override; project CPU default matches active target; znc validates it before lowering",.rejected_reason=""});
+        }else{
+            push[ZagdConcreteCandidate](&out,zagd_rejected_candidate(zagd_candidate_script_default_cpu(),source,target,"project Script CPU default does not match the daemon target identity"));
+        }
+    }
+    if(out.len<budget){if(f.non_overlapping_buffers==1&&f.temporary_bytes>0){push[ZagdConcreteCandidate](&out,zagd_rejected_candidate(zagd_candidate_buffer_reuse(),source,target,"exact lifetime facts exist, but no buffer-reuse transform and end-to-end equivalence proof are implemented"));}else{push[ZagdConcreteCandidate](&out,zagd_rejected_candidate(zagd_candidate_buffer_reuse(),source,target,"exact buffer lifetime and non-overlap proof unavailable"));}}
+    if(out.len<budget){push[ZagdConcreteCandidate](&out,zagd_rejected_candidate(zagd_candidate_arena(),source,target,"temporary byte-size and allocator-body lifetime proof unavailable"));}
+    if(out.len<budget){push[ZagdConcreteCandidate](&out,zagd_rejected_candidate(zagd_candidate_soa_layout(),source,target,"layout rewrite and public-ABI equivalence proof unavailable"));}
+    if(out.len<budget){push[ZagdConcreteCandidate](&out,zagd_rejected_candidate(zagd_candidate_cpu_chunk(),source,target,"parallel execution and ordering equivalence are not implemented"));}
+    if(out.len<budget){push[ZagdConcreteCandidate](&out,zagd_rejected_candidate(zagd_candidate_gpu_region(),source,target,"physical GPU dispatch and device equivalence validation are not implemented"));}
+    return out;
+}
+fn zagd_prune_dominated(input:@consumes ArrayList[ZagdConcreteCandidate],memory_limit:i64,budget:i32,cancelled:i32)ArrayList[ZagdConcreteCandidate]{
+    let out:ArrayList[ZagdConcreteCandidate]=make[ZagdConcreteCandidate](input.len);if(cancelled!=0||budget<1){free[ZagdConcreteCandidate](&input);return out;}let i:i32=0;while(i<input.len&&i<budget){let c:ZagdConcreteCandidate=input.data[i];if(c.valid==1&&c.supported==1&&c.equivalent==1&&c.memory_bytes>=0&&c.memory_bytes<=memory_limit&&c.runtime_ns>=0&&c.setup_ns>=0){let dominated:i32=0;let j:i32=0;while(j<input.len){let d:ZagdConcreteCandidate=input.data[j];if(j!=i&&d.valid==1&&d.supported==1&&d.equivalent==1&&d.memory_bytes<=c.memory_bytes&&d.runtime_ns+d.setup_ns<=c.runtime_ns+c.setup_ns&&(d.memory_bytes<c.memory_bytes||d.runtime_ns+d.setup_ns<c.runtime_ns+c.setup_ns)){dominated=1;}j=j+1;}if(dominated==0){push[ZagdConcreteCandidate](&out,c);}}i=i+1;}free[ZagdConcreteCandidate](&input);return out;
+}
+fn zagd_ingest_measurement(c:*ZagdConcreteCandidate,m:ZagdMeasurement,stable_source:ZagdHash,target:ZagdHash,deep:i32,cancelled:i32)i32{if(deep==0||cancelled!=0||c.*.supported!=1||c.*.equivalent!=1||m.valid!=1||m.runs<3||m.runtime_ns<=0||m.kind!=c.*.kind||zagd_hash_equal(m.source,stable_source)==0||zagd_hash_equal(m.target,target)==0||zagd_hash_equal(c.*.source,stable_source)==0||zagd_hash_equal(c.*.target,target)==0){return 0;}c.*.runtime_ns=m.runtime_ns;c.*.provenance=zagd_provenance_measured();c.*.evidence_basis="measured";return 1;}
+
+fn zagd_default_config() ZagdConfig {
+    return ZagdConfig{
+        .mode = zagd_mode_adaptive(),
+        .idle_deep = 1,
+        .difficulty = "simple",
+        .script_optimization = "automatic",
+        .regular_optimization = "review",
+        .objective = "runtime",
+        .trust_mode = "stable",
+        .max_workers = 1,
+        .max_memory_bytes = 536870912,
+        .max_cache_bytes = 2147483648,
+        .stability_window_ms = 75,
+        .gpu_background = 0,
+        .network_access = 0,
+    };
+}
+
+fn zagd_config_valid(c: ZagdConfig) i32 {
+    if (c.mode < zagd_mode_off() || c.mode > zagd_mode_deep()) { return 0; }
+    if (c.idle_deep != 0 && c.idle_deep != 1) { return 0; }
+    if (!@strEq(c.difficulty, "simple") && !@strEq(c.difficulty, "explained") &&
+        !@strEq(c.difficulty, "explicit") && !@strEq(c.difficulty, "native")) { return 0; }
+    if (!@strEq(c.script_optimization, "automatic") &&
+        !@strEq(c.script_optimization, "review") &&
+        !@strEq(c.script_optimization, "off")) { return 0; }
+    if (!@strEq(c.regular_optimization, "review") &&
+        !@strEq(c.regular_optimization, "automatic") &&
+        !@strEq(c.regular_optimization, "off")) { return 0; }
+    if (!@strEq(c.objective, "runtime")) { return 0; }
+    if (!@strEq(c.trust_mode, "stable") && !@strEq(c.trust_mode, "reviewed") &&
+        !@strEq(c.trust_mode, "autonomous")) { return 0; }
+    if (c.max_workers != 1) { return 0; }
+    if (c.max_memory_bytes < 67108864 || c.max_memory_bytes > 2147483648) { return 0; }
+    if (c.max_cache_bytes < 1048576 || c.max_cache_bytes > 2147483648) { return 0; }
+    if (c.stability_window_ms < 1 || c.stability_window_ms > 60000) { return 0; }
+    if (c.gpu_background != 0 && c.gpu_background != 1) { return 0; }
+    if (c.network_access != 0) { return 0; }
+    return 1;
+}
+
+fn zagd_hash_empty() ZagdHash {
+    return ZagdHash{ .first = 216613626, .second = 131542391, .bytes = 0 };
+}
+
+// Two independent modular rolling hashes make identity deterministic on every
+// supported target without relying on integer overflow semantics. This is a
+// cache identity, not a cryptographic authenticity primitive; cache hits are
+// still validated against all correctness inputs below.
+fn zagd_hash_extend(seed: ZagdHash, data: @borrows []u8) ZagdHash {
+    let a: i64 = seed.first;
+    let b: i64 = seed.second;
+    let i: i32 = 0;
+    while (i < data.len) {
+        let byte: i64 = data[i] as i64;
+        a = (a * 257 + byte + 1) % 1000000007;
+        b = (b * 263 + byte + 1) % 1000000009;
+        i = i + 1;
+    }
+    return ZagdHash{ .first = a, .second = b, .bytes = seed.bytes + data.len };
+}
+
+fn zagd_content_hash(data: @borrows []u8) ZagdHash {
+    return zagd_hash_extend(zagd_hash_empty(), data);
+}
+
+fn zagd_hash_equal(a: ZagdHash, b: ZagdHash) i32 {
+    if (a.first != b.first) { return 0; }
+    if (a.second != b.second) { return 0; }
+    if (a.bytes != b.bytes) { return 0; }
+    return 1;
+}
+
+fn zagd_is_space(c:u8)i32{if(c==' '||c=='\t'||c=='\r'||c=='\n'){return 1;}return 0;}
+fn zagd_is_ident(c:u8)i32{if((c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_'){return 1;}return 0;}
+fn zagd_word_at(s:[]u8,i:i32,w:[]u8)i32{if(i+w.len>s.len){return 0;}if(i>0&&zagd_is_ident(s[i-1])==1){return 0;}let j:i32=0;while(j<w.len){if(s[i+j]!=w[j]){return 0;}j=j+1;}if(i+w.len<s.len&&zagd_is_ident(s[i+w.len])==1){return 0;}return 1;}
+
+// Hash tokens while dropping whitespace and comments. String and character
+// contents remain significant. The public fingerprint includes declaration
+// headers through their opening brace/semicolon, plus the complete balanced
+// body of a public struct. Function bodies remain private implementation
+// detail, but struct fields are layout/ABI facts and must invalidate importers.
+fn zagd_source_facts(source:[]u8) ZagdSourceFacts {
+    let semantic:ZagdHash=zagd_hash_empty();let public_shape:ZagdHash=zagd_hash_empty();let root_profile:ZagdHash=zagd_hash_empty();
+    let i:i32=0;let quote:u8=0;let escape:i32=0;let block_depth:i32=0;let public_decl:i32=0;let header:i32=0;let public_struct:i32=0;let layout_depth:i32=0;let valid:i32=1;
+    while(i<source.len){let c:u8=source[i];
+        if(block_depth>0){if(i+1<source.len&&c=='/'&&source[i+1]=='*'){block_depth=block_depth+1;i=i+2;}else if(i+1<source.len&&c=='*'&&source[i+1]=='/'){block_depth=block_depth-1;i=i+2;}else{i=i+1;}continue;}
+        if(quote!=0){semantic=zagd_hash_extend(semantic,source[i..i+1]);if(header==1||layout_depth>0){public_shape=zagd_hash_extend(public_shape,source[i..i+1]);}if(escape==1){escape=0;}else if(c=='\\'){escape=1;}else if(c==quote){quote=0;}i=i+1;continue;}
+        if(i+1<source.len&&c=='/'&&source[i+1]=='/'){i=i+2;while(i<source.len&&source[i]!='\n'){i=i+1;}continue;}
+        if(i+1<source.len&&c=='/'&&source[i+1]=='*'){block_depth=1;i=i+2;continue;}
+        if(zagd_is_space(c)==1){i=i+1;continue;}
+        if(c=='"'||c=='\''){quote=c;semantic=zagd_hash_extend(semantic,source[i..i+1]);if(header==1||layout_depth>0){public_shape=zagd_hash_extend(public_shape,source[i..i+1]);}i=i+1;continue;}
+        if(zagd_word_at(source,i,"script")==1){root_profile=zagd_hash_extend(root_profile,"script");}
+        if(zagd_word_at(source,i,"pub")==1){public_decl=1;header=1;}
+        if(header==1&&public_decl==1&&zagd_word_at(source,i,"struct")==1){public_struct=1;}
+        semantic=zagd_hash_extend(semantic,source[i..i+1]);
+        if(header==1||layout_depth>0){
+            public_shape=zagd_hash_extend(public_shape,source[i..i+1]);
+            if(header==1&&(c=='{'||c==';')){
+                if(c=='{'&&public_struct==1){layout_depth=1;}header=0;public_decl=0;public_struct=0;
+            }else if(layout_depth>0){
+                if(c=='{'){layout_depth=layout_depth+1;}else if(c=='}'){layout_depth=layout_depth-1;}
+            }
+        }
+        i=i+1;
+    }
+    if(quote!=0||block_depth!=0||header!=0||layout_depth!=0){valid=0;}
+    return ZagdSourceFacts{.content=zagd_content_hash(source),.semantic=semantic,.public_shape=public_shape,.root_profile=root_profile,.valid=valid};
+}
+
+fn zagd_classify_sources(old:ZagdSourceFacts,new:ZagdSourceFacts,target_changed:i32)i32{
+    return zagd_classify_change(1-zagd_hash_equal(old.content,new.content),1-zagd_hash_equal(old.semantic,new.semantic),1-zagd_hash_equal(old.public_shape,new.public_shape),1-zagd_hash_equal(old.root_profile,new.root_profile),target_changed,old.valid*new.valid);
+}
+
+// Adaptive work is intentionally bounded to a fixed candidate set. Advice is
+// never executable authority. Script automatic selection is permitted only
+// when the corresponding choice is unspecified.
+fn zagd_adaptive_advice(f:ZagdPlanFacts,script_profile:i32,budget:i32,cancelled:i32)ZagdAdvice{
+    if(cancelled!=0||budget<1){return ZagdAdvice{.kind=0,.confidence=0,.provenance=zagd_provenance_unknown(),.estimated_saved_bytes=0,.automatic=0,.supported=0,.equivalent=0,.rejected_reason="cancelled or no planner budget"};}
+    if(f.non_overlapping_buffers==1&&f.temporary_bytes>0){return ZagdAdvice{.kind=zagd_advice_reuse_buffer(),.confidence=0,.provenance=zagd_provenance_unknown(),.estimated_saved_bytes=0,.automatic=0,.supported=0,.equivalent=0,.rejected_reason="buffer-reuse transformation is not implemented"};}
+    if(budget>=2&&f.repeated_allocations>1&&f.temporary_bytes>0){return ZagdAdvice{.kind=zagd_advice_arena_temporaries(),.confidence=0,.provenance=zagd_provenance_unknown(),.estimated_saved_bytes=0,.automatic=0,.supported=0,.equivalent=0,.rejected_reason="arena transformation is not implemented"};}
+    if(budget>=3&&f.cpu_loop==1){return ZagdAdvice{.kind=zagd_advice_cpu_region(),.confidence=0,.provenance=zagd_provenance_unknown(),.estimated_saved_bytes=0,.automatic=0,.supported=0,.equivalent=0,.rejected_reason="CPU chunking transformation is not implemented"};}
+    return ZagdAdvice{.kind=0,.confidence=0,.provenance=zagd_provenance_unknown(),.estimated_saved_bytes=0,.automatic=0,.supported=0,.equivalent=0,.rejected_reason="no exact supported candidate"};
+}
+
+// Compose identities with explicit separators and lengths. Callers must supply
+// files in canonical project-relative path order; watcher event order is never
+// a snapshot input.
+fn zagd_snapshot_mix(prior:ZagdHash,label:[]u8,value:ZagdHash)ZagdHash {
+    let h:ZagdHash=zagd_hash_extend(prior,label);
+    h.first=(h.first*257+value.first+value.bytes+label.len)%1000000007;
+    h.second=(h.second*263+value.second+value.bytes+label.len)%1000000009;
+    h.bytes=h.bytes+value.bytes+1;
+    return h;
+}
+
+fn zagd_snapshot_begin(root: ZagdHash, root_module:ZagdHash,
+        root_source:ZagdHash, semantic_graph:ZagdHash,
+        semantic_graph_complete:i32) ZagdHash {
+    let h: ZagdHash = zagd_hash_extend(zagd_hash_empty(), "zagd-snapshot-v2");
+    h=zagd_snapshot_mix(h,"\nproject-root=",root);
+    h=zagd_snapshot_mix(h,"\nroot-module=",root_module);
+    h=zagd_snapshot_mix(h,"\nroot-source=",root_source);
+    h=zagd_snapshot_mix(h,"\nsemantic-graph=",semantic_graph);
+    h=zagd_hash_extend(h,"\ngraph-complete=");
+    h.first=(h.first*257+semantic_graph_complete)%1000000007;
+    h.second=(h.second*263+semantic_graph_complete)%1000000009;
+    h.bytes=h.bytes+1;
+    return h;
+}
+
+fn zagd_snapshot_add(prior: ZagdHash, path: []u8, content: ZagdHash) ZagdHash {
+    let h: ZagdHash = zagd_hash_extend(prior, path);
+    h.first = (h.first * 257 + content.first + path.len) % 1000000007;
+    h.second = (h.second * 263 + content.second + content.bytes) % 1000000009;
+    h.bytes = h.bytes + content.bytes + 1;
+    return h;
+}
+
+fn zagd_make_snapshot(identity: ZagdHash, parent: ZagdHash, root: ZagdHash,
+        root_module:ZagdHash, root_source:ZagdHash, semantic_graph:ZagdHash,
+        semantic_graph_complete:i32, timestamp_ms:i64, file_count: i32,
+        valid: i32) ZagdSnapshot {
+    return ZagdSnapshot{ .identity = identity, .parent = parent, .root = root,
+        .root_module=root_module,.root_source=root_source,
+        .semantic_graph=semantic_graph,
+        .semantic_graph_complete=semantic_graph_complete,
+        .timestamp_ms=timestamp_ms,.file_count = file_count, .valid = valid };
+}
+
+// event_ms is the last observed write/rename/delete event. A negative or
+// backwards clock is treated as unstable rather than guessed safe.
+fn zagd_stability(previous: ZagdHash, current: ZagdHash, event_ms: i64, now_ms: i64, window_ms: i64) ZagdStableDecision {
+    let changed: i32 = 1 - zagd_hash_equal(previous, current);
+    if (window_ms < 1 || event_ms < 0 || now_ms < event_ms) {
+        return ZagdStableDecision{ .stable = 0, .content_changed = changed, .wait_ms = window_ms };
+    }
+    let age: i64 = now_ms - event_ms;
+    if (age < window_ms) {
+        return ZagdStableDecision{ .stable = 0, .content_changed = changed, .wait_ms = window_ms - age };
+    }
+    return ZagdStableDecision{ .stable = 1, .content_changed = changed, .wait_ms = 0 };
+}
+
+fn zagd_classify_change(content_changed: i32, semantic_changed: i32,
+        public_shape_changed: i32, root_profile_changed: i32,
+        target_profile_changed: i32, analysis_complete: i32) i32 {
+    if (content_changed == 0) { return zagd_change_none(); }
+    if (analysis_complete == 0) { return zagd_change_unknown(); }
+    if (target_profile_changed != 0) { return zagd_change_target_profile(); }
+    if (root_profile_changed != 0) { return zagd_change_root_profile(); }
+    if (public_shape_changed != 0) { return zagd_change_public_shape(); }
+    if (semantic_changed != 0) { return zagd_change_private_body(); }
+    return zagd_change_nonsemantic();
+}
+
+// Cache acceptance is fail-closed. Corrupt, partial, oversized, stale compiler,
+// stale target, or stale snapshot records are misses and can never authorize an
+// executable. The payload hash must be recomputed from bytes before this call.
+fn zagd_cache_accept(record: ZagdCacheRecord, compiler: ZagdHash,
+        snapshot: ZagdHash, target: ZagdHash, actual_payload: ZagdHash,
+        max_cache_bytes: i64) i32 {
+    if (record.format_version != zagd_cache_format_version()) { return 0; }
+    if (record.complete != 1) { return 0; }
+    if (record.payload_bytes < 0 || record.payload_bytes > max_cache_bytes) { return 0; }
+    if (record.payload_bytes != actual_payload.bytes) { return 0; }
+    if (zagd_hash_equal(record.compiler_identity, compiler) == 0) { return 0; }
+    if (zagd_hash_equal(record.snapshot_identity, snapshot) == 0) { return 0; }
+    if (zagd_hash_equal(record.target_identity, target) == 0) { return 0; }
+    if (zagd_hash_equal(record.payload_identity, actual_payload) == 0) { return 0; }
+    return 1;
+}

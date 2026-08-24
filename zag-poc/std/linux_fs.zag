@@ -1,0 +1,576 @@
+// std/linux_fs.zag -- bounded Linux x86-64 directory and regular-file I/O.
+//
+// This is deliberately a non-recursive foundation.  A directory is opened
+// without following its final symlink, getdents64 records are copied into
+// caller-owned fixed buffers, and only direct regular-file children are
+// admitted.  Nested directories, symlinks, path traversal, malformed kernel
+// records, entry limits, file-size limits, and syscall failures all stop the
+// operation.  The caller owns the directory handle and must close it.
+//
+// `linux_fs_read_regular_at_prepared` is suitable for a captureless worker
+// only after a parent has prepared the NUL-terminated name and output buffer.
+// It allocates no memory, opens relative to the retained directory descriptor,
+// checks the file kind and size, performs a bounded read loop, and closes its
+// private descriptor on every path.  This module does not claim recursive
+// traversal, filesystem sandboxing, async I/O, a worker pool, or portability
+// beyond Linux x86-64.
+
+@import("rt.zag")
+
+struct LinuxFsDirectory {
+    fd: i64,
+    open: i32,
+}
+
+struct LinuxFsDirectoryResult {
+    ok: i32,
+    code: i64,
+    value: LinuxFsDirectory,
+}
+
+// The caller initializes `name` and `name_capacity` for every available slot.
+// A successful list fills `name_length`, `kind`, and a trailing NUL byte.
+struct LinuxFsEntry {
+    name: *u8,
+    name_capacity: i32,
+    name_length: i32,
+    kind: i32,
+}
+
+struct LinuxFsListResult {
+    ok: i32,
+    code: i64,
+    count: i32,
+    getdents_calls: i32,
+}
+
+struct LinuxFsReadResult {
+    ok: i32,
+    code: i64,
+    bytes_read: i32,
+    read_calls: i32,
+    checksum: i64,
+}
+
+// Linux x86-64's 144-byte struct stat, represented as words.  st_mode is the
+// low 32 bits of mode_uid and st_size is the seventh word.
+struct LinuxFsKernelStat {
+    device: u64,
+    inode: u64,
+    links: u64,
+    mode_uid: u64,
+    gid_padding: u64,
+    rdevice: u64,
+    size: i64,
+    block_size: i64,
+    blocks: i64,
+    access_seconds: i64,
+    access_nanoseconds: i64,
+    modify_seconds: i64,
+    modify_nanoseconds: i64,
+    change_seconds: i64,
+    change_nanoseconds: i64,
+    reserved_zero: i64,
+    reserved_one: i64,
+    reserved_two: i64,
+}
+
+fn linux_fs_status_ok() i64 { return 0; }
+fn linux_fs_status_invalid_argument() i64 { return 0 - 7101; }
+fn linux_fs_status_invalid_state() i64 { return 0 - 7102; }
+fn linux_fs_status_limit() i64 { return 0 - 7103; }
+fn linux_fs_status_traversal() i64 { return 0 - 7104; }
+fn linux_fs_status_symlink() i64 { return 0 - 7105; }
+fn linux_fs_status_unsupported_kind() i64 { return 0 - 7106; }
+fn linux_fs_status_changed() i64 { return 0 - 7107; }
+fn linux_fs_status_malformed() i64 { return 0 - 7108; }
+
+fn linux_fs_invalid_directory() LinuxFsDirectory {
+    return LinuxFsDirectory{ .fd = 0 - 1, .open = 0 };
+}
+
+fn linux_fs_empty_read(code: i64, calls: i32) LinuxFsReadResult {
+    return LinuxFsReadResult{
+        .ok = 0, .code = code, .bytes_read = 0,
+        .read_calls = calls, .checksum = 0,
+    };
+}
+
+fn linux_fs_path_has_parent_component(path: []u8) i32 {
+    let start: i32 = 0;
+    let i: i32 = 0;
+    while (i <= path.len) {
+        if (i == path.len || path[i] == '/') {
+            if (i - start == 2 && path[start] == '.' && path[start + 1] == '.') {
+                return 1;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn linux_fs_path_valid(path: []u8) i32 {
+    if (path.len <= 0 || path.len > 4095) { return 0; }
+    let i: i32 = 0;
+    while (i < path.len) {
+        if (path[i] == 0) { return 0; }
+        i = i + 1;
+    }
+    if (linux_fs_path_has_parent_component(path) != 0) { return 0; }
+    return 1;
+}
+
+fn linux_fs_c_path(path: []u8) *u8 {
+    // A single private page is enough because public paths are capped at 4095
+    // bytes.  This avoids exporting allocator provenance across a raw syscall.
+    let address: i64 = _zag_raw_syscall(9, 0, 4096, 3, 34, 0 - 1, 0);
+    if (address < 0) { return null as *u8; }
+    let raw: *u8 = address as *u8;
+    let i: i32 = 0;
+    while (i < path.len) {
+        raw[i] = path[i];
+        i = i + 1;
+    }
+    raw[path.len] = 0;
+    return raw;
+}
+
+fn linux_fs_c_path_free(path: *u8) i64 {
+    if (path == null as *u8) { return linux_fs_status_invalid_state(); }
+    return _zag_raw_syscall(11, path as i64, 4096, 0, 0, 0, 0);
+}
+
+fn linux_fs_stat_kind(stat: LinuxFsKernelStat) i32 {
+    let mode: i64 = (stat.mode_uid & 4294967295) as i64;
+    return ((mode / 4096) % 16) as i32;
+}
+
+fn linux_fs_fstat(fd: i64, stat: *LinuxFsKernelStat) i64 {
+    return _zag_raw_syscall(5, fd, stat as i64, 0, 0, 0, 0);
+}
+
+fn linux_fs_lstat_c(path: *u8, stat: *LinuxFsKernelStat) i64 {
+    // newfstatat(AT_FDCWD, path, stat, AT_SYMLINK_NOFOLLOW)
+    return _zag_raw_syscall(262, 0 - 100, path as i64, stat as i64, 256, 0, 0);
+}
+
+fn linux_fs_directory_open(path: []u8) LinuxFsDirectoryResult {
+    if (linux_fs_path_valid(path) == 0) {
+        let code: i64 = linux_fs_status_invalid_argument();
+        if (linux_fs_path_has_parent_component(path) != 0) {
+            code = linux_fs_status_traversal();
+        }
+        return LinuxFsDirectoryResult{
+            .ok = 0, .code = code, .value = linux_fs_invalid_directory(),
+        };
+    }
+    let cpath: *u8 = linux_fs_c_path(path);
+    if (cpath == null as *u8) {
+        return LinuxFsDirectoryResult{
+            .ok=0,.code=0 - 12,.value=linux_fs_invalid_directory(),
+        };
+    }
+    let stat: LinuxFsKernelStat = LinuxFsKernelStat{
+        .device=0,.inode=0,.links=0,.mode_uid=0,.gid_padding=0,.rdevice=0,
+        .size=0,.block_size=0,.blocks=0,.access_seconds=0,
+        .access_nanoseconds=0,.modify_seconds=0,.modify_nanoseconds=0,
+        .change_seconds=0,.change_nanoseconds=0,.reserved_zero=0,
+        .reserved_one=0,.reserved_two=0,
+    };
+    let stat_rc: i64 = linux_fs_lstat_c(cpath, &stat);
+    if (stat_rc < 0) {
+        let _unmap: i64 = linux_fs_c_path_free(cpath);
+        return LinuxFsDirectoryResult{
+            .ok=0,.code=stat_rc,.value=linux_fs_invalid_directory(),
+        };
+    }
+    let kind: i32 = linux_fs_stat_kind(stat);
+    if (kind == 10) {
+        let _unmap: i64 = linux_fs_c_path_free(cpath);
+        return LinuxFsDirectoryResult{
+            .ok=0,.code=linux_fs_status_symlink(),
+            .value=linux_fs_invalid_directory(),
+        };
+    }
+    if (kind != 4) {
+        let _unmap: i64 = linux_fs_c_path_free(cpath);
+        return LinuxFsDirectoryResult{
+            .ok=0,.code=linux_fs_status_unsupported_kind(),
+            .value=linux_fs_invalid_directory(),
+        };
+    }
+    // O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC.
+    let fd: i64 = _zag_raw_syscall(
+        257, 0 - 100, cpath as i64, 720896, 0, 0, 0
+    );
+    let unmap_rc: i64 = linux_fs_c_path_free(cpath);
+    if (unmap_rc < 0 && fd >= 0) {
+        let _close: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+        return LinuxFsDirectoryResult{
+            .ok=0,.code=unmap_rc,.value=linux_fs_invalid_directory(),
+        };
+    }
+    if (fd < 0) {
+        return LinuxFsDirectoryResult{
+            .ok=0,.code=fd,.value=linux_fs_invalid_directory(),
+        };
+    }
+    return LinuxFsDirectoryResult{
+        .ok=1,.code=linux_fs_status_ok(),
+        .value=LinuxFsDirectory{.fd=fd,.open=1},
+    };
+}
+
+fn linux_fs_directory_take(result: *LinuxFsDirectoryResult) LinuxFsDirectory {
+    if (result.*.ok == 0 || result.*.value.open == 0) {
+        return linux_fs_invalid_directory();
+    }
+    let value: LinuxFsDirectory = result.*.value;
+    result.*.ok = 0;
+    result.*.code = linux_fs_status_invalid_state();
+    result.*.value = linux_fs_invalid_directory();
+    return value;
+}
+
+fn linux_fs_directory_close(directory: *LinuxFsDirectory) i64 {
+    if (directory.*.open == 0 || directory.*.fd < 0) {
+        return linux_fs_status_invalid_state();
+    }
+    let fd: i64 = directory.*.fd;
+    directory.*.fd = 0 - 1;
+    directory.*.open = 0;
+    return _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+}
+
+fn linux_fs_descriptor_is_open(fd: i64) i32 {
+    if (fd < 0) { return 0; }
+    // fcntl(F_GETFD) returns -EBADF only for a closed descriptor.
+    return (_zag_raw_syscall(72, fd, 1, 0, 0, 0, 0) != (0 - 9)) as i32;
+}
+
+fn linux_fs_u16_at(data: *u8, offset: i32) i32 {
+    return (data[offset] as i32) + (data[offset + 1] as i32) * 256;
+}
+
+fn linux_fs_entry_name_length(data: *u8, offset: i32, capacity: i32) i32 {
+    let length: i32 = 0;
+    while (length < capacity && data[offset + length] != 0) {
+        length = length + 1;
+    }
+    if (length == capacity) { return 0 - 1; }
+    return length;
+}
+
+fn linux_fs_dot_entry(data: *u8, offset: i32, length: i32) i32 {
+    if (length == 1 && data[offset] == '.') { return 1; }
+    if (length == 2 && data[offset] == '.' && data[offset + 1] == '.') {
+        return 1;
+    }
+    return 0;
+}
+
+fn linux_fs_name_valid(name: *u8, length: i32, capacity: i32) i32 {
+    if (name == null as *u8 || length <= 0 || length > 255 ||
+        capacity < length + 1 || capacity > 256) { return 0; }
+    if (length == 1 && name[0] == '.') { return 0; }
+    if (length == 2 && name[0] == '.' && name[1] == '.') { return 0; }
+    let i: i32 = 0;
+    while (i < length) {
+        if (name[i] == 0 || name[i] == '/') { return 0; }
+        i = i + 1;
+    }
+    return (name[length] == 0) as i32;
+}
+
+fn linux_fs_classify_entry(directory_fd: i64, name: *u8,
+                           reported_kind: i32) i64 {
+    if (reported_kind == 8) { return 8; }
+    if (reported_kind == 10) { return linux_fs_status_symlink(); }
+    if (reported_kind == 4) { return linux_fs_status_traversal(); }
+    if (reported_kind != 0) { return linux_fs_status_unsupported_kind(); }
+
+    let stat: LinuxFsKernelStat = LinuxFsKernelStat{
+        .device=0,.inode=0,.links=0,.mode_uid=0,.gid_padding=0,.rdevice=0,
+        .size=0,.block_size=0,.blocks=0,.access_seconds=0,
+        .access_nanoseconds=0,.modify_seconds=0,.modify_nanoseconds=0,
+        .change_seconds=0,.change_nanoseconds=0,.reserved_zero=0,
+        .reserved_one=0,.reserved_two=0,
+    };
+    let rc: i64 = _zag_raw_syscall(
+        262, directory_fd, name as i64, (&stat) as i64, 256, 0, 0
+    );
+    if (rc < 0) { return rc; }
+    let kind: i32 = linux_fs_stat_kind(stat);
+    if (kind == 8) { return 8; }
+    if (kind == 10) { return linux_fs_status_symlink(); }
+    if (kind == 4) { return linux_fs_status_traversal(); }
+    return linux_fs_status_unsupported_kind();
+}
+
+fn linux_fs_entry_before(left: LinuxFsEntry, right: LinuxFsEntry) i32 {
+    let common: i32 = left.name_length;
+    if (right.name_length < common) { common = right.name_length; }
+    let i: i32 = 0;
+    while (i < common) {
+        if (left.name[i] < right.name[i]) { return 1; }
+        if (left.name[i] > right.name[i]) { return 0; }
+        i = i + 1;
+    }
+    return (left.name_length < right.name_length) as i32;
+}
+
+fn linux_fs_sort_entries(entries: *LinuxFsEntry, count: i32) void {
+    let i: i32 = 1;
+    while (i < count) {
+        let j: i32 = i;
+        while (j > 0 && linux_fs_entry_before(entries[j], entries[j - 1]) != 0) {
+            let swap: LinuxFsEntry = entries[j - 1];
+            entries[j - 1] = entries[j];
+            entries[j] = swap;
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn linux_fs_list_regular_children_bounded(
+    directory: *LinuxFsDirectory,
+    entries: *LinuxFsEntry,
+    entry_capacity: i32,
+    scratch: *u8,
+    scratch_capacity: i32,
+    max_getdents_calls: i32
+) LinuxFsListResult {
+    if (directory.*.open == 0 || directory.*.fd < 0) {
+        return LinuxFsListResult{
+            .ok=0,.code=linux_fs_status_invalid_state(),.count=0,
+            .getdents_calls=0,
+        };
+    }
+    if (entries == null as *LinuxFsEntry || scratch == null as *u8 ||
+        entry_capacity <= 0 || entry_capacity > 1024 ||
+        scratch_capacity < 256 || scratch_capacity > 65536 ||
+        max_getdents_calls <= 0 || max_getdents_calls > 1024) {
+        return LinuxFsListResult{
+            .ok=0,.code=linux_fs_status_invalid_argument(),.count=0,
+            .getdents_calls=0,
+        };
+    }
+    let slot: i32 = 0;
+    while (slot < entry_capacity) {
+        if (entries[slot].name == null as *u8 ||
+            entries[slot].name_capacity < 2 ||
+            entries[slot].name_capacity > 256) {
+            return LinuxFsListResult{
+                .ok=0,.code=linux_fs_status_invalid_argument(),.count=0,
+                .getdents_calls=0,
+            };
+        }
+        entries[slot].name_length = 0;
+        entries[slot].kind = 0;
+        entries[slot].name[0] = 0;
+        slot = slot + 1;
+    }
+
+    let count: i32 = 0;
+    let calls: i32 = 0;
+    while (calls < max_getdents_calls) {
+        let nread: i64 = _zag_raw_syscall(
+            217, directory.*.fd, scratch as i64, scratch_capacity, 0, 0, 0
+        );
+        calls = calls + 1;
+        if (nread == 0) {
+            linux_fs_sort_entries(entries, count);
+            return LinuxFsListResult{
+                .ok=1,.code=linux_fs_status_ok(),.count=count,
+                .getdents_calls=calls,
+            };
+        }
+        if (nread == (0 - 4)) { }
+        else if (nread < 0) {
+            return LinuxFsListResult{
+                .ok=0,.code=nread,.count=count,.getdents_calls=calls,
+            };
+        } else {
+            let offset: i32 = 0;
+            while (offset < nread) {
+                if (offset + 19 > nread) {
+                    return LinuxFsListResult{
+                        .ok=0,.code=linux_fs_status_malformed(),.count=count,
+                        .getdents_calls=calls,
+                    };
+                }
+                let record_length: i32 = linux_fs_u16_at(scratch, offset + 16);
+                if (record_length < 20 || offset + record_length > nread) {
+                    return LinuxFsListResult{
+                        .ok=0,.code=linux_fs_status_malformed(),.count=count,
+                        .getdents_calls=calls,
+                    };
+                }
+                let name_length: i32 = linux_fs_entry_name_length(
+                    scratch, offset + 19, record_length - 19
+                );
+                if (name_length < 0) {
+                    return LinuxFsListResult{
+                        .ok=0,.code=linux_fs_status_malformed(),.count=count,
+                        .getdents_calls=calls,
+                    };
+                }
+                if (linux_fs_dot_entry(scratch, offset + 19, name_length) == 0) {
+                    if (count >= entry_capacity) {
+                        return LinuxFsListResult{
+                            .ok=0,.code=linux_fs_status_limit(),.count=count,
+                            .getdents_calls=calls,
+                        };
+                    }
+                    if (name_length <= 0 ||
+                        name_length + 1 > entries[count].name_capacity) {
+                        return LinuxFsListResult{
+                            .ok=0,.code=linux_fs_status_limit(),.count=count,
+                            .getdents_calls=calls,
+                        };
+                    }
+                    let source: *u8 = (scratch as i64 + offset + 19) as *u8;
+                    let kind: i64 = linux_fs_classify_entry(
+                        directory.*.fd, source, scratch[offset + 18] as i32
+                    );
+                    if (kind != 8) {
+                        return LinuxFsListResult{
+                            .ok=0,.code=kind,.count=count,.getdents_calls=calls,
+                        };
+                    }
+                    let byte: i32 = 0;
+                    while (byte < name_length) {
+                        entries[count].name[byte] = source[byte];
+                        byte = byte + 1;
+                    }
+                    entries[count].name[name_length] = 0;
+                    entries[count].name_length = name_length;
+                    entries[count].kind = 8;
+                    count = count + 1;
+                }
+                offset = offset + record_length;
+            }
+            if (offset != nread) {
+                return LinuxFsListResult{
+                    .ok=0,.code=linux_fs_status_malformed(),.count=count,
+                    .getdents_calls=calls,
+                };
+            }
+        }
+    }
+    return LinuxFsListResult{
+        .ok=0,.code=linux_fs_status_limit(),.count=count,
+        .getdents_calls=calls,
+    };
+}
+
+fn linux_fs_weighted_checksum(bytes: *u8, length: i32) i64 {
+    let checksum: i64 = 0;
+    let i: i32 = 0;
+    while (i < length) {
+        checksum = checksum + ((i + 1) as i64) * (bytes[i] as i64);
+        i = i + 1;
+    }
+    return checksum;
+}
+
+fn linux_fs_read_regular_at_prepared(
+    directory_fd: i64,
+    name: *u8,
+    name_length: i32,
+    name_capacity: i32,
+    output: *u8,
+    max_file_bytes: i32,
+    max_read_calls: i32
+) LinuxFsReadResult {
+    if (directory_fd < 0 || output == null as *u8 ||
+        max_file_bytes < 0 || max_file_bytes > 16777216 ||
+        max_read_calls <= 0 || max_read_calls > 65536 ||
+        linux_fs_name_valid(name, name_length, name_capacity) == 0) {
+        return linux_fs_empty_read(linux_fs_status_invalid_argument(), 0);
+    }
+    // O_RDONLY | O_NONBLOCK | O_NOFOLLOW | O_CLOEXEC.  O_NONBLOCK keeps an
+    // unexpected FIFO/device from blocking before fstat rejects its kind.
+    let fd: i64 = _zag_raw_syscall(
+        257, directory_fd, name as i64, 657408, 0, 0, 0
+    );
+    if (fd < 0) { return linux_fs_empty_read(fd, 0); }
+
+    let stat: LinuxFsKernelStat = LinuxFsKernelStat{
+        .device=0,.inode=0,.links=0,.mode_uid=0,.gid_padding=0,.rdevice=0,
+        .size=0,.block_size=0,.blocks=0,.access_seconds=0,
+        .access_nanoseconds=0,.modify_seconds=0,.modify_nanoseconds=0,
+        .change_seconds=0,.change_nanoseconds=0,.reserved_zero=0,
+        .reserved_one=0,.reserved_two=0,
+    };
+    let stat_rc: i64 = linux_fs_fstat(fd, &stat);
+    if (stat_rc < 0) {
+        let _close: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+        return linux_fs_empty_read(stat_rc, 0);
+    }
+    if (linux_fs_stat_kind(stat) != 8) {
+        let _close: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+        return linux_fs_empty_read(linux_fs_status_unsupported_kind(), 0);
+    }
+    if (stat.size < 0 || stat.size > max_file_bytes) {
+        let _close: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+        return linux_fs_empty_read(linux_fs_status_limit(), 0);
+    }
+
+    let total: i32 = 0;
+    let calls: i32 = 0;
+    while (total < stat.size && calls < max_read_calls) {
+        let rc: i64 = _zag_raw_syscall(
+            0, fd, (output as i64) + total,
+            stat.size - total, 0, 0, 0
+        );
+        calls = calls + 1;
+        if (rc == (0 - 4)) { }
+        else if (rc < 0) {
+            let _close: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+            return linux_fs_empty_read(rc, calls);
+        } else if (rc == 0) {
+            let _close: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+            return linux_fs_empty_read(linux_fs_status_changed(), calls);
+        } else {
+            total = total + rc as i32;
+        }
+    }
+    if (total != stat.size) {
+        let _close: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+        return linux_fs_empty_read(linux_fs_status_limit(), calls);
+    }
+
+    // Detect growth after fstat without writing beyond the caller's limit.
+    // The EOF probe shares the public call budget and retries EINTR rather
+    // than silently accepting an unconfirmed end of file.
+    let extra: u8 = 0;
+    let extra_rc: i64 = 0 - 4;
+    while (calls < max_read_calls && extra_rc == (0 - 4)) {
+        extra_rc = _zag_raw_syscall(
+            0, fd, (&extra) as i64, 1, 0, 0, 0
+        );
+        calls = calls + 1;
+    }
+    let close_rc: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+    if (extra_rc == (0 - 4)) {
+        return linux_fs_empty_read(linux_fs_status_limit(), calls);
+    }
+    if (extra_rc > 0) {
+        if (total >= max_file_bytes) {
+            return linux_fs_empty_read(linux_fs_status_limit(), calls);
+        }
+        return linux_fs_empty_read(linux_fs_status_changed(), calls);
+    }
+    if (extra_rc < 0 && extra_rc != (0 - 4)) {
+        return linux_fs_empty_read(extra_rc, calls);
+    }
+    if (close_rc < 0) { return linux_fs_empty_read(close_rc, calls); }
+    return LinuxFsReadResult{
+        .ok=1,.code=linux_fs_status_ok(),.bytes_read=total,
+        .read_calls=calls,.checksum=linux_fs_weighted_checksum(output,total),
+    };
+}

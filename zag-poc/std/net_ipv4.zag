@@ -1,0 +1,602 @@
+// std/net_ipv4.zag — bounded Linux x86-64 IPv4 socket foundation.
+//
+// This module is deliberately small and explicit.  It owns socket descriptor
+// state, prevents a second close through the same resource value, applies
+// receive/send timeouts, and bounds every public data loop.  It does not claim
+// IPv6, TLS, HTTP, WebSocket, hostname resolution, or an async scheduler.
+//
+// Addresses and ports are in host byte order at the public boundary.  Syscall
+// failures retain Linux's negative errno value in `code`; library validation
+// failures use the net_status_* values below.
+
+@import("rt.zag")
+
+struct NetIpv4Endpoint {
+    address: i64,
+    port: i32,
+}
+
+struct NetTcpListener {
+    fd: i64,
+    open: i32,
+    local: NetIpv4Endpoint,
+}
+
+struct NetTcpStream {
+    fd: i64,
+    open: i32,
+}
+
+struct NetUdpSocket {
+    fd: i64,
+    open: i32,
+    local: NetIpv4Endpoint,
+}
+
+struct NetTcpListenerResult {
+    ok: i32,
+    code: i64,
+    value: NetTcpListener,
+}
+
+struct NetTcpStreamResult {
+    ok: i32,
+    code: i64,
+    value: NetTcpStream,
+}
+
+struct NetUdpSocketResult {
+    ok: i32,
+    code: i64,
+    value: NetUdpSocket,
+}
+
+struct NetIoResult {
+    ok: i32,
+    code: i64,
+    transferred: i32,
+    calls: i32,
+}
+
+struct NetUdpReceiveResult {
+    ok: i32,
+    code: i64,
+    transferred: i32,
+    calls: i32,
+    source: NetIpv4Endpoint,
+}
+
+// Raw kernel layouts.  sockaddr_in is exactly 16 bytes.  timeval is two
+// machine words on Linux x86-64.
+struct NetKernelSockAddr {
+    word0: u64,
+    word1: u64,
+}
+
+struct NetKernelTimeval {
+    seconds: i64,
+    microseconds: i64,
+}
+
+fn net_status_ok() i64 { return 0; }
+fn net_status_invalid_argument() i64 { return 0 - 7001; }
+fn net_status_invalid_state() i64 { return 0 - 7002; }
+fn net_status_limit() i64 { return 0 - 7003; }
+fn net_status_eof() i64 { return 0 - 7004; }
+fn net_status_truncated() i64 { return 0 - 7005; }
+fn net_status_incomplete() i64 { return 0 - 7006; }
+
+fn net_ipv4_any() i64 { return 0; }
+fn net_ipv4_loopback() i64 { return 2130706433; } // 127.0.0.1
+
+fn net_ipv4_endpoint(address: i64, port: i32) NetIpv4Endpoint {
+    return NetIpv4Endpoint{ .address = address, .port = port };
+}
+
+fn net_invalid_endpoint() NetIpv4Endpoint {
+    return NetIpv4Endpoint{ .address = 0, .port = 0 };
+}
+
+fn net_invalid_tcp_listener() NetTcpListener {
+    return NetTcpListener{
+        .fd = 0 - 1, .open = 0, .local = net_invalid_endpoint(),
+    };
+}
+
+fn net_invalid_tcp_stream() NetTcpStream {
+    return NetTcpStream{ .fd = 0 - 1, .open = 0 };
+}
+
+fn net_invalid_udp_socket() NetUdpSocket {
+    return NetUdpSocket{
+        .fd = 0 - 1, .open = 0, .local = net_invalid_endpoint(),
+    };
+}
+
+// Constructor results own their successful resource until it is taken.  These
+// helpers provide an explicit move-by-convention and invalidate the result's
+// copy so ordinary extraction does not leave two values claiming the same fd.
+fn net_tcp_listener_take(result: *NetTcpListenerResult) NetTcpListener {
+    if (result.*.ok == 0 || result.*.value.open == 0) {
+        return net_invalid_tcp_listener();
+    }
+    let value: NetTcpListener = result.*.value;
+    result.*.value = net_invalid_tcp_listener();
+    result.*.ok = 0;
+    result.*.code = net_status_invalid_state();
+    return value;
+}
+
+fn net_tcp_stream_take(result: *NetTcpStreamResult) NetTcpStream {
+    if (result.*.ok == 0 || result.*.value.open == 0) {
+        return net_invalid_tcp_stream();
+    }
+    let value: NetTcpStream = result.*.value;
+    result.*.value = net_invalid_tcp_stream();
+    result.*.ok = 0;
+    result.*.code = net_status_invalid_state();
+    return value;
+}
+
+fn net_udp_socket_take(result: *NetUdpSocketResult) NetUdpSocket {
+    if (result.*.ok == 0 || result.*.value.open == 0) {
+        return net_invalid_udp_socket();
+    }
+    let value: NetUdpSocket = result.*.value;
+    result.*.value = net_invalid_udp_socket();
+    result.*.ok = 0;
+    result.*.code = net_status_invalid_state();
+    return value;
+}
+
+fn net_io_result(ok: i32, code: i64, transferred: i32, calls: i32) NetIoResult {
+    return NetIoResult{
+        .ok = ok, .code = code, .transferred = transferred, .calls = calls,
+    };
+}
+
+fn net_udp_receive_result(ok: i32, code: i64, transferred: i32, calls: i32,
+                          source: NetIpv4Endpoint) NetUdpReceiveResult {
+    return NetUdpReceiveResult{
+        .ok = ok, .code = code, .transferred = transferred, .calls = calls,
+        .source = source,
+    };
+}
+
+fn net_endpoint_valid(endpoint: NetIpv4Endpoint, allow_zero_port: i32) i32 {
+    if (endpoint.address < 0 || endpoint.address > 4294967295) { return 0; }
+    if (endpoint.port < 0 || endpoint.port > 65535) { return 0; }
+    if (allow_zero_port == 0 && endpoint.port == 0) { return 0; }
+    return 1;
+}
+
+fn net_timeout_valid(timeout_ms: i32) i32 {
+    return (timeout_ms >= 1 && timeout_ms <= 60000) as i32;
+}
+
+fn net_swap16(value: u64) u64 {
+    return ((value & 255) << 8) | ((value >> 8) & 255);
+}
+
+fn net_swap32(value: u64) u64 {
+    return ((value & 255) << 24) |
+        (((value >> 8) & 255) << 16) |
+        (((value >> 16) & 255) << 8) |
+        ((value >> 24) & 255);
+}
+
+fn net_kernel_address(endpoint: NetIpv4Endpoint) NetKernelSockAddr {
+    let family: u64 = 2;
+    let port_network: u64 = net_swap16(endpoint.port as u64);
+    let address_network: u64 = net_swap32(endpoint.address as u64);
+    return NetKernelSockAddr{
+        .word0 = family | (port_network << 16) | (address_network << 32),
+        .word1 = 0,
+    };
+}
+
+fn net_kernel_family(address: NetKernelSockAddr) i32 {
+    return (address.word0 & 65535) as i32;
+}
+
+fn net_endpoint_from_kernel(address: NetKernelSockAddr) NetIpv4Endpoint {
+    let port_network: u64 = (address.word0 >> 16) & 65535;
+    let address_network: u64 = (address.word0 >> 32) & 4294967295;
+    return NetIpv4Endpoint{
+        .address = net_swap32(address_network) as i64,
+        .port = net_swap16(port_network) as i32,
+    };
+}
+
+fn net_sys_socket(kind: i64) i64 {
+    // SOCK_CLOEXEC keeps descriptors out of a later exec by default.
+    return _zag_raw_syscall(41, 2, kind | 524288, 0, 0, 0, 0);
+}
+
+fn net_sys_close(fd: i64) i64 {
+    return _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+}
+
+fn net_set_timeouts(fd: i64, timeout_ms: i32) i64 {
+    let timeout: NetKernelTimeval = NetKernelTimeval{
+        .seconds = (timeout_ms / 1000) as i64,
+        .microseconds = ((timeout_ms % 1000) * 1000) as i64,
+    };
+    let timeout_pointer: *NetKernelTimeval = &timeout;
+    let receive_rc: i64 = _zag_raw_syscall(
+        54, fd, 1, 20, timeout_pointer as i64, 16, 0
+    );
+    if (receive_rc < 0) { return receive_rc; }
+    return _zag_raw_syscall(54, fd, 1, 21, timeout_pointer as i64, 16, 0);
+}
+
+fn net_set_reuse_address(fd: i64) i64 {
+    let enabled: i64 = 1;
+    let enabled_pointer: *i64 = &enabled;
+    return _zag_raw_syscall(54, fd, 1, 2, enabled_pointer as i64, 4, 0);
+}
+
+fn net_local_endpoint(fd: i64, output: *NetIpv4Endpoint) i64 {
+    let address: NetKernelSockAddr = NetKernelSockAddr{ .word0 = 0, .word1 = 0 };
+    let address_length: i64 = 16;
+    let address_pointer: *NetKernelSockAddr = &address;
+    let length_pointer: *i64 = &address_length;
+    let rc: i64 = _zag_raw_syscall(
+        51, fd, address_pointer as i64, length_pointer as i64, 0, 0, 0
+    );
+    if (rc < 0) { return rc; }
+    if (address_length < 16 || net_kernel_family(address) != 2) {
+        return net_status_incomplete();
+    }
+    output.* = net_endpoint_from_kernel(address);
+    return net_status_ok();
+}
+
+fn net_tcp_listen_ipv4(endpoint: NetIpv4Endpoint, backlog: i32,
+                       timeout_ms: i32) NetTcpListenerResult {
+    let invalid: NetTcpListener = net_invalid_tcp_listener();
+    if (net_endpoint_valid(endpoint, 1) == 0 || backlog < 1 || backlog > 128 ||
+        net_timeout_valid(timeout_ms) == 0) {
+        return NetTcpListenerResult{
+            .ok = 0, .code = net_status_invalid_argument(), .value = invalid,
+        };
+    }
+    let fd: i64 = net_sys_socket(1);
+    if (fd < 0) {
+        return NetTcpListenerResult{ .ok = 0, .code = fd, .value = invalid };
+    }
+    let reuse_rc: i64 = net_set_reuse_address(fd);
+    if (reuse_rc < 0) {
+        let _closed: i64 = net_sys_close(fd);
+        return NetTcpListenerResult{ .ok = 0, .code = reuse_rc, .value = invalid };
+    }
+    let timeout_rc: i64 = net_set_timeouts(fd, timeout_ms);
+    if (timeout_rc < 0) {
+        let _closed: i64 = net_sys_close(fd);
+        return NetTcpListenerResult{ .ok = 0, .code = timeout_rc, .value = invalid };
+    }
+    let address: NetKernelSockAddr = net_kernel_address(endpoint);
+    let address_pointer: *NetKernelSockAddr = &address;
+    let bind_rc: i64 = _zag_raw_syscall(
+        49, fd, address_pointer as i64, 16, 0, 0, 0
+    );
+    if (bind_rc < 0) {
+        let _closed: i64 = net_sys_close(fd);
+        return NetTcpListenerResult{ .ok = 0, .code = bind_rc, .value = invalid };
+    }
+    let listen_rc: i64 = _zag_raw_syscall(50, fd, backlog, 0, 0, 0, 0);
+    if (listen_rc < 0) {
+        let _closed: i64 = net_sys_close(fd);
+        return NetTcpListenerResult{ .ok = 0, .code = listen_rc, .value = invalid };
+    }
+    let local: NetIpv4Endpoint = net_invalid_endpoint();
+    let local_rc: i64 = net_local_endpoint(fd, &local);
+    if (local_rc < 0) {
+        let _closed: i64 = net_sys_close(fd);
+        return NetTcpListenerResult{ .ok = 0, .code = local_rc, .value = invalid };
+    }
+    return NetTcpListenerResult{
+        .ok = 1, .code = net_status_ok(),
+        .value = NetTcpListener{ .fd = fd, .open = 1, .local = local },
+    };
+}
+
+fn net_tcp_connect_ipv4(endpoint: NetIpv4Endpoint,
+                        timeout_ms: i32) NetTcpStreamResult {
+    let invalid: NetTcpStream = net_invalid_tcp_stream();
+    if (net_endpoint_valid(endpoint, 0) == 0 || net_timeout_valid(timeout_ms) == 0) {
+        return NetTcpStreamResult{
+            .ok = 0, .code = net_status_invalid_argument(), .value = invalid,
+        };
+    }
+    let fd: i64 = net_sys_socket(1);
+    if (fd < 0) { return NetTcpStreamResult{ .ok = 0, .code = fd, .value = invalid }; }
+    let timeout_rc: i64 = net_set_timeouts(fd, timeout_ms);
+    if (timeout_rc < 0) {
+        let _closed: i64 = net_sys_close(fd);
+        return NetTcpStreamResult{ .ok = 0, .code = timeout_rc, .value = invalid };
+    }
+    let address: NetKernelSockAddr = net_kernel_address(endpoint);
+    let address_pointer: *NetKernelSockAddr = &address;
+    let connect_rc: i64 = _zag_raw_syscall(
+        42, fd, address_pointer as i64, 16, 0, 0, 0
+    );
+    if (connect_rc < 0) {
+        let _closed: i64 = net_sys_close(fd);
+        return NetTcpStreamResult{ .ok = 0, .code = connect_rc, .value = invalid };
+    }
+    return NetTcpStreamResult{
+        .ok = 1, .code = net_status_ok(),
+        .value = NetTcpStream{ .fd = fd, .open = 1 },
+    };
+}
+
+fn net_tcp_accept(listener: *NetTcpListener, timeout_ms: i32) NetTcpStreamResult {
+    let invalid: NetTcpStream = net_invalid_tcp_stream();
+    if (listener.*.open == 0 || listener.*.fd < 0) {
+        return NetTcpStreamResult{
+            .ok = 0, .code = net_status_invalid_state(), .value = invalid,
+        };
+    }
+    if (net_timeout_valid(timeout_ms) == 0) {
+        return NetTcpStreamResult{
+            .ok = 0, .code = net_status_invalid_argument(), .value = invalid,
+        };
+    }
+    // accept4 with SOCK_CLOEXEC.  The listener timeout bounds this call.
+    let fd: i64 = _zag_raw_syscall(288, listener.*.fd, 0, 0, 524288, 0, 0);
+    if (fd < 0) { return NetTcpStreamResult{ .ok = 0, .code = fd, .value = invalid }; }
+    let timeout_rc: i64 = net_set_timeouts(fd, timeout_ms);
+    if (timeout_rc < 0) {
+        let _closed: i64 = net_sys_close(fd);
+        return NetTcpStreamResult{ .ok = 0, .code = timeout_rc, .value = invalid };
+    }
+    return NetTcpStreamResult{
+        .ok = 1, .code = net_status_ok(),
+        .value = NetTcpStream{ .fd = fd, .open = 1 },
+    };
+}
+
+fn net_tcp_listener_close(listener: *NetTcpListener) i64 {
+    if (listener.*.open == 0 || listener.*.fd < 0) {
+        return net_status_invalid_state();
+    }
+    let fd: i64 = listener.*.fd;
+    listener.*.fd = 0 - 1;
+    listener.*.open = 0;
+    return net_sys_close(fd);
+}
+
+fn net_tcp_stream_close(stream: *NetTcpStream) i64 {
+    if (stream.*.open == 0 || stream.*.fd < 0) {
+        return net_status_invalid_state();
+    }
+    let fd: i64 = stream.*.fd;
+    stream.*.fd = 0 - 1;
+    stream.*.open = 0;
+    return net_sys_close(fd);
+}
+
+fn net_tcp_send_all_bounded(stream: *NetTcpStream, bytes: []u8,
+                            max_bytes: i32, max_calls: i32,
+                            max_syscall_bytes: i32) NetIoResult {
+    if (stream.*.open == 0 || stream.*.fd < 0) {
+        return net_io_result(0, net_status_invalid_state(), 0, 0);
+    }
+    if (max_bytes < 0 || max_bytes > 16777216 || max_calls < 1 ||
+        max_calls > 1048576 || max_syscall_bytes < 1 ||
+        max_syscall_bytes > 1048576) {
+        return net_io_result(0, net_status_invalid_argument(), 0, 0);
+    }
+    if (bytes.len > max_bytes) { return net_io_result(0, net_status_limit(), 0, 0); }
+    let sent: i32 = 0;
+    let calls: i32 = 0;
+    let base: i64 = _zag_slice_ptr(bytes) as i64;
+    while (sent < bytes.len && calls < max_calls) {
+        let amount: i32 = bytes.len - sent;
+        if (amount > max_syscall_bytes) { amount = max_syscall_bytes; }
+        calls = calls + 1;
+        // MSG_NOSIGNAL prevents a peer close from terminating the process.
+        let rc: i64 = _zag_raw_syscall(
+            44, stream.*.fd, base + sent as i64, amount, 16384, 0, 0
+        );
+        if (rc > 0) {
+            if (rc > amount) { return net_io_result(0, net_status_incomplete(), sent, calls); }
+            sent = sent + rc as i32;
+        } else if (rc != 0 - 4) {
+            if (rc == 0) { return net_io_result(0, net_status_incomplete(), sent, calls); }
+            return net_io_result(0, rc, sent, calls);
+        }
+    }
+    if (sent != bytes.len) { return net_io_result(0, net_status_limit(), sent, calls); }
+    return net_io_result(1, net_status_ok(), sent, calls);
+}
+
+fn net_tcp_send_all(stream: *NetTcpStream, bytes: []u8) NetIoResult {
+    return net_tcp_send_all_bounded(stream, bytes, 1048576,
+        bytes.len + 16, 16384);
+}
+
+fn net_tcp_recv_exact_bounded(stream: *NetTcpStream, output: []u8,
+                              exact_bytes: i32, max_bytes: i32,
+                              max_calls: i32,
+                              max_syscall_bytes: i32) NetIoResult {
+    if (stream.*.open == 0 || stream.*.fd < 0) {
+        return net_io_result(0, net_status_invalid_state(), 0, 0);
+    }
+    if (exact_bytes < 0 || exact_bytes > output.len || max_bytes < 0 ||
+        max_bytes > 16777216 || exact_bytes > max_bytes || max_calls < 1 ||
+        max_calls > 1048576 || max_syscall_bytes < 1 ||
+        max_syscall_bytes > 1048576) {
+        return net_io_result(0, net_status_invalid_argument(), 0, 0);
+    }
+    let received: i32 = 0;
+    let calls: i32 = 0;
+    let base: i64 = _zag_slice_ptr(output) as i64;
+    while (received < exact_bytes && calls < max_calls) {
+        let amount: i32 = exact_bytes - received;
+        if (amount > max_syscall_bytes) { amount = max_syscall_bytes; }
+        calls = calls + 1;
+        let rc: i64 = _zag_raw_syscall(
+            45, stream.*.fd, base + received as i64, amount, 0, 0, 0
+        );
+        if (rc > 0) {
+            if (rc > amount) {
+                return net_io_result(0, net_status_incomplete(), received, calls);
+            }
+            received = received + rc as i32;
+        } else if (rc == 0) {
+            return net_io_result(0, net_status_eof(), received, calls);
+        } else if (rc != 0 - 4) {
+            return net_io_result(0, rc, received, calls);
+        }
+    }
+    if (received != exact_bytes) {
+        return net_io_result(0, net_status_limit(), received, calls);
+    }
+    return net_io_result(1, net_status_ok(), received, calls);
+}
+
+fn net_tcp_recv_exact(stream: *NetTcpStream, output: []u8,
+                      exact_bytes: i32) NetIoResult {
+    return net_tcp_recv_exact_bounded(stream, output, exact_bytes, 1048576,
+        exact_bytes + 16, 16384);
+}
+
+fn net_udp_bind_ipv4(endpoint: NetIpv4Endpoint,
+                     timeout_ms: i32) NetUdpSocketResult {
+    let invalid: NetUdpSocket = net_invalid_udp_socket();
+    if (net_endpoint_valid(endpoint, 1) == 0 || net_timeout_valid(timeout_ms) == 0) {
+        return NetUdpSocketResult{
+            .ok = 0, .code = net_status_invalid_argument(), .value = invalid,
+        };
+    }
+    let fd: i64 = net_sys_socket(2);
+    if (fd < 0) { return NetUdpSocketResult{ .ok = 0, .code = fd, .value = invalid }; }
+    let timeout_rc: i64 = net_set_timeouts(fd, timeout_ms);
+    if (timeout_rc < 0) {
+        let _closed: i64 = net_sys_close(fd);
+        return NetUdpSocketResult{ .ok = 0, .code = timeout_rc, .value = invalid };
+    }
+    let address: NetKernelSockAddr = net_kernel_address(endpoint);
+    let address_pointer: *NetKernelSockAddr = &address;
+    let bind_rc: i64 = _zag_raw_syscall(
+        49, fd, address_pointer as i64, 16, 0, 0, 0
+    );
+    if (bind_rc < 0) {
+        let _closed: i64 = net_sys_close(fd);
+        return NetUdpSocketResult{ .ok = 0, .code = bind_rc, .value = invalid };
+    }
+    let local: NetIpv4Endpoint = net_invalid_endpoint();
+    let local_rc: i64 = net_local_endpoint(fd, &local);
+    if (local_rc < 0) {
+        let _closed: i64 = net_sys_close(fd);
+        return NetUdpSocketResult{ .ok = 0, .code = local_rc, .value = invalid };
+    }
+    return NetUdpSocketResult{
+        .ok = 1, .code = net_status_ok(),
+        .value = NetUdpSocket{ .fd = fd, .open = 1, .local = local },
+    };
+}
+
+fn net_udp_close(socket: *NetUdpSocket) i64 {
+    if (socket.*.open == 0 || socket.*.fd < 0) {
+        return net_status_invalid_state();
+    }
+    let fd: i64 = socket.*.fd;
+    socket.*.fd = 0 - 1;
+    socket.*.open = 0;
+    return net_sys_close(fd);
+}
+
+fn net_udp_send_to_bounded(socket: *NetUdpSocket, destination: NetIpv4Endpoint,
+                           bytes: []u8, max_bytes: i32,
+                           max_calls: i32) NetIoResult {
+    if (socket.*.open == 0 || socket.*.fd < 0) {
+        return net_io_result(0, net_status_invalid_state(), 0, 0);
+    }
+    if (net_endpoint_valid(destination, 0) == 0 || max_bytes < 0 ||
+        max_bytes > 65507 || bytes.len > max_bytes || bytes.len > 65507 ||
+        max_calls < 1 || max_calls > 1024) {
+        return net_io_result(0, net_status_invalid_argument(), 0, 0);
+    }
+    let address: NetKernelSockAddr = net_kernel_address(destination);
+    let address_pointer: *NetKernelSockAddr = &address;
+    let calls: i32 = 0;
+    while (calls < max_calls) {
+        calls = calls + 1;
+        let rc: i64 = _zag_raw_syscall(
+            44, socket.*.fd, _zag_slice_ptr(bytes) as i64, bytes.len, 16384,
+            address_pointer as i64, 16
+        );
+        if (rc == bytes.len) {
+            return net_io_result(1, net_status_ok(), bytes.len, calls);
+        }
+        if (rc >= 0) {
+            return net_io_result(0, net_status_incomplete(), rc as i32, calls);
+        }
+        if (rc != 0 - 4) { return net_io_result(0, rc, 0, calls); }
+    }
+    return net_io_result(0, net_status_limit(), 0, calls);
+}
+
+fn net_udp_send_to(socket: *NetUdpSocket, destination: NetIpv4Endpoint,
+                   bytes: []u8) NetIoResult {
+    return net_udp_send_to_bounded(socket, destination, bytes, 65507, 16);
+}
+
+fn net_udp_recv_from_bounded(socket: *NetUdpSocket, output: []u8,
+                             max_bytes: i32,
+                             max_calls: i32) NetUdpReceiveResult {
+    let invalid_source: NetIpv4Endpoint = net_invalid_endpoint();
+    if (socket.*.open == 0 || socket.*.fd < 0) {
+        return net_udp_receive_result(
+            0, net_status_invalid_state(), 0, 0, invalid_source
+        );
+    }
+    if (max_bytes < 0 || max_bytes > output.len || max_bytes > 65507 ||
+        max_calls < 1 || max_calls > 1024) {
+        return net_udp_receive_result(
+            0, net_status_invalid_argument(), 0, 0, invalid_source
+        );
+    }
+    let calls: i32 = 0;
+    while (calls < max_calls) {
+        let source_address: NetKernelSockAddr = NetKernelSockAddr{
+            .word0 = 0, .word1 = 0,
+        };
+        let source_length: i64 = 16;
+        let source_pointer: *NetKernelSockAddr = &source_address;
+        let source_length_pointer: *i64 = &source_length;
+        calls = calls + 1;
+        // MSG_TRUNC makes an oversized datagram observable instead of silently
+        // accepting only its prefix.
+        let rc: i64 = _zag_raw_syscall(
+            45, socket.*.fd, _zag_slice_ptr(output) as i64, max_bytes, 32,
+            source_pointer as i64, source_length_pointer as i64
+        );
+        if (rc >= 0) {
+            if (source_length < 16 || net_kernel_family(source_address) != 2) {
+                return net_udp_receive_result(
+                    0, net_status_incomplete(), 0, calls, invalid_source
+                );
+            }
+            let source: NetIpv4Endpoint = net_endpoint_from_kernel(source_address);
+            if (rc > max_bytes) {
+                return net_udp_receive_result(
+                    0, net_status_truncated(), max_bytes, calls, source
+                );
+            }
+            return net_udp_receive_result(1, net_status_ok(), rc as i32, calls, source);
+        }
+        if (rc != 0 - 4) {
+            return net_udp_receive_result(0, rc, 0, calls, invalid_source);
+        }
+    }
+    return net_udp_receive_result(0, net_status_limit(), 0, calls, invalid_source);
+}
+
+fn net_udp_recv_from(socket: *NetUdpSocket,
+                     output: []u8) NetUdpReceiveResult {
+    return net_udp_recv_from_bounded(socket, output, output.len, 16);
+}

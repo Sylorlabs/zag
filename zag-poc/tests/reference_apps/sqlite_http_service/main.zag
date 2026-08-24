@@ -1,0 +1,322 @@
+// Bounded SQLite-backed HTTP/1.1 service reference for Linux x86-64.
+//
+// Three normal requests plus one cleanup-negative request cross real
+// 127.0.0.1 TCP connections.  The service exposes two fixed i64 KV lookups and
+// rejects non-GET methods.  It is conformance evidence for composing
+// std:http1, std:net_ipv4, and std:sqlite_kv; it is not a production server or
+// a general database API.
+
+@import("std:list")
+@import("std:database_kv") as contract
+@import("std:http1") as http
+@import("std:http1_service") as service
+@import("std:net_ipv4") as net
+@import("std:sqlite_kv") as sqlite
+
+extern fn _zag_allocator_live_bytes() i64
+extern fn _zag_raw_syscall(number: i64, a1: i64, a2: i64, a3: i64,
+                           a4: i64, a5: i64, a6: i64) i64
+
+struct SqliteHttpExchangeState {
+    request: http.Http1Buffer,
+    client: net.NetTcpStream,
+    server: net.NetTcpStream,
+    received_request: http.Http1Buffer,
+    parsed_request: http.Http1Request,
+    response: http.Http1Buffer,
+    received_response: http.Http1Buffer,
+    parsed_response: http.Http1Response,
+}
+
+struct SqliteHttpExchangeResult {
+    code: i32,
+    client_fd: i64,
+    server_fd: i64,
+}
+
+fn sqlite_http_exchange_state_empty() SqliteHttpExchangeState {
+    return SqliteHttpExchangeState{
+        .request = http.http1_empty_buffer(),
+        .client = net.net_invalid_tcp_stream(),
+        .server = net.net_invalid_tcp_stream(),
+        .received_request = http.http1_empty_buffer(),
+        .parsed_request = http.http1_invalid_request(),
+        .response = http.http1_empty_buffer(),
+        .received_response = http.http1_empty_buffer(),
+        .parsed_response = http.http1_invalid_response(),
+    };
+}
+
+fn sqlite_http_exchange_cleanup(state: *SqliteHttpExchangeState) i32 {
+    // Parsed views borrow their corresponding receive buffers, so close views
+    // first.  Each close is attempted independently: one cleanup error must
+    // never short-circuit release of a later owner.
+    let ok: i32 = 1;
+    if (state.*.parsed_response.open != 0 &&
+        http.http1_response_close(&state.*.parsed_response) !=
+            http.http1_status_ok()) { ok = 0; }
+    if (state.*.parsed_request.open != 0 &&
+        http.http1_request_close(&state.*.parsed_request) !=
+            http.http1_status_ok()) { ok = 0; }
+    if (state.*.received_response.open != 0 &&
+        http.http1_buffer_close(&state.*.received_response) !=
+            http.http1_status_ok()) { ok = 0; }
+    if (state.*.response.open != 0 &&
+        http.http1_buffer_close(&state.*.response) !=
+            http.http1_status_ok()) { ok = 0; }
+    if (state.*.received_request.open != 0 &&
+        http.http1_buffer_close(&state.*.received_request) !=
+            http.http1_status_ok()) { ok = 0; }
+    if (state.*.request.open != 0 &&
+        http.http1_buffer_close(&state.*.request) !=
+            http.http1_status_ok()) { ok = 0; }
+    if (state.*.server.open != 0 &&
+        net.net_tcp_stream_close(&state.*.server) !=
+            net.net_status_ok()) { ok = 0; }
+    if (state.*.client.open != 0 &&
+        net.net_tcp_stream_close(&state.*.client) !=
+            net.net_status_ok()) { ok = 0; }
+    return ok;
+}
+
+fn sqlite_http_exchange_finish(state: *SqliteHttpExchangeState,
+                               code: i32) SqliteHttpExchangeResult {
+    let client_fd: i64 = state.*.client.fd;
+    let server_fd: i64 = state.*.server.fd;
+    let final_code: i32 = code;
+    if (sqlite_http_exchange_cleanup(state) == 0) { final_code = 10; }
+    return SqliteHttpExchangeResult{
+        .code = final_code, .client_fd = client_fd, .server_fd = server_fd,
+    };
+}
+
+fn sqlite_http_exchange_fds_closed(result: *SqliteHttpExchangeResult) i32 {
+    if (result.*.client_fd < 0 || result.*.server_fd < 0) { return 0; }
+    // Linux x86-64 fcntl(F_GETFD) returns -EBADF only for a closed fd.
+    if (_zag_raw_syscall(72, result.*.client_fd, 1, 0, 0, 0, 0) != (0 - 9) ||
+        _zag_raw_syscall(72, result.*.server_fd, 1, 0, 0, 0, 0) != (0 - 9)) {
+        return 0;
+    }
+    return 1;
+}
+
+fn sqlite_http_encode_response(status: i32, reason: []u8,
+                               body: []u8) http.Http1BufferResult {
+    let headers: ArrayList[http.Http1Header] = make[http.Http1Header](1);
+    push[http.Http1Header](&headers, http.Http1Header{
+        .name = "Content-Type", .value = "text/plain",
+    });
+    let result: http.Http1BufferResult = http.http1_encode_response(
+        status, reason, headers, body
+    );
+    free[http.Http1Header](&headers);
+    return result;
+}
+
+fn sqlite_http_route(database: *sqlite.SqliteKv,
+                     request: *http.Http1Request) http.Http1BufferResult {
+    if (!@strEq(request.*.method, "GET")) {
+        return sqlite_http_encode_response(405, "Method Not Allowed",
+            "method not allowed\n");
+    }
+    if (@strEq(request.*.path, "/kv/7")) {
+        let value: i64 = 0;
+        let status: i32 = sqlite.sqlite_kv_get(database, 7, &value);
+        if (status == contract.database_kv_ok() && value == 42) {
+            return sqlite_http_encode_response(200, "OK", "42\n");
+        }
+        return sqlite_http_encode_response(500, "Internal Server Error",
+            "backend error\n");
+    }
+    if (@strEq(request.*.path, "/kv/8")) {
+        let value: i64 = 0;
+        let status: i32 = sqlite.sqlite_kv_get(database, 8, &value);
+        if (status == contract.database_kv_missing() && value == 0) {
+            return sqlite_http_encode_response(404, "Not Found", "missing\n");
+        }
+        return sqlite_http_encode_response(500, "Internal Server Error",
+            "backend error\n");
+    }
+    return sqlite_http_encode_response(404, "Not Found", "missing\n");
+}
+
+fn sqlite_http_exchange(listener: *net.NetTcpListener,
+                        database: *sqlite.SqliteKv,
+                        method: []u8, path: []u8,
+                        expected_status: i32,
+                        expected_body: []u8) SqliteHttpExchangeResult {
+    let state: SqliteHttpExchangeState = sqlite_http_exchange_state_empty();
+    let request_headers: ArrayList[http.Http1Header] =
+        make[http.Http1Header](1);
+    let request_result: http.Http1BufferResult = http.http1_encode_request(
+        method, path, "127.0.0.1", request_headers, ""
+    );
+    free[http.Http1Header](&request_headers);
+    if (request_result.ok == 0) {
+        return sqlite_http_exchange_finish(&state, 1);
+    }
+    state.request = http.http1_buffer_take(&request_result);
+
+    let client_result: net.NetTcpStreamResult = net.net_tcp_connect_ipv4(
+        listener.*.local, 2000
+    );
+    if (client_result.ok == 0) {
+        return sqlite_http_exchange_finish(&state, 2);
+    }
+    state.client = net.net_tcp_stream_take(&client_result);
+    let server_result: net.NetTcpStreamResult = net.net_tcp_accept(listener, 2000);
+    if (server_result.ok == 0) {
+        return sqlite_http_exchange_finish(&state, 3);
+    }
+    state.server = net.net_tcp_stream_take(&server_result);
+
+    let request_send: net.NetIoResult = net.net_tcp_send_all_bounded(
+        &state.client, http.http1_buffer_slice(&state.request), 4096, 1024, 7
+    );
+    let received_request_result: service.Http1ReceiveResult =
+        service.http1_receive_message_bounded(
+            &state.server, http.http1_default_limits(), 4096
+        );
+    let request_receive_ok: i32 = received_request_result.ok;
+    let request_receive_calls: i32 = received_request_result.calls;
+    // A successful receive result owns its buffer even if an independent send
+    // assertion below failed, so transfer it before evaluating the joint path.
+    if (request_receive_ok != 0) {
+        state.received_request =
+            service.http1_receive_take(&received_request_result);
+    }
+    if (request_send.ok == 0 || request_send.calls < 2 ||
+        request_receive_ok == 0 || request_receive_calls < 2) {
+        return sqlite_http_exchange_finish(&state, 4);
+    }
+    let parsed_request_result: http.Http1RequestResult = http.http1_parse_request(
+        http.http1_buffer_slice(&state.received_request)
+    );
+    if (parsed_request_result.ok == 0) {
+        return sqlite_http_exchange_finish(&state, 5);
+    }
+    state.parsed_request =
+        http.http1_request_take(&parsed_request_result);
+
+    let response_result: http.Http1BufferResult =
+        sqlite_http_route(database, &state.parsed_request);
+    if (response_result.ok == 0) {
+        return sqlite_http_exchange_finish(&state, 6);
+    }
+    state.response = http.http1_buffer_take(&response_result);
+    let response_send: net.NetIoResult = net.net_tcp_send_all_bounded(
+        &state.server, http.http1_buffer_slice(&state.response), 4096, 1024, 5
+    );
+    let received_response_result: service.Http1ReceiveResult =
+        service.http1_receive_message_bounded(
+            &state.client, http.http1_default_limits(), 4096
+        );
+    let response_receive_ok: i32 = received_response_result.ok;
+    let response_receive_calls: i32 = received_response_result.calls;
+    if (response_receive_ok != 0) {
+        state.received_response =
+            service.http1_receive_take(&received_response_result);
+    }
+    if (response_send.ok == 0 || response_send.calls < 2 ||
+        response_receive_ok == 0 || response_receive_calls < 2) {
+        return sqlite_http_exchange_finish(&state, 7);
+    }
+    let parsed_response_result: http.Http1ResponseResult =
+        http.http1_parse_response(
+            http.http1_buffer_slice(&state.received_response)
+        );
+    if (parsed_response_result.ok == 0) {
+        return sqlite_http_exchange_finish(&state, 8);
+    }
+    state.parsed_response =
+        http.http1_response_take(&parsed_response_result);
+    let content_type: http.Http1HeaderLookup =
+        http.http1_response_header(&state.parsed_response, "content-type");
+    if (state.parsed_response.status != expected_status ||
+        !@strEq(state.parsed_response.body, expected_body) ||
+        content_type.count != 1 ||
+        !@strEq(content_type.value, "text/plain")) {
+        return sqlite_http_exchange_finish(&state, 9);
+    }
+    return sqlite_http_exchange_finish(&state, 0);
+}
+
+fn main() i32 {
+    let baseline: i64 = _zag_allocator_live_bytes();
+    let database: sqlite.SqliteKv = sqlite.sqlite_kv_open(2);
+    if (database.status != contract.database_kv_ok()) { return 1; }
+    if (sqlite.sqlite_kv_put(&database, 7, 42) != contract.database_kv_ok()) {
+        sqlite.sqlite_kv_close(&database);
+        return 2;
+    }
+
+    let listener_result: net.NetTcpListenerResult = net.net_tcp_listen_ipv4(
+        net.net_ipv4_endpoint(net.net_ipv4_loopback(), 0), 4, 2000
+    );
+    if (listener_result.ok == 0) {
+        sqlite.sqlite_kv_close(&database);
+        return 3;
+    }
+    let listener: net.NetTcpListener =
+        net.net_tcp_listener_take(&listener_result);
+
+    // Inject a deterministic deepest-path failure: the server sends and the
+    // client parses a valid 200 response, but the caller expects 201.  Code 9
+    // is therefore reached with every exchange owner acquired.  The unified
+    // cleanup must release all buffers/views and both sockets before return.
+    let cleanup_baseline: i64 = _zag_allocator_live_bytes();
+    let injected: SqliteHttpExchangeResult = sqlite_http_exchange(
+        &listener, &database, "GET", "/kv/7", 201, "42\n"
+    );
+    if (injected.code != 9 || sqlite_http_exchange_fds_closed(&injected) == 0 ||
+        _zag_allocator_live_bytes() != cleanup_baseline) {
+        net.net_tcp_listener_close(&listener);
+        sqlite.sqlite_kv_close(&database);
+        return 4;
+    }
+
+    let found: SqliteHttpExchangeResult = sqlite_http_exchange(
+        &listener, &database, "GET", "/kv/7", 200, "42\n"
+    );
+    let missing: SqliteHttpExchangeResult = sqlite_http_exchange(
+        &listener, &database, "GET", "/kv/8", 404, "missing\n"
+    );
+    let rejected: SqliteHttpExchangeResult = sqlite_http_exchange(
+        &listener, &database,
+        "POST", "/kv/7", 405, "method not allowed\n"
+    );
+    if (found.code != 0 || missing.code != 0 || rejected.code != 0 ||
+        sqlite_http_exchange_fds_closed(&found) == 0 ||
+        sqlite_http_exchange_fds_closed(&missing) == 0 ||
+        sqlite_http_exchange_fds_closed(&rejected) == 0) {
+        net.net_tcp_listener_close(&listener);
+        sqlite.sqlite_kv_close(&database);
+        return 5;
+    }
+
+    let count: i32 = 0;
+    if (sqlite.sqlite_kv_count(&database, &count) != contract.database_kv_ok() ||
+        count != 1) {
+        net.net_tcp_listener_close(&listener);
+        sqlite.sqlite_kv_close(&database);
+        return 6;
+    }
+    // Keep main-resource cleanup non-short-circuiting for the same reason as
+    // per-exchange cleanup: database close is attempted even if a listener
+    // close assertion unexpectedly fails.
+    let listener_close: i64 = net.net_tcp_listener_close(&listener);
+    let listener_double_close: i64 = net.net_tcp_listener_close(&listener);
+    let database_close: i32 = sqlite.sqlite_kv_close(&database);
+    let database_double_close: i32 = sqlite.sqlite_kv_close(&database);
+    if (listener_close != net.net_status_ok() ||
+        listener_double_close != net.net_status_invalid_state() ||
+        database_close != contract.database_kv_ok() ||
+        database_double_close != contract.database_kv_invalid()) {
+        return 7;
+    }
+    if (_zag_allocator_live_bytes() != baseline) { return 8; }
+    _zag_println(
+        "sqlite http service: value=42 missing=404 method=405 requests=3 cleanup_negative=1"
+    );
+    return 0;
+}

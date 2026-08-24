@@ -1,0 +1,215 @@
+// Native Linux/x86-64 bounded concurrent file-indexer reference application.
+//
+// The parent lists and sorts exactly three direct regular-file children, then
+// starts three captureless join-only workers with copied i64 task indexes.
+// Shared task/result memory is pre-mapped and each worker writes a disjoint
+// result slot.  Workers allocate nothing.  This intentionally does not claim a
+// general worker pool, recursive indexing, safe shared-memory inference, async
+// I/O, or portability beyond the compiler's Linux/x86-64 thread boundary.
+
+@import("std:linux_fs") as fs
+@import("std:rt")
+
+extern fn _zag_allocator_live_bytes() i64
+
+struct IndexTask {
+    name: *u8,
+    name_length: i32,
+    output: *u8,
+    output_capacity: i32,
+}
+
+struct IndexResult {
+    ok: i32,
+    code: i64,
+    bytes_read: i32,
+    read_calls: i32,
+    checksum: i64,
+}
+
+global let index_tasks: *IndexTask;
+global let index_results: *IndexResult;
+global let index_directory_fd: i64;
+global let index_gate: i32;
+
+fn index_worker(task_index: i64) void {
+    unsafe {
+        let gate: *mut i32 = (&index_gate) as *mut i32;
+        let _wait: i64 = @atomicWait32(gate, 0);
+        let task: IndexTask = index_tasks[task_index as i32];
+        let read: fs.LinuxFsReadResult =
+            fs.linux_fs_read_regular_at_prepared(
+                index_directory_fd, task.name, task.name_length,
+                256, task.output, task.output_capacity, 8
+            );
+        index_results[task_index as i32].ok = read.ok;
+        index_results[task_index as i32].code = read.code;
+        index_results[task_index as i32].bytes_read = read.bytes_read;
+        index_results[task_index as i32].read_calls = read.read_calls;
+        index_results[task_index as i32].checksum = read.checksum;
+    }
+}
+
+fn index_map(bytes: i32) *u8 {
+    let raw: i64 = _zag_raw_syscall(9, 0, bytes, 3, 34, 0 - 1, 0);
+    if (raw < 0) { return null as *u8; }
+    return raw as *u8;
+}
+
+fn index_unmap(memory: *u8, bytes: i32) i64 {
+    if (memory == null as *u8) { return 0 - 1; }
+    return _zag_raw_syscall(11, memory as i64, bytes, 0, 0, 0, 0);
+}
+
+fn index_write(bytes: []u8) void {
+    let offset: i32 = 0;
+    while (offset < bytes.len) {
+        let rc: i64 = _zag_raw_syscall(
+            1, 1, (_zag_slice_ptr(bytes) as i64) + offset,
+            bytes.len - offset, 0, 0, 0
+        );
+        if (rc <= 0) { return; }
+        offset = offset + rc as i32;
+    }
+}
+
+fn index_print_i64(value: i64, scratch: *u8) void {
+    let cursor: i32 = 32;
+    let n: i64 = value;
+    if (n == 0) {
+        scratch[31] = '0';
+        index_write(scratch[31..32]);
+        return;
+    }
+    while (n != 0 && cursor > 1) {
+        let quotient: i64 = n / 10;
+        let remainder: i64 = n - quotient * 10;
+        cursor = cursor - 1;
+        if (remainder < 0) { remainder = 0 - remainder; }
+        scratch[cursor] = (remainder + 48) as u8;
+        n = quotient;
+    }
+    if (value < 0) {
+        cursor = cursor - 1;
+        scratch[cursor] = '-';
+    }
+    index_write(scratch[cursor..32]);
+}
+
+fn index_cleanup(directory: *fs.LinuxFsDirectory, memory: *u8) i32 {
+    let close_rc: i64 = fs.linux_fs_directory_close(directory);
+    let unmap_rc: i64 = index_unmap(memory, 8192);
+    index_tasks = null as *IndexTask;
+    index_results = null as *IndexResult;
+    index_directory_fd = 0 - 1;
+    if (close_rc != 0 || unmap_rc != 0) { return 0; }
+    return 1;
+}
+
+fn main() i32 {
+    if (_zag_argc() != 2) { return 2; }
+    let allocator_baseline: i64 = _zag_allocator_live_bytes();
+    let opened: fs.LinuxFsDirectoryResult =
+        fs.linux_fs_directory_open(_zag_arg(1));
+    if (opened.ok == 0) { return 2; }
+    let directory: fs.LinuxFsDirectory = fs.linux_fs_directory_take(&opened);
+
+    // One private 8 KiB mapping holds every task, result, fixed-size name,
+    // fixed-size file buffer, and getdents scratch region.  Workers never call
+    // the Zag allocator or mmap/munmap.
+    let memory: *u8 = index_map(8192);
+    if (memory == null as *u8) {
+        fs.linux_fs_directory_close(&directory);
+        return 2;
+    }
+    let entries: *fs.LinuxFsEntry = memory as *fs.LinuxFsEntry;
+    let tasks: *IndexTask = (memory as i64 + 128) as *IndexTask;
+    let results: *IndexResult = (memory as i64 + 256) as *IndexResult;
+    let names: *u8 = (memory as i64 + 512) as *u8;
+    let outputs: *u8 = (memory as i64 + 1280) as *u8;
+    let scratch: *u8 = (memory as i64 + 2048) as *u8;
+    let print_scratch: *u8 = (memory as i64 + 6200) as *u8;
+
+    let i: i32 = 0;
+    while (i < 3) {
+        entries[i].name = (names as i64 + i * 256) as *u8;
+        entries[i].name_capacity = 256;
+        entries[i].name_length = 0;
+        entries[i].kind = 0;
+        tasks[i].name = null as *u8;
+        tasks[i].name_length = 0;
+        tasks[i].output = (outputs as i64 + i * 64) as *u8;
+        tasks[i].output_capacity = 64;
+        results[i].ok = 0;
+        results[i].code = fs.linux_fs_status_invalid_state();
+        results[i].bytes_read = 0;
+        results[i].read_calls = 0;
+        results[i].checksum = 0;
+        i = i + 1;
+    }
+
+    let listed: fs.LinuxFsListResult =
+        fs.linux_fs_list_regular_children_bounded(
+            &directory, entries, 3, scratch, 4096, 8
+        );
+    if (listed.ok == 0 || listed.count != 3) {
+        index_cleanup(&directory, memory);
+        return 3;
+    }
+    i = 0;
+    while (i < listed.count) {
+        tasks[i].name = entries[i].name;
+        tasks[i].name_length = entries[i].name_length;
+        i = i + 1;
+    }
+
+    index_tasks = tasks;
+    index_results = results;
+    index_directory_fd = directory.fd;
+    unsafe {
+        let first: *opaque = @threadSpawn(index_worker, 0);
+        let second: *opaque = @threadSpawn(index_worker, 1);
+        let third: *opaque = @threadSpawn(index_worker, 2);
+        index_gate = 1;
+        let gate: *mut i32 = (&index_gate) as *mut i32;
+        let _woken: i64 = @atomicWake32(gate, 3);
+        @threadJoin(first);
+        @threadJoin(second);
+        @threadJoin(third);
+    }
+
+    let total_bytes: i64 = 0;
+    let total_checksum: i64 = 0;
+    i = 0;
+    while (i < listed.count) {
+        if (results[i].ok == 0) {
+            index_cleanup(&directory, memory);
+            return 4;
+        }
+        total_bytes = total_bytes + results[i].bytes_read;
+        total_checksum = total_checksum + results[i].checksum;
+        i = i + 1;
+    }
+
+    i = 0;
+    while (i < listed.count) {
+        index_write(entries[i].name[0..entries[i].name_length]);
+        index_write(" bytes=");
+        index_print_i64(results[i].bytes_read, print_scratch);
+        index_write(" checksum=");
+        index_print_i64(results[i].checksum, print_scratch);
+        index_write("\n");
+        i = i + 1;
+    }
+    index_write("total files=");
+    index_print_i64(listed.count, print_scratch);
+    index_write(" bytes=");
+    index_print_i64(total_bytes, print_scratch);
+    index_write(" checksum=");
+    index_print_i64(total_checksum, print_scratch);
+    index_write("\n");
+
+    if (index_cleanup(&directory, memory) == 0) { return 5; }
+    if (_zag_allocator_live_bytes() != allocator_baseline) { return 6; }
+    return 0;
+}

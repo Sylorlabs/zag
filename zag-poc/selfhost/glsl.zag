@@ -1,0 +1,185 @@
+// selfhost/glsl.zag — Zag → GLSL 430 compute shader encoder for OpenGL compat.
+//
+// This is the compatibility-tier encoder for opengl-compat. It takes Zag
+// @kernel source and emits GLSL 430 compute shader text that can be loaded
+// by an OpenGL compute pipeline. It is NOT a native GPU backend — it is a
+// non-certified fallback path that uses the system's OpenGL runtime.
+//
+// Like spirv.zag and msl.zag, this encoder starts with a narrow, fully
+// validated kernel subset (the canonical fill kernel) and rejects every other
+// AST shape.
+//
+// The fill kernel maps to GLSL 430 as:
+//   #version 430
+//   layout(local_size_x = 1) in;
+//   layout(std430, binding = 0) buffer OutputBuffer { int out[]; };
+//   uniform int value;
+//   uniform int count;
+//   void main() {
+//       uint gid = gl_GlobalInvocationID.x;
+//       if (gid < count) { out[gid] = value; }
+//   }
+
+@import("parse.zag")
+
+// ── kernel validation (mirrors spirv.zag/msl.zag) ───────────────────────────
+fn glsl_is_id(n: *Node, want: []u8) bool {
+    return switch (n.*) {
+        .id => |x| @strEq(x.name, want),
+        else => false,
+    };
+}
+
+fn glsl_is_zero(n: *Node) bool {
+    return switch (n.*) {
+        .ilit => |x| @strEq(x.text, "0"),
+        else => false,
+    };
+}
+
+fn glsl_is_builtin_dim(n: *Node, name: []u8) bool {
+    let ok: bool = false;
+    switch (n.*) {
+        .call => |c| {
+            if (!glsl_is_id(c.callee, name) || len[*Node](c.args) != 1) { return false; }
+            ok = glsl_is_zero(get[*Node](c.args, 0));
+        }
+        else => { }
+    }
+    return ok;
+}
+
+fn glsl_is_global_index(n: *Node) bool {
+    let ok: bool = false;
+    switch (n.*) {
+        .bin => |add| {
+            if (!@strEq(add.op, "+") || !glsl_is_builtin_dim(add.r, "@gpuThreadIdx")) { return false; }
+            switch (add.l.*) {
+                .bin => |mul| {
+                    ok = @strEq(mul.op, "*") &&
+                        glsl_is_builtin_dim(mul.l, "@gpuBlockIdx") &&
+                        glsl_is_builtin_dim(mul.r, "@gpuBlockDim");
+                }
+                else => { }
+            }
+        }
+        else => { }
+    }
+    return ok;
+}
+
+fn glsl_has_annot(f: FnDecl, want: []u8) bool {
+    let i: i32 = 0;
+    while (i < len[[]u8](f.annots)) {
+        if (@strEq(get[[]u8](f.annots, i), want)) { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn glsl_is_fill_kernel(f: FnDecl) bool {
+    if (!glsl_has_annot(f, "@kernel") || len[Param](f.params) != 3 ||
+        !@strEq(f.ret, "void") || len[*Node](f.body) != 2) { return false; }
+    let p_out: Param = get[Param](f.params, 0);
+    let p_val: Param = get[Param](f.params, 1);
+    let p_cnt: Param = get[Param](f.params, 2);
+    if (!@strEq(p_out.pty, "[]i32") || !@strEq(p_val.pty, "i32") ||
+        !@strEq(p_cnt.pty, "i32")) { return false; }
+    let idx_name: []u8 = "";
+    switch (get[*Node](f.body, 0).*) {
+        .let_ => |l| {
+            if (l.has_init == 0 || !glsl_is_global_index(l.expr)) { return false; }
+            idx_name = l.name;
+        }
+        else => { return false; }
+    }
+    let valid: bool = false;
+    switch (get[*Node](f.body, 1).*) {
+        .if_ => |x| {
+            if (x.has_els != 0 || len[*Node](x.then_body) != 1) { return false; }
+            let cond_ok: bool = switch (x.cond.*) {
+                .bin => |b| @strEq(b.op, "<") && glsl_is_id(b.l, idx_name) && glsl_is_id(b.r, p_cnt.name),
+                else => false,
+            };
+            if (!cond_ok) { return false; }
+            switch (get[*Node](x.then_body, 0).*) {
+                .assign => |a| {
+                    if (!glsl_is_id(a.expr, p_val.name)) { return false; }
+                    valid = switch (a.target.*) {
+                        .idx => |ix| glsl_is_id(ix.base, p_out.name) && glsl_is_id(ix.idx, idx_name),
+                        else => false,
+                    };
+                }
+                else => { }
+            }
+        }
+        else => { }
+    }
+    return valid;
+}
+
+fn glsl_find_profile(decls: ArrayList[*Node]) i32 {
+    let found: i32 = 0;
+    let kernels: i32 = 0;
+    let i: i32 = 0;
+    while (i < len[*Node](decls)) {
+        switch (get[*Node](decls, i).*) {
+            .fn_decl => |f| {
+                if (glsl_has_annot(f, "@kernel") || glsl_has_annot(f, "@device")) {
+                    kernels = kernels + 1;
+                    if (glsl_is_fill_kernel(f)) { found = 1; }
+                }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    if (kernels != 1) { return 0; }
+    return found;
+}
+
+// ── GLSL text emission for the fill kernel ──────────────────────────────────
+fn glsl_emit_fill(out: *ArrayList[u8]) void {
+    let src: []u8 = "#version 430\nlayout(local_size_x = 1) in;\nlayout(std430, binding = 0) buffer OutputBuffer {\n    int out_data[];\n};\nuniform int value;\nuniform int count;\nvoid main() {\n    uint gid = gl_GlobalInvocationID.x;\n    if (gid < count) {\n        out_data[gid] = value;\n    }\n}\n";
+    let i: i32 = 0;
+    while (i < src.len) { push[u8](out, src[i]); i = i + 1; }
+}
+
+// ── public entry point ──────────────────────────────────────────────────────
+fn emit_glsl(src: []u8, errors: *i32) ArrayList[u8] {
+    let decls: ArrayList[*Node] = parse_program(src);
+    let out: ArrayList[u8] = make[u8](256);
+    let profile: i32 = glsl_find_profile(decls);
+    if (profile == 0) {
+        _zag_println("znc[glsl]: unsupported kernel: require exactly one reviewed bounded fill @kernel; loops, host effects, unsafe pointers, and unknown forms are rejected");
+        errors.* = errors.* + 1;
+        return out;
+    }
+    if (profile == 1) {
+        glsl_emit_fill(&out);
+    } else {
+        _zag_println("znc[glsl]: only the fill profile is implemented for GLSL emission");
+        errors.* = errors.* + 1;
+        return out;
+    }
+    return out;
+}
+
+fn emit_glsl_dir(src: []u8, base_dir: []u8, errors: *i32) ArrayList[u8] {
+    let decls: ArrayList[*Node] = parse_program_dir(src, base_dir);
+    let out: ArrayList[u8] = make[u8](256);
+    let profile: i32 = glsl_find_profile(decls);
+    if (profile == 0) {
+        _zag_println("znc[glsl]: unsupported kernel: require exactly one reviewed bounded fill @kernel; loops, host effects, unsafe pointers, and unknown forms are rejected");
+        errors.* = errors.* + 1;
+        return out;
+    }
+    if (profile == 1) {
+        glsl_emit_fill(&out);
+    } else {
+        _zag_println("znc[glsl]: only the fill profile is implemented for GLSL emission");
+        errors.* = errors.* + 1;
+        return out;
+    }
+    return out;
+}

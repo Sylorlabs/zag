@@ -1,0 +1,556 @@
+// std:driver_emulator -- deterministic, generic virtual-device model.
+//
+// This is intentionally not an audio mock and contains no device-class
+// assumptions.  It models the failure and ordering boundaries shared by
+// memory-mapped, DMA-backed Linux devices.  A real driver core can run against
+// these transitions in userspace; an adapter is responsible for translating
+// the same transitions to a kernel/QEMU backend.
+
+@import("std:driver") as driver
+
+// These IDs are the deterministic differential-corpus slots.  The IRQ raise
+// slot also acknowledges the delivered interrupt; the separate ack name is a
+// compatibility alias for that composite event.  Width-specific MMIO is
+// explicit so the corpus cannot silently collapse typed accesses into the
+// generic side-effect path.
+pub fn emulator_event_mmio_write() i32 { return 0; }
+pub fn emulator_event_mmio_read() i32 { return 1; }
+pub fn emulator_event_dma_map() i32 { return 2; }
+pub fn emulator_event_dma_unmap() i32 { return 3; }
+pub fn emulator_event_dma_handoff() i32 { return 4; }
+pub fn emulator_event_dma_complete() i32 { return 5; }
+pub fn emulator_event_irq_raise() i32 { return 6; }
+pub fn emulator_event_irq_ack() i32 { return 6; }
+pub fn emulator_event_reset() i32 { return 7; }
+pub fn emulator_event_suspend() i32 { return 8; }
+pub fn emulator_event_resume() i32 { return 9; }
+pub fn emulator_event_hot_unplug() i32 { return 10; }
+pub fn emulator_event_power_loss() i32 { return 11; }
+pub fn emulator_event_malformed_descriptor() i32 { return 12; }
+pub fn emulator_event_stale_completion() i32 { return 13; }
+pub fn emulator_event_reordered_completion() i32 { return 14; }
+pub fn emulator_event_teardown() i32 { return 15; }
+pub fn emulator_event_mmio_write_width() i32 { return 16; }
+pub fn emulator_event_mmio_read_width() i32 { return 17; }
+
+pub struct EmulatorDevice {
+    bar_bytes: i64,
+    register_endian: i32,
+    register_epoch: i64,
+    mmio_value: u64,
+    mmio_width: i32,
+    mmio_reads: i32,
+    mmio_writes: i32,
+    dma_maps: i32,
+    dma_segments: i32,
+    dma_in_flight: i32,
+    descriptor_count: i32,
+    descriptor_head: i32,
+    descriptor_tail: i32,
+    irq_pending: i32,
+    irq_coalesced: i32,
+    reset_count: i32,
+    suspended: i32,
+    hot_unplugged: i32,
+    power_lost: i32,
+    quiescing: i32,
+    malformed: i32,
+    stale_completion: i32,
+    reordered_completion: i32,
+    double_completion: i32,
+    out_of_range_mmio: i32,
+    dma_after_teardown: i32,
+    leaked_handles: i32,
+    critical_allocations: i32,
+    critical_blocks: i32,
+    last_status: i32,
+}
+
+pub struct EmulatorResult {
+    status: i32,
+    value: i64,
+    invariant_failures: i32,
+}
+
+pub struct EmulatorCorpusResult {
+    status: i32,
+    seeds: i32,
+    steps: i32,
+    invariant_failures: i32,
+}
+
+pub fn emulator_new(bar_bytes: i64, endian: i32, descriptors: i32) EmulatorDevice {
+    return EmulatorDevice{
+        .bar_bytes = bar_bytes,
+        .register_endian = endian,
+        .register_epoch = 1,
+        .mmio_value = 0,
+        .mmio_width = driver.mmio_width_32(),
+        .mmio_reads = 0,
+        .mmio_writes = 0,
+        .dma_maps = 0,
+        .dma_segments = 0,
+        .dma_in_flight = 0,
+        .descriptor_count = descriptors,
+        .descriptor_head = 0,
+        .descriptor_tail = 0,
+        .irq_pending = 0,
+        .irq_coalesced = 0,
+        .reset_count = 0,
+        .suspended = 0,
+        .hot_unplugged = 0,
+        .power_lost = 0,
+        .quiescing = 0,
+        .malformed = 0,
+        .stale_completion = 0,
+        .reordered_completion = 0,
+        .double_completion = 0,
+        .out_of_range_mmio = 0,
+        .dma_after_teardown = 0,
+        .leaked_handles = 0,
+        .critical_allocations = 0,
+        .critical_blocks = 0,
+        .last_status = 0,
+    };
+}
+
+pub fn emulator_unavailable(hot_unplugged: i32, power_lost: i32,
+                            quiescing: i32) i32 {
+    if (hot_unplugged == 1 || power_lost == 1 || quiescing == 1) { return 1; }
+    return 0;
+}
+
+pub fn emulator_mmio_write(device: @borrows_mut *EmulatorDevice,
+                            offset: i64, value: i64) driver.DriverStatus @driver_control {
+    if (offset < 0 || offset >= device.*.bar_bytes) {
+        device.*.out_of_range_mmio = 1;
+        device.*.last_status = driver.driver_out_of_range();
+        return driver.DriverStatus{ .code = driver.driver_out_of_range(), .detail = offset as i64 };
+    }
+    if (emulator_unavailable(device.*.hot_unplugged, device.*.power_lost,
+                             device.*.quiescing) == 1) {
+        device.*.last_status = driver.driver_quiescing();
+        return driver.DriverStatus{ .code = driver.driver_quiescing(), .detail = value as i64 };
+    }
+    // A register write is a visible transaction in the model.  The value is
+    // retained as an epoch perturbation rather than stored in an unbounded
+    // heap, keeping the harness deterministic and architecture-neutral.
+    device.*.register_epoch = device.*.register_epoch + value + (device.*.register_endian as i64);
+    device.*.mmio_writes = device.*.mmio_writes + 1;
+    device.*.last_status = driver.driver_ok();
+    return driver.DriverStatus{ .code = driver.driver_ok(), .detail = device.*.register_epoch as i64 };
+}
+
+pub fn emulator_mmio_bytes(width: i32) i64 {
+    if (width == driver.mmio_width_8()) { return 1; }
+    if (width == driver.mmio_width_16()) { return 2; }
+    if (width == driver.mmio_width_32()) { return 4; }
+    if (width == driver.mmio_width_64()) { return 8; }
+    return 0;
+}
+
+// The virtual device stores the bus byte order, while the typed read returns
+// the caller's declared scalar value. Keeping both transitions explicit lets
+// the same core prove little/big-endian descriptor/register handling without
+// treating an MMIO transaction as an ordinary host-memory load.
+pub fn emulator_swap_register(value: u64, width: i32, endian: i32) u64 {
+    if (endian != driver.endian_big() || width == driver.mmio_width_8()) {
+        return value;
+    }
+    let bytes: i64 = emulator_mmio_bytes(width);
+    let remaining: u64 = value;
+    let swapped: u64 = 0;
+    let i: i64 = 0;
+    while (i < bytes) {
+        swapped = (swapped << 8) | (remaining & 255);
+        remaining = remaining >> 8;
+        i = i + 1;
+    }
+    return swapped;
+}
+
+pub fn emulator_mmio_write_width(device: @borrows_mut *EmulatorDevice,
+                                  offset: i64, width: i32,
+                                  value: u64) driver.DriverStatus @driver_control {
+    let bytes: i64 = emulator_mmio_bytes(width);
+    if (bytes == 0 || driver.mmio_endian_valid(device.*.register_endian) == 0 ||
+        offset < 0 || offset % bytes != 0 || offset + bytes > device.*.bar_bytes) {
+        device.*.out_of_range_mmio = 1;
+        device.*.last_status = driver.driver_out_of_range();
+        return driver.DriverStatus{ .code = driver.driver_out_of_range(), .detail = offset };
+    }
+    if (emulator_unavailable(device.*.hot_unplugged, device.*.power_lost,
+                             device.*.quiescing) == 1) {
+        device.*.last_status = driver.driver_quiescing();
+        return driver.DriverStatus{ .code = driver.driver_quiescing(), .detail = value as i64 };
+    }
+    device.*.mmio_value = emulator_swap_register(value, width, device.*.register_endian);
+    device.*.mmio_width = width;
+    device.*.mmio_writes = device.*.mmio_writes + 1;
+    device.*.register_epoch = device.*.register_epoch + 1;
+    device.*.last_status = driver.driver_ok();
+    return driver.DriverStatus{ .code = driver.driver_ok(), .detail = device.*.mmio_value as i64 };
+}
+
+pub fn emulator_mmio_read_width(device: @borrows_mut *EmulatorDevice,
+                                 offset: i64, width: i32) EmulatorResult @driver_control {
+    let bytes: i64 = emulator_mmio_bytes(width);
+    if (bytes == 0 || driver.mmio_endian_valid(device.*.register_endian) == 0 ||
+        offset < 0 || offset % bytes != 0 || offset + bytes > device.*.bar_bytes) {
+        device.*.out_of_range_mmio = 1;
+        device.*.last_status = driver.driver_out_of_range();
+        return EmulatorResult{ .status = driver.driver_out_of_range(), .value = 0,
+            .invariant_failures = emulator_invariants(device) };
+    }
+    if (emulator_unavailable(device.*.hot_unplugged, device.*.power_lost,
+                             device.*.quiescing) == 1) {
+        device.*.last_status = driver.driver_quiescing();
+        return EmulatorResult{ .status = driver.driver_quiescing(), .value = 0,
+            .invariant_failures = emulator_invariants(device) };
+    }
+    if (device.*.mmio_width != width) {
+        device.*.last_status = driver.driver_invalid_argument();
+        return EmulatorResult{ .status = driver.driver_invalid_argument(), .value = 0,
+            .invariant_failures = emulator_invariants(device) };
+    }
+    device.*.mmio_reads = device.*.mmio_reads + 1;
+    device.*.last_status = driver.driver_ok();
+    return EmulatorResult{ .status = driver.driver_ok(),
+        .value = emulator_swap_register(device.*.mmio_value, width,
+                                        device.*.register_endian) as i64,
+        .invariant_failures = emulator_invariants(device) };
+}
+
+pub fn emulator_register_raw_value(device: @borrows *EmulatorDevice) u64 {
+    return device.*.mmio_value;
+}
+
+pub fn emulator_dma_map(device: @borrows_mut *EmulatorDevice,
+                        segments: i32, alignment: i64) driver.DriverStatus @driver_control {
+    if (emulator_unavailable(device.*.hot_unplugged, device.*.power_lost,
+                             device.*.quiescing) == 1) {
+        return driver.DriverStatus{ .code = driver.driver_quiescing(), .detail = 0 };
+    }
+    if (segments <= 0 || alignment <= 0) {
+        return driver.DriverStatus{ .code = driver.driver_invalid_argument(), .detail = alignment as i64 };
+    }
+    device.*.dma_maps = device.*.dma_maps + 1;
+    device.*.dma_segments = device.*.dma_segments + segments;
+    device.*.last_status = driver.driver_ok();
+    return driver.DriverStatus{ .code = driver.driver_ok(), .detail = device.*.dma_maps as i64 };
+}
+
+pub fn emulator_dma_unmap(device: @borrows_mut *EmulatorDevice,
+                          segments: i32) driver.DriverStatus @driver_control {
+    if (device.*.dma_maps == 0) {
+        return driver.DriverStatus{ .code = driver.driver_stale_handle(), .detail = 0 };
+    }
+    if (device.*.dma_in_flight != 0) {
+        return driver.DriverStatus{ .code = driver.driver_busy(), .detail = device.*.dma_in_flight as i64 };
+    }
+    if (segments <= 0 || segments > device.*.dma_segments) {
+        return driver.DriverStatus{ .code = driver.driver_invalid_argument(), .detail = segments as i64 };
+    }
+    device.*.dma_segments = device.*.dma_segments - segments;
+    device.*.dma_maps = device.*.dma_maps - 1;
+    device.*.last_status = driver.driver_ok();
+    return driver.DriverStatus{ .code = driver.driver_ok(), .detail = device.*.dma_maps as i64 };
+}
+
+pub fn emulator_dma_handoff(device: @borrows_mut *EmulatorDevice,
+                            descriptors: i32) driver.DriverStatus @driver_control {
+    if (emulator_unavailable(device.*.hot_unplugged, device.*.power_lost,
+                             device.*.quiescing) == 1 || device.*.dma_maps == 0) {
+        if (device.*.quiescing == 1) { device.*.dma_after_teardown = 1; }
+        return driver.DriverStatus{ .code = driver.driver_quiescing(), .detail = descriptors as i64 };
+    }
+    if (descriptors <= 0 || descriptors > device.*.descriptor_count) {
+        device.*.malformed = 1;
+        return driver.DriverStatus{ .code = driver.driver_invalid_argument(), .detail = descriptors as i64 };
+    }
+    if (device.*.dma_in_flight < 0 ||
+        descriptors > device.*.descriptor_count - device.*.dma_in_flight) {
+        // A full ring is a recoverable saturation condition, not malformed
+        // input.  Ownership stays mapped and the caller must drain before
+        // retrying the handoff.
+        return driver.DriverStatus{ .code = driver.driver_busy(),
+            .detail = device.*.dma_in_flight as i64 };
+    }
+    device.*.dma_in_flight = device.*.dma_in_flight + descriptors;
+    device.*.descriptor_tail = (device.*.descriptor_tail + descriptors) % device.*.descriptor_count;
+    device.*.last_status = driver.driver_ok();
+    return driver.DriverStatus{ .code = driver.driver_ok(), .detail = device.*.dma_in_flight as i64 };
+}
+
+pub fn emulator_dma_complete(device: @borrows_mut *EmulatorDevice,
+                             descriptors: i32) driver.DriverStatus @driver_control {
+    if (descriptors <= 0 || descriptors > device.*.dma_in_flight) {
+        // Rejecting a stale completion does not itself complete a descriptor
+        // twice. The invariant is reserved for an actual double decrement;
+        // the rejected attempt remains visible through its status code.
+        return driver.DriverStatus{ .code = driver.driver_stale_handle(), .detail = descriptors as i64 };
+    }
+    device.*.dma_in_flight = device.*.dma_in_flight - descriptors;
+    device.*.descriptor_head = (device.*.descriptor_head + descriptors) % device.*.descriptor_count;
+    device.*.last_status = driver.driver_ok();
+    return driver.DriverStatus{ .code = driver.driver_ok(), .detail = device.*.dma_in_flight as i64 };
+}
+
+pub fn emulator_irq_raise(device: @borrows_mut *EmulatorDevice,
+                           coalesced: i32) driver.DriverStatus @irq {
+    if (emulator_unavailable(device.*.hot_unplugged, device.*.power_lost,
+                             device.*.quiescing) == 1) {
+        return driver.DriverStatus{ .code = driver.driver_quiescing(), .detail = 0 };
+    }
+    device.*.irq_pending = 1;
+    if (coalesced != 0) { device.*.irq_coalesced = device.*.irq_coalesced + 1; }
+    return driver.DriverStatus{ .code = driver.driver_ok(), .detail = device.*.irq_coalesced as i64 };
+}
+
+pub fn emulator_irq_ack(device: @borrows_mut *EmulatorDevice) driver.DriverStatus @irq {
+    if (device.*.irq_pending == 0) {
+        return driver.DriverStatus{ .code = driver.driver_stale_handle(), .detail = 0 };
+    }
+    device.*.irq_pending = 0;
+    return driver.DriverStatus{ .code = driver.driver_ok(), .detail = 0 };
+}
+
+pub fn emulator_reset(device: @borrows_mut *EmulatorDevice) driver.DriverStatus @driver_control {
+    device.*.register_epoch = device.*.register_epoch + 1;
+    device.*.mmio_value = 0;
+    device.*.mmio_width = driver.mmio_width_32();
+    device.*.dma_in_flight = 0;
+    device.*.descriptor_head = 0;
+    device.*.descriptor_tail = 0;
+    device.*.irq_pending = 0;
+    device.*.reset_count = device.*.reset_count + 1;
+    device.*.malformed = 0;
+    device.*.stale_completion = 0;
+    device.*.reordered_completion = 0;
+    device.*.last_status = driver.driver_ok();
+    return driver.DriverStatus{ .code = driver.driver_ok(), .detail = device.*.reset_count as i64 };
+}
+
+pub fn emulator_suspend(device: @borrows_mut *EmulatorDevice) driver.DriverStatus @driver_control {
+    device.*.suspended = 1;
+    device.*.last_status = driver.driver_ok();
+    return driver.DriverStatus{ .code = driver.driver_ok(), .detail = 0 };
+}
+
+pub fn emulator_resume(device: @borrows_mut *EmulatorDevice) driver.DriverStatus @driver_control {
+    device.*.suspended = 0;
+    device.*.last_status = driver.driver_ok();
+    return driver.DriverStatus{ .code = driver.driver_ok(), .detail = device.*.register_epoch as i64 };
+}
+
+pub fn emulator_hot_unplug(device: @borrows_mut *EmulatorDevice) driver.DriverStatus @driver_teardown {
+    device.*.hot_unplugged = 1;
+    device.*.quiescing = 1;
+    if (device.*.dma_in_flight != 0) { device.*.dma_after_teardown = 1; }
+    return driver.DriverStatus{ .code = driver.driver_ok(), .detail = device.*.dma_in_flight as i64 };
+}
+
+pub fn emulator_power_loss(device: @borrows_mut *EmulatorDevice) driver.DriverStatus @driver_control {
+    device.*.power_lost = 1;
+    device.*.irq_pending = 0;
+    return driver.DriverStatus{ .code = driver.driver_ok(), .detail = device.*.register_epoch as i64 };
+}
+
+pub fn emulator_malformed_descriptor(device: @borrows_mut *EmulatorDevice) driver.DriverStatus @driver_control {
+    device.*.malformed = 1;
+    return driver.DriverStatus{ .code = driver.driver_invalid_argument(), .detail = -1 };
+}
+
+pub fn emulator_stale_completion(device: @borrows_mut *EmulatorDevice) driver.DriverStatus @driver_control {
+    device.*.stale_completion = 1;
+    return driver.DriverStatus{ .code = driver.driver_stale_handle(), .detail = device.*.register_epoch as i64 };
+}
+
+pub fn emulator_reordered_completion(device: @borrows_mut *EmulatorDevice) driver.DriverStatus @driver_control {
+    device.*.reordered_completion = 1;
+        return driver.DriverStatus{ .code = driver.driver_busy(), .detail = device.*.descriptor_head as i64 };
+}
+
+pub fn emulator_teardown(device: @borrows_mut *EmulatorDevice) driver.DriverStatus @driver_teardown {
+    device.*.quiescing = 1;
+    // Teardown cannot make outstanding mappings disappear.  The caller must
+    // first drain completions, acknowledge pending IRQ state, and unmap every
+    // DMA segment; otherwise a later device event would be a use-after-teardown
+    // disguised as successful cleanup.
+    if (device.*.dma_in_flight != 0 || device.*.irq_pending != 0 ||
+        device.*.dma_maps != 0 || device.*.dma_segments != 0) {
+        return driver.DriverStatus{ .code = driver.driver_busy(), .detail = device.*.dma_in_flight as i64 };
+    }
+    device.*.last_status = driver.driver_ok();
+    return driver.DriverStatus{ .code = driver.driver_ok(), .detail = 0 };
+}
+
+pub fn emulator_invariants(device: @borrows *EmulatorDevice) i32 {
+    let failures: i32 = 0;
+    if (device.*.out_of_range_mmio != 0) { failures = failures | 1; }
+    if (device.*.double_completion != 0) { failures = failures | 2; }
+    if (device.*.dma_after_teardown != 0) { failures = failures | 4; }
+    if (device.*.leaked_handles != 0) { failures = failures | 8; }
+    if (device.*.critical_allocations != 0) { failures = failures | 16; }
+    if (device.*.critical_blocks != 0) { failures = failures | 32; }
+    if (device.*.dma_in_flight < 0 || device.*.dma_maps < 0) { failures = failures | 64; }
+    if (device.*.dma_segments < 0 || device.*.irq_coalesced < 0) { failures = failures | 256; }
+    if (device.*.descriptor_count > 0 &&
+        (device.*.descriptor_head < 0 || device.*.descriptor_head >= device.*.descriptor_count ||
+         device.*.descriptor_tail < 0 || device.*.descriptor_tail >= device.*.descriptor_count)) {
+        failures = failures | 512;
+    }
+    if (device.*.descriptor_count <= 0) { failures = failures | 128; }
+    return failures;
+}
+
+pub fn emulator_snapshot(device: @borrows *EmulatorDevice) EmulatorResult {
+    return EmulatorResult{
+        .status = device.*.last_status,
+        .value = device.*.register_epoch,
+        .invariant_failures = emulator_invariants(device),
+    };
+}
+
+// Bounded fault-injection sequence used by both the userspace corpus and the
+// QEMU-loaded module. Every injected fault is followed by the declared
+// recovery/quiescence transition; a stale completion or malformed descriptor
+// is therefore observable without manufacturing an invariant failure.
+pub fn emulator_run_fault_status() i32 @driver_control {
+    let device: EmulatorDevice = emulator_new(256, driver.endian_big(), 16);
+    let mapped: driver.DriverStatus = emulator_dma_map(&device, 1, 64);
+    let handed: driver.DriverStatus = emulator_dma_handoff(&device, 1);
+    let completed: driver.DriverStatus = emulator_dma_complete(&device, 1);
+    let unmapped: driver.DriverStatus = emulator_dma_unmap(&device, 1);
+    let raised: driver.DriverStatus = emulator_irq_raise(&device, 1);
+    let acknowledged: driver.DriverStatus = emulator_irq_ack(&device);
+    let reset: driver.DriverStatus = emulator_reset(&device);
+    let suspended: driver.DriverStatus = emulator_suspend(&device);
+    let resumed: driver.DriverStatus = emulator_resume(&device);
+    let malformed: driver.DriverStatus = emulator_malformed_descriptor(&device);
+    let stale: driver.DriverStatus = emulator_stale_completion(&device);
+    let reordered: driver.DriverStatus = emulator_reordered_completion(&device);
+    let recovered: driver.DriverStatus = emulator_reset(&device);
+    let power: driver.DriverStatus = emulator_power_loss(&device);
+    let unplugged: driver.DriverStatus = emulator_hot_unplug(&device);
+    let torn_down: driver.DriverStatus = emulator_teardown(&device);
+    let snapshot: EmulatorResult = emulator_snapshot(&device);
+    return (mapped.code == driver.driver_ok() && handed.code == driver.driver_ok() &&
+        completed.code == driver.driver_ok() && unmapped.code == driver.driver_ok() &&
+        raised.code == driver.driver_ok() && acknowledged.code == driver.driver_ok() &&
+        reset.code == driver.driver_ok() && suspended.code == driver.driver_ok() &&
+        resumed.code == driver.driver_ok() && malformed.code == driver.driver_invalid_argument() &&
+        stale.code == driver.driver_stale_handle() && reordered.code == driver.driver_busy() &&
+        recovered.code == driver.driver_ok() && power.code == driver.driver_ok() &&
+        unplugged.code == driver.driver_ok() && torn_down.code == driver.driver_ok() &&
+        snapshot.invariant_failures == 0) as i32;
+}
+
+// Deterministic differential corpus driver. The event generator deliberately
+// uses only bounded integer state; it is reproducible across the userspace and
+// QEMU adapters and never treats host randomness as hardware evidence.
+pub fn emulator_run_differential(seed: i64, steps: i32) EmulatorCorpusResult @driver_control {
+    let state: i64 = seed;
+    if (state < 0) { state = 0 - state; }
+    let device: EmulatorDevice = emulator_new(256, driver.endian_little(), 16);
+    let bounded_steps: i32 = steps;
+    if (bounded_steps < 0) { bounded_steps = 0; }
+    if (bounded_steps > 256) { bounded_steps = 256; }
+    let i: i32 = 0;
+    while (i < bounded_steps) {
+        state = (state * 1103 + 97) % 1000003;
+        // Keep the generator aligned with every public event kind above. A
+        // corpus that only samples the happy-path eight-way subset cannot
+        // exercise hot-unplug, power loss, stale/reordered completions, or
+        // teardown ownership races.
+        let event: i32 = (state % 18) as i32;
+        if (event == 0) {
+            let offset: i64 = (state % device.bar_bytes);
+            let _status_mmio: driver.DriverStatus = emulator_mmio_write(&device, offset, state);
+        } else if (event == 1) {
+            let _read: EmulatorResult = emulator_mmio_read_width(&device, 0, driver.mmio_width_32());
+        } else if (event == 2) {
+            if (device.dma_maps == 0) {
+                let _status_map: driver.DriverStatus = emulator_dma_map(&device, 1, 64);
+            }
+        } else if (event == 3) {
+            if (device.dma_maps != 0 && device.dma_in_flight == 0) {
+                let _status_unmap: driver.DriverStatus = emulator_dma_unmap(&device, 1);
+            }
+        } else if (event == 4) {
+            if (device.dma_maps != 0 && device.dma_in_flight == 0 &&
+                emulator_unavailable(device.hot_unplugged, device.power_lost,
+                                     device.quiescing) == 0) {
+                let _status_handoff: driver.DriverStatus = emulator_dma_handoff(&device, 1);
+            }
+        } else if (event == 5) {
+            if (device.dma_in_flight != 0) {
+                let _status_complete: driver.DriverStatus = emulator_dma_complete(&device, 1);
+            }
+        } else if (event == 6) {
+            let _raise: driver.DriverStatus = emulator_irq_raise(&device, (state & 1) as i32);
+            let _ack: driver.DriverStatus = emulator_irq_ack(&device);
+        } else if (event == 7) {
+            let _reset: driver.DriverStatus = emulator_reset(&device);
+        } else if (event == 8) {
+            let _suspend: driver.DriverStatus = emulator_suspend(&device);
+            let _resume: driver.DriverStatus = emulator_resume(&device);
+        } else if (event == 9) {
+            let _resume_only: driver.DriverStatus = emulator_resume(&device);
+        } else if (event == 10) {
+            // A hot-remove is a teardown boundary, not a license for a
+            // completion to arrive after ownership ended.  Drain the bounded
+            // in-flight descriptors before injecting the unplug event; a
+            // separate direct lifecycle test can still inject the unsafe race
+            // and observe `dma_after_teardown`.
+            while (device.dma_in_flight != 0) {
+                let _drain: driver.DriverStatus = emulator_dma_complete(&device, 1);
+            }
+            let _unplug: driver.DriverStatus = emulator_hot_unplug(&device);
+        } else if (event == 11) {
+            let _power: driver.DriverStatus = emulator_power_loss(&device);
+        } else if (event == 12) {
+            let _malformed: driver.DriverStatus = emulator_malformed_descriptor(&device);
+        } else if (event == 13) {
+            let _stale: driver.DriverStatus = emulator_stale_completion(&device);
+        } else if (event == 14) {
+            let _reordered: driver.DriverStatus = emulator_reordered_completion(&device);
+        } else if (event == 15) {
+            let _teardown: driver.DriverStatus = emulator_teardown(&device);
+        } else if (event == 16) {
+            let _write_width: driver.DriverStatus = emulator_mmio_write_width(
+                &device, 0, driver.mmio_width_32(), state as u64);
+        } else {
+            let _read_width: EmulatorResult = emulator_mmio_read_width(
+                &device, 0, driver.mmio_width_32());
+        }
+        i = i + 1;
+    }
+    if (device.dma_in_flight != 0) {
+        let _reset_final: driver.DriverStatus = emulator_reset(&device);
+    }
+    if (device.irq_pending != 0) {
+        let _ack_final: driver.DriverStatus = emulator_irq_ack(&device);
+    }
+    while (device.dma_maps != 0 && device.dma_in_flight == 0) {
+        let _unmap_final: driver.DriverStatus = emulator_dma_unmap(&device, 1);
+    }
+    let final_teardown: driver.DriverStatus = emulator_teardown(&device);
+    if (final_teardown.code != driver.driver_ok()) { device.leaked_handles = 1; }
+    if (device.dma_maps != 0 || device.dma_segments != 0 || device.irq_pending != 0) {
+        device.leaked_handles = 1;
+    }
+    let snapshot: EmulatorResult = emulator_snapshot(&device);
+    return EmulatorCorpusResult{ .status = snapshot.status, .seeds = 1,
+        .steps = bounded_steps, .invariant_failures = snapshot.invariant_failures };
+}
+
+// Scalar adapter boundary used by the kernel/QEMU lifecycle fixture.  The
+// full corpus result remains available to userspace tests; this helper keeps
+// the module entrypoint independent of an aggregate return ABI while running
+// exactly the same deterministic virtual-device core.
+pub fn emulator_run_differential_status(seed: i64, steps: i32) i32 @driver_control {
+    let result: EmulatorCorpusResult = emulator_run_differential(seed, steps);
+    return (result.status == driver.driver_ok() &&
+        result.invariant_failures == 0) as i32;
+}

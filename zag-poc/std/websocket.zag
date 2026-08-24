@@ -1,0 +1,799 @@
+// std/websocket.zag -- bounded RFC 6455 opening handshake and frame codec.
+//
+// The client handshake, server acceptance, SHA-1, and base64 are implemented
+// in Zag.  Frames support complete text, binary, ping, pong, and close messages.
+// Client encoders always mask; server encoders never mask; parsers require the
+// caller-selected peer role.  Text and close reasons are validated as UTF-8.
+//
+// Deliberate limits: no fragmentation/continuations, extensions (including
+// compression), 64-bit frame lengths, TLS, HTTP/2/3, proxying, async I/O, or
+// connection state machine.  The largest accepted payload is 65535 bytes.
+
+@import("list.zag")
+@import("http1.zag") as http
+
+struct WebSocketBuffer {
+    bytes: ArrayList[u8],
+    open: i32,
+}
+
+struct WebSocketBufferResult {
+    ok: i32,
+    code: i64,
+    value: WebSocketBuffer,
+}
+
+struct WebSocketFrame {
+    opcode: i32,
+    payload: ArrayList[u8],
+    open: i32,
+}
+
+struct WebSocketFrameResult {
+    ok: i32,
+    code: i64,
+    value: WebSocketFrame,
+}
+
+fn websocket_status_ok() i64 { return 0; }
+fn websocket_status_invalid_argument() i64 { return 0 - 7301; }
+fn websocket_status_limit() i64 { return 0 - 7302; }
+fn websocket_status_truncated() i64 { return 0 - 7303; }
+fn websocket_status_malformed() i64 { return 0 - 7304; }
+fn websocket_status_unsupported() i64 { return 0 - 7305; }
+fn websocket_status_protocol() i64 { return 0 - 7306; }
+fn websocket_status_invalid_utf8() i64 { return 0 - 7307; }
+fn websocket_status_handshake() i64 { return 0 - 7308; }
+fn websocket_status_invalid_state() i64 { return 0 - 7309; }
+
+fn websocket_opcode_text() i32 { return 1; }
+fn websocket_opcode_binary() i32 { return 2; }
+fn websocket_opcode_close() i32 { return 8; }
+fn websocket_opcode_ping() i32 { return 9; }
+fn websocket_opcode_pong() i32 { return 10; }
+
+fn websocket_empty_bytes() ArrayList[u8] {
+    return ArrayList[u8]{ .data = null as *u8, .len = 0, .cap = 0 };
+}
+
+fn websocket_empty_buffer() WebSocketBuffer {
+    return WebSocketBuffer{ .bytes = websocket_empty_bytes(), .open = 0 };
+}
+
+fn websocket_empty_frame() WebSocketFrame {
+    return WebSocketFrame{
+        .opcode = 0, .payload = websocket_empty_bytes(), .open = 0,
+    };
+}
+
+fn websocket_buffer_failure(code: i64) WebSocketBufferResult {
+    return WebSocketBufferResult{
+        .ok = 0, .code = code, .value = websocket_empty_buffer(),
+    };
+}
+
+fn websocket_frame_failure(code: i64) WebSocketFrameResult {
+    return WebSocketFrameResult{
+        .ok = 0, .code = code, .value = websocket_empty_frame(),
+    };
+}
+
+fn websocket_buffer_take(result: *WebSocketBufferResult) WebSocketBuffer {
+    if (result.*.ok == 0 || result.*.value.open == 0) {
+        return websocket_empty_buffer();
+    }
+    let value: WebSocketBuffer = result.*.value;
+    result.*.value = websocket_empty_buffer();
+    result.*.ok = 0;
+    result.*.code = websocket_status_invalid_state();
+    return value;
+}
+
+fn websocket_frame_take(result: *WebSocketFrameResult) WebSocketFrame {
+    if (result.*.ok == 0 || result.*.value.open == 0) {
+        return websocket_empty_frame();
+    }
+    let value: WebSocketFrame = result.*.value;
+    result.*.value = websocket_empty_frame();
+    result.*.ok = 0;
+    result.*.code = websocket_status_invalid_state();
+    return value;
+}
+
+fn websocket_buffer_slice(buffer: *WebSocketBuffer) []u8 {
+    if (buffer.*.open == 0) { return ""; }
+    return buffer.*.bytes.data[0..buffer.*.bytes.len];
+}
+
+fn websocket_frame_payload(frame: *WebSocketFrame) []u8 {
+    if (frame.*.open == 0) { return ""; }
+    return frame.*.payload.data[0..frame.*.payload.len];
+}
+
+fn websocket_buffer_close(buffer: *WebSocketBuffer) i64 {
+    if (buffer.*.open == 0) { return websocket_status_invalid_state(); }
+    buffer.*.open = 0;
+    free[u8](&buffer.*.bytes);
+    return websocket_status_ok();
+}
+
+fn websocket_frame_close(frame: *WebSocketFrame) i64 {
+    if (frame.*.open == 0) { return websocket_status_invalid_state(); }
+    frame.*.open = 0;
+    free[u8](&frame.*.payload);
+    return websocket_status_ok();
+}
+
+fn websocket_rotl32(value: u32, amount: i32) u32 {
+    return (value << amount) | (value >> (32 - amount));
+}
+
+fn websocket_sha1_bounded(input: []u8,
+                          max_input_bytes: i32) WebSocketBufferResult {
+    if (max_input_bytes < 0 || max_input_bytes > 1048576) {
+        return websocket_buffer_failure(websocket_status_invalid_argument());
+    }
+    if (input.len > max_input_bytes) {
+        return websocket_buffer_failure(websocket_status_limit());
+    }
+    let padded_length: i32 = ((input.len + 9 + 63) / 64) * 64;
+    let padded: ArrayList[u8] = make[u8](padded_length);
+    let i: i32 = 0;
+    while (i < input.len) {
+        push[u8](&padded, input[i]);
+        i = i + 1;
+    }
+    push[u8](&padded, 128);
+    while (padded.len < padded_length - 8) { push[u8](&padded, 0); }
+    let bit_length: u64 = (input.len as u64) * 8;
+    let length_shift: i32 = 56;
+    while (length_shift >= 0) {
+        push[u8](&padded, ((bit_length >> length_shift) & 255) as u8);
+        length_shift = length_shift - 8;
+    }
+
+    let words: ArrayList[u32] = make[u32](80);
+    let word_index: i32 = 0;
+    while (word_index < 80) {
+        push[u32](&words, 0);
+        word_index = word_index + 1;
+    }
+    let h0: u32 = 1732584193;
+    let h1: u32 = 4023233417;
+    let h2: u32 = 2562383102;
+    let h3: u32 = 271733878;
+    let h4: u32 = 3285377520;
+    let block: i32 = 0;
+    while (block < padded.len) {
+        let t: i32 = 0;
+        while (t < 16) {
+            let offset: i32 = block + t * 4;
+            words.data[t] = ((padded.data[offset] as u32) << 24) |
+                ((padded.data[offset + 1] as u32) << 16) |
+                ((padded.data[offset + 2] as u32) << 8) |
+                (padded.data[offset + 3] as u32);
+            t = t + 1;
+        }
+        while (t < 80) {
+            words.data[t] = websocket_rotl32(
+                words.data[t - 3] ^ words.data[t - 8] ^
+                words.data[t - 14] ^ words.data[t - 16], 1
+            );
+            t = t + 1;
+        }
+        let a: u32 = h0;
+        let b: u32 = h1;
+        let c: u32 = h2;
+        let d: u32 = h3;
+        let e: u32 = h4;
+        t = 0;
+        while (t < 80) {
+            let f: u32 = 0;
+            let k: u32 = 0;
+            if (t < 20) {
+                f = (b & c) | ((b ^ (4294967295 as u32)) & d);
+                k = 1518500249;
+            } else if (t < 40) {
+                f = b ^ c ^ d;
+                k = 1859775393;
+            } else if (t < 60) {
+                f = (b & c) | (b & d) | (c & d);
+                k = 2400959708;
+            } else {
+                f = b ^ c ^ d;
+                k = 3395469782;
+            }
+            let temporary: u32 = websocket_rotl32(a, 5) + f + e + k + words.data[t];
+            e = d;
+            d = c;
+            c = websocket_rotl32(b, 30);
+            b = a;
+            a = temporary;
+            t = t + 1;
+        }
+        h0 = h0 + a;
+        h1 = h1 + b;
+        h2 = h2 + c;
+        h3 = h3 + d;
+        h4 = h4 + e;
+        block = block + 64;
+    }
+    let digest: ArrayList[u8] = make[u8](20);
+    let states: ArrayList[u32] = make[u32](5);
+    push[u32](&states, h0);
+    push[u32](&states, h1);
+    push[u32](&states, h2);
+    push[u32](&states, h3);
+    push[u32](&states, h4);
+    let state_index: i32 = 0;
+    while (state_index < states.len) {
+        push[u8](&digest, ((states.data[state_index] >> 24) & 255) as u8);
+        push[u8](&digest, ((states.data[state_index] >> 16) & 255) as u8);
+        push[u8](&digest, ((states.data[state_index] >> 8) & 255) as u8);
+        push[u8](&digest, (states.data[state_index] & 255) as u8);
+        state_index = state_index + 1;
+    }
+    free[u32](&states);
+    free[u32](&words);
+    free[u8](&padded);
+    return WebSocketBufferResult{
+        .ok = 1, .code = websocket_status_ok(),
+        .value = WebSocketBuffer{ .bytes = digest, .open = 1 },
+    };
+}
+
+fn websocket_sha1(input: []u8) WebSocketBufferResult {
+    return websocket_sha1_bounded(input, 65536);
+}
+
+fn websocket_base64_value(byte: u8) i32 {
+    if (byte >= 65 && byte <= 90) { return (byte - 65) as i32; }
+    if (byte >= 97 && byte <= 122) { return (byte - 97 + 26) as i32; }
+    if (byte >= 48 && byte <= 57) { return (byte - 48 + 52) as i32; }
+    if (byte == 43) { return 62; }
+    if (byte == 47) { return 63; }
+    return 0 - 1;
+}
+
+fn websocket_base64_encode_bounded(input: []u8, max_input_bytes: i32,
+                                   max_output_bytes: i32) WebSocketBufferResult {
+    if (max_input_bytes < 0 || max_input_bytes > 1048576 ||
+        max_output_bytes < 0 || max_output_bytes > 2097152) {
+        return websocket_buffer_failure(websocket_status_invalid_argument());
+    }
+    if (input.len > max_input_bytes) {
+        return websocket_buffer_failure(websocket_status_limit());
+    }
+    let needed: i32 = ((input.len + 2) / 3) * 4;
+    if (needed > max_output_bytes) {
+        return websocket_buffer_failure(websocket_status_limit());
+    }
+    let alphabet: []u8 =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let output: ArrayList[u8] = make[u8](needed);
+    let i: i32 = 0;
+    while (i < input.len) {
+        let remaining: i32 = input.len - i;
+        let first: i32 = input[i] as i32;
+        let second: i32 = 0;
+        let third: i32 = 0;
+        if (remaining > 1) { second = input[i + 1] as i32; }
+        if (remaining > 2) { third = input[i + 2] as i32; }
+        push[u8](&output, alphabet[(first >> 2) & 63]);
+        push[u8](&output, alphabet[((first & 3) << 4) | ((second >> 4) & 15)]);
+        if (remaining > 1) {
+            push[u8](&output, alphabet[((second & 15) << 2) | ((third >> 6) & 3)]);
+        } else {
+            push[u8](&output, 61);
+        }
+        if (remaining > 2) { push[u8](&output, alphabet[third & 63]); }
+        else { push[u8](&output, 61); }
+        i = i + 3;
+    }
+    return WebSocketBufferResult{
+        .ok = 1, .code = websocket_status_ok(),
+        .value = WebSocketBuffer{ .bytes = output, .open = 1 },
+    };
+}
+
+fn websocket_base64_encode(input: []u8) WebSocketBufferResult {
+    return websocket_base64_encode_bounded(input, 65536, 131072);
+}
+
+fn websocket_base64_decode_bounded(input: []u8, max_input_bytes: i32,
+                                   max_output_bytes: i32) WebSocketBufferResult {
+    if (max_input_bytes < 0 || max_input_bytes > 2097152 ||
+        max_output_bytes < 0 || max_output_bytes > 1048576) {
+        return websocket_buffer_failure(websocket_status_invalid_argument());
+    }
+    if (input.len > max_input_bytes) {
+        return websocket_buffer_failure(websocket_status_limit());
+    }
+    if (input.len % 4 != 0) {
+        return websocket_buffer_failure(websocket_status_malformed());
+    }
+    let capacity: i32 = (input.len / 4) * 3;
+    if (capacity > max_output_bytes + 2) {
+        return websocket_buffer_failure(websocket_status_limit());
+    }
+    let output: ArrayList[u8] = make[u8](capacity);
+    let i: i32 = 0;
+    while (i < input.len) {
+        let last: i32 = (i + 4 == input.len) as i32;
+        let v0: i32 = websocket_base64_value(input[i]);
+        let v1: i32 = websocket_base64_value(input[i + 1]);
+        if (v0 < 0 || v1 < 0) {
+            free[u8](&output);
+            return websocket_buffer_failure(websocket_status_malformed());
+        }
+        let third_padding: i32 = (input[i + 2] == 61) as i32;
+        let fourth_padding: i32 = (input[i + 3] == 61) as i32;
+        let v2: i32 = 0;
+        let v3: i32 = 0;
+        if (third_padding == 0) { v2 = websocket_base64_value(input[i + 2]); }
+        if (fourth_padding == 0) { v3 = websocket_base64_value(input[i + 3]); }
+        if (v2 < 0 || v3 < 0 || third_padding != 0 && fourth_padding == 0 ||
+            (third_padding != 0 || fourth_padding != 0) && last == 0 ||
+            (third_padding != 0 && (v1 & 15) != 0) ||
+            (fourth_padding != 0 && third_padding == 0 && (v2 & 3) != 0)) {
+            free[u8](&output);
+            return websocket_buffer_failure(websocket_status_malformed());
+        }
+        if (output.len >= max_output_bytes) {
+            free[u8](&output);
+            return websocket_buffer_failure(websocket_status_limit());
+        }
+        push[u8](&output, ((v0 << 2) | (v1 >> 4)) as u8);
+        if (third_padding == 0) {
+            if (output.len >= max_output_bytes) {
+                free[u8](&output);
+                return websocket_buffer_failure(websocket_status_limit());
+            }
+            push[u8](&output, (((v1 & 15) << 4) | (v2 >> 2)) as u8);
+        }
+        if (fourth_padding == 0) {
+            if (output.len >= max_output_bytes) {
+                free[u8](&output);
+                return websocket_buffer_failure(websocket_status_limit());
+            }
+            push[u8](&output, (((v2 & 3) << 6) | v3) as u8);
+        }
+        i = i + 4;
+    }
+    return WebSocketBufferResult{
+        .ok = 1, .code = websocket_status_ok(),
+        .value = WebSocketBuffer{ .bytes = output, .open = 1 },
+    };
+}
+
+fn websocket_base64_decode(input: []u8) WebSocketBufferResult {
+    return websocket_base64_decode_bounded(input, 131072, 65536);
+}
+
+fn websocket_accept_value(key: []u8) WebSocketBufferResult {
+    let decoded_result: WebSocketBufferResult =
+        websocket_base64_decode_bounded(key, 64, 32);
+    if (decoded_result.ok == 0) {
+        return websocket_buffer_failure(websocket_status_handshake());
+    }
+    let decoded: WebSocketBuffer = websocket_buffer_take(&decoded_result);
+    if (decoded.bytes.len != 16) {
+        let _decoded_invalid_close: i64 = websocket_buffer_close(&decoded);
+        return websocket_buffer_failure(websocket_status_handshake());
+    }
+    let _decoded_close: i64 = websocket_buffer_close(&decoded);
+    let guid: []u8 = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    let combined: ArrayList[u8] = make[u8](key.len + guid.len);
+    let i: i32 = 0;
+    while (i < key.len) { push[u8](&combined, key[i]); i = i + 1; }
+    i = 0;
+    while (i < guid.len) { push[u8](&combined, guid[i]); i = i + 1; }
+    let digest_result: WebSocketBufferResult = websocket_sha1_bounded(
+        combined.data[0..combined.len], 128
+    );
+    free[u8](&combined);
+    if (digest_result.ok == 0) {
+        return websocket_buffer_failure(digest_result.code);
+    }
+    let digest: WebSocketBuffer = websocket_buffer_take(&digest_result);
+    let encoded_result: WebSocketBufferResult = websocket_base64_encode_bounded(
+        digest.bytes.data[0..digest.bytes.len], 20, 28
+    );
+    let _digest_close: i64 = websocket_buffer_close(&digest);
+    return encoded_result;
+}
+
+fn websocket_from_http_buffer(result: *http.Http1BufferResult) WebSocketBufferResult {
+    if (result.*.ok == 0 || result.*.value.open == 0) {
+        return websocket_buffer_failure(websocket_status_handshake());
+    }
+    let owned: http.Http1Buffer = http.http1_buffer_take(result);
+    let bytes: ArrayList[u8] = owned.bytes;
+    owned.bytes = websocket_empty_bytes();
+    owned.open = 0;
+    return WebSocketBufferResult{
+        .ok = 1, .code = websocket_status_ok(),
+        .value = WebSocketBuffer{ .bytes = bytes, .open = 1 },
+    };
+}
+
+fn websocket_trimmed_range_equal(value: []u8, start: i32, end: i32,
+                                  wanted: []u8) i32 {
+    let left: i32 = start;
+    let right: i32 = end;
+    while (left < right && (value[left] == 32 || value[left] == 9)) {
+        left = left + 1;
+    }
+    while (right > left && (value[right - 1] == 32 || value[right - 1] == 9)) {
+        right = right - 1;
+    }
+    return http.http1_equal_case(value[left..right], wanted);
+}
+
+fn websocket_header_token(value: []u8, wanted: []u8) i32 {
+    let start: i32 = 0;
+    let i: i32 = 0;
+    while (i < value.len) {
+        if (value[i] == 44) {
+            if (websocket_trimmed_range_equal(value, start, i, wanted) != 0) {
+                return 1;
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    return websocket_trimmed_range_equal(value, start, value.len, wanted);
+}
+
+fn websocket_encode_client_handshake(host: []u8, path: []u8, key: []u8,
+                                     limits: http.Http1Limits) WebSocketBufferResult {
+    let accept_probe: WebSocketBufferResult = websocket_accept_value(key);
+    if (accept_probe.ok == 0) {
+        return websocket_buffer_failure(websocket_status_handshake());
+    }
+    let unused_accept: WebSocketBuffer = websocket_buffer_take(&accept_probe);
+    let _unused_accept_close: i64 = websocket_buffer_close(&unused_accept);
+    let headers: ArrayList[http.Http1Header] = make[http.Http1Header](4);
+    push[http.Http1Header](&headers, http.Http1Header{
+        .name = "Upgrade", .value = "websocket",
+    });
+    push[http.Http1Header](&headers, http.Http1Header{
+        .name = "Connection", .value = "Upgrade",
+    });
+    push[http.Http1Header](&headers, http.Http1Header{
+        .name = "Sec-WebSocket-Key", .value = key,
+    });
+    push[http.Http1Header](&headers, http.Http1Header{
+        .name = "Sec-WebSocket-Version", .value = "13",
+    });
+    let encoded: http.Http1BufferResult = http.http1_encode_request_bounded(
+        "GET", path, host, headers, "", limits
+    );
+    free[http.Http1Header](&headers);
+    if (encoded.ok == 0) {
+        return websocket_buffer_failure(websocket_status_handshake());
+    }
+    return websocket_from_http_buffer(&encoded);
+}
+
+fn websocket_encode_client_handshake_default(host: []u8, path: []u8,
+                                             key: []u8) WebSocketBufferResult {
+    return websocket_encode_client_handshake(
+        host, path, key, http.http1_default_limits()
+    );
+}
+
+fn websocket_accept_handshake(request_bytes: []u8,
+                              limits: http.Http1Limits) WebSocketBufferResult {
+    let parsed_result: http.Http1RequestResult =
+        http.http1_parse_request_bounded(request_bytes, limits);
+    if (parsed_result.ok == 0) {
+        return websocket_buffer_failure(websocket_status_handshake());
+    }
+    let request: http.Http1Request = http.http1_request_take(&parsed_result);
+    let upgrade: http.Http1HeaderLookup =
+        http.http1_request_header(&request, "upgrade");
+    let connection: http.Http1HeaderLookup =
+        http.http1_request_header(&request, "connection");
+    let version: http.Http1HeaderLookup =
+        http.http1_request_header(&request, "sec-websocket-version");
+    let key_header: http.Http1HeaderLookup =
+        http.http1_request_header(&request, "sec-websocket-key");
+    let valid: i32 = (@strEq(request.method, "GET") && request.body.len == 0 &&
+        upgrade.count == 1 && http.http1_equal_case(upgrade.value, "websocket") != 0 &&
+        connection.count == 1 && websocket_header_token(connection.value, "upgrade") != 0 &&
+        version.count == 1 && @strEq(version.value, "13") &&
+        key_header.count == 1) as i32;
+    if (valid == 0) {
+        let _invalid_request_close: i64 = http.http1_request_close(&request);
+        return websocket_buffer_failure(websocket_status_handshake());
+    }
+    let accept_result: WebSocketBufferResult = websocket_accept_value(key_header.value);
+    if (accept_result.ok == 0) {
+        let _bad_key_request_close: i64 = http.http1_request_close(&request);
+        return websocket_buffer_failure(websocket_status_handshake());
+    }
+    let accept: WebSocketBuffer = websocket_buffer_take(&accept_result);
+    let headers: ArrayList[http.Http1Header] = make[http.Http1Header](3);
+    push[http.Http1Header](&headers, http.Http1Header{
+        .name = "Upgrade", .value = "websocket",
+    });
+    push[http.Http1Header](&headers, http.Http1Header{
+        .name = "Connection", .value = "Upgrade",
+    });
+    push[http.Http1Header](&headers, http.Http1Header{
+        .name = "Sec-WebSocket-Accept",
+        .value = accept.bytes.data[0..accept.bytes.len],
+    });
+    let response: http.Http1BufferResult = http.http1_encode_response_bounded(
+        101, "Switching Protocols", headers, "", limits
+    );
+    free[http.Http1Header](&headers);
+    let _accept_close: i64 = websocket_buffer_close(&accept);
+    let _request_close: i64 = http.http1_request_close(&request);
+    if (response.ok == 0) {
+        return websocket_buffer_failure(websocket_status_handshake());
+    }
+    return websocket_from_http_buffer(&response);
+}
+
+fn websocket_accept_handshake_default(request_bytes: []u8) WebSocketBufferResult {
+    return websocket_accept_handshake(request_bytes, http.http1_default_limits());
+}
+
+fn websocket_validate_server_handshake(response_bytes: []u8, key: []u8,
+                                       limits: http.Http1Limits) i64 {
+    let parsed_result: http.Http1ResponseResult =
+        http.http1_parse_response_bounded(response_bytes, limits);
+    if (parsed_result.ok == 0) { return websocket_status_handshake(); }
+    let response: http.Http1Response = http.http1_response_take(&parsed_result);
+    let upgrade: http.Http1HeaderLookup =
+        http.http1_response_header(&response, "upgrade");
+    let connection: http.Http1HeaderLookup =
+        http.http1_response_header(&response, "connection");
+    let accept_header: http.Http1HeaderLookup =
+        http.http1_response_header(&response, "sec-websocket-accept");
+    let content_length: http.Http1HeaderLookup =
+        http.http1_response_header(&response, "content-length");
+    let expected_result: WebSocketBufferResult = websocket_accept_value(key);
+    if (expected_result.ok == 0) {
+        let _bad_key_response_close: i64 = http.http1_response_close(&response);
+        return websocket_status_handshake();
+    }
+    let expected: WebSocketBuffer = websocket_buffer_take(&expected_result);
+    let valid: i32 = (response.status == 101 && response.body.len == 0 &&
+        upgrade.count == 1 && http.http1_equal_case(upgrade.value, "websocket") != 0 &&
+        connection.count == 1 && websocket_header_token(connection.value, "upgrade") != 0 &&
+        accept_header.count == 1 && content_length.count == 0 &&
+        @strEq(accept_header.value, expected.bytes.data[0..expected.bytes.len])) as i32;
+    let _expected_close: i64 = websocket_buffer_close(&expected);
+    let _response_close: i64 = http.http1_response_close(&response);
+    if (valid == 0) { return websocket_status_handshake(); }
+    return websocket_status_ok();
+}
+
+fn websocket_validate_server_handshake_default(response_bytes: []u8,
+                                               key: []u8) i64 {
+    return websocket_validate_server_handshake(
+        response_bytes, key, http.http1_default_limits()
+    );
+}
+
+fn websocket_utf8_valid(value: []u8) i32 {
+    let i: i32 = 0;
+    while (i < value.len) {
+        let first: u8 = value[i];
+        if (first <= 127) { i = i + 1; }
+        else if (first >= 194 && first <= 223) {
+            if (i + 1 >= value.len || value[i + 1] < 128 || value[i + 1] > 191) {
+                return 0;
+            }
+            i = i + 2;
+        } else if (first >= 224 && first <= 239) {
+            if (i + 2 >= value.len || value[i + 2] < 128 || value[i + 2] > 191) {
+                return 0;
+            }
+            let second: u8 = value[i + 1];
+            if ((first == 224 && (second < 160 || second > 191)) ||
+                (first == 237 && (second < 128 || second > 159)) ||
+                (first != 224 && first != 237 && (second < 128 || second > 191))) {
+                return 0;
+            }
+            i = i + 3;
+        } else if (first >= 240 && first <= 244) {
+            if (i + 3 >= value.len || value[i + 2] < 128 || value[i + 2] > 191 ||
+                value[i + 3] < 128 || value[i + 3] > 191) { return 0; }
+            let second: u8 = value[i + 1];
+            if ((first == 240 && (second < 144 || second > 191)) ||
+                (first == 244 && (second < 128 || second > 143)) ||
+                (first != 240 && first != 244 && (second < 128 || second > 191))) {
+                return 0;
+            }
+            i = i + 4;
+        } else { return 0; }
+    }
+    return 1;
+}
+
+fn websocket_opcode_valid(opcode: i32) i32 {
+    if (opcode == websocket_opcode_text() || opcode == websocket_opcode_binary() ||
+        opcode == websocket_opcode_close() || opcode == websocket_opcode_ping() ||
+        opcode == websocket_opcode_pong()) { return 1; }
+    return 0;
+}
+
+fn websocket_close_payload_valid(payload: []u8) i32 {
+    if (payload.len == 0) { return 1; }
+    if (payload.len == 1) { return 0; }
+    let code: i32 = ((payload[0] as i32) << 8) | (payload[1] as i32);
+    if (code < 1000 || code >= 5000 || code == 1004 || code == 1005 ||
+        code == 1006 || code == 1015 || (code >= 1016 && code <= 2999)) {
+        return 0;
+    }
+    return websocket_utf8_valid(payload[2..payload.len]);
+}
+
+fn websocket_payload_valid(opcode: i32, payload: []u8) i64 {
+    if (websocket_opcode_valid(opcode) == 0) { return websocket_status_protocol(); }
+    if (opcode >= 8 && payload.len > 125) { return websocket_status_limit(); }
+    if (opcode == websocket_opcode_text() && websocket_utf8_valid(payload) == 0) {
+        return websocket_status_invalid_utf8();
+    }
+    if (opcode == websocket_opcode_close() &&
+        websocket_close_payload_valid(payload) == 0) {
+        return websocket_status_protocol();
+    }
+    return websocket_status_ok();
+}
+
+fn websocket_encode_frame_bounded(opcode: i32, payload: []u8, masked: i32,
+                                  mask_key: u32, max_payload_bytes: i32,
+                                  max_frame_bytes: i32) WebSocketBufferResult {
+    if ((masked != 0 && masked != 1) || max_payload_bytes < 0 ||
+        max_payload_bytes > 65535 || max_frame_bytes < 2 ||
+        max_frame_bytes > 131072) {
+        return websocket_buffer_failure(websocket_status_invalid_argument());
+    }
+    if (payload.len > max_payload_bytes || payload.len > 65535) {
+        return websocket_buffer_failure(websocket_status_limit());
+    }
+    let payload_rc: i64 = websocket_payload_valid(opcode, payload);
+    if (payload_rc != websocket_status_ok()) {
+        return websocket_buffer_failure(payload_rc);
+    }
+    let extended: i32 = (payload.len >= 126) as i32;
+    let header_bytes: i32 = 2 + extended * 2 + masked * 4;
+    if (header_bytes + payload.len > max_frame_bytes) {
+        return websocket_buffer_failure(websocket_status_limit());
+    }
+    let output: ArrayList[u8] = make[u8](header_bytes + payload.len);
+    push[u8](&output, (128 | opcode) as u8);
+    if (extended == 0) {
+        push[u8](&output, (payload.len | (masked * 128)) as u8);
+    } else {
+        push[u8](&output, (126 | (masked * 128)) as u8);
+        push[u8](&output, ((payload.len >> 8) & 255) as u8);
+        push[u8](&output, (payload.len & 255) as u8);
+    }
+    let mask0: u8 = ((mask_key >> 24) & 255) as u8;
+    let mask1: u8 = ((mask_key >> 16) & 255) as u8;
+    let mask2: u8 = ((mask_key >> 8) & 255) as u8;
+    let mask3: u8 = (mask_key & 255) as u8;
+    if (masked != 0) {
+        push[u8](&output, mask0);
+        push[u8](&output, mask1);
+        push[u8](&output, mask2);
+        push[u8](&output, mask3);
+    }
+    let i: i32 = 0;
+    while (i < payload.len) {
+        let byte: u8 = payload[i];
+        if (masked != 0) {
+            if (i % 4 == 0) { byte = byte ^ mask0; }
+            else if (i % 4 == 1) { byte = byte ^ mask1; }
+            else if (i % 4 == 2) { byte = byte ^ mask2; }
+            else { byte = byte ^ mask3; }
+        }
+        push[u8](&output, byte);
+        i = i + 1;
+    }
+    return WebSocketBufferResult{
+        .ok = 1, .code = websocket_status_ok(),
+        .value = WebSocketBuffer{ .bytes = output, .open = 1 },
+    };
+}
+
+fn websocket_encode_client_frame(opcode: i32, payload: []u8,
+                                 mask_key: u32) WebSocketBufferResult {
+    return websocket_encode_frame_bounded(
+        opcode, payload, 1, mask_key, 65535, 65543
+    );
+}
+
+fn websocket_encode_server_frame(opcode: i32,
+                                 payload: []u8) WebSocketBufferResult {
+    return websocket_encode_frame_bounded(opcode, payload, 0, 0, 65535, 65539);
+}
+
+fn websocket_parse_frame_bounded(bytes: []u8, expected_masked: i32,
+                                 max_payload_bytes: i32) WebSocketFrameResult {
+    if ((expected_masked != 0 && expected_masked != 1) ||
+        max_payload_bytes < 0 || max_payload_bytes > 65535) {
+        return websocket_frame_failure(websocket_status_invalid_argument());
+    }
+    if (bytes.len < 2) { return websocket_frame_failure(websocket_status_truncated()); }
+    let first: i32 = bytes[0] as i32;
+    let second: i32 = bytes[1] as i32;
+    if ((first & 112) != 0) { return websocket_frame_failure(websocket_status_protocol()); }
+    if ((first & 128) == 0) { return websocket_frame_failure(websocket_status_unsupported()); }
+    let opcode: i32 = first & 15;
+    if (websocket_opcode_valid(opcode) == 0) {
+        return websocket_frame_failure(websocket_status_protocol());
+    }
+    let masked: i32 = ((second & 128) != 0) as i32;
+    if (masked != expected_masked) {
+        return websocket_frame_failure(websocket_status_protocol());
+    }
+    let length_code: i32 = second & 127;
+    let payload_length: i32 = 0;
+    let cursor: i32 = 2;
+    if (length_code <= 125) { payload_length = length_code; }
+    else if (length_code == 126) {
+        if (bytes.len < 4) {
+            return websocket_frame_failure(websocket_status_truncated());
+        }
+        payload_length = ((bytes[2] as i32) << 8) | (bytes[3] as i32);
+        cursor = 4;
+        if (payload_length < 126) {
+            return websocket_frame_failure(websocket_status_malformed());
+        }
+    } else { return websocket_frame_failure(websocket_status_unsupported()); }
+    if (payload_length > max_payload_bytes) {
+        return websocket_frame_failure(websocket_status_limit());
+    }
+    if (opcode >= 8 && payload_length > 125) {
+        return websocket_frame_failure(websocket_status_protocol());
+    }
+    if (masked != 0) {
+        if (bytes.len < cursor + 4) {
+            return websocket_frame_failure(websocket_status_truncated());
+        }
+        cursor = cursor + 4;
+    }
+    if (bytes.len < cursor + payload_length) {
+        return websocket_frame_failure(websocket_status_truncated());
+    }
+    if (bytes.len != cursor + payload_length) {
+        return websocket_frame_failure(websocket_status_malformed());
+    }
+    let payload: ArrayList[u8] = make[u8](payload_length);
+    let mask_start: i32 = cursor - 4;
+    let i: i32 = 0;
+    while (i < payload_length) {
+        let byte: u8 = bytes[cursor + i];
+        if (masked != 0) { byte = byte ^ bytes[mask_start + (i % 4)]; }
+        push[u8](&payload, byte);
+        i = i + 1;
+    }
+    let payload_rc: i64 = websocket_payload_valid(
+        opcode, payload.data[0..payload.len]
+    );
+    if (payload_rc != websocket_status_ok()) {
+        free[u8](&payload);
+        return websocket_frame_failure(payload_rc);
+    }
+    return WebSocketFrameResult{
+        .ok = 1, .code = websocket_status_ok(),
+        .value = WebSocketFrame{ .opcode = opcode, .payload = payload, .open = 1 },
+    };
+}
+
+fn websocket_parse_client_frame(bytes: []u8,
+                                max_payload_bytes: i32) WebSocketFrameResult {
+    return websocket_parse_frame_bounded(bytes, 1, max_payload_bytes);
+}
+
+fn websocket_parse_server_frame(bytes: []u8,
+                                max_payload_bytes: i32) WebSocketFrameResult {
+    return websocket_parse_frame_bounded(bytes, 0, max_payload_bytes);
+}

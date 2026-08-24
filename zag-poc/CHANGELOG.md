@@ -6,6 +6,116 @@ Pacific Time. Tags are listed in chronological order; all tags preceded
 
 ---
 
+## [Unreleased]
+
+### Added
+- **V2 unsafe/raw-pointer vertical slice** — edition-2027 now has a dedicated
+  unsafe-block AST node, direct `unsafe fn` declarations/call-site checks, and
+  `Unsafe` effect propagation into `@pure` and `@realtime`. Qualified pointer
+  categories reach native lowering, and shared semantic checks reject
+  safe-scope dereference, `*const` mutation, opaque dereference, raw-pointer
+  arithmetic outside unsafe, and ordinary type errors inside unsafe. Native
+  execution and AArch64/WASM/GPU lowering regressions cover the boundary; the
+  programs gate now retains actual exit status. Indirect calls, provenance,
+  alignment instrumentation, and the complete unsafe-operation inventory
+  remain incomplete.
+- **V2 raw-pointer nullability and address-space separation** — nullable raw
+  pointers must be explicitly unwrapped before dereference, with a native
+  execution regression for the valid path. Direct casts between generic,
+  host, device, and workgroup pointer spaces now fail before lowering and leave
+  no artifact. Provenance identity, bounds, aliasing, lifetime, and alignment
+  instrumentation remain incomplete.
+- **Shared declared-type authority** (`selfhost/typed.zag`) — native x86-64,
+  AArch64, WASM, GPU MLIR, and restricted gfx1010 builds now reject unknown
+  signature, generic-argument, cast, struct-literal, and explicit-local types
+  before backend lowering. The new E0202 path leaves no target artifact and is
+  exercised by `tests/run_typed_authority.sh`. Conservative shared expression
+  typing also rejects wrong-category returns, call arguments, assignments, and
+  arithmetic with E0203 while preserving existing numeric/generic extensions.
+  Backend IR unification and complete expression typing remain incomplete.
+- **Exact GPU IP/ring certification tuples** (`std/gpu.zag`) — certification
+  identity now includes both kernel HW-IP versions and IP-discovery revisions,
+  plus the available GFX and compute ring masks. A discovery revision or ring
+  topology change invalidates promotion instead of hiding behind an unchanged
+  device ID and firmware pair.
+- **Non-promotable virtual GPU certification** (`std/gpu.zag`) — a distinct
+  evidence type enforces compiler manifests, ownership/fences, 10,000 fills,
+  10,000 transfers, one million submissions, 86,400 logical soak ticks, raster
+  differentials, and zero anomalies. Its success code is explicitly virtual and
+  the type cannot be passed to physical automatic-promotion policy.
+- **User-selectable GPU backends** (`std/gpu.zag`) — applications can expose
+  `auto`, `cpu`, `virtual`, and `physical` without a language-mandated mode.
+  Auto chooses certified isolated hardware when available, otherwise the strict
+  virtual GPU or CPU; explicit physical selection retains the acknowledgement
+  boundary instead of disappearing behind the default.
+- **Named GFX10.1 instruction encoders** — the restricted native GPU backend
+  constructs its reviewed fill program from checked operand fields instead of
+  opaque whole-instruction literals. Out-of-range VGPR/SGPR/immediate fields
+  fail closed, the semantic decoder derives the same sequence, and the emitted
+  ZGK1 bundle remains byte-for-byte stable.
+- **Fail-closed Linux GPU isolation discovery**
+  (`std/linux_gpu_isolation.zag`) — distinguishes shared GPUVM/process-cleaner
+  and partition-control configurations from a probed SR-IOV VF with its own
+  IOMMU group and FLR reset support. Only the latter authorizes destructive GPU
+  testing. Includes fixture regressions and a live sysfs reporting example.
+- **Strict virtual GFX10.1 command processor** (`std/gfx1010_vm.zag`) — loads
+  compiler-owned ZGK1 bundles, decodes the complete supported instruction
+  sequence and PM4 register stream, verifies resource metadata, reserved bits,
+  and virtual addresses, then executes against bounded virtual GPU memory.
+  Unknown packets/registers and out-of-bounds dispatches fail closed without
+  opening DRM, enabling display-safe end-to-end compiler/runtime testing. Its
+  queue model enforces explicit CPU/device ownership, monotonic fences, memory
+  barriers, and permanent anomaly quarantine.
+- **Compiler-owned `std:` imports** — `@import("std:gfx1010_vm")` resolves from
+  the standard library shipped beside/with `znc`, cannot be shadowed by a
+  project's local `std/`, and rejects traversal syntax. `make install` now
+  installs the pure-Zag standard library alongside the self-hosted compiler.
+- **`continue` control flow** — the lexer, parser, AST, semantic walk, generic
+  cloning, and both native backends now support `continue;` with the correct
+  innermost-loop target. Nested-loop regressions run on x86-64 and AArch64.
+- **Static analyzer** (`selfhost/analyze.zag`) — a second analysis pass that runs
+  by default on every `znc` build/check, printing warnings to stderr:
+  - **Memory-leak detection**: `L0001` (a value from a manual allocator —
+    `zalloc`/`zalloc_i`/`_zag_malloc`/`_zag_realloc`/`@cacheAlignedAlloc` — that
+    is never freed, returned, aliased, or passed on) and `L0002` (an allocation
+    whose result is discarded immediately). Conservative: any ownership transfer
+    counts as "handled", so correct code is never flagged.
+  - **Algebraic-efficiency lints**: `E0101` identities (`x+0`, `x-0`, `x*1`,
+    `x/1`), `E0102` always-constant (`x*0`, `x-x`), and `E0103` strength
+    reduction (`× 2ᵏ` → shift) under `--analyze-pedantic`.
+  - Flags: on by default; `--no-analyze` silences; `--analyze-strict` fails the
+    build on findings; `--analyze-pedantic` enables `E0103`. Analysis never
+    changes the emitted binary (self-hosting fixpoint unaffected).
+  - Tests: `tests/run_analyzer.sh` / `make test-analyzer`.
+- **Native live code hot-reload** (`selfhost/native/hot_rt.zag` + `znc hot-patch`)
+  — swap a running program's machine code without restarting; in-memory state
+  survives. Build with `znc build --hot <src>`, drive the loop with
+  `zag_hot_should_continue()` / `zag_hot_wait()`, then after a layout-preserving
+  edit run `znc hot-patch <src>`; the process memcpy's the re-assembled `.text`
+  over its live code in place (guarded so a size-changing edit asks for a rebuild
+  instead of corrupting the process). Pure-Zag runtime, raw syscalls only, no
+  codegen changes. Demo: `examples/hot_demo.zag`. Tests: `tests/run_hot_reload.sh`
+  / `make test-hot-reload`.
+
+### Fixed
+- **Exact-width byte memory operations** — x86 native codegen now emits real
+  `movzx` byte loads and byte stores. The former 8-byte masked load/store
+  workaround could cross an mmap boundary at the final byte and intermittently
+  crash `znc`; a guard-page regression now proves both reads and writes remain
+  within the addressed byte.
+- **Native stack-frame high-water hardening** — function lowering now patches
+  each prologue from the authoritative number of slots actually allocated while
+  lowering. The pre-scan remains a sizing optimization, but an omitted scratch
+  or capture case can no longer under-reserve the frame and corrupt the stack.
+
+### Removed
+- **Non-Zag WASM execution oracles** — removed the Rust/Cargo Wasmtime host,
+  JavaScript/Node fallback, and compiler `--run` shell-out. WASM emission stays
+  pure Zag; execution now fails closed with `E0800` until a pure-Zag runtime is
+  implemented.
+
+---
+
 ## [2026.06.0] — 2026-06-30
 
 First formal CalVer release. `./znc` is the sole supported compiler: native
@@ -17,7 +127,6 @@ in-process `@total` SMT proofs — all from one seed binary.
   and `wasm.zag` merged into `znc.zag`; single `./bootstrap.sh` fixpoint.
 - **In-process SMT solver** (`smt_solve.zag`): QF_LIA/QF_NIA discharge for
   `@total` without shelling out to external tools on the normal path.
-- **WASM runtime harness**: `tests/wasm_invoke_host/` + `wasmtime_run.sh`.
 - **WASM tagged-union/enum switch** lowering (`examples/wasm_op.zag`).
 - **vsa_b\<N\> bitwidth vector operators**: XOR, OR, AND on `vsa_b<N>` types;
   per-program dimension scan so `ZAG_VSA_DEFINE` macros are emitted once per

@@ -1,0 +1,163 @@
+// Process identity for project-local zagd singleton locks.
+//
+// A PID by itself is not an identity: Linux can reuse it after a daemon exits.
+// Each lock therefore records the process start-time token from /proc/PID/stat,
+// and readers also verify that /proc/PID/cmdline is a zagd invocation for the
+// exact project root. A stale, malformed, reused, or unrelated PID is never
+// accepted as the project's daemon.
+
+@import("zagd_store.zag")
+
+extern fn _zag_read_file(path: []u8) []u8
+extern fn _zag_raw_syscall(num: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) i64
+
+fn zli_parse_pid(value: []u8) i64 {
+    let result: i64 = 0;
+    let i: i32 = 0;
+    while (i < value.len && value[i] >= '0' && value[i] <= '9') {
+        result = result * 10 + ((value[i] as i64) - 48);
+        if (result > 2147483647) { return 0 - 1; }
+        i = i + 1;
+    }
+    // Lock records are line-oriented. Accepting a numeric prefix would let a
+    // malformed record acquire the identity of an unrelated process.
+    if (i == 0 || i >= value.len || (value[i] != '\n' && value[i] != '\r')) { return 0 - 1; }
+    return result;
+}
+
+fn zli_lock_start(value: []u8) []u8 {
+    let first_newline: i32 = 0;
+    while (first_newline < value.len && value[first_newline] != '\n') {
+        first_newline = first_newline + 1;
+    }
+    if (first_newline >= value.len) { return ""; }
+    let start: i32 = first_newline + 1;
+    let end: i32 = start;
+    while (end < value.len && value[end] != '\n' && value[end] != '\r') {
+        if (value[end] < '0' || value[end] > '9') { return ""; }
+        end = end + 1;
+    }
+    if (end == start) { return ""; }
+    // Exactly two fields are allowed. Extra bytes are a forged/malformed lock,
+    // not metadata that may be ignored by a singleton decision.
+    if (end >= value.len) { return ""; }
+    let tail: i32 = end + 1;
+    if (tail < value.len && value[tail] == '\n') { if (tail + 1 != value.len) { return ""; } }
+    else if (tail != value.len) { return ""; }
+    return value[start..end];
+}
+
+// Linux /proc/PID/stat field 22. The command name is parenthesized and may
+// contain spaces or ')' bytes, so start after its last ')' and count fields
+// rather than splitting the complete record naively.
+fn zli_stat_start(value: []u8) []u8 {
+    let close: i32 = 0 - 1;
+    let i: i32 = 0;
+    while (i < value.len) {
+        if (value[i] == ')') { close = i; }
+        i = i + 1;
+    }
+    if (close < 0) { return ""; }
+    let at: i32 = close + 1;
+    let field: i32 = 3;
+    while (field <= 22) {
+        while (at < value.len && value[at] == ' ') { at = at + 1; }
+        let start: i32 = at;
+        while (at < value.len && value[at] != ' ' &&
+               value[at] != '\n' && value[at] != '\r') { at = at + 1; }
+        if (at == start) { return ""; }
+        if (field == 22) { return value[start..at]; }
+        field = field + 1;
+    }
+    return "";
+}
+
+fn zli_proc_path(pid: i64, leaf: []u8) []u8 {
+    let out:ArrayList[u8]=zagd_text(leaf.len+32);
+    zagd_text_append(&out,"/proc/");zagd_text_append_i64(&out,pid);
+    zagd_text_append_byte(&out,'/');zagd_text_append(&out,leaf);
+    return out.data[0..out.len];
+}
+
+fn zli_basename(value: []u8) []u8 {
+    let start: i32 = 0;
+    let i: i32 = 0;
+    while (i < value.len) {
+        if (value[i] == '/') { start = i + 1; }
+        i = i + 1;
+    }
+    return value[start..];
+}
+
+// The launcher may obtain a project root from getcwd with a trailing slash,
+// while the daemon canonicalizes that boundary before it publishes status.
+// Treat those two spellings as the same project identity.  This is deliberately
+// narrower than realpath canonicalization: it does not follow symlinks or
+// collapse `..`, so the command-line proof still binds the daemon to the
+// caller's actual project path.
+fn zli_project_path_eq(a: []u8, b: []u8) i32 {
+    let a_end: i32 = a.len;
+    let b_end: i32 = b.len;
+    while (a_end > 1 && a[a_end - 1] == '/') { a_end = a_end - 1; }
+    while (b_end > 1 && b[b_end - 1] == '/') { b_end = b_end - 1; }
+    if (a_end != b_end) { return 0; }
+    return @strEq(a[0..a_end], b[0..b_end]) as i32;
+}
+
+fn zli_cmdline_matches(value: []u8, root: []u8) i32 {
+    let token_start: i32 = 0;
+    let token_index: i32 = 0;
+    let executable_ok: i32 = 0;
+    let root_ok: i32 = 0;
+    let expect_root: i32 = 0;
+    let saw_root_flag: i32 = 0;
+    let i: i32 = 0;
+    while (i <= value.len) {
+        if (i == value.len || value[i] == 0) {
+            let token: []u8 = value[token_start..i];
+            if (token_index == 0) {
+                executable_ok = @strEq(zli_basename(token), "zagd") as i32;
+            } else if (expect_root == 1) {
+                root_ok = zli_project_path_eq(token, root);
+                expect_root = 0;
+            } else if (@strEq(token, "--root")) {
+                if (saw_root_flag == 1) { return 0; }
+                saw_root_flag = 1;
+                expect_root = 1;
+            }
+            token_index = token_index + 1;
+            token_start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (saw_root_flag == 0 && @strEq(root, ".")) { root_ok = 1; }
+    return (executable_ok == 1 && root_ok == 1 && expect_root == 0) as i32;
+}
+
+fn zagd_lock_record(pid: i64) []u8 {
+    if(pid<2){return "";}
+    let path:[]u8=zli_proc_path(pid,"stat");
+    let stat: []u8 = _zag_read_file(path);zagd_text_free(path);
+    let start: []u8 = zli_stat_start(stat);
+    if (start.len == 0) { if(stat.len>=0){_zag_free(_zag_slice_ptr(stat));}return ""; }
+    let out:ArrayList[u8]=zagd_text(start.len+32);zagd_text_append_i64(&out,pid);
+    zagd_text_append_byte(&out,'\n');zagd_text_append(&out,start);zagd_text_append_byte(&out,'\n');
+    _zag_free(_zag_slice_ptr(stat));
+    return out.data[0..out.len];
+}
+
+fn zagd_lock_identity_alive(record: []u8, root: []u8) i32 {
+    let pid: i64 = zli_parse_pid(record);
+    let expected_start: []u8 = zli_lock_start(record);
+    if (pid < 2 || expected_start.len == 0) { return 0; }
+    let stat_path:[]u8=zli_proc_path(pid,"stat");let stat:[]u8=_zag_read_file(stat_path);zagd_text_free(stat_path);
+    let actual_start: []u8 = zli_stat_start(stat);
+    if (actual_start.len == 0 || @strEq(actual_start, expected_start) == 0) { if(stat.len>=0){_zag_free(_zag_slice_ptr(stat));}return 0; }
+    _zag_free(_zag_slice_ptr(stat));
+    let cmdline_path:[]u8=zli_proc_path(pid,"cmdline");let cmdline: []u8 = _zag_read_file(cmdline_path);zagd_text_free(cmdline_path);
+    if (cmdline.len <= 0 || zli_cmdline_matches(cmdline, root) == 0) { if(cmdline.len>=0){_zag_free(_zag_slice_ptr(cmdline));}return 0; }
+    _zag_free(_zag_slice_ptr(cmdline));
+    let rc: i64 = _zag_raw_syscall(62, pid, 0, 0, 0, 0, 0);
+    if (rc == (0 - 3)) { return 0; }
+    return (rc == 0 || rc == (0 - 1)) as i32;
+}

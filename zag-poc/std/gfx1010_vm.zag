@@ -1,0 +1,357 @@
+// gfx1010_vm.zag — strict, deterministic virtual GFX10.1 command processor.
+//
+// This is not a semantic shortcut: it loads the compiler-owned ZGK1 bundle,
+// validates the complete supported instruction sequence, decodes the PM4
+// register stream, verifies resource metadata and virtual addresses, then
+// executes those instructions against bounded virtual GPU memory. Unknown
+// packets, registers, encodings, reserved bits, and out-of-range writes fail
+// closed. It never opens DRM and is safe on a display-only machine.
+
+@import("rt.zag")
+
+struct Gfx1010VmBundle {
+    raw: []u8,
+    code: []u8,
+    user_sgprs: i64,
+    system_sgprs: i64,
+    vgprs: i64,
+    rsrc1: i64,
+    rsrc2: i64,
+    workgroup_x: i64,
+    workgroup_y: i64,
+    workgroup_z: i64,
+    dispatch_initiator: i64,
+    pm4_profile: i64,
+    profile: i32, // 1 fill, 2 depth-write, 3 depth-tested packed RGB blend
+    ok: bool,
+}
+
+struct Gfx1010VmDispatch {
+    shader_va: i64,
+    target_va: i64,
+    depth_va: i64,
+    value: i64,
+    depth_value: i64,
+    alpha: i64,
+    local_x: i64,
+    local_y: i64,
+    local_z: i64,
+    grid_x: i64,
+    grid_y: i64,
+    grid_z: i64,
+    register_mask: i64,
+    ok: bool,
+}
+
+struct Gfx1010VmResult {
+    ok: bool,
+    workgroups: i64,
+    instructions: i64,
+    stores: i64,
+    fence: i64,
+    error_code: i32,
+}
+
+struct Gfx1010VmQueue {
+    owner: i32,       // 0 CPU, 1 virtual GPU
+    last_fence: i64,
+    disabled: bool,
+    submissions: i64,
+    instructions: i64,
+}
+
+fn gfxvm_queue_new() Gfx1010VmQueue {
+    return Gfx1010VmQueue{.owner=0,.last_fence=0,.disabled=false,
+        .submissions=0,.instructions=0};
+}
+
+fn gfxvm_release_to_device(q: *Gfx1010VmQueue) bool {
+    if (q.*.disabled || q.*.owner != 0) { return false; }
+    @memoryFence(); q.*.owner=1; return true;
+}
+
+fn gfxvm_acquire_from_device(q: *Gfx1010VmQueue, fence: i64) bool {
+    if (q.*.disabled) { return false; }
+    if (q.*.owner != 1 || fence != q.*.last_fence) { q.*.disabled=true; return false; }
+    @memoryFence(); q.*.owner=0; return true;
+}
+
+fn gfxvm_u32(b: []u8, off: i32) i64 {
+    if (off < 0 || off + 4 > b.len) { return 0; }
+    return (b[off] as i64) + (b[off+1] as i64) * 256 +
+        (b[off+2] as i64) * 65536 + (b[off+3] as i64) * 16777216;
+}
+
+fn gfxvm_hash(code: []u8) i64 {
+    let h: i64 = 2166136261;
+    let i: i32 = 0;
+    while (i < code.len) {
+        h = (h * 16777619 + (code[i] as i64)) % 4294967296;
+        i = i + 1;
+    }
+    return h;
+}
+
+// Complete decoder for the currently supported compiler profile. Each dword is
+// checked, including the two-dword global_store instruction and wait/end order.
+fn gfxvm_fill_isa_valid(code: []u8) bool {
+    if (code.len != 28) { return false; }
+    return gfxvm_u32(code,0) == 0x7E020203 &&
+        gfxvm_u32(code,4) == 0x34040282 &&
+        gfxvm_u32(code,8) == 0x7E060202 &&
+        gfxvm_u32(code,12) == 0xDC708000 &&
+        gfxvm_u32(code,16) == 0x00000302 &&
+        gfxvm_u32(code,20) == 0xBF8C3F70 &&
+        gfxvm_u32(code,24) == 0xBF810000;
+}
+
+fn gfxvm_depth_isa_valid(code:[]u8)bool{
+    if(code.len!=60){return false;}
+    return gfxvm_u32(code,0)==0x7E000206&&gfxvm_u32(code,4)==0x34020082&&
+        gfxvm_u32(code,8)==0xDC308000&&gfxvm_u32(code,12)==0x02020001&&
+        gfxvm_u32(code,16)==0xBF8C3F70&&gfxvm_u32(code,20)==0x7D060405&&
+        gfxvm_u32(code,24)==0xBF860007&&gfxvm_u32(code,28)==0x7E060204&&
+        gfxvm_u32(code,32)==0xDC708000&&gfxvm_u32(code,36)==0x00000301&&
+        gfxvm_u32(code,40)==0x7E080205&&gfxvm_u32(code,44)==0xDC708000&&
+        gfxvm_u32(code,48)==0x00020401&&gfxvm_u32(code,52)==0xBF8C3F70&&
+        gfxvm_u32(code,56)==0xBF810000;
+}
+
+// Independent complete golden decoder for the compiler's reviewed blend
+// profile. Keep these literal words separate from the encoder so a change to
+// an encoder cannot silently bless the VM oracle at the same time.
+fn gfxvm_blend_isa_valid(code:[]u8)bool{
+    if(code.len!=236){return false;}
+    return gfxvm_u32(code,0)==0x7e000207&&gfxvm_u32(code,4)==0x34020082&&
+        gfxvm_u32(code,8)==0xdc308000&&gfxvm_u32(code,12)==0x02020001&&
+        gfxvm_u32(code,16)==0xdc308000&&gfxvm_u32(code,20)==0x03000001&&
+        gfxvm_u32(code,24)==0xbf8c3f70&&gfxvm_u32(code,28)==0x7d060405&&
+        gfxvm_u32(code,32)==0xbf860031&&gfxvm_u32(code,36)==0x808806ff&&
+        gfxvm_u32(code,40)==0x00000100&&gfxvm_u32(code,44)==0x7e080204&&
+        gfxvm_u32(code,48)==0x7e0a0206&&gfxvm_u32(code,52)==0x7e0c0208&&
+        gfxvm_u32(code,56)==0x2c0e0890&&gfxvm_u32(code,60)==0x360e0eff&&
+        gfxvm_u32(code,64)==0x000000ff&&gfxvm_u32(code,68)==0x2c100690&&
+        gfxvm_u32(code,72)==0x361010ff&&gfxvm_u32(code,76)==0x000000ff&&
+        gfxvm_u32(code,80)==0xd5690007&&gfxvm_u32(code,84)==0x00020b07&&
+        gfxvm_u32(code,88)==0xd5690008&&gfxvm_u32(code,92)==0x00020d08&&
+        gfxvm_u32(code,96)==0x4a0e1107&&gfxvm_u32(code,100)==0x2c0e0e88&&
+        gfxvm_u32(code,104)==0x340e0e90&&gfxvm_u32(code,108)==0x2c100888&&
+        gfxvm_u32(code,112)==0x361010ff&&gfxvm_u32(code,116)==0x000000ff&&
+        gfxvm_u32(code,120)==0x2c120688&&gfxvm_u32(code,124)==0x361212ff&&
+        gfxvm_u32(code,128)==0x000000ff&&gfxvm_u32(code,132)==0xd5690008&&
+        gfxvm_u32(code,136)==0x00020b08&&gfxvm_u32(code,140)==0xd5690009&&
+        gfxvm_u32(code,144)==0x00020d09&&gfxvm_u32(code,148)==0x4a101308&&
+        gfxvm_u32(code,152)==0x2c101088&&gfxvm_u32(code,156)==0x34101088&&
+        gfxvm_u32(code,160)==0x361208ff&&gfxvm_u32(code,164)==0x000000ff&&
+        gfxvm_u32(code,168)==0x361406ff&&gfxvm_u32(code,172)==0x000000ff&&
+        gfxvm_u32(code,176)==0xd5690009&&gfxvm_u32(code,180)==0x00020b09&&
+        gfxvm_u32(code,184)==0xd569000a&&gfxvm_u32(code,188)==0x00020d0a&&
+        gfxvm_u32(code,192)==0x4a121509&&gfxvm_u32(code,196)==0x2c121288&&
+        gfxvm_u32(code,200)==0x380e1107&&gfxvm_u32(code,204)==0x380e1307&&
+        gfxvm_u32(code,208)==0xdc708000&&gfxvm_u32(code,212)==0x00000701&&
+        gfxvm_u32(code,216)==0x7e080205&&gfxvm_u32(code,220)==0xdc708000&&
+        gfxvm_u32(code,224)==0x00020401&&gfxvm_u32(code,228)==0xbf8c3f70&&
+        gfxvm_u32(code,232)==0xbf810000;
+}
+
+fn gfxvm_bad_bundle() Gfx1010VmBundle {
+    return Gfx1010VmBundle{.raw="",.code="",.user_sgprs=0,.system_sgprs=0,
+        .vgprs=0,.rsrc1=0,.rsrc2=0,.workgroup_x=0,.workgroup_y=0,
+        .workgroup_z=0,.dispatch_initiator=0,.pm4_profile=0,.profile=0,.ok=false};
+}
+
+fn gfxvm_bundle_load(path: []u8) Gfx1010VmBundle {
+    let raw: []u8 = _zag_read_file(path);
+    if (raw.len < 80 || raw[0] != 90 || raw[1] != 71 || raw[2] != 75 || raw[3] != 49) {
+        return gfxvm_bad_bundle();
+    }
+    let header: i32 = gfxvm_u32(raw,12) as i32;
+    let code_len: i32 = gfxvm_u32(raw,16) as i32;
+    if (gfxvm_u32(raw,4) != 2 || gfxvm_u32(raw,8) != 1010 || header != 80 ||
+        gfxvm_u32(raw,20) != 0 || code_len <= 0 || header + code_len != raw.len) {
+        return gfxvm_bad_bundle();
+    }
+    let code: []u8 = raw[header..header+code_len];
+    let user: i64 = gfxvm_u32(raw,24); let system: i64 = gfxvm_u32(raw,28);
+    let vgprs: i64 = gfxvm_u32(raw,32); let lds: i64 = gfxvm_u32(raw,36);
+    let scratch: i64 = gfxvm_u32(raw,40); let wave: i64 = gfxvm_u32(raw,44);
+    let rsrc1: i64 = gfxvm_u32(raw,48); let rsrc2: i64 = gfxvm_u32(raw,52);
+    let wx: i64 = gfxvm_u32(raw,56); let wy: i64 = gfxvm_u32(raw,60);
+    let wz: i64 = gfxvm_u32(raw,64); let hash: i64 = gfxvm_u32(raw,68);
+    let initiator:i64=gfxvm_u32(raw,72);let pm4_profile:i64=gfxvm_u32(raw,76);
+    let profile:i32=0;if(gfxvm_fill_isa_valid(code)){profile=1;}else if(gfxvm_depth_isa_valid(code)){profile=2;}else if(gfxvm_blend_isa_valid(code)){profile=3;}
+    let metadata_ok:bool=(profile==1&&user==3&&vgprs>=4)||(profile==2&&user==6&&vgprs>=5)||(profile==3&&user==7&&vgprs>=11);
+    if (!metadata_ok || system != 1 || lds != 0 || scratch != 0 ||
+        wave != 32 || wx != 1 || wy != 1 || wz != 1 || initiator != 1 || pm4_profile != 1 || rsrc2 != user*2+128 ||
+        hash != gfxvm_hash(code)) {
+        return gfxvm_bad_bundle();
+    }
+    return Gfx1010VmBundle{.raw=raw,.code=code,.user_sgprs=user,
+        .system_sgprs=system,.vgprs=vgprs,.rsrc1=rsrc1,.rsrc2=rsrc2,
+        .workgroup_x=wx,.workgroup_y=wy,.workgroup_z=wz,.dispatch_initiator=initiator,
+        .pm4_profile=pm4_profile,.profile=profile,.ok=true};
+}
+
+fn gfxvm_bad_dispatch() Gfx1010VmDispatch {
+    return Gfx1010VmDispatch{.shader_va=0,.target_va=0,.depth_va=0,.value=0,.depth_value=0,.alpha=0,
+        .local_x=0,.local_y=0,.local_z=0,.grid_x=0,.grid_y=0,.grid_z=0,
+        .register_mask=0,.ok=false};
+}
+
+// Decode only the exact safe PM4 profile emitted for the supported kernel.
+fn gfxvm_decode_dispatch(ib: []u8, b: Gfx1010VmBundle) Gfx1010VmDispatch {
+    let d: Gfx1010VmDispatch = gfxvm_bad_dispatch();
+    if (!b.ok || ib.len == 0 || ib.len % 4 != 0) { return d; }
+    let ndw: i32 = ib.len / 4; let i: i32 = 0;
+    while (i < ndw) {
+        let hdr: i64 = gfxvm_u32(ib,i*4);
+        if ((hdr / 0x40000000) % 4 != 3) { return gfxvm_bad_dispatch(); }
+        let count: i32 = ((hdr / 0x10000) % 0x4000) as i32;
+        let body: i32 = count + 1; let total: i32 = body + 1;
+        let op: i64 = (hdr / 0x100) % 256;
+        if (i + total > ndw) { return gfxvm_bad_dispatch(); }
+        if (op == 0x76) {
+            if (body < 2) { return gfxvm_bad_dispatch(); }
+            let reg: i64 = gfxvm_u32(ib,(i+1)*4) + 0x2C00;
+            let n: i32 = body - 1;
+            if (reg == 0x2E04 && n == 3 && (d.register_mask & 1) == 0) {
+                if (gfxvm_u32(ib,(i+2)*4) != 0 || gfxvm_u32(ib,(i+3)*4) != 0 || gfxvm_u32(ib,(i+4)*4) != 0) { return gfxvm_bad_dispatch(); }
+                d.register_mask = d.register_mask | 1;
+            } else if (reg == 0x2E07 && n == 3 && (d.register_mask & 2) == 0) {
+                d.local_x=gfxvm_u32(ib,(i+2)*4); d.local_y=gfxvm_u32(ib,(i+3)*4); d.local_z=gfxvm_u32(ib,(i+4)*4); d.register_mask=d.register_mask|2;
+            } else if (reg == 0x2E0C && n == 2 && (d.register_mask & 4) == 0) {
+                d.shader_va=(gfxvm_u32(ib,(i+2)*4)+gfxvm_u32(ib,(i+3)*4)*4294967296)*256; d.register_mask=d.register_mask|4;
+            } else if (reg == 0x2E12 && n == 2 && (d.register_mask & 8) == 0) {
+                if (gfxvm_u32(ib,(i+2)*4) != b.rsrc1 || gfxvm_u32(ib,(i+3)*4) != b.rsrc2) { return gfxvm_bad_dispatch(); }
+                d.register_mask=d.register_mask|8;
+            } else if (reg == 0x2E40 && n == b.user_sgprs && (d.register_mask & 16) == 0) {
+                d.target_va=gfxvm_u32(ib,(i+2)*4)+gfxvm_u32(ib,(i+3)*4)*4294967296;
+                if(b.profile==1){d.value=gfxvm_u32(ib,(i+4)*4);}
+                else if(b.profile==2||b.profile==3){
+                    d.depth_va=gfxvm_u32(ib,(i+4)*4)+gfxvm_u32(ib,(i+5)*4)*4294967296;
+                    d.value=gfxvm_u32(ib,(i+6)*4);d.depth_value=gfxvm_u32(ib,(i+7)*4);
+                    if(b.profile==3){d.alpha=gfxvm_u32(ib,(i+8)*4);}
+                }else{return gfxvm_bad_dispatch();}
+                d.register_mask=d.register_mask|16;
+            } else { return gfxvm_bad_dispatch(); }
+        } else if (op == 0x15 && body == 4 && (d.register_mask & 32) == 0) {
+            d.grid_x=gfxvm_u32(ib,(i+1)*4); d.grid_y=gfxvm_u32(ib,(i+2)*4); d.grid_z=gfxvm_u32(ib,(i+3)*4);
+            if (gfxvm_u32(ib,(i+4)*4) != b.dispatch_initiator) { return gfxvm_bad_dispatch(); }
+            d.register_mask=d.register_mask|32;
+        } else { return gfxvm_bad_dispatch(); }
+        i = i + total;
+    }
+    d.ok = i == ndw && d.register_mask == 63 && d.local_x == b.workgroup_x &&
+        d.local_y == b.workgroup_y && d.local_z == b.workgroup_z &&
+        d.grid_x > 0 && d.grid_y == 1 && d.grid_z == 1;
+    return d;
+}
+
+fn gfxvm_error(code: i32) Gfx1010VmResult {
+    return Gfx1010VmResult{.ok=false,.workgroups=0,.instructions=0,.stores=0,
+        .fence=0,.error_code=code};
+}
+
+// Execute the decoded ISA: v1=s3(TGID_X), v2=v1<<2, v3=s2(value),
+// global_store_dword [s0:s1+v2], waitcnt, endpgm.
+fn gfxvm_run_fill(b: Gfx1010VmBundle, ib: []u8, shader_va: i64,
+                   target_va: i64, mem: *i64, mem_len: i32, fence: i64) Gfx1010VmResult {
+    if (!b.ok || !gfxvm_fill_isa_valid(b.code)) { return gfxvm_error(1); }
+    let d: Gfx1010VmDispatch = gfxvm_decode_dispatch(ib,b);
+    if (!d.ok) { return gfxvm_error(2); }
+    if (d.shader_va != shader_va || d.target_va != target_va || shader_va % 256 != 0) { return gfxvm_error(3); }
+    if (mem_len < 0 || d.grid_x > mem_len || d.grid_x > 65535 || fence < 1) { return gfxvm_error(4); }
+    let gid: i64 = 0;
+    while (gid < d.grid_x) {
+        // The byte address produced by the ISA must land on exactly this word.
+        let byte_offset: i64 = gid * 4;
+        if (byte_offset % 4 != 0 || byte_offset / 4 >= mem_len) { return gfxvm_error(4); }
+        mem[(byte_offset/4) as i32] = d.value;
+        gid = gid + 1;
+    }
+    return Gfx1010VmResult{.ok=true,.workgroups=d.grid_x,
+        .instructions=d.grid_x*7,.stores=d.grid_x,.fence=fence,.error_code=0};
+}
+
+fn gfxvm_queue_submit_fill(q: *Gfx1010VmQueue, b: Gfx1010VmBundle, ib: []u8,
+                           shader_va: i64, target_va: i64, mem: *i64,
+                           mem_len: i32, fence: i64) Gfx1010VmResult {
+    if (q.*.disabled) { return gfxvm_error(6); }
+    if (q.*.owner != 1 || fence <= q.*.last_fence) {
+        q.*.disabled=true; return gfxvm_error(5);
+    }
+    let r:Gfx1010VmResult=gfxvm_run_fill(b,ib,shader_va,target_va,mem,mem_len,fence);
+    if (!r.ok) { q.*.disabled=true; return r; }
+    q.*.last_fence=fence; q.*.submissions=q.*.submissions+1;
+    q.*.instructions=q.*.instructions+r.instructions;
+    return r;
+}
+
+// Execute the exact depth-write ISA profile. Every lane loads the old signed
+// depth and performs the encoded <= comparison before either two stores or no
+// stores. Color/depth buffers and both virtual addresses are independently
+// bounded; overlap is rejected by the caller-owned mapping contract.
+fn gfxvm_run_depth(b:Gfx1010VmBundle,ib:[]u8,shader_va:i64,color_va:i64,depth_va:i64,
+                   color:*i64,depth:*i64,mem_len:i32,fence:i64)Gfx1010VmResult{
+    if(!b.ok||b.profile!=2||!gfxvm_depth_isa_valid(b.code)){return gfxvm_error(1);}
+    let d:Gfx1010VmDispatch=gfxvm_decode_dispatch(ib,b);if(!d.ok){return gfxvm_error(2);}
+    if(d.shader_va!=shader_va||d.target_va!=color_va||d.depth_va!=depth_va||
+       shader_va%256!=0||color_va==depth_va){return gfxvm_error(3);}
+    if(mem_len<0||d.grid_x>mem_len||d.grid_x>65535||fence<1){return gfxvm_error(4);}
+    let gid:i64=0;let stores:i64=0;
+    while(gid<d.grid_x){
+        let i:i32=gid as i32;let old:i32=depth[i] as i32;let nz:i32=d.depth_value as i32;
+        if(nz<=old){color[i]=d.value;depth[i]=d.depth_value;stores=stores+2;}gid=gid+1;
+    }
+    return Gfx1010VmResult{.ok=true,.workgroups=d.grid_x,.instructions=d.grid_x*15,
+        .stores=stores,.fence=fence,.error_code=0};
+}
+
+fn gfxvm_queue_submit_depth(q:*Gfx1010VmQueue,b:Gfx1010VmBundle,ib:[]u8,
+                            shader_va:i64,color_va:i64,depth_va:i64,color:*i64,
+                            depth:*i64,mem_len:i32,fence:i64)Gfx1010VmResult{
+    if(q.*.disabled){return gfxvm_error(6);}
+    if(q.*.owner!=1||fence<=q.*.last_fence){q.*.disabled=true;return gfxvm_error(5);}
+    let r:Gfx1010VmResult=gfxvm_run_depth(b,ib,shader_va,color_va,depth_va,color,depth,mem_len,fence);
+    if(!r.ok){q.*.disabled=true;return r;}q.*.last_fence=fence;q.*.submissions=q.*.submissions+1;
+    q.*.instructions=q.*.instructions+r.instructions;return r;
+}
+
+fn gfxvm_blend_channel(n:i64,o:i64,a:i64)i64{return (n*a+o*(256-a))/256;}
+
+// Execute the exact 0x00RRGGBB depth/blend profile. Alpha is fixed point in
+// [0,256], avoiding floating-point drift between the VM and target ISA.
+fn gfxvm_run_blend(b:Gfx1010VmBundle,ib:[]u8,shader_va:i64,color_va:i64,depth_va:i64,
+                   color:*i64,depth:*i64,mem_len:i32,fence:i64)Gfx1010VmResult{
+    if(!b.ok||b.profile!=3||!gfxvm_blend_isa_valid(b.code)){return gfxvm_error(1);}
+    let d:Gfx1010VmDispatch=gfxvm_decode_dispatch(ib,b);if(!d.ok){return gfxvm_error(2);}
+    if(d.shader_va!=shader_va||d.target_va!=color_va||d.depth_va!=depth_va||
+       shader_va%256!=0||color_va==depth_va){return gfxvm_error(3);}
+    if(mem_len<0||d.grid_x>mem_len||d.grid_x>65535||fence<1||d.alpha<0||d.alpha>256){return gfxvm_error(4);}
+    let gid:i64=0;let stores:i64=0;
+    while(gid<d.grid_x){
+        let i:i32=gid as i32;let oldz:i32=depth[i] as i32;let nz:i32=d.depth_value as i32;
+        if(nz<=oldz){
+            let old:i64=color[i];let nr:i64=(d.value/65536)&255;let ng:i64=(d.value/256)&255;let nb:i64=d.value&255;
+            let or_:i64=(old/65536)&255;let og:i64=(old/256)&255;let ob:i64=old&255;
+            color[i]=gfxvm_blend_channel(nr,or_,d.alpha)*65536+gfxvm_blend_channel(ng,og,d.alpha)*256+gfxvm_blend_channel(nb,ob,d.alpha);
+            depth[i]=d.depth_value;stores=stores+2;
+        }gid=gid+1;
+    }
+    return Gfx1010VmResult{.ok=true,.workgroups=d.grid_x,.instructions=d.grid_x*59,
+        .stores=stores,.fence=fence,.error_code=0};
+}
+
+fn gfxvm_queue_submit_blend(q:*Gfx1010VmQueue,b:Gfx1010VmBundle,ib:[]u8,
+                            shader_va:i64,color_va:i64,depth_va:i64,color:*i64,
+                            depth:*i64,mem_len:i32,fence:i64)Gfx1010VmResult{
+    if(q.*.disabled){return gfxvm_error(6);}
+    if(q.*.owner!=1||fence<=q.*.last_fence){q.*.disabled=true;return gfxvm_error(5);}
+    let r:Gfx1010VmResult=gfxvm_run_blend(b,ib,shader_va,color_va,depth_va,color,depth,mem_len,fence);
+    if(!r.ok){q.*.disabled=true;return r;}q.*.last_fence=fence;q.*.submissions=q.*.submissions+1;
+    q.*.instructions=q.*.instructions+r.instructions;return r;
+}
+
+fn gfxvm_packet3(op: i64, body: i64) i64 {
+    return 0xC0000000+((body-1)&0x3FFF)*0x10000+(op&255)*0x100;
+}
