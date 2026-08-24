@@ -187,10 +187,10 @@ atomic_rmw_status=$?
 set -e
 [ "$atomic_rmw_status" -eq 42 ]
 atomic_rmw_disasm="$(otool -tvV "$tmpdir/atomic-rmw")"
-printf '%s\n' "$atomic_rmw_disasm" | grep -q 'ldaxr'
-printf '%s\n' "$atomic_rmw_disasm" | grep -q 'stlxr'
-printf '%s\n' "$atomic_rmw_disasm" | grep -q 'ldar'
-printf '%s\n' "$atomic_rmw_disasm" | grep -q 'stlr'
+grep -q 'ldaxr' <<< "$atomic_rmw_disasm"
+grep -q 'stlxr' <<< "$atomic_rmw_disasm"
+grep -q 'ldar' <<< "$atomic_rmw_disasm"
+grep -q 'stlr' <<< "$atomic_rmw_disasm"
 echo "  ok  ARM64 native atomic RMW/CAS (LL/SC)"; pass=$((pass + 1))
 
 # This fixture covers Darwin entry arguments, PIE data addresses, heap,

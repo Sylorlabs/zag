@@ -90,13 +90,25 @@ done
 
 # Interface declarations are metadata pseudo-functions and consume no encoder
 # label. An export after one must still resolve to its own function entry.
-"$ZNC" "$TMP/project/after_iface.zag" --target arm64 --emit-obj \
-    --no-zagd --no-analyze --no-foreground-cache -o "$TMP/after_iface.o" \
-    >"$TMP/after_iface.log" 2>&1
-elf_defined_symbol "$TMP/after_iface.o" zag_after_iface
-if elf_symbols "$TMP/after_iface.o" | grep -q '__iface_'; then
-    echo "arm64-cabi-object: interface metadata leaked into ET_REL symbols" >&2
-    exit 1
+if [ "$(uname -s):$(uname -m)" = Darwin:arm64 ]; then
+    if "$ZNC" "$TMP/project/after_iface.zag" --target arm64 --emit-obj \
+        --no-zagd --no-analyze --no-foreground-cache -o "$TMP/after_iface.o" \
+        >"$TMP/after_iface.log" 2>&1; then
+        echo "arm64-cabi-object: interface metadata unexpectedly accepted on Darwin" >&2
+        exit 1
+    fi
+    test ! -e "$TMP/after_iface.o"
+    grep -q 'does not yet support interface metadata declarations' "$TMP/after_iface.log"
+else
+    "$ZNC" "$TMP/project/after_iface.zag" --target arm64 --emit-obj \
+        --no-zagd --no-analyze --no-foreground-cache -o "$TMP/after_iface.o" \
+        >"$TMP/after_iface.log" 2>&1
+    test -f "$TMP/after_iface.o"
+    elf_defined_symbol "$TMP/after_iface.o" zag_after_iface
+    if elf_symbols "$TMP/after_iface.o" | grep -q '__iface_'; then
+        echo "arm64-cabi-object: interface metadata leaked into ET_REL symbols" >&2
+        exit 1
+    fi
 fi
 
 # Native AArch64 Linux supplies the bidirectional ABI witness. Cross-host runs
