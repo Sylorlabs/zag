@@ -2,7 +2,7 @@
 # tests/test_lsp.sh — basic LSP protocol smoke tests for zag-lsp
 #
 # Build zag-lsp first:
-#   ./znc selfhost/lsp/zag-lsp.zag -o zag-lsp
+#   make zag-lsp
 #
 # Run:
 #   bash tests/test_lsp.sh
@@ -10,7 +10,23 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-ZAG_LSP="${ZAG_LSP:-./zag-lsp}"
+native_compiler=./znc
+native_lsp=./zag-lsp
+native_target_args=()
+case "$(uname -s):$(uname -m)" in
+    Darwin:arm64)
+        native_compiler=./znc-macos-arm64
+        native_lsp=./zag-lsp-macos-arm64
+        native_target_args=(--target macos-arm64)
+        ;;
+    Linux:aarch64|Linux:arm64)
+        native_compiler=./znc-linux-arm64
+        native_lsp=./zag-lsp-linux-arm64
+        native_target_args=(--target arm64)
+        ;;
+esac
+compiler=${ZNC:-$native_compiler}
+ZAG_LSP=${ZAG_LSP:-$native_lsp}
 PASS=0
 FAIL=0
 
@@ -43,7 +59,9 @@ echo "── LSP smoke tests ─────────────────
 # Build the LSP binary if not present
 if [[ ! -x "$ZAG_LSP" ]]; then
     echo "Building zag-lsp..."
-    ./znc selfhost/lsp/zag-lsp.zag -o zag-lsp
+    test -x "$compiler"
+    "$compiler" selfhost/lsp/zag-lsp.zag "${native_target_args[@]}" \
+        -o "$ZAG_LSP" --no-zagd
 fi
 
 # ── Test 1: initialize ─────────────────────────────────────────────────────────

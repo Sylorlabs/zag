@@ -2,6 +2,9 @@
 
 This is the authoritative release checklist. Every step must pass before a
 release tag is pushed. Steps marked **BLOCKING** abort the release if they fail.
+`release.sh VERSION` is the executable authority for ordering these gates,
+creating the tag, assembling the native-platform archive, and validating the
+archive before it can be published.
 
 ---
 
@@ -9,11 +12,18 @@ release tag is pushed. Steps marked **BLOCKING** abort the release if they fail.
 
 - You are on the `native-self-hosting-no-zig` branch (or a release branch cut
   from it).
-- `./znc` is the committed seed binary. `./zagc` is present only for
-  differential testing; it is NOT a release artifact.
-- `./znc` is the native x86-64 compiler (lexer through ELF emission) with
-  integrated GPU MLIR (`--target gpu-*`) and WASM (`--target wasm`) backends.
-  `selfhost/native/znc_target.zag` remains optional for differential checks.
+- Run the release on one supported native host: Linux x86-64, Linux AArch64,
+  or Apple Silicon macOS. Rosetta and cross-host packaging are not release
+  evidence.
+- Provide a trusted seed matching that exact host. Linux x86-64 uses the
+  committed `./znc`; Linux AArch64 uses `./znc-linux-arm64` (or
+  `seeds/linux-arm64/znc`); Apple Silicon uses `./znc-macos-arm64` (or
+  `seeds/macos-arm64/znc`). No Python, C, or Zig compiler is accepted as a
+  fallback.
+- `release.sh` validates the seed identity and selects the matching native
+  target. The GPU MLIR (`--target gpu-*`) and WASM (`--target wasm`) backends
+  remain integrated compiler targets; `selfhost/native/znc_target.zag` is
+  optional differential-test infrastructure.
 - The working tree is clean (`git status` shows no uncommitted changes).
 
 ---
@@ -24,6 +34,12 @@ release tag is pushed. Steps marked **BLOCKING** abort the release if they fail.
 
 No new features after the release branch is cut. Bug fixes to release-blocking
 issues are the only permitted changes.
+
+Verify that retired implementation sources and paths are absent:
+
+```sh
+bash tests/check_pure_zag_tree.sh
+```
 
 ```sh
 git checkout -b release/2026.06.0 native-self-hosting-no-zig
@@ -48,9 +64,11 @@ git commit -m "release: bump version to 2026.06.0"
 
 ### 3. Run the authoritative native gate — BLOCKING
 
-This is the first blocking gate. It poisons host C
-tools and verifies that `znc` can rebuild itself and pass the native test suite
-with zero external dependencies.
+This is the first blocking gate. It poisons host C tools and verifies that the
+host-qualified compiler can rebuild itself and pass the native smoke suite with
+zero compiler-toolchain dependencies. The runner selects `./znc` on Linux
+x86-64, `./znc-linux-arm64` on Linux AArch64, and `./znc-macos-arm64` on Apple
+Silicon.
 
 ```sh
 ./tests/run_native_authority.sh
@@ -58,66 +76,87 @@ with zero external dependencies.
 
 Expected: 100% pass. Any failure is a release blocker.
 
-### 4. Run the native language/backend test suite — BLOCKING
+### 4. Run the platform-native language/backend suite — BLOCKING
 
-```sh
-./tests/run_native.sh
-```
+Run exactly the row for the release host (the executable `release.sh` makes the
+same selection):
 
-Expected: all tests pass.
+| Release host | Blocking native row |
+|---|---|
+| Linux x86-64 | `ZNC=./znc bash tests/run_native.sh` |
+| Linux AArch64 | `ZNC=./znc-linux-arm64 bash tests/run_native_arm64.sh` |
+| Apple Silicon macOS | `ZNC=./znc-macos-arm64 bash tests/run_macos_arm64_release.sh` |
+
+The macOS row must execute on physical Apple Silicon. Linux ELF or qemu output
+does not substitute for its Mach-O loader, Darwin syscall, signing, dyld, and
+Metal evidence. Expected: all tests in the selected row pass.
 
 ### 5. Run semantic and diagnostic conformance — BLOCKING
 
+Use the same compiler selected for the native row:
+
 ```sh
-./tests/run_semantics.sh
-./tests/run_diag.sh
+# Apple Silicon; use ./znc on Linux x86-64 or ./znc-linux-arm64 on Linux ARM.
+export ZNC=./znc-macos-arm64
+bash tests/run_semantics.sh
+bash tests/run_diag.sh
+bash tests/run_tooling.sh
+bash tests/run_programs.sh
 ```
 
 ### 5b. Run multi-target native gates — BLOCKING
 
-These suites exercise GPU MLIR, WASM, and `@total` proofs on the supported
-`./znc` path. All three must pass before tagging.
+ABI/layout hardening runs with the selected native compiler on every release
+host:
 
 ```sh
-bash tests/run_native_gpu.sh
-bash tests/run_native_wasm.sh
-bash tests/run_native_total.sh
+bash tests/run_abi_layout.sh
 ```
 
-### 5c. Run the differential test suites (informational)
-
-These suites test the legacy C-emitting backend (`zagc`) and the self-hosted
-semantic checker. They are not release gates but regressions here indicate
-parser or sema bugs that affect both backends.
+The following additional rows retain the Linux x86-64 release boundary. They
+exercise GPU MLIR, WASM, and `@total` proofs on the committed `./znc` path:
 
 ```sh
-./run_tests.sh
-./tests/run_selfhost.sh
-./tests/run_stdlib.sh
-./tests/run_abi_layout.sh
+ZNC=./znc bash tests/run_native_gpu.sh
+ZNC=./znc bash tests/run_native_wasm.sh
+ZNC=./znc bash tests/run_native_total.sh
 ```
 
 ABI/layout hardening (`tests/run_abi_layout.sh`) documents **current** struct,
-slice, union, `fat_fn`, and `!T` sizing per `COMPATIBILITY.md`. It is an
-informational regression gate — language v1 does **not** freeze binary layout.
+slice, union, `fat_fn`, and `!T` sizing per `COMPATIBILITY.md`. Failure is a
+release blocker — language v1 does **not** freeze binary layout; the suite
+captures documented-current behavior only.
+
+### 5c. Run cross-target native gates — BLOCKING
+
+These are Linux x86-64 cross-target rows, not Apple Silicon substitutes. On
+Linux x86-64, qemu-user executes Linux ARM64 binaries for validation. It is
+test infrastructure only; compilation and self-hosting remain pure Zag.
+
+```sh
+ZNC=./znc bash tests/run_native_arm64.sh
+ZNC=./znc bash tests/run_differential.sh
+ZNC=./znc bash tests/run_arm64_selfhost.sh
+```
+
+On native Linux AArch64, `run_native_arm64.sh` is the platform row from step 4;
+run `ZNC=./znc-linux-arm64 bash tests/run_arm64_selfhost.sh` for its native
+self-hosting row. On Apple Silicon, use only the macOS gate from step 4 for
+release evidence; its explicit `macos-arm64` builds are signed Mach-O, not
+Linux AArch64 ELF.
 
 ### 6. Verify byte-identical self-hosting fixpoint — BLOCKING
 
 ```sh
-./bootstrap.sh                                   # rebuild seed from source
-./znc selfhost/native/znc.zag -o znc.new         # znc compiles znc
-diff znc znc.new && echo "fixpoint OK"
+./bootstrap.sh
+bash tests/check_native_bootstrap_repro.sh
 ```
 
-Or use the dedicated script:
-
-```sh
-./tests/check_native_bootstrap_repro.sh
-```
-
-A non-zero diff on `./znc` is a release blocker. Optionally run
-`./tests/check_native_target_repro.sh` if you rebuilt `znc-target` for
-differential checks.
+Both scripts select the exact native host. The fixed-point output is `./znc`
+on Linux x86-64, `./znc-linux-arm64` on Linux AArch64, and
+`./znc-macos-arm64` on Apple Silicon. A byte mismatch is a release blocker.
+Optionally run `tests/check_native_target_repro.sh` on Linux x86-64 if you
+rebuilt `znc-target` for differential checks.
 
 ### 7. Update CHANGELOG.md
 
@@ -134,18 +173,24 @@ git add CHANGELOG.md
 git commit -m "changelog: add release date for 2026.06.0"
 ```
 
-### 8. Build and commit seed binaries
+### 8. Build and record the native seed binary
 
-Rebuild the seed binary from source and commit it. `./znc` is the release
-artifact for native ELF, GPU MLIR, and WASM. `zagc` is committed for
-differential-testing convenience, not as a supported binary.
+Rebuild the native seed from source. Linux x86-64 updates the committed `./znc`
+seed. Linux AArch64 and Apple Silicon retain their platform-qualified,
+release-gated compiler; `release.sh` packages that compiler as the archive's
+unsuffixed `znc` without overwriting or committing the Linux x86-64 seed.
 
 ```sh
-./bootstrap.sh          # produces ./znc
-git add znc             # REQUIRED: supported seed binary
-# git add zagc          # OPTIONAL: zagc is a differential oracle only
-git commit -m "release: update seed binaries for 2026.06.0"
+./bootstrap.sh
+
+# Linux x86-64 only:
+git add znc
+git commit -m "release: update seed binary for 2026.06.0"
 ```
+
+On Linux AArch64, verify `./znc-linux-arm64`; on Apple Silicon, verify
+`./znc-macos-arm64`. Do not add either qualified artifact as `./znc` in the
+source checkout.
 
 ### 9. Tag the release
 
@@ -158,18 +203,41 @@ git tag -s v2026.06.0 -m "$(head -15 CHANGELOG.md)"
 
 ### 10. Build release tarball
 
-Assemble the release tarball. Only include the supported artifacts.
+`release.sh` assembles `zag-$VERSION-$PLATFORM.tar.gz`; do not maintain a
+second hand-written copy recipe. The standalone archive contains:
+
+- native `znc`, `zagd`, and `zag-lsp` executables;
+- `bootstrap.sh`, `Makefile`, and `zag.mod` as one coherent bootstrap/install
+  surface;
+- the `selfhost`, `std`, `examples`, `programs`, `tests`, `tools`, `docs`, and `editors`
+  trees plus the packaged VS Code extension;
+- `LICENSE` and the top-level install, bootstrap, compatibility, versioning,
+  changelog, and release documentation.
+
+Before writing the checksum, the release flow validates the staged tree,
+extracts the tarball into a fresh directory, compares it with staging, and
+validates the extracted tree again. Validation includes required content and
+permissions, native executable identity, `zag.mod`/compiler version agreement,
+a non-writing `make install` expansion, a native compile/run smoke test, and a
+fail-closed check for AppleDouble files. Archive creation disables both
+copyfile AppleDouble metadata and tar xattr records on macOS while remaining
+compatible with GNU tar on Linux; the layout self-test injects a real macOS
+xattr and proves that ordinary extraction cannot recover it.
+The lightweight contract self-test is safe to run without committing, tagging,
+or creating a release:
 
 ```sh
-VERSION=2026.06.0
-mkdir -p dist/zag-$VERSION
-cp znc znc-target bootstrap.sh run_tests.sh dist/zag-$VERSION/
-cp -r selfhost/ examples/ std/ dist/zag-$VERSION/
-cp README.md BOOTSTRAP.md VERSIONING.md CHANGELOG.md \
-   COMPATIBILITY.md RELEASES.md dist/zag-$VERSION/
-tar -czf dist/zag-$VERSION.tar.gz -C dist zag-$VERSION
-sha256sum dist/zag-$VERSION.tar.gz > dist/zag-$VERSION.tar.gz.sha256
+bash tests/run_release_package_layout.sh
 ```
+
+The `macos-arm64` archive is evidence for the scoped native development target
+described in `docs/SUPPORT.md`; it is not a notarized end-user distribution.
+Its deterministic Mach-O outputs carry embedded ad-hoc signatures, not a
+Developer ID identity or an Apple notarization ticket. Do not present that
+archive as Gatekeeper-ready software. A future general macOS release must add
+credentialed Developer ID signing, hardened-runtime validation, notarization,
+and Gatekeeper assessment as separate blocking release steps before this
+restriction can be removed.
 
 ### 11. Publish
 
@@ -181,8 +249,8 @@ git push origin v2026.06.0
 ```
 
 Attach to the GitHub release:
-- `zag-$VERSION.tar.gz`
-- `zag-$VERSION.tar.gz.sha256`
+- `zag-$VERSION-$PLATFORM.tar.gz`
+- `zag-$VERSION-$PLATFORM.tar.gz.sha256`
 
 ### 12. Post announcement
 

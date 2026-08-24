@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
-# ABI / layout hardening regression suite for ./znc (native x86-64 ELF).
+# ABI/layout hardening regression suite for the checkout-native compiler.
 #
 # Documents CURRENT behavior per COMPATIBILITY.md — NOT a stable-ABI claim.
 # Catches regressions in @sizeOf, struct padding, union tag+payload, slice and
 # fat_fn layout, arbitrary-width integers, and error-union sizing.
 #
 # Usage:  bash tests/run_abi_layout.sh
-#         ZNC=./znc bash tests/run_abi_layout.sh
+#         ZNC=/path/to/znc bash tests/run_abi_layout.sh
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. ./tests/portable.sh
 
-ZNC=${ZNC:-./znc}
+ZNC=${ZNC:-$(zag_native_compiler "$PWD")}
 case "$ZNC" in
     /*) ;;
     *) ZNC="$PWD/${ZNC#./}" ;;

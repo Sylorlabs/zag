@@ -7,14 +7,15 @@
 # Usage:
 #   bash tests/run_diag.sh
 #
-# The ONLY supported compiler is ./znc (the native ELF backend).
-# ./zagc is the legacy C bootstrap and is NOT used here.
+# The selected checkout-native compiler is the only supported compiler.
+# Retired bootstrap implementations are not used here.
 #
 # Exit: 0 = all passed, 1 = at least one mismatch.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. ./tests/portable.sh
 
-ZNC="${ZNC:-./znc}"
+ZNC="${ZNC:-$(zag_native_compiler "$PWD")}"
 
 if [ ! -x "$ZNC" ]; then
     echo "run_diag: $ZNC not found or not executable" >&2
@@ -23,6 +24,9 @@ fi
 
 pass=0
 fail=0
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/zag-diag.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+case_id=0
 
 for expected in tests/diag/*.expected; do
     zag="${expected%.expected}.zag"
@@ -31,14 +35,19 @@ for expected in tests/diag/*.expected; do
         continue
     fi
 
-    # Run znc; capture combined stdout+stderr; ignore exit code (violations exit 1)
-    actual=$("$ZNC" "$zag" -o /dev/null 2>&1 | grep -v "^znc:" || true)
+    artifact="$tmp/out-$case_id"
+    case_id=$((case_id + 1))
+    set +e
+    raw=$("$ZNC" "$zag" -o "$artifact" 2>&1)
+    rc=$?
+    set -e
+    actual=$(printf '%s\n' "$raw" | sed '/^znc:/d')
 
-    if diff -q <(echo "$actual") "$expected" >/dev/null 2>&1; then
+    if [ "$rc" -eq 1 ] && [ ! -e "$artifact" ] && diff -q <(echo "$actual") "$expected" >/dev/null 2>&1; then
         echo "  ok    $zag"
         pass=$((pass + 1))
     else
-        echo "  FAIL  $zag"
+        echo "  FAIL  $zag (exit $rc, artifact=$([ -e "$artifact" ] && echo yes || echo no))"
         echo "  --- expected ---"
         cat "$expected"
         echo "  --- actual ---"

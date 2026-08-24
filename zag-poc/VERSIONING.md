@@ -60,8 +60,8 @@ production build path.
 **additive-only**. Flags documented in that release will not be renamed or
 removed within edition `2026`. New flags may be added in any release.
 
-`zagc` is a **differential-testing oracle** (the legacy C-emitting compiler).
-Its CLI carries **no stability guarantees** and it is not a supported build path.
+The retired C-emitting compiler has no current CLI surface. Consult Git history
+for historical behavior; it must not be restored as a supported path.
 
 ### 4. Stdlib Tier (`std/` module interfaces)
 
@@ -107,16 +107,18 @@ The two-release rule applies from the first `2026.06.x` release onward.
 
 | Platform        | Status          | Notes                                           |
 |-----------------|-----------------|-------------------------------------------------|
-| x86-64 Linux    | **Supported**   | Only current target; native ELF, no libc        |
-| ARM64 Linux     | Planned         | Requires AArch64 ISA + ELF backend             |
+| x86-64 Linux    | **Supported**   | Primary target; native ELF, no libc; compiler-owned binary `#embed` with deterministic and cache-identity conformance |
+| ARM64 Linux     | **Supported, scoped** | `--target arm64`; static v1 output plus separately gated edition-2027 object/dynamic slices, qemu-user verification, and native ARM CI. This does not promise every x86-64 v2 feature. See `docs/SUPPORT.md`. |
 | RISC-V Linux    | Planned         | Requires RV64GC ISA + ELF backend              |
-| macOS (any)     | Not planned yet | Requires Mach-O backend                         |
+| Apple Silicon macOS | **Scoped development target** | `--target macos-arm64`; signed PIE Mach-O executables for the bounded runtime/import slice in `docs/SUPPORT.md`; a seed is release evidence only after the complete native gate and self-host fixpoint pass |
 | Windows         | Not planned     | Requires PE/COFF backend                        |
 
-The ABI used is Linux syscall (`SYS_write`, `SYS_read`, `SYS_mmap`, `SYS_exit`,
-etc.). Generated binaries have no dynamic loader dependency and no libc
-dependency. The runtime uses basic Linux I/O, memory, process, and monotonic
-clock syscalls directly.
+Linux targets use the Linux syscall ABI (`SYS_write`, `SYS_read`, `SYS_mmap`,
+`SYS_exit`, etc.) and have no dynamic-loader or libc dependency. Within the
+scoped Apple Silicon executable path, output uses the Darwin entry ABI, is
+position-independent, and carries an embedded deterministic ad-hoc signature.
+Only the audited raw-syscall and closed dyld-import subsets in
+`docs/MACOS_NATIVE_PARITY.md` are supported.
 
 ## v1 Commitments
 

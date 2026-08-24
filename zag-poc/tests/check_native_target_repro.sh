@@ -11,15 +11,34 @@ set -eu
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 target_source="$root/selfhost/native/znc_target.zag"
+. "$root/tests/portable.sh"
+
+host_target_args=()
+case "$(uname -s):$(uname -m)" in
+    Darwin:arm64) host_platform=macos-arm64; host_target_args=(--target macos-arm64) ;;
+    Linux:x86_64|Linux:amd64) host_platform=linux-x86_64 ;;
+    Linux:aarch64|Linux:arm64) host_platform=linux-arm64; host_target_args=(--target arm64) ;;
+    *) echo "native target repro: unsupported host: $(uname -s) $(uname -m)" >&2; exit 1 ;;
+esac
 
 case ${ZNC_SEED:-} in
-    '') seed="$root/znc" ;;
+    '')
+        seed=""
+        for candidate in "$root/znc-$host_platform" "$root/seeds/$host_platform/znc" "$root/znc"; do
+            if [ -x "$candidate" ] && zag_assert_native_executable "$candidate"; then seed=$candidate; break; fi
+        done
+        ;;
     /*) seed=$ZNC_SEED ;;
     *) seed="$PWD/$ZNC_SEED" ;;
 esac
 
 case ${ZNC_TARGET_SEED:-} in
-    '') target_seed="$root/znc-target" ;;
+    '')
+        target_seed=""
+        for candidate in "$root/znc-target-$host_platform" "$root/seeds/$host_platform/znc-target" "$root/znc-target"; do
+            if [ -x "$candidate" ] && zag_assert_native_executable "$candidate"; then target_seed=$candidate; break; fi
+        done
+        ;;
     /*) target_seed=$ZNC_TARGET_SEED ;;
     *) target_seed="$PWD/$ZNC_TARGET_SEED" ;;
 esac
@@ -33,7 +52,7 @@ fi
 
 if [ ! -x "$target_seed" ]; then
     echo "native target repro: znc-target seed is not executable: $target_seed" >&2
-    echo "native target repro: run ./bootstrap.sh to build ./znc-target from ./znc" >&2
+    echo "native target repro: provide a trusted $host_platform target seed via ZNC_TARGET_SEED" >&2
     exit 1
 fi
 
@@ -47,7 +66,8 @@ build_target_stage() {
     label=$3
     log="$tmp/$label.log"
 
-    if ! PATH="$tmp/empty-path" "$compiler" "$target_source" -o "$output" >"$log" 2>&1; then
+    if ! PATH="$tmp/empty-path" "$compiler" "$target_source" \
+        "${host_target_args[@]}" -o "$output" >"$log" 2>&1; then
         echo "  XX  $label failed" >&2
         sed -n '1,40p' "$log" >&2
         exit 1
@@ -70,13 +90,12 @@ same_bytes() {
     fi
 
     echo "  XX  $label" >&2
-    if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$left" "$right" >&2
-    fi
+    echo "      $(zag_sha256_file "$left")  $left" >&2
+    echo "      $(zag_sha256_file "$right")  $right" >&2
     exit 1
 }
 
-echo "── native znc-target reproducibility (./znc → ELF, empty PATH) ──"
+echo "── native znc-target reproducibility (./znc → $host_platform, empty PATH) ──"
 build_target_stage "$seed" "$tmp/target-stage1" "znc builds znc-target stage 1"
 build_target_stage "$seed" "$tmp/target-stage2" "znc rebuilds znc-target stage 2"
 build_target_stage "$seed" "$tmp/target-stage3" "znc rebuilds znc-target stage 3"
@@ -85,9 +104,6 @@ same_bytes "$target_seed" "$tmp/target-stage1" "committed seed matches znc rebui
 same_bytes "$tmp/target-stage1" "$tmp/target-stage2" "stage 1 equals stage 2 byte-for-byte"
 same_bytes "$tmp/target-stage2" "$tmp/target-stage3" "stage 2 equals stage 3 byte-for-byte"
 
-if command -v sha256sum >/dev/null 2>&1; then
-    digest=$(sha256sum "$tmp/target-stage3")
-    digest=${digest%% *}
-    echo "  sha256  $digest"
-fi
+digest=$(zag_sha256_file "$tmp/target-stage3")
+echo "  sha256  $digest"
 echo "════ native znc-target reproducible: pass=6 fail=0 ════"

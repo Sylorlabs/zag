@@ -1,9 +1,10 @@
 # Zag — the bootstrap, and how to walk its history
 
 Zag is a from-scratch, self-hosting systems language. The compiler that builds
-Zag is **written in Zag**, and the native backend emits ELF executables **with
-no `cc`, `as`, `ld`, `libc`, `Zig`, or `LLVM`** — only the CPU instruction set,
-the ELF format, and the Linux syscall ABI sit beneath it.
+Zag is **written in Zag**, and the native backend emits Linux ELF or Apple
+Silicon Mach-O executables **with no `cc`, `as`, `ld`, `libc`, `Zig`, or
+`LLVM`** — only the CPU instruction set and the target object/runtime ABI sit
+beneath it.
 
 Like every self-hosted language (Rust started in OCaml, Go in C, Zig in C++),
 Zag was bootstrapped from a compiler written in another language, then that
@@ -13,14 +14,15 @@ journey so anyone can walk it — **including recovering the original bootstrap.
 ## The chain, in one line
 
 ```
-Python (zagc.py, removed)  →  Zig bootstrap (src/*.zig, removed at v0.1)
-                          →  self-hosted C-backend (selfhost/*.zag, differential oracle)
+Python prototype (removed) → Zig bootstrap (removed at v0.1)
+                           → self-hosted C emitter (removed)
                           →  native backend (selfhost/native/*.zag)
-                          →  Zig DELETED  →  numeric system in native code
+                          →  pure Zag self-hosting toolchain
 ```
 
-The Python prototype (`zagc.py`) and `gpu/*.py` middlemen are no longer in the tree.
-Recover them from git history (`git show v0.0-zig-bootstrap:zag-poc/zagc.py`) if needed.
+The Python prototype, Zig bootstrap, C emitter, C runtime, and generated C files
+are no longer in the tree. Recover historical implementations only through Git
+history; they are not valid bootstrap fallbacks.
 
 ## Walk the history by tag
 
@@ -36,25 +38,26 @@ git tag -n1 -l 'v0.*'
 | `v0.3-cc-free`         | The **whole toolchain** builds via `znc` with **zero external tools**; the native `zagc` is fully equivalent (46/46 + 28/28). |
 | `v0.4-numerics-native` | The heterogeneous numeric system (posits / 512-bit quire / saturating / RNS / bignum / fixed-point / arbitrary-width) ported into the **native machine-code** backend — numeric programs compile straight to ELF, no `cc`. |
 
-## Recovering the original Zig bootstrap
+## Inspecting retired bootstraps
 
-The Zig bootstrap (~10,500 lines) was removed at `v0.1-native-selfhost`, but git
-never forgets. To see it or build from it:
+Git retains the retired Python, Zig, and C-emitting implementations for
+historical inspection:
 
 ```sh
 # read a file from the bootstrap without changing your tree:
 git show v0.0-zig-bootstrap:zag-poc/src/main.zig
 
-# or check the whole bootstrap tree out:
-git checkout v0.0-zig-bootstrap        # full Zig bootstrap: src/*.zig + build.zig
-zig build                              # builds the bootstrap → ./zagc
-git checkout -                         # back to the latest, Zig-free tree
+# inspect the retired C emitter without restoring it:
+git log --all -- zag-poc/selfhost/zagc.zag zag-poc/selfhost/codegen.zag
+git show <commit>:zag-poc/selfhost/codegen.zag
 ```
 
 ## Supported v1 bootstrap — native only
 
-The committed `./znc` binary is the trusted bootstrap seed. `bootstrap.sh`
-rebuilds it directly from Zag source:
+The committed `./znc` binary is the trusted Linux x86-64 bootstrap seed.
+`bootstrap.sh` selects a trusted seed matching the native host and rebuilds it
+directly from Zag source. Apple Silicon therefore needs a separately verified
+`macos-arm64` seed; the Linux ELF seed is never treated as executable on macOS:
 
 ```sh
 ./bootstrap.sh
@@ -66,25 +69,22 @@ rebuilds it directly from Zag source:
 
 | Binary | Source | Role |
 |--------|--------|------|
-| `./znc` | `selfhost/native/znc.zag` | Native x86-64 compiler **plus** GPU MLIR and WASM backends. Default: `./znc file.zag -o program`. GPU: `--target gpu-nvidia|gpu-amd|gpu-vulkan`. WASM: `--target wasm -o out.wasm`. |
+| `./znc` (Linux x86-64) or `./znc-<platform>` (ARM hosts) | `selfhost/native/znc.zag` | Native compiler for the selected supported host/target **plus** GPU MLIR and WASM backends. GPU: `--target gpu-nvidia|gpu-amd|gpu-vulkan`. WASM: `--target wasm -o out.wasm`. |
 
-`selfhost/mlir.zag` intentionally does **not** import `codegen.zag` (the full C
-backend). It duplicates only the small `emit` / `Binding` / type-helper surface
-mlir needs, so `znc.zag` can link GPU emission without blowing the self-hosting
-fixpoint budget.
+`selfhost/mlir.zag` is a native Zag implementation and does not depend on a
+Python, C, or Zig emitter.
 
 `selfhost/native/znc_target.zag` remains as an optional legacy helper (build
 with `./znc selfhost/native/znc_target.zag -o znc-target`) for differential
 checks; it is not required for normal use.
 
-Generated x86-64 programs use Linux syscalls and have no dynamic loader or libc
-dependency.
+Generated Linux programs use Linux syscalls and have no dynamic loader or libc
+dependency. The scoped Apple Silicon path produces signed PIE Mach-O
+executables that use the Darwin entry ABI and the audited runtime/import slice
+in `docs/SUPPORT.md`; it is not general Linux feature parity.
 
-`./zagc` and `selfhost/codegen.zag` remain in the repository as historical
-bootstrap material and a differential oracle. They are not a supported build
-path, are not an acceptable bootstrap fallback, and must not be required by a
-release gate. C interoperability, when intentionally added later, is an optional
-boundary rather than an implementation dependency.
+The retired `zagc`, C emitter, runtime, and oracle suites exist only in Git
+history. Do not restore them to the current tree or use them as a fallback.
 
 ## The one permanent caveat
 
@@ -97,6 +97,11 @@ safety net.
 
 ## Supported release gates
 
+`make test` is host-scoped: it combines platform-neutral conformance with the
+native release evidence available on that machine. Linux-only ELF/qemu/DRM
+rows remain explicit on macOS; Apple Silicon instead runs the signed Mach-O,
+Darwin runtime, dyld/Metal, and cross-object evidence defined by its gate.
+
 ```sh
 ./tests/run_native_authority.sh       # poison host C tools; self-rebuild and smoke test
 ./tests/run_native.sh                 # native language/backend behavior suite
@@ -107,6 +112,8 @@ bash tests/run_native_total.sh        # @total proofs on ./znc
 ./tests/check_native_target_repro.sh     # optional: byte-identical ./znc-target fixpoint
 ```
 
-The older `run_tests.sh` and `tests/run_selfhost.sh` suites exercise the legacy
-C emitter. They remain useful for differential testing but do not define v1
-support or release readiness.
+ARM64 Linux is cross-compiled and self-hosted from the x86-64 `znc` seed; QEMU
+may execute those binaries on x86-64 as test infrastructure. Apple Silicon
+macOS uses a separately trusted `znc-macos-arm64` development/CI seed. That
+seed becomes release evidence only after the complete physical-Mac gate,
+including a byte-identical self-host fixpoint, succeeds.
