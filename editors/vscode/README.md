@@ -18,13 +18,19 @@ If the binary lives somewhere else, set `zag.serverPath` in VS Code settings.
 
 ## Install the extension
 
+Building the VSIX requires Node.js 22 or later and npm.
+
 ```sh
 cd editors/vscode
-npm install
-npm run compile
-vsce package
-code --install-extension zag-lang-0.1.0.vsix
+npm ci
+npm run package
+code --install-extension zag-lang.vsix
 ```
+
+`npm ci` installs the exact dependency graph recorded in `package-lock.json`.
+The package command always writes `zag-lang.vsix`, matching CI and the Zag
+release archive, and gives every ZIP entry a fixed source-date timestamp so the
+same source and lockfile produce byte-identical VSIX files.
 
 ## Settings
 

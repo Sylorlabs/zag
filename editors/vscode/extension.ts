@@ -3,12 +3,11 @@
 // Starts the Zag LSP server binary and connects it to VS Code via the
 // vscode-languageclient library.  The server binary is located by checking:
 //   1. The zag.serverPath workspace setting
-//   2. The PATH environment variable (binary named "znc-lsp")
+//   2. The PATH environment variable (binary named "zag-lsp")
 //
 // Provides: diagnostics, completion, hover, go-to-definition, rename.
 
-import * as path from "path";
-import { workspace, ExtensionContext, window, OutputChannel } from "vscode";
+import { workspace, ExtensionContext, window } from "vscode";
 import {
   LanguageClient,
   LanguageClientOptions,
@@ -20,7 +19,7 @@ let client: LanguageClient | undefined;
 
 export function activate(context: ExtensionContext): void {
   const config = workspace.getConfiguration("zag");
-  const serverBin: string = config.get<string>("serverPath") ?? "znc-lsp";
+  const serverBin: string = config.get<string>("serverPath") ?? "zag-lsp";
 
   const serverOptions: ServerOptions = {
     command: serverBin,
