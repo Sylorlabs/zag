@@ -41,11 +41,29 @@ AVX2 additionally requires its leaf-7 feature bit. This avoids treating raw
 hardware CPUID as sufficient and preserves the separation between detection
 and emission permission.
 
+AVX-512 additionally requires CPUID.7.0:ECX bit 16 (AVX512F) **and** XGETBV
+confirmation that XCR0 enables the opmask, ZMM_Hi256 and Hi16_ZMM state
+components (bits 5, 6, 7). Both halves are mandatory: a CPU advertising AVX512F
+under an OS that only saved XMM/YMM state faults on the first EVEX instruction.
+
 Features may be detected but not advertised for code generation until their
 instruction encoding, register/state handling, ABI interaction, fallback and
 execution tests pass. Candidate tracked features include SSE2, SSE3, SSSE3,
 SSE4.1, SSE4.2, POPCNT, AVX, AVX2, FMA, BMI1, BMI2 and selected AVX-512 families.
 This list is a roadmap, not a current support claim.
+
+## Vector width ladder
+
+`--vectorize=on` runs the loop vectorizer. The requested profile, never the
+request, selects the width: AVX-512 is 16 lanes, AVX2 is 8, SSE2 is 4. A logical
+vector wider than the target ceiling is split into independent per-piece
+operations by `vecwidth`; a consumer with no defined recombination fails closed
+rather than emitting a wrong encoding. The lowering is bounded to functions the
+ZIR-direct route accepts: that route resolves each SSA name through a linear slot
+scan and is O(words²), so `ZIR_NATIVE_MAX_WORDS` bounds it and a larger module
+falls back to the AST bridge. See
+[`docs/VECTOR_PIPELINE.md`](VECTOR_PIPELINE.md) for the end-to-end sequence, the
+bounds, and what is not yet implemented.
 
 ## Determinism and dispatch
 

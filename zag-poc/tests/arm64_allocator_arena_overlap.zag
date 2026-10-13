@@ -1,0 +1,118 @@
+// Deterministic emitter regression: a fresh arena can cover several retired
+// large-allocation addresses, not just one at the arena's first payload.
+// Synthetic addresses are registry keys only; the fixture never maps or
+// dereferences them. Execute the actual allocator helper against its real
+// writable registry, independently of the kernel's address-selection policy.
+@import("../selfhost/native/ncodegen.zag")
+@import("../selfhost/native/acodegen.zag")
+@import("../selfhost/native/aarch64.zag")
+@import("../selfhost/native/macho_arm64.zag")
+@import("../selfhost/native/elf.zag")
+@import("../selfhost/native/elf_arm64.zag")
+
+fn overlap_expect(out: *ArrayList[AInstr], cg: *ACg, reg: i32,
+                   expected: i64, status: i64) void {
+    let ok: i32 = ac_fresh(cg);
+    push[AInstr](out, ai_mov_imm(A_X17(), expected));
+    push[AInstr](out, ai_cmp(reg, A_X17()));
+    push[AInstr](out, ai_je(ok));
+    push[AInstr](out, ai_mov_imm(A_X0(), status));
+    push[AInstr](out, ai_syscall(93));
+    push[AInstr](out, ai_label(ok));
+}
+
+fn main() i32 {
+    if (_zag_argc() != 3) { return 2; }
+    let darwin: bool = @strEq(_zag_arg(2), "macos-arm64");
+    if (!darwin && !@strEq(_zag_arg(2), "linux-arm64")) { return 3; }
+    let data: ArrayList[u8] = make[u8](66560);
+    while (data.len < 66560) { push[u8](&data, 0); }
+    // Only next, target_os, and data are used by this emitter helper. Zero the
+    // remaining fields explicitly so no uninitialized compiler context leaks
+    // into the regression as the context structure grows.
+    let context: *ACg = _zag_malloc(@sizeOf[ACg]()) as *ACg;
+    let raw: *u8 = context as *u8;
+    let i: i32 = 0;
+    while (i < @sizeOf[ACg]()) { raw[i] = 0; i = i + 1; }
+    context.*.next = 1;
+    context.*.data = &data;
+    if (darwin) { context.*.target_os = AC_OS_MACOS(); }
+    else { context.*.target_os = AC_OS_LINUX(); }
+
+    let base: i64 = 0x7000000000;
+    let size: i64 = ac_allocator_arena_size();
+    let initial: ArrayList[i64] = make[i64](9);
+    push[i64](&initial, 0 - (base + 8));
+    push[i64](&initial, base + size * 2 + 8); // unrelated live mapping
+    push[i64](&initial, 0 - (base - 16384 + 8));
+    push[i64](&initial, 0 - (base + 16384 + 8));
+    push[i64](&initial, 0 - (base + size - 16384 + 8));
+    push[i64](&initial, 0 - (base + size)); // exclusive end must stay retired
+    push[i64](&initial, 0 - 1); // already neutralized row
+    push[i64](&initial, 0 - (base + 32768 + 8));
+    push[i64](&initial, 0); // contiguous registry terminator
+
+    let expected: ArrayList[i64] = make[i64](9);
+    push[i64](&expected, 0 - 1);
+    push[i64](&expected, initial.data[1]);
+    push[i64](&expected, initial.data[2]);
+    push[i64](&expected, 0 - 1);
+    push[i64](&expected, 0 - 1);
+    push[i64](&expected, initial.data[5]);
+    push[i64](&expected, 0 - 1);
+    push[i64](&expected, 0 - 1);
+    push[i64](&expected, 0);
+
+    let program: ArrayList[AInstr] = make[AInstr](256);
+    ac_emit_allocator_word_address(&program, context, A_X15(),
+        ac_large_alloc_registry_offset());
+    i = 0;
+    while (i < initial.len) {
+        push[AInstr](&program, ai_mov_imm(A_X14(), initial.data[i]));
+        push[AInstr](&program, ai_store(A_X15(), i * 16, A_X14()));
+        let logical_size: i64 = 600000 + (i as i64);
+        if (i == 6 || i == 8) { logical_size = 0; }
+        push[AInstr](&program, ai_mov_imm(A_X14(), logical_size));
+        push[AInstr](&program, ai_store(A_X15(), i * 16 + 8, A_X14()));
+        i = i + 1;
+    }
+    push[AInstr](&program, ai_mov_imm(A_X0(), 201));
+    push[AInstr](&program, ai_mov_imm(A_X7(), 207));
+    push[AInstr](&program, ai_mov_imm(A_X14(), size));
+    push[AInstr](&program, ai_mov_imm(A_X6(), base + 8));
+    ac_emit_large_alloc_forget_small_alias(&program, context, A_X6());
+    overlap_expect(&program, context, A_X0(), 201, 31);
+    overlap_expect(&program, context, A_X7(), 207, 32);
+    overlap_expect(&program, context, A_X14(), size, 33);
+    overlap_expect(&program, context, A_X6(), base + 8, 34);
+
+    i = 0;
+    while (i < expected.len) {
+        push[AInstr](&program, ai_load(A_X14(), A_X15(), i * 16));
+        overlap_expect(&program, context, A_X14(), expected.data[i], 10 + (i as i64));
+        let logical_size: i64 = 600000 + (i as i64);
+        if (expected.data[i] == 0 - 1 || i == 8) { logical_size = 0; }
+        push[AInstr](&program, ai_load(A_X14(), A_X15(), i * 16 + 8));
+        overlap_expect(&program, context, A_X14(), logical_size, 20 + (i as i64));
+        i = i + 1;
+    }
+    push[AInstr](&program, ai_mov_imm(A_X0(), 42));
+    push[AInstr](&program, ai_syscall(93));
+    let status: i32 = 0;
+    if (darwin) {
+        let provisional: ArrayList[u8] = aencode_macos(program,
+            macho_code_vmaddr(), MACHO_BASE(), data.len, 0);
+        let code: ArrayList[u8] = aencode_macos(program,
+            macho_code_vmaddr(), macho_data_vmaddr(provisional.len), data.len, 0);
+        status = write_macho_arm64_data(_zag_arg(1), code, 0, data);
+        free[u8](&code); free[u8](&provisional);
+    } else {
+        let code: ArrayList[u8] = aencode(program);
+        status = write_elf_arm64_data(_zag_arg(1), code, 0, data);
+        free[u8](&code);
+    }
+    free[AInstr](&program); free[u8](&data);
+    free[i64](&initial); free[i64](&expected);
+    _zag_free(context as *i8);
+    return status;
+}

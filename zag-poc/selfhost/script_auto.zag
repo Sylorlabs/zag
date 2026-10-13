@@ -1,0 +1,217 @@
+// Bounded auto engine v1. No parser/CLI integration and no ambient effects in
+// the expression language. Host allocation is used for compiler work only.
+//
+// PUBLIC API: ScriptAutoConfig, ScriptAutoResult, ScriptAutoProof,
+// script_auto_optimize(reference, config), script_auto_check(reference,candidate,
+// config), script_auto_verify_record(reference,config,record),
+// script_auto_result_free(&result).
+//
+// Contract: whitespace-separated postfix; decimal constants in [0,2^bits),
+// x/y (according to variables), + - * & | ^. bits=1..4, variables=0..2.
+// Every arithmetic operation wraps modulo 2^bits. No division, shifts, calls,
+// floats, pointers, loops, hidden state or partial input-domain assumptions.
+// At most 31 nodes / 511 bytes. Invalid or incomplete requests fail closed.
+//
+// Finite candidate grammar: reference, all constants then inputs, then every
+// op (+,-,*,&,|,^) over ordered pairs of leaves. Cost = postfix node count.
+// Ties use first enumeration index (reference is 0). All candidates checked on
+// ALL input tuples. This proves only finite-domain equivalence and minimum cost
+// in this exact candidate set, assuming correct execution of this checker.
+// It makes no machine-runtime/global-program optimum claim.
+//
+// Config identities are opaque caller-supplied bindings, NOT authenticated
+// compiler hashes. Parent must supply real graph/compiler/target identities.
+// Verification recomputes, never trusts a record's proof claim. Record fields
+// are length-framed; edits, changed contracts/config or identities invalidate it.
+// No wall clock, randomness, filesystem or benchmark input affects selection.
+// Output is an ordinary Zag function on i64 carriers, rejecting out-of-domain
+// inputs with -1. Every internal value fits i64 (largest product is 225).
+// Result owns generated/record slices; free once via result_free. Proof/error
+// messages are static. Internal sa_* helpers require validated inputs.
+
+@import("../std/list.zag")
+
+struct ScriptAutoConfig {
+    bits:i32, variables:i32, work_budget:i64,
+    source_id:[]u8, compiler_id:[]u8, target_id:[]u8,
+}
+struct ScriptAutoResult {
+    ok:i32, error:[]u8, generated:[]u8, record:[]u8,
+    cost:i32, candidate_index:i32, candidates:i32, assignments:i32,
+    work_bound:i64,
+}
+struct ScriptAutoProof {
+    ok:i32, equivalent:i32, error:[]u8, checked:i32,
+    counter_x:i64, counter_y:i64, reference_value:i64, candidate_value:i64,
+}
+struct SaNode { op:i32, value:i64, left:i32, right:i32 }
+struct SaProgram { nodes:ArrayList[SaNode], valid:i32 }
+
+fn sa_modulus(bits:i32)i64 { let n:i64=1;let i:i32=0;while(i<bits){n=n*2;i=i+1;}return n; }
+fn sa_config_ok(c:ScriptAutoConfig)i32 {
+    if(c.bits<1||c.bits>4||c.variables<0||c.variables>2||c.work_budget<1||c.work_budget>20000000){return 0;}
+    if(c.source_id.len<1||c.source_id.len>1024||c.compiler_id.len<1||c.compiler_id.len>1024||c.target_id.len<1||c.target_id.len>1024){return 0;}
+    return 1;
+}
+fn sa_space(c:u8)bool{return c==32||c==9||c==10||c==13;}
+fn sa_op(s:[]u8)i32 {
+    if(@strEq(s,"+")){return 3;}if(@strEq(s,"-")){return 4;}
+    if(@strEq(s,"*")){return 5;}if(@strEq(s,"&")){return 6;}
+    if(@strEq(s,"|")){return 7;}if(@strEq(s,"^")){return 8;}return -1;
+}
+fn sa_parse(s:[]u8,c:ScriptAutoConfig)SaProgram {
+    let p:SaProgram=SaProgram{.nodes=make[SaNode](31),.valid=0};
+    if(s.len<1||s.len>511){return p;}
+    let stack:ArrayList[i32]=make[i32](31);let i:i32=0;let bad:i32=0;
+    while(i<s.len&&bad==0){
+        if(sa_space(s[i])){i=i+1;}else{
+            let start:i32=i;while(i<s.len&&!sa_space(s[i])){i=i+1;}
+            let t:[]u8=s[start..i];let op:i32=sa_op(t);let value:i64=0;
+            let left:i32=-1;let right:i32=-1;
+            if(@strEq(t,"x")){op=1;if(c.variables<1){bad=1;}}
+            else if(@strEq(t,"y")){op=2;if(c.variables<2){bad=1;}}
+            else if(op<0){
+                op=0;let j:i32=0;
+                // Two decimal digits suffice; reject overflow and alternate spellings.
+                if(t.len>2){bad=1;}
+                while(j<t.len&&bad==0){if(t[j]<'0'||t[j]>'9'){bad=1;}else{value=value*10+(t[j]-'0') as i64;}j=j+1;}
+                if(value>=sa_modulus(c.bits)){bad=1;}
+            }
+            if(op>=3){if(stack.len<2){bad=1;}else{right=pop[i32](&stack);left=pop[i32](&stack);}}
+            if(p.nodes.len>=31){bad=1;}
+            if(bad==0){push[SaNode](&p.nodes,SaNode{.op=op,.value=value,.left=left,.right=right});push[i32](&stack,p.nodes.len-1);}
+        }
+    }
+    if(bad==0&&stack.len==1){p.valid=1;}
+    free[i32](&stack);return p;
+}
+fn sa_apply(op:i32,a:i64,b:i64,m:i64)i64 {
+    if(op==3){return (a+b)%m;}if(op==4){return (a+m-b)%m;}
+    if(op==5){return (a*b)%m;}if(op==6){return a&b;}
+    if(op==7){return a|b;}return a^b;
+}
+fn sa_eval(p:SaProgram,x:i64,y:i64,m:i64,values:*i64)i64 {
+    let i:i32=0;while(i<p.nodes.len){let n:SaNode=p.nodes.data[i];let v:i64=n.value;
+        if(n.op==1){v=x;}else if(n.op==2){v=y;}
+        else if(n.op>=3){v=sa_apply(n.op,values[n.left],values[n.right],m);}
+        values[i]=v;i=i+1;
+    }return values[p.nodes.len-1];
+}
+fn sa_states(c:ScriptAutoConfig)i32 {
+    let n:i32=1;let i:i32=0;while(i<c.variables){n=n*(sa_modulus(c.bits) as i32);i=i+1;}return n;
+}
+fn sa_x(index:i32,c:ScriptAutoConfig)i64 {if(c.variables==0){return 0;}return (index as i64)%sa_modulus(c.bits);}
+fn sa_y(index:i32,c:ScriptAutoConfig)i64 {if(c.variables<2){return 0;}return (index as i64)/sa_modulus(c.bits);}
+fn sa_proof_error(message:[]u8)ScriptAutoProof {
+    return ScriptAutoProof{.ok=0,.equivalent=0,.error=message,.checked=0,.counter_x=-1,.counter_y=-1,.reference_value=-1,.candidate_value=-1};
+}
+fn script_auto_check(reference:[]u8,candidate:[]u8,c:ScriptAutoConfig)ScriptAutoProof {
+    if(sa_config_ok(c)==0){return sa_proof_error("invalid_config");}
+    let r:SaProgram=sa_parse(reference,c);let p:SaProgram=sa_parse(candidate,c);
+    let result:ScriptAutoProof=sa_proof_error("unsupported_expression");
+    if(r.valid==1&&p.valid==1){
+        let states:i32=sa_states(c);let bound:i64=(states as i64)*((r.nodes.len+p.nodes.len) as i64);
+        if(bound>c.work_budget){result.error="work_budget_exceeded";}
+        else{
+            let scratch:ArrayList[i64]=make[i64](31);result.ok=1;result.error="";result.equivalent=1;
+            let i:i32=0;while(i<states&&result.equivalent==1){let x:i64=sa_x(i,c);let y:i64=sa_y(i,c);
+                let rv:i64=sa_eval(r,x,y,sa_modulus(c.bits),scratch.data);
+                let pv:i64=sa_eval(p,x,y,sa_modulus(c.bits),scratch.data);
+                result.checked=result.checked+1;
+                if(rv!=pv){result.equivalent=0;result.counter_x=x;result.counter_y=y;result.reference_value=rv;result.candidate_value=pv;}
+                i=i+1;
+            }free[i64](&scratch);
+        }
+    }
+    free[SaNode](&r.nodes);free[SaNode](&p.nodes);return result;
+}
+fn sa_text(out:*ArrayList[u8],s:[]u8)void{let i:i32=0;while(i<s.len){push[u8](out,s[i]);i=i+1;}}
+fn sa_number(out:*ArrayList[u8],n:i64)void {
+    if(n>=10){sa_number(out,n/10);}push[u8](out,((n%10)+48) as u8);
+}
+fn sa_field(out:*ArrayList[u8],name:[]u8,s:[]u8)void {
+    sa_text(out,name);sa_text(out,"=");sa_number(out,s.len as i64);sa_text(out,":");sa_text(out,s);sa_text(out,"\n");
+}
+fn sa_integer_field(out:*ArrayList[u8],name:[]u8,n:i64)void {
+    sa_text(out,name);sa_text(out,"=");sa_number(out,n);sa_text(out,"\n");
+}
+fn sa_symbol(op:i32)[]u8 {
+    if(op==3){return "+";}if(op==4){return "-";}if(op==5){return "*";}
+    if(op==6){return "&";}if(op==7){return "|";}return "^";
+}
+fn sa_emit_expr(out:*ArrayList[u8],p:SaProgram,index:i32,m:i64)void {
+    let n:SaNode=p.nodes.data[index];
+    if(n.op==0){sa_number(out,n.value);return;}
+    if(n.op==1){sa_text(out,"x");return;}if(n.op==2){sa_text(out,"y");return;}
+    sa_text(out,"((");sa_emit_expr(out,p,n.left,m);
+    if(n.op==4){sa_text(out," + ");sa_number(out,m);}
+    sa_text(out," ");sa_text(out,sa_symbol(n.op));sa_text(out," ");sa_emit_expr(out,p,n.right,m);
+    sa_text(out,") % ");sa_number(out,m);sa_text(out,")");
+}
+fn sa_emit_program(p:SaProgram,c:ScriptAutoConfig)[]u8 {
+    let out:ArrayList[u8]=make[u8](2048);sa_text(&out,"fn script_auto_selected(");
+    if(c.variables>0){sa_text(&out,"x:i64");}if(c.variables>1){sa_text(&out,", y:i64");}
+    sa_text(&out,") i64 {\n");let m:i64=sa_modulus(c.bits);
+    if(c.variables>0){sa_text(&out,"    if (x < 0 || x >= ");sa_number(&out,m);sa_text(&out,") { return -1; }\n");}
+    if(c.variables>1){sa_text(&out,"    if (y < 0 || y >= ");sa_number(&out,m);sa_text(&out,") { return -1; }\n");}
+    sa_text(&out,"    return ");sa_emit_expr(&out,p,p.nodes.len-1,m);sa_text(&out,";\n}\n");
+    return out.data[0..out.len];
+}
+fn sa_leaf(index:i32,m:i64)SaNode {
+    let n:SaNode=SaNode{.op=0,.value=index as i64,.left=-1,.right=-1};
+    if(index as i64>=m){n.op=1+index-(m as i32);n.value=0;}return n;
+}
+fn sa_candidate(p:*SaProgram,index:i32,c:ScriptAutoConfig)void {
+    let m:i64=sa_modulus(c.bits);let leaves:i32=(m as i32)+c.variables;
+    p.*.nodes.len=0;p.*.valid=1;let k:i32=index-1;
+    if(k<leaves){push[SaNode](&p.*.nodes,sa_leaf(k,m));return;}
+    k=k-leaves;let op:i32=3+k/(leaves*leaves);let pair:i32=k%(leaves*leaves);
+    push[SaNode](&p.*.nodes,sa_leaf(pair/leaves,m));push[SaNode](&p.*.nodes,sa_leaf(pair%leaves,m));
+    push[SaNode](&p.*.nodes,SaNode{.op=op,.value=0,.left=0,.right=1});
+}
+fn sa_failure(message:[]u8)ScriptAutoResult {
+    return ScriptAutoResult{.ok=0,.error=message,.generated="",.record="",.cost=0,.candidate_index=-1,.candidates=0,.assignments=0,.work_bound=0};
+}
+fn script_auto_optimize(reference:[]u8,c:ScriptAutoConfig)ScriptAutoResult {
+    if(sa_config_ok(c)==0){return sa_failure("invalid_config");}
+    let r:SaProgram=sa_parse(reference,c);
+    if(r.valid==0){free[SaNode](&r.nodes);return sa_failure("unsupported_reference");}
+    let m:i64=sa_modulus(c.bits);let leaves:i32=(m as i32)+c.variables;
+    let count:i32=1+leaves+6*leaves*leaves;let states:i32=sa_states(c);
+    let bound:i64=(states as i64)*((r.nodes.len+leaves+18*leaves*leaves) as i64);
+    if(bound>c.work_budget){free[SaNode](&r.nodes);return sa_failure("work_budget_exceeded");}
+    let table:ArrayList[i64]=make[i64](states);let scratch:ArrayList[i64]=make[i64](31);
+    let i:i32=0;while(i<states){push[i64](&table,sa_eval(r,sa_x(i,c),sa_y(i,c),m,scratch.data));i=i+1;}
+    let candidate:SaProgram=SaProgram{.nodes=make[SaNode](3),.valid=1};
+    let best:i32=0;let cost:i32=r.nodes.len;let index:i32=1;
+    while(index<count){
+        sa_candidate(&candidate,index,c);let equivalent:i32=1;i=0;
+        // Do not sample, prune on cost, or declare success on budget exhaustion.
+        while(i<states){if(sa_eval(candidate,sa_x(i,c),sa_y(i,c),m,scratch.data)!=table.data[i]){equivalent=0;}i=i+1;}
+        if(equivalent==1&&candidate.nodes.len<cost){best=index;cost=candidate.nodes.len;}
+        index=index+1;
+    }
+    let generated:[]u8="";
+    if(best==0){generated=sa_emit_program(r,c);}else{sa_candidate(&candidate,best,c);generated=sa_emit_program(candidate,c);}
+    let out:ArrayList[u8]=make[u8](4096);
+    sa_text(&out,"zag-script-auto-v1\nchecker=exhaustive-unsigned-modular-v1\ngrammar=reference-or-leaf-or-binary-leaves-v1\ncost=postfix-node-count\ntie=first-enumeration-index\neffects=pure\noptimum=finite-candidate-cost-only\n");
+    sa_field(&out,"reference",reference);sa_field(&out,"source",c.source_id);sa_field(&out,"compiler",c.compiler_id);sa_field(&out,"target",c.target_id);
+    sa_integer_field(&out,"bits",c.bits as i64);sa_integer_field(&out,"variables",c.variables as i64);
+    sa_integer_field(&out,"work_budget",c.work_budget);sa_integer_field(&out,"work_bound",bound);
+    sa_integer_field(&out,"assignments",states as i64);sa_integer_field(&out,"candidates",count as i64);
+    sa_integer_field(&out,"selected",best as i64);sa_integer_field(&out,"cost",cost as i64);
+    sa_field(&out,"generated",generated);sa_text(&out,"evidence=all-domain-inputs-all-candidates\n");
+    let result:ScriptAutoResult=ScriptAutoResult{.ok=1,.error="",.generated=generated,.record=out.data[0..out.len],.cost=cost,.candidate_index=best,.candidates=count,.assignments=states,.work_bound=bound};
+    free[SaNode](&r.nodes);free[SaNode](&candidate.nodes);free[i64](&table);free[i64](&scratch);return result;
+}
+fn script_auto_result_free(result:*ScriptAutoResult)void {
+    if(result.*.generated.len>0){_zag_free(_zag_slice_ptr(result.*.generated));}
+    if(result.*.record.len>0){_zag_free(_zag_slice_ptr(result.*.record));}
+    result.*=sa_failure("released");
+}
+fn script_auto_verify_record(reference:[]u8,c:ScriptAutoConfig,record:[]u8)i32 {
+    if(record.len<1||record.len>16384){return 0;}
+    let r:ScriptAutoResult=script_auto_optimize(reference,c);let ok:i32=0;
+    if(r.ok==1&&@strEq(r.record,record)){ok=1;}
+    script_auto_result_free(&r);return ok;
+}

@@ -1,38 +1,82 @@
 #!/usr/bin/env bash
-# AArch64 Linux backend suite: compile Zag to static EM_AARCH64 ELF, run via
-# qemu-user — or natively when the host is already aarch64 (real-hardware CI).
+# Portable ARM64 backend suite. Linux emits static EM_AARCH64 ELF and runs it
+# through qemu-user or native AArch64 hardware; Apple Silicon emits and runs the
+# equivalent signed Mach-O corpus natively. Format-specific evidence stays in
+# the platform tail below.
 cd "$(dirname "$0")/.."    # zag-poc root
 pass=0; fail=0
-WORK="/tmp/zag_native_arm64_$$"
-SRC="nt_src_arm64_$$.zag"
-mkdir -p "$WORK"
-trap 'rm -rf "$WORK"; rm -f "$SRC"' EXIT
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/zag-native-arm64.XXXXXX")
+SRC="$WORK/native-source.zag"
+trap 'rm -rf "$WORK"' EXIT
+# `std:` imports resolve beside the synthetic root source. Preserve the old
+# repository-root resolution while keeping every generated artifact isolated.
+ln -s "$PWD/std" "$WORK/std"
 
-if [ "$(uname -m)" = "aarch64" ]; then
-    QEMU=""     # native execution: "$QEMU" prog expands to prog
-else
-    QEMU="${QEMU:-qemu-aarch64-static}"
-    if ! command -v "$QEMU" >/dev/null 2>&1; then
-        echo "  XX  $QEMU not found (apt install qemu-user-static)"; exit 1
-    fi
-fi
+HOST_SYSTEM=$(uname -s)
+HOST_MACHINE=$(uname -m)
+TARGET=arm64
+TARGET_DESCRIPTION="AArch64 ELF"
+NATIVE_EXECUTION=0
+QEMU=""
+RUN_PREFIX=()
+
+case "$HOST_SYSTEM:$HOST_MACHINE" in
+    Darwin:arm64)
+        TARGET=macos-arm64
+        TARGET_DESCRIPTION="signed ARM64 Mach-O"
+        NATIVE_EXECUTION=1
+        ;;
+    Linux:aarch64|Linux:arm64)
+        NATIVE_EXECUTION=1
+        ;;
+    Linux:*)
+        QEMU="${QEMU:-qemu-aarch64-static}"
+        if ! command -v "$QEMU" >/dev/null 2>&1; then
+            echo "  XX  $QEMU not found (apt install qemu-user-static)"; exit 1
+        fi
+        RUN_PREFIX=("$QEMU")
+        ;;
+    *)
+        echo "  XX  unsupported ARM64 corpus host: $HOST_SYSTEM $HOST_MACHINE"
+        exit 1
+        ;;
+esac
 
 if [ -z "${ZNC:-}" ]; then
-    if ! ./znc selfhost/native/znc.zag -o "$WORK/znc_drv" >"$WORK/zn_build" 2>&1; then
+    seed=./znc
+    if [ "$HOST_SYSTEM" = Darwin ]; then seed=./znc-macos-arm64; fi
+    if ! "$seed" selfhost/native/znc.zag -o "$WORK/znc_drv" >"$WORK/zn_build" 2>&1; then
         echo "  XX  znc driver build"; sed -n '1,20p' "$WORK/zn_build"
         echo "════ arm64 pass=0 fail=1 ════"; exit 1
     fi
     ZNC="$WORK/znc_drv"
 fi
 
+assert_target_artifact(){
+    if [ "$HOST_SYSTEM" = Darwin ]; then
+        [ "$(file -b "$1" 2>/dev/null)" = "Mach-O 64-bit executable arm64" ] &&
+            codesign --verify --deep --strict "$1" >/dev/null 2>&1
+    else
+        file "$1" | grep -q 'ARM aarch64'
+    fi
+}
+
+run_target(){
+    "${RUN_PREFIX[@]}" "$@"
+}
+
 nt(){
     printf '%s' "$2" > "$SRC"
-    "$ZNC" "$SRC" --target arm64 -o "$WORK/nt_arm" >"$WORK/nt_out" 2>&1
-    if [ ! -x "$WORK/nt_arm" ]; then echo "  XX  $1 (compile failed)"; sed -n '1,8p' "$WORK/nt_out"; fail=$((fail+1)); return; fi
-    if ! file "$WORK/nt_arm" | grep -q 'ARM aarch64'; then
-        echo "  XX  $1 (not aarch64 ELF)"; fail=$((fail+1)); return
+    rm -f "$WORK/nt_arm"
+    if ! "$ZNC" "$SRC" --target "$TARGET" -o "$WORK/nt_arm" >"$WORK/nt_out" 2>&1; then
+        echo "  XX  $1 (compiler failed)"; sed -n '1,8p' "$WORK/nt_out"
+        fail=$((fail+1)); return
     fi
-    $QEMU "$WORK/nt_arm"; local got=$?
+    if [ ! -x "$WORK/nt_arm" ]; then echo "  XX  $1 (compile failed)"; sed -n '1,8p' "$WORK/nt_out"; fail=$((fail+1)); return; fi
+    if ! assert_target_artifact "$WORK/nt_arm"; then
+        echo "  XX  $1 (not $TARGET_DESCRIPTION)"; fail=$((fail+1)); return
+    fi
+    run_target "$WORK/nt_arm"; local got=$?
     if [ "$got" = "$3" ]; then echo "  ok  $1 (exit $got)"; pass=$((pass+1));
     else echo "  XX  $1 (got $got, want $3)"; fail=$((fail+1)); fi
     rm -f "$WORK/nt_arm"
@@ -40,15 +84,22 @@ nt(){
 
 nto(){
     printf '%s' "$2" > "$SRC"
-    "$ZNC" "$SRC" --target arm64 -o "$WORK/nt_arm" >"$WORK/nt_out" 2>&1
+    rm -f "$WORK/nt_arm"
+    if ! "$ZNC" "$SRC" --target "$TARGET" -o "$WORK/nt_arm" >"$WORK/nt_out" 2>&1; then
+        echo "  XX  $1 (compiler failed)"; sed -n '1,8p' "$WORK/nt_out"
+        fail=$((fail+1)); return
+    fi
     if [ ! -x "$WORK/nt_arm" ]; then echo "  XX  $1 (compile failed)"; sed -n '1,8p' "$WORK/nt_out"; fail=$((fail+1)); return; fi
-    local got; got=$($QEMU "$WORK/nt_arm"); local ec=$?
+    if ! assert_target_artifact "$WORK/nt_arm"; then
+        echo "  XX  $1 (not $TARGET_DESCRIPTION)"; fail=$((fail+1)); return
+    fi
+    local got; got=$(run_target "$WORK/nt_arm"); local ec=$?
     if [ "$got" = "$3" ] && [ "$ec" = "$4" ]; then echo "  ok  $1 (stdout='$got' exit=$ec)"; pass=$((pass+1));
     else echo "  XX  $1 (got stdout='$got' exit=$ec, want '$3'/$4)"; fail=$((fail+1)); fi
     rm -f "$WORK/nt_arm"
 }
 
-echo "── arm64 backend: Zag → AArch64 ELF (qemu-user) ──"
+echo "── arm64 backend: Zag → $TARGET_DESCRIPTION ──"
 nt "return literal"  'fn main() i32 { return 42; }' 42
 nt "arithmetic"      'fn main() i32 { let a: i32 = 8; let b: i32 = 5; return a * b - 2; }' 38
 nt "portable memory fence" 'fn main() i32 { let a:i32 = 20; @memoryFence(); return a + 22; }' 42
@@ -160,75 +211,89 @@ nt "method call"     'struct P { x: i32 } fn (self: P) twice() i32 { return self
 nt "iface dispatch"  'interface Shape { fn area(self) i32; } struct Sq { s: i32 } fn (self: Sq) area() i32 { return self.s * self.s; } struct Rc { w: i32, h: i32 } fn (self: Rc) area() i32 { return self.w * self.h; } fn go(s: Shape) i32 { return s.area(); } fn main() i32 { let a: Sq = Sq{ .s = 5 }; let b: Rc = Rc{ .w = 3, .h = 4 }; return go(a) + go(b) + 5; }' 42
 nt "iface multi-meth" 'interface Shape { fn area(self) i32; fn scaled(self, k: i32) i32; } struct Sq { s: i32 } fn (self: Sq) area() i32 { return self.s * self.s; } fn (self: Sq) scaled(k: i32) i32 { return self.s * self.s * k; } fn rep(s: Shape) i32 { return s.area() + s.scaled(2); } fn main() i32 { let a: Sq = Sq{ .s = 3 }; return rep(a) + 15; }' 42
 
-# interfaces example must match the x86 expected output exactly
-"$ZNC" examples/interfaces.zag --target arm64 -o $WORK/nt_if >$WORK/nt_out 2>&1
-if [ -x $WORK/nt_if ] && [ "$($QEMU $WORK/nt_if 2>/dev/null)" = "$(printf '75\n36')" ]; then
+# The interfaces example has one platform-independent exact output contract.
+"$ZNC" examples/interfaces.zag --target "$TARGET" -o "$WORK/nt_if" >"$WORK/nt_out" 2>&1
+if [ -x "$WORK/nt_if" ] && assert_target_artifact "$WORK/nt_if" &&
+        [ "$(run_target "$WORK/nt_if" 2>/dev/null)" = "$(printf '75\n36')" ]; then
     echo "  ok  examples/interfaces.zag (75/36)"; pass=$((pass+1))
 else
-    echo "  XX  examples/interfaces.zag"; sed -n '1,6p' $WORK/nt_out; fail=$((fail+1))
+    echo "  XX  examples/interfaces.zag"; sed -n '1,6p' "$WORK/nt_out"; fail=$((fail+1))
 fi
-rm -f $WORK/nt_if
+rm -f "$WORK/nt_if"
 
-echo "── real programs (output must be byte-identical to x86) ──"
-# On real aarch64 hardware the x86 reference binary cannot be executed (this job
-# deliberately runs without qemu). The byte-identical x86↔arm64 output check is
-# owned by the emulated x86 job that runs this same script; here we instead prove
-# each program loads through the real kernel ELF loader / syscall path and exits
-# cleanly with output.
+echo "── real programs ──"
+# Native ARM hosts prove the program loads through the real platform loader and
+# runtime path. The emulated Linux/x86 job additionally owns byte-identical
+# x86↔ARM64 output comparison because both artifacts can execute there.
 for prog in arena hash_map sort_bench state_machine csv_parser json_parser; do
-    if ! "$ZNC" "programs/$prog.zag" --target arm64 -o $WORK/np_arm >/dev/null 2>&1; then
+    if ! "$ZNC" "programs/$prog.zag" --target "$TARGET" -o "$WORK/np_arm" >/dev/null 2>&1; then
         echo "  XX  $prog (arm64 compile failed)"; fail=$((fail+1)); continue
     fi
-    $QEMU $WORK/np_arm > $WORK/np_arm_out 2>&1; arm_ec=$?
-    if [ "$(uname -m)" = "aarch64" ]; then
-        if [ "$arm_ec" = "0" ] && [ -s $WORK/np_arm_out ]; then
-            echo "  ok  $prog (ran on native aarch64, exit $arm_ec)"; pass=$((pass+1))
+    if ! assert_target_artifact "$WORK/np_arm"; then
+        echo "  XX  $prog (not $TARGET_DESCRIPTION)"; fail=$((fail+1)); rm -f "$WORK/np_arm"; continue
+    fi
+    run_target "$WORK/np_arm" > "$WORK/np_arm_out" 2>&1; arm_ec=$?
+    if [ "$NATIVE_EXECUTION" = 1 ]; then
+        if [ "$arm_ec" = "0" ] && [ -s "$WORK/np_arm_out" ]; then
+            echo "  ok  $prog (ran as native $TARGET_DESCRIPTION, exit $arm_ec)"; pass=$((pass+1))
         else
-            echo "  XX  $prog (native run failed: exit=$arm_ec)"; sed -n '1,4p' $WORK/np_arm_out; fail=$((fail+1))
+            echo "  XX  $prog (native run failed: exit=$arm_ec)"; sed -n '1,4p' "$WORK/np_arm_out"; fail=$((fail+1))
         fi
-        rm -f $WORK/np_arm $WORK/np_arm_out
+        rm -f "$WORK/np_arm" "$WORK/np_arm_out"
         continue
     fi
-    if ! "$ZNC" "programs/$prog.zag" -o $WORK/np_x86 >/dev/null 2>&1; then
-        echo "  XX  $prog (x86 compile failed)"; fail=$((fail+1)); rm -f $WORK/np_arm $WORK/np_arm_out; continue
+    if ! "$ZNC" "programs/$prog.zag" -o "$WORK/np_x86" >/dev/null 2>&1; then
+        echo "  XX  $prog (x86 compile failed)"; fail=$((fail+1)); rm -f "$WORK/np_arm" "$WORK/np_arm_out"; continue
     fi
-    $WORK/np_x86 > $WORK/np_x86_out 2>&1; x86_ec=$?
-    if [ "$x86_ec" = "$arm_ec" ] && diff -q $WORK/np_x86_out $WORK/np_arm_out >/dev/null 2>&1; then
+    "$WORK/np_x86" > "$WORK/np_x86_out" 2>&1; x86_ec=$?
+    if [ "$x86_ec" = "$arm_ec" ] && diff -q "$WORK/np_x86_out" "$WORK/np_arm_out" >/dev/null 2>&1; then
         echo "  ok  $prog (byte-identical output, exit $arm_ec)"; pass=$((pass+1))
     else
         echo "  XX  $prog (output differs from x86: x86=$x86_ec arm=$arm_ec)"
-        diff $WORK/np_x86_out $WORK/np_arm_out 2>/dev/null | head -4
+        diff "$WORK/np_x86_out" "$WORK/np_arm_out" 2>/dev/null | head -4
         fail=$((fail+1))
     fi
-    rm -f $WORK/np_x86 $WORK/np_arm $WORK/np_x86_out $WORK/np_arm_out
+    rm -f "$WORK/np_x86" "$WORK/np_arm" "$WORK/np_x86_out" "$WORK/np_arm_out"
 done
 
-# static ELF, no interpreter
-printf 'fn main() i32 { return 0; }' > $SRC
-"$ZNC" $SRC --target arm64 -o $WORK/nt_elf >/dev/null 2>&1
-if file $WORK/nt_elf | grep -q 'statically linked' && ! readelf -l $WORK/nt_elf 2>/dev/null | grep -q 'INTERP'; then
-    echo "  ok  emitted ELF is static, no interpreter"; pass=$((pass+1))
-else
-    echo "  XX  emitted ELF static/no-interp check"; fail=$((fail+1))
-fi
-rm -f $WORK/nt_elf $SRC
+if [ "$HOST_SYSTEM" = Linux ]; then
+    # Linux-only executable-format and syscall-number translation evidence.
+    printf 'fn main() i32 { return 0; }' > "$SRC"
+    "$ZNC" "$SRC" --target arm64 -o "$WORK/nt_elf" >/dev/null 2>&1
+    if file "$WORK/nt_elf" | grep -q 'statically linked' && ! readelf -l "$WORK/nt_elf" 2>/dev/null | grep -q 'INTERP'; then
+        echo "  ok  emitted ELF is static, no interpreter"; pass=$((pass+1))
+    else
+        echo "  XX  emitted ELF static/no-interp check"; fail=$((fail+1))
+    fi
+    rm -f "$WORK/nt_elf"
 
-echo "── architecture-specific open/openat flags ──"
-if env ZNC="$ZNC" QEMU="$QEMU" bash tests/run_arm64_open_flags.sh; then
-    echo "  ok  x86-64 open flags translate to AArch64"
-    pass=$((pass+1))
-else
-    echo "  XX  x86-64 open flags translate to AArch64"
-    fail=$((fail+1))
-fi
+    echo "── architecture-specific open/openat flags ──"
+    if env ZNC="$ZNC" QEMU="$QEMU" bash tests/run_arm64_open_flags.sh; then
+        echo "  ok  x86-64 open flags translate to AArch64"
+        pass=$((pass+1))
+    else
+        echo "  XX  x86-64 open flags translate to AArch64"
+        fail=$((fail+1))
+    fi
 
-echo "── arm64 C ABI object boundary ──"
-if env ZNC="$ZNC" bash tests/run_arm64_cabi_object.sh; then
-    echo "  ok  entryless scalar ET_REL and data rejection"
-    pass=$((pass+1))
+    echo "── arm64 C ABI object boundary ──"
+    if env ZNC="$ZNC" bash tests/run_arm64_cabi_object.sh; then
+        echo "  ok  entryless scalar ET_REL and data rejection"
+        pass=$((pass+1))
+    else
+        echo "  XX  entryless scalar ET_REL and data rejection"
+        fail=$((fail+1))
+    fi
 else
-    echo "  XX  entryless scalar ET_REL and data rejection"
-    fail=$((fail+1))
+    echo "── native Mach-O/signature boundary ──"
+    printf 'fn main() i32 { return 0; }' > "$SRC"
+    "$ZNC" "$SRC" --target macos-arm64 -o "$WORK/nt_macho" >/dev/null 2>&1
+    if assert_target_artifact "$WORK/nt_macho"; then
+        echo "  ok  emitted executable is signed ARM64 Mach-O"; pass=$((pass+1))
+    else
+        echo "  XX  emitted ARM64 Mach-O/signature check"; fail=$((fail+1))
+    fi
+    rm -f "$WORK/nt_macho"
 fi
 
 echo "════ arm64 pass=$pass fail=$fail ════"

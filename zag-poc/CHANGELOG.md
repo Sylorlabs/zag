@@ -9,6 +9,231 @@ Pacific Time. Tags are listed in chronological order; all tags preceded
 ## [Unreleased]
 
 ### Added
+- **AArch64 stack-machine optimizer** (`selfhost/native/aoptimize.zag`), the
+  counterpart of the x86-64 `optimize.zag`, wired into `znc_macos_lower_code`
+  and into `znc_hot_patch_macos`. The AArch64 backend emitted expression
+  temporaries through a stack region around `x28` and nothing ever removed them:
+  42.3% of the emitted `__text` was memory operations and the hottest pattern in
+  a profile was a pop immediately followed by pushing the same value back. The
+  pass removes constant push/pop pairs, folds constant arithmetic, and deletes
+  dead moves. **Emitted code is 9–10% smaller and a compute-bound loop runs
+  1.36x faster**, with `programs/*` byte-identical in output and exit codes.
+  Gated by `make test-aarch64-optimizer`.
+  - Not every x86 assumption transferred. The stack pointer is `x28` and is also
+    written outside push/pop; float and vector kinds clobber the GPR they name
+    because `v0` **is** `x0`; immediates are unsigned imm12 and a negative one is
+    unencodable; `AK_AND_IMM` and a wide `AK_CMP_IMM` clobber `x9`/`x10`;
+    `AK_MUL_RR`/`AK_SDIV` carry a third GPR in `imm`; and flags cross label
+    boundaries, so a label is a breaker.
+
+### Fixed
+- **A wrong-answer bug in the new AArch64 optimizer's liveness model**, found
+  during review before the pass was wired in. `add x0, x1` encodes as
+  `add xd, xd, xm`, so the destination is also the first source and `src` is a
+  genuine second source. Only the destination was marked live, so a
+  rematerialized `mov x1, 5000` in front of the add looked dead, DCE deleted it,
+  and the add read an unwritten register. `b = b + 5000` evaluated to `b`, and
+  `sort_bench` sorted incorrectly — with no crash and no diagnostic.
+
+### Fixed
+- **The macOS `zagd` daemon reallocated the same path five times per file event.**
+  Every edit rebuilt the deep-measurement record's path from scratch just to
+  unlink it: `zmd_join` is two `_zag_str_concat` calls, and each one allocates
+  both a data buffer *and* a 16-byte `{ptr,len}` descriptor through
+  `__make_slice`, so a function that reads like "one path string" costs four —
+  plus the cstr buffer, five in total. The resource-stress gate counts allocation
+  COUNT rather than bytes, which is why this showed up as a steady +5/edit while
+  `live_bytes` and `peak_live_bytes` stayed perfectly flat.
+  The path is loop-invariant, so it is now built into the caller-owned scratch
+  buffers `zmd_execute_deep_controls` already carries. The unlink stays
+  unconditional — a stale record from a previous deep run is exactly what light
+  mode must clear — so only the rebuilding was removed. **256 edits now allocate
+  146 times total, unchanged from the baseline; RSS growth is negative.**
+  `make test-zagd-macos-resource-stress` passes, as does
+  `test-zagd-background-semantics`, which was blocked behind it.
+- **`tests/run_reference_dynamic_plugin_macos.sh` could not be driven with a
+  wrapper compiler.** The macOS release gate passes a compiler wrapper that
+  resolves the real compiler *relative to its own `argv[0]`*. The test staged
+  `znc` but not `znc-real`, so relocating the symlink made the wrapper exit 127.
+  It now stages `znc-real` too, matching `run_macos_zagscript_authority.sh`.
+
+### Changed
+- **Compiler self-compile is 1.19x faster**, byte-identical output. Two changes,
+  both pure optimizations:
+  - **Mach-O output and SHA-256 no longer copy byte at a time.** The image
+    writers appended through `push[u8]`, one out-of-line call per output byte,
+    and `macho_sha256` built its padded message block the same way. They now
+    reserve once and `_zag_memcpy` once. `sh_constants()` and the 64-entry
+    message schedule were also allocated *per block* — about 236,000
+    allocations and 30M pushes for a 15 MB image — and are now hoisted.
+    Compiles whose cost is dominated by output size are 4.7–6.1x faster
+    (a 4 MB data segment: 17.5 s → 3.7 s).
+  - `sh_ror` built a 32-bit rotate from two loops totalling 32 iterations plus a
+    64-bit divide and remainder — measured at 181 ns per call against a few
+    cycles for the shift-and-or it now compiles to. SHA-256 calls it 384 times
+    per 64 bytes.
+- **The compiler-image read and hash are skipped when the foreground cache
+  cannot use them.** The 15 MB image was read and hashed on every build, and the
+  result feeds exactly one thing: the cache key, inside the branch that only runs
+  when the cache is eligible. Eligibility's cache-independent half is now
+  decided first. This path previously also read the image while
+  `--no-foreground-cache` was set, i.e. precisely when the result was discarded.
+- **Rejected: an arity index for the call-arity check.** Replacing the per-call
+  rescan of the declaration list with a name→arity hash map measured as
+  **neutral** — 247.7 s to 247.6 s on the self-compile, inside noise, so the
+  rescan is evidently short-circuited for nearly every callee. It then
+  **segfaulted** the compiler on `--safety=checked` programs, because it was the
+  first thing to import `selfhost/std/hashmap.zag`, which nothing had ever
+  compiled: wiring up never-exercised code surfaced latent defects in it. Reverted
+  — the binary is byte-identical to before the attempt. The lesson is recorded
+  rather than the code: dead code is not free to adopt, and a plausible-sounding
+  complexity argument is not a measurement.
+
+### Fixed
+- **`_zag_memcpy` was unusable in a `--target macos-arm64` program.** The AArch64
+  backend lowers a call to it and sets `use_mc`, but `ac_emit_memcpy` was only
+  reachable from `aload_program_target_metadata`, so on the macOS path the call
+  targeted a label that was never emitted and jumped to garbage — a `SIGSEGV`.
+  Nothing on that path called `_zag_memcpy` before, so the gap was latent; the
+  bulk-copy change above is what first reached it. Any macOS-arm64 program using
+  `_zag_memcpy` or `_zag_memcmp` would have crashed.
+- **`zvec_ty_valid` counted elements where the ceiling is in 32-bit units.** The
+  width ladder is expressed in 32-bit-equivalent lanes, but this check passed the
+  raw element count, so `vector<i64,16>` (256 bytes, two registers) validated as
+  a single-register type. It now converts exactly as `vectorize.zag` and
+  `ncodegen.zag` do.
+- **The ZIR-to-C printer could read past the end of an operand list.** Its
+  fallback branch indexed `operands[1]` and `results[0]` unconditionally, which
+  is out of bounds for every `vector.*` op (one operand, no result) — reachable
+  only once the vector pipeline began emitting them. It now checks arity and
+  prints an explicit "not representable in C" note. Relatedly, `c_type` returned
+  `int32_t` for any unrecognized type, misstating the `memref<vector<ELEM,N>>`
+  accumulator slot as a scalar; it now names the type instead.
+- **`tests/run_v2_try_borrow.sh` and the macOS release gate required ripgrep**
+  without declaring it, failing with `rg: command not found`.
+
+### Added
+- **Declared x86-64 microarchitecture levels** — `--cpu=x86-64-v2`, `-v3`, and
+  `-v4` name a level instead of detecting one, which is what makes the 256- and
+  512-bit vector rungs buildable and testable on a host that lacks the hardware.
+  `v3` selects the AVX2 rung (4 lanes, `ymm`) and `v4` the AVX-512 rung (8
+  lanes, `zmm`); `v2` adds SSE4.2/POPCNT without changing vector width. Each
+  level has a distinct `cache_key`, so artifacts built for different levels can
+  never be served for one another. Carrying the runtime profile's value of `2`
+  for the AVX bits widens the vector pipeline without also enabling the bounded
+  scalar `i32x4` path. Measured on a 90M-element reduction, speedup tracks lane
+  count: **2.37x** at 2 lanes, **4.22x** at 4. See `docs/VECTOR_PIPELINE.md`.
+- **Vector pipeline** — a target-independent vector IR, an opt-in auto-vectorizer,
+  a vector register allocator, and CPU-width lowering, layered so no layer can
+  guess at another's decision. `selfhost/vector_contract.zag` is the single
+  source of truth for the `vector<ELEM,LANES>` spelling, the op set, the
+  width-class ladder, and the target lane ceilings.
+  - **Vector IR** (`selfhost/zir_vector.zag`): `vector.splat`,
+    `vector.broadcast`, `vector.extract`, `vector.insert`, `vector.add/sub/mul`,
+    `vector.bit_and/bit_or/bit_xor`, `vector.shl/shr`, `vector.icmp`,
+    `vector.select`, `vector.reduction_add`, `vector.shuffle`; an 11-fault-class
+    verifier wired additively into the existing def-before-use sweep, a
+    fixpoint vector-aware DCE that never removes a memory-reading op, an MLIR
+    printer, and module statistics.
+  - **Auto-vectorizer** (`selfhost/vectorize.zag`): natural-loop analysis,
+    induction-variable detection, and an alias/dependency proof with twelve
+    documented reject codes. The sound design is a memory-resident induction
+    variable, so the pass inserts a *vector main loop* guarded by
+    `i + LANES <= n` and leaves the original scalar loop untouched as the
+    epilogue — no phi, no peeling, any trip count. A floating-point accumulator
+    is refused because wrapping integer addition is associative and float
+    addition is not.
+  - **CPU-width lowering** (`selfhost/native/vecwidth.zag`): realizes the ladder
+    in 32-bit-equivalent units, splitting a wider logical vector into
+    independent per-piece operations with distinct virtual registers, and failing
+    closed rather than emitting an unencodable form. The ladder is
+    stride-derived: an element is a whole 8-byte word, so the target ceilings of
+    16/8/4 units are 8/4/**2** elements, and 2 `*i32` lanes is what the generic
+    128-bit baseline actually carries.
+  - **Vector register allocation** (`selfhost/native/vregalloc.zag`): a real
+    backward liveness pass, live intervals, and linear scan over a pool that
+    starts above whatever the scalar float lowering and existing SIMD scratch
+    already use. An unrecognised instruction kind clobbers every vector
+    register; the pass never spills, and refuses instead.
+  - **Machine encoders**: a generalized VEX emitter, a full EVEX emitter for
+    512-bit, scaled-index SIB forms, and width-parameteric packed ops on x86; on
+    AArch64 a packed width/element descriptor replaces the hardcoded `.4S` plus
+    23 new Advanced SIMD opcodes including `bsl`/`bit` select and `ld1`/`st1`
+    element-scaled addressing.
+  - **AVX-512 feature detection** (`x86_cpu_profile.zag`): AVX512F
+    (CPUID.7.0:ECX bit 16) *and* the opmask/ZMM state components (XCR0 bits
+    5,6,7). Both halves are required; either alone can `#UD`. This is what
+    makes the 16-lane rung reachable rather than aspirational.
+  - **`--vectorize=off|on`** (default `off`). The request selects whether the
+    pass runs; the CPU profile alone selects the width. Both the request and the
+    resolved rung are part of the foreground cache key. The vectorized module is
+    re-verified after the pass and discarded in favour of the scalar module on
+    any fault.
+  - **Machine lowering**: `zag.index` indexed element reads, vector SSA values
+    living in virtual vector registers, and real SSE2/AVX2/AVX-512 emission —
+    a word broadcast, a vector load scaled by the element's **address stride**,
+    the elementwise op, and a horizontal fold of one shuffle plus one add plus
+    one 64-bit extraction per 128-bit chunk. The emitted bytes are verified
+    against LLVM's disassembler.
+  - **Runtime proof on x86-64** (`tests/run_vector_equiv_x86_64.sh`, part of
+    `make test-vector-pipeline`): a vectorized and a scalar build of a
+    self-checking equivalence program are both *executed* and must each agree
+    with their own scalar reference across 18 trip counts. This is the only
+    check in the suite that proves the emitted code computes anything, and it is
+    the check that found the five lowering bugs under **Fixed** below. It skips
+    rather than fails where no amd64 emulator is available.
+  - `docs/VECTOR_PIPELINE.md`, `make test-vector-pipeline` (IR, vectorizer,
+    epilogue preservation, machine lowering, off-by-default boundary,
+    runtime equivalence).
+
+- **Native Apple-Silicon dynamic libraries and custom linking** — strict
+  edition-2027 scalar/bounded-`f32`/`f64` plus bounded flat/nested 64-bit-leaf
+  and flat small integer/bool/pointer struct import/export and direct-callback
+  C-ABI `--emit-dylib`/`--emit-shared`, custom `--dynamic`
+  executables, `-l`/`-L`/`--needed`, bounded TAPI-v4 SDK-library and `-framework`/`-F` lookup, source/manifest dependencies, install names
+  and runtime paths now use a Zag-owned linker and deterministic signer.
+  Native CLI and format suites cover checked C/Zag/C calls, independent
+  Darwin FP/X-register `f32`/`f64` imports and exports with explicit f32 single/double conversion, direct scalar callbacks, and bounded
+  f32/f64 callbacks through explicit `pub @cabi_export` callback targets,
+  including closed libSystem `cosf`/`powf`/`ldexpf` execution without a host linker,
+  plus ten-FP-argument import/export/callback witnesses covering V0-V7 and
+  Darwin's naturally packed stack overflow, plus ordinary 64-bit-leaf struct
+  imports/exports covering flat/nested small INTEGER register/stack transport
+  and flat/nested large caller-copy/`X8` indirect results, plus an explicit
+  pack/unpack adapter for flat naturally aligned integer/bool/raw-pointer
+  structs whose Darwin C layout is at most 16 bytes (including subword fields,
+  padding, one/two-register transport, and whole-value stack spill),
+  real CoreFoundation framework lookup plus target-scoped `.tbd` validation, relocated trees,
+  versioned symlinks, 305 exports, pointer rebase/bind, universal dependencies
+  and malformed inputs. They are required by the full source-qualified Mac
+  gate; this does not add a general C ABI, Intel Mac support or whole-target
+  Linux parity.
+- **Native Apple-Silicon static object/archive input linking** — explicit ARM64
+  Mach-O `.o` and BSD `.a` inputs now merge into Zag-owned dylib and custom
+  executable output through positional operands or `--static-input`. The native
+  gate covers deterministic CLI forms, bounded/symlinked inputs, selective and
+  transitive archive extraction, COMMON plus strong/weak resolution,
+  private-external visibility, absolute/page/GOT/`POINTER_TO_GOT` relocations,
+  resolved and missing weak imports with dyld null fallback, imported TLVP loads
+  through dylib-exported thread-local symbols, same/cross-output-section
+  subtractors, and static/dynamic composition. Static TLS-defining object
+  sections, authenticated ARM64e pointers, and arbitrary foreign-object formats
+  remain fail-closed.
+- **Reviewable clean-checkout Apple-Silicon bootstrap** — the physical-Mac CI
+  gate now publishes its actual fixed-point compiler only after the complete
+  native gate passes, under a name distinct from the Linux cross-built
+  precursor and alongside a logged SHA-256 plus source commit. The explicit
+  `tools/bootstrap-macos-seed.sh` intake verifies checksum, signed Mach-O host
+  identity, a source-built fixed point, and the independent empty-`PATH`
+  reproducibility proof before building checkout-qualified compiler, daemon,
+  and LSP artifacts; it never downloads or auto-selects trust.
+  Native release archives also carry `znc.sha256` for a durable intake route
+  after verification of the signed tag and outer archive checksum.
+- **Reproducible VS Code packaging** — the extension now has a committed npm
+  lockfile, pinned `vsce`/bundler dependencies, a working `npm run package`, a
+  bundled runtime client, and fixed ZIP timestamps. CI and `release.sh` require
+  repeated packages to be byte-identical, and release archives ship both the
+  ready VSIX and the locked source package without transient build trees.
 - **V2 unsafe/raw-pointer vertical slice** — edition-2027 now has a dedicated
   unsafe-block AST node, direct `unsafe fn` declarations/call-site checks, and
   `Unsafe` effect propagation into `@pure` and `@realtime`. Qualified pointer
@@ -107,6 +332,51 @@ Pacific Time. Tags are listed in chronological order; all tags preceded
   each prologue from the authoritative number of slots actually allocated while
   lowering. The pre-scan remains a sizing optimization, but an omitted scratch
   or capture case can no longer under-reserve the frame and corrupt the stack.
+- **Vector lowering read and computed the wrong values.** Eight defects, all of
+  which passed every IR, byte-decoding and shape assertion in the suite because
+  the emitted machine code was well-formed in every one of them. They were found
+  only by *executing* a vectorized program on x86-64, which is why
+  `tests/run_vector_equiv_x86_64.sh` now exists:
+  - **The vector load was scaled by the element WIDTH, not its address
+    STRIDE.** Native layout gives every non-byte scalar a full 8-byte word, so
+    `p[i]` over a `*i32` advances eight bytes; a load scaled by 4 gathered four
+    bytes-packed words, none of which are adjacent array elements. The loop read
+    the wrong data and still decoded perfectly. Lanes are now derived from the
+    stride (`zvec_elem_stride`), which also makes the correct lane count per
+    width 2/4/8 rather than 4/8/16.
+  - **The horizontal fold added the scratch to itself**, doubling one partial
+    sum (`2q`) instead of totalling the vector (`p+q`). A shuffle tree needs the
+    un-permuted partials in one register and their permutation in another; with
+    one scratch that is not expressible. Replaced with `vpshufd $0x4E` (which
+    swaps the two 64-bit halves of each 128-bit chunk) plus one `vpaddq` plus
+    one 64-bit extraction per chunk.
+  - **The 64-bit extract fold loaded each lane into the accumulator before
+    adding the pending one**, dropping every other lane and leaving the last
+    pair as the whole sum.
+  - **A fold left stale high-half garbage in the GPR** (`vpextrd` writes 32
+    bits) while i32 comparisons lower to a 64-bit `cmpq`, so a correct reduction
+    failed its own `==`.
+  - **A broadcast accumulator was summed once per lane** by the horizontal fold,
+    making the second and later vector iterations compute `L*acc + sum(e)`. The
+    vectorizer now splats zero and the `reduce = "add"` store accumulates into
+    the scalar slot once per iteration.
+  - Also in the same path: the scaled-index load hardcoded REX.X, so every
+    index register was read 8 higher (`index=2` encoded as `r10`); and
+    `zag.index` used `i_imul(idx, idx)`, addressing `a + n*n` in the scalar
+    epilogue that has to stay equivalent to the original loop.
+  - The vector accumulator slot was reserved at **one** 8-byte frame word. A
+    vector slot is a whole 16/32/64-byte register, so the value after it landed
+    inside it: the loop's step constant was overwritten with the slot's low
+    bytes, the step became zero, and the loop never terminated. The size test
+    missed it because a vector slot's type is `memref<vector<ELEM,N>>`, which is
+    not itself a vector type.
+- **The vector loop's epilogue was silently dropped from the diagnostic output.**
+  A module that the ZIR-direct route refuses fell back to the AST bridge with no
+  indication, so a vectorized program could be built, run, timed, and reported as
+  "vectorized" while every vector instruction had been discarded. The lowering
+  line now names the refusing op (`refusal=<op>`), which is also what caught a
+  benchmark whose single `&` in `main` kept the whole module out of the direct
+  subset — so the first "no speedup" measurement was measuring scalar code.
 
 ### Removed
 - **Non-Zag WASM execution oracles** — removed the Rust/Cargo Wasmtime host,

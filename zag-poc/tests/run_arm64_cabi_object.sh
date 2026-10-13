@@ -53,6 +53,36 @@ cp "$ROOT/tests/fixtures/cabi_object_add.zag" "$TMP/project/add.zag"
 cp "$ROOT/tests/fixtures/cabi_object_import.zag" "$TMP/project/import.zag"
 cp "$ROOT/tests/fixtures/cabi_object_narrow.zag" "$TMP/project/narrow.zag"
 cp "$ROOT/tests/fixtures/cabi_object_after_iface.zag" "$TMP/project/after_iface.zag"
+cp "$ROOT/tests/fixtures/cabi_object_float.zag" "$TMP/project/float-export.zag"
+cp "$ROOT/tests/fixtures/cabi_object_float32.zag" "$TMP/project/float32-export.zag"
+cp "$ROOT/tests/fixtures/cabi_object_float_callback.zag" "$TMP/project/float-callback.zag"
+
+# f32/f64 @cabi_export are currently an Apple-Silicon Mach-O boundary only.
+# Keep Linux AArch64 fail-closed until it has its own native FP-register witness.
+if "$ZNC" "$TMP/project/float-export.zag" --target arm64 --emit-obj \
+    --no-zagd --no-analyze --no-foreground-cache -o "$TMP/float-export.o" \
+    >"$TMP/float-export.log" 2>&1; then
+    echo "arm64-cabi-object: macOS-only f64 export leaked into Linux AArch64" >&2
+    exit 1
+fi
+grep -q '@cabi_export supports only scalar integers' "$TMP/float-export.log"
+test ! -e "$TMP/float-export.o"
+if "$ZNC" "$TMP/project/float32-export.zag" --target arm64 --emit-obj \
+    --no-zagd --no-analyze --no-foreground-cache -o "$TMP/float32-export.o" \
+    >"$TMP/float32-export.log" 2>&1; then
+    echo "arm64-cabi-object: macOS-only f32 export leaked into Linux AArch64" >&2
+    exit 1
+fi
+grep -q '@cabi_export supports only scalar integers' "$TMP/float32-export.log"
+test ! -e "$TMP/float32-export.o"
+if "$ZNC" "$TMP/project/float-callback.zag" --target arm64 --emit-obj \
+    --no-zagd --no-analyze --no-foreground-cache -o "$TMP/float-callback.o" \
+    >"$TMP/float-callback.log" 2>&1; then
+    echo "arm64-cabi-object: macOS-only floating-point callback leaked into Linux AArch64" >&2
+    exit 1
+fi
+grep -Eq '@cabi|callback|scalar' "$TMP/float-callback.log"
+test ! -e "$TMP/float-callback.o"
 
 "$ZNC" "$TMP/project/add.zag" --target arm64 --emit-obj \
     --no-zagd --no-analyze --no-foreground-cache -o "$TMP/add.o" \
@@ -89,26 +119,16 @@ for symbol in cabi_narrow_i8 cabi_narrow_u8 cabi_narrow_i16 cabi_narrow_u16 \
 done
 
 # Interface declarations are metadata pseudo-functions and consume no encoder
-# label. An export after one must still resolve to its own function entry.
-if [ "$(uname -s):$(uname -m)" = Darwin:arm64 ]; then
-    if "$ZNC" "$TMP/project/after_iface.zag" --target arm64 --emit-obj \
-        --no-zagd --no-analyze --no-foreground-cache -o "$TMP/after_iface.o" \
-        >"$TMP/after_iface.log" 2>&1; then
-        echo "arm64-cabi-object: interface metadata unexpectedly accepted on Darwin" >&2
-        exit 1
-    fi
-    test ! -e "$TMP/after_iface.o"
-    grep -q 'does not yet support interface metadata declarations' "$TMP/after_iface.log"
-else
-    "$ZNC" "$TMP/project/after_iface.zag" --target arm64 --emit-obj \
-        --no-zagd --no-analyze --no-foreground-cache -o "$TMP/after_iface.o" \
-        >"$TMP/after_iface.log" 2>&1
-    test -f "$TMP/after_iface.o"
-    elf_defined_symbol "$TMP/after_iface.o" zag_after_iface
-    if elf_symbols "$TMP/after_iface.o" | grep -q '__iface_'; then
-        echo "arm64-cabi-object: interface metadata leaked into ET_REL symbols" >&2
-        exit 1
-    fi
+# label. An export after one must still resolve to its own function entry on
+# every host that can emit the compiler-owned AArch64 ELF object format.
+"$ZNC" "$TMP/project/after_iface.zag" --target arm64 --emit-obj \
+    --no-zagd --no-analyze --no-foreground-cache -o "$TMP/after_iface.o" \
+    >"$TMP/after_iface.log" 2>&1
+test -f "$TMP/after_iface.o"
+elf_defined_symbol "$TMP/after_iface.o" zag_after_iface
+if elf_symbols "$TMP/after_iface.o" | grep -q '__iface_'; then
+    echo "arm64-cabi-object: interface metadata leaked into ET_REL symbols" >&2
+    exit 1
 fi
 
 # Native AArch64 Linux supplies the bidirectional ABI witness. Cross-host runs

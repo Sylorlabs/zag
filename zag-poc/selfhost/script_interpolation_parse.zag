@@ -1,0 +1,122 @@
+// Shared parser lowering for f"literal {expression}". Plain strings are inert.
+// The generated calls copy each chunk once into a fixed-capacity arena builder.
+// Braces double in literal text; expressions use ordinary Zag grammar.
+fn interpolation_error(p:*Parser,at:i32,message:[]u8)void{
+    let line:i32=1;let col:i32=1;let i:i32=0;
+    while(i<at&&i<p.*.source.len){if(p.*.source[i]=='\n'){line=line+1;col=1;}else{col=col+1;}i=i+1;}
+    diag_emit("E0020",message,p.*.origin,line,col,1,
+        "interpolation accepts at most 64 scalar expressions and 65536 output bytes",
+        "use f\"text {expression}\"; write {{ and }} for literal braces",p.*.source);
+    _zag_exit(1);
+}
+fn interpolation_call(name:[]u8,first:*Node,second:*Node,count:i32)*Node{
+    let args:ArrayList[*Node]=make[*Node](2);push[*Node](&args,first);
+    if(count==2){push[*Node](&args,second);}
+    return mk_call(mk_ident(name),args);
+}
+fn interpolation_generated(n:*Node)i32{
+    switch(n.*){.call=>|c|{switch(c.callee.*){.id=>|id|{
+        if(@strEq(id.name,"script_interpolation_finish")||@strEq(id.name,"__zag_script_map_literal")){return 1;}
+    }else=>{}}}else=>{}}return 0;
+}
+fn interpolation_ahead(p:*Parser)bool{
+    if(!at_k(p,Tk.Ident)||!@strEq(cur(p).val,"f")){return false;}
+    let end:i32=cur(p).byte_end;
+    return end<p.*.source.len&&p.*.source[end]=='"';
+}
+fn interpolation_hole(p:*Parser,start:i32,end:i32)*Node{
+    let probe:i32=start;while(probe<end&&(p.*.source[probe]==' '||p.*.source[probe]=='\t'||p.*.source[probe]=='\n'||p.*.source[probe]=='\r')){probe=probe+1;}
+    if(probe<end&&p.*.source[probe]=='{'){interpolation_error(p,start,"interpolation requires a string, bool, or signed integer; aggregate values must be formatted explicitly");}
+    let nested:Parser=p.*;nested.toks=parser_lex(p.*.source[start..end]);nested.i=0;
+    if(nested.toks.len<=1){interpolation_error(p,start,"empty interpolation expression");}
+    let line:i32=1;let col:i32=1;let i:i32=0;
+    while(i<start){if(p.*.source[i]=='\n'){line=line+1;col=1;}else{col=col+1;}i=i+1;}
+    i=0;while(i<nested.toks.len){let t:Token=nested.toks.data[i];
+        if(t.line==1){t.col=t.col+col-1;}t.line=t.line+line-1;
+        t.byte_start=t.byte_start+start;t.byte_end=t.byte_end+start;
+        nested.toks.data[i]=t;i=i+1;
+    }
+    let expr:*Node=parse_expr(&nested);
+    if(!at_k(&nested,Tk.Eof)){interpolation_error(p,cur(&nested).byte_start,"malformed interpolation expression or unsupported format specifier");}
+    p.*.closures=nested.closures;p.*.cctr=nested.cctr;
+    return interpolation_call("__zag_script_format",mk_ident("__zag_script_context"),expr,2);
+}
+fn parse_interpolation(p:*Parser)*Node{
+    let first:Token=cur(p);let pos:i32=first.byte_end+1;
+    let src:[]u8=p.*.source;let holes:i32=0;
+    let builder:*Node=interpolation_call("script_interpolation_new",mk_ident("__zag_script_context"),mk_int("0"),1);
+    let literal:ArrayList[u8]=make[u8](32);push[u8](&literal,'"');
+    while(pos<src.len){let c:u8=src[pos];
+        if(c=='\\'){
+            if(pos+1>=src.len){interpolation_error(p,pos,"unterminated interpolation escape");}
+            if(src[pos+1]=='{'||src[pos+1]=='}'){interpolation_error(p,pos,"escape braces by doubling them");}
+            push[u8](&literal,c);push[u8](&literal,src[pos+1]);pos=pos+2;
+        }else if(c=='"'){
+            push[u8](&literal,'"');
+            builder=interpolation_call("script_interpolation_append",builder,mk_str(literal.data[0..literal.len]),2);
+            pos=pos+1;
+            while(p.*.i<p.*.toks.len&&p.*.toks.data[p.*.i].byte_start<pos){p.*.i=p.*.i+1;}
+            return interpolation_call("script_interpolation_finish",builder,mk_int("0"),1);
+        }else if((c=='{'||c=='}')&&pos+1<src.len&&src[pos+1]==c){
+            push[u8](&literal,c);pos=pos+2;
+        }else if(c=='}'){interpolation_error(p,pos,"unmatched closing interpolation brace");
+        }else if(c=='{'){
+            push[u8](&literal,'"');builder=interpolation_call("script_interpolation_append",builder,mk_str(literal.data[0..literal.len]),2);
+            literal=make[u8](32);push[u8](&literal,'"');
+            holes=holes+1;if(holes>64){interpolation_error(p,pos,"too many interpolation expressions");}
+            let begin:i32=pos+1;pos=begin;let delimiters:ArrayList[u8]=make[u8](8);let quote:u8=0;
+            while(pos<src.len){let h:u8=src[pos];
+                if(quote!=0){if(h=='\\'){pos=pos+1;}else if(h==quote){quote=0;}}
+                else if(h=='"'||h==39){quote=h;}
+                else if(h=='{'||h=='('||h=='['){
+                    if(delimiters.len>=64){interpolation_error(p,pos,"interpolation expression nesting exceeds 64");}
+                    push[u8](&delimiters,h);
+                }else if(h=='}'||h==')'||h==']'){
+                    if(h=='}'&&delimiters.len==0){break;}
+                    if(delimiters.len==0){interpolation_error(p,pos,"unmatched interpolation expression delimiter");}
+                    let open:u8=delimiters.data[delimiters.len-1];
+                    if((h=='}'&&open!='{')||(h==')'&&open!='(')||(h==']'&&open!='[')){
+                        interpolation_error(p,pos,"mismatched interpolation expression delimiter");
+                    }
+                    delimiters.len=delimiters.len-1;
+                }
+                // Comments inside holes are deliberately excluded: they can
+                // swallow the delimiter and make diagnostics misleading.
+                else if(h=='/'&&pos+1<src.len&&(src[pos+1]=='/'||src[pos+1]=='*')){interpolation_error(p,pos,"comments are not supported inside interpolation expressions");}
+                pos=pos+1;
+            }
+            if(pos>=src.len){interpolation_error(p,begin-1,"unterminated interpolation expression");}
+            builder=interpolation_call("script_interpolation_append",builder,interpolation_hole(p,begin,pos),2);pos=pos+1;
+        }else{push[u8](&literal,c);pos=pos+1;}
+    }
+    interpolation_error(p,first.byte_start,"unterminated interpolated string");return mk_str("\"\"");
+}
+
+// Hide interpolation interiors from the ordinary lexer while preserving every
+// byte position. Otherwise an apostrophe inside a quoted hole can be mistaken
+// for a character token before the interpolation parser ever sees the source.
+fn parser_lex(src:[]u8)ArrayList[Token]{
+    let masked:ArrayList[u8]=make[u8](src.len);let i:i32=0;
+    while(i<src.len){
+        if(zs_fstring_at(src,i)){
+            let end:i32=zs_fstring_end(src,i);let j:i32=i;
+            while(j<end){let c:u8=src[j];
+                if(j>i+1&&j<end-1&&c!='\n'){c=' ';}
+                push[u8](&masked,c);j=j+1;
+            }i=end;
+        }else if(src[i]=='"'||src[i]==39){
+            let end:i32=zs_literal_end(src,i);while(i<end){push[u8](&masked,src[i]);i=i+1;}
+        }else if(src[i]=='/'&&i+1<src.len&&src[i+1]=='/'){
+            while(i<src.len&&src[i]!='\n'){push[u8](&masked,src[i]);i=i+1;}
+        }else if(src[i]=='/'&&i+1<src.len&&src[i+1]=='*'){
+            push[u8](&masked,src[i]);push[u8](&masked,src[i+1]);i=i+2;
+            while(i<src.len){let c:u8=src[i];push[u8](&masked,c);i=i+1;
+                if(c=='*'&&i<src.len&&src[i]=='/'){push[u8](&masked,src[i]);i=i+1;break;}}
+        }else{push[u8](&masked,src[i]);i=i+1;}
+    }
+    let toks:ArrayList[Token]=lex(masked.data[0..masked.len]);
+    i=0;while(i<toks.len){let t:Token=toks.data[i];
+        if(tk_code(t.kind)==tk_code(Tk.Str)){t.val=src[t.byte_start..t.byte_end];toks.data[i]=t;}
+        i=i+1;
+    }return toks;
+}

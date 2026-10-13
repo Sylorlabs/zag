@@ -3,6 +3,9 @@ set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 ZNC=${ZNC:-"$ROOT/znc"}
+ZNC_TARGET=${ZNC_TARGET:-}
+TARGET_ARGS=()
+if [ -n "$ZNC_TARGET" ]; then TARGET_ARGS=(--target "$ZNC_TARGET"); fi
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/zag-repr-c.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 pass=0
@@ -20,12 +23,20 @@ if "$ZNC" fmt --in-place "$TMP/formatted.zag" >"$TMP/fmt.log" 2>&1 &&
 else
     bad "formatter preserves @repr(C)"
 fi
-if "$ZNC" "$TMP/main.zag" -o "$TMP/repr-c" --no-zagd --no-foreground-cache >"$TMP/build.log" 2>&1; then
+if "$ZNC" "$TMP/main.zag" "${TARGET_ARGS[@]}" -o "$TMP/repr-c" --no-zagd --no-foreground-cache >"$TMP/build.log" 2>&1; then
     set +e
     "$TMP/repr-c"
     rc=$?
     set -e
     if [ "$rc" = 42 ]; then ok "XButtonEvent C offsets, 96-byte stride, and narrow real-byte access execute"; else bad "XButtonEvent native exit=$rc"; fi
+    if [ "$ZNC_TARGET" = "macos-arm64" ]; then
+        if file "$TMP/repr-c" | grep -q 'Mach-O 64-bit executable arm64' &&
+           codesign --verify --deep --strict --verbose=2 "$TMP/repr-c" >/dev/null 2>&1; then
+            ok "C-layout witness is a valid signed ARM64 Mach-O executable"
+        else
+            bad "C-layout witness is signed native ARM64 Mach-O"
+        fi
+    fi
 else
     sed -n '1,120p' "$TMP/build.log" >&2
     bad "XButtonEvent @repr(C) compiles"
@@ -35,7 +46,7 @@ cat >"$TMP/ordinary.zag" <<'ZAG'
 struct Ordinary { a:i32, b:i64, c:i32, p:*u8 }
 fn main() i32 { return @sizeOf[Ordinary](); }
 ZAG
-if "$ZNC" "$TMP/ordinary.zag" -o "$TMP/ordinary" --no-zagd --no-foreground-cache >"$TMP/ordinary.log" 2>&1; then
+if "$ZNC" "$TMP/ordinary.zag" "${TARGET_ARGS[@]}" -o "$TMP/ordinary" --no-zagd --no-foreground-cache >"$TMP/ordinary.log" 2>&1; then
     set +e; "$TMP/ordinary"; rc=$?; set -e
     if [ "$rc" = 32 ]; then ok "ordinary Zag struct layout remains word-oriented"; else bad "ordinary struct size/exit=$rc"; fi
 else
@@ -51,7 +62,7 @@ cat >"$TMP/imported/main.zag" <<'ZAG'
 fn main() i32 { return @sizeOf[event.Event](); }
 ZAG
 cp "$TMP/zag.mod" "$TMP/imported/zag.mod"
-if "$ZNC" "$TMP/imported/main.zag" -o "$TMP/imported/app" --no-zagd --no-foreground-cache >"$TMP/import.log" 2>&1; then
+if "$ZNC" "$TMP/imported/main.zag" "${TARGET_ARGS[@]}" -o "$TMP/imported/app" --no-zagd --no-foreground-cache >"$TMP/import.log" 2>&1; then
     set +e; "$TMP/imported/app"; rc=$?; set -e
     if [ "$rc" = 24 ]; then ok "qualified import preserves explicit C representation"; else bad "qualified repr(C) size/exit=$rc"; fi
 else
@@ -62,7 +73,7 @@ fi
 mkdir "$TMP/v1"
 printf 'name = "repr-c-v1"\nversion = "0"\nedition = "2026"\n' >"$TMP/v1/zag.mod"
 cp "$ROOT/tests/fixtures/repr_c_xbutton_event.zag" "$TMP/v1/main.zag"
-if "$ZNC" "$TMP/v1/main.zag" -o "$TMP/v1/app" --no-zagd --no-foreground-cache >"$TMP/v1.log" 2>&1; then
+if "$ZNC" "$TMP/v1/main.zag" "${TARGET_ARGS[@]}" -o "$TMP/v1/app" --no-zagd --no-foreground-cache >"$TMP/v1.log" 2>&1; then
     bad "edition 2026 rejects @repr(C)"
 elif grep -q 'E0200' "$TMP/v1.log" && [ ! -e "$TMP/v1/app" ]; then
     ok "edition gate rejects @repr(C) without an artifact"
@@ -74,7 +85,7 @@ cat >"$TMP/packed.zag" <<'ZAG'
 @repr(packed) struct Bad { x:u8, y:u16 }
 fn main() i32 { return 0; }
 ZAG
-if "$ZNC" "$TMP/packed.zag" -o "$TMP/packed" --no-zagd --no-foreground-cache >"$TMP/packed.log" 2>&1; then
+if "$ZNC" "$TMP/packed.zag" "${TARGET_ARGS[@]}" -o "$TMP/packed" --no-zagd --no-foreground-cache >"$TMP/packed.log" 2>&1; then
     bad "unaligned packed layout rejects"
 elif grep -Eq 'unaligned field|unsupported representation|E0018' "$TMP/packed.log" && [ ! -e "$TMP/packed" ]; then
     ok "unaligned packed layout fails closed without an artifact"
@@ -86,7 +97,7 @@ cat >"$TMP/unsupported-field.zag" <<'ZAG'
 @repr(C) struct Bad { value:[]u8 }
 fn main() i32 { return 0; }
 ZAG
-if "$ZNC" "$TMP/unsupported-field.zag" -o "$TMP/unsupported-field" --no-zagd --no-foreground-cache >"$TMP/unsupported-field.log" 2>&1; then
+if "$ZNC" "$TMP/unsupported-field.zag" "${TARGET_ARGS[@]}" -o "$TMP/unsupported-field" --no-zagd --no-foreground-cache >"$TMP/unsupported-field.log" 2>&1; then
     bad "unsupported C-layout field rejects"
 elif grep -Eq '@repr\(C\) fields require target-supported scalar/pointer C leaves|@repr\(C\) fields require scalar/pointer C leaves' "$TMP/unsupported-field.log" && [ ! -e "$TMP/unsupported-field" ]; then
     ok "unsupported C-layout field fails closed"
@@ -99,7 +110,7 @@ cat >"$TMP/by-value.zag" <<'ZAG'
 fn consume(value: Pair) i32 { return value.left + value.right; }
 fn main() i32 { return 0; }
 ZAG
-if "$ZNC" "$TMP/by-value.zag" -o "$TMP/by-value" --no-zagd --no-foreground-cache >"$TMP/by-value.log" 2>&1; then
+if "$ZNC" "$TMP/by-value.zag" "${TARGET_ARGS[@]}" -o "$TMP/by-value" --no-zagd --no-foreground-cache >"$TMP/by-value.log" 2>&1; then
     bad "unsupported by-value C-layout aggregate rejects"
 elif grep -q '@repr(C) aggregates are pointer-only' "$TMP/by-value.log" && [ ! -e "$TMP/by-value" ]; then
     ok "unsupported by-value C-layout aggregate fails closed"

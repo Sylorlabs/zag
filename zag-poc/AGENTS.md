@@ -9,6 +9,23 @@ or a focused test never broadens that contract by itself.
 The primary target. All syscalls use Linux x86-64 numbers directly.
 Supports static, dynamic (`--dynamic`), and object (`--emit-obj`) output modes.
 
+**Selecting a width rung.** `--cpu` has two kinds of value. `native` and
+`runtime` DETECT — they execute CPUID and permit only proven features.
+`x86-64-v2/v3/v4` DECLARE a level, exactly as naming a `-march` level does, and
+a binary built for `v3`/`v4` raises `#UD` on a CPU below it. That is the point:
+without a declaring profile there is no way to build, let alone test or time,
+the 256- and 512-bit rungs on a host that lacks the hardware. Keep declared
+levels carrying `2` for the AVX bits — both `1` and `2` select the vector rung,
+but only `1` enables the bounded scalar `i32x4` path, so `2` widens the vector
+pipeline and nothing else.
+
+**The amd64 emulator on the Apple-Silicon test host is SSE2-only.** AVX2 and
+AVX-512 raise `SIGILL` (exit 132), and `QEMU_CPU=` does not change it. Treat
+that as BUILD-ONLY in tests, never as a failure. Prove the harness before
+concluding the ISA is missing: a probe that dereferences an uninitialized
+register, or an ELF wrapper whose entry maps to the ELF header, also produces
+`SIGSEGV` — run an SSE2 control to tell the two apart.
+
 ### AArch64 Linux (supported scoped target)
 ARM64 is supported for the exact static, object, dynamic, safety, qemu-user,
 and native-CI rows below. This is not a claim that every x86-64 v2 feature has
@@ -161,8 +178,94 @@ The `@cabi` / `@cabi_export` annotations gate the v2 C ABI contract.
 - `znc_object_externs_ok` validates that all externs in object mode are `@cabi`.
 - `znc_x86_object_exports` collects `@cabi_export` pub fns for object output.
 
+## Vector Pipeline
+
+Five layers, each owning exactly one decision. `selfhost/vector_contract.zag`
+is the shared vocabulary every one of them imports — the `vector<ELEM,LANES>`
+spelling, the op-name set, the width-class ladder, and the target lane
+ceilings. Never re-derive a type spelling or a lane count in a layer; that is
+how the verifier and the producer drift apart.
+
+```
+vector IR      selfhost/zir_vector.zag      `vector.*` ops, 11-class verifier, DCE, printer
+vectorizer     selfhost/vectorize.zag       loop + IV + alias analysis, main loop + epilogue
+CPU width      selfhost/native/vecwidth.zag logical lanes -> target width, splitting, fail-closed
+vector regalloc selfhost/native/vregalloc.zag backward liveness, linear scan, never spills
+encoders       native/x86.zag (VEX+EVEX) / native/aarch64.zag (NEON)
+```
+
+**Lane count is logical, not physical.** The IR never says 256-bit, YMM, or ZMM.
+But a lane is an ELEMENT, and an element is a whole 8-byte word in native layout
+(`zvec_elem_stride`; `p[i]` over a `*i32` advances eight bytes), so the counts
+are 8 elements on AVX-512, 4 on AVX2, **2** on SSE2/NEON. The width ladder still
+counts 32-bit-equivalent units, where a word element is 2. Never scale a vector
+load by the element's width: it decodes cleanly and reads the wrong memory.
+
+Floats and byte/halfword element types are refused with a reject code, not
+mis-encoded: a word add is not a float add and it carries between sub-word
+elements.
+
+**The accumulator is lane-wise and folded ONCE, after the loop.** Lane *k* sums
+the elements whose index is congruent to *k*, so the lanes hold disjoint partial
+sums. It is carried across the back edge through a vector-typed slot
+(`memref<vector<ELEM,N>>`) — no phi, no block argument. A store of a vector into
+a *vector* slot and into a *scalar* slot are different things: the scalar one is
+the horizontal fold, and doing that per iteration counts the running total once
+per lane. A vector slot is also the one vector result that gets frame space, at
+the **full register width**: reserving one word for a 16-byte slot puts the next
+value inside it, and a loop's step constant read as zero never terminates.
+
+`--vectorize=on` is the request; the CPU profile alone picks the width. Off by
+default. The request and the resolved rung are both in the foreground cache key,
+so a vectorized build can never be served a non-vectorized artifact. After the
+pass runs, the module is re-verified with the vector verifier and **discarded in
+favour of the scalar module** on any fault — the authority is verified *before*
+vectorization, so its `valid` flag says nothing about the module being lowered.
+
+Vector ops **do** reach emitted x86 machine code, but only for functions the
+ZIR-direct route accepts. That route resolves each SSA name through
+`zir_native_disp`, a linear slot scan, so it is O(words²); `ZIR_NATIVE_MAX_WORDS`
+bounds it and a larger module falls back to the AST bridge. Two rules follow from
+this and must not be relaxed casually: a vector value live across a `call` is
+refused (every vector register is caller-saved), and so is anything the
+allocator cannot colour. A refusal aborts the build — it never falls back to a
+silently scalar function. See `docs/VECTOR_PIPELINE.md` for the end-to-end
+sequence and what is still missing.
+
+`bash tests/run_vector_pipeline.sh` (or `make test-vector-pipeline`) runs the
+vector IR as an executed program, then the vectorizer end to end through
+`znc view --level native`, including an assertion that the scalar epilogue is
+preserved byte for byte, and then `tests/run_vector_equiv_x86_64.sh`.
+
+**Shape checks do not prove arithmetic.** The lowering shipped eight bugs that
+every IR, byte-decoding and shape assertion accepted, because the emitted code
+was well-formed in all of them: a load scaled by element width instead of
+address stride, a fold that doubled a partial sum, an extract fold that dropped
+half the lanes, a fold that left stale high-half garbage in the GPR, a broadcast
+accumulator counted once per lane, REX.X hardcoded on a scaled-index load, a
+`zag.index` that addressed `a + n*n`, and a vector slot sized at one word that
+overwrote the loop's step constant. Only executing a vectorized program found
+them. The x86-64 equivalence run is not optional polish; add a trip count there
+whenever the lowering changes.
+
+**Read `refusal=` before trusting any measurement.** A module the ZIR-direct
+route refuses falls back to the AST bridge, which is correct but silently drops
+every vector instruction — and the vectorizer's own report still says
+"vectorized". The lowering line names the refusing op. One `&` in `main` is
+enough to keep a whole module out of the direct subset, so a benchmark can
+measure scalar code and report no speedup. That happened here, and the reason
+the first speedup number was 6% instead of 150% was that nothing vectorized.
+
 ## Key Files
 
+- `selfhost/vector_contract.zag` — the shared vector vocabulary: types, op set,
+  width ladder, lane ceilings, cost model
+- `selfhost/zir_vector.zag` — target-independent vector IR: constructors,
+  verifier, DCE, MLIR printer, stats
+- `selfhost/vectorize.zag` — loop/induction-variable/alias analysis and the
+  vectorization transform
+- `selfhost/native/vecwidth.zag` — CPU-width lowering and register splitting
+- `selfhost/native/vregalloc.zag` — vector liveness and physical assignment
 - `selfhost/native/acodegen.zag` — ARM64 codegen: syscall translation,
   safety checks, dynamic/object mode calls, alloc provenance probes
 - `selfhost/native/ncodegen.zag` — x86-64 codegen (defines `BSS_VBASE`)

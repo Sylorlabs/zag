@@ -46,7 +46,7 @@ fi
 pass=0
 fail=0
 total=0
-expected_total=82
+expected_total=101
 if ! log_dir=$(mktemp -d "${TMPDIR:-/tmp}/zag-script-release.XXXXXX"); then
     echo "cannot create release-gate log directory" >&2
     exit 1
@@ -132,6 +132,7 @@ check_required_files() {
         selfhost/zagd_generation.zag \
         selfhost/zagd_generation_test.zag \
         selfhost/script_projection_test.zag \
+        selfhost/script_ergonomics_test.zag \
         selfhost/script_syntax_test.zag \
         selfhost/source_origin_test.zag \
         selfhost/zir_contract.zag \
@@ -240,6 +241,14 @@ check_required_files() {
         tests/run_package_resolution.sh \
         tests/run_package_lock_generator.sh \
         tests/run_script_cst.sh \
+        tests/run_script_ergonomics.sh \
+        selfhost/std/script_format.zag \
+        selfhost/std/script_json.zag \
+        tests/script_format.zag \
+        tests/script_json_context.zag \
+        tests/run_script_format.sh \
+        tests/run_script_json_context.sh \
+        tests/run_zagscript_symbol_view.sh \
         tests/run_source_origins.sh \
         tests/run_zagscript_views.sh \
         tests/run_script_projection.sh \
@@ -288,6 +297,8 @@ echo
 echo "── checked-in compiler authority before application aggregates"
 run_gate "pure self-hosted native authority and ABI/layout" \
     bash tests/run_native_authority.sh
+run_gate "integer right-shift signedness semantics" \
+    bash tests/run_shift_signedness.sh
 run_gate "byte-identical pure-Zag bootstrap reproduction" \
     bash tests/check_native_bootstrap_repro.sh
 
@@ -358,6 +369,24 @@ run_gate "bounded process timeout and capture boundary" \
     bash tests/run_script_process_boundary.sh
 run_gate "typed JSON and CSV behavior" \
     bash tests/run_script_json_csv.sh
+run_gate "context-accounted typed formatting" \
+    bash tests/run_script_format.sh
+run_gate "context-accounted JSON string output" \
+    bash tests/run_script_json_context.sh
+run_gate "typed interpolation parsing" bash tests/run_script_interpolation_parser.sh
+run_gate "typed interpolation native and explicit parity" bash tests/run_script_interpolation.sh
+run_gate "bounded monomorphic function inference" bash tests/run_script_inference.sh
+run_gate "named record shorthand" bash tests/run_script_records.sh
+run_gate "context-accounted typed map storage" bash tests/run_script_map.sh
+run_gate "module-aware compiler error-set import dedupe" bash tests/run_error_import_dedupe.sh
+run_gate "typed map literals" bash tests/run_script_map_literals.sh
+run_gate "typed map literal explicit expansion parity" bash tests/run_script_map_explicit.sh
+run_gate "typed JSON document convenience" bash tests/run_script_json_document.sh
+run_gate "exhaustively checked finite auto engine" bash tests/run_script_auto.sh
+run_gate "finite auto CLI and evidence replay" bash tests/run_script_auto_cli.sh
+run_gate "source auto opt-in lowering" bash tests/run_script_auto_lower.sh
+run_gate "JSON root convenience and shadowing" bash tests/run_script_json_root.sh
+run_gate "typed interpolation and map projection" bash tests/run_script_interpolation_project.sh
 run_gate "deterministic local package-import foundation" \
     bash tests/run_package_resolution.sh
 run_gate "create-only canonical vendored package-lock generation" \
@@ -366,6 +395,10 @@ run_gate "beginner-facing Script conveniences" \
     bash tests/run_script_beginner.sh
 run_gate "Python-shaped Script syntax remains Zag lowering" \
     bash tests/run_script_python_shape.sh
+run_gate "Python-shaped Script ergonomics lower deterministically" \
+    bash tests/run_script_ergonomics.sh
+run_gate "selective function exposure and rejected option combinations" \
+    bash tests/run_zagscript_symbol_view.sh
 run_gate "lossless indentation CST spans and generated origin coverage" \
     bash tests/run_script_cst.sh
 run_gate "exact parser and typed-IR source origin authority" \

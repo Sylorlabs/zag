@@ -1,153 +1,698 @@
-// std/metal_loader.zag — pure-Zag FFI adapter to the system Metal framework.
+// std/metal_loader.zag — bounded native Metal adapter for Apple Silicon macOS.
 //
-// STATUS: STUB. The dispatch function returns -201. The open/available
-// functions return false. This file is documentation/reference code showing
-// the intended FFI surface, not a working implementation. It uses `type`
-// aliases and `[N]T` array syntax that the current Zag parser does not accept.
+// This is intentionally not a general Objective-C or FFI layer.  It uses the
+// closed Metal.framework/libobjc ABI admitted by the native macos-arm64
+// executable writer: one default device, one command queue, MSL source
+// compilation, bounded fill/depth/blend dispatch, shared-buffer readback, and
+// deterministic release of every object returned by a `new...` method. Callers
+// own the source, kernel-name, and input/output storage.
 //
-// A contributor with a Mac is needed to:
-//   1. Implement the real Objective-C dispatch (replace `return -201`)
-//   2. Hook up available() to actually call MTLCreateSystemDefaultDevice()
-//   3. Run tests/run_metal_mac.sh and verify the kernel output
+// Source and kernel-name slices must include their trailing NUL byte.  Metal
+// command buffers do not expose cancellation through this closed bridge, so a
+// nonzero timeout is rejected rather than accepted without enforcement.  A
+// zero timeout means wait for this bounded command to complete.
 //
-// See docs/V2_TARGET_SUPPORT.md for the contributor call.
-//
-// This is the compatibility-tier runtime adapter for metal-compat. It loads
-// Metal.framework via Objective-C runtime (objc_msgSend) and creates a minimal
-// MTLDevice, MTLCommandQueue, MTLBuffer, MTLComputePipelineState, and
-// MTLCommandBuffer to submit a Metal compute kernel with bounded dispatch
-// dimensions, then reads back results.
-//
-// This module is NON-CERTIFIED. It uses CompatLoad and CompatDispatch effects
-// and is forbidden in @kernel, @realtime, and @pure functions. It is a
-// fallback below native and virtual execution, and below vulkan/opencl-compat.
-//
-// Metal is macOS-only. On other platforms, zag_metal_compat_available() returns
-// false and the compat chooser falls through to the next backend.
-//
-// DEVICE ENUMERATION: On macOS, MTLCreateSystemDefaultDevice() returns the
-// default GPU (integrated or discrete). For multi-GPU systems (e.g., MacBook
-// Pro with both integrated and discrete GPUs), use MTLCopyAllDevices() to
-// enumerate all available Metal devices and select the one with the highest
-// MTLDeviceLocation or lowest power-for-performance ratio.
-//
-// The MSL encoder uses [[thread_position_in_grid]] as a 1D scalar uint for
-// the fill kernel. This is correct for 1D dispatch. For 2D/3D grids, the
-// attribute returns uint2/uint3 and the encoder would need to select .x.
-//
-// MSL VERSION: The encoder emits plain MSL without a language-version pragma.
-// Metal frameworks on macOS 10.11+ accept this. For Metal 3+ features
-// (macOS 13+), a `#pragma clang diagnostic` or version pragma may be needed.
+// The implementation is native to macos-arm64 dynamic Mach-O output.  Other
+// targets do not gain a Metal fallback by importing this module: they must
+// reject or fail to resolve these platform imports rather than substitute a
+// Linux GPU API or a software result.
 
-// ── Objective-C runtime extern declarations ─────────────────────────────────
-// These are resolved at link time via --dynamic --needed libobjc.dylib.
-extern fn objc_getClass(name: *u8) *u8 @cabi;
-extern fn sel_registerName(name: *u8) *u8 @cabi;
-extern fn objc_msgSend(receiver: *u8, sel: *u8) *u8 @cabi;
+@import("gpu_compat_contract.zag")
 
-// ── Metal type aliases ──────────────────────────────────────────────────────
-// Metal objects are Objective-C ids (opaque pointers).
-type MTLDevice = *u8;
-type MTLCommandQueue = *u8;
-type MTLCommandBuffer = *u8;
-type MTLBuffer = *u8;
-type MTLComputePipelineState = *u8;
-type MTLComputeCommandEncoder = *u8;
-type MTLFunction = *u8;
-type MTLLibrary = *u8;
-
-// ── Metal compat context ────────────────────────────────────────────────────
-struct ZagMetalCompatContext {
-    device: MTLDevice,
-    command_queue: MTLCommandQueue,
-    available: bool,
-    error_code: i32,
-    error_msg: [128]u8,
+// MTLSize is three machine words.  Darwin's arm64 ABI passes aggregates over
+// sixteen bytes indirectly, so the Objective-C call receives pointers to
+// these local values in x2 and x3.
+struct MtlSize {
+    width:i64,
+    height:i64,
+    depth:i64,
 }
 
-// Opens a minimal Metal compute context. Returns a context with
-// available=true if a Metal device was found.
-// On macOS, calls MTLCreateSystemDefaultDevice() via the Objective-C runtime.
-// On non-macOS platforms, returns available=false.
-fn zag_metal_compat_open() ZagMetalCompatContext @compatLoad {
-    let ctx: ZagMetalCompatContext = ZagMetalCompatContext{
-        .device = null as MTLDevice,
-        .command_queue = null as MTLCommandQueue,
-        .available = false,
-        .error_code = 0,
-        .error_msg = [128]u8{0},
+extern fn MTLCreateSystemDefaultDevice() *u8;
+extern fn objc_getClass(name:*i8) *u8;
+extern fn sel_registerName(name:*i8) *u8;
+extern fn objc_msgSend(receiver:*u8, selector:*u8, a2:*u8, a3:*u8,
+                       a4:*u8, a5:*u8, a6:*u8, a7:*u8) *u8;
+extern fn _zag_slice_ptr(value:[]u8) *i8;
+
+pub struct ZagMetalCompatContext {
+    device:*u8,
+    command_queue:*u8,
+    available:bool,
+    error_code:i32,
+}
+
+pub struct ZagMetalCompatCapabilities {
+    available:bool,
+    command_queue:bool,
+    unified_memory:bool,
+    registry_id:u64,
+    max_buffer_length:u64,
+    recommended_working_set_size:u64,
+}
+
+pub struct ZagMetalMemoryResult {
+    ok:bool,
+    bytes:i32,
+    exact_readback:bool,
+    release_issued:bool,
+    error_code:i32,
+}
+
+pub fn zag_metal_status_ok() i32 { return 0; }
+pub fn zag_metal_status_unavailable() i32 { return 0-200; }
+pub fn zag_metal_status_invalid_argument() i32 { return 0-201; }
+pub fn zag_metal_status_limit() i32 { return 0-202; }
+pub fn zag_metal_status_source() i32 { return 0-203; }
+pub fn zag_metal_status_library() i32 { return 0-204; }
+pub fn zag_metal_status_function() i32 { return 0-205; }
+pub fn zag_metal_status_pipeline() i32 { return 0-206; }
+pub fn zag_metal_status_buffer() i32 { return 0-207; }
+pub fn zag_metal_status_command() i32 { return 0-208; }
+pub fn zag_metal_status_execution() i32 { return 0-209; }
+
+fn metal_null() *u8 { return null as *u8; }
+
+fn metal_selector(name:[]u8) *u8 {
+    return sel_registerName(_zag_slice_ptr(name));
+}
+
+// objc_msgSend is declared with the widest pointer-register shape used by the
+// adapter.  Methods with fewer arguments ignore the remaining zeroed argument
+// registers, exactly as in the native readback witness.
+fn metal_msg(receiver:*u8, selector:*u8, a2:*u8, a3:*u8,
+             a4:*u8, a5:*u8, a6:*u8, a7:*u8) *u8 {
+    return objc_msgSend(receiver,selector,a2,a3,a4,a5,a6,a7);
+}
+
+fn metal_msg0(receiver:*u8, selector:*u8) *u8 {
+    let z:*u8=metal_null();
+    return metal_msg(receiver,selector,z,z,z,z,z,z);
+}
+
+fn metal_pool_open() *u8 {
+    let pool_class:*u8=objc_getClass(_zag_slice_ptr("NSAutoreleasePool\x00"));
+    if (pool_class==metal_null()) { return metal_null(); }
+    let pool:*u8=metal_msg0(pool_class,metal_selector("alloc\x00"));
+    if (pool==metal_null()) { return metal_null(); }
+    return metal_msg0(pool,metal_selector("init\x00"));
+}
+
+fn metal_pool_close(pool:*u8) void {
+    if (pool==metal_null()) { return; }
+    let ignored:*u8=metal_msg0(pool,metal_selector("drain\x00"));
+}
+
+fn metal_release(value:*u8) void {
+    if (value==metal_null()) { return; }
+    let ignored:*u8=metal_msg0(value,metal_selector("release\x00"));
+}
+
+fn metal_context_unavailable(code:i32) ZagMetalCompatContext {
+    return ZagMetalCompatContext{
+        .device=metal_null(),
+        .command_queue=metal_null(),
+        .available=false,
+        .error_code=code,
     };
-    // A full implementation would:
-    // 1. Call objc_getClass("MTLCreateSystemDefaultDevice") to get the C function
-    //    from the Metal framework. This is a C function, not an Objective-C method,
-    //    so it must be called directly, not via objc_msgSend.
-    //    extern fn MTLCreateSystemDefaultDevice() MTLDevice @cabi;
-    // 2. ctx.device = MTLCreateSystemDefaultDevice();
-    // 3. Create a command queue: ctx.command_queue = objc_msgSend(ctx.device, sel_registerName("newCommandQueue"));
-    // 4. For multi-GPU systems, use MTLCopyAllDevices() to enumerate.
-    //
-    // The actual implementation requires linking against -framework Metal -framework Foundation.
-    // On Linux, this function returns available=false.
-    return ctx;
 }
 
-// Closes a Metal compat context and releases all resources.
-fn zag_metal_compat_close(ctx: *ZagMetalCompatContext) void @compatLoad {
-    // In Metal, resources are automatically released when the device is
-    // released. A full implementation would call objc_msgSend with release
-    // selectors:
-    //   objc_msgSend(ctx.command_queue, sel_registerName("release"));
-    //   objc_msgSend(ctx.device, sel_registerName("release"));
-    ctx.available = false;
+pub fn zag_metal_compat_open() ZagMetalCompatContext @compatLoad {
+    let device:*u8=MTLCreateSystemDefaultDevice();
+    if (device==metal_null()) {
+        return metal_context_unavailable(zag_metal_status_unavailable());
+    }
+    let queue:*u8=metal_msg0(device,metal_selector("newCommandQueue\x00"));
+    if (queue==metal_null()) {
+        // MTLCreateSystemDefaultDevice is NS_RETURNS_RETAINED.
+        metal_release(device);
+        return metal_context_unavailable(zag_metal_status_unavailable());
+    }
+    return ZagMetalCompatContext{
+        .device=device,
+        .command_queue=queue,
+        .available=true,
+        .error_code=zag_metal_status_ok(),
+    };
 }
 
-// Dispatches a Metal compute kernel with bounded dimensions.
-// The MSL source is compiled into a MTLLibrary via device.newLibraryWithSource,
-// the kernel function is extracted, a compute pipeline state is created,
-// a command buffer is recorded with the dispatch, committed, and waited on,
-// then the output buffer is read back.
-fn zag_metal_compat_dispatch(
-    ctx: *ZagMetalCompatContext,
-    msl_source: *u8,
-    msl_length: u64,
-    kernel_name: *u8,
-    output_buffer: *i32,
-    output_count: u32,
-    value: i32,
-    count: i32,
-    group_count_x: u32,
-    group_count_y: u32,
-    group_count_z: u32,
-    timeout_ns: u64,
+pub fn zag_metal_compat_is_open(ctx:*ZagMetalCompatContext) bool {
+    if (ctx==null as *ZagMetalCompatContext) { return false; }
+    return ctx.*.available && ctx.*.device!=metal_null() &&
+        ctx.*.command_queue!=metal_null();
+}
+
+pub fn zag_metal_compat_error(ctx:*ZagMetalCompatContext) i32 {
+    if (ctx==null as *ZagMetalCompatContext) {
+        return zag_metal_status_invalid_argument();
+    }
+    return ctx.*.error_code;
+}
+
+pub fn zag_metal_compat_capabilities(
+    ctx:*ZagMetalCompatContext,
+) ZagMetalCompatCapabilities @compatLoad {
+    let bad:ZagMetalCompatCapabilities=ZagMetalCompatCapabilities{
+        .available=false,
+        .command_queue=false,
+        .unified_memory=false,
+        .registry_id=0,
+        .max_buffer_length=0,
+        .recommended_working_set_size=0,
+    };
+    if (!zag_metal_compat_is_open(ctx)) { return bad; }
+    let registry_id:u64=metal_msg0(ctx.*.device,
+        metal_selector("registryID\x00")) as u64;
+    let unified:bool=(metal_msg0(ctx.*.device,
+        metal_selector("hasUnifiedMemory\x00")) as u64)!=0;
+    let max_buffer:u64=metal_msg0(ctx.*.device,
+        metal_selector("maxBufferLength\x00")) as u64;
+    let working_set:u64=metal_msg0(ctx.*.device,
+        metal_selector("recommendedMaxWorkingSetSize\x00")) as u64;
+    return ZagMetalCompatCapabilities{
+        .available=true,
+        .command_queue=ctx.*.command_queue!=metal_null(),
+        .unified_memory=unified,
+        .registry_id=registry_id,
+        .max_buffer_length=max_buffer,
+        .recommended_working_set_size=working_set,
+    };
+}
+
+// Capability-equivalent to the Linux native preflight's bounded CPU-visible
+// memory roundtrip. Metal deliberately does not expose DRM-style GPU virtual
+// addresses or GEM map/unmap handles; the public equivalent is a shared Metal
+// resource whose contents are CPU-visible and whose lifetime is explicit.
+pub fn zag_metal_compat_memory_roundtrip(
+    ctx:*ZagMetalCompatContext,
+    bytes:i32,
+) ZagMetalMemoryResult @compatLoad {
+    let bad:ZagMetalMemoryResult=ZagMetalMemoryResult{
+        .ok=false,.bytes=bytes,.exact_readback=false,.release_issued=false,
+        .error_code=zag_metal_status_invalid_argument(),
+    };
+    if (!zag_metal_compat_is_open(ctx)) {
+        bad.error_code=zag_metal_status_unavailable();
+        return bad;
+    }
+    // Keep this probe exactly aligned with the Linux preflight envelope.
+    if (bytes!=4096) { return bad; }
+    let z:*u8=metal_null();
+    let buffer:*u8=metal_msg(ctx.*.device,
+        metal_selector("newBufferWithLength:options:\x00"),
+        bytes as *u8,z,z,z,z,z);
+    if (buffer==z) {
+        bad.error_code=zag_metal_status_buffer();
+        ctx.*.error_code=bad.error_code;
+        return bad;
+    }
+    let contents:*u8=metal_msg0(buffer,metal_selector("contents\x00"));
+    if (contents==z) {
+        metal_release(buffer);
+        bad.release_issued=true;
+        bad.error_code=zag_metal_status_buffer();
+        ctx.*.error_code=bad.error_code;
+        return bad;
+    }
+    let i:i32=0;
+    while (i<bytes) {
+        contents[i]=((i*37+19)&255) as u8;
+        i=i+1;
+    }
+    let exact:bool=true;
+    i=0;
+    while (i<bytes) {
+        if (contents[i]!=(((i*37+19)&255) as u8)) { exact=false; }
+        i=i+1;
+    }
+    metal_release(buffer);
+    let result_code:i32=zag_metal_status_ok();
+    if (!exact) { result_code=zag_metal_status_execution(); }
+    let result:ZagMetalMemoryResult=ZagMetalMemoryResult{
+        .ok=exact,.bytes=bytes,.exact_readback=exact,.release_issued=true,
+        .error_code=result_code,
+    };
+    ctx.*.error_code=result.error_code;
+    return result;
+}
+
+pub fn zag_metal_compat_close(ctx:*ZagMetalCompatContext) void @compatLoad {
+    if (ctx==null as *ZagMetalCompatContext) { return; }
+    // Both objects are retained at open: newCommandQueue follows the `new`
+    // rule and MTLCreateSystemDefaultDevice is NS_RETURNS_RETAINED.
+    metal_release(ctx.*.command_queue);
+    metal_release(ctx.*.device);
+    ctx.*.command_queue=metal_null();
+    ctx.*.device=metal_null();
+    ctx.*.available=false;
+    ctx.*.error_code=zag_metal_status_unavailable();
+}
+
+fn metal_c_string_slice_valid(value:[]u8, max_bytes:i32) bool {
+    if (value.len<2 || value.len>max_bytes) { return false; }
+    return value[value.len-1]==0;
+}
+
+fn metal_dispatch_shape_valid(output_count:u32, count:i32,
+                              group_count_x:u32, group_count_y:u32,
+                              group_count_z:u32) i32 {
+    if (output_count==0 || count<0 || (count as u32)>output_count ||
+        group_count_x==0 || group_count_y==0 || group_count_z==0) {
+        return zag_metal_status_invalid_argument();
+    }
+    if (output_count>1048576 || group_count_x>1048576 ||
+        group_count_y>1048576 || group_count_z>1048576) {
+        return zag_metal_status_limit();
+    }
+    let work:i64=(group_count_x as i64)*(group_count_y as i64)*
+        (group_count_z as i64);
+    if (work>1048576) { return zag_metal_status_limit(); }
+    if (work<(count as i64)) { return zag_metal_status_invalid_argument(); }
+    return zag_metal_status_ok();
+}
+
+fn metal_copy_i32_readback(contents:*u8, output:*i32, count:u32) void {
+    let i:u32=0;
+    while (i<count) {
+        let source:i32=(i as i32)*4;
+        let word:u64=(contents[source] as u64) |
+            ((contents[source+1] as u64)<<8) |
+            ((contents[source+2] as u64)<<16) |
+            ((contents[source+3] as u64)<<24);
+        let signed:i64=word as i64;
+        if ((word & 2147483648)!=0) { signed=signed-4294967296; }
+        output[i]=signed as i32;
+        i=i+1;
+    }
+}
+
+fn metal_copy_i32_upload(input:*i32, contents:*u8, count:u32) void {
+    let i:u32=0;
+    while(i<count){
+        let word:u64=input[i] as u64;
+        let target:i32=(i as i32)*4;
+        contents[target]=(word&255) as u8;
+        contents[target+1]=((word>>8)&255) as u8;
+        contents[target+2]=((word>>16)&255) as u8;
+        contents[target+3]=((word>>24)&255) as u8;
+        i=i+1;
+    }
+}
+
+// Raw-pointer compatibility entry point.  msl_length includes the trailing
+// NUL byte.  Prefer zag_metal_compat_dispatch_source for slice validation.
+pub fn zag_metal_compat_dispatch(
+    ctx:*ZagMetalCompatContext,
+    msl_source:*u8,
+    msl_length:u64,
+    kernel_name:*u8,
+    output_buffer:*i32,
+    output_count:u32,
+    value:i32,
+    count:i32,
+    group_count_x:u32,
+    group_count_y:u32,
+    group_count_z:u32,
+    timeout_ns:u64,
 ) i32 @compatDispatch {
-    if (!ctx.available) { return -200; }
-    // A full implementation would:
-    // 1. Create a MTLLibrary from MSL source:
-    //    let lib: MTLLibrary = objc_msgSend(ctx.device, sel_registerName("newLibraryWithSource:options:error:"), msl_source, null, &err);
-    // 2. Get the kernel function:
-    //    let fn: MTLFunction = objc_msgSend(lib, sel_registerName("newFunctionWithName:"), kernel_name);
-    // 3. Create a compute pipeline state:
-    //    let pipeline: MTLComputePipelineState = objc_msgSend(ctx.device, sel_registerName("newComputePipelineStateWithFunction:error:"), fn, &err);
-    // 4. Create an output buffer:
-    //    let buf: MTLBuffer = objc_msgSend(ctx.device, sel_registerName("newBufferWithLength:options:"), output_count * 4, 0);
-    // 5. Create a command buffer and encoder:
-    //    let cmd_buf: MTLCommandBuffer = objc_msgSend(ctx.command_queue, sel_registerName("commandBuffer"));
-    //    let encoder: MTLComputeCommandEncoder = objc_msgSend(cmd_buf, sel_registerName("computeCommandEncoder"));
-    // 6. Set the pipeline, bind the buffer and arguments, dispatch:
-    //    objc_msgSend(encoder, sel_registerName("setComputePipelineState:"), pipeline);
-    //    objc_msgSend(encoder, sel_registerName("setBuffer:offset:atIndex:"), buf, 0, 0);
-    //    objc_msgSend(encoder, sel_registerName("dispatchThreadgroups:threadsPerThreadgroup:"), ...);
-    // 7. End encoding, commit, wait:
-    //    objc_msgSend(encoder, sel_registerName("endEncoding"));
-    //    objc_msgSend(cmd_buf, sel_registerName("commit"));
-    //    objc_msgSend(cmd_buf, sel_registerName("waitUntilCompleted"));
-    // 8. Read back: memcpy(output_buffer, [buf contents], output_count * 4);
-    // 9. Release resources.
-    return -201; // not yet implemented — requires Objective-C runtime
+    if (!zag_metal_compat_is_open(ctx)) {
+        return zag_metal_status_unavailable();
+    }
+    let contract_rc:i32=zag_gpu_compat_validate(
+        ZagGpuCompatReadback{.output_buffer=output_buffer,.output_count=output_count},
+        ZagGpuCompatLaunch{.group_count_x=group_count_x,.group_count_y=group_count_y,
+            .group_count_z=group_count_z,.local_work_size=1,.timeout_ns=timeout_ns});
+    if (contract_rc!=0) { return contract_rc; }
+    if (msl_source==metal_null() || kernel_name==metal_null() || msl_length<2) {
+        return zag_metal_status_invalid_argument();
+    }
+    if (msl_length>1048576) { return zag_metal_status_limit(); }
+    if (msl_source[(msl_length-1) as i32]!=0) {
+        return zag_metal_status_invalid_argument();
+    }
+    let shape:i32=metal_dispatch_shape_valid(output_count,count,
+        group_count_x,group_count_y,group_count_z);
+    if (shape!=zag_metal_status_ok()) { return shape; }
+    // The admitted Objective-C surface has waitUntilCompleted but no
+    // cancellable timed wait.  Never claim a deadline that cannot be kept.
+    if (timeout_ns!=0) { return zag_metal_status_invalid_argument(); }
+
+    let z:*u8=metal_null();
+    // NSString, commandBuffer, and computeCommandEncoder are autoreleased.
+    // Keep a dispatch-scoped pool so the adapter leaves no implicit lifetime
+    // debt in a caller that otherwise has no Objective-C runtime scaffolding.
+    let pool:*u8=metal_pool_open();
+    if (pool==z) { return zag_metal_status_source(); }
+    let ns:*u8=objc_getClass(_zag_slice_ptr("NSString\x00"));
+    if (ns==z) {
+        metal_pool_close(pool);
+        return zag_metal_status_source();
+    }
+    let source_string:*u8=metal_msg(ns,
+        metal_selector("stringWithUTF8String:\x00"),msl_source,z,z,z,z,z);
+    if (source_string==z) {
+        metal_pool_close(pool);
+        return zag_metal_status_source();
+    }
+
+    let error:*u8=z;
+    let library:*u8=metal_msg(ctx.*.device,
+        metal_selector("newLibraryWithSource:options:error:\x00"),
+        source_string,z,(&error) as *u8,z,z,z);
+    if (library==z) {
+        metal_pool_close(pool);
+        return zag_metal_status_library();
+    }
+
+    let kernel_string:*u8=metal_msg(ns,
+        metal_selector("stringWithUTF8String:\x00"),kernel_name,z,z,z,z,z);
+    if (kernel_string==z) {
+        metal_release(library);
+        metal_pool_close(pool);
+        return zag_metal_status_function();
+    }
+    let kernel_fn:*u8=metal_msg(library,
+        metal_selector("newFunctionWithName:\x00"),kernel_string,z,z,z,z,z);
+    if (kernel_fn==z) {
+        metal_release(library);
+        metal_pool_close(pool);
+        return zag_metal_status_function();
+    }
+
+    error=z;
+    let pipeline:*u8=metal_msg(ctx.*.device,
+        metal_selector("newComputePipelineStateWithFunction:error:\x00"),
+        kernel_fn,(&error) as *u8,z,z,z,z);
+    if (pipeline==z) {
+        metal_release(kernel_fn);
+        metal_release(library);
+        metal_pool_close(pool);
+        return zag_metal_status_pipeline();
+    }
+
+    let buffer_bytes:i64=(output_count as i64)*4;
+    let buffer:*u8=metal_msg(ctx.*.device,
+        metal_selector("newBufferWithLength:options:\x00"),
+        buffer_bytes as *u8,z,z,z,z,z);
+    if (buffer==z) {
+        metal_release(pipeline);
+        metal_release(kernel_fn);
+        metal_release(library);
+        metal_pool_close(pool);
+        return zag_metal_status_buffer();
+    }
+
+    let command:*u8=metal_msg0(ctx.*.command_queue,
+        metal_selector("commandBuffer\x00"));
+    if (command==z) {
+        metal_release(buffer);
+        metal_release(pipeline);
+        metal_release(kernel_fn);
+        metal_release(library);
+        metal_pool_close(pool);
+        return zag_metal_status_command();
+    }
+    let encoder:*u8=metal_msg0(command,
+        metal_selector("computeCommandEncoder\x00"));
+    if (encoder==z) {
+        metal_release(buffer);
+        metal_release(pipeline);
+        metal_release(kernel_fn);
+        metal_release(library);
+        metal_pool_close(pool);
+        return zag_metal_status_command();
+    }
+
+    let ignored_pipeline:*u8=metal_msg(encoder,
+        metal_selector("setComputePipelineState:\x00"),pipeline,z,z,z,z,z);
+    let ignored_buffer:*u8=metal_msg(encoder,
+        metal_selector("setBuffer:offset:atIndex:\x00"),buffer,z,z,z,z,z);
+    let ignored_value:*u8=metal_msg(encoder,
+        metal_selector("setBytes:length:atIndex:\x00"),
+        (&value) as *u8,4 as *u8,1 as *u8,z,z,z);
+    let ignored_count:*u8=metal_msg(encoder,
+        metal_selector("setBytes:length:atIndex:\x00"),
+        (&count) as *u8,4 as *u8,2 as *u8,z,z,z);
+
+    let groups:MtlSize=MtlSize{
+        .width=group_count_x as i64,
+        .height=group_count_y as i64,
+        .depth=group_count_z as i64,
+    };
+    let threads:MtlSize=MtlSize{.width=1,.height=1,.depth=1};
+    // The audited native readback witness establishes this arm64 indirect
+    // aggregate shape.  Use the already-admitted widest objc_msgSend call but
+    // keep the MTLSize details private to this adapter.
+    let ignored_dispatch:*u8=metal_msg(encoder,
+        metal_selector("dispatchThreadgroups:threadsPerThreadgroup:\x00"),
+        (&groups) as *u8,(&threads) as *u8,z,z,z,z);
+    let ignored_end:*u8=metal_msg0(encoder,metal_selector("endEncoding\x00"));
+    let ignored_commit:*u8=metal_msg0(command,metal_selector("commit\x00"));
+    let ignored_wait:*u8=metal_msg0(command,
+        metal_selector("waitUntilCompleted\x00"));
+
+    let status:i64=metal_msg0(command,metal_selector("status\x00")) as i64;
+    let result:i32=zag_metal_status_ok();
+    if (status!=4) {
+        result=zag_metal_status_execution();
+    } else {
+        let contents:*u8=metal_msg0(buffer,metal_selector("contents\x00"));
+        if (contents==z) {
+            result=zag_metal_status_execution();
+        } else {
+            metal_copy_i32_readback(contents,output_buffer,output_count);
+        }
+    }
+
+    // commandBuffer and computeCommandEncoder are autoreleased.  These four
+    // values are owned by the adapter's `new...` calls and are released in
+    // reverse construction order after the completed command no longer needs
+    // them.
+    metal_release(buffer);
+    metal_release(pipeline);
+    metal_release(kernel_fn);
+    metal_release(library);
+    metal_pool_close(pool);
+    ctx.*.error_code=result;
+    return result;
 }
 
-// Checks if the Metal framework is available on the current system.
-fn zag_metal_compat_available() bool @compatLoad {
-    // Metal is macOS-only. On Linux, return false.
-    return false;
+pub fn zag_metal_compat_dispatch_source(
+    ctx:*ZagMetalCompatContext,
+    msl_source:[]u8,
+    kernel_name:[]u8,
+    output_buffer:*i32,
+    output_count:u32,
+    value:i32,
+    count:i32,
+    group_count_x:u32,
+    group_count_y:u32,
+    group_count_z:u32,
+    timeout_ns:u64,
+) i32 @compatDispatch {
+    if (!metal_c_string_slice_valid(msl_source,1048576) ||
+        !metal_c_string_slice_valid(kernel_name,256)) {
+        return zag_metal_status_invalid_argument();
+    }
+    return zag_metal_compat_dispatch(ctx,
+        _zag_slice_ptr(msl_source) as *u8,msl_source.len as u64,
+        _zag_slice_ptr(kernel_name) as *u8,output_buffer,output_count,
+        value,count,group_count_x,group_count_y,group_count_z,timeout_ns);
+}
+
+// Native two-buffer profile used by the reviewed depth-write and packed-RGB
+// blend kernels. Both buffers are copied to Metal shared memory before launch
+// and copied back after completion so the public semantics match the bounded
+// GFX10.1 VM profile on Linux.
+fn zag_metal_dispatch_dual(
+    ctx:*ZagMetalCompatContext,
+    msl_source:*u8,
+    msl_length:u64,
+    kernel_name:*u8,
+    color:*i32,
+    depth:*i32,
+    element_count:u32,
+    value:i32,
+    z_value:i32,
+    alpha:i32,
+    has_alpha:bool,
+    group_count_x:u32,
+    group_count_y:u32,
+    group_count_z:u32,
+    timeout_ns:u64,
+) i32 @compatDispatch {
+    if(!zag_metal_compat_is_open(ctx)){return zag_metal_status_unavailable();}
+    if(msl_source==metal_null()||kernel_name==metal_null()||
+        color==null as *i32||depth==null as *i32||msl_length<2||element_count==0){
+        return zag_metal_status_invalid_argument();
+    }
+    if(msl_length>1048576||element_count>1048576){return zag_metal_status_limit();}
+    if(msl_source[(msl_length-1) as i32]!=0){return zag_metal_status_invalid_argument();}
+    if(has_alpha&&(alpha<0||alpha>256)){return zag_metal_status_invalid_argument();}
+    let contract_rc:i32=zag_gpu_compat_validate(
+        ZagGpuCompatReadback{.output_buffer=color,.output_count=element_count},
+        ZagGpuCompatLaunch{.group_count_x=group_count_x,.group_count_y=group_count_y,
+            .group_count_z=group_count_z,.local_work_size=1,.timeout_ns=timeout_ns});
+    if(contract_rc!=0){return contract_rc;}
+    let work:i64=(group_count_x as i64)*(group_count_y as i64)*
+        (group_count_z as i64);
+    if(work<1||work>(element_count as i64)){return zag_metal_status_invalid_argument();}
+    let shape:i32=metal_dispatch_shape_valid(element_count,work as i32,
+        group_count_x,group_count_y,group_count_z);
+    if(shape!=zag_metal_status_ok()){return shape;}
+    if(timeout_ns!=0){return zag_metal_status_invalid_argument();}
+
+    let z:*u8=metal_null();
+    let pool:*u8=metal_pool_open();
+    if(pool==z){return zag_metal_status_source();}
+    let ns:*u8=objc_getClass(_zag_slice_ptr("NSString\x00"));
+    if(ns==z){metal_pool_close(pool);return zag_metal_status_source();}
+    let source_string:*u8=metal_msg(ns,metal_selector("stringWithUTF8String:\x00"),
+        msl_source,z,z,z,z,z);
+    if(source_string==z){metal_pool_close(pool);return zag_metal_status_source();}
+    let error:*u8=z;
+    let library:*u8=metal_msg(ctx.*.device,
+        metal_selector("newLibraryWithSource:options:error:\x00"),
+        source_string,z,(&error) as *u8,z,z,z);
+    if(library==z){metal_pool_close(pool);return zag_metal_status_library();}
+    let kernel_string:*u8=metal_msg(ns,metal_selector("stringWithUTF8String:\x00"),
+        kernel_name,z,z,z,z,z);
+    if(kernel_string==z){metal_release(library);metal_pool_close(pool);return zag_metal_status_function();}
+    let kernel_fn:*u8=metal_msg(library,metal_selector("newFunctionWithName:\x00"),
+        kernel_string,z,z,z,z,z);
+    if(kernel_fn==z){metal_release(library);metal_pool_close(pool);return zag_metal_status_function();}
+    error=z;
+    let pipeline:*u8=metal_msg(ctx.*.device,
+        metal_selector("newComputePipelineStateWithFunction:error:\x00"),
+        kernel_fn,(&error) as *u8,z,z,z,z);
+    if(pipeline==z){metal_release(kernel_fn);metal_release(library);metal_pool_close(pool);return zag_metal_status_pipeline();}
+
+    let bytes:i64=(element_count as i64)*4;
+    let color_buffer:*u8=metal_msg(ctx.*.device,
+        metal_selector("newBufferWithLength:options:\x00"),bytes as *u8,z,z,z,z,z);
+    if(color_buffer==z){metal_release(pipeline);metal_release(kernel_fn);metal_release(library);metal_pool_close(pool);return zag_metal_status_buffer();}
+    let depth_buffer:*u8=metal_msg(ctx.*.device,
+        metal_selector("newBufferWithLength:options:\x00"),bytes as *u8,z,z,z,z,z);
+    if(depth_buffer==z){metal_release(color_buffer);metal_release(pipeline);metal_release(kernel_fn);metal_release(library);metal_pool_close(pool);return zag_metal_status_buffer();}
+    let color_contents:*u8=metal_msg0(color_buffer,metal_selector("contents\x00"));
+    let depth_contents:*u8=metal_msg0(depth_buffer,metal_selector("contents\x00"));
+    if(color_contents==z||depth_contents==z){
+        metal_release(depth_buffer);metal_release(color_buffer);metal_release(pipeline);
+        metal_release(kernel_fn);metal_release(library);metal_pool_close(pool);
+        return zag_metal_status_buffer();
+    }
+    metal_copy_i32_upload(color,color_contents,element_count);
+    metal_copy_i32_upload(depth,depth_contents,element_count);
+
+    let command:*u8=metal_msg0(ctx.*.command_queue,metal_selector("commandBuffer\x00"));
+    if(command==z){
+        metal_release(depth_buffer);metal_release(color_buffer);metal_release(pipeline);
+        metal_release(kernel_fn);metal_release(library);metal_pool_close(pool);
+        return zag_metal_status_command();
+    }
+    let encoder:*u8=metal_msg0(command,metal_selector("computeCommandEncoder\x00"));
+    if(encoder==z){
+        metal_release(depth_buffer);metal_release(color_buffer);metal_release(pipeline);
+        metal_release(kernel_fn);metal_release(library);metal_pool_close(pool);
+        return zag_metal_status_command();
+    }
+    let _pipeline:*u8=metal_msg(encoder,metal_selector("setComputePipelineState:\x00"),pipeline,z,z,z,z,z);
+    let _color:*u8=metal_msg(encoder,metal_selector("setBuffer:offset:atIndex:\x00"),color_buffer,z,z,z,z,z);
+    let _depth:*u8=metal_msg(encoder,metal_selector("setBuffer:offset:atIndex:\x00"),depth_buffer,z,1 as *u8,z,z,z);
+    let _value:*u8=metal_msg(encoder,metal_selector("setBytes:length:atIndex:\x00"),
+        (&value) as *u8,4 as *u8,2 as *u8,z,z,z);
+    let _zvalue:*u8=metal_msg(encoder,metal_selector("setBytes:length:atIndex:\x00"),
+        (&z_value) as *u8,4 as *u8,3 as *u8,z,z,z);
+    if(has_alpha){
+        let _alpha:*u8=metal_msg(encoder,metal_selector("setBytes:length:atIndex:\x00"),
+            (&alpha) as *u8,4 as *u8,4 as *u8,z,z,z);
+    }
+    let groups:MtlSize=MtlSize{.width=group_count_x as i64,
+        .height=group_count_y as i64,.depth=group_count_z as i64};
+    let threads:MtlSize=MtlSize{.width=1,.height=1,.depth=1};
+    let _dispatch:*u8=metal_msg(encoder,
+        metal_selector("dispatchThreadgroups:threadsPerThreadgroup:\x00"),
+        (&groups) as *u8,(&threads) as *u8,z,z,z,z);
+    let _end:*u8=metal_msg0(encoder,metal_selector("endEncoding\x00"));
+    let _commit:*u8=metal_msg0(command,metal_selector("commit\x00"));
+    let _wait:*u8=metal_msg0(command,metal_selector("waitUntilCompleted\x00"));
+
+    let status:i64=metal_msg0(command,metal_selector("status\x00")) as i64;
+    let result:i32=zag_metal_status_ok();
+    if(status!=4){
+        result=zag_metal_status_execution();
+    }else{
+        metal_copy_i32_readback(color_contents,color,element_count);
+        metal_copy_i32_readback(depth_contents,depth,element_count);
+    }
+    metal_release(depth_buffer);metal_release(color_buffer);metal_release(pipeline);
+    metal_release(kernel_fn);metal_release(library);metal_pool_close(pool);
+    ctx.*.error_code=result;
+    return result;
+}
+
+pub fn zag_metal_dispatch_depth_source(
+    ctx:*ZagMetalCompatContext,msl_source:[]u8,kernel_name:[]u8,
+    color:*i32,depth:*i32,element_count:u32,value:i32,z_value:i32,
+    group_count_x:u32,group_count_y:u32,group_count_z:u32,timeout_ns:u64,
+) i32 @compatDispatch {
+    if(!metal_c_string_slice_valid(msl_source,1048576)||
+        !metal_c_string_slice_valid(kernel_name,256)){
+        return zag_metal_status_invalid_argument();
+    }
+    return zag_metal_dispatch_dual(ctx,_zag_slice_ptr(msl_source) as *u8,
+        msl_source.len as u64,_zag_slice_ptr(kernel_name) as *u8,color,depth,
+        element_count,value,z_value,0,false,group_count_x,group_count_y,
+        group_count_z,timeout_ns);
+}
+
+pub fn zag_metal_dispatch_blend_source(
+    ctx:*ZagMetalCompatContext,msl_source:[]u8,kernel_name:[]u8,
+    color:*i32,depth:*i32,element_count:u32,value:i32,z_value:i32,alpha:i32,
+    group_count_x:u32,group_count_y:u32,group_count_z:u32,timeout_ns:u64,
+) i32 @compatDispatch {
+    if(!metal_c_string_slice_valid(msl_source,1048576)||
+        !metal_c_string_slice_valid(kernel_name,256)){
+        return zag_metal_status_invalid_argument();
+    }
+    return zag_metal_dispatch_dual(ctx,_zag_slice_ptr(msl_source) as *u8,
+        msl_source.len as u64,_zag_slice_ptr(kernel_name) as *u8,color,depth,
+        element_count,value,z_value,alpha,true,group_count_x,group_count_y,
+        group_count_z,timeout_ns);
+}
+
+// First-class names. The *_compat entry points remain source-compatible aliases
+// for existing callers, but Apple Silicon users do not need to opt into a
+// second-class compatibility API to use the native Metal path.
+pub fn zag_metal_open() ZagMetalCompatContext @compatLoad {
+    return zag_metal_compat_open();
+}
+pub fn zag_metal_is_open(ctx:*ZagMetalCompatContext) bool {
+    return zag_metal_compat_is_open(ctx);
+}
+pub fn zag_metal_close(ctx:*ZagMetalCompatContext) void @compatLoad {
+    zag_metal_compat_close(ctx);
+}
+pub fn zag_metal_capabilities(ctx:*ZagMetalCompatContext) ZagMetalCompatCapabilities @compatLoad {
+    return zag_metal_compat_capabilities(ctx);
+}
+pub fn zag_metal_dispatch_fill_source(
+    ctx:*ZagMetalCompatContext,msl_source:[]u8,kernel_name:[]u8,
+    output_buffer:*i32,output_count:u32,value:i32,count:i32,
+    group_count_x:u32,group_count_y:u32,group_count_z:u32,timeout_ns:u64,
+) i32 @compatDispatch {
+    return zag_metal_compat_dispatch_source(ctx,msl_source,kernel_name,
+        output_buffer,output_count,value,count,group_count_x,group_count_y,
+        group_count_z,timeout_ns);
+}
+
+pub fn zag_metal_compat_available() bool @compatLoad {
+    let ctx:ZagMetalCompatContext=zag_metal_compat_open();
+    let ok:bool=zag_metal_compat_is_open(&ctx);
+    zag_metal_compat_close(&ctx);
+    return ok;
+}
+
+pub fn zag_metal_available() bool @compatLoad {
+    return zag_metal_compat_available();
 }

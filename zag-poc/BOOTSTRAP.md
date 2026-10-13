@@ -65,6 +65,27 @@ directly from Zag source. Apple Silicon therefore needs a separately verified
 #   znc.new -> ./znc
 ```
 
+No generated Apple binary is committed to the source tree. For a clean
+Apple-Silicon checkout, the physical-Mac CI gate publishes a
+`zag-znc-macos-arm64-verified-<commit>` artifact containing its fixed-point
+compiler, SHA-256 record, and source commit. After reviewing the successful job
+and comparing its printed digest, use the explicit intake helper:
+
+```sh
+bash tools/bootstrap-macos-seed.sh /path/to/znc-macos-arm64 \
+  /path/to/znc-macos-arm64.sha256
+```
+
+A verified `macos-arm64` release archive is the durable alternative: after
+checking the archive's published outer checksum, pass its normalized `znc` and
+included `znc.sha256` to the same helper.
+
+The helper validates the exact signed Mach-O seed, rebuilds the compiler to a
+fixed point from the current checkout, runs the independent empty-`PATH`
+reproducibility proof, and builds the platform-qualified daemon and LSP. It
+never downloads or chooses a binary; the `-cross-` CI artifact remains
+development evidence and is not a trusted native-gate seed.
+
 ### Single compiler binary
 
 | Binary | Source | Role |
@@ -114,6 +135,7 @@ bash tests/run_native_total.sh        # @total proofs on ./znc
 
 ARM64 Linux is cross-compiled and self-hosted from the x86-64 `znc` seed; QEMU
 may execute those binaries on x86-64 as test infrastructure. Apple Silicon
-macOS uses a separately trusted `znc-macos-arm64` development/CI seed. That
-seed becomes release evidence only after the complete physical-Mac gate,
+macOS uses a separately trusted `znc-macos-arm64` seed; the verified CI artifact
+above is the reviewable clean-checkout route. A compiler built for the current
+source becomes release evidence only after the complete physical-Mac gate,
 including a byte-identical self-host fixpoint, succeeds.

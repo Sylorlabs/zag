@@ -1,0 +1,1167 @@
+// selfhost/zir_vector.zag — the TARGET-INDEPENDENT VECTOR IR LAYER of ZIR.
+//
+// This file is one of the five consumers of selfhost/vector_contract.zag. It
+// owns everything about vector IR that is true for every CPU: the op
+// constructors, the verifier, a vector-aware DCE, the MLIR text form, and the
+// `znc view` counters. It knows about WIDTH only as a logical lane count, and it
+// never mentions a register, a VEX prefix, or a machine type — those belong to
+// selfhost/native/vecwidth.zag and selfhost/native/isa.zag.
+//
+// ── WHY THIS FILE DOES NOT IMPORT zir.zag ────────────────────────────────────
+// zir.zag will import THIS file to verify and to print vector ops, so importing
+// zir.zag back would be a cycle. The only thing that made needs was the op
+// construction idiom (mk_op / zfresh / zir_value), which is four lines wide, so
+// this file restates it against a local `ZV` builder. Everything semantic —
+// the type spelling, the op vocabulary, the predicate table, the width ladder,
+// the purity rule — comes from vector_contract.zag and zir_contract.zag, so
+// there is still exactly one source of truth for each of those facts.
+//
+// ── WHY THE BUILDER HELPERS ARE CALLED zvb_* ─────────────────────────────────
+// Zag has one flat global function namespace and no overloading, so a top-level
+// name is shared by every file that is linked into one binary. selfhost/
+// vectorize.zag already owns `zv_fresh` and `zv_op` (with a different, purely
+// local builder), and this file's builders are a different thing with a
+// different signature, so this file's family is named `zvb_*` — "ZIR vector
+// builder" — to keep the two linkable. Everything else public here is `zvec_*`,
+// which is the namespace this file owns; import it as a unit.
+//
+// ── WHY THE VERIFIER IS ADDITIVE ─────────────────────────────────────────────
+// zvec_verify_op returns 0 for any op that is not a vector op, without looking
+// at its types. The vectorizer is a LATER pass: a module that has not been
+// vectorized must verify exactly as it did before this file existed, and a
+// module that HAS been vectorized must not become un-verifiable because an
+// unrelated scalar op carries a type this file has never heard of. The one
+// exception is a name carrying the `vector.` prefix that is not in the
+// contract's vocabulary: that is a typo or a stale spelling of a vector op, and
+// silently accepting it would let an op that NO lowering handles reach the
+// backend. So `vector.foo` fails closed (code 1) while `arith.addi` is opaque
+// to this verifier entirely.
+//
+// ── WHY EACH VERIFIER RULE EXISTS ────────────────────────────────────────────
+// Every rule below rejects IR that a CORRECT backend cannot execute, or IR that
+// two backends would execute differently. That is the only thing a verifier in
+// this position is allowed to do: it never rejects IR merely because this file
+// has no lowering for it, and it never repairs IR silently.
+//
+//   arity        (2,3) A vector op with a missing or extra result/operand has
+//                        no unique reading: `vector.add %a` is either a splat
+//                        (pessimisation) or a broken add, and a lowering that
+//                        picked the wrong one would be a miscompile, not a
+//                        performance bug.
+//   vector ty    (4,6) The result of a vector-producing op must be a
+//                        `vector<elem,lanes>` whose element type the backend can
+//                        pack. A target-independent layer that accepted
+//                        `vector<i128,4>` or `vector<3x i32>` would be making
+//                        a promise no backend can keep.
+//   shape        (5)    Lane-for-lane elementwise ops are only defined when
+//                        every operand and the result agree on element type AND
+//                        lane count. A half-width add has no operand mapping in
+//                        any instruction set; `vecwidth.zag` splits WIDE
+//                        vectors, it never invents a narrow-destination add.
+//   scalar form  (5)    extract/reduction_add produce a scalar and splat/
+//                        insert consume one. Confusing the two is how a
+//                        vector<i32,4> ends up being loaded out of the low 4
+//                        bytes of a register, or an i32 being splatted into
+//                        lane 0 only.
+//   lane index   (7)    An out-of-range `index` is an out-of-bounds read of a
+//                        register. Rejecting it at the IR level is the only
+//                        place the mistake is still cheap to fix.
+//   predicate    (8)    The lowering must know whether to emit an ORDERED or
+//                        UNORDERED compare, and whether the operands are float
+//                        or integer. `slt` on a float vector has no encoding, and
+//                        silently reading `slt` as `olt` is a miscompile on
+//                        NaN. vector_contract.zag partitions the predicate
+//                        vocabulary into exactly the integer and the float
+//                        halves, so this file requires the predicate half to
+//                        match the element half and nothing more.
+//   select mask  (9)    A select mixes lanes by index, so a mask of the wrong
+//                        lane count indexes past the end of the value being
+//                        selected. The mask is `vector<i1,N>`, which is why the
+//                        rule is about the MASK and not about the operands'
+//                        types (that is rule 5).
+//   purity       (10)   An op the contract calls pure must not carry a memory
+//                        read or write region. Purity is what licenses the DCE
+//                        below and the vectorizer's rewrite; an impure op
+//                        wearing a pure op's name would be deleted while live
+//                        and lose memory traffic. Conversely `vector.broadcast`
+//                        is NOT pure (it loads), which is why the DCE keeps it.
+//   shuffle mask (11)   The mask is an immediate lane-selection list baked into
+//                        the instruction. It must be a non-empty decimal list,
+//                        every index must be below `2*lanes` (the concatenation
+//                        of the two operands), and the list length must equal the
+//                        result's lane count — otherwise the machine form and
+//                        the IR disagree about how many lanes were produced.
+//
+// ── ONE RULE BEYOND THE MINIMUM ──────────────────────────────────────────────
+// `vector.shl` / `vector.shr` / the bitwise ops on a FLOAT element are rejected
+// with code 6. No target in the width ladder has a float shift, so such an op
+// has no machine form at all, and accepting it would push an unimplementable
+// operand past the verifier and into the backend. Integer masks are fine:
+// `vector.bit_and` on `vector<i1,4>` is ordinary mask algebra.
+//
+// ── A MISSING ATTRIBUTE ──────────────────────────────────────────────────────
+// An absent or non-decimal attribute is reported as the code for the FACT it was
+// meant to state, not as a generic malformation: no `elem` is code 6 (no
+// packable element type was named), no `predicate` is code 8, an unusable
+// `index` is code 7, an unusable `lanes` is code 5, and a malformed `mask` is
+// code 11. That keeps each code meaning one thing a caller can act on.
+//
+// A note on what is deliberately NOT rejected: the contract has no UNSIGNED
+// comparison predicates, so `slt` on `vector<u32,4>` is spelled the same way a
+// signed compare is. Sign-interpretation is a frontend/vectorizer decision and
+// is not re-decided here; only the float/integer partition, which the backends
+// must branch on, is enforced.
+//
+// ── A NOTE ON THE `elem` ATTRIBUTE ───────────────────────────────────────────
+// The `elem`, `lanes`, `index`, `mask`, and `predicate` attribute keys are the
+// contract between this layer, vectorize.zag, the machine lowering, and the
+// printer. They are written by the constructors below and read by everything
+// else. `zvec_attr_*` spells them once so a rename cannot leave two layers
+// disagreeing.
+
+@import("zir_contract.zag")     // ZVal / ZOp / ZBlock / ZRegion / ZFunc / ZModule / attr_val
+@import("vector_contract.zag")  // the vector type, the op vocabulary, purity, predicates
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ERROR CODES — the verifier's entire output. 0 means valid; every other value
+//  is one of these. `zvec_error_text` is the only human-readable form.
+// ═══════════════════════════════════════════════════════════════════════════
+fn ZVERR_UNKNOWN() i32 { return 1; }      // unknown `vector.*` op / malformed op
+fn ZVERR_RESULT_ARITY() i32 { return 2; } // wrong number of results
+fn ZVERR_OPERAND_ARITY() i32 { return 3; }// wrong number of operands
+fn ZVERR_RESULT_TYPE() i32 { return 4; }  // result is not a vector type
+fn ZVERR_SHAPE() i32 { return 5; }        // operand/result shape mismatch
+fn ZVERR_ELEM_TYPE() i32 { return 6; }    // unsupported element type
+fn ZVERR_LANE_INDEX() i32 { return 7; }   // lane index out of range
+fn ZVERR_PREDICATE() i32 { return 8; }    // invalid icmp predicate
+fn ZVERR_SELECT_MASK() i32 { return 9; }  // select mask/operand mismatch
+fn ZVERR_PURITY() i32 { return 10; }      // a pure op carries memory effects
+fn ZVERR_SHUFFLE_MASK() i32 { return 11; }// shuffle mask malformed/out of range
+
+fn zvec_error_text(code: i32) []u8 {
+    if (code == ZVERR_UNKNOWN()) { return "unknown or malformed vector op"; }
+    if (code == ZVERR_RESULT_ARITY()) { return "vector op has a bad result count"; }
+    if (code == ZVERR_OPERAND_ARITY()) { return "vector op has a bad operand count"; }
+    if (code == ZVERR_RESULT_TYPE()) { return "vector op result is not a vector type"; }
+    if (code == ZVERR_SHAPE()) { return "vector op operand shape mismatch"; }
+    if (code == ZVERR_ELEM_TYPE()) { return "unsupported vector element type"; }
+    if (code == ZVERR_LANE_INDEX()) { return "vector lane index out of range"; }
+    if (code == ZVERR_PREDICATE()) { return "invalid vector.icmp predicate"; }
+    if (code == ZVERR_SELECT_MASK()) { return "vector.select mask does not match its operands"; }
+    if (code == ZVERR_PURITY()) { return "pure vector op carries memory effects"; }
+    if (code == ZVERR_SHUFFLE_MASK()) { return "malformed or out-of-range vector.shuffle mask"; }
+    return "no vector ir error";
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ATTRIBUTE KEYS
+// ═══════════════════════════════════════════════════════════════════════════
+fn zvec_attr_elem() []u8 { return "elem"; }
+fn zvec_attr_lanes() []u8 { return "lanes"; }
+fn zvec_attr_index() []u8 { return "index"; }
+fn zvec_attr_mask() []u8 { return "mask"; }
+fn zvec_attr_predicate() []u8 { return "predicate"; }
+fn zvec_effect_none() []u8 { return "none"; }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  SMALL HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+fn zvec_block() ZBlock { return ZBlock{ .ops = make[ZOp](8) }; }
+
+// Does `n` carry the `vector.` dialect prefix without being a known op? This is
+// the fail-closed half of `zvec_op_is_vector`.
+fn zvec_name_is_vector_prefixed(n: []u8) i32 {
+    if (n.len < 7) { return 0; }
+    return @strEq(n[0..7], "vector.") as i32;
+}
+
+// Decimal attribute reader. Returns -1 when the attribute is absent or is not a
+// plain non-negative decimal; the caller maps -1 onto the code that describes
+// the fact the attribute was supposed to carry.
+fn zvec_attr_int(op: ZOp, key: []u8) i32 {
+    let s: []u8 = attr_val(op, key);
+    if (s.len == 0 || s.len > 3) { return 0 - 1; }
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while (i < s.len) {
+        let c: u8 = s[i];
+        if (c < '0' || c > '9') { return 0 - 1; }
+        n = n * 10 + (c - '0') as i32;
+        i = i + 1;
+    }
+    return n;
+}
+
+// Operand/result count an op in the contract's vocabulary is defined with.
+// Every vector op has a fixed operand count, so the verifier can test arity
+// with a single lookup before it touches any type.
+fn zvec_min_operands(name: []u8) i32 {
+    if (@strEq(name, zvec_op_select())) { return 3; }
+    if (@strEq(name, zvec_op_insert())) { return 2; }
+    if (zvec_op_is_elementwise(name) == 1) { return 2; }
+    if (@strEq(name, zvec_op_icmp())) { return 2; }
+    if (@strEq(name, zvec_op_shuffle())) { return 2; }
+    return 1;  // splat, broadcast, extract, reduction_add
+}
+
+// ── the shuffle mask, read once and validated in place ───────────────────────
+// A mask is an immediate list like "0,4,1,5". Returns the number of entries
+// when every entry is a decimal in [0,limit) and the list is well formed, and 0
+// otherwise. One pass, no allocation: the mask is short and the printer wants
+// its text verbatim anyway.
+fn zvec_mask_entries(mask: []u8, limit: i32) i32 {
+    if (mask.len == 0) { return 0; }
+    if (limit < 1) { return 0; }
+    let n: i32 = 0;
+    let cur: i32 = 0;
+    let have: i32 = 0;
+    let i: i32 = 0;
+    while (i < mask.len) {
+        let c: u8 = mask[i];
+        if (c == ',') {
+            if (have == 0) { return 0; }          // empty entry: "0,,1"
+            if (cur >= limit) { return 0; }      // index outside the concatenation
+            n = n + 1; have = 0; cur = 0;
+        } else if (c >= '0' && c <= '9') {
+            if (have >= 3) { return 0; }          // bounded width, no overflow
+            cur = cur * 10 + (c - '0') as i32; have = 1;
+        } else { return 0; }                     // not a decimal list
+        i = i + 1;
+    }
+    if (have == 0) { return 0; }                  // trailing comma
+    if (cur >= limit) { return 0; }
+    return n + 1;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  LOCAL BUILDER CONTEXT
+//
+//  The same shape as zir.zag's `ZB`, minus everything that is not needed to make
+//  a vector op. `zvb_fresh` produces "%vN" exactly as `zfresh` does, because the
+//  existing SSA-uniqueness verifier, the def-before-use checker, and the MLIR
+//  printer all key off that spelling.
+// ═══════════════════════════════════════════════════════════════════════════
+struct ZV { ctr: i32, origin: ZOrigin, effects: i32 }
+
+fn zvb_init(o: ZOrigin, e: i32) ZV {
+    return ZV{ .ctr = 0, .origin = o, .effects = e };
+}
+fn zvb_value(name: []u8, ty: []u8, origin: ZOrigin) ZVal {
+    return ZVal{ .name = name, .ty = ty, .ownership = "ssa", .alias_region = "none",
+        .lifetime = "function", .layout = "target-default", .origin = origin };
+}
+fn zvb_fresh(b: *ZV, ty: []u8) ZVal {
+    b.*.ctr = b.*.ctr + 1;
+    return zvb_value(_zag_str_concat("%v", _zag_i64_to_str(b.*.ctr as i64)), ty, b.*.origin);
+}
+// An op carrying the contract's default metadata, stamped with the builder's
+// origin and effect class the way `mk_op_at` does.
+fn zvb_mk_op(b: *ZV, name: []u8) ZOp {
+    return ZOp{ .name = name, .results = make[ZVal](1), .operands = make[ZVal](2),
+        .attrs = make[ZAttr](1), .regions = make[ZRegion](1), .effects = b.*.effects,
+        .reads = "none", .writes = "none", .origin = b.*.origin };
+}
+fn zvb_attr(o: *ZOp, key: []u8, val: []u8) void {
+    push[ZAttr](&o.*.attrs, ZAttr{ .key = key, .val = val });
+}
+fn zvb_emit(blk: *ZBlock, o: ZOp) void { push[ZOp](&blk.*.ops, o); }
+fn zvb_num(n: i32) []u8 { return _zag_i64_to_str(n as i64); }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  OP CONSTRUCTORS
+//
+//  Each appends exactly one op to `blk` and returns the result value. None of
+//  them repair their arguments: a caller that asks for a 0-lane vector gets a
+//  `vector<i32,0>` result that the verifier below rejects. Silently coercing
+//  here would move a shape bug from the verifier into a wrong machine form,
+//  which is the one place it cannot be caught.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// One scalar into every lane. The result type is the transfer's declared shape,
+// not a function of the scalar's width: the caller picked the lane count.
+fn zvec_splat(b: *ZV, blk: *ZBlock, elem: []u8, lanes: i32, src: ZVal) ZVal {
+    let r: ZVal = zvb_fresh(b, zvec_ty(elem, lanes));
+    let o: ZOp = zvb_mk_op(b, zvec_op_splat());
+    push[ZVal](&o.results, r);
+    push[ZVal](&o.operands, src);
+    zvb_attr(&o, zvec_attr_elem(), elem);
+    zvb_attr(&o, zvec_attr_lanes(), zvb_num(lanes));
+    zvb_emit(blk, o);
+    return r;
+}
+
+// A load-shaped op: the whole vector comes from memory. `reads` is set to the
+// pointer's alias region exactly as `memref.load` does, which is the ONLY way the
+// vectorizer's alias analysis learns that this op touches memory — and therefore
+// the reason the DCE below may not remove it.
+fn zvec_broadcast(b: *ZV, blk: *ZBlock, elem: []u8, lanes: i32, ptr: ZVal) ZVal {
+    let r: ZVal = zvb_fresh(b, zvec_ty(elem, lanes));
+    let o: ZOp = zvb_mk_op(b, zvec_op_broadcast());
+    o.reads = ptr.alias_region;
+    push[ZVal](&o.results, r);
+    push[ZVal](&o.operands, ptr);
+    zvb_attr(&o, zvec_attr_elem(), elem);
+    zvb_attr(&o, zvec_attr_lanes(), zvb_num(lanes));
+    zvb_emit(blk, o);
+    return r;
+}
+
+// Lane `lane` as a scalar. The result type is derived from the operand, so a
+// malformed operand yields an empty (invalid) scalar type and fails rule 4/5.
+fn zvec_extract(b: *ZV, blk: *ZBlock, vec: ZVal, lane: i32) ZVal {
+    let r: ZVal = zvb_fresh(b, zvec_elem_ty(vec.ty));
+    let o: ZOp = zvb_mk_op(b, zvec_op_extract());
+    push[ZVal](&o.results, r);
+    push[ZVal](&o.operands, vec);
+    zvb_attr(&o, zvec_attr_index(), zvb_num(lane));
+    zvb_emit(blk, o);
+    return r;
+}
+
+// Replace lane `lane`. The result keeps the vector's type; `val` is a scalar.
+fn zvec_insert(b: *ZV, blk: *ZBlock, vec: ZVal, lane: i32, val: ZVal) ZVal {
+    let r: ZVal = zvb_fresh(b, vec.ty);
+    let o: ZOp = zvb_mk_op(b, zvec_op_insert());
+    push[ZVal](&o.results, r);
+    push[ZVal](&o.operands, vec);
+    push[ZVal](&o.operands, val);
+    zvb_attr(&o, zvec_attr_index(), zvb_num(lane));
+    zvb_emit(blk, o);
+    return r;
+}
+
+// Elementwise binary op: same shape in, same shape out. `name` must be one of the
+// contract's elementwise ops; the verifier rejects anything else.
+fn zvec_binop(b: *ZV, blk: *ZBlock, name: []u8, l: ZVal, r: ZVal) ZVal {
+    let res: ZVal = zvb_fresh(b, l.ty);
+    let o: ZOp = zvb_mk_op(b, name);
+    push[ZVal](&o.results, res);
+    push[ZVal](&o.operands, l);
+    push[ZVal](&o.operands, r);
+    zvb_attr(&o, zvec_attr_elem(), zvec_elem_ty(l.ty));
+    zvb_emit(blk, o);
+    return res;
+}
+
+// Lane-wise compare. The result is a mask: `vector<i1,lanes>`, one lane per
+// compared lane. It is NOT `zvec_ty_valid` — a mask element is i1, which the
+// contract deliberately keeps out of the packable-element set — so the verifier
+// tests masks with `zvec_mask_lanes` instead.
+fn zvec_icmp(b: *ZV, blk: *ZBlock, pred: []u8, l: ZVal, r: ZVal) ZVal {
+    let res: ZVal = zvb_fresh(b, zvec_mask_ty(zvec_lanes(l.ty)));
+    let o: ZOp = zvb_mk_op(b, zvec_op_icmp());
+    push[ZVal](&o.results, res);
+    push[ZVal](&o.operands, l);
+    push[ZVal](&o.operands, r);
+    zvb_attr(&o, zvec_attr_predicate(), pred);
+    zvb_attr(&o, zvec_attr_elem(), zvec_elem_ty(l.ty));
+    zvb_emit(blk, o);
+    return res;
+}
+
+// Lane-wise select: `c` is the mask, `l` is the true value, `r` the false one.
+fn zvec_select(b: *ZV, blk: *ZBlock, c: ZVal, l: ZVal, r: ZVal) ZVal {
+    let res: ZVal = zvb_fresh(b, l.ty);
+    let o: ZOp = zvb_mk_op(b, zvec_op_select());
+    push[ZVal](&o.results, res);
+    push[ZVal](&o.operands, c);
+    push[ZVal](&o.operands, l);
+    push[ZVal](&o.operands, r);
+    zvb_attr(&o, zvec_attr_elem(), zvec_elem_ty(l.ty));
+    zvb_emit(blk, o);
+    return res;
+}
+
+// Horizontal sum: vector in, one scalar of the element type out.
+fn zvec_reduction_add(b: *ZV, blk: *ZBlock, vec: ZVal) ZVal {
+    let r: ZVal = zvb_fresh(b, zvec_elem_ty(vec.ty));
+    let o: ZOp = zvb_mk_op(b, zvec_op_reduction_add());
+    push[ZVal](&o.results, r);
+    push[ZVal](&o.operands, vec);
+    zvb_attr(&o, zvec_attr_elem(), zvec_elem_ty(vec.ty));
+    zvb_emit(blk, o);
+    return r;
+}
+
+// Arbitrary lane selection across the concatenation of two equally shaped
+// vectors. `mask` is the contract's comma-separated decimal form ("0,4,1,5");
+// its length is the result's lane count.
+fn zvec_shuffle(b: *ZV, blk: *ZBlock, l: ZVal, r: ZVal, mask: []u8) ZVal {
+    let res: ZVal = zvb_fresh(b, l.ty);
+    let o: ZOp = zvb_mk_op(b, zvec_op_shuffle());
+    push[ZVal](&o.results, res);
+    push[ZVal](&o.operands, l);
+    push[ZVal](&o.operands, r);
+    zvb_attr(&o, zvec_attr_mask(), mask);
+    zvb_emit(blk, o);
+    return res;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  DEF / USE AND CLASSIFICATION
+// ═══════════════════════════════════════════════════════════════════════════
+fn zvec_op_is_vector_op(op: ZOp) i32 { return zvec_op_is_vector(op.name); }
+
+fn zvec_op_uses_value(op: ZOp, name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[ZVal](op.operands)) {
+        if (@strEq(get[ZVal](op.operands, i).name, name)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+fn zvec_op_defs_value(op: ZOp, name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[ZVal](op.results)) {
+        if (@strEq(get[ZVal](op.results, i).name, name)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+// Is `name` read anywhere in this block, including its nested regions? A use in a
+// nested region is still a use: an `scf.while` body that reads a value defined
+// outside it keeps that value alive.
+fn zvec_value_is_live_in_block(blk: ZBlock, name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[ZOp](blk.ops)) {
+        let o: ZOp = get[ZOp](blk.ops, i);
+        if (zvec_op_uses_value(o, name) == 1) { return 1; }
+        let rg: i32 = 0;
+        while (rg < len[ZRegion](o.regions)) {
+            let reg: ZRegion = get[ZRegion](o.regions, rg);
+            let bb: i32 = 0;
+            while (bb < len[ZBlock](reg.blocks)) {
+                if (zvec_value_is_live_in_block(get[ZBlock](reg.blocks, bb), name) == 1) { return 1; }
+                bb = bb + 1;
+            }
+            rg = rg + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  THE VERIFIER
+// ═══════════════════════════════════════════════════════════════════════════
+
+// A value that must BE a data vector: right shape, packable element, a lane
+// count the width ladder can express. Codes 4 then 6, in that order, so the
+// message distinguishes "not a vector" from "a vector we cannot lower".
+fn zvec_check_vec_result(v: ZVal) i32 {
+    if (zvec_is_vector_ty(v.ty) == 0) { return ZVERR_RESULT_TYPE(); }
+    if (zvec_ty_valid(v.ty) == 0) { return ZVERR_ELEM_TYPE(); }
+    return 0;
+}
+// A value that must BE a data vector, in operand position. Code 5 rather than 4
+// because the RESULT being wrong is what code 4 is about.
+fn zvec_check_vec_operand(v: ZVal) i32 {
+    if (zvec_is_vector_ty(v.ty) == 0) { return ZVERR_SHAPE(); }
+    if (zvec_ty_valid(v.ty) == 0) { return ZVERR_ELEM_TYPE(); }
+    return 0;
+}
+// The `elem` attribute must name a type the backend can pack. An absent `elem`
+// reads back as "" and lands here too, which is the intended answer: an op that
+// does not say what its lanes hold has not said enough to be lowered.
+fn zvec_check_elem_attr(op: ZOp) i32 {
+    if (zvec_is_elem_ty(attr_val(op, zvec_attr_elem())) == 0) { return ZVERR_ELEM_TYPE(); }
+    return 0;
+}
+
+fn zvec_verify_splat(op: ZOp) i32 {
+    let r: ZVal = get[ZVal](op.results, 0);
+    // ── the ADDRESS form: `vector.splat %base, %index` ──────────────────────
+    // An address splat produces a vector of POINTERS, `vector<*ELEM,LANES>`,
+    // which `zvec_ty_valid` deliberately rejects because it is about packable
+    // DATA types.  It is nevertheless the form the auto-vectorizer emits for
+    // every unit-stride window, so it is verified here explicitly rather than
+    // routed through the data rule that would reject it.  Both operands are
+    // required: an address splat without its index is the bug that would read
+    // a[0..lanes-1] on every iteration.
+    if (zvec_is_ptr_vec_ty(r.ty) == 1) {
+        if (op.operands.len != 2) { return ZVERR_OPERAND_ARITY(); }
+        if (zvec_is_ptr_vec_ty(op.operands.data[0].ty) == 1) { return ZVERR_SHAPE(); }
+        if (zvec_is_vector_ty(op.operands.data[0].ty) == 1) { return ZVERR_SHAPE(); }
+        if (zvec_is_vector_ty(op.operands.data[1].ty) == 1) { return ZVERR_SHAPE(); }
+        // The pointee named by the result type must be the pointee the
+        // `elem` attribute declares; that is what ties the window to the array.
+        if (!@strEq(zvec_ptr_elem_ty(r.ty), attr_val(op, zvec_attr_elem()))) {
+            return ZVERR_SHAPE();
+        }
+        if (zvec_elem_bytes(attr_val(op, zvec_attr_elem())) < 1) {
+            return ZVERR_ELEM_TYPE();
+        }
+        return 0;
+    }
+    // The DATA form lifts exactly one scalar. Two operands here is the address
+    // form, which returned above, so the counts must not overlap.
+    if (len[ZVal](op.operands) != 1) { return ZVERR_OPERAND_ARITY(); }
+    let e: i32 = zvec_check_vec_result(r);
+    if (e != 0) { return e; }
+    let ea: i32 = zvec_check_elem_attr(op);
+    if (ea != 0) { return ea; }
+    // The declared element and lane count must BE the result's shape: the result
+    // type is what the lowering reads to pick a machine form.
+    if (!@strEq(zvec_elem_ty(r.ty), attr_val(op, zvec_attr_elem()))) { return ZVERR_SHAPE(); }
+    let lanes: i32 = zvec_attr_int(op, zvec_attr_lanes());
+    if (lanes < 0 || lanes != zvec_lanes(r.ty)) { return ZVERR_SHAPE(); }
+    // The operand is a SCALAR of the element type. A vector operand here is the
+    // difference between a splat and a copy, and copying is not what was asked.
+    let s: ZVal = get[ZVal](op.operands, 0);
+    if (zvec_is_vector_ty(s.ty) == 1) { return ZVERR_SHAPE(); }
+    if (zvec_is_elem_ty(s.ty) == 1 && !@strEq(s.ty, attr_val(op, zvec_attr_elem()))) { return ZVERR_SHAPE(); }
+    return 0;
+}
+
+fn zvec_verify_broadcast(op: ZOp) i32 {
+    if (len[ZVal](op.operands) != 1) { return ZVERR_OPERAND_ARITY(); }
+    let r: ZVal = get[ZVal](op.results, 0);
+    let e: i32 = zvec_check_vec_result(r);
+    if (e != 0) { return e; }
+    let ea: i32 = zvec_check_elem_attr(op);
+    if (ea != 0) { return ea; }
+    if (!@strEq(zvec_elem_ty(r.ty), attr_val(op, zvec_attr_elem()))) { return ZVERR_SHAPE(); }
+    let lanes: i32 = zvec_attr_int(op, zvec_attr_lanes());
+    if (lanes < 0 || lanes != zvec_lanes(r.ty)) { return ZVERR_SHAPE(); }
+    // The operand is a memory reference in one of two forms, and BOTH are
+    // produced by the real pipeline:
+    //   1. `memref<ELEM>`            — a whole-vector load from one object
+    //   2. `vector<*ELEM,LANES>`     — an address splat, i.e. a strided window
+    // Rejecting form 2 would make the auto-vectorizer's own output fail the
+    // verifier, so both are accepted here and the pointee is checked against
+    // `elem` in each case.  Anything else is not a load.
+    let p: ZVal = get[ZVal](op.operands, 0);
+    if (zvec_is_ptr_vec_ty(p.ty) == 1) {
+        if (zvec_lanes(p.ty) != lanes) { return ZVERR_SHAPE(); }
+        if (!@strEq(zvec_ptr_elem_ty(p.ty), attr_val(op, zvec_attr_elem()))) {
+            return ZVERR_SHAPE();
+        }
+        return 0;
+    }
+    if (p.ty.len < 8) { return ZVERR_SHAPE(); }
+    if (!@strEq(p.ty[0..7], "memref<")) { return ZVERR_SHAPE(); }
+    return 0;
+}
+
+fn zvec_verify_extract(op: ZOp) i32 {
+    if (len[ZVal](op.operands) != 1) { return ZVERR_OPERAND_ARITY(); }
+    let v: ZVal = get[ZVal](op.operands, 0);
+    let e: i32 = zvec_check_vec_operand(v);
+    if (e != 0) { return e; }
+    // The result is the element type, and it must be a scalar: extract is the
+    // only vector op that leaves the vector domain.
+    let r: ZVal = get[ZVal](op.results, 0);
+    if (zvec_is_vector_ty(r.ty) == 1) { return ZVERR_SHAPE(); }
+    if (!@strEq(r.ty, zvec_elem_ty(v.ty))) { return ZVERR_SHAPE(); }
+    let lanes: i32 = zvec_lanes(v.ty);
+    let idx: i32 = zvec_attr_int(op, zvec_attr_index());
+    if (idx < 0 || idx >= lanes) { return ZVERR_LANE_INDEX(); }
+    return 0;
+}
+
+fn zvec_verify_insert(op: ZOp) i32 {
+    if (len[ZVal](op.operands) != 2) { return ZVERR_OPERAND_ARITY(); }
+    let v: ZVal = get[ZVal](op.operands, 0);
+    let e: i32 = zvec_check_vec_operand(v);
+    if (e != 0) { return e; }
+    // insert keeps the vector's shape; a changed shape is a different op.
+    let r: ZVal = get[ZVal](op.results, 0);
+    if (!zvec_same_shape(r.ty, v.ty)) { return ZVERR_SHAPE(); }
+    // The written value is a scalar, and when it is a known packable type it
+    // must be the element type being written.
+    let s: ZVal = get[ZVal](op.operands, 1);
+    if (zvec_is_vector_ty(s.ty) == 1) { return ZVERR_SHAPE(); }
+    if (zvec_is_elem_ty(s.ty) == 1 && !@strEq(s.ty, zvec_elem_ty(v.ty))) { return ZVERR_SHAPE(); }
+    let lanes: i32 = zvec_lanes(v.ty);
+    let idx: i32 = zvec_attr_int(op, zvec_attr_index());
+    if (idx < 0 || idx >= lanes) { return ZVERR_LANE_INDEX(); }
+    return 0;
+}
+
+fn zvec_verify_elementwise(op: ZOp) i32 {
+    if (len[ZVal](op.operands) != 2) { return ZVERR_OPERAND_ARITY(); }
+    let l: ZVal = get[ZVal](op.operands, 0);
+    let r: ZVal = get[ZVal](op.operands, 1);
+    let e0: i32 = zvec_check_vec_operand(l);
+    if (e0 != 0) { return e0; }
+    let e1: i32 = zvec_check_vec_operand(r);
+    if (e1 != 0) { return e1; }
+    // Lane-for-lane: equal element type AND equal lane count, and the result is
+    // that same shape. vecwidth.zag may SPLIT a wide vector across registers; it
+    // never widens or narrows one, so a shape disagreement here has no encoding.
+    if (zvec_same_shape(l.ty, r.ty) == 0) { return ZVERR_SHAPE(); }
+    let res: ZVal = get[ZVal](op.results, 0);
+    let e2: i32 = zvec_check_vec_result(res);
+    if (e2 != 0) { return e2; }
+    if (zvec_same_shape(res.ty, l.ty) == 0) { return ZVERR_SHAPE(); }
+    let ea: i32 = zvec_check_elem_attr(op);
+    if (ea != 0) { return ea; }
+    if (!@strEq(attr_val(op, zvec_attr_elem()), zvec_elem_ty(l.ty))) { return ZVERR_SHAPE(); }
+    // The integer-only ops (shifts, bitwise) have no float encoding on any
+    // target in the ladder, so a float lane is an unsupported element type
+    // rather than a shape problem.
+    if (zvec_op_is_integer_only(op.name) == 1) {
+        if (zvec_elem_is_float(zvec_elem_ty(l.ty)) == 1) { return ZVERR_ELEM_TYPE(); }
+    }
+    return 0;
+}
+
+fn zvec_verify_icmp(op: ZOp) i32 {
+    if (len[ZVal](op.operands) != 2) { return ZVERR_OPERAND_ARITY(); }
+    let l: ZVal = get[ZVal](op.operands, 0);
+    let r: ZVal = get[ZVal](op.operands, 1);
+    let e0: i32 = zvec_check_vec_operand(l);
+    if (e0 != 0) { return e0; }
+    let e1: i32 = zvec_check_vec_operand(r);
+    if (e1 != 0) { return e1; }
+    if (zvec_same_shape(l.ty, r.ty) == 0) { return ZVERR_SHAPE(); }
+    // One mask lane per compared lane. Compared with `zvec_mask_lanes` rather
+    // than `zvec_ty_valid` because a mask's element is i1, which is not one of
+    // the packable data element types.
+    let res: ZVal = get[ZVal](op.results, 0);
+    if (zvec_mask_lanes(res.ty) != zvec_lanes(l.ty)) { return ZVERR_SHAPE(); }
+    let ea: i32 = zvec_check_elem_attr(op);
+    if (ea != 0) { return ea; }
+    if (!@strEq(attr_val(op, zvec_attr_elem()), zvec_elem_ty(l.ty))) { return ZVERR_SHAPE(); }
+    // The predicate half must match the element half. Reading `slt` on a float
+    // vector as `olt` would be a silent miscompile on NaN, and reading `olt` on
+    // an integer vector has no encoding at all.
+    let pred: []u8 = attr_val(op, zvec_attr_predicate());
+    if (zvec_pred_valid(pred) == 0) { return ZVERR_PREDICATE(); }
+    if (zvec_elem_is_float(zvec_elem_ty(l.ty)) == 1) {
+        if (zvec_pred_is_signed_int(pred) == 1) { return ZVERR_PREDICATE(); }
+        return 0;
+    }
+    if (zvec_pred_is_float(pred) == 1) { return ZVERR_PREDICATE(); }
+    return 0;
+}
+
+fn zvec_verify_select(op: ZOp) i32 {
+    if (len[ZVal](op.operands) != 3) { return ZVERR_OPERAND_ARITY(); }
+    // The mask first, and on its own terms: select indexes the value operands
+    // lane by lane with the mask, so a mask of a different lane count is an
+    // out-of-range read regardless of how well the operands agree.
+    let c: ZVal = get[ZVal](op.operands, 0);
+    if (zvec_mask_lanes(c.ty) < 1) { return ZVERR_SELECT_MASK(); }
+    let l: ZVal = get[ZVal](op.operands, 1);
+    let r: ZVal = get[ZVal](op.operands, 2);
+    let e1: i32 = zvec_check_vec_operand(l);
+    if (e1 != 0) { return e1; }
+    let e2: i32 = zvec_check_vec_operand(r);
+    if (e2 != 0) { return e2; }
+    if (zvec_same_shape(l.ty, r.ty) == 0) { return ZVERR_SHAPE(); }
+    if (zvec_mask_lanes(c.ty) != zvec_lanes(l.ty)) { return ZVERR_SELECT_MASK(); }
+    let res: ZVal = get[ZVal](op.results, 0);
+    let e3: i32 = zvec_check_vec_result(res);
+    if (e3 != 0) { return e3; }
+    if (zvec_same_shape(res.ty, l.ty) == 0) { return ZVERR_SHAPE(); }
+    let ea: i32 = zvec_check_elem_attr(op);
+    if (ea != 0) { return ea; }
+    if (!@strEq(attr_val(op, zvec_attr_elem()), zvec_elem_ty(l.ty))) { return ZVERR_SHAPE(); }
+    return 0;
+}
+
+fn zvec_verify_reduction(op: ZOp) i32 {
+    if (len[ZVal](op.operands) != 1) { return ZVERR_OPERAND_ARITY(); }
+    let v: ZVal = get[ZVal](op.operands, 0);
+    let e: i32 = zvec_check_vec_operand(v);
+    if (e != 0) { return e; }
+    // The result is one scalar of the element type — never a shorter vector.
+    let r: ZVal = get[ZVal](op.results, 0);
+    if (zvec_is_vector_ty(r.ty) == 1) { return ZVERR_SHAPE(); }
+    if (!@strEq(r.ty, zvec_elem_ty(v.ty))) { return ZVERR_SHAPE(); }
+    let ea: i32 = zvec_check_elem_attr(op);
+    if (ea != 0) { return ea; }
+    if (!@strEq(attr_val(op, zvec_attr_elem()), zvec_elem_ty(v.ty))) { return ZVERR_SHAPE(); }
+    return 0;
+}
+
+fn zvec_verify_shuffle(op: ZOp) i32 {
+    if (len[ZVal](op.operands) != 2) { return ZVERR_OPERAND_ARITY(); }
+    let l: ZVal = get[ZVal](op.operands, 0);
+    let r: ZVal = get[ZVal](op.operands, 1);
+    let e0: i32 = zvec_check_vec_operand(l);
+    if (e0 != 0) { return e0; }
+    let e1: i32 = zvec_check_vec_operand(r);
+    if (e1 != 0) { return e1; }
+    if (zvec_same_shape(l.ty, r.ty) == 0) { return ZVERR_SHAPE(); }
+    let res: ZVal = get[ZVal](op.results, 0);
+    let e2: i32 = zvec_check_vec_result(res);
+    if (e2 != 0) { return e2; }
+    if (zvec_same_shape(res.ty, l.ty) == 0) { return ZVERR_SHAPE(); }
+    // The mask is an immediate: a non-empty decimal list, every index inside the
+    // 2*lanes concatenation, and exactly as many entries as the result has lanes.
+    let lanes: i32 = zvec_lanes(l.ty);
+    let n: i32 = zvec_mask_entries(attr_val(op, zvec_attr_mask()), 2 * lanes);
+    if (n < 1) { return ZVERR_SHUFFLE_MASK(); }
+    if (n != zvec_lanes(res.ty)) { return ZVERR_SHUFFLE_MASK(); }
+    return 0;
+}
+
+// ── diagnostics ────────────────────────────────────────────────────────────
+// A fault code alone is not a diagnosis: a module with four vector ops gives the
+// same code whether the splat or the add is wrong. This walks the module the
+// same way verify_module does and returns the NAME of the first op that fails,
+// so a caller can point at the actual op. "" means the module is clean.
+fn zvec_describe(op: ZOp, code: i32) []u8 {
+    let out: ArrayList[u8] = make[u8](160);
+    zvec_emit(&out, op.name);
+    zvec_emit(&out, " code=");
+    zvec_emit(&out, _zag_i64_to_str(code as i64));
+    if (len[ZVal](op.results) == 1) {
+        zvec_emit(&out, " result=");
+        zvec_emit(&out, get[ZVal](op.results, 0).ty);
+    }
+    let i: i32 = 0;
+    while (i < len[ZVal](op.operands)) {
+        zvec_emit(&out, " operand=");
+        zvec_emit(&out, get[ZVal](op.operands, i).ty);
+        i = i + 1;
+    }
+    zvec_emit(&out, " elem=");
+    zvec_emit(&out, attr_val(op, zvec_attr_elem()));
+    zvec_emit(&out, " lanes=");
+    zvec_emit(&out, attr_val(op, zvec_attr_lanes()));
+    zvec_emit(&out, "\n");
+    return out.data[0..out.len];
+}
+fn zvec_first_bad_block(blk: ZBlock) []u8 {
+    let i: i32 = 0;
+    while (i < len[ZOp](blk.ops)) {
+        let o: ZOp = get[ZOp](blk.ops, i);
+        if (zvec_op_is_vector(o.name) == 1) {
+            let code: i32 = zvec_verify_op(o);
+            if (code != 0) { return zvec_describe(o, code); }
+        }
+        let r: i32 = 0;
+        while (r < len[ZRegion](o.regions)) {
+            let reg: ZRegion = get[ZRegion](o.regions, r);
+            let b: i32 = 0;
+            while (b < len[ZBlock](reg.blocks)) {
+                let n: []u8 = zvec_first_bad_block(get[ZBlock](reg.blocks, b));
+                if (n.len > 0) { return n; }
+                b = b + 1;
+            }
+            r = r + 1;
+        }
+        i = i + 1;
+    }
+    return "";
+}
+fn zvec_verify_first_bad(m: ZModule) []u8 {
+    let i: i32 = 0;
+    while (i < len[ZFunc](m.funcs)) {
+        let n: []u8 = zvec_first_bad_block(get[ZFunc](m.funcs, i).body);
+        if (n.len > 0) { return n; }
+        i = i + 1;
+    }
+    return "";
+}
+
+// 0 = valid, >0 = the code of the first rule this op breaks.
+fn zvec_verify_op(op: ZOp) i32 {
+    let n: []u8 = op.name;
+    if (zvec_op_is_vector(n) == 0) {
+        // Not ours. UNLESS it claims the vector dialect, in which case some other
+        // layer wrote a vector op this compiler does not implement and must not
+        // let it reach a lowering.
+        if (zvec_name_is_vector_prefixed(n) == 1) { return ZVERR_UNKNOWN(); }
+        return 0;
+    }
+    // Purity is checked before anything else because it is the property the DCE
+    // below and the vectorizer's rewrite both rely on, and because a pure op that
+    // reads memory is wrong regardless of how well-typed its operands are.
+    if (zvec_op_is_pure(n) == 1) {
+        if (!@strEq(op.reads, zvec_effect_none())) { return ZVERR_PURITY(); }
+        if (!@strEq(op.writes, zvec_effect_none())) { return ZVERR_PURITY(); }
+    }
+    if (len[ZVal](op.results) != 1) { return ZVERR_RESULT_ARITY(); }
+    // This is a MINIMUM, not an exact count: `vector.splat` has one form with
+    // one operand and an address form with two.  Each op verifier below then
+    // checks its own EXACT count, so nothing is loosened by relaxing it here.
+    if (len[ZVal](op.operands) < zvec_min_operands(n)) { return ZVERR_OPERAND_ARITY(); }
+    if (@strEq(n, zvec_op_splat())) { return zvec_verify_splat(op); }
+    if (@strEq(n, zvec_op_broadcast())) { return zvec_verify_broadcast(op); }
+    if (@strEq(n, zvec_op_extract())) { return zvec_verify_extract(op); }
+    if (@strEq(n, zvec_op_insert())) { return zvec_verify_insert(op); }
+    if (zvec_op_is_elementwise(n) == 1) { return zvec_verify_elementwise(op); }
+    if (@strEq(n, zvec_op_icmp())) { return zvec_verify_icmp(op); }
+    if (@strEq(n, zvec_op_select())) { return zvec_verify_select(op); }
+    if (@strEq(n, zvec_op_reduction_add())) { return zvec_verify_reduction(op); }
+    return zvec_verify_shuffle(op);   // the only remaining member of the vocabulary
+}
+
+// The first error in block order, descending into regions as it goes, so the
+// reported code is a deterministic function of the IR and not of map order.
+fn zvec_verify_block(blk: ZBlock) i32 {
+    let i: i32 = 0;
+    while (i < len[ZOp](blk.ops)) {
+        let o: ZOp = get[ZOp](blk.ops, i);
+        let e: i32 = zvec_verify_op(o);
+        if (e != 0) { return e; }
+        let rg: i32 = 0;
+        while (rg < len[ZRegion](o.regions)) {
+            let reg: ZRegion = get[ZRegion](o.regions, rg);
+            let bb: i32 = 0;
+            while (bb < len[ZBlock](reg.blocks)) {
+                let e2: i32 = zvec_verify_block(get[ZBlock](reg.blocks, bb));
+                if (e2 != 0) { return e2; }
+                bb = bb + 1;
+            }
+            rg = rg + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Every vector result name in a function, nested regions included.
+fn zvec_block_result_names(blk: ZBlock, names: *ArrayList[[]u8]) void {
+    let i: i32 = 0;
+    while (i < len[ZOp](blk.ops)) {
+        let o: ZOp = get[ZOp](blk.ops, i);
+        if (zvec_op_is_vector(o.name) == 1) {
+            let k: i32 = 0;
+            while (k < len[ZVal](o.results)) {
+                push[[]u8](names, get[ZVal](o.results, k).name);
+                k = k + 1;
+            }
+        }
+        let rg: i32 = 0;
+        while (rg < len[ZRegion](o.regions)) {
+            let reg: ZRegion = get[ZRegion](o.regions, rg);
+            let bb: i32 = 0;
+            while (bb < len[ZBlock](reg.blocks)) {
+                zvec_block_result_names(get[ZBlock](reg.blocks, bb), names);
+                bb = bb + 1;
+            }
+            rg = rg + 1;
+        }
+        i = i + 1;
+    }
+}
+fn zvec_name_in(names: ArrayList[[]u8], n: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[[]u8](names)) {
+        if (@strEq(get[[]u8](names, i), n)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// A function verifies when its body does, and when no two vector ops in it claim
+// the same SSA name. zir.zag already runs a module-wide uniqueness and
+// def-before-use check; this is the vector-local restatement of it, so a
+// mis-typed vector op is caught by the vector gate even when the general check is
+// not run. It cannot fire on non-vector IR, so it stays additive.
+fn zvec_verify_function(f: ZFunc) i32 {
+    let e: i32 = zvec_verify_block(f.body);
+    if (e != 0) { return e; }
+    let names: ArrayList[[]u8] = make[[]u8](16);
+    zvec_block_result_names(f.body, &names);
+    let seen: ArrayList[[]u8] = make[[]u8](16);
+    let i: i32 = 0;
+    while (i < len[[]u8](names)) {
+        let n: []u8 = get[[]u8](names, i);
+        if (zvec_name_in(seen, n) == 1) { return ZVERR_UNKNOWN(); }
+        push[[]u8](&seen, n);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// 0 when every function in the module verifies, otherwise the first error code.
+fn zvec_verify_module(m: ZModule) i32 {
+    let i: i32 = 0;
+    while (i < len[ZFunc](m.funcs)) {
+        let e: i32 = zvec_verify_function(get[ZFunc](m.funcs, i));
+        if (e != 0) { return e; }
+        i = i + 1;
+    }
+    return 0;
+}
+// The diagnostic entry point: same answer as zvec_verify_module, named for what
+// a caller does with it — one code to turn into one zvec_error_text message.
+fn zvec_verify_first_error(m: ZModule) i32 { return zvec_verify_module(m); }
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  VECTOR-AWARE DEAD CODE ELIMINATION
+//
+//  Removes a vector op when BOTH hold: its result is read nowhere in the
+//  function, and the contract calls it pure. `vector.broadcast` is excluded by
+//  purity, not by a name check, because it loads memory — dropping a live load
+//  would delete a memory access the program performs. Non-vector ops are never
+//  candidates and keep their order.
+//
+//  Liveness is a single set of every operand name anywhere in the function tree
+//  (this block plus all nested regions). A block-local set would be unsound: a
+//  value defined inside an `scf.while` body and read by an op after the loop has
+//  no use in its own block and would be deleted. One whole-function set is the
+//  conservative over-approximation that makes the intra-block deletion safe.
+// ═══════════════════════════════════════════════════════════════════════════
+fn zvec_collect_uses(blk: ZBlock, used: *ArrayList[[]u8]) void {
+    let i: i32 = 0;
+    while (i < len[ZOp](blk.ops)) {
+        let o: ZOp = get[ZOp](blk.ops, i);
+        let k: i32 = 0;
+        while (k < len[ZVal](o.operands)) {
+            push[[]u8](used, get[ZVal](o.operands, k).name);
+            k = k + 1;
+        }
+        let rg: i32 = 0;
+        while (rg < len[ZRegion](o.regions)) {
+            let reg: ZRegion = get[ZRegion](o.regions, rg);
+            let bb: i32 = 0;
+            while (bb < len[ZBlock](reg.blocks)) {
+                zvec_collect_uses(get[ZBlock](reg.blocks, bb), used);
+                bb = bb + 1;
+            }
+            rg = rg + 1;
+        }
+        i = i + 1;
+    }
+}
+fn zvec_dce_regions(o: ZOp, used: ArrayList[[]u8], changed: *i32) ZOp {
+    if (len[ZRegion](o.regions) == 0) { return o; }
+    let no: ZOp = ZOp{ .name = o.name, .results = o.results, .operands = o.operands,
+        .attrs = o.attrs, .regions = make[ZRegion](1), .effects = o.effects,
+        .reads = o.reads, .writes = o.writes, .origin = o.origin };
+    let rg: i32 = 0;
+    while (rg < len[ZRegion](o.regions)) {
+        let reg: ZRegion = get[ZRegion](o.regions, rg);
+        let nr: ZRegion = ZRegion{ .blocks = make[ZBlock](1) };
+        let bb: i32 = 0;
+        while (bb < len[ZBlock](reg.blocks)) {
+            push[ZBlock](&nr.blocks, zvec_dce_block(get[ZBlock](reg.blocks, bb), used, changed));
+            bb = bb + 1;
+        }
+        push[ZRegion](&no.regions, nr);
+        rg = rg + 1;
+    }
+    return no;
+}
+fn zvec_dce_block(blk: ZBlock, used: ArrayList[[]u8], changed: *i32) ZBlock {
+    let out: ZBlock = zvec_block();
+    let i: i32 = 0;
+    while (i < len[ZOp](blk.ops)) {
+        let o: ZOp = zvec_dce_regions(get[ZOp](blk.ops, i), used, changed);
+        let drop: i32 = 0;
+        // Only a pure, single-result, region-free VECTOR op is a candidate.
+        if (zvec_op_is_vector(o.name) == 1 && len[ZVal](o.results) == 1 &&
+            len[ZRegion](o.regions) == 0 && zvec_op_is_pure(o.name) == 1) {
+            if (zvec_name_in(used, get[ZVal](o.results, 0).name) == 0) { drop = 1; }
+        }
+        if (drop == 1) { changed.* = changed.* + 1; } else { push[ZOp](&out.ops, o); }
+        i = i + 1;
+    }
+    return out;
+}
+fn zvec_block_dce(blk: ZBlock) ZBlock {
+    let used: ArrayList[[]u8] = make[[]u8](32);
+    let cur: ZBlock = blk;
+    let changed: i32 = 1;
+    let guard: i32 = 0;
+    // The use set is RECOMPUTED every round.  Computing it once would make the
+    // fixpoint loop useless: removing an op can make the op that produced one of
+    // its operands dead, and a stale use set would keep that operand alive and
+    // stop the pass one round early.  That is not a cosmetic difference — the
+    // single pass would leave a dead pure op behind, which is the whole thing
+    // the pass exists to prevent.
+    while (changed > 0 && guard < 64) {
+        free[[]u8](&used);
+        used = make[[]u8](32);
+        zvec_collect_uses(cur, &used);
+        let c: i32 = 0;
+        cur = zvec_dce_block(cur, used, &c);
+        changed = c;
+        guard = guard + 1;
+    }
+    free[[]u8](&used);
+    return cur;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  MLIR TEXT
+//
+//  The same house style as print_op_mlir in zir.zag: one op per line, `pad`
+//  indentation of two spaces per level, a memory operand printed with `[]`, and
+//  a trailing ` : <type>`. Attributes the ZIR spelling needs but MLIR has no
+//  positional form for (lanes, index) are printed inline in braces. The full
+//  `vector<elem,lanes>` spelling is always printed: dropping the lane count would
+//  make the text lose the one fact a reader cannot recover from the op name.
+// ═══════════════════════════════════════════════════════════════════════════
+fn zvec_emit(buf: *ArrayList[u8], s: []u8) void {
+    let i: i32 = 0;
+    while (i < s.len) { push[u8](buf, s[i]); i = i + 1; }
+}
+fn zvec_pad(buf: *ArrayList[u8], ind: i32) void {
+    let i: i32 = 0;
+    while (i < ind) { zvec_emit(buf, "  "); i = i + 1; }
+}
+// "0,4,1,5" as MLIR's positional shuffle list "[0, 4, 1, 5]".
+fn zvec_emit_mask(buf: *ArrayList[u8], mask: []u8) void {
+    zvec_emit(buf, "[");
+    let i: i32 = 0;
+    while (i < mask.len) {
+        if (mask[i] == ',') { zvec_emit(buf, ", "); } else { push[u8](buf, mask[i]); }
+        i = i + 1;
+    }
+    zvec_emit(buf, "]");
+}
+fn zvec_emit_operands(buf: *ArrayList[u8], o: ZOp, from: i32) void {
+    let i: i32 = from;
+    while (i < len[ZVal](o.operands)) {
+        if (i > from) { zvec_emit(buf, ", "); }
+        zvec_emit(buf, get[ZVal](o.operands, i).name);
+        i = i + 1;
+    }
+}
+
+// Returns 1 when it printed `op`, 0 when `op.name` is not a vector op so the
+// caller can fall through to its own cases. A vector op too malformed to print
+// is reported as such rather than indexed out of bounds: the verifier is the
+// gate, but a printer must not be the thing that crashes the compiler.
+fn zvec_print_op_mlir(buf: *ArrayList[u8], o: ZOp, ind: i32) i32 {
+    let n: []u8 = o.name;
+    if (zvec_op_is_vector(n) == 0) { return 0; }
+    zvec_pad(buf, ind);
+    if (len[ZVal](o.results) != 1 || len[ZVal](o.operands) < zvec_min_operands(n)) {
+        zvec_emit(buf, n); zvec_emit(buf, " (malformed vector op)\n");
+        return 1;
+    }
+    let r: ZVal = get[ZVal](o.results, 0);
+    if (@strEq(n, zvec_op_splat())) {
+        zvec_emit(buf, r.name); zvec_emit(buf, " = vector.splat ");
+        // Print EVERY operand, not just the first.  A data splat is
+        // `vector.splat %scalar`, but the address form is
+        // `vector.splat %base, %index` and the index is what makes the load
+        // read a[i..i+lanes-1] rather than a[0..lanes-1].  Dropping operand 2
+        // here would print a module that reads differently from the one lowered.
+        zvec_emit_operands(buf, o, 0);
+        zvec_emit(buf, " {lanes = \""); zvec_emit(buf, attr_val(o, zvec_attr_lanes()));
+        zvec_emit(buf, "\", elem = \""); zvec_emit(buf, attr_val(o, zvec_attr_elem()));
+        // `stride` names the access pattern of an address splat and is what a
+        // backend uses to pick scaled indexing; it is absent on a data splat.
+        if (attr_val(o, "stride").len > 0) {
+            zvec_emit(buf, "\", stride = \""); zvec_emit(buf, attr_val(o, "stride"));
+        }
+        zvec_emit(buf, "\"} : "); zvec_emit(buf, r.ty); zvec_emit(buf, "\n");
+    } else if (@strEq(n, zvec_op_broadcast())) {
+        zvec_emit(buf, r.name); zvec_emit(buf, " = vector.broadcast ");
+        zvec_emit(buf, get[ZVal](o.operands, 0).name); zvec_emit(buf, "[]");
+        zvec_emit(buf, " {lanes = \""); zvec_emit(buf, attr_val(o, zvec_attr_lanes()));
+        zvec_emit(buf, "\"} : "); zvec_emit(buf, r.ty);
+        zvec_emit(buf, " from "); zvec_emit(buf, get[ZVal](o.operands, 0).ty);
+        zvec_emit(buf, "\n");
+    } else if (@strEq(n, zvec_op_extract())) {
+        zvec_emit(buf, r.name); zvec_emit(buf, " = vector.extract ");
+        zvec_emit(buf, get[ZVal](o.operands, 0).name);
+        zvec_emit(buf, " {index = \""); zvec_emit(buf, attr_val(o, zvec_attr_index()));
+        zvec_emit(buf, "\"} : "); zvec_emit(buf, get[ZVal](o.operands, 0).ty);
+        zvec_emit(buf, "\n");
+    } else if (@strEq(n, zvec_op_insert())) {
+        zvec_emit(buf, r.name); zvec_emit(buf, " = vector.insert ");
+        zvec_emit(buf, get[ZVal](o.operands, 0).name); zvec_emit(buf, ", ");
+        zvec_emit(buf, get[ZVal](o.operands, 1).name);
+        zvec_emit(buf, " {index = \""); zvec_emit(buf, attr_val(o, zvec_attr_index()));
+        zvec_emit(buf, "\"} : "); zvec_emit(buf, r.ty); zvec_emit(buf, "\n");
+    } else if (@strEq(n, zvec_op_icmp())) {
+        zvec_emit(buf, r.name); zvec_emit(buf, " = vector.icmp ");
+        zvec_emit(buf, attr_val(o, zvec_attr_predicate())); zvec_emit(buf, ", ");
+        zvec_emit_operands(buf, o, 0);
+        zvec_emit(buf, " : "); zvec_emit(buf, get[ZVal](o.operands, 0).ty);
+        zvec_emit(buf, "\n");
+    } else if (@strEq(n, zvec_op_select())) {
+        zvec_emit(buf, r.name); zvec_emit(buf, " = vector.select ");
+        zvec_emit_operands(buf, o, 0);
+        zvec_emit(buf, " : "); zvec_emit(buf, r.ty); zvec_emit(buf, "\n");
+    } else if (@strEq(n, zvec_op_reduction_add())) {
+        zvec_emit(buf, r.name); zvec_emit(buf, " = vector.reduction_add ");
+        zvec_emit(buf, get[ZVal](o.operands, 0).name);
+        zvec_emit(buf, " : "); zvec_emit(buf, get[ZVal](o.operands, 0).ty);
+        zvec_emit(buf, " -> "); zvec_emit(buf, r.ty); zvec_emit(buf, "\n");
+    } else if (@strEq(n, zvec_op_shuffle())) {
+        zvec_emit(buf, r.name); zvec_emit(buf, " = vector.shuffle ");
+        zvec_emit_operands(buf, o, 0); zvec_emit(buf, " ");
+        zvec_emit_mask(buf, attr_val(o, zvec_attr_mask()));
+        zvec_emit(buf, " : "); zvec_emit(buf, r.ty); zvec_emit(buf, "\n");
+    } else {
+        // The remaining vector ops are exactly the elementwise binaries.
+        zvec_emit(buf, r.name); zvec_emit(buf, " = "); zvec_emit(buf, n); zvec_emit(buf, " ");
+        zvec_emit_operands(buf, o, 0);
+        zvec_emit(buf, " : "); zvec_emit(buf, r.ty); zvec_emit(buf, "\n");
+    }
+    return 1;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  STATS for `znc view`
+//
+//  `ops` is the total vector op count and the ten kind counters are a partition
+//  of it, so `ops` equals their sum on any well-formed module. `max_lanes` is
+//  the widest LOGICAL vector the module names, in lanes, over both results and
+//  operands: extract and reduction_add leave the vector domain in their result,
+//  so counting results alone would under-report the module's width.
+// ═══════════════════════════════════════════════════════════════════════════
+struct ZvecStats { ops:i32, splat:i32, broadcast:i32, extract:i32, insert:i32,
+    elementwise:i32, icmp:i32, select:i32, reduction:i32, shuffle:i32, max_lanes:i32 }
+
+fn zvec_stats_note_lanes(ty: []u8, s: *ZvecStats) void {
+    if (zvec_is_vector_ty(ty) == 0) { return; }
+    let n: i32 = zvec_lanes(ty);
+    if (n > s.*.max_lanes) { s.*.max_lanes = n; }
+}
+fn zvec_stats_op(o: ZOp, s: *ZvecStats) void {
+    if (zvec_op_is_vector(o.name) == 1) {
+        s.*.ops = s.*.ops + 1;
+        if (@strEq(o.name, zvec_op_splat())) { s.*.splat = s.*.splat + 1; }
+        else if (@strEq(o.name, zvec_op_broadcast())) { s.*.broadcast = s.*.broadcast + 1; }
+        else if (@strEq(o.name, zvec_op_extract())) { s.*.extract = s.*.extract + 1; }
+        else if (@strEq(o.name, zvec_op_insert())) { s.*.insert = s.*.insert + 1; }
+        else if (@strEq(o.name, zvec_op_icmp())) { s.*.icmp = s.*.icmp + 1; }
+        else if (@strEq(o.name, zvec_op_select())) { s.*.select = s.*.select + 1; }
+        else if (@strEq(o.name, zvec_op_reduction_add())) { s.*.reduction = s.*.reduction + 1; }
+        else if (@strEq(o.name, zvec_op_shuffle())) { s.*.shuffle = s.*.shuffle + 1; }
+        else if (zvec_op_is_elementwise(o.name) == 1) { s.*.elementwise = s.*.elementwise + 1; }
+        let i: i32 = 0;
+        while (i < len[ZVal](o.results)) { zvec_stats_note_lanes(get[ZVal](o.results, i).ty, s); i = i + 1; }
+        i = 0;
+        while (i < len[ZVal](o.operands)) { zvec_stats_note_lanes(get[ZVal](o.operands, i).ty, s); i = i + 1; }
+    }
+    // Regions are counted even for a non-vector op: the ops that live inside an
+    // `scf.while` body are the whole point of the vectorizer's coverage report.
+    let rg: i32 = 0;
+    while (rg < len[ZRegion](o.regions)) {
+        let reg: ZRegion = get[ZRegion](o.regions, rg);
+        let bb: i32 = 0;
+        while (bb < len[ZBlock](reg.blocks)) { zvec_stats_block(get[ZBlock](reg.blocks, bb), s); bb = bb + 1; }
+        rg = rg + 1;
+    }
+}
+fn zvec_stats_block(blk: ZBlock, s: *ZvecStats) void {
+    let i: i32 = 0;
+    while (i < len[ZOp](blk.ops)) { zvec_stats_op(get[ZOp](blk.ops, i), s); i = i + 1; }
+}
+fn zvec_module_stats(m: ZModule) ZvecStats {
+    let s: ZvecStats = ZvecStats{ .ops=0,.splat=0,.broadcast=0,.extract=0,.insert=0,
+        .elementwise=0,.icmp=0,.select=0,.reduction=0,.shuffle=0,.max_lanes=0 };
+    let i: i32 = 0;
+    while (i < len[ZFunc](m.funcs)) { zvec_stats_block(get[ZFunc](m.funcs, i).body, &s); i = i + 1; }
+    return s;
+}
+fn zvec_kv(tag: []u8, v: i32) []u8 { return _zag_str_concat(tag, zvb_num(v)); }
+// One report line, newline-terminated, ready to append to a `znc view` report.
+fn zvec_stats_text(s: ZvecStats) []u8 {
+    let a: []u8 = zvec_kv("vector-ops=", s.ops);
+    let b: []u8 = _zag_str_concat(a, zvec_kv(" splat=", s.splat));
+    let c: []u8 = _zag_str_concat(b, zvec_kv(" broadcast=", s.broadcast));
+    let d: []u8 = _zag_str_concat(c, zvec_kv(" extract=", s.extract));
+    let e: []u8 = _zag_str_concat(d, zvec_kv(" insert=", s.insert));
+    let f: []u8 = _zag_str_concat(e, zvec_kv(" elementwise=", s.elementwise));
+    let g: []u8 = _zag_str_concat(f, zvec_kv(" icmp=", s.icmp));
+    let h: []u8 = _zag_str_concat(g, zvec_kv(" select=", s.select));
+    let j: []u8 = _zag_str_concat(h, zvec_kv(" reduction=", s.reduction));
+    let k: []u8 = _zag_str_concat(j, zvec_kv(" shuffle=", s.shuffle));
+    let l: []u8 = _zag_str_concat(k, zvec_kv(" max-lanes=", s.max_lanes));
+    return _zag_str_concat(l, "\n");
+}

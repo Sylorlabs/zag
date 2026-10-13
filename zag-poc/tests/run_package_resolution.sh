@@ -123,6 +123,22 @@ else
     fail=$((fail + 1))
 fi
 
+closure_unit="$work/package-closure-unit"
+closure_unit_output="$work/package-closure-unit.out"
+if "$znc" "$root/selfhost/package_closure_test.zag" --no-zagd \
+    --no-foreground-cache -o "$closure_unit" >"$work/package-closure-unit.build" 2>&1 &&
+    artifact_native_exec "$closure_unit" &&
+    (cd "$root" && "$closure_unit" >"$closure_unit_output" 2>&1) &&
+    grep -F -x -q 'Package closure unit: fail=0' "$closure_unit_output"; then
+    printf 'ok  manifest closure unit covers deterministic traversal and fail-closed manifest errors\n'
+    pass=$((pass + 1))
+else
+    printf 'FAIL manifest closure unit\n'
+    sed -n '1,24p' "$work/package-closure-unit.build"
+    sed -n '1,24p' "$closure_unit_output" 2>/dev/null || true
+    fail=$((fail + 1))
+fi
+
 manifest_inputs_test="$work/zagd-manifest-inputs-test"
 manifest_inputs_build="$work/zagd-manifest-inputs-test.build"
 parent_manifest="$work/vendor-parent-cwd.semantic"
@@ -289,6 +305,10 @@ else
     fail=$((fail + 1))
 fi
 
+# Manifest-wide validation now runs before the parser's per-import resolver.
+# These malformed manifest cases must fail at that earlier authority boundary;
+# module/lock errors below still require their specific resolver diagnostics.
+manifest_preflight_error='znc: cannot verify toolchain identity: dependency manifest closure is invalid'
 expect_invalid_dependency_path() {
     case_name=$1
     case_label=$2
@@ -299,7 +319,7 @@ expect_invalid_dependency_path() {
         -o "$case_binary" >"$case_output" 2>&1; then
         printf 'FAIL %s dependency path compiled\n' "$case_label"
         fail=$((fail + 1))
-    elif grep -q "dependency path must be relative and use '/'" "$case_output" &&
+    elif grep -Fq "$manifest_preflight_error" "$case_output" &&
         [ ! -e "$case_binary" ]; then
         printf 'ok  %s dependency path fails closed\n' "$case_label"
         pass=$((pass + 1))
@@ -339,11 +359,11 @@ expect_package_failure() {
 }
 
 expect_package_failure duplicate_alias duplicate_alias/src/main.zag \
-    'duplicate dependency alias' "dependency 'toolkit' is declared more than once"
+    'duplicate dependency alias' "$manifest_preflight_error"
 expect_package_failure missing_manifest missing_manifest/src/main.zag \
     'missing package manifest' "no ancestor zag.mod declares local dependencies"
 expect_package_failure malformed_entry malformed_entry/src/main.zag \
-    'malformed matching dependency entry' "invalid or missing path entry for dependency 'toolkit'"
+    'malformed matching dependency entry' "$manifest_preflight_error"
 
 shadow_source="$work/workspace/nearest_shadow/outer/inner/src/main.zag"
 shadow_binary="$work/nearest-shadow"
@@ -675,22 +695,22 @@ vendor_case="$work/vendor-traversal-root"
 cp -R "$work/workspace/vendor_consumer" "$vendor_case"
 zag_sed_in_place 's#path = "vendor/toolkit"#path = "../toolkit"#' "$vendor_case/zag.mod"
 expect_vendor_failure "$vendor_case" 'vendor root traversal' \
-    'vendor dependency path must be a traversal-free vendor/<name> root'
+    "$manifest_preflight_error"
 
 vendor_case="$work/vendor-unknown-mode"
 cp -R "$work/workspace/vendor_consumer" "$vendor_case"
 zag_sed_in_place 's/mode = "vendor"/mode = "registry"/' "$vendor_case/zag.mod"
 expect_vendor_failure "$vendor_case" 'unknown dependency mode' \
-    'invalid or missing path entry'
+    "$manifest_preflight_error"
 
 vendor_case="$work/vendor-duplicate-mode"
 cp -R "$work/workspace/vendor_consumer" "$vendor_case"
 zag_sed_in_place 's/mode = "vendor"/mode = "vendor", mode = "vendor"/' \
     "$vendor_case/zag.mod"
 expect_vendor_failure "$vendor_case" 'duplicate vendor manifest field' \
-    'invalid or missing path entry'
+    "$manifest_preflight_error"
 
-expected_passes=41
+expected_passes=42
 if [ "$pass" -ne "$expected_passes" ]; then
     printf 'FAIL fixed package pass total: expected=%s actual=%s\n' \
         "$expected_passes" "$pass"

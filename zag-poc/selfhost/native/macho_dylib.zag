@@ -1,0 +1,501 @@
+// Self-hosted ARM64 dynamic-library linker for Zag relocatable machine IR.
+// Format authority: Apple SDK mach-o/loader.h and mach-o/arm64/reloc.h.
+@import("macho_object_encoder.zag")
+
+struct MdylibImport { symbol: i32, library: i32, weak: i32 }
+struct MdylibTrieNode {
+    edge: u8, symbol: i32, child: i32, sibling: i32, offset: i32, size: i32
+}
+
+fn md_uleb_size(value: i64) i32 {
+    let size: i32 = 1;
+    while (value >= 128) { value = value / 128; size = size + 1; }
+    return size;
+}
+fn md_uleb(out: *ArrayList[u8], value: i64) void {
+    while (value >= 128) { mo_b(out, (value % 128) + 128); value = value / 128; }
+    mo_b(out, value);
+}
+fn md_read_word(bytes: ArrayList[u8], at: i32) i64 {
+    let value: i64 = 0; let scale: i64 = 1; let i: i32 = 0;
+    while (i < 4) { value = value + (bytes.data[at+i] as i64)*scale; scale = scale*256; i = i+1; }
+    return value;
+}
+fn md_patch(bytes: *ArrayList[u8], at: i32, value: i64, width: i32) void {
+    let i: i32 = 0;
+    while (i < width) { bytes.*.data[at+i] = (value & 255) as u8; value = value / 256; i = i+1; }
+}
+fn md_read_signed(bytes: ArrayList[u8], at: i32, width: i32) i64 {
+    let value: i64 = bytes.data[at+width-1] as i64;
+    if (value >= 128) { value=value-256; }
+    let i: i32 = width-1;
+    while (i > 0) { i=i-1; value=value*256+(bytes.data[at+i] as i64); }
+    return value;
+}
+fn md_patch_signed(bytes: *ArrayList[u8], at: i32, value: i64, width: i32) i32 {
+    if (width != 4 && width != 8) { return 0; }
+    if (width == 4 && (value < -2147483648 || value >= 2147483648)) { return 0; }
+    let rest: i64 = value; let i: i32 = 0;
+    while (i < width) {
+        let byte: i64 = rest & 255;
+        bytes.*.data[at+i] = byte as u8;
+        rest=(rest-byte)/256; i=i+1;
+    }
+    if (rest != 0 && rest != -1) { return 0; }
+    return 1;
+}
+fn md_symbol_address(symbol: MobjSymbol, code_off: i64, data_off: i64) i64 {
+    if (symbol.section == 1) { return code_off + symbol.offset; }
+    return data_off + symbol.offset;
+}
+fn md_import_index(imports: ArrayList[MdylibImport], symbol: i32) i32 {
+    let i: i32 = 0;
+    while (i < imports.len) { if (imports.data[i].symbol == symbol) { return i; } i = i+1; }
+    return -1;
+}
+fn md_i32_index(values: ArrayList[i32], value: i32) i32 {
+    let i: i32 = 0;
+    while (i < values.len) { if (values.data[i] == value) { return i; } i = i+1; }
+    return -1;
+}
+fn md_local_got_symbols(encoded: MobjEncoded) ArrayList[i32] {
+    let out: ArrayList[i32] = make[i32](8);
+    let i: i32 = 0;
+    while (i < encoded.relocs.len) {
+        let reloc: MobjReloc = encoded.relocs.data[i];
+        if ((reloc.kind == 5 || reloc.kind == 6 || reloc.kind == 7 || reloc.kind == 12) &&
+            encoded.symbols.data[reloc.symbol].section != 0 &&
+            md_i32_index(out,reloc.symbol) < 0) { push[i32](&out,reloc.symbol); }
+        i = i+1;
+    }
+    return out;
+}
+
+// A byte-edge trie avoids a one-node/255-export limit and handles symbols that
+// are prefixes of other symbols. Node offsets converge because ULEB widths
+// grow monotonically from their initial single-byte representation.
+fn md_exports(symbols: ArrayList[MobjSymbol], code_off: i64, data_off: i64,
+    errors: *i32) ArrayList[u8] {
+    let out: ArrayList[u8] = make[u8](16);
+    let nodes: ArrayList[MdylibTrieNode] = make[MdylibTrieNode](32);
+    push[MdylibTrieNode](&nodes, MdylibTrieNode{.edge=0,.symbol=-1,.child=-1,.sibling=-1,.offset=0,.size=2});
+    let i: i32 = 0;
+    while (i < symbols.len) {
+        let symbol: MobjSymbol = symbols.data[i];
+        if (symbol.external == 1 && symbol.section != 0) {
+            let node: i32 = 0; let j: i32 = 0;
+            while (j < symbol.name.len) {
+                let child: i32 = nodes.data[node].child; let previous: i32 = -1;
+                while (child >= 0 && nodes.data[child].edge != symbol.name[j]) {
+                    previous = child; child = nodes.data[child].sibling;
+                }
+                if (child < 0) {
+                    if (nodes.len >= 1048576) { errors.* = mobj_error("export trie exceeds node limit"); free[MdylibTrieNode](&nodes); return out; }
+                    child = nodes.len;
+                    push[MdylibTrieNode](&nodes, MdylibTrieNode{.edge=symbol.name[j],.symbol=-1,.child=-1,.sibling=-1,.offset=0,.size=2});
+                    if (previous < 0) { nodes.data[node].child = child; }
+                    else { nodes.data[previous].sibling = child; }
+                }
+                node = child; j = j+1;
+            }
+            nodes.data[node].symbol = i;
+        }
+        i = i+1;
+    }
+    let changed: i32 = 1; let iteration: i32 = 0;
+    while (changed == 1 && iteration < 32) {
+        changed = 0; let offset: i32 = 0; i = 0;
+        while (i < nodes.len) {
+            if (nodes.data[i].offset != offset) { nodes.data[i].offset = offset; changed = 1; }
+            let payload: i32 = 0;
+            if (nodes.data[i].symbol >= 0) {
+                payload = 1 + md_uleb_size(md_symbol_address(symbols.data[nodes.data[i].symbol],code_off,data_off));
+            }
+            let size: i32 = md_uleb_size(payload as i64) + payload + 1;
+            let child: i32 = nodes.data[i].child;
+            while (child >= 0) {
+                size = size + 2 + md_uleb_size(nodes.data[child].offset as i64);
+                child = nodes.data[child].sibling;
+            }
+            if (size != nodes.data[i].size) { nodes.data[i].size = size; changed = 1; }
+            offset = offset + size; i = i+1;
+        }
+        iteration = iteration+1;
+    }
+    if (changed == 1) { errors.* = mobj_error("export trie offsets did not converge"); free[MdylibTrieNode](&nodes); return out; }
+    i = 0;
+    while (i < nodes.len) {
+        if (out.len != nodes.data[i].offset) { errors.* = mobj_error("export trie sizing mismatch"); break; }
+        let payload: i32 = 0; let address: i64 = 0;
+        if (nodes.data[i].symbol >= 0) {
+            address = md_symbol_address(symbols.data[nodes.data[i].symbol],code_off,data_off);
+            payload = 1 + md_uleb_size(address);
+        }
+        md_uleb(&out,payload as i64);
+        if (payload > 0) { md_uleb(&out,0); md_uleb(&out,address); }
+        let count: i32 = 0; let child: i32 = nodes.data[i].child;
+        while (child >= 0) { count = count+1; child = nodes.data[child].sibling; }
+        mo_b(&out,count as i64); child = nodes.data[i].child;
+        while (child >= 0) {
+            mo_b(&out,nodes.data[child].edge as i64); mo_b(&out,0);
+            md_uleb(&out,nodes.data[child].offset as i64); child = nodes.data[child].sibling;
+        }
+        i = i+1;
+    }
+    free[MdylibTrieNode](&nodes);
+    return out;
+}
+fn md_bind(out: *ArrayList[u8], name: []u8, library: i32, weak: i32,
+    data_offset: i64, segment: i32) void {
+    if (library == -2) { mo_b(out,0x3e); }
+    else { mo_b(out,0x20); md_uleb(out,library as i64); }
+    mo_b(out,0x40+weak); mo_bytes(out,name); mo_b(out,0);
+    mo_b(out,0x51); mo_b(out,(0x70+segment) as i64); md_uleb(out,data_offset); mo_b(out,0x90);
+}
+fn md_validate(encoded: MobjEncoded, data: ArrayList[u8], libraries: ArrayList[[]u8],
+    imports: ArrayList[MdylibImport], install_name: []u8, entry_off: i32) i32 {
+    if (encoded.valid != 1 || encoded.text.len == 0 || encoded.text.len % 4 != 0) { return mobj_error("invalid dynamic-library machine code"); }
+    if (mobj_validate(encoded.text,data,encoded.symbols,encoded.relocs) != 0) { return 1; }
+    if (mobj_name_valid(install_name) == 0 || install_name.len > 4096 || libraries.len > 253) { return mobj_error("invalid dylib install name or dependency count"); }
+    if (entry_off < -1 || entry_off >= encoded.text.len || (entry_off >= 0 && entry_off % 4 != 0)) { return mobj_error("invalid dynamic-executable entry point"); }
+    let i: i32 = 0;
+    while (i < libraries.len) {
+        if (mobj_name_valid(libraries.data[i]) == 0 || libraries.data[i].len > 4096) { return mobj_error("invalid dylib dependency"); }
+        let j: i32 = 0;
+        while (j < i) { if (@strEq(libraries.data[j],libraries.data[i])) { return mobj_error("duplicate dylib dependency"); } j = j+1; }
+        i = i+1;
+    }
+    i = 0;
+    while (i < imports.len) {
+        let item: MdylibImport = imports.data[i];
+        if (item.symbol < 0 || item.symbol >= encoded.symbols.len ||
+            item.weak < 0 || item.weak > 1 ||
+            !((item.library >= 1 && item.library <= libraries.len) || (item.library == -2 && item.weak == 1))) {
+            return mobj_error("invalid dylib import mapping");
+        }
+        if (encoded.symbols.data[item.symbol].section != 0 || md_import_index(imports,item.symbol) != i) { return mobj_error("duplicate or defined dylib import mapping"); }
+        if (encoded.symbols.data[item.symbol].weak != item.weak) { return mobj_error("weak-import mapping disagrees with symbol metadata"); }
+        i = i+1;
+    }
+    let exports: i32 = 0; i = 0;
+    while (i < encoded.symbols.len) {
+        let symbol: MobjSymbol = encoded.symbols.data[i];
+        if (symbol.section == 0 && md_import_index(imports,i) < 0) { return mobj_error("unresolved dylib symbol"); }
+        if (symbol.external == 1 && symbol.section != 0) {
+            exports = exports+1;
+            if (symbol.section == 1 && (symbol.offset >= (encoded.text.len as i64) || symbol.offset % 4 != 0)) { return mobj_error("invalid exported function address"); }
+        }
+        i = i+1;
+    }
+    if (exports == 0 && entry_off < 0) { return mobj_error("dynamic library has no exports"); }
+    return 0;
+}
+
+fn md_build_full(encoded: MobjEncoded, data: ArrayList[u8], libraries: ArrayList[[]u8],
+    imports: ArrayList[MdylibImport], install_name: []u8, entry_off: i32,
+    rpaths: ArrayList[[]u8], errors: *i32) ArrayList[u8] {
+    let image: ArrayList[u8] = make[u8](0);
+    errors.* = md_validate(encoded,data,libraries,imports,install_name,entry_off);
+    if (errors.* != 0) { return image; }
+    let executable: i32 = (entry_off >= 0) as i32;
+    let text_base: i64 = (executable as i64)*MACHO_BASE();
+    let command_bytes: i64 = 592 + (mo_dylib_cmd_size(install_name) as i64);
+    if (executable == 1) { command_bytes = 720; }
+    let i: i32 = 0;
+    while (i < libraries.len) { command_bytes = command_bytes + (mo_dylib_cmd_size(libraries.data[i]) as i64); i = i+1; }
+    if (rpaths.len > 253) { errors.* = mobj_error("too many dynamic-library runtime paths"); return image; }
+    i = 0;
+    while (i < rpaths.len) {
+        if (mobj_name_valid(rpaths.data[i]) == 0 || rpaths.data[i].len > 4096) { errors.* = mobj_error("invalid dynamic-library runtime path"); return image; }
+        command_bytes = command_bytes+macho_align(13+(rpaths.data[i].len as i64),8); i = i+1;
+    }
+    let code_off: i64 = macho_align(32+command_bytes,4096);
+    let stub_off: i64 = code_off + (encoded.text.len as i64);
+    let text_length: i64 = (encoded.text.len as i64) + (imports.len as i64)*16;
+    let data_off: i64 = macho_align(code_off+text_length,MACHO_PAGE());
+    let got_off: i64 = macho_align(data.len as i64,8);
+    let local_gots: ArrayList[i32] = md_local_got_symbols(encoded);
+    let data_length: i64 = got_off + ((imports.len+local_gots.len) as i64)*8;
+    if (data_length == 0) { data_length = 8; }
+    let link_off: i64 = macho_align(data_off+data_length,MACHO_PAGE());
+    if (link_off > 2147483647) {
+        free[i32](&local_gots); errors.* = mobj_error("dynamic-library sections exceed supported buffer range"); return image;
+    }
+    let text: ArrayList[u8] = make[u8](text_length as i32);
+    let writable: ArrayList[u8] = make[u8](data_length as i32);
+    let rebases: ArrayList[u8] = make[u8](16);
+    let binds: ArrayList[u8] = make[u8](32);
+    mo_list_bytes(&text,encoded.text); mo_list_bytes(&writable,data); mo_pad_to(&writable,data_length);
+    i = 0;
+    while (i < imports.len) {
+        let slot: i64 = data_off+got_off+(i as i64)*8;
+        emit_adrp_add(&text,16,code_off+(text.len as i64),slot);
+        emit_ldr_uoff(&text,16,16,0); mo_le(&text,0xd61f0200,4); // BR X16.
+        md_bind(&binds,encoded.symbols.data[imports.data[i].symbol].name,
+            imports.data[i].library,imports.data[i].weak,got_off+(i as i64)*8,1+executable);
+        i = i+1;
+    }
+    i = 0;
+    while (i < encoded.relocs.len && errors.* == 0) {
+        let reloc: MobjReloc = encoded.relocs.data[i];
+        let symbol: MobjSymbol = encoded.symbols.data[reloc.symbol];
+        let target: i64 = text_base+md_symbol_address(symbol,code_off,data_off);
+        let pc: i64 = text_base+code_off+(reloc.offset as i64);
+        if (reloc.kind == 13 || reloc.kind == 14) {
+            let width: i32 = 4; if (reloc.kind == 14) { width=8; }
+            let target_section: i32 = symbol.section;
+            if (target_section != 1 && target_section != 2) {
+                errors.* = mobj_error("cross-section SUBTRACTOR has an invalid target section");
+            } else {
+                let bytes: *ArrayList[u8] = &text;
+                if (reloc.section == 2) { bytes=&writable; }
+                else if (reloc.section != 1) { errors.* = mobj_error("cross-section SUBTRACTOR has an invalid source section"); }
+                if (errors.* == 0) {
+                    let value: i64 = md_read_signed(bytes.*,reloc.offset,width);
+                    if (target_section == 1) { value=value+code_off-data_off; }
+                    else { value=value+data_off-code_off; }
+                    if (md_patch_signed(bytes,reloc.offset,value,width) == 0) {
+                        errors.* = mobj_error("cross-section SUBTRACTOR result is out of range");
+                    }
+                }
+            }
+        } else if (reloc.kind == 0) {
+            if (reloc.section != 2) { errors.* = mobj_error("absolute text fixups would require writable executable pages"); }
+            else if (md_read_word(writable,reloc.offset) != 0 || md_read_word(writable,reloc.offset+4) != 0) {
+                errors.* = mobj_error("absolute pointer relocation requires a zero addend");
+            }
+            else if (symbol.section == 0) {
+                let imported: i32 = md_import_index(imports,reloc.symbol);
+                md_patch(&writable,reloc.offset,0,8);
+                md_bind(&binds,symbol.name,imports.data[imported].library,imports.data[imported].weak,
+                    reloc.offset as i64,1+executable);
+            } else {
+                md_patch(&writable,reloc.offset,target,8);
+                mo_b(&rebases,0x11); mo_b(&rebases,(0x21+executable) as i64); md_uleb(&rebases,reloc.offset as i64); mo_b(&rebases,0x51);
+            }
+        } else if (reloc.kind == 7) {
+            let slot_index: i32 = md_import_index(imports,reloc.symbol);
+            if (symbol.section != 0) {
+                let local: i32 = md_i32_index(local_gots,reloc.symbol);
+                if (local >= 0) { slot_index = imports.len+local; }
+            }
+            if (slot_index < 0) { errors.* = mobj_error("POINTER_TO_GOT relocation has no allocated GOT slot"); }
+            else {
+                let site: i64 = text_base+(reloc.offset as i64);
+                if (reloc.section == 1) { site = site+code_off; }
+                else if (reloc.section == 2) { site = site+data_off; }
+                else { errors.* = mobj_error("POINTER_TO_GOT relocation has an invalid section"); }
+                if (errors.* == 0) {
+                    let got_target: i64 = text_base+data_off+got_off+(slot_index as i64)*8;
+                    let delta: i64 = got_target-site;
+                    if (delta < -2147483648 || delta >= 2147483648) {
+                        errors.* = mobj_error("out-of-range 32-bit POINTER_TO_GOT relocation");
+                    } else {
+                        let encoded_delta: i64 = delta;
+                        if (encoded_delta < 0) { encoded_delta = encoded_delta+4294967296; }
+                        if (reloc.section == 1) { md_patch(&text,reloc.offset,encoded_delta,4); }
+                        else { md_patch(&writable,reloc.offset,encoded_delta,4); }
+                    }
+                }
+            }
+        } else if (reloc.kind == 12) {
+            let slot_index: i32 = md_import_index(imports,reloc.symbol);
+            if (symbol.section != 0) {
+                let local: i32 = md_i32_index(local_gots,reloc.symbol);
+                if (local >= 0) { slot_index = imports.len+local; }
+            }
+            if (slot_index < 0) { errors.* = mobj_error("absolute POINTER_TO_GOT relocation has no allocated GOT slot"); }
+            else {
+                let got_target: i64 = text_base+data_off+got_off+(slot_index as i64)*8;
+                md_patch(&writable,reloc.offset,got_target,8);
+                mo_b(&rebases,0x11); mo_b(&rebases,(0x21+executable) as i64);
+                md_uleb(&rebases,reloc.offset as i64); mo_b(&rebases,0x51);
+            }
+        } else if (reloc.section != 1) { errors.* = mobj_error("instruction relocation outside executable section"); }
+        else if (reloc.kind == 2) {
+            let instruction: i64 = md_read_word(text,reloc.offset);
+            if (symbol.section == 0) { target = text_base+stub_off+(md_import_index(imports,reloc.symbol) as i64)*16; }
+            let delta: i64 = target-pc;
+            if ((instruction & 0x7fffffff) != 0x14000000 || delta % 4 != 0 || delta < -134217728 || delta >= 134217728) {
+                errors.* = mobj_error("invalid or out-of-range zero-addend branch relocation");
+            } else { md_patch(&text,reloc.offset,(instruction & 0xfc000000)+((delta/4) & 0x3ffffff),4); }
+        } else {
+            let instruction: i64 = md_read_word(text,reloc.offset);
+            if (reloc.kind == 5 || reloc.kind == 6) {
+                let slot_index: i32 = md_import_index(imports,reloc.symbol);
+                if (symbol.section != 0) {
+                    let local: i32 = md_i32_index(local_gots,reloc.symbol);
+                    if (local >= 0) { slot_index = imports.len+local; }
+                }
+                if (slot_index < 0) { errors.* = mobj_error("GOT load relocation has no allocated GOT slot"); }
+                else {
+                    let got_target: i64 = text_base+data_off+got_off+(slot_index as i64)*8;
+                    if (reloc.kind == 5) {
+                        let pages: i64 = ((got_target-(got_target%4096))-(pc-(pc%4096)))/4096;
+                        if ((instruction & 0xffffffe0) != 0x90000000 || pages < -1048576 || pages >= 1048576) {
+                            errors.* = mobj_error("invalid zero-addend GOT_LOAD_PAGE21 relocation");
+                        } else {
+                            let bits: i64 = pages & 0x1fffff;
+                            md_patch(&text,reloc.offset,0x90000000+(bits%4)*536870912+(bits/4)*32+(instruction%32),4);
+                        }
+                    } else {
+                        let pageoff: i64 = got_target%4096;
+                        // A Darwin GOT slot is one 64-bit pointer. The paired
+                        // PAGEOFF12 relocation must therefore be the canonical
+                        // unsigned-immediate LDR Xt form, scaled by eight.
+                        if ((instruction & 0xffc00000) != 0xf9400000 || pageoff%8 != 0 || pageoff/8 >= 4096) {
+                            errors.* = mobj_error("invalid zero-addend GOT_LOAD_PAGEOFF12 relocation");
+                        } else {
+                            md_patch(&text,reloc.offset,(instruction & 0xffc003ff)+(pageoff/8)*1024,4);
+                        }
+                    }
+                }
+            }
+            else if (symbol.section == 0) { errors.* = mobj_error("external address requires an import pointer relocation"); }
+            else if (reloc.kind == 3) {
+                let pages: i64 = ((target-(target%4096))-(pc-(pc%4096)))/4096;
+                if ((instruction & 0xffffffe0) != 0x90000000 || pages < -1048576 || pages >= 1048576) {
+                    errors.* = mobj_error("invalid zero-addend ADRP relocation");
+                } else {
+                    let bits: i64 = pages & 0x1fffff;
+                    md_patch(&text,reloc.offset,0x90000000+(bits%4)*536870912+(bits/4)*32+(instruction%32),4);
+                }
+            } else if (reloc.kind == 4) {
+                let pageoff: i64 = target%4096;
+                if ((instruction & 0xfffffc00) == 0x91000000) {
+                    md_patch(&text,reloc.offset,instruction+pageoff*1024,4);
+                } else if ((instruction & 0x3b000000) == 0x39000000) {
+                    // ARM64_RELOC_PAGEOFF12 also applies to unsigned-immediate
+                    // LDR/STR forms. Integer/scalar widths use size[31:30];
+                    // the Q-vector form uses the otherwise-reserved 16-byte
+                    // scale selected by bit26+bit23. The instruction carries
+                    // a zero addend, so replace only imm12[21:10].
+                    let scale: i32 = ((instruction/1073741824) & 3) as i32;
+                    if ((instruction & 0x04800000) == 0x04800000) { scale = 4; }
+                    let unit: i64 = 1; let bit: i32 = 0;
+                    while (bit < scale) { unit = unit*2; bit = bit+1; }
+                    if (pageoff%unit != 0 || pageoff/unit >= 4096) {
+                        errors.* = mobj_error("misaligned PAGEOFF12 load/store relocation");
+                    } else {
+                        md_patch(&text,reloc.offset,(instruction & 0xffc003ff)+(pageoff/unit)*1024,4);
+                    }
+                } else { errors.* = mobj_error("invalid zero-addend PAGEOFF12 relocation"); }
+            }
+        }
+        i = i+1;
+    }
+    i = 0;
+    while (i < local_gots.len && errors.* == 0) {
+        let symbol: MobjSymbol = encoded.symbols.data[local_gots.data[i]];
+        let slot_offset: i64 = got_off+((imports.len+i) as i64)*8;
+        let value: i64 = text_base+md_symbol_address(symbol,code_off,data_off);
+        md_patch(&writable,slot_offset as i32,value,8);
+        mo_b(&rebases,0x11); mo_b(&rebases,(0x21+executable) as i64);
+        md_uleb(&rebases,slot_offset); mo_b(&rebases,0x51);
+        i = i+1;
+    }
+    mo_b(&rebases,0); mo_b(&binds,0);
+    let exports: ArrayList[u8] = md_exports(encoded.symbols,code_off,data_off,errors);
+    let strings: ArrayList[u8] = make[u8](32); mo_b(&strings,0);
+    let nlists: ArrayList[u8] = make[u8](encoded.symbols.len*16);
+    let locals: i32 = 0; let defined: i32 = 0; let undefined: i32 = 0; i = 0;
+    while (i < encoded.symbols.len) {
+        let symbol: MobjSymbol = encoded.symbols.data[i];
+        let value: i64 = 0; let descriptor: i64 = 0; let kind: i64 = symbol.external as i64;
+        if (symbol.section == 0) {
+            undefined = undefined+1;
+            let imported: MdylibImport = imports.data[md_import_index(imports,i)];
+            if (imported.library == -2) { descriptor=0xfe00; }
+            else { descriptor=(imported.library as i64)*256; }
+            descriptor=descriptor+(imported.weak as i64)*0x40;
+        }
+        else {
+            kind = kind+14; value = text_base+md_symbol_address(symbol,code_off,data_off);
+            if (symbol.external == 0) { locals = locals+1; } else { defined = defined+1; }
+        }
+        mo_le(&nlists,strings.len as i64,4); mo_b(&nlists,kind); mo_b(&nlists,symbol.section as i64);
+        mo_le(&nlists,descriptor,2); mo_le(&nlists,value,8); mo_bytes(&strings,symbol.name); mo_b(&strings,0);
+        i = i+1;
+    }
+    let bind_off: i64 = link_off+(rebases.len as i64);
+    let export_off: i64 = bind_off+(binds.len as i64);
+    let symbol_off: i64 = macho_align(export_off+(exports.len as i64),8);
+    let string_off: i64 = symbol_off+(nlists.len as i64);
+    let sig_off: i64 = macho_align(string_off+(strings.len as i64),16);
+    let nslots: i64 = (sig_off+MACHO_HASH_PAGE()-1)/MACHO_HASH_PAGE();
+    let sig_size: i64 = macho_align(20+96+nslots*32,16);
+    let total: i64 = sig_off+sig_size;
+    if (total > 2147483647) { errors.* = mobj_error("dynamic library exceeds supported buffer range"); }
+    if (errors.* == 0) {
+        free[u8](&image); image = make[u8](total as i32);
+        mo_le(&image,0xfeedfacf,4); mo_le(&image,0x100000c,4); mo_le(&image,0,4); mo_le(&image,(6-4*executable) as i64,4);
+        mo_le(&image,(10+2*executable+libraries.len+rpaths.len) as i64,4); mo_le(&image,command_bytes,4); mo_le(&image,0x85+(executable as i64)*0x200000,4); mo_le(&image,0,4);
+        if (executable == 1) { mo_segment(&image,"__PAGEZERO",0,text_base,0,0,0,0); }
+        mo_segment(&image,"__TEXT",text_base,data_off,0,data_off,5,1);
+        mo_section(&image,"__text","__TEXT",text_base+code_off,text.len as i64,code_off,2,0x80000400);
+        mo_segment(&image,"__DATA",text_base+data_off,link_off-data_off,data_off,data_length,3,1);
+        mo_section(&image,"__data","__DATA",text_base+data_off,data_length,data_off,3,0);
+        mo_segment(&image,"__LINKEDIT",text_base+link_off,macho_align(total-link_off,MACHO_PAGE()),link_off,total-link_off,1,0);
+        if (executable == 0) {
+            mo_le(&image,13,4); mo_le(&image,mo_dylib_cmd_size(install_name) as i64,4); mo_le(&image,24,4); mo_le(&image,0,4);
+            mo_le(&image,65536,4); mo_le(&image,65536,4); mo_bytes(&image,install_name); mo_b(&image,0);
+            while (image.len % 8 != 0) { mo_b(&image,0); }
+        } else {
+            mo_le(&image,14,4); mo_le(&image,32,4); mo_le(&image,12,4); mo_bytes(&image,"/usr/lib/dyld"); mo_b(&image,0);
+            while (image.len % 8 != 0) { mo_b(&image,0); }
+            mo_le(&image,0x80000028,4); mo_le(&image,24,4); mo_le(&image,code_off+(entry_off as i64),8); mo_le(&image,0,8);
+        }
+        mo_le(&image,0x32,4); mo_le(&image,24,4); mo_le(&image,1,4); mo_le(&image,0xb0000,4); mo_le(&image,0xb0000,4); mo_le(&image,0,4);
+        mo_le(&image,0x1b,4); mo_le(&image,24,4); let uuid_off: i32 = image.len; mo_zero(&image,16);
+        mo_le(&image,2,4); mo_le(&image,24,4); mo_le(&image,symbol_off,4); mo_le(&image,encoded.symbols.len as i64,4); mo_le(&image,string_off,4); mo_le(&image,strings.len as i64,4);
+        mo_le(&image,0xb,4); mo_le(&image,80,4); mo_le(&image,0,4); mo_le(&image,locals as i64,4);
+        mo_le(&image,locals as i64,4); mo_le(&image,defined as i64,4); mo_le(&image,(locals+defined) as i64,4); mo_le(&image,undefined as i64,4); mo_zero(&image,48);
+        i = 0; while (i < libraries.len) { mo_load_dylib(&image,libraries.data[i]); i = i+1; }
+        i = 0;
+        while (i < rpaths.len) {
+            mo_le(&image,0x8000001c,4); mo_le(&image,macho_align(13+(rpaths.data[i].len as i64),8),4);
+            mo_le(&image,12,4); mo_bytes(&image,rpaths.data[i]); mo_b(&image,0);
+            while (image.len%8 != 0) { mo_b(&image,0); } i = i+1;
+        }
+        mo_le(&image,0x80000022,4); mo_le(&image,48,4);
+        mo_le(&image,link_off,4); mo_le(&image,rebases.len as i64,4); mo_le(&image,bind_off,4); mo_le(&image,binds.len as i64,4);
+        mo_zero(&image,16); mo_le(&image,export_off,4); mo_le(&image,exports.len as i64,4);
+        mo_le(&image,29,4); mo_le(&image,16,4); mo_le(&image,sig_off,4); mo_le(&image,sig_size,4);
+        if ((image.len as i64) != 32+command_bytes) { errors.* = mobj_error("dynamic-library command sizing mismatch"); }
+        if (errors.* == 0) {
+            mo_pad_to(&image,code_off); mo_list_bytes(&image,text); mo_pad_to(&image,data_off); mo_list_bytes(&image,writable);
+            mo_pad_to(&image,link_off); mo_list_bytes(&image,rebases); mo_list_bytes(&image,binds); mo_list_bytes(&image,exports);
+            mo_pad_to(&image,symbol_off); mo_list_bytes(&image,nlists); mo_list_bytes(&image,strings); mo_pad_to(&image,sig_off);
+            let uuid: ArrayList[u8] = macho_sha256(image.data[0..image.len]);
+            i = 0; while (i < 16) { image.data[uuid_off+i] = uuid.data[i]; i = i+1; } free[u8](&uuid);
+            let signature: ArrayList[u8] = mo_signature(image.data[0..image.len],data_off);
+            // CodeDirectory execSegFlags: a dylib is not the main executable.
+            md_patch(&signature,100,0,8);
+            signature.data[107] = executable as u8;
+            mo_list_bytes(&image,signature); free[u8](&signature);
+            if ((image.len as i64) != total) { errors.* = mobj_error("dynamic-library signature sizing mismatch"); }
+        }
+    }
+    free[u8](&text); free[u8](&writable); free[u8](&rebases); free[u8](&binds);
+    free[u8](&exports); free[u8](&strings); free[u8](&nlists);
+    free[i32](&local_gots);
+    if (errors.* != 0) { free[u8](&image); image = make[u8](0); }
+    return image;
+}
+fn md_build_mode(encoded: MobjEncoded, data: ArrayList[u8], libraries: ArrayList[[]u8],
+    imports: ArrayList[MdylibImport], install_name: []u8, entry_off: i32, errors: *i32) ArrayList[u8] {
+    let rpaths: ArrayList[[]u8] = make[[]u8](0);
+    let image: ArrayList[u8] = md_build_full(encoded,data,libraries,imports,install_name,entry_off,rpaths,errors);
+    free[[]u8](&rpaths); return image;
+}
+fn md_build(encoded: MobjEncoded, data: ArrayList[u8], libraries: ArrayList[[]u8],
+    imports: ArrayList[MdylibImport], install_name: []u8, errors: *i32) ArrayList[u8] {
+    return md_build_mode(encoded,data,libraries,imports,install_name,-1,errors);
+}
+fn md_write(path: []u8, encoded: MobjEncoded, data: ArrayList[u8],
+    libraries: ArrayList[[]u8], imports: ArrayList[MdylibImport], install_name: []u8) i32 {
+    let errors: i32 = 0;
+    let image: ArrayList[u8] = md_build(encoded,data,libraries,imports,install_name,&errors);
+    if (errors == 0) { errors = _zag_write_file(path,image.data[0..image.len]); }
+    free[u8](&image); return errors;
+}

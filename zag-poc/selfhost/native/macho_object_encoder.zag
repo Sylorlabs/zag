@@ -1,0 +1,203 @@
+// Darwin object encoding: section-relative control flow and symbol-valued
+// address/import relocations. No executable entrypoint or import trampolines.
+@import("macho_object.zag")
+@import("aarch64.zag")
+
+struct MobjEncoded {
+    text: ArrayList[u8],
+    symbols: ArrayList[MobjSymbol],
+    relocs: ArrayList[MobjReloc],
+    valid: i32
+}
+
+fn mobj_uses_code_label(ins: AInstr) i32 {
+    return (a_is_label_kind(ins.kind) == 1 || ins.kind == AK_LEA_LBL() ||
+        (ins.kind >= AK_CALL() && ins.kind <= AK_JGE())) as i32;
+}
+
+fn mobj_call_import_index(ins: AInstr) i64 {
+    if (ins.kind == AK_CALL_EXT()) { return ins.lbl as i64; }
+    return ins.imm;
+}
+
+fn mobj_encode_shape(out: *ArrayList[u8], ins: AInstr,
+    labels: ArrayList[i32], offset: i32) void {
+    if (ins.kind == AK_DATA_ADDR() || ins.kind == AK_LEA_LBL()) {
+        // Zero addend; local symbols at exact offsets avoid ADDEND records
+        // and materialize addresses beyond ADR's signed one-MiB range.
+        emit_adrp_add(out, ins.dst, 0, 0);
+    } else if (ins.kind == AK_EXTERN_CALL() || ins.kind == AK_CALL_EXT()) {
+        emit_bl(out, 0);
+    } else {
+        a_encode_one_macos(out, ins, labels, offset, 0, 0, 0);
+    }
+}
+
+fn mobj_find_local(symbols: ArrayList[MobjSymbol], section: i32, offset: i64) i32 {
+    let i: i32 = 0;
+    while (i < symbols.len) {
+        let s: MobjSymbol = symbols.data[i];
+        if (s.external == 0 && s.section == section && s.offset == offset) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn mobj_find_undefined(symbols: ArrayList[MobjSymbol], name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < symbols.len) {
+        if (symbols.data[i].section == 0 && @strEq(symbols.data[i].name, name)) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn mobj_add_local(symbols: *ArrayList[MobjSymbol], section: i32, offset: i64) void {
+    if (mobj_find_local(symbols.*, section, offset) >= 0) { return; }
+    let prefix: []u8 = "Lzag.text.";
+    if (section == 2) { prefix = "Lzag.data."; }
+    let number: []u8 = _zag_i64_to_str(offset);
+    let name: []u8 = _zag_str_concat(prefix, number);
+    _zag_str_free(number);
+    push[MobjSymbol](symbols, MobjSymbol{.name=name,.section=section,.offset=offset,.external=0,.weak=0});
+}
+
+fn mobj_encode_macos(prog: ArrayList[AInstr], data: ArrayList[u8],
+    imports: ArrayList[[]u8], exports: ArrayList[AObjectExport]) MobjEncoded {
+    let result: MobjEncoded = MobjEncoded{
+        .text=make[u8](16),.symbols=make[MobjSymbol](16),
+        .relocs=make[MobjReloc](16),.valid=0};
+    let maxlabel: i32 = 0;
+    let i: i32 = 0;
+    while (i < prog.len) {
+        if (mobj_uses_code_label(prog.data[i]) == 1 && prog.data[i].lbl > maxlabel) {
+            maxlabel = prog.data[i].lbl;
+        }
+        i = i + 1;
+    }
+    if (maxlabel >= 8388608) { mobj_error("label table exceeds supported buffer range"); return result; }
+    let labels: ArrayList[i32] = make[i32](maxlabel + 1);
+    let function_labels: ArrayList[i32] = make[i32](maxlabel + 1);
+    i = 0;
+    while (i <= maxlabel) {
+        push[i32](&labels, 0 - 1); push[i32](&function_labels, 0); i = i + 1;
+    }
+    let scratch: ArrayList[u8] = make[u8](64);
+    let import_indices: ArrayList[i32] = make[i32](imports.len);
+    let failed: i32 = 0;
+    i = 0;
+    while (i < prog.len && failed == 0) {
+        let ins: AInstr = prog.data[i];
+        if (a_is_label_kind(ins.kind) == 1) {
+            if (ins.lbl < 0 || ins.lbl >= labels.len || labels.data[ins.lbl] >= 0) {
+                failed = mobj_error("invalid or duplicate code label");
+            } else {
+                labels.data[ins.lbl] = scratch.len;
+                function_labels.data[ins.lbl] = (ins.kind == AK_FN_LABEL()) as i32;
+            }
+        } else if (mobj_uses_code_label(ins) == 1 && ins.lbl < 0) {
+            failed = mobj_error("instruction has a negative code label");
+        }
+        if (failed == 0) { mobj_encode_shape(&scratch, ins, labels, scratch.len); }
+        i = i + 1;
+    }
+    // Build locals first, external definitions next, then undefineds. The
+    // lowering pass supplied export labels, including injected/generic decls.
+    i = 0;
+    while (i < prog.len && failed == 0) {
+        let ins: AInstr = prog.data[i];
+        if (mobj_uses_code_label(ins) == 1 && labels.data[ins.lbl] < 0) {
+            failed = mobj_error("instruction references undefined code label");
+        } else if (ins.kind == AK_DATA_ADDR()) {
+            if (ins.imm < 0 || ins.imm > (data.len as i64)) {
+                failed = mobj_error("data address is outside its section");
+            } else { mobj_add_local(&result.symbols, 2, ins.imm); }
+        } else if (ins.kind == AK_LEA_LBL()) {
+            mobj_add_local(&result.symbols, 1, labels.data[ins.lbl] as i64);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < exports.len && failed == 0) {
+        let symbol: AObjectExport = exports.data[i];
+        if (symbol.label < 0 || symbol.label >= labels.len ||
+            labels.data[symbol.label] < 0 || function_labels.data[symbol.label] != 1 ||
+            mobj_name_valid(symbol.name) == 0) {
+            failed = mobj_error("export does not name an emitted function label");
+        } else {
+            // C _example exports __example: always add exactly one ABI prefix.
+            let name: []u8 = _zag_str_concat("_", symbol.name);
+            push[MobjSymbol](&result.symbols, MobjSymbol{.name=name,.section=1,
+                .offset=labels.data[symbol.label] as i64,.external=1,.weak=0});
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < imports.len && failed == 0) {
+        if (mobj_name_valid(imports.data[i]) == 0) {
+            failed = mobj_error("invalid external symbol name"); break;
+        }
+        let name: []u8 = _zag_str_concat("_", imports.data[i]);
+        let index: i32 = mobj_find_undefined(result.symbols, name);
+        if (index < 0) {
+            index = result.symbols.len;
+            push[MobjSymbol](&result.symbols, MobjSymbol{.name=name,.section=0,.offset=0,.external=1,.weak=0});
+        } else { _zag_str_free(name); }
+        push[i32](&import_indices, index);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < prog.len && failed == 0) {
+        let ins: AInstr = prog.data[i];
+        let offset: i32 = result.text.len;
+        let symbol: i32 = 0 - 1;
+        if (ins.kind >= AK_CALL() && ins.kind <= AK_JGE()) {
+            let delta: i64 = (labels.data[ins.lbl] as i64) - (offset as i64);
+            let bound: i64 = 134217728;
+            if (ins.kind >= AK_JE()) { bound = 1048576; }
+            if (delta % 4 != 0 || delta < 0 - bound || delta >= bound) {
+                failed = mobj_error("internal branch exceeds instruction range");
+            }
+        }
+        if (ins.kind == AK_DATA_ADDR()) {
+            symbol = mobj_find_local(result.symbols, 2, ins.imm);
+        } else if (ins.kind == AK_LEA_LBL()) {
+            symbol = mobj_find_local(result.symbols, 1, labels.data[ins.lbl] as i64);
+        }
+        if (ins.kind == AK_DATA_ADDR() || ins.kind == AK_LEA_LBL()) {
+            if (symbol < 0) { failed = mobj_error("address relocation has no local symbol"); }
+            else {
+                push[MobjReloc](&result.relocs, MobjReloc{.section=1,.offset=offset,.symbol=symbol,.kind=3});
+                push[MobjReloc](&result.relocs, MobjReloc{.section=1,.offset=offset+4,.symbol=symbol,.kind=4});
+            }
+        } else if (ins.kind == AK_EXTERN_CALL() || ins.kind == AK_CALL_EXT()) {
+            let import_index: i64 = mobj_call_import_index(ins);
+            if (import_index < 0 || import_index >= (import_indices.len as i64)) {
+                failed = mobj_error("external call references absent import metadata");
+            } else {
+                push[MobjReloc](&result.relocs, MobjReloc{.section=1,.offset=offset,
+                    .symbol=import_indices.data[import_index as i32],.kind=2});
+            }
+        }
+        if (failed == 0) { mobj_encode_shape(&result.text, ins, labels, offset); }
+        i = i + 1;
+    }
+    if (failed == 0 && result.text.len != scratch.len) {
+        failed = mobj_error("object sizing and emission disagree");
+    }
+    if (failed == 0) { failed = mobj_validate(result.text, data, result.symbols, result.relocs); }
+    result.valid = (failed == 0) as i32;
+    free[i32](&labels); free[i32](&function_labels);
+    free[u8](&scratch); free[i32](&import_indices);
+    return result;
+}
+
+fn mobj_encoded_release(encoded: *MobjEncoded) void {
+    let i: i32 = 0;
+    while (i < encoded.*.symbols.len) {
+        _zag_str_free(encoded.*.symbols.data[i].name); i = i + 1;
+    }
+    free[u8](&encoded.*.text);
+    free[MobjSymbol](&encoded.*.symbols);
+    free[MobjReloc](&encoded.*.relocs);
+}

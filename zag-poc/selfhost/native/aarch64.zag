@@ -111,6 +111,11 @@ fn emit_asrv(buf: *ArrayList[u8], rd: i32, rn: i32, rm: i32) void {
     let low: i32 = rd + rn * 32 + 10240;
     emit_pack(buf, a_lo3(low), a_lo3(low / 256), a_lo3(192 + rm), 154);
 }
+fn emit_lsrv(buf: *ArrayList[u8], rd: i32, rn: i32, rm: i32) void {
+    // LSRV Xd, Xn, Xm = 0x9AC02400 | rm<<16 | rn<<5 | rd
+    let low: i32 = rd + rn * 32 + 9216;
+    emit_pack(buf, a_lo3(low), a_lo3(low / 256), a_lo3(192 + rm), 154);
+}
 
 // ARMv8.0 acquire/release and exclusive 64-bit operations.  These are used
 // instead of ARMv8.1 LSE so the generated Mach-O runs on the complete arm64
@@ -237,6 +242,67 @@ fn emit_strq_uoff(buf: *ArrayList[u8], vt: i32, rn: i32, off: i32) void {
         a_lo3(128 + low / 65536), 61);
 }
 
+// LDR/STR Qt with a register index, `[Xn, Xm, LSL #s]`:
+//   00 111 V 00 opc 1 Rm(20:16) option(15:13) S(12) 10 Rn(9:5) Rt(4:0)
+// with size = 00 selecting the 128-bit access, option = 011 selecting an
+// unscaled X-register index, opc = 00 for LDR and 10 for STR, and S = 0/1 giving
+// LSL #0 / LSL #4.
+//
+// A64 spends the whole `size` field on "this is a 128-bit access", which leaves
+// only two architecturally defined index scales for it: the access size itself
+// (0) and a whole vector (4).  An i32 element stride is LSL #2 and has NO
+// encoding in this form.  Rather than emit a wrong instruction the emitter
+// rejects it (returns 1, emits nothing) and the lowering must use LD1/ST1 below,
+// whose element-scaled index is what an auto-vectorized `a[i]` actually needs.
+fn emit_ldrq_index(buf: *ArrayList[u8], store: i32, vt: i32,
+                   rn: i32, rm: i32, amount: i32) i32 {
+    if (rn == A_SP()) { return 1; }        // the register-offset form has no SP base
+    if (rm < 0 || rm > 30) { return 1; }   // 31 is XZR, never a legal index
+    if (vt < 0 || vt > 31) { return 1; }   // also rejects a virtual vector number
+    let sb: i32 = 0;
+    if (amount != 0) { sb = 4096; }
+    let low: i32 = 3 * 8192 + sb + 2 * 1024 + rn * 32 + vt;
+    let b2: i32 = 0;
+    if (store == 1) { b2 = 160 + rm; } else { b2 = 224 + rm; }
+    emit_pack(buf, a_lo3(low), a_lo3(low / 256), a_lo3(b2), 60);
+    return 0;
+}
+
+// LD1/ST1 of one vector register, post-indexed by a register:
+//   0 Q 0 01110 0 1 L 000000 1 Rm(20:16) 110 L(14:13) S(12) Rn(9:5) Rt(4:0)
+// L = log2(element bytes) is the SCALE, not a selector: the hardware multiplies
+// the index by it, so `ld1 {v0.4s},[x1],x2` means address x1 with the index
+// multiplied by four.  There is no separate LSL field and no displacement, and
+// S = 1 makes this post-indexed — the base register is WRITTEN BACK with the
+// scaled index.  opc splits the two directions: bits 23:21 = 110 for LD1 and
+// 100 for ST1, and an index of 31 would mean "no index" (bits 23:21 = 010).
+fn emit_ld1_st1(buf: *ArrayList[u8], store: i32, e: i32,
+                 vt: i32, rn: i32, rm: i32) i32 {
+    if (av_elem_ok(e) == 0) { return 1; }
+    if (vt < 0 || vt > 31) { return 1; }   // also rejects a virtual vector number
+    if (rn < 0 || rn > 31) { return 1; }
+    let l: i32 = 0;
+    if (e == 2) { l = 1; }
+    else if (e == 4) { l = 2; }
+    else if (e == 8) { l = 3; }
+    let low: i32 = (112 + l * 4) * 256 + rn * 32 + vt;
+    let b2: i32 = 0;
+    if (rm == 31) { b2 = 64; }             // no index: bits 23:21 = 010
+    else if (store == 1) { b2 = 128 + rm; }
+    else { b2 = 192 + rm; }
+    emit_pack(buf, a_lo3(low), a_lo3(low / 256), a_lo3(b2), 76);
+    return 0;
+}
+
+// ADD Xd, Xn, Xm, LSL #amount — the address materialization a scaled index needs
+// when a displacement must be folded in as well.  0x8B000000 | amount<<10 |
+// Rm<<16 | Rn<<5 | Rd, with `shift` = 00 meaning LSL.  Rn must be a general
+// register: in this encoding 31 reads as XZR, not SP.
+fn emit_add_lsl(buf: *ArrayList[u8], rd: i32, rn: i32, rm: i32, amount: i32) void {
+    let low: i32 = rd + rn * 32 + amount * 1024 + rm * 65536;
+    emit_pack(buf, a_lo3(low), a_lo3(low / 256), a_lo3(rm), 139);
+}
+
 fn emit_ldrq(buf: *ArrayList[u8], vt: i32, rn: i32, off: i32) void {
     if (off >= 0 && (off % 16) == 0 && off <= 65520) {
         emit_ldrq_uoff(buf, vt, rn, off);
@@ -259,10 +325,354 @@ fn emit_strq(buf: *ArrayList[u8], vt: i32, rn: i32, off: i32) void {
     emit_strq_uoff(buf, vt, A_X17(), 0);
 }
 
+// LDR/STR Qt with the descriptor's optional index register.  Three shapes, in
+// order of preference:
+//   1. index present, no displacement, base is a GPR -> one register-offset
+//      instruction, `[Xn, Xm, LSL #0 or #4]` (see emit_ldrq_index);
+//   2. index present with a displacement, or an SP base (which the
+//      register-offset form forbids) -> materialize base+index<<#s into X17 and
+//      fall back to the ordinary displacement path.  X16/X17 are the backend's
+//      reserved intra-procedure scratch registers;
+//   3. no index -> the historical displacement-only encoding, byte for byte.
+// An index scale A64 has no 128-bit encoding for is rejected outright: this
+// returns 1 having emitted nothing, and the caller records the error.
+fn emit_ldrq_disp_index(buf: *ArrayList[u8], store: i32, vt: i32, rn: i32,
+                        rm: i32, amount: i32, off: i32) i32 {
+    if (rm < 0) { return 0 - 1; }               // caller uses the plain path
+    if (amount != 0 && amount != 4) { return 1; }
+    if (off == 0 && rn != A_SP()) {
+        return emit_ldrq_index(buf, store, vt, rn, rm, amount);
+    }
+    // Materializing needs a scratch base plus a scratch temporary, and the index
+    // has to survive that arithmetic, so it may not be one of them.
+    if (rm == A_X16() || rm == A_X17()) { return 1; }
+    if (rn == A_SP()) {
+        // ADD (shifted register) reads Rn as XZR when it is 31, never as SP, so
+        // an SP base is copied into a general register first.
+        emit_add_imm(buf, A_X16(), A_SP(), 0);
+        emit_add_lsl(buf, A_X17(), A_X16(), rm, amount);
+    } else {
+        emit_add_lsl(buf, A_X17(), rn, rm, amount);
+    }
+    if (store == 1) { emit_strq(buf, vt, A_X17(), off); }
+    else { emit_ldrq(buf, vt, A_X17(), off); }
+    return 0;
+}
+
+// ── Advanced SIMD: derived arrangements ──────────────────────────────────────
+// A64 never spells a vector width in a mnemonic: one `Q` bit and a two-bit field
+// select the arrangement, and the same opcode byte serves `.16b`, `.8h`, `.4s`
+// and `.2d`.  So the encoder DERIVES that field from the two facts the vector
+// contract already fixes — the width class (VW_128/VW_256/VW_512) and the element
+// width — instead of hardcoding `.4S` the way the pre-vector backend did.  The
+// payoff is that the ISA layer stops being special-cased to four lanes of i32:
+// one emitter now serves every arrangement A64 actually has, and a request the
+// backend cannot execute (a width class above 128 bits, an element width with no
+// `size` code) comes back as a recorded error instead of silently wrong bytes.
+fn a_arrangement(w: i32, e: i32) i32 {
+    // Advanced SIMD is architecturally mandatory on AArch64, so there is no
+    // runtime feature gate here; the only limit is that this backend implements
+    // the 128-bit Q form.  `zvec_wclass_lanes(VW_128())` being 4 is exactly that
+    // statement: 4 lanes of 32-bit-equivalent width. Note those are UNITS, not
+    // elements -- under Zag's 8-byte stride a `*i32` vector of 2 elements already
+    // fills a Q register, and a `*i16` vector of 4 does too.  256/512-bit Advanced
+    // SIMD is SVE and is out of scope, so those width classes fail closed here.
+    if (w != VW_128()) { return 0 - 1; }
+    if (e == 1) { return 0; }   // 16B
+    if (e == 2) { return 1; }   // 8H
+    if (e == 4) { return 2; }   // 4S
+    if (e == 8) { return 3; }   // 2D
+    return 0 - 1;
+}
+
+// The A64 FP three-same group does not use bits 23:22 as a plain lane size: for
+// FADD/FMUL/FDIV/FCMEQ/FCMGE the field is `elem_bytes/4` (0 = 4S, 1 = 2D) while
+// the negate-form opcodes FSUB and FCMGT also set bit 23, i.e. `elem_bytes/2`
+// (2 = 4S, 3 = 2D).  Both halves were read straight out of the assembler; see the
+// byte-for-byte table in tests/zz_armvec_probe's successor test.
+fn a_fp_size_field(e: i32, negate_form: i32) i32 {
+    if (e == 4) {
+        if (negate_form == 1) { return 2; }
+        return 0;
+    }
+    if (e == 8) {
+        if (negate_form == 1) { return 3; }
+        return 1;
+    }
+    return 0 - 1;
+}
+
+// The shared "Advanced SIMD three same / three different" core:
+//   Q(30) U(29) 01110(28:24) sfield(23:22) 1(21) Vm(20:16) op(15:10) Rn(9:5) Vd(4:0)
+// `b3` supplies 0x4E (Q=1,U=0) or 0x6E (Q=1,U=1); `op` is the raw six-bit
+// bits-15:10 field.  Every arrangement-sensitive vector kind funnels through here,
+// which is what makes AK_VADD_I32 and AK_VADD the same machine operation at
+// different lane widths.
+fn emit_vthree(buf: *ArrayList[u8], b3: i32, sfield: i32, op: i32,
+                vd: i32, vn: i32, vm: i32) void {
+    let low: i32 = op * 1024 + vn * 32 + vd;
+    emit_pack(buf, a_lo3(low), a_lo3(low / 256), a_lo3(sfield * 64 + 32 + vm), b3);
+}
+
+// Shared guard for every vector kind: the width class must be executable here,
+// the element width must be one A64 has a `size` code for (a zero element width
+// means the caller did not say, and `def` supplies the kind's own default), and
+// the three register operands must be real Q registers.  Returns 0 when the
+// combination is encodable and 1 when it is not — the caller then emits nothing
+// and records the kind as an error rather than producing a partial encoding.
+fn av_check(w: i32, e: i32, def: i32, vd: i32, vn: i32, vm: i32) i32 {
+    let elem: i32 = e;
+    if (elem == 0) { elem = def; }
+    if (av_elem_ok(elem) == 0) { return 1; }
+    if (a_arrangement(w, elem) < 0) { return 1; }
+    if (vd < 0 || vd > 31) { return 1; }
+    if (vn < 0 || vn > 31) { return 1; }
+    if (vm < 0 || vm > 31) { return 1; }
+    return 0;
+}
+
 fn emit_vector_logic(buf: *ArrayList[u8], high: i32, middle: i32,
                      vd: i32, vn: i32, vm: i32) void {
     let low: i32 = 7168 + vn * 32 + vd;
     emit_pack(buf, a_lo3(low), a_lo3(low / 256), middle + vm, high);
+}
+
+// ── the width-parameteric elementwise kinds ─────────────────────────────────
+// Every emitter here takes the descriptor's width class and element width and
+// emits the matching arrangement.  `op` and `b3` are the as-assembled opcode
+// fields; the arrangement is `a_arrangement`.
+//
+//   AK_VADD_I32 / AK_VSUB_I32   add/sub  op=100001 U=0/1     all of 16B/8H/4S/2D
+//   AK_VMUL                     mul      op=100111 U=0      16B/8H/4S only
+//   AK_VSHL                     ushl     op=010001 U=1      all four
+//   AK_VCMGT/CMEQ/CMGE          cmgt/cmeq/cmge             all four
+//   AK_VFADD/FSUB/FMUL/FDIV     f*       all four           4S/2D only
+//   AK_VFCMGT/FCMEQ             fcmgt/fcmeq                4S/2D only
+fn emit_vaddsub(buf: *ArrayList[u8], u_bit: i32, w: i32, e: i32,
+                 vd: i32, vn: i32, vm: i32) i32 {
+    let elem: i32 = e;
+    if (elem == 0) { elem = 4; }
+    if (av_check(w, elem, 4, vd, vn, vm) != 0) { return 1; }
+    let s: i32 = a_arrangement(w, elem);
+    let b3: i32 = 78;
+    if (u_bit == 1) { b3 = 110; }
+    emit_vthree(buf, b3, s, 33, vd, vn, vm);
+    return 0;
+}
+
+// A64 has no `mul v.2d`: 64-bit integer multiply needs SMULL/UMULL plus a pair
+// add, which is out of scope here, so the emitter refuses it instead of
+// substituting a 32-bit multiply.  16B/8H/4S all encode.
+fn emit_vmul(buf: *ArrayList[u8], w: i32, e: i32,
+              vd: i32, vn: i32, vm: i32) i32 {
+    let elem: i32 = e;
+    if (elem == 0) { elem = 4; }
+    if (av_check(w, elem, 4, vd, vn, vm) != 0) { return 1; }
+    if (elem == 8) { return 1; }
+    emit_vthree(buf, 78, a_arrangement(w, elem), 39, vd, vn, vm);
+    return 0;
+}
+
+// USHL shifts each lane left by the amount in the low bits of the matching lane
+// of Vm.  `vector.shl` carries an unsigned magnitude, so USHL is the correct
+// choice: SSHL would read a negative splat as a request to shift right.
+fn emit_vshl(buf: *ArrayList[u8], w: i32, e: i32,
+             vd: i32, vn: i32, vm: i32) i32 {
+    let elem: i32 = e;
+    if (elem == 0) { elem = 4; }
+    if (av_check(w, elem, 4, vd, vn, vm) != 0) { return 1; }
+    emit_vthree(buf, 110, a_arrangement(w, elem), 17, vd, vn, vm);
+    return 0;
+}
+
+// A64 FP elementwise.  `negate_form` selects the FSUB/FCMGT `size` bias.
+fn emit_vfp(buf: *ArrayList[u8], b3: i32, op: i32, negate_form: i32, w: i32, e: i32,
+            vd: i32, vn: i32, vm: i32) i32 {
+    let elem: i32 = e;
+    if (elem == 0) { elem = 4; }
+    if (av_check(w, elem, 4, vd, vn, vm) != 0) { return 1; }
+    if (elem == 1 || elem == 2) { return 1; }   // no half/single-byte FP in A64 NEON
+    let s: i32 = a_fp_size_field(elem, negate_form);
+    emit_vthree(buf, b3, s, op, vd, vn, vm);
+    return 0;
+}
+
+// Integer and float compares.  Each writes an all-ones / all-zeros lane mask,
+// which is the machine form of the IR's `vector<i1,lanes>` and the operand AK_VBSL
+// expects.  A float compare derives its bits 23:22 from a_fp_size_field, so
+// FCMGT (the negate form) and FCMEQ do not share a field value.
+fn emit_vcmp(buf: *ArrayList[u8], b3: i32, op: i32, fp: i32, negate_form: i32,
+             w: i32, e: i32, vd: i32, vn: i32, vm: i32) i32 {
+    let elem: i32 = e;
+    if (elem == 0) { elem = 4; }
+    if (av_check(w, elem, 4, vd, vn, vm) != 0) { return 1; }
+    let s: i32 = a_arrangement(w, elem);
+    if (fp == 1) {
+        s = a_fp_size_field(elem, negate_form);
+    }
+    if (s < 0) { return 1; }   // A64 has no half/single-byte float compare
+    emit_vthree(buf, b3, s, op, vd, vn, vm);
+    return 0;
+}
+
+// "Advanced SIMD shift by immediate":
+//   0 Q U 01111 0 immh:immb(22:16) op(15:10) Rn(9:5) Rd(4:0)
+// The seven-bit shift field carries `elem_bits + amount` for the left shift and
+// `2*elem_bits - amount` for the two right shifts — the assembler-derived layout,
+// not a guessed one.  op = 010101 for SHL and 000001 for USHR/SSHR, and U
+// separates the logical right shift from the arithmetic one.
+//
+// A64 has no by-register right shift, so `vector.shr` must reach the lowering as
+// a splat constant in the descriptor; a dynamic per-lane count has no encoding.
+fn emit_vshift_imm(buf: *ArrayList[u8], u_bit: i32, op: i32, right: i32,
+                    w: i32, e: i32, amount: i32, vd: i32, vn: i32) i32 {
+    let elem: i32 = e;
+    if (elem == 0) { elem = 4; }
+    if (av_check(w, elem, 4, vd, vn, 0) != 0) { return 1; }
+    if (elem != 4 && elem != 8) { return 1; }
+    let bits: i32 = elem * 8;
+    if (amount < 0) { return 1; }
+    if (right == 1) {
+        // A64 encodes the right shifts as 1..elem_bits; #0 is not a legal ushr.
+        if (amount < 1 || amount > bits) { return 1; }
+    } else {
+        if (amount > bits - 1) { return 1; }
+    }
+    let field: i32 = 0;
+    if (right == 1) { field = 2 * bits - amount; } else { field = bits + amount; }
+    if (field < 0 || field > 127) { return 1; }
+    let b3: i32 = 79;
+    if (u_bit == 1) { b3 = 111; }
+    let low: i32 = op * 1024 + vn * 32 + vd;
+    emit_pack(buf, a_lo3(low), a_lo3(low / 256), a_lo3(field), b3);
+    return 0;
+}
+
+// DUP (general) — splat a GPR into every lane.
+//   0 Q 0 01110 000 0010000 1 imm5(20:16) 000011 Rn(9:5) Rd(4:0)
+// imm5 is the destination size in bytes, so bits 15:8 are the constant 0x0C and
+// bits 20:16 are the element width; a 64-bit element width names a 64-bit source
+// register, anything narrower names the low 32 bits.
+fn emit_vdup_gpr(buf: *ArrayList[u8], w: i32, e: i32,
+                  vd: i32, rn: i32) i32 {
+    let elem: i32 = e;
+    if (elem == 0) { elem = 4; }
+    if (av_check(w, elem, 4, vd, rn, 0) != 0) { return 1; }
+    if (rn < 0 || rn > 31) { return 1; }
+    emit_pack(buf, rn * 32 + vd, 12, a_lo3(elem), 78);
+    return 0;
+}
+
+// DUP (element) — broadcast one lane of Vn across Vd.
+//   0 Q 0 01110 000 imm5(20:16) 000001 Rn(9:5) Rd(4:0)
+// imm5 = elem_bytes * (2*lane + 1) in bits 20:16, with bits 15:8 holding 0x04.
+// `vector.broadcast` is this; `vector.splat` from a constant is DUP (general).
+fn emit_vdup_lane(buf: *ArrayList[u8], w: i32, e: i32, lane: i32,
+                   vd: i32, vn: i32) i32 {
+    let elem: i32 = e;
+    if (elem == 0) { elem = 4; }
+    if (av_check(w, elem, 4, vd, vn, 0) != 0) { return 1; }
+    let lanes: i32 = zvec_wclass_bytes(w) / elem;
+    if (lane < 0 || lane >= lanes) { return 1; }
+    emit_pack(buf, vn * 32 + vd, 4, a_lo3(elem * (2 * lane + 1)), 78);
+    return 0;
+}
+
+// UMOV / MOV (from SIMD) — `vector.extract`.
+//   0 Q opc 01110 000 imm5(20:16) 000111 Rn(9:5) Rd(4:0)
+// Same imm5 shape as DUP (element); bits 15:8 are the constant 0x3C and the Q bit
+// says whether the destination is a 64-bit (X) or 32-bit (W) GPR.
+fn emit_vextract(buf: *ArrayList[u8], w: i32, e: i32, lane: i32,
+                  rd: i32, vn: i32) i32 {
+    let elem: i32 = e;
+    if (elem == 0) { elem = 4; }
+    if (av_check(w, elem, 4, vn, 0, 0) != 0) { return 1; }
+    let lanes: i32 = zvec_wclass_bytes(w) / elem;
+    if (lane < 0 || lane >= lanes) { return 1; }
+    if (rd < 0 || rd > 31) { return 1; }
+    let b3: i32 = 14;
+    if (elem == 8) { b3 = 78; }
+    emit_pack(buf, vn * 32 + rd, 60, a_lo3(elem * (2 * lane + 1)), b3);
+    return 0;
+}
+
+// INS (element) — `vector.insert`.
+//   0 Q 0 01110 000 imm5(20:16) 001100 Rn(9:5) Rd(4:0)
+// imm5 as above; bits 15:8 are the constant 0x1C.  Rn is the GPR source and Rd
+// the vector destination.
+fn emit_vinsert(buf: *ArrayList[u8], w: i32, e: i32, lane: i32,
+                 rd: i32, rn: i32) i32 {
+    let elem: i32 = e;
+    if (elem == 0) { elem = 4; }
+    if (av_check(w, elem, 4, rd, 0, 0) != 0) { return 1; }
+    let lanes: i32 = zvec_wclass_bytes(w) / elem;
+    if (lane < 0 || lane >= lanes) { return 1; }
+    if (rn < 0 || rn > 31) { return 1; }
+    emit_pack(buf, rn * 32 + rd, 28, a_lo3(elem * (2 * lane + 1)), 78);
+    return 0;
+}
+
+// MOVI Vd.<T>, #0 — the zero constant of a given arrangement.  The two families
+// differ in more than spelling: 2D has no 8-bit immediate form, so it uses the
+// shifted 16-bit encoding, which is what sets bit 29 in the top byte.
+fn emit_vzero(buf: *ArrayList[u8], w: i32, e: i32, vd: i32) i32 {
+    let elem: i32 = e;
+    if (elem == 0) { elem = 4; }
+    if (av_check(w, elem, 4, vd, 0, 0) != 0) { return 1; }
+    let b3: i32 = 79;
+    let b1: i32 = 4;
+    if (elem == 1) { b1 = 228; }
+    else if (elem == 2) { b1 = 132; }
+    else if (elem == 4) { b1 = 4; }
+    else { b3 = 111; b1 = 228; }
+    emit_pack(buf, vd, b1, 0, b3);
+    return 0;
+}
+
+// MVN Vd.16B, Vn.16B — the all-ones constant.  A64 has no all-ones immediate for
+// the 32-bit and narrower arrangements, so the canonical form is the bitwise NOT
+// of a zero vector, and the lowering is expected to have produced one (see
+// ai_vones).  op = 010110, U = 1, and bits 23:22 = 00 select the 16B form: the
+// bitwise group has no per-lane arrangement at all, which is exactly why
+// AK_VAND/ORR/EOR derive their encoding from the width class alone.
+fn emit_vones(buf: *ArrayList[u8], w: i32, e: i32, vd: i32, vn: i32) i32 {
+    if (av_check(w, 1, 1, vd, vn, 0) != 0) { return 1; }
+    emit_vthree(buf, 110, 0, 22, vd, vn, 0);
+    return 0;
+}
+
+// BSL / BIT — the three-source bitwise-select and bitwise-insert forms, the A64
+// idiom behind `vector.select`.  A64 has no masked-select instruction: BSL
+// computes dst = (Vn & dst) | (Vm & ~dst) from the mask already in dst, so the
+// lowering must place the compare result in the destination register.  BIT
+// computes dst |= Vn & Vm.  Both are op = 000111 with the `size` field used as a
+// sub-opcode: 01 for BSL, 10 for BIT, over the arrangement-free 16B form.
+fn emit_vbsl(buf: *ArrayList[u8], bit_form: i32, w: i32,
+              vd: i32, vn: i32, vm: i32) i32 {
+    if (av_check(w, 1, 1, vd, vn, vm) != 0) { return 1; }
+    let s: i32 = 1;
+    if (bit_form == 1) { s = 2; }
+    emit_vthree(buf, 110, s, 7, vd, vn, vm);
+    return 0;
+}
+
+fn emit_prefetch_l1_keep(buf: *ArrayList[u8], rn: i32) void {
+    // PRFM PLDL1KEEP,[Xn] = 0xF9800000 | Rn<<5.
+    let low: i32 = rn * 32;
+    emit_pack(buf, a_lo3(low), a_lo3(low / 256), 128, 249);
+}
+
+fn emit_data1_64(buf: *ArrayList[u8], op16: i32, rd: i32, rn: i32) void {
+    // REV/CLZ/RBIT share the data-processing (1 source) encoding family:
+    // 0xDAC00000 | opcode-in-low16 | Rn<<5 | Rd.
+    let low: i32 = op16 + rn * 32 + rd;
+    emit_pack(buf, a_lo3(low), a_lo3(low / 256), 192, 218);
+}
+
+fn emit_bic64(buf: *ArrayList[u8], rd: i32, rn: i32, rm: i32) void {
+    // BIC Xd,Xn,Xm = 0x8A200000 | Rm<<16 | Rn<<5 | Rd.
+    let low: i32 = rn * 32 + rd;
+    emit_pack(buf, a_lo3(low), a_lo3(low / 256), 32 + rm, 138);
 }
 
 fn emit_vcnt(buf: *ArrayList[u8], vd: i32, vn: i32) void {
@@ -331,6 +741,26 @@ fn emit_fmov_xd(buf: *ArrayList[u8], rd: i32, rn: i32) void {
     let low: i32 = rd + rn * 32;
     emit_pack(buf, a_lo3(low), a_lo3(low / 256), 102, 158);
 }
+fn emit_fmov_sw(buf: *ArrayList[u8], rd: i32, rn: i32) void {
+    // FMOV Sd, Wn = 0x1E270000 | rn<<5 | rd
+    let low: i32 = rd + rn * 32;
+    emit_pack(buf, a_lo3(low), a_lo3(low / 256), 39, 30);
+}
+fn emit_fmov_ws(buf: *ArrayList[u8], rd: i32, rn: i32) void {
+    // FMOV Wd, Sn = 0x1E260000 | rn<<5 | rd
+    let low: i32 = rd + rn * 32;
+    emit_pack(buf, a_lo3(low), a_lo3(low / 256), 38, 30);
+}
+fn emit_fcvt_sd(buf: *ArrayList[u8], rd: i32, rn: i32) void {
+    // FCVT Sd, Dn = 0x1E624000 | rn<<5 | rd
+    let low: i32 = 16384 + rd + rn * 32;
+    emit_pack(buf, a_lo3(low), a_lo3(low / 256), 98, 30);
+}
+fn emit_fcvt_ds(buf: *ArrayList[u8], rd: i32, rn: i32) void {
+    // FCVT Dd, Sn = 0x1E22C000 | rn<<5 | rd
+    let low: i32 = 49152 + rd + rn * 32;
+    emit_pack(buf, a_lo3(low), a_lo3(low / 256), 34, 30);
+}
 fn emit_scvtf(buf: *ArrayList[u8], rd: i32, rn: i32) void {
     // SCVTF Dd, Xn = 0x9E620000 | rn<<5 | rd
     let low: i32 = rd + rn * 32;
@@ -388,6 +818,7 @@ fn a_darwin_sysno(linux_num: i32) i32 {
     if (linux_num == 260) { return 7; }   // wait4
     if (linux_num == 221) { return 59; }  // execve
     if (linux_num == 222) { return 197; } // mmap
+    if (linux_num == 226) { return 74; }  // mprotect
     if (linux_num == 215) { return 73; }  // munmap
     if (linux_num == 169) { return 116; } // gettimeofday
     return 0 - 1;
@@ -601,6 +1032,11 @@ fn a_is_jcc(kind: i32) i32 {
     return 0;
 }
 
+fn a_is_label_kind(kind: i32) i32 {
+    if (kind == AK_LABEL() || kind == AK_FN_LABEL()) { return 1; }
+    return 0;
+}
+
 fn emit_driver_data_literal(buf: *ArrayList[u8], rd: i32) void {
     // LDR Xt, #+8; B #+12; .quad relocated .data address. The branch skips
     // the inline literal so the pool cannot become executable fall-through.
@@ -611,10 +1047,16 @@ fn emit_driver_data_literal(buf: *ArrayList[u8], rd: i32) void {
     while (i < 8) { a_eb(buf, 0); i = i + 1; }
 }
 
-fn a_encode_one_mode(buf: *ArrayList[u8], ins: AInstr, labels: ArrayList[i32],
-                     base_off: i32, driver_mode: i32) void {
+// Every entry point comes in two flavours.  The historical one has the signature
+// the rest of the compiler calls and discards the error list; the `_counted` one
+// hands the caller a list that receives the kind number of every instruction the
+// encoder refused to encode.  A vector kind with no valid A64 encoding emits
+// NOTHING and is recorded here — never a partial or plausible-looking word.
+fn a_encode_one_mode_err(buf: *ArrayList[u8], ins: AInstr, labels: ArrayList[i32],
+                         base_off: i32, driver_mode: i32,
+                         errors: *ArrayList[i32]) void {
     let k: i32 = ins.kind;
-    if (k == AK_LABEL()) {
+    if (a_is_label_kind(k) == 1) {
         // Linux kernels with CONFIG_ARM64_BTI_KERNEL call module entrypoints
         // through an indirect function pointer.  Emit a valid BTI landing pad
         // for every driver-mode label; this covers exported entries and keeps
@@ -711,8 +1153,13 @@ fn a_encode_one_mode(buf: *ArrayList[u8], ins: AInstr, labels: ArrayList[i32],
     if (k == AK_ANDR_RR()) { emit_and_rr(buf, ins.dst, ins.dst, ins.src); return; }
     if (k == AK_SHL_RR()) { emit_lslv(buf, ins.dst, ins.dst, ins.src); return; }
     if (k == AK_SHR_RR()) { emit_asrv(buf, ins.dst, ins.dst, ins.src); return; }
+    if (k == AK_LSHR_RR()) { emit_lsrv(buf, ins.dst, ins.dst, ins.src); return; }
     if (k == AK_FMOV_DX()) { emit_fmov_dx(buf, ins.dst, ins.src); return; }
     if (k == AK_FMOV_XD()) { emit_fmov_xd(buf, ins.dst, ins.src); return; }
+    if (k == AK_FMOV_SW()) { emit_fmov_sw(buf, ins.dst, ins.src); return; }
+    if (k == AK_FMOV_WS()) { emit_fmov_ws(buf, ins.dst, ins.src); return; }
+    if (k == AK_FCVT_SD()) { emit_fcvt_sd(buf, ins.dst, ins.src); return; }
+    if (k == AK_FCVT_DS()) { emit_fcvt_ds(buf, ins.dst, ins.src); return; }
     if (k == AK_FADD()) { emit_fadd(buf, ins.dst, ins.dst, ins.src); return; }
     if (k == AK_FSUB()) { emit_fsub(buf, ins.dst, ins.dst, ins.src); return; }
     if (k == AK_FMUL()) { emit_fmul(buf, ins.dst, ins.dst, ins.src); return; }
@@ -793,14 +1240,201 @@ fn a_encode_one_mode(buf: *ArrayList[u8], ins: AInstr, labels: ArrayList[i32],
         emit_pack(buf, a_lo3(b0), a_lo3(b1), a_lo3(b2), 211);
         return;
     }
-    if (k == AK_VLOADQ()) { emit_ldrq(buf, ins.dst, ins.src, ins.disp); return; }
-    if (k == AK_VSTOREQ()) { emit_strq(buf, ins.src, ins.dst, ins.disp); return; }
-    if (k == AK_VEOR()) { emit_vector_logic(buf, 110, 32, ins.dst, ins.dst, ins.src); return; }
-    if (k == AK_VAND()) { emit_vector_logic(buf, 78, 32, ins.dst, ins.dst, ins.src); return; }
-    if (k == AK_VORR()) { emit_vector_logic(buf, 78, 160, ins.dst, ins.dst, ins.src); return; }
+    if (k == AK_VLOADQ()) {
+        let r: i32 = emit_ldrq_disp_index(buf, 0, ins.dst, ins.src,
+            av_index(ins.imm), av_imm8(ins.imm), ins.disp);
+        if (r == 1) { push[i32](errors, k); }
+        if (r == 0 - 1) { emit_ldrq(buf, ins.dst, ins.src, ins.disp); }
+        return;
+    }
+    if (k == AK_VSTOREQ()) {
+        let r: i32 = emit_ldrq_disp_index(buf, 1, ins.src, ins.dst,
+            av_index(ins.imm), av_imm8(ins.imm), ins.disp);
+        if (r == 1) { push[i32](errors, k); }
+        if (r == 0 - 1) { emit_strq(buf, ins.src, ins.dst, ins.disp); }
+        return;
+    }
+    // The bitwise group has no per-lane arrangement in A64 (bits 23:22 are a
+    // sub-opcode over the fixed 16B form), so the arrangement is derived from the
+    // width class alone and the descriptor's element width is carried only so the
+    // lowering can reason about lane counts.  The four sub-opcodes keep their
+    // historical bytes at VW_128().
+    if (k == AK_VEOR() || k == AK_VAND() || k == AK_VORR()) {
+        if (av_w(ins.imm) != VW_128()) { push[i32](errors, k); return; }
+        if (k == AK_VEOR()) { emit_vector_logic(buf, 110, 32, ins.dst, ins.dst, ins.src); return; }
+        if (k == AK_VAND()) { emit_vector_logic(buf, 78, 32, ins.dst, ins.dst, ins.src); return; }
+        emit_vector_logic(buf, 78, 160, ins.dst, ins.dst, ins.src);
+        return;
+    }
+    if (k == AK_VADD_I32()) {
+        if (emit_vaddsub(buf, 0, av_w(ins.imm), av_elem(ins.imm), ins.dst, ins.dst, ins.src) != 0) {
+            push[i32](errors, k);
+        }
+        return;
+    }
+    if (k == AK_VSUB_I32()) {
+        if (emit_vaddsub(buf, 1, av_w(ins.imm), av_elem(ins.imm), ins.dst, ins.dst, ins.src) != 0) {
+            push[i32](errors, k);
+        }
+        return;
+    }
     if (k == AK_VCNT()) { emit_vcnt(buf, ins.dst, ins.src); return; }
     if (k == AK_VADDV_B()) { emit_vaddv_b(buf, ins.dst, ins.src); return; }
     if (k == AK_VUMOV_B()) { emit_vumov_b(buf, ins.dst, ins.src); return; }
+    // ── the width-parameteric vector surface ──────────────────────────────────
+    if (k == AK_VMUL()) {
+        if (emit_vmul(buf, av_w(ins.imm), av_elem(ins.imm), ins.dst, ins.dst, ins.src) != 0) {
+            push[i32](errors, k);
+        }
+        return;
+    }
+    if (k == AK_VSHL()) {
+        if (emit_vshl(buf, av_w(ins.imm), av_elem(ins.imm), ins.dst, ins.dst, ins.src) != 0) {
+            push[i32](errors, k);
+        }
+        return;
+    }
+    if (k == AK_VSHR_S()) {
+        if (emit_vshift_imm(buf, 0, 1, 1, av_w(ins.imm), av_elem(ins.imm),
+                            av_imm8(ins.imm), ins.dst, ins.dst) != 0) {
+            push[i32](errors, k);
+        }
+        return;
+    }
+    if (k == AK_VSHR_U()) {
+        if (emit_vshift_imm(buf, 1, 1, 1, av_w(ins.imm), av_elem(ins.imm),
+                            av_imm8(ins.imm), ins.dst, ins.dst) != 0) {
+            push[i32](errors, k);
+        }
+        return;
+    }
+    if (k == AK_VFADD()) {
+        if (emit_vfp(buf, 78, 53, 0, av_w(ins.imm), av_elem(ins.imm), ins.dst, ins.dst, ins.src) != 0) {
+            push[i32](errors, k);
+        }
+        return;
+    }
+    if (k == AK_VFSUB()) {
+        if (emit_vfp(buf, 78, 53, 1, av_w(ins.imm), av_elem(ins.imm), ins.dst, ins.dst, ins.src) != 0) {
+            push[i32](errors, k);
+        }
+        return;
+    }
+    if (k == AK_VFMUL()) {
+        if (emit_vfp(buf, 110, 55, 0, av_w(ins.imm), av_elem(ins.imm), ins.dst, ins.dst, ins.src) != 0) {
+            push[i32](errors, k);
+        }
+        return;
+    }
+    if (k == AK_VFDIV()) {
+        if (emit_vfp(buf, 110, 63, 0, av_w(ins.imm), av_elem(ins.imm), ins.dst, ins.dst, ins.src) != 0) {
+            push[i32](errors, k);
+        }
+        return;
+    }
+    if (k == AK_VCMGT()) {
+        if (emit_vcmp(buf, 78, 13, 0, 0, av_w(ins.imm), av_elem(ins.imm), ins.dst, ins.dst, ins.src) != 0) {
+            push[i32](errors, k);
+        }
+        return;
+    }
+    if (k == AK_VCMEQ()) {
+        if (emit_vcmp(buf, 110, 35, 0, 0, av_w(ins.imm), av_elem(ins.imm), ins.dst, ins.dst, ins.src) != 0) {
+            push[i32](errors, k);
+        }
+        return;
+    }
+    if (k == AK_VCMGE()) {
+        if (emit_vcmp(buf, 78, 15, 0, 0, av_w(ins.imm), av_elem(ins.imm), ins.dst, ins.dst, ins.src) != 0) {
+            push[i32](errors, k);
+        }
+        return;
+    }
+    if (k == AK_VFCMGT()) {
+        if (emit_vcmp(buf, 110, 57, 1, 1, av_w(ins.imm), av_elem(ins.imm), ins.dst, ins.dst, ins.src) != 0) {
+            push[i32](errors, k);
+        }
+        return;
+    }
+    if (k == AK_VFCMEQ()) {
+        if (emit_vcmp(buf, 78, 57, 1, 0, av_w(ins.imm), av_elem(ins.imm), ins.dst, ins.dst, ins.src) != 0) {
+            push[i32](errors, k);
+        }
+        return;
+    }
+    if (k == AK_VBSL()) {
+        if (emit_vbsl(buf, 0, av_w(ins.imm), ins.dst, ins.src, ins.disp) != 0) {
+            push[i32](errors, k);
+        }
+        return;
+    }
+    if (k == AK_VBIT()) {
+        if (emit_vbsl(buf, 1, av_w(ins.imm), ins.dst, ins.src, ins.disp) != 0) {
+            push[i32](errors, k);
+        }
+        return;
+    }
+    if (k == AK_VDUP_GPR()) {
+        if (emit_vdup_gpr(buf, av_w(ins.imm), av_elem(ins.imm), ins.dst, ins.src) != 0) {
+            push[i32](errors, k);
+        }
+        return;
+    }
+    if (k == AK_VDUP_LANE()) {
+        if (emit_vdup_lane(buf, av_w(ins.imm), av_elem(ins.imm), ins.disp,
+                           ins.dst, ins.src) != 0) { push[i32](errors, k); }
+        return;
+    }
+    if (k == AK_VEXTRACT()) {
+        if (emit_vextract(buf, av_w(ins.imm), av_elem(ins.imm), ins.disp,
+                          ins.dst, ins.src) != 0) { push[i32](errors, k); }
+        return;
+    }
+    if (k == AK_VINSERT()) {
+        if (emit_vinsert(buf, av_w(ins.imm), av_elem(ins.imm), ins.disp,
+                         ins.dst, ins.src) != 0) { push[i32](errors, k); }
+        return;
+    }
+    if (k == AK_VZERO()) {
+        if (emit_vzero(buf, av_w(ins.imm), av_elem(ins.imm), ins.dst) != 0) {
+            push[i32](errors, k);
+        }
+        return;
+    }
+    if (k == AK_VONES()) {
+        if (emit_vones(buf, av_w(ins.imm), av_elem(ins.imm), ins.dst, ins.src) != 0) {
+            push[i32](errors, k);
+        }
+        return;
+    }
+    if (k == AK_VLOAD1()) {
+        if (av_w(ins.imm) != VW_128()) { push[i32](errors, k); return; }
+        if (emit_ld1_st1(buf, 0, av_elem(ins.imm), ins.dst, ins.src,
+                         av_index(ins.imm)) != 0) { push[i32](errors, k); }
+        return;
+    }
+    if (k == AK_VSTORE1()) {
+        if (av_w(ins.imm) != VW_128()) { push[i32](errors, k); return; }
+        if (emit_ld1_st1(buf, 1, av_elem(ins.imm), ins.src, ins.dst,
+                         av_index(ins.imm)) != 0) { push[i32](errors, k); }
+        return;
+    }
+    if (k == AK_PREFETCH()) { emit_prefetch_l1_keep(buf, ins.src); return; }
+    if (k == AK_REV64()) { emit_data1_64(buf, 3072, ins.dst, ins.src); return; }
+    if (k == AK_CLZ64()) { emit_data1_64(buf, 4096, ins.dst, ins.src); return; }
+    if (k == AK_RBIT64()) { emit_data1_64(buf, 0, ins.dst, ins.src); return; }
+    if (k == AK_BIC64()) { emit_bic64(buf, ins.dst, ins.src, ins.imm as i32); return; }
+    // Safety net: a vector kind that reached the end of the dispatch has no
+    // implementation.  Record it so a lowering that invents one is caught rather
+    // than silently producing a hole in the instruction stream.
+    if (a_is_veclike(k) == 1) { push[i32](errors, k); }
+}
+
+fn a_encode_one_mode(buf: *ArrayList[u8], ins: AInstr, labels: ArrayList[i32],
+                     base_off: i32, driver_mode: i32) void {
+    let discard: ArrayList[i32] = make[i32](1);
+    a_encode_one_mode_err(buf, ins, labels, base_off, driver_mode, &discard);
+    free[i32](&discard);
 }
 
 fn a_encode_one(buf: *ArrayList[u8], ins: AInstr, labels: ArrayList[i32], base_off: i32) void {
@@ -810,6 +1444,15 @@ fn a_encode_one(buf: *ArrayList[u8], ins: AInstr, labels: ArrayList[i32], base_o
 fn a_encode_one_macos(buf: *ArrayList[u8], ins: AInstr, labels: ArrayList[i32],
                       base_off: i32, code_vmaddr: i64, data_vmaddr: i64,
                       extern_stub_off: i32) void {
+    let discard: ArrayList[i32] = make[i32](1);
+    a_encode_one_macos_err(buf, ins, labels, base_off, code_vmaddr, data_vmaddr,
+                           extern_stub_off, &discard);
+    free[i32](&discard);
+}
+
+fn a_encode_one_macos_err(buf: *ArrayList[u8], ins: AInstr, labels: ArrayList[i32],
+                          base_off: i32, code_vmaddr: i64, data_vmaddr: i64,
+                          extern_stub_off: i32, errors: *ArrayList[i32]) void {
     if (ins.kind == AK_DATA_ADDR()) {
         emit_adrp_add(buf, ins.dst, code_vmaddr + (base_off as i64), data_vmaddr + ins.imm);
         return;
@@ -851,7 +1494,7 @@ fn a_encode_one_macos(buf: *ArrayList[u8], ins: AInstr, labels: ArrayList[i32],
     a_encode_one(buf, ins, labels, base_off);
 }
 
-fn aencode(prog: ArrayList[AInstr]) ArrayList[u8] {
+fn aencode_counted(prog: ArrayList[AInstr], errors: *ArrayList[i32]) ArrayList[u8] {
     let n: i32 = prog.len;
     let maxlbl: i32 = 0;
     let i: i32 = 0;
@@ -865,29 +1508,52 @@ fn aencode(prog: ArrayList[AInstr]) ArrayList[u8] {
     let j: i32 = 0;
     while (j < nlbl) { push[i32](&labels, 0); j = j + 1; }
 
+    // Pass 1 only measures, so a kind it refuses must not be counted twice: the
+    // caller's list describes the instructions that were actually emitted.
+    let measuring: ArrayList[i32] = make[i32](1);
     let scratch: ArrayList[u8] = make[u8](64);
     i = 0;
     while (i < n) {
         let ins1: AInstr = get[AInstr](prog, i);
         let here: i32 = scratch.len;
-        if (ins1.kind == AK_LABEL()) { set[i32](&labels, ins1.lbl, here); }
-        a_encode_one(&scratch, ins1, labels, here);
+        if (a_is_label_kind(ins1.kind) == 1) { set[i32](&labels, ins1.lbl, here); }
+        a_encode_one_mode_err(&scratch, ins1, labels, here, 0, &measuring);
         i = i + 1;
     }
+    free[i32](&measuring);
 
     let out: ArrayList[u8] = make[u8](scratch.len + 8);
     i = 0;
     while (i < n) {
         let ins2: AInstr = get[AInstr](prog, i);
         let off: i32 = out.len;
-        a_encode_one(&out, ins2, labels, off);
+        a_encode_one_mode_err(&out, ins2, labels, off, 0, errors);
         i = i + 1;
     }
     return out;
 }
 
-fn aencode_macos(prog: ArrayList[AInstr], code_vmaddr: i64, data_vmaddr: i64,
-                 extern_data_off: i32, extern_count: i32) ArrayList[u8] {
+fn aencode(prog: ArrayList[AInstr]) ArrayList[u8] {
+    let discard: ArrayList[i32] = make[i32](1);
+    let out: ArrayList[u8] = aencode_counted(prog, &discard);
+    free[i32](&discard);
+    return out;
+}
+
+// Apple Silicon maps executable pages at 16 KiB granularity. Hot images align
+// only explicit source-function entry markers; ordinary/internal labels remain
+// compact, and the non-hot wrapper below emits exactly the historical bytes.
+fn a_hot_pad_to_vm_page(buf: *ArrayList[u8], code_vmaddr: i64) void {
+    while (((code_vmaddr + (buf.*.len as i64)) % 16384) != 0) {
+        // Architectural NOP (0xd503201f). Padding is executable so a function
+        // that ever falls through its terminal sequence remains deterministic.
+        emit_pack(buf, 31, 32, 3, 213);
+    }
+}
+
+fn aencode_macos_mode_counted(prog: ArrayList[AInstr], code_vmaddr: i64, data_vmaddr: i64,
+                              extern_data_off: i32, extern_count: i32,
+                              hot_page_layout: i32, errors: *ArrayList[i32]) ArrayList[u8] {
     let n: i32 = prog.len;
     let maxlbl: i32 = 0;
     let i: i32 = 0;
@@ -900,23 +1566,31 @@ fn aencode_macos(prog: ArrayList[AInstr], code_vmaddr: i64, data_vmaddr: i64,
     let j: i32 = 0;
     while (j < maxlbl + 1) { push[i32](&labels, 0); j = j + 1; }
 
+    let measuring: ArrayList[i32] = make[i32](1);
     let scratch: ArrayList[u8] = make[u8](64);
     i = 0;
     while (i < n) {
         let ins1: AInstr = get[AInstr](prog, i);
+        if (hot_page_layout == 1 && ins1.kind == AK_FN_LABEL()) {
+            a_hot_pad_to_vm_page(&scratch, code_vmaddr);
+        }
         let here: i32 = scratch.len;
-        if (ins1.kind == AK_LABEL()) { set[i32](&labels, ins1.lbl, here); }
-        a_encode_one_macos(&scratch, ins1, labels, here, code_vmaddr, data_vmaddr, 0);
+        if (a_is_label_kind(ins1.kind) == 1) { set[i32](&labels, ins1.lbl, here); }
+        a_encode_one_macos_err(&scratch, ins1, labels, here, code_vmaddr, data_vmaddr, 0, &measuring);
         i = i + 1;
     }
+    free[i32](&measuring);
 
     let stub_off: i32 = scratch.len;
     let out: ArrayList[u8] = make[u8](scratch.len + extern_count * 16 + 8);
     i = 0;
     while (i < n) {
         let ins2: AInstr = get[AInstr](prog, i);
+        if (hot_page_layout == 1 && ins2.kind == AK_FN_LABEL()) {
+            a_hot_pad_to_vm_page(&out, code_vmaddr);
+        }
         let off: i32 = out.len;
-        a_encode_one_macos(&out, ins2, labels, off, code_vmaddr, data_vmaddr, stub_off);
+        a_encode_one_macos_err(&out, ins2, labels, off, code_vmaddr, data_vmaddr, stub_off, errors);
         i = i + 1;
     }
     i = 0;
@@ -928,7 +1602,27 @@ fn aencode_macos(prog: ArrayList[AInstr], code_vmaddr: i64, data_vmaddr: i64,
         emit_pack(&out, 0, 2, 31, 214);
         i = i + 1;
     }
+    // The first Mach-O page contains its 4 KiB header prefix. Ending at the
+    // next VM boundary makes every subsequently replaceable patch span a set
+    // of complete, aligned 16 KiB destination pages.
+    if (hot_page_layout == 1) { a_hot_pad_to_vm_page(&out, code_vmaddr); }
     return out;
+}
+
+fn aencode_macos_mode(prog: ArrayList[AInstr], code_vmaddr: i64, data_vmaddr: i64,
+                      extern_data_off: i32, extern_count: i32,
+                      hot_page_layout: i32) ArrayList[u8] {
+    let discard: ArrayList[i32] = make[i32](1);
+    let out: ArrayList[u8] = aencode_macos_mode_counted(prog, code_vmaddr, data_vmaddr,
+                                extern_data_off, extern_count, hot_page_layout, &discard);
+    free[i32](&discard);
+    return out;
+}
+
+fn aencode_macos(prog: ArrayList[AInstr], code_vmaddr: i64, data_vmaddr: i64,
+                 extern_data_off: i32, extern_count: i32) ArrayList[u8] {
+    return aencode_macos_mode(prog, code_vmaddr, data_vmaddr,
+                              extern_data_off, extern_count, 0);
 }
 
 // ── object mode: encode with label offsets and relocation tracking ──────────
@@ -937,7 +1631,8 @@ fn aencode_macos(prog: ArrayList[AInstr], code_vmaddr: i64, data_vmaddr: i64,
 struct AObjectReloc { offset: i32, import: i32, kind: i32, data_offset: i32 }
 struct AEncoded { text: ArrayList[u8], labels: ArrayList[i32], relocs: ArrayList[AObjectReloc] }
 
-fn aencode_with_labels_mode(prog: ArrayList[AInstr], driver_mode: i32) AEncoded {
+fn aencode_with_labels_mode_counted(prog: ArrayList[AInstr], driver_mode: i32,
+                                    errors: *ArrayList[i32]) AEncoded {
     let n: i32 = prog.len;
     let maxlbl: i32 = 0;
     let i: i32 = 0;
@@ -951,16 +1646,19 @@ fn aencode_with_labels_mode(prog: ArrayList[AInstr], driver_mode: i32) AEncoded 
     let j: i32 = 0;
     while (j < nlbl) { push[i32](&labels, 0); j = j + 1; }
 
-    // Pass 1: measure offsets to resolve labels.
+    // Pass 1: measure offsets to resolve labels.  Refused kinds are counted
+    // from the emitting pass only, so one instruction yields one entry.
+    let measuring: ArrayList[i32] = make[i32](1);
     let scratch: ArrayList[u8] = make[u8](64);
     i = 0;
     while (i < n) {
         let ins1: AInstr = get[AInstr](prog, i);
         let here: i32 = scratch.len;
-        if (ins1.kind == AK_LABEL()) { set[i32](&labels, ins1.lbl, here); }
-        a_encode_one_mode(&scratch, ins1, labels, here, driver_mode);
+        if (a_is_label_kind(ins1.kind) == 1) { set[i32](&labels, ins1.lbl, here); }
+        a_encode_one_mode_err(&scratch, ins1, labels, here, driver_mode, &measuring);
         i = i + 1;
     }
+    free[i32](&measuring);
 
     // Pass 2: emit final bytes and record AK_CALL_EXT relocations.
     let out: ArrayList[u8] = make[u8](scratch.len + 8);
@@ -975,10 +1673,17 @@ fn aencode_with_labels_mode(prog: ArrayList[AInstr], driver_mode: i32) AEncoded 
             // The literal follows the 4-byte LDR and 4-byte branch.
             push[AObjectReloc](&relocs, AObjectReloc{ .offset = off + 8, .import = -1, .kind = 1, .data_offset = ins2.imm as i32 });
         }
-        a_encode_one_mode(&out, ins2, labels, off, driver_mode);
+        a_encode_one_mode_err(&out, ins2, labels, off, driver_mode, errors);
         i = i + 1;
     }
     return AEncoded{ .text = out, .labels = labels, .relocs = relocs };
+}
+
+fn aencode_with_labels_mode(prog: ArrayList[AInstr], driver_mode: i32) AEncoded {
+    let discard: ArrayList[i32] = make[i32](1);
+    let out: AEncoded = aencode_with_labels_mode_counted(prog, driver_mode, &discard);
+    free[i32](&discard);
+    return out;
 }
 
 fn aencode_with_labels(prog: ArrayList[AInstr]) AEncoded {

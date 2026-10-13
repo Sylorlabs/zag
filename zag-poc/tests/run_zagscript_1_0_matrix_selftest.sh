@@ -42,8 +42,8 @@ evidence_log="$tmp/evidence.log"
 (cd "$fixture" && ZAGSCRIPT_MATRIX_SELFTEST_LOG="$evidence_log" \
     bash tests/run_zagscript_1_0_matrix.sh --verify-evidence) >"$tmp/evidence.out"
 expected_unique=$(awk -F '\t' '$3 == "supported" { print $4 }' \
-    "$fixture/tests/zagscript_1_0_capabilities.tsv" | sort -u | wc -l)
-actual_unique=$(wc -l <"$evidence_log")
+    "$fixture/tests/zagscript_1_0_capabilities.tsv" | sort -u | wc -l | tr -d ' ')
+actual_unique=$(wc -l <"$evidence_log" | tr -d ' ')
 test "$actual_unique" -eq "$expected_unique"
 test -z "$(sort "$evidence_log" | uniq -d)"
 grep -q "zagscript-1.0-evidence unique=$expected_unique passed=$expected_unique" \

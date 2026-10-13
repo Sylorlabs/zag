@@ -51,13 +51,36 @@ fn mo_name16(buf: *ArrayList[u8], s: []u8) void {
         i = i + 1;
     }
 }
-fn mo_bytes(buf: *ArrayList[u8], s: []u8) void {
-    let i: i32 = 0;
-    while (i < s.len) { mo_b(buf, s[i] as i64); i = i + 1; }
+fn mo_reserve(buf: *ArrayList[u8], extra: i32) void {
+    let need: i32 = buf.*.len + extra;
+    if (buf.*.cap >= need) { return; }
+    let nc: i32 = buf.*.cap;
+    while (nc < need) { nc = nc * 2; if (nc < 4) { nc = 4; } }
+    buf.*.data = _zag_realloc(buf.*.data as *i8, nc) as *u8;
+    buf.*.cap = nc;
 }
+
+// Bulk-append from a raw pointer. These run over whole image sections — a 15 MB
+// __text is one call — so the per-byte `push` (a capacity test, a length bump
+// and an out-of-line call for every byte) was costing seconds per emitted image.
+// Reserve once, copy once, publish the length once.
+fn mo_raw_bytes(buf: *ArrayList[u8], src: *u8, n: i32) void {
+    if (n < 1) { return; }
+    mo_reserve(buf, n);
+    let base: i32 = buf.*.len;
+    _zag_memcpy((buf.*.data + base) as *i8, src as *i8, n);
+    buf.*.len = base + n;
+}
+
+// `_zag_slice_ptr`, not a cast: a slice is a (pointer, len) pair, so casting one
+// to a pointer yields the address of the HEADER. Copying from that reads the
+// header as if it were the bytes and faults.
+fn mo_bytes(buf: *ArrayList[u8], s: []u8) void {
+    mo_raw_bytes(buf, _zag_slice_ptr(s) as *u8, s.len);
+}
+
 fn mo_list_bytes(buf: *ArrayList[u8], s: ArrayList[u8]) void {
-    let i: i32 = 0;
-    while (i < s.len) { mo_b(buf, get[u8](s, i) as i64); i = i + 1; }
+    mo_raw_bytes(buf, s.data, s.len);
 }
 
 // ── SHA-256 (pure Zag, unsigned-32 arithmetic represented in i64) ──────────
@@ -69,12 +92,15 @@ fn sh_pow2(n: i32) i64 {
     while (i < n) { p = p * 2; i = i + 1; }
     return p;
 }
+// A 32-bit rotate is two shifts and an or. It used to be built from a loop plus a
+// divide and a remainder, which is ~181 ns per call instead of a few cycles, and
+// SHA-256 calls it 384 times per 64 bytes. Masking after the shift keeps the
+// high bits that `x << (32 - n)` pushes above bit 31 out of the result.
 fn sh_ror(x0: i64, n: i32) i64 {
     let x: i64 = sh_u32(x0);
-    let p: i64 = sh_pow2(n);
-    return sh_u32((x / p) + (x % p) * sh_pow2(32 - n));
+    return sh_u32((x >> n) | (x << (32 - n)));
 }
-fn sh_shr(x: i64, n: i32) i64 { return sh_u32(x) / sh_pow2(n); }
+fn sh_shr(x: i64, n: i32) i64 { return sh_u32(x) >> n; }
 
 fn sh_constants() ArrayList[i64] {
     let k: ArrayList[i64] = make[i64](64);
@@ -101,9 +127,11 @@ fn macho_sha256(src: []u8) ArrayList[u8] {
     let total: i32 = (((src.len + 9) + 63) / 64) * 64;
     let msg: ArrayList[u8] = make[u8](total);
     let i: i32 = 0;
-    while (i < src.len) { push[u8](&msg, src[i]); i = i + 1; }
-    push[u8](&msg, 128);
-    while (msg.len < total) { push[u8](&msg, 0); }
+    if (src.len > 0) { _zag_memcpy(msg.data as *i8, _zag_slice_ptr(src), src.len); }
+    set[u8](&msg, src.len, 128);
+    i = src.len + 1;
+    while (i < total) { set[u8](&msg, i, 0); i = i + 1; }
+    msg.len = total;
     let bitlen: i64 = (src.len as i64) * 8;
     i = 0;
     while (i < 8) {
@@ -116,9 +144,13 @@ fn macho_sha256(src: []u8) ArrayList[u8] {
     push[i64](&h,1779033703); push[i64](&h,3144134277); push[i64](&h,1013904242); push[i64](&h,2773480762);
     push[i64](&h,1359893119); push[i64](&h,2600822924); push[i64](&h,528734635); push[i64](&h,1541459225);
     let k: ArrayList[i64] = sh_constants();
+    // The message schedule is a fixed 64-entry scratch buffer reused by every
+    // block. Allocating it per block meant ~236,000 allocations and ~30M pushes
+    // for a 15 MB image; it is overwritten in full below, so one buffer suffices.
+    let w: ArrayList[i64] = make[i64](64);
     let off: i32 = 0;
     while (off < total) {
-        let w: ArrayList[i64] = make[i64](64);
+        w.len = 0;
         i = 0;
         while (i < 16) {
             let b: i32 = off + i * 4;
@@ -159,11 +191,19 @@ fn macho_sha256(src: []u8) ArrayList[u8] {
     return out;
 }
 
-fn mo_segment(buf: *ArrayList[u8], name: []u8, vmaddr: i64, vmsize: i64,
-              fileoff: i64, filesize: i64, prot: i32, nsects: i32) void {
+fn mo_segment_protections(buf: *ArrayList[u8], name: []u8,
+                          vmaddr: i64, vmsize: i64,
+                          fileoff: i64, filesize: i64,
+                          maxprot: i32, initprot: i32,
+                          nsects: i32) void {
     mo_le(buf,25,4); mo_le(buf,72 + nsects * 80,4); mo_name16(buf,name);
     mo_le(buf,vmaddr,8); mo_le(buf,vmsize,8); mo_le(buf,fileoff,8); mo_le(buf,filesize,8);
-    mo_le(buf,prot,4); mo_le(buf,prot,4); mo_le(buf,nsects,4); mo_le(buf,0,4);
+    mo_le(buf,maxprot,4); mo_le(buf,initprot,4); mo_le(buf,nsects,4); mo_le(buf,0,4);
+}
+fn mo_segment(buf: *ArrayList[u8], name: []u8, vmaddr: i64, vmsize: i64,
+              fileoff: i64, filesize: i64, prot: i32, nsects: i32) void {
+    mo_segment_protections(buf,name,vmaddr,vmsize,fileoff,filesize,
+        prot,prot,nsects);
 }
 fn mo_section(buf: *ArrayList[u8], sect: []u8, seg: []u8, addr: i64, size: i64,
               off: i64, align_pow: i32, flags: i64) void {
@@ -204,13 +244,28 @@ fn mo_signature(image: []u8, text_limit: i64) ArrayList[u8] {
     return sig;
 }
 
-fn write_macho_arm64_data_debug(path: []u8, text: ArrayList[u8], entry_off: i32, data: ArrayList[u8],
-                                abbrev: ArrayList[u8], info: ArrayList[u8], line: ArrayList[u8]) i32 {
+fn write_macho_arm64_data_debug_mode(path: []u8, text: ArrayList[u8], entry_off: i32, data: ArrayList[u8],
+                                abbrev: ArrayList[u8], info: ArrayList[u8], line: ArrayList[u8], hot_text: i32) i32 {
+    let image: ArrayList[u8] = build_macho_arm64_data_debug_mode(text, entry_off, data, abbrev, info, line, hot_text);
+    if (image.len == 0) { free[u8](&image); return 1; }
+    let rc: i32 = _zag_write_exec(path, image.data[0..image.len]);
+    free[u8](&image); return rc;
+}
+
+// Keep the signed final image in compiler custody until publication completes.
+fn build_macho_arm64_data_debug_mode(text: ArrayList[u8], entry_off: i32, data: ArrayList[u8],
+                                abbrev: ArrayList[u8], info: ArrayList[u8], line: ArrayList[u8], hot_text: i32) ArrayList[u8] {
     let code_off: i64 = MACHO_CODE_OFF();
     let data_off: i64 = macho_data_fileoff(text.len);
     let debug_len: i64 = (abbrev.len + info.len + line.len) as i64;
     let has_debug: i32 = (debug_len > 0) as i32;
     let debug_off: i64 = macho_align(data_off + (data.len as i64), 16);
+    // Distinct VM mappings may not share a partial Apple-Silicon page. A
+    // signed file with a mid-page __DWARF segment can pass metadata inspection
+    // yet be killed by the kernel when launched.
+    if (has_debug == 1) {
+        debug_off = macho_align(data_off + (data.len as i64), MACHO_PAGE());
+    }
     let sig_off: i64 = macho_align(debug_off + debug_len, MACHO_PAGE());
     let text_size: i64 = data_off;
     let data_size: i64 = debug_off - data_off;
@@ -234,15 +289,17 @@ fn write_macho_arm64_data_debug(path: []u8, text: ArrayList[u8], entry_off: i32,
     mo_le(&buf,ncmds,4); mo_le(&buf,sizeofcmds,4); mo_le(&buf,2097285,4); mo_le(&buf,0,4);
 
     mo_segment(&buf,"__PAGEZERO",0,MACHO_BASE(),0,0,0,0);
-    mo_segment(&buf,"__TEXT",MACHO_BASE(),text_size,0,text_size,5,1);
+    let text_maxprot: i32 = 5;
+    if (hot_text == 1) { text_maxprot = 7; }
+    mo_segment_protections(&buf,"__TEXT",MACHO_BASE(),text_size,0,text_size,text_maxprot,5,1);
     mo_section(&buf,"__text","__TEXT",MACHO_BASE()+code_off,text.len,code_off,2,2147484672);
     mo_segment(&buf,"__DATA",MACHO_BASE()+data_off,data_size,data_off,data_size,3,1);
     mo_section(&buf,"__data","__DATA",MACHO_BASE()+data_off,data.len,data_off,3,0);
     if (has_debug == 1) {
-        mo_segment(&buf,"__DWARF",MACHO_BASE()+debug_off,debug_len,debug_off,debug_len,1,3);
-        mo_section(&buf,"__debug_abbrev","__DWARF",MACHO_BASE()+debug_off,abbrev.len,debug_off,0,0);
-        mo_section(&buf,"__debug_info","__DWARF",MACHO_BASE()+debug_off+(abbrev.len as i64),info.len,debug_off+(abbrev.len as i64),0,0);
-        mo_section(&buf,"__debug_line","__DWARF",MACHO_BASE()+debug_off+(abbrev.len as i64)+(info.len as i64),line.len,debug_off+(abbrev.len as i64)+(info.len as i64),0,0);
+        mo_segment(&buf,"__DWARF",MACHO_BASE()+debug_off,macho_align(debug_len,MACHO_PAGE()),debug_off,debug_len,1,3);
+        mo_section(&buf,"__debug_abbrev","__DWARF",MACHO_BASE()+debug_off,abbrev.len,debug_off,0,0x02000000);
+        mo_section(&buf,"__debug_info","__DWARF",MACHO_BASE()+debug_off+(abbrev.len as i64),info.len,debug_off+(abbrev.len as i64),0,0x02000000);
+        mo_section(&buf,"__debug_line","__DWARF",MACHO_BASE()+debug_off+(abbrev.len as i64)+(info.len as i64),line.len,debug_off+(abbrev.len as i64)+(info.len as i64),0,0x02000000);
     }
     mo_segment(&buf,"__LINKEDIT",MACHO_BASE()+sig_off,link_size,sig_off,sig_size,1,0);
 
@@ -260,13 +317,18 @@ fn write_macho_arm64_data_debug(path: []u8, text: ArrayList[u8], entry_off: i32,
     mo_bytes(&buf,"/usr/lib/libSystem.B.dylib"); mo_b(&buf,0); while ((buf.len % 8) != 0) { mo_b(&buf,0); }
     mo_le(&buf,29,4); mo_le(&buf,16,4); mo_le(&buf,sig_off,4); mo_le(&buf,sig_size,4);
 
-    if (buf.len > code_off) { return 1; }
+    if (buf.len > code_off) { free[u8](&buf); return make[u8](0); }
     mo_pad_to(&buf,code_off); mo_list_bytes(&buf,text); mo_pad_to(&buf,data_off); mo_list_bytes(&buf,data);
     if (has_debug == 1) { mo_pad_to(&buf,debug_off); mo_list_bytes(&buf,abbrev); mo_list_bytes(&buf,info); mo_list_bytes(&buf,line); }
     mo_pad_to(&buf,sig_off);
     let sig: ArrayList[u8] = mo_signature(buf.data[0..buf.len],text_size);
     mo_list_bytes(&buf,sig);
-    return _zag_write_exec(path,buf.data[0..buf.len]);
+    return buf;
+}
+
+fn write_macho_arm64_data_debug(path: []u8, text: ArrayList[u8], entry_off: i32, data: ArrayList[u8],
+                                abbrev: ArrayList[u8], info: ArrayList[u8], line: ArrayList[u8]) i32 {
+    return write_macho_arm64_data_debug_mode(path,text,entry_off,data,abbrev,info,line,0);
 }
 
 fn write_macho_arm64_data(path: []u8, text: ArrayList[u8], entry_off: i32, data: ArrayList[u8]) i32 {
@@ -284,13 +346,57 @@ fn mo_has_prefix(value: []u8, prefix: []u8) i32 {
     return 1;
 }
 
-// dylib ordinal 1 is libSystem, 2 is Metal.framework, and 3 is libobjc.
-// Keep this mapping narrow and explicit: a symbol never falls through from a
-// framework to libSystem merely because an import name happens to be unknown.
+// Import families are classified before their compact dylib ordinal is
+// resolved.  libSystem is always ordinal 1; optional libraries follow it in
+// the exact load-command order Metal, libobjc, SQLite.  Keep SQLite especially
+// narrow: std:sqlite_kv needs only these eight entry points, and a similarly
+// named extension API must not cause another symbol or library to be admitted.
+fn mo_is_sqlite_import(name: []u8) i32 {
+    if (@strEq(name,"sqlite3_open") || @strEq(name,"sqlite3_close") ||
+        @strEq(name,"sqlite3_prepare_v2") || @strEq(name,"sqlite3_bind_int64") ||
+        @strEq(name,"sqlite3_step") || @strEq(name,"sqlite3_column_int64") ||
+        @strEq(name,"sqlite3_finalize") || @strEq(name,"sqlite3_changes")) { return 1; }
+    return 0;
+}
+
+fn mo_is_libsystem_import(name: []u8) i32 {
+    if (@strEq(name,"getpid") || @strEq(name,"getppid") ||
+        @strEq(name,"close") || @strEq(name,"dup2") || @strEq(name,"open") ||
+        @strEq(name,"unlink") || @strEq(name,"strlen") || @strEq(name,"cos") ||
+        @strEq(name,"cosf") || @strEq(name,"pow") || @strEq(name,"powf") ||
+        @strEq(name,"ldexp") || @strEq(name,"ldexpf") || @strEq(name,"qsort") ||
+        @strEq(name,"clock_gettime") || @strEq(name,"arc4random_buf") ||
+        @strEq(name,"mach_continuous_time") || @strEq(name,"clonefile") ||
+        @strEq(name,"dlopen") || @strEq(name,"dlsym") || @strEq(name,"dlclose") ||
+        @strEq(name,"sys_icache_invalidate") || @strEq(name,"kqueue") ||
+        @strEq(name,"kevent") || @strEq(name,"pthread_create") ||
+        @strEq(name,"pthread_join") || @strEq(name,"pthread_mutex_init") ||
+        @strEq(name,"pthread_mutex_lock") || @strEq(name,"pthread_mutex_unlock") ||
+        @strEq(name,"pthread_cond_init") || @strEq(name,"pthread_cond_wait") ||
+        @strEq(name,"pthread_cond_signal") || @strEq(name,"pthread_cond_destroy")) { return 1; }
+    return 0;
+}
+
 fn mo_import_ordinal(name: []u8) i32 {
-    if (mo_has_prefix(name,"MTL") == 1) { return 2; }
-    if (mo_has_prefix(name,"objc_") == 1 || mo_has_prefix(name,"sel_") == 1) { return 3; }
+    if (mo_is_libsystem_import(name) == 1) { return 1; }
+    if (@strEq(name,"MTLCreateSystemDefaultDevice")) { return 2; }
+    if (@strEq(name,"objc_getClass") || @strEq(name,"sel_registerName") ||
+        @strEq(name,"objc_msgSend") || @strEq(name,"objc_msgSend_sizes")) { return 3; }
+    if (mo_is_sqlite_import(name) == 1) { return 4; }
+    return 0;
+}
+
+fn mo_imports_known(names: ArrayList[[]u8]) i32 {
+    let i:i32=0;while(i<names.len){if(mo_import_ordinal(names.data[i])==0){return 0;}i=i+1;}
     return 1;
+}
+
+fn mo_resolved_import_ordinal(name: []u8, needs_metal:i32,
+                              needs_objc:i32) i32 {
+    let ordinal:i32=mo_import_ordinal(name);
+    if(ordinal==3){return 2+needs_metal;}
+    if(ordinal==4){return 2+needs_metal+needs_objc;}
+    return ordinal;
 }
 
 // Zag source may declare ABI-specialized Objective-C send entry points (for
@@ -302,14 +408,14 @@ fn mo_bind_symbol(name: []u8) []u8 {
     return name;
 }
 
-fn mo_bind_stream(names: ArrayList[[]u8], data_len: i32, needs_metal:i32) ArrayList[u8] {
+fn mo_bind_stream(names: ArrayList[[]u8], data_len: i32, needs_metal:i32,
+                  needs_objc:i32) ArrayList[u8] {
     let out: ArrayList[u8] = make[u8](names.len * 24 + 8);
     let i: i32 = 0;
     while (i < names.len) {
-        let ordinal:i32=mo_import_ordinal(names.data[i]);
-        // Metal is optional, so libobjc occupies ordinal 2 in a pure ObjC
-        // image and ordinal 3 only when Metal.framework was emitted first.
-        if(ordinal==3){ordinal=2+needs_metal;}
+        // Optional libraries use compact ordinals in their actual load-command
+        // order; SQLite remains last when Metal and/or libobjc are present.
+        let ordinal:i32=mo_resolved_import_ordinal(names.data[i],needs_metal,needs_objc);
         mo_b(&out, 16 + ordinal); // SET_DYLIB_ORDINAL_IMM
         mo_b(&out, 64);                         // SET_SYMBOL_TRAILING_FLAGS_IMM(0)
         let symbol:[]u8=mo_bind_symbol(names.data[i]);
@@ -333,6 +439,7 @@ fn mo_bind_stream(names: ArrayList[[]u8], data_len: i32, needs_metal:i32) ArrayL
 
 fn mo_need_metal(names: ArrayList[[]u8]) i32 { let i:i32=0;while(i<names.len){if(mo_import_ordinal(names.data[i])==2){return 1;}i=i+1;}return 0; }
 fn mo_need_objc(names: ArrayList[[]u8]) i32 { let i:i32=0;while(i<names.len){if(mo_import_ordinal(names.data[i])==3){return 1;}i=i+1;}return 0; }
+fn mo_need_sqlite(names: ArrayList[[]u8]) i32 { let i:i32=0;while(i<names.len){if(mo_import_ordinal(names.data[i])==4){return 1;}i=i+1;}return 0; }
 fn mo_dylib_cmd_size(path: []u8) i32 { return macho_align((24 + path.len + 1) as i64,8) as i32; }
 fn mo_load_dylib(buf: *ArrayList[u8], path: []u8) void {
     let size:i32=mo_dylib_cmd_size(path);
@@ -340,24 +447,34 @@ fn mo_load_dylib(buf: *ArrayList[u8], path: []u8) void {
     mo_bytes(buf,path);mo_b(buf,0);while((buf.*.len%8)!=0){mo_b(buf,0);}
 }
 
-fn write_macho_arm64_dynamic(path: []u8, text: ArrayList[u8], entry_off: i32,
-                              data: ArrayList[u8], imports: ArrayList[[]u8]) i32 {
-    if (imports.len == 0) { return write_macho_arm64_data(path,text,entry_off,data); }
+fn write_macho_arm64_dynamic_debug_mode(path: []u8, text: ArrayList[u8], entry_off: i32,
+                                   data: ArrayList[u8], imports: ArrayList[[]u8],
+                                   hot_text: i32, abbrev: ArrayList[u8],
+                                   info: ArrayList[u8], line: ArrayList[u8]) i32 {
+    if (imports.len == 0) {
+        return write_macho_arm64_data_debug_mode(path,text,entry_off,data,abbrev,info,line,hot_text);
+    }
+    if (mo_imports_known(imports) == 0) { return 1; }
     let code_off: i64 = MACHO_CODE_OFF();
     let data_off: i64 = macho_data_fileoff(text.len);
     let import_bytes: i32 = imports.len * 8;
     let data_len: i32 = data.len + import_bytes;
     let needs_metal:i32=mo_need_metal(imports);
     let needs_objc:i32=mo_need_objc(imports);
-    let bind: ArrayList[u8] = mo_bind_stream(imports,data.len,needs_metal);
+    let needs_sqlite:i32=mo_need_sqlite(imports);
+    let bind: ArrayList[u8] = mo_bind_stream(imports,data.len,needs_metal,needs_objc);
     let libsystem:[]u8="/usr/lib/libSystem.B.dylib";
     let metal:[]u8="/System/Library/Frameworks/Metal.framework/Versions/A/Metal";
     let libobjc:[]u8="/usr/lib/libobjc.A.dylib";
-    let dylib_bytes:i32=mo_dylib_cmd_size(libsystem)+needs_metal*mo_dylib_cmd_size(metal)+needs_objc*mo_dylib_cmd_size(libobjc);
+    let sqlite:[]u8="/usr/lib/libsqlite3.dylib";
+    let dylib_bytes:i32=mo_dylib_cmd_size(libsystem)+needs_metal*mo_dylib_cmd_size(metal)+needs_objc*mo_dylib_cmd_size(libobjc)+needs_sqlite*mo_dylib_cmd_size(sqlite);
     // Link-edit data has its own page-aligned file/VM mapping.  Keeping the
     // dyld stream in the post-__DATA padding leaves a conventional contiguous
     // __LINKEDIT mapping for the loader instead of a mismatched file/VM pair.
-    let bind_off: i64 = macho_align(data_off + (data_len as i64),MACHO_PAGE());
+    let debug_len: i64 = (abbrev.len + info.len + line.len) as i64;
+    let has_debug: i32 = (debug_len > 0) as i32;
+    let debug_off: i64 = macho_align(data_off + (data_len as i64),MACHO_PAGE());
+    let bind_off: i64 = macho_align(debug_off + debug_len,MACHO_PAGE());
     let sig_off: i64 = macho_align(bind_off + (bind.len as i64),16);
     let text_size: i64 = data_off;
     let data_size: i64 = macho_align(data_len as i64,MACHO_PAGE());
@@ -365,17 +482,32 @@ fn write_macho_arm64_dynamic(path: []u8, text: ArrayList[u8], entry_off: i32,
     let sig_size: i64 = macho_align(20 + 96 + nslots * 32,16);
     let link_size: i64 = macho_align(sig_off + sig_size - bind_off,MACHO_PAGE());
     let buf: ArrayList[u8] = make[u8]((sig_off + sig_size) as i32);
-    let uuid_source: ArrayList[u8] = make[u8](text.len + data.len + bind.len);
+    let uuid_source: ArrayList[u8] = make[u8](text.len + data.len + bind.len + abbrev.len + info.len + line.len);
     mo_list_bytes(&uuid_source,text); mo_list_bytes(&uuid_source,data); mo_list_bytes(&uuid_source,bind);
+    mo_list_bytes(&uuid_source,abbrev); mo_list_bytes(&uuid_source,info); mo_list_bytes(&uuid_source,line);
     let uuid_hash: ArrayList[u8] = macho_sha256(uuid_source.data[0..uuid_source.len]);
 
     mo_le(&buf,4277009103,4); mo_le(&buf,16777228,4); mo_le(&buf,0,4); mo_le(&buf,2,4);
-    mo_le(&buf,11+needs_metal+needs_objc,4); mo_le(&buf,616+dylib_bytes,4); mo_le(&buf,2097285,4); mo_le(&buf,0,4);
+    mo_le(&buf,11+needs_metal+needs_objc+needs_sqlite+has_debug,4); mo_le(&buf,616+dylib_bytes+has_debug*312,4); mo_le(&buf,2097285,4); mo_le(&buf,0,4);
     mo_segment(&buf,"__PAGEZERO",0,MACHO_BASE(),0,0,0,0);
-    mo_segment(&buf,"__TEXT",MACHO_BASE(),text_size,0,text_size,5,1);
+    // Normal images are immutable RX. A --hot image remains initially RX but
+    // advertises RWX as its maximum VM protection so the explicit live-patch
+    // runtime may open a short, process-local write window. Without this
+    // load-command contract XNU correctly rejects mprotect with EACCES.
+    let text_maxprot:i32=5;if(hot_text==1){text_maxprot=7;}
+    mo_segment_protections(&buf,"__TEXT",MACHO_BASE(),text_size,0,text_size,
+        text_maxprot,5,1);
     mo_section(&buf,"__text","__TEXT",MACHO_BASE()+code_off,text.len,code_off,2,2147484672);
     mo_segment(&buf,"__DATA",MACHO_BASE()+data_off,data_size,data_off,data_len,3,1);
     mo_section(&buf,"__data","__DATA",MACHO_BASE()+data_off,data_len,data_off,3,0);
+    // __DATA keeps segment index 2, so the dyld binding stream still targets
+    // the same writable import slots with or without debug information.
+    if (has_debug == 1) {
+        mo_segment(&buf,"__DWARF",MACHO_BASE()+debug_off,macho_align(debug_len,MACHO_PAGE()),debug_off,debug_len,1,3);
+        mo_section(&buf,"__debug_abbrev","__DWARF",MACHO_BASE()+debug_off,abbrev.len,debug_off,0,0x02000000);
+        mo_section(&buf,"__debug_info","__DWARF",MACHO_BASE()+debug_off+(abbrev.len as i64),info.len,debug_off+(abbrev.len as i64),0,0x02000000);
+        mo_section(&buf,"__debug_line","__DWARF",MACHO_BASE()+debug_off+(abbrev.len as i64)+(info.len as i64),line.len,debug_off+(abbrev.len as i64)+(info.len as i64),0,0x02000000);
+    }
     mo_segment(&buf,"__LINKEDIT",MACHO_BASE()+bind_off,link_size,bind_off,sig_off+sig_size-bind_off,1,0);
     mo_le(&buf,14,4); mo_le(&buf,32,4); mo_le(&buf,12,4); mo_bytes(&buf,"/usr/lib/dyld"); mo_b(&buf,0);
     while ((buf.len % 8) != 0) { mo_b(&buf,0); }
@@ -386,6 +518,7 @@ fn write_macho_arm64_dynamic(path: []u8, text: ArrayList[u8], entry_off: i32,
     mo_load_dylib(&buf,libsystem);
     if(needs_metal==1){mo_load_dylib(&buf,metal);}
     if(needs_objc==1){mo_load_dylib(&buf,libobjc);}
+    if(needs_sqlite==1){mo_load_dylib(&buf,sqlite);}
     // LC_DYLD_INFO_ONLY: rebase, weak-bind and lazy-bind streams are empty;
     // bind is the regular import stream located in __LINKEDIT.
     mo_le(&buf,2147483682,4); mo_le(&buf,48,4);
@@ -394,8 +527,25 @@ fn write_macho_arm64_dynamic(path: []u8, text: ArrayList[u8], entry_off: i32,
     mo_le(&buf,29,4); mo_le(&buf,16,4); mo_le(&buf,sig_off,4); mo_le(&buf,sig_size,4);
     if (buf.len > code_off) { return 1; }
     mo_pad_to(&buf,code_off); mo_list_bytes(&buf,text); mo_pad_to(&buf,data_off); mo_list_bytes(&buf,data);
-    mo_zero(&buf,import_bytes as i64); mo_pad_to(&buf,bind_off); mo_list_bytes(&buf,bind); mo_pad_to(&buf,sig_off);
+    mo_zero(&buf,import_bytes as i64);
+    if (has_debug == 1) {
+        mo_pad_to(&buf,debug_off); mo_list_bytes(&buf,abbrev); mo_list_bytes(&buf,info); mo_list_bytes(&buf,line);
+    }
+    mo_pad_to(&buf,bind_off); mo_list_bytes(&buf,bind); mo_pad_to(&buf,sig_off);
     let sig: ArrayList[u8] = mo_signature(buf.data[0..buf.len],text_size);
     mo_list_bytes(&buf,sig);
     return _zag_write_exec(path,buf.data[0..buf.len]);
+}
+
+fn write_macho_arm64_dynamic_mode(path: []u8, text: ArrayList[u8], entry_off: i32,
+                                   data: ArrayList[u8], imports: ArrayList[[]u8],
+                                   hot_text: i32) i32 {
+    let empty: ArrayList[u8] = make[u8](0);
+    return write_macho_arm64_dynamic_debug_mode(path,text,entry_off,data,imports,
+        hot_text,empty,empty,empty);
+}
+
+fn write_macho_arm64_dynamic(path: []u8, text: ArrayList[u8], entry_off: i32,
+                              data: ArrayList[u8], imports: ArrayList[[]u8]) i32 {
+    return write_macho_arm64_dynamic_mode(path,text,entry_off,data,imports,0);
 }

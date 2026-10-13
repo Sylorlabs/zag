@@ -5,16 +5,20 @@
 - **Linux x86-64** — host for the committed compiler seed and primary release
 - **Linux AArch64** — scoped supported target and CI host; x86-64 can
   cross-compile it and verify it through qemu-user
-- **Apple Silicon macOS** — scoped signed PIE Mach-O executable development
-  path; a matching `znc-macos-arm64` seed is usable as release evidence only
+- **Apple Silicon macOS** — scoped signed PIE Mach-O executable and bounded
+  C-ABI object/archive development paths; a matching `znc-macos-arm64` seed is usable as release evidence only
   after the entire physical-Apple-Silicon gate passes
 - **No compiler toolchain required** — no `cc`, `zig`, `llvm`, assembler, or
   linker; `make` is only an optional convenience for `make install`
-- Tested on: Ubuntu 22.04, Ubuntu 24.04, Fedora 40, Arch Linux (rolling)
+- Tested on: Ubuntu 22.04, Ubuntu 24.04, Fedora 40, Arch Linux (rolling), and
+  the physical Apple-Silicon macOS 15 CI gate
 
 The committed `./znc` is the Linux bootstrap seed. Apple Silicon requires a
-separate trusted development/CI `znc-macos-arm64` bootstrap seed; the tree does
-not treat the Linux seed or a cross-emitted Mach-O file as a macOS release.
+separate trusted `znc-macos-arm64` bootstrap seed; the tree does not treat the
+Linux seed or a cross-emitted Mach-O file as a macOS release. A successful
+physical-Mac CI gate publishes a distinct checksum-paired verified seed so a
+clean checkout has a reviewable intake path without committing generated Mac
+binaries.
 Read [`docs/SUPPORT.md`](docs/SUPPORT.md) before choosing a target; support is
 scoped by output mode and language edition rather than claimed as universal
 backend parity.
@@ -31,6 +35,8 @@ sudo make install
 ```
 
 `make install` builds and installs `znc`, `zagd`, and `zag-lsp`.
+The snippet above starts from the committed Linux x86-64 seed. On Apple
+Silicon, complete the checksum-verified seed intake below first.
 
 Create a project:
 
@@ -55,11 +61,43 @@ Build and run in one native step:
 
 ### Apple Silicon macOS
 
-With a trusted matching development/CI `znc-macos-arm64` seed, make it
-executable and exercise the scoped native path directly:
+The durable route is a `macos-arm64` release archive: verify its outer
+`.tar.gz.sha256` against the published release, extract it, and use the included
+tools directly. To use that release compiler as the seed for a separate source
+checkout, pass the extracted `znc` and `znc.sha256` to the helper described
+below.
+
+For an exact development commit without a release, open a successful
+`test-macos-arm64-native` job for the
+commit you reviewed and download its
+`zag-znc-macos-arm64-verified-<commit>` artifact. Do not use the similarly named
+`-cross-` artifact: it is only the bootstrap precursor supplied to the physical
+Mac job. Confirm `SOURCE_COMMIT`, compare the SHA-256 printed in the job summary
+with `znc-macos-arm64.sha256`, then run:
 
 ```sh
-chmod +x znc-macos-arm64
+bash tools/bootstrap-macos-seed.sh \
+  ~/Downloads/zag-macos-seed/znc-macos-arm64 \
+  ~/Downloads/zag-macos-seed/znc-macos-arm64.sha256
+```
+
+For a verified release archive, the corresponding invocation is:
+
+```sh
+bash tools/bootstrap-macos-seed.sh \
+  /path/to/zag-release/znc /path/to/zag-release/znc.sha256
+```
+
+The helper verifies bytes, signed Mach-O host identity, a source-built fixed
+point, and an independent empty-`PATH` rebuild before creating
+`znc-macos-arm64`, `zagd-macos-arm64`, and `zag-lsp-macos-arm64` in the
+checkout. It deliberately performs no download and makes no trust decision for
+you. An older reviewed seed can bootstrap later source, but only a complete
+native gate can certify that later source.
+
+Exercise the scoped native path directly:
+
+```sh
 ./znc-macos-arm64 examples/numeric.zag -o numeric --run
 ```
 
@@ -74,15 +112,102 @@ The explicit spelling is useful for cross-compilation and reproducible scripts:
 The Mach-O writer, PIE address lowering, SHA-256 ad-hoc signer, Darwin entry ABI,
 and syscall runtime are all implemented in Zag. No Xcode, system assembler,
 linker, `codesign`, C, Python, or Zig is invoked to produce the executable.
-Native dyld binding is available only for the writer's closed
+The ordinary import-bearing executable path retains the writer's closed
 libSystem/Metal/libobjc `extern fn` map; the generated executable contains its
-own Mach-O bind stream and ARM64 import stubs. Mach-O object, archive, and
-shared-library output, BSS-backed edition-2027 globals, checked safety and
-memory sanitizing, `--debug` with imports, arbitrary dylib install names, and
-general `-l`/`-L` linking are unsupported and must reject rather than silently
-producing a partial artifact. `_zag_raw_syscall` retains Linux x86-64 source
+own Mach-O bind stream and ARM64 import stubs. Strict edition-2027 projects can
+emit Mach-O objects with `--emit-obj` and BSD static archives with
+`--emit-static`. These require defined `pub @cabi_export` functions and scalar
+integer/bool/raw-pointer exports, plus bounded `f32`/`f64` exports on Apple Silicon.
+Imports may use the same scalar forms plus fixed `f32`/`f64` signatures using
+Darwin's `V0`-`V7` FP bank and naturally packed stack overflow, plus direct captureless
+scalar/pointer callbacks. Apple Silicon also accepts bounded f32/f64 callback signatures when the direct callback target is
+`pub @cabi_export`; mixed FP/GPR and ten-`f32` callback entry are exercised natively.
+Apple Silicon additionally supports ordinary named structs whose leaves are only
+naturally aligned `i64`, `u64`, or raw pointers; leaves may be nested through
+ordinary non-generic structs within the bounded recursive classifier. One- and two-word values use
+Darwin's INTEGER aggregate class (`X` registers when they completely fit,
+otherwise the whole value on the stack; `X0`/`X1` results). Larger values use
+the caller-owned indirect copy and `X8` result convention. Object tests execute
+both C-to-Zag and Zag-to-C directions, cover flat/nested small and large values,
+and force the small-value stack-spill path.
+Apple Silicon also accepts flat ordinary structs made only from naturally aligned
+integer/`bool`/raw-pointer leaves when their Darwin C layout is at most 16 bytes.
+The compiler explicitly packs/unpacks that byte layout from Zag's eight-byte
+internal field slots. Native object and dylib/custom-link tests cover signed and
+unsigned subword fields, padding, `bool`, raw pointers, one/two-register
+arguments/results, and complete-value stack spill. Nested narrow/mixed-width
+structs, mixed-layout structs larger than 16 bytes, HFA/HVA structs, unions, and
+by-value `@repr(C)` remain rejected.
+The native tests link and execute these forms with Apple's toolchain. Zag itself does not invoke that
+external linker.
+
+The same strict edition-2027 scalar/bounded-`f32`/`f64` plus both bounded struct import/export slices support
+native dylib output and custom dynamically linked executables. Custom macOS
+links also accept SDK `libNAME.tbd` fallback plus `-framework NAME` and `-F PATH`;
+`.tbd` input is bounded to TAPI v4 install-name plus target-scoped direct symbol lists. Given a library with exported
+`pub @cabi_export` definitions and an application with matching `@cabi` imports:
+
+```sh
+./znc-macos-arm64 library.zag --emit-dylib --install-name @rpath/libexample.dylib -o libexample.dylib
+./znc-macos-arm64 app.zag --dynamic -L . -l example --rpath @loader_path -o app
+./app
+```
+
+`--emit-shared` aliases `--emit-dylib`. `--needed path/to/libexample.dylib`,
+source `@link`, and linked dependencies in the nearest/imported `zag.mod` use
+the same bounded native dependency reader. Install names are taken from the
+library; user-specified runtime paths precede discovered build directories.
+Versioned symlinks and ARM64 slices in universal dylibs are tested. These
+images are linked and signed by Zag itself, with no host linker or signer.
+
+The same native linker accepts explicit ARM64 Mach-O object and BSD archive
+inputs on dylib or custom-executable builds. Inputs can be positional or use
+`--static-input`:
+
+```sh
+./znc-macos-arm64 library.zag helper.o --emit-dylib -o libexample.dylib
+./znc-macos-arm64 app.zag --static-input libhelper.a --dynamic -o app
+```
+
+The static-input reader is bounded to 64 MiB regular-file snapshots and the
+ARM64 Mach-O relocation/symbol families exercised by
+`tests/run_macos_static_link.sh`; imported TLVP loads against dylib-exported
+thread-local symbols are supported, and unresolved weak imports use dyld's
+weak flat-lookup/null semantics. Static TLS-defining input sections and
+authenticated-pointer relocations fail closed. Same- and cross-output-section
+SUBTRACTOR constants are resolved by the native linker. Aggregate shapes outside
+the bounded flat/nested 64-bit-leaf and flat small integer/bool/raw-pointer
+slices, including HFA/HVA aggregates and unions, plus by-value `@repr(C)`, variadic, aggregate-callback,
+callback-alias/capture/returned-callback forms, arbitrary foreign-object formats, and aggregate
+globals remain unsupported. Custom linked
+images permit checked access but reject hot/debug/exit-sanitizer combinations.
+Scalar globals, bounded checked-access/sanitizer modes,
+and `--debug` with audited imports have their separate native gates; this is
+not complete instrumentation or whole-language memory safety. Unsupported
+link requests must reject rather than silently produce a partial artifact.
+`_zag_raw_syscall` retains Linux x86-64 source
 numbers and only an audited literal subset is translated for Darwin; unknown
 or computed numbers return `ENOSYS`.
+
+### VS Code extension
+
+Native release archives include `zag-lang.vsix` at the archive root. After
+installing `zag-lsp`, install the client without Node.js tooling:
+
+```sh
+code --install-extension zag-lang.vsix
+```
+
+To rebuild the VSIX from a source checkout, use Node.js 22+ and the committed
+lockfile. The package command produces the same unversioned filename used by CI
+and release archives:
+
+```sh
+cd ../editors/vscode
+npm ci
+npm run package
+code --install-extension zag-lang.vsix
+```
 
 ---
 
@@ -286,5 +411,20 @@ The Linux result uses Linux syscalls directly and has no runtime dependency
 beyond the kernel. Within the scoped Apple Silicon executable path, output uses
 the Darwin entry ABI, is position-independent, carries a deterministic
 embedded ad-hoc signature, and loads through macOS dyld. Supported `extern fn`
-fixtures use the writer's closed dyld-import map; this is not a general linker
-or a claim that Linux raw-syscall coverage carries over to Darwin.
+fixtures use the writer's closed dyld-import map unless custom library inputs
+select the separate bounded C-ABI native linker. Fixed `f32`/`f64` imports use
+Darwin's independent FP/GPR argument banks; bounded exports use the same
+independent banks on entry and return `f32` in `S0` or `f64` in `D0`. Zag's
+internal f32 values are converted explicitly at this boundary. Ordinary
+64-bit-leaf structs, including bounded ordinary nesting, use Darwin's small
+INTEGER register/stack class or, when larger than 16 bytes, caller-copy/`X8`
+indirect result convention;
+flat ordinary integer/`bool`/raw-pointer structs with Darwin C layouts up to
+16 bytes use an explicit byte-layout adapter and the same small INTEGER-class
+complete-fit register/stack rule. Nested narrow/mixed-width aggregates,
+mixed-layout aggregates larger than 16 bytes, HFA/HVA aggregates, unions,
+by-value `@repr(C)`, aggregate
+callbacks, variadics, callback aliases/captures, callbacks returned from C, and
+unannotated floating-point callback targets remain
+outside this contract. Neither path means general
+foreign-object linking or Linux raw-syscall coverage on Darwin.

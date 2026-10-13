@@ -1,0 +1,359 @@
+// Source dependency closure, using the compiler's one authoritative parser.
+// No source scanner, subprocess, or advisory/evidence record is involved.
+@import("parse.zag")
+@import("native/macho_arm64.zag") // existing pure-Zag SHA-256
+
+// Owns text only when valid=1. error is a borrowed diagnostic. Parser errors
+// (missing imports/resources, cycles, syntax) retain the parser's exit(1)
+// contract. No closure bytes are published before parsing/validation finishes.
+struct SourceClosureResult { valid: i32, error: []u8, text: []u8 }
+struct SourceClosureInput { kind: []u8, path: []u8, digest: []u8, bytes: i64 }
+struct SourceClosureBuilder {
+    inputs: ArrayList[SourceClosureInput],
+    imports: ArrayList[ResolvedImport],
+    lines: ArrayList[[]u8],
+    bytes: i64,
+    error: []u8,
+    expected_compiler_pin: []u8, // borrowed; empty only for unpinned inspection
+}
+
+fn source_closure_release(result: *SourceClosureResult) void {
+    if (result.*.text.len > 0) { _zag_str_free(result.*.text); }
+    result.*.text = ""; result.*.valid = 0;
+}
+
+fn source_closure_sha256(bytes: []u8) []u8 {
+    let hash: ArrayList[u8] = macho_sha256(bytes);
+    let text: ArrayList[u8] = make[u8](64);
+    let digits: []u8 = "0123456789abcdef";
+    let i: i32 = 0;
+    while (i < hash.len) {
+        push[u8](&text, digits[(hash.data[i] / 16) as i32]);
+        push[u8](&text, digits[(hash.data[i] % 16) as i32]); i = i + 1;
+    }
+    let out: []u8 = _zag_str_concat("", text.data[0..text.len]);
+    free[u8](&text); free[u8](&hash); return out;
+}
+
+// Absolute lexical identities make relative/absolute entry spellings and CWD
+// changes agree. This deliberately matches the parser's lexical path model;
+// it does not claim symlink containment or relocation-independent identities.
+fn source_closure_path(cwd: []u8, path: []u8) []u8 {
+    if (path.len > 0 && path[0] == '/') { return package_manifest_path_normalize(path); }
+    let joined: []u8 = package_import_join(cwd, path);
+    let out: []u8 = package_manifest_path_normalize(joined);
+    _zag_str_free(joined); return out;
+}
+
+fn sc_append(out: *ArrayList[u8], text: []u8) void {
+    let i: i32 = 0;
+    while (i < text.len) { push[u8](out, text[i]); i = i + 1; }
+}
+
+// TSV values escape '%' and non-printable/non-ASCII bytes as %hh. Paths stay
+// readable and arbitrary filename/specifier bytes cannot inject records.
+fn sc_field(out: *ArrayList[u8], text: []u8) void {
+    let digits: []u8 = "0123456789abcdef";
+    let i: i32 = 0;
+    while (i < text.len) {
+        let c: u8 = text[i];
+        if (c < 32 || c > 126 || c == '%') {
+            push[u8](out, '%'); push[u8](out, digits[(c / 16) as i32]);
+            push[u8](out, digits[(c % 16) as i32]);
+        } else { push[u8](out, c); }
+        i = i + 1;
+    }
+}
+
+fn sc_line(b: *SourceClosureBuilder, line: *ArrayList[u8]) void {
+    if (b.*.lines.len >= 65536) { b.*.error = "source closure record limit exceeded"; }
+    else { push[[]u8](&b.*.lines, _zag_str_concat("", line.*.data[0..line.*.len])); }
+    free[u8](line);
+}
+
+fn sc_input_index(b: SourceClosureBuilder, kind: []u8, path: []u8) i32 {
+    let i: i32 = 0;
+    while (i < b.inputs.len) {
+        if (@strEq(b.inputs.data[i].kind, kind) && @strEq(b.inputs.data[i].path, path)) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// Hash the retained snapshot, never reopen a source or resource by pathname.
+// Same-path, different-byte snapshots fail even across source/resource kinds.
+fn sc_input(b: *SourceClosureBuilder, kind: []u8, path: []u8, data: []u8) void {
+    if (b.*.error.len > 0) { return; }
+    if (path.len == 0 || data.len < 0 || data.len > 67108864 ||
+        b.*.inputs.len >= 8192 || b.*.bytes + data.len > 268435456) {
+        b.*.error = "invalid or oversized source closure input"; return;
+    }
+    let digest: []u8 = source_closure_sha256(data);
+    let i: i32 = 0;
+    let duplicate: i32 = 0;
+    while (i < b.*.inputs.len) {
+        let prior: SourceClosureInput = b.*.inputs.data[i];
+        if (@strEq(prior.path, path)) {
+            if (!@strEq(prior.digest, digest) || prior.bytes != data.len) {
+                b.*.error = "source closure input changed between snapshots";
+            }
+            if (@strEq(prior.kind, kind)) { duplicate = 1; }
+        }
+        i = i + 1;
+    }
+    if (duplicate == 1 || b.*.error.len > 0) { _zag_str_free(digest); return; }
+    push[SourceClosureInput](&b.*.inputs, SourceClosureInput{
+        .kind=kind, .path=_zag_str_concat("", path), .digest=digest, .bytes=data.len});
+    b.*.bytes = b.*.bytes + data.len;
+    let line: ArrayList[u8] = make[u8](128);
+    sc_append(&line, kind); sc_append(&line, "="); sc_field(&line, path);
+    sc_append(&line, "\tsha256:"); sc_append(&line, digest); sc_append(&line, "\t");
+    let count: []u8 = _zag_i64_to_str(data.len);
+    sc_append(&line, count); _zag_str_free(count); sc_line(b, &line);
+}
+
+fn sc_manifest_at(b: *SourceClosureBuilder, path: []u8) void {
+    if (b.*.error.len > 0) { return; }
+    if (sc_input_index(b.*, "manifest", path) >= 0) { return; }
+    // Exact path, not a fresh ancestor search: a deleted parser-retained
+    // manifest must fail rather than fall back to an unrelated ancestor.
+    let graph: PackageManifestClosure = PackageManifestClosure{.root=_zag_str_concat("", path),
+        .nodes=make[PackageClosureNode](8),.edges=make[PackageClosureEdge](8),
+        .error=PackageImportError.none,.valid=0};
+    let active: ArrayList[[]u8] = make[[]u8](8);
+    package_manifest_closure_visit(&graph, graph.root, &active);
+    free[[]u8](&active);
+    graph.valid = (graph.error == PackageImportError.none && graph.nodes.len > 0) as i32;
+    if (graph.valid == 0) {
+        b.*.error = "invalid dependency manifest closure";
+        package_manifest_closure_release(&graph); return;
+    }
+    let i: i32 = 0;
+    while (i < graph.nodes.len && b.*.error.len == 0) {
+        let node: PackageClosureNode = graph.nodes.data[i];
+        // compiler_pin was parsed from node.source, the exact snapshot hashed
+        // and recorded below. Never authorize a separate preflight/reread.
+        if (b.*.expected_compiler_pin.len > 0 && node.compiler_pin.len > 0 &&
+            !@strEq(node.compiler_pin, b.*.expected_compiler_pin)) {
+            b.*.error = "source closure compiler pin mismatch";
+            package_manifest_closure_release(&graph); return;
+        }
+        sc_input(b, "manifest", node.manifest, node.source);
+        let line: ArrayList[u8] = make[u8](128);
+        sc_append(&line, "pin="); sc_field(&line, node.manifest); sc_append(&line, "\t");
+        sc_field(&line, node.compiler_pin); sc_line(b, &line);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < graph.edges.len && b.*.error.len == 0) {
+        let edge: PackageClosureEdge = graph.edges.data[i];
+        let line: ArrayList[u8] = make[u8](128);
+        sc_append(&line, "package="); sc_field(&line, edge.from); sc_append(&line, "\t");
+        sc_field(&line, edge.to); sc_append(&line, "\t"); sc_field(&line, edge.alias);
+        sc_append(&line, "\t"); sc_field(&line, edge.path); sc_append(&line, "\t");
+        sc_field(&line, edge.mode); sc_line(b, &line); i = i + 1;
+    }
+    package_manifest_closure_release(&graph);
+}
+
+fn sc_manifest_graph(b: *SourceClosureBuilder, module_path: []u8) void {
+    if (b.*.error.len > 0) { return; }
+    let nearest: []u8 = package_import_manifest(package_import_dir(module_path));
+    if (nearest.len == 0) { return; } // standalone source has no required manifest
+    sc_manifest_at(b, nearest); _zag_str_free(nearest);
+}
+
+fn sc_is_manifest(path: []u8) i32 {
+    if (path.len < 8) { return 0; }
+    return @strEq(path[path.len - 8..path.len], "/zag.mod") as i32;
+}
+
+// ResolvedResource has no kind tag. Identify package metadata via an actual
+// pkg: importer and its nearest retained ancestor, not by filename alone:
+// #embed("assets/zag.mod") may legitimately contain arbitrary binary data.
+fn sc_retained_manifest(b: SourceClosureBuilder, importer: []u8) i32 {
+    let best: i32 = -1;
+    let length: i32 = 0;
+    let i: i32 = 0;
+    while (i < b.inputs.len) {
+        let input: SourceClosureInput = b.inputs.data[i];
+        if (@strEq(input.kind, "resource") && sc_is_manifest(input.path) == 1) {
+            let prefix: []u8 = input.path[0..input.path.len - 7];
+            if (prefix.len > length && package_import_starts_with(importer, prefix) == 1) {
+                best = i; length = prefix.len;
+            }
+        }
+        i = i + 1;
+    }
+    return best;
+}
+
+fn sc_visit(b: *SourceClosureBuilder, states: *ArrayList[i32], index: i32, depth: i32) void {
+    if (b.*.error.len > 0 || states.*.data[index] == 2) { return; }
+    if (states.*.data[index] == 1) { b.*.error = "source dependency cycle"; return; }
+    if (depth >= 256) { b.*.error = "source dependency depth limit exceeded"; return; }
+    states.*.data[index] = 1;
+    let i: i32 = 0;
+    while (i < b.*.imports.len && b.*.error.len == 0) {
+        let edge: ResolvedImport = b.*.imports.data[i];
+        if (@strEq(edge.importer, b.*.inputs.data[index].path)) {
+            let child: i32 = sc_input_index(b.*, "source", edge.imported);
+            if (child < 0) { b.*.error = "import edge has no source snapshot"; }
+            else { sc_visit(b, states, child, depth + 1); }
+        }
+        i = i + 1;
+    }
+    states.*.data[index] = 2;
+}
+
+fn sc_builder_release(b: *SourceClosureBuilder) void {
+    let i: i32 = 0;
+    while (i < b.*.inputs.len) {
+        _zag_str_free(b.*.inputs.data[i].path); _zag_str_free(b.*.inputs.data[i].digest); i = i + 1;
+    }
+    i = 0;
+    while (i < b.*.imports.len) {
+        _zag_str_free(b.*.imports.data[i].importer); _zag_str_free(b.*.imports.data[i].imported); i = i + 1;
+    }
+    i = 0;
+    while (i < b.*.lines.len) { _zag_str_free(b.*.lines.data[i]); i = i + 1; }
+    free[SourceClosureInput](&b.*.inputs); free[ResolvedImport](&b.*.imports); free[[]u8](&b.*.lines);
+}
+
+// Borrows unit and its raw snapshots; does not modify it or reread source or
+// resource files. cwd must be the absolute CWD used to resolve this unit.
+// Supplemental nearest/dependency manifests are read once per graph; their
+// exact snapshots must agree with any same-path parser-retained resource.
+// Includes all loaded modules (including injected Script preludes); import=
+// records are precisely the explicit edges retained by CompilationUnit.imports.
+// Resources are inputs, not fabricated import edges: the parser does not retain
+// resource-to-importer edges. This wrapper records pins for inspection only.
+fn source_closure_from_unit(path: []u8, cwd: []u8, unit: CompilationUnit) SourceClosureResult {
+    return sc_from_unit(path, cwd, unit, "");
+}
+
+// The caller supplies the actual compiler identity as canonical lowercase
+// sha256:<64 hex>. Every declared pin must match the same manifest snapshot
+// recorded in the closure. Absent optional pins are still recorded normally.
+// Invalid expected pins (including empty) fail even if no manifest has a pin.
+fn source_closure_from_unit_pinned(path: []u8, cwd: []u8, unit: CompilationUnit,
+    expected_compiler_pin: []u8) SourceClosureResult {
+    if (package_toolchain_pin_safe(expected_compiler_pin) != 1) {
+        return SourceClosureResult{.valid=0,.error="invalid expected compiler pin",.text=""};
+    }
+    return sc_from_unit(path, cwd, unit, expected_compiler_pin);
+}
+
+fn sc_from_unit(path: []u8, cwd: []u8, unit: CompilationUnit,
+    expected_compiler_pin: []u8) SourceClosureResult {
+    let result: SourceClosureResult = SourceClosureResult{.valid=0,.error="",.text=""};
+    if (path.len == 0 || cwd.len == 0 || cwd[0] != '/') {
+        result.error = "source closure requires a source path and absolute resolver CWD"; return result;
+    }
+    let root: []u8 = source_closure_path(cwd, path);
+    let b: SourceClosureBuilder = SourceClosureBuilder{.inputs=make[SourceClosureInput](16),
+        .imports=make[ResolvedImport](16),.lines=make[[]u8](32),.bytes=0,.error="",
+        .expected_compiler_pin=expected_compiler_pin};
+    if (unit.modules.len == 0 || unit.modules.len > 8192 || unit.imports.len > 65536 || unit.resources.len > 8192) {
+        b.error = "invalid source closure compilation unit size";
+    }
+    let i: i32 = 0;
+    while (i < unit.modules.len && b.error.len == 0) {
+        let node: ResolvedModule = unit.modules.data[i];
+        let label: []u8 = node.path;
+        if (@strEq(label, "<root>")) { label = root; }
+        let absolute: []u8 = source_closure_path(cwd, label);
+        sc_input(&b, "source", absolute, node.source); _zag_str_free(absolute); i = i + 1;
+    }
+    if (sc_input_index(b, "source", root) < 0) { b.error = "root source snapshot missing"; }
+    i = 0;
+    while (i < unit.resources.len && b.error.len == 0) {
+        let resource: ResolvedResource = unit.resources.data[i];
+        let absolute: []u8 = source_closure_path(cwd, resource.path);
+        sc_input(&b, "resource", absolute, resource.data); _zag_str_free(absolute); i = i + 1;
+    }
+    i = 0;
+    while (i < unit.imports.len && b.error.len == 0) {
+        let edge: ResolvedImport = unit.imports.data[i];
+        let from: []u8 = edge.importer;
+        if (@strEq(from, "<root>")) { from = root; }
+        let a: []u8 = source_closure_path(cwd, from);
+        let z: []u8 = source_closure_path(cwd, edge.imported);
+        push[ResolvedImport](&b.imports, ResolvedImport{.importer=a,.imported=z,.specifier=edge.specifier});
+        if (sc_input_index(b, "source", a) < 0 || sc_input_index(b, "source", z) < 0) {
+            b.error = "import edge has no source snapshot";
+        }
+        let line: ArrayList[u8] = make[u8](128);
+        sc_append(&line, "import="); sc_field(&line, a); sc_append(&line, "\t");
+        sc_field(&line, z); sc_append(&line, "\t"); sc_field(&line, edge.specifier);
+        sc_line(&b, &line); i = i + 1;
+    }
+    let states: ArrayList[i32] = make[i32](b.inputs.len);
+    i = 0; while (i < b.inputs.len) { push[i32](&states, 0); i = i + 1; }
+    i = 0;
+    while (i < b.inputs.len && b.error.len == 0) {
+        if (@strEq(b.inputs.data[i].kind, "source")) { sc_visit(&b, &states, i, 0); }
+        i = i + 1;
+    }
+    free[i32](&states);
+    // Discover manifest requirements even on ordinary same-package/relative
+    // imports, which do not populate the parser's package resource snapshots.
+    let input_count: i32 = b.inputs.len;
+    i = 0;
+    while (i < b.imports.len && b.error.len == 0) {
+        let edge: ResolvedImport = b.imports.data[i];
+        if (package_import_starts_with(edge.specifier, "pkg:") == 1) {
+            let retained: i32 = sc_retained_manifest(b, edge.importer);
+            if (retained < 0) { b.error = "package import manifest snapshot missing"; }
+            else { sc_manifest_at(&b, b.inputs.data[retained].path); }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < input_count && b.error.len == 0) {
+        if (@strEq(b.inputs.data[i].kind, "source")) { sc_manifest_graph(&b, b.inputs.data[i].path); }
+        i = i + 1;
+    }
+    if (b.error.len == 0) {
+        // Sort complete escaped records, not parser discovery/alias order.
+        i = 1;
+        while (i < b.lines.len) {
+            let j: i32 = i;
+            while (j > 0 && package_lock_compare(b.lines.data[j], b.lines.data[j - 1]) < 0) {
+                let swap: []u8 = b.lines.data[j]; b.lines.data[j] = b.lines.data[j - 1];
+                b.lines.data[j - 1] = swap; j = j - 1;
+            }
+            i = i + 1;
+        }
+        let text: ArrayList[u8] = make[u8](1024);
+        sc_append(&text, "format=zag-source-closure-v1\nroot="); sc_field(&text, root); sc_append(&text, "\n");
+        i = 0;
+        while (i < b.lines.len) {
+            if (i == 0 || !@strEq(b.lines.data[i], b.lines.data[i - 1])) {
+                sc_append(&text, b.lines.data[i]); sc_append(&text, "\n");
+            }
+            i = i + 1;
+        }
+        result.text = _zag_str_concat("", text.data[0..text.len]); result.valid = 1;
+        free[u8](&text);
+    } else { result.error = b.error; }
+    sc_builder_release(&b); _zag_str_free(root); return result;
+}
+
+// CLI convenience entry: calls the existing parser exactly once on raw root
+// bytes. Parser allocations have its existing one-compilation process lifetime;
+// reusable compiler callers should prefer source_closure_from_unit instead.
+fn source_closure_load(path: []u8, cwd: []u8) SourceClosureResult {
+    if (path.len == 0 || cwd.len == 0 || cwd[0] != '/') {
+        return SourceClosureResult{.valid=0,.error="source closure requires a source path and absolute resolver CWD",.text=""};
+    }
+    let absolute: []u8 = source_closure_path(cwd, path);
+    let source: []u8 = _zag_read_file(absolute);
+    if (source.len < 0 || source.len > 67108864) {
+        package_import_free_read(source); _zag_str_free(absolute);
+        return SourceClosureResult{.valid=0,.error="cannot read source closure root (64 MiB limit)",.text=""};
+    }
+    let unit: CompilationUnit = parse_compilation_unit_dir(source, package_import_dir(absolute));
+    let result: SourceClosureResult = source_closure_from_unit(absolute, cwd, unit);
+    package_import_free_read(source); _zag_str_free(absolute); return result;
+}

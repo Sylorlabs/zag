@@ -74,7 +74,30 @@ if [ -z "$release_seed" ]; then
     echo "ERROR: no executable $RELEASE_PLATFORM release seed found" >&2
     exit 1
 fi
+if ! zag_verify_manifest_toolchain "$release_seed" "$PWD/zag.mod"; then
+    echo "ERROR: release seed does not match the zag.mod toolchain identity pin." >&2
+    exit 1
+fi
 export ZNC="$release_seed"
+
+# Editor packaging is a release-only dependency. Fail before compiler work,
+# changelog mutation, commits, or tags if the locked Node toolchain is absent.
+if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1 ||
+   ! command -v unzip >/dev/null 2>&1; then
+    echo "ERROR: release packaging requires Node.js 22+, npm, and unzip." >&2
+    exit 1
+fi
+release_node_major=$(node -p 'Number(process.versions.node.split(".")[0])')
+case "$release_node_major" in
+    ''|*[!0-9]*)
+        echo "ERROR: could not determine the Node.js major version." >&2
+        exit 1
+        ;;
+esac
+if [ "$release_node_major" -lt 22 ]; then
+    echo "ERROR: release packaging requires Node.js 22+ (found $(node --version))." >&2
+    exit 1
+fi
 
 echo "════════════════════════════════════════════════════════════════"
 
@@ -92,6 +115,29 @@ fi
 
 if ! grep -Fq "return \"$VERSION\"" selfhost/version.zag; then
     echo "ERROR: selfhost/version.zag does not report $VERSION." >&2
+    exit 1
+fi
+
+# Build the editor artifact before any release mutation. npm ci consumes the
+# committed lockfile, while SOURCE_DATE_EPOCH in the package script makes the
+# VSIX byte-reproducible. Prove that property instead of merely assuming it.
+echo ""
+echo "── preflight: locked VS Code extension package ──"
+(cd ../editors/vscode && npm ci && npm run package)
+release_vsix_first=$(zag_sha256_file ../editors/vscode/zag-lang.vsix)
+(cd ../editors/vscode && npm run package)
+release_vsix_second=$(zag_sha256_file ../editors/vscode/zag-lang.vsix)
+if [ "$release_vsix_first" != "$release_vsix_second" ]; then
+    echo "ERROR: repeated VS Code packages are not byte-identical." >&2
+    exit 1
+fi
+echo "  VSIX sha256: $release_vsix_second"
+if ! unzip -tq ../editors/vscode/zag-lang.vsix >/dev/null ||
+   ! unzip -p ../editors/vscode/zag-lang.vsix extension/out/extension.js |
+       awk 'index($0, "vscode-languageclient") { found=1 } END { exit !found }' ||
+   ! unzip -p ../editors/vscode/zag-lang.vsix extension/out/extension.js |
+       awk 'index($0, "zag-lsp") { found=1 } END { exit !found }'; then
+    echo "ERROR: VS Code package is corrupt or missing its bundled client/server default." >&2
     exit 1
 fi
 release_manifest_version=$(sed -n \
@@ -208,116 +254,10 @@ echo "  tagged v$VERSION"
 echo ""
 echo "── step 7: build release tarball ──"
 TARNAME="zag-$VERSION-$RELEASE_PLATFORM"
-STAGING_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/zag-release.XXXXXX")
-STAGING="$STAGING_ROOT/$TARNAME"
-cleanup_staging() { rm -rf "$STAGING_ROOT"; }
-release_signal() { cleanup_staging; exit 130; }
-trap cleanup_staging EXIT
-trap release_signal HUP INT TERM
-mkdir -p "$STAGING"
-
-# Primary release artifacts: compiler, planner daemon, and editor server.
-"$release_compiler" selfhost/lsp/zag-lsp.zag "${release_target_args[@]}" \
-    -o "$STAGING/zag-lsp" --no-zagd
-cp "$release_compiler" "$STAGING/znc"
-cp "$release_daemon" "$STAGING/zagd"
-cp bootstrap.sh "$STAGING/"
-
-# Source, tests, install helpers, documentation, and editor integration are
-# required release contents. A copy error must abort instead of silently
-# producing a partial tarball.
-cp Makefile zag.mod "$STAGING/"
-cp -R examples programs tests selfhost std tools docs "$STAGING/"
-cp -R ../editors "$STAGING/"
-# Ignored packaging outputs may exist even in a clean worktree. Keep the editor
-# sources, but never inherit a workstation's dependency tree or an older VSIX.
-rm -rf "$STAGING/editors/vscode/node_modules"
-rm -f "$STAGING/editors/vscode/zag-lang.vsix"
-find "$STAGING" -name '.DS_Store' -delete
-find "$STAGING" -type d -name '.zag-cache' -prune -exec rm -rf {} +
-
-# Ship an installable editor client, not instructions that require users to
-# reconstruct release tooling. Node is a release-packaging dependency only.
-(cd ../editors/vscode && npm ci && npm run package)
-cp ../editors/vscode/zag-lang.vsix "$STAGING/"
-
-# Required license and release documentation. The repository license lives one
-# level above zag-poc, but the archive is a standalone distribution.
-cp ../LICENSE "$STAGING/LICENSE"
-cp README.md BOOTSTRAP.md INSTALL.md CHANGELOG.md COMPATIBILITY.md \
-    NATIVE_BOOTSTRAP_REPRODUCIBILITY.md RELEASES.md VERSIONING.md "$STAGING/"
-
-# Strip generated artifacts from the tarball and reject forbidden source types.
-# This operates only inside the fresh staging directory: ignored workstation
-# binaries are not visible to the clean-worktree preflight, but must never be
-# inherited by any platform archive.
-find "$STAGING" -type d -name '*.dSYM' -prune -exec rm -rf {} +
-find "$STAGING" \( \
-    -name '*.zag.c' -o \
-    -name '*.out' -o \
-    -name '*.zag.zir.c' -o \
-    -name '*.o' -o \
-    -name '*.a' -o \
-    -name '*.a.o' -o \
-    -name '*.dylib' -o \
-    -name '*.so' -o \
-    -name '*.wasm' -o \
-    -name '*.mlir' \
-    \) -delete
-forbidden_artifact=$(find "$STAGING" \( \
-    -name '*.zag.c' -o \
-    -name '*.out' -o \
-    -name '*.zag.zir.c' -o \
-    -name '*.o' -o \
-    -name '*.a' -o \
-    -name '*.a.o' -o \
-    -name '*.dylib' -o \
-    -name '*.so' -o \
-    -name '*.wasm' -o \
-    -name '*.mlir' -o \
-    -name '*.dSYM' \
-    \) -print -quit)
-if [ -n "$forbidden_artifact" ]; then
-    echo "ERROR: forbidden generated artifact remains in release: $forbidden_artifact" >&2
-    exit 1
-fi
-
-# Finder downloads and ordinary copies can attach quarantine/provenance xattrs
-# to otherwise deterministic source inputs. Tell both BSD tar and GNU tar not
-# to serialize them. COPYFILE_DISABLE also prevents macOS copyfile(3) from
-# synthesizing AppleDouble payloads; it is harmless on GNU/Linux.
-
-# Validate the tree users will receive, including native binary identity, the
-# shipped Makefile install recipe, compiler/version coherence, and a native
-# compile/run smoke. The same validator runs after extraction below.
-bash "$STAGING/tests/check_release_package.sh" \
-    "$STAGING" "$RELEASE_PLATFORM" "$VERSION"
-
-COPYFILE_DISABLE=1 tar --no-xattrs -czf "$TARNAME.tar.gz" \
-    -C "$STAGING_ROOT" "$TARNAME"
-EXTRACTED_ROOT="$STAGING_ROOT/extracted"
-EXTRACTED="$EXTRACTED_ROOT/$TARNAME"
-mkdir -p "$EXTRACTED_ROOT"
-COPYFILE_DISABLE=1 tar --no-xattrs -xzf "$TARNAME.tar.gz" \
-    -C "$EXTRACTED_ROOT"
-if ! diff -qr "$STAGING" "$EXTRACTED" >"$STAGING_ROOT/archive.diff"; then
-    echo "ERROR: extracted release differs from staged release:" >&2
-    cat "$STAGING_ROOT/archive.diff" >&2
-    exit 1
-fi
-bash "$EXTRACTED/tests/check_release_package.sh" \
-    "$EXTRACTED" "$RELEASE_PLATFORM" "$VERSION"
-
-if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$TARNAME.tar.gz" >"$TARNAME.tar.gz.sha256"
-elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$TARNAME.tar.gz" >"$TARNAME.tar.gz.sha256"
-else
-    echo "ERROR: SHA-256 tool unavailable (need sha256sum or shasum)" >&2
-    exit 1
-fi
-cleanup_staging
-trap - EXIT HUP INT TERM
+# The exact production recipe is independently exercisable on a development
+# tree. This helper performs no Git writes and refuses existing artifacts.
+bash tools/package-release.sh "$VERSION" "$RELEASE_PLATFORM" \
+    "$release_compiler" "$release_daemon" ../editors/vscode/zag-lang.vsix "$PWD"
 
 echo ""
 echo "════════════════════════════════════════════════════════════════"

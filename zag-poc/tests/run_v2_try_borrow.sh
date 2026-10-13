@@ -10,10 +10,18 @@ if (cd "$tmp" && "$ZNC" main.zag -o out --no-zagd --no-analyze) >"$tmp/log" 2>&1
   echo 'not ok - try-wrapped mutable borrow permits backing release' >&2
   exit 1
 fi
-if rg -q 'exclusive mutable borrow' "$tmp/log" && rg -q 'cannot pass a borrow to a consuming call' "$tmp/log"; then
-  echo 'v2-try-borrow pass=1 fail=0'
-else
-  sed -n '1,80p' "$tmp/log" >&2
-  echo 'v2-try-borrow pass=0 fail=1' >&2
+# Raw allocations participate in the resource provenance checker. Require its
+# retained-view diagnostic from both entry points; an unrelated backend error
+# must never count as proof that `try` preserved the backing owner's identity.
+if (cd "$tmp" && "$ZNC" check main.zag --no-zagd --no-analyze) >"$tmp/check.log" 2>&1; then
+  echo 'not ok - check permits backing release through a try-wrapped borrow' >&2
   exit 1
 fi
+for result in "$tmp/log" "$tmp/check.log"; do
+  if ! rg -Fq 'resource `backing` cannot be released while a container retains a borrowed view' "$result"; then
+    sed -n '1,80p' "$result" >&2
+    echo 'v2-try-borrow pass=0 fail=1' >&2
+    exit 1
+  fi
+done
+echo 'v2-try-borrow pass=2 fail=0'

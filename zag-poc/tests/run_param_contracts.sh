@@ -35,6 +35,14 @@ check_reject() {
         bad "$label"; sed -n '1,12p' "$WORK/$name/log"
     fi
 }
+build_cabi() {
+    dir="$1"
+    if [ "$(uname -s)" = Darwin ]; then
+        (cd "$dir" && "$ZNC_BIN" main.zag --dynamic --no-zagd --no-analyze -o out)
+    else
+        (cd "$dir" && "$ZNC_BIN" main.zag --dynamic --needed libc.so.6 --no-zagd --no-analyze -o out)
+    fi
+}
 
 project format 2027
 printf '%s\n' 'extern fn inspect(left:@borrows *u8,right:@borrows_mut *u8)void @cabi;' 'fn inspect_slices(data:@borrows []u8,out:@borrows_mut []u8)void { }' 'fn main()i32{return 0;}' >"$WORK/format/main.zag"
@@ -126,6 +134,27 @@ printf '%s\n' \
   >"$WORK/exact_argument/main.zag"
 check_reject exact_argument "an unannotated second owner remains fail-closed" 'root `right`'
 
+project owned_slice_pointer_borrow 2027
+printf '%s\n' \
+  'fn inspect(bytes:@borrows *u8,n:i64)void { }' \
+  'fn main() i32 { let d:[]u8=_zag_read_file("payload.bin"); inspect(_zag_slice_ptr(d) as *u8,d.len as i64); _zag_free(_zag_slice_ptr(d)); return 0; }' \
+  >"$WORK/owned_slice_pointer_borrow/main.zag"
+check_ok owned_slice_pointer_borrow "owned slice backing may be projected into an explicit raw-pointer borrow"
+
+project owned_slice_pointer_escape 2027
+printf '%s\n' \
+  'fn retain(bytes:*u8,n:i64)void { }' \
+  'fn main() i32 { let d:[]u8=_zag_read_file("payload.bin"); retain(_zag_slice_ptr(d) as *u8,d.len as i64); _zag_free(_zag_slice_ptr(d)); return 0; }' \
+  >"$WORK/owned_slice_pointer_escape/main.zag"
+check_reject owned_slice_pointer_escape "owned slice backing remains fail-closed for an uncontracted raw-pointer call" 'owned allocation escapes through uncontracted call `retain`'
+
+project owned_slice_pointer_integer_escape 2027
+printf '%s\n' \
+  'fn retain(v:i64)void { }' \
+  'fn main() i32 { let d:[]u8=_zag_read_file("payload.bin"); retain(_zag_slice_ptr(d) as i64); _zag_free(_zag_slice_ptr(d)); return 0; }' \
+  >"$WORK/owned_slice_pointer_integer_escape/main.zag"
+check_reject owned_slice_pointer_integer_escape "pointer-to-integer casts cannot launder owned slice backing" 'owned allocation escapes through uncontracted call `retain`'
+
 project mixed_modes 2027
 printf '%s\n' \
   'fn finish(dead:@consumes *u8,live:@borrows *u8)void { unsafe { _zag_free(dead); } }' \
@@ -207,11 +236,18 @@ printf '%s\n' \
 check_reject declaration_conflict "conflicting contracts across duplicate declarations fail closed" 'conflicting parameter lifetime contracts'
 
 project cabi_multi 2027
-printf '%s\n' \
-  'extern fn memcmp(left:@borrows *u8,right:@borrows *u8,count:i64)i32 @cabi;' \
-  'fn main() i32 { unsafe { let left:*u8=_zag_malloc(8); let right:*u8=_zag_malloc(8); left[0]=42; right[0]=42; let same:i32=memcmp(left,right,8); _zag_free(left); _zag_free(right); if(same==0){return 42;} return 1; } }' \
-  >"$WORK/cabi_multi/main.zag"
-if (cd "$WORK/cabi_multi" && "$ZNC_BIN" main.zag --dynamic --needed libc.so.6 --no-zagd --no-analyze -o out) >"$WORK/cabi_multi/log" 2>&1 && [ -x "$WORK/cabi_multi/out" ]; then
+if [ "$(uname -s)" = Darwin ]; then
+  printf '%s\n' \
+    'extern fn strlen(value:@borrows *i8)i64 @cabi;' \
+    'fn main() i32 { unsafe { let left:[]u8=_zag_strdup("abc"); let right:[]u8=_zag_strdup("defg"); let a:i64=strlen(_zag_slice_ptr(left) as *i8); let b:i64=strlen(_zag_slice_ptr(right) as *i8); _zag_str_free(left); _zag_str_free(right); if(a==3&&b==4){return 42;} return 1; } }' \
+    >"$WORK/cabi_multi/main.zag"
+else
+  printf '%s\n' \
+    'extern fn memcmp(left:@borrows *u8,right:@borrows *u8,count:i64)i32 @cabi;' \
+    'fn main() i32 { unsafe { let left:*u8=_zag_malloc(8); let right:*u8=_zag_malloc(8); left[0]=42; right[0]=42; let same:i32=memcmp(left,right,8); _zag_free(left); _zag_free(right); if(same==0){return 42;} return 1; } }' \
+    >"$WORK/cabi_multi/main.zag"
+fi
+if build_cabi "$WORK/cabi_multi" >"$WORK/cabi_multi/log" 2>&1 && [ -x "$WORK/cabi_multi/out" ]; then
     "$WORK/cabi_multi/out"; rc=$?
     [ "$rc" = 42 ] && ok "multi-pointer parameter contracts execute through libc" || bad "multi-pointer C ABI execution exit=$rc"
 else
@@ -219,11 +255,18 @@ else
 fi
 
 project cabi_null 2027
-printf '%s\n' \
-  'extern fn write(fd:i32,data:@borrows *u8,count:i64)i64 @cabi;' \
-  'fn main() i32 { unsafe { let wrote:i64=write(1,null as *u8,0); if(wrote==0){return 42;} return 1; } }' \
-  >"$WORK/cabi_null/main.zag"
-if (cd "$WORK/cabi_null" && "$ZNC_BIN" main.zag --dynamic --needed libc.so.6 --no-zagd --no-analyze -o out) >"$WORK/cabi_null/log" 2>&1 && [ -x "$WORK/cabi_null/out" ]; then
+if [ "$(uname -s)" = Darwin ]; then
+  printf '%s\n' \
+    'extern fn unlink(path:@borrows *i8)i32 @cabi;' \
+    'fn main() i32 { unsafe { _=unlink(null as *i8); return 42; } }' \
+    >"$WORK/cabi_null/main.zag"
+else
+  printf '%s\n' \
+    'extern fn write(fd:i32,data:@borrows *u8,count:i64)i64 @cabi;' \
+    'fn main() i32 { unsafe { let wrote:i64=write(1,null as *u8,0); if(wrote==0){return 42;} return 1; } }' \
+    >"$WORK/cabi_null/main.zag"
+fi
+if build_cabi "$WORK/cabi_null" >"$WORK/cabi_null/log" 2>&1 && [ -x "$WORK/cabi_null/out" ]; then
     "$WORK/cabi_null/out"; rc=$?
     [ "$rc" = 42 ] && ok "parameter-local C borrow accepts an untracked null pointer" || bad "null-pointer C ABI execution exit=$rc"
 else

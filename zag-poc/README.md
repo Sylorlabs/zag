@@ -3,8 +3,12 @@
 The supported compiler is `znc`. It writes static Linux ELF binaries,
 WebAssembly (`--target wasm`), or GPU MLIR frontend output (`--target gpu-*`).
 Its scoped Apple Silicon development path can write signed PIE Mach-O
-executables with `--target macos-arm64`; that path is executable-only and does
-not imply Linux parity or a general macOS release contract.
+executables, edition-2027 bounded C-ABI objects/static archives (including
+scalar/f32/f64, flat/nested 64-bit-leaf structs, and a flat small
+integer/bool/pointer struct adapter), native dylibs,
+custom dynamically linked executables, and bounded ARM64 Mach-O `.o`/`.a`
+static inputs with `--target macos-arm64`. This does not imply Linux parity,
+arbitrary foreign-object linking, or a general macOS release contract.
 GPU MLIR output is not a GPU executable or dispatch runtime.
 GPU MLIR is not physical GPU execution. No `cc`, no `as`, no `ld`,
 no libc, no Zig, no LLVM is used by these compiler paths.
@@ -64,8 +68,21 @@ More detail lives in [INSTALL.md](INSTALL.md) and [BOOTSTRAP.md](BOOTSTRAP.md). 
 ./znc fmt --in-place source.zag
 ./znc source.zag -o program --run
 ./znc source.zag -o program --debug
+./znc --emit-closure source.zag -o dependency-closure.manifest
 make test
 ```
+
+`--emit-closure` emits the actual transitive source/import graph, resource and
+manifest snapshots, SHA-256 identities, and declared compiler pins. `znc
+emit-closure source.zag` is the equivalent subcommand spelling; the supported
+compiler binary is `znc`, not the retired `zagc`. Manifest toolchain requirements
+are enforced during compilation, including requirements discovered through
+relative imports. Inspection alone does not enforce the recorded pins.
+
+Opt-in native build receipts, content-addressed artifacts, provenance, and
+native callback replay are documented in [Native evidence](docs/NATIVE_EVIDENCE.md).
+That guide states the supported slice and remaining sandbox/instrumentation
+gaps; it is not an all-target parity claim.
 
 `--debug` is the only supported native debug-output request; it appends the
 current bounded DWARF metadata.  `-g`, parameterized/alternate debug spellings,
@@ -153,7 +170,7 @@ bash tests/run_native.sh
 
 `make test` always runs the platform-neutral conformance suites and the native
 release evidence available on the current host. On Apple Silicon that includes
-the Mach-O fixed point, Darwin runtime, dyld/Metal, ARM64 object, tooling,
+the Mach-O fixed point, Darwin runtime, dyld/Metal, ARM64 object/dylib and custom-linking, tooling,
 diagnostic, and program gates. Linux-only ELF, qemu, DRM, and hot-reload rows
 remain explicit targets and are not misreported as macOS failures.
 
@@ -187,11 +204,14 @@ rows and then failed the 9 required unsupported rows. That is strong
 development evidence, not a production release result.
 The passing slices include
 checked native word and byte volatile transactions, fixed unsafe i64 atomic
-load/store/exchange/compare-exchange/fetch-add/sub/and/or/xor operations, bounded Linux futex wait/wake building blocks, a guarded direct-worker Linux spawn/join boundary, scalar plus bounded `f64` `@cabi` dynamic imports, validated x86
-POPCNT/ANDN/trailing-zero intrinsics, bounded SSE2 four-lane integer
+load/store/exchange/compare-exchange/fetch-add/sub/and/or/xor operations, bounded target-native raw wait/wake building blocks, guarded direct-worker spawn/join slices on Linux x86-64 and Apple Silicon, scalar plus bounded `f64` `@cabi` dynamic imports, five compiler-owned scalar CPU intrinsics on native x86-64 and Apple Silicon, bounded SSE2 four-lane integer
 add/subtract/and/or/xor operations,
 and bounded native memory sanitizer coverage with checked 16-byte trailing
-red zones for small ordinary allocations. Checked execution also quarantines
+red zones for small ordinary allocations on native x86-64 and Apple Silicon;
+both physically verified paths also poison quarantined small payloads with
+`0xA5`. Apple Silicon dedicated sanitizer allocations above 512 KiB also use
+a physically verified trailing 16 KiB `PROT_NONE` guard page and poison their
+exact logical payload with `0xA5` immediately before unmap. Checked execution also quarantines
 retired small blocks and rejects ordinary allocator address reuse, preventing
 raw stale aliases from reviving as successor objects within its bounded
 provenance table. General atomics/concurrency,
@@ -201,7 +221,8 @@ native object, static, and shared-object requests also fail closed rather than
 silently producing the wrong artifact. The
 atomic slice has compiler-reserved `AtomicI64` storage with unsafe receiver-only
 operations, plus legacy raw i64 pointer transactions, a separate raw i32 futex
-word boundary, and a Linux/x86-64 unsafe join-only worker slice; it is not a
+word boundary, and a bounded unsafe join-only worker slice on Linux x86-64 and
+Apple Silicon; it is not a
 general memory-order or threading model. The passing count is refreshed only by
 an authoritative post-bootstrap release-gate run.
 Its current checked native x86-64 allocator slice is
@@ -254,3 +275,7 @@ Linux ELF, WASM, GPU MLIR frontend output, and the scoped signed macOS Mach-O
 executable slice are emitted by Zag sources without Python, C, or Zig. The
 Mach-O slice has the explicit unsupported modes in `docs/SUPPORT.md`; GPU MLIR
 is not physical GPU execution.
+
+Compiler speed, what was measured to improve it, and the measured
+*non*-improvements worth not re-attempting are in
+[`docs/PERFORMANCE.md`](docs/PERFORMANCE.md).

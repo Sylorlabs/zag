@@ -292,8 +292,9 @@ non-local store.
 
 ## Implemented volatile/MMIO byte, halfword, dword, and word slice
 
-Edition-2027 native x86-64 provides `@volatileLoad(ptr)` and
-`@volatileStore(ptr, value)` for explicit 64-bit transactions, plus
+Edition-2027 native x86-64 and Apple Silicon macOS provide
+`@volatileLoad(ptr)` and `@volatileStore(ptr, value)` for explicit 64-bit
+transactions, plus
 `@volatileLoad8(ptr)`/`@volatileStore8(ptr, value)`,
 `@volatileLoad16(ptr)`/`@volatileStore16(ptr, value)`, and
 `@volatileLoad32(ptr)`/`@volatileStore32(ptr, value)` for explicit byte,
@@ -311,8 +312,10 @@ native lowering. `@volatileLoad8` zero-extends its loaded byte, and
 preserving the requested device-register width even though the backend's
 scalar stack is 64-bit. Store preserves its checked address across
 value-expression calls before issuing that
-one memory transaction. They are **not atomic**, provide no memory ordering,
-and do not imply a fence.
+one memory transaction. The Apple-Silicon lowering uses the corresponding
+AArch64 byte/halfword/word/doubleword loads and stores; the native gate executes
+them and inspects the width-specific instructions. They are **not atomic**,
+provide no memory ordering, and do not imply a fence.
 
 With `--safety=checked`, a volatile transaction uses the same immediate
 null/alignment/live-allocation/bounds probe as an ordinary raw access. Unknown
@@ -428,14 +431,15 @@ is fixed.  Reading a packed field is lowered as an unaligned byte operation or
 requires unsafe; it is never silently emitted as an invalid aligned load.
 
 The current executable subset is edition-2027 `@repr(C) struct` on Linux
-x86-64 for integer, boolean, and raw-pointer leaves. It applies System V AMD64
-natural field alignment and tail padding; `@sizeOf`, pointer stride, address-of
-field offsets, and exact-width field loads/stores agree. Ordinary Zag structs
-retain the established word layout. `tests/run_repr_c_layout.sh` is the native
-byte/offset authority. The current aggregate contract is pointer-only: direct
-by-value literals, locals, assignments, arguments, and results fail closed.
-Packed layout, general `offset_of` syntax, nested or generic C-layout
-aggregates, floats, and other targets remain unavailable.
+x86-64 and Apple Silicon macOS for integer, boolean, and raw-pointer leaves. It
+applies each target C ABI's natural field alignment and tail padding;
+`@sizeOf`, pointer stride, address-of field offsets, and exact-width field
+loads/stores agree. Ordinary Zag structs retain the established word layout.
+`tests/run_repr_c_layout.sh` is the shared native byte/offset authority. The
+current aggregate contract is pointer-only: direct by-value literals, locals,
+assignments, arguments, and results fail closed. Packed layout, general
+`offset_of` syntax, nested or generic C-layout aggregates, floats, and other
+targets remain unavailable.
 
 Exact-width integers use two's-complement representation.  Endian conversion
 is explicit (`to_le`, `from_be`, and equivalents); native byte order may not be

@@ -5,16 +5,16 @@ cd "$(dirname "$0")/.."
 
 fail=0
 
-# The dynamic-plugin fixture needs one C source for ABI parity; it is explicitly
-# allowed here to prevent false purity failures while retaining a general ban.
+# These two external-loader fixtures provide independent C ABI oracles. Keep
+# the exceptions exact: production compiler and runtime code remains Zag.
 forbidden_files=
 while IFS= read -r file; do
     case "$file" in
-        ./tests/reference_apps/dynamic_plugin/answer_plugin.c) ;;
+        ./tests/reference_apps/dynamic_plugin/answer_plugin.c|./tests/fixtures/macos_dylib_loader.c) ;;
         *) forbidden_files=$'\n'"$file"$forbidden_files ;;
     esac
 done <<EOF
-$(find . -path './.git' -prune -o -type f \
+$(find . \( -path './.git' -o -path './build' \) -prune -o -type f \
     \( -iname '*.c' -o -iname '*.h' -o -iname '*.py' -o -iname '*.zig' -o \
        -iname '*.rs' -o -iname '*.js' -o -iname 'Cargo.toml' -o -iname 'Cargo.lock' \) -print)
 EOF
@@ -24,7 +24,7 @@ if [ -n "$forbidden_files" ]; then
     echo "$forbidden_files"
     fail=1
 else
-    echo "ok no C, header, Python, Zig, Rust, JavaScript, or Cargo source files"
+    echo "ok no non-Zag implementation files; only the two explicit C ABI fixtures are allowed"
 fi
 
 for path in zagc selfhost/zagc selfhost/zagc.zag selfhost/codegen.zag std/runtime.c \

@@ -2,6 +2,24 @@
 # Exercise the release archive layout contract without running release.sh.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. ./tests/portable.sh
+
+# Exercise banner parsing without needing a compiler for this layout-only
+# suite. Real compiler banners are checked again by the archive roundtrip.
+(
+    zag_run_bounded() { printf '%s\n' "$test_banner"; }
+    test_banner='znc 2026.07.0-dev (edition 2026)'
+    test "$(zag_compiler_version ignored)" = 2026.07.0-dev
+    test_banner='znc 2026.07.0 (edition 2027)'
+    test "$(zag_compiler_version ignored)" = 2026.07.0
+    for test_banner in '2026.07.0' 'znc ../../bad (edition 2026)' \
+        'znc 2026.07.0 (edition unknown)' $'znc 2026.07.0 (edition 2026)\nextra'; do
+        if zag_compiler_version ignored >/dev/null 2>&1; then
+            echo 'release layout self-test: invalid version banner accepted' >&2
+            exit 1
+        fi
+    done
+)
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/zag-release-layout.XXXXXX")
 cleanup() { rm -rf "$tmp"; }
@@ -30,6 +48,7 @@ required_files=(
     NATIVE_BOOTSTRAP_REPRODUCIBILITY.md
     RELEASES.md
     VERSIONING.md
+    znc.sha256
     examples/numeric.zag
     examples/zagd.conf
     programs/GAPS.md
@@ -45,9 +64,13 @@ required_files=(
     selfhost/lsp/zag-lsp.zag
     std/checksum.zag
     tests/portable.sh
+    tests/run_zagscript_install_layout.sh
+    tools/package-release.sh
     docs/SUPPORT.md
     docs/MACOS_NATIVE_PARITY.md
+    editors/vscode/LICENSE
     editors/vscode/package.json
+    editors/vscode/package-lock.json
     zag-lang.vsix
 )
 for required_file in "${required_files[@]}"; do
@@ -59,6 +82,7 @@ printf 'name = "zag"\nversion = "2099.01.0"\nedition = "2026"\n' \
 
 for required_executable in \
     znc zagd zag-lsp bootstrap.sh \
+    tools/bootstrap-macos-seed.sh \
     tools/zagd-user-service.sh tools/zagd-launchd-service.sh; do
     printf '#!/usr/bin/env bash\nexit 0\n' >"$fixture/$required_executable"
     chmod +x "$fixture/$required_executable"
@@ -95,6 +119,24 @@ if bash tests/check_release_package.sh --layout-only \
 fi
 mv "$fixture/LICENSE.saved" "$fixture/LICENSE"
 
+mv "$fixture/znc.sha256" "$fixture/znc.sha256.saved"
+if bash tests/check_release_package.sh --layout-only \
+    "$fixture" linux-x86_64 2099.01.0 >/dev/null 2>&1; then
+    echo "release layout self-test: missing compiler checksum was accepted" >&2
+    exit 1
+fi
+mv "$fixture/znc.sha256.saved" "$fixture/znc.sha256"
+
+mv "$fixture/editors/vscode/package-lock.json" \
+    "$fixture/editors/vscode/package-lock.json.saved"
+if bash tests/check_release_package.sh --layout-only \
+    "$fixture" linux-x86_64 2099.01.0 >/dev/null 2>&1; then
+    echo "release layout self-test: missing editor lockfile was accepted" >&2
+    exit 1
+fi
+mv "$fixture/editors/vscode/package-lock.json.saved" \
+    "$fixture/editors/vscode/package-lock.json"
+
 mv "$fixture/tools/zagd-launchd-service.sh" \
     "$fixture/tools/zagd-launchd-service.sh.saved"
 if bash tests/check_release_package.sh --layout-only \
@@ -104,6 +146,16 @@ if bash tests/check_release_package.sh --layout-only \
 fi
 mv "$fixture/tools/zagd-launchd-service.sh.saved" \
     "$fixture/tools/zagd-launchd-service.sh"
+
+mv "$fixture/tools/bootstrap-macos-seed.sh" \
+    "$fixture/tools/bootstrap-macos-seed.sh.saved"
+if bash tests/check_release_package.sh --layout-only \
+    "$fixture" linux-x86_64 2099.01.0 >/dev/null 2>&1; then
+    echo "release layout self-test: missing macOS seed helper was accepted" >&2
+    exit 1
+fi
+mv "$fixture/tools/bootstrap-macos-seed.sh.saved" \
+    "$fixture/tools/bootstrap-macos-seed.sh"
 
 cp "$fixture/zag.mod" "$fixture/zag.mod.saved"
 printf 'name = "zag"\nversion = "2099.02.0"\nedition = "2026"\n' \
@@ -147,6 +199,14 @@ if bash tests/check_release_package.sh --layout-only \
     exit 1
 fi
 rmdir "$fixture/editors/vscode/node_modules"
+
+mkdir "$fixture/editors/vscode/out"
+if bash tests/check_release_package.sh --layout-only \
+    "$fixture" linux-x86_64 2099.01.0 >/dev/null 2>&1; then
+    echo "release layout self-test: stale editor build output was accepted" >&2
+    exit 1
+fi
+rmdir "$fixture/editors/vscode/out"
 
 : >"$fixture/.DS_Store"
 if bash tests/check_release_package.sh --layout-only \

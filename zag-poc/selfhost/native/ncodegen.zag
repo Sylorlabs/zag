@@ -40,6 +40,8 @@
 @import("ncodegen_env.zag")       // FnSym, Env, scope, slots, break/continue
 @import("ncodegen_scan.zag")      // frame pre-scan, type inference, runtime classification
 @import("../zir_contract.zag")    // shared typed IR contract; producer stays out of backend
+@import("../vector_contract.zag") // vector type/op/width vocabulary shared with the vector passes
+@import("../../std/map.zag") as map   // SSA name -> frame slot; see zir_native_disp
 
 // ── decimal integer-literal parser ───────────────────────────────────────────
 // We parse IntLit text ourselves (a small base-10 scanner) rather than calling
@@ -462,6 +464,7 @@ struct Cg {
     dynamic_names: *ArrayList[[]u8], // GOT slots, in declaration order
     allow_popcnt:i32,
     allow_bmi1:i32,
+    allow_avx2:i32, // 1 when runtime-qualified AVX2 lowering is permitted
     safety_checked:i32, // emit edition-2027 raw-pointer null/alignment guards
     sanitize_memory:i32, // checked provenance plus exit-time ordinary-allocation leak failure
     v2_edition:i32,     // 1 when the project is edition 2027 (v2 ownership rules)
@@ -560,10 +563,10 @@ fn cg_fn_has_annot(f: FnDecl, annot: []u8) i32 {
 // The initial C ABI surface is deliberately narrow: one-word integers, bool,
 // pointers, void, and a validated f64 dynamic-import slice. Aggregates and f32
 // use distinct SysV classifications and remain rejected until tested.
-// Callback signatures use only the existing proven integer/pointer register
-// convention.  At the call site a direct captureless Zag function is lowered
-// to its code address, never to the ordinary two-word Zag fat-function block.
-fn cg_dynamic_callback_type_ok(t0: []u8) i32 {
+// Callback signatures normally use only the existing proven integer/pointer
+// convention. Apple Silicon has a separate explicitly selected bounded float
+// callback slice; keep the shared x86/Linux predicate scalar-only.
+fn cg_dynamic_callback_type_ok_mode(t0: []u8, allow_float: i32) i32 {
     if (t0.len < 5 || t0[0] != 'f' || t0[1] != 'n' || t0[2] != '(') { return 0; }
     let close: i32 = 0 - 1;
     let i: i32 = 3;
@@ -577,13 +580,24 @@ fn cg_dynamic_callback_type_ok(t0: []u8) i32 {
     i = 0;
     while (i <= params.len) {
         if (i == params.len || params[i] == ',') {
-            if (i > start && cg_dynamic_scalar_abi_type_ok(params[start..i]) == 0) { return 0; }
+            if (i > start) {
+                let p: []u8 = cg_norm_type(params[start..i]);
+                let fp: i32 = (@strEq(p, "f32") || @strEq(p, "f64")) as i32;
+                if (cg_dynamic_scalar_abi_type_ok(p) == 0 && (allow_float == 0 || fp == 0)) { return 0; }
+            }
             start = i + 1;
         }
         i = i + 1;
     }
-    return cg_dynamic_scalar_abi_type_ok(t0[close + 1..]);
+    let ret: []u8 = cg_norm_type(t0[close + 1..]);
+    if (cg_dynamic_scalar_abi_type_ok(ret) == 1) { return 1; }
+    return (allow_float == 1 && (@strEq(ret, "f32") || @strEq(ret, "f64"))) as i32;
 }
+
+// At the call site a direct captureless Zag function is lowered to its code
+// address, never to the ordinary two-word Zag fat-function block.
+fn cg_dynamic_callback_type_ok(t0: []u8) i32 { return cg_dynamic_callback_type_ok_mode(t0, 0); }
+fn cg_dynamic_float_callback_type_ok(t0: []u8) i32 { return cg_dynamic_callback_type_ok_mode(t0, 1); }
 
 fn cg_dynamic_scalar_abi_type_ok(t0: []u8) i32 {
     let t: []u8 = cg_norm_type(t0);
@@ -805,11 +819,12 @@ fn cg_expr_type(n: *Node, env: *Env, syms: ArrayList[FnSym], cg: *Cg) []u8 {
                             if (len[*Node](c.args) == 2) { return "i64"; }
                             return "";
                         }
-                        if (@strEq(cid.name, "@threadSpawn")) {
-                            if (len[*Node](c.args) == 1) { return "*opaque"; }
+                        if (@strEq(cid.name, "@threadSpawn") || @strEq(cid.name, "@asyncSpawn")) {
+                            if (len[*Node](c.args) == 1 || len[*Node](c.args) == 2) { return "*opaque"; }
                             return "";
                         }
-                        if (@strEq(cid.name, "@threadJoin")) { return "void"; }
+                        if (@strEq(cid.name, "@threadJoin") || @strEq(cid.name, "@asyncJoin")) { return "void"; }
+                        if (@strEq(cid.name, "@asyncCancelled") && len[*Node](c.args) == 0) { return "bool"; }
                         if (@strEq(cid.name, "@volatileLoad8")) {
                             if (len[*Node](c.args) == 1) { return "u8"; }
                             return "";
@@ -1027,7 +1042,14 @@ fn cg_types_compatible(expected0: []u8, actual0: []u8, cg: *Cg) i32 {
     if (expected.len > 0) { if (expected[0] == '*') { ep = 1; } }
     if (actual.len > 0) { if (actual[0] == '*') { ap = 1; } }
     if (ep != ap) { return 0; }
-    if (ep == 1) { return 0; } // different pointee types
+    if (ep == 1) {
+        // `*opaque` is the native runtime's erased pointer type.  Compiler-
+        // generated Script wrappers intentionally spell the context handle as
+        // `*i8` in edition 2026, while the private runtime primitive reports
+        // `*opaque`; both are the same one-word address at this boundary.
+        if (@strEq(expected, "*opaque") || @strEq(actual, "*opaque")) { return 1; }
+        return 0; // different concrete pointee types
+    }
     // Known scalar numeric types retain the backend's existing widening and
     // narrowing behavior. Cast requirements can be tightened in a later edition.
     return 1;
@@ -1508,7 +1530,8 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                                             .annots = fd2.annots, .body = fd2.body,
                                             .is_extern = fd2.is_extern, .ret_eff = fd2.ret_eff,
                                             .caps = fd2.caps, .cap_names = fd2.cap_names,
-                                            .cap_types = tys, .line = fd2.line, .is_pub = fd2.is_pub } };
+                                            .cap_types = tys, .line = fd2.line, .is_pub = fd2.is_pub,
+                                            .origin = fd2.origin } };
                                     }
                                 }
                                 else => { }
@@ -3025,7 +3048,11 @@ fn cg_lower_bin(out: *ArrayList[Instr], bb: Bin, env: *Env, syms: ArrayList[FnSy
     } else if (@strEq(bb.op, "<<")) {
         push[Instr](out, i_shl_cl(R_RAX()));               // shift count already in cl
     } else if (@strEq(bb.op, ">>")) {
-        push[Instr](out, i_sar_cl(R_RAX()));               // arithmetic (signed) shift
+        if (cg_is_unsigned_int_type(cg_expr_type(bb.l, env, syms, cg)) == 1) {
+            push[Instr](out, i_shr_cl(R_RAX()));           // logical unsigned shift
+        } else {
+            push[Instr](out, i_sar_cl(R_RAX()));           // arithmetic signed shift
+        }
     } else {
         cg_err(cg, "native: unsupported binary operator");
         // leave rax = l so we still push something recognizable
@@ -3960,7 +3987,7 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
     // cell before unmapping either mapping.  The child returns at the instruction
     // following `syscall`, so it branches immediately to a compiler-known worker
     // label and never resumes the parent lowering or touches parent frame slots.
-    if (@strEq(b, "threadSpawn")) {
+    if (@strEq(b, "threadSpawn") || @strEq(b, "asyncSpawn")) {
         if (nargs != 1 && nargs != 2) {
             cg_err(cg, "native: @threadSpawn expects a direct worker, optionally followed by one i64 argument");
             push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;
@@ -3992,7 +4019,8 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
         push[Instr](out,i_mov_imm(R_RAX(),9));push[Instr](out,i_syscall());
         push[Instr](out,i_cmp_imm(R_RAX(),0));push[Instr](out,i_jl(fail));
         push[Instr](out,i_store(R_RBP(),handle_slot,R_RAX()));
-        push[Instr](out,i_mov_imm(R_RCX(),0));push[Instr](out,i_store32(R_RAX(),0,R_RCX()));push[Instr](out,i_store(R_RBP(),stack_slot,R_RCX()));
+        push[Instr](out,i_mov_imm(R_RCX(),0));push[Instr](out,i_store32(R_RAX(),0,R_RCX()));
+        push[Instr](out,i_store32(R_RAX(),32,R_RCX()));push[Instr](out,i_store(R_RBP(),stack_slot,R_RCX()));
         if(with_i64==1){push[Instr](out,i_load(R_RCX(),R_RBP(),arg_slot));push[Instr](out,i_store(R_RAX(),24,R_RCX()));}
         // mmap one guard page plus a 64 KiB child stack.
         push[Instr](out,i_mov_imm(R_RDI(),0));push[Instr](out,i_mov_imm(R_RSI(),69632));
@@ -4021,7 +4049,13 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
         // and RDX is the clone parent-TID pointer: our affine handle. The
         // child therefore loads its copied scalar from handle+24 without
         // consulting the parent frame.
-        push[Instr](out,i_label(child));if(with_i64==1){push[Instr](out,i_load(R_RDI(),R_RDX(),24));}push[Instr](out,i_call(worker));
+        push[Instr](out,i_label(child));
+        // Script async context is inherited through reserved r12. Strict
+        // @threadSpawn workers receive a null context and keep explicit thread
+        // semantics; Script workers see their compiler-owned handle.
+        if(@strEq(b,"asyncSpawn")){push[Instr](out,i_mov_rr(R_R12(),R_RDX()));}
+        else{push[Instr](out,i_mov_imm(R_R12(),0));}
+        if(with_i64==1){push[Instr](out,i_load(R_RDI(),R_RDX(),24));}push[Instr](out,i_call(worker));
         push[Instr](out,i_mov_imm(R_RDI(),0));push[Instr](out,i_mov_imm(R_RAX(),60));push[Instr](out,i_syscall());
         // SYS_exit must not return. Loop if a hostile environment violates it,
         // rather than falling through into parent cleanup with a child stack.
@@ -4034,7 +4068,16 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
         push[Instr](out,i_label(done));push[Instr](out,i_push(R_RAX()));return;
     }
 
-    if (@strEq(b, "threadJoin")) {
+    if (@strEq(b,"asyncCancelled")) {
+        if(nargs!=0){cg_err(cg,"native: @asyncCancelled expects no arguments");}
+        let none:i32=cg_fresh(cg);let done_cancel:i32=cg_fresh(cg);
+        push[Instr](out,i_cmp_imm(R_R12(),0));push[Instr](out,i_je(none));
+        push[Instr](out,i_load32(R_RAX(),R_R12(),32));push[Instr](out,i_jmp(done_cancel));
+        push[Instr](out,i_label(none));push[Instr](out,i_mov_imm(R_RAX(),0));
+        push[Instr](out,i_label(done_cancel));push[Instr](out,i_push(R_RAX()));return;
+    }
+
+    if (@strEq(b, "threadJoin") || @strEq(b, "asyncJoin")) {
         if (nargs != 1) { cg_err(cg,"native: @threadJoin expects one *opaque handle");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return; }
         let hty:[]u8=cg_expr_type(get[*Node](c.args,0),env,syms,cg);
         if (@strEq(hty,"*opaque")==0) { cg_err(cg,"native: @threadJoin requires *opaque handle");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return; }
@@ -4045,7 +4088,9 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
         push[Instr](out,i_mov_imm(R_RSI(),0));push[Instr](out,i_mov_imm(R_R10(),0));push[Instr](out,i_mov_imm(R_R8(),0));push[Instr](out,i_mov_imm(R_R9(),0));push[Instr](out,i_mov_imm(R_RAX(),202));push[Instr](out,i_syscall());push[Instr](out,i_jmp(wait));
         push[Instr](out,i_label(clean));push[Instr](out,i_load(R_RDI(),R_RBP(),handle_slot));push[Instr](out,i_load(R_RCX(),R_RDI(),8));push[Instr](out,i_mov_rr(R_RDI(),R_RCX()));push[Instr](out,i_mov_imm(R_RSI(),69632));push[Instr](out,i_mov_imm(R_RAX(),11));push[Instr](out,i_syscall());
         push[Instr](out,i_load(R_RDI(),R_RBP(),handle_slot));push[Instr](out,i_mov_imm(R_RSI(),4096));push[Instr](out,i_mov_imm(R_RAX(),11));push[Instr](out,i_syscall());
-        push[Instr](out,i_label(done));push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;
+        push[Instr](out,i_label(done));
+        if(@strEq(b,"asyncJoin")){switch(get[*Node](c.args,0).*){.id=>|task_id|{let task_disp:i32=cg_slot_find(env.*,task_id.name);if(task_disp!=0-2147483647){push[Instr](out,i_mov_imm(R_RCX(),0));push[Instr](out,i_store(R_RBP(),task_disp,R_RCX()));}}else=>{}}}
+        push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;
     }
 
     if (@strEq(b, "memoryFence")) {
@@ -4682,9 +4727,12 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
     // rejected until they have a typed, independently verified contract.
     if (@strEq(b, "simdAddI32x4") || @strEq(b, "simdSubI32x4") ||
         @strEq(b, "simdAndI32x4") || @strEq(b, "simdOrI32x4") ||
-        @strEq(b, "simdXorI32x4")) {
+        @strEq(b, "simdXorI32x4") ||
+        @strEq(b, "simdAddI32x8") || @strEq(b, "simdSubI32x8") ||
+        @strEq(b, "simdAndI32x8") || @strEq(b, "simdOrI32x8") ||
+        @strEq(b, "simdXorI32x8")) {
         if (nargs != 3) {
-            cg_err(cg, "native: packed i32x4 SIMD expects dst, lhs, rhs raw i32 pointers");
+            cg_err(cg, "native: packed i32x4/i32x8 SIMD expects dst, lhs, rhs raw i32 pointers");
             push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return;
         }
         let dst_ty: []u8 = cg_expr_type(get[*Node](c.args, 0), env, syms, cg);
@@ -4712,22 +4760,50 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
         push[Instr](out, i_store(R_RBP(), ptrs + 8, R_R9()));
         push[Instr](out, i_store(R_RBP(), ptrs + 16, R_R10()));
         push[Instr](out, i_load(R_RAX(), R_RBP(), ptrs + 0)); push[Instr](out, i_mov_rr(R_RDI(), R_RAX()));
-        cg_emit_checked_raw_access(out, cg, 1, 16);
+        let simd_bytes: i32 = 16;
+        if (@strEq(b, "simdAddI32x8") || @strEq(b, "simdSubI32x8") ||
+            @strEq(b, "simdAndI32x8") || @strEq(b, "simdOrI32x8") ||
+            @strEq(b, "simdXorI32x8")) { simd_bytes = 32; }
+        cg_emit_checked_raw_access(out, cg, 1, simd_bytes);
         push[Instr](out, i_load(R_RAX(), R_RBP(), ptrs + 8)); push[Instr](out, i_mov_rr(R_RDI(), R_RAX()));
-        cg_emit_checked_raw_access(out, cg, 1, 16);
+        cg_emit_checked_raw_access(out, cg, 1, simd_bytes);
         push[Instr](out, i_load(R_RAX(), R_RBP(), ptrs + 16)); push[Instr](out, i_mov_rr(R_RDI(), R_RAX()));
-        cg_emit_checked_raw_access(out, cg, 1, 16);
+        cg_emit_checked_raw_access(out, cg, 1, simd_bytes);
         push[Instr](out, i_load(R_R8(), R_RBP(), ptrs + 0));
         push[Instr](out, i_load(R_R9(), R_RBP(), ptrs + 8));
         push[Instr](out, i_load(R_R10(), R_RBP(), ptrs + 16));
-        push[Instr](out, i_movdqu_load(R_XMM0(), R_R9(), 0));
-        push[Instr](out, i_movdqu_load(R_XMM1(), R_R10(), 0));
-        if (@strEq(b, "simdAddI32x4")) { push[Instr](out, i_paddd(R_XMM0(), R_XMM1())); }
-        else if (@strEq(b, "simdSubI32x4")) { push[Instr](out, i_psubd(R_XMM0(), R_XMM1())); }
-        else if (@strEq(b, "simdAndI32x4")) { push[Instr](out, i_pand(R_XMM0(), R_XMM1())); }
-        else if (@strEq(b, "simdOrI32x4")) { push[Instr](out, i_por(R_XMM0(), R_XMM1())); }
-        else { push[Instr](out, i_pxor(R_XMM0(), R_XMM1())); }
-        push[Instr](out, i_movdqu_store(R_R8(), 0, R_XMM0()));
+        if (simd_bytes == 32 && cg.*.allow_avx2 == 1) {
+            push[Instr](out, i_vmovdqu_load(R_YMM0(), R_R9(), 0));
+            push[Instr](out, i_vmovdqu_load(R_YMM1(), R_R10(), 0));
+            if (@strEq(b, "simdAddI32x8")) { push[Instr](out, i_vpaddd(R_YMM0(), R_YMM1())); }
+            else if (@strEq(b, "simdSubI32x8")) { push[Instr](out, i_vpsubd(R_YMM0(), R_YMM1())); }
+            else if (@strEq(b, "simdAndI32x8")) { push[Instr](out, i_vpand(R_YMM0(), R_YMM1())); }
+            else if (@strEq(b, "simdOrI32x8")) { push[Instr](out, i_vpor(R_YMM0(), R_YMM1())); }
+            else { push[Instr](out, i_vpxor(R_YMM0(), R_YMM1())); }
+            push[Instr](out, i_vmovdqu_store(R_R8(), 0, R_YMM0()));
+        } else {
+            push[Instr](out, i_movdqu_load(R_XMM0(), R_R9(), 0));
+            push[Instr](out, i_movdqu_load(R_XMM1(), R_R10(), 0));
+            if (@strEq(b, "simdAddI32x4") || @strEq(b, "simdAddI32x8")) { push[Instr](out, i_paddd(R_XMM0(), R_XMM1())); }
+            else if (@strEq(b, "simdSubI32x4") || @strEq(b, "simdSubI32x8")) { push[Instr](out, i_psubd(R_XMM0(), R_XMM1())); }
+            else if (@strEq(b, "simdAndI32x4") || @strEq(b, "simdAndI32x8")) { push[Instr](out, i_pand(R_XMM0(), R_XMM1())); }
+            else if (@strEq(b, "simdOrI32x4") || @strEq(b, "simdOrI32x8")) { push[Instr](out, i_por(R_XMM0(), R_XMM1())); }
+            else { push[Instr](out, i_pxor(R_XMM0(), R_XMM1())); }
+            push[Instr](out, i_movdqu_store(R_R8(), 0, R_XMM0()));
+            // i32x8 without AVX2 still has an 8-lane semantic contract. The
+            // fallback must execute the upper four lanes instead of silently
+            // producing a partial result.
+            if (simd_bytes == 32) {
+                push[Instr](out, i_movdqu_load(R_XMM0(), R_R9(), 16));
+                push[Instr](out, i_movdqu_load(R_XMM1(), R_R10(), 16));
+                if (@strEq(b, "simdAddI32x8")) { push[Instr](out, i_paddd(R_XMM0(), R_XMM1())); }
+                else if (@strEq(b, "simdSubI32x8")) { push[Instr](out, i_psubd(R_XMM0(), R_XMM1())); }
+                else if (@strEq(b, "simdAndI32x8")) { push[Instr](out, i_pand(R_XMM0(), R_XMM1())); }
+                else if (@strEq(b, "simdOrI32x8")) { push[Instr](out, i_por(R_XMM0(), R_XMM1())); }
+                else { push[Instr](out, i_pxor(R_XMM0(), R_XMM1())); }
+                push[Instr](out, i_movdqu_store(R_R8(), 16, R_XMM0()));
+            }
+        }
         push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX()));
         return;
     }
@@ -5774,6 +5850,59 @@ fn cg_lower_native_rt(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, s
         return 1;
     }
 
+    // Typed process-platform boundary. Linux is the native x86-64 backend;
+    // keep the platform identity and retry errno normalization out of shared
+    // process source. The wait uses one poll-shaped primitive, not a timerfd
+    // or a backend-specific event loop.
+    if (@strEq(fname, "_zag_process_platform_capabilities")) {
+        if (nargs != 0) { cg_err(cg, "native: process platform capabilities expects no arguments"); }
+        push[Instr](out, i_mov_imm(R_RAX(), 61));
+        push[Instr](out, i_push(R_RAX()));
+        return 1;
+    }
+    if (@strEq(fname, "_zag_process_read_disposition")) {
+        if (nargs != 1) { cg_err(cg, "native: process read disposition expects one argument"); push[Instr](out, i_mov_imm(R_RAX(), 2)); push[Instr](out, i_push(R_RAX())); return 1; }
+        let retry: i32 = cg_fresh(cg); let done: i32 = cg_fresh(cg);
+        cg_rt_lower_args(out, c, env, syms, cg);
+        push[Instr](out, i_cmp_imm(R_RDI(), 0 - 11)); push[Instr](out, i_je(retry));
+        push[Instr](out, i_cmp_imm(R_RDI(), 0 - 4)); push[Instr](out, i_je(retry));
+        push[Instr](out, i_mov_imm(R_RAX(), 2)); push[Instr](out, i_jmp(done));
+        push[Instr](out, i_label(retry)); push[Instr](out, i_mov_imm(R_RAX(), 0));
+        push[Instr](out, i_label(done)); push[Instr](out, i_push(R_RAX()));
+        return 1;
+    }
+    if (@strEq(fname, "_zag_process_wait_readable")) {
+        if (nargs != 2) { cg_err(cg, "native: process wait readable expects fd and timeout"); push[Instr](out, i_mov_imm(R_RAX(), 0 - 22)); push[Instr](out, i_push(R_RAX())); return 1; }
+        let timed: i32 = cg_fresh(cg); let failed: i32 = cg_fresh(cg); let done: i32 = cg_fresh(cg);
+        let invalid: i32 = cg_fresh(cg); let bad_fd: i32 = cg_fresh(cg);
+        cg_rt_lower_args(out, c, env, syms, cg);
+        push[Instr](out, i_sub_imm(R_RSP(), 16));
+        push[Instr](out, i_cmp_imm(R_RDI(), -1)); push[Instr](out, i_jl(invalid));
+        push[Instr](out, i_cmp_imm(R_RDI(), 2147483647)); push[Instr](out, i_jg(invalid));
+        push[Instr](out, i_cmp_imm(R_RSI(), 0)); push[Instr](out, i_jl(invalid));
+        push[Instr](out, i_cmp_imm(R_RSI(), 60000)); push[Instr](out, i_jg(invalid));
+        push[Instr](out, i_store32(R_RSP(), 0, R_RDI()));
+        push[Instr](out, i_mov_imm(R_RAX(), 1)); push[Instr](out, i_store16(R_RSP(), 4, R_RAX()));
+        push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_store16(R_RSP(), 6, R_RAX()));
+        push[Instr](out, i_store(R_RSP(), 8, R_RSI()));
+        push[Instr](out, i_mov_imm(R_RAX(), 7)); push[Instr](out, i_mov_rr(R_RDI(), R_RSP()));
+        push[Instr](out, i_mov_imm(R_RSI(), 1)); push[Instr](out, i_load(R_RDX(), R_RSP(), 8));
+        push[Instr](out, i_syscall());
+        push[Instr](out, i_cmp_imm(R_RAX(), 0)); push[Instr](out, i_je(timed));
+        push[Instr](out, i_cmp_imm(R_RAX(), 0 - 4)); push[Instr](out, i_je(timed));
+        push[Instr](out, i_cmp_imm(R_RAX(), 0)); push[Instr](out, i_jl(failed));
+        push[Instr](out, i_load16(R_R10(), R_RSP(), 6));
+        push[Instr](out, i_mov_imm(R_R11(), 32)); push[Instr](out, i_and(R_R10(), R_R11()));
+        push[Instr](out, i_cmp_imm(R_R10(), 0)); push[Instr](out, i_jne(bad_fd));
+        push[Instr](out, i_mov_imm(R_RAX(), 1)); push[Instr](out, i_jmp(done));
+        push[Instr](out, i_label(timed)); push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_jmp(done));
+        push[Instr](out, i_label(invalid)); push[Instr](out, i_mov_imm(R_RAX(), -22)); push[Instr](out, i_jmp(done));
+        push[Instr](out, i_label(bad_fd)); push[Instr](out, i_mov_imm(R_RAX(), -9));
+        push[Instr](out, i_label(failed));
+        push[Instr](out, i_label(done)); push[Instr](out, i_add_imm(R_RSP(), 16)); push[Instr](out, i_push(R_RAX()));
+        return 1;
+    }
+
     // ── the routine-backed runtime fns (RT_* index, expected arg count) ──────
     let idx: i32 = 0 - 1; let want: i32 = 0; let found: i32 = 0;
     if (@strEq(fname, "_zag_str_concat"))       { idx = RT_CONCAT();  want = 2; found = 1; }
@@ -6251,7 +6380,7 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
     } else {
         // If callee is a known generic fn and targs is STILL empty, type inference
         // failed — emit loud error rather than silently calling the wrong symbol.
-        let gcheck: FnDecl = FnDecl{ .name = "", .tparams = make[[]u8](1), .params = make[Param](1), .ret = "", .annots = make[[]u8](1), .body = make[*Node](1), .is_extern = 0, .ret_eff = "", .caps = 0, .cap_names = "", .cap_types = "", .line = 0, .is_pub = 0 };
+        let gcheck: FnDecl = FnDecl{ .name = "", .tparams = make[[]u8](1), .params = make[Param](1), .ret = "", .annots = make[[]u8](1), .body = make[*Node](1), .is_extern = 0, .ret_eff = "", .caps = 0, .cap_names = "", .cap_types = "", .line = 0, .is_pub = 0, .origin = "" };
         if (cg_find_generic_fn(cg.*.decls, fname, &gcheck) == 1) {
             cg_err(cg, "native: could not infer type arguments for generic call (provide them explicitly as foo[T](...))");
         }
@@ -7035,6 +7164,7 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                 let disp: i32 = cg_slot_alloc_typed(env, l.name, lty, 1);
                 cg_emit_norm_scalar_for_ty(out, lty, R_RAX());
                 push[Instr](out, i_store(R_RBP(), disp, R_RAX()));
+                if(l.has_init==1){switch(l.expr.*){.call=>|task_call|{switch(task_call.callee.*){.id=>|task_fn|{if(@strEq(task_fn.name,"@asyncSpawn")){push[i32](&env.*.async_task_disps,disp);}}else=>{}}}else=>{}}}
             }
         }
         .assign => |a| {
@@ -7521,6 +7651,51 @@ fn cg_lower_scoped_block(out: *ArrayList[Instr], body: ArrayList[*Node], env: *E
     cg_scope_end(env, mark);
 }
 
+fn cg_is_direct_async_spawn(n: *Node) i32 {
+    switch (n.*) {
+        .call => |c| {
+            switch (c.callee.*) {
+                .id => |x| { return (@strEq(x.name, "@asyncSpawn")) as i32; }
+                else => { }
+            }
+        }
+        else => { }
+    }
+    return 0;
+}
+
+// Async locals are recorded while every control-flow arm is lowered, including
+// arms that may not execute at runtime. Detect such functions before emitting
+// their prologue so the frame can start zeroed; skipped async declarations then
+// remain null and the structured cleanup safely ignores them.
+fn cg_body_has_async_spawn(body: ArrayList[*Node]) i32 {
+    let i: i32 = 0;
+    while (i < len[*Node](body)) {
+        switch (get[*Node](body, i).*) {
+            .let_ => |l| {
+                if (l.has_init == 1 && cg_is_direct_async_spawn(l.expr) == 1) { return 1; }
+            }
+            .if_ => |x| {
+                if (cg_body_has_async_spawn(x.then_body) == 1 ||
+                    (x.has_els == 1 && cg_body_has_async_spawn(x.els_body) == 1)) { return 1; }
+            }
+            .while_ => |x| { if (cg_body_has_async_spawn(x.body) == 1) { return 1; } }
+            .unsafe_ => |x| { if (cg_body_has_async_spawn(x.body) == 1) { return 1; } }
+            .switch_ => |x| {
+                let ai: i32 = 0;
+                while (ai < x.arms.len) {
+                    if (cg_body_has_async_spawn(x.arms.data[ai].body) == 1) { return 1; }
+                    ai = ai + 1;
+                }
+                if (x.has_els == 1 && cg_body_has_async_spawn(x.els_body) == 1) { return 1; }
+            }
+            else => { }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
 // ── per-function lowering ────────────────────────────────────────────────────
 fn cg_lower_fn(out: *ArrayList[Instr], f: FnDecl, lbl: i32, syms: ArrayList[FnSym], cg: *Cg) void {
     cg.*.cur_fn = f.name;
@@ -7582,6 +7757,15 @@ fn cg_lower_fn(out: *ArrayList[Instr], f: FnDecl, lbl: i32, syms: ArrayList[FnSy
     let pre_epilogue: i32 = cg_fresh(cg);
     let env: Env = cg_env_new(epilogue);
     env.pre_epilogue = pre_epilogue;
+    let has_async_tasks: i32 = cg_body_has_async_spawn(f.body);
+    let async_init_lbl: i32 = 0;
+    let async_body_lbl: i32 = 0;
+    let async_body_done_lbl: i32 = 0;
+    if (has_async_tasks == 1) {
+        async_init_lbl = cg_fresh(cg);
+        async_body_lbl = cg_fresh(cg);
+        async_body_done_lbl = cg_fresh(cg);
+    }
 
     // ── prologue ──
     push[Instr](out, i_label(lbl));
@@ -7693,7 +7877,33 @@ fn cg_lower_fn(out: *ArrayList[Instr], f: FnDecl, lbl: i32, syms: ArrayList[FnSy
     }
 
     // ── body ──
+    // Exact async-local displacements are only known after lowering the body.
+    // Route first entry through a small initialization block emitted after the
+    // function body, then jump back here. This avoids zeroing unrelated frame
+    // words such as ABI/callee-saved spills while still making skipped branch
+    // declarations null for function-exit cleanup.
+    if (has_async_tasks == 1) {
+        push[Instr](out, i_jmp(async_init_lbl));
+        push[Instr](out, i_label(async_body_lbl));
+    }
     cg_lower_block(out, f.body, &env, syms, cg);
+
+    // Exact async-local displacements are known only after lowering. Keep the
+    // initialization block inside this function's pre-epilogue region so the
+    // x86 register-promotion pass rewrites these stores consistently with all
+    // later loads/stores of the same logical task locals.
+    if (has_async_tasks == 1) {
+        push[Instr](out, i_jmp(async_body_done_lbl));
+        push[Instr](out, i_label(async_init_lbl));
+        push[Instr](out, i_mov_imm(R_RAX(), 0));
+        let async_init_i: i32 = 0;
+        while (async_init_i < len[i32](&env.async_task_disps)) {
+            push[Instr](out, i_store(R_RBP(), get[i32](&env.async_task_disps, async_init_i), R_RAX()));
+            async_init_i = async_init_i + 1;
+        }
+        push[Instr](out, i_jmp(async_body_lbl));
+        push[Instr](out, i_label(async_body_done_lbl));
+    }
 
     // The lowering pass owns the true frame high-water mark. Patch the already
     // emitted prologue before optimization/encoding so scanner drift can never
@@ -7735,6 +7945,51 @@ fn cg_lower_fn(out: *ArrayList[Instr], f: FnDecl, lbl: i32, syms: ArrayList[FnSy
             ei = ei - 1;
         }
         push[Instr](out, i_label(skip_err));
+    }
+    // Structured ZagScript async locals are compiler-owned resources. Any
+    // task that was not consumed by an explicit `await` still has a nonzero
+    // handle in its original affine local. Request cooperative cancellation,
+    // wait for CLONE_CHILD_CLEARTID to publish completion, release both native
+    // mappings, and tombstone the local. Do this in reverse declaration order
+    // while the return value remains saved on the machine stack.
+    let ati: i32 = len[i32](&env.async_task_disps) - 1;
+    while (ati >= 0) {
+        let task_disp: i32 = get[i32](&env.async_task_disps, ati);
+        let task_wait: i32 = cg_fresh(cg);
+        let task_clean: i32 = cg_fresh(cg);
+        let task_done: i32 = cg_fresh(cg);
+        push[Instr](out, i_load(R_RDI(), R_RBP(), task_disp));
+        push[Instr](out, i_cmp_imm(R_RDI(), 0));
+        push[Instr](out, i_je(task_done));
+        push[Instr](out, i_mov_imm(R_RCX(), 1));
+        push[Instr](out, i_store32(R_RDI(), 32, R_RCX()));
+        push[Instr](out, i_label(task_wait));
+        push[Instr](out, i_load(R_RDI(), R_RBP(), task_disp));
+        push[Instr](out, i_load32(R_RDX(), R_RDI(), 0));
+        push[Instr](out, i_cmp_imm(R_RDX(), 0));
+        push[Instr](out, i_je(task_clean));
+        push[Instr](out, i_mov_imm(R_RSI(), 0));
+        push[Instr](out, i_mov_imm(R_R10(), 0));
+        push[Instr](out, i_mov_imm(R_R8(), 0));
+        push[Instr](out, i_mov_imm(R_R9(), 0));
+        push[Instr](out, i_mov_imm(R_RAX(), 202));
+        push[Instr](out, i_syscall());
+        push[Instr](out, i_jmp(task_wait));
+        push[Instr](out, i_label(task_clean));
+        push[Instr](out, i_load(R_RDI(), R_RBP(), task_disp));
+        push[Instr](out, i_load(R_RCX(), R_RDI(), 8));
+        push[Instr](out, i_mov_rr(R_RDI(), R_RCX()));
+        push[Instr](out, i_mov_imm(R_RSI(), 69632));
+        push[Instr](out, i_mov_imm(R_RAX(), 11));
+        push[Instr](out, i_syscall());
+        push[Instr](out, i_load(R_RDI(), R_RBP(), task_disp));
+        push[Instr](out, i_mov_imm(R_RSI(), 4096));
+        push[Instr](out, i_mov_imm(R_RAX(), 11));
+        push[Instr](out, i_syscall());
+        push[Instr](out, i_mov_imm(R_RCX(), 0));
+        push[Instr](out, i_store(R_RBP(), task_disp, R_RCX()));
+        push[Instr](out, i_label(task_done));
+        ati = ati - 1;
     }
     push[Instr](out, i_pop(R_RAX()));   // restore return value
 
@@ -11383,7 +11638,7 @@ fn cg_numeric_rt3_src() []u8 {
     return s;
 }
 
-fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8], dynamic_mode: i32,allow_popcnt:i32,allow_bmi1:i32,safety_checked:i32,sanitize_memory:i32,v2_edition:i32,object_mode:i32) ArrayList[Instr] {
+fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8], dynamic_mode: i32,allow_popcnt:i32,allow_bmi1:i32,allow_avx2:i32,safety_checked:i32,sanitize_memory:i32,v2_edition:i32,object_mode:i32) ArrayList[Instr] {
     let out: ArrayList[Instr] = make[Instr](128);
     let top_err: i32 = 0;
 
@@ -11595,6 +11850,7 @@ fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *Ar
         .dynamic_names = &dynamic_names,
         .allow_popcnt=allow_popcnt,
         .allow_bmi1=allow_bmi1,
+        .allow_avx2=allow_avx2,
         .safety_checked=safety_checked,
         .sanitize_memory=sanitize_memory,
         .v2_edition=v2_edition,
@@ -11624,6 +11880,10 @@ fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *Ar
         return out;
     }
     push[Instr](&out, i_mov_rr(15, R_RSP()));   // r15 = initial rsp (argc/argv base)
+    // r12 is reserved for a compiler-owned ZagScript async task context. A
+    // normal process/root function has no task, so make `cancelled()` reliably
+    // false rather than depending on unspecified process-entry register state.
+    push[Instr](&out, i_mov_imm(R_R12(), 0));
     push[Instr](&out, i_call(main_lbl));
     if (cg.sanitize_memory == 1) {
         let leak_free: i32 = cg_fresh(&cg);
@@ -11695,15 +11955,15 @@ fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *Ar
 }
 
 fn lower_program(decls0in: ArrayList[*Node], errout: *i32, dataout: *ArrayList[u8]) ArrayList[Instr] {
-    return lower_program_mode_cpu(decls0in, errout, dataout, 0,0,0,0,0,0,0);
+    return lower_program_mode_cpu(decls0in, errout, dataout, 0,0,0,0,0,0,0,0);
 }
-fn lower_program_mode(decls0in:ArrayList[*Node],errout:*i32,dataout:*ArrayList[u8],dynamic_mode:i32)ArrayList[Instr]{return lower_program_mode_cpu(decls0in,errout,dataout,dynamic_mode,0,0,0,0,0,0);}
-fn lower_program_cpu(decls0in:ArrayList[*Node],errout:*i32,dataout:*ArrayList[u8],allow_popcnt:i32)ArrayList[Instr]{return lower_program_mode_cpu(decls0in,errout,dataout,0,allow_popcnt,0,0,0,0,0);}
+fn lower_program_mode(decls0in:ArrayList[*Node],errout:*i32,dataout:*ArrayList[u8],dynamic_mode:i32)ArrayList[Instr]{return lower_program_mode_cpu(decls0in,errout,dataout,dynamic_mode,0,0,0,0,0,0,0);}
+fn lower_program_cpu(decls0in:ArrayList[*Node],errout:*i32,dataout:*ArrayList[u8],allow_popcnt:i32)ArrayList[Instr]{return lower_program_mode_cpu(decls0in,errout,dataout,0,allow_popcnt,0,0,0,0,0,0);}
 // znc uses this counted entry for the executable-cache boundary. A validated
 // hit must leave the caller-owned witness at zero; a miss must increment it
 // exactly once before authoritative lowering.
-fn lower_program_mode_cpu_counted(decls0in:ArrayList[*Node],errout:*i32,dataout:*ArrayList[u8],dynamic_mode:i32,allow_popcnt:i32,allow_bmi1:i32,witness:*i64)ArrayList[Instr]{witness.*=witness.*+1;return lower_program_mode_cpu(decls0in,errout,dataout,dynamic_mode,allow_popcnt,allow_bmi1,0,0,0,0);}
-fn lower_program_mode_cpu_counted_safety(decls0in:ArrayList[*Node],errout:*i32,dataout:*ArrayList[u8],dynamic_mode:i32,allow_popcnt:i32,allow_bmi1:i32,safety_checked:i32,sanitize_memory:i32,witness:*i64)ArrayList[Instr]{witness.*=witness.*+1;return lower_program_mode_cpu(decls0in,errout,dataout,dynamic_mode,allow_popcnt,allow_bmi1,safety_checked,sanitize_memory,0,0);}
+fn lower_program_mode_cpu_counted(decls0in:ArrayList[*Node],errout:*i32,dataout:*ArrayList[u8],dynamic_mode:i32,allow_popcnt:i32,allow_bmi1:i32,witness:*i64)ArrayList[Instr]{witness.*=witness.*+1;return lower_program_mode_cpu(decls0in,errout,dataout,dynamic_mode,allow_popcnt,allow_bmi1,0,0,0,0,0);}
+fn lower_program_mode_cpu_counted_safety(decls0in:ArrayList[*Node],errout:*i32,dataout:*ArrayList[u8],dynamic_mode:i32,allow_popcnt:i32,allow_bmi1:i32,safety_checked:i32,sanitize_memory:i32,witness:*i64)ArrayList[Instr]{witness.*=witness.*+1;return lower_program_mode_cpu(decls0in,errout,dataout,dynamic_mode,allow_popcnt,allow_bmi1,0,safety_checked,sanitize_memory,0,0);}
 
 // ── verified ZIR scalar lowering ─────────────────────────────────────────────
 // This is the first production path that consumes ZIR operations directly.
@@ -11721,6 +11981,83 @@ fn zir_native_scalar_ty(ty:[]u8)i32{
     if(@strEq(ty,"bool")||@strEq(ty,"i32")){return 1;}
     return 0;
 }
+// A parameter may additionally be a raw pointer.  The vectorizer's address form
+// needs one: the vector load's base is a function parameter, and the scalar
+// epilogue that must remain indexes through the same pointer.  Only the
+// 32-bit-compatible pointee types are admitted, because the index arithmetic
+// below scales by a constant element size and nothing else has been given one.
+fn zir_native_ptr_ty(ty:[]u8)i32{
+    if(ty.len<3||ty[0]!='*'){return 0;}
+    let e:[]u8=ty[1..];
+    if(@strEq(e,"i32")||@strEq(e,"f32")||@strEq(e,"i8")||@strEq(e,"u8")||
+       @strEq(e,"i16")||@strEq(e,"u16")||@strEq(e,"u32")){return 1;}
+    return 0;
+}
+fn zir_native_param_ty(ty:[]u8)i32{
+    if(zir_native_scalar_ty(ty)==1){return 1;}
+    return zir_native_ptr_ty(ty);
+}
+// ── vector values ──────────────────────────────────────────────────────────
+// A vector SSA name becomes a VIRTUAL vector register, and the register number
+// is derived from the name rather than threaded through the emitter as a
+// counter.  ZIR mints `%vN` with a monotone counter and no padding, so N is
+// unique within a module; deriving from the name keeps the lowering a pure
+// function of the IR and removes a state variable that could drift out of step
+// between the slot collector and the emitter.
+fn zir_native_vreg_index(name:[]u8)i32{
+    if(name.len<3||name[0]!='%'||name[1]!='v'){return 0-1;}
+    let n:i64=0;let i:i32=2;let digits:i32=0;
+    while(i<name.len){let c:u8=name[i];
+        if(c<'0'||c>'9'){return 0-1;}
+        n=n*10+((c as i64)-48);digits=digits+1;if(n>1000000){return 0-1;}i=i+1;}
+    if(digits==0){return 0-1;}
+    return n as i32;
+}
+fn zir_native_vreg_by_name(name:[]u8)i32{
+    let n:i32=zir_native_vreg_index(name);
+    if(n<0){return 0-1;}
+    return R_VREG(n);
+}
+fn zir_native_vreg(name:[]u8)i32{
+    let n:i32=zir_native_vreg_index(name);
+    if(n<0){return 0-1;}
+    return R_VREG(n);
+}
+fn zir_native_is_vec_ty(ty:[]u8)i32{return zvec_is_vector_ty(ty);}
+// `memref<vector<ELEM,N>>` names a slot holding a WHOLE VECTOR VALUE, which is
+// how the lane-wise accumulator is carried across the loop's back edge.  The
+// spelling comes from vector_contract.zag, beside the producer that writes it.
+fn zir_native_vec_memref_inner(ty:[]u8)[]u8{return zvec_memref_vec_ty(ty);}
+// Frame words a vector slot occupies.  A vector slot is the ONE vector result
+// that really does live in memory, and it must be wide enough for the whole
+// register: under-reserving it would have the loop's load and store overlap
+// whatever the collector handed to the next value.
+fn zir_native_vec_slot_words(ty:[]u8)i32{
+    let inner:[]u8=zir_native_vec_memref_inner(ty);
+    if(inner.len==0){return 0;}
+    let w:i32=zir_native_vec_w(inner);
+    if(w<0){return 0;}
+    return zvec_wclass_bytes(w)/8;
+}
+// Width class and element size of a vector type, both straight from the ladder
+// in vector_contract.zag so the lowering cannot invent its own mapping.
+//
+// Lanes are ELEMENTS and an element is a whole 8-byte word, so the ladder needs
+// 32-bit-equivalent UNITS, not lanes: 2 i32 elements are 4 units (a 128-bit
+// request) and 4 are 8 (256-bit).  Reading `zvec_lanes` as units agrees only at
+// the 128-bit rung by coincidence, and above it picks a register half the width
+// the vector actually occupies.
+fn zir_native_vec_w(ty:[]u8)i32{return zvec_wclass_for_lanes(zvec_32bit_units(zvec_lanes(ty),zvec_elem_ty(ty)));}
+fn zir_native_vec_eb(ty:[]u8)i32{return zvec_elem_bytes(zvec_elem_ty(ty));}
+// Index of the op in `blk` that defines `name`, or -1.  Used to recover the two
+// operands of an address splat at the point its broadcast is lowered: the splat
+// result has no stack word of its own, so its base and index have to be found
+// from the definition rather than from a slot.
+fn zir_native_find_def(blk:ZBlock,name:[]u8)i32{
+    let i:i32=0;while(i<blk.ops.len){let o:ZOp=blk.ops.data[i];
+        let r:i32=0;while(r<o.results.len){if(@strEq(o.results.data[r].name,name)){return i;}r=r+1;}i=i+1;}
+    return 0-1;
+}
 fn zir_native_ret_ty(ty:[]u8)i32{
     // Void functions can be compiled directly if all other constraints pass.
     if(@strEq(ty,"void")==1){return 1;}
@@ -11732,8 +12069,20 @@ fn zir_native_fn_label(fs:ArrayList[ZirNativeFn],name:[]u8)i32{
 fn zir_native_fn_index(fs:ArrayList[ZirNativeFn],name:[]u8)i32{
     let i:i32=0;while(i<fs.len){if(@strEq(fs.data[i].name,name)){return i;}i=i+1;}return 0-1;
 }
-fn zir_native_disp(bs:ArrayList[ZirNativeBind],name:[]u8)i32{
-    let i:i32=bs.len-1;while(i>=0){if(@strEq(bs.data[i].name,name)){return bs.data[i].disp;}i=i-1;}return 0;
+// SSA name -> frame displacement.  This used to be a linear scan backwards
+// through the function's bind list, which made the whole ZIR-direct route
+// O(words^2) per function and forced an arbitrary module-size bound to keep the
+// compiler from trying to self-compile through it.  A map makes the lookup
+// constant time, so the route scales with the language instead of with a
+// constant.  A missing name yields 0, which is the first slot word; that only
+// happens for a name the verifier would already have rejected.
+fn zir_native_disp(slots:map.StringMap[i32],name:[]u8)i32{
+    return map.get[i32](slots,name) orelse 0;
+}
+fn zir_native_slots_of(bs:ArrayList[ZirNativeBind])map.StringMap[i32]{
+    let m:map.StringMap[i32]=map.make[i32](bs.len*2+8);
+    let i:i32=0;while(i<bs.len){map.put[i32](&m,bs.data[i].name,bs.data[i].disp);i=i+1;}
+    return m;
 }
 fn zir_native_i32_magnitude(text:[]u8,limit:i64)i32{
     if(text.len==0||text[0]=='+'||text[0]=='-'||(text[0]=='0'&&text.len!=1)){return 0;}
@@ -11758,6 +12107,95 @@ fn zir_native_predicate_exact(value:[]u8)i32{
         @strEq(value,"sle")||@strEq(value,"sgt")||@strEq(value,"sge")) as i32;
 }
 fn zir_native_block_supported(blk:ZBlock,fs:ArrayList[ZirNativeFn],ret_ty:[]u8)i32;
+fn zir_native_vec_op_supported(o:ZOp)i32{
+    // Only the ops the vectorizer actually produces are admitted.  Anything
+    // else in the `vector.` dialect falls through to the AST bridge, which is
+    // the correct behaviour for an op this backend has not proven it can encode.
+    if(@strEq(o.name,"vector.splat")){
+        // One form lifts a scalar accumulator; the other is an address splat and
+        // carries the index as a SECOND operand.  Both have one result.
+        if(o.results.len!=1||o.operands.len<1||o.operands.len>2){return 0;}
+        if(zir_native_is_vec_ty(o.results.data[0].ty)==0){return 0;}
+        if(o.operands.len==1){
+            return (zir_native_scalar_ty(o.operands.data[0].ty)==1) as i32;}
+        // The address form's base must be a pointer parameter and its index a
+        // scalar: that is exactly the window the alias analysis proved safe.
+        if(zvec_is_ptr_vec_ty(o.results.data[0].ty)==0){return 0;}
+        if(zir_native_ptr_ty(o.operands.data[0].ty)==0){return 0;}
+        return (zir_native_scalar_ty(o.operands.data[1].ty)==1) as i32;
+    }
+    if(@strEq(o.name,"vector.broadcast")){
+        // A load-shaped op, so it is the ONLY vector op that reads memory.  Only
+        // the ADDRESS form is admitted: the source is a pointer vector whose
+        // definition supplies a base and an index, which the emitter turns into
+        // a scaled-index load.  A `memref<ELEM>` source is left to the AST bridge
+        // rather than guessed at, because a memref slot in this backend holds a
+        // value and not a base address.
+        if(o.results.len!=1||o.operands.len!=1){return 0;}
+        if(zir_native_is_vec_ty(o.results.data[0].ty)==0){return 0;}
+        return zvec_is_ptr_vec_ty(o.operands.data[0].ty);
+    }
+    if(@strEq(o.name,"memref.alloca")){
+        // A vector SLOT.  Distinct from a scalar alloca, which the scalar rules
+        // below handle; the vector slot is what carries an accumulator across
+        // the loop's back edge.
+        if(o.results.len!=1){return 0;}
+        let inner:[]u8=zir_native_vec_memref_inner(o.results.data[0].ty);
+        if(inner.len==0){return 0;}
+        if(zir_native_vec_w(inner)<0){return 0;}
+        return (zvec_lanes(inner)>0) as i32;
+    }
+    if(@strEq(o.name,"memref.load")){
+        // Loading a WHOLE VECTOR out of its slot.  The result must be the same
+        // shape as the slot, or the load would move a different number of bytes
+        // than the slot was sized for.
+        if(o.results.len!=1||o.operands.len!=1){return 0;}
+        if(zir_native_is_vec_ty(o.results.data[0].ty)==0){return 0;}
+        let inner:[]u8=zir_native_vec_memref_inner(o.operands.data[0].ty);
+        if(inner.len==0){return 0;}
+        return zvec_same_shape(o.results.data[0].ty,inner);
+    }
+    if(o.results.len==0&&o.operands.len==2&&@strEq(o.name,"memref.store")&&
+       zir_native_is_vec_ty(o.operands.data[0].ty)==1&&
+       zir_native_vec_memref_inner(o.operands.data[1].ty).len>0){
+        // A PLAIN vector store into a VECTOR slot.  This is the loop-carried half
+        // of the lane-wise accumulator, and it is NOT a fold.
+        //
+        // The VECTOR SLOT in the guard is what keeps the two apart.  Both forms
+        // store a vector and differ only in the destination, so testing "is this
+        // a vector store" claims the horizontal fold too -- and then rejects it on
+        // the `reduce` attribute the fold legitimately carries, refusing the
+        // accumulator write the loop cannot run without.  A store into a SCALAR
+        // slot therefore falls THROUGH to the fold rule below.
+        if(attr_val(o,"reduce").len!=0){return 0;}
+        return zvec_same_shape(o.operands.data[0].ty,
+            zir_native_vec_memref_inner(o.operands.data[1].ty));
+    }
+    if(o.results.len==0&&o.operands.len==2&&@strEq(o.name,"memref.store")){
+        // The horizontal fold: a vector value stored back into a scalar slot.
+        // The slot's element type must be the vector's element type, or the fold
+        // would reinterpret the accumulator.
+        if(zir_native_is_vec_ty(o.operands.data[0].ty)==0){return 0;}
+        if(!@strEq(attr_val(o,"reduce"),"add")){return 0;}
+        if(zir_native_scalar_ty(attr_val(o,"elem"))==0){return 0;}
+        if(zir_native_memref_exact(o.operands.data[1].ty,attr_val(o,"elem"))==0){return 0;}
+        return (zvec_elem_bytes(zvec_elem_ty(o.operands.data[0].ty))==
+            zvec_elem_bytes(attr_val(o,"elem"))) as i32;
+    }
+    if(@strEq(o.name,"vector.add")||@strEq(o.name,"vector.sub")||
+       @strEq(o.name,"vector.mul")||@strEq(o.name,"vector.bit_and")||
+       @strEq(o.name,"vector.bit_or")||@strEq(o.name,"vector.bit_xor")){
+        if(o.results.len!=1||o.operands.len!=2){return 0;}
+        if(zvec_same_shape(o.results.data[0].ty,o.operands.data[0].ty)==0){return 0;}
+        if(zvec_same_shape(o.results.data[0].ty,o.operands.data[1].ty)==0){return 0;}
+        // Only the packable integer widths have a lowering here.  A float
+        // element would need the reduction rule to be re-proved for FP, which
+        // the vectorizer refuses anyway (ZR_NOOP).
+        return (zir_native_vec_eb(o.results.data[0].ty)==4||
+            zir_native_vec_eb(o.results.data[0].ty)==8) as i32;
+    }
+    return 0;
+}
 fn zir_native_op_supported(o:ZOp,fs:ArrayList[ZirNativeFn],ret_ty:[]u8)i32{
     if(@strEq(o.name,"scf.if")){
         if(o.operands.len!=1||!@strEq(o.operands.data[0].ty,"bool")||
@@ -11782,6 +12220,25 @@ fn zir_native_op_supported(o:ZOp,fs:ArrayList[ZirNativeFn],ret_ty:[]u8)i32{
         return (defaults<=1) as i32;
     }
     if(o.regions.len!=0){return 0;}
+    // A vector-valued op, or the store that folds a vector back into a scalar
+    // slot.  Both are dispatched to the vector admission rules; everything else
+    // falls through to the scalar cases below.
+    let vec_result:i32=0;
+    if(o.results.len==1){
+        vec_result=zir_native_is_vec_ty(o.results.data[0].ty);
+        // A vector SLOT's result type is a memref OF a vector, not a vector, so
+        // the plain type test misses it and the op would fall through to the
+        // scalar alloca rule, which refuses it as a non-scalar element -- and the
+        // whole function would then silently fall back to the scalar bridge.
+        if(vec_result==0){
+            vec_result=(zir_native_vec_memref_inner(o.results.data[0].ty).len>0) as i32;
+        }
+    }
+    let vec_store:i32=0;
+    if(o.results.len==0&&@strEq(o.name,"memref.store")&&o.operands.len==2){
+        vec_store=zir_native_is_vec_ty(o.operands.data[0].ty);
+    }
+    if(vec_result==1||vec_store==1){return zir_native_vec_op_supported(o);}
     if(@strEq(o.name,"arith.constant")){
         if(o.results.len!=1||o.operands.len!=0||o.attrs.len!=1||
            !@strEq(o.attrs.data[0].key,"value")){return 0;}
@@ -11794,6 +12251,9 @@ fn zir_native_op_supported(o:ZOp,fs:ArrayList[ZirNativeFn],ret_ty:[]u8)i32{
             zir_native_memref_exact(o.results.data[0].ty,attr_val(o,"elem"))==1) as i32;
     }
     if(@strEq(o.name,"memref.load")){
+        // `splat="1"` marks the seed of a vector value.  The load itself is
+        // still an ordinary scalar load; only the following `vector.splat`
+        // differs, so the marker does not change what this admits.
         return (o.results.len==1&&o.operands.len==1&&zir_native_scalar_ty(attr_val(o,"elem"))==1&&
             @strEq(o.results.data[0].ty,attr_val(o,"elem"))&&
             zir_native_memref_exact(o.operands.data[0].ty,attr_val(o,"elem"))==1) as i32;
@@ -11814,6 +12274,33 @@ fn zir_native_op_supported(o:ZOp,fs:ArrayList[ZirNativeFn],ret_ty:[]u8)i32{
             @strEq(o.operands.data[0].ty,"i32")&&@strEq(o.operands.data[1].ty,"i32")&&
             o.attrs.len==1&&@strEq(o.attrs.data[0].key,"predicate")&&
             zir_native_predicate_exact(o.attrs.data[0].val)==1) as i32;
+    }
+    if(@strEq(o.name,"zag.cast")){
+        // Every value this route handles lives in a full 64-bit frame word, so a
+        // cast between two of them is a register move and cannot reinterpret or
+        // truncate anything. Nothing wider or aggregate is admitted.
+        //
+        // This is also the only construct in the direct subset that can produce
+        // a POINTER value, which is what makes a pointer-argument function --
+        // and therefore the vectorized one -- callable, and testable, at all.
+        if(o.results.len!=1||o.operands.len!=1){return 0;}
+        let a_ptr:i32=zir_native_ptr_ty(o.operands.data[0].ty);
+        let b_ptr:i32=zir_native_ptr_ty(o.results.data[0].ty);
+        let a_ok:i32=a_ptr+zir_native_scalar_ty(o.operands.data[0].ty);
+        let b_ok:i32=b_ptr+zir_native_scalar_ty(o.results.data[0].ty);
+        if(a_ok==1&&b_ok==1){return 1;}
+        return 0;
+    }
+    if(@strEq(o.name,"zag.index")){
+        // An indexed element read: base pointer, i32 index, scalar element
+        // result.  This is the op the vector loop's scalar epilogue is made of,
+        // and the ZIR-direct route could not lower a vectorized loop without it.
+        if(o.results.len!=1||o.operands.len!=2){return 0;}
+        if(zir_native_ptr_ty(o.operands.data[0].ty)==0){return 0;}
+        if(!@strEq(o.operands.data[1].ty,"i32")){return 0;}
+        if(zir_native_scalar_ty(o.results.data[0].ty)==0){return 0;}
+        if(!@strEq(o.results.data[0].ty,o.operands.data[0].ty[1..])){return 0;}
+        return 1;
     }
     if(@strEq(o.name,"func.call")){
         if(o.attrs.len!=1||!@strEq(o.attrs.data[0].key,"callee")){return 0;}
@@ -11864,6 +12351,8 @@ fn zir_native_ast_expr(n:*Node)i32{
             @strEq(b.op,"<")||@strEq(b.op,"<=")||@strEq(b.op,">")||
             @strEq(b.op,">=")) as i32;
             return (op_ok==1&&zir_native_ast_expr(b.l)==1&&zir_native_ast_expr(b.r)==1) as i32;}
+        .idx=>|x|{return (zir_native_ast_expr(x.base)==1&&zir_native_ast_expr(x.idx)==1) as i32;}
+        .cast_=>|c|{return zir_native_ast_expr(c.expr);}
         .call=>|c|{switch(c.callee.*){.id=>|_id|{}else=>{return 0;}}
             let i:i32=0;while(i<c.args.len){if(zir_native_ast_expr(c.args.data[i])==0){return 0;}i=i+1;}return 1;}
         else=>{return 0;}
@@ -11874,8 +12363,11 @@ fn zir_native_int_tag(s:[]u8)i32{
 }
 fn zir_native_ast_body_mode(body:ArrayList[*Node],allow_let:i32,in_loop:i32,ret_ty:[]u8)i32{
     let i:i32=0;while(i<body.len){switch(body.data[i].*){
+        // A local may hold a pointer as well as a scalar: a same-width cast
+        // binds one, and without that a pointer-argument function is
+        // unreachable from any program this route will lower.
         .let_=>|l|{if(allow_let==0||l.is_global==1||l.has_init==0||l.has_dty!=1||
-            zir_native_scalar_ty(l.dty)==0||zir_native_ast_expr(l.expr)==0){return 0;}}
+            zir_native_param_ty(l.dty)==0||zir_native_ast_expr(l.expr)==0){return 0;}}
         .assign=>|a|{switch(a.target.*){.id=>|_id|{}else=>{return 0;}}
             if(zir_native_ast_expr(a.expr)==0){return 0;}}
         .ret=>|r|{
@@ -11911,7 +12403,9 @@ fn zir_native_ast_subset(decls:ArrayList[*Node])i32{
             // Captured environments are not represented by the direct ZIR ABI.
             if(f.is_extern==1||f.caps!=0||f.cap_names.len!=0||f.tparams.len!=0||zir_native_ret_ty(f.ret)==0||
                f.body.len==0||zir_native_ast_body(f.body,f.ret)==0){return 0;}
-            let p:i32=0;while(p<f.params.len){if(zir_native_scalar_ty(f.params.data[p].pty)==0){return 0;}p=p+1;}
+            // Params may be raw pointers as well as scalars: a vectorized loop
+            // needs one for its base, and its scalar epilogue indexes through it.
+            let p:i32=0;while(p<f.params.len){if(zir_native_param_ty(f.params.data[p].pty)==0){return 0;}p=p+1;}
         }
         else=>{return 0;}
     }i=i+1;}return 1;
@@ -11953,7 +12447,7 @@ fn zir_native_subset_supported(ir:ZirAuthority)i32{
         // operation whitelists below restrict this route to defined / and %.
         // Allocation, I/O, locking, async, and every other effect stay fallback.
         if((f.effects!=0&&f.effects!=2)||f.params.len>6||zir_native_ret_ty(f.ret)==0){free[ZirNativeFn](&fs);return 0;}
-        let p:i32=0;while(p<f.params.len){if(zir_native_scalar_ty(f.params.data[p].ty)==0){free[ZirNativeFn](&fs);return 0;}p=p+1;}
+        let p:i32=0;while(p<f.params.len){if(zir_native_param_ty(f.params.data[p].ty)==0){free[ZirNativeFn](&fs);return 0;}p=p+1;}
         push[ZirNativeFn](&fs,ZirNativeFn{.name=f.name,.lbl=i+1,.ret=f.ret,.params=f.params});i=i+1;
     }
     if(have_main==0){free[ZirNativeFn](&fs);return 0;}
@@ -11964,6 +12458,57 @@ fn zir_native_subset_supported(ir:ZirAuthority)i32{
     }
     free[ZirNativeFn](&fs);return 1;
 }
+// The name of the first op this route refuses, or "" if it refuses none.
+//
+// The route's fallback is otherwise SILENT, which makes "this backend cannot
+// encode this shape" indistinguishable from "this program was never a
+// candidate".  For a vectorized function that is the difference between "the
+// vector code is in the binary" and "the vector code was quietly thrown away
+// and a scalar build was emitted instead", with the same exit code.
+fn zir_native_first_unsupported(blk:ZBlock,fs:ArrayList[ZirNativeFn],ret_ty:[]u8)[]u8{
+    let i:i32=0;
+    while(i<blk.ops.len){
+        let o:ZOp=blk.ops.data[i];
+        if(zir_native_op_supported(o,fs,ret_ty)==0){return o.name;}
+        let r:i32=0;
+        while(r<o.regions.len){
+            let region:ZRegion=o.regions.data[r];
+            let b:i32=0;
+            while(b<region.blocks.len){
+                let n:[]u8=zir_native_first_unsupported(region.blocks.data[b],fs,ret_ty);
+                if(n.len>0){return n;}
+                b=b+1;}
+            r=r+1;}
+        i=i+1;}
+    return "";
+}
+// Why `zir_native_subset_supported` would say no, in words.  "" means it would.
+fn zir_native_refusal_reason(ir:ZirAuthority)[]u8{
+    if(ir.valid==0){return "authority-invalid";}
+    if(ir.module.funcs.len==0){return "no-functions";}
+    if(zir_native_ast_subset(ir.ast_bridge)==0){return "ast-subset";}
+    if(zir_native_transform_selection_supported(ir)==0){return "transform-selection";}
+    let fs:ArrayList[ZirNativeFn]=make[ZirNativeFn](ir.module.funcs.len+1);
+    let why:[]u8="";
+    let i:i32=0;
+    while(i<ir.module.funcs.len){
+        let f:ZFunc=ir.module.funcs.data[i];
+        if(@strEq(f.name,"main")&&(f.params.len!=0||zir_native_scalar_ty(f.ret)==0)){why="main-signature";break;}
+        if(f.effects!=0&&f.effects!=2){why="function-effects";break;}
+        if(f.params.len>6){why="too-many-params";break;}
+        if(zir_native_ret_ty(f.ret)==0){why="return-type";break;}
+        push[ZirNativeFn](&fs,ZirNativeFn{.name=f.name,.lbl=i+1,.ret=f.ret,.params=f.params});i=i+1;}
+    if(why.len==0){
+        i=0;
+        while(i<ir.module.funcs.len){
+            let f:ZFunc=ir.module.funcs.data[i];
+            let n:[]u8=zir_native_first_unsupported(f.body,fs,f.ret);
+            if(n.len>0){why=n;break;}
+            if(zir_native_control_valid(f.body,0)==0){why="control-structure";break;}
+            i=i+1;}}
+    free[ZirNativeFn](&fs);
+    return why;
+}
 fn zir_native_pred_cc(pred:[]u8)i32{
     if(@strEq(pred,"eq")){return CC_E();}if(@strEq(pred,"ne")){return CC_NE();}
     if(@strEq(pred,"slt")){return CC_L();}if(@strEq(pred,"sle")){return CC_LE();}
@@ -11971,8 +12516,32 @@ fn zir_native_pred_cc(pred:[]u8)i32{
 }
 fn zir_native_collect_block_slots(blk:ZBlock,bs:*ArrayList[ZirNativeBind],words:*i32)void{
     let i:i32=0;while(i<blk.ops.len){let o:ZOp=blk.ops.data[i];let r:i32=0;
-        while(r<o.results.len){words.*=words.*+1;push[ZirNativeBind](bs,
-            ZirNativeBind{.name=o.results.data[r].name,.disp=0-8*words.*});r=r+1;}
+        while(r<o.results.len){
+            // A vector result gets NO stack word: it lives in a vector register
+            // named after the value, and giving it frame space would both waste
+            // a word and hide the fact that the emitter never writes it.
+            // The exception is a vector SLOT -- a `memref.alloca` of a vector
+            // type -- which is exactly where a loop-carried vector value IS
+            // written.  It gets its full register width, or the loop's load and
+            // store would land on top of whatever came next.
+            // The VECTOR SLOT test must come first.  A vector slot's result type
+            // is `memref<vector<ELEM,N>>`, which is NOT itself a vector type, so
+            // the plain "is this a vector result" test below does not match it
+            // and the slot would be sized at ONE word.  The slot is 16/32/64
+            // bytes wide, so the next value lands inside it: the loop's step
+            // constant gets overwritten with the slot's low bytes, the step
+            // becomes 0, and the loop never terminates.
+            if(@strEq(o.name,"memref.alloca")==1&&
+               zir_native_vec_memref_inner(o.results.data[r].ty).len>0){
+                let nw:i32=zir_native_vec_slot_words(o.results.data[r].ty);
+                if(nw<1){nw=1;}
+                words.*=words.*+nw;push[ZirNativeBind](bs,
+                    ZirNativeBind{.name=o.results.data[r].name,.disp=0-8*words.*});
+            }else if(zir_native_is_vec_ty(o.results.data[r].ty)==0){
+                words.*=words.*+1;push[ZirNativeBind](bs,
+                    ZirNativeBind{.name=o.results.data[r].name,.disp=0-8*words.*});
+            }
+            r=r+1;}
         let ri:i32=0;while(ri<o.regions.len){let region:ZRegion=o.regions.data[ri];let bi:i32=0;
             while(bi<region.blocks.len){zir_native_collect_block_slots(region.blocks.data[bi],bs,words);bi=bi+1;}ri=ri+1;}i=i+1;}
 }
@@ -11994,23 +12563,82 @@ fn zir_native_emit_div0(out:*ArrayList[Instr],lbl:i32,off:i32)void{
     push[Instr](out,i_mov_imm(R_RAX(),60));push[Instr](out,i_mov_imm(R_RDI(),134));
     push[Instr](out,i_syscall());push[Instr](out,i_ret());
 }
-fn zir_native_emit_block(out:*ArrayList[Instr],blk:ZBlock,bs:ArrayList[ZirNativeBind],
+// Fold the lanes of `vreg` into RAX with integer adds.
+//
+// Lanes fold as whole 64-bit WORDS, which is what makes a reduction worth
+// vectorizing.  `vpshufd` permutes 32-bit lanes, but $0x4E selects [2,3,0,1],
+// which within each 128-bit chunk swaps the two 64-bit halves -- so the one
+// existing shuffle opcode halves a word pair without a second shuffle family:
+//
+//   t = vpshufd(vres, 0x4E)  -> [q1,q0,q1,q0] per 128-bit chunk
+//   t = vpaddq(t, vres)       -> [q0+q1, q0+q1, ...] : each chunk totalled
+//   rax = t[0]; for each further chunk L: rax += t[L*2]
+//
+// That is ONE shuffle and ONE add for the whole vector, then one 64-bit
+// extract per 128-bit chunk: 1 / 2 / 4 extractions at 128 / 256 / 512 bits.
+// A 32-bit-lane tree cannot beat that here, and the packed-32 model this used
+// to assume was not even the memory layout: see zvec_elem_stride.
+fn zir_native_vec_fold_word(out:*ArrayList[Instr],vreg:i32,lanes:i32,w:i32,scratch:i32)void{
+    push[Instr](out,i_vshuf32(scratch,vreg,0x4E,w));
+    // dst = s1 + s2, so this must read the scratch as ONE of the addends.
+    // Naming `vreg` twice computes vreg+vreg, which doubles the vector instead
+    // of totalling it -- the same class of error the old 32-bit tree made.
+    push[Instr](out,i_vpaddq(scratch,scratch,vreg,w));
+    push[Instr](out,i_mov_imm(R_RAX(),0));
+    // One 128-bit chunk per 16 bytes of the width class, regardless of how many
+    // ELEMENTS that is: the chunk count is a property of the register, not of
+    // the lane type.
+    let nch:i32=zvec_wclass_bytes(w)/16;
+    if(nch<1){nch=1;}
+    let l:i32=0;
+    while(l<nch){
+        push[Instr](out,i_vextract64(R_RCX(),scratch,l*2,scratch,w));
+        push[Instr](out,i_add(R_RAX(),R_RCX()));
+        l=l+1;
+    }
+}
+// The extract-based fold, for the (currently unadmitted) non-word lane types.
+// Correct for any lane count: RAX is zeroed once and thereafter only ever READ
+// by the add, so no lane can be clobbered before it has been folded in.  Loading
+// the next lane straight into RAX and only then adding the pending one from RCX
+// drops the even-indexed lanes and leaves the last pair as the whole sum.
+fn zir_native_vec_fold_extract(out:*ArrayList[Instr],vreg:i32,lanes:i32,w:i32,scratch:i32)void{
+    push[Instr](out,i_mov_imm(R_RAX(),0));
+    let l:i32=0;
+    while(l<lanes){
+        push[Instr](out,i_vextract64(R_RCX(),vreg,l,scratch,w));
+        push[Instr](out,i_add(R_RAX(),R_RCX()));
+        l=l+1;
+    }
+}
+// `eb` is the ELEMENT width in bytes: it decides how wide the total has to be
+// narrowed, not how wide the lanes are.  Every lane this reaches is a word --
+// the vectorizer refuses byte, halfword and float elements (zvec_is_word_elem),
+// so a non-word lane cannot arrive here and is not silently mis-encoded.
+//
+// This leaves the fold in RAX UNNORMALIZED: the caller adds it to the scalar
+// accumulator, and that 64-bit add needs both operands at full width.
+fn zir_native_vec_reduce(out:*ArrayList[Instr],vreg:i32,lanes:i32,eb:i32,w:i32,scratch:i32)void{
+    if(lanes<1){return;}
+    zir_native_vec_fold_word(out,vreg,lanes,w,scratch);
+}
+fn zir_native_emit_block(out:*ArrayList[Instr],blk:ZBlock,slots:map.StringMap[i32],
     fs:ArrayList[ZirNativeFn],epilogue:i32,loop_head:i32,loop_done:i32,
     div0_lbl:i32,next:*i32)void{
     let i:i32=0;while(i<blk.ops.len){let o:ZOp=blk.ops.data[i];
         if(@strEq(o.name,"scf.if")){
             let else_lbl:i32=next.*;next.*=next.*+1;let done_lbl:i32=next.*;next.*=next.*+1;
-            push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(bs,o.operands.data[0].name)));
+            push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(slots,o.operands.data[0].name)));
             push[Instr](out,i_cmp_imm(R_RAX(),0));push[Instr](out,i_je(else_lbl));
-            zir_native_emit_block(out,o.regions.data[0].blocks.data[0],bs,fs,epilogue,loop_head,loop_done,div0_lbl,next);
+            zir_native_emit_block(out,o.regions.data[0].blocks.data[0],slots,fs,epilogue,loop_head,loop_done,div0_lbl,next);
             push[Instr](out,i_jmp(done_lbl));push[Instr](out,i_label(else_lbl));
-            if(o.regions.len==2){zir_native_emit_block(out,o.regions.data[1].blocks.data[0],bs,fs,epilogue,loop_head,loop_done,div0_lbl,next);}
+            if(o.regions.len==2){zir_native_emit_block(out,o.regions.data[1].blocks.data[0],slots,fs,epilogue,loop_head,loop_done,div0_lbl,next);}
             push[Instr](out,i_label(done_lbl));
         }else if(@strEq(o.name,"scf.while")){
             let head:i32=next.*;next.*=next.*+1;let done:i32=next.*;next.*=next.*+1;
             push[Instr](out,i_label(head));zir_native_emit_block(out,
-                o.regions.data[0].blocks.data[0],bs,fs,epilogue,head,done,div0_lbl,next);
-            zir_native_emit_block(out,o.regions.data[1].blocks.data[0],bs,fs,epilogue,head,done,div0_lbl,next);
+                o.regions.data[0].blocks.data[0],slots,fs,epilogue,head,done,div0_lbl,next);
+            zir_native_emit_block(out,o.regions.data[1].blocks.data[0],slots,fs,epilogue,head,done,div0_lbl,next);
             push[Instr](out,i_jmp(head));push[Instr](out,i_label(done));
         }else if(@strEq(o.name,"zag.switch")){
             let done:i32=next.*;next.*=next.*+1;let labels:ArrayList[i32]=make[i32](o.regions.len+1);
@@ -12018,19 +12646,19 @@ fn zir_native_emit_block(out:*ArrayList[Instr],blk:ZBlock,bs:ArrayList[ZirNative
                 push[i32](&labels,lbl);let marker:ZOp=o.regions.data[r].blocks.data[0].ops.data[0];
                 if(@strEq(marker.name,"zag.default")){default_lbl=lbl;}else{let tags:ArrayList[[]u8]=split_args(attr_val(marker,"patterns"));
                     let t:i32=0;while(t<tags.len){push[Instr](out,i_load(R_RAX(),R_RBP(),
-                        zir_native_disp(bs,o.operands.data[0].name)));push[Instr](out,i_cmp_imm(R_RAX(),cg_parse_i64(tags.data[t])));
+                        zir_native_disp(slots,o.operands.data[0].name)));push[Instr](out,i_cmp_imm(R_RAX(),cg_parse_i64(tags.data[t])));
                         push[Instr](out,i_je(lbl));t=t+1;}free[[]u8](&tags);}r=r+1;}
             push[Instr](out,i_jmp(default_lbl));r=0;while(r<o.regions.len){push[Instr](out,i_label(labels.data[r]));
-                zir_native_emit_block(out,o.regions.data[r].blocks.data[0],bs,fs,epilogue,loop_head,loop_done,div0_lbl,next);
+                zir_native_emit_block(out,o.regions.data[r].blocks.data[0],slots,fs,epilogue,loop_head,loop_done,div0_lbl,next);
                 push[Instr](out,i_jmp(done));r=r+1;}push[Instr](out,i_label(done));free[i32](&labels);
         }else if(@strEq(o.name,"arith.constant")){
             push[Instr](out,i_mov_imm(R_RAX(),cg_parse_i64(attr_val(o,"value"))));
-            push[Instr](out,i_store(R_RBP(),zir_native_disp(bs,o.results.data[0].name),R_RAX()));
+            push[Instr](out,i_store(R_RBP(),zir_native_disp(slots,o.results.data[0].name),R_RAX()));
         }else if(@strEq(o.name,"arith.addi")||@strEq(o.name,"arith.subi")||
                  @strEq(o.name,"arith.muli")||@strEq(o.name,"arith.divsi")||
                  @strEq(o.name,"arith.remsi")||@strEq(o.name,"arith.cmpi")){
-            push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(bs,o.operands.data[0].name)));
-            push[Instr](out,i_load(R_RCX(),R_RBP(),zir_native_disp(bs,o.operands.data[1].name)));
+            push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(slots,o.operands.data[0].name)));
+            push[Instr](out,i_load(R_RCX(),R_RBP(),zir_native_disp(slots,o.operands.data[1].name)));
             if(@strEq(o.name,"arith.addi")){push[Instr](out,i_add(R_RAX(),R_RCX()));}
             else if(@strEq(o.name,"arith.subi")){push[Instr](out,i_sub(R_RAX(),R_RCX()));}
             else if(@strEq(o.name,"arith.muli")){push[Instr](out,i_imul(R_RAX(),R_RCX()));}
@@ -12047,25 +12675,179 @@ fn zir_native_emit_block(out:*ArrayList[Instr],blk:ZBlock,bs:ArrayList[ZirNative
             }
             else{push[Instr](out,i_cmp(R_RAX(),R_RCX()));push[Instr](out,i_setcc(R_RAX(),zir_native_pred_cc(attr_val(o,"predicate"))));}
             if(!@strEq(o.name,"arith.cmpi")){cg_emit_norm_scalar_for_ty(out,o.results.data[0].ty,R_RAX());}
-            push[Instr](out,i_store(R_RBP(),zir_native_disp(bs,o.results.data[0].name),R_RAX()));
+            push[Instr](out,i_store(R_RBP(),zir_native_disp(slots,o.results.data[0].name),R_RAX()));
+        }else if(@strEq(o.name,"zag.cast")){
+            // Both sides are full frame words, so this is a plain move.
+            push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(slots,o.operands.data[0].name)));
+            push[Instr](out,i_store(R_RBP(),zir_native_disp(slots,o.results.data[0].name),R_RAX()));
+        }else if(@strEq(o.name,"zag.index")){
+            // address = base + index*stride, then load the element.  The stride
+            // is the element's ADDRESS STRIDE (8 for a `*i32`), the same quantity
+            // `p[i]` adds in the main pipeline -- not the element width.
+            //
+            // `i_imul(dst, src)` is a true two-operand multiply, dst = dst*src,
+            // so the scale goes in the SECOND slot.  Passing the index in both
+            // slots computes index*index, which is right only for i=0 and reads
+            // a[n*n] for every other n -- and the epilogue is exactly the code
+            // that has to stay byte-for-byte equivalent to the scalar loop.
+            let st:i32=zvec_elem_stride(o.operands.data[0].ty[1..]);
+            if(st<1){return;}
+            push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(slots,o.operands.data[0].name)));
+            push[Instr](out,i_load(R_RCX(),R_RBP(),zir_native_disp(slots,o.operands.data[1].name)));
+            if(st>1){
+                push[Instr](out,i_mov_imm(R_RDX(),st as i64));
+                push[Instr](out,i_imul(R_RCX(),R_RDX()));
+                push[Instr](out,i_add(R_RAX(),R_RCX()));
+            }
+            push[Instr](out,i_load32(R_RCX(),R_RAX(),0));
+            push[Instr](out,i_store(R_RBP(),zir_native_disp(slots,o.results.data[0].name),R_RCX()));
+        }else if(@strEq(o.name,"vector.splat")){
+            let vr:i32=zir_native_vreg(o.results.data[0].name);
+            let w:i32=zir_native_vec_w(o.results.data[0].ty);
+            if(vr<0||w<0){return;}
+            if(o.operands.len==1){
+                // Lift a scalar into every lane.  The value is a stack word, so
+                // it must be read into a GPR before it can be broadcast -- and
+                // broadcast as a WORD, because the lane is a whole 8-byte slot.
+                // vbroadcastss would replicate four bytes into four lanes and
+                // leave the other half of every element undefined.
+                let st:i32=zvec_elem_stride(zvec_elem_ty(o.results.data[0].ty));
+                push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(slots,o.operands.data[0].name)));
+                if(st==8){push[Instr](out,i_vsplat64(vr,R_RAX(),w));}
+                else{push[Instr](out,i_vsplat32(vr,R_RAX(),w));}
+            }
+            // The address form has no machine instruction of its own: the
+            // broadcast that consumes it is where base and index meet.
+        }else if(@strEq(o.name,"vector.broadcast")){
+            let vr:i32=zir_native_vreg(o.results.data[0].name);
+            let w:i32=zir_native_vec_w(o.results.data[0].ty);
+            if(vr<0||w<0){return;}
+            // The SIB scale is the element's ADDRESS STRIDE, not its width.
+            // A `*i32` element advances 8 bytes, so a 256-bit load scaled by 8
+            // gathers the four real adjacent elements; scaled by 4 it would
+            // gather four bytes-packed words that are not elements at all.
+            let st:i32=zvec_elem_stride(zvec_elem_ty(o.results.data[0].ty));
+            if(st<1){return;}
+            if(zvec_is_ptr_vec_ty(o.operands.data[0].ty)==1){
+                let di:i32=zir_native_find_def(blk,o.operands.data[0].name);
+                if(di<0){return;}
+                let sp:ZOp=blk.ops.data[di];
+                if(sp.operands.len!=2){return;}
+                push[Instr](out,i_load(R_RCX(),R_RBP(),zir_native_disp(slots,sp.operands.data[0].name)));
+                push[Instr](out,i_load(R_RDX(),R_RBP(),zir_native_disp(slots,sp.operands.data[1].name)));
+                push[Instr](out,i_vmovdqu_load_idx(vr,R_RCX(),R_RDX(),st,0,w));
+            }
+        }else if(@strEq(o.name,"vector.add")||@strEq(o.name,"vector.sub")||
+                 @strEq(o.name,"vector.mul")||@strEq(o.name,"vector.bit_and")||
+                 @strEq(o.name,"vector.bit_or")||@strEq(o.name,"vector.bit_xor")){
+            let vr:i32=zir_native_vreg(o.results.data[0].name);
+            let w:i32=zir_native_vec_w(o.results.data[0].ty);
+            if(vr<0||w<0){return;}
+            let a:i32=zir_native_vreg(o.operands.data[0].name);
+            let b:i32=zir_native_vreg(o.operands.data[1].name);
+            if(a<0||b<0){return;}
+            // Word lanes, not element width: `vector<i32,4>` over a `*i32` has
+            // eb==4 but occupies four 8-byte slots, so it adds with vpaddq. The
+            // low 32 bits come out right mod 2^32 whatever the high half held.
+            let wide:i32=(zvec_elem_stride(zvec_elem_ty(o.results.data[0].ty))==8) as i32;
+            if(@strEq(o.name,"vector.add")){
+                if(wide==1){push[Instr](out,i_vpaddq(vr,a,b,w));}
+                else{push[Instr](out,i_vpaddd_w(vr,a,b,w));}
+            }else if(@strEq(o.name,"vector.sub")){
+                if(wide==1){push[Instr](out,i_vpsubq(vr,a,b,w));}
+                else{push[Instr](out,i_vpsubd_w(vr,a,b,w));}
+            }else if(@strEq(o.name,"vector.mul")){
+                if(wide==1){push[Instr](out,i_vpmullq(vr,a,b,w));}
+                else{push[Instr](out,i_vpmulld(vr,a,b,w));}
+            }else if(@strEq(o.name,"vector.bit_and")){
+                push[Instr](out,i_vpand_w(vr,a,b,w));
+            }else if(@strEq(o.name,"vector.bit_or")){
+                push[Instr](out,i_vpor_w(vr,a,b,w));
+            }else{
+                push[Instr](out,i_vpxor_w(vr,a,b,w));
+            }
+        }else if(@strEq(o.name,"memref.store")){
+            if(o.operands.len==2&&zir_native_is_vec_ty(o.operands.data[0].ty)==1&&
+               zir_native_vec_memref_inner(o.operands.data[1].ty).len>0){
+                // A PLAIN store of a vector into a VECTOR slot.  This is the
+                // loop-carried half of the lane-wise accumulator, and it is NOT
+                // a fold: the horizontal fold writes a SCALAR slot and happens
+                // once, after the loop.  Writing the vector back to a scalar slot
+                // here would drop 15 of 16 bytes and leave a number behind.
+                let svr:i32=zir_native_vreg(o.operands.data[0].name);
+                let sw:i32=zir_native_vec_w(o.operands.data[0].ty);
+                if(svr<0||sw<0){return;}
+                push[Instr](out,i_vmovdqu_store_w(R_RBP(),
+                    zir_native_disp(slots,o.operands.data[1].name),svr,sw));
+            }else if(o.operands.len==2&&zir_native_is_vec_ty(o.operands.data[0].ty)==1){
+                // The horizontal fold.  `reduce` names the combine operation and
+                // the vectorizer only ever emits "add"; anything else is refused
+                // rather than guessed at.
+                if(!@strEq(attr_val(o,"reduce"),"add")){return;}
+                let vr:i32=zir_native_vreg(o.operands.data[0].name);
+                let w:i32=zir_native_vec_w(o.operands.data[0].ty);
+                if(vr<0||w<0){return;}
+                let lanes:i32=zvec_lanes(o.operands.data[0].ty);
+                let eb:i32=zvec_elem_bytes(zvec_elem_ty(o.operands.data[0].ty));
+                if(lanes<1){return;}
+                zir_native_vec_reduce(out,vr,lanes,eb,w,R_VSCRATCH());
+                // ACCUMULATE into the slot; do not overwrite it.  The vector
+                // main loop runs many iterations, and each contributes only the
+                // sum of the elements it loaded, so the slot must survive across
+                // them.  The accumulator is added here in scalar form precisely
+                // so that the fold above does not see it once per lane.
+                push[Instr](out,i_load(R_RCX(),R_RBP(),zir_native_disp(slots,o.operands.data[1].name)));
+                push[Instr](out,i_add(R_RAX(),R_RCX()));
+                // Narrow only now: the 64-bit add of two sign-extended i32s can
+                // exceed the i32 range, and the slot holds a sign-extended i32.
+                if(eb==4){cg_emit_sext_i32_reg(out,R_RAX());}
+                push[Instr](out,i_store(R_RBP(),zir_native_disp(slots,o.operands.data[1].name),R_RAX()));
+            }else{
+                push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(slots,o.operands.data[0].name)));
+                push[Instr](out,i_store(R_RBP(),zir_native_disp(slots,o.operands.data[1].name),R_RAX()));
+            }
         }else if(@strEq(o.name,"func.call")){
-            let a:i32=0;while(a<o.operands.len){push[Instr](out,i_load(arg_reg(a),R_RBP(),zir_native_disp(bs,o.operands.data[a].name)));a=a+1;}
+            let a:i32=0;while(a<o.operands.len){push[Instr](out,i_load(arg_reg(a),R_RBP(),zir_native_disp(slots,o.operands.data[a].name)));a=a+1;}
             push[Instr](out,i_call(zir_native_fn_label(fs,attr_val(o,"callee"))));
-            if(o.results.len==1){push[Instr](out,i_store(R_RBP(),zir_native_disp(bs,o.results.data[0].name),R_RAX()));}
+            if(o.results.len==1){push[Instr](out,i_store(R_RBP(),zir_native_disp(slots,o.results.data[0].name),R_RAX()));}
         }else if(@strEq(o.name,"func.return")){
-            if(o.operands.len==1){push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(bs,o.operands.data[0].name)));}
+            if(o.operands.len==1){push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(slots,o.operands.data[0].name)));}
             else{push[Instr](out,i_mov_imm(R_RAX(),0));}push[Instr](out,i_jmp(epilogue));
         }else if(@strEq(o.name,"memref.alloca")){
-            push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,
-                i_store(R_RBP(),zir_native_disp(bs,o.results.data[0].name),R_RAX()));
+            let inner:[]u8=zir_native_vec_memref_inner(o.results.data[0].ty);
+            if(inner.len>0){
+                // A vector slot: reserve its full width and zero it, so the slot
+                // is self-contained rather than depending on some later store to
+                // initialise it.  The scratch register is free here -- nothing is
+                // live across a slot's own initialisation.
+                //
+                // NOTE: this dispatch is a chain inside the block's op LOOP, so a
+                // `return` here aborts the WHOLE rest of the function, not just
+                // this op.  A normal path must therefore fall through the if/else
+                // and never return; only the fail-closed guards below may.
+                let w:i32=zir_native_vec_w(inner);
+                if(w<0){return;}
+                push[Instr](out,i_vzero(R_VSCRATCH(),w));
+                push[Instr](out,i_vmovdqu_store_w(R_RBP(),
+                    zir_native_disp(slots,o.results.data[0].name),R_VSCRATCH(),w));
+            }else{
+                push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,
+                    i_store(R_RBP(),zir_native_disp(slots,o.results.data[0].name),R_RAX()));
+            }
         }else if(@strEq(o.name,"memref.load")){
-            push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(bs,o.operands.data[0].name)));
-            push[Instr](out,i_store(R_RBP(),zir_native_disp(bs,o.results.data[0].name),R_RAX()));
-        }else if(@strEq(o.name,"memref.store")){
-            push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(bs,o.operands.data[0].name)));
-            push[Instr](out,i_store(R_RBP(),zir_native_disp(bs,o.operands.data[1].name),R_RAX()));
+            if(o.results.len==1&&zir_native_is_vec_ty(o.results.data[0].ty)==1){
+                // The whole vector out of its slot, straight into its register.
+                let vr:i32=zir_native_vreg(o.results.data[0].name);
+                let w:i32=zir_native_vec_w(o.results.data[0].ty);
+                if(vr<0||w<0){return;}
+                push[Instr](out,i_vmovdqu_load_w(vr,R_RBP(),
+                    zir_native_disp(slots,o.operands.data[0].name),w));
+            }else{
+                push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(slots,o.operands.data[0].name)));
+                push[Instr](out,i_store(R_RBP(),zir_native_disp(slots,o.results.data[0].name),R_RAX()));
+            }
         }else if(@strEq(o.name,"scf.condition")){
-            push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(bs,o.operands.data[0].name)));
+            push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(slots,o.operands.data[0].name)));
             push[Instr](out,i_cmp_imm(R_RAX(),0));push[Instr](out,i_je(loop_done));
         }else if(@strEq(o.name,"scf.yield")){
         }else if(@strEq(o.name,"scf.break")){
@@ -12084,8 +12866,12 @@ fn zir_native_emit_fn(out:*ArrayList[Instr],f:ZFunc,lbl:i32,fs:ArrayList[ZirNati
     let epilogue:i32=next.*;next.*=next.*+1;
     push[Instr](out,i_label(lbl));push[Instr](out,i_push(R_RBP()));
     push[Instr](out,i_mov_rr(R_RBP(),R_RSP()));push[Instr](out,i_sub_imm(R_RSP(),frame as i64));
-    p=0;while(p<f.params.len){push[Instr](out,i_store(R_RBP(),zir_native_disp(bs,f.params.data[p].name),arg_reg(p)));p=p+1;}
-    zir_native_emit_block(out,f.body,bs,fs,epilogue,0-1,0-1,div0_lbl,next);push[Instr](out,i_mov_imm(R_RAX(),0));
+    // One map for the whole function, built once the slot table is final. The
+    // parameter spills below need it too, and building it twice would be two
+    // chances for the two halves to disagree about a displacement.
+    let slots:map.StringMap[i32]=zir_native_slots_of(bs);
+    p=0;while(p<f.params.len){push[Instr](out,i_store(R_RBP(),zir_native_disp(slots,f.params.data[p].name),arg_reg(p)));p=p+1;}
+    zir_native_emit_block(out,f.body,slots,fs,epilogue,0-1,0-1,div0_lbl,next);push[Instr](out,i_mov_imm(R_RAX(),0));
     push[Instr](out,i_label(epilogue));
     push[Instr](out,i_mov_rr(R_RSP(),R_RBP()));push[Instr](out,i_pop(R_RBP()));push[Instr](out,i_ret());
     free[ZirNativeBind](&bs);
@@ -12111,7 +12897,7 @@ fn lower_zir_scalar_program(ir:ZirAuthority,dataout:*ArrayList[u8],route:*i32)Ar
 // points above are retained as migration/differential oracles and tests.
 // route: 1 = direct ZIR scalar backend, 0 = checked AST oracle/fallback.
 fn lower_zir_program_mode_cpu_with_route(ir:ZirAuthority,errout:*i32,dataout:*ArrayList[u8],
-    dynamic_mode:i32,allow_popcnt:i32,allow_bmi1:i32,safety_checked:i32,
+    dynamic_mode:i32,allow_popcnt:i32,allow_bmi1:i32,allow_avx2:i32,safety_checked:i32,
     sanitize_memory:i32,v2_edition:i32,object_mode:i32,route:*i32)ArrayList[Instr]{
     route.*=0;
     if(ir.valid==0){errout.*=errout.*+1;
@@ -12123,12 +12909,12 @@ fn lower_zir_program_mode_cpu_with_route(ir:ZirAuthority,errout:*i32,dataout:*Ar
         return lower_zir_scalar_program(ir,dataout,route);
     }
     return lower_program_mode_cpu(ir.ast_bridge,errout,dataout,dynamic_mode,
-        allow_popcnt,allow_bmi1,safety_checked,sanitize_memory,v2_edition,object_mode);
+        allow_popcnt,allow_bmi1,allow_avx2,safety_checked,sanitize_memory,v2_edition,object_mode);
 }
 fn lower_zir_program_mode_cpu(ir:ZirAuthority,errout:*i32,dataout:*ArrayList[u8],
-    dynamic_mode:i32,allow_popcnt:i32,allow_bmi1:i32,safety_checked:i32,
+    dynamic_mode:i32,allow_popcnt:i32,allow_bmi1:i32,allow_avx2:i32,safety_checked:i32,
     sanitize_memory:i32,v2_edition:i32,object_mode:i32)ArrayList[Instr]{
     let route:i32=0;return lower_zir_program_mode_cpu_with_route(ir,errout,dataout,
-        dynamic_mode,allow_popcnt,allow_bmi1,safety_checked,sanitize_memory,
+        dynamic_mode,allow_popcnt,allow_bmi1,allow_avx2,safety_checked,sanitize_memory,
         v2_edition,object_mode,&route);
 }

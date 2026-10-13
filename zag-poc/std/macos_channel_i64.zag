@@ -1,0 +1,353 @@
+// std/macos_channel_i64.zag -- bounded Apple Silicon macOS SPSC channel.
+//
+// The Linux service uses futex/eventfd/epoll. This Darwin equivalent keeps the
+// same bounded SPSC contract but uses two kqueues with EVFILT_USER
+// notifications, so producer and consumer waits cannot consume each other's
+// wakeups. Channel storage is shared anonymous Darwin memory.
+
+@import("rt.zag")
+
+extern fn _zag_darwin_syscall(num: i64, a1: i64, a2: i64, a3: i64,
+                              a4: i64, a5: i64, a6: i64) i64
+
+// Darwin kernel constants used by this module. Keep them behind named helpers
+// so the channel algorithm reads in terms of its OS contract rather than raw
+// XNU syscall and kevent packing literals.
+fn macos_channel_page_bytes() i64 { return 4096; }
+fn macos_channel_mmap_protection_rw() i64 { return 3; }
+fn macos_channel_mmap_shared_anon() i64 { return 4098; }
+fn macos_channel_user_ident() i64 { return 1; }
+fn macos_channel_ev_filter_user_bits() i64 { return 65526; }
+fn macos_channel_ev_add_clear_bits() i64 { return 33; }
+fn macos_channel_note_trigger_bits() i64 { return 16777216; }
+fn macos_channel_i64_state_bytes() i64 { return 64; }
+fn macos_channel_i64_counter_limit() i64 { return 9223372036854775807; }
+
+fn macos_channel_pack_kevent_flags(filter_bits: i64, flags: i64, fflags: i64) i64 {
+    return filter_bits + flags * 65536 + fflags * 4294967296;
+}
+
+fn macos_channel_user_registration_flags() i64 {
+    return macos_channel_pack_kevent_flags(
+        macos_channel_ev_filter_user_bits(), macos_channel_ev_add_clear_bits(), 0
+    );
+}
+
+fn macos_channel_user_trigger_flags() i64 {
+    return macos_channel_pack_kevent_flags(
+        macos_channel_ev_filter_user_bits(), 0, macos_channel_note_trigger_bits()
+    );
+}
+
+fn macos_channel_close_fd(fd: i64) i64 {
+    return _zag_darwin_syscall(6, fd, 0, 0, 0, 0, 0);
+}
+
+fn macos_channel_unmap_page(address: i64) i64 {
+    return _zag_darwin_syscall(
+        73, address, macos_channel_page_bytes(), 0, 0, 0, 0
+    );
+}
+
+fn macos_channel_map_shared_page() i64 {
+    return _zag_darwin_syscall(
+        197, 0, macos_channel_page_bytes(),
+        macos_channel_mmap_protection_rw(), macos_channel_mmap_shared_anon(), 0 - 1, 0
+    );
+}
+
+struct MacosChannelI64State {
+    magic: i64,
+    capacity: i64,
+    head: i64,
+    tail: i64,
+    readable_kq: i64,
+    writable_kq: i64,
+    mapping_address: i64,
+    reserved: i64,
+}
+
+struct MacosChannelI64 {
+    state: *MacosChannelI64State,
+    open: i32,
+}
+
+struct MacosChannelI64SendResult {
+    ok: i32,
+    code: i64,
+    wait_calls: i32,
+    elapsed_ms: i64,
+}
+
+struct MacosChannelI64ReceiveResult {
+    ok: i32,
+    code: i64,
+    value: i64,
+    wait_calls: i32,
+    elapsed_ms: i64,
+}
+
+struct MacosChannelKevent {
+    ident: i64,
+    // ABI-exact Darwin `struct kevent` layout on arm64. Zag word-aligns scalar
+    // struct fields, so filter/flags/fflags must share one packed 64-bit word.
+    filter_flags: i64,
+    data: i64,
+    udata: i64,
+}
+
+struct MacosChannelTimespec {
+    seconds: i64,
+    nanoseconds: i64,
+}
+
+fn macos_channel_kqueue_open() i64 {
+    // Darwin kqueue(2). The compiler requires this syscall selector literal at
+    // the intrinsic call site, so the numeric ABI detail stays in this wrapper.
+    return _zag_darwin_syscall(362, 0, 0, 0, 0, 0, 0);
+}
+
+fn macos_channel_kevent_change(kq: i64, change: *MacosChannelKevent) i64 {
+    // Darwin kevent(2), one changelist entry and no returned events.
+    return _zag_darwin_syscall(363, kq, change as i64, 1, 0, 0, 0);
+}
+
+fn macos_channel_kevent_wait_one(kq: i64, event: *MacosChannelKevent,
+                                 timeout: *MacosChannelTimespec) i64 {
+    // Darwin kevent(2), no changes and at most one returned event.
+    return _zag_darwin_syscall(363, kq, 0, 0, event as i64, 1, timeout as i64);
+}
+
+fn macos_channel_i64_status_ok() i64 { return 0; }
+fn macos_channel_i64_status_invalid_argument() i64 { return 0 - 7401; }
+fn macos_channel_i64_status_invalid_state() i64 { return 0 - 7402; }
+fn macos_channel_i64_status_full() i64 { return 0 - 7403; }
+fn macos_channel_i64_status_empty() i64 { return 0 - 7404; }
+fn macos_channel_i64_status_timeout() i64 { return 0 - 7405; }
+fn macos_channel_i64_status_limit() i64 { return 0 - 7406; }
+fn macos_channel_i64_magic() i64 { return 6510615555426900570; }
+
+fn macos_channel_i64_invalid() MacosChannelI64 {
+    return MacosChannelI64{ .state = null as *MacosChannelI64State, .open = 0 };
+}
+
+fn macos_channel_kqueue_new() i64 {
+    let kq: i64 = macos_channel_kqueue_open();
+    if (kq < 0) { return kq; }
+    // low16=EVFILT_USER(-10), bits16..31=EV_ADD|EV_CLEAR, fflags=0.
+    let registration: MacosChannelKevent = MacosChannelKevent{
+        .ident = macos_channel_user_ident(),
+        .filter_flags = macos_channel_user_registration_flags(),
+        .data = 0,
+        .udata = 0,
+    };
+    let rc: i64 = macos_channel_kevent_change(kq, &registration);
+    if (rc < 0) {
+        let _closed: i64 = macos_channel_close_fd(kq);
+        return rc;
+    }
+    return kq;
+}
+
+fn macos_channel_kqueue_trigger(kq: i64) i64 {
+    // low16=EVFILT_USER(-10), flags=0, fflags=NOTE_TRIGGER.
+    let event: MacosChannelKevent = MacosChannelKevent{
+        .ident = macos_channel_user_ident(),
+        .filter_flags = macos_channel_user_trigger_flags(),
+        .data = 0,
+        .udata = 0,
+    };
+    return macos_channel_kevent_change(kq, &event);
+}
+
+fn macos_channel_kqueue_wait(kq: i64, timeout_ms: i64) i64 {
+    if (timeout_ms <= 0) { return 0; }
+    let event: MacosChannelKevent = MacosChannelKevent{
+        .ident = 0, .filter_flags = 0, .data = 0, .udata = 0,
+    };
+    let timeout: MacosChannelTimespec = MacosChannelTimespec{
+        .seconds = timeout_ms / 1000,
+        .nanoseconds = (timeout_ms % 1000) * 1000000,
+    };
+    return macos_channel_kevent_wait_one(kq, &event, &timeout);
+}
+
+fn macos_channel_i64_create_into(destination: @borrows_mut *MacosChannelI64,
+                                 capacity: i32) i64 {
+    if (destination == null as *MacosChannelI64 || capacity < 1 || capacity > 64) {
+        return macos_channel_i64_status_invalid_argument();
+    }
+    if (destination.*.open != 0 || destination.*.state != null as *MacosChannelI64State) {
+        return macos_channel_i64_status_invalid_state();
+    }
+    let address: i64 = macos_channel_map_shared_page();
+    if (address < 0) { return address; }
+    let state: *MacosChannelI64State = null as *MacosChannelI64State;
+    unsafe { state = address as *MacosChannelI64State; }
+    let readable: i64 = macos_channel_kqueue_new();
+    if (readable < 0) {
+        let _unmap: i64 = macos_channel_unmap_page(address);
+        return readable;
+    }
+    let writable: i64 = macos_channel_kqueue_new();
+    if (writable < 0) {
+        let _closed: i64 = macos_channel_close_fd(readable);
+        let _unmap: i64 = macos_channel_unmap_page(address);
+        return writable;
+    }
+    state.*.magic = macos_channel_i64_magic();
+    state.*.capacity = capacity as i64;
+    state.*.head = 0;
+    state.*.tail = 0;
+    state.*.readable_kq = readable;
+    state.*.writable_kq = writable;
+    state.*.mapping_address = address;
+    state.*.reserved = 0;
+    destination.*.state = state;
+    destination.*.open = 1;
+    return macos_channel_i64_status_ok();
+}
+
+fn macos_channel_i64_valid(channel: @borrows *MacosChannelI64) i32 {
+    if (channel == null as *MacosChannelI64 || channel.*.open == 0 ||
+        channel.*.state == null as *MacosChannelI64State) { return 0; }
+    if (channel.*.state.*.magic != macos_channel_i64_magic() ||
+        channel.*.state.*.capacity < 1 || channel.*.state.*.capacity > 64 ||
+        channel.*.state.*.readable_kq < 0 || channel.*.state.*.writable_kq < 0) { return 0; }
+    return 1;
+}
+
+fn macos_channel_i64_close(channel: @borrows_mut *MacosChannelI64) i64 {
+    if (macos_channel_i64_valid(channel) == 0) { return macos_channel_i64_status_invalid_state(); }
+    let state: *MacosChannelI64State = channel.*.state;
+    let readable_kq: i64 = state.*.readable_kq;
+    let writable_kq: i64 = state.*.writable_kq;
+    let mapping_address: i64 = state.*.mapping_address;
+    // Invalidate the public handle before releasing native resources. Even if
+    // close/munmap reports an error, callers cannot reuse a partially released
+    // channel and compound the failure.
+    state.*.magic = 0;
+    channel.*.state = null as *MacosChannelI64State;
+    channel.*.open = 0;
+    let read_close: i64 = macos_channel_close_fd(readable_kq);
+    let write_close: i64 = macos_channel_close_fd(writable_kq);
+    let unmap: i64 = macos_channel_unmap_page(mapping_address);
+    if (read_close < 0) { return read_close; }
+    if (write_close < 0) { return write_close; }
+    if (unmap < 0) { return unmap; }
+    return macos_channel_i64_status_ok();
+}
+
+fn macos_channel_i64_slots(state: @borrows *MacosChannelI64State) *i64 {
+    return ((state as i64) + macos_channel_i64_state_bytes()) as *i64;
+}
+
+fn macos_channel_i64_elapsed(start: i64) i64 {
+    let elapsed: i64 = _zag_clock_monotonic_ms() - start;
+    if (elapsed < 0) { return 0; }
+    return elapsed;
+}
+
+fn macos_channel_i64_send_wait(channel: @borrows_mut *MacosChannelI64,
+                               value: i64, timeout_ms: i32) MacosChannelI64SendResult {
+    let start: i64 = _zag_clock_monotonic_ms();
+    if (macos_channel_i64_valid(channel) == 0) {
+        return MacosChannelI64SendResult{ .ok=0,.code=macos_channel_i64_status_invalid_state(),.wait_calls=0,.elapsed_ms=0 };
+    }
+    if (timeout_ms < 0 || timeout_ms > 5000) {
+        return MacosChannelI64SendResult{ .ok=0,.code=macos_channel_i64_status_invalid_argument(),.wait_calls=0,.elapsed_ms=0 };
+    }
+    let state: *MacosChannelI64State = channel.*.state;
+    unsafe {
+        let head_pointer: *const i64 = (&state.*.head) as *const i64;
+        let tail_pointer: *mut i64 = (&state.*.tail) as *mut i64;
+        let waits: i32 = 0;
+        let attempts: i32 = 0;
+        while (attempts < 128) {
+            let tail: i64 = @atomicLoad64Order(tail_pointer as *const i64, 0);
+            let head: i64 = @atomicLoad64Order(head_pointer, 1);
+            if (head < 0 || tail < head || tail - head > state.*.capacity) {
+                return MacosChannelI64SendResult{ .ok=0,.code=macos_channel_i64_status_invalid_state(),.wait_calls=waits,.elapsed_ms=macos_channel_i64_elapsed(start) };
+            }
+            if (tail - head < state.*.capacity) {
+                if (tail == macos_channel_i64_counter_limit()) {
+                    return MacosChannelI64SendResult{ .ok=0,.code=macos_channel_i64_status_limit(),.wait_calls=waits,.elapsed_ms=macos_channel_i64_elapsed(start) };
+                }
+                let index: i32 = (tail % state.*.capacity) as i32;
+                macos_channel_i64_slots(state)[index] = value;
+                @atomicStore64Order(tail_pointer, tail + 1, 2);
+                // A receiver can only be asleep after observing an empty
+                // channel. Keep burst traffic in userspace and enter the
+                // kernel only for the empty -> nonempty transition.
+                if (tail == head) {
+                    let wake: i64 = macos_channel_kqueue_trigger(state.*.readable_kq);
+                    if (wake < 0) { return MacosChannelI64SendResult{ .ok=0,.code=wake,.wait_calls=waits,.elapsed_ms=macos_channel_i64_elapsed(start) }; }
+                }
+                return MacosChannelI64SendResult{ .ok=1,.code=0,.wait_calls=waits,.elapsed_ms=macos_channel_i64_elapsed(start) };
+            }
+            if (timeout_ms == 0) { return MacosChannelI64SendResult{ .ok=0,.code=macos_channel_i64_status_full(),.wait_calls=waits,.elapsed_ms=macos_channel_i64_elapsed(start) }; }
+            let elapsed: i64 = macos_channel_i64_elapsed(start);
+            if (elapsed >= timeout_ms) { return MacosChannelI64SendResult{ .ok=0,.code=macos_channel_i64_status_timeout(),.wait_calls=waits,.elapsed_ms=elapsed }; }
+            let wait_rc: i64 = macos_channel_kqueue_wait(state.*.writable_kq, (timeout_ms as i64) - elapsed);
+            waits = waits + 1;
+            if (wait_rc < 0) { return MacosChannelI64SendResult{ .ok=0,.code=wait_rc,.wait_calls=waits,.elapsed_ms=macos_channel_i64_elapsed(start) }; }
+            attempts = attempts + 1;
+        }
+        return MacosChannelI64SendResult{ .ok=0,.code=macos_channel_i64_status_limit(),.wait_calls=waits,.elapsed_ms=macos_channel_i64_elapsed(start) };
+    }
+}
+
+fn macos_channel_i64_receive_wait(channel: @borrows_mut *MacosChannelI64,
+                                  timeout_ms: i32) MacosChannelI64ReceiveResult {
+    let start: i64 = _zag_clock_monotonic_ms();
+    if (macos_channel_i64_valid(channel) == 0) {
+        return MacosChannelI64ReceiveResult{ .ok=0,.code=macos_channel_i64_status_invalid_state(),.value=0,.wait_calls=0,.elapsed_ms=0 };
+    }
+    if (timeout_ms < 0 || timeout_ms > 5000) {
+        return MacosChannelI64ReceiveResult{ .ok=0,.code=macos_channel_i64_status_invalid_argument(),.value=0,.wait_calls=0,.elapsed_ms=0 };
+    }
+    let state: *MacosChannelI64State = channel.*.state;
+    unsafe {
+        let head_pointer: *mut i64 = (&state.*.head) as *mut i64;
+        let tail_pointer: *const i64 = (&state.*.tail) as *const i64;
+        let waits: i32 = 0;
+        let attempts: i32 = 0;
+        while (attempts < 128) {
+            let head: i64 = @atomicLoad64Order(head_pointer as *const i64, 0);
+            let tail: i64 = @atomicLoad64Order(tail_pointer, 1);
+            if (head < 0 || tail < head || tail - head > state.*.capacity) {
+                return MacosChannelI64ReceiveResult{ .ok=0,.code=macos_channel_i64_status_invalid_state(),.value=0,.wait_calls=waits,.elapsed_ms=macos_channel_i64_elapsed(start) };
+            }
+            if (head < tail) {
+                let index: i32 = (head % state.*.capacity) as i32;
+                let value: i64 = macos_channel_i64_slots(state)[index];
+                @atomicStore64Order(head_pointer, head + 1, 2);
+                // A producer can only be asleep after observing a full
+                // channel. Wake it only when this receive creates space.
+                if (tail - head == state.*.capacity) {
+                    let wake: i64 = macos_channel_kqueue_trigger(state.*.writable_kq);
+                    if (wake < 0) { return MacosChannelI64ReceiveResult{ .ok=0,.code=wake,.value=0,.wait_calls=waits,.elapsed_ms=macos_channel_i64_elapsed(start) }; }
+                }
+                return MacosChannelI64ReceiveResult{ .ok=1,.code=0,.value=value,.wait_calls=waits,.elapsed_ms=macos_channel_i64_elapsed(start) };
+            }
+            if (timeout_ms == 0) { return MacosChannelI64ReceiveResult{ .ok=0,.code=macos_channel_i64_status_empty(),.value=0,.wait_calls=waits,.elapsed_ms=macos_channel_i64_elapsed(start) }; }
+            let elapsed: i64 = macos_channel_i64_elapsed(start);
+            if (elapsed >= timeout_ms) { return MacosChannelI64ReceiveResult{ .ok=0,.code=macos_channel_i64_status_timeout(),.value=0,.wait_calls=waits,.elapsed_ms=elapsed }; }
+            let wait_rc: i64 = macos_channel_kqueue_wait(state.*.readable_kq, (timeout_ms as i64) - elapsed);
+            waits = waits + 1;
+            if (wait_rc < 0) { return MacosChannelI64ReceiveResult{ .ok=0,.code=wait_rc,.value=0,.wait_calls=waits,.elapsed_ms=macos_channel_i64_elapsed(start) }; }
+            attempts = attempts + 1;
+        }
+        return MacosChannelI64ReceiveResult{ .ok=0,.code=macos_channel_i64_status_limit(),.value=0,.wait_calls=waits,.elapsed_ms=macos_channel_i64_elapsed(start) };
+    }
+}
+
+fn macos_channel_i64_try_send(channel: @borrows_mut *MacosChannelI64,
+                              value: i64) MacosChannelI64SendResult {
+    return macos_channel_i64_send_wait(channel, value, 0);
+}
+
+fn macos_channel_i64_try_receive(channel: @borrows_mut *MacosChannelI64)
+    MacosChannelI64ReceiveResult {
+    return macos_channel_i64_receive_wait(channel, 0);
+}

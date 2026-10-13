@@ -39,6 +39,35 @@ struct X86Detection {
     xmm_ymm_state: i32,
     avx_usable: i32,
     avx2_usable: i32,
+    avx512_usable: i32,
+}
+
+// Returns the widest integer SIMD backend currently proven safe for runtime
+// dispatch. Keeping this decision centralized prevents individual lowering
+// paths from making inconsistent AVX2 assumptions.
+fn x86_vector_width(d: X86Detection) i32 {
+    if (d.avx512_usable == 1) { return 16; }
+    if (d.avx2_usable == 1) { return 8; }
+    return 4;
+}
+
+// Central AVX2 gate used by future lowering paths. Keep all AVX2 decisions
+// behind qualified runtime state rather than checking raw CPUID bits directly
+// in code generators.
+fn x86_can_use_avx2(d: X86Detection) i32 {
+    if (d.available == 1 && d.avx2_usable == 1) { return 1; }
+    return 0;
+}
+
+// Central AVX-512 gate. AVX-512 needs strictly more than AVX2 does: the CPU
+// must report AVX512F (CPUID.7.0:ECX bit 16) AND the OS must have enabled the
+// opmask, ZMM_Hi256 and Hi16_ZMM state components (XCR0 bits 5,6,7). A CPU with
+// AVX512F but an OS that only saved XMM/YMM state would #UD on the first EVEX
+// instruction, so the ZMM half of the state is a hard requirement, not a
+// nicety. This is what makes the 16-lane rung of the vector ladder reachable.
+fn x86_can_use_avx512(d: X86Detection) i32 {
+    if (d.available == 1 && d.avx2_usable == 1 && d.avx512_usable == 1) { return 1; }
+    return 0;
 }
 
 fn x86_bit(v: i64, bit: i32) i32 {
@@ -46,26 +75,35 @@ fn x86_bit(v: i64, bit: i32) i32 {
     return 0;
 }
 
-fn x86_gate_avx(ecx1: i64, xcr0: i64, ebx7: i64) X86Detection {
+fn x86_gate_avx(ecx1: i64, xcr0: i64, ebx7: i64, ecx7: i64) X86Detection {
     let cpu_avx: i32 = x86_bit(ecx1, 28);
     let osxsave: i32 = x86_bit(ecx1, 27);
     let state: i32 = 0;
     if ((xcr0 & 6) == 6) { state = 1; }
     let avx_ok: i32 = cpu_avx * osxsave * state;
     let avx2_ok: i32 = x86_bit(ebx7, 5) * avx_ok;
+    // AVX512F is CPUID.7.0:ECX bit 16, and the OS must additionally have
+    // enabled the three ZMM/opmask state components (XCR0 bits 5,6,7). Both
+    // are required: either one alone can #UD.
+    let cpu_avx512: i32 = x86_bit(ecx7, 16);
+    let zmm_state: i32 = 0;
+    if ((xcr0 & 224) == 224) { zmm_state = 1; }
+    let avx512_ok: i32 = cpu_avx512 * avx_ok * zmm_state;
     return X86Detection{.available=1,.cpu_avx=cpu_avx,.osxsave=osxsave,
-        .xmm_ymm_state=state,.avx_usable=avx_ok,.avx2_usable=avx2_ok};
+        .xmm_ymm_state=state,.avx_usable=avx_ok,.avx2_usable=avx2_ok,
+        .avx512_usable=avx512_ok};
 }
 
 fn x86_detect_raw() X86Detection {
     let max_leaf: i64 = _zag_x86_cpuid_eax(0, 0);
-    if (max_leaf < 1) { return X86Detection{.available=0,.cpu_avx=0,.osxsave=0,.xmm_ymm_state=0,.avx_usable=0,.avx2_usable=0}; }
+    if (max_leaf < 1) { return X86Detection{.available=0,.cpu_avx=0,.osxsave=0,.xmm_ymm_state=0,.avx_usable=0,.avx2_usable=0,.avx512_usable=0}; }
     let ecx1: i64 = _zag_x86_cpuid_ecx(1, 0);
     let xcr0: i64 = 0;
     if (x86_bit(ecx1, 28) == 1 && x86_bit(ecx1, 27) == 1) { xcr0 = _zag_x86_xgetbv(0); }
     let ebx7: i64 = 0;
-    if (max_leaf >= 7) { ebx7 = _zag_x86_cpuid_ebx(7, 0); }
-    return x86_gate_avx(ecx1, xcr0, ebx7);
+    let ecx7: i64 = 0;
+    if (max_leaf >= 7) { ebx7 = _zag_x86_cpuid_ebx(7, 0); ecx7 = _zag_x86_cpuid_ecx(7, 0); }
+    return x86_gate_avx(ecx1, xcr0, ebx7, ecx7);
 }
 
 fn x86_no_features() X86Features {
@@ -109,10 +147,66 @@ fn x86_runtime_profile(requested: []u8) X86CpuProfile {
     let f:X86Features=x86_generic_features();
     f.popcnt=2;
     f.bmi1=2;
+    // Runtime dispatch can safely expose AVX2 only after CPUID/XGETBV
+    // qualification. This keeps the feature visible to later lowering stages
+    // while preserving the generic profile fallback.
+    let detected:X86Detection=x86_detect_raw();
+    let avx512:i32=0;
+    if (detected.avx2_usable == 1) { f.avx2=2; }
+    if (x86_can_use_avx512(detected) == 1) { f.avx512=2; avx512=1; }
+    let key:[]u8="linux-x86_64|runtime-dispatch|sse2,popcnt,bmi1,avx2";
+    if (avx512==1) { key="linux-x86_64|runtime-dispatch|sse2,popcnt,bmi1,avx2,avx512"; }
     return X86CpuProfile{.valid=1,.request_kind=4,.requested=requested,
         .canonical="x86-64-runtime",.detection="runtime-cpuid",
-        .cache_key="linux-x86_64|runtime-dispatch|sse2,popcnt,bmi1",
+        .cache_key=key,
         .diagnostic="",.features=f};
+}
+
+// ── DECLARED MICROARCHITECTURE LEVELS ────────────────────────────────────────
+//
+// `native` and `runtime` ask the host what it has.  These name a LEVEL instead,
+// which is what makes the 256-bit and 512-bit vector rungs buildable and
+// testable on a machine that does not have the hardware.
+//
+// The feature bits here are PERMISSION, not detection.  Nothing in these
+// functions runs CPUID, and a binary built for v3 or v4 raises #UD on a CPU
+// without those instructions.  That is the same contract as naming a `-march`
+// level rather than using `-march=native`, it is why asking for a level is an
+// explicit act, and it is why every level gets its own cache key: artifacts
+// built for different levels must never be served for one another.
+//
+// `avx`/`avx2`/`avx512` carry the runtime profile's "usable" value of 2 rather
+// than 1.  Both select the vector rung (`znc_vectorize_target` tests `>= 1`),
+// but only 1 enables the bounded scalar `i32x4` path in `cg_allow_avx2`, so a
+// declared level widens the VECTOR pipeline and nothing else.
+fn x86_v2_profile(requested: []u8) X86CpuProfile {
+    let f: X86Features = x86_generic_features();
+    f.sse42 = 1; f.popcnt = 1;
+    return X86CpuProfile{ .valid = 1, .request_kind = 3,
+        .requested = requested, .canonical = "x86-64-v2",
+        .detection = "declared",
+        .cache_key = "linux-x86_64|x86-64-v2|sse2,sse42,popcnt",
+        .diagnostic = "", .features = f };
+}
+
+fn x86_v3_profile(requested: []u8) X86CpuProfile {
+    let f: X86Features = x86_v2_profile(requested).features;
+    f.avx = 1; f.avx2 = 2; f.fma = 1; f.bmi1 = 1; f.bmi2 = 1;
+    return X86CpuProfile{ .valid = 1, .request_kind = 3,
+        .requested = requested, .canonical = "x86-64-v3",
+        .detection = "declared",
+        .cache_key = "linux-x86_64|x86-64-v3|sse2,sse42,popcnt,avx,avx2,fma,bmi1,bmi2",
+        .diagnostic = "", .features = f };
+}
+
+fn x86_v4_profile(requested: []u8) X86CpuProfile {
+    let f: X86Features = x86_v3_profile(requested).features;
+    f.avx512 = 2;
+    return X86CpuProfile{ .valid = 1, .request_kind = 3,
+        .requested = requested, .canonical = "x86-64-v4",
+        .detection = "declared",
+        .cache_key = "linux-x86_64|x86-64-v4|sse2,sse42,popcnt,avx,avx2,fma,bmi1,bmi2,avx512",
+        .diagnostic = "", .features = f };
 }
 
 fn x86_ascii_space(c: u8) i32 {
@@ -186,26 +280,33 @@ fn x86_native_profile(requested: []u8) X86CpuProfile {
         .diagnostic = "", .features = features };
 }
 
-// Accepted values: generic, native, x86-64, and x86-64-v1.  Named aliases
-// canonicalize to one cache identity so spelling cannot fragment plan caches.
+// Accepted values: generic, native, runtime, x86-64-v1, x86-64-v2, x86-64-v3 and
+// x86-64-v4.  Named aliases canonicalize to one cache identity so spelling
+// cannot fragment plan caches.  v2/v3/v4 DECLARE a microarchitecture level
+// rather than detecting one, so the wider vector rungs can be built and measured
+// anywhere; running such a binary on a CPU below the level raises #UD.
 fn parse_x86_cpu_profile(raw: []u8) X86CpuProfile {
     let name: []u8 = x86_cpu_value(raw);
     if (@strEq(name, "generic")) { return x86_generic_profile(name, 1); }
     if (@strEq(name, "x86-64") || @strEq(name, "x86-64-v1")) {
         return x86_generic_profile(name, 3);
     }
+    if (@strEq(name, "x86-64-v2")) { return x86_v2_profile(name); }
+    if (@strEq(name, "x86-64-v3")) { return x86_v3_profile(name); }
+    if (@strEq(name, "x86-64-v4")) { return x86_v4_profile(name); }
     if (@strEq(name, "native")) {
         return x86_native_profile(name);
     }
     if (@strEq(name, "runtime")) { return x86_runtime_profile(name); }
     return x86_profile_error(name, 0,
-        "unknown x86 cpu profile; supported profiles: generic, native, runtime, x86-64-v1");
+        "unknown x86 cpu profile; supported profiles: generic, native, runtime, x86-64-v1, x86-64-v2, x86-64-v3, x86-64-v4");
 }
 
 // Stable machine-readable data.  Its field order and feature order are part of
 // the cache/report contract; callers need not inspect host-dependent state.
 fn x86_profile_report_json(p: X86CpuProfile) []u8 {
     if (p.valid == 1 && p.request_kind == 4) {
+        if(p.features.avx512==2){return "{\"target\":\"linux-x86_64\",\"profile\":\"x86-64-runtime\",\"detection\":\"runtime-cpuid\",\"features\":[\"sse2\",\"popcnt\",\"bmi1\",\"avx2\",\"avx512\"],\"cache_key\":\"linux-x86_64|runtime-dispatch|sse2,popcnt,bmi1,avx2,avx512\"}";}
         return "{\"target\":\"linux-x86_64\",\"profile\":\"x86-64-runtime\",\"detection\":\"runtime-cpuid\",\"features\":[\"sse2\",\"popcnt\",\"bmi1\"],\"cache_key\":\"linux-x86_64|runtime-dispatch|sse2,popcnt,bmi1\"}";
     }
     if (p.valid == 1 && p.request_kind == 2) {
@@ -213,6 +314,17 @@ fn x86_profile_report_json(p: X86CpuProfile) []u8 {
         if(p.features.bmi1==1){return "{\"target\":\"linux-x86_64\",\"profile\":\"native-sse2-bmi1\",\"resolved\":true,\"detection\":\"cpuid-xgetbv\",\"permitted_features\":[\"sse2\",\"bmi1\"],\"cache_key\":\"linux-x86_64|native|permitted=sse2,bmi1\"}";}
         if(p.features.popcnt==1){return "{\"target\":\"linux-x86_64\",\"profile\":\"native-sse2-popcnt\",\"resolved\":true,\"detection\":\"cpuid-xgetbv\",\"permitted_features\":[\"sse2\",\"popcnt\"],\"cache_key\":\"linux-x86_64|native|permitted=sse2,popcnt\"}";}
         return "{\"target\":\"linux-x86_64\",\"profile\":\"native-sse2\",\"resolved\":true,\"detection\":\"cpuid-xgetbv\",\"permitted_features\":[\"sse2\"],\"cache_key\":\"linux-x86_64|native|permitted=sse2\"}";
+    }
+    // A DECLARED level, reported verbatim.  Reporting these as x86-64-v1 would
+    // be a lie, and it would also hide which rung an artifact was built for.
+    if (p.valid == 1 && @strEq(p.canonical, "x86-64-v2")) {
+        return "{\"target\":\"linux-x86_64\",\"profile\":\"x86-64-v2\",\"detection\":\"declared\",\"features\":[\"sse2\",\"sse42\",\"popcnt\"],\"cache_key\":\"linux-x86_64|x86-64-v2|sse2,sse42,popcnt\"}";
+    }
+    if (p.valid == 1 && @strEq(p.canonical, "x86-64-v3")) {
+        return "{\"target\":\"linux-x86_64\",\"profile\":\"x86-64-v3\",\"detection\":\"declared\",\"features\":[\"sse2\",\"sse42\",\"popcnt\",\"avx\",\"avx2\",\"fma\",\"bmi1\",\"bmi2\"],\"cache_key\":\"linux-x86_64|x86-64-v3|sse2,sse42,popcnt,avx,avx2,fma,bmi1,bmi2\"}";
+    }
+    if (p.valid == 1 && @strEq(p.canonical, "x86-64-v4")) {
+        return "{\"target\":\"linux-x86_64\",\"profile\":\"x86-64-v4\",\"detection\":\"declared\",\"features\":[\"sse2\",\"sse42\",\"popcnt\",\"avx\",\"avx2\",\"fma\",\"bmi1\",\"bmi2\",\"avx512\"],\"cache_key\":\"linux-x86_64|x86-64-v4|sse2,sse42,popcnt,avx,avx2,fma,bmi1,bmi2,avx512\"}";
     }
     if (p.valid == 1) {
         return "{\"target\":\"linux-x86_64\",\"profile\":\"x86-64-v1\",\"detection\":\"defined\",\"features\":[\"sse2\"],\"cache_key\":\"linux-x86_64|x86-64-v1|sse2\"}";

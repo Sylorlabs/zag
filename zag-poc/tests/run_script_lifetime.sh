@@ -6,8 +6,14 @@ case "$ZNC" in
     /*) ;;
     *) ZNC="$PWD/${ZNC#./}" ;;
 esac
+repo_root=$PWD
 tmp=$(mktemp -d /tmp/zag-script-lifetime.XXXXXX)
 trap 'find "$tmp" -depth -delete' EXIT
+mkdir -p "$tmp/compiler"
+ln -s "$ZNC" "$tmp/compiler/znc"
+ln -s "$repo_root/selfhost" "$tmp/compiler/selfhost"
+ln -s "$repo_root/std" "$tmp/compiler/std"
+ZNC="$tmp/compiler/znc"
 printf 'payload' >"$tmp/input.txt"
 cat >"$tmp/escape.zag" <<'ZAG'
 script;

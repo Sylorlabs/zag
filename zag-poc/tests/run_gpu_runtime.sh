@@ -19,6 +19,9 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+if [ "$(uname -s):$(uname -m)" = "Darwin:arm64" ]; then
+    exec bash tests/run_macos_metal_loader.sh
+fi
 ZNC=${ZNC:-./znc}
 case "$ZNC" in /*) ;; *) ZNC="$PWD/${ZNC#./}";; esac
 tmp=$(mktemp -d /tmp/zag-gpu-runtime.XXXXXX)

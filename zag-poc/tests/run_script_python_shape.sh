@@ -43,9 +43,11 @@ grep -q 'fn doubled(value:i64) i64' "$tmp/formatted.zag"
 
 "$compiler" harden "$tmp/program.zs" --output "$tmp/hardened.zag" \
     --format json --no-zagd >"$tmp/harden.json"
-grep -q '"status":"unsupported"' "$tmp/harden.json"
-grep -q '"candidate_compilable":false' "$tmp/harden.json"
-test ! -e "$tmp/hardened.zag"
+grep -q '"status":"preview"' "$tmp/harden.json"
+grep -q '"candidate_compilable":true' "$tmp/harden.json"
+grep -q '"candidate_checked":true' "$tmp/harden.json"
+test -s "$tmp/hardened.zag"
+"$compiler" check "$tmp/hardened.zag" --no-zagd --no-analyze >/dev/null
 if "$compiler" harden "$tmp/program.zs" --apply \
     --test-command true --no-zagd >"$tmp/apply.log" 2>&1; then
     echo "removed harden --apply mode unexpectedly succeeded" >&2

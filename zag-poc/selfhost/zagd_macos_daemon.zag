@@ -7,6 +7,8 @@
 // compiler correctness.
 
 @import("zagd.zag")
+@import("zagd_benchmark.zag")
+@import("semantic_manifest_format.zag")
 @import("../std/list.zag")
 
 extern fn _zag_raw_syscall(num: i64, a1: i64, a2: i64, a3: i64, a4: i64, a5: i64, a6: i64) i64
@@ -18,14 +20,20 @@ extern fn kevent(kq: i32, changelist: *ZmdKevent, nchanges: i32, eventlist: *Zmd
 extern fn _zag_darwin_fork() i64
 extern fn _zag_argc() i32
 extern fn _zag_arg(i: i32) []u8
-extern fn _zag_read_file(path: []u8) []u8
-extern fn _zag_write_file(path: []u8, content: []u8) i32
-extern fn _zag_file_exists(path: []u8) i32
-extern fn _zag_exec_cmd(command: []u8) i32
+extern fn _zag_process_envp() i64
+extern fn _zag_read_file(path:[]u8)[]u8
+extern fn _zag_write_file(path:[]u8,text:[]u8)i32
+extern fn _zag_script_file_size(path:[]u8)i64
 extern fn _zag_slice_ptr(s: []u8) *i8
+extern fn _zag_free(ptr:*i8)void
+extern fn _zag_clock_monotonic_ms()i64
+extern fn _zag_exit(code:i32)void
+extern fn _zag_allocator_allocation_count() i64
+extern fn _zag_allocator_live_bytes() i64
+extern fn _zag_allocator_peak_live_bytes() i64
 
 struct ZmdTimespec { sec: i64, nsec: i64 }
-struct ZmdWatch { fd: i64, path: []u8 }
+struct ZmdWatch { fd: i64, identity: ZagdHash }
 // ABI-exact Darwin `struct kevent` layout on arm64 (32 bytes).  Zag scalar
 // struct fields are word-aligned, so the filter/flags/fflags region is stored
 // as one packed i64 rather than three independently-declared fields.
@@ -33,18 +41,48 @@ struct ZmdKevent { ident: i64, filter_flags: i64, data: i64, udata: i64 }
 
 fn zmd_kqueue() i64 { return kqueue() as i64; }
 
-fn zmd_open_event_dir(path: []u8) i64 {
-    // libSystem is the stable macOS ABI boundary for pathname handling.  The
-    // returned descriptor is native and is passed directly to kqueue.
-    let cpath: ArrayList[u8] = zmd_cstr(path);
-    return open(_zag_slice_ptr(cpath.data[0..cpath.len]),32768) as i64;
+fn zmd_buf_byte(out:*ArrayList[u8],byte:u8)i32{
+    if(out.*.len>=out.*.cap){return 0;}
+    out.*.data[out.*.len]=byte;out.*.len=out.*.len+1;return 1;
 }
 
-fn zmd_open_read_dir(path: []u8) i64 {
+fn zmd_buf_text(out:*ArrayList[u8],text:[]u8)i32{
+    if(text.len>out.*.cap-out.*.len){return 0;}
+    let i:i32=0;while(i<text.len){out.*.data[out.*.len]=text[i];out.*.len=out.*.len+1;i=i+1;}
+    return 1;
+}
+
+fn zmd_buf_i64(out:*ArrayList[u8],value:i64)i32{
+    let n:i64=value;
+    if(n==0){return zmd_buf_byte(out,'0');}
+    if(n<0){if(zmd_buf_byte(out,'-')==0){return 0;}n=0-n;}
+    let divisor:i64=1;
+    while(n/divisor>=10&&divisor<=100000000000000000){divisor=divisor*10;}
+    while(divisor>0){
+        if(zmd_buf_byte(out,((n/divisor)%10+48) as u8)==0){return 0;}
+        divisor=divisor/10;
+    }
+    return 1;
+}
+
+fn zmd_set_cpath(path:[]u8,scratch:*ArrayList[u8])i32{
+    scratch.*.len=0;
+    if(zmd_buf_text(scratch,path)==0||zmd_buf_byte(scratch,0 as u8)==0){scratch.*.len=0;return 0;}
+    return 1;
+}
+
+fn zmd_open_event_dir(path: []u8, cpath:*ArrayList[u8]) i64 {
+    // libSystem is the stable macOS ABI boundary for pathname handling.  The
+    // returned descriptor is native and is passed directly to kqueue.
+    if(zmd_set_cpath(path,cpath)==0){return 0-1;}
+    return open(_zag_slice_ptr(cpath.*.data[0..cpath.*.len]),32768) as i64;
+}
+
+fn zmd_open_read_dir(path: []u8, cpath:*ArrayList[u8]) i64 {
     // getdirentries64 needs a readable descriptor; keep this separate from
     // the O_EVTONLY descriptor used by the event filter.
-    let cpath: ArrayList[u8] = zmd_cstr(path);
-    return open(_zag_slice_ptr(cpath.data[0..cpath.len]),0) as i64;
+    if(zmd_set_cpath(path,cpath)==0){return 0-1;}
+    return open(_zag_slice_ptr(cpath.*.data[0..cpath.*.len]),0) as i64;
 }
 
 fn zmd_close(fd: i64) void { let _rc: i64 = _zag_darwin_syscall(6, fd, 0, 0, 0, 0, 0); }
@@ -77,21 +115,39 @@ fn zmd_name(data: []u8, off: i32, count: i32) []u8 {
 
 fn zmd_ignored_dir(name: []u8) i32 {
     if (@strEq(name, ".") || @strEq(name, "..")) { return 1; }
-    if (@strEq(name, ".zag-cache") || @strEq(name, ".git")) { return 1; }
+    if (@strEq(name, ".zag-cache") || @strEq(name, ".git") ||
+        @strEq(name, ".zig-cache") || @strEq(name, "zig-cache") ||
+        @strEq(name, "node_modules") || @strEq(name, "__pycache__") ||
+        @strEq(name, "build") || @strEq(name, "dist") ||
+        @strEq(name, "target")) { return 1; }
     return 0;
+}
+
+fn zmd_has_suffix(value:[]u8,suffix:[]u8)i32{
+    if(value.len<suffix.len){return 0;}
+    return @strEq(value[value.len-suffix.len..value.len],suffix) as i32;
+}
+
+fn zmd_input_name(name:[]u8)i32{
+    if(@strEq(name,"zag.mod")||@strEq(name,"zag.lock")){return 1;}
+    return (zmd_has_suffix(name,".zag")==1||zmd_has_suffix(name,".zs")==1) as i32;
 }
 
 fn zmd_watch_known(watches: ArrayList[ZmdWatch], path: []u8) i32 {
+    let identity:ZagdHash=zagd_content_hash(path);
     let i: i32 = 0;
-    while (i < watches.len) { if (@strEq(watches.data[i].path, path)) { return 1; } i = i + 1; }
+    while (i < watches.len) { if (zagd_hash_equal(watches.data[i].identity,identity)==1) { return 1; } i = i + 1; }
     return 0;
 }
 
-fn zmd_add_watch(kq: i64, path: []u8, watches: *ArrayList[ZmdWatch]) i32 {
-    if (path.len == 0 || watches.*.len >= 512 || zmd_watch_known(watches.*,path) == 1) { return 0; }
-    let fd: i64 = zmd_open_event_dir(path);
+fn zmd_add_watch(kq: i64, path: []u8, watches: *ArrayList[ZmdWatch],
+                 remaining:i32,cpath:*ArrayList[u8]) i32 {
+    if (path.len == 0) { return 0; }
+    if (zmd_watch_known(watches.*,path) == 1) { return 1; }
+    if (remaining <= 0 || watches.*.len >= watches.*.cap) { return 0; }
+    let fd: i64 = zmd_open_event_dir(path,cpath);
     if (fd < 0 || zmd_kqueue_watch(kq,fd) < 0) { if (fd >= 0) { zmd_close(fd); } return 0; }
-    push[ZmdWatch](watches,ZmdWatch{.fd=fd,.path=path});
+    push[ZmdWatch](watches,ZmdWatch{.fd=fd,.identity=zagd_content_hash(path)});
     return 1;
 }
 
@@ -99,19 +155,22 @@ fn zmd_add_watch(kq: i64, path: []u8, watches: *ArrayList[ZmdWatch]) i32 {
 // ino@0, seekoff@8, reclen@16, namlen@18, type@20, name@21.  Every project
 // directory gets its own EVFILT_VNODE fd; this is actual recursive coverage,
 // not a root-only kqueue approximation.
-fn zmd_watch_tree(kq: i64, path: []u8, watches: *ArrayList[ZmdWatch]) void {
-    let _added: i32 = zmd_add_watch(kq,path,watches);
-    let fd: i64 = zmd_open_read_dir(path);
-    if (fd < 0 || watches.*.len >= 512) { if (fd >= 0) { zmd_close(fd); } return; }
+fn zmd_watch_tree(kq: i64, path: []u8, watches: *ArrayList[ZmdWatch],
+                  cpath:*ArrayList[u8]) i32 {
+    let complete:i32=zmd_add_watch(kq,path,watches,512-watches.*.len,cpath);
+    if(complete==0){return 0;}
+    let fd: i64 = zmd_open_read_dir(path,cpath);
+    if (fd < 0) { return 0; }
     let entries: ArrayList[u8] = make[u8](4096);
     while (entries.len < 4096) { push[u8](&entries,0 as u8); }
-    while (1 == 1) {
+    while (complete == 1) {
         let base: i64 = 0;
         let nread: i64 = _zag_darwin_syscall(344,fd,_zag_slice_ptr(entries.data[0..entries.len]) as i64,
             entries.len,(&base) as i64,0,0);
-        if (nread <= 0) { break; }
+        if (nread == 0) { break; }
+        if (nread < 0) { complete=0;break; }
         let off: i32 = 0;
-        while (off + 21 <= nread) {
+        while (off + 21 <= nread && complete == 1) {
             let reclen: i32 = zmd_u16(entries.data[0..nread as i32],off + 16);
             let namlen: i32 = zmd_u16(entries.data[0..nread as i32],off + 18);
             if (reclen < 21 || off + reclen > nread || namlen > reclen - 21) { off = nread as i32; }
@@ -120,18 +179,24 @@ fn zmd_watch_tree(kq: i64, path: []u8, watches: *ArrayList[ZmdWatch]) void {
                 let name: []u8 = zmd_name(entries.data[0..nread as i32],off + 21,namlen);
                 if (dtype == 4 && zmd_ignored_dir(name) == 0) {
                     let child: []u8 = zmd_join(path,name);
-                    zmd_watch_tree(kq,child,watches);
+                    if(zmd_watch_tree(kq,child,watches,cpath)==0){complete=0;}
+                    _zag_str_free(child);
                 }
                 off = off + reclen;
             }
         }
     }
-    free[u8](&entries); zmd_close(fd);
+    free[u8](&entries); zmd_close(fd);return complete;
+}
+
+fn zmd_close_watch_fds(watches: *ArrayList[ZmdWatch]) void {
+    let i: i32 = 0;
+    while (i < watches.*.len) { zmd_close(watches.*.data[i].fd);i = i + 1; }
+    watches.*.len=0;
 }
 
 fn zmd_close_watches(watches: *ArrayList[ZmdWatch]) void {
-    let i: i32 = 0;
-    while (i < watches.*.len) { zmd_close(watches.*.data[i].fd); i = i + 1; }
+    zmd_close_watch_fds(watches);
     free[ZmdWatch](watches);
 }
 
@@ -140,9 +205,10 @@ fn zmd_sleep_ms(ms: i64) void {
     if (wait < 1) { wait = 1; }
     let ts: ZmdTimespec = ZmdTimespec{.sec=wait / 1000,
         .nsec=(wait % 1000) * 1000000};
-    // Darwin arm64 nanosleep(2), with the Darwin syscall number carried by
-    // the macOS-only raw-syscall adapter.
-    let _rc: i64 = _zag_darwin_syscall(240, (&ts) as i64, 0, 0, 0, 0, 0);
+    // The portable raw boundary identifies Linux nanosleep(35); Darwin ARM64
+    // lowering converts its timespec to a timeval and performs select(2) with
+    // empty descriptor sets. XNU has no public raw nanosleep Unix syscall.
+    let _rc: i64 = _zag_raw_syscall(35, (&ts) as i64, 0, 0, 0, 0, 0);
 }
 
 fn zmd_pid() i64 { return _zag_darwin_syscall(20, 0, 0, 0, 0, 0, 0); }
@@ -156,25 +222,53 @@ fn zmd_cstr(value: []u8) ArrayList[u8] {
     return out;
 }
 
-fn zmd_unlink(path: []u8) void {
-    let cpath: ArrayList[u8] = zmd_cstr(path);
-    let _rc: i32 = unlink(_zag_slice_ptr(cpath.data[0..cpath.len]));
+fn zmd_unlink_cpath(cpath: []u8) void {
+    let _rc: i32 = unlink(_zag_slice_ptr(cpath));
+}
+
+fn zmd_exists_cpath(cpath:[]u8)i32{
+    let fd:i64=open(_zag_slice_ptr(cpath),0) as i64;
+    if(fd<0){return 0;}zmd_close(fd);return 1;
+}
+
+fn zmd_write_cpath(cpath:[]u8,text:[]u8)i32{
+    // The stable status path is created once before the loop. Repeated writes
+    // need only O_WRONLY|O_TRUNC, avoiding the allocating runtime path bridge.
+    let fd:i64=open(_zag_slice_ptr(cpath),1025) as i64;
+    if(fd<0){return 0-1;}
+    let off:i32=0;let ok:i32=1;
+    while(off<text.len&&ok==1){
+        let wrote:i64=_zag_darwin_syscall(4,fd,
+            _zag_slice_ptr(text[off..text.len]) as i64,text.len-off,0,0,0);
+        if(wrote<=0){ok=0;}else{off=off+wrote as i32;}
+    }
+    zmd_close(fd);if(ok==0){return 0-1;}return 0;
 }
 
 fn zmd_join(root: []u8, leaf: []u8) []u8 {
     if (root.len > 0 && root[root.len - 1] == '/') { return _zag_str_concat(root, leaf); }
-    return _zag_str_concat(root, _zag_str_concat("/", leaf));
+    let suffix:[]u8=_zag_str_concat("/",leaf);
+    let out:[]u8=_zag_str_concat(root,suffix);_zag_str_free(suffix);return out;
 }
 
-fn zmd_quote(value: []u8) []u8 {
-    let out: []u8 = "'";
+fn zmd_shell_quote(out:*ArrayList[u8],value:[]u8)void{
+    push[u8](out,'\'');
     let i: i32 = 0;
     while (i < value.len) {
-        if (value[i] == '\'') { out = _zag_str_concat(out, "'\\''"); }
-        else { out = _zag_str_concat(out, value[i..i + 1]); }
+        if (value[i] == '\'') {
+            push[u8](out,'\'');push[u8](out,'\\');push[u8](out,'\'');push[u8](out,'\'');
+        } else { push[u8](out,value[i]); }
         i = i + 1;
     }
-    return _zag_str_concat(out, "'");
+    push[u8](out,'\'');
+}
+
+fn zmd_command(compiler:[]u8,source:[]u8)ArrayList[u8]{
+    let out:ArrayList[u8]=make[u8](compiler.len*4+source.len*4+96);
+    zmd_shell_quote(&out,compiler);let _a:i32=zmd_buf_text(&out," check ");
+    zmd_shell_quote(&out,source);
+    let _b:i32=zmd_buf_text(&out," --no-zagd --no-analyze >/dev/null 2>/dev/null");
+    push[u8](&out,0 as u8);return out;
 }
 
 fn zmd_dir(path: []u8) []u8 {
@@ -186,6 +280,267 @@ fn zmd_dir(path: []u8) []u8 {
     return path[0..last];
 }
 
+// Kqueue notifications are hints.  Existing-file writes, atomic editor saves,
+// and descriptor exhaustion can all change which vnode reports an event.  The
+// daemon therefore keys work to a bounded fingerprint of compiler inputs and
+// uses kqueue only to wake the comparison early.
+struct ZmdInputFingerprint { hash:ZagdHash, files:i32, complete:i32 }
+
+fn zmd_fingerprint_merge(out:*ZmdInputFingerprint,entry:ZagdHash)void{
+    out.*.hash.first=(out.*.hash.first+entry.first)%1000000007;
+    out.*.hash.second=(out.*.hash.second+entry.second)%1000000009;
+    out.*.hash.bytes=out.*.hash.bytes+entry.bytes;
+    out.*.files=out.*.files+1;
+}
+
+// Hash one compiler input through a fixed read buffer. The ARM64 runtime's
+// general allocator is a physical bump arena, so `_zag_read_file` is not safe
+// in a daemon poll loop even if its logical owner is released afterwards.
+fn zmd_fingerprint_file(out:*ZmdInputFingerprint,path:[]u8,
+                        cpath:*ArrayList[u8],read_buffer:*ArrayList[u8])void{
+    if(out.*.complete==0){return;}
+    if(out.*.files>=4096||zmd_set_cpath(path,cpath)==0){out.*.complete=0;return;}
+    let entry:ZagdHash=zagd_hash_extend(zagd_content_hash(path),"\n");
+    let fd:i64=open(_zag_slice_ptr(cpath.*.data[0..cpath.*.len]),0) as i64;
+    if(fd<0){zmd_fingerprint_merge(out,zagd_hash_extend(entry,"<missing>"));return;}
+    let ok:i32=1;
+    while(ok==1){
+        let n:i64=_zag_darwin_syscall(3,fd,
+            _zag_slice_ptr(read_buffer.*.data[0..read_buffer.*.len]) as i64,
+            read_buffer.*.len,0,0,0);
+        if(n==0){break;}
+        if(n<0){ok=0;}else{entry=zagd_hash_extend(entry,read_buffer.*.data[0..n as i32]);}
+    }
+    zmd_close(fd);
+    if(ok==0){out.*.complete=0;return;}
+    zmd_fingerprint_merge(out,entry);
+}
+
+// Match the foreground manifest's accepted path forms: canonical absolute,
+// project-relative, or leading-parent paths for reviewed sibling packages.
+fn zmd_manifest_path_safe(path:[]u8)i32{
+    if(path.len==0||path[path.len-1]=='/'){return 0;}
+    let absolute:i32=(path[0]=='/') as i32;let start:i32=absolute;
+    let normal_seen:i32=0;let i:i32=start;
+    while(i<=path.len){
+        if(i<path.len&&(path[i]=='\n'||path[i]=='\r'||path[i]=='\t'||
+            path[i]==0||path[i]=='\\')){return 0;}
+        if(i==path.len||path[i]=='/'){
+            if(i==start){return 0;}
+            let segment:[]u8=path[start..i];
+            if(@strEq(segment,".")){return 0;}
+            if(@strEq(segment,"..")){if(absolute==1||normal_seen==1){return 0;}}
+            else{normal_seen=1;}
+            start=i+1;
+        }
+        i=i+1;
+    }
+    return 1;
+}
+
+fn zmd_manifest_input_path(root:[]u8,name:[]u8,out:*ArrayList[u8])i32{
+    out.*.len=0;
+    if(name.len>0&&name[0]=='/'){return zmd_buf_text(out,name);}
+    if(zmd_buf_text(out,root)==0){return 0;}
+    if(root.len==0||root[root.len-1]!='/'){if(zmd_buf_byte(out,'/')==0){return 0;}}
+    return zmd_buf_text(out,name);
+}
+
+fn zmd_manifest_input_name(line:[]u8)[]u8{
+    let prefix:[]u8="module_node=";
+    if(line.len>prefix.len&&@strEq(line[0..prefix.len],prefix)){
+        let node:[]u8=line[prefix.len..line.len];let tab:i32=0;
+        while(tab<node.len&&node[tab]!='\t'){tab=tab+1;}
+        if(tab<node.len){return node[0..tab];}
+        return "";
+    }
+    prefix="dependency_input_node=";
+    if(line.len>prefix.len&&@strEq(line[0..prefix.len],prefix)){
+        let node:[]u8=line[prefix.len..line.len];let tab:i32=0;
+        while(tab<node.len&&node[tab]!='\t'){tab=tab+1;}
+        if(tab<node.len){return node[0..tab];}
+    }
+    return "";
+}
+
+// An argument-less `znc watch` may replace a daemon that was auto-started by
+// a foreground build. Recover that compiler-selected root only from a fully
+// checksum-validated manifest; an explicit --root-source always wins.
+fn zmd_manifest_selected_source(root:[]u8,semantic_path:[]u8)[]u8{
+    let text:[]u8=_zag_read_file(semantic_path);
+    if(text.len<0){return "";}
+    if(semantic_manifest_decode(text).valid==0){
+        _zag_free(_zag_slice_ptr(text));let cpath:ArrayList[u8]=zmd_cstr(semantic_path);
+        zmd_unlink_cpath(cpath.data[0..cpath.len]);free[u8](&cpath);return "";
+    }
+    let module:[]u8=smf_value(text,"module");let out:[]u8="";
+    if(zmd_manifest_path_safe(module)==1){
+        if(module[0]=='/'||@strEq(root,".")){out=_zag_str_concat("",module);}
+        else{out=zmd_join(root,module);}
+    }
+    _zag_free(_zag_slice_ptr(text));return out;
+}
+
+fn zmd_fingerprint_manifest(root:[]u8,text:[]u8,out:*ZmdInputFingerprint,
+                            path:*ArrayList[u8],cpath:*ArrayList[u8],
+                            read_buffer:*ArrayList[u8])void{
+    if(semantic_manifest_decode(text).valid==0){return;}
+    let start:i32=0;let i:i32=0;
+    while(i<=text.len&&out.*.complete==1){
+        if(i==text.len||text[i]=='\n'){
+            let name:[]u8=zmd_manifest_input_name(text[start..i]);
+            if(name.len>0){
+                if(zmd_manifest_path_safe(name)==0||out.*.files>=4096){out.*.complete=0;}
+                else{
+                    if(zmd_manifest_input_path(root,name,path)==0){out.*.complete=0;}
+                    else{zmd_fingerprint_file(out,path.*.data[0..path.*.len],cpath,read_buffer);}
+                }
+            }
+            start=i+1;
+        }
+        i=i+1;
+    }
+}
+
+fn zmd_project_fingerprint(root:[]u8,source:[]u8,module_file:[]u8,lock_file:[]u8,
+                           manifest:[]u8,path:*ArrayList[u8],cpath:*ArrayList[u8],
+                           read_buffer:*ArrayList[u8])ZmdInputFingerprint{
+    let out:ZmdInputFingerprint=ZmdInputFingerprint{.hash=zagd_hash_empty(),.files=0,.complete=1};
+    if(source.len>0){zmd_fingerprint_file(&out,source,cpath,read_buffer);}
+    zmd_fingerprint_file(&out,module_file,cpath,read_buffer);
+    zmd_fingerprint_file(&out,lock_file,cpath,read_buffer);
+    if(out.complete==1){zmd_fingerprint_manifest(root,manifest,&out,path,cpath,read_buffer);}
+    return out;
+}
+
+fn zmd_fingerprint_equal(a:ZmdInputFingerprint,b:ZmdInputFingerprint)i32{
+    return (a.complete==b.complete&&a.files==b.files&&
+        zagd_hash_equal(a.hash,b.hash)==1) as i32;
+}
+
+// Require two equal bounded snapshots separated by the configured stability
+// window before compiling. Atomic renames normally settle in one pass; a
+// partial in-place save is allowed a bounded number of additional windows.
+fn zmd_stable_fingerprint(root:[]u8,source:[]u8,module_file:[]u8,lock_file:[]u8,
+                          manifest:[]u8,path:*ArrayList[u8],cpath:*ArrayList[u8],
+                          read_buffer:*ArrayList[u8],first:ZmdInputFingerprint,
+                          window_ms:i64)ZmdInputFingerprint{
+    let current:ZmdInputFingerprint=first;let attempts:i32=0;
+    while(attempts<8){
+        zmd_sleep_ms(window_ms);
+        let next:ZmdInputFingerprint=zmd_project_fingerprint(root,source,module_file,
+            lock_file,manifest,path,cpath,read_buffer);
+        if(zmd_fingerprint_equal(current,next)==1){return next;}
+        current=next;attempts=attempts+1;
+    }
+    return current;
+}
+
+fn zmd_watch_one(kq:i64,path:[]u8,project:ArrayList[ZmdWatch],
+                 parents:*ArrayList[ZmdWatch],inputs:*ArrayList[ZmdWatch],
+                 parent:i32,cpath:*ArrayList[u8])i32{
+    let target:[]u8=path;if(parent==1){target=zmd_dir(path);}
+    if(parent==1&&zmd_watch_known(project,target)==1){return 1;}
+    let list:*ArrayList[ZmdWatch]=inputs;if(parent==1){list=parents;}
+    if(zmd_watch_known(list.*,target)==1){return 1;}
+    let used:i32=project.len+parents.*.len+inputs.*.len;
+    if(used>=512){return 0;}
+    if(parent==0){
+        if(zmd_set_cpath(target,cpath)==0){return 0;}
+        if(zmd_exists_cpath(cpath.*.data[0..cpath.*.len])==0){return 1;}
+    }
+    return zmd_add_watch(kq,target,list,512-used,cpath);
+}
+
+fn zmd_watch_manifest_inputs(kq:i64,root:[]u8,text:[]u8,
+                             project:ArrayList[ZmdWatch],parents:*ArrayList[ZmdWatch],
+                             inputs:*ArrayList[ZmdWatch],parent:i32,
+                             path:*ArrayList[u8],cpath:*ArrayList[u8])i32{
+    if(semantic_manifest_decode(text).valid==0){return 1;}
+    let complete:i32=1;let start:i32=0;let i:i32=0;
+    while(i<=text.len){
+        if(i==text.len||text[i]=='\n'){
+            let name:[]u8=zmd_manifest_input_name(text[start..i]);
+            if(name.len>0){
+                if(zmd_manifest_path_safe(name)==0){complete=0;}
+                else{
+                    if(zmd_manifest_input_path(root,name,path)==0){complete=0;}
+                    else if(zmd_watch_one(kq,path.*.data[0..path.*.len],project,
+                        parents,inputs,parent,cpath)==0){complete=0;}
+                }
+            }
+            start=i+1;
+        }
+        i=i+1;
+    }
+    return complete;
+}
+
+fn zmd_rearm_inputs(kq:i64,root:[]u8,source:[]u8,module_file:[]u8,lock_file:[]u8,
+                    manifest:[]u8,project:ArrayList[ZmdWatch],
+                    parents:*ArrayList[ZmdWatch],inputs:*ArrayList[ZmdWatch],
+                    path:*ArrayList[u8],cpath:*ArrayList[u8])i32{
+    zmd_close_watch_fds(parents);zmd_close_watch_fds(inputs);
+    let complete:i32=1;
+    if(source.len==0||zmd_watch_one(kq,source,project,parents,inputs,1,cpath)==0){complete=0;}
+    if(zmd_watch_one(kq,module_file,project,parents,inputs,1,cpath)==0||
+       zmd_watch_one(kq,lock_file,project,parents,inputs,1,cpath)==0){complete=0;}
+    if(zmd_watch_manifest_inputs(kq,root,manifest,project,parents,inputs,1,path,cpath)==0){complete=0;}
+    if(source.len>0&&zmd_watch_one(kq,source,project,parents,inputs,0,cpath)==0){complete=0;}
+    if(zmd_watch_one(kq,module_file,project,parents,inputs,0,cpath)==0||
+       zmd_watch_one(kq,lock_file,project,parents,inputs,0,cpath)==0){complete=0;}
+    if(zmd_watch_manifest_inputs(kq,root,manifest,project,parents,inputs,0,path,cpath)==0){complete=0;}
+    if(complete==0){zmd_close_watch_fds(parents);zmd_close_watch_fds(inputs);}
+    return complete;
+}
+
+fn zmd_setup_watches(kq:i64,root:[]u8,source:[]u8,module_file:[]u8,lock_file:[]u8,
+                     manifest:[]u8,project:*ArrayList[ZmdWatch],
+                     parents:*ArrayList[ZmdWatch],inputs:*ArrayList[ZmdWatch],
+                     path:*ArrayList[u8],cpath:*ArrayList[u8])i32{
+    if(kq<0){return 0;}
+    let complete:i32=zmd_watch_tree(kq,root,project,cpath);
+    if(complete==1&&zmd_rearm_inputs(kq,root,source,module_file,lock_file,manifest,
+        project.*,parents,inputs,path,cpath)==0){complete=0;}
+    return (complete==1&&project.*.len>0) as i32;
+}
+
+struct ZmdManifestBuffers{
+    first:ArrayList[u8],second:ArrayList[u8],active:i32,valid:i32
+}
+
+fn zmd_manifest_text(state:*ZmdManifestBuffers)[]u8{
+    if(state.*.valid==0){return "";}
+    if(state.*.active==0){return state.*.first.data[0..state.*.first.len];}
+    return state.*.second.data[0..state.*.second.len];
+}
+
+fn zmd_read_cpath(cpath:[]u8,out:*ArrayList[u8],read_buffer:*ArrayList[u8],ceiling:i32)i32{
+    out.*.len=0;
+    let fd:i64=open(_zag_slice_ptr(cpath),0) as i64;
+    if(fd<0){return 0;}
+    let ok:i32=1;
+    while(ok==1){
+        let n:i64=_zag_darwin_syscall(3,fd,
+            _zag_slice_ptr(read_buffer.*.data[0..read_buffer.*.len]) as i64,
+            read_buffer.*.len,0,0,0);
+        if(n==0){break;}
+        if(n<0||n>ceiling-out.*.len){ok=0;}
+        else{let i:i32=0;while(i<n){push[u8](out,read_buffer.*.data[i]);i=i+1;}}
+    }
+    zmd_close(fd);return ok;
+}
+
+fn zmd_refresh_manifest(semantic_cpath:[]u8,state:*ZmdManifestBuffers,
+                        read_buffer:*ArrayList[u8])i32{
+    let target:*ArrayList[u8]=&state.*.second;
+    if(state.*.active==1){target=&state.*.first;}
+    if(zmd_read_cpath(semantic_cpath,target,read_buffer,8388608)==0){return 0;}
+    if(semantic_manifest_decode(target.*.data[0..target.*.len]).valid==0){return 0;}
+    if(state.*.active==0){state.*.active=1;}else{state.*.active=0;}
+    state.*.valid=1;return 1;
+}
+
 struct ZmdConfig {
     idle_deep: []u8, difficulty: []u8, script_optimization: []u8,
     regular_optimization: []u8, objective: []u8, trust_mode: []u8,
@@ -193,40 +548,59 @@ struct ZmdConfig {
     max_cache_bytes: []u8, max_workers: []u8, notifications: []u8,
 }
 
-fn zmd_status(root: []u8, pid: i64, mode: []u8, state: []u8, events: i64,
-              native_events: i32, watch_dirs: i32, check_status: i32, cfg: ZmdConfig) void {
-    let watcher: []u8 = "watcher=polling-root-module\n";
-    if (native_events == 1) { watcher = "watcher=kqueue-recursive\n"; }
-    let text: []u8 = _zag_str_concat("advisory=true\nexecutable_authority=false\ntarget=macos-arm64\n", watcher);
-    text = _zag_str_concat(text, _zag_str_concat("pid=", _zag_i64_to_str(pid)));
-    text = _zag_str_concat(text, _zag_str_concat("\nmode=", mode));
-    text = _zag_str_concat(text, _zag_str_concat("\nstate=", state));
-    text = _zag_str_concat(text, _zag_str_concat("\nevents=", _zag_i64_to_str(events)));
-    text = _zag_str_concat(text, _zag_str_concat("\nwatch_directories=", _zag_i64_to_str(watch_dirs as i64)));
-    text = _zag_str_concat(text, _zag_str_concat("\nlast_check_status=", _zag_i64_to_str(check_status as i64)));
-    let semantic_manifest: []u8 = "false";
-    if (_zag_file_exists(zmd_join(root, ".zag-cache/zagd/semantic.record")) == 1) {
-        semantic_manifest = "true";
-    }
-    text = _zag_str_concat(text, _zag_str_concat("\nsemantic_manifest=", semantic_manifest));
-    text = _zag_str_concat(text, _zag_str_concat("\nidle_deep=", cfg.idle_deep));
-    text = _zag_str_concat(text, _zag_str_concat("\ndifficulty=", cfg.difficulty));
-    text = _zag_str_concat(text, _zag_str_concat("\nscript_optimization=", cfg.script_optimization));
-    text = _zag_str_concat(text, _zag_str_concat("\nregular_optimization=", cfg.regular_optimization));
-    text = _zag_str_concat(text, _zag_str_concat("\nobjective=", cfg.objective));
-    text = _zag_str_concat(text, _zag_str_concat("\ntrust_mode=", cfg.trust_mode));
+fn zmd_status(status_cpath:[]u8,semantic_cpath:[]u8,pid: i64,last_file:[]u8,
+              mode: []u8, state: []u8, events: i64,
+              native_events: i32, watch_dirs: i32, check_status: i32,
+              input_complete:i32,cfg: ZmdConfig,out:*ArrayList[u8]) void {
+    out.*.len=0;let ok:i32=1;
+    if(zmd_buf_text(out,"advisory=true\nexecutable_authority=false\ntarget=macos-arm64\n")==0){ok=0;}
+    if(native_events==1){if(zmd_buf_text(out,"watcher=kqueue-recursive\n")==0){ok=0;}}
+    else{if(zmd_buf_text(out,"watcher=polling-project-inputs\n")==0){ok=0;}}
+    // Both the native kqueue path and the bounded polling fallback are valid
+    // watcher implementations. Publish an explicit health bit so readiness
+    // clients do not have to infer liveness from the implementation name.
+    if(zmd_buf_text(out,"watcher_health=ok\n")==0){ok=0;}
+    if(zmd_buf_text(out,"pid=")==0||zmd_buf_i64(out,pid)==0){ok=0;}
+    if(zmd_buf_text(out,"\nlast_file=")==0||zmd_buf_text(out,last_file)==0){ok=0;}
+    if(zmd_buf_text(out,"\nmode=")==0||zmd_buf_text(out,mode)==0){ok=0;}
+    if(zmd_buf_text(out,"\nstate=")==0||zmd_buf_text(out,state)==0){ok=0;}
+    if(zmd_buf_text(out,"\nevents=")==0||zmd_buf_i64(out,events)==0){ok=0;}
+    if(zmd_buf_text(out,"\nwatch_directories=")==0||zmd_buf_i64(out,watch_dirs as i64)==0){ok=0;}
+    if(input_complete==1){if(zmd_buf_text(out,"\ninput_scan_complete=true")==0){ok=0;}}
+    else{if(zmd_buf_text(out,"\ninput_scan_complete=false")==0){ok=0;}}
+    if(zmd_buf_text(out,"\nlast_check_status=")==0||zmd_buf_i64(out,check_status as i64)==0){ok=0;}
+    if(zmd_buf_text(out,"\nsemantic_manifest=")==0){ok=0;}
+    if(zmd_exists_cpath(semantic_cpath)==1){if(zmd_buf_text(out,"true")==0){ok=0;}}
+    else{if(zmd_buf_text(out,"false")==0){ok=0;}}
+    if(zmd_buf_text(out,"\nidle_deep=")==0||zmd_buf_text(out,cfg.idle_deep)==0){ok=0;}
+    if(zmd_buf_text(out,"\ndifficulty=")==0||zmd_buf_text(out,cfg.difficulty)==0){ok=0;}
+    if(zmd_buf_text(out,"\nscript_optimization=")==0||zmd_buf_text(out,cfg.script_optimization)==0){ok=0;}
+    if(zmd_buf_text(out,"\nregular_optimization=")==0||zmd_buf_text(out,cfg.regular_optimization)==0){ok=0;}
+    if(zmd_buf_text(out,"\nobjective=")==0||zmd_buf_text(out,cfg.objective)==0){ok=0;}
+    if(zmd_buf_text(out,"\ntrust_mode=")==0||zmd_buf_text(out,cfg.trust_mode)==0){ok=0;}
     // The Darwin watcher consumes policy but never executes optimizer output.
     // Publish the same explicit authority boundary as the Linux daemon so
     // status clients do not have to infer capabilities from the target name.
-    text = _zag_str_concat(text, "\ntrust_mode_scope=policy-only");
-    text = _zag_str_concat(text, "\noptimizer_generation=unimplemented");
-    text = _zag_str_concat(text, _zag_str_concat("\ncpu=", cfg.cpu));
-    text = _zag_str_concat(text, _zag_str_concat("\nstability_window_ms=", cfg.stability_window_ms));
-    text = _zag_str_concat(text, _zag_str_concat("\nmax_memory_bytes=", cfg.max_memory_bytes));
-    text = _zag_str_concat(text, _zag_str_concat("\nmax_cache_bytes=", cfg.max_cache_bytes));
-    text = _zag_str_concat(text, _zag_str_concat("\nmax_workers=", cfg.max_workers));
-    text = _zag_str_concat(text, _zag_str_concat("\nnotifications=", cfg.notifications));
-    let _rc: i32 = _zag_write_file(zmd_join(root, ".zagd.status"), _zag_str_concat(text, "\n"));
+    if(zmd_buf_text(out,"\ntrust_mode_scope=policy-only\noptimizer_generation=bounded-finite-sandbox")==0){ok=0;}
+    if(zmd_buf_text(out,"\npolicy_validation=enforced\nstability_window_enforced=true\nmemory_limit_enforced=allocator-peak-guard\nmax_workers_enforced=true")==0){ok=0;}
+    if(zmd_buf_text(out,"\ncpu=")==0||zmd_buf_text(out,cfg.cpu)==0){ok=0;}
+    if(zmd_buf_text(out,"\nstability_window_ms=")==0||zmd_buf_text(out,cfg.stability_window_ms)==0){ok=0;}
+    if(zmd_buf_text(out,"\nmax_memory_bytes=")==0||zmd_buf_text(out,cfg.max_memory_bytes)==0){ok=0;}
+    if(zmd_buf_text(out,"\nmax_cache_bytes=")==0||zmd_buf_text(out,cfg.max_cache_bytes)==0){ok=0;}
+    if(zmd_buf_text(out,"\nmax_workers=")==0||zmd_buf_text(out,cfg.max_workers)==0){ok=0;}
+    if(zmd_buf_text(out,"\nnotifications=")==0||zmd_buf_text(out,cfg.notifications)==0){ok=0;}
+    if(zmd_buf_text(out,"\nallocator_allocation_count=")==0||
+       zmd_buf_i64(out,_zag_allocator_allocation_count())==0){ok=0;}
+    if(zmd_buf_text(out,"\nallocator_live_bytes=")==0||
+       zmd_buf_i64(out,_zag_allocator_live_bytes())==0){ok=0;}
+    if(zmd_buf_text(out,"\nallocator_peak_live_bytes=")==0||
+       zmd_buf_i64(out,_zag_allocator_peak_live_bytes())==0){ok=0;}
+    if(zmd_buf_byte(out,'\n')==0){ok=0;}
+    if(ok==0){
+        out.*.len=0;
+        let _fallback:i32=zmd_buf_text(out,"advisory=true\nexecutable_authority=false\ntarget=macos-arm64\nstate=degraded\nstatus_overflow=true\n");
+    }
+    let _rc:i32=zmd_write_cpath(status_cpath,out.*.data[0..out.*.len]);
 }
 
 fn zmd_path_ends(value: []u8, suffix: []u8) i32 {
@@ -240,20 +614,38 @@ fn zmd_sibling_znc() []u8 {
     if (zmd_path_ends(daemon, "zagd-macos-arm64") == 1) { name = "znc-macos-arm64"; }
     else if (zmd_path_ends(daemon, "zagd-linux-arm64") == 1) { name = "znc-linux-arm64"; }
     let sibling: []u8 = zmd_join(zmd_dir(daemon), name);
-    if (_zag_file_exists(sibling) == 1) { return sibling; }
-    return name;
+    let cpath:ArrayList[u8]=zmd_cstr(sibling);
+    let found:i32=zmd_exists_cpath(cpath.data[0..cpath.len]);free[u8](&cpath);
+    if(found==1){return sibling;}
+    _zag_str_free(sibling);return _zag_str_concat("",name);
 }
 
-fn zmd_check(root: []u8, source: []u8) i32 {
-    if (source.len == 0 || _zag_file_exists(source) == 0) { return 127; }
-    let compiler: []u8 = zmd_sibling_znc();
-    let command: []u8 = _zag_str_concat(zmd_quote(compiler),
-        _zag_str_concat(" check ", _zag_str_concat(zmd_quote(source), " --no-zagd --no-analyze >/dev/null 2>/dev/null")));
-    let rc: i32 = _zag_exec_cmd(command);
-    // A failed authoritative check must never leave an older advisory
-    // manifest available to foreground clients.
-    if (rc != 0) { zmd_unlink(zmd_join(root, ".zag-cache/zagd/semantic.record")); }
-    return rc;
+fn zmd_exec(shell_cpath:[]u8,argv:*ArrayList[i64],envp:i64)i32{
+    let child:i64=zmd_fork();
+    if(child<0){return 127;}
+    if(child==0){
+        // Darwin rejects a null envp. Forward the immutable startup
+        // environment so PATH-based installed compiler/daemon pairs work too.
+        let _exec:i64=_zag_darwin_syscall(59,_zag_slice_ptr(shell_cpath) as i64,
+            argv.*.data as i64,envp,0,0,0);
+        let _exit:i64=_zag_darwin_syscall(1,127,0,0,0,0,0);return 127;
+    }
+    let status:i32=0;let waited:i64=0-1;let attempts:i32=0;
+    while(waited<0&&attempts<8){
+        waited=_zag_darwin_syscall(7,child,(&status) as i64,0,0,0,0);attempts=attempts+1;
+    }
+    if(waited<0){return 127;}
+    let code:i32=(status/256)%256;if(code==0&&status!=0){return 1;}return code;
+}
+
+fn zmd_check(source_cpath:[]u8,semantic_cpath:[]u8,ready_cpath:[]u8,
+             shell_cpath:[]u8,exec_argv:*ArrayList[i64],envp:i64) i32 {
+    // The old record is never evidence for the check about to run. Remove it
+    // before all early exits so a deleted root or an advisory publication
+    // failure cannot leave stale semantic state visible as current.
+    zmd_unlink_cpath(semantic_cpath);zmd_unlink_cpath(ready_cpath);
+    if(source_cpath.len<=1||zmd_exists_cpath(source_cpath)==0){return 127;}
+    return zmd_exec(shell_cpath,exec_argv,envp);
 }
 
 fn zmd_arg_value(flag: []u8) []u8 {
@@ -265,37 +657,426 @@ fn zmd_arg_value(flag: []u8) []u8 {
     return "";
 }
 
+fn zmd_arg_default(flag:[]u8,fallback:[]u8)[]u8{
+    let value:[]u8=zmd_arg_value(flag);if(value.len>0){return value;}return fallback;
+}
+
+fn zmd_cpu_arg()[]u8{
+    let value:[]u8=zmd_arg_value("--cpu");if(value.len>0){return value;}
+    let i:i32=1;while(i<_zag_argc()){
+        let arg:[]u8=_zag_arg(i);
+        if(arg.len>6&&@strEq(arg[0..6],"--cpu=")){return arg[6..];}
+        i=i+1;
+    }
+    return "generic";
+}
+
+fn zmd_value_flag(arg:[]u8)i32{
+    return (@strEq(arg,"--root")||@strEq(arg,"--root-source")||
+        @strEq(arg,"--mode")||@strEq(arg,"--idle-deep")||
+        @strEq(arg,"--difficulty")||@strEq(arg,"--script-optimization")||
+        @strEq(arg,"--regular-optimization")||@strEq(arg,"--objective")||
+        @strEq(arg,"--trust-mode")||@strEq(arg,"--cpu")||
+        @strEq(arg,"--window-ms")||@strEq(arg,"--max-memory-bytes")||
+        @strEq(arg,"--max-cache-bytes")||@strEq(arg,"--max-workers")||
+        @strEq(arg,"--notifications")) as i32;
+}
+
+fn zmd_validate_args()i32{
+    let i:i32=1;
+    while(i<_zag_argc()){
+        let arg:[]u8=_zag_arg(i);
+        if(@strEq(arg,"--daemonize")){i=i+1;}
+        else if(arg.len>6&&@strEq(arg[0..6],"--cpu=")){i=i+1;}
+        else if(zmd_value_flag(arg)==1){
+            if(i+1>=_zag_argc()){
+                let message:[]u8=_zag_str_concat("zagd: unknown or incomplete argument: ",arg);
+                _zag_eprintln(message);_zag_str_free(message);
+                return 0;
+            }
+            i=i+2;
+        }else{
+            let message:[]u8=_zag_str_concat("zagd: unknown or incomplete argument: ",arg);
+            _zag_eprintln(message);_zag_str_free(message);
+            return 0;
+        }
+    }
+    return 1;
+}
+
+fn zmd_decimal(value:[]u8,max:i64)i64{
+    if(value.len==0){return 0-1;}
+    let out:i64=0;let i:i32=0;
+    while(i<value.len){
+        if(value[i]<'0'||value[i]>'9'){return 0-1;}
+        let digit:i64=(value[i] as i64)-48;
+        if(out>(max-digit)/10){return 0-1;}
+        out=out*10+digit;i=i+1;
+    }
+    return out;
+}
+
 fn zmd_config_from_args() ZmdConfig {
     return ZmdConfig{
-        .idle_deep = zmd_arg_value("--idle-deep"),
-        .difficulty = zmd_arg_value("--difficulty"),
-        .script_optimization = zmd_arg_value("--script-optimization"),
-        .regular_optimization = zmd_arg_value("--regular-optimization"),
-        .objective = zmd_arg_value("--objective"),
-        .trust_mode = zmd_arg_value("--trust-mode"),
-        .cpu = zmd_arg_value("--cpu"),
-        .stability_window_ms = zmd_arg_value("--window-ms"),
-        .max_memory_bytes = zmd_arg_value("--max-memory-bytes"),
-        .max_cache_bytes = zmd_arg_value("--max-cache-bytes"),
-        .max_workers = zmd_arg_value("--max-workers"),
-        .notifications = zmd_arg_value("--notifications"),
+        .idle_deep = zmd_arg_default("--idle-deep","true"),
+        .difficulty = zmd_arg_default("--difficulty","simple"),
+        .script_optimization = zmd_arg_default("--script-optimization","automatic"),
+        .regular_optimization = zmd_arg_default("--regular-optimization","review"),
+        .objective = zmd_arg_default("--objective","runtime"),
+        .trust_mode = zmd_arg_default("--trust-mode","stable"),
+        .cpu = zmd_cpu_arg(),
+        .stability_window_ms = zmd_arg_default("--window-ms","75"),
+        .max_memory_bytes = zmd_arg_default("--max-memory-bytes","536870912"),
+        .max_cache_bytes = zmd_arg_default("--max-cache-bytes","2147483648"),
+        .max_workers = zmd_arg_default("--max-workers","1"),
+        .notifications = zmd_arg_default("--notifications","advisory"),
     };
+}
+
+fn zmd_validate_config(cfg:ZmdConfig)i32{
+    if(@strEq(cfg.idle_deep,"true")==0&&@strEq(cfg.idle_deep,"false")==0){
+        _zag_eprintln("zagd: planner config: idle_deep must be true or false");return 0;}
+    if(@strEq(cfg.difficulty,"simple")==0&&@strEq(cfg.difficulty,"explained")==0&&
+       @strEq(cfg.difficulty,"explicit")==0&&@strEq(cfg.difficulty,"native")==0){
+        _zag_eprintln("zagd: planner config: difficulty must be simple, explained, explicit, or native");return 0;}
+    if(@strEq(cfg.script_optimization,"automatic")==0&&
+       @strEq(cfg.script_optimization,"review")==0&&@strEq(cfg.script_optimization,"off")==0){
+        _zag_eprintln("zagd: planner config: script_optimization must be automatic, review, or off");return 0;}
+    if(@strEq(cfg.regular_optimization,"automatic")==0&&
+       @strEq(cfg.regular_optimization,"review")==0&&@strEq(cfg.regular_optimization,"off")==0){
+        _zag_eprintln("zagd: planner config: regular_optimization must be review, automatic, or off");return 0;}
+    if(@strEq(cfg.objective,"runtime")==0){
+        _zag_eprintln("zagd: planner config: this build supports objective=runtime");return 0;}
+    if(@strEq(cfg.trust_mode,"stable")==0&&@strEq(cfg.trust_mode,"reviewed")==0&&
+       @strEq(cfg.trust_mode,"autonomous")==0){
+        _zag_eprintln("zagd: planner config: trust_mode must be stable, reviewed, or autonomous");return 0;}
+    if(@strEq(cfg.cpu,"generic")==0&&@strEq(cfg.cpu,"native")==0&&
+       @strEq(cfg.cpu,"apple-silicon")==0&&@strEq(cfg.cpu,"apple-m1")==0&&
+       @strEq(cfg.cpu,"apple-m2")==0){
+        _zag_eprintln("zagd: unsupported macOS CPU profile; expected generic, native, apple-silicon, apple-m1, or apple-m2");return 0;}
+    let window:i64=zmd_decimal(cfg.stability_window_ms,60000);
+    if(window<1){_zag_eprintln("zagd: --window-ms must be 1..60000");return 0;}
+    let memory:i64=zmd_decimal(cfg.max_memory_bytes,2147483648);
+    if(memory<67108864){_zag_eprintln("zagd: --max-memory-bytes must be 67108864..2147483648");return 0;}
+    let cache:i64=zmd_decimal(cfg.max_cache_bytes,2147483648);
+    if(cache<1048576){_zag_eprintln("zagd: --max-cache-bytes must be 1048576..2147483648");return 0;}
+    if(zmd_decimal(cfg.max_workers,64)!=1){
+        _zag_eprintln("zagd: this build supports exactly one quiet worker");return 0;}
+    if(@strEq(cfg.notifications,"errors_only")==0&&@strEq(cfg.notifications,"advisory")==0){
+        _zag_eprintln("zagd: --notifications must be errors_only or advisory");return 0;}
+    return 1;
+}
+
+fn zmd_apply_memory_limit(bytes:i64)i32{
+    // macOS rejects useful RLIMIT_AS ceilings because its shared-cache address
+    // space already exceeds the portable daemon budget. All persistent daemon
+    // storage is owned by Zag, so guard the allocator's exact peak instead;
+    // fixed read/watch buffers bound the interval between checks.
+    return (_zag_allocator_peak_live_bytes()<=bytes) as i32;
+}
+
+fn zmd_trim_line(value:[]u8)[]u8{
+    let n:i32=value.len;
+    while(n>0&&(value[n-1]=='\n'||value[n-1]=='\r')){n=n-1;}
+    return value[0..n];
+}
+
+fn zmd_deep_target_key(cpu:[]u8)[]u8{return _zag_str_concat("macos-arm64:",cpu);}
+fn zmd_deep_semantic_identity(text:[]u8,target_key:[]u8)ZagdHash{return zagd_hash_extend(zagd_content_hash(text),target_key);}
+
+fn zmd_deep_file_exists(path:[]u8)i32{
+    if(path.len==0){return 0;}
+    let cpath:ArrayList[u8]=zmd_cstr(path);let exists:i32=zmd_exists_cpath(cpath.data[0..cpath.len]);
+    free[u8](&cpath);return exists;
+}
+
+fn zmd_deep_control_path(root:[]u8,name:[]u8)[]u8{
+    let control:[]u8=zmd_join(root,name);
+    if(zmd_deep_file_exists(control)==0){_zag_str_free(control);return "";}
+    let raw:[]u8=_zag_read_file(control);_zag_str_free(control);
+    if(raw.len<=0){if(raw.len>=0){_zag_free(_zag_slice_ptr(raw));}return "";}
+    let value:[]u8=zmd_trim_line(raw);if(value.len==0){_zag_free(_zag_slice_ptr(raw));return "";}
+    let out:[]u8="";if(value[0]=='/'){out=_zag_str_concat("",value);}else{out=zmd_join(root,value);}
+    _zag_free(_zag_slice_ptr(raw));return out;
+}
+
+fn zmd_deep_value_safe(value:[]u8)i32{
+    if(value.len==0){return 0;}let i:i32=0;
+    while(i<value.len){if(value[i]=='\n'||value[i]=='\r'||value[i]=='\t'){return 0;}i=i+1;}return 1;
+}
+
+fn zmd_deep_relative(root:[]u8,path:[]u8)[]u8{
+    if(path.len>root.len&&@strEq(path[0..root.len],root)&&path[root.len]=='/'){return path[root.len+1..path.len];}
+    return path;
+}
+
+fn zmd_deep_append_hash(out:*ArrayList[u8],value:ZagdHash)i32{
+    if(zmd_buf_i64(out,value.first)==0||zmd_buf_byte(out,'\t')==0||zmd_buf_i64(out,value.second)==0||
+       zmd_buf_byte(out,'\t')==0||zmd_buf_i64(out,value.bytes)==0){return 0;}return 1;
+}
+
+fn zmd_deep_append_samples(out:*ArrayList[u8],key:[]u8,values:ArrayList[i64])i32{
+    if(zmd_buf_text(out,key)==0||zmd_buf_byte(out,'=')==0){return 0;}let i:i32=0;
+    while(i<values.len){if(i>0&&zmd_buf_byte(out,',')==0){return 0;}if(zmd_buf_i64(out,values.data[i])==0){return 0;}i=i+1;}
+    return zmd_buf_byte(out,'\n');
+}
+
+fn zmd_deep_free_workload(w:*ZagdBenchmarkWorkloadEvidence)void{
+    free[i64](&w.*.reference_warmups);free[i64](&w.*.finalist_warmups);free[i64](&w.*.noise_reference);
+    free[i64](&w.*.noise_repeat);free[i64](&w.*.reference_runs);free[i64](&w.*.finalist_runs);
+}
+
+fn zmd_deep_sample_ns(result:ZagdExecutionResult)i64{
+    if(result.state!=zagd_execution_exited()||result.elapsed_ms<0){return 0;}return (result.elapsed_ms+1)*1000000;
+}
+
+fn zmd_deep_atomic_write(path:[]u8,payload:[]u8)i32{
+    let temp:[]u8=_zag_str_concat(path,".tmp");let temp_c:ArrayList[u8]=zmd_cstr(temp);let final_c:ArrayList[u8]=zmd_cstr(path);
+    zmd_unlink_cpath(temp_c.data[0..temp_c.len]);let _written:i32=_zag_write_file(temp,payload);let ok:i32=0;
+    if(zmd_exists_cpath(temp_c.data[0..temp_c.len])==1){
+        let verify:[]u8=_zag_read_file(temp);
+        if(verify.len==payload.len&&verify.len>=0&&zagd_hash_equal(zagd_content_hash(verify),zagd_content_hash(payload))==1&&
+           _zag_raw_syscall(82,_zag_slice_ptr(temp_c.data[0..temp_c.len]) as i64,
+               _zag_slice_ptr(final_c.data[0..final_c.len]) as i64,0,0,0,0)==0){ok=1;}
+        if(verify.len>=0){_zag_free(_zag_slice_ptr(verify));}
+    }
+    if(ok==0){zmd_unlink_cpath(temp_c.data[0..temp_c.len]);}
+    free[u8](&final_c);free[u8](&temp_c);_zag_str_free(temp);return ok;
+}
+
+// The deep-measurement record is a MODE-INVARIANT artifact at a path that never
+// changes, and it must be unlinked in light mode too -- a stale record left by a
+// previous deep run is exactly what light mode is supposed to clear. So the
+// unlink stays unconditional, but the PATH must not be rebuilt to perform it.
+//
+// It used to be `zmd_join(root, ".zag-cache/zagd/deep-measurement.record")` plus
+// a fresh `zmd_cstr`, on every single event. That cost five counted allocations
+// per edit -- `zmd_join` is two `_zag_str_concat` calls, and each one allocates
+// both a data buffer AND a 16-byte {ptr,len} descriptor via `__make_slice`, so a
+// function that looks like "one path string" costs four, and the cstr buffer
+// makes five. The resource-stress gate counts allocation COUNT, not bytes, so
+// this showed up as a steady +5/edit with live_bytes perfectly flat.
+//
+// The path is loop-invariant, so it is built into the caller-owned scratch
+// buffers that `zmd_execute_deep_controls` already carries for exactly this
+// purpose. Same unlink, zero allocations.
+fn zmd_deep_remove_record(root:[]u8,path_scratch:*ArrayList[u8],cpath_scratch:*ArrayList[u8])void{
+    if(zmd_manifest_input_path(root,".zag-cache/zagd/deep-measurement.record",path_scratch)==0){return;}
+    if(zmd_set_cpath(path_scratch.*.data[0..path_scratch.*.len],cpath_scratch)==0){return;}
+    zmd_unlink_cpath(cpath_scratch.*.data[0..cpath_scratch.*.len]);
+}
+
+fn zmd_deep_current(root:[]u8,source:[]u8,module_file:[]u8,dependency_lock:[]u8,target_key:[]u8,
+                    expected:ZagdHash,expected_inputs:ZmdInputFingerprint,path_scratch:*ArrayList[u8],
+                    cpath_scratch:*ArrayList[u8],read_buffer:*ArrayList[u8])i32{
+    let semantic_path:[]u8=zmd_join(root,".zag-cache/zagd/semantic.record");
+    if(zmd_deep_file_exists(semantic_path)==0){_zag_str_free(semantic_path);return 0;}
+    let text:[]u8=_zag_read_file(semantic_path);_zag_str_free(semantic_path);
+    if(text.len<=0){if(text.len>=0){_zag_free(_zag_slice_ptr(text));}return 0;}
+    let valid_manifest:i32=semantic_manifest_decode(text).valid;let identity:ZagdHash=zmd_deep_semantic_identity(text,target_key);
+    let current_inputs:ZmdInputFingerprint=zmd_project_fingerprint(root,source,module_file,dependency_lock,text,
+        path_scratch,cpath_scratch,read_buffer);
+    let current:i32=(valid_manifest==1&&zagd_hash_equal(identity,expected)==1&&current_inputs.complete==1&&
+        expected_inputs.complete==1&&zmd_fingerprint_equal(current_inputs,expected_inputs)==1) as i32;
+    _zag_free(_zag_slice_ptr(text));return current;
+}
+
+fn zmd_persist_deep_measurement(root:[]u8,cpu:[]u8,target_key:[]u8,view:SemanticManifestView,
+        semantic_identity:ZagdHash,target:ZagdHash,reference:[]u8,finalist:[]u8,
+        evidence:ZagdBenchmarkWorkloadEvidence,selection:ZagdBenchmarkPolicySelection,
+        memory_bound:i64,binary_size:i64)i32{
+    if(zmd_deep_value_safe(reference)==0||zmd_deep_value_safe(finalist)==0||
+       evidence.reference_warmups.len<zagd_benchmark_policy_min_warmups()||
+       evidence.noise_reference.len!=zagd_benchmark_policy_min_runs()||
+       evidence.reference_runs.len!=zagd_benchmark_policy_min_runs()||binary_size<1){return 0;}
+    let body:ArrayList[u8]=make[u8](16384);let ok:i32=1;
+    if(zmd_buf_text(&body,"format=zagd-deep-measurement-v3\nadvisory=true\nexecutable_authority=false\nmode=deep\nexplicit=true\nforeground_consumption=false\nprovenance=measured\nequivalence=exact-output-stderr-exit-signal-state\nselector=paired-sign-familywise-99\ncpu_profile=")==0||
+       zmd_buf_text(&body,cpu)==0||zmd_buf_text(&body,"\ntarget_cache_key=")==0||zmd_buf_text(&body,target_key)==0||
+       zmd_buf_text(&body,"\nsource=")==0||zmd_deep_append_hash(&body,view.source)==0||
+       zmd_buf_text(&body,"\nsemantic_identity=")==0||zmd_deep_append_hash(&body,semantic_identity)==0||
+       zmd_buf_text(&body,"\ntarget=")==0||zmd_deep_append_hash(&body,target)==0||
+       zmd_buf_text(&body,"\nreference=")==0||zmd_buf_text(&body,reference)==0||
+       zmd_buf_text(&body,"\nfinalist=")==0||zmd_buf_text(&body,finalist)==0||zmd_buf_byte(&body,'\n')==0){ok=0;}
+    if(ok==1&&(zmd_buf_text(&body,"warmups=")==0||zmd_buf_i64(&body,evidence.reference_warmups.len)==0||
+       zmd_buf_text(&body,"\nnoise_pairs=")==0||zmd_buf_i64(&body,evidence.noise_reference.len)==0||
+       zmd_buf_text(&body,"\nruns=")==0||zmd_buf_i64(&body,evidence.reference_runs.len)==0||
+       zmd_buf_text(&body,"\nmemory_bound_bytes=")==0||zmd_buf_i64(&body,memory_bound)==0||
+       zmd_buf_text(&body,"\nbinary_size_bytes=")==0||zmd_buf_i64(&body,binary_size)==0||
+       zmd_buf_text(&body,"\nselection_status=")==0)){ok=0;}
+    if(ok==1){if(selection.status==zagd_benchmark_policy_selected()){ok=zmd_buf_text(&body,"selected");}else{ok=zmd_buf_text(&body,"no-win");}}
+    if(ok==1&&(zmd_buf_text(&body,"\nwinner_kind=")==0||zmd_buf_i64(&body,selection.winner_kind)==0||
+       zmd_buf_text(&body,"\nconfidence_percent=")==0||zmd_buf_i64(&body,selection.confidence_percent)==0||
+       zmd_buf_text(&body,"\nno_regression=")==0||zmd_buf_i64(&body,selection.no_regression)==0||
+       zmd_buf_text(&body,"\nruntime_score_ns=")==0||zmd_buf_i64(&body,selection.runtime_score_ns)==0||zmd_buf_byte(&body,'\n')==0)){ok=0;}
+    if(ok==1&&zmd_deep_append_samples(&body,"reference_warmups_ns",evidence.reference_warmups)==0){ok=0;}
+    if(ok==1&&zmd_deep_append_samples(&body,"finalist_warmups_ns",evidence.finalist_warmups)==0){ok=0;}
+    if(ok==1&&zmd_deep_append_samples(&body,"noise_reference_ns",evidence.noise_reference)==0){ok=0;}
+    if(ok==1&&zmd_deep_append_samples(&body,"noise_repeat_ns",evidence.noise_repeat)==0){ok=0;}
+    if(ok==1&&zmd_deep_append_samples(&body,"reference_runs_ns",evidence.reference_runs)==0){ok=0;}
+    if(ok==1&&zmd_deep_append_samples(&body,"finalist_runs_ns",evidence.finalist_runs)==0){ok=0;}
+    if(ok==1){let sum:ZagdHash=zagd_content_hash(body.data[0..body.len]);if(zmd_buf_text(&body,"checksum_first=")==0||zmd_buf_i64(&body,sum.first)==0||zmd_buf_byte(&body,'\n')==0){ok=0;}}
+    let written:i32=0;
+    if(ok==1){let path:[]u8=zmd_join(root,".zag-cache/zagd/deep-measurement.record");written=zmd_deep_atomic_write(path,body.data[0..body.len]);_zag_str_free(path);}
+    free[u8](&body);return written;
+}
+
+fn zmd_execute_deep_controls(root:[]u8,enabled:i32,source:[]u8,module_file:[]u8,
+        dependency_lock:[]u8,semantic_text:[]u8,cpu:[]u8,stop_cpath:[]u8,
+        expected_inputs:ZmdInputFingerprint,path_scratch:*ArrayList[u8],
+        cpath_scratch:*ArrayList[u8],read_buffer:*ArrayList[u8])i32{
+    zmd_deep_remove_record(root,path_scratch,cpath_scratch);
+    if(enabled!=1||expected_inputs.complete!=1){return 0;}
+    let view:SemanticManifestView=semantic_manifest_decode(semantic_text);
+    let target_key:[]u8=zmd_deep_target_key(cpu);
+    let semantic_identity:ZagdHash=zmd_deep_semantic_identity(semantic_text,target_key);
+    if(view.valid==0||semantic_identity.bytes<=0||zmd_deep_current(root,source,module_file,
+       dependency_lock,target_key,semantic_identity,expected_inputs,path_scratch,cpath_scratch,read_buffer)==0){
+        _zag_str_free(target_key);return 0;
+    }
+    let reference:[]u8=zmd_deep_control_path(root,".zagd.deep-reference");
+    let finalist:[]u8=zmd_deep_control_path(root,".zagd.deep-finalist");
+    if(reference.len==0||finalist.len==0||zmd_deep_file_exists(reference)==0||zmd_deep_file_exists(finalist)==0){
+        if(reference.len>0){_zag_str_free(reference);}if(finalist.len>0){_zag_str_free(finalist);}
+        _zag_str_free(target_key);return 0;
+    }
+    let target:ZagdHash=zagd_content_hash(target_key);
+    let req:ZagdBenchmarkRequest=ZagdBenchmarkRequest{.explicit=1,.mode=zagd_mode_deep(),.finalists=1,
+        .timeout_ms=1000,.max_memory=67108864,.source=semantic_identity,.stable_source=semantic_identity,
+        .target=target,.active_target=target,.cancelled=0,.network=0,.gpu=0,.source_writes=0};
+    let decision:ZagdBenchmarkDecision=zagd_benchmark_decide(req);
+    if(decision.allowed==0){_zag_str_free(reference);_zag_str_free(finalist);_zag_str_free(target_key);return 0;}
+    let evidence:ZagdBenchmarkWorkloadEvidence=ZagdBenchmarkWorkloadEvidence{.workload=1,
+        .reference_warmups=make[i64](3),.finalist_warmups=make[i64](3),
+        .noise_reference=make[i64](30),.noise_repeat=make[i64](30),
+        .reference_runs=make[i64](30),.finalist_runs=make[i64](30)};
+    let cancelled:i32=0;let valid:i32=1;let warm:i32=0;
+    while(warm<zagd_benchmark_policy_min_warmups()&&valid==1){
+        if(zmd_exists_cpath(stop_cpath)==1||zmd_deep_current(root,source,module_file,dependency_lock,
+           target_key,semantic_identity,expected_inputs,path_scratch,cpath_scratch,read_buffer)==0){cancelled=1;valid=0;}
+        else{
+            let baseline:ZagdExecutionResult=zagd_execute_finalist(reference,1000,req.max_memory,1048576,&cancelled);
+            let candidate:ZagdExecutionResult=zagd_execute_finalist(finalist,1000,req.max_memory,1048576,&cancelled);
+            let br:i64=zmd_deep_sample_ns(baseline);let cr:i64=zmd_deep_sample_ns(candidate);
+            if(zagd_measurement_may_persist(decision,baseline,candidate)==0||br<1||cr<1||
+               zmd_deep_current(root,source,module_file,dependency_lock,target_key,semantic_identity,
+               expected_inputs,path_scratch,cpath_scratch,read_buffer)==0){valid=0;}
+            else{push[i64](&evidence.reference_warmups,br);push[i64](&evidence.finalist_warmups,cr);warm=warm+1;}
+            zagd_execution_result_free(&baseline);zagd_execution_result_free(&candidate);
+        }
+    }
+    let noise_run:i32=0;
+    while(noise_run<zagd_benchmark_policy_min_runs()&&valid==1){
+        if(zmd_exists_cpath(stop_cpath)==1||zmd_deep_current(root,source,module_file,dependency_lock,
+           target_key,semantic_identity,expected_inputs,path_scratch,cpath_scratch,read_buffer)==0){cancelled=1;valid=0;}
+        else{
+            let first:ZagdExecutionResult=zagd_execute_finalist(reference,1000,req.max_memory,1048576,&cancelled);
+            let repeat:ZagdExecutionResult=zagd_execute_finalist(reference,1000,req.max_memory,1048576,&cancelled);
+            let a:i64=zmd_deep_sample_ns(first);let b:i64=zmd_deep_sample_ns(repeat);
+            if(zagd_measurement_may_persist(decision,first,repeat)==0||a<1||b<1||
+               zmd_deep_current(root,source,module_file,dependency_lock,target_key,semantic_identity,
+               expected_inputs,path_scratch,cpath_scratch,read_buffer)==0){valid=0;}
+            else{push[i64](&evidence.noise_reference,a);push[i64](&evidence.noise_repeat,b);noise_run=noise_run+1;}
+            zagd_execution_result_free(&first);zagd_execution_result_free(&repeat);
+        }
+    }
+    let run:i32=0;
+    while(run<zagd_benchmark_policy_min_runs()&&valid==1){
+        if(zmd_exists_cpath(stop_cpath)==1||zmd_deep_current(root,source,module_file,dependency_lock,
+           target_key,semantic_identity,expected_inputs,path_scratch,cpath_scratch,read_buffer)==0){cancelled=1;valid=0;}
+        else{
+            let baseline:ZagdExecutionResult=zagd_execute_finalist(reference,1000,req.max_memory,1048576,&cancelled);
+            let candidate:ZagdExecutionResult=zagd_execute_finalist(finalist,1000,req.max_memory,1048576,&cancelled);
+            let br:i64=zmd_deep_sample_ns(baseline);let cr:i64=zmd_deep_sample_ns(candidate);
+            if(zagd_measurement_may_persist(decision,baseline,candidate)==0||br<1||cr<1||
+               zmd_deep_current(root,source,module_file,dependency_lock,target_key,semantic_identity,
+               expected_inputs,path_scratch,cpath_scratch,read_buffer)==0){valid=0;}
+            else{push[i64](&evidence.reference_runs,br);push[i64](&evidence.finalist_runs,cr);run=run+1;}
+            zagd_execution_result_free(&baseline);zagd_execution_result_free(&candidate);
+        }
+    }
+    let written:i32=0;
+    if(valid==1&&run==zagd_benchmark_policy_min_runs()&&zmd_exists_cpath(stop_cpath)==0&&
+       zmd_deep_current(root,source,module_file,dependency_lock,target_key,semantic_identity,
+       expected_inputs,path_scratch,cpath_scratch,read_buffer)==1){
+        let workloads:ArrayList[ZagdBenchmarkWorkloadEvidence]=make[ZagdBenchmarkWorkloadEvidence](1);
+        push[ZagdBenchmarkWorkloadEvidence](&workloads,evidence);
+        let binary_size:i64=_zag_script_file_size(finalist);
+        let candidate_evidence:ZagdBenchmarkCandidateEvidence=ZagdBenchmarkCandidateEvidence{.kind=1,.valid=1,
+            .equivalent=1,.peak_memory_bytes=req.max_memory,.binary_size_bytes=binary_size,.workloads=workloads};
+        let candidates:ArrayList[ZagdBenchmarkCandidateEvidence]=make[ZagdBenchmarkCandidateEvidence](1);
+        push[ZagdBenchmarkCandidateEvidence](&candidates,candidate_evidence);
+        let required:ArrayList[i32]=make[i32](1);push[i32](&required,1);
+        let selection:ZagdBenchmarkPolicySelection=zagd_benchmark_select_99(candidates,required,req.max_memory);
+        if(binary_size>0){written=zmd_persist_deep_measurement(root,cpu,target_key,view,semantic_identity,target,
+            zmd_deep_relative(root,reference),zmd_deep_relative(root,finalist),evidence,selection,req.max_memory,binary_size);}
+        free[i32](&required);free[ZagdBenchmarkCandidateEvidence](&candidates);free[ZagdBenchmarkWorkloadEvidence](&workloads);
+    }
+    zmd_deep_free_workload(&evidence);_zag_str_free(reference);_zag_str_free(finalist);_zag_str_free(target_key);
+    return written;
 }
 
 fn main() i32 {
     let root: []u8 = zmd_arg_value("--root");
-    if (root.len == 0) { root = "."; }
-    let source: []u8 = zmd_arg_value("--root-source");
+    if (root.len == 0 || @strEq(root,"./")) { root = "."; }
+    if(zmd_validate_args()==0){return 4;}
     let mode: []u8 = zmd_arg_value("--mode");
     if (mode.len == 0) { mode = "light"; }
+    if (@strEq(mode,"off")==0 && @strEq(mode,"light")==0 &&
+        @strEq(mode,"adaptive")==0 && @strEq(mode,"deep")==0) {
+        _zag_eprintln("zagd: mode must be off, light, adaptive, or deep");
+        return 4;
+    }
     let config: ZmdConfig = zmd_config_from_args();
+    if(zmd_validate_config(config)==0){return 4;}
+    let stability_window_ms:i64=zmd_decimal(config.stability_window_ms,60000);
+    let max_memory_bytes:i64=zmd_decimal(config.max_memory_bytes,2147483648);
+    let memory_limit_ok:i32=1;
+    if(zmd_apply_memory_limit(max_memory_bytes)==0){
+        _zag_eprintln("zagd: could not apply process memory limit");return 7;
+    }
+    let semantic_path:[]u8=zmd_join(root,".zag-cache/zagd/semantic.record");
+    let source_arg: []u8 = zmd_arg_value("--root-source");
+    let source:[]u8="";let source_owned:i32=0;
+    // Keep one stable selected path for the process lifetime. Besides handling
+    // absolute-root direct invocations, this lets the check command and every
+    // c-string bridge be constructed exactly once before the event loop.
+    if(source_arg.len>0){
+        let source_arg_cpath:ArrayList[u8]=zmd_cstr(source_arg);
+        let source_in_cwd:i32=zmd_exists_cpath(source_arg_cpath.data[0..source_arg_cpath.len]);
+        free[u8](&source_arg_cpath);
+        if(source_arg[0]=='/'||source_in_cwd==1){source=_zag_str_concat("",source_arg);}
+        else{source=zmd_join(root,source_arg);}
+        source_owned=1;
+    }else{
+        source=zmd_manifest_selected_source(root,semantic_path);
+        if(source.len>0){source_owned=1;}
+    }
     let stop: []u8 = zmd_join(root, ".zagd.stop");
     let lock: []u8 = zmd_join(root, ".zagd.lock");
+    let status_path:[]u8=zmd_join(root,".zagd.status");
+    let ready_path:[]u8=zmd_join(root,".zagd.semantic-ready");
+    let module_file:[]u8=zmd_join(root,"zag.mod");
+    let dependency_lock:[]u8=zmd_join(root,"zag.lock");
+    let stop_cpath:ArrayList[u8]=zmd_cstr(stop);
+    let lock_cpath:ArrayList[u8]=zmd_cstr(lock);
+    let status_cpath:ArrayList[u8]=zmd_cstr(status_path);
+    let semantic_cpath:ArrayList[u8]=zmd_cstr(semantic_path);
+    let ready_cpath:ArrayList[u8]=zmd_cstr(ready_path);
+    let source_cpath:ArrayList[u8]=zmd_cstr(source);
+    let status_buffer:ArrayList[u8]=make[u8](65536);
 
     if (@strEq(mode, "off")) {
-        let _stop: i32 = _zag_write_file(stop, "stop\n");
-        zmd_unlink(lock);
-        zmd_status(root, 0, mode, "stopped", 0, 0, 0, 0, config);
+        let _status_create:i32=_zag_write_file(status_path,"");
+        let _stop: i32 = _zag_write_file(stop,"stop\n");
+        zmd_unlink_cpath(lock_cpath.data[0..lock_cpath.len]);
+        zmd_status(status_cpath.data[0..status_cpath.len],
+            semantic_cpath.data[0..semantic_cpath.len],0,source,mode,"stopped",0,0,0,0,1,
+            config,&status_buffer);
+        if(source_owned==1){_zag_str_free(source);}
+        free[u8](&status_buffer);free[u8](&source_cpath);free[u8](&ready_cpath);
+        free[u8](&semantic_cpath);free[u8](&status_cpath);free[u8](&lock_cpath);free[u8](&stop_cpath);
+        _zag_str_free(dependency_lock);_zag_str_free(module_file);_zag_str_free(ready_path);
+        _zag_str_free(semantic_path);_zag_str_free(status_path);_zag_str_free(stop);_zag_str_free(lock);
         return 0;
     }
 
@@ -308,52 +1089,149 @@ fn main() i32 {
         if (child > 0) { return 0; }
     }
 
-    zmd_unlink(stop);
-    let kq: i64 = zmd_kqueue();
-    let watches: ArrayList[ZmdWatch] = make[ZmdWatch](32);
-    // Preserve the direct, previously verified root setup, then expand that
-    // root recursively. Subsequent traversal only adds unknown descendants.
-    let root_fd: i64 = zmd_open_event_dir(root);
-    let native_events: i32 = (kq >= 0 && root_fd >= 0 && zmd_kqueue_watch(kq,root_fd) >= 0) as i32;
-    if (native_events == 1) {
-        push[ZmdWatch](&watches,ZmdWatch{.fd=root_fd,.path=root});
-        zmd_watch_tree(kq,root,&watches);
-        let _source: i32 = zmd_add_watch(kq,source,&watches);
-    } else { if (root_fd >= 0) { zmd_close(root_fd); } }
-    if (native_events == 0 && kq >= 0) { zmd_close(kq); }
+    let compiler:[]u8=zmd_sibling_znc();
+    let command:ArrayList[u8]=zmd_command(compiler,source);_zag_str_free(compiler);
+    let shell_cpath:ArrayList[u8]=zmd_cstr("/bin/sh");
+    let dashc_cpath:ArrayList[u8]=zmd_cstr("-c");
+    let exec_argv:ArrayList[i64]=make[i64](4);
+    push[i64](&exec_argv,_zag_slice_ptr(shell_cpath.data[0..shell_cpath.len]) as i64);
+    push[i64](&exec_argv,_zag_slice_ptr(dashc_cpath.data[0..dashc_cpath.len]) as i64);
+    push[i64](&exec_argv,command.data as i64);push[i64](&exec_argv,0);
+    let inherited_envp:i64=_zag_process_envp();
+    let read_buffer:ArrayList[u8]=make[u8](65536);
+    while(read_buffer.len<read_buffer.cap){push[u8](&read_buffer,0 as u8);}
+    let path_scratch:ArrayList[u8]=make[u8](16384);
+    let cpath_scratch:ArrayList[u8]=make[u8](16385);
+    let manifests:ZmdManifestBuffers=ZmdManifestBuffers{
+        .first=make[u8](65536),.second=make[u8](65536),.active=0,.valid=0};
+    if(zmd_apply_memory_limit(max_memory_bytes)==0){
+        _zag_eprintln("zagd: configured allocator memory limit exceeded");return 7;
+    }
+
+    zmd_unlink_cpath(stop_cpath.data[0..stop_cpath.len]);
+    let _status_create:i32=_zag_write_file(status_path,"");
     let pid: i64 = zmd_pid();
-    let _lock: i32 = _zag_write_file(lock, _zag_str_concat(_zag_i64_to_str(pid), "\n"));
-    let prior: []u8 = _zag_read_file(source);
-    let prior_hash: ZagdHash = zagd_content_hash(prior);
+    status_buffer.len=0;let _pid_text:i32=zmd_buf_i64(&status_buffer,pid);
+    let _pid_newline:i32=zmd_buf_byte(&status_buffer,'\n');
+    let _lock_write:i32=_zag_write_file(lock,status_buffer.data[0..status_buffer.len]);
+    status_buffer.len=0;
     let events: i64 = 0;
     // A newly started watcher owns the initial semantic manifest as well as
     // later changes.  Without this first check, an unchanged project stays
     // permanently idle and foreground clients cannot obtain a record.
-    let check_status: i32 = zmd_check(root, source);
-    zmd_status(root, pid, mode, "idle", events, native_events, watches.len, check_status, config);
+    let check_status:i32=zmd_check(source_cpath.data[0..source_cpath.len],
+        semantic_cpath.data[0..semantic_cpath.len],ready_cpath.data[0..ready_cpath.len],
+        shell_cpath.data[0..shell_cpath.len],&exec_argv,inherited_envp);
+    if(check_status==0){let _manifest:i32=zmd_refresh_manifest(
+        semantic_cpath.data[0..semantic_cpath.len],&manifests,&read_buffer);}
 
-    while (_zag_file_exists(stop) == 0) {
-        let changed: i32 = 1;
-        if (native_events == 1) { changed = (zmd_kqueue_wait(kq) > 0) as i32; }
-        else { zmd_sleep_ms(250); }
-        if (changed == 1) {
-            // VNODE events on a parent report child creation/rename. Rescan
-            // the tree before checking source content so new nested folders
-            // gain descriptors immediately and without polling.
-            if (native_events == 1) { zmd_watch_tree(kq,root,&watches); }
-            let current: []u8 = _zag_read_file(source);
-            let current_hash: ZagdHash = zagd_content_hash(current);
-            if (zagd_hash_equal(prior_hash, current_hash) == 0) {
-            prior_hash = current_hash;
-            events = events + 1;
-            zmd_status(root, pid, mode, "checking", events, native_events, watches.len, check_status, config);
-            check_status = zmd_check(root, source);
-            zmd_status(root, pid, mode, "idle", events, native_events, watches.len, check_status, config);
+    let kq:i64=zmd_kqueue();
+    let project_watches:ArrayList[ZmdWatch]=make[ZmdWatch](512);
+    let parent_watches:ArrayList[ZmdWatch]=make[ZmdWatch](512);
+    let input_watches:ArrayList[ZmdWatch]=make[ZmdWatch](512);
+    let native_events:i32=zmd_setup_watches(kq,root,source,module_file,dependency_lock,
+        zmd_manifest_text(&manifests),&project_watches,&parent_watches,&input_watches,
+        &path_scratch,&cpath_scratch);
+    if(native_events==0){
+        zmd_close_watch_fds(&project_watches);zmd_close_watch_fds(&parent_watches);
+        zmd_close_watch_fds(&input_watches);
+        if(kq>=0){zmd_close(kq);}kq=0-1;
+    }
+    let prior_inputs:ZmdInputFingerprint=zmd_project_fingerprint(root,source,module_file,
+        dependency_lock,zmd_manifest_text(&manifests),&path_scratch,&cpath_scratch,&read_buffer);
+    let _initial_deep:i32=zmd_execute_deep_controls(root,(@strEq(mode,"deep")) as i32,
+        source,module_file,dependency_lock,zmd_manifest_text(&manifests),config.cpu,
+        stop_cpath.data[0..stop_cpath.len],prior_inputs,&path_scratch,&cpath_scratch,&read_buffer);
+    zmd_status(status_cpath.data[0..status_cpath.len],semantic_cpath.data[0..semantic_cpath.len],
+        pid,source,mode,"idle",events,native_events,project_watches.len+parent_watches.len,
+        check_status,prior_inputs.complete,config,&status_buffer);
+
+    while (zmd_exists_cpath(stop_cpath.data[0..stop_cpath.len]) == 0) {
+        let woke:i32=0;
+        if(native_events==1){
+            let wait_result:i64=zmd_kqueue_wait(kq);
+            if(wait_result==0){continue;}
+            if(wait_result<0){
+                zmd_close_watch_fds(&project_watches);zmd_close_watch_fds(&parent_watches);
+                zmd_close_watch_fds(&input_watches);zmd_close(kq);kq=0-1;native_events=0;
+                zmd_status(status_cpath.data[0..status_cpath.len],semantic_cpath.data[0..semantic_cpath.len],
+                    pid,source,mode,"idle",events,native_events,0,check_status,prior_inputs.complete,
+                    config,&status_buffer);continue;
             }
+            woke=1;
+        }else{zmd_sleep_ms(250);}
+        let current_inputs:ZmdInputFingerprint=zmd_project_fingerprint(root,source,module_file,
+            dependency_lock,zmd_manifest_text(&manifests),&path_scratch,&cpath_scratch,&read_buffer);
+        let changed:i32=(1-zmd_fingerprint_equal(prior_inputs,current_inputs));
+        if(changed==1){
+            current_inputs=zmd_stable_fingerprint(root,source,module_file,dependency_lock,
+                zmd_manifest_text(&manifests),&path_scratch,&cpath_scratch,&read_buffer,
+                current_inputs,stability_window_ms);
+            changed=1-zmd_fingerprint_equal(prior_inputs,current_inputs);
+        }
+        // A transiently incomplete scan is an advisory miss. If kqueue also
+        // observed a vnode event, validate conservatively instead of assuming
+        // the partial prefix is unchanged.
+        if(current_inputs.complete==0&&woke==1){changed=1;}
+        if (changed == 1) {
+            events = events + 1;
+            zmd_status(status_cpath.data[0..status_cpath.len],semantic_cpath.data[0..semantic_cpath.len],
+                pid,source,mode,"checking",events,native_events,project_watches.len+parent_watches.len,
+                check_status,current_inputs.complete,config,&status_buffer);
+            check_status=zmd_check(source_cpath.data[0..source_cpath.len],
+                semantic_cpath.data[0..semantic_cpath.len],ready_cpath.data[0..ready_cpath.len],
+                shell_cpath.data[0..shell_cpath.len],&exec_argv,inherited_envp);
+            if(check_status==0){let _manifest:i32=zmd_refresh_manifest(
+                semantic_cpath.data[0..semantic_cpath.len],&manifests,&read_buffer);}
+            prior_inputs=zmd_project_fingerprint(root,source,module_file,dependency_lock,
+                zmd_manifest_text(&manifests),&path_scratch,&cpath_scratch,&read_buffer);
+            let _deep_write:i32=zmd_execute_deep_controls(root,(@strEq(mode,"deep")) as i32,
+                source,module_file,dependency_lock,zmd_manifest_text(&manifests),config.cpu,
+                stop_cpath.data[0..stop_cpath.len],prior_inputs,&path_scratch,&cpath_scratch,&read_buffer);
+        }
+
+        // An atomic editor save replaces the file vnode. Parent-directory
+        // watches guarantee the rename wakes us; then exact file watches are
+        // rearmed from the retained compiler manifest without reallocating any
+        // Zag storage. Rearm even for equal bytes so a same-content rename
+        // cannot make the next in-place edit invisible.
+        let watcher_changed:i32=0;
+        if(native_events==1&&woke==1&&zmd_rearm_inputs(kq,root,source,module_file,
+            dependency_lock,zmd_manifest_text(&manifests),project_watches,&parent_watches,
+            &input_watches,&path_scratch,&cpath_scratch)==0){
+            zmd_close_watch_fds(&project_watches);zmd_close_watch_fds(&parent_watches);
+            zmd_close_watch_fds(&input_watches);zmd_close(kq);kq=0-1;native_events=0;
+            watcher_changed=1;
+        }
+        if(changed==1||watcher_changed==1){
+            zmd_status(status_cpath.data[0..status_cpath.len],semantic_cpath.data[0..semantic_cpath.len],
+                pid,source,mode,"idle",events,native_events,project_watches.len+parent_watches.len,
+                check_status,prior_inputs.complete,config,&status_buffer);
+        }
+        if(zmd_apply_memory_limit(max_memory_bytes)==0){
+            memory_limit_ok=0;
+            zmd_status(status_cpath.data[0..status_cpath.len],semantic_cpath.data[0..semantic_cpath.len],
+                pid,source,mode,"memory-limit-exceeded",events,native_events,
+                project_watches.len+parent_watches.len,127,prior_inputs.complete,
+                config,&status_buffer);
+            break;
         }
     }
-    if (native_events == 1) { zmd_close_watches(&watches); zmd_close(kq); }
-    zmd_unlink(stop); zmd_unlink(lock);
-    zmd_status(root, pid, mode, "stopped", events, native_events, watches.len, check_status, config);
-    return 0;
+    zmd_close_watches(&project_watches);zmd_close_watches(&parent_watches);
+    zmd_close_watches(&input_watches);if(kq>=0){zmd_close(kq);}
+    zmd_unlink_cpath(stop_cpath.data[0..stop_cpath.len]);
+    zmd_unlink_cpath(lock_cpath.data[0..lock_cpath.len]);
+    let final_state:[]u8="stopped";if(memory_limit_ok==0){final_state="memory-limit-exceeded";}
+    zmd_status(status_cpath.data[0..status_cpath.len],semantic_cpath.data[0..semantic_cpath.len],
+        pid,source,mode,final_state,events,native_events,0,check_status,prior_inputs.complete,
+        config,&status_buffer);
+    free[u8](&manifests.first);free[u8](&manifests.second);
+    free[u8](&cpath_scratch);free[u8](&path_scratch);free[u8](&read_buffer);
+    free[i64](&exec_argv);free[u8](&dashc_cpath);free[u8](&shell_cpath);free[u8](&command);
+    free[u8](&status_buffer);free[u8](&source_cpath);free[u8](&ready_cpath);
+    free[u8](&semantic_cpath);free[u8](&status_cpath);free[u8](&lock_cpath);free[u8](&stop_cpath);
+    if(source_owned==1){_zag_str_free(source);}
+    _zag_str_free(dependency_lock);_zag_str_free(module_file);_zag_str_free(ready_path);
+    _zag_str_free(semantic_path);_zag_str_free(status_path);_zag_str_free(stop);_zag_str_free(lock);
+    if(memory_limit_ok==0){return 7;}return 0;
 }

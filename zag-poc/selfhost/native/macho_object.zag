@@ -1,0 +1,299 @@
+// Self-hosted ARM64 MH_OBJECT and deterministic BSD archive writer.
+// Layout authority: Apple mach-o/{loader,nlist,arm64/reloc,ranlib}.h.
+@import("macho_arm64.zag")
+
+// Local definitions, external definitions, then undefined symbols. Names
+// already include the Mach-O prefix; offsets are relative to their section.
+struct MobjSymbol { name: []u8, section: i32, offset: i64, external: i32, weak: i32 }
+// Each section's records are supplied in ascending address order. Targets
+// are nlist indices (r_extern=1, including local definitions). Kind 12 is an
+// internal normalized 64-bit absolute POINTER_TO_GOT; object serialization
+// maps it back to Mach-O kind 7 with r_length=3. Kinds 13/14 are final-link-only
+// 32/64-bit cross-output-section SUBTRACTOR constants; their symbol identifies
+// the minuend section, while the encoded datum already contains both symbol
+// offsets plus the source addend. They are never serialized as MH_OBJECT.
+struct MobjReloc { section: i32, offset: i32, symbol: i32, kind: i32 }
+
+fn mobj_error(message: []u8) i32 {
+    _zag_eprintln(_zag_str_concat("Mach-O object: ", message));
+    return 1;
+}
+
+fn mobj_name_valid(name: []u8) i32 {
+    if (name.len == 0) { return 0; }
+    let i: i32 = 0;
+    while (i < name.len) {
+        if (name[i] == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn mobj_section(buf: *ArrayList[u8], name: []u8, segment: []u8,
+    address: i64, size: i64, offset: i64, alignment: i32,
+    reloc_offset: i64, reloc_count: i32, flags: i64) void {
+    mo_name16(buf, name); mo_name16(buf, segment);
+    mo_le(buf, address, 8); mo_le(buf, size, 8);
+    mo_le(buf, offset, 4); mo_le(buf, alignment as i64, 4);
+    mo_le(buf, reloc_offset, 4); mo_le(buf, reloc_count as i64, 4);
+    mo_le(buf, flags, 4); mo_zero(buf, 12);
+}
+
+fn mobj_validate(text: ArrayList[u8], data: ArrayList[u8],
+    symbols: ArrayList[MobjSymbol], relocs: ArrayList[MobjReloc]) i32 {
+    if (symbols.len > 16777216) { return mobj_error("symbol index exceeds 24-bit relocation field"); }
+    let phase: i32 = 0;
+    let i: i32 = 0;
+    while (i < symbols.len) {
+        let symbol: MobjSymbol = symbols.data[i];
+        if (mobj_name_valid(symbol.name) == 0) { return mobj_error("empty or NUL-containing symbol"); }
+        if (symbol.external != 0 && symbol.external != 1) { return mobj_error("invalid symbol visibility"); }
+        if (symbol.weak != 0 && symbol.weak != 1) { return mobj_error("invalid weak-import marker"); }
+        let rank: i32 = symbol.external;
+        let limit: i64 = text.len as i64;
+        if (symbol.section == 0) {
+            rank = 2; limit = 0;
+            if (symbol.external != 1) { return mobj_error("undefined symbol must be external"); }
+        } else {
+            if (symbol.weak != 0) { return mobj_error("weak-import marker requires an undefined symbol"); }
+            if (symbol.section == 2) { limit = data.len as i64; }
+            else if (symbol.section != 1) { return mobj_error("unsupported symbol section"); }
+        }
+        if (symbol.offset < 0 || symbol.offset > limit) { return mobj_error("symbol lies outside its section"); }
+        if (rank < phase) { return mobj_error("symbol groups are not in nlist order"); }
+        phase = rank;
+        let j: i32 = 0;
+        while (j < i) {
+            if (@strEq(symbols.data[j].name, symbol.name)) { return mobj_error("duplicate symbol name"); }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    let text_end: i32 = 0;
+    let data_end: i32 = 0;
+    i = 0;
+    while (i < relocs.len) {
+        let relocation: MobjReloc = relocs.data[i];
+        let width: i32 = 4;
+        if (relocation.kind == 0 || relocation.kind == 12 || relocation.kind == 14) { width = 8; }
+        else if (relocation.kind != 2 && relocation.kind != 3 && relocation.kind != 4 &&
+            relocation.kind != 5 && relocation.kind != 6 && relocation.kind != 7 && relocation.kind != 13) {
+            return mobj_error("unsupported relocation type");
+        }
+        let limit: i32 = text.len;
+        if (relocation.section == 2) { limit = data.len; }
+        else if (relocation.section != 1) { return mobj_error("invalid relocation section"); }
+        if (relocation.offset < 0 || relocation.offset > limit - width || relocation.offset % width != 0) {
+            return mobj_error("relocation is out of bounds or misaligned");
+        }
+        if (relocation.symbol < 0 || relocation.symbol >= symbols.len) {
+            return mobj_error("relocation references an absent symbol");
+        }
+        if ((relocation.kind == 5 || relocation.kind == 6) && relocation.section != 1) {
+            return mobj_error("GOT load relocation must originate in executable text");
+        }
+        if (relocation.kind == 12 && relocation.section != 2) {
+            return mobj_error("absolute POINTER_TO_GOT relocation must reside in writable data");
+        }
+        if ((relocation.kind == 13 || relocation.kind == 14) &&
+            symbols.data[relocation.symbol].section == 0) {
+            return mobj_error("cross-section SUBTRACTOR target must be defined");
+        }
+        if (relocation.section == 1) {
+            if (relocation.offset < text_end) { return mobj_error("unsorted or overlapping text relocations"); }
+            text_end = relocation.offset + width;
+        } else {
+            if (relocation.offset < data_end) { return mobj_error("unsorted or overlapping data relocations"); }
+            data_end = relocation.offset + width;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn mobj_build(text: ArrayList[u8], data: ArrayList[u8],
+    symbols: ArrayList[MobjSymbol], relocs: ArrayList[MobjReloc], errors: *i32) ArrayList[u8] {
+    let output: ArrayList[u8] = make[u8](0);
+    errors.* = mobj_validate(text, data, symbols, relocs);
+    if (errors.* != 0) { return output; }
+    let internal: i32 = 0;
+    while (internal < relocs.len) {
+        if (relocs.data[internal].kind == 13 || relocs.data[internal].kind == 14) {
+            errors.* = mobj_error("final-link-only SUBTRACTOR relocation cannot be emitted as MH_OBJECT");
+            return output;
+        }
+        internal = internal+1;
+    }
+    let strings: ArrayList[u8] = make[u8](64);
+    let string_offsets: ArrayList[i32] = make[i32](symbols.len);
+    mo_b(&strings, 0);
+    let local_count: i32 = 0;
+    let defined_count: i32 = 0;
+    let undefined_count: i32 = 0;
+    let i: i32 = 0;
+    while (i < symbols.len) {
+        let symbol: MobjSymbol = symbols.data[i];
+        if (symbol.section == 0) { undefined_count = undefined_count + 1; }
+        else if (symbol.external == 0) { local_count = local_count + 1; }
+        else { defined_count = defined_count + 1; }
+        push[i32](&string_offsets, strings.len);
+        mo_bytes(&strings, symbol.name); mo_b(&strings, 0);
+        i = i + 1;
+    }
+    let text_reloc_count: i32 = 0;
+    let data_reloc_count: i32 = 0;
+    i = 0;
+    while (i < relocs.len) {
+        if (relocs.data[i].section == 1) { text_reloc_count = text_reloc_count + 1; }
+        else { data_reloc_count = data_reloc_count + 1; }
+        i = i + 1;
+    }
+    let command_bytes: i64 = 232 + 24 + 24 + 80;
+    let text_offset: i64 = macho_align(32 + command_bytes, 16);
+    let data_offset: i64 = macho_align(text_offset + (text.len as i64), 16);
+    let data_address: i64 = macho_align(text.len as i64, 16);
+    let text_reloc_offset: i64 = macho_align(data_offset + (data.len as i64), 8);
+    let data_reloc_offset: i64 = text_reloc_offset + (text_reloc_count as i64) * 8;
+    let symbol_offset: i64 = data_reloc_offset + (data_reloc_count as i64) * 8;
+    let string_offset: i64 = symbol_offset + (symbols.len as i64) * 16;
+    let total: i64 = string_offset + (strings.len as i64);
+    if (total > 2147483647) {
+        errors.* = mobj_error("object exceeds supported buffer range");
+        free[u8](&strings); free[i32](&string_offsets);
+        return output;
+    }
+    free[u8](&output); output = make[u8](total as i32);
+    mo_le(&output, 0xfeedfacf, 4); mo_le(&output, 0x100000c, 4);
+    mo_le(&output, 0, 4); mo_le(&output, 1, 4); // ARM64, MH_OBJECT.
+    mo_le(&output, 4, 4); mo_le(&output, command_bytes, 4); mo_zero(&output, 8);
+    mo_segment(&output, "", 0, data_address + (data.len as i64),
+        text_offset, data_offset + (data.len as i64) - text_offset, 7, 2);
+    let text_rel: i64 = 0;
+    let data_rel: i64 = 0;
+    if (text_reloc_count > 0) { text_rel = text_reloc_offset; }
+    if (data_reloc_count > 0) { data_rel = data_reloc_offset; }
+    mobj_section(&output, "__text", "__TEXT", 0, text.len as i64,
+        text_offset, 4, text_rel, text_reloc_count, 0x80000400);
+    mobj_section(&output, "__data", "__DATA", data_address, data.len as i64,
+        data_offset, 3, data_rel, data_reloc_count, 0);
+    mo_le(&output, 0x32, 4); mo_le(&output, 24, 4); // LC_BUILD_VERSION.
+    mo_le(&output, 1, 4); mo_le(&output, 0xb0000, 4); mo_zero(&output, 8);
+    mo_le(&output, 2, 4); mo_le(&output, 24, 4); // LC_SYMTAB.
+    mo_le(&output, symbol_offset, 4); mo_le(&output, symbols.len as i64, 4);
+    mo_le(&output, string_offset, 4); mo_le(&output, strings.len as i64, 4);
+    mo_le(&output, 0xb, 4); mo_le(&output, 80, 4); // LC_DYSYMTAB.
+    mo_le(&output, 0, 4); mo_le(&output, local_count as i64, 4);
+    mo_le(&output, local_count as i64, 4); mo_le(&output, defined_count as i64, 4);
+    mo_le(&output, (local_count + defined_count) as i64, 4);
+    mo_le(&output, undefined_count as i64, 4); mo_zero(&output, 48);
+    mo_pad_to(&output, text_offset); mo_list_bytes(&output, text);
+    mo_pad_to(&output, data_offset); mo_list_bytes(&output, data);
+    mo_pad_to(&output, text_reloc_offset);
+    let section: i32 = 1;
+    while (section <= 2) {
+        i = relocs.len;
+        while (i > 0) {
+            i = i - 1;
+            let relocation: MobjReloc = relocs.data[i];
+            if (relocation.section == section) {
+                let length: i64 = 2;
+                let relative: i64 = 0;
+                let macho_kind: i64 = relocation.kind as i64;
+                if (relocation.kind == 0 || relocation.kind == 12) { length = 3; }
+                if (relocation.kind == 12) { macho_kind = 7; }
+                if (relocation.kind == 2 || relocation.kind == 3 || relocation.kind == 5 || relocation.kind == 7) { relative = 1; }
+                mo_le(&output, relocation.offset as i64, 4);
+                mo_le(&output, (relocation.symbol as i64) + relative * 16777216 +
+                    length * 33554432 + 134217728 + macho_kind * 268435456, 4);
+            }
+        }
+        section = section + 1;
+    }
+    mo_pad_to(&output, symbol_offset);
+    i = 0;
+    while (i < symbols.len) {
+        let symbol: MobjSymbol = symbols.data[i];
+        let kind: i64 = symbol.external as i64;
+        let value: i64 = symbol.offset;
+        if (symbol.section != 0) { kind = kind + 14; }
+        if (symbol.section == 2) { value = value + data_address; }
+        mo_le(&output, string_offsets.data[i] as i64, 4);
+        mo_b(&output, kind); mo_b(&output, symbol.section as i64);
+        mo_le(&output,(symbol.weak as i64)*0x40,2); mo_le(&output, value, 8);
+        i = i + 1;
+    }
+    mo_list_bytes(&output, strings);
+    free[u8](&strings); free[i32](&string_offsets);
+    return output;
+}
+
+fn mobj_write(path: []u8, text: ArrayList[u8], data: ArrayList[u8],
+    symbols: ArrayList[MobjSymbol], relocs: ArrayList[MobjReloc]) i32 {
+    let errors: i32 = 0;
+    let bytes: ArrayList[u8] = mobj_build(text, data, symbols, relocs, &errors);
+    if (errors == 0) { errors = _zag_write_file(path, bytes.data[0..bytes.len]); }
+    free[u8](&bytes);
+    return errors;
+}
+
+fn mobj_ar_field(buf: *ArrayList[u8], text: []u8, width: i32) void {
+    mo_bytes(buf, text);
+    let i: i32 = text.len;
+    while (i < width) { mo_b(buf, 32); i = i + 1; }
+}
+
+fn mobj_ar_header(buf: *ArrayList[u8], name: []u8, payload_size: i64) void {
+    mobj_ar_field(buf, "#1/12", 16);
+    mobj_ar_field(buf, "0", 12);
+    mobj_ar_field(buf, "0", 6); mobj_ar_field(buf, "0", 6);
+    mobj_ar_field(buf, "100644", 8);
+    let length: []u8 = _zag_i64_to_str(payload_size + 12);
+    mobj_ar_field(buf, length, 10); _zag_str_free(length);
+    mo_b(buf, 96); mo_b(buf, 10);
+    mo_bytes(buf, name); mo_zero(buf, (12 - name.len) as i64);
+}
+
+fn mobj_write_static(path: []u8, text: ArrayList[u8], data: ArrayList[u8],
+    symbols: ArrayList[MobjSymbol], relocs: ArrayList[MobjReloc]) i32 {
+    let errors: i32 = 0;
+    let object: ArrayList[u8] = mobj_build(text, data, symbols, relocs, &errors);
+    if (errors != 0) { free[u8](&object); return errors; }
+    let strings: ArrayList[u8] = make[u8](64);
+    let offsets: ArrayList[i32] = make[i32](symbols.len);
+    let i: i32 = 0;
+    while (i < symbols.len) {
+        let symbol: MobjSymbol = symbols.data[i];
+        if (symbol.external == 1 && symbol.section != 0) {
+            push[i32](&offsets, strings.len);
+            mo_bytes(&strings, symbol.name); mo_b(&strings, 0);
+        }
+        i = i + 1;
+    }
+    // ranlib counts are byte counts; offsets point to member headers. Extended
+    // 12-byte names and padded symbol index align the embedded Mach-O to 8.
+    let table_bytes: i64 = macho_align(8 + (offsets.len as i64) * 8 + (strings.len as i64), 8);
+    let member_offset: i64 = 8 + 72 + table_bytes;
+    let total: i64 = member_offset + 72 + (object.len as i64) + ((object.len % 2) as i64);
+    if (total > 2147483647) {
+        free[u8](&object); free[u8](&strings); free[i32](&offsets);
+        return mobj_error("archive exceeds supported buffer range");
+    }
+    let archive: ArrayList[u8] = make[u8](total as i32);
+    mo_bytes(&archive, "!<arch>\n");
+    mobj_ar_header(&archive, "__.SYMDEF", table_bytes);
+    mo_le(&archive, (offsets.len as i64) * 8, 4);
+    i = 0;
+    while (i < offsets.len) {
+        mo_le(&archive, offsets.data[i] as i64, 4);
+        mo_le(&archive, member_offset, 4);
+        i = i + 1;
+    }
+    mo_le(&archive, strings.len as i64, 4); mo_list_bytes(&archive, strings);
+    mo_pad_to(&archive, member_offset);
+    mobj_ar_header(&archive, "module.o", object.len as i64);
+    mo_list_bytes(&archive, object);
+    if (object.len % 2 != 0) { mo_b(&archive, 10); }
+    errors = _zag_write_file(path, archive.data[0..archive.len]);
+    free[u8](&archive); free[u8](&object); free[u8](&strings); free[i32](&offsets);
+    return errors;
+}

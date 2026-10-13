@@ -1,0 +1,238 @@
+@import("macho_dylib.zag")
+@import("macho_dependency.zag")
+@import("foreground_cache.zag")
+@import("../parse.zag")
+
+struct MdLinkPlan {
+    libraries: ArrayList[[]u8], paths: ArrayList[[]u8],
+    snapshots: ArrayList[ForegroundBoundedRead], dependencies: ArrayList[MdDependency],
+    opaque: ArrayList[i32], imports: ArrayList[MdylibImport], rpaths: ArrayList[[]u8], valid: i32
+}
+fn ml_system_path(kind: i32) []u8 {
+    if (kind == 1) { return "/usr/lib/libSystem.B.dylib"; }
+    if (kind == 2) { return "/System/Library/Frameworks/Metal.framework/Versions/A/Metal"; }
+    if (kind == 3) { return "/usr/lib/libobjc.A.dylib"; }
+    if (kind == 4) { return "/usr/lib/libsqlite3.dylib"; }
+    return "";
+}
+fn ml_system_kind(path: []u8) i32 {
+    let kind: i32 = 1;
+    while (kind <= 4) { if (@strEq(path,ml_system_path(kind))) { return kind; } kind = kind+1; }
+    return 0;
+}
+fn ml_framework_runtime_path(path: []u8) i32 {
+    let prefix: []u8 = "/System/Library/Frameworks/";
+    if (mo_has_prefix(path,prefix) == 0) { return 0; }
+    let i: i32 = prefix.len;
+    let seen_framework: i32 = 0;
+    while (i < path.len) {
+        if (i+11 <= path.len && @strEq(path[i..i+11],".framework/")) { seen_framework = 1; }
+        i = i+1;
+    }
+    return seen_framework;
+}
+fn ml_error(message: []u8) i32 {
+    _zag_eprintln(_zag_str_concat("znc macos-arm64 link: ",message)); return 0;
+}
+fn ml_index(names: ArrayList[[]u8], name: []u8) i32 {
+    let i: i32 = 0; while (i < names.len) { if (@strEq(names.data[i],name)) { return i; } i = i+1; }
+    return -1;
+}
+fn ml_add_unique(names: *ArrayList[[]u8], name: []u8) void {
+    if (ml_index(names.*,name) < 0) { push[[]u8](names,name); }
+}
+fn ml_add_dependency(plan: *MdLinkPlan, path: []u8, explicit: i32) i32 {
+    let previous: i32 = ml_index(plan.*.paths,path);
+    if (previous >= 0) {
+        if (plan.*.opaque.data[previous] != 0 && explicit == 1) { plan.*.opaque.data[previous] = 2; }
+        return previous;
+    }
+    if (plan.*.libraries.len >= 253) { plan.*.valid = ml_error("too many linked libraries"); return -1; }
+    let kind: i32 = ml_system_kind(path);
+    let snapshot: ForegroundBoundedRead = ForegroundBoundedRead{.bytes=make[u8](0),.ok=0};
+    let dependency: MdDependency = mdep_parse("");
+    let load_name: []u8 = path;
+    let opaque: i32 = 0;
+    if (kind != 0 || ml_framework_runtime_path(path) == 1) { opaque = 1+explicit; }
+    else {
+        free[u8](&snapshot.bytes); snapshot = fc_read_bounded(path,67108864);
+        if (snapshot.ok == 0) { free[u8](&snapshot.bytes); snapshot = fc_read_bounded_mode(path,67108864,1); }
+        if (snapshot.ok == 0) { free[u8](&snapshot.bytes); plan.*.valid = ml_error(_zag_str_concat("cannot read bounded regular library: ",path)); return -1; }
+        dependency = mdep_parse(snapshot.bytes.data[0..snapshot.bytes.len]);
+        if (dependency.valid == 0 && path.len >= 4 && @strEq(path[path.len-4..path.len],".tbd")) {
+            dependency = mdep_parse_tbd(snapshot.bytes.data[0..snapshot.bytes.len]);
+        }
+        if (dependency.valid == 0) { free[u8](&snapshot.bytes); plan.*.valid = ml_error(_zag_str_concat("invalid ARM64 macOS dynamic library: ",path)); return -1; }
+        load_name = dependency.install_name;
+        if (mo_has_prefix(load_name,"@rpath/") == 1) { ml_add_unique(&plan.*.rpaths,dir_of(path)); }
+    }
+    if (ml_index(plan.*.libraries,load_name) >= 0) {
+        free[u8](&snapshot.bytes); plan.*.valid = ml_error("different inputs share a dylib install name"); return -1;
+    }
+    let index: i32 = plan.*.libraries.len;
+    push[[]u8](&plan.*.libraries,load_name); push[[]u8](&plan.*.paths,path);
+    push[ForegroundBoundedRead](&plan.*.snapshots,snapshot);
+    push[MdDependency](&plan.*.dependencies,dependency); push[i32](&plan.*.opaque,opaque);
+    return index;
+}
+fn ml_find_library(name: []u8, paths: ArrayList[[]u8], named: i32) []u8 {
+    if (mobj_name_valid(name) == 0) { return ""; }
+    if (named == 1) {
+        if (@strEq(name,"c") || @strEq(name,"m") || @strEq(name,"pthread") || @strEq(name,"System")) { return ml_system_path(1); }
+        if (@strEq(name,"objc")) { return ml_system_path(3); }
+        if (@strEq(name,"sqlite3")) { return ml_system_path(4); }
+        let i: i32 = 0;
+        while (i < name.len) {
+            let c: u8 = name[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.' || c == '+')) { return ""; }
+            i = i+1;
+        }
+    } else {
+        if (ml_system_kind(name) != 0 || _zag_file_exists(name) == 1) { return name; }
+        // Explicit relative/absolute paths never fall through to a different
+        // same-basename file in a search directory.
+        let i: i32 = 0; while (i < name.len) { if (name[i] == '/') { return ""; } i = i+1; }
+    }
+    let file: []u8 = name;
+    if (named == 1) { file = _zag_str_concat("lib",_zag_str_concat(name,".dylib")); }
+    let i: i32 = 0;
+    while (i < paths.len) {
+        let candidate: []u8 = join_path(paths.data[i],file);
+        if (_zag_file_exists(candidate) == 1) { return candidate; }
+        _zag_str_free(candidate);
+        if (named == 1) {
+            let stub: []u8 = join_path(paths.data[i],_zag_str_concat("lib",_zag_str_concat(name,".tbd")));
+            if (_zag_file_exists(stub) == 1) { return stub; }
+            _zag_str_free(stub);
+        }
+        i = i+1;
+    }
+    return "";
+}
+fn ml_framework_name_ok(name: []u8) i32 {
+    if (name.len == 0 || name.len > 255) { return 0; }
+    let i: i32 = 0;
+    while (i < name.len) {
+        let c: u8 = name[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')) { return 0; }
+        i = i+1;
+    }
+    return 1;
+}
+fn ml_find_framework(name: []u8, paths: ArrayList[[]u8]) []u8 {
+    if (ml_framework_name_ok(name) == 0) { return ""; }
+    let bundle: []u8 = _zag_str_concat(name,".framework");
+    let i: i32 = 0;
+    while (i < paths.len) {
+        let root: []u8 = join_path(paths.data[i],bundle);
+        let stub: []u8 = join_path(root,_zag_str_concat(name,".tbd"));
+        if (_zag_file_exists(stub) == 1) { return stub; }
+        _zag_str_free(stub);
+        let versions: []u8 = join_path(root,"Versions/A");
+        let version_stub: []u8 = join_path(versions,_zag_str_concat(name,".tbd"));
+        if (_zag_file_exists(version_stub) == 1) { return version_stub; }
+        _zag_str_free(version_stub);
+        let binary: []u8 = join_path(root,name);
+        if (_zag_file_exists(binary) == 1) { return binary; }
+        _zag_str_free(binary);
+        let version_binary: []u8 = join_path(versions,name);
+        if (_zag_file_exists(version_binary) == 1) { return version_binary; }
+        _zag_str_free(version_binary); _zag_str_free(versions); _zag_str_free(root); i = i+1;
+    }
+    // Shared-cache frameworks may have no ordinary runtime file. The explicit
+    // framework selection still gives dyld an unambiguous load command.
+    let runtime_root: []u8 = "/System/Library/Frameworks";
+    i = 0;
+    while (i < paths.len) {
+        if (@strEq(paths.data[i],runtime_root)) {
+            let runtime_bundle: []u8 = _zag_str_concat(_zag_str_concat(runtime_root,"/"),bundle);
+            if (_zag_file_exists(runtime_bundle) == 1) {
+                return _zag_str_concat(runtime_bundle,_zag_str_concat("/Versions/A/",name));
+            }
+            _zag_str_free(runtime_bundle);
+        }
+        i = i+1;
+    }
+    return "";
+}
+fn ml_resolve(encoded: MobjEncoded, needed: ArrayList[[]u8], names: ArrayList[[]u8],
+    paths: ArrayList[[]u8], frameworks: ArrayList[[]u8], framework_paths: ArrayList[[]u8],
+    rpaths: ArrayList[[]u8]) MdLinkPlan {
+    let plan: MdLinkPlan = MdLinkPlan{.libraries=make[[]u8](4),.paths=make[[]u8](4),
+        .snapshots=make[ForegroundBoundedRead](4),.dependencies=make[MdDependency](4),
+        .opaque=make[i32](4),.imports=make[MdylibImport](8),.rpaths=make[[]u8](4),.valid=1};
+    let ignored: i32 = ml_add_dependency(&plan,ml_system_path(1),0);
+    let i: i32 = 0;
+    while (i < rpaths.len) { ml_add_unique(&plan.rpaths,rpaths.data[i]); i = i+1; }
+    let group: i32 = 0;
+    while (group < 3 && plan.valid == 1) {
+        let requested: ArrayList[[]u8] = needed; if (group == 1) { requested = names; }
+        if (group == 2) { requested = frameworks; }
+        i = 0;
+        while (i < requested.len && plan.valid == 1) {
+            let path: []u8 = "";
+            if (group == 2) { path = ml_find_framework(requested.data[i],framework_paths); }
+            else { path = ml_find_library(requested.data[i],paths,group); }
+            if (path.len == 0) {
+                let what: []u8 = "dynamic library not found: "; if (group == 2) { what = "framework not found: "; }
+                plan.valid = ml_error(_zag_str_concat(what,requested.data[i]));
+            }
+            else { ignored = ml_add_dependency(&plan,path,1); }
+            i = i+1;
+        }
+        group = group+1;
+    }
+    i = 0;
+    while (i < encoded.symbols.len && plan.valid == 1) {
+        let symbol: MobjSymbol = encoded.symbols.data[i];
+        if (symbol.section == 0) {
+            let library: i32 = -1; let j: i32 = 0;
+            while (j < plan.dependencies.len && library < 0 && plan.valid == 1) {
+                if (plan.opaque.data[j] == 0) {
+                    let found: i32 = mdep_has_export(plan.dependencies.data[j],symbol.name);
+                    if (found < 0) { plan.valid = ml_error("malformed export metadata"); }
+                    else if (found == 1) { library = j; }
+                }
+                j = j+1;
+            }
+            let source_name: []u8 = symbol.name;
+            if (source_name.len > 0 && source_name[0] == '_') { source_name = source_name[1..]; }
+            if (library < 0 && plan.valid == 1) {
+                let kind: i32 = mo_import_ordinal(source_name);
+                if (kind > 0 && @strEq(mo_bind_symbol(source_name),source_name)) {
+                    library = ml_add_dependency(&plan,ml_system_path(kind),0);
+                }
+            }
+            if (library < 0 && plan.valid == 1) {
+                // Shared-cache system images need not exist as ordinary files.
+                // An explicit single opaque dependency identifies its ordinal;
+                // ambiguous opaque providers are never guessed.
+                let candidates: i32 = 0; j = 0;
+                while (j < plan.opaque.len) {
+                    if (plan.opaque.data[j] == 2) { candidates = candidates+1; library = j; }
+                    j = j+1;
+                }
+                if (candidates != 1) { library = -1; }
+            }
+            if (library < 0 && symbol.weak == 1) {
+                // Match Apple's optional-import convention: flat lookup plus
+                // BIND_SYMBOL_FLAGS_WEAK_IMPORT leaves the slot null when no
+                // loaded image exports the symbol.
+                push[MdylibImport](&plan.imports,MdylibImport{.symbol=i,.library=-2,.weak=1});
+            } else if (library < 0) {
+                plan.valid = ml_error(_zag_str_concat("unresolved or ambiguous external symbol: ",symbol.name));
+            } else {
+                push[MdylibImport](&plan.imports,MdylibImport{.symbol=i,.library=library+1,.weak=symbol.weak});
+            }
+        }
+        i = i+1;
+    }
+    return plan;
+}
+fn ml_release(plan: *MdLinkPlan) void {
+    let i: i32 = 0;
+    while (i < plan.*.snapshots.len) { free[u8](&plan.*.snapshots.data[i].bytes); i = i+1; }
+    free[[]u8](&plan.*.libraries); free[[]u8](&plan.*.paths);
+    free[ForegroundBoundedRead](&plan.*.snapshots); free[MdDependency](&plan.*.dependencies);
+    free[i32](&plan.*.opaque); free[MdylibImport](&plan.*.imports); free[[]u8](&plan.*.rpaths);
+}

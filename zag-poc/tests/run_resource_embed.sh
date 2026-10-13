@@ -144,33 +144,27 @@ if compile_native "$work/search/app/main.zag" -o "$work/search/app/out" \
 fi
 grep -q 'error\[E0017\]' "$work/search/app/compile.log"
 
-# The foreground cache identity includes resource bytes, not only source tokens.
-# Its implementation deliberately owns Linux descriptor/stat layouts and is
-# disabled on Darwin, where the native/deterministic embedding checks above are
-# still authoritative.
-if [ "$(uname -s)" = Linux ]; then
-    mkdir -p "$work/cache/assets"
-    printf 'name = "resource-cache"\nversion = "0"\nedition = "2026"\n' \
-        >"$work/cache/zag.mod"
-    printf '*' >"$work/cache/assets/value.bin"
-    cat >"$work/cache/main.zag" <<'EOF'
+# Resource bytes participate in foreground-cache identity on every native
+# host. This is both a cache hit witness and a stale-resource rejection test.
+mkdir -p "$work/cache/assets"
+printf 'name = "resource-cache"\nversion = "0"\nedition = "2026"\n' \
+    >"$work/cache/zag.mod"
+printf '*' >"$work/cache/assets/value.bin"
+cat >"$work/cache/main.zag" <<'EOF'
 fn main() i32 { let data: []u8 = #embed("assets/value.bin"); return data[0] as i32; }
 EOF
-    (
-        cd "$work/cache"
-        compile_native main.zag -o cold --cache-report --no-zagd >cold.log
-        grep -q 'znc cache: MISS stored machine code and data' cold.log
-        expect_exit 42 ./cold
-        compile_native main.zag -o warm --cache-report --no-zagd >warm.log
-        grep -q 'znc cache: HIT revalidated machine code and data; codegen skipped' warm.log
-        expect_exit 42 ./warm
-        printf '+' >assets/value.bin
-        compile_native main.zag -o changed --cache-report --no-zagd >changed.log
-        grep -q 'znc cache: MISS stored machine code and data' changed.log
-        expect_exit 43 ./changed
-    )
-else
-    echo 'resource embedding foreground-cache identity: SKIP on Darwin (cache is fail-closed)'
-fi
+(
+    cd "$work/cache"
+    compile_native main.zag -o cold --cache-report --no-zagd >cold.log
+    grep -q 'znc cache: MISS stored machine code and data' cold.log
+    expect_exit 42 ./cold
+    compile_native main.zag -o warm --cache-report --no-zagd >warm.log
+    grep -q 'znc cache: HIT revalidated machine code and data; codegen skipped' warm.log
+    expect_exit 42 ./warm
+    printf '+' >assets/value.bin
+    compile_native main.zag -o changed --cache-report --no-zagd >changed.log
+    grep -q 'znc cache: MISS stored machine code and data' changed.log
+    expect_exit 43 ./changed
+)
 
 echo 'resource embedding conformance: PASS (native, parser, formatter, cache, determinism)'

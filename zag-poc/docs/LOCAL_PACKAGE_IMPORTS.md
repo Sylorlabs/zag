@@ -173,13 +173,117 @@ contain symlinks, and normal kernel symlink semantics apply. Ordinary local
 dependencies without `mode = "vendor"` retain the sibling-path behavior above
 and do not implicitly become locked.
 
+## Parser-backed source closure
+
+`znc --emit-closure` uses the actual compiler parser to capture the transitive
+source inputs, explicit resolved imports, retained resources, and dependency
+manifests. The current CLI emits `zag-source-closure-v1`, replacing the earlier
+manifest-only description of `zag-dependency-closure-v1`.
+
+Set `ZNC` to the current compiler executable. `znc` is the supported name;
+`zagc` is retired, with no new compatibility alias.
+
+```sh
+"$ZNC" --emit-closure src/main.zag --output source-closure.manifest
+"$ZNC" emit-closure src/main.zag
+```
+
+The first form requires a new output path; `-o` also works. Without an output
+option, closure text goes to stdout. Source-first spelling (`"$ZNC"
+src/main.zag --emit-closure`) is also accepted. Parsing and closure validation
+finish before the compiler publishes closure bytes. Shell redirection has its
+own create/truncate behavior; use `--output` for compiler-enforced create-only
+publication.
+
+After `format=zag-source-closure-v1` and `root=<absolute lexical path>`, the
+following tab-separated records are sorted by their complete escaped bytes and
+deduplicated:
+
+| Record | Fields after `=` |
+|---|---|
+| `source` | path, `sha256:<digest>`, raw byte count |
+| `resource` | path, `sha256:<digest>`, raw byte count |
+| `manifest` | path, `sha256:<digest>`, raw byte count |
+| `import` | importer path, resolved source path, original import specifier |
+| `package` | declaring manifest, child manifest, alias, declared path, mode |
+| `pin` | manifest path, optional `sha256:<compiler digest>` (empty when absent) |
+
+Source and resource hashes cover the exact parser-retained snapshots, not a
+later reopening of those files. This includes loaded relative, `std:`, and
+`pkg:` modules, any injected Script preludes, embedded resource bytes, and
+package manifest/lock buffers retained by package resolution. Import records
+are exactly the explicit edges retained in `CompilationUnit.imports`; resources
+are inputs, without invented resource-to-importer edges. The closure records
+hashes and sizes, not an archive of the input contents.
+
+For every loaded source, the closure also discovers its nearest manifest and
+recursively visits declared local dependencies, including declarations not
+selected by an explicit source import. Supplemental manifest snapshots must
+agree with any same-path parser-retained bytes. Every manifest has a `pin`
+record, including an empty pin when optional toolchain identity is absent. A
+standalone source does not require a manifest. An embedded asset merely named
+`zag.mod` is not automatically treated as package metadata.
+
+Paths are absolute and lexically normalized. Equivalent relative/absolute
+entry spellings agree when they resolve to the same inputs; moving a checkout
+or changing resolver layout can change the closure. This is not symlink
+containment or relocation-independent identity. Fields escape `%` and
+non-printable/non-ASCII bytes as `%hh`, preventing record injection.
+
+Missing imports/resources, invalid vendor locks, malformed dependency graphs,
+cycles, inconsistent same-path snapshots, and exceeded limits fail closed.
+Bounds include 64 MiB per input, 256 MiB of recorded input bytes, 8,192 inputs,
+65,536 collected records, source depth below 256, and the manifest walk's
+256-manifest limit.
+
+The reusable APIs in `selfhost/source_closure.zag` are
+`source_closure_from_unit(path, cwd, unit)` and
+`source_closure_from_unit_pinned(path, cwd, unit, expected_compiler_pin)`.
+They borrow the compilation unit and require its absolute resolver CWD;
+`source_closure_load(path, cwd)` is the parse-once convenience entry used by the
+CLI. Check `SourceClosureResult.valid`, read `error` on failure, and release
+owned text with `source_closure_release`. Parser errors retain the parser's
+exit-on-error contract.
+
+## Toolchain identity pins
+
+A project that must be built only by one compiler image may declare an exact
+SHA-256 pin in each manifest that participates in the closure:
+
+```ini
+[toolchain]
+compiler = "sha256:<64 lowercase hexadecimal digits>"
+```
+
+For ordinary builds, the root manifest graph is checked against the running
+compiler image before daemon startup, parsing, cache lookup, or target dispatch.
+The compiler also checks manifests associated with actual loaded source paths,
+including relative and `std:` imports, after parsing. An unavailable image or
+mismatch for a declared pin fails closed. Manifest pins remain optional.
+
+Closure inspection (`--emit-closure` and the unpinned API) records pins without
+enforcing them against the running image. The pinned closure API requires a
+canonical `sha256:<64 lowercase hex>` expected identity and checks each declared
+pin against the same manifest snapshot it records. It rejects an invalid or
+empty expected pin even if all manifests are unpinned; the caller supplies the
+actual compiler identity.
+
+Native build evidence additionally requires CLI `--compiler-pin` with **64
+lowercase hexadecimal digits, without `sha256:`**, even when no manifest has a
+toolchain pin. The driver verifies the running image and uses the pinned
+closure API. See [Native evidence](NATIVE_EVIDENCE.md) for the bounded build
+workflow, receipt verification, and replay APIs. Hash pins establish exact-byte
+integrity relative to a trusted expected value; they do not authenticate a
+compiler publisher or package author.
+
 ## Current boundary
 
 The compiler now enforces deterministic local lock entries and raw checksums for
 explicit vendored `pkg:` modules, while preserving unlocked sibling development
-imports. It does not provide a lock/update generator, recursively require every
-ordinary source-relative import beneath a vendor root to appear in the lock,
-snapshot non-Zag assets, resolve versions, identify revisions, verify package
-signatures, fetch source, speak a registry protocol, or contain symlinks. This
-is a truthful offline/vendor reproducibility slice, not the complete package
-capability or a supply-chain authenticity system.
+imports. The create-only `package lock` generator is bounded as described above;
+there is no general lock-update or version-solving workflow. It does not
+recursively require every ordinary source-relative import beneath a vendor root
+to appear in the lock, snapshot unreferenced non-Zag assets, resolve versions,
+identify revisions, verify package signatures, fetch source, speak a registry
+protocol, or contain symlinks. This is a truthful offline/vendor reproducibility
+slice, not the complete package capability or a supply-chain authenticity system.

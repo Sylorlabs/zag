@@ -81,6 +81,11 @@ run_prog sort_bench 0 \
     "QS == MS: PASS" \
     "LCG i32 wrap: PASS"
 
+run_prog large_slice_scale 0 \
+    "2^25+1: PASS" \
+    "88MiB: PASS" \
+    "read_file 88MiB: PASS"
+
 run_prog state_machine 0 \
     "final state (Green after 10 ticks): PASS" \
     "final state (Ident for 'world'): PASS" \

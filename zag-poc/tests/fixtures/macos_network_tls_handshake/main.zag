@@ -1,0 +1,359 @@
+// Real TLS 1.3 client handshake through Apple's Network + Security frameworks,
+// with an explicit DER trust anchor and the hostname policy supplied by the
+// Network TLS stack. The gate runs both a valid localhost name and a required
+// wrong-host rejection without changing the user's system trust settings.
+
+extern fn objc_getClass(name: *i8) *u8 @cabi;
+extern fn dispatch_queue_create(label: *i8, attributes: *u8) *u8 @cabi;
+extern fn dispatch_semaphore_create(value: i64) *u8 @cabi;
+extern fn dispatch_semaphore_wait(semaphore: *u8, timeout: u64) i64 @cabi;
+extern fn dispatch_semaphore_signal(semaphore: *u8) i64 @cabi;
+extern fn dispatch_time(when: u64, delta: i64) u64 @cabi;
+
+extern fn nw_parameters_create() *u8 @cabi;
+extern fn nw_parameters_copy_default_protocol_stack(parameters: *u8) *u8 @cabi;
+extern fn nw_tcp_create_options() *u8 @cabi;
+extern fn nw_tls_create_options() *u8 @cabi;
+extern fn nw_tls_copy_sec_protocol_options(options: *u8) *u8 @cabi;
+extern fn nw_protocol_stack_set_transport_protocol(stack: *u8,
+                                                     options: *u8) void @cabi;
+extern fn nw_protocol_stack_prepend_application_protocol(stack: *u8,
+                                                          options: *u8) void @cabi;
+extern fn nw_endpoint_create_host(hostname: *i8, port: *i8) *u8 @cabi;
+extern fn nw_connection_create(endpoint: *u8, parameters: *u8) *u8 @cabi;
+extern fn nw_connection_set_state_changed_handler(connection: *u8,
+                                                   handler: @borrows *u8) void @cabi;
+extern fn nw_connection_set_queue(connection: *u8, queue: *u8) void @cabi;
+extern fn nw_connection_start(connection: *u8) void @cabi;
+extern fn nw_connection_cancel(connection: *u8) void @cabi;
+extern fn nw_protocol_copy_tls_definition() *u8 @cabi;
+extern fn nw_connection_copy_protocol_metadata(connection: *u8,
+                                                definition: *u8) *u8 @cabi;
+extern fn nw_tls_copy_sec_protocol_metadata(metadata: *u8) *u8 @cabi;
+extern fn nw_release(value: *u8) void @cabi;
+
+extern fn sec_protocol_options_set_min_tls_protocol_version(options: *u8,
+                                                             version: u16) void @cabi;
+extern fn sec_protocol_options_set_max_tls_protocol_version(options: *u8,
+                                                             version: u16) void @cabi;
+extern fn sec_protocol_options_set_peer_authentication_required(options: *u8,
+                                                                 required: bool) void @cabi;
+extern fn sec_protocol_options_set_tls_server_name(options: *u8,
+                                                    server_name: *i8) void @cabi;
+extern fn sec_protocol_options_set_verify_block(options: *u8,
+                                                 block: @borrows *u8,
+                                                 queue: *u8) void @cabi;
+extern fn sec_protocol_metadata_get_negotiated_tls_protocol_version(metadata: *u8) u16 @cabi;
+extern fn sec_trust_copy_ref(trust: *u8) *u8 @cabi;
+extern fn sec_release(value: *u8) void @cabi;
+
+extern fn CFDataCreate(allocator: *u8, bytes: @borrows *u8,
+                       length: i64) *u8 @cabi;
+extern fn CFArrayCreate(allocator: *u8, values: @borrows *u8, count: i64,
+                        callbacks: *u8) *u8 @cabi;
+extern fn CFRelease(value: *u8) void @cabi;
+extern fn SecCertificateCreateWithData(allocator: *u8, data: *u8) *u8 @cabi;
+extern fn SecTrustSetAnchorCertificates(trust: *u8, anchors: *u8) i32 @cabi;
+extern fn SecTrustSetAnchorCertificatesOnly(trust: *u8, only: bool) i32 @cabi;
+extern fn SecTrustEvaluateWithError(trust: *u8, error: *u8) bool @cabi;
+
+extern fn _zag_code_anchor() i64;
+
+// CFDataCreate copies the supplied DER bytes. Keep the owner/view relation
+// explicit at this boundary instead of laundering an owned pointer through an
+// integer and reconstructing it at the foreign call site.
+fn tls_copy_der_data(bytes: @borrows *u8, length: i64) *u8 {
+    unsafe { return CFDataCreate(null as *u8, bytes, length); }
+}
+
+global let tls_handshake_semaphore: *u8;
+global let tls_handshake_state: i32;
+global let tls_handshake_had_error: i32;
+global let tls_verify_anchors: *u8;
+global let tls_verify_thunk_workspace: *u8;
+
+struct TlsBoolBlockThunk {
+    call: fn(bool)void,
+}
+
+@repr(C) struct TlsHandshakeBlockDescriptor {
+    reserved: i64,
+    size: i64,
+}
+
+@repr(C) struct TlsHandshakeBlockLiteral {
+    isa: *u8,
+    flags: i32,
+    reserved: i32,
+    invoke: *u8,
+    descriptor: *TlsHandshakeBlockDescriptor,
+}
+
+// The callback's scalar/pointer ABI is AAPCS64-compatible. A sentinel direct
+// call returns its own ASLR-safe label; Network.framework ignores the return
+// register when invoking this as a void block.
+fn zag_tls_handshake_state_handler(block: *u8, state: i32, error: *u8) i64 {
+    if (block == null as *u8 && state == 99) { return _zag_code_anchor(); }
+    tls_handshake_state = state;
+    if (error != null as *u8) { tls_handshake_had_error = 1; }
+    if (state == 3 || state == 4 || error != null as *u8) {
+        unsafe {
+            let _signal: i64 = dispatch_semaphore_signal(tls_handshake_semaphore);
+        }
+    }
+    return 0;
+}
+
+fn tls_complete_bool(block: @borrows *u8,
+                     workspace: @borrows_mut *u8,
+                     value: bool) void {
+    unsafe {
+        let block_words: *i64 = block as *i64;
+        let thunk_words: *i64 = workspace as *i64;
+        thunk_words[0] = block_words[2];
+        thunk_words[1] = block as i64;
+        let thunk: *TlsBoolBlockThunk = workspace as *TlsBoolBlockThunk;
+        thunk.*.call(value);
+    }
+}
+
+fn zag_tls_verify_handler(block: *u8, metadata: *u8,
+                          trust_object: *u8, complete: *u8) i64 {
+    if (block == null as *u8 && metadata == null as *u8 &&
+        trust_object == null as *u8 && complete == null as *u8) {
+        return _zag_code_anchor();
+    }
+    unsafe {
+        let accepted: bool = false;
+        if (trust_object != null as *u8 && complete != null as *u8 &&
+            tls_verify_anchors != null as *u8 &&
+            tls_verify_thunk_workspace != null as *u8) {
+            let trust: *u8 = sec_trust_copy_ref(trust_object);
+            if (trust != null as *u8) {
+                if (SecTrustSetAnchorCertificates(trust, tls_verify_anchors) == 0 &&
+                    SecTrustSetAnchorCertificatesOnly(trust, true) == 0) {
+                    accepted = SecTrustEvaluateWithError(trust, null as *u8);
+                }
+                CFRelease(trust);
+            }
+        }
+        if (complete != null as *u8 && tls_verify_thunk_workspace != null as *u8) {
+            tls_complete_bool(complete, tls_verify_thunk_workspace, accepted);
+        }
+        return 0;
+    }
+}
+
+fn tls_handshake_run(storage: @borrows_mut *u8, port_address: i64,
+                     server_name_address: i64, anchors_address: i64,
+                     expect_ready: bool) i32 {
+    unsafe {
+        let port: *i8 = port_address as *i8;
+        let server_name: *i8 = server_name_address as *i8;
+        let anchors: *u8 = anchors_address as *u8;
+        if (anchors == null as *u8) { return 23; }
+        let descriptor: *TlsHandshakeBlockDescriptor =
+            storage as *TlsHandshakeBlockDescriptor;
+        let block: *TlsHandshakeBlockLiteral =
+            ((storage as i64) + 16) as *TlsHandshakeBlockLiteral;
+        let verify_descriptor: *TlsHandshakeBlockDescriptor =
+            ((storage as i64) + 64) as *TlsHandshakeBlockDescriptor;
+        let verify_block: *TlsHandshakeBlockLiteral =
+            ((storage as i64) + 80) as *TlsHandshakeBlockLiteral;
+        let verify_thunk_workspace: *u8 = ((storage as i64) + 128) as *u8;
+        let global_block_class: *u8 = objc_getClass(
+            _zag_slice_ptr("__NSGlobalBlock__\x00") as *i8
+        );
+        if (global_block_class == null as *u8) { return 10; }
+        let invoke_address: i64 = zag_tls_handshake_state_handler(
+            null as *u8, 99, null as *u8
+        );
+        if (invoke_address == 0) { return 11; }
+        descriptor.*.reserved = 0;
+        descriptor.*.size = 32;
+        block.*.isa = global_block_class;
+        block.*.flags = 268435456; // BLOCK_IS_GLOBAL
+        block.*.reserved = 0;
+        block.*.invoke = invoke_address as *u8;
+        block.*.descriptor = descriptor;
+
+        let verify_invoke: i64 = zag_tls_verify_handler(
+            null as *u8, null as *u8, null as *u8, null as *u8
+        );
+        if (verify_invoke == 0) { return 20; }
+        verify_descriptor.*.reserved = 0;
+        verify_descriptor.*.size = 32;
+        verify_block.*.isa = global_block_class;
+        verify_block.*.flags = 268435456; // BLOCK_IS_GLOBAL
+        verify_block.*.reserved = 0;
+        verify_block.*.invoke = verify_invoke as *u8;
+        verify_block.*.descriptor = verify_descriptor;
+
+        let queue: *u8 = dispatch_queue_create(
+            _zag_slice_ptr("dev.zag.tls-handshake\x00") as *i8,
+            null as *u8
+        );
+        let semaphore: *u8 = dispatch_semaphore_create(0);
+        if (queue == null as *u8 || semaphore == null as *u8) { return 17; }
+        tls_verify_anchors = anchors;
+        tls_verify_thunk_workspace = verify_thunk_workspace;
+
+        let parameters: *u8 = nw_parameters_create();
+        if (parameters == null as *u8) { return 12; }
+        let stack: *u8 = nw_parameters_copy_default_protocol_stack(parameters);
+        let tcp: *u8 = nw_tcp_create_options();
+        let tls: *u8 = nw_tls_create_options();
+        if (stack == null as *u8 || tcp == null as *u8 || tls == null as *u8) {
+            if (tls != null as *u8) { nw_release(tls); }
+            if (tcp != null as *u8) { nw_release(tcp); }
+            if (stack != null as *u8) { nw_release(stack); }
+            nw_release(parameters);
+            return 13;
+        }
+        let security: *u8 = nw_tls_copy_sec_protocol_options(tls);
+        if (security == null as *u8) {
+            nw_release(tls); nw_release(tcp); nw_release(stack);
+            nw_release(parameters);
+            return 14;
+        }
+        sec_protocol_options_set_min_tls_protocol_version(security, 772 as u16);
+        sec_protocol_options_set_max_tls_protocol_version(security, 772 as u16);
+        sec_protocol_options_set_peer_authentication_required(security, true);
+        sec_protocol_options_set_tls_server_name(security, server_name);
+        sec_protocol_options_set_verify_block(
+            security, verify_block as *u8, queue
+        );
+        nw_protocol_stack_set_transport_protocol(stack, tcp);
+        nw_protocol_stack_prepend_application_protocol(stack, tls);
+
+        let endpoint: *u8 = nw_endpoint_create_host(
+            _zag_slice_ptr("127.0.0.1\x00") as *i8, port
+        );
+        if (endpoint == null as *u8) {
+            sec_release(security); nw_release(tls); nw_release(tcp);
+            nw_release(stack); nw_release(parameters);
+            return 15;
+        }
+        let connection: *u8 = nw_connection_create(endpoint, parameters);
+        if (connection == null as *u8) {
+            nw_release(endpoint); sec_release(security); nw_release(tls);
+            nw_release(tcp); nw_release(stack); nw_release(parameters);
+            return 16;
+        }
+        tls_handshake_state = 0;
+        tls_handshake_had_error = 0;
+        tls_handshake_semaphore = semaphore;
+        nw_connection_set_state_changed_handler(connection, block as *u8);
+        nw_connection_set_queue(connection, queue);
+        nw_connection_start(connection);
+
+        let deadline: u64 = dispatch_time(0, 5000000000);
+        let wait_status: i64 = dispatch_semaphore_wait(semaphore, deadline);
+        if (wait_status != 0) {
+            nw_connection_cancel(connection);
+            nw_release(connection); nw_release(endpoint);
+            sec_release(security); nw_release(tls); nw_release(tcp);
+            nw_release(stack); nw_release(parameters);
+            tls_verify_anchors = null as *u8;
+            tls_verify_thunk_workspace = null as *u8;
+            return 18;
+        }
+
+        if (!expect_ready) {
+            let rejected: bool = tls_handshake_state != 3 &&
+                tls_handshake_had_error == 1;
+            nw_connection_cancel(connection);
+            nw_release(connection); nw_release(endpoint);
+            sec_release(security); nw_release(tls); nw_release(tcp);
+            nw_release(stack); nw_release(parameters);
+            tls_handshake_semaphore = null as *u8;
+            tls_verify_anchors = null as *u8;
+            tls_verify_thunk_workspace = null as *u8;
+            if (rejected) { return 42; }
+            return 24;
+        }
+        if (tls_handshake_state != 3 || tls_handshake_had_error != 0) {
+            nw_connection_cancel(connection);
+            nw_release(connection); nw_release(endpoint);
+            sec_release(security); nw_release(tls); nw_release(tcp);
+            nw_release(stack); nw_release(parameters);
+            tls_verify_anchors = null as *u8;
+            tls_verify_thunk_workspace = null as *u8;
+            return 25;
+        }
+
+        let definition: *u8 = nw_protocol_copy_tls_definition();
+        let metadata: *u8 = nw_connection_copy_protocol_metadata(
+            connection, definition
+        );
+        let tls_metadata: *u8 = null as *u8;
+        if (metadata != null as *u8) {
+            tls_metadata = nw_tls_copy_sec_protocol_metadata(metadata);
+        }
+        let negotiated: u16 = 0;
+        if (tls_metadata != null as *u8) {
+            negotiated = sec_protocol_metadata_get_negotiated_tls_protocol_version(
+                tls_metadata
+            );
+        }
+
+        nw_connection_cancel(connection);
+        if (tls_metadata != null as *u8) { sec_release(tls_metadata); }
+        if (metadata != null as *u8) { nw_release(metadata); }
+        if (definition != null as *u8) { nw_release(definition); }
+        nw_release(connection); nw_release(endpoint); sec_release(security);
+        nw_release(tls); nw_release(tcp); nw_release(stack); nw_release(parameters);
+        tls_handshake_semaphore = null as *u8;
+        tls_verify_anchors = null as *u8;
+        tls_verify_thunk_workspace = null as *u8;
+        if (negotiated != 772 as u16) { return 19; }
+        return 42;
+    }
+}
+
+fn main() i32 {
+    if (_zag_argc() != 5) { return 2; }
+    let storage: *u8 = _zag_malloc(4096);
+    let der: []u8 = _zag_read_file(_zag_arg(2));
+    let port_address: i64 = _zag_slice_ptr(_zag_arg(1)) as i64;
+    let server_name_address: i64 = _zag_slice_ptr(_zag_arg(3)) as i64;
+    let expect_ready: bool = _zag_arg(4)[0] == '1';
+    let cert_data: *u8 = null as *u8;
+    let certificate: *u8 = null as *u8;
+    let anchors: *u8 = null as *u8;
+    let result: i32 = 3;
+    unsafe {
+        if (der.len > 0) {
+            cert_data = tls_copy_der_data(
+                _zag_slice_ptr(der) as *u8, der.len as i64
+            );
+            if (cert_data != null as *u8) {
+                certificate = SecCertificateCreateWithData(
+                    null as *u8, cert_data
+                );
+            }
+            if (certificate != null as *u8) {
+                let anchor_slot: **u8 = ((storage as i64) + 160) as **u8;
+                anchor_slot[0] = certificate;
+                anchors = CFArrayCreate(
+                    null as *u8, anchor_slot as *u8, 1, null as *u8
+                );
+            }
+            if (anchors != null as *u8) {
+                result = tls_handshake_run(
+                    storage,
+                    port_address,
+                    server_name_address,
+                    anchors as i64,
+                    expect_ready
+                );
+            }
+        }
+        if (anchors != null as *u8) { CFRelease(anchors); }
+        if (certificate != null as *u8) { CFRelease(certificate); }
+        if (cert_data != null as *u8) { CFRelease(cert_data); }
+    }
+    _zag_free(_zag_slice_ptr(der));
+    _zag_free(storage);
+    return result;
+}

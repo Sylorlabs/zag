@@ -1,0 +1,420 @@
+// selfhost/vector_contract.zag — THE SINGLE SOURCE OF TRUTH for the vector
+// pipeline.  Four components agree on the vocabulary defined here and nothing
+// else:
+//
+//   selfhost/zir_vector.zag       target-independent vector IR ops (ZIR dialect)
+//   selfhost/vectorize.zag        loop / IV / alias analysis + the transform
+//   selfhost/native/isa.zag       machine ops (width-parameteric VEX/EVEX/NEON)
+//   selfhost/native/vregalloc.zag vector liveness + register assignment
+//   selfhost/native/vecwidth.zag  CPU-width lowering (16/8/4 lanes + splitting)
+//
+// Like zir_contract.zag and isa.zag this file holds schema and identity rules
+// only: no parser state, no codegen, no map construction.  Every other vector
+// file must import this one instead of re-deriving a spelling, a lane count, or
+// a width class, so that a change to the vector type or the width ladder
+// cannot leave two layers disagreeing.
+//
+// ── THE VECTOR TYPE ─────────────────────────────────────────────────────────
+// ZIR already carries a target-independent type on every value (`ZVal.ty`).
+// A vector value uses the spelling
+//
+//     vector<elem,lanes>          e.g. vector<i32,4>   vector<f32,8>
+//
+// `lanes` is a LOGICAL lane count chosen by the frontend for the transfer; it is
+// never a machine register width.  `vecwidth.zag` owns the mapping from a
+// logical lane count to whatever the selected CPU can actually execute, and
+// splits when the CPU is narrower than the logical vector.  Keeping those two
+// facts separate is the whole reason this file exists: the IR must not encode
+// "256-bit" or "ymm" anywhere.
+//
+// A comparison result is `vector<i1,lanes>`, matching MLIR's `vector<1xi1>`
+// flattening: one lane of i1 per compared lane.  `zvec_mask_lanes` recovers the
+// compared lane count from a mask type.
+//
+// ── THE WIDTH LADDER ─────────────────────────────────────────────────────────
+// Vector machine ops are width-parameteric through a two-bit width class held
+// in `Instr.imm` for the vector kinds (see isa.zag).  The ladder is fixed:
+//
+//     VW_128 = 0  ->  16 bytes   SSE2 xmm / NEON q  / EVEX.128
+//     VW_256 = 1  ->  32 bytes   AVX2 ymm
+//     VW_512 = 2  ->  64 bytes   AVX-512 zmm
+//
+// `zvec_wclass_bytes` and `zvec_wclass_lanes` are the only places a width
+// class becomes a size or a lane count.
+
+// ── width classes (must match isa.zag) ───────────────────────────────────────
+fn VW_128() i32 { return 0; }
+fn VW_256() i32 { return 1; }
+fn VW_512() i32 { return 2; }
+
+fn zvec_wclass_bytes(w: i32) i32 {
+    if (w == VW_512()) { return 64; }
+    if (w == VW_256()) { return 32; }
+    return 16;
+}
+fn zvec_wclass_lanes(w: i32) i32 {
+    if (w == VW_512()) { return 16; }
+    if (w == VW_256()) { return 8; }
+    return 4;
+}
+// The narrowest class that holds `lanes` 32-bit-equivalent lanes, or -1 when the
+// request exceeds the ladder (16 lanes is the hard ceiling; a 32-lane logical
+// vector must be expressed as two 16-lane vectors by the lowering pass).
+fn zvec_wclass_for_lanes(lanes: i32) i32 {
+    if (lanes <= 4) { return VW_128(); }
+    if (lanes <= 8) { return VW_256(); }
+    if (lanes <= 16) { return VW_512(); }
+    return 0 - 1;
+}
+// How many machine registers of class `w` are needed to cover `lanes` logical
+// lanes (0 = impossible).  Splitting a 16-lane vector on an SSE2-only CPU
+// yields 4 registers, which is exactly what vecwidth.zag must emit.
+fn zvec_reg_count(lanes: i32, w: i32) i32 {
+    if (lanes < 1) { return 0; }
+    let per: i32 = zvec_wclass_lanes(w);
+    if (per < 1) { return 0; }
+    let n: i32 = lanes / per;
+    if (lanes % per != 0) { n = n + 1; }
+    return n;
+}
+
+// ── target lane ceilings ─────────────────────────────────────────────────────
+// The ideal pipeline, in one place.  A target reports the widest logical vector
+// it can execute in a single instruction; a logical vector wider than the
+// target ceiling is legal IR but is always lowered as several instructions.
+fn ZT_SSE2() i32 { return 0; }   // x86-64 baseline
+fn ZT_AVX2() i32 { return 1; }   // VEX.256
+fn ZT_AVX512() i32 { return 2; } // EVEX.512
+fn ZT_NEON() i32 { return 3; }   // AArch64 Advanced SIMD (128-bit Q)
+
+fn zt_lane_ceiling(target: i32) i32 {
+    if (target == ZT_AVX512()) { return 16; }
+    if (target == ZT_AVX2()) { return 8; }
+    // SSE2 and NEON are both 128-bit.
+    return 4;
+}
+fn zt_width_class(target: i32) i32 {
+    if (target == ZT_AVX512()) { return VW_512(); }
+    if (target == ZT_AVX2()) { return VW_256(); }
+    return VW_128();
+}
+fn zt_name(target: i32) []u8 {
+    if (target == ZT_AVX512()) { return "avx512"; }
+    if (target == ZT_AVX2()) { return "avx2"; }
+    if (target == ZT_NEON()) { return "neon"; }
+    return "sse2";
+}
+
+// ── element types ────────────────────────────────────────────────────────────
+// A vector element type must be one the backend can pack: an integer or an IEEE
+// float of 8/16/32/64 bits.  Wider or narrower (or any aggregate) is rejected so
+// that `vecwidth.zag` never has to invent a packing for it.
+fn zvec_is_elem_ty(t: []u8) i32 {
+    if (@strEq(t, "i8") || @strEq(t, "u8")) { return 1; }
+    if (@strEq(t, "i16") || @strEq(t, "u16")) { return 1; }
+    if (@strEq(t, "i32") || @strEq(t, "u32")) { return 1; }
+    if (@strEq(t, "i64") || @strEq(t, "u64")) { return 1; }
+    if (@strEq(t, "f32")) { return 1; }
+    if (@strEq(t, "f64")) { return 1; }
+    return 0;
+}
+fn zvec_elem_bytes(t: []u8) i32 {
+    if (@strEq(t, "i8") || @strEq(t, "u8")) { return 1; }
+    if (@strEq(t, "i16") || @strEq(t, "u16")) { return 2; }
+    if (@strEq(t, "i32") || @strEq(t, "u32") || @strEq(t, "f32")) { return 4; }
+    if (@strEq(t, "i64") || @strEq(t, "u64") || @strEq(t, "f64")) { return 8; }
+    return 0;
+}
+
+// The ADDRESS STRIDE of a `*ELEM` array element -- what `p[i]` actually adds.
+// This is deliberately NOT `zvec_elem_bytes`: native layout gives every
+// non-byte scalar a full 8-byte word (cg_elem_stride -> cg_type_size), so a
+// `*i32` element advances EIGHT bytes even though only four carry the value.
+// Using the element width here is the mistake that made every vectorized loop
+// read the wrong elements: a 128-bit load scaled by 4 gathers four bytes-packed
+// words, none of which are adjacent array elements.
+fn zvec_elem_stride(t: []u8) i32 {
+    if (@strEq(t, "i8") || @strEq(t, "u8")) { return 1; }
+    if (@strEq(t, "i16") || @strEq(t, "u16")) { return 2; }
+    if (zvec_elem_bytes(t) > 0) { return 8; }
+    return 0;
+}
+
+// 32-bit-equivalent units a `lanes`-element vector of `t` spans in memory.
+//
+// The width ladder already counts 32-bit-equivalent units (4 / 8 / 16 per
+// class), and a stride-8 element is exactly two of them, so the ladder needs
+// no change: 4 i32 lanes over a `*i32` is 8 units and therefore a 256-bit
+// request, not a 128-bit one. Returns 0 when the element is not word-sized.
+fn zvec_32bit_units(lanes: i32, t: []u8) i32 {
+    let st: i32 = zvec_elem_stride(t);
+    if (st < 4) { return 0; }
+    if (st % 4 != 0) { return 0; }
+    return lanes * (st / 4);
+}
+
+// Element types one word-lane instruction can carry.
+//
+// Every non-byte scalar is exactly one 8-byte word, so a 64-bit lane add is
+// correct for i32 (the low 32 bits are right mod 2^32 whatever the high half
+// held), for i64, and for pointers. Floats are excluded because a word add on
+// float BITS is not a float add and the ISA has no vector FP add yet; byte and
+// halfword arrays are excluded because a word add carries between elements.
+// Both are refused loudly by the vectorizer rather than mis-encoded.
+fn zvec_is_word_elem(t: []u8) i32 {
+    if (zvec_elem_is_float(t) == 1) { return 0; }
+    if (zvec_elem_stride(t) != 8) { return 0; }
+    if (zvec_elem_bytes(t) < 1) { return 0; }
+    return 1;
+}
+fn zvec_elem_is_float(t: []u8) i32 {
+    if (@strEq(t, "f32") || @strEq(t, "f64")) { return 1; }
+    return 0;
+}
+fn zvec_elem_is_signed(t: []u8) i32 {
+    if (@strEq(t, "i8") || @strEq(t, "i16") || @strEq(t, "i32") || @strEq(t, "i64")) { return 1; }
+    return 0;
+}
+
+// ── the vector type spelling `vector<elem,lanes>` ────────────────────────────
+fn zvec_ty(elem: []u8, lanes: i32) []u8 {
+    return _zag_str_concat("vector<", _zag_str_concat(elem,
+        _zag_str_concat(",", _zag_str_concat(_zag_i64_to_str(lanes as i64), ">"))));
+}
+fn zvec_mask_ty(lanes: i32) []u8 { return zvec_ty("i1", lanes); }
+
+// The slot type for a value of vector type `vty`: `memref<vector<ELEM,N>>`.
+//
+// This is how a VECTOR value is made memory-resident, and it is what carries a
+// loop-carried accumulator across a loop's back edge without a phi, a block
+// argument, or a `while` result.  The spelling lives here, beside `zvec_ty`, so
+// the producer that writes the slot and the backend that sizes it cannot
+// disagree about what a vector slot is called.
+fn zvec_memref_ty(vty: []u8) []u8 {
+    return _zag_str_concat("memref<", _zag_str_concat(vty, ">"));
+}
+// The vector type a slot holds, or "" when `ty` is not a vector slot.
+fn zvec_memref_vec_ty(ty: []u8) []u8 {
+    if (ty.len < 12) { return ""; }
+    if (!@strEq(ty[0..7], "memref<")) { return ""; }
+    if (ty[ty.len - 1] != '>') { return ""; }
+    let inner: []u8 = ty[7..ty.len - 1];
+    if (zvec_is_vector_ty(inner) == 0) { return ""; }
+    return inner;
+}
+
+fn zvec_is_vector_ty(t: []u8) i32 {
+    if (t.len < 12) { return 0; }
+    if (!@strEq(t[0..7], "vector<")) { return 0; }
+    if (t[t.len - 1] != '>') { return 0; }
+    return 1;
+}
+
+// Element type of a vector type, or "" when `t` is not a vector type.
+fn zvec_elem_ty(t: []u8) []u8 {
+    if (zvec_is_vector_ty(t) == 0) { return ""; }
+    let inner: []u8 = t[7..t.len - 1];
+    let comma: i32 = 0 - 1;
+    let i: i32 = 0;
+    while (i < inner.len) { if (inner[i] == ',') { comma = i; } i = i + 1; }
+    if (comma <= 0) { return ""; }
+    return inner[0..comma];
+}
+
+// Lane count of a vector type, or 0 when `t` is not a vector type.
+fn zvec_lanes(t: []u8) i32 {
+    if (zvec_is_vector_ty(t) == 0) { return 0; }
+    let inner: []u8 = t[7..t.len - 1];
+    let comma: i32 = 0 - 1;
+    let i: i32 = 0;
+    while (i < inner.len) { if (inner[i] == ',') { comma = i; } i = i + 1; }
+    if (comma <= 0) { return 0; }
+    let digits: []u8 = inner[comma + 1..];
+    if (digits.len == 0 || digits.len > 3) { return 0; }
+    let n: i32 = 0;
+    let j: i32 = 0;
+    while (j < digits.len) {
+        let c: u8 = digits[j];
+        if (c < '0' || c > '9') { return 0; }
+        n = n * 10 + (c - '0') as i32;
+        j = j + 1;
+    }
+    return n;
+}
+
+// Do two vector types have the same element type and lane count?  Two different
+// spellings of the same shape are not a thing here, but comparing by shape
+// rather than by string keeps the rule independent of spelling.
+fn zvec_same_shape(a: []u8, b: []u8) i32 {
+    if (zvec_is_vector_ty(a) == 0 || zvec_is_vector_ty(b) == 0) { return 0; }
+    if (zvec_lanes(a) != zvec_lanes(b)) { return 0; }
+    return @strEq(zvec_elem_ty(a), zvec_elem_ty(b)) as i32;
+}
+// True when `t` is a well-formed vector type this compiler will accept: right
+// shape, a packable element, and a lane count inside the 16-lane ceiling.
+fn zvec_ty_valid(t: []u8) i32 {
+    if (zvec_is_vector_ty(t) == 0) { return 0; }
+    if (zvec_is_elem_ty(zvec_elem_ty(t)) == 0) { return 0; }
+    let n: i32 = zvec_lanes(t);
+    if (n < 1) { return 0; }
+    // The ceiling is in 32-bit-EQUIVALENT lanes, but `n` counts ELEMENTS. For a
+    // 4-byte element they coincide; for an 8-byte one, `vector<i64,16>` is 256
+    // bytes and needs two registers, so passing `n` unchecked accepted a type no
+    // single width class can hold. Convert, exactly as vectorize.zag and
+    // ncodegen.zag do.
+    if (zvec_wclass_for_lanes(zvec_32bit_units(n, zvec_elem_ty(t))) < 0) { return 0; }
+    return 1;
+}
+// A comparison result (`vector<i1,N>`) reduces back to the compared lane count.
+fn zvec_mask_lanes(t: []u8) i32 {
+    if (!@strEq(zvec_elem_ty(t), "i1")) { return 0; }
+    return zvec_lanes(t);
+}
+
+// ── pointer vectors (address splats) ────────────────────────────────────────
+// The address form of a splat produces a vector of POINTERS, spelled
+// `vector<*ELEM,LANES>`.  It is not a data vector, so `zvec_ty_valid` is false
+// for it by design — that predicate is about packable data types.  Keeping the
+// spelling here (rather than inside the vectorizer) is what lets the verifier
+// and the vectorizer agree on what an address splat is, and it is the reason a
+// `vector.broadcast` can name either a memory reference or an address vector.
+fn zvec_ptr_ty(elem: []u8, lanes: i32) []u8 {
+    return zvec_ty(_zag_str_concat("*", elem), lanes);
+}
+fn zvec_is_ptr_vec_ty(t: []u8) i32 {
+    if (zvec_is_vector_ty(t) == 0) { return 0; }
+    let e: []u8 = zvec_elem_ty(t);
+    if (e.len < 2) { return 0; }
+    return (e[0] == '*') as i32;
+}
+// Pointee element type of `vector<*ELEM,LANES>`, or "" when `t` is not one.
+fn zvec_ptr_elem_ty(t: []u8) []u8 {
+    if (zvec_is_ptr_vec_ty(t) == 0) { return ""; }
+    let e: []u8 = zvec_elem_ty(t);
+    return e[1..];
+}
+
+// ── vector op vocabulary ─────────────────────────────────────────────────────
+// Every op the vector IR may contain.  `zvec_op_is_vector` is the single
+// membership test used by the verifier, the DCE, the vectorizer, the cost
+// model, and the MLIR printer, so adding an op in one place cannot leave the
+// others disagreeing about whether it exists.
+fn zvec_op_splat() []u8 { return "vector.splat"; }
+fn zvec_op_broadcast() []u8 { return "vector.broadcast"; }
+fn zvec_op_extract() []u8 { return "vector.extract"; }
+fn zvec_op_insert() []u8 { return "vector.insert"; }
+fn zvec_op_add() []u8 { return "vector.add"; }
+fn zvec_op_sub() []u8 { return "vector.sub"; }
+fn zvec_op_mul() []u8 { return "vector.mul"; }
+fn zvec_op_and() []u8 { return "vector.bit_and"; }
+fn zvec_op_or() []u8 { return "vector.bit_or"; }
+fn zvec_op_xor() []u8 { return "vector.bit_xor"; }
+fn zvec_op_shl() []u8 { return "vector.shl"; }
+fn zvec_op_shr() []u8 { return "vector.shr"; }
+fn zvec_op_icmp() []u8 { return "vector.icmp"; }
+fn zvec_op_select() []u8 { return "vector.select"; }
+fn zvec_op_reduction_add() []u8 { return "vector.reduction_add"; }
+fn zvec_op_shuffle() []u8 { return "vector.shuffle"; }
+
+fn zvec_op_is_vector(name: []u8) i32 {
+    if (@strEq(name, zvec_op_splat())) { return 1; }
+    if (@strEq(name, zvec_op_broadcast())) { return 1; }
+    if (@strEq(name, zvec_op_extract())) { return 1; }
+    if (@strEq(name, zvec_op_insert())) { return 1; }
+    if (@strEq(name, zvec_op_add())) { return 1; }
+    if (@strEq(name, zvec_op_sub())) { return 1; }
+    if (@strEq(name, zvec_op_mul())) { return 1; }
+    if (@strEq(name, zvec_op_and())) { return 1; }
+    if (@strEq(name, zvec_op_or())) { return 1; }
+    if (@strEq(name, zvec_op_xor())) { return 1; }
+    if (@strEq(name, zvec_op_shl())) { return 1; }
+    if (@strEq(name, zvec_op_shr())) { return 1; }
+    if (@strEq(name, zvec_op_icmp())) { return 1; }
+    if (@strEq(name, zvec_op_select())) { return 1; }
+    if (@strEq(name, zvec_op_reduction_add())) { return 1; }
+    if (@strEq(name, zvec_op_shuffle())) { return 1; }
+    return 0;
+}
+
+// Elementwise binary ops: two vector operands, one vector result of the same
+// shape.  `zvec_op_is_elementwise` gates the vectorizer's rewrite match and the
+// DCE's purity test.
+fn zvec_op_is_elementwise(name: []u8) i32 {
+    if (@strEq(name, zvec_op_add())) { return 1; }
+    if (@strEq(name, zvec_op_sub())) { return 1; }
+    if (@strEq(name, zvec_op_mul())) { return 1; }
+    if (@strEq(name, zvec_op_and())) { return 1; }
+    if (@strEq(name, zvec_op_or())) { return 1; }
+    if (@strEq(name, zvec_op_xor())) { return 1; }
+    if (@strEq(name, zvec_op_shl())) { return 1; }
+    if (@strEq(name, zvec_op_shr())) { return 1; }
+    return 0;
+}
+// Elementwise ops that need no operand of a float type (and are the only ones
+// an integer-only unit may use).
+fn zvec_op_is_integer_only(name: []u8) i32 {
+    if (@strEq(name, zvec_op_and())) { return 1; }
+    if (@strEq(name, zvec_op_or())) { return 1; }
+    if (@strEq(name, zvec_op_xor())) { return 1; }
+    if (@strEq(name, zvec_op_shl())) { return 1; }
+    if (@strEq(name, zvec_op_shr())) { return 1; }
+    return 0;
+}
+// Vector ops are pure: they read only their operands and have no side effect,
+// so a dead result may always be removed and CSE is sound.  `vector.broadcast`
+// and `vector.store`-like memory reads are NOT in this set: they touch memory.
+fn zvec_op_is_pure(name: []u8) i32 {
+    if (zvec_op_is_vector(name) == 0) { return 0; }
+    if (@strEq(name, zvec_op_broadcast())) { return 0; }
+    return 1;
+}
+
+// The scalar arith op a vector elementwise op mirrors, used to match a scalar
+// loop body against a vector body.  Returns "" for non-elementwise ops.
+fn zvec_op_scalar_name(name: []u8) []u8 {
+    if (@strEq(name, zvec_op_add())) { return "arith.addi"; }
+    if (@strEq(name, zvec_op_sub())) { return "arith.subi"; }
+    if (@strEq(name, zvec_op_mul())) { return "arith.muli"; }
+    if (@strEq(name, zvec_op_and())) { return "zag.band"; }
+    if (@strEq(name, zvec_op_or())) { return "zag.bor"; }
+    if (@strEq(name, zvec_op_xor())) { return "zag.bxor"; }
+    return "";
+}
+// And the inverse: the vector op a scalar arith op becomes, or "" when the
+// scalar op has no elementwise vector form on this target-independent IR.
+fn zvec_op_from_scalar(scalar: []u8) []u8 {
+    if (@strEq(scalar, "arith.addi") || @strEq(scalar, "arith.addf")) { return zvec_op_add(); }
+    if (@strEq(scalar, "arith.subi") || @strEq(scalar, "arith.subf")) { return zvec_op_sub(); }
+    if (@strEq(scalar, "arith.muli") || @strEq(scalar, "arith.mulf")) { return zvec_op_mul(); }
+    return "";
+}
+
+// ── comparison predicates ────────────────────────────────────────────────────
+fn zvec_pred_is_signed_int(p: []u8) i32 {
+    if (@strEq(p, "eq") || @strEq(p, "ne")) { return 1; }
+    if (@strEq(p, "slt") || @strEq(p, "sle") || @strEq(p, "sgt") || @strEq(p, "sge")) { return 1; }
+    return 0;
+}
+fn zvec_pred_is_float(p: []u8) i32 {
+    if (@strEq(p, "oeq") || @strEq(p, "one")) { return 1; }
+    if (@strEq(p, "olt") || @strEq(p, "ole") || @strEq(p, "ogt") || @strEq(p, "oge")) { return 1; }
+    if (@strEq(p, "ueq") || @strEq(p, "une")) { return 1; }
+    if (@strEq(p, "ult") || @strEq(p, "ule") || @strEq(p, "ugt") || @strEq(p, "uge")) { return 1; }
+    return 0;
+}
+fn zvec_pred_valid(p: []u8) i32 {
+    if (zvec_pred_is_signed_int(p) == 1) { return 1; }
+    return zvec_pred_is_float(p);
+}
+
+// ── cost model ───────────────────────────────────────────────────────────────
+// The vectorizer only vectorizes a loop when the vector form is not a pessimization.
+// The unit is "scalar-equivalent operations": one 4-lane SSE2 add is worth 4,
+// so `zvec_op_cost` is the number of scalar ops the machine form replaces, and
+// the prologue/epilogue overhead the transform adds is charged against it.
+// Machine-independent on purpose — it is compared against a scalar trip count,
+// not against a cycle model.
+fn zvec_op_cost(lanes: i32) i32 {
+    if (lanes < 1) { return 0; }
+    return lanes;
+}

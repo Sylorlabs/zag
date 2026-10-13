@@ -1,0 +1,1462 @@
+// selfhost/vectorize.zag — the AUTO-VECTORIZATION pass: loop discovery,
+// induction-variable detection, alias/dependency analysis, and the transform.
+//
+// The pass runs on ZIR (see zir_contract.zag) and turns ONE narrowly recognized
+// scalar loop shape into "vector main loop + untouched scalar epilogue".  It is
+// deliberately tiny: one loop shape, one elementwise op site, one accumulator.
+// Everything else is reported with a reject code and left alone.  A vectorizer
+// that is wrong is worse than no vectorizer, so every rule below carries an
+// explicit soundness argument, in the spirit of native/regalloc.zag.
+//
+// ── THE SHAPE THAT IS RECOGNIZED ──────────────────────────────────────────────
+// A Zag `while` lowers to `scf.while` with two regions (region 0 = condition,
+// region 1 = body).  For `let s = 0; let i = 0; while (i < n) { s = s + a[i];
+// i = i + 1; }` the body is memory-resident:
+//
+//     %acc = memref.alloca() : memref<i32>      // accumulator in MEMORY
+//     %iv  = memref.alloca() : memref<i32>      // induction variable in MEMORY
+//     %c0  = arith.constant 0 : i32
+//     memref.store %c0, %iv[]
+//     scf.while { %i = memref.load %iv[]; %c = arith.cmpi slt, %i, %n
+//                 scf.condition(%c) }
+//             do { %s = memref.load %acc[]; %i2 = memref.load %iv[]
+//                  %e = zag.index %a, %i2; %y = arith.addi %s, %e
+//                  memref.store %y, %acc[]
+//                  %i3 = memref.load %iv[]; %c1 = arith.constant 1
+//                  %i4 = arith.addi %i3, %c1; memref.store %i4, %iv[]
+//                  scf.yield }
+//
+// The memory-residency is the whole trick: there is NO phi to build and NO
+// peeling, because the induction variable and the accumulator survive across
+// the loop boundary in their stack slots.
+//
+// ── THE TRANSFORM ─────────────────────────────────────────────────────────────
+// A vector MAIN loop is inserted immediately BEFORE the original `scf.while`;
+// the original scalar loop is left byte-for-byte untouched and becomes the
+// EPILOGUE.  The main loop advances the IV by `lanes` per iteration and guards
+// with `sle`, so it stops at the last full vector.  The epilogue then continues
+// from whatever the IV and accumulator slots hold.
+//
+// EQUIVALENCE.  Write the scalar loop as n steps of `acc <- acc ⊕ a[i]`,
+// `i <- i + 1`, starting at i = 0, and let L = lanes, q = floor(n / L).
+//  * iterations 0 .. L*q-1 of the scalar loop are exactly the lane groups the
+//    main loop covers, and each vector op performs the same per-lane operation
+//    on the same lane element, so after main-iteration k the accumulator holds
+//    the same value the scalar loop holds after step L*k (mod 2^32, and for
+//    exactly-associative integer elementwise ops the lane-parallel carry and
+//    the horizontal reduction `reduce=add` store are bit-identical).  This is
+//    why FLOAT accumulators are rejected (code 5): a lane-parallel float carry
+//    plus a horizontal sum is NOT the scalar left-to-right sum, and the
+//    accumulator is observed after the loop, so the result would differ.
+//  * the main loop's `sle` guard means its last iteration ends at i = L*q <= n,
+//    so it never touches a[i] for i >= n (no speculative out-of-bounds read).
+//  * the untouched epilogue resumes at i = L*q and finishes steps L*q .. n-1
+//    with the original scalar ops, so the accumulator ends bit-identical.
+//
+// ── WHY A VECTOR LOAD IS PROVABLY SAFE HERE (rules 7 and 8) ───────────────────
+// Two memory proofs are required and both are conservative to the point of
+// uselessness elsewhere:
+//
+//  (7) The accumulator's ADDRESS never escapes.  The accumulator is a
+//      `memref.alloca` stack slot; only `memref.load`/`memref.store` may name
+//      it, and no value derived from a load of it may reach an op outside the
+//      transparent set (arith ops, cmp, constant, memref).  A `func.call`,
+//      `zag.field`, `zag.cast`, `zag.slice`, `zag.index` or a condition/switch
+//      subject built from the accumulator would let something outside the loop
+//      OBSERVE the slot mid-iteration, and the vectorized main loop would hand
+//      it a stale or per-lane value.
+//
+//  (8) The indexed base is touched by exactly one unit-stride access.  The body
+//      contains exactly one `zag.index` whose index operand is a load of the
+//      induction variable (stride exactly +1), and no op anywhere else in the
+//      function names the base pointer.  That makes `a[i .. i+L)` a contiguous,
+//      non-overlapping, provably unaliased read: nothing else in the function
+//      can write inside the window, and the write set is the single private
+//      accumulator slot.
+//
+// ── THE WIDTH LADDER IS NOT DECIDED HERE ──────────────────────────────────────
+// `lanes` is a LOGICAL lane count.  Choosing the lane count is all this pass
+// does; deciding how many machine registers that becomes (and splitting when the
+// CPU is narrower than the logical vector) belongs to native/vecwidth.zag.  This
+// file never names a machine register or a bit width.
+
+@import("zir_contract.zag")    // ZVal / ZOp / ZBlock / ZRegion / ZFunc / ZModule
+@import("vector_contract.zag") // vector<elem,lanes>, vector op names, target ladder
+
+// ── reject codes ──────────────────────────────────────────────────────────────
+// The numbers are part of this pass's contract: the report, the tests, and any
+// future diagnostic all quote them.  `zloop_reject_text` is the only place a
+// code turns into prose.
+fn ZR_NOTLOOP() i32 { return 1; }
+fn ZR_NOCOND() i32 { return 2; }
+fn ZR_NOIV() i32 { return 3; }
+fn ZR_NOACC() i32 { return 4; }
+fn ZR_NOOP() i32 { return 5; }
+fn ZR_NOTY() i32 { return 6; }
+fn ZR_ESCAPE() i32 { return 7; }
+fn ZR_BASEALIAS() i32 { return 8; }
+fn ZR_BOUND() i32 { return 9; }
+fn ZR_UNSUPPORTED() i32 { return 10; }
+fn ZR_SHORTTRIP() i32 { return 11; }
+fn ZR_STEP() i32 { return 12; }
+
+fn zloop_reject_text(code: i32) []u8 {
+    if (code == ZR_NOTLOOP()) { return "not a loop"; }
+    if (code == ZR_NOCOND()) { return "loop has no condition region or no scf.condition"; }
+    if (code == ZR_NOIV()) { return "induction variable not recognised"; }
+    if (code == ZR_NOACC()) { return "accumulator slot not recognised"; }
+    if (code == ZR_NOOP()) { return "elementwise op has no supported vector form"; }
+    if (code == ZR_NOTY()) { return "element type is not a packable word lane"; }
+    if (code == ZR_ESCAPE()) { return "accumulator address escapes the loop"; }
+    if (code == ZR_BASEALIAS()) { return "indexed base is not a single unit-stride access"; }
+    if (code == ZR_BOUND()) { return "loop bound is not loop-invariant"; }
+    if (code == ZR_UNSUPPORTED()) { return "unsupported op in loop body"; }
+    if (code == ZR_SHORTTRIP()) { return "trip count is below the policy minimum"; }
+    if (code == ZR_STEP()) { return "vector main loop cannot preserve the trip count"; }
+    return "unknown";
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 1. POLICY
+// ═════════════════════════════════════════════════════════════════════════════
+
+struct ZvecPolicy { enabled:i32, target:i32, min_trip:i32, max_lanes:i32 }
+
+// Conservative default: OFF.  Nothing is rewritten unless a caller explicitly
+// asks for a target, because an unrequested change of arithmetic is a
+// behaviour change even when it is a correct one.
+fn zvec_policy_default() ZvecPolicy {
+    return ZvecPolicy{ .enabled=0, .target=ZT_SSE2(), .min_trip=8, .max_lanes=16 };
+}
+// Opt-in constructor for a resolved target.  The lane ceiling is the target's
+// widest single-instruction logical vector: 16 / 8 / 4 / 4.
+fn zvec_policy_for_target(target: i32) ZvecPolicy {
+    return ZvecPolicy{ .enabled=1, .target=target, .min_trip=8,
+        .max_lanes=zt_lane_ceiling(target) };
+}
+// The LOGICAL lane count to vectorize with, or 0 when the policy cannot vector
+// at all.  `lanes` counts ELEMENTS, and an element is a whole 8-byte word, so
+// the target's 32-bit-equivalent ceiling is halved: 8 elements on AVX-512, 4 on
+// AVX2, 2 on SSE2/NEON, further clamped by `max_lanes`.  Anything the ladder
+// cannot express is refused rather than silently widened, because the ladder is
+// the only place a width is decided.
+fn zvec_choose_lanes(policy: ZvecPolicy, elem: []u8) i32 {
+    if (policy.max_lanes < 1) { return 0; }
+    let units: i32 = zt_lane_ceiling(policy.target);
+    if (policy.max_lanes < units) { units = policy.max_lanes; }
+    if (units < 1) { return 0; }
+    if (zvec_elem_stride(elem) != 8) { return 0; }
+    let n: i32 = units / 2;
+    if (n < 1) { return 0; }
+    if (zvec_wclass_for_lanes(zvec_32bit_units(n, elem)) < 0) { return 0; }
+    return n;
+}
+
+// The vector type of `lanes` element addresses used to live here.  It is now
+// `zvec_ptr_ty` in vector_contract.zag, beside `zvec_ty` and the rest of the
+// vocabulary: the verifier in zir_vector.zag has to agree about what an address
+// splat is, and a type spelling that only the producer could see is exactly how
+// the two layers drift apart.  This file imports the shared one.
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 2. SMALL IR HELPERS
+//    Everything here is read-only.  The pass never mutates an op it did not
+//    create, so an untouched module is bit-for-bit the module it was handed.
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn zv_is_op(o: ZOp, n: []u8) i32 {
+    if (@strEq(o.name, n)) { return 1; }
+    return 0;
+}
+fn zv_attr_is(o: ZOp, key: []u8, val: []u8) i32 {
+    if (@strEq(attr_val(o, key), val)) { return 1; }
+    return 0;
+}
+fn zv_op1(o: ZOp, name: []u8) i32 {
+    if (zv_is_op(o, name) == 1 && o.results.len == 1) { return 1; }
+    return 0;
+}
+fn zv_bin2(o: ZOp, name: []u8) i32 {
+    if (zv_is_op(o, name) == 1 && o.results.len == 1 && o.operands.len == 2) { return 1; }
+    return 0;
+}
+// A `memref.load` is unary (one slot operand), so it must not be matched with
+// the binary predicate above.
+fn zv_load1(o: ZOp) i32 {
+    if (zv_is_op(o, "memref.load") == 1 && o.results.len == 1 && o.operands.len == 1) { return 1; }
+    return 0;
+}
+fn zv_store2(o: ZOp) i32 {
+    if (zv_is_op(o, "memref.store") == 1 && o.operands.len == 2) { return 1; }
+    return 0;
+}
+fn zv_val(name: []u8, ty: []u8, ar: []u8, o: ZOrigin) ZVal {
+    return ZVal{ .name=name, .ty=ty, .ownership="ssa", .alias_region=ar,
+        .lifetime="function", .layout="target-default", .origin=o };
+}
+fn zv_op(name: []u8, o: ZOrigin) ZOp {
+    return ZOp{ .name=name, .results=make[ZVal](1), .operands=make[ZVal](2),
+        .attrs=make[ZAttr](2), .regions=make[ZRegion](2), .effects=0,
+        .reads="none", .writes="none", .origin=o };
+}
+fn zv_block() ZBlock { return ZBlock{ .ops=make[ZOp](8) }; }
+fn zv_region(b: ZBlock) ZRegion {
+    let r: ZRegion = ZRegion{ .blocks=make[ZBlock](1) };
+    push[ZBlock](&r.blocks, b);
+    return r;
+}
+
+// Ops that read a derived value and can neither observe it nor let its address
+// escape.  Anything else holding a value derived from the accumulator is an
+// escape (rule 7).  `zag.index` is NOT transparent: indexing into a derived
+// value dereferences an address computed from it.
+fn zv_is_transparent(o: ZOp) i32 {
+    if (zv_is_op(o, "memref.alloca") == 1) { return 1; }
+    if (zv_is_op(o, "memref.load") == 1) { return 1; }
+    if (zv_is_op(o, "memref.store") == 1) { return 1; }
+    if (zv_is_op(o, "arith.constant") == 1) { return 1; }
+    if (zv_is_op(o, "arith.addi") == 1) { return 1; }
+    if (zv_is_op(o, "arith.subi") == 1) { return 1; }
+    if (zv_is_op(o, "arith.muli") == 1) { return 1; }
+    if (zv_is_op(o, "arith.addf") == 1) { return 1; }
+    if (zv_is_op(o, "arith.subf") == 1) { return 1; }
+    if (zv_is_op(o, "arith.mulf") == 1) { return 1; }
+    if (zv_is_op(o, "arith.cmpi") == 1) { return 1; }
+    if (zv_is_op(o, "arith.cmpf") == 1) { return 1; }
+    return 0;
+}
+
+// Every op allowed inside a recognized loop body.  A call, a nested loop, an
+// `scf.break`/`scf.continue`, a switch or a defer would all change the number
+// of iterations, skip iterations, or run code the analysis has not read, so
+// they are refused outright (rule 10) rather than reasoned about.
+fn zv_is_body_safe(o: ZOp) i32 {
+    if (zv_is_op(o, "memref.load") == 1) { return 1; }
+    if (zv_is_op(o, "memref.store") == 1) { return 1; }
+    if (zv_is_op(o, "arith.constant") == 1) { return 1; }
+    if (zv_is_op(o, "arith.addi") == 1) { return 1; }
+    if (zv_is_op(o, "arith.subi") == 1) { return 1; }
+    if (zv_is_op(o, "arith.muli") == 1) { return 1; }
+    if (zv_is_op(o, "arith.addf") == 1) { return 1; }
+    if (zv_is_op(o, "arith.subf") == 1) { return 1; }
+    if (zv_is_op(o, "arith.mulf") == 1) { return 1; }
+    if (zv_is_op(o, "arith.cmpi") == 1) { return 1; }
+    if (zv_is_op(o, "arith.cmpf") == 1) { return 1; }
+    if (zv_is_op(o, "zag.index") == 1) { return 1; }
+    return 0;
+}
+
+// Binary arithmetic that could BE the elementwise site.  The set is wider than
+// the set with a vector form on purpose: an unsupported op must be reported as
+// "no vector form" (5) rather than mis-parsed as "no accumulator" (4).
+fn zv_is_ew_candidate(o: ZOp) i32 {
+    if (o.results.len != 1 || o.operands.len != 2) { return 0; }
+    if (zv_is_op(o, "arith.addi") == 1) { return 1; }
+    if (zv_is_op(o, "arith.subi") == 1) { return 1; }
+    if (zv_is_op(o, "arith.muli") == 1) { return 1; }
+    if (zv_is_op(o, "arith.divsi") == 1) { return 1; }
+    if (zv_is_op(o, "arith.remsi") == 1) { return 1; }
+    if (zv_is_op(o, "arith.addf") == 1) { return 1; }
+    if (zv_is_op(o, "arith.subf") == 1) { return 1; }
+    if (zv_is_op(o, "arith.mulf") == 1) { return 1; }
+    if (zv_is_op(o, "arith.divf") == 1) { return 1; }
+    if (zv_is_op(o, "arith.shli") == 1) { return 1; }
+    if (zv_is_op(o, "arith.shrsi") == 1) { return 1; }
+    if (zv_is_op(o, "arith.andi") == 1) { return 1; }
+    if (zv_is_op(o, "arith.ori") == 1) { return 1; }
+    if (zv_is_op(o, "arith.xori") == 1) { return 1; }
+    if (zv_is_op(o, "zag.band") == 1) { return 1; }
+    if (zv_is_op(o, "zag.bor") == 1) { return 1; }
+    if (zv_is_op(o, "zag.bxor") == 1) { return 1; }
+    return 0;
+}
+fn zv_is_float_arith(n: []u8) i32 {
+    if (@strEq(n, "arith.addf")) { return 1; }
+    if (@strEq(n, "arith.subf")) { return 1; }
+    if (@strEq(n, "arith.mulf")) { return 1; }
+    if (@strEq(n, "arith.divf")) { return 1; }
+    return 0;
+}
+
+// ── small name utilities ──────────────────────────────────────────────────────
+fn zv_name_num(n: []u8) i32 {
+    if (n.len < 3) { return 0; }
+    if (n[0] != '%') { return 0; }
+    if (n[1] != 'v') { return 0; }
+    let v: i32 = 0;
+    let i: i32 = 2;
+    while (i < n.len) {
+        let c: u8 = n[i];
+        if (c < '0' || c > '9') { return 0; }
+        v = v * 10 + (c - '0') as i32;
+        i = i + 1;
+    }
+    return v;
+}
+fn zv_is_value_in(ns: ArrayList[[]u8], n: []u8) i32 {
+    let i: i32 = 0;
+    while (i < ns.len) { if (@strEq(ns.data[i], n)) { return 1; } i = i + 1; }
+    return 0;
+}
+fn zv_name_add(ns: *ArrayList[[]u8], n: []u8) void {
+    if (n.len == 0) { return; }
+    if (zv_is_value_in(ns.*, n) == 1) { return; }
+    push[[]u8](ns, n);
+}
+
+// One forward pre-order pass computing every value transitively derived from the
+// seeds.  A single pass is exact because ZIR is def-before-use: every operand of
+// an op is defined earlier in the same enclosing walk, so when the op is reached
+// its operands' derivations are already in the set.
+fn zv_op_derive(ns: *ArrayList[[]u8], o: ZOp) void {
+    let derived: i32 = 0;
+    let k: i32 = 0;
+    while (k < o.operands.len) {
+        if (zv_is_value_in(ns.*, o.operands.data[k].name) == 1) { derived = 1; }
+        k = k + 1;
+    }
+    if (derived == 1) {
+        let i: i32 = 0;
+        while (i < o.results.len) { zv_name_add(ns, o.results.data[i].name); i = i + 1; }
+    }
+    let r: i32 = 0;
+    while (r < o.regions.len) {
+        let b: i32 = 0;
+        while (b < o.regions.data[r].blocks.len) {
+            zv_block_derive(ns, o.regions.data[r].blocks.data[b]);
+            b = b + 1;
+        }
+        r = r + 1;
+    }
+}
+fn zv_block_derive(ns: *ArrayList[[]u8], blk: ZBlock) void {
+    let i: i32 = 0;
+    while (i < blk.ops.len) { zv_op_derive(ns, blk.ops.data[i]); i = i + 1; }
+}
+// One forward pre-order pass expanding `ns` to every name derived from it.
+fn zv_derive_all(ns: *ArrayList[[]u8], f: ZFunc) void {
+    zv_block_derive(ns, f.body);
+}
+
+// Ops that name one of `ns` and are outside the allowed vocabulary.
+fn zv_op_escape(o: ZOp, ns: ArrayList[[]u8]) i32 {
+    if (zv_is_transparent(o) == 1) { return 0; }
+    let k: i32 = 0;
+    while (k < o.operands.len) {
+        if (zv_is_value_in(ns, o.operands.data[k].name) == 1) { return 1; }
+        k = k + 1;
+    }
+    return 0;
+}
+fn zv_block_escape(blk: ZBlock, ns: ArrayList[[]u8]) i32 {
+    let hit: i32 = 0;
+    let i: i32 = 0;
+    while (i < blk.ops.len) {
+        let o: ZOp = blk.ops.data[i];
+        if (zv_op_escape(o, ns) == 1) { hit = 1; }
+        let r: i32 = 0;
+        while (r < o.regions.len) {
+            let b: i32 = 0;
+            while (b < o.regions.data[r].blocks.len) {
+                if (zv_block_escape(o.regions.data[r].blocks.data[b], ns) == 1) { hit = 1; }
+                b = b + 1;
+            }
+            r = r + 1;
+        }
+        i = i + 1;
+    }
+    return hit;
+}
+
+// Every op in the function that names `n` as an operand, minus the two
+// address-consuming memory ops.  This is rule 7a's test: a stack slot's address
+// may only be handed to `memref.load` / `memref.store`.
+fn zv_slot_misuse_in(blk: ZBlock, n: []u8) i32 {
+    let hit: i32 = 0;
+    let i: i32 = 0;
+    while (i < blk.ops.len) {
+        let o: ZOp = blk.ops.data[i];
+        if (zv_is_op(o, "memref.load") == 0 && zv_is_op(o, "memref.store") == 0) {
+            let k: i32 = 0;
+            while (k < o.operands.len) {
+                if (@strEq(o.operands.data[k].name, n)) { hit = 1; }
+                k = k + 1;
+            }
+        }
+        let r: i32 = 0;
+        while (r < o.regions.len) {
+            let b: i32 = 0;
+            while (b < o.regions.data[r].blocks.len) {
+                if (zv_slot_misuse_in(o.regions.data[r].blocks.data[b], n) == 1) { hit = 1; }
+                b = b + 1;
+            }
+            r = r + 1;
+        }
+        i = i + 1;
+    }
+    return hit;
+}
+
+// ── lookups ───────────────────────────────────────────────────────────────────
+fn zv_alloca_index(f: ZFunc, name: []u8, before: i32) i32 {
+    let i: i32 = 0;
+    while (i < before && i < f.body.ops.len) {
+        let o: ZOp = f.body.ops.data[i];
+        if (zv_op1(o, "memref.alloca") == 1 && @strEq(o.results.data[0].name, name)) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+fn zv_top_const_index(f: ZFunc, name: []u8, before: i32) i32 {
+    let i: i32 = 0;
+    while (i < before && i < f.body.ops.len) {
+        let o: ZOp = f.body.ops.data[i];
+        if (zv_op1(o, "arith.constant") == 1 && @strEq(o.results.data[0].name, name)) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+fn zv_top_load_index(f: ZFunc, name: []u8, before: i32) i32 {
+    let i: i32 = 0;
+    while (i < before && i < f.body.ops.len) {
+        let o: ZOp = f.body.ops.data[i];
+        if (zv_load1(o) == 1 && @strEq(o.results.data[0].name, name)) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+// Non-negative decimal attr parse; -1 when the attr is not a plain integer.
+fn zv_attr_int(o: ZOp, key: []u8) i32 {
+    let s: []u8 = attr_val(o, key);
+    if (s.len == 0 || s.len > 9) { return 0 - 1; }
+    let v: i32 = 0;
+    let i: i32 = 0;
+    while (i < s.len) {
+        let c: u8 = s[i];
+        if (c < '0' || c > '9') { return 0 - 1; }
+        v = v * 10 + (c - '0') as i32;
+        i = i + 1;
+    }
+    return v;
+}
+fn zv_find_val_in_block(blk: ZBlock, name: []u8) ZVal {
+    let i: i32 = 0;
+    while (i < blk.ops.len) {
+        let o: ZOp = blk.ops.data[i];
+        let k: i32 = 0;
+        while (k < o.results.len) {
+            if (@strEq(o.results.data[k].name, name)) { return o.results.data[k]; }
+            k = k + 1;
+        }
+        k = 0;
+        while (k < o.operands.len) {
+            if (@strEq(o.operands.data[k].name, name)) { return o.operands.data[k]; }
+            k = k + 1;
+        }
+        let r: i32 = 0;
+        while (r < o.regions.len) {
+            let b: i32 = 0;
+            while (b < o.regions.data[r].blocks.len) {
+                let v: ZVal = zv_find_val_in_block(o.regions.data[r].blocks.data[b], name);
+                if (v.name.len > 0) { return v; }
+                b = b + 1;
+            }
+            r = r + 1;
+        }
+        i = i + 1;
+    }
+    return zv_val("", "", "none", zir_unknown_origin());
+}
+fn zv_find_val(f: ZFunc, name: []u8) ZVal {
+    let i: i32 = 0;
+    while (i < f.params.len) {
+        if (@strEq(f.params.data[i].name, name)) { return f.params.data[i]; }
+        i = i + 1;
+    }
+    return zv_find_val_in_block(f.body, name);
+}
+fn zv_is_param(f: ZFunc, name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < f.params.len) {
+        if (@strEq(f.params.data[i].name, name)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+// Is `name` defined by an op inside either loop region?  A bound defined here
+// is not loop-invariant by construction: it may change every iteration.
+fn zv_defined_in_loop(cond: ZBlock, body: ZBlock, name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < cond.ops.len) {
+        let o: ZOp = cond.ops.data[i];
+        let k: i32 = 0;
+        while (k < o.results.len) {
+            if (@strEq(o.results.data[k].name, name)) { return 1; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < body.ops.len) {
+        let o: ZOp = body.ops.data[i];
+        let k: i32 = 0;
+        while (k < o.results.len) {
+            if (@strEq(o.results.data[k].name, name)) { return 1; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// The single `arith.cmpi` that ends the condition block, or -1.
+fn zv_cond_cmp(cond: ZBlock) i32 {
+    if (cond.ops.len < 2) { return 0 - 1; }
+    let i: i32 = cond.ops.len - 2;
+    if (zv_is_op(cond.ops.data[i], "arith.cmpi") == 0) { return 0 - 1; }
+    return i;
+}
+
+// Fresh SSA names.  The counter starts one past the largest `%v<N>` anywhere in
+// the function, so a generated name can never collide with an existing one (the
+// IR verifier requires unique definitions).
+fn zv_scan_ctr_block(blk: ZBlock, ctr: *i32) void {
+    let i: i32 = 0;
+    while (i < blk.ops.len) {
+        let o: ZOp = blk.ops.data[i];
+        let k: i32 = 0;
+        while (k < o.results.len) { zv_bump(ctr, o.results.data[k].name); k = k + 1; }
+        k = 0;
+        while (k < o.operands.len) { zv_bump(ctr, o.operands.data[k].name); k = k + 1; }
+        let r: i32 = 0;
+        while (r < o.regions.len) {
+            let b: i32 = 0;
+            while (b < o.regions.data[r].blocks.len) {
+                zv_scan_ctr_block(o.regions.data[r].blocks.data[b], ctr);
+                b = b + 1;
+            }
+            r = r + 1;
+        }
+        i = i + 1;
+    }
+}
+fn zv_bump(ctr: *i32, name: []u8) void {
+    let v: i32 = zv_name_num(name);
+    if (v > ctr.*) { ctr.* = v; }
+}
+fn zv_scan_ctr(f: ZFunc) i32 {
+    let ctr: i32 = 0;
+    let i: i32 = 0;
+    while (i < f.params.len) { zv_bump(&ctr, f.params.data[i].name); i = i + 1; }
+    zv_scan_ctr_block(f.body, &ctr);
+    return ctr;
+}
+fn zv_fresh(ctr: *i32, ty: []u8, o: ZOrigin) ZVal {
+    ctr.* = ctr.* + 1;
+    let digits: []u8 = _zag_i64_to_str(ctr.* as i64);
+    return zv_val(_zag_str_concat("%v", digits), ty, "none", o);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 3. LOOP DISCOVERY
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn zv_count_loops_block(blk: ZBlock) i32 {
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while (i < blk.ops.len) {
+        let o: ZOp = blk.ops.data[i];
+        if (zv_is_op(o, "scf.while") == 1) { n = n + 1; }
+        let r: i32 = 0;
+        while (r < o.regions.len) {
+            let b: i32 = 0;
+            while (b < o.regions.data[r].blocks.len) {
+                n = n + zv_count_loops_block(o.regions.data[r].blocks.data[b]);
+                b = b + 1;
+            }
+            r = r + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+// Every `scf.while` in the module, at any nesting depth.
+fn zloops_count(m: ZModule) i32 {
+    let n: i32 = 0;
+    let i: i32 = 0;
+    while (i < m.funcs.len) { n = n + zv_count_loops_block(m.funcs.data[i].body); i = i + 1; }
+    return n;
+}
+// 1 when block op `oi` of function `fi` is an `scf.while`.
+fn zloop_find(m: ZModule, fi: i32, oi: i32) i32 {
+    if (fi < 0 || fi >= m.funcs.len) { return 0; }
+    let blk: ZBlock = m.funcs.data[fi].body;
+    if (oi < 0 || oi >= blk.ops.len) { return 0; }
+    if (zv_is_op(blk.ops.data[oi], "scf.while") == 1) { return 1; }
+    return 0;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 4. ANALYSIS
+// ═════════════════════════════════════════════════════════════════════════════
+
+struct ZLoopCandidate {
+    found: i32,        // 1 when block op `op_index` looks like the recognized loop
+    reject: i32,       // 0 = vectorizable, > 0 = reason code
+    func_index: i32,
+    op_index: i32,
+    iv_slot: []u8,     // ZVal name of the IV alloca
+    acc_slot: []u8,    // ZVal name of the accumulator alloca
+    base: []u8,        // ZVal name of the indexed base pointer
+    bound: []u8,       // ZVal name of the loop bound
+    elem: []u8,
+    lanes: i32,
+    vector_op: []u8,   // the elementwise vector op, e.g. "vector.add"
+}
+
+fn zloop_empty() ZLoopCandidate {
+    return ZLoopCandidate{ .found=0, .reject=ZR_NOTLOOP(), .func_index=0-1,
+        .op_index=0-1, .iv_slot="", .acc_slot="", .base="", .bound="",
+        .elem="", .lanes=0, .vector_op="" };
+}
+
+// Trip count when both the start and the bound are static integers, else -1.
+// Used only for the "too short to be worth vectorizing" screen, which is a
+// cost decision, never a correctness one.
+fn zloop_static_trip(f: ZFunc, op_index: i32) i32 {
+    if (op_index < 0 || op_index >= f.body.ops.len) { return 0 - 1; }
+    let w: ZOp = f.body.ops.data[op_index];
+    if (zv_is_op(w, "scf.while") == 0) { return 0 - 1; }
+    if (w.regions.len != 2) { return 0 - 1; }
+    if (w.regions.data[0].blocks.len != 1) { return 0 - 1; }
+    let cond: ZBlock = w.regions.data[0].blocks.data[0];
+    let ci: i32 = zv_cond_cmp(cond);
+    if (ci < 0) { return 0 - 1; }
+    let cmp: ZOp = cond.ops.data[ci];
+    if (cmp.operands.len != 2) { return 0 - 1; }
+    let bi: i32 = zv_top_const_index(f, cmp.operands.data[1].name, op_index);
+    if (bi < 0) { return 0 - 1; }
+    let bound: i32 = zv_attr_int(f.body.ops.data[bi], "value");
+    if (bound < 0) { return 0 - 1; }
+    // The IV must start at a known constant in the preheader.
+    let i: i32 = 0;
+    while (i < op_index) {
+        let o: ZOp = f.body.ops.data[i];
+        if (zv_store2(o) == 1) {
+            let ci2: i32 = zv_top_const_index(f, o.operands.data[0].name, op_index);
+            if (ci2 >= 0) {
+                let start: i32 = zv_attr_int(f.body.ops.data[ci2], "value");
+                if (start >= 0) { return bound - start; }
+            }
+        }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+// The whole analysis.  Reads only; the returned candidate names the SSA values
+// the transform needs.  The reject cascade is a fixed order, so a loop trips
+// exactly the most specific reason it fails.
+//
+// Order: 1 (not a loop) -> 2 (region shape) -> 3 (IV) -> 4 (accumulator)
+//        -> 5 (op has no vector form) -> 6 (element type) -> 7 (acc escape)
+//        -> 8 (base alias) -> 9 (bound) -> 10 (unsupported body op)
+//        -> 11 (short trip) -> 12 (step is not +1).
+fn zloop_analyze(f: ZFunc, op_index: i32) ZLoopCandidate {
+    let c: ZLoopCandidate = zloop_empty();
+    c.op_index = op_index;
+    // Lanes are chosen later, once the element type (and therefore the
+    // address stride) is known; they are ELEMENTS, not 32-bit units.
+    c.lanes = 0;
+    if (op_index < 0 || op_index >= f.body.ops.len) { return c; }
+    let w: ZOp = f.body.ops.data[op_index];
+
+    // (1) not a loop.  Without this, a `memref.store` would be analyzed as if it
+    // owned a body region and every later rule would be reading garbage.
+    if (zv_is_op(w, "scf.while") == 0) { c.reject = ZR_NOTLOOP(); return c; }
+    if (w.regions.len != 2) { c.reject = ZR_NOCOND(); return c; }
+    if (w.regions.data[0].blocks.len != 1) { c.reject = ZR_NOCOND(); return c; }
+    if (w.regions.data[1].blocks.len != 1) { c.reject = ZR_NOCOND(); return c; }
+    let cond: ZBlock = w.regions.data[0].blocks.data[0];
+    let body: ZBlock = w.regions.data[1].blocks.data[0];
+
+    // (2) the condition region must END in scf.condition and the body in
+    // scf.yield.  Anything else is a loop shape this pass has not read (an
+    // scf.break, a multi-block body, a condition region with extra
+    // terminators), and the generated main loop would not be equivalent to it.
+    if (cond.ops.len < 2) { c.reject = ZR_NOCOND(); return c; }
+    if (zv_is_op(cond.ops.data[cond.ops.len - 1], "scf.condition") == 0) { c.reject = ZR_NOCOND(); return c; }
+    if (body.ops.len < 1) { c.reject = ZR_NOCOND(); return c; }
+    if (zv_is_op(body.ops.data[body.ops.len - 1], "scf.yield") == 0) { c.reject = ZR_NOCOND(); return c; }
+    // From here on the op IS a loop of the recognized family, so `found` is 1
+    // and any later refusal is reported as a `reject` reason rather than as
+    // "this was never a loop".  `vectorize_module` therefore gets one report line
+    // per loop it had to think about, which is what makes a silent miss visible.
+    c.found = 1;
+
+    // (3) induction variable: the loop's last condition op is `arith.cmpi slt`
+    // whose left operand is a load of a stack slot initialized to a constant 0
+    // before the loop.  A `while (i <= n)`, a `!= 0` loop, or a non-zero start
+    // all break the "n steps, i from 0" arithmetic the equivalence proof rests
+    // on, and a bound recomputed inside the loop is not invariant (see (9)).
+    let ci: i32 = zv_cond_cmp(cond);
+    if (ci < 0) { c.reject = ZR_NOIV(); return c; }
+    let cmp: ZOp = cond.ops.data[ci];
+    if (cmp.operands.len != 2) { c.reject = ZR_NOIV(); return c; }
+    if (zv_attr_is(cmp, "predicate", "slt") == 0) { c.reject = ZR_NOIV(); return c; }
+    let li: i32 = 0 - 1;
+    let k: i32 = 0;
+    while (k < ci) {
+        let o: ZOp = cond.ops.data[k];
+        if (zv_load1(o) == 1 && @strEq(o.results.data[0].name, cmp.operands.data[0].name)) { li = k; }
+        k = k + 1;
+    }
+    if (li < 0) { c.reject = ZR_NOIV(); return c; }
+    let ivload: ZOp = cond.ops.data[li];
+    if (ivload.operands.len != 1) { c.reject = ZR_NOIV(); return c; }
+    let iv: ZVal = ivload.operands.data[0];
+    c.iv_slot = iv.name;
+    c.bound = cmp.operands.data[1].name;
+    if (zv_alloca_index(f, iv.name, op_index) < 0) { c.reject = ZR_NOIV(); return c; }
+    let inits: i32 = 0;
+    let init_name: []u8 = "";
+    k = 0;
+    while (k < op_index) {
+        let o: ZOp = f.body.ops.data[k];
+        if (zv_store2(o) == 1 &&
+            @strEq(o.operands.data[1].name, iv.name)) {
+            inits = inits + 1;
+            init_name = o.operands.data[0].name;
+        }
+        k = k + 1;
+    }
+    if (inits != 1) { c.reject = ZR_NOIV(); return c; }
+    let ic: i32 = zv_top_const_index(f, init_name, op_index);
+    if (ic < 0) { c.reject = ZR_NOIV(); return c; }
+    if (zv_attr_int(f.body.ops.data[ic], "value") != 0) { c.reject = ZR_NOIV(); return c; }
+
+    // (8a) exactly one indexed access in the body.  Two accesses through the
+    // same base are not a single contiguous stream, and a `vector.broadcast`
+    // reads `lanes` elements at once, so the second access could overlap it.
+    let xi: i32 = 0 - 1;
+    let xcount: i32 = 0;
+    k = 0;
+    while (k < body.ops.len) {
+        if (zv_is_op(body.ops.data[k], "zag.index") == 1) {
+            xcount = xcount + 1;
+            if (xi < 0) { xi = k; }
+        }
+        k = k + 1;
+    }
+    if (xcount == 0) { c.reject = ZR_NOACC(); return c; }
+    if (xcount > 1) { c.reject = ZR_BASEALIAS(); return c; }
+    let xop: ZOp = body.ops.data[xi];
+    if (xop.results.len != 1 || xop.operands.len != 2) { c.reject = ZR_NOACC(); return c; }
+    let xr: ZVal = xop.results.data[0];
+    c.base = xop.operands.data[0].name;
+
+    // (4) accumulator: one `arith` op combining the indexed element with a load
+    // of a stack slot, exactly one load of that slot, and exactly one store back
+    // of that op's result.  A second read or write inside the loop would make
+    // the lane-parallel carry observe a value the scalar loop would not.
+    let ei: i32 = 0 - 1;
+    k = 0;
+    while (k < body.ops.len) {
+        let o: ZOp = body.ops.data[k];
+        if (zv_is_ew_candidate(o) == 1) {
+            if ((@strEq(o.operands.data[0].name, xr.name) && zv_block_defines_load(body, o.operands.data[1].name) == 1) ||
+                (@strEq(o.operands.data[1].name, xr.name) && zv_block_defines_load(body, o.operands.data[0].name) == 1)) {
+                ei = k;
+            }
+        }
+        k = k + 1;
+    }
+    if (ei < 0) { c.reject = ZR_NOACC(); return c; }
+    let eo: ZOp = body.ops.data[ei];
+    let accv: ZVal = zv_other_operand(eo, xr.name);
+    let alo: ZOp = zv_load_def(body, accv.name);
+    if (zv_is_op(alo, "memref.load") == 0) { c.reject = ZR_NOACC(); return c; }
+    if (alo.operands.len != 1) { c.reject = ZR_NOACC(); return c; }
+    let acc: ZVal = alo.operands.data[0];
+    c.acc_slot = acc.name;
+    let aai: i32 = zv_alloca_index(f, acc.name, op_index);
+    if (aai < 0) { c.reject = ZR_NOACC(); return c; }
+    let nload: i32 = 0;
+    let nstore: i32 = 0;
+    let store_ok: i32 = 0;
+    k = 0;
+    while (k < body.ops.len) {
+        let o: ZOp = body.ops.data[k];
+        if (zv_load1(o) == 1 && @strEq(o.operands.data[0].name, acc.name)) { nload = nload + 1; }
+        if (zv_store2(o) == 1 && @strEq(o.operands.data[1].name, acc.name)) {
+            nstore = nstore + 1;
+            if (@strEq(o.operands.data[0].name, eo.results.data[0].name)) { store_ok = 1; }
+        }
+        k = k + 1;
+    }
+    if (nload != 1 || nstore != 1 || store_ok != 1) { c.reject = ZR_NOACC(); return c; }
+    c.elem = attr_val(alo, "elem");
+
+    // (5) the elementwise op must have a vector form on this IR, and the op
+    // family must match the element type.  `arith.divsi`/`remsi` have no
+    // elementwise vector form at all, and a float op on an integer element (or
+    // the reverse) would silently reinterpret the accumulator.
+    //
+    // A FLOAT accumulator is refused here too, and this is the one place where
+    // the pass is stricter than "has a vector form": a float loop carried
+    // lane-parallel and then reduced horizontally is NOT the scalar
+    // left-to-right sum, and the accumulator is read after the loop, so the
+    // program would compute a different number.  Relaxing this requires a
+    // serial-order reduction, not just a wider vector.
+    let vecop: []u8 = zvec_op_from_scalar(eo.name);
+    if (vecop.len == 0) { c.reject = ZR_NOOP(); return c; }
+    if (zvec_op_is_elementwise(vecop) == 0) { c.reject = ZR_NOOP(); return c; }
+    if (c.elem.len == 0) { c.reject = ZR_NOTY(); return c; }
+    if (zvec_elem_is_float(c.elem) == 1) { c.reject = ZR_NOOP(); return c; }
+    if (zv_is_float_arith(eo.name) == 1) { c.reject = ZR_NOOP(); return c; }
+    c.vector_op = vecop;
+
+    // (6) the element type must be one the backend can pack, and the load, the
+    // elementwise op and the indexed access must agree on it.  Disagreement
+    // would make `vector.add` mix lane widths and read a different span of
+    // memory per lane.
+    if (zvec_is_elem_ty(c.elem) == 0) { c.reject = ZR_NOTY(); return c; }
+    if (!@strEq(eo.results.data[0].ty, c.elem)) { c.reject = ZR_NOTY(); return c; }
+    if (!@strEq(alo.results.data[0].ty, c.elem)) { c.reject = ZR_NOTY(); return c; }
+    if (!@strEq(xr.ty, c.elem)) { c.reject = ZR_NOTY(); return c; }
+    if (!@strEq(attr_val(f.body.ops.data[aai], "elem"), c.elem)) { c.reject = ZR_NOTY(); return c; }
+    // A lane instruction addresses whole WORDS, so the element has to be a word.
+    // `*i32` qualifies (its value is in the low half of an 8-byte slot) because
+    // a 64-bit add leaves the low 32 bits correct mod 2^32; `*u8` and `*i16` do
+    // not, because a word add carries between elements, and floats do not,
+    // because a word add on float bits is not a float add.  Refused here, with
+    // a code, rather than encoded into a sequence that reads the wrong bytes.
+    if (zvec_is_word_elem(c.elem) == 0) { c.reject = ZR_NOTY(); return c; }
+    // Lanes are ELEMENTS, so they follow the element's address stride, not the
+    // target's 32-bit-equivalent ceiling: 4 i32 lanes over a `*i32` is 8 units
+    // and therefore a 256-bit request, not a 128-bit one.
+    c.lanes = zvec_choose_lanes(zvec_policy_default(), c.elem);
+    if (c.lanes < 1) { c.reject = ZR_NOTY(); return c; }
+
+    // (7) ALIAS, the accumulator.  Two independent tests:
+    //  7a  the stack slot's address is named only by memref.load / memref.store.
+    //      A load, store, field, cast, index, slice or call operand naming the
+    //      slot would hand its address to code this pass has not read; the value
+    //      written by the vector main loop could then be observed (or changed)
+    //      by something that expected the scalar schedule.
+    //  7b  no value derived from a load of the slot reaches an op outside the
+    //      transparent set.  A `func.call`/`zag.field`/`zag.cast`/`zag.index`
+    //      operand, a loop condition, or a switch subject built from the
+    //      accumulator would observe it mid-iteration, and the vectorized
+    //      schedule would hand it a per-lane value instead of the running sum.
+    if (zv_slot_misuse_in(f.body, acc.name) == 1) { c.reject = ZR_ESCAPE(); return c; }
+    let derived: ArrayList[[]u8] = make[[]u8](8);
+    zv_name_add(&derived, acc.name);
+    zv_block_derive(&derived, cond);
+    zv_block_derive(&derived, body);
+    if (zv_block_escape(cond, derived) == 1) { c.reject = ZR_ESCAPE(); return c; }
+    if (zv_block_escape(body, derived) == 1) { c.reject = ZR_ESCAPE(); return c; }
+    free[[]u8](&derived);
+
+    // (8) ALIAS, the indexed base.  The single `zag.index` must be indexed by a
+    // load of the induction variable (unit stride +1, nothing else scaled by it)
+    // and the base pointer must be named by NO other op anywhere in the function.
+    // Together these prove the `lanes`-element window is contiguous, lies inside
+    // the same array, and cannot overlap any other access the function makes.
+    if (!@strEq(xop.operands.data[1].name, zv_iv_index_name(body, iv.name))) {
+        c.reject = ZR_BASEALIAS();
+        return c;
+    }
+    if (zv_is_param(f, c.base) == 0 && zv_defined_before(f, c.base, op_index) == 0) { c.reject = ZR_BASEALIAS(); return c; }
+    if (zv_base_used_outside(f, c.base, body) == 1) { c.reject = ZR_BASEALIAS(); return c; }
+
+    // (9) the bound must be a value that exists before the loop, and must not
+    // be a load from a slot the loop writes.  A bound recomputed inside the
+    // loop, or one that the loop mutates, changes between the main loop and the
+    // epilogue, and the two would then disagree about the trip count.
+    if (zv_defined_in_loop(cond, body, c.bound) == 1) { c.reject = ZR_BOUND(); return c; }
+    if (zv_is_param(f, c.bound) == 0 && zv_defined_before(f, c.bound, op_index) == 0) { c.reject = ZR_BOUND(); return c; }
+    let bl: i32 = zv_top_load_index(f, c.bound, op_index);
+    if (bl >= 0) {
+        let lop: ZOp = f.body.ops.data[bl];
+        if (lop.operands.len == 1 && zv_body_stores_slot(body, lop.operands.data[0].name) == 1) { c.reject = ZR_BOUND(); return c; }
+    }
+
+    // (10) no op in the body outside the recognized vocabulary.  A call, a
+    // nested loop, scf.break/scf.continue, a switch or a defer can change the
+    // number of iterations, skip one, or run code whose memory effects this
+    // pass never read; none of that is modelled by the equivalence proof.
+    k = 0;
+    while (k < body.ops.len - 1) {
+        if (zv_is_body_safe(body.ops.data[k]) == 0) { c.reject = ZR_UNSUPPORTED(); return c; }
+        k = k + 1;
+    }
+
+    // (11) cost screen: a statically known trip count below the policy floor is
+    // left scalar.  Purely a pessimization guard -- the epilogue argument makes
+    // the transform correct for any trip count, so this is never a correctness
+    // test and is skipped whenever the trip count is unknown.
+    let trip: i32 = zloop_static_trip(f, op_index);
+    if (trip >= 0 && trip < zvec_policy_default().min_trip) { c.reject = ZR_SHORTTRIP(); return c; }
+
+    // (12) the step must be exactly +1.  The main loop advances the IV by
+    // `lanes` and its `sle` guard assumes one iteration == one element; with any
+    // other stride the vector loop would cover a different set of indices than
+    // the scalar loop and the accumulator would be wrong.
+    if (zv_iv_step_is_plus1(body, iv.name) == 0) { c.reject = ZR_STEP(); return c; }
+
+    c.reject = 0;
+    return c;
+}
+
+// The operand of `o` that is not `other`'s value.
+fn zv_other_operand(o: ZOp, other: []u8) ZVal {
+    if (o.operands.len < 2) { return zv_val("", "", "none", zir_unknown_origin()); }
+    if (@strEq(o.operands.data[0].name, other)) { return o.operands.data[1]; }
+    return o.operands.data[0];
+}
+// The `memref.load` in `blk` whose result is `name`, or an empty op.
+fn zv_load_def(blk: ZBlock, name: []u8) ZOp {
+    let i: i32 = 0;
+    while (i < blk.ops.len) {
+        let o: ZOp = blk.ops.data[i];
+        if (zv_load1(o) == 1 && @strEq(o.results.data[0].name, name)) { return o; }
+        i = i + 1;
+    }
+    return zv_op("memref.load", zir_unknown_origin());
+}
+fn zv_block_defines_load(blk: ZBlock, name: []u8) i32 {
+    if (zv_is_op(zv_load_def(blk, name), "memref.load") == 1) { return 1; }
+    return 0;
+}
+// Name of the value the body's `zag.index` is indexed by, when it is a load of
+// the induction variable; "" otherwise (a non-unit-stride or symbolic index).
+fn zv_iv_index_name(body: ZBlock, ivname: []u8) []u8 {
+    let i: i32 = 0;
+    while (i < body.ops.len) {
+        let o: ZOp = body.ops.data[i];
+        if (zv_is_op(o, "zag.index") == 1 && o.operands.len == 2) {
+            let l: ZOp = zv_load_def(body, o.operands.data[1].name);
+            if (zv_is_op(l, "memref.load") == 1 && l.operands.len == 1 &&
+                @strEq(l.operands.data[0].name, ivname)) {
+                return o.operands.data[1].name;
+            }
+            return "";
+        }
+        i = i + 1;
+    }
+    return "";
+}
+fn zv_defined_before(f: ZFunc, name: []u8, before: i32) i32 {
+    let i: i32 = 0;
+    while (i < before && i < f.body.ops.len) {
+        let o: ZOp = f.body.ops.data[i];
+        let k: i32 = 0;
+        while (k < o.results.len) {
+            if (@strEq(o.results.data[k].name, name)) { return 1; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+fn zv_body_stores_slot(body: ZBlock, name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < body.ops.len) {
+        let o: ZOp = body.ops.data[i];
+        if (zv_store2(o) == 1 &&
+            @strEq(o.operands.data[1].name, name)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+// Does any op OUTSIDE the loop body name the base pointer?  (The single
+// `zag.index` inside the body is the one access the analysis is about.)
+fn zv_base_used_outside(f: ZFunc, base: []u8, body: ZBlock) i32 {
+    let outside: ArrayList[[]u8] = make[[]u8](1);
+    zv_name_add(&outside, base);
+    zv_derive_all(&outside, f);
+    let inside: ArrayList[[]u8] = make[[]u8](1);
+    let i: i32 = 0;
+    while (i < body.ops.len) {
+        let o: ZOp = body.ops.data[i];
+        let k: i32 = 0;
+        while (k < o.results.len) { zv_name_add(&inside, o.results.data[k].name); k = k + 1; }
+        i = i + 1;
+    }
+    // Only the top-level block is scanned: the loop's own regions are exactly
+    // the access this analysis is about, and every other op that could name the
+    // base lives in the same top-level block.
+    let hit: i32 = 0;
+    let fi: i32 = 0;
+    while (fi < f.body.ops.len) {
+        let o: ZOp = f.body.ops.data[fi];
+        let k: i32 = 0;
+        while (k < o.operands.len) {
+            let n: []u8 = o.operands.data[k].name;
+            if (zv_is_value_in(outside, n) == 1 && zv_is_value_in(inside, n) == 0) { hit = 1; }
+            k = k + 1;
+        }
+        // The base's own name must never be re-defined at the top level either.
+        let r2: i32 = 0;
+        while (r2 < o.results.len) {
+            if (@strEq(o.results.data[r2].name, base)) { hit = 1; }
+            r2 = r2 + 1;
+        }
+        fi = fi + 1;
+    }
+    free[[]u8](&outside);
+    free[[]u8](&inside);
+    return hit;
+}
+// The body's IV update must be exactly: load iv, constant 1, addi, store iv.
+fn zv_iv_step_is_plus1(body: ZBlock, ivname: []u8) i32 {
+    let nstore: i32 = 0;
+    let si: i32 = 0 - 1;
+    let i: i32 = 0;
+    while (i < body.ops.len) {
+        let o: ZOp = body.ops.data[i];
+        if (zv_store2(o) == 1 &&
+            @strEq(o.operands.data[1].name, ivname)) {
+            nstore = nstore + 1;
+            si = i;
+        }
+        i = i + 1;
+    }
+    if (nstore != 1 || si < 0) { return 0; }
+    let s: ZOp = body.ops.data[si];
+    let add: ZOp = zv_addi_def(body, s.operands.data[0].name);
+    if (zv_bin2(add, "arith.addi") == 0) { return 0; }
+    // exactly one operand is a load of the IV; the other must be the constant 1
+    let cname: []u8 = "";
+    if (zv_is_ivload(body, add.operands.data[0], ivname) == 1) {
+        cname = add.operands.data[1].name;
+    } else {
+        if (zv_is_ivload(body, add.operands.data[1], ivname) == 0) { return 0; }
+        cname = add.operands.data[0].name;
+    }
+    let c1: ZOp = zv_const_def(body, cname);
+    if (zv_op1(c1, "arith.constant") == 0) { return 0; }
+    if (zv_attr_int(c1, "value") != 1) { return 0; }
+    return 1;
+}
+// Is `v` the result of a `memref.load` of the induction-variable slot?
+fn zv_is_ivload(body: ZBlock, v: ZVal, ivname: []u8) i32 {
+    let l: ZOp = zv_load_def(body, v.name);
+    if (zv_load1(l) == 0) { return 0; }
+    if (!@strEq(l.operands.data[0].name, ivname)) { return 0; }
+    return 1;
+}
+fn zv_addi_def(blk: ZBlock, name: []u8) ZOp {
+    let i: i32 = 0;
+    while (i < blk.ops.len) {
+        let o: ZOp = blk.ops.data[i];
+        if (zv_bin2(o, "arith.addi") == 1 && @strEq(o.results.data[0].name, name)) { return o; }
+        i = i + 1;
+    }
+    return zv_op("arith.addi", zir_unknown_origin());
+}
+fn zv_const_def(blk: ZBlock, name: []u8) ZOp {
+    let i: i32 = 0;
+    while (i < blk.ops.len) {
+        let o: ZOp = blk.ops.data[i];
+        if (zv_op1(o, "arith.constant") == 1 && @strEq(o.results.data[0].name, name)) { return o; }
+        i = i + 1;
+    }
+    return zv_op("arith.constant", zir_unknown_origin());
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 5. THE TRANSFORM
+// ═════════════════════════════════════════════════════════════════════════════
+
+// A `memref.load` of a stack slot, lifted to the vector shape.  `splat = 1`
+// says the scalar accumulator word is broadcast to every lane, so no backend
+// has to guess what a `vector<ELEM,L>` coming out of a `memref<ELEM>` means.
+// The seed load produces a SCALAR of `elem`.  The `splat="1"` attribute only
+// records that this scalar is the seed of a vector value; it does not change what
+// the load produces.  Typing the result as the vector would make the following
+// `vector.splat` a splat of a vector — a copy, not a broadcast — and the vector
+// verifier rejects exactly that shape.
+fn zv_op_splat_load(ctr: *i32, slot: ZVal, elem: []u8, o: ZOrigin) ZOp {
+    let op: ZOp = zv_op("memref.load", o);
+    op.reads = slot.alias_region;
+    let r: ZVal = zv_fresh(ctr, elem, o);
+    push[ZVal](&op.results, r);
+    push[ZVal](&op.operands, slot);
+    push[ZAttr](&op.attrs, ZAttr{ .key="elem", .val=elem });
+    push[ZAttr](&op.attrs, ZAttr{ .key="splat", .val="1" });
+    return op;
+}
+fn zv_op_load(ctr: *i32, slot: ZVal, elem: []u8, o: ZOrigin) ZOp {
+    let op: ZOp = zv_op("memref.load", o);
+    op.reads = slot.alias_region;
+    let r: ZVal = zv_fresh(ctr, elem, o);
+    push[ZVal](&op.results, r);
+    push[ZVal](&op.operands, slot);
+    push[ZAttr](&op.attrs, ZAttr{ .key="elem", .val=elem });
+    return op;
+}
+fn zv_op_store(ctr: *i32, v: ZVal, slot: ZVal, elem: []u8, o: ZOrigin) ZOp {
+    let op: ZOp = zv_op("memref.store", o);
+    op.writes = slot.alias_region;
+    push[ZVal](&op.operands, v);
+    push[ZVal](&op.operands, slot);
+    push[ZAttr](&op.attrs, ZAttr{ .key="elem", .val=elem });
+    return op;
+}
+fn zv_op_const(ctr: *i32, text: []u8, ty: []u8, o: ZOrigin) ZOp {
+    let op: ZOp = zv_op("arith.constant", o);
+    let r: ZVal = zv_fresh(ctr, ty, o);
+    push[ZVal](&op.results, r);
+    push[ZAttr](&op.attrs, ZAttr{ .key="value", .val=text });
+    return op;
+}
+fn zv_op_bin(ctr: *i32, name: []u8, l: ZVal, r: ZVal, o: ZOrigin) ZOp {
+    let op: ZOp = zv_op(name, o);
+    let res: ZVal = zv_fresh(ctr, l.ty, o);
+    push[ZVal](&op.results, res);
+    push[ZVal](&op.operands, l);
+    push[ZVal](&op.operands, r);
+    return op;
+}
+fn zv_op_unop(ctr: *i32, name: []u8, a: ZVal, ty: []u8, o: ZOrigin) ZOp {
+    let op: ZOp = zv_op(name, o);
+    let res: ZVal = zv_fresh(ctr, ty, o);
+    push[ZVal](&op.results, res);
+    push[ZVal](&op.operands, a);
+    return op;
+}
+fn zv_op_cmp(ctr: *i32, pred: []u8, l: ZVal, r: ZVal, o: ZOrigin) ZOp {
+    let op: ZOp = zv_op("arith.cmpi", o);
+    let res: ZVal = zv_fresh(ctr, "bool", o);
+    push[ZVal](&op.results, res);
+    push[ZVal](&op.operands, l);
+    push[ZVal](&op.operands, r);
+    push[ZAttr](&op.attrs, ZAttr{ .key="predicate", .val=pred });
+    return op;
+}
+fn zv_result_of(op: ZOp) ZVal {
+    if (op.results.len < 1) { return zv_val("", "", "none", zir_unknown_origin()); }
+    return op.results.data[0];
+}
+
+// The vector MAIN loop.  Inserted immediately before the original `scf.while`,
+// which is left untouched and becomes the epilogue.
+//
+// EQUIVALENCE (restated, because this is the only place it is enforced):
+//   n steps, IV from 0, step +1, lanes L, q = floor(n/L).
+//   * main iteration k covers indices [kL, kL+L) -- exactly the L steps the
+//     scalar loop would take next -- and each lane performs the same op on the
+//     same element, so lane-parallel carry + the `reduce = add` horizontal store
+//     leaves the accumulator bit-identical to the scalar value after step
+//     (k+1)L-1 (exact for the exactly-associative integer ops accepted above).
+//   * the `sle` guard means the main loop stops at k = q-1 with IV = qL <= n, so
+//     `vector.broadcast` never reads a[i] for i >= n.
+//   * the epilogue resumes at IV = qL and runs steps qL .. n-1 unchanged.
+//
+// One deliberate ordering fix versus the sketch: the body's IV load is hoisted
+// to the TOP of the body and used for both the address computation and the
+// increment.  Referencing the preheader's IV load inside the body would be
+// stale from the second main iteration on (a real miscompile), and hoisting one
+// load is the same op count and is also what the SSA verifier requires.
+// `post` receives the ops that run AFTER the vector main loop: the single
+// horizontal fold of the lane-wise accumulator into the scalar slot.  The fold
+// is once per loop, not once per vector iteration, so it cannot live inside the
+// body -- and that is the whole performance argument for the lane-wise form.
+fn zv_build_vector_loop(f: ZFunc, c: ZLoopCandidate, lanes: i32,
+    ctr: *i32, lanes_name: ZVal, iv: ZVal, acc: ZVal, bound: ZVal,
+    base: ZVal, ivelem: []u8, pre: *ArrayList[ZOp], post: *ArrayList[ZOp],
+    o: ZOrigin) ZOp {
+
+    let vty: []u8 = zvec_ty(c.elem, lanes);
+    let pty: []u8 = zvec_ptr_ty(c.elem, lanes);
+    let ltext: []u8 = _zag_i64_to_str(lanes as i64);
+    let vslot: []u8 = zvec_memref_ty(vty);
+
+    // Preheader: the LANE-WISE accumulator's slot, zeroed.
+    //
+    // Lane k of this vector accumulates the elements whose index is congruent to
+    // k, so the L lanes hold L DISJOINT partial sums and the horizontal fold
+    // totals them.  That is the classic multiple-accumulator reduction, and it
+    // is what makes the loop body cost one load and one add per L elements: no
+    // fold, no accumulator round trip, and no sign normalization inside the loop.
+    //
+    // The alternative -- broadcasting a SCALAR accumulator into every lane and
+    // folding each iteration -- counts the running total once per lane, so the
+    // second and later iterations compute L*acc + sum(e) while the first is
+    // right.  A slot costs one vector load and one vector store per iteration
+    // and is correct; the fold-then-add form that avoids the slot is correct too
+    // but gives almost all of the saving back on a 2-lane width.
+    // The slot needs no explicit zero store: `memref.alloca` allocates ZEROED,
+    // and the backend lowers that to a vpxor plus one whole-register store.  A
+    // `vector.splat 0` here as well would be a second, redundant initialisation
+    // costing three more instructions in the preheader.
+    let va: ZOp = zv_op("memref.alloca", o);
+    let vav: ZVal = zv_fresh(ctr, vslot, o);
+    vav.alias_region = vav.name;
+    push[ZVal](&va.results, vav);
+    push[ZAttr](&va.attrs, ZAttr{ .key="elem", .val=vty });
+    push[ZAttr](&va.attrs, ZAttr{ .key="lanes", .val=ltext });
+    push[ZOp](pre, va);
+
+    // Preheader: hoist the full-vector fit test next to the loop.  The while's
+    // own condition region recomputes the same predicate, so this hoisted copy
+    // is what a later guard-hoisting / vector-peel pass consumes; correctness
+    // does not depend on it, and dropping it would change nothing observable.
+    let o1: ZOp = zv_op_load(ctr, iv, ivelem, o);
+    let vi: ZVal = zv_result_of(o1);
+    let o2: ZOp = zv_op_bin(ctr, "arith.addi", vi, lanes_name, o);
+    let ve: ZVal = zv_result_of(o2);
+    let o3: ZOp = zv_op_cmp(ctr, "sle", ve, bound, o);
+    push[ZOp](pre, o1);
+    push[ZOp](pre, o2);
+    push[ZOp](pre, o3);
+
+    // region 0: continue while a whole vector still fits
+    let cblk: ZBlock = zv_block();
+    let c1: ZOp = zv_op_load(ctr, iv, ivelem, o);
+    let ci: ZVal = zv_result_of(c1);
+    let c2: ZOp = zv_op_bin(ctr, "arith.addi", ci, lanes_name, o);
+    let ce: ZVal = zv_result_of(c2);
+    let c3: ZOp = zv_op_cmp(ctr, "sle", ce, bound, o);
+    let cond: ZOp = zv_op("scf.condition", o);
+    push[ZVal](&cond.operands, zv_result_of(c3));
+    push[ZOp](&cblk.ops, c1);
+    push[ZOp](&cblk.ops, c2);
+    push[ZOp](&cblk.ops, c3);
+    push[ZOp](&cblk.ops, cond);
+
+    // region 1: the vector body
+    let bblk: ZBlock = zv_block();
+    let b1: ZOp = zv_op_load(ctr, iv, ivelem, o);
+    let cur: ZVal = zv_result_of(b1);
+    // The lane-wise partial sums carried in from the previous iteration.  A
+    // VECTOR load out of the vector slot -- not a splat of a scalar, and not a
+    // fresh zero: the point is that each lane keeps its own partial sum.
+    let b2: ZOp = zv_op("memref.load", o);
+    b2.reads = vav.alias_region;
+    let accs: ZVal = zv_fresh(ctr, vty, o);
+    push[ZVal](&b2.results, accs);
+    push[ZVal](&b2.operands, vav);
+    push[ZAttr](&b2.attrs, ZAttr{ .key="elem", .val=vty });
+    push[ZAttr](&b2.attrs, ZAttr{ .key="lanes", .val=ltext });
+    let b4: ZOp = zv_op("vector.splat", o);
+    let ptr: ZVal = zv_fresh(ctr, pty, o);
+    push[ZVal](&b4.results, ptr);
+    push[ZVal](&b4.operands, base);
+    push[ZVal](&b4.operands, cur);
+    push[ZAttr](&b4.attrs, ZAttr{ .key="elem", .val=c.elem });
+    push[ZAttr](&b4.attrs, ZAttr{ .key="lanes", .val=ltext });
+    push[ZAttr](&b4.attrs, ZAttr{ .key="stride", .val="unit" });
+    // vector.broadcast IS the memory read on this IR (it is deliberately absent
+    // from zvec_op_is_pure), so it carries the base's alias region exactly as
+    // memref.load does.
+    let b5: ZOp = zv_op_unop(ctr, zvec_op_broadcast(), ptr, vty, o);
+    b5.reads = base.alias_region;
+    push[ZAttr](&b5.attrs, ZAttr{ .key="elem", .val=c.elem });
+    push[ZAttr](&b5.attrs, ZAttr{ .key="lanes", .val=ltext });
+    // The elementwise op ACCUMULATES into the carried partial sums: the first
+    // operand is the lane-wise vector loaded from the slot, the second the
+    // elements this iteration just read.
+    let b6: ZOp = zv_op_bin(ctr, c.vector_op, accs, zv_result_of(b5), o);
+    // The elementwise op needs the same `elem`/`lanes` facts as every other
+    // vector op: the lowering reads the result type to pick a machine form and
+    // the verifier requires the declared element to match the operands.
+    push[ZAttr](&b6.attrs, ZAttr{ .key="elem", .val=c.elem });
+    push[ZAttr](&b6.attrs, ZAttr{ .key="lanes", .val=ltext });
+    // Back into the vector slot for the next iteration.  NO `reduce` here: this
+    // is a store of a whole vector to a vector slot, not a horizontal fold, and
+    // giving it `reduce` would make the backend totalise it into a scalar and
+    // throw away L-1 of the L partial sums.
+    let b7: ZOp = zv_op_store(ctr, zv_result_of(b6), vav, vty, o);
+    let b8: ZOp = zv_op_bin(ctr, "arith.addi", cur, lanes_name, o);
+    let b9: ZOp = zv_op_store(ctr, zv_result_of(b8), iv, ivelem, o);
+    let by: ZOp = zv_op("scf.yield", o);
+    push[ZOp](&bblk.ops, b1);
+    push[ZOp](&bblk.ops, b2);
+    push[ZOp](&bblk.ops, b4);
+    push[ZOp](&bblk.ops, b5);
+    push[ZOp](&bblk.ops, b6);
+    push[ZOp](&bblk.ops, b7);
+    push[ZOp](&bblk.ops, b8);
+    push[ZOp](&bblk.ops, b9);
+    push[ZOp](&bblk.ops, by);
+
+    let w: ZOp = zv_op("scf.while", o);
+    w.origin = f.body.ops.data[c.op_index].origin;
+    push[ZRegion](&w.regions, zv_region(cblk));
+    push[ZRegion](&w.regions, zv_region(bblk));
+
+    // After the main loop, and ONCE: totalise the L disjoint partial sums and
+    // add them into the scalar accumulator the epilogue continues from.  The
+    // epilogue then resumes at IV = qL and adds the tail to this same slot, so
+    // the accumulator the loop exits with is exactly the one the scalar loop
+    // would have held at that point.
+    let p1: ZOp = zv_op("memref.load", o);
+    p1.reads = vav.alias_region;
+    let pv: ZVal = zv_fresh(ctr, vty, o);
+    push[ZVal](&p1.results, pv);
+    push[ZVal](&p1.operands, vav);
+    push[ZAttr](&p1.attrs, ZAttr{ .key="elem", .val=vty });
+    push[ZAttr](&p1.attrs, ZAttr{ .key="lanes", .val=ltext });
+    // `elem` is the SCALAR element here: this store targets the scalar slot and
+    // is the horizontal fold, so the backend may totalise it.
+    let p2: ZOp = zv_op_store(ctr, pv, acc, c.elem, o);
+    push[ZAttr](&p2.attrs, ZAttr{ .key="reduce", .val="add" });
+    push[ZOp](post, p1);
+    push[ZOp](post, p2);
+    return w;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 6. THE PASS
+// ═════════════════════════════════════════════════════════════════════════════
+
+struct ZvecResult { module: ZModule, vectorized: i32, loops: i32, rejected: i32, report: []u8 }
+
+// Insert a vector main loop before every recognized, un-rejected loop.  The
+// input module is never mutated: a rewritten function gets a fresh op list, and
+// every other function is carried across by value with its op list untouched.
+fn vectorize_module(m: ZModule, policy: ZvecPolicy) ZvecResult {
+    // A module no longer has one lane count: it depends on each loop's element
+    // stride, so the per-loop count lives in the candidate and this is only the
+    // ceiling for a word element, used for report text.
+    let lanes: i32 = zvec_choose_lanes(policy, "i32");
+    let ltext: []u8 = _zag_i64_to_str(lanes as i64);
+    let funcs: ArrayList[ZFunc] = make[ZFunc](m.funcs.len);
+    let report: []u8 = "";
+    let vectorized: i32 = 0;
+    let loops: i32 = 0;
+    let rejected: i32 = 0;
+
+    let fi: i32 = 0;
+    while (fi < m.funcs.len) {
+        let f: ZFunc = m.funcs.data[fi];
+        let ops: ArrayList[ZOp] = make[ZOp](f.body.ops.len + 8);
+        let ctr: i32 = zv_scan_ctr(f);
+        let changed: i32 = 0;
+        let oi: i32 = 0;
+        while (oi < f.body.ops.len) {
+            // The name check keeps this linear: `zloop_analyze` is only ever
+            // called on an op that could be a loop, so reject code 1 is a
+            // `zloop_analyze`/`zloop_find` outcome, never a pass outcome.
+            if (zv_is_op(f.body.ops.data[oi], "scf.while") == 1) {
+                let c: ZLoopCandidate = zloop_analyze(f, oi);
+                loops = loops + 1;
+                    c.func_index = fi;
+                    c.lanes = lanes;
+                    let mintrip: i32 = policy.min_trip;
+                    let trip: i32 = zloop_static_trip(f, oi);
+                    let short: i32 = 0;
+                    if (trip >= 0 && trip < mintrip) { short = 1; }
+                    if (c.reject == 0 && policy.enabled == 1 && lanes > 0 && short == 0) {
+                        let origin: ZOrigin = f.body.ops.data[oi].origin;
+                        let iv: ZVal = zv_find_val(f, c.iv_slot);
+                        let acc: ZVal = zv_find_val(f, c.acc_slot);
+                        let base: ZVal = zv_find_val(f, c.base);
+                        let bound: ZVal = zv_find_val(f, c.bound);
+                        let ivelem: []u8 = attr_val(f.body.ops.data[zv_alloca_index(f, c.iv_slot, oi)], "elem");
+                        if (ivelem.len == 0) { ivelem = "i32"; }
+                        let lop: ZOp = zv_op_const(&ctr, ltext, ivelem, origin);
+                        let lname: ZVal = zv_result_of(lop);
+                        push[ZOp](&ops, lop);
+                        let post: ArrayList[ZOp] = make[ZOp](2);
+                        let vloop: ZOp = zv_build_vector_loop(f, c, lanes, &ctr, lname,
+                            iv, acc, bound, base, ivelem, &ops, &post, origin);
+                        push[ZOp](&ops, vloop);
+                        // The single fold of the lane-wise accumulator, and the
+                        // end of the vector main loop, BEFORE the epilogue.
+                        let pk: i32 = 0;
+                        while (pk < post.len) {
+                            push[ZOp](&ops, post.data[pk]);
+                            pk = pk + 1;
+                        }
+                        free[ZOp](&post);
+                        changed = 1;
+                        vectorized = vectorized + 1;
+                        report = _zag_str_concat(report, f.name);
+                        report = _zag_str_concat(report, ": vectorized lanes=");
+                        report = _zag_str_concat(report, ltext);
+                        report = _zag_str_concat(report, " op=");
+                        report = _zag_str_concat(report, c.vector_op);
+                        report = _zag_str_concat(report, " elem=");
+                        report = _zag_str_concat(report, c.elem);
+                        report = _zag_str_concat(report, "\n");
+                    } else {
+                        rejected = rejected + 1;
+                        report = _zag_str_concat(report, f.name);
+                        report = _zag_str_concat(report, ": ");
+                        if (c.reject != 0) {
+                            report = _zag_str_concat(report, "rejected ");
+                            report = _zag_str_concat(report, _zag_i64_to_str(c.reject as i64));
+                            report = _zag_str_concat(report, ": ");
+                            report = _zag_str_concat(report, zloop_reject_text(c.reject));
+                        } else {
+                            if (policy.enabled == 0 || lanes < 1) {
+                                report = _zag_str_concat(report, "skipped: policy disabled");
+                            } else {
+                                report = _zag_str_concat(report, "rejected ");
+                                report = _zag_str_concat(report, _zag_i64_to_str(ZR_SHORTTRIP() as i64));
+                                report = _zag_str_concat(report, ": ");
+                                report = _zag_str_concat(report, zloop_reject_text(ZR_SHORTTRIP()));
+                            }
+                        }
+                        report = _zag_str_concat(report, "\n");
+                    }
+            }
+            push[ZOp](&ops, f.body.ops.data[oi]);
+            oi = oi + 1;
+        }
+        if (changed == 1) {
+            push[ZFunc](&funcs, ZFunc{ .name=f.name, .params=f.params, .ret=f.ret,
+                .body=ZBlock{ .ops=ops }, .effects=f.effects, .origin=f.origin,
+                .coverage_complete=f.coverage_complete, .coverage_errors=f.coverage_errors });
+        } else {
+            free[ZOp](&ops);
+            push[ZFunc](&funcs, f);
+        }
+        fi = fi + 1;
+    }
+
+    report = _zag_str_concat(report, "totals: loops=");
+    report = _zag_str_concat(report, _zag_i64_to_str(loops as i64));
+    report = _zag_str_concat(report, " vectorized=");
+    report = _zag_str_concat(report, _zag_i64_to_str(vectorized as i64));
+    report = _zag_str_concat(report, " rejected=");
+    report = _zag_str_concat(report, _zag_i64_to_str(rejected as i64));
+    report = _zag_str_concat(report, " target=");
+    report = _zag_str_concat(report, zt_name(policy.target));
+    report = _zag_str_concat(report, "\n");
+
+    return ZvecResult{ .module=ZModule{ .funcs=funcs, .schema_version=m.schema_version,
+        .transform_version=m.transform_version, .coverage_complete=m.coverage_complete,
+        .coverage_errors=m.coverage_errors, .origin_complete=m.origin_complete,
+        .origin_exact=m.origin_exact }, .vectorized=vectorized, .loops=loops,
+        .rejected=rejected, .report=report };
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// 7. WHAT THE REST OF THE PIPELINE HAS TO DO WITH THIS OUTPUT
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// The transform emits target-independent vector IR and nothing else.  Three
+// seams belong to other files and are listed here so the contract is explicit
+// rather than implied:
+//
+//  * zir.zag's MLIR printer has no case for `vector.*` today, so it falls
+//    through to the generic "binary op : result type" arm.  That is lossless
+//    for `vector.splat` / `vector.broadcast` / `vector.add`, but it DROPS three
+//    attributes this pass relies on: `splat = 1` on the accumulator load (which
+//    is what makes a `vector<ELEM,L>` out of a `memref<ELEM>` unambiguous),
+//    `reduce = add` on the accumulator store (the horizontal reduction), and
+//    `elem` / `lanes` / `stride` on the pointer splat.  A backend must never
+//    have to guess any of those, so the printer needs explicit cases.
+//
+//  * native/ncodegen.zag must not lower a vector module until the vector op
+//    dispatch exists.  Until then `vectorize_module` should be called with
+//    `enabled = 0` (the default), which is a verified no-op.
+//
+//  * native/vecwidth.zag owns the CPU-width decision.  `lanes` here is logical;
+//  a 16-lane logical vector on an SSE2-only target is 4 machine registers of
+//    4 lanes, and that split must not be second-guessed here.

@@ -1,7 +1,8 @@
 # HTTP/1.1 and WebSocket foundation
 
-Zag's Linux x86-64 runtime includes a bounded synchronous wire and loopback
-foundation for HTTP/1.1 and RFC 6455 WebSocket services:
+Zag's native Linux x86-64 and Apple Silicon macOS runtimes include a bounded
+synchronous wire and loopback foundation for HTTP/1.1 and RFC 6455 WebSocket
+services:
 
 - `std/http1.zag` encodes and parses one complete request or response with
   caller-visible limits for message, method, path, headers, and body. It
@@ -29,7 +30,8 @@ The gate executes strict negative corpora and two static native reference
 services over `127.0.0.1`: one HTTP request/response and one WebSocket upgrade
 plus masked-client/unmasked-server text exchange. It checks exact stdout,
 descriptor double-close behavior, allocator return to baseline, static ELF64
-x86-64 output, and byte-identical rebuilds of both reference applications.
+x86-64 or signed Mach-O arm64 output as appropriate, and byte-identical rebuilds
+of both reference applications.
 
 ## Explicit non-claims
 

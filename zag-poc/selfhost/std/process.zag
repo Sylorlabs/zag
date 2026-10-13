@@ -5,25 +5,33 @@
 // returns its exit status; use it only when shell interpretation is wanted.
 
 @import("std:list")
+@import("process_platform.zag")
 
 // Opaque stable ABI for the future bounded supervisor. Module-prefixing may
 // rename ProcessResult, but cannot change the compiler-owned handle layout.
 struct ProcessResult { handle: *opaque }
+struct ProcessIsolationRunResult { isolation: ProcessIsolationResult, process: ProcessResult }
 
 fn process_state_exited() i32 { return 0; }
 fn process_state_timed_out() i32 { return 1; }
 fn process_state_output_limit() i32 { return 2; }
 fn process_state_runtime_error() i32 { return 3; }
+fn process_state_isolation_unsupported() i32 { return 4; }
 
 fn process_result_status(result: ProcessResult) i32 {
+    // Allocation failure can leave no room even for the result header. Null
+    // is the allocation-free error representation, never a successful exit.
+    unsafe { if (result.handle == null as *opaque) { return -1; } }
     return _zag_process_result_status(result.handle);
 }
 
 fn process_result_state(result: ProcessResult) i32 {
+    unsafe { if (result.handle == null as *opaque) { return process_state_runtime_error(); } }
     return _zag_process_result_state(result.handle);
 }
 
 fn process_result_output(result: ProcessResult) []u8 {
+    unsafe { if (result.handle == null as *opaque) { return ""; } }
     return _zag_process_result_output(result.handle);
 }
 
@@ -52,9 +60,8 @@ fn process_result_new(context: *opaque, scripted: i32, status: i32, state: i32, 
     return _zag_process_result_abi_new(status, state, output);
 }
 
-// Run `/bin/sh -c command` with a native sleep-tick deadline and a hard stdout cap.
-// Native raw process primitives.  The AArch64 Mach-O backend translates the
-// audited Linux-numbered operations below to their Darwin equivalents; no
+// Run `/bin/sh -c command` with a monotonic deadline and a hard stdout cap.
+// The typed platform backend owns the raw process and wait mechanisms; no
 // libc process wrapper, polling thread, or external timeout program is used.
 // State 0=exited, 1=timed out, 2=output cap, 3=runtime error.
 fn process_run_bounded_internal(context: *opaque, scripted: i32, command: []u8, timeout_ms: i64, max_output: i64) ProcessResult {
@@ -62,42 +69,57 @@ fn process_run_bounded_internal(context: *opaque, scripted: i32, command: []u8, 
     // pointer conversions. Keep that authority lexical so the public process
     // helpers do not make ordinary v1 callers implicitly unsafe.
     unsafe {
+    if (scripted == 1 && context == null as *opaque) {
+        return ProcessResult{ .handle = null as *opaque };
+    }
     if (timeout_ms < 1 || max_output < 1 || max_output > 1048576) {
         return ProcessResult{ .handle = process_result_new(context, scripted, 0 - 1, process_state_runtime_error(), "") };
     }
+    // Do not silently turn an unknown target into a parent-only or polling
+    // supervisor. These are supervision capabilities, not sandbox guarantees.
+    if (process_platform_supervision_ready(process_platform_capabilities()) == 0) {
+        return ProcessResult{ .handle = process_result_new(context, scripted, 0 - 1, process_state_runtime_error(), "") };
+    }
+    // Script process authority is a compiler-owned capability bit (bit 2 in
+    // ScriptContext). This checks policy in a valid compiler-owned context;
+    // it does not authenticate arbitrary raw pointers or establish a sandbox.
+    if (scripted == 1) {
+        if ((((context as *i64)[4] as i32) & 4) == 0) {
+            return ProcessResult{ .handle = process_result_new(context, scripted, 0 - 1, process_state_runtime_error(), "") };
+        }
+    }
     let pair: *i64 = process_alloc(context, scripted, 8) as *i64;
     if (pair == null as *i64) { _zag_eprintln("Zag Script memory limit exceeded by process setup"); return ProcessResult{ .handle = null as *opaque }; }
-    if (_zag_raw_syscall(293, pair as i64, 2048, 0, 0, 0, 0) < 0) { // pipe2 O_NONBLOCK
+    if (process_platform_pipe(pair as i64) < 0) {
         return ProcessResult{ .handle = process_result_new(context, scripted, 0 - 1, process_state_runtime_error(), "") };
     }
     let packed: i64 = pair[0];
     let read_fd: i64 = packed & 4294967295;
     let write_fd: i64 = packed >> 32;
-    // Darwin's pipe(2) has no flags argument.  Set the read end nonblocking
-    // explicitly; on Linux this is harmlessly equivalent to pipe2's flag.
-    if (_zag_raw_syscall(72, read_fd, 4, 2048, 0, 0, 0) < 0) {
-        let _close_pipe_read: i64 = _zag_raw_syscall(3, read_fd, 0, 0, 0, 0, 0);
-        let _close_pipe_write: i64 = _zag_raw_syscall(3, write_fd, 0, 0, 0, 0, 0);
+    // The backend owns the pipe flag translation. The shared supervisor only
+    // relies on the declared nonblocking-observation capability.
+    if (process_platform_nonblocking(read_fd) < 0) {
+        let _close_pipe_read: i64 = process_platform_close(read_fd);
+        let _close_pipe_write: i64 = process_platform_close(write_fd);
         return ProcessResult{ .handle = process_result_new(context, scripted, 0 - 1, process_state_runtime_error(), "") };
     }
     if (command.len < 0) {
-        let _close_invalid_read: i64 = _zag_raw_syscall(3, read_fd, 0, 0, 0, 0, 0);
-        let _close_invalid_write: i64 = _zag_raw_syscall(3, write_fd, 0, 0, 0, 0, 0);
+        let _close_invalid_read: i64 = process_platform_close(read_fd);
+        let _close_invalid_write: i64 = process_platform_close(write_fd);
         return ProcessResult{ .handle = process_result_new(context, scripted,
             0 - 1, process_state_runtime_error(), "") };
     }
     let command_bytes: i64 = (command.len as i64) + 1;
     let cmd_memory: *i8 = process_alloc(context, scripted, command_bytes);
     let argv: **i8 = process_alloc(context, scripted, 32) as **i8;
-    // XNU rejects a null envp with EFAULT even though Linux accepts it. An
-    // allocated one-entry vector is a valid empty environment on both hosts.
+    // An explicit empty environment is part of the portable launch contract.
     let envp: **i8 = process_alloc(context, scripted, 8) as **i8;
     if (cmd_memory == null as *i8 || argv == null as **i8 || envp == null as **i8) {
         // pipe2 succeeded, so both descriptors are live even though no child
         // has been created. Close them before reporting the bounded allocator
         // failure; otherwise repeated failures exhaust RLIMIT_NOFILE.
-        let _close_command_read: i64 = _zag_raw_syscall(3, read_fd, 0, 0, 0, 0, 0);
-        let _close_command_write: i64 = _zag_raw_syscall(3, write_fd, 0, 0, 0, 0, 0);
+        let _close_command_read: i64 = process_platform_close(read_fd);
+        let _close_command_write: i64 = process_platform_close(write_fd);
         _zag_eprintln("Zag Script memory limit exceeded by process command");
         return ProcessResult{ .handle = null as *opaque };
     }
@@ -107,37 +129,47 @@ fn process_run_bounded_internal(context: *opaque, scripted: i32, command: []u8, 
     argv[0] = _zag_slice_ptr("/bin/sh\0"); argv[1] = _zag_slice_ptr("-c\0");
     argv[2] = cmd_memory; argv[3] = null as *i8;
     envp[0] = null as *i8;
-    let pid: i64 = _zag_raw_syscall(57, 0, 0, 0, 0, 0, 0);
+    let pid: i64 = process_platform_fork();
     if (pid == 0) {
-        let _group: i64 = _zag_raw_syscall(109, 0, 0, 0, 0, 0, 0); // setpgid(0,0)
-        let _dup: i64 = _zag_raw_syscall(33, write_fd, 1, 0, 0, 0, 0);
-        let _cr: i64 = _zag_raw_syscall(3, read_fd, 0, 0, 0, 0, 0);
-        let _cw: i64 = _zag_raw_syscall(3, write_fd, 0, 0, 0, 0, 0);
-        let _exec: i64 = _zag_raw_syscall(59, _zag_slice_ptr("/bin/sh\0") as i64,
-            argv as i64, envp as i64, 0, 0, 0);
+        let _group: i64 = process_platform_set_group(0);
+        if (_group < 0) { _zag_exit(126); }
+        let _dup: i64 = process_platform_dup2(write_fd, 1);
+        if (_dup < 0) { _zag_exit(126); }
+        if (read_fd != 1) { let _cr: i64 = process_platform_close(read_fd); }
+        if (write_fd != 1) { let _cw: i64 = process_platform_close(write_fd); }
+        let _exec: i64 = process_platform_exec_shell(_zag_slice_ptr("/bin/sh\0") as i64,
+            argv as i64, envp as i64);
         _zag_exit(127);
     }
     if (pid < 0) {
-        let _a: i64 = _zag_raw_syscall(3, read_fd, 0, 0, 0, 0, 0);
-        let _b: i64 = _zag_raw_syscall(3, write_fd, 0, 0, 0, 0, 0);
+        let _a: i64 = process_platform_close(read_fd);
+        let _b: i64 = process_platform_close(write_fd);
         return ProcessResult{ .handle = process_result_new(context, scripted, 0 - 1, process_state_runtime_error(), "") };
     }
     // Parent-side setpgid closes the fork/exec race; EACCES means child won it.
-    let _pg: i64 = _zag_raw_syscall(109, pid, pid, 0, 0, 0, 0);
-    let _closew: i64 = _zag_raw_syscall(3, write_fd, 0, 0, 0, 0, 0);
+    let _pg: i64 = process_platform_set_group(pid);
+    let _closew: i64 = process_platform_close(write_fd);
     let buffer: *i8 = process_alloc(context, scripted, max_output + 1);
     let statusp: *i64 = process_alloc(context, scripted, 8) as *i64;
-    let sleep_ts: *i64 = process_alloc(context, scripted, 16) as *i64;
-    if (buffer == null as *i8 || statusp == null as *i64 || sleep_ts == null as *i64) {
+    if (buffer == null as *i8 || statusp == null as *i64) {
         _zag_eprintln("Zag Script memory limit exceeded by process capture");
-        let _kill_alloc: i64 = _zag_raw_syscall(62, 0 - pid, 9, 0, 0, 0, 0);
-        let _reap_alloc: i64 = _zag_raw_syscall(61, pid, 0, 0, 0, 0, 0);
+        let _kill_alloc: i64 = process_platform_kill_group(pid);
+        let _kill_alloc_child: i64 = process_platform_kill_child(pid);
+        let _reap_alloc: i64 = process_platform_wait(pid, 0, 0);
         // The parent already closed write_fd after fork. read_fd remains ours
         // on this early return and must be closed after the child is reaped.
-        let _close_capture_read: i64 = _zag_raw_syscall(3, read_fd, 0, 0, 0, 0, 0);
+        let _close_capture_read: i64 = process_platform_close(read_fd);
         return ProcessResult{ .handle = null as *opaque };
     }
-    sleep_ts[0] = 0; sleep_ts[1] = 1000000; // 1ms
+    statusp[0] = 0;
+    let started: i64 = _zag_clock_monotonic_ms();
+    if (started < 0) {
+        let _kill_clock: i64 = process_platform_kill_group(pid);
+        let _kill_clock_child: i64 = process_platform_kill_child(pid);
+        let _reap_clock: i64 = process_platform_wait(pid, 0, 0);
+        let _close_clock: i64 = process_platform_close(read_fd);
+        return ProcessResult{ .handle = process_result_new(context, scripted, 0 - 1, process_state_runtime_error(), "") };
+    }
     let remaining_ms: i64 = timeout_ms;
     let total: i64 = 0;
     let state: i32 = process_state_exited();
@@ -147,33 +179,48 @@ fn process_run_bounded_internal(context: *opaque, scripted: i32, command: []u8, 
     while (done == 0) {
         if (total > max_output) { state = process_state_output_limit(); total = max_output; done = 1; }
         else if (eof == 0) {
-            let nr: i64 = _zag_raw_syscall(0, read_fd, (buffer as i64) + total,
-                (max_output + 1) - total, 0, 0, 0);
-            if (nr > 0) { total = total + nr; }
+            let nr: i64 = process_platform_read(read_fd, (buffer as i64) + total,
+                (max_output + 1) - total);
+            if (nr > 0) {
+                total = total + nr;
+                if (total > max_output) { total = max_output; state = process_state_output_limit(); done = 1; }
+            }
             else if (nr == 0) { eof = 1; }
-            // Linux EAGAIN is 11; Darwin's EWOULDBLOCK is 35.  Both mean a
-            // nonblocking pipe has no bytes yet and the deadline loop should
-            // continue rather than classify the supervisor as broken.
-            else if (nr != 0 - 11 && nr != 0 - 35 && nr != 0 - 4) { state = process_state_runtime_error(); done = 1; }
+            else if (process_platform_read_disposition(nr) == 2) { state = process_state_runtime_error(); done = 1; }
         }
         if (done == 0 && reaped == 0) {
-            let waited: i64 = _zag_raw_syscall(61, pid, statusp as i64, 1, 0, 0, 0); // WNOHANG
+            let waited: i64 = process_platform_wait(pid, statusp as i64, 1);
             if (waited == pid) { reaped = 1; }
             else if (waited < 0 && waited != 0 - 4) { state = process_state_runtime_error(); done = 1; }
         }
         if (done == 0 && eof == 1 && reaped == 1) { done = 1; }
+        let now: i64 = _zag_clock_monotonic_ms();
+        if (done == 0 && now < started) { state = process_state_runtime_error(); done = 1; }
+        remaining_ms = timeout_ms - (now - started);
         if (done == 0 && remaining_ms <= 0) { state = process_state_timed_out(); done = 1; }
         if (done == 0) {
-            let _nap: i64 = _zag_raw_syscall(35, sleep_ts as i64, 0, 0, 0, 0, 0);
-            remaining_ms = remaining_ms - 1;
+            // Child exit and EOF are independent. An ignored descriptor after
+            // EOF avoids a HUP spin; finite slices let us observe child exit.
+            let wait_fd: i64 = read_fd;
+            if (eof == 1) { wait_fd = 0 - 1; }
+            let slice_ms: i64 = remaining_ms;
+            if (slice_ms > 10) { slice_ms = 10; }
+            let wait_result: i32 = process_platform_wait_readable(wait_fd, slice_ms);
+            if (wait_result < 0) { state = process_state_runtime_error(); done = 1; }
         }
     }
     if (state != process_state_exited()) {
-        let _kill: i64 = _zag_raw_syscall(62, 0 - pid, 9, 0, 0, 0, 0); // whole process group
+        let _kill: i64 = process_platform_kill_group(pid);
+        if (reaped == 0) { let _kill_child: i64 = process_platform_kill_child(pid); }
     }
-    if (reaped == 0) { let _reap: i64 = _zag_raw_syscall(61, pid, statusp as i64, 0, 0, 0, 0); }
-    let _closer: i64 = _zag_raw_syscall(3, read_fd, 0, 0, 0, 0, 0);
+    while (reaped == 0) {
+        let waited: i64 = process_platform_wait(pid, statusp as i64, 0);
+        if (waited == pid) { reaped = 1; }
+        else if (waited != 0 - 4) { state = process_state_runtime_error(); break; }
+    }
+    let _closer: i64 = process_platform_close(read_fd);
     let exit_status: i32 = ((statusp[0] >> 8) & 255) as i32;
+    if ((statusp[0] & 127) != 0) { exit_status = (128 + (statusp[0] & 127)) as i32; }
     return ProcessResult{ .handle = process_result_new(context, scripted, exit_status, state, buffer[0..total as i32]) };
     }
 }
@@ -182,6 +229,22 @@ fn process_run_bounded(command: []u8, timeout_ms: i64, max_output: i64) ProcessR
     unsafe {
         return process_run_bounded_internal(null as *opaque, 0, command, timeout_ms, max_output);
     }
+}
+
+// An explicit sandbox requirement is refused BEFORE any child can run. The
+// ordinary bounded API requests supervision only and makes no sandbox claim.
+fn process_run_bounded_with_isolation(command: []u8, timeout_ms: i64,
+        max_output: i64, requirement: ProcessIsolationRequirement) ProcessIsolationRunResult {
+    let decision: ProcessIsolationResult = process_platform_check_isolation(requirement);
+    if (decision.accepted == 0) {
+        unsafe {
+            return ProcessIsolationRunResult{.isolation=decision,
+                .process=ProcessResult{.handle=process_result_new(null as *opaque, 0, -1,
+                    process_state_isolation_unsupported(), "")}};
+        }
+    }
+    return ProcessIsolationRunResult{.isolation=decision,
+        .process=process_run_bounded(command, timeout_ms, max_output)};
 }
 
 fn process_run_bounded_script(context: *opaque, command: []u8, timeout_ms: i64, max_output: i64) ProcessResult {

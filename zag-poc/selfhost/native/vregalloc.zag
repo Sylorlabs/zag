@@ -1,0 +1,976 @@
+// selfhost/native/vregalloc.zag — VECTOR REGISTER ALLOCATION: the liveness
+// model the vector pipeline was missing, plus the assignment of physical
+// xmm/ymm/zmm (or q) registers to the virtual vector registers that
+// vecwidth.zag hands it.
+//
+// ── WHERE THIS PASS SITS ─────────────────────────────────────────────────────
+//
+//   zir `vector<elem,lanes>` ─► vectorize ─► vecwidth_lower ─► [ vregalloc ]
+//                                                                  │
+//                                              rewrites R_IS_VREG operands
+//                                              to physical register numbers
+//                                                                  ▼
+//                                                        peephole → encode
+//
+// It runs AFTER vecwidth_lower and that order is FORCED, not chosen: the
+// splitter MINTS virtual registers (one per chunk of a split logical value) and
+// this pass is what gives every one of them a physical home.  Running the
+// allocator first would leave the split pieces uncoloured, i.e. carrying numbers
+// the encoder is forbidden to put in a ModRM field (isa.zag: `R_IS_VREG` is a
+// total, exact test precisely so the encoder can never be handed a virtual
+// number).  The reverse dependency does not exist: nothing below mentions a
+// logical lane count, only width classes.  See vecwidth.zag's header for the
+// full argument and for the one thing — a vextract-family recombination
+// instruction — that would change it.
+//
+// ── THE REGISTER CLASS WE ALLOCATE FROM ──────────────────────────────────────
+// isa.zag gives vectors a virtual class: `R_VREG(i) = R_VBASE() + i` with
+// `R_VBASE() == 256` and `R_VREG_MAX() == 256`, under the invariant that no
+// physical GPR/XMM/YMM/ZMM number is ever >= 256.  `R_IS_VREG(r)` is therefore a
+// total, exact discriminator between a scalar register field and a vector one,
+// and this pass owns exactly the fields for which it returns 1.
+//
+// The virtual namespace is PER FUNCTION.  ncodegen emits each function as a
+// contiguous run and the frontend restarts its vector value numbers per
+// function, so virtual register 0 in function A and virtual register 0 in
+// function B are unrelated values.  That is why liveness is reset at every
+// function boundary and why a read of a virtual register that is never defined
+// anywhere in its own function is refused rather than reinterpreted: there is
+// no vector calling convention in this pipeline that could give it a meaning.
+//
+// ── THE LIVENESS MODEL ────────────────────────────────────────────────────────
+// A real backward dataflow pass over the flat ArrayList[Instr], in the idiom
+// `optimize.zag`'s `opt_dce` established (optimize.zag lines 585-684): walk
+// backwards, kill the instruction's vector definitions, make its vector reads
+// live, and at a control-flow boundary assume a conservative live-out.  Every
+// instruction is classified by `vra_class` into exactly one of eight cases and
+// the classification is TOTAL — anything not named in isa.zag lands in case 7,
+// "unknown", which does the most conservative thing available.
+//
+//   K_LABEL at a function start  -> live = {} (nothing is live into a function;
+//                                   see the per-function argument above)
+//   K_LABEL inside a function    -> live = every virtual register MENTIONED in
+//                                   the function (a merge can be reached from
+//                                   anywhere; without a CFG we cannot do better)
+//   K_RET                        -> live = {} (a return transfers control out of
+//                                   the function and its vector values are dead.
+//                                   ncodegen lowers every `return` to
+//                                   `jmp epilogue`, so the ret is reached once)
+//   K_JMP / K_Jcc               -> live = all mentioned (a branch target is a
+//                                   merge; this is what makes a LOOP-CARRIED
+//                                   vector value live across the back edge)
+//   K_CALL / K_CALL_EXT /
+//   K_CALL_REG / K_SYSCALL      -> NOT reset: the backward pass already holds
+//                                   the exact live-after set.  Every currently
+//                                   live virtual register is marked
+//                                   CALL-SPANNING, because all vector registers
+//                                   are caller-saved under every ABI this
+//                                   backend targets
+//   known vector op              -> kill defs, mark reads live
+//   known scalar-XMM op          -> live = all mentioned.  `movsd xmm0` writes
+//                                   the low 128 bits of ymm0/zmm0, so it
+//                                   destroys any vector value living there
+//   known scalar GPR / control   -> no vector-register effect at all
+//   UNKNOWN kind                 -> live = all mentioned AND the physical pool
+//                                   is treated as fully occupied, so a function
+//                                   containing one cannot be coloured at all
+//
+// "All mentioned" (every virtual register appearing anywhere in the function)
+// is the right conservative live-out for a merge: some path into the merge may
+// carry any of them, and with no CFG the identity of that path is not knowable.
+//
+// ── WHY liveness + [first_def .. last_use] INTERVALS IS THE WHOLE MODEL ──────
+// A value's live range is bounded below by its earliest definition and above by
+// its latest read.  There is no third possibility, because a value that is live
+// at some index either has a definition before it (possibly a loop-carried one
+// from a definition later in program order inside the same loop) or a read after
+// it, and a function has no vector live-out.  So the interval
+// `[first_def(v), last_use(v)]` is a SUPERSET of v's live range, and allocating
+// non-overlapping intervals to distinct physical registers is sound: two values
+// whose intervals do not overlap are never live at the same time, so they can
+// share a register.  The backward dataflow pass is what makes the two extra
+// facts exact — which values are live across a CALL, and what the true pressure
+// is — and it is also the safety net: an instruction this file does not
+// recognise cannot silently look like a GPR op that touches no vector register,
+// which is the missed case that would be a silent miscompile.
+//
+// A value that is defined and never read still gets the one-point interval
+// `[first_def, first_def]` rather than an empty one.  An empty interval would
+// interfere with nothing and would therefore be handed physical register 0,
+// which would CLOBBER whatever live value already had it.  One point costs
+// nothing and keeps the invariant "an assigned register is never written while
+// another live value holds it".
+//
+// ── THE BAIL-OUTS, AND WHY FAILING CLOSED IS THE ONLY SAFE ANSWER ────────────
+//
+// (1) NO SPILLING.  If more vector values are live at one point than the target
+//     has physical vector registers, the pass returns the program UNCHANGED
+//     with `spilled` set, and the caller must refuse to emit that function.  A
+//     spill needs a real home (a frame slot, a reload at every use, a decision
+//     about which of the two VEX.NDS operands a reload may clobber, and about
+//     the lane-index and k-mask fields that are not registers at all), and this
+//     pass has no frame layout, no reload sequence and no encoding authority.
+//     Inventing one would be a guess in the one place where a guess is a silent
+//     miscompile; a caller told "spilled" can simply not vectorize, which is
+//     slow and always correct.  A wrong spill is worse than no vectorization
+//     because the first is invisible and the second is a performance decision
+//     somebody else can revisit.
+//
+// (2) A VIRTUAL REGISTER READ WITH NO DEFINITION ANYWHERE IN ITS FUNCTION.
+//     There is no vector calling convention here, so such a read has no
+//     meaning.  Bailing is the only option that does not invent one.
+//
+// (3) A VALUE LIVE ACROSS A CALL.  All vector registers are caller-saved on
+//     every ABI this backend targets, so there is nowhere to put it.  Same
+//     reasoning as (1).
+//
+// (4) AN UNRECOGNISED INSTRUCTION KIND, or a function whose whole vector pool
+//     is claimed by the scalar-FP namespace.  Both make the physical assignment
+//     unknowable; see below for the unknown-kind argument.
+//
+// ── PHYSICAL POOL, AND WHY IT IS NOT A CONSTANT ───────────────────────────────
+// Architecturally xmmN/ymmN/zmmN are the SAME sixteen registers, and the scalar
+// float lowering (ncodegen's K_F* forms) plus the compiler-owned SSE2 memcpy /
+// @simdAddI32x4 helpers write xmm0..xmm3.  A 256-bit integer temporary and an
+// f64 temporary in "register 3" are the same hardware, so handing a vector value
+// a number some other instruction in the function writes would destroy it.  The
+// hand-written AVX2 runtime path in ncodegen has the same problem with YMM0 /
+// YMM1.  The pool base is therefore computed:
+//
+//     base = 1 + ( the highest vector register number written by any
+//                  NON-VIRTUAL register field in this function )
+//
+// and an unknown kind sets the base to the whole pool size, i.e. no vector
+// register is available at all, which routes straight into bail-out (4).  So:
+//
+//   * a function with no floating point and no pre-existing vector code gets the
+//     whole 0..15 pool and its first assignment is register 0;
+//   * a function using the float scratch xmm0..xmm3 gets 4..15;
+//   * a function using YMM0/YMM1 directly gets 2..15;
+//   * a function with an unrecognised kind gets nothing and is refused.
+//
+// This is what "leave all GPR/XMM scalar-FP uses completely untouched" means in
+// practice.  The pass NEVER rewrites a non-virtual operand: it only ever touches
+// fields for which `vecw_fields` says VECTOR, and only when `R_IS_VREG` holds
+// for them.  No register is reserved program-wide, because that would waste the
+// pool in the many functions that use no floating point at all.
+//
+// ── PHYSICAL CLASS SELECTION ─────────────────────────────────────────────────
+// A value's class is the MAXIMUM width class over every vector instruction that
+// reads or writes it:
+//
+//   all 128-bit   -> XMM / Q register class.  Every access is a 128-bit op, so a
+//                    128-bit register provably holds the whole value at all
+//                    times.
+//   any 512-bit   -> ZMM class.  Required, not preferred: a 512-bit value in a
+//                    256-bit register is a truncation.
+//   undetermined  -> the widest class the target has (`zt_width_class`), which is
+//                    also the answer when the class cannot be established at all
+//                    (a virtual register touched only through a field this pass
+//                    does not model).  "Cannot prove narrower" MUST mean "assume
+//                    widest": assuming narrower is the one choice that loses
+//                    bits.
+//
+// The class is a property of the INSTRUCTIONS, not of the register number —
+// on x86 the encoder reads the width out of `Instr.imm` — so it does not change
+// which number is assigned.  It is computed and reported so a class-aware
+// encoder, or the ARM backend where the class is part of the register NAME, can
+// use it; `vregalloc_class_for` is the public reader and needs no pass run.
+//
+// ── TARGET SHAPE ─────────────────────────────────────────────────────────────
+// This file is deliberately X86-SHAPED and imports NOTHING from aisa.zag or
+// aarch64.zag, because those are being edited concurrently.  The only x86
+// assumption is that a physical vector register number is the plain
+// architectural index 0..15 shared by xmm/ymm/zmm.  The ARM pool size (32) is
+// expressed through `vreg_pool_size`, which reads `ZT_NEON()` from the contract
+// and needs no `A_*` symbol; when the ARM encoder lands the only change needed
+// is to route the pool index through `A_VREG()` inside `vreg_phys`, which is one
+// function.
+//
+// ── IDEMPOTENCE ──────────────────────────────────────────────────────────────
+// A program with no `R_IS_VREG` operand contains no virtual vector registers, so
+// every interval is empty, nothing is assigned, and the output is
+// byte-identical to the input.  Together with vecwidth.zag's idempotence this
+// makes the pair safe to run unconditionally in the main pipeline.
+//
+// ── LANGUAGE SUBSET ──────────────────────────────────────────────────────────
+// No `for`, no `<<`/`>>`, no `|`/`||`, no `break`/`continue`, no ternary.  All
+// loops are bound- or flag-guarded `while`.  `Instr` is passed by value;
+// mutable state is threaded through `*T` parameters.
+
+@import("isa.zag")
+@import("vecwidth.zag")   // vecw_fields / vecw_def_fields: the operand contract
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 1. STATISTICS
+// ══════════════════════════════════════════════════════════════════════════════
+
+struct VRegStats {
+    allocated: i32,    // virtual registers given a physical register
+    reused: i32,       // assignments that took a register a dead value held
+    spilled: i32,      // 1 = the pass refused; `prog` came back unchanged
+    max_pressure: i32, // high-water mark of simultaneously live vector registers
+    report: []u8,
+}
+
+// No module-level mutable storage exists in an imported Zag module (`global let`
+// is permitted only in the ROOT compilation unit, and a top-level `let` is
+// E0204), so there is no cell for a "last run" getter to read and no honest way
+// to fabricate one.  The pass therefore takes its statistics as an explicit
+// out-parameter — the integrator owns the root module and can hold the cell —
+// and the two accessors below return the zeroed struct.  `report` is an
+// allocated string rather than storage, so it has the same problem and the same
+// answer.  vecwidth.zag carries the identical note.
+fn vregalloc_stats_last() VRegStats {
+    return VRegStats{ .allocated = 0, .reused = 0, .spilled = 0, .max_pressure = 0, .report = "" };
+}
+fn vregalloc_report_text() []u8 { return ""; }
+
+fn vrg_reset(st: *VRegStats) void {
+    st.*.allocated = 0;
+    st.*.reused = 0;
+    st.*.spilled = 0;
+    st.*.max_pressure = 0;
+    st.*.report = "";
+}
+fn vrg_note(st: *VRegStats, msg: []u8) void { st.*.report = _zag_str_concat(st.*.report, msg); }
+fn vrg_note_i(st: *VRegStats, msg: []u8, v: i32) void {
+    st.*.report = _zag_str_concat(st.*.report, msg);
+    st.*.report = _zag_str_concat(st.*.report, _zag_i64_to_str(v as i64));
+    st.*.report = _zag_str_concat(st.*.report, "\n");
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 2. KIND CLASSIFICATION — TOTAL, WITH A CONSERVATIVE DEFAULT
+// ══════════════════════════════════════════════════════════════════════════════
+//
+//   1 vector op (a width-parameteric kind; isa.zag 105..158, which no scalar
+//     kind shares)
+//   2 scalar-XMM user: the float lowering and the 128-bit SSE2 helpers
+//   3 call: every vector register is caller-saved
+//   4 label
+//   5 ret
+//   6 branch / control transfer (jmp, jcc, and the kinds that do not return
+//     normally)
+//   0 known scalar GPR / control op
+//   7 UNKNOWN — clobbers every vector register and empties the physical pool
+//
+// The default is 7 on purpose.  A kind added to isa.zag after this file was
+// written, or one this file never enumerated, must not be allowed to look like
+// a scalar GPR op that touches no vector register: that is precisely the missed
+// case that produces a silent miscompile.  Case 7 costs one refused function;
+// being wrong costs correctness.
+fn vra_is_vec(k: i32) i32 { if (vecw_fields(k) != 0) { return 1; } return 0; }
+
+fn vra_is_xmm(k: i32) i32 {
+    // float lowering
+    if (k == K_FMOVQ_GX() || k == K_FMOVQ_XG() || k == K_FADD() || k == K_FSUB() ||
+        k == K_FMUL() || k == K_FDIV() || k == K_FUCOMI() || k == K_FSI2SD() ||
+        k == K_FTSD2SI() || k == K_FSD2SS() || k == K_FSS2SD() || k == K_FXORPS() ||
+        k == K_FSQRTSD()) { return 1; }
+    // compiler-owned SSE2 128-bit helpers (movdqu copy, @simdAddI32x4)
+    if (k == K_MOVDQU_LOAD() || k == K_MOVDQU_STORE() || k == K_PADDD() ||
+        k == K_PSUBD() || k == K_PAND() || k == K_POR() || k == K_PXOR()) { return 1; }
+    return 0;
+}
+
+fn vra_is_call(k: i32) i32 {
+    if (k == K_CALL()) { return 1; }
+    if (k == K_CALL_EXT()) { return 1; }
+    if (k == K_CALL_REG()) { return 1; }
+    if (k == K_SYSCALL()) { return 1; }
+    return 0;
+}
+
+fn vra_is_label(k: i32) i32 { if (k == K_LABEL()) { return 1; } return 0; }
+fn vra_is_ret(k: i32) i32 { if (k == K_RET()) { return 1; } return 0; }
+
+// Control transfers that end a linear run, plus the kinds that do not return
+// normally or that leave the machine in a state this pass cannot reason about.
+// Being generous here only costs precision in the live-out, never soundness.
+fn vra_is_branch(k: i32) i32 {
+    if (k == K_JMP()) { return 1; }
+    if (k == K_JE()) { return 1; }
+    if (k == K_JNE()) { return 1; }
+    if (k == K_JL()) { return 1; }
+    if (k == K_JLE()) { return 1; }
+    if (k == K_JG()) { return 1; }
+    if (k == K_JGE()) { return 1; }
+    if (k == K_REP_MOVSB()) { return 1; }
+    if (k == K_X87_SIN() || k == K_X87_COS() || k == K_X87_SQRT()) { return 1; }
+    if (k == K_HLT() || k == K_CLI() || k == K_STI()) { return 1; }
+    if (k == K_LGDT() || k == K_LIDT() || k == K_LTR() || k == K_INVLPG()) { return 1; }
+    if (k == K_RDMSR() || k == K_WRMSR() || k == K_RDCR0() || k == K_WRCR0()) { return 1; }
+    if (k == K_RDCR2() || k == K_RDCR3() || k == K_WRCR3()) { return 1; }
+    if (k == K_RDCR4() || k == K_WRCR4()) { return 1; }
+    return 0;
+}
+
+// Everything else isa.zag names, which touches no vector register and no xmm
+// register.  ENUMERATED rather than inferred, so that the UNKNOWN case stays
+// reachable: adding a kind to isa.zag then requires one line here, which is the
+// intended friction.
+fn vra_is_known_scalar(k: i32) i32 {
+    if (k == K_MOV_IMM() || k == K_MOV_RR() || k == K_ADD_RR() || k == K_SUB_RR()) { return 1; }
+    if (k == K_IMUL_RR() || k == K_CMP_RR() || k == K_PUSH() || k == K_POP()) { return 1; }
+    if (k == K_ADD_RI() || k == K_SUB_RI() || k == K_CMP_RI() || k == K_SETCC()) { return 1; }
+    if (k == K_NEG() || k == K_AND_RR() || k == K_OR_RR() || k == K_XOR_RR()) { return 1; }
+    if (k == K_LOAD() || k == K_STORE() || k == K_LEA() || k == K_LEA_LBL()) { return 1; }
+    if (k == K_IDIV() || k == K_ANDN() || k == K_POPCNT() || k == K_TZCNT()) { return 1; }
+    if (k == K_BSWAP() || k == K_BSR() || k == K_SHL_CL() || k == K_SHR_CL() ||
+        k == K_SAR_CL()) { return 1; }
+    if (k == K_LOAD8() || k == K_STORE8() || k == K_LOAD16() || k == K_STORE16()) { return 1; }
+    if (k == K_LOAD32() || k == K_STORE32() || k == K_XCHG_MEM() || k == K_XADD_MEM()) { return 1; }
+    if (k == K_CMPXCHG_MEM() || k == K_PREFETCHT0() || k == K_MFENCE() || k == K_CPUID()) { return 1; }
+    if (k == K_XGETBV() || k == K_OUTB() || k == K_INB() || k == K_OUTW() || k == K_INW()) { return 1; }
+    if (k == K_OUTL() || k == K_INL() || k == K_PAUSE() || k == K_WBINVD()) { return 1; }
+    if (k == K_X87_LOAD() || k == K_X87_STORE()) { return 1; }
+    return 0;
+}
+
+fn vra_class(k: i32) i32 {
+    if (vra_is_vec(k) == 1) { return 1; }
+    if (vra_is_xmm(k) == 1) { return 2; }
+    if (vra_is_call(k) == 1) { return 3; }
+    if (vra_is_label(k) == 1) { return 4; }
+    if (vra_is_ret(k) == 1) { return 5; }
+    if (vra_is_branch(k) == 1) { return 6; }
+    if (vra_is_known_scalar(k) == 1) { return 0; }
+    return 7;
+}
+
+// Which xmm number a known-XMM op WRITES.  This sets the pool base, so it reads
+// the register fields per isa.zag's per-kind field layout and returns -1 for a
+// read-only form (a scalar double loaded out of xmm3 does not destroy a ymm3
+// vector value, it merely borrows its low half).
+fn vra_xmm_written(k: i32, ins: Instr) i32 {
+    let m: i32 = 0 - 1;
+    if (k == K_FMOVQ_GX()) { return ins.dst; }   // xmm[dst] <- gpr[src]
+    if (k == K_FMOVQ_XG()) { return m; }          // gpr[dst] <- xmm[src]
+    if (k == K_FSI2SD()) { return ins.dst; }      // xmm[dst] <- (double)gpr
+    if (k == K_FTSD2SI()) { return m; }           // gpr <- (i64)xmm
+    if (k == K_MOVDQU_LOAD()) { return ins.dst; } // xmm[dst] <- mem
+    if (k == K_MOVDQU_STORE()) { return m; }      // mem <- xmm[src]
+    if (k == K_FADD()) { return ins.dst; }
+    if (k == K_FSUB()) { return ins.dst; }
+    if (k == K_FMUL()) { return ins.dst; }
+    if (k == K_FDIV()) { return ins.dst; }
+    if (k == K_FUCOMI()) { return m; }            // reads both operands
+    if (k == K_FSD2SS()) { return ins.dst; }
+    if (k == K_FSS2SD()) { return ins.dst; }
+    if (k == K_FXORPS()) { return ins.dst; }
+    if (k == K_FSQRTSD()) { return ins.dst; }
+    if (k == K_PADDD()) { return ins.dst; }
+    if (k == K_PSUBD()) { return ins.dst; }
+    if (k == K_PAND()) { return ins.dst; }
+    if (k == K_POR()) { return ins.dst; }
+    if (k == K_PXOR()) { return ins.dst; }
+    return m;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 3. THE PHYSICAL POOL
+// ══════════════════════════════════════════════════════════════════════════════
+
+// 16 architectural xmm/ymm/zmm registers on x86-64; 32 q registers on AArch64
+// Advanced SIMD.  A target fact read from the contract, not re-derived: the
+// ladder already knows NEON is a 128-bit target, which is the same fact as "32 q
+// registers".
+fn vreg_pool_size(target: i32) i32 {
+    if (target == ZT_NEON()) { return 32; }
+    return 16;
+}
+
+// The top physical vector register is withheld from the pool and reserved as the
+// cross-lane extraction scratch.  Reading lane N of a vector wider than 128 bits
+// needs a second register: `VEXTRACTI128` (or its 512-bit equivalent) must park
+// the high half somewhere before `VPEXTRD` can reach it, and that somewhere
+// cannot be a register the allocator is also handing to a live value.  Withholding
+// one register is strictly cheaper than the alternative, which is a spill.
+fn vreg_scratch(target: i32) i32 {
+    if (target == ZT_NEON()) { return 31; }
+    return R_VSCRATCH();
+}
+
+// Pool slot -> physical register number.  On x86 the architectural number IS the
+// pool index (isa.zag's XMM/YMM/ZMM namespaces all return 0..15 for the same
+// hardware).  When the ARM encoder lands this is the one function to route
+// through A_VREG(); nothing else in this file needs to know a register number
+// exists.  Note for whoever wires that encoder: a 32-register pool maps pool slot
+// 31 onto q31, which Advanced SIMD spells as a plain vector register for every
+// kind in isa.zag's vocabulary — the encoder must not special-case it as sp.
+fn vreg_phys(target: i32, slot: i32) i32 { return slot; }
+
+fn vreg_target_valid(target: i32) i32 {
+    if (target == ZT_SSE2()) { return 1; }
+    if (target == ZT_AVX2()) { return 1; }
+    if (target == ZT_AVX512()) { return 1; }
+    if (target == ZT_NEON()) { return 1; }
+    return 0;
+}
+
+// The widest width class the target can hold, and therefore the class chosen for
+// a value whose class cannot be proven.  See "PHYSICAL CLASS SELECTION".
+fn vreg_widest_w(target: i32) i32 { return zt_width_class(target); }
+
+// Public reader for the class rule: what class would virtual register `v` be
+// given?  Returns `zt_width_class(target)` when `v` names no vector operand at
+// all, which is the documented "cannot prove narrower -> widest" answer, so the
+// function is total.
+fn vregalloc_class_for(prog: ArrayList[Instr], v: i32, target: i32) i32 {
+    let want: i32 = R_VREG(v);
+    let best: i32 = 0 - 1;
+    let n: i32 = len[Instr](prog);
+    let i: i32 = 0;
+    while (i < n) {
+        let ins: Instr = get[Instr](prog, i);
+        if (vra_is_vec(ins.kind) == 1) {
+            let f: i32 = vecw_fields(ins.kind);
+            if (((f & 1) == 1 && ins.dst == want) || ((f & 2) == 2 && ins.src == want) ||
+                ((f & 4) == 4 && ins.lbl == want) || ((f & 8) == 8 && ins.disp == want)) {
+                let w: i32 = x86vec_wclass(ins.imm);
+                if (w > best) { best = w; }
+            }
+        }
+        i = i + 1;
+    }
+    if (best < 0) { return vreg_widest_w(target); }
+    return best;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 4. PER-FUNCTION STATE AND THE BACKWARD LIVENESS PASS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Scalars that come out of the analysis of one function.  They are collected in
+// one struct and handed back through a pointer rather than read out of a nested
+// struct field, because `&v.*.field` is not a spelling this subset should be
+// asked to lower.
+struct VraRes { bad: i32, unknown: i32, count: i32, peak: i32 }
+
+// "No definition yet" sentinel for `first_def`.  It has to be a value LARGER than
+// any instruction index, because the backward walk takes the MINIMUM: seeding
+// with -1 (the natural "none" spelling) would make every `i < first_def[v]` test
+// false and silently drop every definition.  `last_use` is seeded with -1
+// because it takes a MAXIMUM.
+fn vreg_no_def() i32 { return 2147483647; }
+fn vreg_has_def(first_def: ArrayList[i32], v: i32) i32 { return (get[i32](first_def, v) < vreg_no_def()) as i32; }
+
+fn vrg_fill0(xs: *ArrayList[i32], v: i32) void {
+    let i: i32 = 0;
+    while (i < v) { set[i32](xs, i, 0); i = i + 1; }
+}
+fn vrg_filln(xs: *ArrayList[i32], v: i32, n: i32) void {
+    let i: i32 = 0;
+    while (i < v) { set[i32](xs, i, n); i = i + 1; }
+}
+fn vrg_count(xs: ArrayList[i32]) i32 {
+    let c: i32 = 0;
+    let i: i32 = 0;
+    while (i < R_VREG_MAX()) {
+        if (get[i32](xs, i) == 1) { c = c + 1; }
+        i = i + 1;
+    }
+    return c;
+}
+// Is any virtual register live across a call?  The single most important
+// bail-out in this file: every vector register is caller-saved on every ABI this
+// backend targets, so there is nowhere to put such a value.
+fn vra_call_span_any(cs: *ArrayList[i32]) i32 {
+    let i: i32 = 0;
+    while (i < R_VREG_MAX()) {
+        if (cs.*.data[i] == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn vra_in_list(xs: *ArrayList[i32], v: i32) i32 {
+    let i: i32 = 0;
+    while (i < xs.*.len) {
+        if (xs.*.data[i] == v) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Mark every virtual register the function mentions anywhere.  This is the
+// conservative live-out of a merge point: some path into the merge may carry any
+// of them, and with no CFG the identity of that path is not knowable.
+fn vrg_mark_mentioned(live: *ArrayList[i32], mentioned: ArrayList[i32]) void {
+    let i: i32 = 0;
+    while (i < R_VREG_MAX()) {
+        if (get[i32](mentioned, i) == 1) { set[i32](live, i, 1); }
+        i = i + 1;
+    }
+}
+
+// Record a read of virtual register `v` at index `i`: it becomes live and the
+// latest-read index moves forward.  `v < 0` is a PHYSICAL register operand, not
+// a virtual value, and is not recorded.
+fn vra_use(live: *ArrayList[i32], lu: *ArrayList[i32], v: i32, i: i32) void {
+    if (v < 0) { return; }
+    set[i32](live, v, 1);
+    if (i > get[i32](lu, v)) { set[i32](lu, v, i); }
+}
+
+// Is `ins` the first instruction of a function?  ncodegen emits every function
+// as `K_LABEL ; push rbp ; ... ; K_RET`, the same invariant regalloc.zag already
+// depends on ("what follows the ret is either end-of-stream or the next
+// function's K_LABEL").  A leading run with no label is still treated as one
+// function, so a fragment always gets a scope rather than none.
+// The shape test is the PROLOGUE, not a preceding `K_RET`.  The "previous
+// instruction is a ret" rule misses the first function of a program, whose label
+// is preceded by the `_start` stub's trailing `K_SYSCALL` — and a region that
+// swallows the whole program makes every vector value look live across that one
+// call, so the allocator refuses everything.  Matching `K_LABEL ; push rbp ; mov
+// rbp,rsp` is also strictly more precise than a label test: a LOOP label is
+// followed by the loop's condition code, never by a prologue, so loop-carried
+// values are no longer cut in half at a back edge.
+fn vra_func_start(prog: ArrayList[Instr], i: i32) i32 {
+    if (get[Instr](prog, i).kind != K_LABEL()) { return 0; }
+    if (i + 1 < len[Instr](prog)) {
+        let a: Instr = get[Instr](prog, i + 1);
+        if (a.kind == K_PUSH() && a.dst == R_RBP()) { return 1; }
+    }
+    if (i == 0) { return 1; }
+    if (get[Instr](prog, i - 1).kind == K_RET()) { return 1; }
+    return 0;
+}
+
+// ── the pre-pass: which virtual registers does [s,e) mention at all? ──────────
+// Run before the dataflow so that a function with no virtual vector register in
+// it — every ordinary scalar function in the program — costs one linear scan
+// instead of a 256-bit-set update per instruction.
+fn vra_collect_mentions(prog: ArrayList[Instr], s: i32, e: i32, mentioned: *ArrayList[i32]) i32 {
+    let nm: i32 = 0;
+    let p: i32 = s;
+    while (p < e) {
+        let ins: Instr = get[Instr](prog, p);
+        if (vra_is_vec(ins.kind) == 1) {
+            let f: i32 = vecw_fields(ins.kind);
+            if ((f & 1) == 1) { let v: i32 = R_VREG_IDX(ins.dst); if (v >= 0) { if (get[i32](mentioned, v) == 0) { set[i32](mentioned, v, 1); nm = nm + 1; } } }
+            if ((f & 2) == 2) { let v: i32 = R_VREG_IDX(ins.src); if (v >= 0) { if (get[i32](mentioned, v) == 0) { set[i32](mentioned, v, 1); nm = nm + 1; } } }
+            if ((f & 4) == 4) { let v: i32 = R_VREG_IDX(ins.lbl); if (v >= 0) { if (get[i32](mentioned, v) == 0) { set[i32](mentioned, v, 1); nm = nm + 1; } } }
+            if ((f & 8) == 8) { let v: i32 = R_VREG_IDX(ins.disp); if (v >= 0) { if (get[i32](mentioned, v) == 0) { set[i32](mentioned, v, 1); nm = nm + 1; } } }
+        }
+        p = p + 1;
+    }
+    return nm;
+}
+
+// THE LIVENESS PASS over [s,e).  Fills first_def / last_use / call_span and the
+// result scalars.  It never bails: it REPORTS, and the caller decides, so a
+// refusal can name the reason.  The case analysis and the soundness argument for
+// each case are in the header.
+fn vra_analyse(prog: ArrayList[Instr], s: i32, e: i32, nm: i32,
+               first_def: *ArrayList[i32], last_use: *ArrayList[i32],
+               call_span: *ArrayList[i32], mentioned: ArrayList[i32],
+               res: *VraRes) void {
+    if (nm == 0) { return; }
+    let live: ArrayList[i32] = make[i32](R_VREG_MAX());
+    vrg_fill0(&live, R_VREG_MAX());
+    let unknown: i32 = 0;
+    let peak: i32 = 0;
+
+    let i: i32 = e - 1;
+    while (i >= s) {
+        let ins: Instr = get[Instr](prog, i);
+        let k: i32 = ins.kind;
+        let cl: i32 = vra_class(k);
+        // Register pressure at index `i` is the number of vector values live
+        // SIMULTANEOUSLY with the ones this instruction writes, i.e.
+        // |live-after-i| + |vector definitions at i| (a definition is not yet in
+        // live-after-i because the backward walk kills it).  Measuring
+        // |live-after-i| alone would undercount by exactly the instruction's own
+        // destination and would report, for a straight-line
+        // load/load/add/store body, a pressure one lower than the truth.
+        let livec: i32 = vrg_count(live);
+        if (cl == 1) {
+            let f2: i32 = vecw_fields(k);
+            let d2: i32 = vecw_def_fields(k);
+            let extra: i32 = 0;
+            if (((f2 & 1) == 1 && (d2 & 1) == 1) && R_IS_VREG(ins.dst) == 1) {
+                // only if the destination is NOT already live-after-i: a
+                // redefinition of a live value adds no pressure
+                if (get[i32](&live, R_VREG_IDX(ins.dst)) == 0) { extra = 1; }
+            }
+            if (livec + extra > peak) { peak = livec + extra; }
+        } else {
+            if (livec > peak) { peak = livec; }
+        }
+
+        if (cl == 1) {
+            // A vector op: kill the definition, mark the reads live.
+            let db: i32 = vecw_def_fields(k);
+            let ub: i32 = vecw_use_fields(k);
+            let f: i32 = vecw_fields(k);
+            if ((f & 1) == 1 && (db & 1) == 1) {
+                let v: i32 = R_VREG_IDX(ins.dst);
+                if (v >= 0) {
+                    set[i32](&live, v, 0);
+                    if (i < get[i32](first_def, v)) { set[i32](first_def, v, i); }
+                }
+            }
+            if ((ub & 1) == 1) { vra_use(&live, last_use, R_VREG_IDX(ins.dst), i); }
+            if ((ub & 2) == 2) { vra_use(&live, last_use, R_VREG_IDX(ins.src), i); }
+            if ((ub & 4) == 4) { vra_use(&live, last_use, R_VREG_IDX(ins.lbl), i); }
+            if ((ub & 8) == 8) { vra_use(&live, last_use, R_VREG_IDX(ins.disp), i); }
+        } else {
+            if (cl == 4) {
+                // A label is a merge point.  At a function's own entry nothing is
+                // live in (there is no vector calling convention); anywhere else
+                // assume every mentioned value arrives live.
+                if (vra_func_start(prog, i) == 1) { vrg_fill0(&live, R_VREG_MAX()); }
+                else { vrg_mark_mentioned(&live, mentioned); }
+            } else {
+                if (cl == 5) {
+                    // A return transfers control out of the function, so nothing of
+                    // it is live afterwards.
+                    vrg_fill0(&live, R_VREG_MAX());
+                } else {
+                    if (cl == 3) {
+                        // A call.  The backward pass already holds the exact
+                        // live-after set, so NO reset — but every live value would
+                        // be destroyed by the callee, since all vector registers
+                        // are caller-saved.
+                        let v: i32 = 0;
+                        while (v < R_VREG_MAX()) {
+                            if (get[i32](&live, v) == 1) { set[i32](call_span, v, 1); }
+                            v = v + 1;
+                        }
+                    } else {
+                        if (cl == 2) { vrg_mark_mentioned(&live, mentioned); }
+                        else {
+                            if (cl == 6) { vrg_mark_mentioned(&live, mentioned); }
+                            else {
+                                if (cl == 7) {
+                                    // UNKNOWN kind: it may write any register, so
+                                    // every live value is killed by it.
+                                    unknown = 1;
+                                    vrg_mark_mentioned(&live, mentioned);
+                                }
+                                // cl == 0: a known scalar GPR / control op has no
+                                // vector-register effect at all.
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i - 1;
+    }
+
+    // Bail-out (2): a read whose virtual register is never defined anywhere in
+    // this function.  A read that merely HAPPENS to precede a definition is not
+    // an error — that is the loop-carried case the interval model exists to
+    // express — so only the total absence of a definition is refused.
+    let v: i32 = 0;
+    while (v < R_VREG_MAX()) {
+        if (get[i32](last_use, v) >= 0 && vreg_has_def(first_def, v) == 0) { res.*.bad = 1; }
+        v = v + 1;
+    }
+    let cnt: i32 = 0;
+    let w: i32 = 0;
+    while (w < R_VREG_MAX()) {
+        if (vreg_has_def(first_def, w) == 1) { cnt = cnt + 1; }
+        w = w + 1;
+    }
+    res.*.count = cnt;
+    res.*.unknown = unknown;
+    res.*.peak = peak;
+    free[i32](&live);
+}
+
+// The lowest physical register number this function may hand to a vector value:
+// one above the highest vector register that some OTHER instruction in the
+// region already names — whether that is a scalar-FP xmm write or a pre-existing
+// hand-written AVX2 / AVX-512 sequence.  Returns -1 when the region holds an
+// unrecognised kind, because nothing bounds what such a kind writes.
+fn vra_pool_base(prog: ArrayList[Instr], s: i32, e: i32) i32 {
+    let hi: i32 = 0 - 1;
+    let i: i32 = s;
+    while (i < e) {
+        let ins: Instr = get[Instr](prog, i);
+        let k: i32 = ins.kind;
+        if (vra_class(k) == 7) { return 0 - 1; }
+        if (vra_is_xmm(k) == 1) {
+            let w: i32 = vra_xmm_written(k, ins);
+            if (w > hi) { hi = w; }
+        }
+        if (vra_is_vec(k) == 1) {
+            let f: i32 = vecw_fields(k);
+            // The reserved extraction scratch is OURS, not another writer's: it
+            // is withheld from the pool above, so it must be excluded in EVERY
+            // operand field. The fold uses it as a shuffle destination as well
+            // as an extraction source, and counting it would push the pool base
+            // past the end of the register file and refuse the whole function.
+            if ((f & 1) == 1 && R_IS_VREG(ins.dst) == 0 &&
+                ins.dst != R_VSCRATCH() && ins.dst > hi) { hi = ins.dst; }
+            if ((f & 2) == 2 && R_IS_VREG(ins.src) == 0 &&
+                ins.src != R_VSCRATCH() && ins.src > hi) { hi = ins.src; }
+            if ((f & 4) == 4 && R_IS_VREG(ins.lbl) == 0 &&
+                ins.lbl != R_VSCRATCH() && ins.lbl > hi) { hi = ins.lbl; }
+            if ((f & 8) == 8 && R_IS_VREG(ins.disp) == 0 &&
+                ins.disp != R_VSCRATCH() && ins.disp > hi) { hi = ins.disp; }
+        }
+        i = i + 1;
+    }
+    if (hi < 0) { return 0; }
+    return hi + 1;
+}
+
+// THE LINEAR SCAN.  Intervals are visited in start order (smallest `first_def`
+// first, ties by lowest virtual number, so the result is deterministic); each
+// takes the lowest-numbered physical register whose current occupant's interval
+// does not overlap.  `pl` accumulates the placed virtual numbers so the
+// interference test stays linear in the number PLACED rather than in
+// R_VREG_MAX.  Returns 0 when no register was free: bail-out (1), NO SPILLING.
+fn vra_scan(first_def: ArrayList[i32], last_use: ArrayList[i32], count: i32,
+            base: i32, pool: i32, target: i32,
+            phys: *ArrayList[i32], pl: *ArrayList[i32], st: *VRegStats) i32 {    let step: i32 = 0;
+    while (step < count) {
+        // the unplaced interval with the smallest start, ties by lowest number
+        let pick: i32 = 0 - 1;
+        let cand: i32 = 0;
+        while (cand < R_VREG_MAX()) {
+            if (vreg_has_def(first_def, cand) == 1 && vra_in_list(pl, cand) == 0) {
+                if (pick < 0) { pick = cand; }
+                else { if (get[i32](first_def, cand) < get[i32](first_def, pick)) { pick = cand; } }
+            }
+            cand = cand + 1;
+        }
+        if (pick < 0) { return 0; }
+        let s: i32 = get[i32](first_def, pick);
+        let e2: i32 = get[i32](last_use, pick);
+        if (e2 < s) { e2 = s; }
+        let slot: i32 = 0 - 1;
+        let t: i32 = 0;
+        while (t < pool) {
+            let free: i32 = 1;
+            let q: i32 = 0;
+            let np: i32 = len[i32](pl);
+            while (q < np) {
+                let u: i32 = get[i32](pl, q);
+                if (get[i32](phys, u) == vreg_phys(target, base + t)) {
+                    let us: i32 = get[i32](first_def, u);
+                    let ue: i32 = get[i32](last_use, u);
+                    if (ue < us) { ue = us; }
+                    if (s <= ue && us <= e2) { free = 0; }
+                }
+                q = q + 1;
+            }
+            if (free == 1) { slot = t; t = pool; }
+            else { t = t + 1; }
+        }
+        if (slot < 0) { return 0; }
+        set[i32](phys, pick, vreg_phys(target, base + slot));
+        // A "reuse" is a register a NON-overlapping (hence dead) interval already
+        // held.  The slot was chosen precisely because no live value holds it, so
+        // any earlier occupant is provably dead at this point.
+        if (vra_slot_was_used(phys, pl, pick, vreg_phys(target, base + slot)) == 1) {            st.*.reused = st.*.reused + 1;
+        }
+        st.*.allocated = st.*.allocated + 1;
+        push[i32](pl, pick);
+        step = step + 1;
+    }
+    return 1;
+}
+
+// Does any already-placed virtual number (other than `self`) hold physical
+// register number `p`?  `self` is compared only after `phys[self]` has been
+// written, which is why the caller passes the freshly assigned value.
+fn vra_slot_was_used(phys: *ArrayList[i32], pl: *ArrayList[i32], self: i32, p: i32) i32 {
+    let r: i32 = 0;
+    let np: i32 = pl.*.len;
+    while (r < np) {
+        if (pl.*.data[r] != self) {
+            if (phys.*.data[pl.*.data[r]] == p) { return 1; }
+        }
+        r = r + 1;
+    }
+    return 0;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 5. THE PASS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Rewrite one instruction's VIRTUAL vector operands to their physical numbers.
+// Fields that are not vector fields, and vector fields already holding a
+// physical number, are left exactly as they are — which is how the scalar float
+// lowering, the GPR uses and any pre-existing hand-written vector code stay
+// untouched.
+fn vra_rewrite(ins: Instr, phys: ArrayList[i32]) Instr {
+    if (vra_is_vec(ins.kind) == 0) { return ins; }
+    let f: i32 = vecw_fields(ins.kind);
+    let e: Instr = ins;
+    if ((f & 1) == 1 && R_IS_VREG(ins.dst) == 1) { e.dst = get[i32](phys, R_VREG_IDX(ins.dst)); }
+    if ((f & 2) == 2 && R_IS_VREG(ins.src) == 1) { e.src = get[i32](phys, R_VREG_IDX(ins.src)); }
+    if ((f & 4) == 4 && R_IS_VREG(ins.lbl) == 1) { e.lbl = get[i32](phys, R_VREG_IDX(ins.lbl)); }
+    if ((f & 8) == 8 && R_IS_VREG(ins.disp) == 1) { e.disp = get[i32](phys, R_VREG_IDX(ins.disp)); }
+    return e;
+}
+
+fn vra_copy(prog: ArrayList[Instr]) ArrayList[Instr] {
+    let n: i32 = len[Instr](prog);
+    let out: ArrayList[Instr] = make[Instr](n + 1);
+    let i: i32 = 0;
+    while (i < n) { push[Instr](&out, get[Instr](prog, i)); i = i + 1; }
+    return out;
+}
+
+fn vra_copy_range(out: *ArrayList[Instr], prog: ArrayList[Instr], a: i32, b: i32) void {
+    let j: i32 = a;
+    while (j < b) { push[Instr](out, get[Instr](prog, j)); j = j + 1; }
+}
+
+fn vra_copy_range_rewritten(out: *ArrayList[Instr], prog: ArrayList[Instr], a: i32, b: i32, phys: ArrayList[i32]) void {
+    let j: i32 = a;
+    while (j < b) { push[Instr](out, vra_rewrite(get[Instr](prog, j), phys)); j = j + 1; }
+}
+
+// The authoritative entry point.  The input list is never mutated.  On any
+// bail-out a fresh copy of the input is returned unchanged and `spilled` is set;
+// the caller must then refuse to emit the function.
+fn vregalloc_st(prog: ArrayList[Instr], target: i32, st: *VRegStats) ArrayList[Instr] {
+    let n: i32 = len[Instr](prog);
+    vrg_reset(st);
+
+    if (vreg_target_valid(target) == 0) {
+        st.*.spilled = 1;
+        vrg_note(st, "refused: target is not one of sse2/avx2/avx512/neon\n");
+        return vra_copy(prog);
+    }
+    let pool: i32 = vreg_pool_size(target);
+    // The scratch register is never available to a live value, so the usable
+    // pool is one shorter than the architectural count.
+    let usable: i32 = pool - 1;
+    // Cross-check the width contract this file SHARES with vecwidth.zag: the lane
+    // ceiling the splitter lowered against and the lane count the allocator's
+    // native width implies must be the same rung of the ladder.  They are derived
+    // from the same contract functions, so this can only fail if the two files
+    // have drifted; refusing is the honest response to that, because guessing
+    // which one is right would silently change how wide a piece is.
+    if (vecw_ceiling(target) != vecw_chunk_lanes(vecw_native_w(target))) {
+        st.*.spilled = 1;
+        vrg_note(st, "refused: vecwidth.zag and vregalloc.zag disagree about the target width ladder\n");
+        return vra_copy(prog);
+    }
+
+    let out: ArrayList[Instr] = make[Instr](n + 1);
+    let phys: ArrayList[i32] = make[i32](R_VREG_MAX());
+    vrg_fill0(&phys, R_VREG_MAX());
+    let first_def: ArrayList[i32] = make[i32](R_VREG_MAX());
+    let last_use:  ArrayList[i32] = make[i32](R_VREG_MAX());
+    let call_span: ArrayList[i32] = make[i32](R_VREG_MAX());
+    let mentioned: ArrayList[i32] = make[i32](R_VREG_MAX());
+
+    let s: i32 = 0;
+    let bail: i32 = 0;
+    while (bail == 0 && s < n) {
+        // ── the end of this function is the next function start, or EOF ──
+        let e: i32 = n;
+        let scan: i32 = s + 1;
+        while (scan < n) {
+            if (vra_func_start(prog, scan) == 1) { e = scan; scan = n; }
+            else { scan = scan + 1; }
+        }
+
+        vrg_filln(&first_def, R_VREG_MAX(), vreg_no_def());
+        vrg_filln(&last_use, R_VREG_MAX(), 0 - 1);
+        vrg_fill0(&call_span, R_VREG_MAX());
+        vrg_fill0(&mentioned, R_VREG_MAX());
+        let res: VraRes = VraRes{ .bad = 0, .unknown = 0, .count = 0, .peak = 0 };
+        let nm: i32 = vra_collect_mentions(prog, s, e, &mentioned);
+        vra_analyse(prog, s, e, nm, &first_def, &last_use, &call_span, mentioned, &res);
+
+        // ── decide, as a sequence of flat guards.  A `stage` counter replaces
+        //    nesting so that each refusal's REASON sits next to its TEST, which
+        //    is what makes `report` worth reading.
+        //      stage 0 = nothing decided yet
+        //      stage 1 = copy this function through untouched
+        //      stage 2 = colour it
+        let stage: i32 = 0;
+        let base: i32 = 0 - 1;
+        if (nm == 0) { stage = 1; }
+        if (stage == 0 && res.bad == 1) {
+            vrg_note(st, "refused: a virtual vector register is read but never defined in its function\n");
+            bail = 1;
+        }
+        if (stage == 0 && bail == 0 && res.unknown == 1) {
+            vrg_note(st, "refused: an unrecognised instruction kind clobbers every vector register\n");
+            bail = 1;
+        }
+        if (stage == 0 && bail == 0 && res.count == 0) {
+            // Unreachable: `bad` already refuses a function whose registers are
+            // all read and none defined.  Copying rather than guessing keeps the
+            // pass total if the analysis ever changes.
+            stage = 1;
+        }
+        if (stage == 0 && bail == 0) {
+            if (vra_call_span_any(&call_span) == 1) {
+                vrg_note(st, "refused: a vector value is live across a call and every vector register is caller-saved\n");
+                vrg_note_i(st, "  region ", s);
+                vrg_note_i(st, "..", e);
+                vrg_note_i(st, " vector-values=", res.count);
+                bail = 1;
+            } else {
+                base = vra_pool_base(prog, s, e);
+                if (base < 0) {
+                    vrg_note(st, "refused: an unrecognised instruction kind clobbers every vector register\n");
+                    bail = 1;
+                } else {
+                    if (base >= usable) {
+                        vrg_note(st, "refused: every allocatable physical vector register is claimed by other code in this function\n");
+                        bail = 1;
+                    } else { stage = 2; }
+                }
+            }
+        }
+        if (stage == 2) {
+            let pl: ArrayList[i32] = make[i32](res.count + 4);
+            vrg_fill0(&phys, R_VREG_MAX());
+            if (vra_scan(first_def, last_use, res.count, base, usable - base, target, &phys, &pl, st) == 0) {
+                vrg_note(st, "refused: more vector values are live at one point than the target has registers\n");
+                bail = 1;
+            } else {
+                if (res.peak > st.*.max_pressure) { st.*.max_pressure = res.peak; }
+                vrg_note_i(st, "allocated ", res.count);
+                vrg_note_i(st, " vector values from base ", base);
+                vrg_note(st, " at ");
+                vrg_note(st, zt_name(target));
+                vrg_note_i(st, ", live pressure ", res.peak);
+                vrg_note(st, "\n");
+                vra_copy_range_rewritten(&out, prog, s, e, phys);
+            }
+            free[i32](&pl);
+        }
+        if (stage == 1) {
+            // No virtual vector register in this function, or nothing to colour.
+            // Copied through byte-for-byte, whatever else it contains.
+            vra_copy_range(&out, prog, s, e);
+        }
+        s = e;
+    }
+
+    free[i32](&first_def);
+    free[i32](&last_use);
+    free[i32](&call_span);
+    free[i32](&mentioned);
+    free[i32](&phys);
+
+    if (bail == 1) {
+        st.*.spilled = 1;
+        free[Instr](&out);
+        return vra_copy(prog);
+    }
+    return out;
+}
+
+// Convenience form.  Statistics are discarded — see the note above
+// `vregalloc_stats_last()`; use `vregalloc_st` when the caller needs them.
+fn vregalloc(prog: ArrayList[Instr], target: i32) ArrayList[Instr] {
+    let st: VRegStats = VRegStats{ .allocated = 0, .reused = 0, .spilled = 0, .max_pressure = 0, .report = "" };
+    return vregalloc_st(prog, target, &st);
+}

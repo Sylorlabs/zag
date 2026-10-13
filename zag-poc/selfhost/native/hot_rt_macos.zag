@@ -40,21 +40,65 @@ fn hm_sleep(ms:i64)void{
 }
 
 fn hm_apply(code:[]u8)i32{
-    let n:i64=code.len as i64;
+    let n:i32=code.len;
     let image:i64=hm_image_base();
     if(image==0||n<=0){return 0;}
-    let span:i64=HM_CODE_OFF()+n;
-    let pages:i64=((span+HM_PAGE()-1)/HM_PAGE())*HM_PAGE();
-    // SYS_mprotect is 74 on Darwin; W^X is opened only for the replacement.
-    if(_zag_darwin_syscall(74,image,pages,7,0,0,0)!=0){return 0;}
+    // The encoder pads hot __text through a VM boundary. Its 4 KiB header-page
+    // suffix is intentionally immutable; every following patch unit is one
+    // complete, destination-aligned Apple-Silicon page.
+    if((HM_CODE_OFF()+(n as i64))%HM_PAGE()!=0){return 0;}
+    let first:i32=(HM_PAGE()-HM_CODE_OFF()) as i32;
+    if(n<first){return 0;}
     let text:*i8=(image+HM_CODE_OFF()) as *i8;
-    // Keep the copy in Zag so this runtime has no libc memcpy dependency and
-    // can be emitted by the self-contained Mach-O backend.
     let src:*i8=_zag_slice_ptr(code);
+    let patcher:i64=_zag_code_anchor();
+    let patcher_page:i64=patcher-(patcher%HM_PAGE());
+    let text_end:i64=image+HM_CODE_OFF()+(n as i64);
+    // A hot encoder must have placed this source-function entry exactly at a
+    // page boundary within the complete-page region. Fail closed on a regular
+    // or otherwise incompatible image before changing any protection.
+    if(patcher!=patcher_page||patcher_page<image+HM_PAGE()||patcher_page>=text_end){return 0;}
+
+    // The patch does not contain the Mach-O header prefix, so page zero can be
+    // verified but never partially replaced.
     let i:i32=0;
-    while(i<n as i32){text[i]=src[i];i=i+1;}
-    sys_icache_invalidate(text,n);
-    if(_zag_darwin_syscall(74,image,pages,5,0,0,0)!=0){return 0;}
+    while(i<first){if(text[i]!=src[i]){return 0;}i=i+1;}
+
+    // Preflight every full page before the first mutation. In particular, a
+    // patch that changes hm_apply's currently executing page is rejected as a
+    // whole instead of partially applying earlier pages first.
+    let off:i32=first;
+    while(off<n){
+        if(off+(HM_PAGE() as i32)>n){return 0;}
+        let page_addr:i64=image+HM_CODE_OFF()+(off as i64);
+        if(page_addr%HM_PAGE()!=0){return 0;}
+        let dst:*i8=page_addr as *i8;
+        let different:i32=0;
+        let j:i32=0;
+        while(j<HM_PAGE() as i32){if(dst[j]!=src[off+j]){different=1;}j=j+1;}
+        if(different==1&&page_addr==patcher_page){return 0;}
+        off=off+(HM_PAGE() as i32);
+    }
+
+    // Darwin SYS_mprotect is 74. Changed nonexecuting pages transition RX->RW,
+    // receive exactly 16 KiB, return to RX, and only then have their I-cache
+    // invalidated. No page is simultaneously writable and executable.
+    off=first;
+    while(off<n){
+        let page_addr:i64=image+HM_CODE_OFF()+(off as i64);
+        let dst:*i8=page_addr as *i8;
+        let different:i32=0;
+        let j:i32=0;
+        while(j<HM_PAGE() as i32){if(dst[j]!=src[off+j]){different=1;}j=j+1;}
+        if(different==1){
+            if(_zag_darwin_syscall(74,page_addr,HM_PAGE(),3,0,0,0)!=0){return 0;}
+            j=0;
+            while(j<HM_PAGE() as i32){dst[j]=src[off+j];j=j+1;}
+            if(_zag_darwin_syscall(74,page_addr,HM_PAGE(),5,0,0,0)!=0){return 0;}
+            sys_icache_invalidate(dst,HM_PAGE());
+        }
+        off=off+(HM_PAGE() as i32);
+    }
     return 1;
 }
 
@@ -63,7 +107,10 @@ fn zag_hot_poll()i32{
     let patch:[]u8=_zag_read_file(HM_PATCH());
     if(patch.len<=0){return 0;}
     let ok:i32=hm_apply(patch);
-    let _consumed:i32=_zag_write_file(HM_PATCH(),"");
+    // Preserve a failed patch for diagnosis/retry. Consuming bytes after an
+    // mprotect or cache-synchronization failure makes the runtime look as if a
+    // live replacement succeeded when the old text is still executing.
+    if(ok==1){let _consumed:i32=_zag_write_file(HM_PATCH(),"");}
     return ok;
 }
 

@@ -9,7 +9,7 @@ cd "$(dirname "$0")/.."
 
 pass=0
 fail=0
-tmp="${TMPDIR:-/tmp}/zag-native-authority.$$"
+tmp=""
 
 authority_host_system=$(uname -s)
 authority_host_machine=$(uname -m)
@@ -103,7 +103,7 @@ authority_cleanup() {
         zag_terminate_process_tree "$authority_pid" "$authority_pgid"
         wait "$authority_pid" 2>/dev/null || true
     fi
-    rm -rf "$tmp"
+    if [ -n "$tmp" ]; then rm -rf "$tmp"; fi
 }
 authority_signal() {
     authority_cleanup
@@ -111,7 +111,12 @@ authority_signal() {
 }
 trap authority_cleanup EXIT
 trap authority_signal HUP INT TERM
-mkdir -p "$tmp/bin"
+mkdir -p "$PWD/build"
+tmp=$(mktemp -d "$PWD/build/native-authority.XXXXXX")
+mkdir "$tmp/bin"
+# The rebuilt compiler resolves standard modules from its executable layout.
+ln -s "$PWD/std" "$tmp/std"
+ln -s "$PWD/selfhost" "$tmp/selfhost"
 
 authority_limit=${ZAG_SELFHOST_MEMORY_MAX_BYTES:-}
 authority_swap=${ZAG_SELFHOST_SWAP_MAX_BYTES:-0}

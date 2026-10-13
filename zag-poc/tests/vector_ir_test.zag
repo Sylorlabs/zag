@@ -1,0 +1,456 @@
+// tests/vector_ir_test.zag — executable proof for the target-independent vector
+// IR: the shared contract, the verifier's fault classes, vector-aware DCE, the
+// MLIR printer, and the module statistics.
+//
+// It is a normal Zag program that the shell test compiles and RUNS, so the
+// evidence is a real exit code, not an inspection. Exit 0 means every assertion
+// held; a nonzero exit is the number of failed checks.
+
+@import("../selfhost/zir_vector.zag")
+
+// A `let` at top level is immutable here and mutable globals need a v2 contract
+// the language does not have, so the running totals travel as an out-parameter.
+struct VC { checks: i32, failures: i32 }
+
+fn ck(vc: *VC, cond: i32, what: []u8) void {
+    vc.*.checks = vc.*.checks + 1;
+    if (cond == 0) {
+        vc.*.failures = vc.*.failures + 1;
+        _zag_print("vector IR FAIL: ");
+        _zag_println(what);
+    }
+}
+
+// Substring search: the runtime has no string-contains builtin, and a test must
+// not invent a dependency the compiler itself lacks.
+fn has(hay: []u8, needle: []u8) i32 {
+    if (needle.len == 0 || hay.len < needle.len) { return 0; }
+    let i: i32 = 0;
+    while (i + needle.len <= hay.len) {
+        let j: i32 = 0;
+        let ok: i32 = 1;
+        while (j < needle.len) {
+            if (hay[i + j] != needle[j]) { ok = 0; }
+            j = j + 1;
+        }
+        if (ok == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn last_op(blk: *ZBlock) ZOp { return blk.*.ops.data[blk.*.ops.len - 1]; }
+
+fn vec_fresh() ZV { return zvb_init(zir_unknown_origin(), 0); }
+
+// ── the shared contract ─────────────────────────────────────────────────────
+// ── statistics ──────────────────────────────────────────────────────────────
+fn module_of(blk: ZBlock) ZModule {
+    let fs: ArrayList[ZFunc] = make[ZFunc](1);
+    let f: ZFunc = ZFunc{ .name = "f", .params = make[ZVal](1), .ret = "void",
+        .body = blk, .effects = 0, .origin = zir_unknown_origin(),
+        .coverage_complete = 1, .coverage_errors = 0 };
+    push[ZFunc](&fs, f);
+    return ZModule{ .funcs = fs, .schema_version = "zag-ir-v1",
+        .transform_version = "zag-transform-v1", .coverage_complete = 1,
+        .coverage_errors = 0, .origin_complete = 1, .origin_exact = 1 };
+}
+
+fn test_contract(vc: *VC) void {
+    ck(vc, zvec_is_vector_ty(zvec_ty("i32", 4)) == 1, "vector<i32,4> is a vector type");
+    ck(vc, zvec_lanes(zvec_ty("i32", 8)) == 8, "lane count parses");
+    ck(vc, zvec_lanes(zvec_ty("f32", 16)) == 16, "16-lane count parses");
+    ck(vc, @strEq(zvec_elem_ty(zvec_ty("f64", 4)), "f64"), "element type parses");
+    ck(vc, zvec_lanes("i32") == 0, "a scalar type has no lanes");
+    ck(vc, zvec_is_vector_ty("i32") == 0, "a scalar type is not a vector type");
+    ck(vc, zvec_ty_valid(zvec_ty("i32", 0)) == 0, "zero lanes is rejected");
+    ck(vc, zvec_ty_valid(zvec_ty("i32", 32)) == 0, "32 lanes exceeds the ladder");
+    ck(vc, zvec_ty_valid(zvec_ty("bool", 4)) == 0, "bool is not packable");
+    ck(vc, zvec_ty_valid(zvec_ty("i32", 4)) == 1, "vector<i32,4> is valid");
+    // The lane ceiling is counted in 32-bit-equivalent units, so a wide element
+    // halves the element count that fits. These pin the unit conversion: before
+    // it, vector<i64,16> (256 bytes, two registers) passed as valid.
+    ck(vc, zvec_ty_valid(zvec_ty("i64", 8)) == 1, "vector<i64,8> is 512-bit and valid");
+    ck(vc, zvec_ty_valid(zvec_ty("i64", 16)) == 0, "vector<i64,16> needs two registers and is rejected");
+    ck(vc, zvec_ty_valid(zvec_ty("f64", 16)) == 0, "vector<f64,16> needs two registers and is rejected");
+    ck(vc, zvec_ty_valid(zvec_ty("f64", 8)) == 1, "vector<f64,8> is 512-bit and valid");
+
+    // The ladder: 16 / 8 / 4 / 4.  This is the single place the ideal pipeline
+    // is stated, so it is asserted target by target rather than by constant.
+    ck(vc, zt_lane_ceiling(ZT_AVX512()) == 16, "AVX-512 is 16 lanes");
+    ck(vc, zt_lane_ceiling(ZT_AVX2()) == 8, "AVX2 is 8 lanes");
+    ck(vc, zt_lane_ceiling(ZT_SSE2()) == 4, "SSE2 is 4 lanes");
+    ck(vc, zt_lane_ceiling(ZT_NEON()) == 4, "NEON is 4 lanes");
+    ck(vc, zt_width_class(ZT_AVX512()) == VW_512(), "AVX-512 maps to the 512-bit class");
+    ck(vc, zt_width_class(ZT_AVX2()) == VW_256(), "AVX2 maps to the 256-bit class");
+    ck(vc, zt_width_class(ZT_NEON()) == VW_128(), "NEON maps to the 128-bit class");
+
+    ck(vc, zvec_wclass_for_lanes(16) == VW_512(), "16 lanes need a 512-bit class");
+    ck(vc, zvec_wclass_for_lanes(9) == VW_512(), "9 lanes round up to 512-bit");
+    ck(vc, zvec_wclass_for_lanes(8) == VW_256(), "8 lanes need a 256-bit class");
+    ck(vc, zvec_wclass_for_lanes(5) == VW_256(), "5 lanes round up to 256-bit");
+    ck(vc, zvec_wclass_for_lanes(17) == 0 - 1, "17 lanes is impossible");
+    ck(vc, zvec_wclass_bytes(VW_512()) == 64, "512-bit class is 64 bytes");
+    ck(vc, zvec_wclass_bytes(VW_256()) == 32, "256-bit class is 32 bytes");
+    ck(vc, zvec_wclass_bytes(VW_128()) == 16, "128-bit class is 16 bytes");
+
+    // Splitting: how many machine registers a logical vector becomes.
+    ck(vc, zvec_reg_count(16, VW_512()) == 1, "16 lanes is one ZMM register");
+    ck(vc, zvec_reg_count(16, VW_256()) == 2, "16 lanes is two YMM registers");
+    ck(vc, zvec_reg_count(16, VW_128()) == 4, "16 lanes is four XMM registers");
+    ck(vc, zvec_reg_count(5, VW_128()) == 2, "5 lanes rounds up to two XMM registers");
+    ck(vc, zvec_reg_count(0, VW_128()) == 0, "zero lanes needs no register");
+
+    ck(vc, zvec_elem_bytes("i16") == 2, "i16 is two bytes");
+    ck(vc, zvec_elem_bytes("f64") == 8, "f64 is eight bytes");
+    ck(vc, zvec_elem_bytes("bool") == 0, "bool has no packable size");
+    ck(vc, @strEq(zt_name(ZT_NEON()), "neon"), "the NEON rung names itself");
+    ck(vc, zvec_mask_lanes(zvec_mask_ty(4)) == 4, "a mask reports its lane count");
+    ck(vc, zvec_mask_lanes(zvec_ty("i32", 4)) == 0, "a data vector is not a mask");
+
+    // Purity: broadcast reads memory, everything else does not.  DCE depends on
+    // this distinction being exactly right.
+    ck(vc, zvec_op_is_pure(zvec_op_broadcast()) == 0, "broadcast is not pure");
+    ck(vc, zvec_op_is_pure(zvec_op_add()) == 1, "add is pure");
+    ck(vc, zvec_op_is_pure(zvec_op_reduction_add()) == 1, "reduction is pure");
+    ck(vc, zvec_op_is_pure("arith.addi") == 0, "a scalar op is not a vector op");
+}
+
+// A fresh canonical block. Every fault case builds its OWN block: the ZIR op
+// carries ArrayList fields, and mutating `results.data[0]` on a shared list
+// would write through into the next case and silently change which rule is
+// under test.  Isolation is what makes each fault attributable.
+fn canon() ZBlock {
+    let b: ZV = zvb_init(zir_unknown_origin(), 0);
+    let blk: ZBlock = zvec_block();
+    let s: ZVal = zvb_value("%s", "i32", zir_unknown_origin());
+    // A broadcast names its source by TYPE, and the verifier accepts two forms:
+    // a whole-object `memref<ELEM>` and an address splat `vector<*ELEM,LANES>`.
+    let m32: ZVal = zvb_value("%m", "memref<i32>", zir_unknown_origin());
+    let a: ZVal = zvec_splat(&b, &blk, "i32", 4, s);            // 0 splat
+    let c: ZVal = zvec_broadcast(&b, &blk, "i32", 4, m32);      // 1 broadcast
+    let add: ZVal = zvec_binop(&b, &blk, zvec_op_add(), a, c);  // 2 add
+    let ins: ZVal = zvec_insert(&b, &blk, add, 2, s);           // 3 insert
+    let m: ZVal = zvec_icmp(&b, &blk, "slt", a, c);             // 4 icmp
+    zvec_select(&b, &blk, m, a, c);                             // 5 select
+    zvec_reduction_add(&b, &blk, a);                            // 6 reduction
+    zvec_shuffle(&b, &blk, a, c, "0,4,1,5");                    // 7 shuffle
+    zvec_extract(&b, &blk, ins, 1);                             // 8 extract
+    return blk;
+}
+fn splat_of(blk: ZBlock) ZVal { return get[ZVal](get[ZOp](blk.ops, 0).results, 0); }
+fn bcast_of(blk: ZBlock) ZVal { return get[ZVal](get[ZOp](blk.ops, 1).results, 0); }
+
+// A bare op with exactly the arities a fault case needs, and no attributes
+// beyond the empty set.  List capacities are requested up front because
+// assigning a list FIELD on a local struct is silently dropped in this language.
+fn bare_op(name: []u8, res_ty: []u8, nres: i32, nops: i32) ZOp {
+    return ZOp{ .name = name, .results = make[ZVal](nres),
+        .operands = make[ZVal](nops), .attrs = make[ZAttr](3),
+        .regions = make[ZRegion](1), .effects = 0, .reads = "none",
+        .writes = "none", .origin = zir_unknown_origin() };
+}
+
+// ── the verifier's fault classes ────────────────────────────────────────────
+// One canonical block is built, every op in it is checked to verify, and then
+// each fault damages exactly ONE op of its OWN fresh copy.
+fn test_verifier(vc: *VC) void {
+    let blk: ZBlock = canon();
+    let a: ZVal = splat_of(blk);
+    let c: ZVal = bcast_of(blk);
+
+    // The address-splat form of a broadcast is what the vectorizer actually
+    // emits, so it must verify too.
+    let bb: ZV = vec_fresh();
+    let bblk: ZBlock = zvec_block();
+    let pv: ZVal = zvb_value("%pv", zvec_ptr_ty("i32", 4), zir_unknown_origin());
+    zvec_broadcast(&bb, &bblk, "i32", 4, pv);
+    ck(vc, zvec_verify_op(bblk.ops.data[0]) == 0,
+        "a broadcast over an address splat verifies");
+    // A pointer vector whose pointee disagrees with `elem` is a shape fault.
+    let bc: ZV = vec_fresh();
+    let cblk: ZBlock = zvec_block();
+    let pw: ZVal = zvb_value("%pw", zvec_ptr_ty("i64", 4), zir_unknown_origin());
+    zvec_broadcast(&bc, &cblk, "i32", 4, pw);
+    ck(vc, zvec_verify_op(cblk.ops.data[0]) == ZVERR_SHAPE(),
+        "an address splat with the wrong pointee is a shape fault");
+
+    // Positive control: every op of a fresh canonical block must verify.
+    let good: ZBlock = canon();
+    let i: i32 = 0;
+    while (i < good.ops.len) {
+        ck(vc, zvec_verify_op(good.ops.data[i]) == 0, "a well-formed vector op verifies");
+        i = i + 1;
+    }
+    ck(vc, good.ops.len == 9, "the canonical block has nine vector ops");
+    ck(vc, zvec_verify_block(good) == 0, "a well-formed vector block verifies");
+    ck(vc, zvec_verify_module(module_of(good)) == 0, "a well-formed vector module verifies");
+
+    // Faults are driven from a table.  Each row states the op, its result type,
+    // both arities, one optional bad attribute, and the code it must produce.
+    // Building them from one code path keeps the cases independent (a literal
+    // per case allocates enough to exhaust the arena partway through a run) and
+    // makes the whole fault table readable in one place.
+    let names: ArrayList[[]u8] = make[[]u8](8);
+    push[[]u8](&names, "vector.nonexistent");
+    push[[]u8](&names, "vector.add");
+    push[[]u8](&names, "vector.add");
+    push[[]u8](&names, "vector.add");
+    push[[]u8](&names, "vector.add");
+    push[[]u8](&names, "vector.shuffle");
+    let tys: ArrayList[[]u8] = make[[]u8](8);
+    push[[]u8](&tys, "vector<i32,4>");
+    push[[]u8](&tys, "vector<i32,4>");
+    push[[]u8](&tys, "vector<i32,4>");
+    push[[]u8](&tys, "i32");
+    push[[]u8](&tys, "vector<bool,4>");
+    push[[]u8](&tys, "vector<i32,4>");
+    push[[]u8](&tys, "vector<i32,4>");
+    // result arity: 1 0 1 1 1 1 1 1
+    let nres: ArrayList[i32] = make[i32](8);
+    push[i32](&nres, 1); push[i32](&nres, 0); push[i32](&nres, 1); push[i32](&nres, 1);
+    push[i32](&nres, 1); push[i32](&nres, 1);
+    // operand arity: 2 2 1 2 2 2 2 2
+    let nops: ArrayList[i32] = make[i32](8);
+    push[i32](&nops, 2); push[i32](&nops, 2); push[i32](&nops, 1); push[i32](&nops, 2);
+    push[i32](&nops, 2); push[i32](&nops, 2);
+    // the one deliberately bad attribute per row ("" = none)
+    let keys: ArrayList[[]u8] = make[[]u8](8);
+    let vals: ArrayList[[]u8] = make[[]u8](8);
+    push[[]u8](&keys, ""); push[[]u8](&vals, "");
+    push[[]u8](&keys, "elem"); push[[]u8](&vals, "i32");
+    push[[]u8](&keys, "elem"); push[[]u8](&vals, "i32");
+    push[[]u8](&keys, "elem"); push[[]u8](&vals, "i32");
+    push[[]u8](&keys, "elem"); push[[]u8](&vals, "i32");
+    push[[]u8](&keys, "mask"); push[[]u8](&vals, "0,8,1,9");
+    let want: ArrayList[i32] = make[i32](8);
+    push[i32](&want, 1); push[i32](&want, 2); push[i32](&want, 3); push[i32](&want, 4);
+    push[i32](&want, 6); push[i32](&want, 11);
+
+    let row: i32 = 0;
+    while (row < names.len) {
+        let o: ZOp = bare_op(names.data[row], tys.data[row], nres.data[row], nops.data[row]);
+        if (nres.data[row] == 1) {
+            push[ZVal](&o.results, zvb_value("%r", tys.data[row], zir_unknown_origin()));
+        }
+        let k: i32 = 0;
+        while (k < nops.data[row]) {
+            push[ZVal](&o.operands, zvb_value("%a", "vector<i32,4>", zir_unknown_origin()));
+            k = k + 1;
+        }
+        // The lanes the op claims must agree with a 4-lane operand so that only
+        // the ONE bad attribute in this row can be the reason it is rejected.
+        push[ZAttr](&o.attrs, ZAttr{ .key = "lanes", .val = "4" });
+        if (keys.data[row].len > 0) {
+            push[ZAttr](&o.attrs, ZAttr{ .key = keys.data[row], .val = vals.data[row] });
+        }
+        // Every op that checks an element type needs one, or the element-type
+        // rule would fire first and the row would test the wrong thing.
+        if (!@strEq(names.data[row], "vector.nonexistent") &&
+            !@strEq(names.data[row], "vector.insert") &&
+            !@strEq(names.data[row], "vector.shuffle") &&
+            !@strEq(names.data[row], "vector.icmp")) {
+            push[ZAttr](&o.attrs, ZAttr{ .key = "elem", .val = "i32" });
+        }
+        ck(vc, zvec_verify_op(o) == want.data[row], "table fault row is exact");
+        row = row + 1;
+    }
+
+    // Fault 7: an insert whose lane index is one past the end.  The second
+    // operand must be the SCALAR an insert takes, or the shape rule fires first
+    // and the row would not be testing the lane index.
+    let o7: ZOp = bare_op("vector.insert", "vector<i32,4>", 1, 2);
+    push[ZVal](&o7.results, zvb_value("%r", "vector<i32,4>", zir_unknown_origin()));
+    push[ZVal](&o7.operands, zvb_value("%a", "vector<i32,4>", zir_unknown_origin()));
+    push[ZVal](&o7.operands, zvb_value("%s", "i32", zir_unknown_origin()));
+    push[ZAttr](&o7.attrs, ZAttr{ .key = "index", .val = "4" });
+    ck(vc, zvec_verify_op(o7) == ZVERR_LANE_INDEX(), "fault 7: lane index");
+    // ...and the same op with an in-range index must verify.
+    let o7b: ZOp = bare_op("vector.insert", "vector<i32,4>", 1, 2);
+    push[ZVal](&o7b.results, zvb_value("%r", "vector<i32,4>", zir_unknown_origin()));
+    push[ZVal](&o7b.operands, zvb_value("%a", "vector<i32,4>", zir_unknown_origin()));
+    push[ZVal](&o7b.operands, zvb_value("%s", "i32", zir_unknown_origin()));
+    push[ZAttr](&o7b.attrs, ZAttr{ .key = "index", .val = "2" });
+    ck(vc, zvec_verify_op(o7b) == 0, "fault 7 positive control verifies");
+
+    // Fault 8: an unknown predicate.  `elem` and `lanes` must both be present or
+    // the element-type rule fires first and the row tests the wrong thing.
+    let o8: ZOp = bare_op("vector.icmp", "vector<i1,4>", 1, 2);
+    push[ZVal](&o8.results, zvb_value("%r", "vector<i1,4>", zir_unknown_origin()));
+    push[ZVal](&o8.operands, zvb_value("%a", "vector<i32,4>", zir_unknown_origin()));
+    push[ZVal](&o8.operands, zvb_value("%b", "vector<i32,4>", zir_unknown_origin()));
+    push[ZAttr](&o8.attrs, ZAttr{ .key = "predicate", .val = "approximately" });
+    push[ZAttr](&o8.attrs, ZAttr{ .key = "elem", .val = "i32" });
+    push[ZAttr](&o8.attrs, ZAttr{ .key = "lanes", .val = "4" });
+    ck(vc, zvec_verify_op(o8) == ZVERR_PREDICATE(), "fault 8: predicate");
+    // ...and a real predicate must verify.
+    let o8b: ZOp = bare_op("vector.icmp", "vector<i1,4>", 1, 2);
+    push[ZVal](&o8b.results, zvb_value("%r", "vector<i1,4>", zir_unknown_origin()));
+    push[ZVal](&o8b.operands, zvb_value("%a", "vector<i32,4>", zir_unknown_origin()));
+    push[ZVal](&o8b.operands, zvb_value("%b", "vector<i32,4>", zir_unknown_origin()));
+    push[ZAttr](&o8b.attrs, ZAttr{ .key = "predicate", .val = "slt" });
+    push[ZAttr](&o8b.attrs, ZAttr{ .key = "elem", .val = "i32" });
+    push[ZAttr](&o8b.attrs, ZAttr{ .key = "lanes", .val = "4" });
+    ck(vc, zvec_verify_op(o8b) == 0, "fault 8 positive control verifies");
+
+    // Fault 5: the second operand has 8 lanes against a 4-lane result.
+    let o5: ZOp = bare_op("vector.add", "vector<i32,4>", 1, 2);
+    push[ZVal](&o5.results, zvb_value("%r", "vector<i32,4>", zir_unknown_origin()));
+    push[ZVal](&o5.operands, zvb_value("%a", "vector<i32,4>", zir_unknown_origin()));
+    push[ZVal](&o5.operands, zvb_value("%b", "vector<i32,8>", zir_unknown_origin()));
+    push[ZAttr](&o5.attrs, ZAttr{ .key = "elem", .val = "i32" });
+    push[ZAttr](&o5.attrs, ZAttr{ .key = "lanes", .val = "4" });
+    ck(vc, zvec_verify_op(o5) == ZVERR_SHAPE(), "fault 5: shape mismatch");
+
+    // Fault 9: a select whose mask has 8 lanes against 4-lane values.
+    let o9: ZOp = bare_op("vector.select", "vector<i32,4>", 1, 3);
+    push[ZVal](&o9.results, zvb_value("%r", "vector<i32,4>", zir_unknown_origin()));
+    push[ZVal](&o9.operands, zvb_value("%m", "vector<i1,8>", zir_unknown_origin()));
+    push[ZVal](&o9.operands, zvb_value("%a", "vector<i32,4>", zir_unknown_origin()));
+    push[ZVal](&o9.operands, zvb_value("%b", "vector<i32,4>", zir_unknown_origin()));
+    ck(vc, zvec_verify_op(o9) == ZVERR_SELECT_MASK(), "fault 9: select mask");
+
+    // Fault 10: a pure op carrying a memory effect.
+    let o10: ZOp = bare_op("vector.add", "vector<i32,4>", 1, 2);
+    push[ZVal](&o10.results, zvb_value("%r", "vector<i32,4>", zir_unknown_origin()));
+    push[ZVal](&o10.operands, zvb_value("%a", "vector<i32,4>", zir_unknown_origin()));
+    push[ZVal](&o10.operands, zvb_value("%b", "vector<i32,4>", zir_unknown_origin()));
+    push[ZAttr](&o10.attrs, ZAttr{ .key = "elem", .val = "i32" });
+    push[ZAttr](&o10.attrs, ZAttr{ .key = "lanes", .val = "4" });
+    o10.writes = "somewhere";
+    ck(vc, zvec_verify_op(o10) == ZVERR_PURITY(), "fault 10: purity");
+
+    // Additive: the verifier must never reject non-vector IR, or adding it to
+    // the def-before-use sweep would reject previously-valid modules.
+    let sc: ZOp = ZOp{ .name = "scf.while", .results = make[ZVal](1),
+        .operands = make[ZVal](2), .attrs = make[ZAttr](1),
+        .regions = make[ZRegion](1), .effects = 0, .reads = "none",
+        .writes = "none", .origin = zir_unknown_origin() };
+    ck(vc, zvec_verify_op(sc) == 0, "a non-vector op verifies (additive)");
+    ck(vc, zvec_error_text(0).len > 0, "fault 0 has text");
+    ck(vc, zvec_error_text(ZVERR_SHUFFLE_MASK()).len > 0, "fault 11 has text");
+}
+
+// ── vector-aware dead code elimination ──────────────────────────────────────
+// The property that matters is not "N ops disappear" but WHICH ops survive: a
+// dead PURE op must go, and a dead op that reads memory must stay, or the DCE
+// would delete a load whose only purpose was the memory access.
+fn test_dce(vc: *VC) void {
+    let b: ZV = vec_fresh();
+    let blk: ZBlock = zvec_block();
+    let s: ZVal = zvb_value("%s", "i32", zir_unknown_origin());
+    let m32: ZVal = zvb_value("%m", "memref<i32>", zir_unknown_origin());
+    zvec_splat(&b, &blk, "i32", 4, s);                      // 0 dead + pure -> removed
+    let live: ZVal = zvec_splat(&b, &blk, "i32", 4, s);    // 1 feeds the add -> kept
+    let ld: ZVal = zvec_broadcast(&b, &blk, "i32", 4, m32); // 2 feeds the add -> kept
+    zvec_broadcast(&b, &blk, "i32", 4, m32);                // 3 dead, reads memory -> kept
+    let sum: ZVal = zvec_binop(&b, &blk, zvec_op_add(), live, ld); // 4 stored -> kept
+    // A non-vector consumer.  Without it the whole pure chain would be dead and
+    // the DCE would (correctly) delete four ops, which tests nothing about
+    // keeping a LIVE op.  The store is what a vectorizer actually produces.
+    let st: ZOp = bare_op("memref.store", "", 0, 2);
+    push[ZVal](&st.operands, sum);
+    push[ZVal](&st.operands, zvb_value("%acc", "memref<i32>", zir_unknown_origin()));
+    push[ZOp](&blk.ops, st);
+    ck(vc, blk.ops.len == 6, "the DCE fixture has six ops");
+
+    let d1: ZBlock = zvec_block_dce(blk);
+    ck(vc, d1.ops.len == 5, "DCE removes exactly the one dead pure op");
+    ck(vc, @strEq(d1.ops.data[0].name, zvec_op_splat()), "the live splat survives");
+    ck(vc, @strEq(d1.ops.data[1].name, zvec_op_broadcast()), "the live broadcast survives");
+    ck(vc, @strEq(d1.ops.data[2].name, zvec_op_broadcast()),
+        "a dead broadcast that reads memory is never removed");
+    ck(vc, @strEq(d1.ops.data[3].name, zvec_op_add()), "the live add survives");
+    ck(vc, @strEq(d1.ops.data[4].name, "memref.store"), "the non-vector consumer survives");
+
+    // With no consumer at all, the ENTIRE pure chain is dead and must all go.
+    // This is the case a single-pass DCE gets wrong: removing the add makes the
+    // splat dead in the same round, so the use set has to be recomputed.
+    let b2: ZV = vec_fresh();
+    let chain: ZBlock = zvec_block();
+    let t: ZVal = zvb_value("%t", "i32", zir_unknown_origin());
+    let m2: ZVal = zvb_value("%m", "memref<i32>", zir_unknown_origin());
+    let a2: ZVal = zvec_splat(&b2, &chain, "i32", 4, t);
+    let c2: ZVal = zvec_broadcast(&b2, &chain, "i32", 4, m2);
+    zvec_binop(&b2, &chain, zvec_op_add(), a2, c2);
+    zvec_broadcast(&b2, &chain, "i32", 4, m2);
+    let d2: ZBlock = zvec_block_dce(chain);
+    ck(vc, chain.ops.len == 4, "the chain fixture has four ops");
+    ck(vc, d2.ops.len == 2,
+        "DCE cascades to a fixpoint: both dead pure ops go in one call");
+    ck(vc, @strEq(d2.ops.data[0].name, zvec_op_broadcast()) &&
+        @strEq(d2.ops.data[1].name, zvec_op_broadcast()),
+        "only the memory-reading ops survive the cascade");
+
+    let d3: ZBlock = zvec_block_dce(d1);
+    ck(vc, d3.ops.len == d1.ops.len, "DCE is idempotent");
+    ck(vc, zvec_block_dce(d2).ops.len == d2.ops.len,
+        "a second pass over the cascade changes nothing");
+}
+
+// ── the printer ─────────────────────────────────────────────────────────────
+fn test_printer(vc: *VC) void {
+    let b: ZV = vec_fresh();
+    let blk: ZBlock = zvec_block();
+    let s: ZVal = zvb_value("%s", "i32", zir_unknown_origin());
+    let m32: ZVal = zvb_value("%m", "memref<i32>", zir_unknown_origin());
+    let a: ZVal = zvec_splat(&b, &blk, "i32", 4, s);
+    let c: ZVal = zvec_broadcast(&b, &blk, "i32", 4, m32);
+    zvec_binop(&b, &blk, zvec_op_add(), a, c);
+    let out: ArrayList[u8] = make[u8](256);
+    let i: i32 = 0;
+    while (i < blk.ops.len) {
+        ck(vc, zvec_print_op_mlir(&out, blk.ops.data[i], 2) == 1,
+            "the printer claims each vector op");
+        i = i + 1;
+    }
+    let text: []u8 = out.data[0..out.len];
+    ck(vc, has(text, "vector.splat") == 1, "the printer emits vector.splat");
+    ck(vc, has(text, "vector.broadcast") == 1, "the printer emits vector.broadcast");
+    ck(vc, has(text, "vector.add") == 1, "the printer emits vector.add");
+    ck(vc, has(text, "vector<i32,4>") == 1, "the printer keeps the lane count");
+    let sc: ZOp = ZOp{ .name = "arith.addi", .results = make[ZVal](1),
+        .operands = make[ZVal](2), .attrs = make[ZAttr](1),
+        .regions = make[ZRegion](1), .effects = 0, .reads = "none",
+        .writes = "none", .origin = zir_unknown_origin() };
+    ck(vc, zvec_print_op_mlir(&out, sc, 2) == 0,
+        "the printer declines a non-vector op so zir.zag can print it");
+}
+
+
+fn test_stats(vc: *VC) void {
+    let b: ZV = vec_fresh();
+    let blk: ZBlock = zvec_block();
+    let s: ZVal = zvb_value("%s", "i32", zir_unknown_origin());
+    let p: ZVal = zvb_value("%p", "*i32", zir_unknown_origin());
+    let a: ZVal = zvec_splat(&b, &blk, "i32", 4, s);
+    let c: ZVal = zvec_broadcast(&b, &blk, "i32", 4, p);
+    zvec_binop(&b, &blk, zvec_op_add(), a, c);
+    zvec_splat(&b, &blk, "i64", 16, s);
+    let st: ZvecStats = zvec_module_stats(module_of(blk));
+    ck(vc, st.ops == blk.ops.len, "stats count every vector op");
+    ck(vc, st.max_lanes == 16, "stats record the widest lane count");
+    ck(vc, st.broadcast == 1, "stats count broadcasts");
+    ck(vc, st.elementwise == 1, "stats count elementwise ops");
+    ck(vc, st.splat == 2, "stats count splats");
+    ck(vc, has(zvec_stats_text(st), "vector-ops=") == 1, "the stats line is labelled");
+}
+
+fn main() i32 {
+    let vc: VC = VC{ .checks = 0, .failures = 0 };
+    test_contract(&vc);
+    test_verifier(&vc);
+    test_dce(&vc);
+    test_printer(&vc);
+    test_stats(&vc);
+    if (vc.failures == 0) {
+        _zag_print("vector IR: pass=");
+        _zag_println(_zag_i64_to_str(vc.checks as i64));
+        return 0;
+    }
+    _zag_print("vector IR: checks=");
+    _zag_print(_zag_i64_to_str(vc.checks as i64));
+    _zag_print(" FAILURES=");
+    _zag_println(_zag_i64_to_str(vc.failures as i64));
+    return 1;
+}

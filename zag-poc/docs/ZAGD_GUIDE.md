@@ -114,11 +114,11 @@ optimizer-generation implementation. Its standalone test can persist immutable,
 flat, content-addressed manifests with no payload, current/last-known-good
 pointers, a three-success canary counter, and three-crash quarantine plus
 rollback. Every record is checksum-validated, says
-`executable_authority=false` and `generation_execution=disabled`, and falls back
+`executable_authority=false` and `generation_execution=bounded-finite-sandbox`, and falls back
 to the release-linked foreground identity after missing, stale, mutated,
 truncated, or inconsistent state. The production daemon does not import this
 module or execute its records; status therefore remains
-`optimizer_generation=unimplemented`. Worker synthesis, isolated generation
+`optimizer_generation=bounded-finite-sandbox`. Worker synthesis, isolated generation
 execution, verifier evolution, canary builds, and promotion are still
 unavailable, so the ZagScript capability-matrix row remains `unavailable`.
 
@@ -134,14 +134,19 @@ select a transformed foreground artifact.
 
 Deep finalist execution is separately explicit. Put the reviewed executable
 paths in `.zagd.deep-reference` and `.zagd.deep-finalist` (one relative-to-root
-or absolute path per file), then select deep mode. The daemon runs three bounded
-reference/finalist pairs only for the current valid semantic snapshot and writes
-`.zag-cache/zagd/deep-measurement.record` only when every pair has identical
-stdout, stderr, exit status, terminating signal, and success state. A stop
-request or root/imported-module change between executions prevents persistence.
-The measurement is bound to the whole semantic/module graph and active CPU cache
-key and explicitly has no foreground authority. Removing either control file
-disables execution; adaptive and light modes never execute them.
+or absolute path per file), then select deep mode. The daemon warms both
+executables with three reference/finalist pairs, calibrates host/process noise
+with 30 reference/reference pairs, then records 30 reference/finalist pairs for
+the current valid semantic snapshot. Every relevant pair must have identical
+stdout, stderr, exit status, terminating signal, and success state. The complete
+sample vectors feed the shared family-wise 99% paired-sign selector plus its
+per-workload no-regression bound; an equivalent but statistically inconclusive
+candidate is persisted as `selection_status=no-win`, not guessed into a win. A
+stop request or root/imported-module change between executions prevents
+persistence. The v3 measurement is bound to the whole semantic/module graph and
+active CPU cache key and explicitly has no foreground authority. Removing either
+control file disables execution; light mode never executes them. Adaptive mode
+uses the same bounded path only after its opt-in idle-deep interval.
 
 Regular Zag consumes the service as warnings and suggestions only. Zag Script
 may apply the supported allocator/CPU/device/layout defaults when source and CLI
@@ -209,8 +214,9 @@ Set `notifications=errors_only` in `.zagd.conf` to make routine foreground
 commands quiet without disabling analysis. Unsupported constant-fold/inline
 planner scaffolding never triggers the warning.
 
-The implemented pure-Zag core in `selfhost/zagd.zag` and Linux service in
-`selfhost/zagd_daemon.zag` provide:
+The implemented pure-Zag core in `selfhost/zagd.zag`, Linux service in
+`selfhost/zagd_daemon.zag`, and Darwin adapter in
+`selfhost/zagd_macos_daemon.zag` provide:
 
 - deterministic content identities;
 - canonical snapshot identity composition;
@@ -220,6 +226,8 @@ The implemented pure-Zag core in `selfhost/zagd.zag` and Linux service in
 - fail-closed cache-record acceptance;
 - recursive inotify observation, atomic-save handling, and ignored build/cache
   paths;
+- recursive kqueue observation on Apple Silicon, with exact `.zag`, `.zs`,
+  `zag.mod`, `zag.lock`, and compiler-published external-input fingerprinting;
 - transactional persistent snapshot/advisory records; and
 - stable-source semantic rechecks by the sibling self-hosted `znc` process.
 
@@ -236,6 +244,20 @@ Background checks use `--no-zagd`, so they cannot recursively start a daemon.
 Failed checks mark the snapshot invalid and cannot authorize an executable. The
 semantic artifact index persists stable declaration, public/effect, layout,
 compiler, target, and source identities with conservative invalidation.
+
+On macOS, kqueue is a low-latency hint rather than the change identity. Every
+vnode wake compares the complete project-input fingerprint, so an imported
+module or package manifest change is observed even when the selected root
+module is byte-identical; an ordinary kqueue timeout does not rescan an idle
+project. If the 512-descriptor vnode budget cannot cover the tree, all partial
+descriptors are closed and status reports `watcher=polling-project-inputs`;
+that fallback compares the bounded fingerprint on each polling interval.
+Successful checks publish the same checksum-bound,
+`advisory=true`, `executable_authority=false` semantic manifest used by
+foreground suggestion inspection. Failed checks remove the published record,
+while the watcher retains its last successful input set only to notice a later
+repair. macOS still publishes no optimizer generation or executable payload.
+
 `detail_level=compact` is used for large merged units: it keeps exact
 declaration/call/type/layout/import/module graph data and raw module hashes while
 explicitly marking expression/value/copy and local buffer-lifetime witnesses

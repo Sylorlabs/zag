@@ -9,8 +9,14 @@ case "$znc_bin" in
     /*) ;;
     *) znc_bin="$PWD/${znc_bin#./}" ;;
 esac
+repo_root=$PWD
 tmp_dir=$(mktemp -d /tmp/zag-script-accounting.XXXXXX)
 trap 'rm -rf "$tmp_dir"' EXIT
+mkdir -p "$tmp_dir/compiler"
+ln -s "$znc_bin" "$tmp_dir/compiler/znc"
+ln -s "$repo_root/selfhost" "$tmp_dir/compiler/selfhost"
+ln -s "$repo_root/std" "$tmp_dir/compiler/std"
+znc_bin="$tmp_dir/compiler/znc"
 
 printf '1234567890' >"$tmp_dir/input.txt"
 printf 'script_memory_bytes=1048576\nmode=off\n' >"$tmp_dir/.zagd.conf"

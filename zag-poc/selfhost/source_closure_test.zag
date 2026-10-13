@@ -1,0 +1,234 @@
+@import("source_closure.zag")
+
+fn sct_expect(ok: i32, name: []u8, failures: *i32) void {
+    if (ok == 1) { _zag_print("ok  "); }
+    else { failures.* = failures.* + 1; _zag_print("FAIL "); }
+    _zag_println(name);
+}
+
+fn sct_has(text: []u8, needle: []u8) i32 {
+    let i: i32 = 0;
+    while (i + needle.len <= text.len) {
+        if (@strEq(text[i..i + needle.len], needle)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn sct_unit(root: []u8, cwd: []u8) i32 {
+    let failures: i32 = 0;
+    let sha: []u8 = source_closure_sha256("abc");
+    let empty_sha: []u8 = source_closure_sha256("");
+    sct_expect(@strEq(sha, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad") &&
+        @strEq(empty_sha, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"),
+        "SHA-256 known answers for source and empty resources", &failures);
+    _zag_str_free(sha); _zag_str_free(empty_sha);
+    let raw: []u8 = _zag_read_file(root);
+    if (raw.len < 0) { return 2; }
+    let unit: CompilationUnit = parse_compilation_unit_dir(raw, package_import_dir(root));
+    let before: SourceClosureResult = source_closure_from_unit(root, cwd, unit);
+    sct_expect(before.valid == 1 && sct_has(before.text, "format=zag-source-closure-v1\n") == 1 &&
+        sct_has(before.text, "\tio_helper.zag\n") == 1 && sct_has(before.text, "\tstd:rt\n") == 1,
+        "nested SHA-helper -> IO and std import edges retained", &failures);
+    if (before.valid == 0) { _zag_eprintln(before.error); return 1; }
+
+    // Input list ordering is not graph identity. Aliased diamonds can repeat
+    // exact edges/resources; serialization must deduplicate and sort them.
+    let i: i32 = 0;
+    while (i < unit.modules.len / 2) {
+        let j: i32 = unit.modules.len - i - 1;
+        let swap: ResolvedModule = unit.modules.data[i];
+        unit.modules.data[i] = unit.modules.data[j]; unit.modules.data[j] = swap; i = i + 1;
+    }
+    i = 0;
+    while (i < unit.imports.len / 2) {
+        let j: i32 = unit.imports.len - i - 1;
+        let swap: ResolvedImport = unit.imports.data[i];
+        unit.imports.data[i] = unit.imports.data[j]; unit.imports.data[j] = swap; i = i + 1;
+    }
+    i = 0;
+    while (i < unit.resources.len / 2) {
+        let j: i32 = unit.resources.len - i - 1;
+        let swap: ResolvedResource = unit.resources.data[i];
+        unit.resources.data[i] = unit.resources.data[j]; unit.resources.data[j] = swap; i = i + 1;
+    }
+    let again: SourceClosureResult = source_closure_from_unit(root, cwd, unit);
+    sct_expect(again.valid == 1 && @strEq(before.text, again.text),
+        "serialization independent of module, import, and resource order", &failures);
+    source_closure_release(&again);
+    push[ResolvedImport](&unit.imports, unit.imports.data[0]);
+    push[ResolvedResource](&unit.resources, unit.resources.data[0]);
+    again = source_closure_from_unit(root, cwd, unit);
+    sct_expect(again.valid == 1 && @strEq(before.text, again.text),
+        "duplicate diamond edges and resources serialize once", &failures);
+    source_closure_release(&again);
+
+    let bad_edge: ResolvedImport = ResolvedImport{.importer="<root>",.imported="/missing/snapshot.zag",.specifier="missing.zag"};
+    push[ResolvedImport](&unit.imports, bad_edge);
+    again = source_closure_from_unit(root, cwd, unit);
+    sct_expect(again.valid == 0 && again.text.len == 0,
+        "dangling import snapshot fails closed", &failures);
+    source_closure_release(&again);
+    let _drop_edge: ResolvedImport = pop[ResolvedImport](&unit.imports);
+    push[ResolvedImport](&unit.imports, ResolvedImport{.importer="<root>",.imported=root,.specifier="main.zag"});
+    again = source_closure_from_unit(root, cwd, unit);
+    sct_expect(again.valid == 0 && @strEq(again.error, "source dependency cycle"),
+        "cycle in supplied CompilationUnit fails closed", &failures);
+    source_closure_release(&again);
+    let _drop_cycle: ResolvedImport = pop[ResolvedImport](&unit.imports);
+    push[ResolvedModule](&unit.modules, ResolvedModule{.path=root,.source="different root bytes"});
+    again = source_closure_from_unit(root, cwd, unit);
+    sct_expect(again.valid == 0 && again.text.len == 0,
+        "conflicting same-path source snapshots fail closed", &failures);
+    source_closure_release(&again);
+    let _drop_node: ResolvedModule = pop[ResolvedModule](&unit.modules);
+
+    push[ResolvedResource](&unit.resources, ResolvedResource{.path="asset\tbad\n%name",.data="binary\0data"});
+    again = source_closure_from_unit(root, cwd, unit);
+    sct_expect(again.valid == 1 && sct_has(again.text, "/asset%09bad%0a%25name\tsha256:") == 1 &&
+        sct_has(again.text, "\n%name") == 0,
+        "resource path control bytes cannot inject closure records", &failures);
+    source_closure_release(&again);
+    let _drop_resource: ResolvedResource = pop[ResolvedResource](&unit.resources);
+
+    // Only the temporary runner-owned fixture is changed here. This tests that
+    // from_unit hashes snapshots while a fresh load observes the changed file.
+    let io_path: []u8 = package_import_join(package_import_dir(root), "io_helper.zag");
+    let io: []u8 = _zag_read_file(io_path);
+    let changed: []u8 = _zag_str_concat(io, "\n// raw source change\n");
+    if (_zag_write_file(io_path, changed) != 0) { return 2; }
+    again = source_closure_from_unit(root, cwd, unit);
+    sct_expect(again.valid == 1 && @strEq(before.text, again.text),
+        "source hashes bind parser snapshots, not a later disk read", &failures);
+    source_closure_release(&again);
+    again = source_closure_load(root, cwd);
+    sct_expect(again.valid == 1 && !@strEq(before.text, again.text),
+        "fresh source closure changes after nested IO source edit", &failures);
+    source_closure_release(&again);
+    if (_zag_write_file(io_path, io) != 0) { return 2; }
+    _zag_str_free(changed); package_import_free_read(io); _zag_str_free(io_path);
+
+    let asset_path: []u8 = package_import_join(package_import_dir(root), "payload.bin");
+    let asset: []u8 = _zag_read_file(asset_path);
+    if (_zag_write_file(asset_path, "changed resource") != 0) { return 2; }
+    again = source_closure_from_unit(root, cwd, unit);
+    sct_expect(again.valid == 1 && @strEq(before.text, again.text),
+        "resource hashes bind retained binary snapshots", &failures);
+    source_closure_release(&again);
+    again = source_closure_load(root, cwd);
+    sct_expect(again.valid == 1 && !@strEq(before.text, again.text),
+        "fresh source closure changes after resource edit", &failures);
+    source_closure_release(&again);
+    if (_zag_write_file(asset_path, asset) != 0) { return 2; }
+    package_import_free_read(asset); _zag_str_free(asset_path);
+
+    // A parser-retained manifest and a new manifest read cannot be silently
+    // mixed even when both still declare the same dependency aliases.
+    let mod_path: []u8 = package_import_join(package_import_dir(root), "zag.mod");
+    let manifest: []u8 = _zag_read_file(mod_path);
+    push[ResolvedResource](&unit.resources, ResolvedResource{.path=mod_path,.data=manifest});
+    changed = _zag_str_concat(manifest, "\n# changed manifest snapshot\n");
+    if (_zag_write_file(mod_path, changed) != 0) { return 2; }
+    again = source_closure_from_unit(root, cwd, unit);
+    sct_expect(again.valid == 0 && again.text.len == 0,
+        "changed parser-retained manifest fails closed", &failures);
+    source_closure_release(&again);
+    if (_zag_write_file(mod_path, manifest) != 0) { return 2; }
+    _zag_str_free(changed);
+    source_closure_release(&before);
+    _zag_print("Source closure unit: fail="); _zag_print_i64(failures as i64); _zag_println("");
+    if (failures == 0) { return 0; } return 1;
+}
+
+fn sct_pinned(root: []u8, cwd: []u8, expected: []u8) i32 {
+    let failures: i32 = 0;
+    let raw: []u8 = _zag_read_file(root);
+    if (raw.len < 0) { return 2; }
+    let unit: CompilationUnit = parse_compilation_unit_dir(raw, package_import_dir(root));
+    let inspected: SourceClosureResult = source_closure_from_unit(root, cwd, unit);
+    let checked: SourceClosureResult = source_closure_from_unit_pinned(root, cwd, unit, expected);
+    sct_expect(inspected.valid == 1 && checked.valid == 1 && @strEq(inspected.text, checked.text),
+        "matching compiler pins preserve exact inspection closure bytes", &failures);
+    if (checked.valid != 1) { _zag_eprintln(checked.error); return 1; }
+    let optional: []u8 = package_import_join(package_import_dir(root), "optional/zag.mod");
+    let optional_line: []u8 = _zag_str_concat("pin=", optional);
+    let optional_record: []u8 = _zag_str_concat(optional_line, "\t\n");
+    sct_expect(sct_has(checked.text, optional_record) == 1,
+        "absent optional compiler pin remains recorded in pinned closure", &failures);
+    _zag_str_free(optional_record); _zag_str_free(optional_line); _zag_str_free(optional);
+
+    let invalid: ArrayList[[]u8] = make[[]u8](8);
+    push[[]u8](&invalid, "");
+    push[[]u8](&invalid, "sha256:00");
+    push[[]u8](&invalid, "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+    push[[]u8](&invalid, "sha256:gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg");
+    let upper_prefix: []u8 = _zag_str_concat("SHA256:", expected[7..expected.len]);
+    let trailing: []u8 = _zag_str_concat(expected, "\n");
+    let leading: []u8 = _zag_str_concat(" ", expected);
+    push[[]u8](&invalid, upper_prefix); push[[]u8](&invalid, trailing); push[[]u8](&invalid, leading);
+    let invalid_ok: i32 = 1;
+    let i: i32 = 0;
+    while (i < invalid.len) {
+        let rejected: SourceClosureResult = source_closure_from_unit_pinned(root, cwd, unit, invalid.data[i]);
+        if (rejected.valid != 0 || rejected.text.len != 0 ||
+            !@strEq(rejected.error, "invalid expected compiler pin")) { invalid_ok = 0; }
+        source_closure_release(&rejected); i = i + 1;
+    }
+    sct_expect(invalid_ok, "seven noncanonical expected pins reject with empty output", &failures);
+    free[[]u8](&invalid); _zag_str_free(upper_prefix); _zag_str_free(trailing); _zag_str_free(leading);
+
+    // This nested module is reached only through an ordinary relative import.
+    // Its manifest is not a pkg: parser resource or a declared package edge.
+    // A completed earlier check must not authorize a subsequently captured pin.
+    let nested: []u8 = package_import_join(package_import_dir(root), "nested/zag.mod");
+    let original: []u8 = _zag_read_file(nested);
+    if (original.len < 0) { return 2; }
+    let other: []u8 = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    if (@strEq(expected, other)) { other = "sha256:1111111111111111111111111111111111111111111111111111111111111111"; }
+    let prefix: []u8 = _zag_str_concat("name = \"nested\"\n[toolchain]\ncompiler = \"", other);
+    let mutation: []u8 = _zag_str_concat(prefix, "\"\n");
+    _zag_str_free(prefix);
+    if (_zag_write_file(nested, mutation) != 0) { return 2; }
+    let rejected: SourceClosureResult = source_closure_from_unit_pinned(root, cwd, unit, expected);
+    sct_expect(rejected.valid == 0 && rejected.text.len == 0 &&
+        @strEq(rejected.error, "source closure compiler pin mismatch"),
+        "manifest pin mutation after prior successful check rejects at capture", &failures);
+    source_closure_release(&rejected);
+    let fresh: CompilationUnit = parse_compilation_unit_dir(raw, package_import_dir(root));
+    rejected = source_closure_from_unit_pinned(root, cwd, fresh, expected);
+    sct_expect(rejected.valid == 0 && rejected.text.len == 0 &&
+        @strEq(rejected.error, "source closure compiler pin mismatch"),
+        "wrong nested relative module pin rejects with matching root pin", &failures);
+    source_closure_release(&rejected);
+
+    let after: SourceClosureResult = source_closure_from_unit(root, cwd, unit);
+    let digest: []u8 = source_closure_sha256(mutation);
+    let manifest_prefix: []u8 = _zag_str_concat("manifest=", nested);
+    let hash_prefix: []u8 = _zag_str_concat(manifest_prefix, "\tsha256:");
+    let hash_record: []u8 = _zag_str_concat(hash_prefix, digest);
+    sct_expect(after.valid == 1 && sct_has(after.text, other) == 1 &&
+        sct_has(after.text, hash_record) == 1 && !@strEq(checked.text, after.text),
+        "inspection records mutated pin and SHA-256 from the same captured manifest", &failures);
+    source_closure_release(&after);
+    _zag_str_free(hash_record); _zag_str_free(hash_prefix); _zag_str_free(manifest_prefix); _zag_str_free(digest);
+    if (_zag_write_file(nested, original) != 0) { return 2; }
+    after = source_closure_from_unit_pinned(root, cwd, unit, expected);
+    sct_expect(after.valid == 1 && @strEq(checked.text, after.text),
+        "restored matching pin reproduces original checked closure", &failures);
+    source_closure_release(&after); source_closure_release(&checked); source_closure_release(&inspected);
+    _zag_str_free(mutation); package_import_free_read(original); _zag_str_free(nested);
+    _zag_print("Source closure pinned unit: fail="); _zag_print_i64(failures as i64); _zag_println("");
+    if (failures == 0) { return 0; } return 1;
+}
+
+fn main() i32 {
+    if (_zag_argc() == 5 && @strEq(_zag_arg(1), "--pinned-unit")) {
+        return sct_pinned(_zag_arg(2), _zag_arg(3), _zag_arg(4));
+    }
+    if (_zag_argc() == 4 && @strEq(_zag_arg(1), "--unit")) { return sct_unit(_zag_arg(2), _zag_arg(3)); }
+    if (_zag_argc() != 5 || !@strEq(_zag_arg(1), "--emit")) { return 2; }
+    let result: SourceClosureResult = source_closure_load(_zag_arg(2), _zag_arg(3));
+    if (result.valid != 1) { _zag_eprintln(result.error); source_closure_release(&result); return 1; }
+    let rc: i32 = _zag_write_file(_zag_arg(4), result.text);
+    source_closure_release(&result); return rc;
+}

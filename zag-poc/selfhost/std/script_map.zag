@@ -1,0 +1,245 @@
+// Typed string-key maps. Keys are copied; values use ordinary T assignment
+// (referenced value storage is not deep-copied). All buffers, copied keys,
+// alignment padding and allocator-policy overhead belong to ScriptContext.
+// Old tables survive growth until context shutdown and remain budget-charged.
+// Treat the descriptor and borrowed keys as read-only except through this API.
+
+enum ScriptMapError {
+    none,
+    invalid_state,
+    invalid_key,
+    capacity_limit,
+    allocation_failed,
+}
+
+struct ScriptMapEntry[T] {
+    key: []u8,
+    value: T,
+}
+
+struct ScriptMap[T] {
+    data: *ScriptMapEntry[T],
+    slots: *i64,
+    len: i32,
+    cap: i32,
+    context: *opaque,
+    error: ScriptMapError,
+}
+
+// found distinguishes a missing key/end of iteration from a present zero,
+// false, or empty value. On absence/error, value is null and key is empty.
+// value and key are borrowed; reacquire after mutation (growth moves values).
+struct ScriptMapLookup[T] {
+    key: []u8,
+    value: *T,
+    found: bool,
+    error: ScriptMapError,
+}
+
+// Overflow-free byte hash. Equality always checks the complete byte slice.
+fn script_map_hash(key: []u8) i64 {
+    let hash: i64 = 0;
+    let i: i32 = 0;
+    while (i < key.len) {
+        hash = (hash * 31 + key[i] as i64) & 2147483647;
+        i = i + 1;
+    }
+    return hash;
+}
+
+// One table allocation contains aligned entries followed by 2*cap i64 slots.
+// Seven charged padding bytes allow alignment even after an odd-sized arena
+// allocation. Zag's current ordinary value layouts require at most 8 bytes.
+fn script_map_storage_bytes[T](capacity: i32) i64 {
+    let size: i64 = @sizeOf[ScriptMapEntry[T]]() as i64;
+    if (capacity < 4 || capacity > 1073741823 || size <= 0 ||
+        (capacity as i64) > (2147483647 - 7) / (size + 16)) { return 0; }
+    return (capacity as i64) * (size + 16) + 7;
+}
+
+fn script_map_new[T](context: *opaque, capacity: i32) ScriptMap[T] {
+    unsafe {
+        let result: ScriptMap[T] = ScriptMap[T]{ .data = null as *ScriptMapEntry[T],
+            .slots = null as *i64, .len = 0, .cap = 0, .context = context,
+            .error = ScriptMapError.none };
+        if (context == null as *opaque) { result.error = ScriptMapError.invalid_state; return result; }
+        if (capacity < 0) { result.error = ScriptMapError.capacity_limit; return result; }
+        let cap: i32 = capacity;
+        if (cap < 4) { cap = 4; }
+        let bytes: i64 = script_map_storage_bytes[T](cap);
+        if (bytes == 0) { result.error = ScriptMapError.capacity_limit; return result; }
+        let raw: *i8 = _zag_script_alloc(context, bytes);
+        if (raw == null as *i8) { result.error = ScriptMapError.allocation_failed; return result; }
+        let address: i64 = ((raw as i64) + 7) & (0 - 8);
+        result.data = address as *ScriptMapEntry[T];
+        result.slots = (address + (cap as i64) * (@sizeOf[ScriptMapEntry[T]]() as i64)) as *i64;
+        result.cap = cap;
+        let i: i32 = 0;
+        while (i < cap * 2) { result.slots[i] = 0; i = i + 1; }
+        return result;
+    }
+}
+
+fn script_map_valid[T](map: ScriptMap[T]) bool {
+    unsafe {
+        return map.error == ScriptMapError.none && map.context != null as *opaque &&
+            script_map_storage_bytes[T](map.cap) != 0 && map.len >= 0 && map.len <= map.cap &&
+            map.data != null as *ScriptMapEntry[T] && map.slots != null as *i64;
+    }
+}
+
+// Internal bounded linear probe: slot containing key, first empty slot, or -1
+// for an invalid descriptor. Slots encode insertion index + 1 (zero is empty).
+fn script_map_slot[T](map: ScriptMap[T], key: []u8) i32 {
+    unsafe {
+        let count: i32 = map.cap * 2;
+        let slot: i32 = (script_map_hash(key) % (count as i64)) as i32;
+        let probes: i32 = 0;
+        while (probes < count) {
+            let encoded: i64 = map.slots[slot];
+            if (encoded == 0) { return slot; }
+            if (encoded < 0 || encoded > (map.len as i64)) { return -1; }
+            let entry: i32 = encoded as i32;
+            if (@strEq(map.data[entry - 1].key, key)) { return slot; }
+            slot = slot + 1;
+            if (slot == count) { slot = 0; }
+            probes = probes + 1;
+        }
+        return -1;
+    }
+}
+
+// Insert or replace. Failure leaves contents, capacity and iteration order
+// unchanged; it is returned explicitly and does not poison an existing map.
+// Replacement allocates nothing and retains the original copied key.
+fn script_map_put[T](map: *ScriptMap[T], key: []u8, value: T) ScriptMapError {
+    unsafe {
+        if (!script_map_valid[T](map.*)) { return ScriptMapError.invalid_state; }
+        if (key.len < 0 || (key.len > 0 && _zag_slice_ptr(key) == null as *u8)) {
+            return ScriptMapError.invalid_key;
+        }
+        let slot: i32 = script_map_slot[T](map.*, key);
+        if (slot < 0) { return ScriptMapError.invalid_state; }
+        let entry: i32 = map.*.slots[slot] as i32;
+        if (entry != 0) { map.*.data[entry - 1].value = value; return ScriptMapError.none; }
+        let next: ScriptMap[T] = map.*;
+        let table_bytes: i64 = 0;
+        if (map.*.len == map.*.cap) {
+            if (map.*.cap > 536870911) { return ScriptMapError.capacity_limit; }
+            next.cap = map.*.cap * 2;
+            table_bytes = script_map_storage_bytes[T](next.cap);
+            if (table_bytes == 0) { return ScriptMapError.capacity_limit; }
+        }
+        let bytes: i64 = table_bytes + (key.len as i64);
+        if (bytes > 2147483647) { return ScriptMapError.capacity_limit; }
+        // Combine growth and new key into one request, so allocation rejection
+        // cannot consume budget for half an insertion. Existing keys are reused.
+        let raw: *i8 = _zag_script_alloc(map.*.context, bytes);
+        if (raw == null as *i8) { return ScriptMapError.allocation_failed; }
+        let key_data: *u8 = ((raw as i64) + table_bytes) as *u8;
+        let i: i32 = 0;
+        while (i < key.len) { key_data[i] = key[i]; i = i + 1; }
+        if (table_bytes != 0) {
+            let address: i64 = ((raw as i64) + 7) & (0 - 8);
+            next.data = address as *ScriptMapEntry[T];
+            next.slots = (address + (next.cap as i64) * (@sizeOf[ScriptMapEntry[T]]() as i64)) as *i64;
+            i = 0;
+            while (i < next.cap * 2) { next.slots[i] = 0; i = i + 1; }
+            i = 0;
+            while (i < map.*.len) {
+                next.data[i] = map.*.data[i];
+                let old_slot: i32 = script_map_slot[T](next, next.data[i].key);
+                next.slots[old_slot] = i + 1;
+                i = i + 1;
+            }
+            slot = script_map_slot[T](next, key);
+        }
+        next.data[next.len] = ScriptMapEntry[T]{ .key = key_data[0..key.len], .value = value };
+        next.slots[slot] = next.len + 1;
+        next.len = next.len + 1;
+        map.* = next;
+        return ScriptMapError.none;
+    }
+}
+
+fn script_map_absent[T](error: ScriptMapError) ScriptMapLookup[T] {
+    unsafe {
+        return ScriptMapLookup[T]{ .key = (null as *u8)[0..0], .value = null as *T,
+            .found = false, .error = error };
+    }
+}
+
+fn script_map_get[T](map: ScriptMap[T], key: []u8) ScriptMapLookup[T] {
+    unsafe {
+        if (!script_map_valid[T](map)) { return script_map_absent[T](ScriptMapError.invalid_state); }
+        if (key.len < 0 || (key.len > 0 && _zag_slice_ptr(key) == null as *u8)) {
+            return script_map_absent[T](ScriptMapError.invalid_key);
+        }
+        let slot: i32 = script_map_slot[T](map, key);
+        if (slot < 0) { return script_map_absent[T](ScriptMapError.invalid_state); }
+        let entry: i32 = map.slots[slot] as i32;
+        if (entry == 0) { return script_map_absent[T](ScriptMapError.none); }
+        return script_map_at[T](map, entry - 1);
+    }
+}
+
+// Deterministic insertion-order iteration: visit indices 0 .. len-1.
+// Negative/past-end indices return found=false without dereferencing storage.
+// Replacements retain position; successful new keys append at the end.
+fn script_map_at[T](map: ScriptMap[T], index: i32) ScriptMapLookup[T] {
+    unsafe {
+        if (!script_map_valid[T](map)) { return script_map_absent[T](ScriptMapError.invalid_state); }
+        if (index < 0 || index >= map.len) { return script_map_absent[T](ScriptMapError.none); }
+        return ScriptMapLookup[T]{ .key = map.data[index].key, .value = &map.data[index].value,
+            .found = true, .error = ScriptMapError.none };
+    }
+}
+
+fn script_map_len[T](map: ScriptMap[T]) i32 { return map.len; }
+
+// Compiler-facing expression helpers. Nested insert calls evaluate the prior
+// map, key and value exactly once; each error terminates before publication of
+// a partial literal. Diagnostics themselves do not allocate Script storage.
+fn script_map_abort(error: ScriptMapError) void {
+    if (error == ScriptMapError.allocation_failed) {
+        _zag_eprintln("Zag Script map allocation failed: memory budget exhausted");
+    } else if (error == ScriptMapError.capacity_limit) {
+        _zag_eprintln("Zag Script map capacity limit exceeded");
+    } else if (error == ScriptMapError.invalid_key) {
+        _zag_eprintln("Zag Script map key is invalid");
+    } else {
+        _zag_eprintln("Zag Script map state is invalid");
+    }
+    _zag_exit(1);
+}
+
+fn script_map_new_checked[T](context: *opaque, capacity: i32) ScriptMap[T] {
+    let map: ScriptMap[T] = script_map_new[T](context, capacity);
+    if (map.error != ScriptMapError.none) { script_map_abort(map.error); }
+    return map;
+}
+
+fn script_map_insert_checked[T](map: ScriptMap[T], key: []u8, value: T) ScriptMap[T] {
+    let error: ScriptMapError = script_map_put[T](&map, key, value);
+    if (error != ScriptMapError.none) { script_map_abort(error); }
+    return map;
+}
+
+// Compiler-facing named-map bracket assignment. Update the original descriptor
+// so inserting a new key (including growth) remains visible to the caller.
+fn script_map_set_checked[T](map: *ScriptMap[T], key: []u8, value: T) void {
+    let error: ScriptMapError = script_map_put[T](map, key, value);
+    if (error != ScriptMapError.none) { script_map_abort(error); }
+}
+
+fn script_map_index_checked[T](map: ScriptMap[T], key: []u8) T {
+    unsafe {
+        let result: ScriptMapLookup[T] = script_map_get[T](map, key);
+        if (result.error != ScriptMapError.none) { script_map_abort(result.error); }
+        if (!result.found) {
+            _zag_eprintln("Zag Script map key was not found");
+            _zag_exit(1);
+        }
+        return result.value.*;
+    }
+}

@@ -1,13 +1,14 @@
-// std/net_ipv4.zag — bounded Linux x86-64 IPv4 socket foundation.
+// std/net_ipv4.zag — bounded native IPv4 socket foundation.
 //
 // This module is deliberately small and explicit.  It owns socket descriptor
 // state, prevents a second close through the same resource value, applies
 // receive/send timeouts, and bounds every public data loop.  It does not claim
 // IPv6, TLS, HTTP, WebSocket, hostname resolution, or an async scheduler.
 //
-// Addresses and ports are in host byte order at the public boundary.  Syscall
-// failures retain Linux's negative errno value in `code`; library validation
-// failures use the net_status_* values below.
+// Addresses and ports are in host byte order at the public boundary.  Library
+// validation, state, timeout, and framing failures use the stable net_status_*
+// values below. Connection completion normalizes its portable outcomes;
+// otherwise a negative `code` may retain the target kernel's errno value.
 
 @import("rt.zag")
 
@@ -78,6 +79,13 @@ struct NetKernelTimeval {
     microseconds: i64,
 }
 
+// pollfd is exactly eight bytes on the supported native hosts: i32 fd,
+// i16 events, i16 revents. A single word makes that layout independent of
+// aggregate-field padding in the language ABI.
+struct NetKernelPollFd {
+    word: u64,
+}
+
 fn net_status_ok() i64 { return 0; }
 fn net_status_invalid_argument() i64 { return 0 - 7001; }
 fn net_status_invalid_state() i64 { return 0 - 7002; }
@@ -85,6 +93,7 @@ fn net_status_limit() i64 { return 0 - 7003; }
 fn net_status_eof() i64 { return 0 - 7004; }
 fn net_status_truncated() i64 { return 0 - 7005; }
 fn net_status_incomplete() i64 { return 0 - 7006; }
+fn net_status_timeout() i64 { return 0 - 7007; }
 
 fn net_ipv4_any() i64 { return 0; }
 fn net_ipv4_loopback() i64 { return 2130706433; } // 127.0.0.1
@@ -217,6 +226,43 @@ fn net_sys_close(fd: i64) i64 {
     return _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
 }
 
+fn net_sys_set_nonblocking(fd: i64) i64 {
+    return _zag_raw_syscall(72, fd, 4, 2048, 0, 0, 0);
+}
+
+fn net_sys_set_blocking(fd: i64) i64 {
+    return _zag_raw_syscall(72, fd, 4, 0, 0, 0, 0);
+}
+
+fn net_poll_one(fd: i64, events: i32, timeout_ms: i32,
+                revents: *i32) i64 {
+    let descriptor_bits: u64 = fd as u64 & 4294967295;
+    let event_bits: u64 = (events as u64 & 65535) << 32;
+    let pollfd: NetKernelPollFd = NetKernelPollFd{
+        .word = descriptor_bits | event_bits,
+    };
+    let pointer: *NetKernelPollFd = &pollfd;
+    let rc: i64 = _zag_raw_syscall(
+        7, pointer as i64, 1, timeout_ms, 0, 0, 0
+    );
+    revents.* = ((pollfd.word >> 48) & 65535) as i32;
+    return rc;
+}
+
+fn net_get_socket_error(fd: i64, output: *i64) i64 {
+    let error_value: i64 = 0;
+    let error_length: i64 = 4;
+    let error_pointer: *i64 = &error_value;
+    let length_pointer: *i64 = &error_length;
+    let rc: i64 = _zag_raw_syscall(
+        55, fd, 1, 4, error_pointer as i64, length_pointer as i64, 0
+    );
+    if (rc < 0) { return rc; }
+    if (error_length < 4) { return net_status_incomplete(); }
+    output.* = error_value & 4294967295;
+    return net_status_ok();
+}
+
 fn net_set_timeouts(fd: i64, timeout_ms: i32) i64 {
     let timeout: NetKernelTimeval = NetKernelTimeval{
         .seconds = (timeout_ms / 1000) as i64,
@@ -316,14 +362,62 @@ fn net_tcp_connect_ipv4(endpoint: NetIpv4Endpoint,
         let _closed: i64 = net_sys_close(fd);
         return NetTcpStreamResult{ .ok = 0, .code = timeout_rc, .value = invalid };
     }
+    // A blocking Darwin connect is not bounded by SO_SNDTIMEO. Use the same
+    // nonblocking-connect + poll + SO_ERROR sequence on every native host so
+    // timeout_ms is an observable API bound rather than a platform accident.
+    let nonblocking_rc: i64 = net_sys_set_nonblocking(fd);
+    if (nonblocking_rc < 0) {
+        let _closed: i64 = net_sys_close(fd);
+        return NetTcpStreamResult{
+            .ok = 0, .code = nonblocking_rc, .value = invalid,
+        };
+    }
     let address: NetKernelSockAddr = net_kernel_address(endpoint);
     let address_pointer: *NetKernelSockAddr = &address;
     let connect_rc: i64 = _zag_raw_syscall(
         42, fd, address_pointer as i64, 16, 0, 0, 0
     );
-    if (connect_rc < 0) {
+    // Linux EINPROGRESS is -115. The Darwin adapter normalizes its -36 here.
+    if (connect_rc < 0 && connect_rc != 0 - 115) {
         let _closed: i64 = net_sys_close(fd);
         return NetTcpStreamResult{ .ok = 0, .code = connect_rc, .value = invalid };
+    }
+    if (connect_rc == 0 - 115) {
+        let revents: i32 = 0;
+        let poll_rc: i64 = net_poll_one(fd, 4, timeout_ms, &revents);
+        if (poll_rc < 0) {
+            let _closed: i64 = net_sys_close(fd);
+            return NetTcpStreamResult{ .ok = 0, .code = poll_rc, .value = invalid };
+        }
+        if (poll_rc == 0) {
+            let _closed: i64 = net_sys_close(fd);
+            return NetTcpStreamResult{
+                .ok = 0, .code = net_status_timeout(), .value = invalid,
+            };
+        }
+        if ((revents & 32) != 0 || (revents & 28) == 0) {
+            let _closed: i64 = net_sys_close(fd);
+            return NetTcpStreamResult{
+                .ok = 0, .code = net_status_incomplete(), .value = invalid,
+            };
+        }
+        let socket_error: i64 = 0;
+        let error_rc: i64 = net_get_socket_error(fd, &socket_error);
+        if (error_rc < 0) {
+            let _closed: i64 = net_sys_close(fd);
+            return NetTcpStreamResult{ .ok = 0, .code = error_rc, .value = invalid };
+        }
+        if (socket_error != 0) {
+            let _closed: i64 = net_sys_close(fd);
+            return NetTcpStreamResult{
+                .ok = 0, .code = 0 - socket_error, .value = invalid,
+            };
+        }
+    }
+    let blocking_rc: i64 = net_sys_set_blocking(fd);
+    if (blocking_rc < 0) {
+        let _closed: i64 = net_sys_close(fd);
+        return NetTcpStreamResult{ .ok = 0, .code = blocking_rc, .value = invalid };
     }
     return NetTcpStreamResult{
         .ok = 1, .code = net_status_ok(),
@@ -343,7 +437,25 @@ fn net_tcp_accept(listener: *NetTcpListener, timeout_ms: i32) NetTcpStreamResult
             .ok = 0, .code = net_status_invalid_argument(), .value = invalid,
         };
     }
-    // accept4 with SOCK_CLOEXEC.  The listener timeout bounds this call.
+    // SO_RCVTIMEO does not bound accept on Darwin. poll(2) has an identical
+    // one-pollfd layout on the supported native hosts and honors this call's
+    // timeout argument directly.
+    let revents: i32 = 0;
+    let poll_rc: i64 = net_poll_one(listener.*.fd, 1, timeout_ms, &revents);
+    if (poll_rc < 0) {
+        return NetTcpStreamResult{ .ok = 0, .code = poll_rc, .value = invalid };
+    }
+    if (poll_rc == 0) {
+        return NetTcpStreamResult{
+            .ok = 0, .code = net_status_timeout(), .value = invalid,
+        };
+    }
+    if ((revents & 32) != 0 || (revents & 25) == 0) {
+        return NetTcpStreamResult{
+            .ok = 0, .code = net_status_incomplete(), .value = invalid,
+        };
+    }
+    // accept4 with SOCK_CLOEXEC after the readiness bound above.
     let fd: i64 = _zag_raw_syscall(288, listener.*.fd, 0, 0, 524288, 0, 0);
     if (fd < 0) { return NetTcpStreamResult{ .ok = 0, .code = fd, .value = invalid }; }
     let timeout_rc: i64 = net_set_timeouts(fd, timeout_ms);

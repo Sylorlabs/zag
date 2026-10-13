@@ -8,6 +8,7 @@
 # and requires the final stable content hash to win.
 set -eu
 cd "$(dirname "$0")/.."
+. tests/portable.sh
 
 ZNC=${ZNC:-"$PWD/znc"}
 ZAGD=${ZAGD:-"$PWD/zagd"}
@@ -33,7 +34,7 @@ reject_script() {
     log="$tmp/$name.log"
     printf '%s' "$source" > "$src"
     set +e
-    timeout 8 "$ZNC" script "$src" -o "$out" --no-zagd --no-foreground-cache >"$log" 2>&1
+    zag_run_bounded 8 "$ZNC" script "$src" -o "$out" --no-zagd --no-foreground-cache >"$log" 2>&1
     status=$?
     set -e
     case "$status" in
@@ -55,17 +56,12 @@ reject_script mixed_collection 'script; let xs = [1, "two"]; say(xs)'
 reject_script bad_try 'script; let value = try; say(value)'
 reject_script bad_python_block 'script; if true:\n    say("missing real newline")'
 reject_script generated_name_collision 'script; fn __zag_compiler_script_body_7f3a() i32 { return 0; }'
-# Future concurrency spellings are reserved at the lexer boundary.  Keep them
-# in the malformed-input corpus so an older parser cannot silently accept an
-# ordinary identifier/call and change the meaning of a later language edition.
-reject_script async_surface 'async fn main() i32 { return 0; }'
-reject_script await_surface 'fn main() i32 { return await(1); }'
 
 printf '\377script;\nshow("bad")\n' > "$tmp/invalid_utf8.zag"
 printf 'script;\nshow("bad")\000\n' > "$tmp/nul_byte.zag"
 for name in invalid_utf8 nul_byte; do
     set +e
-    timeout 8 "$ZNC" script "$tmp/$name.zag" -o "$tmp/$name.bin" \
+    zag_run_bounded 8 "$ZNC" script "$tmp/$name.zag" -o "$tmp/$name.bin" \
         --no-zagd --no-foreground-cache >"$tmp/$name.log" 2>&1
     status=$?
     set -e
@@ -130,6 +126,14 @@ while [ "$i" -lt 20 ]; do
 done
 printf 'script;\nsay("final-stable")\n' > "$tmp/project/.app.zag.final"
 mv "$tmp/project/.app.zag.final" "$tmp/project/app.zag"
+
+# Rapid save hints can collapse onto the same final bytes. A later duplicate
+# app.zag hint is then correctly deduplicated, so last_file may still name a
+# different source whose unique change was processed afterward. Give the burst
+# a brief quiescence window, then publish one distinct final root update.
+sleep 0.20
+printf 'script;\nsay("final-stable-authority")\n' > "$tmp/project/.app.zag.authority"
+mv "$tmp/project/.app.zag.authority" "$tmp/project/app.zag"
 
 deadline=$((SECONDS + 15))
 while :; do

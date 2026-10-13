@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-ZNC="${ZNC:-./znc}"
+. ./tests/portable.sh
+ZNC="${ZNC:-$(zag_native_compiler "$PWD")}"
 case "$ZNC" in
     /*) ;;
     *) ZNC="$PWD/${ZNC#./}" ;;

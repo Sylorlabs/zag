@@ -1,0 +1,184 @@
+// Native driver integration. No subprocess performs hashing or builds receipts.
+// This bounded mode accepts strict, unlinked native executables only. Source
+// origins without prior authenticated custody stay synthetic, never "sealed".
+@import("../artifact_provenance.zag")
+@import("../content_addressed_build.zag")
+
+struct NativeBuildEvidence {
+    enabled: i32,
+    valid: i32,
+    inputs: []u8,
+    compiler: []u8,
+    pin: []u8,
+    target: []u8,
+}
+
+fn znc_build_evidence_requested() i32 { return has_flag("--build-receipt"); }
+
+// Paired options are checked before any output or daemon activity. This is an
+// intentionally closed option set until the other artifact writers carry their
+// full link inputs; unsupported modes may not silently omit requested evidence.
+fn znc_build_evidence_preflight() i32 {
+    let requested: i32 = znc_build_evidence_requested();
+    if (requested == 0) {
+        if (has_flag("--compiler-pin") == 1 || has_flag("--content-store") == 1) {
+            _zag_eprintln("znc: --compiler-pin and --content-store require --build-receipt");
+            return 1;
+        }
+        return 0;
+    }
+    if (!@strEq(_zag_arg(1), "build") && znc_source_path_command(_zag_arg(1)) == 0) {
+        _zag_eprintln("znc: build receipts are only valid for native build commands"); return 1;
+    }
+    let pin: []u8 = flag_value("--compiler-pin");
+    if (ev_digest_ok(pin) == 0 || flag_value("--build-receipt").len == 0 ||
+        flag_value("--content-store").len == 0) {
+        _zag_eprintln("znc: --build-receipt requires --compiler-pin <64 lowercase SHA256> and --content-store <existing directory>");
+        return 1;
+    }
+    let i: i32 = 1;
+    while (i < _zag_argc()) {
+        let arg: []u8 = _zag_arg(i);
+        if (@strEq(arg, "--build-receipt") || @strEq(arg, "--compiler-pin") ||
+            @strEq(arg, "--content-store") || @strEq(arg, "-o") || @strEq(arg, "--target")) {
+            if (i + 1 >= _zag_argc() || _zag_arg(i + 1).len == 0) { return 1; }
+            let value: []u8 = _zag_arg(i + 1);
+            if (value[0] == '-') {
+                _zag_eprintln("znc: flag-shaped evidence option value refused; use ./ for such paths"); return 1;
+            }
+            let j: i32 = i + 2;
+            while (j < _zag_argc()) {
+                if (@strEq(_zag_arg(j), arg)) {
+                    _zag_eprintln("znc: duplicate evidence build option"); return 1;
+                }
+                j = j + 1;
+            }
+            i = i + 2;
+        } else if (@strEq(arg, "build") || @strEq(arg, "--no-zagd") ||
+            @strEq(arg, "--no-foreground-cache") || @strEq(arg, "--no-analyze") ||
+            @strEq(arg, "--safety=checked") ||
+            @strEq(arg, "--sanitize=memory") || @strEq(arg, src_arg())) {
+            i = i + 1;
+        } else {
+            _zag_eprintln(_zag_str_concat("znc: unsupported evidence build option: ", arg));
+            return 1;
+        }
+    }
+    let output: []u8 = out_flag();
+    if (output.len == 0) { output = default_out(src_arg()); }
+    let cwd: []u8 = znc_cwd();
+    let artifact_path: []u8 = source_closure_path(cwd, output);
+    let receipt_path: []u8 = source_closure_path(cwd, flag_value("--build-receipt"));
+    let input_path: []u8 = _zag_str_concat(receipt_path, ".inputs");
+    let provenance_path: []u8 = _zag_str_concat(receipt_path, ".provenance");
+    let conflict: i32 = (@strEq(artifact_path, receipt_path) ||
+        @strEq(artifact_path, input_path) || @strEq(artifact_path, provenance_path)) as i32;
+    _zag_str_free(cwd); _zag_str_free(artifact_path); _zag_str_free(receipt_path);
+    _zag_str_free(input_path); _zag_str_free(provenance_path);
+    if (conflict == 1) { _zag_eprintln("znc: artifact and evidence output paths conflict"); return 1; }
+    let target: []u8 = flag_value("--target");
+    if (target.len > 0 && !@strEq(target, "macos-arm64") &&
+        !@strEq(target, "arm64") && !@strEq(target, "x86-64")) {
+        _zag_eprintln("znc: evidence builds support macos-arm64, arm64 and x86-64 only"); return 1;
+    }
+    let image: []u8 = znc_current_compiler_image();
+    let ok: i32 = ev_matches(image, pin);
+    package_import_free_read(image);
+    if (ok == 0) { _zag_eprintln("znc: compiler pin mismatch; evidence build refused"); return 1; }
+    return 0;
+}
+
+fn znc_build_evidence_capture(path: []u8, unit: CompilationUnit,
+    target: []u8) NativeBuildEvidence {
+    let out: NativeBuildEvidence = NativeBuildEvidence{.enabled=znc_build_evidence_requested(),
+        .valid=1,.inputs="",.compiler="",.pin="",.target=target};
+    if (out.enabled == 0) { return out; }
+    out.valid = 0;
+    if (unit.profile == ModuleProfile.script) {
+        _zag_eprintln("znc: evidence builds currently require strict Zag, not generated Script"); return out;
+    }
+    let cwd: []u8 = znc_cwd();
+    let expected: []u8 = _zag_str_concat("sha256:", flag_value("--compiler-pin"));
+    let closure: SourceClosureResult = source_closure_from_unit_pinned(path, cwd, unit, expected);
+    _zag_str_free(expected);
+    _zag_str_free(cwd);
+    if (closure.valid != 1) { _zag_eprintln(closure.error); source_closure_release(&closure); return out; }
+    out.compiler = znc_current_compiler_image();
+    out.pin = flag_value("--compiler-pin");
+    if (ev_matches(out.compiler, out.pin) == 0) {
+        source_closure_release(&closure); _zag_eprintln("znc: compiler identity changed"); return out;
+    }
+    let fields: ArrayList[[]u8] = make[[]u8](16);
+    ev_add(&fields, "zag-native-build-inputs-v1"); ev_add(&fields, target);
+    ev_add(&fields, closure.text);
+    // Retain exact invocation and project planner configuration as evidence,
+    // including options rather than pretending a root source alone is a key.
+    let config_path: []u8 = _zag_str_concat(znc_project_root(dir_of(path)), "/.zagd.conf");
+    let config: []u8 = _zag_read_file(config_path);
+    ev_add(&fields, config_path);
+    if (config.len >= 0) { ev_add(&fields, "present"); ev_add(&fields, config); }
+    else { ev_add(&fields, "absent"); ev_add(&fields, ""); }
+    package_import_free_read(config); _zag_str_free(config_path);
+    let i: i32 = 1;
+    while (i < _zag_argc()) { ev_add(&fields, _zag_arg(i)); i = i + 1; }
+    out.inputs = ev_encode(fields); ev_fields_free(&fields);
+    source_closure_release(&closure);
+    out.valid = (out.inputs.len > 0) as i32;
+    return out;
+}
+
+fn znc_build_evidence_publish(evidence: NativeBuildEvidence, artifact_path: []u8,
+    artifact: []u8) i32 {
+    if (evidence.enabled == 0) { return 0; }
+    if (evidence.valid != 1) { return 1; }
+    if (artifact.len <= 0 || artifact.len > 67108864) {
+        _zag_eprintln("znc: invalid emitted artifact for receipt (64 MiB limit)"); return 1;
+    }
+    // Consume only the final owned image from the artifact writer. O_EXCL
+    // refuses existing inodes, including symlink and hard-link aliases, without
+    // truncating a prior receipt, CAS object or concurrent build's executable.
+    if (znc_write_new_staging_mode(artifact_path, artifact, 493) != 1) {
+        _zag_eprintln("znc: evidence publication failed; artifact output must be new"); return 1;
+    }
+    let inputs_sha: []u8 = ev_hash(evidence.inputs);
+    let inputs: ArrayList[ArtifactInput] = make[ArtifactInput](1);
+    push[ArtifactInput](&inputs, ArtifactInput{.name="compiler-input-snapshot",
+        .digest=inputs_sha,.provenance=inputs_sha,.kind="synthetic"});
+    let custody: ArrayList[ArtifactCustody] = make[ArtifactCustody](1);
+    push[ArtifactCustody](&custody, ArtifactCustody{.from="znc",.to="content-store",
+        .action="native-build"});
+    let provenance: []u8 = artifact_provenance_encode(artifact, "znc", evidence.compiler,
+        "synthetic", inputs, custody);
+    free[ArtifactInput](&inputs); free[ArtifactCustody](&custody); _zag_str_free(inputs_sha);
+    let receipt: []u8 = content_build_receipt_encode(evidence.inputs, evidence.compiler,
+        evidence.target, artifact, provenance, evidence.pin);
+    let rc: i32 = 1;
+    if (provenance.len > 0 && receipt.len > 0) {
+        let digest: []u8 = ev_hash(artifact);
+        let store_path: []u8 = package_import_join(flag_value("--content-store"), digest);
+        let stored: []u8 = _zag_read_file(store_path);
+        let stored_ok: i32 = 0;
+        if (stored.len >= 0) { stored_ok = ev_equal(stored, artifact); }
+        else { stored_ok = znc_write_new_staging(store_path, artifact); }
+        package_import_free_read(stored);
+        let output: []u8 = flag_value("--build-receipt");
+        let input_path: []u8 = _zag_str_concat(output, ".inputs");
+        let provenance_path: []u8 = _zag_str_concat(output, ".provenance");
+        // Receipt is the completion marker, published last. All files are
+        // create-only via Zag's raw open/write/fsync path, never shell tools.
+        if (stored_ok == 1 && znc_write_new_staging(input_path, evidence.inputs) == 1 &&
+            znc_write_new_staging(provenance_path, provenance) == 1 &&
+            znc_write_new_staging(output, receipt) == 1) {
+            let receipt_sha: []u8 = ev_hash(receipt);
+            _zag_println(_zag_str_concat("znc evidence: receipt-sha256=", receipt_sha));
+            _zag_println(_zag_str_concat("znc evidence: artifact-sha256=", digest));
+            _zag_str_free(receipt_sha); rc = 0;
+        }
+        _zag_str_free(input_path); _zag_str_free(provenance_path);
+        _zag_str_free(digest); _zag_str_free(store_path);
+    }
+    _zag_str_free(receipt); _zag_str_free(provenance);
+    _zag_str_free(evidence.inputs); package_import_free_read(evidence.compiler);
+    if (rc != 0) { _zag_eprintln("znc: evidence publication failed; build is not receipted (partial sidecars may remain)"); }
+    return rc;
+}

@@ -87,7 +87,12 @@ pub fn add(a:i64,b:i64)i64 @cabi_export { return a+b; }
 ZAG
 $compiler "$tmp/cabi.zag" --emit-obj -o "$tmp/cabi.o" --no-zagd --no-analyze --no-foreground-cache >"$tmp/cabidump.log" 2>&1
 objdump -d "$tmp/cabi.o" >"$tmp/cabi.asm"
-grep -q 'add .*%rcx,%rax' "$tmp/cabi.asm"
+object_kind=$(file "$tmp/cabi.o")
+case "$object_kind" in
+    *Mach-O*arm64*) grep -Eq 'add[[:space:]]+x0, x0, x1' "$tmp/cabi.asm" ;;
+    *ELF*x86-64*|*ELF*X86-64*) grep -Eq 'add[^[:cntrl:]]*%rcx[^[:cntrl:]]*%rax' "$tmp/cabi.asm" ;;
+    *) echo "unsupported object format in native view fixture: $object_kind" >&2; exit 1 ;;
+esac
 
 "$compiler" expand "$tmp/app.zag" --to explicit \
     --output "$tmp/derived-only.zag" --no-zagd >/dev/null
@@ -375,11 +380,11 @@ test ! -e "$unexpand_link_target"
 # unchanged v1 promoted file still restores through the public command.
 "$compiler" selfhost/derivation_ledger_test.zag -o "$tmp/ledger-helper" \
     --no-zagd --no-analyze --no-foreground-cache >/dev/null
-printf 'fn main() i32 { return 1; }\n' >"$tmp/v1-promoted.zag"
+printf '// policy\nreturn 7;\n' >"$tmp/v1-promoted.zag"
 "$tmp/ledger-helper" --emit-v1-fixture >"$tmp/v1-promoted.zag.zsledger"
 "$compiler" unexpand "$tmp/v1-promoted.zag" \
     --output "$tmp/v1-restored.zs" --no-zagd >/dev/null
-printf 'script;\nreturn 1;\n' | cmp -s - "$tmp/v1-restored.zs"
+printf 'script;\nreturn 7;\n' | cmp -s - "$tmp/v1-restored.zs"
 
 # Appended or truncated ledger data invalidates the complete-record checksum.
 cp "$tmp/promoted.zag.zsledger" "$tmp/ledger.saved"
@@ -389,7 +394,7 @@ if "$compiler" unexpand "$tmp/promoted.zag" --no-zagd \
     echo "unexpand accepted a tampered ledger" >&2
     exit 1
 fi
-grep -q 'invalid portable derivation ledger' "$tmp/tampered-ledger.log"
+grep -q 'sidecar failed bounded validation' "$tmp/tampered-ledger.log"
 mv "$tmp/ledger.saved" "$tmp/promoted.zag.zsledger"
 
 # Sidecars are read through the same hard byte ceiling enforced by the codec.
@@ -400,7 +405,7 @@ if "$compiler" unexpand "$tmp/promoted.zag" --no-zagd \
     echo "unexpand accepted an oversized ledger" >&2
     exit 1
 fi
-grep -q 'invalid portable derivation ledger' "$tmp/oversized-ledger.log"
+grep -Eq 'sidecar is unavailable|sidecar failed bounded validation' "$tmp/oversized-ledger.log"
 mv "$tmp/ledger.saved" "$tmp/promoted.zag.zsledger"
 
 # A localized edit to uniquely preserved body context projects back to compact

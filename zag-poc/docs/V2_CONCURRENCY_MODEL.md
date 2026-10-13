@@ -13,16 +13,20 @@ the suffixed RMW order forms, and
 `@atomicFence(order)`. The fence accepts the same literal order ABI: relaxed is
 a no-op, and every non-relaxed order lowers conservatively to a full hardware
 fence. Compiler-reserved `AtomicI64` storage now exists for a deliberately
-narrow receiver-only native slice; threads and litmus evidence remain release
-blockers. See
+narrow receiver-only native slice; a bounded join-only worker surface now has
+native Linux/x86-64 and Apple-Silicon macOS evidence, while broader threading
+and litmus evidence remain release blockers. See
 `docs/V2_CONCURRENCY_GUIDE.md` for the implemented boundary.
 
-Edition-2027 Linux/x86-64 also has two deliberately narrow futex building
-blocks: `@atomicWait32(ptr: *const/*mut/*host i32, expected: i32) i64` and
-`@atomicWake32(ptr: *const/*mut/*host i32, count: i32) i64`. They issue the
-shared `futex(2)` WAIT/WAKE operations and return the raw kernel result. They
-are unsafe, require a non-null four-byte-aligned host word, and do not supply
-a memory order, retry policy, ownership transfer, or a thread API. In
+Edition-2027 Linux/x86-64 and Apple Silicon macOS also have two deliberately
+narrow raw wait/wake building blocks:
+`@atomicWait32(ptr: *const/*mut/*host i32, expected: i32) i64` and
+`@atomicWake32(ptr: *const/*mut/*host i32, count: i32) i64`. Linux issues
+shared futex(2) WAIT/WAKE operations. macOS implements the same user-facing
+contract through compiler-owned pthread mutex/condition state keyed by the
+waited-on address. They are unsafe, require a non-null four-byte-aligned host
+word, preserve raw mismatch/wake-count results, and do not supply a memory
+order, retry policy, ownership transfer, or a general thread API. In
 particular, a caller must not infer a happens-before edge merely from these
 operations; `AtomicI64` does not yet make that general language-model claim.
 
@@ -89,11 +93,13 @@ reinterpreted while another thread can access it.
 
 ## Threads and blocking
 
-Linux/x86-64 native output now has a bounded unsafe `@threadSpawn(worker)` /
-`@threadJoin(handle)` pair. Spawn accepts a direct captureless `fn() void` or
-`fn(i64) void` worker; the sole scalar argument is copied into the affine
-handle before clone. Join consumes that handle after
-the kernel clears its TID and wakes the futex. This establishes a real kernel
+Linux/x86-64 and Apple Silicon macOS native output now have the same bounded
+unsafe `@threadSpawn(worker)` / `@threadJoin(handle)` pair. Spawn accepts a
+direct captureless `fn() void` or `fn(i64) void` worker; the sole scalar
+argument is copied into the affine handle before launch. Linux lowers through
+`clone`/clear-TID/futex; macOS lowers through compiler-owned pthread imports and
+an ARM64 callback trampoline that restores Zag runtime context. Join consumes
+the handle only after native thread completion. This establishes a real native
 completion boundary for the worker and join result, but does not yet model
 pointer/aggregate worker arguments, returns, detach, mutexes, condition variables, TLS, general atomic storage,
 or general source-level happens-before/race freedom. `selfhost/native/thread_rt.zag`

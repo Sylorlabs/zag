@@ -26,6 +26,8 @@
 @import("sema.zag")    // authoritative effect fixpoint used by ZIR contracts
 @import("../std/map.zag") as map
 @import("zir_contract.zag") // shared IR schema, identity, and certificate types
+@import("zir_vector.zag")   // target-independent vector dialect: printer + verifier
+@import("vector_contract.zag") // vector type spelling, op vocabulary, width ladder
 
 // ── builder ──────────────────────────────────────────────────────────────────
 struct ZB { ctr: i32, origin: ZOrigin, effects: i32, coverage_errors: i32,
@@ -646,6 +648,11 @@ fn verify_block(blk: ZBlock, defined: *map.StringMap[i32]) i32 {
     let i: i32 = 0;
     while (i < len[ZOp](blk.ops)) {
         let o: ZOp = get[ZOp](blk.ops, i);
+        // A vector op is checked for well-typedness BEFORE the def-before-use
+        // sweep below, so a shape/arity/purity fault is reported as a vector
+        // fault rather than as a confusing missing definition.  It returns 0 for
+        // every non-vector op, so this is purely additive.
+        errs = errs + zvec_verify_op(o);
         let k: i32 = 0;
         while (k < len[ZVal](o.operands)) {
             let nm: []u8 = get[ZVal](o.operands, k).name;
@@ -1440,6 +1447,10 @@ fn print_block_mlir(buf: *ArrayList[u8], blk: ZBlock, ind: i32) void {
 }
 fn print_op_mlir(buf: *ArrayList[u8], o: ZOp, ind: i32) void {
     pad(buf, ind);
+    // The vector dialect is printed by its own module so the schema, the
+    // verifier, and the printer can never disagree about what an op is.  It
+    // returns 0 for every non-vector op and the dispatch below continues.
+    if (zvec_print_op_mlir(buf, o, ind) == 1) { return; }
     if (@strEq(o.name, "arith.constant")) {
         let r: ZVal = get[ZVal](o.results, 0);
         emit_z(buf, r.name); emit_z(buf, " = arith.constant "); emit_z(buf, attr_val(o, "value")); emit_z(buf, " : "); emit_z(buf, r.ty); emit_z(buf, "\n");
@@ -1453,9 +1464,18 @@ fn print_op_mlir(buf: *ArrayList[u8], o: ZOp, ind: i32) void {
         emit_z(buf, r.name); emit_z(buf, " = memref.alloca() : memref<"); emit_z(buf, attr_val(o, "elem")); emit_z(buf, ">\n");
     } else if (@strEq(o.name, "memref.load")) {
         let r: ZVal = get[ZVal](o.results, 0);
-        emit_z(buf, r.name); emit_z(buf, " = memref.load "); emit_z(buf, get[ZVal](o.operands, 0).name); emit_z(buf, "[] : memref<"); emit_z(buf, attr_val(o, "elem")); emit_z(buf, ">\n");
+        emit_z(buf, r.name); emit_z(buf, " = memref.load "); emit_z(buf, get[ZVal](o.operands, 0).name); emit_z(buf, "[] : memref<"); emit_z(buf, attr_val(o, "elem")); emit_z(buf, ">");
+        // `splat="1"` is the vectorizer's marker that this scalar slot holds the
+        // seed of a vector value.  It is what makes `vector<ELEM,LANES>` a
+        // well-typed operand of a memref<ELEM>; a backend must never infer it.
+        if (attr_val(o, "splat").len > 0) { emit_z(buf, " {splat = \""); emit_z(buf, attr_val(o, "splat")); emit_z(buf, "\"}"); }
+        emit_z(buf, "\n");
     } else if (@strEq(o.name, "memref.store")) {
-        emit_z(buf, "memref.store "); emit_z(buf, get[ZVal](o.operands, 0).name); emit_z(buf, ", "); emit_z(buf, get[ZVal](o.operands, 1).name); emit_z(buf, "[] : memref<"); emit_z(buf, attr_val(o, "elem")); emit_z(buf, ">\n");
+        emit_z(buf, "memref.store "); emit_z(buf, get[ZVal](o.operands, 0).name); emit_z(buf, ", "); emit_z(buf, get[ZVal](o.operands, 1).name); emit_z(buf, "[] : memref<"); emit_z(buf, attr_val(o, "elem")); emit_z(buf, ">");
+        // `reduce="add"` is a horizontal reduction: the vector result is folded
+        // back into a scalar slot.  Absent on an ordinary store.
+        if (attr_val(o, "reduce").len > 0) { emit_z(buf, " {reduce = \""); emit_z(buf, attr_val(o, "reduce")); emit_z(buf, "\"}"); }
+        emit_z(buf, "\n");
     } else if (@strEq(o.name, "func.call")) {
         if (len[ZVal](o.results) == 1) { emit_z(buf, get[ZVal](o.results, 0).name); emit_z(buf, " = "); }
         emit_z(buf, "func.call @"); emit_z(buf, attr_val(o, "callee")); emit_z(buf, "(");
@@ -1504,7 +1524,12 @@ fn c_type(t: []u8) []u8 {
     if (@strEq(t, "f32")) { return "float"; }
     if (@strEq(t, "f64")) { return "double"; }
     if (@strEq(t, "void")) { return "void"; }
-    return "int32_t";
+    // Anything else has no C scalar spelling -- notably the
+    // `memref<vector<ELEM,N>>` slot the vector pipeline accumulates into, which
+    // arrives here from every vector.load/store. Falling back to `int32_t`
+    // would misstate the type and silently change the program's meaning, so name
+    // it in a form that cannot be mistaken for a scalar.
+    return "c_unmapped";
 }
 fn cvar(name: []u8) []u8 { if (name.len > 0 && name[0] == '%') { return name[1..]; } return name; }
 
@@ -1581,11 +1606,18 @@ fn print_op_c(buf: *ArrayList[u8], o: ZOp, ind: i32) void {
         emit_z(buf,"break;\n");
     } else if (@strEq(o.name,"scf.continue")) {
         emit_z(buf,"continue;\n");
-    } else {
+    } else if (len[ZVal](o.results) == 1 && len[ZVal](o.operands) == 2) {
         // binary arith / cmp → C operator
         let r: ZVal = get[ZVal](o.results, 0);
         emit_z(buf, c_type(r.ty)); emit_z(buf, " "); emit_z(buf, cvar(r.name)); emit_z(buf, " = ");
         emit_z(buf, cvar(get[ZVal](o.operands, 0).name)); emit_z(buf, " "); emit_z(buf, c_binop(o)); emit_z(buf, " "); emit_z(buf, cvar(get[ZVal](o.operands, 1).name)); emit_z(buf, ";\n");
+    } else {
+        // Not a binary op. Every `vector.*` op lands here with 1 operand and no
+        // result, so indexing operands[1] or results[0] unconditionally would
+        // read past the end of the array -- a memory-safety bug that only became
+        // reachable once the vector pipeline started emitting these. Say what
+        // could not be printed instead.
+        emit_z(buf, "/* not representable in C: "); emit_z(buf, o.name); emit_z(buf, " */\n");
     }
 }
 fn c_binop(o: ZOp) []u8 {

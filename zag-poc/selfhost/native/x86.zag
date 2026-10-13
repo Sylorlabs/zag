@@ -19,6 +19,7 @@
 //   break/continue (flag-guarded while). Deref pointer field as `p.*.field`.
 
 @import("isa.zag")
+@import("../vector_contract.zag")   // VW_128/VW_256/VW_512 + lane counts
 
 // ── verified little-endian byte emitter (sign-correct for two's complement) ──
 fn eb(buf: *ArrayList[u8], b: i32) void {
@@ -141,6 +142,444 @@ fn is_jcc(kind: i32) i32 {
     return 0;
 }
 
+// ── AVX / AVX-512 prefix encoders ────────────────────────────────────────────
+// 3-byte VEX.  Byte 0 is C4, byte 1 is `R̄ X̄ B̄ mmmmm`, byte 2 is
+// `W v̄v̄v̄v̄ L pp`:
+//
+//   bit    7  6  5  4  3  2  1  0
+//   byte 1 R̄ X̄ B̄ 0  0 m2 m1 m0     mmmmm = opcode map (1 = 0F, 2 = 0F38, 3 = 0F3A)
+//   byte 2 W  v3 v2 v1 v0  L  pp1 pp0
+//
+// `vvvv` is the vvvv register NUMBER and is stored INVERTED (~vvvv, four bits,
+// bits 6-3), which is why the field is multiplied by 8 and not 16: bit 7 of
+// byte 2 is W and must stay clear.  `L` is 1 for a 256-bit (YMM) operand and 0
+// for 128-bit (XMM); a 512-bit operand cannot be expressed in VEX at all and
+// goes to EVEX below.  The 2-byte (C5) form is never emitted: C4 is legal
+// whenever C5 is, and a fixed 4-byte prefix keeps every instruction's length
+// independent of its operands, which is what the two-pass label resolver
+// assumes.
+fn vex3(buf: *ArrayList[u8], R:i32, X:i32, B:i32, mmmmm:i32, W:i32, vvvv:i32, L:i32, pp:i32) void {
+    eb(buf, 196); // C4
+    eb(buf, (1-R)*128 + (1-X)*64 + (1-B)*32 + mmmmm);
+    eb(buf, W*128 + ((15-vvvv) % 16) * 8 + L*4 + pp);
+}
+
+// Emit a VEX.NDS.L.pp.0F/W0 op /r three-operand packed form:
+//   ModRM.reg = dst, VEX.vvvv = vvvv (src1), ModRM.rm = rm (src2).
+fn vex3_op3(buf:*ArrayList[u8], pp:i32, opcode:i32, L:i32, dst:i32, vvvv:i32, rm:i32) void {
+    vex3_op3_at(buf, pp, 1, 0, L, opcode, dst, vvvv, rm);
+}
+
+// The general three-operand packed form: `mmmmm` selects the opcode map
+// (1 = 0F, 2 = 0F38, 3 = 0F3A) and `W` the operand width.  Every width-
+// parameteric packed op in isa.zag goes through this one routine.
+fn vex3_op3_at(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, L:i32, opcode:i32, dst:i32, vvvv:i32, rm:i32) void {
+    vex3(buf, (dst/8)%2, 0, (rm/8)%2, mmmmm, W, vvvv, L, pp);
+    // (no 0F escape byte: mmmmm/mm already selects the opcode map)
+    eb(buf, opcode);
+    eb(buf, modrm_rr(dst, rm));
+}
+
+// VEX.NDS.L.pp.0F /r 2-operand form: `dst` is BOTH the destination and src1
+// (ModRM.reg and VEX.vvvv), `src` is src2 (ModRM.rm).  This is the shape of the
+// pre-existing K_VPADDD etc. contract.
+fn vex3_op(buf:*ArrayList[u8], pp:i32, opcode:i32, L:i32, dst:i32, src:i32) void {
+    vex3(buf, (dst/8)%2, 0, (src/8)%2, 1, 0, dst, L, pp);
+    // (no 0F escape byte: mmmmm/mm already selects the opcode map)
+    eb(buf, opcode);
+    eb(buf, modrm_rr(dst, src));
+}
+fn vex3_op_w(buf:*ArrayList[u8], pp:i32, opcode:i32, W:i32, L:i32, dst:i32, src:i32) void {
+    vex3(buf, (dst/8)%2, 0, (src/8)%2, 1, W, dst, L, pp);
+    // (no 0F escape byte: mmmmm/mm already selects the opcode map)
+    eb(buf, opcode);
+    eb(buf, modrm_rr(dst, src));
+}
+
+// VEX.L.pp.0F /r memory form with NO vvvv operand (v = 0): `vec` is ModRM.reg
+// and the memory operand is ModRM.rm.
+fn vex3_mem(buf:*ArrayList[u8], pp:i32, opcode:i32, L:i32, vec:i32, base:i32, disp:i32) void {
+    vex3_mem_at(buf, pp, 1, 0, L, opcode, vec, base, disp);
+}
+// The general form of the above (any map / W).
+fn vex3_mem_at(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, L:i32, opcode:i32, vec:i32, base:i32, disp:i32) void {
+    vex3(buf, (vec/8)%2, 0, (base/8)%2, mmmmm, W, 0, L, pp);
+    // (no 0F escape byte: mmmmm/mm already selects the opcode map)
+    eb(buf, opcode);
+    mem(buf, vec, base, disp);
+}
+// VEX.L.pp.<map> /r NDS form with a trailing imm8 and NO vvvv operand (the
+// two-operand VPEXTRD/VPEXTRQ/VPINSRD/VPINSRQ shape: ModRM.reg is the xmm and
+// ModRM.rm is the GPR).
+fn vex3_ib_at(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, L:i32, opcode:i32, ib:i32, xmm_reg:i32, rm:i32) void {
+    vex3(buf, (xmm_reg/8)%2, 0, (rm/8)%2, mmmmm, W, 0, L, pp);
+    // (no 0F escape byte: mmmmm/mm already selects the opcode map)
+    eb(buf, opcode);
+    eb(buf, modrm_rr(xmm_reg, rm));
+    eb(buf, ib);
+}
+// VEX.L.pp.<map> /r NDS form with a trailing imm8 (VPSHUFD: ModRM.reg is the
+// destination, ModRM.rm the source, VEX.vvvv unused).
+fn vex3_op3_ib_at(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, L:i32, opcode:i32, ib:i32, dst:i32, vvvv:i32, rm:i32) void {
+    vex3_op3_ib_vv_at(buf, pp, mmmmm, W, L, opcode, ib, dst, vvvv, rm);
+}
+fn vex3_op3_ib_vv_at(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, L:i32, opcode:i32, ib:i32, dst:i32, vvvv:i32, rm:i32) void {
+    vex3(buf, (dst/8)%2, 0, (rm/8)%2, mmmmm, W, vvvv, L, pp);
+    // (no 0F escape byte: mmmmm/mm already selects the opcode map)
+    eb(buf, opcode);
+    eb(buf, modrm_rr(dst, rm));
+    eb(buf, ib);
+}
+
+// Scaled-index memory operand: ModRM mod=10 (disp32 present) with rm=100, so the
+// SIB byte is ALWAYS emitted and any base 0..15 is encodable — including
+// rsp/r12 (SIB base field 100) and rbp/r13 (SIB base field 101), neither of
+// which needs a special case once the SIB byte is present.  An `index` of 4
+// (rsp) means "no index", which is how a caller degrades the form to a plain
+// base+disp32 access.  `scale_log` is 0/1/2/3 for byte scale 1/2/4/8.
+fn mem_idx(buf: *ArrayList[u8], reg_field: i32, base: i32, index: i32, scale_log: i32, disp: i32) void {
+    let ix: i32 = index;
+    if (ix == R_RSP()) { ix = 4; }   // index==rsp is architecturally "none"
+    eb(buf, 128 + lo3(reg_field) * 8 + 4);                  // ModRM mod=10 reg rm=100(SIB)
+    eb(buf, scale_log * 64 + lo3(ix) * 8 + lo3(base));     // SIB scale:index:base
+    emit_le(buf, disp as i64, 4);
+}
+
+// VEX.L.pp.0F /r with a scaled-index memory operand and no vvvv operand.
+fn vex3_mem_idx(buf:*ArrayList[u8], pp:i32, opcode:i32, L:i32, vec:i32, base:i32, index:i32, scale_log:i32, disp:i32) void {
+    vex3(buf, (vec/8)%2, 1, (base/8)%2, 1, 0, 0, L, pp);
+    // (no 0F escape byte: mmmmm/mm already selects the opcode map)
+    eb(buf, opcode);
+    mem_idx(buf, vec, base, index, scale_log, disp);
+}
+// Same, for the 0F38 / 0F3A maps.
+fn vex3_mem_idx_at(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, L:i32, opcode:i32, vec:i32, base:i32, index:i32, scale_log:i32, disp:i32) void {
+    // REX.X extends SIB.index, so it must be the index register's extension
+    // bit. Hardcoding it to 1 sets REX.X unconditionally, which adds 8 to the
+    // SIB index and reads a DIFFERENT register: an index of 2 encodes as r10.
+    // The encoding stays perfectly decodable, so nothing but execution notices.
+    let ix: i32 = index;
+    if (ix == R_RSP()) { ix = 4; }
+    vex3(buf, (vec/8)%2, (ix/8)%2, (base/8)%2, mmmmm, W, 0, L, pp);
+    // (no 0F escape byte: mmmmm/mm already selects the opcode map)
+    eb(buf, opcode);
+    mem_idx(buf, vec, base, index, scale_log, disp);
+}
+
+// ── EVEX prefix (AVX-512) ────────────────────────────────────────────────────
+// 62 | P0 | P1 | P2 | opcode | ModRM/SIB/disp
+//
+//   P0 = R̄ X̄ B̄ R̄' 0 0 mm       mm = 1 -> 0F, 2 -> 0F38, 3 -> 0F3A
+//   P1 = W v3 v2 v1 v0 1 pp       vvvv stored INVERTED in bits 6-3; bit 2 is a
+//                                 must-be-1 field, not a length bit.
+//   P2 = z L' L b V̄' a2 a1 a0    L'L = 00/01/10 for EVEX.128/256/512, which is
+//                                 exactly the VW_128/VW_256/VW_512 width class;
+//                                 `b` is the embedded-broadcast bit (0 here);
+//                                 V̄' is bit 3 of the vvvv register;
+//                                 aaa is the mask register k0..k7 (0 = none).
+//
+// Register extension, verified against the Intel SDM tables:
+//   ModRM.reg  (the destination)   = reg3 + 8*R + 16*R'   -> R is P0 bit 7, R' is P0 bit 4
+//   ModRM.rm / SIB.base / SIB.index (the rm operand) = rm3 + 8*B + 16*X
+//                                                                -> B is P0 bit 5, X is P0 bit 6
+//   VEX.vvvv   (src1)             = (15 - vvvv3) + 16*V'  -> V' is P2 bit 3 (inverted)
+// In every field the bit stored in the prefix is the INVERSE of the register's
+// own high bit, so `1 - bit` is the packing below.
+fn evex_p0(R:i32, X:i32, B:i32, Rp:i32, mmmmm:i32) i32 {
+    return (1-R)*128 + (1-X)*64 + (1-B)*32 + (1-Rp)*16 + mmmmm;
+}
+fn evex_p1(W:i32, vvvv:i32, pp:i32) i32 {
+    return W*128 + ((15-vvvv) % 16) * 8 + 4 + pp;
+}
+// `ll` is the width class: 0 = 128, 1 = 256, 2 = 512 — the same two bits EVEX
+// calls L'L.  `vp` is bit 4 of the vvvv register, `b` the broadcast bit and
+// `aaa` the mask register number (0 = no masking).
+fn evex_p2(ll:i32, vp:i32, b:i32, aaa:i32, z:i32) i32 {
+    return z*128 + (ll/2)*64 + (ll%2)*32 + b*16 + (1-vp)*8 + aaa;
+}
+
+// EVEX.NDS.L'L.pp.<map> /r three-operand form, unmasked, with an explicit
+// opcode byte.  `dst` is ModRM.reg (extended by R and R'), `vvvv` is src1, `rm`
+// is src2 (ModRM.rm, extended by B and X).
+fn evex_op3_at(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, L:i32, opcode:i32, dst:i32, vvvv:i32, rm:i32) void {
+    evex_op3_mask_at(buf, pp, mmmmm, W, L, opcode, dst, vvvv, rm, 0, 0);
+}
+// EVEX.NDS.L'L.pp.<map> /r three-operand form, unmasked.
+fn evex_op3(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, dst:i32, vvvv:i32, rm:i32, L:i32) void {
+    evex_op3_mask_at(buf, pp, mmmmm, W, L, 0, dst, vvvv, rm, 0, 0);
+}
+// Merge-masked (`z`=0) or zero-masked (`z`=1) three-operand form.
+fn evex_op3_mask_at(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, L:i32, opcode:i32, dst:i32, vvvv:i32, rm:i32, k:i32, z:i32) void {
+    eb(buf, 98);                                     // 62
+    eb(buf, evex_p0((dst/8)%2, (rm/8)%2, (rm/16)%2, (dst/16)%2, mmmmm));
+    eb(buf, evex_p1(W, vvvv, pp));
+    eb(buf, evex_p2(L, (vvvv/16)%2, 0, k, z));
+    // (no 0F escape byte: mmmmm/mm already selects the opcode map)
+    eb(buf, opcode);
+    eb(buf, modrm_rr(dst, rm));
+}
+fn evex_op3_mask(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, dst:i32, vvvv:i32, rm:i32, L:i32, k:i32, z:i32) void {
+    evex_op3_mask_at(buf, pp, mmmmm, W, L, 0, dst, vvvv, rm, k, z);
+}
+// EVEX.NDS.L'L.pp.0F3A.<map> /r ib with an explicit opcode AND a trailing imm8:
+// VPEXTRD/VPEXTRQ/VPINSRD/VPINSRQ and the 0F3A chunk selects all need it.
+fn evex_op3_ib_at(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, L:i32, opcode:i32, ib:i32, dst:i32, vvvv:i32, rm:i32) void {
+    evex_op3_mask_at(buf, pp, mmmmm, W, L, opcode, dst, vvvv, rm, 0, 0);
+    eb(buf, ib);
+}
+// EVEX compare form: the DESTINATION is a k0..k7 mask register, which lives in
+// ModRM.reg as a plain 3-bit field with NO R / R' extension, and P2.aaa is 0
+// (the destination is not a masking operand).  `ib` is the trailing imm8.
+fn evex_op3_k(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, k:i32, vvvv:i32, rm:i32, L:i32, opcode:i32, ib:i32) void {
+    eb(buf, 98);
+    eb(buf, evex_p0(0, (rm/8)%2, (rm/16)%2, 0, mmmmm));
+    eb(buf, evex_p1(W, vvvv, pp));
+    eb(buf, evex_p2(L, (vvvv/16)%2, 0, 0, 0));
+    // (no 0F escape byte: mmmmm/mm already selects the opcode map)
+    eb(buf, opcode);
+    eb(buf, 192 + (k % 8) * 8 + lo3(rm));
+    eb(buf, ib);
+}
+// EVEX.L'L.pp.<map> /r with a scaled-index memory operand, no vvvv operand.
+fn evex_mem_idx(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, opcode:i32, vec:i32, base:i32, index:i32, scale_log:i32, disp:i32, L:i32) void {
+    eb(buf, 98);
+    // X extends SIB.index and B extends SIB.base, NOT the rm register here.
+    let ix: i32 = index;
+    if (ix == R_RSP()) { ix = 4; }
+    eb(buf, evex_p0((vec/8)%2, (ix/8)%2, (base/16)%2, (vec/16)%2, mmmmm));
+    eb(buf, evex_p1(W, 0, pp));
+    eb(buf, evex_p2(L, 0, 0, 0, 0));
+    eb(buf, opcode);
+    mem_idx(buf, vec, base, index, scale_log, disp);
+}
+// EVEX.L'L.pp.<map> /r with a plain base+disp32 memory operand, no vvvv operand.
+fn evex_mem(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, opcode:i32, vec:i32, base:i32, disp:i32, L:i32) void {
+    eb(buf, 98);
+    eb(buf, evex_p0((vec/8)%2, 1, (base/16)%2, (vec/16)%2, mmmmm));
+    eb(buf, evex_p1(W, 0, pp));
+    eb(buf, evex_p2(L, 0, 0, 0, 0));
+    eb(buf, opcode);
+    mem(buf, vec, base, disp);
+}
+// EVEX.512/256/128.66.0F38 /r with `opcode` = 0x7C and a GPR in the ModRM.rm
+// position: VPBROADCASTD (W=0) / VPBROADCASTQ (W=1).  This is the AVX-512 form
+// that turns a scalar GPR into a full-width lane splat in ONE instruction (the
+// VEX forms need a preceding vmovd/vmovq into an xmm first).
+fn evex_broadcast(buf:*ArrayList[u8], opcode:i32, W:i32, dst:i32, gpr:i32, L:i32) void {
+    eb(buf, 98);
+    eb(buf, evex_p0((dst/8)%2, (gpr/8)%2, (gpr/16)%2, (dst/16)%2, 2));
+    eb(buf, evex_p1(W, 0, 1));
+    eb(buf, evex_p2(L, 0, 0, 0, 0));
+    eb(buf, opcode);               // 0x7C
+    eb(buf, 192 + lo3(dst) * 8 + lo3(gpr));
+}
+
+// Emit AVX2 integer NDS register form: VEX.256.pp.0F op /r.
+// dst is both the destination and the first source, src is the second source.
+// (Kept as the named spelling of the 256-bit width for callers that do not carry
+// a width class; the vector dispatch uses vec_op3_vvv, which is the same routine
+// with the L bit parameterised.)
+fn avx2_op(buf:*ArrayList[u8], pp:i32, op:i32, dst:i32, src:i32) void {
+    vex3_op(buf, pp, op, 1, dst, src);
+}
+
+// vmovdqu load/store use VEX.256.F3.0F 6F/7F with no vvvv operand.
+fn avx2_mem(buf:*ArrayList[u8], reg:i32, base:i32, disp:i32, load:i32) void {
+    vex3_mem(buf, 2, load, 1, reg, base, disp);
+}
+
+// ── width-class dispatch for the packed vector kinds ─────────────────────────
+// Every width-parameteric vector op resolves through these three helpers, so
+// "VEX for 128/256, EVEX for 512" is stated once.  Each returns 1 and emits
+// NOTHING when the requested combination has no encoding, which is how an
+// unsupported (width, opcode) pair is rejected instead of being approximated.
+fn vec_w_ok(w: i32) i32 { return x86vec_wclass_valid(w); }
+// A physical vector/GPR register number is 0..15; virtual vector registers
+// (>= R_VBASE) and mask registers are never encodable in these fields.
+fn vec_r_ok(r: i32) i32 { return R_IS_PHYS(r) as i32; }
+
+// 3-operand packed op at width class `w`.
+fn vec_op3(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, opcode:i32, w:i32, dst:i32, vvvv:i32, rm:i32) i32 {
+    if (vec_w_ok(w) == 0) { return 1; }
+    if (vec_r_ok(dst) == 0 || vec_r_ok(vvvv) == 0 || vec_r_ok(rm) == 0) { return 1; }
+    if (w == VW_512()) { evex_op3_at(buf, pp, mmmmm, W, w, opcode, dst, vvvv, rm); return 0; }
+    vex3_op3_at(buf, pp, mmmmm, W, w, opcode, dst, vvvv, rm);
+    return 0;
+}
+// VEX-only variant: rejects VW_512 outright (an EVEX form of the same opcode
+// would write a k register, or does not exist, so silently widening is wrong).
+fn vec_op3_vex(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, opcode:i32, w:i32, dst:i32, vvvv:i32, rm:i32) i32 {
+    if (w == VW_512()) { return 1; }
+    return vec_op3(buf, pp, mmmmm, W, opcode, w, dst, vvvv, rm);
+}
+// EVEX-only variant (requires AVX-512VL for the 128/256 forms).
+fn vec_op3_evex(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, opcode:i32, w:i32, dst:i32, vvvv:i32, rm:i32) i32 {
+    if (vec_w_ok(w) == 0) { return 1; }
+    if (vec_r_ok(dst) == 0 || vec_r_ok(vvvv) == 0 || vec_r_ok(rm) == 0) { return 1; }
+    evex_op3_at(buf, pp, mmmmm, W, w, opcode, dst, vvvv, rm);
+    return 0;
+}
+// EVEX compare writing a k0..k7 destination (ModRM.reg, never extended).
+fn vec_op3_k(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, opcode:i32, ib:i32, w:i32, k:i32, vvvv:i32, rm:i32) i32 {
+    if (vec_w_ok(w) == 0) { return 1; }
+    if (k < 0 || k >= R_KMASK_MAX()) { return 1; }
+    if (vec_r_ok(vvvv) == 0 || vec_r_ok(rm) == 0) { return 1; }
+    evex_op3_k(buf, pp, mmmmm, W, k, vvvv, rm, w, opcode, ib);
+    return 0;
+}
+// Plain memory form with no vvvv operand (vmovdqu / vbroadcastss / vbroadcastsd).
+fn vec_mem(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, opcode:i32, w:i32, vec:i32, base:i32, disp:i32) i32 {
+    if (vec_w_ok(w) == 0) { return 1; }
+    if (vec_r_ok(vec) == 0 || vec_r_ok(base) == 0) { return 1; }
+    if (w == VW_512()) {
+        evex_mem(buf, pp, mmmmm, W, opcode, vec, base, disp, w);
+        return 0;
+    }
+    vex3_mem_at(buf, pp, mmmmm, W, w, opcode, vec, base, disp);
+    return 0;
+}
+
+// VEX-only NDS form with a trailing imm8 (VPSHUFD, the packed VCMPPS/VCMPPD).
+fn vec_op3_ib_vex(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, opcode:i32, ib:i32, w:i32, dst:i32, vvvv:i32, rm:i32) i32 {
+    if (w == VW_512()) { return 1; }
+    if (vec_w_ok(w) == 0) { return 1; }
+    if (vec_r_ok(dst) == 0 || vec_r_ok(vvvv) == 0 || vec_r_ok(rm) == 0) { return 1; }
+    vex3_op3_ib_at(buf, pp, mmmmm, W, w, opcode, ib, dst, vvvv, rm);
+    return 0;
+}
+// 3-operand packed op that also serves the 2-operand legacy contract: when the
+// src2 field holds NOLBL the destination doubles as src1 and `s1` is the only
+// explicit second source (the pre-existing K_VPADDD / K_VPSUBD / K_VPAND /
+// K_VPOR / K_VPXOR spelling).
+fn vec_op3_vvv(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, opcode:i32, w:i32, d:i32, s1:i32, s2:i32) i32 {
+    if (s2 < 0) { return vec_op3(buf, pp, mmmmm, W, opcode, w, d, d, s1); }
+    return vec_op3(buf, pp, mmmmm, W, opcode, w, d, s1, s2);
+}
+// 2-operand packed op: VEX.vvvv is UNUSED, ModRM.reg is the destination and
+// ModRM.rm the source (VSQRTPS/VSQRTPD).
+fn vec_sqrt(buf:*ArrayList[u8], pp:i32, W:i32, opcode:i32, w:i32, d:i32, s:i32) i32 {
+    return vec_op3(buf, pp, 1, W, opcode, w, d, 0, s);
+}
+// vmovd / vmovq  xmm[gpr_dst], gpr[src] : 66 0F.W{0,1} 6E /r, vvvv unused.
+fn vex3_ib_at_6e(buf:*ArrayList[u8], W:i32, xmm_reg:i32, gpr:i32) void {
+    vex3(buf, (xmm_reg/8)%2, 0, (gpr/8)%2, 1, W, 0, 0, 1);
+    eb(buf, 110);
+    eb(buf, modrm_rr(xmm_reg, gpr));
+}
+// vbroadcastss / vbroadcastsd with a REGISTER source: 66 0F38.W0 18|19 /r,
+// vvvv unused, ModRM.reg = the destination, ModRM.rm = the source xmm.
+fn vex3_reg_18(buf:*ArrayList[u8], L:i32, vec:i32) void {
+    let rm: i32 = vec;
+    vex3(buf, (vec/8)%2, 0, (rm/8)%2, 2, 0, 0, L, 1);
+    eb(buf, 24);
+    eb(buf, modrm_rr(vec, rm));
+}
+fn vex3_reg_19(buf:*ArrayList[u8], L:i32, vec:i32) void {
+    let rm: i32 = vec;
+    vex3(buf, (vec/8)%2, 0, (rm/8)%2, 2, 0, 0, L, 1);
+    eb(buf, 25);
+    eb(buf, modrm_rr(vec, rm));
+}
+// K_VEXTRACT32 / K_VEXTRACT64.
+//
+// VPEXTRD/VPEXTRQ read only the low 128 bits of their source, so a lane that
+// lives in 128-bit chunk N > 0 needs a chunk select first — VEXTRACTI128 (256)
+// or VEXTRACTI32X4 (512), both 66 0F3A.W0 39 /r ib — into the caller-supplied
+// scratch register.  `gpr` is the destination, `vec` the source vector, `lane`
+// the logical lane index and `scratch` a physical vector register used only
+// when the chunk is non-zero.  Nothing is emitted unless the whole request is
+// encodable, so a bad scratch register rejects instead of corrupting a live
+// value.
+fn vec_extract(buf:*ArrayList[u8], isq:i32, w:i32, gpr:i32, vec:i32, lane:i32, scratch:i32) i32 {
+    if (vec_w_ok(w) == 0) { return 1; }
+    if (vec_r_ok(gpr) == 0 || vec_r_ok(vec) == 0) { return 1; }
+    // `lane` counts lanes OF THIS ELEMENT WIDTH, so the ceiling is bytes/lane
+    // width -- not zvec_wclass_lanes, which counts 32-bit units. Bounding a
+    // 64-bit lane against a 32-bit count admits lanes that name a chunk the
+    // width class does not have, and the VEXTRACTI128 imm8 goes out of range.
+    let per0: i32 = vec_lanes_per_chunk(4);
+    if (isq == 1) { per0 = vec_lanes_per_chunk(8); }
+    if (lane < 0 || lane >= (zvec_wclass_bytes(w) / per0)) { return 1; }
+    let per: i32 = per0;
+    let chunk: i32 = lane / per;
+    let inch: i32 = lane % per;
+    let src: i32 = vec;
+    if (chunk > 0) {
+        if (vec_r_ok(scratch) == 0) { return 1; }
+        // 66 0F3A.W0 39 /r ib : VEXTRACTI128 / VEXTRACTI32X4
+        if (w == VW_512()) {
+            evex_op3_ib_at(buf, 1, 3, 0, w, 57, chunk, scratch, 0, vec);
+        } else {
+            vex3_op3_ib_at(buf, 1, 3, 0, w, 57, chunk, scratch, 0, vec);
+        }
+        src = scratch;
+    }
+    // 66 0F3A.W0/1 16 /r ib : ModRM.reg = the xmm, ModRM.rm = the GPR.
+    if (w == VW_512()) {
+        evex_op3_ib_at(buf, 1, 3, isq, 0, 22, inch, src, 0, gpr);
+        return 0;
+    }
+    vex3_ib_at(buf, 1, 3, isq, 0, 22, inch, src, gpr);
+    return 0;
+}
+// K_VINSERT32 / K_VINSERT64.
+//
+// dst is the vector result, `src` the vector read and `gpr` the scalar.  The
+// 128-bit VPINSRD/VPINSRQ (66 0F3A.W0/1 22 /r ib) writes dst's LOW 128 bits
+// only, so a width > 128 vector is finished with one 66 0F3A.W0 38 /r ib
+// (VINSERTI128 / VINSERTI32X4) that re-inserts the new chunk.  dst may alias
+// src: the insert reads src and writes dst in one instruction.
+fn vec_insert(buf:*ArrayList[u8], isq:i32, w:i32, d:i32, s:i32, gpr:i32, lane:i32) i32 {
+    if (vec_w_ok(w) == 0) { return 1; }
+    if (vec_r_ok(d) == 0 || vec_r_ok(s) == 0 || vec_r_ok(gpr) == 0) { return 1; }
+    // `lane` counts lanes OF THIS ELEMENT WIDTH, so the ceiling is bytes/lane
+    // width -- not zvec_wclass_lanes, which counts 32-bit units. Bounding a
+    // 64-bit lane against a 32-bit count admits lanes that name a chunk the
+    // width class does not have, and the VEXTRACTI128 imm8 goes out of range.
+    let per0: i32 = vec_lanes_per_chunk(4);
+    if (isq == 1) { per0 = vec_lanes_per_chunk(8); }
+    if (lane < 0 || lane >= (zvec_wclass_bytes(w) / per0)) { return 1; }
+    let per: i32 = per0;
+    let chunk: i32 = lane / per;
+    let inch: i32 = lane % per;
+    if (chunk > 0) {
+        // Pull the old chunk into dst's low 128 bits, overwrite it, then splice
+        // the whole chunk back into `src`.
+        if (w == VW_512()) {
+            evex_op3_ib_at(buf, 1, 3, 0, w, 57, chunk, d, 0, s);
+        } else {
+            vex3_op3_ib_at(buf, 1, 3, 0, w, 57, chunk, d, 0, s);
+        }
+    }
+    if (w == VW_512()) {
+        evex_op3_ib_at(buf, 1, 3, isq, 0, 34, inch, d, s, gpr);
+    } else {
+        vex3_op3_ib_at(buf, 1, 3, isq, 0, 34, inch, d, s, gpr);
+    }
+    if (w == VW_128()) { return 0; }
+    // 66 0F3A.W0 38 /r ib : VINSERTI128 / VINSERTI32X4
+    if (w == VW_512()) {
+        evex_op3_ib_at(buf, 1, 3, 0, w, 56, chunk, d, s, d);
+        return 0;
+    }
+    vex3_op3_ib_at(buf, 1, 3, 0, w, 56, chunk, d, s, d);
+    return 0;
+}
+
+// Scaled-index memory form: [base + index*scale + disp32].
+fn vec_mem_idx(buf:*ArrayList[u8], pp:i32, mmmmm:i32, W:i32, opcode:i32, w:i32, vec:i32, base:i32, index:i32, scale_log:i32, disp:i32) i32 {
+    if (vec_w_ok(w) == 0) { return 1; }
+    if (vec_r_ok(vec) == 0 || vec_r_ok(base) == 0) { return 1; }
+    if (index < 0 || index > 15) { return 1; }
+    if (scale_log < 0 || scale_log > 3) { return 1; }
+    if (w == VW_512()) {
+        evex_mem_idx(buf, pp, mmmmm, W, opcode, vec, base, index, scale_log, disp, w);
+        return 0;
+    }
+    vex3_mem_idx_at(buf, pp, mmmmm, W, w, opcode, vec, base, index, scale_log, disp);
+    return 0;
+}
+
 // ── core: encode a single instruction into `buf` ─────────────────────────────
 // `labels[lbl]` holds the resolved byte offset of each label (valid in pass 2;
 // zero-filled in pass 1, which is fine because lengths don't depend on it).
@@ -153,14 +592,23 @@ fn x86_driver_data_address(v: i64) i32 {
     return (v >= DATA_VBASE() && v < DATA_VBASE() + 16777216) as i32;
 }
 
+// Returns 0 when the instruction was encoded (or legitimately emitted nothing)
+// and 1 when the requested (kind, width class, operand) combination has NO
+// x86-64 encoding.  A rejected vector instruction emits ZERO bytes, never a
+// partial or approximated one, and the caller accumulates the count.
 fn encode_one_mode(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32],
-                   base_off: i32, driver_mode: i32) void {
+                   base_off: i32, driver_mode: i32) i32 {
     let k: i32 = ins.kind;
 
     if (k == K_LABEL()) {
         // emits nothing; its offset was recorded during pass 1.
-        return;
+        return 0;
     }
+
+    // ── width-parameteric vector family (VEX.128 / VEX.256 / EVEX.512) ────────
+    // Dispatched before everything else so a vector kind can never fall through
+    // to the legacy 2-operand SSE spelling of a same-numbered scalar kind.
+    if (x86_vec_kind(k) == 1) { return x86_vec_encode(buf, ins); }
 
     // ── mov dst, imm ─────────────────────────────────────────────────────────
     if (k == K_MOV_IMM()) {
@@ -189,26 +637,26 @@ fn encode_one_mode(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32],
             eb(buf, 184 + lo3(d));        // 0xB8 + rd (movabs)
             emit_le(buf, v, 8);
         }
-        return;
+        return 0;
     }
 
     // ── reg-reg ALU/mov: opcode /r with reg=src, rm=dst ─────────────────────
-    if (k == K_MOV_RR()) { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 137); eb(buf, modrm_rr(ins.src, ins.dst)); return; }  // 0x89
-    if (k == K_ADD_RR()) { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 1);   eb(buf, modrm_rr(ins.src, ins.dst)); return; }  // 0x01
-    if (k == K_SUB_RR()) { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 41);  eb(buf, modrm_rr(ins.src, ins.dst)); return; }  // 0x29
-    if (k == K_CMP_RR()) { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 57);  eb(buf, modrm_rr(ins.src, ins.dst)); return; }  // 0x39
-    if (k == K_AND_RR()) { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 33);  eb(buf, modrm_rr(ins.src, ins.dst)); return; }  // 0x21
-    if (k == K_OR_RR())  { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 9);   eb(buf, modrm_rr(ins.src, ins.dst)); return; }  // 0x09
-    if (k == K_XOR_RR()) { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 49);  eb(buf, modrm_rr(ins.src, ins.dst)); return; }  // 0x31
-    if (k == K_SHL_CL()) { rex(buf, 1, 0, 0, ext(ins.dst)); eb(buf, 211); eb(buf, 224 + lo3(ins.dst)); return; }  // D3 /4
-    if (k == K_SAR_CL()) { rex(buf, 1, 0, 0, ext(ins.dst)); eb(buf, 211); eb(buf, 248 + lo3(ins.dst)); return; }  // D3 /7
+    if (k == K_MOV_RR()) { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 137); eb(buf, modrm_rr(ins.src, ins.dst)); return 0; }  // 0x89
+    if (k == K_ADD_RR()) { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 1);   eb(buf, modrm_rr(ins.src, ins.dst)); return 0; }  // 0x01
+    if (k == K_SUB_RR()) { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 41);  eb(buf, modrm_rr(ins.src, ins.dst)); return 0; }  // 0x29
+    if (k == K_CMP_RR()) { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 57);  eb(buf, modrm_rr(ins.src, ins.dst)); return 0; }  // 0x39
+    if (k == K_AND_RR()) { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 33);  eb(buf, modrm_rr(ins.src, ins.dst)); return 0; }  // 0x21
+    if (k == K_OR_RR())  { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 9);   eb(buf, modrm_rr(ins.src, ins.dst)); return 0; }  // 0x09
+    if (k == K_XOR_RR()) { rex(buf, 1, ext(ins.src), 0, ext(ins.dst)); eb(buf, 49);  eb(buf, modrm_rr(ins.src, ins.dst)); return 0; }  // 0x31
+    if (k == K_SHL_CL()) { rex(buf, 1, 0, 0, ext(ins.dst)); eb(buf, 211); eb(buf, 224 + lo3(ins.dst)); return 0; }  // D3 /4
+    if (k == K_SAR_CL()) { rex(buf, 1, 0, 0, ext(ins.dst)); eb(buf, 211); eb(buf, 248 + lo3(ins.dst)); return 0; }  // D3 /7
 
     // ── imul dst, src : 0F AF /r with reg=dst, rm=src (operands SWAPPED) ─────
     if (k == K_IMUL_RR()) {
         rex(buf, 1, ext(ins.dst), 0, ext(ins.src));
         eb(buf, 15); eb(buf, 175);                 // 0F AF
         eb(buf, modrm_rr(ins.dst, ins.src));
-        return;
+        return 0;
     }
 
     // ── push / pop ───────────────────────────────────────────────────────────
@@ -216,60 +664,60 @@ fn encode_one_mode(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32],
         let r: i32 = ins.dst;
         if (r >= 8) { eb(buf, 65); }               // 0x41 = REX.B
         eb(buf, 80 + lo3(r));                       // 0x50 + rd
-        return;
+        return 0;
     }
     if (k == K_POP()) {
         let r: i32 = ins.dst;
         if (r >= 8) { eb(buf, 65); }               // 0x41 = REX.B
         eb(buf, 88 + lo3(r));                       // 0x58 + rd
-        return;
+        return 0;
     }
 
     // ── ret / syscall ─────────────────────────────────────────────────────────
-    if (k == K_RET())     { eb(buf, 195); return; }            // 0xC3
-    if (k == K_SYSCALL()) { eb(buf, 15); eb(buf, 5); return; } // 0F 05
-    if (k == K_MFENCE()) { eb(buf, 15); eb(buf, 174); eb(buf, 240); return; } // 0F AE F0
-    if (k == K_CPUID()) { eb(buf, 15); eb(buf, 162); return; } // 0F A2
-    if (k == K_XGETBV()) { eb(buf, 15); eb(buf, 1); eb(buf, 208); return; } // 0F 01 D0
-    if(k==K_POPCNT()){eb(buf,243);rex(buf,1,ext(ins.dst),0,ext(ins.src));eb(buf,15);eb(buf,184);eb(buf,modrm_rr(ins.dst,ins.src));return;}
+    if (k == K_RET())     { eb(buf, 195); return 0; }            // 0xC3
+    if (k == K_SYSCALL()) { eb(buf, 15); eb(buf, 5); return 0; } // 0F 05
+    if (k == K_MFENCE()) { eb(buf, 15); eb(buf, 174); eb(buf, 240); return 0; } // 0F AE F0
+    if (k == K_CPUID()) { eb(buf, 15); eb(buf, 162); return 0; } // 0F A2
+    if (k == K_XGETBV()) { eb(buf, 15); eb(buf, 1); eb(buf, 208); return 0; } // 0F 01 D0
+    if(k==K_POPCNT()){eb(buf,243);rex(buf,1,ext(ins.dst),0,ext(ins.src));eb(buf,15);eb(buf,184);eb(buf,modrm_rr(ins.dst,ins.src));return 0;}
     if(k==K_ANDN()){
         // C4 RXB m-mmmm, W vvvv L pp. X is unused and therefore inverted=1.
         eb(buf,196);eb(buf,(1-ext(ins.dst))*128+64+(1-ext(ins.imm as i32))*32+2);
-        eb(buf,128+((15-lo3(ins.src))*8));eb(buf,242);eb(buf,modrm_rr(ins.dst,ins.imm as i32));return;
+        eb(buf,128+((15-lo3(ins.src))*8));eb(buf,242);eb(buf,modrm_rr(ins.dst,ins.imm as i32));return 0;
     }
-    if (k == K_REP_MOVSB()){ eb(buf, 243); eb(buf, 164); return; } // F3 A4 rep movsb
-    if (k == K_OUTB())  { eb(buf, 238); return; }                 // EE
-    if (k == K_INB())   { eb(buf, 236); return; }                 // EC
-    if (k == K_OUTW())  { eb(buf, 102); eb(buf, 239); return; }   // 66 EF
-    if (k == K_INW())   { eb(buf, 102); eb(buf, 237); return; }   // 66 ED
-    if (k == K_OUTL())  { eb(buf, 239); return; }                 // EF
-    if (k == K_INL())   { eb(buf, 237); return; }                 // ED
-    if (k == K_RDMSR()) { eb(buf, 15); eb(buf, 50); return; }     // 0F 32
-    if (k == K_WRMSR()) { eb(buf, 15); eb(buf, 48); return; }     // 0F 30
-    if (k == K_RDCR0()) { eb(buf, 15); eb(buf, 32); eb(buf, 192); return; }  // 0F 20 C0
-    if (k == K_WRCR0()) { eb(buf, 15); eb(buf, 34); eb(buf, 192); return; }  // 0F 22 C0
-    if (k == K_RDCR2()) { eb(buf, 15); eb(buf, 32); eb(buf, 208); return; }  // 0F 20 D0
-    if (k == K_RDCR3()) { eb(buf, 15); eb(buf, 32); eb(buf, 216); return; }  // 0F 20 D8
-    if (k == K_WRCR3()) { eb(buf, 15); eb(buf, 34); eb(buf, 216); return; }  // 0F 22 D8
-    if (k == K_RDCR4()) { eb(buf, 15); eb(buf, 32); eb(buf, 224); return; }  // 0F 20 E0
-    if (k == K_WRCR4()) { eb(buf, 15); eb(buf, 34); eb(buf, 224); return; }  // 0F 22 E0
-    if (k == K_LGDT())  { eb(buf, 15); eb(buf, 1); eb(buf, 16); return; }    // 0F 01 10 lgdt [rax]
-    if (k == K_LIDT())  { eb(buf, 15); eb(buf, 1); eb(buf, 24); return; }    // 0F 01 18 lidt [rax]
-    if (k == K_LTR())   { eb(buf, 15); eb(buf, 0); eb(buf, 216); return; }   // 0F 00 D8 ltr ax
-    if (k == K_INVLPG()){ eb(buf, 15); eb(buf, 1); eb(buf, 56); return; }    // 0F 01 38 invlpg [rax]
-    if (k == K_HLT())   { eb(buf, 244); return; }                 // F4
-    if (k == K_CLI())   { eb(buf, 250); return; }                 // FA
-    if (k == K_STI())   { eb(buf, 251); return; }                 // FB
-    if (k == K_PAUSE()) { eb(buf, 243); eb(buf, 144); return; }   // F3 90
-    if (k == K_WBINVD()){ eb(buf, 15); eb(buf, 9); return; }      // 0F 09
-    if (k == K_SHR_CL()){ rex(buf, 1, 0, 0, ext(ins.dst)); eb(buf, 211); eb(buf, 232 + lo3(ins.dst)); return; }  // REX.W D3 /5
+    if (k == K_REP_MOVSB()){ eb(buf, 243); eb(buf, 164); return 0; } // F3 A4 rep movsb
+    if (k == K_OUTB())  { eb(buf, 238); return 0; }                 // EE
+    if (k == K_INB())   { eb(buf, 236); return 0; }                 // EC
+    if (k == K_OUTW())  { eb(buf, 102); eb(buf, 239); return 0; }   // 66 EF
+    if (k == K_INW())   { eb(buf, 102); eb(buf, 237); return 0; }   // 66 ED
+    if (k == K_OUTL())  { eb(buf, 239); return 0; }                 // EF
+    if (k == K_INL())   { eb(buf, 237); return 0; }                 // ED
+    if (k == K_RDMSR()) { eb(buf, 15); eb(buf, 50); return 0; }     // 0F 32
+    if (k == K_WRMSR()) { eb(buf, 15); eb(buf, 48); return 0; }     // 0F 30
+    if (k == K_RDCR0()) { eb(buf, 15); eb(buf, 32); eb(buf, 192); return 0; }  // 0F 20 C0
+    if (k == K_WRCR0()) { eb(buf, 15); eb(buf, 34); eb(buf, 192); return 0; }  // 0F 22 C0
+    if (k == K_RDCR2()) { eb(buf, 15); eb(buf, 32); eb(buf, 208); return 0; }  // 0F 20 D0
+    if (k == K_RDCR3()) { eb(buf, 15); eb(buf, 32); eb(buf, 216); return 0; }  // 0F 20 D8
+    if (k == K_WRCR3()) { eb(buf, 15); eb(buf, 34); eb(buf, 216); return 0; }  // 0F 22 D8
+    if (k == K_RDCR4()) { eb(buf, 15); eb(buf, 32); eb(buf, 224); return 0; }  // 0F 20 E0
+    if (k == K_WRCR4()) { eb(buf, 15); eb(buf, 34); eb(buf, 224); return 0; }  // 0F 22 E0
+    if (k == K_LGDT())  { eb(buf, 15); eb(buf, 1); eb(buf, 16); return 0; }    // 0F 01 10 lgdt [rax]
+    if (k == K_LIDT())  { eb(buf, 15); eb(buf, 1); eb(buf, 24); return 0; }    // 0F 01 18 lidt [rax]
+    if (k == K_LTR())   { eb(buf, 15); eb(buf, 0); eb(buf, 216); return 0; }   // 0F 00 D8 ltr ax
+    if (k == K_INVLPG()){ eb(buf, 15); eb(buf, 1); eb(buf, 56); return 0; }    // 0F 01 38 invlpg [rax]
+    if (k == K_HLT())   { eb(buf, 244); return 0; }                 // F4
+    if (k == K_CLI())   { eb(buf, 250); return 0; }                 // FA
+    if (k == K_STI())   { eb(buf, 251); return 0; }                 // FB
+    if (k == K_PAUSE()) { eb(buf, 243); eb(buf, 144); return 0; }   // F3 90
+    if (k == K_WBINVD()){ eb(buf, 15); eb(buf, 9); return 0; }      // 0F 09
+    if (k == K_SHR_CL()){ rex(buf, 1, 0, 0, ext(ins.dst)); eb(buf, 211); eb(buf, 232 + lo3(ins.dst)); return 0; }  // REX.W D3 /5
 
     // ── neg dst : F7 /3 ───────────────────────────────────────────────────────
     if (k == K_NEG()) {
         rex(buf, 1, 0, 0, ext(ins.dst));
         eb(buf, 247);                              // 0xF7
         eb(buf, 192 + 3 * 8 + lo3(ins.dst));       // ModRM reg=/3 rm=dst
-        return;
+        return 0;
     }
 
     // ── idiv src : CQO (48 99) then F7 /7 ──────────────────────────────────────
@@ -278,13 +726,13 @@ fn encode_one_mode(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32],
         rex(buf, 1, 0, 0, ext(ins.src));
         eb(buf, 247);                              // 0xF7
         eb(buf, 192 + 7 * 8 + lo3(ins.src));       // ModRM reg=/7 rm=src
-        return;
+        return 0;
     }
 
     // ── reg-imm32 ALU : 81 /digit id ──────────────────────────────────────────
-    if (k == K_ADD_RI()) { rex(buf, 1, 0, 0, ext(ins.dst)); eb(buf, 129); eb(buf, 192 + 0 * 8 + lo3(ins.dst)); emit_le(buf, ins.imm, 4); return; }  // /0
-    if (k == K_SUB_RI()) { rex(buf, 1, 0, 0, ext(ins.dst)); eb(buf, 129); eb(buf, 192 + 5 * 8 + lo3(ins.dst)); emit_le(buf, ins.imm, 4); return; }  // /5
-    if (k == K_CMP_RI()) { rex(buf, 1, 0, 0, ext(ins.dst)); eb(buf, 129); eb(buf, 192 + 7 * 8 + lo3(ins.dst)); emit_le(buf, ins.imm, 4); return; }  // /7
+    if (k == K_ADD_RI()) { rex(buf, 1, 0, 0, ext(ins.dst)); eb(buf, 129); eb(buf, 192 + 0 * 8 + lo3(ins.dst)); emit_le(buf, ins.imm, 4); return 0; }  // /0
+    if (k == K_SUB_RI()) { rex(buf, 1, 0, 0, ext(ins.dst)); eb(buf, 129); eb(buf, 192 + 5 * 8 + lo3(ins.dst)); emit_le(buf, ins.imm, 4); return 0; }  // /5
+    if (k == K_CMP_RI()) { rex(buf, 1, 0, 0, ext(ins.dst)); eb(buf, 129); eb(buf, 192 + 7 * 8 + lo3(ins.dst)); emit_le(buf, ins.imm, 4); return 0; }  // /7
 
     // ── memory ops (base+disp32) ───────────────────────────────────────────────
     if (k == K_LOAD()) {
@@ -292,14 +740,14 @@ fn encode_one_mode(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32],
         rex(buf, 1, ext(ins.dst), 0, ext(ins.src));
         eb(buf, 139);                              // 0x8B
         mem(buf, ins.dst, ins.src, ins.disp);
-        return;
+        return 0;
     }
     if (k == K_STORE()) {
         // mov [dst + disp], src : 89 /r  reg=src rm=[base=dst]
         rex(buf, 1, ext(ins.src), 0, ext(ins.dst));
         eb(buf, 137);                              // 0x89
         mem(buf, ins.src, ins.dst, ins.disp);
-        return;
+        return 0;
     }
     if (k == K_XCHG_MEM()) {
         // xchg r/m64,r64: x86 implicitly supplies the LOCK semantics whenever
@@ -307,7 +755,7 @@ fn encode_one_mode(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32],
         rex(buf, 1, ext(ins.src), 0, ext(ins.dst));
         eb(buf, 135);                              // 0x87
         mem(buf, ins.src, ins.dst, ins.disp);
-        return;
+        return 0;
     }
     if (k == K_XADD_MEM()) {
         // LOCK XADD r/m64,r64 returns the old memory word in src.  A zero add
@@ -315,7 +763,7 @@ fn encode_one_mode(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32],
         eb(buf, 240); rex(buf, 1, ext(ins.src), 0, ext(ins.dst));
         eb(buf, 15); eb(buf, 193);                 // F0 48 0F C1 /r
         mem(buf, ins.src, ins.dst, ins.disp);
-        return;
+        return 0;
     }
     if (k == K_CMPXCHG_MEM()) {
         // LOCK CMPXCHG r/m64,r64 compares RAX with memory and stores the
@@ -323,35 +771,35 @@ fn encode_one_mode(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32],
         eb(buf, 240); rex(buf, 1, ext(ins.src), 0, ext(ins.dst));
         eb(buf, 15); eb(buf, 177);                 // F0 48 0F B1 /r
         mem(buf, ins.src, ins.dst, ins.disp);
-        return;
+        return 0;
     }
     if (k == K_BSWAP()) {
         // bswap r64: REX.W 0F C8+rd. This is baseline x86-64, not an
         // optional SIMD or target-feature instruction.
         rex(buf, 1, 0, 0, ext(ins.dst));
         eb(buf, 15); eb(buf, 200 + lo3(ins.dst));
-        return;
+        return 0;
     }
     if (k == K_BSR()) {
         // bsr r64,r64: REX.W 0F BD /r. The caller guards zero because BSR
         // leaves its destination undefined for that input.
         rex(buf, 1, ext(ins.dst), 0, ext(ins.src));
         eb(buf, 15); eb(buf, 189); eb(buf, modrm_rr(ins.dst, ins.src));
-        return;
+        return 0;
     }
     if (k == K_PREFETCHT0()) {
         // prefetcht0 m8: 0F 18 /1. It is advisory and has no synchronization
         // semantics; the native lowering supplies a raw-pointer base.
         rex(buf, 0, 0, 0, ext(ins.dst));
         eb(buf, 15); eb(buf, 24); mem(buf, 1, ins.dst, 0);
-        return;
+        return 0;
     }
     if (k == K_LOAD8()) {
         // movzx dst, byte [src + disp] : REX.W 0F B6 /r
         rex(buf, 1, ext(ins.dst), 0, ext(ins.src));
         eb(buf, 15); eb(buf, 182);
         mem(buf, ins.dst, ins.src, ins.disp);
-        return;
+        return 0;
     }
     if (k == K_STORE8()) {
         // mov byte [dst + disp], src8 : REX 88 /r. Always emit REX so
@@ -359,7 +807,7 @@ fn encode_one_mode(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32],
         rex(buf, 0, ext(ins.src), 0, ext(ins.dst));
         eb(buf, 136);
         mem(buf, ins.src, ins.dst, ins.disp);
-        return;
+        return 0;
     }
     if (k == K_LOAD16()) {
         // movzx dst, word [src + disp] : 66 REX.W 0F B7 /r
@@ -367,7 +815,7 @@ fn encode_one_mode(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32],
         rex(buf, 1, ext(ins.dst), 0, ext(ins.src));
         eb(buf, 15); eb(buf, 183);             // 0F B7
         mem(buf, ins.dst, ins.src, ins.disp);
-        return;
+        return 0;
     }
     if (k == K_STORE16()) {
         // mov word [dst + disp], src16 : 66 REX 89 /r
@@ -375,7 +823,7 @@ fn encode_one_mode(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32],
         rex(buf, 0, ext(ins.src), 0, ext(ins.dst));
         eb(buf, 137);                          // 89
         mem(buf, ins.src, ins.dst, ins.disp);
-        return;
+        return 0;
     }
     if (k == K_LOAD32()) {
         // mov dst32, dword [src + disp] : 8B /r.  A 32-bit write zero-extends
@@ -386,7 +834,7 @@ fn encode_one_mode(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32],
         }
         eb(buf, 139);                          // 8B
         mem(buf, ins.dst, ins.src, ins.disp);
-        return;
+        return 0;
     }
     if (k == K_STORE32()) {
         // mov dword [dst + disp], src32 : 89 /r (no REX.W)
@@ -395,14 +843,14 @@ fn encode_one_mode(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32],
         }
         eb(buf, 137);                          // 89
         mem(buf, ins.src, ins.dst, ins.disp);
-        return;
+        return 0;
     }
     if (k == K_LEA()) {
         // lea dst, [src + disp] : 8D /r  reg=dst rm=[base=src]
         rex(buf, 1, ext(ins.dst), 0, ext(ins.src));
         eb(buf, 141);                              // 0x8D
         mem(buf, ins.dst, ins.src, ins.disp);
-        return;
+        return 0;
     }
 
     // ── setcc → movzx (dst = cc ? 1 : 0) ───────────────────────────────────────
@@ -416,7 +864,7 @@ fn encode_one_mode(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32],
         rex(buf, 1, ext(d), 0, ext(d));
         eb(buf, 15); eb(buf, 182);                 // 0F B6
         eb(buf, modrm_rr(d, d));
-        return;
+        return 0;
     }
 
     // ── relative branches (rel32) ──────────────────────────────────────────────
@@ -429,7 +877,7 @@ fn encode_one_mode(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32],
         if (r >= 8) { eb(buf, 65); r = r - 8; }   // 0x41 = REX.B
         eb(buf, 255);                               // 0xFF
         eb(buf, 208 + lo3(r));                      // ModRM: 11_010_rrr
-        return;
+        return 0;
     }
     // K_LEA_LBL: lea dst, [rip+label] = REX.W 8D ModRM05 rel32 (always 7 bytes)
     if (k == K_LEA_LBL()) {
@@ -441,99 +889,409 @@ fn encode_one_mode(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32],
         eb(buf, 141);                                // 0x8D = LEA
         eb(buf, 5 + lo3(dst) * 8);                  // ModRM: mod=00 reg=dst rm=101 (RIP+disp32)
         emit_le(buf, (target - (base_off + 7)) as i64, 4);
-        return;
+        return 0;
     }
 
     if (k == K_CALL_EXT()) {
-        eb(buf, 232); emit_le(buf, 0, 4); return;
+        eb(buf, 232); emit_le(buf, 0, 4); return 0;
     }
     if (k == K_CALL()) {
         let target: i32 = get[i32](labels, ins.lbl);
         eb(buf, 232);                              // 0xE8
         emit_le(buf, (target - (base_off + 5)) as i64, 4);
-        return;
+        return 0;
     }
     if (k == K_JMP()) {
         let target: i32 = get[i32](labels, ins.lbl);
         eb(buf, 233);                              // 0xE9
         emit_le(buf, (target - (base_off + 5)) as i64, 4);
-        return;
+        return 0;
     }
     if (is_jcc(k) == 1) {
         let target: i32 = get[i32](labels, ins.lbl);
         eb(buf, 15); eb(buf, jcc_op(k));           // 0F op
         emit_le(buf, (target - (base_off + 6)) as i64, 4);
-        return;
+        return 0;
     }
 
     // ── SSE scalar floating-point ─────────────────────────────────────────────
     // movq xmm[dst], gpr[src] : 66 REX.W 0F 6E /r  (reg=xmm dst, rm=gpr src)
-    if (k == K_FMOVQ_GX()) { sse_op(buf, 102, 1, ins.dst, ins.src, 110); return; }
+    if (k == K_FMOVQ_GX()) { sse_op(buf, 102, 1, ins.dst, ins.src, 110); return 0; }
     // movq gpr[dst], xmm[src] : 66 REX.W 0F 7E /r  (reg=xmm src, rm=gpr dst)
-    if (k == K_FMOVQ_XG()) { sse_op(buf, 102, 1, ins.src, ins.dst, 126); return; }
+    if (k == K_FMOVQ_XG()) { sse_op(buf, 102, 1, ins.src, ins.dst, 126); return 0; }
     // addsd/subsd/mulsd/divsd xmm[dst], xmm[src] : F2 0F {58,5C,59,5E} /r
-    if (k == K_FADD()) { sse_op(buf, 242, 0, ins.dst, ins.src, 88);  return; }  // 0x58
-    if (k == K_FSUB()) { sse_op(buf, 242, 0, ins.dst, ins.src, 92);  return; }  // 0x5C
-    if (k == K_FMUL()) { sse_op(buf, 242, 0, ins.dst, ins.src, 89);  return; }  // 0x59
-    if (k == K_FDIV()) { sse_op(buf, 242, 0, ins.dst, ins.src, 94);  return; }  // 0x5E
+    if (k == K_FADD()) { sse_op(buf, 242, 0, ins.dst, ins.src, 88);  return 0; }  // 0x58
+    if (k == K_FSUB()) { sse_op(buf, 242, 0, ins.dst, ins.src, 92);  return 0; }  // 0x5C
+    if (k == K_FMUL()) { sse_op(buf, 242, 0, ins.dst, ins.src, 89);  return 0; }  // 0x59
+    if (k == K_FDIV()) { sse_op(buf, 242, 0, ins.dst, ins.src, 94);  return 0; }  // 0x5E
     // ucomisd xmm[dst], xmm[src] : 66 0F 2E /r
-    if (k == K_FUCOMI()) { sse_op(buf, 102, 0, ins.dst, ins.src, 46); return; } // 0x2E
+    if (k == K_FUCOMI()) { sse_op(buf, 102, 0, ins.dst, ins.src, 46); return 0; } // 0x2E
     // cvtsi2sd xmm[dst], gpr[src] : F2 REX.W 0F 2A /r (reg=xmm dst, rm=gpr src)
-    if (k == K_FSI2SD()) { sse_op(buf, 242, 1, ins.dst, ins.src, 42); return; } // 0x2A
+    if (k == K_FSI2SD()) { sse_op(buf, 242, 1, ins.dst, ins.src, 42); return 0; } // 0x2A
     // cvttsd2si gpr[dst], xmm[src] : F2 REX.W 0F 2C /r (reg=gpr dst, rm=xmm src)
-    if (k == K_FTSD2SI()) { sse_op(buf, 242, 1, ins.dst, ins.src, 44); return; }// 0x2C
+    if (k == K_FTSD2SI()) { sse_op(buf, 242, 1, ins.dst, ins.src, 44); return 0; }// 0x2C
     // cvtsd2ss / cvtss2sd xmm[dst], xmm[src] : F2/F3 0F 5A /r
-    if (k == K_FSD2SS()) { sse_op(buf, 242, 0, ins.dst, ins.src, 90); return; } // 0x5A
-    if (k == K_FSS2SD()) { sse_op(buf, 243, 0, ins.dst, ins.src, 90); return; }
+    if (k == K_FSD2SS()) { sse_op(buf, 242, 0, ins.dst, ins.src, 90); return 0; } // 0x5A
+    if (k == K_FSS2SD()) { sse_op(buf, 243, 0, ins.dst, ins.src, 90); return 0; }
     // xorps xmm[dst], xmm[src] : 0F 57 /r (no prefix)
-    if (k == K_FXORPS()) { sse_op(buf, 0, 0, ins.dst, ins.src, 87); return; }   // 0x57
+    if (k == K_FXORPS()) { sse_op(buf, 0, 0, ins.dst, ins.src, 87); return 0; }   // 0x57
     // sqrtsd xmm[dst], xmm[src] : F2 0F 51 /r
-    if (k == K_FSQRTSD()) { sse_op(buf, 242, 0, ins.dst, ins.src, 81); return; } // 0x51
+    if (k == K_FSQRTSD()) { sse_op(buf, 242, 0, ins.dst, ins.src, 81); return 0; } // 0x51
     // SSE2 MOVDQU 128-bit unaligned loads/stores.  The only current producer is
     // the compiler-owned memcpy runtime; no user vector ABI is exposed here.
-    if (k == K_MOVDQU_LOAD()) { sse_mem(buf, 243, ins.dst, ins.src, ins.disp, 111); return; } // 0x6F
-    if (k == K_MOVDQU_STORE()) { sse_mem(buf, 243, ins.src, ins.dst, ins.disp, 127); return; } // 0x7F
+    if (k == K_MOVDQU_LOAD()) { sse_mem(buf, 243, ins.dst, ins.src, ins.disp, 111); return 0; } // 0x6F
+    if (k == K_MOVDQU_STORE()) { sse_mem(buf, 243, ins.src, ins.dst, ins.disp, 127); return 0; } // 0x7F
     // SSE2 PADDD performs four independent modulo-2^32 lane additions.  Like
     // MOVDQU, it is an x86-64 baseline instruction, not a host-selected AVX
     // feature, and its operands are XMM registers only.
-    if (k == K_PADDD()) { sse_op(buf, 102, 0, ins.dst, ins.src, 254); return; } // 0xFE
+    if (k == K_PADDD()) { sse_op(buf, 102, 0, ins.dst, ins.src, 254); return 0; } // 0xFE
     // SSE2 PSUBD is the matching four-lane modulo-2^32 subtraction form.
-    if (k == K_PSUBD()) { sse_op(buf, 102, 0, ins.dst, ins.src, 250); return; } // 0xFA
-    if (k == K_PAND()) { sse_op(buf, 102, 0, ins.dst, ins.src, 219); return; } // 0xDB
-    if (k == K_POR())  { sse_op(buf, 102, 0, ins.dst, ins.src, 235); return; } // 0xEB
-    if (k == K_PXOR()) { sse_op(buf, 102, 0, ins.dst, ins.src, 239); return; } // 0xEF
+    if (k == K_PSUBD()) { sse_op(buf, 102, 0, ins.dst, ins.src, 250); return 0; } // 0xFA
+    if (k == K_PAND()) { sse_op(buf, 102, 0, ins.dst, ins.src, 219); return 0; } // 0xDB
+    if (k == K_POR())  { sse_op(buf, 102, 0, ins.dst, ins.src, 235); return 0; } // 0xEB
+    if (k == K_PXOR()) { sse_op(buf, 102, 0, ins.dst, ins.src, 239); return 0; } // 0xEF
+    // The 256-bit AVX2 vector family (K_VMOVDQU_LOAD/STORE, K_VPADDD, K_VPSUBD,
+    // K_VPAND, K_VPOR, K_VPXOR) is width-parameteric and is dispatched by
+    // x86_vec_encode above, together with the rest of the VEX/EVEX kinds.
     // BMI1 TZCNT dst,src : F3 REX.W 0F BC /r.  It is emitted only from the
     // target-gated trailing_zeros intrinsic; generic code uses its exact loop.
-    if (k == K_TZCNT()) { sse_op(buf, 243, 1, ins.dst, ins.src, 188); return; } // 0xBC
+    if (k == K_TZCNT()) { sse_op(buf, 243, 1, ins.dst, ins.src, 188); return 0; } // 0xBC
     // fldl [src+disp] : DD /0 mod/rm/disp  (x87 load 64-bit double, no REX)
     if (k == K_X87_LOAD()) {
         eb(buf, 221);                           // DD
         mem(buf, 0, ins.src, ins.disp);         // /0 [base+disp32]
-        return;
+        return 0;
     }
     // fstpl [dst+disp] : DD /3 mod/rm/disp  (x87 store-and-pop, no REX)
     if (k == K_X87_STORE()) {
         eb(buf, 221);                           // DD
         mem(buf, 3, ins.dst, ins.disp);         // /3 [base+disp32]
-        return;
+        return 0;
     }
-    if (k == K_X87_SIN())  { eb(buf, 217); eb(buf, 254); return; }  // D9 FE
-    if (k == K_X87_COS())  { eb(buf, 217); eb(buf, 255); return; }  // D9 FF
-    if (k == K_X87_SQRT()) { eb(buf, 217); eb(buf, 250); return; }  // D9 FA
+    if (k == K_X87_SIN())  { eb(buf, 217); eb(buf, 254); return 0; }  // D9 FE
+    if (k == K_X87_COS())  { eb(buf, 217); eb(buf, 255); return 0; }  // D9 FF
+    if (k == K_X87_SQRT()) { eb(buf, 217); eb(buf, 250); return 0; }  // D9 FA
 
     // unknown kind: emit nothing (should never happen for a valid program).
-    return;
+    return 0;
 }
 
-fn encode_one(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32], base_off: i32) void {
-    encode_one_mode(buf, ins, labels, base_off, 0);
+// ── the width-parameteric vector dispatch ─────────────────────────────────────
+// Membership test for the VEX/EVEX family.  Keeping it in one function is what
+// lets encode_one_mode hand the whole family to one encoder and guarantees no
+// new kind can be forgotten by a dispatch chain.
+fn x86_vec_kind(k: i32) i32 {
+    if (k == K_VMOVDQU_LOAD())  { return 1; }
+    if (k == K_VMOVDQU_STORE()) { return 1; }
+    if (k == K_VPADDD()) { return 1; }
+    if (k == K_VPSUBD()) { return 1; }
+    if (k == K_VPAND())  { return 1; }
+    if (k == K_VPOR())   { return 1; }
+    if (k == K_VPXOR())  { return 1; }
+    if (k == K_VPADDQ())  { return 1; }
+    if (k == K_VPSUBQ())  { return 1; }
+    if (k == K_VPMULLD()) { return 1; }
+    if (k == K_VPMULLQ()) { return 1; }
+    if (k == K_VPSLLD())  { return 1; }
+    if (k == K_VPSLLQ())  { return 1; }
+    if (k == K_VPSRLD())  { return 1; }
+    if (k == K_VPSRLQ())  { return 1; }
+    if (k == K_VPCMPEQI()) { return 1; }
+    if (k == K_VPCMPGTI()) { return 1; }
+    if (k == K_VPCMPNEI()) { return 1; }
+    if (k == K_VPCMPGTU()) { return 1; }
+    if (k == K_VCMPIK())   { return 1; }
+    if (k == K_VADDPS())  { return 1; }
+    if (k == K_VADDPD())  { return 1; }
+    if (k == K_VSUBPS())  { return 1; }
+    if (k == K_VSUBPD())  { return 1; }
+    if (k == K_VMULPS())  { return 1; }
+    if (k == K_VMULPD())  { return 1; }
+    if (k == K_VDIVPS())  { return 1; }
+    if (k == K_VDIVPD())  { return 1; }
+    if (k == K_VSQRTPS()) { return 1; }
+    if (k == K_VSQRTPD()) { return 1; }
+    if (k == K_VANDPS())  { return 1; }
+    if (k == K_VANDPD())  { return 1; }
+    if (k == K_VANDNPS()) { return 1; }
+    if (k == K_VANDNPD()) { return 1; }
+    if (k == K_VORPS())   { return 1; }
+    if (k == K_VORPD())   { return 1; }
+    if (k == K_VXORPS())  { return 1; }
+    if (k == K_VXORPD())  { return 1; }
+    if (k == K_VCMPF())   { return 1; }
+    if (k == K_VSPLAT32())    { return 1; }
+    if (k == K_VSPLAT64())    { return 1; }
+    if (k == K_VBROADCAST32()) { return 1; }
+    if (k == K_VBROADCAST64()) { return 1; }
+    if (k == K_VEXTRACT32())  { return 1; }
+    if (k == K_VEXTRACT64())  { return 1; }
+    if (k == K_VINSERT32())   { return 1; }
+    if (k == K_VINSERT64())   { return 1; }
+    if (k == K_VSHUF32())     { return 1; }
+    if (k == K_VSHUFB())      { return 1; }
+    if (k == K_VZERO())       { return 1; }
+    if (k == K_VSELECT())     { return 1; }
+    if (k == K_VSELECTK())    { return 1; }
+    if (k == K_VMOVDQU_LOAD_IDX())  { return 1; }
+    if (k == K_VMOVDQU_STORE_IDX()) { return 1; }
+    return 0;
+}
+
+// Lanes per 128-bit chunk, and the reverse, for the lane-indexed forms.
+fn vec_lanes_per_chunk(ew: i32) i32 { return 16 / ew; }
+
+// Encode one width-parameteric vector instruction.  Returns 1 (and emits
+// NOTHING) when the requested combination is not encodable on x86-64.
+//
+// Encoding summary for the whole family, all verified against the SDM tables:
+//
+//   3-operand packed   VEX.NDS.L.pp.mm.W? /r        (128/256)
+//                      EVEX.NDS.L'L.pp.mm.W? /r     (512, and the EVEX-only ops)
+//                      ModRM.reg=dst  vvvv=src  ModRM.rm=src2
+//   2-operand NDS+ib   VEX.L.pp.0F3A.W? /r ib       (vpextrd/vpextrq/vpinsrd/…
+//                                                   vpshufd, imm8 = lane/selector)
+//   memory              VEX.L.pp.mm.W? /r            (v = 0, no vvvv)
+//                      [base + disp32]  or  [base + index*scale + disp32]
+//   broadcast from GPR  EVEX.L'L.66.0F38.W? 7C /r   (vpbroadcastd / vpbroadcastq)
+//
+// `pp`: 0 = no prefix, 1 = 66, 2 = F3, 3 = F2.  `mm`: 1 = 0F, 2 = 0F38, 3 = 0F3A.
+fn x86_vec_encode(buf: *ArrayList[u8], ins: Instr) i32 {
+    let k: i32 = ins.kind;
+    let w: i32 = x86vec_wclass(ins.imm);
+    let d: i32 = ins.dst;
+    let s1: i32 = ins.src;
+    let s2: i32 = ins.lbl;
+
+    // ── the pre-existing AVX2 foundation, now width-parameteric ──────────────
+    // These six/seven kinds are the 2-operand NDS form (`dst` is both the
+    // destination and src1) plus the plain memory form.  `i_vpaddd(d, s)`
+    // still builds a VW_256 instruction, so the historical AVX2 bytes are
+    // unchanged; `i_vpaddd_w(d, s1, s2, w)` selects the width and the
+    // non-destructive 3-operand form.
+    if (k == K_VMOVDQU_LOAD())  { return vec_mem(buf, 2, 1, 0, 111, w, d, s1, ins.disp); }
+    if (k == K_VMOVDQU_STORE()) { return vec_mem(buf, 2, 1, 0, 127, w, d, s1, ins.disp); }
+    if (k == K_VPADDD()) { return vec_op3_vvv(buf, 1, 1, 0, 254, w, d, s1, s2); }
+    if (k == K_VPSUBD()) { return vec_op3_vvv(buf, 1, 1, 0, 250, w, d, s1, s2); }
+    if (k == K_VPAND())  { return vec_op3_vvv(buf, 1, 1, 0, 219, w, d, s1, s2); }
+    if (k == K_VPOR())   { return vec_op3_vvv(buf, 1, 1, 0, 235, w, d, s1, s2); }
+    if (k == K_VPXOR())  { return vec_op3_vvv(buf, 1, 1, 0, 239, w, d, s1, s2); }
+
+    // ── integer elementwise ────────────────────────────────────────────────
+    // `s2` is NOLBL for the 2-operand contract, in which case `dst` is also
+    // src1 and `s1` is the only explicit second source.
+    if (k == K_VPADDQ())  { return vec_op3_vvv(buf, 1, 1, 1, 212, w, d, s1, s2); }   // 0F D4
+    if (k == K_VPSUBQ())  { return vec_op3_vvv(buf, 1, 1, 1, 251, w, d, s1, s2); }   // 0F FB
+    if (k == K_VPMULLD()) { return vec_op3_vvv(buf, 1, 2, 0, 64,  w, d, s1, s2); }    // 0F38 40
+    if (k == K_VPMULLQ()) {
+        // VPMULLQ is EVEX.512.66.0F.W1 44 only (AVX512DQ); no VEX form exists.
+        if (w != VW_512()) { return 1; }
+        return vec_op3(buf, 1, 2, 1, 64, w, d, s1, s2);
+    }
+    // Shifts: the count operand is an XMM/m128 even for a 512-bit destination.
+    if (k == K_VPSLLD())  { return vec_op3_vvv(buf, 1, 1, 0, 242, w, d, s1, s2); }  // 0F F2
+    if (k == K_VPSLLQ())  { return vec_op3_vvv(buf, 1, 1, 1, 243, w, d, s1, s2); }  // 0F.W1 F3
+    if (k == K_VPSRLD())  { return vec_op3_vvv(buf, 1, 1, 0, 210, w, d, s1, s2); }  // 0F D2
+    if (k == K_VPSRLQ())  { return vec_op3_vvv(buf, 1, 1, 1, 211, w, d, s1, s2); }  // 0F.W1 D3
+
+    // ── integer compare ─────────────────────────────────────────────────────
+    // `ew` (ins.disp) selects 32-bit (4) or 64-bit (8) lanes.
+    let ew: i32 = ins.disp;
+    let is64: i32 = (ew == 8) as i32;
+    if (k == K_VPCMPEQI()) {
+        if (ew != 4 && ew != 8) { return 1; }
+        // 32-bit: 66 0F.W0 76   VPCMPEQD (0F map)
+        // 64-bit: 66 0F38.W1 29 VPCMPEQQ (0F38 map — VPCMPEQQ is NOT 0F 76 W1)
+        if (is64 == 1) { return vec_op3_vex(buf, 1, 2, 1, 41, w, d, s1, s2); }
+        return vec_op3_vex(buf, 1, 1, 0, 118, w, d, s1, s2);
+    }
+    if (k == K_VPCMPGTI()) {
+        if (ew != 4 && ew != 8) { return 1; }
+        // 32-bit: 66 0F.W0 66  VPCMPGTD
+        // 64-bit: 66 0F38.W1 37 VPCMPGTQ
+        if (is64 == 1) { return vec_op3_vex(buf, 1, 2, 1, 55, w, d, s1, s2); }
+        return vec_op3_vex(buf, 1, 1, 0, 102, w, d, s1, s2);
+    }
+    if (k == K_VPCMPNEI()) {
+        // 66 0F3A.W0/1 1F /r ib, imm8 = 4 (NE).  Writes a k register, so it is
+        // EVEX-only and `d` is a k number.
+        if (ew != 4 && ew != 8) { return 1; }
+        return vec_op3_k(buf, 1, 3, is64, 31, 4, w, d, s1, s2);
+    }
+    if (k == K_VPCMPGTU()) {
+        // 66 0F3A.W0/1 1E /r ib, imm8 = 7 (GT, unsigned).  k destination.
+        if (ew != 4 && ew != 8) { return 1; }
+        return vec_op3_k(buf, 1, 3, is64, 30, 7, w, d, s1, s2);
+    }
+    if (k == K_VCMPIK()) {
+        // VPCMPD/VPCMPQ (0F3A 1F, signed + ordered float) or VPCMPUD/VPCMPUQD
+        // (0F3A 1E, unsigned + unordered float).  `ins.disp` = ew + 256*unsigned.
+        if (ew != 4 && ew != 8) { return 1; }
+        let unsign: i32 = (ew / 256) % 2;
+        let lwe: i32 = ew % 256;
+        let pred: i32 = x86vec_imm8(ins.imm);
+        if (lwe != 4 && lwe != 8) { return 1; }
+        let opc: i32 = 31;
+        if (unsign == 1) { opc = 30; }
+        let wex: i32 = 0;
+        if (lwe == 8) { wex = 1; }
+        return vec_op3_k(buf, 1, 3, wex, opc, pred, w, d, s1, s2);
+    }
+
+    // ── float elementwise ───────────────────────────────────────────────────
+    if (k == K_VADDPS()) { return vec_op3_vvv(buf, 0, 1, 0, 88,  w, d, s1, s2); }
+    if (k == K_VADDPD()) { return vec_op3_vvv(buf, 1, 1, 1, 88,  w, d, s1, s2); }
+    if (k == K_VSUBPS()) { return vec_op3_vvv(buf, 0, 1, 0, 92,  w, d, s1, s2); }
+    if (k == K_VSUBPD()) { return vec_op3_vvv(buf, 1, 1, 1, 92,  w, d, s1, s2); }
+    if (k == K_VMULPS()) { return vec_op3_vvv(buf, 0, 1, 0, 89,  w, d, s1, s2); }
+    if (k == K_VMULPD()) { return vec_op3_vvv(buf, 1, 1, 1, 89,  w, d, s1, s2); }
+    if (k == K_VDIVPS()) { return vec_op3_vvv(buf, 0, 1, 0, 94,  w, d, s1, s2); }
+    if (k == K_VDIVPD()) { return vec_op3_vvv(buf, 1, 1, 1, 94,  w, d, s1, s2); }
+    if (k == K_VANDPS()) { return vec_op3_vvv(buf, 0, 1, 0, 84,  w, d, s1, s2); }
+    if (k == K_VANDPD()) { return vec_op3_vvv(buf, 1, 1, 1, 84,  w, d, s1, s2); }
+    if (k == K_VANDNPS()) { return vec_op3_vvv(buf, 0, 1, 0, 85,  w, d, s1, s2); }
+    if (k == K_VANDNPD()) { return vec_op3_vvv(buf, 1, 1, 1, 85,  w, d, s1, s2); }
+    if (k == K_VORPS())  { return vec_op3_vvv(buf, 0, 1, 0, 86,  w, d, s1, s2); }
+    if (k == K_VORPD())  { return vec_op3_vvv(buf, 1, 1, 1, 86,  w, d, s1, s2); }
+    if (k == K_VXORPS()) { return vec_op3_vvv(buf, 0, 1, 0, 87,  w, d, s1, s2); }
+    if (k == K_VXORPD()) { return vec_op3_vvv(buf, 1, 1, 1, 87,  w, d, s1, s2); }
+    if (k == K_VZERO())  { return vec_op3_vvv(buf, 1, 1, 0, 239, w, d, d, d); }
+    // SQRT is 2-operand: VEX.vvvv is the destination, ModRM.rm the source.
+    if (k == K_VSQRTPS()) { return vec_sqrt(buf, 0, 0, 81, w, d, s2); }
+    if (k == K_VSQRTPD()) { return vec_sqrt(buf, 1, 1, 81, w, d, s2); }
+
+    // ── float compare ───────────────────────────────────────────────────────
+    // VEX.128/256.0F.W0 C2 (f32) and VEX.128/256.66.0F.W0 C2 (f64) /r ib.  With
+    // a REGISTER in the ModRM.rm position these are the PACKED forms, so one
+    // kind covers a whole vector.  At 512 bits the EVEX form writes a k
+    // register, so VW_512 is rejected here; K_VCMPIK covers it.
+    if (k == K_VCMPF()) {
+        if (w == VW_512()) { return 1; }
+        if (ew != 4 && ew != 8) { return 1; }
+        let pred: i32 = x86vec_imm8(ins.imm);
+        let ppf: i32 = 0;
+        if (ew == 8) { ppf = 1; }
+        return vec_op3_ib_vex(buf, ppf, 1, 0, 194, pred, w, d, s1, s2);
+    }
+
+    // ── splat / broadcast ───────────────────────────────────────────────────
+    if (k == K_VSPLAT32()) {
+        if (vec_r_ok(d) == 0 || vec_r_ok(s1) == 0) { return 1; }
+        if (w == VW_512()) { evex_broadcast(buf, 124, 0, d, s1, w); return 0; }
+        // vmovd xmm[dst], gpr  (66 0F.W0 6E, vvvv unused) then
+        // vbroadcastss vec[dst], xmm[dst] (66 0F38.W0 18, vvvv unused)
+        vex3_ib_at_6e(buf, 0, d, s1);
+        vex3_reg_18(buf, w, d);
+        return 0;
+    }
+    if (k == K_VSPLAT64()) {
+        if (vec_r_ok(d) == 0 || vec_r_ok(s1) == 0) { return 1; }
+        if (w == VW_512()) { evex_broadcast(buf, 124, 1, d, s1, w); return 0; }
+        // vmovq xmm[dst], gpr  (66 0F.W1 6E, vvvv unused)
+        vex3_ib_at_6e(buf, 1, d, s1);
+        if (w == VW_256()) { vex3_reg_19(buf, w, d); return 0; }
+        // 128-bit qword splat: VBROADCASTSD has no 128-bit register form, so
+        // duplicate the low qword instead (66 0F.W0 6C VPUNPCKLQDQ).
+        vec_op3(buf, 1, 1, 0, 108, w, d, d, d);
+        return 0;
+    }
+    if (k == K_VBROADCAST32()) {
+        // vbroadcastss vec, m32 : 66 0F38.W0 18 /r
+        return vec_mem(buf, 1, 2, 0, 24, w, d, s1, ins.disp);
+    }
+    if (k == K_VBROADCAST64()) {
+        // vbroadcastsd vec, m64 : 66 0F38 19 /r.  Note the prefix-dependent W:
+        // the VEX form is 66 0F38.W0 19 and the EVEX form is 66 0F38.W1 19
+        // (W=0 at 512 bits is VBROADCASTF32X2, a DIFFERENT instruction that
+        // duplicates a pair of f32 lanes instead of one qword).
+        if (w == VW_512()) { return vec_mem(buf, 1, 2, 1, 25, w, d, s1, ins.disp); }
+        return vec_mem(buf, 1, 2, 0, 25, w, d, s1, ins.disp);
+    }
+
+    // ── lane movement ───────────────────────────────────────────────────────
+    if (k == K_VEXTRACT32() || k == K_VEXTRACT64()) {
+        let isq: i32 = 0;
+        if (k == K_VEXTRACT64()) { isq = 1; }
+        return vec_extract(buf, isq, w, d, s1, s2, ins.disp);
+    }
+    if (k == K_VINSERT32() || k == K_VINSERT64()) {
+        let isq: i32 = 0;
+        if (k == K_VINSERT64()) { isq = 1; }
+        // dst = the vector result, src = the vector read, lbl = the GPR
+        // scalar, disp = the lane index (see the isa.zag field layout).
+        return vec_insert(buf, isq, w, d, s1, s2, ins.disp);
+    }
+    if (k == K_VSHUF32()) {
+        // vpshufd vec, vec, imm8 : 66 0F.W0 70 /r ib, vvvv unused
+        let sel: i32 = x86vec_imm8(ins.imm);
+        if (sel < 0 || sel > 255) { return 1; }
+        if (w == VW_512()) {
+            evex_op3_ib_at(buf, 1, 1, 0, w, 112, sel, d, 0, s1);
+            return 0;
+        }
+        vex3_op3_ib_at(buf, 1, 1, 0, w, 112, sel, d, 0, s1);
+        return 0;
+    }
+    if (k == K_VSHUFB()) {
+        // vpshufb dst, control, data : 66 0F38.W0 00 /r
+        return vec_op3(buf, 1, 2, 0, 0, w, d, s1, s2);
+    }
+
+    // ── select ──────────────────────────────────────────────────────────────
+    if (k == K_VSELECT()) {
+        // dst = (mask ? a : b) as  dst = a ^ ((a ^ b) & mask),  three
+        // bitwise 32-bit-lane ops.  W=0 (VPXORD/VPANDD) is correct for BOTH
+        // 32- and 64-bit lanes because a bitwise op on 32-bit lanes IS the
+        // 64-bit lane op.  `d` is clobbered and may alias `a`; it must differ
+        // from `b` and from the mask register.
+        if (vec_w_ok(w) == 0) { return 1; }
+        if (vec_r_ok(d) == 0 || vec_r_ok(s1) == 0 || vec_r_ok(s2) == 0) { return 1; }
+        if (ins.disp < 0 || ins.disp > 15) { return 1; }
+        let mask: i32 = ins.disp;
+        if (d == mask || d == s2) { return 1; }
+        if (vec_op3(buf, 1, 1, 0, 239, w, d, d, s2) == 1) { return 1; }
+        if (vec_op3(buf, 1, 1, 0, 219, w, d, d, mask) == 1) { return 1; }
+        vec_op3(buf, 1, 1, 0, 239, w, d, d, s2);
+        return 0;
+    }
+    if (k == K_VSELECTK()) {
+        // dst = (k ? a : b) in ONE instruction: VPXORD dst{k}, a, b merges
+        // (a ^ b) into dst under the mask, so dst must already hold `a` — which
+        // is the same aliasing contract as K_VSELECT.  EVEX only (AVX512VL for
+        // the 128/256 forms).
+        if (vec_w_ok(w) == 0) { return 1; }
+        if (vec_r_ok(d) == 0 || vec_r_ok(s1) == 0 || vec_r_ok(s2) == 0) { return 1; }
+        let kk: i32 = ins.disp;
+        if (kk < 0 || kk >= R_KMASK_MAX()) { return 1; }
+        evex_op3_mask_at(buf, 1, 1, 0, w, 239, d, s1, s2, kk, 0);
+        return 0;
+    }
+
+    // ── scaled-index memory ─────────────────────────────────────────────────
+    if (k == K_VMOVDQU_LOAD_IDX() || k == K_VMOVDQU_STORE_IDX()) {
+        let opc: i32 = 111;
+        if (k == K_VMOVDQU_STORE_IDX()) { opc = 127; }
+        return vec_mem_idx(buf, 2, 1, 0, opc, w, d, s1, s2,
+                           x86vec_scale_log(ins.imm), ins.disp);
+    }
+
+    return 1;
+}
+
+fn encode_one(buf: *ArrayList[u8], ins: Instr, labels: ArrayList[i32], base_off: i32) i32 {
+    return encode_one_mode(buf, ins, labels, base_off, 0);
 }
 
 // kind=0 is a declared foreign call; kind=1 is a compiler-owned .data
 // address. Keeping both in one target record preserves the encoder's exact
 // byte offset without pattern-matching machine code in the driver writer.
 struct X86ObjectReloc { offset:i32, import:i32, kind:i32, data_offset:i32 }
-struct X86Encoded { text:ArrayList[u8], labels:ArrayList[i32], relocs:ArrayList[X86ObjectReloc] }
+// `errors` counts instructions that had NO valid x86-64 encoding at the
+// width class they asked for (an EVEX-only opcode at 128 bits, a virtual
+// register in a ModRM field, a lane index outside the width, ...).  Those
+// instructions emit zero bytes, so the count is the only signal; a driver
+// or test that requires errors == 0 has a machine-checkable contract.
+struct X86Encoded { text:ArrayList[u8], labels:ArrayList[i32], relocs:ArrayList[X86ObjectReloc], errors:i32 }
 
 // ── two-pass label resolution + assembly ──────────────────────────────────────
 // Object emission needs the same resolved label offsets used for branch
@@ -553,6 +1311,7 @@ fn encode_with_labels_mode(prog: ArrayList[Instr], driver_mode: i32) X86Encoded 
     let nlbl: i32 = maxlbl + 1;
 
     let labels: ArrayList[i32] = make[i32](nlbl + 1);
+    let errs: i32 = 0;
     let j: i32 = 0;
     while (j < nlbl) { push[i32](&labels, 0); j = j + 1; }
 
@@ -565,7 +1324,7 @@ fn encode_with_labels_mode(prog: ArrayList[Instr], driver_mode: i32) X86Encoded 
         if (ins1.kind == K_LABEL()) {
             set[i32](&labels, ins1.lbl, here);
         }
-        encode_one_mode(&scratch, ins1, labels, here, driver_mode);
+        errs = errs + encode_one_mode(&scratch, ins1, labels, here, driver_mode);
         i = i + 1;
     }
 
@@ -584,11 +1343,13 @@ fn encode_with_labels_mode(prog: ArrayList[Instr], driver_mode: i32) X86Encoded 
             // the instruction's two-byte REX/opcode prefix.
             push[X86ObjectReloc](&relocs, X86ObjectReloc{.offset=off+2,.import=-1,.kind=1,.data_offset=(ins2.imm-DATA_VBASE()) as i32});
         }
-        encode_one_mode(&out, ins2, labels, off, driver_mode);
+        errs = errs + encode_one_mode(&out, ins2, labels, off, driver_mode);
         i = i + 1;
     }
 
-    return X86Encoded{.text=out,.labels=labels,.relocs=relocs};
+    free[u8](&scratch);
+
+    return X86Encoded{.text=out,.labels=labels,.relocs=relocs,.errors=errs};
 }
 
 fn encode_with_labels(prog: ArrayList[Instr]) X86Encoded {

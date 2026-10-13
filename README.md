@@ -73,19 +73,30 @@ chmod +x znc bootstrap.sh
 ./znc examples/numeric.zag -o numeric --run
 ```
 
-On Apple Silicon macOS, a trusted development/CI `znc-macos-arm64` seed can be
-used to exercise the scoped signed-Mach-O path. This is not a general macOS
-release or Linux-parity claim:
+On Apple Silicon macOS, download the
+`zag-znc-macos-arm64-verified-<commit>` artifact from a successful physical-Mac
+CI gate for a commit you reviewed. Confirm its `SOURCE_COMMIT` and compare the
+job-summary SHA-256 with the included checksum, then bootstrap the clean tree:
 
 ```bash
-chmod +x znc-macos-arm64
+bash tools/bootstrap-macos-seed.sh /path/to/znc-macos-arm64 \
+  /path/to/znc-macos-arm64.sha256
 ./znc-macos-arm64 examples/numeric.zag -o numeric --run
 ```
 
+The similarly named `-cross-` artifact is not a verified seed. The helper does
+not download or choose trust for you; it validates the signed Mach-O input and
+rebuilds the current source to a byte-identical fixed point. This remains the
+scoped support contract, not a general macOS or Linux-parity claim.
+A verified `macos-arm64` release archive is the durable alternative; after
+checking its published outer checksum, the same helper accepts the archive's
+normalized `znc` and included `znc.sha256`.
+
 `./znc` is the supported v1 compiler on its documented Linux release path: it
 lexes, parses, type-checks, proves capabilities, optimizes, and emits Linux ELF
-without external tools. The Apple Silicon writer emits only the scoped Mach-O
-executable slice described by the support contract. See
+without external tools. The Apple Silicon writer emits the scoped Mach-O
+executable, object/archive and dynamic-library slices described by the support
+contract. See
 [`zag-poc/INSTALL.md`](zag-poc/INSTALL.md) and [`zag-poc/BOOTSTRAP.md`](zag-poc/BOOTSTRAP.md).
 
 No C-emitting compiler or external prover is required for the supported path.

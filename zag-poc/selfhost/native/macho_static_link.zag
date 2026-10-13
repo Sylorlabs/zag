@@ -1,0 +1,464 @@
+@import("macho_static_read.zag")
+@import("macho_object_encoder.zag")
+
+struct MsPlacedSection { object: i32, section: i32, output_section: i32, base: i64 }
+// rank: 3 strong section definition, 2 COMMON, 1 weak section definition.
+struct MsDefRef {
+    name: []u8, object: i32, symbol: i32, rank: i32,
+    common_size: i64, common_align: i32, common_base: i64, output: i32
+}
+struct MsSymMap { object: i32, symbol: i32, output: i32 }
+struct MsRelocAlias { object: i32, relocation: i32, output: i32 }
+struct MsMerged { encoded: MobjEncoded, data: ArrayList[u8] }
+
+fn ms_merge_error(message: []u8) i32 {
+    _zag_eprintln(_zag_str_concat("Mach-O static link: ", message));
+    return 0;
+}
+fn ms_owned(text: []u8) []u8 { return _zag_str_concat("", text); }
+fn ms_unique_local(prefix: []u8, object: i32, index: i32) []u8 {
+    let a: []u8 = _zag_i64_to_str(object as i64);
+    let b: []u8 = _zag_i64_to_str(index as i64);
+    let out: []u8 = _zag_str_concat(prefix,_zag_str_concat(a,_zag_str_concat(".",b)));
+    _zag_str_free(a); _zag_str_free(b); return out;
+}
+fn ms_place_find(places: ArrayList[MsPlacedSection], object: i32, section: i32) MsPlacedSection {
+    let i: i32 = 0;
+    while (i < places.len) {
+        if (places.data[i].object == object && places.data[i].section == section) { return places.data[i]; }
+        i = i+1;
+    }
+    return MsPlacedSection{.object=-1,.section=-1,.output_section=0,.base=0};
+}
+fn ms_def_find(defs: ArrayList[MsDefRef], name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < defs.len) { if (@strEq(defs.data[i].name,name)) { return i; } i=i+1; }
+    return -1;
+}
+fn ms_map_find(maps: ArrayList[MsSymMap], object: i32, symbol: i32) i32 {
+    let i: i32 = 0;
+    while (i < maps.len) {
+        if (maps.data[i].object == object && maps.data[i].symbol == symbol) { return maps.data[i].output; }
+        i=i+1;
+    }
+    return -1;
+}
+fn ms_alias_find(aliases: ArrayList[MsRelocAlias], object: i32, relocation: i32) i32 {
+    let i: i32 = 0;
+    while (i < aliases.len) {
+        if (aliases.data[i].object == object && aliases.data[i].relocation == relocation) { return aliases.data[i].output; }
+        i=i+1;
+    }
+    return -1;
+}
+fn ms_append_section(out: *ArrayList[u8], source: MsSection, bytes: []u8) i64 {
+    let alignment: i64 = ms_pow2(source.alignment);
+    let base: i64 = macho_align(out.*.len as i64,alignment);
+    mo_pad_to(out,base);
+    if (source.zero == 1) { mo_zero(out,source.size as i64); }
+    else { mo_bytes(out,bytes[source.offset..source.offset+source.size]); }
+    return base;
+}
+fn ms_patch_zero(bytes: *ArrayList[u8], at: i32, width: i32) void {
+    let i: i32 = 0; while (i < width) { bytes.*.data[at+i]=0; i=i+1; }
+}
+fn ms_patch_signed(bytes: *ArrayList[u8], at: i32, width: i32, value: i64) i32 {
+    if (width != 4 && width != 8) { return 0; }
+    if (width == 4 && (value < -2147483648 || value >= 2147483648)) { return 0; }
+    let rest: i64 = value; let i: i32 = 0;
+    while (i < width) {
+        let byte: i64 = rest & 255;
+        bytes.*.data[at+i] = byte as u8;
+        rest = (rest-byte)/256;
+        i=i+1;
+    }
+    if (width == 4 && rest != 0 && rest != -1) { return 0; }
+    return 1;
+}
+fn ms_reloc_insert(relocs: *ArrayList[MobjReloc], item: MobjReloc) void {
+    let at: i32 = relocs.*.len;
+    push[MobjReloc](relocs,item);
+    while (at > 0) {
+        let before: MobjReloc = relocs.*.data[at-1];
+        let move: i32 = 0;
+        if (before.section > item.section || (before.section == item.section && before.offset > item.offset)) { move=1; }
+        if (move == 0) { return; }
+        relocs.*.data[at]=before; relocs.*.data[at-1]=item; at=at-1;
+    }
+}
+
+fn ms_objects_define(objects: ArrayList[MsObject], name: []u8) i32 {
+    let oi: i32 = 0;
+    while (oi < objects.len) {
+        let si: i32 = 0;
+        while (si < objects.data[oi].symbols.len) {
+            let symbol: MsSymbol = objects.data[oi].symbols.data[si];
+            if (symbol.external == 1 && @strEq(symbol.name,name) &&
+                ((symbol.section > 0 && symbol.weak_def == 0) || symbol.common_size > 0)) { return 1; }
+            si=si+1;
+        }
+        oi=oi+1;
+    }
+    return 0;
+}
+fn ms_names_have(names: ArrayList[[]u8], name: []u8) i32 {
+    let i: i32=0; while (i<names.len) { if (@strEq(names.data[i],name)) { return 1; } i=i+1; } return 0;
+}
+fn ms_unresolved(objects: ArrayList[MsObject]) ArrayList[[]u8] {
+    let names: ArrayList[[]u8]=make[[]u8](16);
+    let oi: i32=0;
+    while (oi<objects.len) {
+        let si: i32=0;
+        while (si<objects.data[oi].symbols.len) {
+            let symbol: MsSymbol=objects.data[oi].symbols.data[si];
+            if (symbol.external==1 && symbol.section==0 && symbol.common_size==0 && symbol.weak_ref==0 &&
+                ms_objects_define(objects,symbol.name)==0 &&
+                ms_names_have(names,symbol.name)==0) { push[[]u8](&names,symbol.name); }
+            si=si+1;
+        }
+        oi=oi+1;
+    }
+    return names;
+}
+fn ms_object_satisfies(object: MsObject, unresolved: ArrayList[[]u8]) i32 {
+    let si: i32=0;
+    while (si<object.symbols.len) {
+        let symbol: MsSymbol=object.symbols.data[si];
+        if (symbol.external==1 && ms_names_have(unresolved,symbol.name)==1 &&
+            ((symbol.section>0 && symbol.weak_def==0) || symbol.common_size>0)) { return 1; }
+        si=si+1;
+    }
+    return 0;
+}
+
+// Archive extraction follows the ordinary static-link fixed point: include a
+// member only when it defines a currently unresolved external, then repeat so
+// newly introduced references can pull later members. The archive's index is
+// deliberately not trusted for correctness.
+fn ms_extract_archive(objects: *ArrayList[MsObject], archive: MsArchive) i32 {
+    if (archive.valid != 1) { return ms_merge_error(archive.error); }
+    let selected: ArrayList[i32]=make[i32](archive.members.len);
+    while (selected.len<archive.members.len) { push[i32](&selected,0); }
+    let changed: i32=1; let valid: i32=1;
+    while (changed==1 && valid==1) {
+        changed=0;
+        let unresolved: ArrayList[[]u8]=ms_unresolved(objects.*);
+        if (unresolved.len==0) { free[[]u8](&unresolved); break; }
+        let mi: i32=0;
+        while (mi<archive.members.len && valid==1) {
+            if (selected.data[mi]==0) {
+                let object: MsObject=ms_read_object(archive.members.data[mi].bytes);
+                if (object.valid!=1) {
+                    valid=ms_merge_error(_zag_str_concat("invalid archive object member: ",archive.members.data[mi].name));
+                    ms_object_release(&object);
+                } else if (ms_object_satisfies(object,unresolved)==1) {
+                    selected.data[mi]=1; push[MsObject](objects,object); changed=1;
+                } else { ms_object_release(&object); }
+            }
+            mi=mi+1;
+        }
+        free[[]u8](&unresolved);
+    }
+    free[i32](&selected); return valid;
+}
+
+fn ms_merge_objects(objects: ArrayList[MsObject]) MsMerged {
+    let out: MobjEncoded = MobjEncoded{.text=make[u8](256),.symbols=make[MobjSymbol](64),
+        .relocs=make[MobjReloc](64),.valid=0};
+    let data: ArrayList[u8] = make[u8](256);
+    let places: ArrayList[MsPlacedSection] = make[MsPlacedSection](16);
+    let defs: ArrayList[MsDefRef] = make[MsDefRef](32);
+    let maps: ArrayList[MsSymMap] = make[MsSymMap](64);
+    let aliases: ArrayList[MsRelocAlias] = make[MsRelocAlias](32);
+    let valid: i32 = 1;
+
+    let oi: i32 = 0;
+    while (oi < objects.len && valid == 1) {
+        if (objects.data[oi].valid != 1) { valid=ms_merge_error(objects.data[oi].error); }
+        let si: i32 = 0;
+        while (si < objects.data[oi].sections.len && valid == 1) {
+            let section: MsSection = objects.data[oi].sections.data[si];
+            if (section.kind == 1) {
+                let base: i64 = ms_append_section(&out.text,section,objects.data[oi].image);
+                push[MsPlacedSection](&places,MsPlacedSection{.object=oi,.section=si+1,.output_section=1,.base=base});
+            } else if (section.kind == 2) {
+                let base: i64 = ms_append_section(&data,section,objects.data[oi].image);
+                push[MsPlacedSection](&places,MsPlacedSection{.object=oi,.section=si+1,.output_section=2,.base=base});
+            }
+            si=si+1;
+        }
+        oi=oi+1;
+    }
+
+    oi=0;
+    while (oi < objects.len && valid == 1) {
+        let si: i32 = 0;
+        while (si < objects.data[oi].symbols.len && valid == 1) {
+            let symbol: MsSymbol = objects.data[oi].symbols.data[si];
+            if (symbol.external == 1 && (symbol.section > 0 || symbol.common_size > 0)) {
+                let rank: i32=1;
+                if (symbol.common_size>0) { rank=2; }
+                else if (symbol.weak_def==0) { rank=3; }
+                let place_ok: i32=1;
+                if (symbol.section>0 && ms_place_find(places,oi,symbol.section).object<0) { place_ok=0; }
+                if (place_ok==1) {
+                    let hit: i32=ms_def_find(defs,symbol.name);
+                    if (hit<0) {
+                        push[MsDefRef](&defs,MsDefRef{.name=symbol.name,.object=oi,.symbol=si,.rank=rank,
+                            .common_size=symbol.common_size,.common_align=symbol.common_align,.common_base=-1,.output=-1});
+                    } else if (rank==3 && defs.data[hit].rank==3) {
+                        valid=ms_merge_error(_zag_str_concat("duplicate external definition: ",symbol.name));
+                    } else if (rank==2 && defs.data[hit].rank==2) {
+                        if (symbol.common_size>defs.data[hit].common_size) { defs.data[hit].common_size=symbol.common_size; }
+                        if (symbol.common_align>defs.data[hit].common_align) { defs.data[hit].common_align=symbol.common_align; }
+                    } else if (rank>defs.data[hit].rank) {
+                        defs.data[hit]=MsDefRef{.name=symbol.name,.object=oi,.symbol=si,.rank=rank,
+                            .common_size=symbol.common_size,.common_align=symbol.common_align,.common_base=-1,.output=-1};
+                    }
+                }
+            }
+            si=si+1;
+        }
+        oi=oi+1;
+    }
+
+    let di: i32=0;
+    while (di<defs.len && valid==1) {
+        if (defs.data[di].rank==2) {
+            let align: i64=defs.data[di].common_align as i64;
+            if (defs.data[di].common_size<=0 || align<=0 || (align & (align-1))!=0 || align>16384) {
+                valid=ms_merge_error("invalid COMMON size or alignment");
+            } else {
+                defs.data[di].common_base=macho_align(data.len as i64,align);
+                mo_pad_to(&data,defs.data[di].common_base); mo_zero(&data,defs.data[di].common_size);
+            }
+        }
+        di=di+1;
+    }
+
+    oi=0;
+    while (oi < objects.len && valid == 1) {
+        let si: i32 = 0;
+        while (si < objects.data[oi].symbols.len) {
+            let symbol: MsSymbol = objects.data[oi].symbols.data[si];
+            if (symbol.section > 0 && symbol.external == 0) {
+                let place: MsPlacedSection = ms_place_find(places,oi,symbol.section);
+                if (place.object >= 0) {
+                    let output: i32 = out.symbols.len;
+                    push[MobjSymbol](&out.symbols,MobjSymbol{.name=ms_unique_local("Lms.local.",oi,si),
+                        .section=place.output_section,.offset=place.base+symbol.value,.external=0,.weak=0});
+                    push[MsSymMap](&maps,MsSymMap{.object=oi,.symbol=si,.output=output});
+                }
+            }
+            si=si+1;
+        }
+        oi=oi+1;
+    }
+
+    oi=0;
+    while (oi < objects.len && valid == 1) {
+        let ri: i32 = 0;
+        while (ri < objects.data[oi].relocations.len && valid == 1) {
+            let reloc: MsReloc = objects.data[oi].relocations.data[ri];
+            if (reloc.addend != 0 || reloc.external == 0) {
+                let target_section: i32 = -1; let target_value: i64 = 0;
+                if (reloc.external == 0) {
+                    target_section=reloc.target; target_value=reloc.addend;
+                } else {
+                    let source: MsSymbol = objects.data[oi].symbols.data[reloc.target];
+                    let definition: i32 = ms_def_find(defs,source.name);
+                    if (definition >= 0) {
+                        let d: MsDefRef = defs.data[definition];
+                        let place: MsPlacedSection=MsPlacedSection{.object=d.object,.section=0,.output_section=2,.base=d.common_base};
+                        if (d.rank!=2) {
+                            let ds: MsSymbol = objects.data[d.object].symbols.data[d.symbol];
+                            target_section=ds.section; target_value=ds.value+reloc.addend;
+                            place=ms_place_find(places,d.object,target_section);
+                        } else { target_value=reloc.addend; }
+                        if (place.object >= 0 || d.rank==2) {
+                            let output: i32 = out.symbols.len;
+                            push[MobjSymbol](&out.symbols,MobjSymbol{.name=ms_unique_local("Lms.alias.",oi,ri),
+                                .section=place.output_section,.offset=place.base+target_value,.external=0,.weak=0});
+                            push[MsRelocAlias](&aliases,MsRelocAlias{.object=oi,.relocation=ri,.output=output});
+                        }
+                        target_section=-1;
+                    } else if (reloc.addend != 0) {
+                        valid=ms_merge_error(_zag_str_concat("unresolved external relocation has a nonzero addend: ",source.name));
+                    }
+                }
+                if (reloc.external == 0 && valid == 1) {
+                    let place: MsPlacedSection = ms_place_find(places,oi,target_section);
+                    if (place.object < 0 || target_value < 0 || target_value > objects.data[oi].sections.data[target_section-1].size) {
+                        valid=ms_merge_error("internal relocation points outside retained section");
+                    } else {
+                        let output: i32 = out.symbols.len;
+                        push[MobjSymbol](&out.symbols,MobjSymbol{.name=ms_unique_local("Lms.section.",oi,ri),
+                            .section=place.output_section,.offset=place.base+target_value,.external=0,.weak=0});
+                        push[MsRelocAlias](&aliases,MsRelocAlias{.object=oi,.relocation=ri,.output=output});
+                    }
+                }
+            }
+            ri=ri+1;
+        }
+        oi=oi+1;
+    }
+
+    // Mach-O N_PEXT definitions participate in static resolution but must not
+    // become dylib exports. Emit those winners in the local-symbol phase before
+    // ordinary external definitions so Mobj's nlist ordering stays valid.
+    let visibility_pass: i32 = 0;
+    while (visibility_pass < 2 && valid == 1) {
+        di = 0;
+        while (di < defs.len && valid == 1) {
+            let d: MsDefRef = defs.data[di];
+            let source: MsSymbol = objects.data[d.object].symbols.data[d.symbol];
+            let emit: i32 = 0;
+            if (visibility_pass == 0 && source.hidden == 1) { emit=1; }
+            if (visibility_pass == 1 && source.hidden == 0) { emit=1; }
+            if (emit == 1) {
+                let place: MsPlacedSection = MsPlacedSection{.object=d.object,.section=0,.output_section=2,.base=d.common_base};
+                let offset: i64=d.common_base;
+                if (d.rank!=2) { place=ms_place_find(places,d.object,source.section); offset=place.base+source.value; }
+                let output: i32 = out.symbols.len;
+                push[MobjSymbol](&out.symbols,MobjSymbol{.name=ms_owned(source.name),.section=place.output_section,
+                    .offset=offset,.external=(source.hidden == 0) as i32,.weak=0});
+                defs.data[di].output=output;
+            }
+            di=di+1;
+        }
+        visibility_pass=visibility_pass+1;
+    }
+
+    oi=0;
+    while (oi<objects.len) {
+        let si:i32=0;
+        while (si<objects.data[oi].symbols.len) {
+            let source:MsSymbol=objects.data[oi].symbols.data[si];
+            if (source.external==1 && (source.section>0 || source.common_size>0)) {
+                let hit:i32=ms_def_find(defs,source.name);
+                if (hit>=0) { push[MsSymMap](&maps,MsSymMap{.object=oi,.symbol=si,.output=defs.data[hit].output}); }
+            }
+            si=si+1;
+        }
+        oi=oi+1;
+    }
+
+    oi=0;
+    while (oi < objects.len && valid == 1) {
+        let si: i32 = 0;
+        while (si < objects.data[oi].symbols.len) {
+            let source: MsSymbol = objects.data[oi].symbols.data[si];
+            if (source.section == 0) {
+                let definition: i32 = ms_def_find(defs,source.name);
+                let output: i32 = -1;
+                if (definition >= 0) {
+                    output=defs.data[definition].output;
+                } else {
+                    let existing: i32 = 0;
+                    while (existing < out.symbols.len) {
+                        if (out.symbols.data[existing].section == 0 && @strEq(out.symbols.data[existing].name,source.name)) { output=existing; }
+                        existing=existing+1;
+                    }
+                    if (output < 0) {
+                        output=out.symbols.len;
+                        push[MobjSymbol](&out.symbols,MobjSymbol{.name=ms_owned(source.name),.section=0,.offset=0,
+                            .external=1,.weak=source.weak_ref});
+                    } else if (source.weak_ref == 0) {
+                        // A strong undefined reference dominates a weak one to
+                        // the same output symbol.
+                        out.symbols.data[output].weak=0;
+                    }
+                }
+                if (output >= 0) { push[MsSymMap](&maps,MsSymMap{.object=oi,.symbol=si,.output=output}); }
+            }
+            si=si+1;
+        }
+        oi=oi+1;
+    }
+
+    oi=0;
+    while (oi < objects.len && valid == 1) {
+        let ri: i32 = 0;
+        while (ri < objects.data[oi].relocations.len && valid == 1) {
+            let source: MsReloc = objects.data[oi].relocations.data[ri];
+            let section_place: MsPlacedSection = ms_place_find(places,oi,source.section+1);
+            if (section_place.object < 0) { valid=ms_merge_error("relocation belongs to an omitted section"); }
+            else if (source.subtract >= 0) {
+                let target: i32 = ms_map_find(maps,oi,source.target);
+                let subtract: i32 = ms_map_find(maps,oi,source.subtract);
+                if (source.external != 1 || target < 0 || subtract < 0) {
+                    valid=ms_merge_error("SUBTRACTOR relocation target could not be resolved statically");
+                } else {
+                    let to_symbol: MobjSymbol = out.symbols.data[target];
+                    let from_symbol: MobjSymbol = out.symbols.data[subtract];
+                    if (to_symbol.section == 0 || from_symbol.section == 0) {
+                        valid=ms_merge_error("unresolved SUBTRACTOR relocation is not representable");
+                    } else if (to_symbol.section != from_symbol.section) {
+                        let value: i64 = to_symbol.offset-from_symbol.offset+source.addend;
+                        let offset: i32 = (section_place.base as i32)+source.offset;
+                        let bytes: *ArrayList[u8] = &out.text;
+                        if (section_place.output_section == 2) { bytes = &data; }
+                        else if (section_place.output_section != 1) {
+                            valid=ms_merge_error("SUBTRACTOR relocation belongs to an unsupported section");
+                        }
+                        if (valid == 1 && ms_patch_signed(bytes,offset,source.width,value) == 0) {
+                            valid=ms_merge_error("cross-section SUBTRACTOR constant is out of range");
+                        }
+                        if (valid == 1) {
+                            let kind: i32 = 13;
+                            if (source.width == 8) { kind=14; }
+                            ms_reloc_insert(&out.relocs,MobjReloc{.section=section_place.output_section,
+                                .offset=offset,.symbol=target,.kind=kind});
+                        }
+                    } else {
+                        let value: i64 = to_symbol.offset-from_symbol.offset+source.addend;
+                        let offset: i32 = (section_place.base as i32)+source.offset;
+                        if (section_place.output_section == 1) {
+                            if (ms_patch_signed(&out.text,offset,source.width,value) == 0) {
+                                valid=ms_merge_error("SUBTRACTOR relocation is out of range");
+                            }
+                        } else if (section_place.output_section == 2) {
+                            if (ms_patch_signed(&data,offset,source.width,value) == 0) {
+                                valid=ms_merge_error("SUBTRACTOR relocation is out of range");
+                            }
+                        } else { valid=ms_merge_error("SUBTRACTOR relocation belongs to an unsupported section"); }
+                    }
+                }
+            }
+            else if (source.kind != 0 && source.kind != 2 && source.kind != 3 && source.kind != 4 &&
+                source.kind != 5 && source.kind != 6 && source.kind != 7 && source.kind != 8 && source.kind != 9) {
+                valid=ms_merge_error("unsupported relocation is not represented by the native static merger");
+            } else {
+                let target: i32 = ms_alias_find(aliases,oi,ri);
+                if (target < 0 && source.external == 1) { target=ms_map_find(maps,oi,source.target); }
+                if (target < 0) { valid=ms_merge_error("relocation target could not be mapped"); }
+                else {
+                    let offset: i32 = (section_place.base as i32)+source.offset;
+                    if (source.kind == 0) {
+                        if (section_place.output_section == 1) { valid=ms_merge_error("absolute pointer relocation in executable text is unsupported"); }
+                        else { ms_patch_zero(&data,offset,source.width); }
+                    }
+                    if (valid == 1) {
+                        // ARM64 TLVP_LOAD_PAGE21/PAGEOFF12 address a pointer
+                        // slot with the same instruction encoding as a GOT
+                        // load. For an imported TLS symbol dyld binds that
+                        // slot to the provider's exported TLV descriptor, so
+                        // the final writer can reuse its audited GOT machinery.
+                        let output_kind: i32 = source.kind;
+                        if (source.kind == 8) { output_kind = 5; }
+                        if (source.kind == 9) { output_kind = 6; }
+                        if (source.kind == 7 && source.width == 8) { output_kind = 12; }
+                        ms_reloc_insert(&out.relocs,MobjReloc{.section=section_place.output_section,
+                            .offset=offset,.symbol=target,.kind=output_kind});
+                    }
+                }
+            }
+            ri=ri+1;
+        }
+        oi=oi+1;
+    }
+    out.valid=(valid == 1 && mobj_validate(out.text,data,out.symbols,out.relocs) == 0) as i32;
+    if (out.valid == 0 && valid == 1) { ms_merge_error("merged object failed native IR validation"); }
+    free[MsPlacedSection](&places); free[MsDefRef](&defs); free[MsSymMap](&maps); free[MsRelocAlias](&aliases);
+    return MsMerged{.encoded=out,.data=data};
+}

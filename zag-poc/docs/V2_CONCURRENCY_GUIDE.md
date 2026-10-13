@@ -37,10 +37,13 @@ failure)`. Every valid RMW/CAS order currently keeps its established locked
 x86 lowering (a seq_cst superset); CAS failure is restricted to
 relaxed/acquire/seq_cst and may not be stronger than success. This is not a
 claim of relaxed machine code or of a complete language memory model.
-Compare-exchange returns the old word whether the swap succeeds or fails. They are callable only
-inside an `unsafe` block on Linux x86-64 native output. Load emits `LOCK XADD`
-with zero, preserving and returning the old word; store/exchange use memory
-`XCHG`, which is implicitly locked by x86. The compiler rejects invalid
+Compare-exchange returns the old word whether the swap succeeds or fails. The
+raw operations are callable only inside an `unsafe` block. Linux x86-64 uses
+the existing locked instruction forms; Apple Silicon macOS lowers the same
+bounded i64 operations to ARMv8 acquire/release LL/SC plus conservative DMB
+boundaries for seq_cst forms. On x86-64, load emits `LOCK XADD` with zero,
+preserving and returning the old word; store/exchange use memory `XCHG`, which
+is implicitly locked by x86. The compiler rejects invalid
 mutability and non-`i64` bound store/exchange/compare-exchange values; integer
 literals are contextually accepted as `i64`. The runtime rejects null or misaligned addresses
 before issuing the instruction. With `--safety=checked`, ordinary allocator liveness/bounds
@@ -55,33 +58,41 @@ fence (`mfence` on x86-64 and `dmb` on ARM). It is a typed `Unsafe` operation,
 but does not establish a compiler-wide happens-before graph, prove object
 lifetime, or provide thread/race safety.
 
-On Linux x86-64, `@atomicWait32(ptr, expected) i64` and
-`@atomicWake32(ptr, count) i64` are a separate unsafe futex(2) slice. They
-accept only non-null, four-byte-aligned `*const`, `*mut`, or `*host i32`
+`@atomicWait32(ptr, expected) i64` and `@atomicWake32(ptr, count) i64` are a
+separate unsafe raw wait/wake slice on Linux x86-64 and Apple Silicon macOS.
+They accept only non-null, four-byte-aligned `*const`, `*mut`, or `*host i32`
 pointers and a typed `i32` expected value/count; checked mode also validates
-tracked allocation liveness and four-byte bounds before the syscall. Wait maps
-to shared `FUTEX_WAIT`; wake maps to shared `FUTEX_WAKE`; both return the raw
-kernel result, including negative errno values. There is deliberately no
-implicit retry, timeout conversion, ownership handoff, or memory-order claim.
-These primitives are useful native building blocks, but they do not establish
-a general happens-before relation, race freedom, or a supported
-threading API.
+tracked allocation liveness and four-byte bounds before entering the native
+mechanism. Linux maps these to shared `FUTEX_WAIT`/`FUTEX_WAKE`. macOS uses a
+compiler-owned address-keyed waiter list backed by a process-global pthread
+mutex and per-waiter condition variable. Both surfaces return raw integer
+results: mismatch is `-EAGAIN`, wake reports the exact number signalled, and a
+waiter-free wake returns zero. There is deliberately no implicit retry,
+timeout conversion, ownership handoff, or memory-order claim. These primitives
+are useful native building blocks, but they do not establish a general
+happens-before relation, race freedom, or a public mutex/condition API.
 
-The first public thread boundary is Linux/x86-64 native only:
+The first public thread boundary is implemented on Linux/x86-64 and Apple
+Silicon macOS:
 `@threadSpawn(worker) *opaque` accepts a direct, non-generic, captureless
 `fn() void` label, or `@threadSpawn(worker, value)` accepts `fn(i64) void`
 with one by-value `i64` argument inside `unsafe`; `@threadJoin(handle)` consumes
 that named opaque handle inside `unsafe`. The scalar is copied into the handle
-before `clone`, so it never borrows a parent frame. Spawn maps a separate guarded 64 KiB
-child stack and persistent handle, lowers `clone(2)` with parent/child TID and
-child-clear-TID flags, branches the child directly to the worker, then uses
-`SYS_exit`. Join waits on the kernel-cleared aligned TID with `FUTEX_WAIT` and
-only then unmaps the stack and handle. The handle is affine in the current
+before launch, so it never borrows a parent frame. Linux maps a separate guarded
+64 KiB child stack, lowers `clone(2)` with parent/child TID and child-clear-TID
+flags, branches the child directly to the worker, then uses `SYS_exit`; join
+waits on the kernel-cleared aligned TID with `FUTEX_WAIT` before cleanup.
+macOS uses compiler-owned `pthread_create`/`pthread_join` imports and an ARM64
+start trampoline that restores Zag's process/runtime context before directly
+calling the same validated worker shape. The handle is affine in the current
 ownership pass: it must be joined or returned, and a joined handle cannot be
-used again. `tests/run_x86_thread_spawn.sh` uses `strace -f` to observe actual
-`clone`, blocking `FUTEX_WAIT`, gate wake, and clear-TID join, while also
-rejecting safe-scope spawn/join, wrong worker/handle shapes, `@pure` use, and
-an unjoined handle.
+used again. `tests/run_x86_thread_spawn.sh` observes actual Linux clone/futex
+behavior; `tests/run_macos_thread_spawn.sh` executes signed Mach-O pthread
+imports, a one-worker trampoline smoke, four checked atomic workers, a copied
+scalar argument, and the same safe-scope/shape/`@pure`/unjoined-handle
+rejections. `tests/run_macos_atomic_wait_wake.sh` separately executes two
+pthread-backed waiters, exact wake-one behavior, mismatch/empty-wake results,
+checked null/alignment traps, and the same unsafe/effect/type boundary.
 
 `async` and `await` are reserved spellings in the ZagScript 1.0 lexer and are
 rejected with a focused unsupported-surface diagnostic. They are not aliases
@@ -124,5 +135,5 @@ lowering, and the MOV versus locked x86 lowering boundary.
 wait and waiter-free wake under `strace`, proving actual `FUTEX_WAIT`/`WAKE`
 kernel calls and raw return values while also covering unsafe, type, pure, and
 null-pointer rejection. It is not a thread stress or litmus test. The spawn
-test is similarly a bounded process-level witness, not proof of a language-wide
-happens-before, lifetime, or race-freedom model.
+tests on Linux and macOS are similarly bounded process-level witnesses, not
+proof of a language-wide happens-before, lifetime, or race-freedom model.

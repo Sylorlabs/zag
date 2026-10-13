@@ -31,6 +31,54 @@ zag_native_compiler() { zag_native_tool znc "${1:-.}"; }
 zag_native_daemon() { zag_native_tool zagd "${1:-.}"; }
 zag_native_lsp() { zag_native_tool zag-lsp "${1:-.}"; }
 
+# A freshly rebuilt compiler can live outside the checkout (for example under
+# /tmp), while Script imports are resolved relative to the compiler layout.
+# Give such a compiler the same sibling std/selfhost layout as an installed or
+# checkout compiler without copying either tree. Callers may use the exported
+# ZAG_COMPILER_BUNDLE_COMPILER and invoke zag_cleanup_compiler_bundle on exit.
+zag_prepare_compiler_bundle() {
+    local zag_bundle_compiler=$1 zag_bundle_root=${2:-.}
+    local zag_bundle_compiler_dir zag_bundle_abs
+    ZAG_COMPILER_BUNDLE_DIR=
+    ZAG_COMPILER_BUNDLE_COMPILER=
+    [ -x "$zag_bundle_compiler" ] || {
+        echo "compiler bundle: compiler is not executable: $zag_bundle_compiler" >&2
+        return 1
+    }
+    case "$zag_bundle_compiler" in
+        /*) zag_bundle_abs=$zag_bundle_compiler ;;
+        *)
+            zag_bundle_abs=$(cd "$(dirname "$zag_bundle_compiler")" && pwd)/$(basename "$zag_bundle_compiler") || return 1
+            ;;
+    esac
+    zag_bundle_compiler_dir=$(dirname "$zag_bundle_abs")
+    if [ -e "$zag_bundle_compiler_dir/std" ] && [ -e "$zag_bundle_compiler_dir/selfhost" ]; then
+        ZAG_COMPILER_BUNDLE_COMPILER=$zag_bundle_abs
+        return 0
+    fi
+    [ -d "$zag_bundle_root/std" ] && [ -d "$zag_bundle_root/selfhost" ] || {
+        echo "compiler bundle: checkout std/selfhost missing under: $zag_bundle_root" >&2
+        return 1
+    }
+    ZAG_COMPILER_BUNDLE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/zag-compiler-bundle.XXXXXX") || return 1
+    if ! ln -s "$zag_bundle_abs" "$ZAG_COMPILER_BUNDLE_DIR/znc" ||
+       ! ln -s "$(cd "$zag_bundle_root/std" && pwd)" "$ZAG_COMPILER_BUNDLE_DIR/std" ||
+       ! ln -s "$(cd "$zag_bundle_root/selfhost" && pwd)" "$ZAG_COMPILER_BUNDLE_DIR/selfhost"; then
+        rm -rf "$ZAG_COMPILER_BUNDLE_DIR"
+        ZAG_COMPILER_BUNDLE_DIR=
+        return 1
+    fi
+    ZAG_COMPILER_BUNDLE_COMPILER="$ZAG_COMPILER_BUNDLE_DIR/znc"
+}
+
+zag_cleanup_compiler_bundle() {
+    if [ -n "${ZAG_COMPILER_BUNDLE_DIR:-}" ] && [ -d "$ZAG_COMPILER_BUNDLE_DIR" ]; then
+        rm -rf "$ZAG_COMPILER_BUNDLE_DIR"
+    fi
+    ZAG_COMPILER_BUNDLE_DIR=
+    ZAG_COMPILER_BUNDLE_COMPILER=
+}
+
 zag_sha256_file() {
     local zag_hash_output zag_hash_digest
     if command -v sha256sum >/dev/null 2>&1; then
@@ -81,6 +129,47 @@ zag_sha256_stream() {
     printf '%s\n' "$zag_hash_digest" | tr 'A-F' 'a-f'
 }
 
+# A [toolchain] pin is an authority input for bootstrap/release, not a banner.
+# Empty output means the manifest has no pin; malformed or duplicate pin
+# declarations return failure so callers cannot accidentally treat them as
+# unpinned.
+zag_manifest_toolchain_pin() {
+    local zag_manifest=$1
+    awk '
+        BEGIN { section = ""; count = 0; bad = 0 }
+        /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+        /^[[:space:]]*\[/ {
+            line=$0; sub(/^[[:space:]]*\[/, "", line); sub(/\][[:space:]]*$/, "", line)
+            section=line; next
+        }
+        section == "toolchain" {
+            if ($0 !~ /^[[:space:]]*compiler[[:space:]]*=[[:space:]]*"sha256:[0-9A-Fa-f]{64}"[[:space:]]*$/) { bad=1; next }
+            value=$0; sub(/^[^\"]*\"/, "", value); sub(/\"[^\"]*$/, "", value)
+            count++
+            if (count == 1) pin=value
+        }
+        END {
+            if (bad || count > 1) exit 1
+            if (count == 1) print pin
+        }
+    ' "$zag_manifest"
+}
+
+zag_verify_manifest_toolchain() {
+    local zag_image=$1 zag_manifest=$2 zag_pin zag_digest
+    zag_pin=$(zag_manifest_toolchain_pin "$zag_manifest") || {
+        echo "toolchain identity: malformed [toolchain] compiler pin in $zag_manifest" >&2
+        return 1
+    }
+    [ -n "$zag_pin" ] || return 0
+    zag_digest=$(zag_sha256_file "$zag_image") || return 1
+    if [ "$zag_pin" != "sha256:$zag_digest" ]; then
+        echo "toolchain identity: $zag_image does not match the compiler pin in $zag_manifest" >&2
+        return 1
+    fi
+    return 0
+}
+
 # BSD sort lacks -z. Keep path inventories NUL-delimited and byte-sorted by
 # preferring GNU sort, with ubiquitous scripting runtimes as bounded fallbacks.
 zag_sort_nul() {
@@ -116,6 +205,22 @@ zag_file_size() {
     fi
 }
 
+# macOS does not ship GNU truncate. Keep sparse-file and torn-record fixtures
+# available on both hosts without materializing their zero-filled contents.
+zag_truncate_file() {
+    local zag_truncate_size=$1 zag_truncate_path=$2
+    case "$zag_truncate_size" in ''|*[!0-9]*) return 2 ;; esac
+    if command -v truncate >/dev/null 2>&1; then
+        truncate -s "$zag_truncate_size" "$zag_truncate_path"
+    elif command -v perl >/dev/null 2>&1; then
+        perl -e 'truncate($ARGV[0], $ARGV[1]) or die "truncate: $!\n"' \
+            "$zag_truncate_path" "$zag_truncate_size"
+    else
+        echo 'file truncation unavailable (need truncate or perl)' >&2
+        return 1
+    fi
+}
+
 zag_direct_children() {
     local zag_parent_pid=$1
     if command -v pgrep >/dev/null 2>&1; then
@@ -142,7 +247,9 @@ zag_start_isolated() {
     "$@" &
     ZAG_ISOLATED_PID=$!
     [ "$zag_monitor_was_on" -eq 1 ] || set +m
-    zag_started_pgid=$(ps -o pgid= -p "$ZAG_ISOLATED_PID" 2>/dev/null | tr -d '[:space:]')
+    # A successful command may exit before ps observes it. Treat that as an
+    # already-finished child, not as a harness failure under set -e/pipefail.
+    zag_started_pgid=$(ps -o pgid= -p "$ZAG_ISOLATED_PID" 2>/dev/null | tr -d '[:space:]' || true)
     if [ "$zag_started_pgid" = "$ZAG_ISOLATED_PID" ]; then
         ZAG_ISOLATED_PGID=$zag_started_pgid
     else
@@ -212,6 +319,21 @@ zag_run_bounded() {
         sleep 1
     done
     wait "$zag_bound_pid"
+}
+
+# The public CLI prints a banner, not a bare version. Parse exactly that
+# contract so release checks neither reject valid compilers nor accept a
+# warning, multi-line output, or a filename masquerading as a version.
+zag_compiler_version() {
+    local zag_version_banner zag_version_pattern
+    zag_version_banner=$(zag_run_bounded 30 "$1" version) || return 1
+    zag_version_pattern='^znc ([0-9][0-9A-Za-z._-]*) \(edition [0-9]+\)$'
+    if [[ $zag_version_banner =~ $zag_version_pattern ]]; then
+        printf '%s\n' "${BASH_REMATCH[1]}"
+    else
+        echo 'compiler version: expected one znc VERSION (edition YEAR) banner' >&2
+        return 1
+    fi
 }
 
 zag_assert_native_executable() {

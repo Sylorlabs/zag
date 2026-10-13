@@ -36,11 +36,12 @@ concurrency, GPU, effect, and safety-tooling documents.
 
 The implemented explicit-layout spelling is `@repr(C) struct Name { ... }`
 (or `pub @repr(C) struct ...`). It is edition-2027-only and currently lowers
-only integer/boolean/raw-pointer leaves for pointer access on Linux x86-64.
+only integer/boolean/raw-pointer leaves for pointer access on Linux x86-64 and
+Apple Silicon macOS.
 Direct by-value aggregate literals, locals, assignments, arguments, and results,
-other representations, field categories, and targets reject before artifact
-output; an ordinary `struct` does not inherit C layout. The exact boundary and
-native evidence are specified in `V2_ABI.md`.
+other representations, unsupported field categories, and unqualified targets
+reject before artifact output; an ordinary `struct` does not inherit C layout.
+The exact boundary and native evidence are specified in `V2_ABI.md`.
 
 The current vertical slice implements dedicated lexical `unsafe { ... }` AST
 nodes, direct `unsafe fn` declarations/calls, and the raw-pointer qualifier
@@ -50,17 +51,27 @@ in every scope, and calling an unsafe function requires an unsafe call site.
 Unsafe blocks and direct calls infer the `Unsafe` effect, which `@pure` and
 `@realtime` reject. Nullable raw pointers require explicit unwrapping before
 dereference, and direct casts between generic, host, device, and workgroup
-address spaces are rejected. Native x86-64 has a bounded unsafe volatile/MMIO
-slice (`@volatileLoad`/`Store` and explicit 8/16/32-bit companions) with
-checked width/alignment probes; full device capability validation remains
-unsupported. Fixed unsafe i64 atomics, raw Linux `@atomicWait32`/`@atomicWake32`
-futex building blocks, and a literal-validated load/store/RMW/CAS memory-order
-subset are implemented, but atomic storage, typed fence order selection,
-threads, and a complete concurrency model remain
-unsupported. The only packed-SIMD operations are unsafe four-lane `i32`
-addition, subtraction, AND, OR, and XOR through raw pointers on native x86-64;
-vector value types, wider SIMD, and target-selected ISA variants remain
-unsupported. Inline `asm` remains
+address spaces are rejected. Native x86-64 and Apple Silicon macOS have the
+same bounded unsafe volatile/MMIO slice (`@volatileLoad`/`Store` and explicit
+8/16/32-bit companions) with checked width/alignment probes; full device
+capability validation remains unsupported. Fixed unsafe i64 atomics, raw
+`@atomicWait32`/`@atomicWake32`
+building blocks on Linux x86-64 and Apple Silicon macOS, a literal-validated
+load/store/RMW/CAS memory-order subset, and a bounded direct captureless
+join-only worker surface with one copied `i64` argument on those two targets
+are implemented. The wait/wake mechanism is target-native (Linux futex versus
+compiler-owned Darwin pthread state). General atomic storage semantics,
+detach, arbitrary thread arguments, mutex/condition/TLS language APIs, and a
+complete concurrency model remain unsupported. The only packed-SIMD operations
+are unsafe four-lane `i32` addition, subtraction, AND, OR, and XOR through raw
+pointers on native x86-64 and Apple Silicon macOS. The x86-64 backend uses
+baseline SSE2; Apple Silicon uses mandatory AArch64 Advanced SIMD/NEON. Vector
+value types, wider SIMD, and target-selected optional ISA variants remain
+unsupported. The compiler-owned scalar CPU-control spellings `popcount`,
+`byte_swap64`, `leading_zeros`, `trailing_zeros`, and `andn` also execute on
+both native x86-64 and Apple Silicon macOS with identical integer semantics;
+Apple Silicon uses baseline/mandatory AArch64 forms rather than inheriting
+x86 optional-feature requirements. Inline `asm` remains
 fail-closed. Pointer provenance identity, bounds and alignment
 instrumentation, source-span audit records, the complete device capability
 model, and the complete

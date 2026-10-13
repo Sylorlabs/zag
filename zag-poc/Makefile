@@ -9,7 +9,7 @@
 #   make install   — install under PREFIX (default: /usr/local)
 #   make clean     — remove scratch artifacts (keeps native toolchain seeds)
 
-.PHONY: all bootstrap znc zagd zag-lsp print-native-host test test-host-selection test-driver-foundation test-zagscript-release test-zagscript-master test-v1-compat test-zagd-product test-zagd-launchd-service test-zagd-core test-zagd-incremental test-zagd-executor test-zagd-background-semantics test-macho-debug-writer test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-analyzer test-native-total test-native-lint test-hot-reload test-dynamic-abi test-resource-embed test-release-package-layout test-database-drivers test-script-capabilities test-script-allocation-accounting test-zagscript-install-layout test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-gpu-compat test-gpu-runtime test-gpu-zag-runtime test-linux-drm test-std-namespace test-docs-truth test-effect-witness \
+.PHONY: all bootstrap znc zagd zag-lsp print-native-host test test-vector-pipeline test-host-selection test-driver-foundation test-zagscript-release test-zagscript-master test-v1-compat test-zagd-product test-zagd-launchd-service test-zagd-core test-zagd-incremental test-zagd-executor test-zagd-background-semantics test-zagd-macos-resource-stress test-macho-debug-writer test-pure-tree test-authority test-bootstrap test-semantics test-typed-authority test-analyzer test-native-total test-native-lint test-hot-reload test-dynamic-abi test-resource-embed test-foreground-cache test-macos-checked-safety test-macos-thread-spawn test-macos-atomic-wait-wake test-macos-machine-control test-macos-scalar-intrinsics test-macos-network-abi test-network-foundation test-http-websocket-foundation test-package-resolution test-lsp test-release-package-layout test-database-drivers test-script-capabilities test-script-allocation-accounting test-zagscript-install-layout test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-gpu-compat test-gpu-runtime test-gpu-zag-runtime test-linux-drm test-std-namespace test-protocol-codecs test-config-log test-docs-truth test-effect-witness test-macos-metal-native-profiles \
 		test-diagnostics test-tooling test-programs test-native test-abi-layout test-arm64 test-arm64-cabi-object \
 		test-arm64-memory-offsets test-arm64-rt-builtins test-differential-backends test-arm64-selfhost test-macos-arm64-release test-macos-dyld-import clean install
 
@@ -17,6 +17,17 @@
 # single evidence stream even when callers pass `-j`; GNU make 3.81 supports
 # this global special target on the oldest macOS toolchain in scope.
 .NOTPARALLEL:
+.PHONY: test-process-platform test-source-closure test-evidence-codec test-native-evidence
+
+test-source-closure:
+	bash tests/run_source_closure.sh
+
+test-evidence-codec:
+	bash tests/run_evidence_codec.sh
+
+test-native-evidence:
+	bash tests/run_native_evidence.sh
+
 .DEFAULT_GOAL := all
 
 PREFIX ?= /usr/local
@@ -118,18 +129,40 @@ test-tooling:
 test-docs-truth:
 	bash tests/run_docs_truth.sh
 
+# Vector pipeline: the target-independent vector IR (executed), the opt-in
+# auto-vectorizer end to end, and the off-by-default boundary.
+# AArch64 stack-machine optimizer. Wired into the compiler's own build path, so
+# it needs its own gate: a wrong rewrite computes the wrong answer silently
+# rather than crashing. Set AOPT_BASELINE to an unoptimized compiler to enable
+# the differential layer; without it the unit suite and wiring check still run.
+test-aarch64-optimizer:
+	@echo "── aarch64 stack-machine optimizer ──"
+	bash tests/run_aarch64_optimizer.sh
+
+test-vector-pipeline:
+	bash tests/run_vector_pipeline.sh
+	bash tests/run_vector_equiv_x86_64.sh
+
 test-effect-witness:
 	bash tests/run_effect_witness.sh
+
+test-process-platform:
+	bash tests/run_process_platform.sh
 
 # Static analyzer (analyze.zag): leak (L00xx) + efficiency (E01xx) lints.
 test-analyzer:
 	@echo "── static analyzer suite ──"
 	bash tests/run_analyzer.sh
 
-# Live code hot-reload (hot_rt.zag + `znc hot-patch`): end-to-end swap test.
+# Live code hot-reload: each native host runs its own executable-format and VM
+# adapter while keeping the same `--hot` / `hot-patch` user workflow.
 test-hot-reload:
 	@echo "── hot-reload suite ──"
-	bash tests/run_hot_reload.sh
+	@if [ "$(NATIVE_PLATFORM)" = macos-arm64 ]; then \
+		bash tests/run_macos_hot_reload.sh; \
+	else \
+		bash tests/run_hot_reload.sh; \
+	fi
 
 # Fail-closed Linux GPU reset/fault-domain classification.
 test-gpu-isolation:
@@ -149,24 +182,30 @@ test-gpu-platform:
 	@echo "── GPU compiler/runtime/driver boundary suite ──"
 	bash tests/run_gpu_platform.sh
 
-# Compat-tier artifact, loader, and bounded runtime gate. Physical dispatch is
-# still opt-in inside run_gpu_runtime.sh via ZAG_RUN_PHYSICAL_GPU=1.
+# GPU runtime gate. Apple Silicon includes first-class physical Metal dispatch;
+# other hosts retain the portable compatibility/runtime matrix below.
 test-gpu-compat:
-	@echo "── GPU compatibility-tier suite ──"
-	bash tests/run_compat_vulkan.sh
-	bash tests/run_compat_opengl.sh
-	bash tests/run_compat_opencl.sh
-	bash tests/run_compat_cuda.sh
-	bash tests/run_compat_metal.sh
-	bash tests/run_gpu_runtime.sh
-	bash tests/run_gpu_zag_runtime.sh
+	@echo "── GPU runtime suite ──"
+	@if [ "$(HOST_ID)" = "Darwin-arm64" ]; then \
+		bash tests/run_compat_metal.sh && \
+		bash tests/run_macos_metal_loader.sh && \
+		bash tests/run_macos_metal_native_profiles.sh; \
+	else \
+		bash tests/run_compat_vulkan.sh && \
+		bash tests/run_compat_opengl.sh && \
+		bash tests/run_compat_opencl.sh && \
+		bash tests/run_compat_cuda.sh && \
+		bash tests/run_compat_metal.sh && \
+		bash tests/run_gpu_runtime.sh && \
+		bash tests/run_gpu_zag_runtime.sh; \
+	fi
 
 test-gpu-runtime:
 	@echo "── GPU bounded runtime gate ──"
 	bash tests/run_gpu_runtime.sh
 
 test-gpu-zag-runtime:
-	@echo "── pure-Zag Vulkan/OpenGL/OpenCL runtime gate ──"
+	@echo "── pure-Zag native GPU compatibility runtime gate ──"
 	bash tests/run_gpu_zag_runtime.sh
 
 # Hardware-specific, read-only AMDGPU DRM boundary. This target is separate
@@ -180,6 +219,17 @@ test-linux-drm:
 test-std-namespace:
 	@echo "── std namespace suite ──"
 	bash tests/run_std_namespace.sh
+
+# Pure protocol codecs do not depend on the platform socket ABI. Keep their
+# native evidence visible on every supported host instead of hiding Mach-O
+# coverage behind the Linux-only loopback-service gates.
+test-protocol-codecs:
+	@echo "── native protocol codec suite ──"
+	bash tests/run_protocol_codecs.sh
+
+test-config-log:
+	@echo "── native configuration and structured logging suite ──"
+	bash tests/run_config_log_services.sh
 
 test-programs:
 	bash tests/run_programs.sh
@@ -213,6 +263,9 @@ test-zagd-executor:
 
 test-zagd-background-semantics:
 	bash tests/run_zagd_background_semantics.sh
+
+test-zagd-macos-resource-stress:
+	bash tests/run_zagd_macos_resource_stress.sh
 
 test-zagd-product: znc zagd
 	bash tests/run_zagd_product.sh
@@ -248,9 +301,10 @@ test-abi-layout:
 	@echo "── ABI/layout regression suite (release gate) ──"
 	bash tests/run_abi_layout.sh
 
-# AArch64 Linux backend (runs via qemu-user; requires qemu-aarch64-static).
+# Portable ARM64 backend corpus: qemu/native ELF on Linux, signed Mach-O on
+# Apple Silicon. The script keeps format- and syscall-specific tails separate.
 test-arm64:
-	@echo "── arm64 backend suite (qemu-user) ──"
+	@echo "── portable arm64 backend suite ──"
 	bash tests/run_native_arm64.sh
 
 test-arm64-cabi-object:
@@ -264,6 +318,26 @@ test-arm64-memory-offsets:
 test-arm64-rt-builtins:
 	@echo "── arm64 public std/rt and numeric-time parity ──"
 	bash tests/run_arm64_rt_builtins.sh
+
+.PHONY: test-arm64-allocator-arena-overlap
+test-arm64-allocator-arena-overlap:
+	bash tests/run_arm64_allocator_arena_overlap.sh
+
+.PHONY: test-macos-object test-macos-link-options test-macos-dylib test-macos-dylib-format test-macos-static-link
+test-macos-dylib:
+	bash tests/run_macos_dylib.sh
+
+test-macos-dylib-format:
+	bash tests/run_macos_dylib_format.sh
+
+test-macos-static-link:
+	bash tests/run_macos_static_link.sh
+
+test-macos-link-options:
+	bash tests/run_macos_link_options.sh
+
+test-macos-object:
+	bash tests/run_macos_object.sh
 
 # Cross-backend differential gate: identical output on x86-64 and arm64.
 test-differential-backends:
@@ -279,6 +353,22 @@ test-macos-arm64-release:
 	@echo "── native macOS arm64 release gate ──"
 	bash tests/run_macos_arm64_release.sh
 
+.PHONY: test-macos-filesystem-abi test-macos-metal-loader test-macos-metal-native-profiles test-macos-zagscript-authority test-macos-debug
+test-macos-debug:
+	bash tests/run_macos_debug.sh
+
+test-macos-filesystem-abi:
+	bash tests/run_macos_filesystem_abi.sh
+
+test-macos-metal-loader:
+	bash tests/run_macos_metal_loader.sh
+
+test-macos-metal-native-profiles:
+	bash tests/run_macos_metal_native_profiles.sh
+
+test-macos-zagscript-authority:
+	bash tests/run_macos_zagscript_authority.sh
+
 test-dynamic-abi:
 	@echo "── explicit dynamic system ABI gate ──"
 	bash tests/run_dynamic_abi.sh
@@ -287,9 +377,63 @@ test-resource-embed:
 	@echo "── deterministic resource embedding gate ──"
 	bash tests/run_resource_embed.sh
 
+test-foreground-cache:
+	@echo "── foreground machine-cache integration gate ──"
+	bash tests/run_foreground_cache_integration.sh
+
+test-macos-checked-safety:
+	@echo "── native Apple-Silicon checked-safety gate ──"
+	bash tests/run_macos_checked_safety.sh
+
+test-macos-thread-spawn:
+	@echo "── native Apple-Silicon thread spawn/join gate ──"
+	bash tests/run_macos_thread_spawn.sh
+
+test-macos-atomic-wait-wake:
+	@echo "── native Apple-Silicon atomic wait/wake gate ──"
+	bash tests/run_macos_atomic_wait_wake.sh
+
+test-macos-machine-control:
+	@echo "── native Apple-Silicon machine-control gate ──"
+	bash tests/run_macos_machine_control.sh
+
+test-macos-scalar-intrinsics:
+	@echo "── native Apple-Silicon scalar-intrinsic gate ──"
+	bash tests/run_macos_scalar_intrinsics.sh
+
+test-macos-network-abi:
+	@echo "── audited Darwin IPv4 syscall ABI gate ──"
+	bash tests/run_macos_network_abi.sh
+
+test-network-foundation:
+	@echo "── native IPv4 and DNS foundation gate ──"
+	bash tests/run_network_foundation.sh
+
+test-http-websocket-foundation:
+	@echo "── native HTTP and WebSocket foundation gate ──"
+	bash tests/run_http_websocket_foundation.sh
+
+test-package-resolution:
+	@echo "── native package and lock resolution gate ──"
+	bash tests/run_package_resolution.sh
+
+.PHONY: test-toolchain-identity
+test-toolchain-identity:
+	bash tests/run_toolchain_identity.sh
+
+test-lsp: zag-lsp
+	@echo "── native language-server protocol gate ──"
+	bash tests/test_lsp.sh
+
 test-release-package-layout:
 	@echo "── release package layout self-test ──"
 	bash tests/run_release_package_layout.sh
+
+.PHONY: test-release-package-roundtrip
+# Requires a prebuilt editor client; this is packaging evidence, not a Node
+# dependency for ordinary compilation or the compiler-only native gate.
+test-release-package-roundtrip:
+	bash tests/run_release_package_roundtrip.sh
 
 # Unified pure-Zag driver foundation release gate. This stays separate from
 # the broad v1 suite because its six Linux-series/architecture QEMU matrix is
@@ -305,23 +449,26 @@ test-driver-foundation: znc
 ifeq ($(HOST_ID),Darwin-arm64)
 DEFAULT_TEST_TARGETS = test-host-selection test-pure-tree test-authority test-bootstrap test-semantics \
 	test-typed-authority test-diagnostics test-effect-witness test-tooling \
-	test-docs-truth test-analyzer test-native-total test-native-lint test-programs test-abi-layout \
+	test-docs-truth test-vector-pipeline test-analyzer test-native-total test-native-lint test-hot-reload test-programs test-abi-layout test-arm64 \
 	test-database-drivers test-script-capabilities test-script-allocation-accounting \
 	test-zagscript-install-layout test-zagd-core test-zagd-incremental \
 	test-zagd-executor test-zagd-background-semantics test-zagd-product \
+	test-zagd-macos-resource-stress \
 	test-zagd-launchd-service test-macho-debug-writer test-arm64-cabi-object test-arm64-memory-offsets test-arm64-rt-builtins \
-	test-resource-embed test-gpu-isolation test-gfx1010-vm test-gpu-std \
-	test-std-namespace test-release-package-layout test-macos-arm64-release
+	test-resource-embed test-foreground-cache test-macos-checked-safety test-macos-thread-spawn test-macos-atomic-wait-wake test-macos-machine-control test-gpu-isolation test-gfx1010-vm test-gpu-std test-gpu-platform test-gpu-compat \
+	test-std-namespace test-protocol-codecs test-config-log test-macos-network-abi test-network-foundation \
+	test-http-websocket-foundation test-package-resolution test-toolchain-identity test-lsp test-release-package-layout test-macos-arm64-release
 else ifneq ($(filter $(HOST_ID),Linux-aarch64 Linux-arm64),)
 DEFAULT_TEST_TARGETS = test-host-selection test-pure-tree test-authority test-bootstrap test-arm64 \
 	test-arm64-selfhost test-release-package-layout
 else ifeq ($(NATIVE_PLATFORM),linux-x86_64)
 DEFAULT_TEST_TARGETS = test-host-selection test-pure-tree test-authority test-bootstrap test-semantics \
 	test-typed-authority test-diagnostics test-effect-witness test-tooling \
-	test-docs-truth test-analyzer test-hot-reload test-dynamic-abi \
-	test-resource-embed test-gpu-isolation test-gfx1010-vm test-gpu-std \
+	test-docs-truth test-vector-pipeline test-analyzer test-hot-reload test-dynamic-abi \
+	test-resource-embed test-foreground-cache test-gpu-isolation test-gfx1010-vm test-gpu-std \
 	test-gpu-platform test-gpu-compat test-std-namespace test-programs \
-	test-native test-abi-layout test-arm64 test-differential-backends \
+	test-protocol-codecs test-config-log test-network-foundation test-http-websocket-foundation \
+	test-package-resolution test-toolchain-identity test-lsp test-native test-abi-layout test-arm64 test-differential-backends \
 	test-arm64-selfhost test-release-package-layout
 else
 $(error internal error: no default test matrix for '$(HOST_ID)')
@@ -349,6 +496,11 @@ install: znc zagd zag-lsp
 	$(INSTALL) -m644 selfhost/std/script_list.zag "$(DESTDIR)$(LIBDIR)/zag/std/script_list.zag"
 	$(INSTALL) -m644 selfhost/std/script_string.zag "$(DESTDIR)$(LIBDIR)/zag/std/script_string.zag"
 	$(INSTALL) -m644 selfhost/std/script_path.zag "$(DESTDIR)$(LIBDIR)/zag/std/script_path.zag"
+	$(INSTALL) -m644 selfhost/std/script_format.zag "$(DESTDIR)$(LIBDIR)/zag/std/script_format.zag"
+	$(INSTALL) -m644 selfhost/std/script_interpolate.zag "$(DESTDIR)$(LIBDIR)/zag/std/script_interpolate.zag"
+	$(INSTALL) -m644 selfhost/std/script_map.zag "$(DESTDIR)$(LIBDIR)/zag/std/script_map.zag"
+	$(INSTALL) -m644 selfhost/std/script_json.zag "$(DESTDIR)$(LIBDIR)/zag/std/script_json.zag"
+	$(INSTALL) -m644 selfhost/std/script_json_document.zag "$(DESTDIR)$(LIBDIR)/zag/std/script_json_document.zag"
 	@echo "Installed tools → $(DESTDIR)$(BINDIR), std → $(DESTDIR)$(LIBDIR)/zag/std, policy → $(DESTDIR)$(DATADIR)/zag"
 
 # ── Clean ─────────────────────────────────────────────────────────────────────

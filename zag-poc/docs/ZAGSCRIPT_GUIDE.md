@@ -89,6 +89,21 @@ documented native bootstrap before testing the new syntax. The committed `znc`
 binary is the bootstrap seed; no external compiler, assembler, or linker is part
 of the supported path.
 
+### Structured async and cancellation
+
+Zag Script `async` creates an affine task handle and `await` consumes that
+handle while joining the worker. If the owning scope exits without an `await`,
+the compiler requests cooperative cancellation and joins the task before the
+scope completes. A worker observes that request with `cancelled()`.
+
+Task handles cannot be copied, returned, or passed through unrelated calls.
+Async task declarations inside repeating loop scopes currently fail closed
+until per-iteration cleanup is implemented. Raw `@threadSpawn` remains an
+unsafe Zag primitive and does not participate in Zag Script structured
+cancellation. `tests/run_zagscript_async.sh` is the executable authority for
+the supported surface, including explicit join, automatic cancellation and
+join, raw-thread separation, and the rejected escape/copy/double-await shapes.
+
 ## Command reference
 
 The profile declaration and command form reach the same compilation path:
@@ -234,6 +249,16 @@ without annotations currently default to `i64`; annotations may use `int`,
 Python emulation. Classes, decorators, generators, comprehensions, arbitrary
 Python modules, and dynamic mixed-type containers are not accepted.
 
+The compact surface also accepts `and`/`or`, assignment without
+mandatory surrounding spaces, `+=`, `-=`, `*=`, `/=`, `%=`, and inline `#`
+comments. These spellings normalize deterministically to ordinary Zag
+operators and statements before entering the shared parser; they do not add
+Python runtime semantics or a dynamic identity model. `is` and `is not` are
+rejected; use `==` or `!=` for the supported types’ value equality.
+
+The staged product and compiler plan is recorded in
+`docs/ZAGSCRIPT_1_0_MASTERPLAN.md`.
+
 `print` and `println` accept strings/slices and integer expressions. Script
 users do not need to manually convert a counter merely to display it:
 
@@ -322,8 +347,10 @@ storage. `path_join`, `path_basename`, `path_dirname`, and `path_extension` are
 lexical path helpers. `path_join` allocates from the bounded Script context; the
 other helpers return input slices and never access the filesystem.
 
-Implicit JSON bindings are not implemented; JSON remains available through the
-ordinary `std:json` declarations.
+Root Zag Script code can use the checked `script_json_*` facade without an
+explicit import. The compiler adds only the documented facade declarations and
+preserves user-defined or explicitly imported declarations with the same names.
+Ordinary `std:json` remains available when direct ownership control is wanted.
 Project `.zagd.conf` defaults for allocator, CPU, device, layout, and Script
 memory budget are resolved by foreground compilation; command-line
 `--script-allocator`, `--cpu`, `--device`, and `--layout` choices win. This is
@@ -442,6 +469,15 @@ exposes each limit. `csv_encode` emits deterministic CRLF records,
 infer or validate a character encoding or require uniform row widths. Call `csv_free` and
 `csv_encode_result_free` for owned results.
 
+The JSON and CSV modules expose ownership contracts on their document/table,
+view, encoder, and release APIs. ZagScript therefore uses the same explicit
+ownership boundary as strict Zag: parsing returns an owned aggregate, read and
+encode operations borrow it, returned field/key slices retain the aggregate's
+lifetime, and the matching `*_free` call consumes it. These ordinary codec
+allocations are released explicitly rather than being charged to the hidden
+Script context; context-accounted JSON encoding remains available through the
+`script_json_*_context` facade when that accounting is required.
+
 Zag Script can import both modules and inspect their typed aggregate results:
 
 ```zag
@@ -449,13 +485,40 @@ Zag Script can import both modules and inspect their typed aggregate results:
 let document: json.JsonDocument = json.json_parse_value("{\"ready\":true}");
 ```
 
-The current conservative Script lifetime check rejects passing an imported
-owned aggregate back to ordinary encode/free helpers because it cannot yet
-prove that the call does not retain a Script-context value. Long-lived Script
-code should put parse/use/encode/free in an ordinary strict-Zag helper with a
-scalar or otherwise non-owning result. Direct strict Zag has the full ownership
-API. The focused Script-profile fixture intentionally only parses and inspects;
-the strict fixtures prove encoding and leak-free success/failure cleanup.
+Root facade calls support parse, typed traversal, ordinary or context-backed
+encoding, and explicit document/result release. Document parsing uses the
+ordinary native allocator and therefore remains outside `script_alloc_used()`;
+context-backed encoding charges its returned bytes to the Script budget.
+Document and ordinary encoded-result cleanup stays explicit and consuming.
+
+## Explicit context-backed formatting and JSON strings
+
+The internal `selfhost/std/script_format.zag` module provides the checked
+string, boolean, and signed-integer conversions used by Zag Script
+interpolation. Interpolated expressions are evaluated once in source order and
+the bounded result is allocated through the Script context. Unsupported scalar
+types fail during checking instead of acquiring a dynamic stringification rule.
+
+The internal `selfhost/std/script_json.zag` module provides
+`script_json_stringify_string_bounded(context, value, max_bytes)` and a wrapper
+using the ordinary JSON output limit. It validates UTF-8, escapes a single JSON
+string, and allocates its exact output through the context. Inspect the returned
+`JsonEncodeResult.ok`. The bound includes quotes and escapes; allocator overhead
+is charged separately by the context policy. This scalar helper is separate
+from the document encoder exposed by `script_json_document.zag` and the root
+facade.
+
+The root Script JSON conveniences insert the hidden context only for their
+documented unqualified facade calls. Explicit imports and strict Zag calls keep
+their explicit ownership and context contracts. Context-backed returned bytes
+live until context shutdown.
+
+`std:utf8` provides strict, allocation-free validation, decoding, scalar
+iteration, scalar indexing, and scalar-range slicing. `utf8_slice_scalars`
+returns a borrowed byte slice whose endpoints are proven UTF-8 scalar
+boundaries; malformed input and out-of-range requests return explicit statuses.
+These are Unicode-scalar operations. Normalization and grapheme-cluster
+segmentation remain outside the current supported boundary.
 
 ## Safety boundary
 

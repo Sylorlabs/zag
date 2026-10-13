@@ -13,16 +13,40 @@ in the encoder.
 | --- | --- |
 | `generic` | implemented; canonicalizes to `x86-64-v1` |
 | `x86-64`, `x86-64-v1` | implemented aliases |
+| `x86-64-v2` | implemented; declares SSE4.2 + POPCNT; no vector width change |
+| `x86-64-v3` | implemented; declares AVX2 + FMA + BMI1/BMI2; selects the 256-bit vector rung |
+| `x86-64-v4` | implemented; declares AVX-512; selects the 512-bit vector rung |
 | SSE2 | advertised by the generic profile; scalar floating point and baseline MOVDQU memcpy chunks |
 | SSE3, SSSE3, SSE4.1, SSE4.2 | not advertised |
 | baseline scalar byte swap | `byte_swap64(i64)` lowers to `BSWAP r64`; fixed x86-64 instruction, not SIMD |
 | baseline scalar leading-zero count | `leading_zeros(i64)` guards zero then lowers nonzero input to `BSR r64`; fixed x86-64 instruction, not SIMD |
 | baseline cache hint | `@prefetch(*T)` lowers to advisory `PREFETCHT0`; it is neither synchronization nor SIMD |
 | POPCNT | generic fallback; native-gated opcode; cached dispatch with `--cpu=runtime` |
-| AVX, AVX2, FMA, BMI1, BMI2, AVX-512 | not advertised |
+| AVX, AVX2, FMA, BMI1, BMI2, AVX-512 | not advertised by any *detected* profile; permitted only by a declared level (`v3`/`v4`) |
 | `native` | CPUID/OS-gated SSE2 plus POPCNT when present and tested |
 | runtime multiversioning | `popcount(i64)`, BMI1 `andn(i64,i64)`, and BMI1 `trailing_zeros(i64)` intrinsics |
 | i686 / ELF32 | executable/relocatable i32 and SysV x87 f32/f64 subset |
+
+## Declared levels versus detected profiles
+
+`native` and `runtime` DETECT: they execute CPUID (and, for `runtime`, the
+instruction itself) and permit only what the host proves it can run. A declared
+level PERMITS: `x86-64-v2`, `v3`, and `v4` name a microarchitecture level without
+probing anything, exactly as naming a `-march` level does. A binary built for
+`v3` or `v4` raises `#UD` on a CPU below that level, which is the same contract
+`-march=native` already had: the caller chooses the risk.
+
+This distinction is what makes the 256- and 512-bit vector rungs buildable and
+testable anywhere. Without it there is no way to produce — and therefore no way
+to check or time — the wider rungs on a host that lacks the hardware.
+
+Two properties keep the permissive path honest. Each level has its own
+`cache_key`, so an artifact built for one level can never be served for another.
+And `avx`/`avx2`/`avx512` carry the runtime profile's value of `2` rather than
+`1`: both values select the vector rung (`znc_vectorize_target` tests `>= 1`),
+but only `1` enables the bounded scalar `i32x4` path in `cg_allow_avx2`. A
+declared level therefore widens the VECTOR pipeline and nothing else, and
+`x86_cpu_profile_test.zag` pins both halves of that.
 
 Native resolution executes CPUID directly. AVX usability requires the CPU AVX
 bit, OSXSAVE, and XGETBV confirmation that XCR0 enables both XMM and YMM state;

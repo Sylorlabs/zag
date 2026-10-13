@@ -75,10 +75,21 @@ fi
 if [ ! -x "$bootstrap_seed" ]; then
     echo "bootstrap: native seed is missing or not executable: $bootstrap_seed" >&2
     echo "bootstrap: provide a trusted $bootstrap_platform Zag-built seed via ZAG_BOOTSTRAP_SEED." >&2
+    if [ "$bootstrap_platform" = macos-arm64 ]; then
+        echo "bootstrap: for a clean checkout, use tools/bootstrap-macos-seed.sh with the" >&2
+        echo "bootstrap: seed and checksum from a successful native-gate-verified CI artifact." >&2
+        echo "bootstrap: a cross-only Mach-O artifact is not a trusted native-gate seed." >&2
+    fi
     exit 1
 fi
 if ! bootstrap_legacy_seed_compatible "$bootstrap_seed"; then
     echo "bootstrap: seed does not match exact host architecture: $bootstrap_seed" >&2
+    exit 1
+fi
+bootstrap_manifest="${ZAG_BOOTSTRAP_MANIFEST:-$PWD/zag.mod}"
+if [ ! -f "$bootstrap_manifest" ] ||
+   ! zag_verify_manifest_toolchain "$bootstrap_seed" "$bootstrap_manifest"; then
+    echo "bootstrap: trusted seed is not the compiler identity declared by $bootstrap_manifest" >&2
     exit 1
 fi
 

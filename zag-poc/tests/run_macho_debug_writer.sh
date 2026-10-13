@@ -21,9 +21,12 @@ cat >"$tmp/probe.zag" <<ZAG
 @import("$PWD/selfhost/native/dwarf.zag")
 fn main() i32 {
     if (_zag_argc() != 2) { return 2; }
-    let text: ArrayList[u8] = make[u8](4);
-    push[u8](&text,192 as u8);push[u8](&text,3 as u8);push[u8](&text,95 as u8);push[u8](&text,214 as u8);
+    let text: ArrayList[u8] = make[u8](12);
+    // mov x0,#42; mov x16,#1; svc #0x80 (Darwin exit(42)).
+    mo_le(&text,0xd2800540,4);mo_le(&text,0xd2800030,4);mo_le(&text,0xd4001001,4);
     let data: ArrayList[u8] = make[u8](1);
+    // An empty data segment accidentally concealed mid-page debug mappings.
+    push[u8](&data,7);
     let db: DwarfBuilder = dwarf_new("probe.zag");
     dwarf_build_abbrev(&db);dwarf_emit_compile_unit(&db);dwarf_emit_function(&db,"main",3);dwarf_finish(&db);dwarf_emit_line_program(&db);
     let ds: DwarfSections = dwarf_build(&db);
@@ -39,4 +42,9 @@ codesign --verify --deep --strict "$output"
 otool -l "$output" | grep -q '__DWARF'
 dwarfdump "$output" | grep -q 'DW_TAG_compile_unit'
 dwarfdump "$output" | grep -q 'DW_TAG_subprogram'
+set +e
+"$output"
+status=$?
+set -e
+test "$status" -eq 42
 echo "macho debug writer: pass"

@@ -1,0 +1,202 @@
+// Source opt-in lowering, before type/effect checking and native codegen.
+// Parent seam: script_auto_lower(&unit.decls, compiler_id,source_id,target_id).
+// Returns 0 on success, positive errors otherwise. On errors no existing AST
+// nodes or declaration-list entries are changed. No driver or parser changes.
+//
+// __zag_auto_u4("postfix reference" [, x [, y]])
+// script_auto_u4("postfix reference" [, x [, y]])
+// Both spellings are reserved opt-in call markers. Shadowing either spelling
+// anywhere in this flattened compilation unit is rejected if markers are used.
+// The literal supplies ALL semantics; arguments supply i64 carriers. Generated
+// signatures are checked by the ordinary type/effect authorities afterward.
+// No casts or duplicated argument expressions are inserted. Domain is all u4
+// tuples, guards return -1 outside 0..15. Other widths are not guessed.
+//
+// Optional evidence seam: script_auto_lower_with_records(...,&records).
+// Each evidence item binds a unique symbol to the engine's deterministic record
+// and exact pre-rename source. The record proves that source; only the function
+// declaration name is changed in the AST. It is NOT a certificate for arbitrary
+// later AST edits. Generated origins are <script-auto-generated>, line 0, with
+// no invented exact source provenance. Existing call node pointers are retained.
+// Parent should publish evidence before transformations and invalidate on edits.
+//
+// Ownership: AST strings point into generated source. Keep that allocation alive
+// for the compilation-unit lifetime. The default seam discards record bytes;
+// with_records transfers record/generated/name bytes to the caller (free only
+// after AST retirement). Parser allocations use the existing compilation arena
+// convention. No AST destructor is provided by this module. Max 64 markers,
+// 512 traversal depth, and 20M evaluator-node steps TOTAL per invocation over
+// the flattened source/import graph. A preflight sums exact engine work bounds
+// and rejects over-budget graphs before any optimizer search or AST mutation.
+// Separate driver invocations are separate budgets; parent owns session limits.
+
+@import("parse.zag")
+@import("script_auto.zag")
+
+struct ScriptAutoLowerRecord { symbol:[]u8, reference:[]u8, record:[]u8, generated:[]u8 }
+struct SalState {
+    markers:ArrayList[*Node], names:ArrayList[[]u8], errors:i32,
+    reserved_binding:i32, visits:i32,
+}
+struct SalLiteral { ok:i32, bytes:[]u8 }
+
+fn sal_marker(name:[]u8)bool{return @strEq(name,"__zag_auto_u4")||@strEq(name,"script_auto_u4");}
+fn sal_error(s:*SalState,message:[]u8)void {
+    _zag_eprintln(_zag_str_concat("E_AUTO_U4: ",message));s.*.errors=s.*.errors+1;
+}
+fn sal_bind(s:*SalState,name:[]u8)void {
+    push[[]u8](&s.*.names,name);if(sal_marker(name)){s.*.reserved_binding=1;}
+}
+fn sal_body(body:ArrayList[*Node],s:*SalState,depth:i32)void;
+fn sal_visit(n:*Node,s:*SalState,depth:i32)void {
+    if(s.*.errors>0){return;}
+    if(depth>512||s.*.visits>=1000000){sal_error(s,"AST traversal bound exceeded");return;}
+    s.*.visits=s.*.visits+1;
+    switch(n.*){
+        .fn_decl=>|f|{
+            sal_bind(s,f.name);let i:i32=0;while(i<f.params.len){sal_bind(s,f.params.data[i].name);i=i+1;}
+            sal_body(f.body,s,depth+1);
+        }
+        .let_=>|l|{sal_bind(s,l.name);if(l.has_init==1){sal_visit(l.expr,s,depth+1);}}
+        .ret=>|r|{if(r.has_expr==1){sal_visit(r.expr,s,depth+1);}}
+        .if_=>|x|{sal_visit(x.cond,s,depth+1);if(x.has_cap==1){sal_bind(s,x.cap);}sal_body(x.then_body,s,depth+1);if(x.has_els==1){sal_body(x.els_body,s,depth+1);}}
+        .while_=>|x|{sal_visit(x.cond,s,depth+1);if(x.has_cap==1){sal_bind(s,x.cap);}sal_body(x.body,s,depth+1);}
+        .unsafe_=>|x|{sal_body(x.body,s,depth+1);}
+        .assign=>|x|{sal_visit(x.target,s,depth+1);sal_visit(x.expr,s,depth+1);}
+        .estmt=>|x|{sal_visit(x.expr,s,depth+1);}
+        .defer_=>|x|{sal_visit(x.expr,s,depth+1);}
+        .switch_=>|x|{sal_visit(x.subject,s,depth+1);let i:i32=0;while(i<x.arms.len){let arm:SwitchArm=x.arms.data[i];sal_bind(s,arm.cap);sal_body(arm.body,s,depth+1);i=i+1;}if(x.has_els==1){sal_body(x.els_body,s,depth+1);}}
+        .bin=>|x|{sal_visit(x.l,s,depth+1);sal_visit(x.r,s,depth+1);}
+        .un=>|x|{sal_visit(x.e,s,depth+1);}
+        .idx=>|x|{sal_visit(x.base,s,depth+1);sal_visit(x.idx,s,depth+1);}
+        .fld=>|x|{sal_visit(x.base,s,depth+1);}
+        .cast_=>|x|{sal_visit(x.expr,s,depth+1);}
+        .slice_=>|x|{sal_visit(x.base,s,depth+1);sal_visit(x.lo,s,depth+1);if(x.has_hi==1){sal_visit(x.hi,s,depth+1);}}
+        .slit_=>|x|{let i:i32=0;while(i<x.fields.len){sal_visit(x.fields.data[i].val,s,depth+1);i=i+1;}}
+        .call=>|c|{
+            let marker:i32=0;
+            switch(c.callee.*){.id=>|id|{push[[]u8](&s.*.names,id.name);if(sal_marker(id.name)){marker=1;}}else=>{sal_visit(c.callee,s,depth+1);}}
+            let i:i32=0;while(i<c.args.len){sal_visit(c.args.data[i],s,depth+1);i=i+1;}
+            if(marker==1){
+                if(c.targs.len!=0){sal_error(s,"auto markers do not accept type arguments");}
+                else if(c.args.len<1||c.args.len>3){sal_error(s,"expected literal reference and zero, one or two inputs");}
+                else{
+                    let duplicate:i32=0;i=0;while(i<s.*.markers.len){if(s.*.markers.data[i]==n){duplicate=1;}i=i+1;}
+                    if(duplicate==0){if(s.*.markers.len>=64){sal_error(s,"at most 64 auto markers per compilation unit");}else{push[*Node](&s.*.markers,n);}}
+                }
+            }
+        }
+        .id=>|x|{push[[]u8](&s.*.names,x.name);if(sal_marker(x.name)){sal_error(s,"auto marker must be called directly, not used as a value");}}
+        .struct_=>|x|{sal_bind(s,x.name);}
+        .enum_=>|x|{sal_bind(s,x.name);}
+        .union_=>|x|{sal_bind(s,x.name);}
+        .ilit=>|_|{} .slit=>|_|{} .break_=>|_|{} .continue_=>|_|{} .link_dir=>|_|{} .embed=>|_|{}
+    }
+}
+fn sal_body(body:ArrayList[*Node],s:*SalState,depth:i32)void {
+    let i:i32=0;while(i<body.len&&s.*.errors==0){sal_visit(body.data[i],s,depth);i=i+1;}
+}
+fn sal_literal(n:*Node)SalLiteral {
+    let raw:[]u8="";switch(n.*){.slit=>|x|{raw=x.text;}else=>{return SalLiteral{.ok=0,.bytes=""};}}
+    if(raw.len>1024){return SalLiteral{.ok=0,.bytes=""};}
+    let start:i32=0;let end:i32=raw.len;
+    if(raw.len>=2&&raw[0]==34&&raw[raw.len-1]==34){start=1;end=end-1;}
+    let out:ArrayList[u8]=make[u8](512);let i:i32=start;let ok:i32=1;
+    while(i<end&&ok==1){let ch:u8=raw[i];i=i+1;
+        if(ch==92){if(i>=end){ok=0;}else{let esc:u8=raw[i];i=i+1;
+            if(esc=='n'){ch=10;}else if(esc=='r'){ch=13;}else if(esc=='t'){ch=9;}else{ok=0;}
+        }}
+        if(ok==1){if(out.len>=511){ok=0;}else{push[u8](&out,ch);}}
+    }
+    if(ok==0){free[u8](&out);return SalLiteral{.ok=0,.bytes=""};}
+    return SalLiteral{.ok=1,.bytes=out.data[0..out.len]};
+}
+fn sal_name(s:*SalState,counter:*i32)[]u8 {
+    let found:i32=0;let name:[]u8="";
+    while(found==0){let out:ArrayList[u8]=make[u8](64);sa_text(&out,"__zag_auto_u4_generated_");sa_number(&out,counter.* as i64);counter.*=counter.*+1;
+        name=out.data[0..out.len];found=1;let i:i32=0;
+        while(i<s.*.names.len){if(@strEq(name,s.*.names.data[i])){found=0;}i=i+1;}
+        if(found==0){free[u8](&out);}
+    }
+    push[[]u8](&s.*.names,name);return name;
+}
+// Mirrors the finite grammar's exact evaluator-node count. Tests cross-check
+// this estimate against ScriptAutoResult.work_bound. No speculative sampling.
+fn script_auto_lower_work_budget()i64{return 20000000;}
+fn sal_source_work(markers:ArrayList[*Node],compiler_id:[]u8,source_id:[]u8,target_id:[]u8)i64 {
+    let total:i64=0;let i:i32=0;
+    while(i<markers.len){switch(markers.data[i].*){.call=>|call|{
+        let c:ScriptAutoConfig=ScriptAutoConfig{.bits=4,.variables=call.args.len-1,.work_budget=script_auto_lower_work_budget(),.source_id=source_id,.compiler_id=compiler_id,.target_id=target_id};
+        if(sa_config_ok(c)==0){return -1;}
+        let literal:SalLiteral=sal_literal(call.args.data[0]);if(literal.ok==0){return -1;}
+        let parsed:SaProgram=sa_parse(literal.bytes,c);let valid:i32=parsed.valid;
+        let leaves:i32=16+c.variables;
+        let work:i64=(sa_states(c) as i64)*((parsed.nodes.len+leaves+18*leaves*leaves) as i64);
+        free[SaNode](&parsed.nodes);_zag_free(_zag_slice_ptr(literal.bytes));
+        if(valid==0){return -1;}
+        total=total+work;
+        if(total>script_auto_lower_work_budget()){return total;}
+    }else=>{return -1;}}i=i+1;}
+    return total;
+}
+fn script_auto_lower_with_records(decls:*ArrayList[*Node],compiler_id:[]u8,source_id:[]u8,target_id:[]u8,records:*ArrayList[ScriptAutoLowerRecord])i32 {
+    let s:SalState=SalState{.markers=make[*Node](8),.names=make[[]u8](64),.errors=0,.reserved_binding=0,.visits=0};
+    sal_body(decls.*,&s,0);
+    if(s.markers.len>0&&s.reserved_binding==1){sal_error(&s,"auto marker spelling is shadowed by a declaration or binding");}
+    if(s.errors==0){
+        let work:i64=sal_source_work(s.markers,compiler_id,source_id,target_id);
+        if(work<0){sal_error(&s,"invalid literal reference or auto configuration during source preflight");}
+        else if(work>script_auto_lower_work_budget()){sal_error(&s,"source aggregate auto work budget exceeds 20000000 evaluator-node steps");}
+    }
+    let generated:ArrayList[*Node]=make[*Node](8);let replacements:ArrayList[*Node]=make[*Node](8);
+    let evidence:ArrayList[ScriptAutoLowerRecord]=make[ScriptAutoLowerRecord](8);let counter:i32=0;let i:i32=0;
+    while(i<s.markers.len&&s.errors==0){
+        let marker:*Node=s.markers.data[i];
+        switch(marker.*){.call=>|call|{
+            let literal:SalLiteral=sal_literal(call.args.data[0]);
+            if(literal.ok==0){sal_error(&s,"reference must be a literal postfix string (only whitespace escapes are supported)");}
+            else{
+                let config:ScriptAutoConfig=ScriptAutoConfig{.bits=4,.variables=call.args.len-1,.work_budget=script_auto_lower_work_budget(),.source_id=source_id,.compiler_id=compiler_id,.target_id=target_id};
+                let result:ScriptAutoResult=script_auto_optimize(literal.bytes,config);
+                if(result.ok==0){sal_error(&s,result.error);script_auto_result_free(&result);_zag_free(_zag_slice_ptr(literal.bytes));}
+                else{
+                    // Only engine-produced source is parsed; no source text is built
+                    // from marker arguments or caller-provided identity strings.
+                    let parsed:ArrayList[*Node]=parse_program(result.generated);
+                    if(parsed.len!=1){sal_error(&s,"internal generated declaration shape mismatch");}
+                    else{switch(parsed.data[0].*){.fn_decl=>|f|{
+                        let name:[]u8=sal_name(&s,&counter);f.name=name;f.origin="<script-auto-generated>";f.line=0;
+                        parsed.data[0].*=Node{.fn_decl=f};push[*Node](&generated,parsed.data[0]);
+                        let args:ArrayList[*Node]=make[*Node](2);let ai:i32=1;
+                        while(ai<call.args.len){push[*Node](&args,call.args.data[ai]);ai=ai+1;}
+                        push[*Node](&replacements,mk_call(mk_ident(name),args));
+                        push[ScriptAutoLowerRecord](&evidence,ScriptAutoLowerRecord{.symbol=name,.reference=literal.bytes,.record=result.record,.generated=result.generated});
+                    }else=>{sal_error(&s,"internal generated node is not a function");}}}
+                    // Token payloads borrow result.generated, so its lifetime is
+                    // deliberately transferred with the generated AST, not freed.
+                    free[*Node](&parsed);
+                }
+            }
+        }else=>{sal_error(&s,"internal marker changed before commit");}}
+        i=i+1;
+    }
+    if(s.errors==0){
+        i=0;while(i<generated.len){push[*Node](decls,generated.data[i]);push[ScriptAutoLowerRecord](records,evidence.data[i]);i=i+1;}
+        // Children were collected first; replacing their pointed-to payloads
+        // also updates the original argument nodes retained by outer calls.
+        i=0;while(i<s.markers.len){s.markers.data[i].*=replacements.data[i].*;i=i+1;}
+    }else{
+        // Staged AST is unreachable on failure. Its parser-owned nodes follow
+        // compiler lifetime, but engine-owned text/evidence can be retired now.
+        i=0;while(i<evidence.len){let e:ScriptAutoLowerRecord=evidence.data[i];_zag_free(_zag_slice_ptr(e.reference));_zag_free(_zag_slice_ptr(e.record));_zag_free(_zag_slice_ptr(e.generated));_zag_free(_zag_slice_ptr(e.symbol));i=i+1;}
+    }
+    let errors:i32=s.errors;
+    free[*Node](&s.markers);free[[]u8](&s.names);free[*Node](&generated);free[*Node](&replacements);free[ScriptAutoLowerRecord](&evidence);
+    return errors;
+}
+fn script_auto_lower(decls:*ArrayList[*Node],compiler_id:[]u8,source_id:[]u8,target_id:[]u8)i32 {
+    let records:ArrayList[ScriptAutoLowerRecord]=make[ScriptAutoLowerRecord](8);
+    let errors:i32=script_auto_lower_with_records(decls,compiler_id,source_id,target_id,&records);
+    let i:i32=0;while(i<records.len){let r:ScriptAutoLowerRecord=records.data[i];_zag_free(_zag_slice_ptr(r.reference));_zag_free(_zag_slice_ptr(r.record));i=i+1;}
+    free[ScriptAutoLowerRecord](&records);return errors;
+}

@@ -19,27 +19,40 @@ if "$tmp_dir/parser-probe" tests/script_frontend/reserved_symbol.zag \
 fi
 grep -q 'compiler-owned script symbol' "$tmp_dir/reserved.out"
 
-set +e
-/tmp/zag_script_top_return
-return_status=$?
-/tmp/zag_script_uncaught 2>"$tmp_dir/uncaught.err"
-error_status=$?
-/tmp/zag_script_alloc_limit
-alloc_status=$?
-/tmp/zag_script_explicit_alloc
-explicit_status=$?
-/tmp/zag_script_custom_limit
-custom_limit_status=$?
-set -e
+if [ "$(uname -s):$(uname -m)" = "Linux:x86_64" ] ||
+   [ "$(uname -s):$(uname -m)" = "Linux:amd64" ]; then
+    set +e
+    /tmp/zag_script_top_return
+    return_status=$?
+    /tmp/zag_script_uncaught 2>"$tmp_dir/uncaught.err"
+    error_status=$?
+    /tmp/zag_script_alloc_limit
+    alloc_status=$?
+    /tmp/zag_script_explicit_alloc
+    explicit_status=$?
+    /tmp/zag_script_custom_limit
+    custom_limit_status=$?
+    set -e
 
-test "$return_status" -eq 23
-test "$error_status" -eq 1
-test "$alloc_status" -eq 0
-test "$explicit_status" -eq 19
-test "$custom_limit_status" -eq 0
-grep -q 'uncaught Zag Script error code 1' "$tmp_dir/uncaught.err"
-grep -q 'uncaught Zag Script error name: Failure' "$tmp_dir/uncaught.err"
-grep -q 'operation: root script top-level try call `fail`' "$tmp_dir/uncaught.err"
+    test "$return_status" -eq 23
+    test "$error_status" -eq 1
+    test "$alloc_status" -eq 0
+    test "$explicit_status" -eq 19
+    test "$custom_limit_status" -eq 0
+    grep -q 'uncaught Zag Script error code 1' "$tmp_dir/uncaught.err"
+    grep -q 'uncaught Zag Script error name: Failure' "$tmp_dir/uncaught.err"
+    grep -q 'operation: root script top-level try call `fail`' "$tmp_dir/uncaught.err"
+else
+    for generated in \
+        /tmp/zag_script_top_return \
+        /tmp/zag_script_uncaught \
+        /tmp/zag_script_alloc_limit \
+        /tmp/zag_script_explicit_alloc \
+        /tmp/zag_script_custom_limit; do
+        test -s "$generated"
+        file "$generated" | grep -Eq 'ELF 64-bit.*x86-64|ELF 64-bit.*x86_64'
+    done
+fi
 
 "$znc_bin" tests/script_frontend/uncaught_error.zag -o "$tmp_dir/direct-uncaught" --no-analyze --no-zagd >/dev/null
 set +e

@@ -13,6 +13,8 @@
 // environment search path, registry lookup, download, version solving, or
 // implicit entry-point convention in this layer.
 
+@import("../std/list.zag")
+
 enum PackageImportError {
     none,
     invalid_specifier,
@@ -28,6 +30,9 @@ enum PackageImportError {
     lock_entry_not_found,
     checksum_mismatch,
     dependency_input_changed,
+    manifest_dependency_missing,
+    manifest_dependency_cycle,
+    manifest_closure_limit,
 }
 
 // Two bounded modular accumulators avoid target-dependent overflow semantics.
@@ -59,6 +64,53 @@ struct PackageManifestDependency {
     path: []u8,
     mode: []u8,
     count: i32,
+    valid: i32,
+}
+
+// The manifest is the source-level dependency API.  These records own their
+// strings; callers may therefore retain a parsed manifest while recursively
+// loading its children.  `package_manifest_dependency` above remains the
+// borrowed, single-alias query used by the existing import/lock path.
+struct PackageManifestDependencyEntry {
+    alias: []u8,
+    path: []u8,
+    mode: []u8,
+    valid: i32,
+}
+
+struct PackageManifest {
+    path: []u8,
+    name: []u8,
+    version: []u8,
+    compiler_pin: []u8,
+    deps: ArrayList[PackageManifestDependencyEntry],
+    valid: i32,
+}
+
+struct PackageClosureNode {
+    manifest: []u8,
+    name: []u8,
+    version: []u8,
+    compiler_pin: []u8,
+    checksum: PackageRawChecksum,
+    // Owned exact read used to parse metadata/pins. Consumers needing SHA-256
+    // must hash this snapshot, never reopen the manifest after traversal.
+    source: []u8,
+}
+
+struct PackageClosureEdge {
+    from: []u8,
+    alias: []u8,
+    path: []u8,
+    mode: []u8,
+    to: []u8,
+}
+
+struct PackageManifestClosure {
+    root: []u8,
+    nodes: ArrayList[PackageClosureNode],
+    edges: ArrayList[PackageClosureEdge],
+    error: PackageImportError,
     valid: i32,
 }
 
@@ -210,6 +262,17 @@ fn package_import_module_safe(module: []u8) i32 {
         i = i + 1;
     }
     return package_import_safe_segment(module[segment_start..module.len]);
+}
+
+fn package_toolchain_pin_safe(pin: []u8) i32 {
+    if (pin.len != 71 || !@strEq(pin[0..7], "sha256:")) { return 0; }
+    let i: i32 = 7;
+    while (i < pin.len) {
+        let c: u8 = pin[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) { return 0; }
+        i = i + 1;
+    }
+    return 1;
 }
 
 fn package_import_local_path_safe(path: []u8) i32 {
@@ -531,6 +594,400 @@ fn package_manifest_dependency(source: []u8,
         else { position = end + 1; }
     }
     return result;
+}
+
+fn package_manifest_owned_entry_release(entry: *PackageManifestDependencyEntry) void {
+    if (entry.*.alias.len > 0) { _zag_str_free(entry.*.alias); }
+    if (entry.*.path.len > 0) { _zag_str_free(entry.*.path); }
+    if (entry.*.mode.len > 0) { _zag_str_free(entry.*.mode); }
+    entry.*.alias = ""; entry.*.path = ""; entry.*.mode = ""; entry.*.valid = 0;
+}
+
+fn package_manifest_release(manifest: *PackageManifest) void {
+    if (manifest.*.path.len > 0) { _zag_str_free(manifest.*.path); }
+    if (manifest.*.name.len > 0) { _zag_str_free(manifest.*.name); }
+    if (manifest.*.version.len > 0) { _zag_str_free(manifest.*.version); }
+    if (manifest.*.compiler_pin.len > 0) { _zag_str_free(manifest.*.compiler_pin); }
+    let i: i32 = 0;
+    while (i < manifest.*.deps.len) {
+        package_manifest_owned_entry_release(&manifest.*.deps.data[i]);
+        i = i + 1;
+    }
+    free[PackageManifestDependencyEntry](&manifest.*.deps);
+    manifest.*.path = ""; manifest.*.name = ""; manifest.*.version = ""; manifest.*.compiler_pin = "";
+    manifest.*.valid = 0;
+}
+
+fn package_manifest_bad(path: []u8) PackageManifest {
+    return PackageManifest{.path = _zag_str_concat("", path), .name = "",
+        .version = "", .compiler_pin = "", .deps = make[PackageManifestDependencyEntry](4), .valid = 0};
+}
+
+// No escapes in the bounded manifest subset. In particular, fields cannot
+// inject tabs/newlines into the canonical closure record.
+fn package_manifest_string(raw: []u8) i32 {
+    if (raw.len < 2 || raw[0] != '"' || raw[raw.len - 1] != '"') { return 0; }
+    let i: i32 = 1;
+    while (i < raw.len - 1) {
+        if (raw[i] < 32 || raw[i] == 127 || raw[i] == '"' || raw[i] == '\\') { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn package_manifest_local_table_valid(raw: []u8) i32 {
+    if (raw.len < 2 || raw[0] != '{' || raw[raw.len - 1] != '}') { return 0; }
+    let body: []u8 = package_import_trim(raw[1..raw.len - 1]);
+    let eq: i32 = 0;
+    while (eq < body.len && body[eq] != '=') { eq = eq + 1; }
+    if (eq == body.len || !@strEq(package_import_trim(body[0..eq]), "path")) { return 0; }
+    return package_manifest_string(package_import_trim(body[eq + 1..body.len]));
+}
+
+fn package_manifest_link_table_valid(raw: []u8) i32 {
+    if (raw.len < 2 || raw[0] != '{' || raw[raw.len - 1] != '}') { return 0; }
+    let body: []u8 = package_import_trim(raw[1..raw.len - 1]);
+    let eq: i32 = 0;
+    while (eq < body.len && body[eq] != '=') { eq = eq + 1; }
+    if (eq == body.len || !@strEq(package_import_trim(body[0..eq]), "link")) { return 0; }
+    return package_manifest_string(package_import_trim(body[eq + 1..body.len]));
+}
+
+// The first-class manifest parser accepts the package metadata used by the
+// existing top-level zag.mod as well as an optional [package] section.  Only
+// path/mode dependency fields are part of this resolver API; unknown fields
+// fail closed rather than being silently ignored.
+fn package_manifest_parse(path: []u8, source: []u8) PackageManifest {
+    let out: PackageManifest = package_manifest_bad(path);
+    if (source.len < 0 || source.len > 1048576) { return out; }
+    let section: i32 = 0;
+    let position: i32 = 0;
+    while (position <= source.len) {
+        let end: i32 = position;
+        while (end < source.len && source[end] != '\n') { end = end + 1; }
+        let line: []u8 = package_import_trim(source[position..end]);
+        if (line.len > 0 && line[0] != '#') {
+            if (line[0] == '[') {
+                let close: i32 = 1;
+                while (close < line.len && line[close] != ']') { close = close + 1; }
+                if (close != line.len - 1) { package_manifest_release(&out); return package_manifest_bad(path); }
+                let title: []u8 = package_import_trim(line[1..close]);
+                if (@strEq(title, "package")) { section = 1; }
+                else if (@strEq(title, "deps")) { section = 2; }
+                else if (@strEq(title, "toolchain")) { section = 3; }
+                else { section = 4; }
+            } else {
+                let equals: i32 = 0;
+                while (equals < line.len && line[equals] != '=') { equals = equals + 1; }
+                if (equals >= line.len) { package_manifest_release(&out); return package_manifest_bad(path); }
+                let key: []u8 = package_import_trim(line[0..equals]);
+                let raw: []u8 = package_import_trim(line[equals + 1..line.len]);
+                if (section == 3) {
+                    if (@strEq(key, "compiler")) {
+                        let pin: []u8 = package_import_unquote(raw);
+                        if (out.compiler_pin.len > 0 || package_toolchain_pin_safe(pin) == 0) {
+                            package_manifest_release(&out); return package_manifest_bad(path);
+                        }
+                        out.compiler_pin = _zag_str_concat("", pin);
+                    } else {
+                        package_manifest_release(&out); return package_manifest_bad(path);
+                    }
+                } else if (section == 1 || section == 0) {
+                    if (@strEq(key, "name")) {
+                        if (out.name.len > 0 || package_manifest_string(raw) == 0 || raw.len == 2) {
+                            package_manifest_release(&out); return package_manifest_bad(path);
+                        }
+                        out.name = _zag_str_concat("", package_import_unquote(raw));
+                    }
+                    else if (@strEq(key, "version")) {
+                        if (out.version.len > 0 || package_manifest_string(raw) == 0 || raw.len == 2) {
+                            package_manifest_release(&out); return package_manifest_bad(path);
+                        }
+                        out.version = _zag_str_concat("", package_import_unquote(raw));
+                    }
+                    else if (section == 1 && !@strEq(key, "edition")) {
+                        package_manifest_release(&out); return package_manifest_bad(path);
+                    }
+                } else if (section == 2) {
+                    let path_value: []u8 = "";
+                    let mode_value: []u8 = "";
+                    if (raw.len > 0 && raw[0] == '{') {
+                        if (raw[raw.len - 1] != '}') {
+                            package_manifest_release(&out); return package_manifest_bad(path);
+                        }
+                        // Link-only entries are compiler/linker inputs, not
+                        // local package edges, and remain outside the source
+                        // closure while retaining existing zag.mod support.
+                        if (package_import_field_mentioned(raw, "path") == 0) {
+                            if (package_import_field_mentioned(raw, "link") != 0 &&
+                                package_import_field_mentioned(raw, "mode") == 0) {
+                                if (package_manifest_link_table_valid(raw) == 0) {
+                                    package_manifest_release(&out); return package_manifest_bad(path);
+                                }
+                                if (end >= source.len) { position = source.len + 1; }
+                                else { position = end + 1; }
+                                continue;
+                            }
+                            package_manifest_release(&out); return package_manifest_bad(path);
+                        }
+                        // The strict vendor grammar is also the strict table
+                        // grammar whenever mode is present.  A local table may
+                        // omit mode but may not contain any other field.
+                        if (package_import_field_mentioned(raw, "mode") != 0) {
+                            if (package_import_vendor_table_valid(raw) == 0) {
+                                package_manifest_release(&out); return package_manifest_bad(path);
+                            }
+                        } else if (package_manifest_local_table_valid(raw) == 0) {
+                            package_manifest_release(&out); return package_manifest_bad(path);
+                        }
+                        path_value = package_import_field(raw, "path");
+                        mode_value = package_import_field(raw, "mode");
+                    } else {
+                        if (package_manifest_string(raw) == 0) { package_manifest_release(&out); return package_manifest_bad(path); }
+                        // The quoted shorthand is the existing link form.
+                        if (end >= source.len) { position = source.len + 1; }
+                        else { position = end + 1; }
+                        continue;
+                    }
+                    if (package_import_safe_name(key) == 0 || path_value.len == 0 ||
+                        package_import_local_path_safe(path_value) == 0 ||
+                        (mode_value.len > 0 && (!@strEq(mode_value, "vendor") ||
+                            package_import_vendor_path_safe(path_value) == 0))) {
+                        package_manifest_release(&out); return package_manifest_bad(path);
+                    }
+                    let duplicate: i32 = 0;
+                    let di: i32 = 0;
+                    while (di < out.deps.len) {
+                        if (@strEq(out.deps.data[di].alias, key)) { duplicate = 1; }
+                        di = di + 1;
+                    }
+                    if (duplicate != 0 || out.deps.len >= 256) {
+                        package_manifest_release(&out); return package_manifest_bad(path);
+                    }
+                    push[PackageManifestDependencyEntry](&out.deps,
+                        PackageManifestDependencyEntry{.alias = _zag_str_concat("", key),
+                            .path = _zag_str_concat("", path_value),
+                            .mode = _zag_str_concat("", mode_value), .valid = 1});
+                }
+            }
+        }
+        if (end >= source.len) { position = source.len + 1; }
+        else { position = end + 1; }
+    }
+    if (out.name.len > 0) { out.valid = 1; }
+    return out;
+}
+
+fn package_manifest_path_normalize(path: []u8) []u8 {
+    let absolute: i32 = (path.len > 0 && path[0] == '/') as i32;
+    let parts: ArrayList[[]u8] = make[[]u8](8);
+    let start: i32 = 0;
+    let i: i32 = 0;
+    while (i <= path.len) {
+        if (i == path.len || path[i] == '/') {
+            let part: []u8 = path[start..i];
+            if (part.len == 0 || @strEq(part, ".")) { }
+            else if (@strEq(part, "..")) {
+                if (parts.len > 0 && !@strEq(parts.data[parts.len - 1], "..")) {
+                    let _drop: []u8 = pop[[]u8](&parts);
+                } else if (absolute == 0) { push[[]u8](&parts, part); }
+            } else { push[[]u8](&parts, part); }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    let out: []u8 = "";
+    if (absolute == 1) { out = _zag_str_concat("", "/"); }
+    i = 0;
+    while (i < parts.len) {
+        if (out.len > 0 && !(absolute == 1 && i == 0)) { package_closure_append(&out, "/"); }
+        package_closure_append(&out, parts.data[i]); i = i + 1;
+    }
+    free[[]u8](&parts);
+    if (out.len == 0) { return _zag_str_concat("", "."); }
+    return out;
+}
+
+fn package_closure_node_index(closure: PackageManifestClosure, path: []u8) i32 {
+    let i: i32 = 0;
+    while (i < closure.nodes.len) {
+        if (@strEq(closure.nodes.data[i].manifest, path)) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn package_closure_active(active: ArrayList[[]u8], path: []u8) i32 {
+    let i: i32 = 0;
+    while (i < active.len) { if (@strEq(active.data[i], path)) { return 1; } i = i + 1; }
+    return 0;
+}
+
+fn package_closure_compare(a: PackageManifestDependencyEntry,
+    b: PackageManifestDependencyEntry) i32 {
+    let common: i32 = a.alias.len;
+    if (b.alias.len < common) { common = b.alias.len; }
+    let i: i32 = 0;
+    while (i < common) {
+        if (a.alias[i] < b.alias[i]) { return 0 - 1; }
+        if (a.alias[i] > b.alias[i]) { return 1; }
+        i = i + 1;
+    }
+    if (a.alias.len < b.alias.len) { return 0 - 1; }
+    if (a.alias.len > b.alias.len) { return 1; }
+    return 0;
+}
+
+fn package_manifest_deps_sort(deps: *ArrayList[PackageManifestDependencyEntry]) void {
+    let i: i32 = 1;
+    while (i < deps.*.len) {
+        let j: i32 = i;
+        while (j > 0 && package_closure_compare(deps.*.data[j], deps.*.data[j - 1]) < 0) {
+            let swap: PackageManifestDependencyEntry = deps.*.data[j];
+            deps.*.data[j] = deps.*.data[j - 1]; deps.*.data[j - 1] = swap; j = j - 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn package_manifest_closure_visit(closure: *PackageManifestClosure,
+    manifest_path: []u8, active: *ArrayList[[]u8]) void {
+    if (closure.*.error != PackageImportError.none) { return; }
+    if (package_closure_active(active.*, manifest_path) != 0) {
+        closure.*.error = PackageImportError.manifest_dependency_cycle; return;
+    }
+    if (package_closure_node_index(closure.*, manifest_path) >= 0) { return; }
+    if (closure.*.nodes.len >= 256 || active.*.len >= 64 || closure.*.edges.len > 4096) {
+        closure.*.error = PackageImportError.manifest_closure_limit; return;
+    }
+    if (_zag_file_exists(manifest_path) == 0) {
+        closure.*.error = PackageImportError.manifest_dependency_missing; return;
+    }
+    let source: []u8 = _zag_read_file(manifest_path);
+    let manifest: PackageManifest = package_manifest_parse(manifest_path, source);
+    if (source.len < 0 || manifest.valid == 0) {
+        if (source.len >= 0) { package_import_free_read(source); }
+        package_manifest_release(&manifest);
+        closure.*.error = PackageImportError.invalid_manifest; return;
+    }
+    push[PackageClosureNode](&closure.*.nodes, PackageClosureNode{
+        .manifest = _zag_str_concat("", manifest.path), .name = _zag_str_concat("", manifest.name),
+        .version = _zag_str_concat("", manifest.version), .compiler_pin = _zag_str_concat("", manifest.compiler_pin),
+        .checksum = package_raw_checksum(source), .source = source});
+    push[[]u8](active, manifest_path);
+    package_manifest_deps_sort(&manifest.deps);
+    let i: i32 = 0;
+    while (i < manifest.deps.len && closure.*.error == PackageImportError.none) {
+        let dep: PackageManifestDependencyEntry = manifest.deps.data[i];
+        let root: []u8 = package_import_join(package_import_dir(manifest_path), dep.path);
+        let child_raw: []u8 = package_import_join(root, "zag.mod");
+        let child: []u8 = package_manifest_path_normalize(child_raw);
+        _zag_str_free(child_raw);
+        _zag_str_free(root);
+        if (_zag_file_exists(child) == 0) {
+            closure.*.error = PackageImportError.manifest_dependency_missing;
+        } else if (package_closure_active(active.*, child) != 0) {
+            closure.*.error = PackageImportError.manifest_dependency_cycle;
+        } else {
+            push[PackageClosureEdge](&closure.*.edges, PackageClosureEdge{
+                .from = _zag_str_concat("", manifest_path), .alias = _zag_str_concat("", dep.alias),
+                .path = _zag_str_concat("", dep.path), .mode = _zag_str_concat("", dep.mode),
+                .to = _zag_str_concat("", child)});
+            package_manifest_closure_visit(closure, child, active);
+        }
+        _zag_str_free(child); i = i + 1;
+    }
+    let _pop: []u8 = pop[[]u8](active);
+    package_manifest_release(&manifest);
+}
+
+fn package_manifest_closure_release(closure: *PackageManifestClosure) void {
+    if (closure.*.root.len > 0) { _zag_str_free(closure.*.root); }
+    let i: i32 = 0;
+    while (i < closure.*.nodes.len) {
+        if (closure.*.nodes.data[i].manifest.len > 0) { _zag_str_free(closure.*.nodes.data[i].manifest); }
+        if (closure.*.nodes.data[i].name.len > 0) { _zag_str_free(closure.*.nodes.data[i].name); }
+        if (closure.*.nodes.data[i].version.len > 0) { _zag_str_free(closure.*.nodes.data[i].version); }
+        if (closure.*.nodes.data[i].compiler_pin.len > 0) { _zag_str_free(closure.*.nodes.data[i].compiler_pin); }
+        package_import_free_read(closure.*.nodes.data[i].source);
+        i = i + 1;
+    }
+    i = 0; while (i < closure.*.edges.len) {
+        if (closure.*.edges.data[i].from.len > 0) { _zag_str_free(closure.*.edges.data[i].from); }
+        if (closure.*.edges.data[i].alias.len > 0) { _zag_str_free(closure.*.edges.data[i].alias); }
+        if (closure.*.edges.data[i].path.len > 0) { _zag_str_free(closure.*.edges.data[i].path); }
+        if (closure.*.edges.data[i].mode.len > 0) { _zag_str_free(closure.*.edges.data[i].mode); }
+        if (closure.*.edges.data[i].to.len > 0) { _zag_str_free(closure.*.edges.data[i].to); }
+        i = i + 1;
+    }
+    free[PackageClosureNode](&closure.*.nodes); free[PackageClosureEdge](&closure.*.edges);
+    closure.*.root = ""; closure.*.valid = 0;
+}
+
+fn package_manifest_closure(base_dir: []u8) PackageManifestClosure {
+    let root: []u8 = package_import_manifest(base_dir);
+    let out: PackageManifestClosure = PackageManifestClosure{
+        .root = "", .nodes = make[PackageClosureNode](8), .edges = make[PackageClosureEdge](8),
+        .error = PackageImportError.none, .valid = 0};
+    if (root.len == 0) { out.error = PackageImportError.manifest_not_found; return out; }
+    out.root = package_manifest_path_normalize(root); _zag_str_free(root);
+    let active: ArrayList[[]u8] = make[[]u8](8);
+    package_manifest_closure_visit(&out, out.root, &active);
+    free[[]u8](&active);
+    if (out.error == PackageImportError.none && out.nodes.len > 0) { out.valid = 1; }
+    return out;
+}
+
+fn package_closure_append(out: *[]u8, text: []u8) void {
+    let next: []u8 = _zag_str_concat(out.*, text);
+    if (out.*.len > 0) { _zag_str_free(out.*); }
+    out.* = next;
+}
+
+fn package_closure_checksum_text(sum: PackageRawChecksum) []u8 {
+    let first: []u8 = _zag_i64_to_str(sum.first);
+    let second: []u8 = _zag_i64_to_str(sum.second);
+    let bytes: []u8 = _zag_i64_to_str(sum.bytes);
+    let out: []u8 = "";
+    package_closure_append(&out, first); package_closure_append(&out, ",");
+    package_closure_append(&out, second); package_closure_append(&out, ",");
+    package_closure_append(&out, bytes);
+    _zag_str_free(first); _zag_str_free(second); _zag_str_free(bytes);
+    return out;
+}
+
+// Canonical closure API: the root is followed by a deterministic depth-first
+// traversal whose children are byte-sorted by dependency alias.  The output
+// contains exact manifest checksums and every manifest edge, so consumers can
+// compare it byte-for-byte without reproducing filesystem traversal order.
+fn package_manifest_closure_render(closure: PackageManifestClosure) []u8 {
+    if (closure.valid == 0) { return ""; }
+    let out: []u8 = _zag_str_concat("", "format=zag-dependency-closure-v1\n");
+    package_closure_append(&out, "root="); package_closure_append(&out, closure.root);
+    package_closure_append(&out, "\n");
+    let i: i32 = 0;
+    while (i < closure.nodes.len) {
+        let node: PackageClosureNode = closure.nodes.data[i];
+        let sum: []u8 = package_closure_checksum_text(node.checksum);
+        package_closure_append(&out, "node="); package_closure_append(&out, node.manifest);
+        package_closure_append(&out, "\t"); package_closure_append(&out, node.name);
+        package_closure_append(&out, "\t"); package_closure_append(&out, node.version);
+        package_closure_append(&out, "\t"); package_closure_append(&out, node.compiler_pin);
+        package_closure_append(&out, "\t"); package_closure_append(&out, sum);
+        package_closure_append(&out, "\n"); _zag_str_free(sum);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < closure.edges.len) {
+        let current_edge: PackageClosureEdge = closure.edges.data[i];
+        package_closure_append(&out, "edge="); package_closure_append(&out, current_edge.from);
+        package_closure_append(&out, "\t"); package_closure_append(&out, current_edge.alias);
+        package_closure_append(&out, "\t"); package_closure_append(&out, current_edge.path);
+        package_closure_append(&out, "\t"); package_closure_append(&out, current_edge.mode);
+        package_closure_append(&out, "\t"); package_closure_append(&out, current_edge.to);
+        package_closure_append(&out, "\n"); i = i + 1;
+    }
+    return out;
 }
 
 fn package_lock_validate(lock: []u8, manifest_source: []u8,

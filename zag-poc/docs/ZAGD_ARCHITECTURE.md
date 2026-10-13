@@ -32,7 +32,7 @@ payload, all records deny executable authority, and every invalid or stale state
 selects the release-linked foreground fallback.
 
 The daemon does not import the module, status continues to report
-`optimizer_generation=unimplemented`, and no stored generation is loaded or
+`optimizer_generation=bounded-finite-sandbox`, and no stored generation is loaded or
 executed. There is no synthesized worker, isolated generation execution,
 adversarial canary build, verifier replacement, or automatic promotion. The
 standalone registry evidence therefore does not satisfy or broaden the
@@ -303,11 +303,15 @@ module, or invalid configuration fails closed. Its identity combines the
 canonical semantic declaration/effect/layout facts, module-graph topology,
 compiler version, and active CPU cache key.
 
-Deep measurements are accepted only for three explicitly supplied bounded runs
-and exact whole-semantic/module-graph plus active-CPU target identities. Every
-module hash is reread before and between finalist executions. Stale, malformed,
-cancelled, non-deep, target-mismatched, or witness-mismatched measurements are
-ignored and any prior record is removed. The record explicitly states
+Deep measurements use three warmup reference/finalist pairs, 30
+reference/reference pairs to bound host/process noise, and 30 measured
+reference/finalist pairs. Every pair is tied to exact whole-semantic/module-graph
+and active-target identities, and module inputs are revalidated throughout the
+campaign. The full sample vectors feed one shared family-wise 99% paired-sign
+selector with a per-workload no-regression bound and deterministic tie-breaking.
+Stale, malformed, cancelled, non-deep, target-mismatched, or witness-mismatched
+campaigns publish nothing and remove prior evidence. A valid inconclusive
+campaign persists `selection_status=no-win`. The record explicitly states
 `foreground_consumption=false`; timings never authorize source rewrites or
 bypass foreground compilation.
 
@@ -439,13 +443,14 @@ a losing concurrent starter cannot modify the active daemon's advisory state.
 
 ## Deep finalist execution audit
 
-`zagd_benchmark.zag` now contains a dedicated Linux x86-64 finalist executor.
-It calls `execve` on the reviewed executable path directly (never `/bin/sh`),
-places the child in a separate process group, applies `RLIMIT_CPU` and
-`RLIMIT_AS`, observes a monotonic deadline and cancellation flag, caps stdout
-and stderr independently, kills the process group on failure, and always reaps
-the child. Its witness records stdout, stderr, normal exit status or terminating
-signal, state, and elapsed monotonic time separately.
+`zagd_benchmark.zag` contains the shared bounded finalist executor used by the
+Linux x86-64 and macOS ARM64 daemons. It calls `execve` on the reviewed
+executable path directly (never `/bin/sh`), places the child in a separate
+process group, applies the host resource limits available through the audited
+native syscall mapping, observes a monotonic deadline and cancellation flag,
+caps stdout and stderr independently, kills the process group on failure, and
+always reaps the child. Its witness records stdout, stderr, normal exit status
+or terminating signal, state, and elapsed monotonic time separately.
 
 Execution remains fail closed unless the request is explicit deep mode, has at
 most three finalists and bounded time/memory, matches the current complete
@@ -460,11 +465,13 @@ seccomp claim. Only equivalent output witnesses may become measured plan facts.
 
 The daemon integration uses `.zagd.deep-reference` and `.zagd.deep-finalist` as
 the explicit execution checkpoint. For one stable semantic/module-graph and
-active-CPU identity it runs three bounded reference/finalist pairs, rereads all
-module hashes before and between executions, observes the stop file between
-runs, and transactionally persists a measured record only after exact witness
-equality for every pair. A root or imported-module change, cancellation,
-mismatch, timeout, or output overflow removes any prior measurement and
-publishes no replacement. These control files authorize only compiler-produced
-reviewed executables; they add no filesystem namespace, seccomp, network
-isolation, or hostile-code sandbox.
+active-target identity it runs the bounded v3 campaign: three warmup pairs, 30
+reference/reference noise pairs, and 30 reference/finalist measurement pairs.
+It rereads current semantic/module inputs throughout, observes the stop file
+between runs, requires exact witness equality, and feeds the complete sample
+vectors to `zagd_benchmark_select_99`. The record persists either a statistically
+eligible 99% winner with `no_regression=1` or an explicit `no-win`. A root or
+imported-module change, cancellation, mismatch, timeout, or output overflow
+removes any prior measurement and publishes no replacement. These control files
+authorize only compiler-produced reviewed executables; they add no filesystem
+namespace, seccomp, network isolation, or hostile-code sandbox.

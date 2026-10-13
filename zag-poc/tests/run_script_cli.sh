@@ -54,14 +54,38 @@ grep -q 'harden status: preview' "$tmp_dir/view-explicit.log"
 grep -q 'fn main() i32' "$tmp_dir/view-explicit.zag"
 grep -q 'extern fn _zag_script_context_init' "$tmp_dir/view-explicit.zag"
 grep -q 'fn __zag_hardened_status_boundary' "$tmp_dir/view-explicit.zag"
+! grep -q '\*opaque' "$tmp_dir/view-explicit.zag"
+"$znc_bin" check "$tmp_dir/view-explicit.zag" --no-analyze --no-zagd >/dev/null
 "$znc_bin" "$tmp_dir/view-explicit.zag" -o "$tmp_dir/view-explicit-bin" --no-analyze --no-zagd >/dev/null
 test -x "$tmp_dir/view-explicit-bin"
+set +e
+"$tmp_dir/view-explicit-bin"
+explicit_status=$?
+set -e
+test "$explicit_status" -eq 7
 "$znc_bin" view tests/script_frontend/basic.zag --level explicit --format json \
     --output "$tmp_dir/view-explicit-json.zag" --no-zagd >"$tmp_dir/view-explicit.json"
 grep -q '"status":"preview"' "$tmp_dir/view-explicit.json"
 grep -q '"candidate_compilable":true' "$tmp_dir/view-explicit.json"
 test -s "$tmp_dir/view-explicit-json.zag"
 cmp "$tmp_dir/view-explicit-json.zag" "$tmp_dir/view-explicit.zag"
+
+# Generated wrappers and user source obey the same edition gate. A
+# user-authored v2 qualifier in edition-2026 Script fails before publication.
+cat >"$tmp_dir/view-user-v2.zag" <<'EOF'
+script;
+fn user_context(value:*opaque) i32 { return 0; }
+return user_context(null as *opaque);
+EOF
+if "$znc_bin" view "$tmp_dir/view-user-v2.zag" --level explicit \
+    --output "$tmp_dir/view-user-v2-output.zag" --no-zagd \
+    >"$tmp_dir/view-user-v2.log" 2>&1; then
+    echo "explicit view bypassed the user-source edition gate" >&2
+    exit 1
+fi
+grep -q 'v2 machine-control syntax requires `edition = "2027"`' \
+    "$tmp_dir/view-user-v2.log"
+test ! -e "$tmp_dir/view-user-v2-output.zag"
 
 "$znc_bin" expand tests/script_frontend/basic.zag --to explicit --no-zagd \
     --output "$tmp_dir/expand-explicit.zag" > "$tmp_dir/expand-explicit.log"
@@ -202,19 +226,136 @@ grep -q 'script_read_file' "$tmp_dir/harden-prelude-output.zag"
 "$znc_bin" "$tmp_dir/harden-prelude-output.zag" -o "$tmp_dir/harden-prelude" --no-analyze --no-zagd >/dev/null
 (cd "$tmp_dir" && ./harden-prelude)
 
-# The bounded process helper still depends on the edition-2027 affine list;
-# default-edition expansion refuses it rather than importing an invalid module
-# graph or manufacturing a weaker ownership contract.
+# Expansion imports the module that owns a helper even when the selected helper
+# is not the module's constructor/primary entry point. `path_basename` is the
+# minimal regression: the bound root contains only `script_path_basename`, so a
+# constructor-keyed import check would produce strict output with an unknown id.
+cat >"$tmp_dir/harden-path-basename.zag" <<'EOF'
+script;
+let base = path_basename("dir/file.txt");
+if (!@strEq(base, "file.txt")) { return 1; }
+return 0;
+EOF
+"$znc_bin" harden "$tmp_dir/harden-path-basename.zag" --format json \
+    --output "$tmp_dir/harden-path-basename-output.zag" --no-zagd \
+    >"$tmp_dir/harden-path-basename.json"
+grep -q '"status":"preview"' "$tmp_dir/harden-path-basename.json"
+grep -q '"candidate_compilable":true' "$tmp_dir/harden-path-basename.json"
+grep -q '@import("std:script_path")' "$tmp_dir/harden-path-basename-output.zag"
+grep -q 'script_path_basename' "$tmp_dir/harden-path-basename-output.zag"
+"$znc_bin" check "$tmp_dir/harden-path-basename-output.zag" --no-zagd >/dev/null
+"$znc_bin" "$tmp_dir/harden-path-basename-output.zag" \
+    -o "$tmp_dir/harden-path-basename" --no-analyze --no-zagd >/dev/null
+"$tmp_dir/harden-path-basename"
+
+# The bounded process helper is valid in edition 2026. Expansion must publish
+# ordinary Zag that imports the owning module, type-checks, builds, and runs.
 cat >"$tmp_dir/harden-process.zag" <<'EOF'
 script;
-let result = process_run_timeout("true", 1000, 64);
+let result = process_run_timeout("printf harden-ok", 1000, 64);
+if (process_result_state(result) != process_state_exited()) { return 21; }
+if (process_result_status(result) != 0) { return 22; }
+if (!@strEq(process_result_output(result), "harden-ok")) { return 23; }
 return 0;
 EOF
 "$znc_bin" harden "$tmp_dir/harden-process.zag" --format json \
     --output "$tmp_dir/harden-process-output.zag" --no-zagd >"$tmp_dir/harden-process.json"
-grep -q '"status":"unsupported"' "$tmp_dir/harden-process.json"
-grep -q '"kind":"script_prelude"' "$tmp_dir/harden-process.json"
-test ! -e "$tmp_dir/harden-process-output.zag"
+grep -q '"status":"preview"' "$tmp_dir/harden-process.json"
+grep -q '"candidate_compilable":true' "$tmp_dir/harden-process.json"
+test -s "$tmp_dir/harden-process-output.zag"
+grep -q '@import("std:process")' "$tmp_dir/harden-process-output.zag"
+grep -q 'process_run_bounded_script' "$tmp_dir/harden-process-output.zag"
+"$znc_bin" check "$tmp_dir/harden-process-output.zag" --no-zagd >/dev/null
+"$znc_bin" "$tmp_dir/harden-process-output.zag" -o "$tmp_dir/harden-process" --no-analyze --no-zagd >/dev/null
+"$tmp_dir/harden-process"
+
+# Root `try` already has a precise Script contract: the hidden body returns
+# !i32, the wrapper catches through the compiler-generated uncaught reporter,
+# then shuts the Script context down. Explicit expansion must preserve both the
+# successful payload path and the uncaught-error stderr/exit boundary.
+cat >"$tmp_dir/harden-try-success.zag" <<'EOF'
+script;
+error { Exploded }
+fn maybe_value(fail: i32) !i32 {
+    if (fail != 0) { return error.Exploded; }
+    return 42;
+}
+let value: i32 = try maybe_value(0);
+return value;
+EOF
+"$znc_bin" harden "$tmp_dir/harden-try-success.zag" --format json \
+    --output "$tmp_dir/harden-try-success-output.zag" --no-zagd \
+    >"$tmp_dir/harden-try-success.json"
+grep -q '"status":"preview"' "$tmp_dir/harden-try-success.json"
+grep -q '"candidate_compilable":true' "$tmp_dir/harden-try-success.json"
+grep -q 'fn __zag_hardened_script_body(__zag_script_context:\*i8) !i32' \
+    "$tmp_dir/harden-try-success-output.zag"
+grep -q 'catch |__zag_script_error_code| __zag_compiler_script_uncaught_7f3a' \
+    "$tmp_dir/harden-try-success-output.zag"
+"$znc_bin" "$tmp_dir/harden-try-success-output.zag" \
+    -o "$tmp_dir/harden-try-success" --no-analyze --no-zagd >/dev/null
+set +e
+"$tmp_dir/harden-try-success"
+harden_try_success_status=$?
+set -e
+test "$harden_try_success_status" -eq 42
+
+cat >"$tmp_dir/harden-try-error.zag" <<'EOF'
+script;
+error { Exploded }
+fn maybe_value(fail: i32) !i32 {
+    if (fail != 0) { return error.Exploded; }
+    return 42;
+}
+let value: i32 = try maybe_value(1);
+return value;
+EOF
+"$znc_bin" "$tmp_dir/harden-try-error.zag" -o "$tmp_dir/harden-try-error-compact" \
+    --no-analyze --no-zagd >/dev/null
+"$znc_bin" harden "$tmp_dir/harden-try-error.zag" --format json \
+    --output "$tmp_dir/harden-try-error-output.zag" --no-zagd \
+    >"$tmp_dir/harden-try-error.json"
+grep -q '"status":"preview"' "$tmp_dir/harden-try-error.json"
+grep -q '"candidate_compilable":true' "$tmp_dir/harden-try-error.json"
+"$znc_bin" "$tmp_dir/harden-try-error-output.zag" -o "$tmp_dir/harden-try-error-explicit" \
+    --no-analyze --no-zagd >/dev/null
+set +e
+"$tmp_dir/harden-try-error-compact" >"$tmp_dir/harden-try-error-compact.out" \
+    2>"$tmp_dir/harden-try-error-compact.err"
+harden_try_compact_status=$?
+"$tmp_dir/harden-try-error-explicit" >"$tmp_dir/harden-try-error-explicit.out" \
+    2>"$tmp_dir/harden-try-error-explicit.err"
+harden_try_explicit_status=$?
+set -e
+test "$harden_try_compact_status" -eq 1
+test "$harden_try_explicit_status" -eq 1
+cmp -s "$tmp_dir/harden-try-error-compact.out" "$tmp_dir/harden-try-error-explicit.out"
+cmp -s "$tmp_dir/harden-try-error-compact.err" "$tmp_dir/harden-try-error-explicit.err"
+grep -q 'uncaught Zag Script error name: Exploded' "$tmp_dir/harden-try-error-explicit.err"
+
+# Script declarations are static and the parser already separates them from
+# executable root statements. A declaration after a statement must therefore
+# be hoisted into the ordinary-Zag declaration section instead of making the
+# explicit view fail closed.
+cat >"$tmp_dir/harden-late-declaration.zag" <<'EOF'
+script;
+let value: i32 = late_value();
+fn late_value() i32 { return 42; }
+return value;
+EOF
+"$znc_bin" harden "$tmp_dir/harden-late-declaration.zag" --format json \
+    --output "$tmp_dir/harden-late-declaration-output.zag" --no-zagd \
+    >"$tmp_dir/harden-late-declaration.json"
+grep -q '"status":"preview"' "$tmp_dir/harden-late-declaration.json"
+grep -q '"candidate_compilable":true' "$tmp_dir/harden-late-declaration.json"
+grep -q '^fn late_value() i32' "$tmp_dir/harden-late-declaration-output.zag"
+"$znc_bin" "$tmp_dir/harden-late-declaration-output.zag" \
+    -o "$tmp_dir/harden-late-declaration" --no-analyze --no-zagd >/dev/null
+set +e
+"$tmp_dir/harden-late-declaration"
+harden_late_declaration_status=$?
+set -e
+test "$harden_late_declaration_status" -eq 42
 
 # --output publishes through an exclusive sibling staging file and a
 # create-only final rename. A human-owned final path is never overwritten.

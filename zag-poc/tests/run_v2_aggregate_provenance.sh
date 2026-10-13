@@ -76,6 +76,7 @@ printf '%s\n' \
   'fn retain(value:Box) void { }' \
   'fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=1}) as *mut Node; let value:Box=Box{.ptr=p}; let copied:Box=value; value.ptr=null as *mut Node; retain(copied); delete(p); } return 0; }' \
   >"$tmp/owner-copy-survives-clear/main.zag"
+reject_check owner-copy-survives-clear "check preserves copied owner provenance" 'owned allocation escapes through uncontracted call `retain`'
 reject owner-copy-survives-clear "aggregate copy keeps independent owner provenance" 'owned allocation escapes through uncontracted call `retain`'
 
 project owner-return
@@ -100,6 +101,7 @@ printf '%s\n' \
   'fn retain(value:Pair) void { }' \
   'fn main() i32 { unsafe { let p:*mut Node=new(Node{.value=1}) as *mut Node; let q:*mut Node=new(Node{.value=2}) as *mut Node; let value:Pair=Pair{.first=p,.second=q}; value.first=null as *mut Node; retain(value); delete(p); delete(q); } return 0; }' \
   >"$tmp/owner-partial-overwrite/main.zag"
+reject_check owner-partial-overwrite "check preserves sibling owner provenance after a field clear" 'root `q`'
 reject owner-partial-overwrite "overwriting one field preserves sibling provenance" 'root `q`'
 
 project owner-branch-may

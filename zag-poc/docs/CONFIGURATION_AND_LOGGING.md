@@ -26,6 +26,7 @@ bash tests/run_config_log_services.sh
 
 It covers valid lookup and typed conversion, duplicate/malformed/capacity
 failures, overflow, exact structured stderr, non-mutating log failures,
-allocator balance, and static Linux x86-64 output. This is not a hot-reload
-configuration service, multi-process log rotation, remote telemetry, tracing,
-redaction engine, or cryptographic audit log.
+allocator balance, and the exact native executable format on Linux x86-64 and
+Apple Silicon macOS (static ELF and signed Mach-O respectively). This is not a
+hot-reload configuration service, multi-process log rotation, remote telemetry,
+tracing, redaction engine, or cryptographic audit log.

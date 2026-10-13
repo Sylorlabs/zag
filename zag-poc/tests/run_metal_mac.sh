@@ -21,7 +21,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-ZNC=${ZNC:-./znc}
+. ./tests/portable.sh
+ZNC=${ZNC:-$(zag_native_compiler "$PWD")}
 case "$ZNC" in /*) ;; *) ZNC="$PWD/${ZNC#./}";; esac
 tmp=$(mktemp -d /tmp/zag-metal-mac.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT
@@ -37,10 +38,13 @@ if [ "$(uname)" != "Darwin" ]; then
     exit 1
 fi
 
-# Check for Metal compiler
-if ! command -v xcrun >/dev/null 2>&1; then
-    echo "xcrun not found. Install Xcode Command Line Tools: xcode-select --install"
-    exit 1
+# Native runtime compilation goes through Metal.framework and does not require
+# Xcode. When Apple's standalone offline compiler is present, this gate also
+# cross-checks the same emitted MSL through `metal` + `metallib`.
+has_offline_metal=false
+if command -v xcrun >/dev/null 2>&1 && xcrun -find metal >/dev/null 2>&1 && \
+   xcrun -find metallib >/dev/null 2>&1; then
+    has_offline_metal=true
 fi
 
 # ── 1. Emit MSL source from the fill kernel ─────────────────────────────────
@@ -92,7 +96,22 @@ else
     xx "MSL missing device address space qualifier"
 fi
 
-# ── 3. Compile MSL to metallib ──────────────────────────────────────────────
+# ── 3. Prove the native Zag-owned runtime path ──────────────────────────────
+if ZNC="$ZNC" bash tests/run_macos_metal_loader.sh >/dev/null; then
+    ok "native std:metal_loader compiles MSL and verifies physical GPU readback"
+else
+    xx "native std:metal_loader runtime verification failed"
+    exit 1
+fi
+
+if [ "$has_offline_metal" != "true" ]; then
+    ok "native Metal runtime does not depend on the optional Xcode offline compiler"
+    echo "════ metal-mac pass=$pass fail=$fail ════"
+    [ "$fail" -eq 0 ]
+    exit
+fi
+
+# ── 4. Cross-check MSL with Apple's offline compiler ────────────────────────
 if xcrun -sdk macosx metal -c "$tmp/fill.metal" -o "$tmp/fill.air" 2>"$tmp/metal_err.txt"; then
     ok "MSL compiles with metal compiler (macosx SDK)"
 else
@@ -109,7 +128,7 @@ else
     exit 1
 fi
 
-# ── 4. Run the kernel on the GPU via a Swift harness ────────────────────────
+# ── 5. Run the offline-compiled kernel on the GPU via a Swift harness ───────
 cat >"$tmp/harness.swift" <<'SWIFT'
 import Foundation
 import Metal
@@ -180,7 +199,7 @@ else
     cat "$tmp/swift_out.txt"
 fi
 
-# ── 5. Determinism check ────────────────────────────────────────────────────
+# ── 6. Determinism check ────────────────────────────────────────────────────
 if [ "$skip_emit" = "false" ] && [ -x "$ZNC" ]; then
     "$ZNC" "$tmp/fill.zag" --target metal-compat -o "$tmp/fill2.metal" >/dev/null 2>&1
     if cmp -s "$tmp/fill.metal" "$tmp/fill2.metal"; then

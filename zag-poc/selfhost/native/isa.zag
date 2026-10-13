@@ -28,6 +28,7 @@
 // while). Deref a pointer field as `p.*.field`.
 
 @import("../../std/list.zag")
+@import("../vector_contract.zag")   // VW_128/VW_256/VW_512 — the width ladder
 
 struct Instr {
     kind: i32,   // one of the K_* kinds below
@@ -171,10 +172,212 @@ fn K_PSUBD() i32 { return 101; } // psubd xmm[dst],xmm[src] : 66 0F FA /r
 fn K_PAND() i32 { return 102; } // pand xmm[dst],xmm[src] : 66 0F DB /r
 fn K_POR()  i32 { return 103; } // por xmm[dst],xmm[src] : 66 0F EB /r
 fn K_PXOR() i32 { return 104; } // pxor xmm[dst],xmm[src] : 66 0F EF /r
+// AVX2 256-bit integer vector foundation. These instructions use YMM registers
+// with VEX encoding. They are kept separate from SSE2 so runtime dispatch can
+// choose a wider path without changing the baseline x86-64 output.
+//
+// WIDTH-PARAMETRIC: these seven kinds now carry the vector width class in
+// `Instr.imm` bits 0-1 (see the width ladder below) and the encoder picks
+// VEX.128 / VEX.256 / EVEX.512 from it.  The `i_v*` constructors below default
+// the width class to VW_256(), so the pre-existing two-argument
+// `i_vpaddd(dst, src)` call sites keep emitting exactly the 256-bit AVX2 form
+// they emitted before.  `i_v*_w(...)` takes the width explicitly.
+fn K_VMOVDQU_LOAD() i32 { return 105; } // vmovdqu vec, [base + disp] : F3 0F 6F /r
+fn K_VMOVDQU_STORE() i32 { return 106; } // vmovdqu [base + disp], vec : F3 0F 7F /r
+                                       // (dst = the vector register, src = the base GPR,
+fn K_VPADDD() i32 { return 107; } // vpaddd vec,vec,vec : 66 0F FE /r
+fn K_VPSUBD() i32 { return 108; } // vpsubd vec,vec,vec : 66 0F FA /r
+fn K_VPAND() i32 { return 109; } // vpand  vec,vec,vec : 66 0F DB /r
+fn K_VPOR() i32 { return 110; } // vpor   vec,vec,vec : 66 0F EB /r
+fn K_VPXOR() i32 { return 111; } // vpxor  vec,vec,vec : 66 0F EF /r
 // Object-only direct external call. `lbl` is a compiler-local import index;
 // the x86 encoder emits E8 + zero rel32 and records its immediate location for
 // an ELF R_X86_64_PLT32 relocation. It is never valid in an executable blob.
 fn K_CALL_EXT() i32 { return 100; }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// WIDTH-PARAMETRIC VECTOR OPS (VEX.128 / VEX.256 / EVEX.512)
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// WHY THE WIDTH CLASS LIVES IN `Instr.imm`
+// ─────────────────────────────────────────
+// A vector op is a LOGICAL op (`vector.add`) that a chosen target width must
+// execute.  x86-64 spells the same logical op three ways — VEX.128, VEX.256
+// and EVEX.512 — and the ONLY thing that differs between the three is the
+// vector-length field (VEX `L`, EVEX `L'L`).  So the width is a *property of the
+// machine instruction*, not of the operation, and the machine instruction needs
+// exactly one small integer to say which of the three it is.  `Instr` has six
+// fields and every one of them is already spoken for by the legacy scalar and
+// SSE dialects:
+//
+//   dst  src      : register operands (an index operand fits in lbl)
+//   disp          : memory displacement for LOAD/STORE/LEA
+//   lbl           : label id for branches
+//   imm           : immediate  (and the condition code for SETCC)
+//
+// `imm` is an i64 that the vector kinds never use for anything else, and it is
+// already 0 for every kind that predates this scheme.  Making the width class
+// `imm` bits 0-1 is therefore strictly compatible: a kind that used to mean
+// "128-bit, hard-wired" keeps meaning 128-bit, and a kind that used to mean
+// "256-bit, hard-wired" gets an explicit 1 from its constructor (see the
+// `i_v*` constructors below, which keep `i_vpaddd(d, s)` = 256-bit).
+//
+// The width class IS the EVEX `L'L` field and the VEX `L` field:
+//
+//   imm bits 0-1   width class        bytes   VEX.L    EVEX L'L
+//   -----------   ---------------    -----   -----    ---------
+//        0         VW_128()             16      0        00
+//        1         VW_256()             32      1        01
+//        2         VW_512()             64      -        10
+//
+// `x86vec_wclass()` is the only place a width class is read out of `imm` and
+// `x86vec_pack_imm()` the only place one is written, so a target backend (or a
+// future 128-bit NEON path) can share the same `Instr` spelling.
+//
+// FIELD LAYOUT FOR THE VECTOR KINDS
+// ──────────────────────────────────
+// 3-operand (VEX.NDS / EVEX.NDS) packed ops — the non-destructive form the
+// vectorizer wants, so the lowering never has to copy a live value:
+//     dst = result register          src = src1 (VEX.vvvv / EVEX.vvvv)
+//     lbl = src2 (ModRM.rm)          imm = width class
+// `lbl` carries a register number here, not a label id.  That is safe because
+// a vector op is never also a branch target, and it is the only field left
+// after dst/src/imm/disp.
+//
+// SCALED-INDEX MEMORY FORMS (K_VMOVDQU_LOAD_IDX / K_VMOVDQU_STORE_IDX)
+// ─────────────────────────────────────────────────────────────────────
+// The auto-vectorizer needs `dst[i]` addressing without a separate scalar
+// multiply, i.e. a real SIB form `[base + index*scale + disp32]`.  `imm` is
+// already two fields wide, so scale is packed ABOVE the width class rather than
+// stealing `disp` (which must stay the displacement):
+//
+//     imm bits 0-1  : width class (VW_128/VW_256/VW_512)
+//     imm bits 2-3  : SIB scale exponent, 0/1/2/3 == byte scale 1/2/4/8
+//     disp         : signed 32-bit displacement
+//
+// and the registers:
+//     LOAD   dst = vector result          src = base GPR      lbl = index GPR
+//     STORE  dst = vector SOURCE register src = base GPR      lbl = index GPR
+//
+// `scale` is therefore the *element stride of the logical vector type*
+// (i8/i16/i32/i64/f32/f64 -> 1/2/4/8), decided by the lowering from the ZIR
+// element type, and `lbl` is a hardware GPR number 0..15.  For STORE the
+// vector register is in `dst` (not `src`) so that BOTH memory forms use the
+// identical `[base=lbl? no: src] + [index=lbl]` spelling and the encoder needs
+// only one SIB routine.  Use `x86vec_pack_imm(w, scale_log)` to build `imm` and
+// `x86vec_wclass(imm)` / `x86vec_scale_log(imm)` to take it apart.
+//
+// LANE-INDEXED AND PREDICATE FORMS
+// ─────────────────────────────────
+//   K_VEXTRACT* : dst = GPR, src = vector, lbl = lane index,
+//                 disp = scratch vector register (ONLY consulted when the lane
+//                        lives in 128-bit chunk != 0; pass a negative value to
+//                        be rejected).  The chunk select is a second
+//                        instruction because no x86 instruction extracts lane
+//                        5 of a ymm in one go.
+//   K_VINSERT*  : dst = vector result, src = the vector read, lbl = the GPR
+//                 scalar, disp = the lane index.  No scratch is needed: the
+//                 result may alias the source.
+//   K_VSHUF32   : dst = result (also the implicit src1 of the 2-operand
+//                 VPSHUFD form), src = the vector read, imm bits 8-15 = imm8.
+//   K_VCMPF     : imm bits 8-15 = the VCMPPS/PD imm8 predicate.
+//   K_VCMPIK    : imm bits 8-15 = the VPCMP imm8 predicate, disp = 0 for
+//                 signed/float (0F3A 1F) or 1 for unsigned (0F3A 1E).
+//   K_VPCMPEQI / K_VPCMPGTI / K_VPCMPGTU : disp = element width in bytes
+//                 (4 = dword lanes, 8 = qword lanes).
+//
+// REGISTER CLASS OF A COMPARISON RESULT
+// ──────────────────────────────────────
+// x86-64 has two kinds of lane mask and they are NOT interchangeable:
+//   • a VECTOR mask — one all-ones/all-zeros element per lane, usable by AND /
+//     XOR and therefore by K_VSELECT.  VEX.128/VEX.256 PCMPEQx / PCMPGTx /
+//     VCMPPSx produce one.  The EVEX forms of those opcodes at 512 bits write
+//     a k register instead, so K_VPCMPEQI / K_VPCMPGTI / K_VCMPF are VEX-only
+//     and REJECT width 2.
+//   • a K-REGISTER mask — k0..k7, one bit per lane.  Every EVEX compare writes
+//     one, and there is NO single instruction that widens a k mask into a lane
+//     mask, so a k mask must stay a k mask.  K_VPCMPNEI / K_VPCMPGTU /
+//     K_VCMPIK therefore put the k register NUMBER in `dst` and are EVEX-only,
+//     and K_VSELECTK consumes a k mask where K_VSELECT consumes a vector mask.
+//
+// ── integer elementwise (3-operand NDS) ───────────────────────────────────────
+fn K_VPADDQ()  i32 { return 112; } // vpaddq  vec,vec,vec  : 66 0F.W1 D4
+fn K_VPSUBQ()  i32 { return 113; } // vpsubq  vec,vec,vec  : 66 0F.W1 FB
+fn K_VPMULLD() i32 { return 114; } // vpmulld vec,vec,vec  : 66 0F38.W0 40
+fn K_VPMULLQ() i32 { return 115; } // vpmullq vec,vec,vec  : 66 0F38.W1 40  (EVEX.512 only: AVX512DQ)
+fn K_VPSLLD()  i32 { return 116; } // vpslld  vec,vec,xmm/m128 : 66 0F.W0 F2  (count operand is 128-bit)
+fn K_VPSLLQ()  i32 { return 117; } // vpsllq  vec,vec,xmm/m128 : 66 0F.W1 F3
+fn K_VPSRLD()  i32 { return 118; } // vpsrld  vec,vec,xmm/m128 : 66 0F.W0 D2
+fn K_VPSRLQ()  i32 { return 119; } // vpsrlq  vec,vec,xmm/m128 : 66 0F.W1 D3
+// ── integer compare ───────────────────────────────────────────────────────────
+fn K_VPCMPEQI() i32 { return 120; } // disp=4: 66 0F.W0 76 / disp=8: 66 0F38.W1 29  [VEX, vector mask]
+fn K_VPCMPGTI() i32 { return 121; } // disp=4: 66 0F.W0 66 / disp=8: 66 0F38.W1 37  [VEX, vector mask]
+fn K_VPCMPNEI() i32 { return 122; } // 66 0F3A.W0/1 1F /r ib, imm8=4 (NE)      [EVEX, k mask]
+fn K_VPCMPGTU() i32 { return 123; } // 66 0F3A.W0/1 1E /r ib, imm8=7 (GT)      [EVEX, k mask]
+fn K_VCMPIK()   i32 { return 124; } // 66 0F3A.W0/1 {1E unsigned|1F signed} /r ib,
+                                   // pred in imm bits 8-15, elem bytes in disp, dst = k reg [EVEX, k mask]
+// ── float elementwise (3-operand NDS) ────────────────────────────────────────
+fn K_VADDPS()  i32 { return 125; } // vaddps  vec,vec,vec : 0F.W0 58
+fn K_VADDPD()  i32 { return 126; } // vaddpd  vec,vec,vec : 66 0F.W1 58
+fn K_VSUBPS()  i32 { return 127; } // vsubps  vec,vec,vec : 0F.W0 5C
+fn K_VSUBPD()  i32 { return 128; } // vsubpd  vec,vec,vec : 66 0F.W1 5C
+fn K_VMULPS()  i32 { return 129; } // vmulps  vec,vec,vec : 0F.W0 59
+fn K_VMULPD()  i32 { return 130; } // vmulpd  vec,vec,vec : 66 0F.W1 59
+fn K_VDIVPS()  i32 { return 131; } // vdivps  vec,vec,vec : 0F.W0 5E
+fn K_VDIVPD()  i32 { return 132; } // vdivpd  vec,vec,vec : 66 0F.W1 5E
+fn K_VSQRTPS() i32 { return 133; } // vsqrtps vec,vec    : 0F.W0 51  (2-operand: dst=vvvv, src=rm)
+fn K_VSQRTPD() i32 { return 134; } // vsqrtpd vec,vec    : 66 0F.W1 51
+fn K_VANDPS()  i32 { return 135; } // vandps  vec,vec,vec : 0F.W0 54
+fn K_VANDPD()  i32 { return 136; } // vandpd  vec,vec,vec : 66 0F.W1 54
+fn K_VANDNPS() i32 { return 137; } // vandnps vec,vec,vec : 0F.W0 55
+fn K_VANDNPD() i32 { return 138; } // vandnps vec,vec,vec : 66 0F.W1 55
+fn K_VORPS()   i32 { return 139; } // vorps   vec,vec,vec : 0F.W0 56
+fn K_VORPD()   i32 { return 140; } // vorpd   vec,vec,vec : 66 0F.W1 56
+fn K_VXORPS()  i32 { return 141; } // vxorps  vec,vec,vec : 0F.W0 57
+fn K_VXORPD()  i32 { return 142; } // vxorpd  vec,vec,vec : 66 0F.W1 57
+// ── float compare (VEX, vector mask; pred in imm bits 8-15) ───────────────────
+fn K_VCMPF()   i32 { return 143; } // disp=4: 0F.W0 C2 /r ib / disp=8: 66 0F.W0 C2 /r ib
+// ── lane movement ─────────────────────────────────────────────────────────────
+fn K_VSPLAT32()    i32 { return 144; } // GPR -> all dword lanes: vpbroadcastd 66 0F38.W0 7C (GPR form, EVEX.512)
+fn K_VSPLAT64()    i32 { return 145; } // GPR -> all qword lanes: vpbroadcastq 66 0F38.W1 7C (GPR form, EVEX.512)
+fn K_VBROADCAST32() i32 { return 146; } // m32 -> all dword lanes : vbroadcastss 66 0F38.W0 18 /r
+fn K_VBROADCAST64() i32 { return 147; } // m64 -> all qword lanes : vbroadcastsd 66 0F38.W0 19 /r
+fn K_VEXTRACT32()  i32 { return 148; } // vec -> GPR dword : vpextrd 66 0F3A.W0 16 /r ib
+fn K_VEXTRACT64()  i32 { return 149; } // vec -> GPR qword  : vpextrq 66 0F3A.W1 16 /r ib
+fn K_VINSERT32()   i32 { return 150; } // vec, GPR, lane -> vec : vpinsrd 66 0F3A.W0 22 /r ib
+fn K_VINSERT64()   i32 { return 151; } // vec, GPR, lane -> vec : vpinsrq 66 0F3A.W1 22 /r ib
+fn K_VSHUF32()     i32 { return 152; } // vpshufd 66 0F.W0 70 /r ib (per-128-bit-lane, unary)
+fn K_VSHUFB()      i32 { return 153; } // vpshufb 66 0F38.W0 00 /r (binary; src = control vector)
+fn K_VZERO()       i32 { return 154; } // vpxor  vec,vec,vec : 66 0F.W0 EF /r
+// ── select ────────────────────────────────────────────────────────────────────
+fn K_VSELECT()  i32 { return 155; } // vector mask, 3-instruction expansion (see x86.zag)
+fn K_VSELECTK() i32 { return 156; } // k mask, single masked vpxord 66 0F.W0 EF /r {k}, EVEX only
+// ── scaled-index memory ───────────────────────────────────────────────────────
+fn K_VMOVDQU_LOAD_IDX()  i32 { return 157; } // vec <- [base + index*scale + disp] : F3 0F 6F /r
+fn K_VMOVDQU_STORE_IDX() i32 { return 158; } // [base + index*scale + disp] <- vec : F3 0F 7F /r
+
+// ── the width ladder accessors (the ONLY place imm is split) ─────────────────
+fn x86vec_wclass(imm: i64) i32 { return (imm % 4) as i32; }
+fn x86vec_scale_log(imm: i64) i32 { return ((imm / 4) % 4) as i32; }
+fn x86vec_pack_imm(w: i32, scale_log: i32) i64 { return (w + scale_log * 4) as i64; }
+// The imm8 sub-field of the shuffle / compare kinds (imm bits 8-15).
+fn x86vec_imm8(imm: i64) i32 { return ((imm / 256) % 256) as i32; }
+fn x86vec_pack_imm8(w: i32, imm8: i32) i64 { return (w + imm8 * 256) as i64; }
+// Byte scale (1/2/4/8) for a SIB form, as a shift-free exponent.  Returns 0 when
+// `bytes` is not one of the four encodable strides, so the caller can reject.
+fn x86vec_scale_log_of(bytes: i32) i32 {
+    if (bytes == 1) { return 0; }
+    if (bytes == 2) { return 1; }
+    if (bytes == 4) { return 2; }
+    if (bytes == 8) { return 3; }
+    return 0 - 1;
+}
+fn x86vec_wclass_valid(w: i32) i32 {
+    if (w == VW_128()) { return 1; }
+    if (w == VW_256()) { return 1; }
+    if (w == VW_512()) { return 1; }
+    return 0;
+}
 
 // condition codes for K_SETCC (imm field). 0..5 are SIGNED (integer compares);
 // 6..9 are UNSIGNED (above/below) and are what float ucomisd compares need
@@ -203,12 +406,109 @@ fn R_R8()  i32 { return 8; }
 fn R_R9()  i32 { return 9; }
 fn R_R10() i32 { return 10; }
 fn R_R11() i32 { return 11; }
+// Reserved compiler async-context register. Ordinary generated functions never
+// allocate r12, so a Script async worker and its callees inherit the task handle
+// without changing the source ABI. `_start` initializes it to null.
+fn R_R12() i32 { return 12; }
 
 // xmm scratch registers used by the float lowering (their own 0..15 space).
 fn R_XMM0() i32 { return 0; }
 fn R_XMM1() i32 { return 1; }
 fn R_XMM2() i32 { return 2; }
 fn R_XMM3() i32 { return 3; }
+
+// YMM register namespace. AVX/AVX2 uses the same architectural register
+// numbering as XMM, but the backend keeps a distinct namespace so vector
+// allocation cannot accidentally mix scalar floating point temporaries with
+// 256-bit integer vector temporaries.
+// The top vector register is withheld from allocation and reserved as the
+// cross-lane extraction scratch: reading lane N of a vector wider than 128 bits
+// must park the high half somewhere, and that somewhere cannot be a register
+// holding a live value.  regalloc's vector allocator honours this.
+fn R_VSCRATCH() i32 { return 15; }
+
+fn R_YMM0() i32 { return 0; }
+fn R_YMM1() i32 { return 1; }
+fn R_YMM2() i32 { return 2; }
+fn R_YMM3() i32 { return 3; }
+fn R_YMM4() i32 { return 4; }
+fn R_YMM5() i32 { return 5; }
+fn R_YMM6() i32 { return 6; }
+fn R_YMM7() i32 { return 7; }
+fn R_YMM8() i32 { return 8; }
+fn R_YMM9() i32 { return 9; }
+fn R_YMM10() i32 { return 10; }
+fn R_YMM11() i32 { return 11; }
+fn R_YMM12() i32 { return 12; }
+fn R_YMM13() i32 { return 13; }
+fn R_YMM14() i32 { return 14; }
+fn R_YMM15() i32 { return 15; }
+
+// ZMM register namespace (AVX-512, 512-bit / 64 bytes).
+//
+// Architecturally xmmN/ymmN/zmmN are the SAME sixteen registers and every one
+// of their encoding fields (ModRM.reg, VEX.vvvv, ModRM.rm, SIB.base) holds the
+// same 0..15 number.  The backend nevertheless keeps FOUR namespaces (XMM,
+// YMM, ZMM) whose accessors all return the same 0..15 values, for the same
+// reason the YMM namespace already exists above: a 128-bit temporary that is
+// live across a 256- or 512-bit value must never be mistaken for one, and
+// register-class checks in the lowering must be able to say "this is a 128-bit
+// temp" without consulting the width of the instruction that produced it.  The
+// namespaces are enforced by CONVENTION plus the width class in `Instr.imm`;
+// they are not different hardware.
+fn R_ZMM0() i32 { return 0; }
+fn R_ZMM1() i32 { return 1; }
+fn R_ZMM2() i32 { return 2; }
+fn R_ZMM3() i32 { return 3; }
+fn R_ZMM4() i32 { return 4; }
+fn R_ZMM5() i32 { return 5; }
+fn R_ZMM6() i32 { return 6; }
+fn R_ZMM7() i32 { return 7; }
+fn R_ZMM8() i32 { return 8; }
+fn R_ZMM9() i32 { return 9; }
+fn R_ZMM10() i32 { return 10; }
+fn R_ZMM11() i32 { return 11; }
+fn R_ZMM12() i32 { return 12; }
+fn R_ZMM13() i32 { return 13; }
+fn R_ZMM14() i32 { return 14; }
+fn R_ZMM15() i32 { return 15; }
+
+// ── virtual vector registers ──────────────────────────────────────────────────
+// The machine layer needs a virtual register class for vectors exactly as it
+// has one for GPRs: between the ZIR vector value and the physical xmm/ymm/zmm
+// there must be a numbered class that liveness analysis, interference graphs
+// and the eventual spill/reload path can talk about.  A virtual vector
+// register lives at R_VBASE() + i, which is disjoint from every physical class.
+//
+// INVARIANT: **no physical GPR / XMM / YMM / ZMM number is ever >= 256**, so a
+// register field taken from `Instr.dst` / `.src` / `.lbl` is unambiguously
+// scalar (0..15), vector (0..15, class decided by the kind + width) or
+// virtual vector (>= 256).  R_IS_VREG() is therefore a total, exact test and
+// the encoder can never be handed a virtual number to put in a ModRM field.
+fn R_VBASE() i32 { return 256; }
+fn R_VREG(i: i32) i32 { return 256 + i; }
+fn R_IS_VREG(r: i32) i32 { return ((r >= 256) && (r < 512)) as i32; }
+fn R_VREG_IDX(r: i32) i32 {
+    if (R_IS_VREG(r) == 0) { return 0 - 1; }
+    return r - R_VBASE();
+}
+fn R_VREG_MAX() i32 { return 256; }   // virtual vector registers addressable
+// Is `r` a physical (machine-encodable) register number?  Virtual vector
+// registers have no encoding, so a target encoder must reject them.
+fn R_IS_PHYS(r: i32) i32 { return ((r >= 0) && (r < R_VBASE())) as i32; }
+// The mask-register namespace used by the EVEX compare / masked-select kinds.
+// k0..k7 are encoded in a 3-bit ModRM.reg field and never extended, so their
+// numbers are the plain 0..7 of that field — deliberately NOT >= 256 and
+// deliberately distinct from the vector namespaces above.
+fn R_K0() i32 { return 0; }
+fn R_K1() i32 { return 1; }
+fn R_K2() i32 { return 2; }
+fn R_K3() i32 { return 3; }
+fn R_K4() i32 { return 4; }
+fn R_K5() i32 { return 5; }
+fn R_K6() i32 { return 6; }
+fn R_K7() i32 { return 7; }
+fn R_KMASK_MAX() i32 { return 8; }
 
 // System V integer argument register for argument index 0..5 (else returns -1).
 fn arg_reg(i: i32) i32 {
@@ -261,6 +561,26 @@ fn i_popcnt(dst:i32,src:i32)Instr{return ins6(84,dst,src,0,0,0-1);}
 fn i_andn(dst:i32,src1:i32,src2:i32)Instr{return ins6(85,dst,src1,src2,0,0-1);}
 fn i_movdqu_load(xmm:i32,base:i32,disp:i32)Instr{return ins6(86,xmm,base,0,disp,0-1);}
 fn i_movdqu_store(base:i32,disp:i32,xmm:i32)Instr{return ins6(87,base,xmm,0,disp,0-1);}
+fn i_vmovdqu_load(ymm:i32,base:i32,disp:i32)Instr{return ins6(105,ymm,base,VW_256() as i64,disp,0-1);}
+fn i_vmovdqu_store(base:i32,disp:i32,ymm:i32)Instr{return ins6(106,ymm,base,VW_256() as i64,disp,0-1);}
+fn i_vpaddd(dst:i32,src:i32)Instr{return ins6(107,dst,src,VW_256() as i64,0,0-1);}
+fn i_vpsubd(dst:i32,src:i32)Instr{return ins6(108,dst,src,VW_256() as i64,0,0-1);}
+fn i_vpand(dst:i32,src:i32)Instr{return ins6(109,dst,src,VW_256() as i64,0,0-1);}
+fn i_vpor(dst:i32,src:i32)Instr{return ins6(110,dst,src,VW_256() as i64,0,0-1);}
+fn i_vpxor(dst:i32,src:i32)Instr{return ins6(111,dst,src,VW_256() as i64,0,0-1);}
+// Width-explicit forms of the same seven kinds.  The two-argument forms above
+// stay at VW_256() so the pre-existing AVX2 call sites are unchanged.
+fn i_vmovdqu_load_w(vec:i32,base:i32,disp:i32,w:i32)Instr{return ins6(105,vec,base,w as i64,disp,0-1);}
+fn i_vmovdqu_store_w(base:i32,disp:i32,vec:i32,w:i32)Instr{return ins6(106,vec,base,w as i64,disp,0-1);}
+fn i_vpaddd_w(dst:i32,src1:i32,src2:i32,w:i32)Instr{return ins6(107,dst,src1,w as i64,0,src2);}
+fn i_vpsubd_w(dst:i32,src1:i32,src2:i32,w:i32)Instr{return ins6(108,dst,src1,w as i64,0,src2);}
+fn i_vpand_w(dst:i32,src1:i32,src2:i32,w:i32)Instr{return ins6(109,dst,src1,w as i64,0,src2);}
+fn i_vpor_w(dst:i32,src1:i32,src2:i32,w:i32)Instr{return ins6(110,dst,src1,w as i64,0,src2);}
+fn i_vpxor_w(dst:i32,src1:i32,src2:i32,w:i32)Instr{return ins6(111,dst,src1,w as i64,0,src2);}
+// 2-operand forms: `dst` is both the destination and src1, `lbl` is src2.
+fn i_vpaddd2(dst:i32,src2:i32,w:i32)Instr{return ins6(107,dst,dst,w as i64,0,src2);}
+fn i_vpxor2(dst:i32,src2:i32,w:i32)Instr{return ins6(111,dst,dst,w as i64,0,src2);}
+fn i_vpand2(dst:i32,src2:i32,w:i32)Instr{return ins6(109,dst,dst,w as i64,0,src2);}
 fn i_tzcnt(dst:i32,src:i32)Instr{return ins6(88,dst,src,0,0,0-1);}
 fn i_paddd(dst:i32,src:i32)Instr{return ins6(99,dst,src,0,0,0-1);}
 fn i_psubd(dst:i32,src:i32)Instr{return ins6(101,dst,src,0,0,0-1);}
@@ -332,3 +652,71 @@ fn i_sti()    Instr { return ins6(75, 0, 0, 0, 0, 0 - 1); }
 fn i_pause()  Instr { return ins6(76, 0, 0, 0, 0, 0 - 1); }
 fn i_wbinvd() Instr { return ins6(77, 0, 0, 0, 0, 0 - 1); }
 fn i_shr_cl(dst: i32) Instr { return ins6(78, dst, 0, 0, 0, 0 - 1); }
+
+// ── width-parameteric vector constructors ─────────────────────────────────────
+// 3-operand packed arithmetic: dst = result, src = src1 (vvvv), lbl = src2 (rm).
+// `w` is a raw width class (VW_128()/VW_256()/VW_512()).
+fn i_vpaddq (dst:i32, s1:i32, s2:i32, w:i32) Instr { return ins6(112,dst,s1,w as i64,0,s2); }
+fn i_vpsubq (dst:i32, s1:i32, s2:i32, w:i32) Instr { return ins6(113,dst,s1,w as i64,0,s2); }
+fn i_vpmulld(dst:i32, s1:i32, s2:i32, w:i32) Instr { return ins6(114,dst,s1,w as i64,0,s2); }
+fn i_vpmullq(dst:i32, s1:i32, s2:i32, w:i32) Instr { return ins6(115,dst,s1,w as i64,0,s2); }
+fn i_vpslld (dst:i32, s1:i32, cnt:i32, w:i32) Instr { return ins6(116,dst,s1,w as i64,0,cnt); }
+fn i_vpsllq (dst:i32, s1:i32, cnt:i32, w:i32) Instr { return ins6(117,dst,s1,w as i64,0,cnt); }
+fn i_vpsrld (dst:i32, s1:i32, cnt:i32, w:i32) Instr { return ins6(118,dst,s1,w as i64,0,cnt); }
+fn i_vpsrlq (dst:i32, s1:i32, cnt:i32, w:i32) Instr { return ins6(119,dst,s1,w as i64,0,cnt); }
+// Vector-mask compares (VEX only): `ew` is the element width in bytes (4|8).
+fn i_vpcmpeqi(dst:i32, s1:i32, s2:i32, ew:i32, w:i32) Instr { return ins6(120,dst,s1,w as i64,ew,s2); }
+fn i_vpcmpgti(dst:i32, s1:i32, s2:i32, ew:i32, w:i32) Instr { return ins6(121,dst,s1,w as i64,ew,s2); }
+// k-mask compares (EVEX only): `k` is a k-register number 0..7 in dst.
+fn i_vpcmpnei(k:i32, s1:i32, s2:i32, ew:i32, w:i32) Instr { return ins6(122,k,s1,w as i64,ew,s2); }
+fn i_vpcmpgtu(k:i32, s1:i32, s2:i32, ew:i32, w:i32) Instr { return ins6(123,k,s1,w as i64,ew,s2); }
+// VPCMPD/VPCMPQ/VPCMPUD/VPCMPUQ: `unsign` in disp (0 signed/float 0F3A 1F, 1 unsigned 0F3A 1E),
+// predicate in `pred`, element width in bytes in `ew`.
+fn i_vcmpik(k:i32, s1:i32, s2:i32, pred:i32, ew:i32, unsign:i32, w:i32) Instr {
+    return ins6(124, k, s1, x86vec_pack_imm8(w, pred), ew + unsign * 256, s2);
+}
+fn i_vaddps(dst:i32, s1:i32, s2:i32, w:i32) Instr { return ins6(125,dst,s1,w as i64,0,s2); }
+fn i_vaddpd(dst:i32, s1:i32, s2:i32, w:i32) Instr { return ins6(126,dst,s1,w as i64,0,s2); }
+fn i_vsubps(dst:i32, s1:i32, s2:i32, w:i32) Instr { return ins6(127,dst,s1,w as i64,0,s2); }
+fn i_vsubpd(dst:i32, s1:i32, s2:i32, w:i32) Instr { return ins6(128,dst,s1,w as i64,0,s2); }
+fn i_vmulps(dst:i32, s1:i32, s2:i32, w:i32) Instr { return ins6(129,dst,s1,w as i64,0,s2); }
+fn i_vmulpd(dst:i32, s1:i32, s2:i32, w:i32) Instr { return ins6(130,dst,s1,w as i64,0,s2); }
+fn i_vdivps(dst:i32, s1:i32, s2:i32, w:i32) Instr { return ins6(131,dst,s1,w as i64,0,s2); }
+fn i_vdivpd(dst:i32, s1:i32, s2:i32, w:i32) Instr { return ins6(132,dst,s1,w as i64,0,s2); }
+fn i_vsqrtps(dst:i32, s:i32, w:i32) Instr { return ins6(133,dst,0,w as i64,0,s); }
+fn i_vsqrtpd(dst:i32, s:i32, w:i32) Instr { return ins6(134,dst,0,w as i64,0,s); }
+fn i_vandps (dst:i32, s1:i32, s2:i32, w:i32) Instr { return ins6(135,dst,s1,w as i64,0,s2); }
+fn i_vandpd (dst:i32, s1:i32, s2:i32, w:i32) Instr { return ins6(136,dst,s1,w as i64,0,s2); }
+fn i_vandnps(dst:i32, s1:i32, s2:i32, w:i32) Instr { return ins6(137,dst,s1,w as i64,0,s2); }
+fn i_vandnpd(dst:i32, s1:i32, s2:i32, w:i32) Instr { return ins6(138,dst,s1,w as i64,0,s2); }
+fn i_vorps  (dst:i32, s1:i32, s2:i32, w:i32) Instr { return ins6(139,dst,s1,w as i64,0,s2); }
+fn i_vorpd  (dst:i32, s1:i32, s2:i32, w:i32) Instr { return ins6(140,dst,s1,w as i64,0,s2); }
+fn i_vxorps (dst:i32, s1:i32, s2:i32, w:i32) Instr { return ins6(141,dst,s1,w as i64,0,s2); }
+fn i_vxorpd (dst:i32, s1:i32, s2:i32, w:i32) Instr { return ins6(142,dst,s1,w as i64,0,s2); }
+// VCMPPS/VCMPPD packed compare: predicate in `pred`, element width in `ew`.
+fn i_vcmpf(dst:i32, s1:i32, s2:i32, pred:i32, ew:i32, w:i32) Instr {
+    return ins6(143, dst, s1, x86vec_pack_imm8(w, pred), ew, s2);
+}
+// splat / broadcast: `gpr` is a GPR for splat, a base GPR for the memory form.
+fn i_vsplat32   (vec:i32, gpr:i32, w:i32) Instr { return ins6(144,vec,gpr,w as i64,0,0-1); }
+fn i_vsplat64   (vec:i32, gpr:i32, w:i32) Instr { return ins6(145,vec,gpr,w as i64,0,0-1); }
+fn i_vbroadcast32(vec:i32, base:i32, disp:i32, w:i32) Instr { return ins6(146,vec,base,w as i64,disp,0-1); }
+fn i_vbroadcast64(vec:i32, base:i32, disp:i32, w:i32) Instr { return ins6(147,vec,base,w as i64,disp,0-1); }
+// lane moves: `lane` in lbl, optional scratch vector register in disp (<0 = none).
+fn i_vextract32(gpr:i32, vec:i32, lane:i32, scratch:i32, w:i32) Instr { return ins6(148,gpr,vec,w as i64,scratch,lane); }
+fn i_vextract64(gpr:i32, vec:i32, lane:i32, scratch:i32, w:i32) Instr { return ins6(149,gpr,vec,w as i64,scratch,lane); }
+fn i_vinsert32 (vec:i32, src:i32, gpr:i32, lane:i32, w:i32) Instr { return ins6(150,vec,src,w as i64,lane,gpr); }
+fn i_vinsert64 (vec:i32, src:i32, gpr:i32, lane:i32, w:i32) Instr { return ins6(151,vec,src,w as i64,lane,gpr); }
+fn i_vshuf32   (dst:i32, src:i32, imm8:i32, w:i32) Instr { return ins6(152,dst,src,x86vec_pack_imm8(w,imm8),0,0-1); }
+fn i_vshufb    (dst:i32, ctl:i32, data:i32, w:i32) Instr { return ins6(153,dst,ctl,w as i64,0,data); }
+fn i_vzero     (vec:i32, w:i32) Instr { return ins6(154,vec,vec,w as i64,0,vec); }
+// select: vector-mask 3-instruction form (mask in disp) and k-mask masked form.
+fn i_vselect (dst:i32, a:i32, b:i32, mask:i32, w:i32) Instr { return ins6(155,dst,a,w as i64,mask,b); }
+fn i_vselectk(dst:i32, a:i32, b:i32, k:i32, w:i32) Instr { return ins6(156,dst,a,w as i64,k,b); }
+// scaled-index memory: `elem_bytes` is the lane stride (1/2/4/8).
+fn i_vmovdqu_load_idx (vec:i32, base:i32, index:i32, elem_bytes:i32, disp:i32, w:i32) Instr {
+    return ins6(157, vec, base, x86vec_pack_imm(w, x86vec_scale_log_of(elem_bytes)), disp, index);
+}
+fn i_vmovdqu_store_idx(vec:i32, base:i32, index:i32, elem_bytes:i32, disp:i32, w:i32) Instr {
+    return ins6(158, vec, base, x86vec_pack_imm(w, x86vec_scale_log_of(elem_bytes)), disp, index);
+}

@@ -1,0 +1,214 @@
+// Native callback replay, with exact-byte observations and actual-call evidence.
+// Mutants are inputs, not executable code. Callbacks are trusted in-process Zag
+// functions: this is neither a sandbox nor a timeout/crash containment boundary.
+@import("execution_transcript.zag")
+
+struct ReplayCase {
+    name: []u8,
+    input: []u8,
+    expected: []u8,
+    parent: []u8,
+    mutation: []u8,
+}
+
+struct ReplayResult {
+    // valid = all calls completed and a complete transcript was encoded.
+    // passed additionally requires every actual observation to match.
+    // On refusal/failure, executed counts calls already made; no partial
+    // transcript is published. All strings in this result are owned.
+    valid: i32,
+    passed: i32,
+    executed: i32,
+    mismatches: i32,
+    mutants: i32,
+    mutant_mismatches: i32,
+    survivors: i32,
+    transcript: []u8,
+}
+
+// A survivor is a mutant whose actual observation equals its parent's actual
+// observation although the recorded expectations differ. It is necessarily a
+// mutant mismatch only when the parent matched. Report both counts separately.
+fn hostile_replay_empty_result() ReplayResult {
+    return ReplayResult{ .valid = 0, .passed = 0, .executed = 0,
+        .mismatches = 0, .mutants = 0, .mutant_mismatches = 0,
+        .survivors = 0, .transcript = ev_empty() };
+}
+
+fn hostile_replay_result_free(result: *ReplayResult) void {
+    _zag_str_free(result.*.transcript);
+    let empty: *u8 = 0 as *u8;
+    result.*.transcript = empty[0..0];
+    result.*.valid = 0;
+    result.*.passed = 0;
+}
+
+// Shared semantic validator for encoding, verification, and preflight replay.
+// Empty input/output is meaningful. Names are unique; parents must precede
+// mutants, preventing ambiguous lookup, cycles, and forward references.
+fn hostile_replay_valid(record: EvidenceRecord) i32 {
+    if (record.valid != 1 || record.fields.len < 11 ||
+        ev_equal(ev_get(record, 0), "zag-hostile-replay-v1") == 0 ||
+        ev_digest_ok(ev_get(record, 1)) == 0 ||
+        ev_equal(ev_get(record, 2), "hostile") == 0) { return 0; }
+    let count: i32 = ev_uint(ev_get(record, 3), 256);
+    if (count < 1 || record.fields.len != 5 + count * 6) { return 0; }
+    let claimed: i32 = ev_uint(ev_get(record, record.fields.len - 1), count);
+    if (claimed < 0) { return 0; }
+    let mutants: i32 = 0;
+    let i: i32 = 0;
+    while (i < count) {
+        let p: i32 = 4 + i * 6;
+        if (ev_get(record, p).len == 0 || ev_get(record, p + 4).len == 0 ||
+            ev_matches(ev_get(record, p + 1), ev_get(record, p + 5)) == 0) {
+            return 0;
+        }
+        let parent: []u8 = ev_get(record, p + 3);
+        let found: i32 = 0;
+        let j: i32 = 0;
+        while (j < i) {
+            let prior: i32 = 4 + j * 6;
+            if (ev_equal(ev_get(record, p), ev_get(record, prior)) == 1) { return 0; }
+            if (parent.len > 0 && ev_equal(parent, ev_get(record, prior)) == 1) {
+                found = 1;
+                if (ev_equal(ev_get(record, p + 1), ev_get(record, prior + 1)) == 1) {
+                    return 0;
+                }
+            }
+            j = j + 1;
+        }
+        if (parent.len > 0) {
+            if (found == 0) { return 0; }
+            mutants = mutants + 1;
+        }
+        i = i + 1;
+    }
+    return (mutants == claimed) as i32;
+}
+
+fn hostile_replay_encode(compiler: []u8, cases: ArrayList[ReplayCase]) []u8 {
+    if (compiler.len <= 0 || cases.len < 1 || cases.len > 256) { return ev_empty(); }
+    let fields: ArrayList[[]u8] = make[[]u8](16);
+    ev_add(&fields, "zag-hostile-replay-v1");
+    push[[]u8](&fields, ev_hash(compiler));
+    ev_add(&fields, "hostile");
+    ev_add_int(&fields, cases.len);
+    let mutants: i32 = 0;
+    let i: i32 = 0;
+    while (i < cases.len) {
+        let x: ReplayCase = cases.data[i];
+        if (x.name.len <= 0 || x.mutation.len <= 0 || x.input.len < 0 ||
+            x.expected.len < 0 || x.input.len > ev_max_bytes() ||
+            x.expected.len > ev_max_bytes()) {
+            ev_fields_free(&fields);
+            return ev_empty();
+        }
+        if (x.parent.len > 0) { mutants = mutants + 1; }
+        ev_add(&fields, x.name);
+        ev_add(&fields, x.input);
+        ev_add(&fields, x.expected);
+        ev_add(&fields, x.parent);
+        ev_add(&fields, x.mutation);
+        push[[]u8](&fields, ev_hash(x.input));
+        i = i + 1;
+    }
+    ev_add_int(&fields, mutants);
+    let record: EvidenceRecord = EvidenceRecord{ .fields = fields, .valid = 1 };
+    let result: []u8 = ev_empty();
+    if (hostile_replay_valid(record) == 1) {
+        _zag_str_free(result);
+        result = ev_encode(fields);
+    }
+    ev_fields_free(&fields);
+    return result;
+}
+
+fn hostile_replay_verify(text: []u8, pin: []u8, compiler: []u8) i32 {
+    let record: EvidenceRecord = ev_decode(text, pin);
+    let ok: i32 = hostile_replay_valid(record);
+    if (ok == 1) { ok = ev_matches(compiler, ev_get(record, 1)); }
+    ev_fields_free(&record.fields);
+    return ok;
+}
+
+// callback appends its observation to the runner-owned buffer and returns 0
+// on completion, nonzero on callback failure. Neither buffer nor input may be
+// freed/retained by the callback. A private input copy keeps callback writes
+// from changing the corpus or the transcript request. The scalar return plus
+// output pointer also works on native backends lacking indirect slice returns.
+// module_context identifies the tested module/configuration, supplied by the
+// adapter. It is hashed into the transcript, not authentication of the callback.
+// No callback runs until the entire pinned corpus and compiler pin pass.
+// Event operation = case name, request = recorded input, response = actual
+// observation, status = 0 match / 1 mismatch. Terminal status is 1 iff any
+// observation mismatched. The transcript's input hash binds the entire corpus,
+// including expectations and mutant relationships, rather than just one input.
+fn hostile_replay_run(text: []u8, pin: []u8, compiler: []u8,
+    expected_compiler_sha: []u8, module_context: []u8,
+    callback: fn([]u8, *ArrayList[u8]) i32) ReplayResult {
+    let result: ReplayResult = hostile_replay_empty_result();
+    if (compiler.len <= 0 || module_context.len <= 0 ||
+        module_context.len > ev_max_bytes() ||
+        ev_matches(compiler, expected_compiler_sha) == 0) { return result; }
+    let record: EvidenceRecord = ev_decode(text, pin);
+    if (hostile_replay_valid(record) == 0 ||
+        ev_equal(ev_get(record, 1), expected_compiler_sha) == 0) {
+        ev_fields_free(&record.fields);
+        return result;
+    }
+    let recorder: ExecutionRecorder = execution_record_begin(compiler, text, module_context);
+    let actuals: ArrayList[[]u8] = make[[]u8](16);
+    let count: i32 = ev_uint(ev_get(record, 3), 256);
+    let failed: i32 = 0;
+    let i: i32 = 0;
+    while (i < count && failed == 0) {
+        let p: i32 = 4 + i * 6;
+        let input: []u8 = _zag_str_concat("", ev_get(record, p + 1));
+        let observation: ArrayList[u8] = make[u8](16);
+        let callback_status: i32 = callback(input, &observation);
+        result.executed = result.executed + 1;
+        _zag_str_free(input);
+        if (callback_status != 0 || observation.len < 0 ||
+            observation.len > ev_max_bytes()) {
+            failed = 1;
+        } else {
+            let actual: []u8 = observation.data[0..observation.len];
+            let mismatch: i32 = 1 - ev_equal(actual, ev_get(record, p + 2));
+            result.mismatches = result.mismatches + mismatch;
+            let parent: []u8 = ev_get(record, p + 3);
+            if (parent.len > 0) {
+                result.mutants = result.mutants + 1;
+                result.mutant_mismatches = result.mutant_mismatches + mismatch;
+                let j: i32 = 0;
+                while (j < i) {
+                    if (ev_equal(parent, ev_get(record, 4 + j * 6)) == 1 &&
+                        ev_equal(actual, actuals.data[j]) == 1 &&
+                        ev_equal(ev_get(record, p + 2), ev_get(record, 6 + j * 6)) == 0) {
+                        result.survivors = result.survivors + 1;
+                    }
+                    j = j + 1;
+                }
+            }
+            let event: ExecutionEvent = ExecutionEvent{
+                .operation = ev_get(record, p), .request = ev_get(record, p + 1),
+                .response = actual, .status = mismatch };
+            if (execution_record_event(&recorder, event) == 0) { failed = 1; }
+            ev_add(&actuals, actual);
+        }
+        free[u8](&observation);
+        i = i + 1;
+    }
+    if (failed == 0) {
+        let status: i32 = (result.mismatches > 0) as i32;
+        _zag_str_free(result.transcript);
+        result.transcript = execution_record_finish(&recorder, status);
+        if (result.transcript.len > 0) {
+            result.valid = 1;
+            result.passed = 1 - status;
+        }
+    }
+    ev_fields_free(&actuals);
+    ev_fields_free(&recorder.fields);
+    ev_fields_free(&record.fields);
+    return result;
+}

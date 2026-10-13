@@ -1,0 +1,716 @@
+// selfhost/native/vecwidth.zag — CPU-WIDTH LOWERING for Zag's machine vector
+// ops.  It takes a vector op whose width is still the LOGICAL width the
+// frontend chose and either re-tags it at the width the selected CPU can
+// execute, or SPLITS it into several independent native-width ops.
+//
+// ── WHERE THIS PASS SITS, AND WHY IT RUNS FIRST ──────────────────────────────
+//
+//   zir `vector<elem,lanes>` ─► vectorize ─► [ vecwidth_lower ] ─► [ vregalloc ]
+//                                          │                        │
+//                                          └─ splits a wide         └─ assigns
+//                                             logical vector             physical
+//                                                                        registers
+//
+//   then peephole → encode.
+//
+// The order is FORCED, not chosen.  `vecwidth_lower` mints NEW virtual
+// registers (one per piece of a split logical value), and `vregalloc` decides
+// which physical register each virtual register occupies.  If the allocator
+// ran first it would have coloured the pre-split names, and the pieces the
+// splitter then invents would have no colour at all — the output would contain
+// virtual numbers the encoder cannot put in a ModRM field, which isa.zag
+// explicitly forbids.  Conversely, the splitter needs no physical register
+// numbers: it only needs to know which fields of an `Instr` hold vector
+// operands, and that is a property of the KIND, read out of isa.zag's field
+// layout table below.  So the dependency is strictly one-way:
+//
+//     vecwidth needs the kind/field table  ──►  (it defines it here)
+//     vregalloc needs the chunk arithmetic  ──►  (it imports vecw_* from here)
+//
+// I looked for a case where the reverse order would be right and found none:
+// no part of the splitting rule mentions a physical register number, and no
+// part of the allocation rule mentions a logical lane count.  If a future
+// target ever needs a *recombination* instruction (vextract-family) to join
+// pieces back together, THAT would be the first thing to force a reordering,
+// and it does not exist in the current vocabulary — see the reject rules.
+//
+// ── THE WIDTH LADDER IS NOT RE-DERIVED HERE ──────────────────────────────────
+// `VW_128`/`VW_256`/`VW_512`, `zvec_wclass_lanes`, `zvec_wclass_bytes`,
+// `zvec_reg_count`, `zt_lane_ceiling` and `zt_width_class` all come from
+// selfhost/vector_contract.zag (re-exported through isa.zag).  This file
+// contains ZERO width constants of its own.  Adding a rung to the ladder is a
+// one-line change in the contract and this pass follows it automatically.
+//
+//     AVX512 -> 16 lanes (VW_512, one ZMM)   AVX2 -> 8 (VW_256, one YMM)
+//     SSE2   ->  4 lanes (VW_128, one XMM)  NEON -> 4 (VW_128, one Q)
+//
+// ── WHERE THE LOGICAL LANE COUNT LIVES ───────────────────────────────────────
+// isa.zag puts the width class in `Instr.imm` bits 0-1 for every vector kind,
+// and `zvec_wclass_for_lanes()` is the frontend's map from a logical lane count
+// onto that class.  So `zvec_wclass_lanes(x86vec_wclass(imm))` recovers the
+// logical lane count, and that is the ONLY reading of it this pass uses.  A
+// vector op is lowered iff its logical lane count exceeds the target's ceiling.
+//
+//   The lane counts on both sides of that map are 32-bit-EQUIVALENT units, not
+//   elements. A `*i32` has 8-byte stride under Zag's native layout, so a
+//   2-element vector is 4 units wide and needs VW_128; an 8-element one is 16
+//   units and needs VW_512. Reading either side as an element count
+//   systematically under-counts wide elements by half.
+//
+//   Note what is deliberately NOT done: an op whose logical lane count is
+//   NARROWER than the target's native width is left at its own narrow width.
+//   Re-tagging a `vector<i32,4>` from VW_128 to VW_256 would double the register
+//   and leave the upper four lanes uninitialised, and every later read of the
+//   "8-lane" value would see garbage.  A 4-lane value on an AVX2 target is
+//   already correct code; this pass has nothing to do to it.
+//
+// ── THE SPLITTING RULE AND ITS SOUNDNESS ARGUMENT ────────────────────────────
+// Let `per` = `zvec_wclass_lanes(nw)` (lanes per native register), `L` = the
+// logical lane count, `n` = `zvec_reg_count(L, nw)` = ceil(L/per).  We require
+// `L <= 16` (guaranteed: `zvec_wclass_lanes` of any of the three classes is
+// 4, 8 or 16) and `L` a multiple of `per`, so the `n` pieces are exact and
+// cover lanes [0,per) [per,2*per) … [(n-1)per, n*per) with no overlap and no
+// gap.  Write `chunk(v,k)` for "the machine register holding lanes
+// [k*per,(k+1)*per) of the logical value v".
+//
+//   WIDTH-SLICING LEMMA.  For every kind in `vecw_splittable`, and for every
+//   k < n:
+//        chunk(op_L(a, b), k)  ==  op_per(chunk(a,k), chunk(b,k))
+//   Proof by case on the class of instruction, all of which are stated in the
+//   ISA:
+//    (a) Packed elementwise arithmetic and logic (VPADD*/VPSUB*/VPMULL*/
+//        VPAND/VPOR/VPXOR/VPADDS/SHL/SRL/VPANDN*/VPOR*, VADDPS..VXORPD,
+//        VSQRTPS/PD).  x86 packed instructions are defined lane-by-lane: lane j
+//        of the destination is a function of lane j of the sources only, and no
+//        packed arithmetic instruction has a cross-lane side effect.  Restricting
+//        to the first `per` lanes of a 512-bit op is therefore literally the
+//        same computation as the 128/256-bit op on those lanes.
+//    (b) VPSHUFB / VPSHUFD.  The one packed pair that is NOT lane-local; both are
+//        defined *per 128-bit lane* (VPSHUFD's imm8 selects within the two
+//        32-bit groups of each 128-bit lane; VPSHUFB's control indices are
+//        0..15, i.e. within one 128-bit lane).  A 512-bit execution is
+//        defined as four independent 128-bit lane operations, so its chunk k is
+//        the 128-bit operation on lane-group k — which is exactly what the
+//        256/128-bit form does on that group.  The invariant to preserve is
+//        that a chunk boundary never falls INSIDE a 128-bit lane; since
+//        `per` ∈ {4,8,16} lanes and every element is 4 or 8 bytes in the
+//        vocabulary these kinds carry, a chunk is a whole number of 128-bit
+//        lanes, and the slice is exact.
+//    (c) VSELECT / VSELECTK.  A masked blend is lane-local by definition.
+//    (d) VMOVQU load/store.  Handled in detail below.
+//    (e) VSPLAT32/64, VBROADCAST32/64, VZERO.  Unary: chunk k of the result is
+//        the same scalar broadcast / zero written into a narrower register, so
+//        the lemma is immediate.
+//
+// ── THE MEMORY FORMS, AND WHY disp += k*native_bytes IS EXACT ────────────────
+// `_IDX` forms compute `[base + index*scale + disp]` where `scale` is the SIB
+// scale and a plain form computes `[base + disp]`.  Element e of the logical
+// vector lives at byte `e*scale` of the addressed object, and `scale` is the
+// element's ADDRESS STRIDE (isa.zag: `x86vec_scale_log_of(stride)`), not its
+// width -- see zvec_elem_stride.  So the elements a single native chunk covers
+// is `bytes(nw)/scale`, NOT `zvec_wclass_lanes(nw)`, which counts 32-bit
+// units and is deliberately a different quantity.
+//
+// The displacement does not need either number: chunk k of the logical vector
+// is simply the byte range starting at `k*bytes(nw)`, so `disp += k*bytes(nw)`
+// addresses exactly chunk k, and the alternative spelling (bump the index
+// register by k*(bytes(nw)/scale)) computes the same address -- I use the
+// displacement because it needs no extra GPR and no separate instruction.  The
+// SCALE ITSELF IS UNCHANGED: the stride between consecutive elements of a chunk
+// is still one element, which is the whole reason a wider vector can be fetched
+// as several narrower fetches.
+//
+// Three guards, each of which fails CLOSED:
+//   * the resulting displacement must still fit in the signed 32-bit `disp`
+//     field (checked once, for the largest k, BEFORE any piece is emitted);
+//   * the base and index registers of a memory form must be physical GPRs —
+//     a virtual number in a ModRM/SIB base field is not encodable;
+//   * `vecw_target_valid(target)` — an unrecognised target id gets NO
+//     lowering at all rather than the default 128-bit answer.
+//
+// ── WHY THE PIECES GET DISTINCT VIRTUAL REGISTERS ─────────────────────────────
+// If piece k of a 16-lane add read and wrote the SAME virtual register as
+// piece 0, the four machine ops would be four aliases of one value and the
+// second would overwrite the first.  So every piece of a logical value gets its
+// own virtual number: **piece 0 keeps the original number** (which makes the
+// single-chunk case — the overwhelmingly common one — a byte-for-byte no-op)
+// and pieces 1..n-1 are minted from `VecwRen.next`, which starts strictly
+// ABOVE the highest virtual number anywhere in the input.  Fresh numbers can
+// therefore never collide with a name the frontend already handed out, nor with
+// each other.  If the rename would run past `R_VREG_MAX()` the pass ABORTS
+// ENTIRELY: a half-split program in which some pieces are renamed and others
+// are not is a miscompile, so the whole output is discarded and the input is
+// returned byte-for-byte with `rejected` set.  The caller must then refuse to
+// emit the function — see "FAIL CLOSED" below.
+//
+// ── FAIL CLOSED: WHAT CANNOT BE SPLIT ─────────────────────────────────────────
+// A split is only legal for a kind in `vecw_splittable`.  Everything else is
+// left EXACTLY as it was and counted in `rejected`:
+//
+//   K_VEXTRACT32/64, K_VINSERT32/64
+//       These name a LANE of the logical vector.  A lane of a 16-lane vector is
+//       not a lane of any 4-lane register, so extracting lane 9 needs the chunk
+//       that owns it brought down to the target width FIRST — a vextract-style
+//       recombination step.  No such step exists in the vocabulary this pass is
+//       allowed to emit, and silently pointing the extract at chunk 0 would
+//       return lane 1 where the program asked for lane 9.  (isa.zag's `disp`
+//       scratch field is the hook an encoder would use for the recombination,
+//       but the encoder for it does not exist, so this pass will not pretend.)
+//   K_VPCMPNEI / K_VPCMPGTU / K_VCMPIK
+//       These write a K-REGISTER, one bit per lane, for the WHOLE logical
+//       vector.  There is no instruction that concatenates two k masks, so
+//       splitting them would produce n independent masks that no later masked
+//       op can consume.
+//   Any kind this file does not know
+//       `vecw_fields()` returns 0 for it, so it is not a vector op here; if it
+//       were one we had not enumerated, the safe answer is "do not touch it"
+//       and let the caller's kind audit find it.  See vregalloc.zag, whose
+//       equivalent fallback is the stronger "clobbers every vector register".
+//
+// A rejected instruction is left BYTE-IDENTICAL, so the program the caller gets
+// is either fully lowered or fully original — never a mixture.  The caller is
+// expected to check `rejected` and refuse to emit a function it cannot lower;
+// `report` names every rejected kind so the refusal can be explained.
+//
+// ── IDEMPOTENCE ──────────────────────────────────────────────────────────────
+// After the pass every vector op carries `zt_width_class(target)` and
+// `zvec_wclass_lanes(zt_width_class(target)) == zt_lane_ceiling(target)`, which
+// is NOT `> zt_lane_ceiling(target)` — so a second run over the output lowers
+// nothing, renames nothing, and returns a byte-identical program.  Likewise a
+// program that is already at or below the target ceiling is never touched, on
+// any target.  That is what makes it safe for the integrator to run this pass
+// unconditionally in the main pipeline, ahead of a vregalloc that is equally a
+// no-op on already-physical code.
+//
+// ── LANGUAGE SUBSET ──────────────────────────────────────────────────────────
+// No `for`, no `<<`/`>>`, no `|`/`||`, no `break`/`continue`, no ternary.  All
+// loops are flag- or bound-guarded `while`.  `Instr` is passed and returned by
+// value; mutable state is threaded through `*T` parameters.
+
+@import("isa.zag")
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 1. STATISTICS
+// ══════════════════════════════════════════════════════════════════════════════
+
+struct VecWidthStats {
+    lowered: i32,     // machine vector ops EMITTED at the target's native width
+    split: i32,       // source vector ops that were expanded into >1 piece
+    rejected: i32,    // source vector ops left byte-identical (see FAIL CLOSED)
+    chunks_max: i32,  // widest expansion of a single source op
+    report: []u8,     // human-readable, one line per decision
+}
+
+// ── WHY THERE IS NO MODULE-LEVEL "LAST STATS" CELL ────────────────────────────
+// An imported Zag module has no mutable global storage: `global let` is
+// rejected outside the ROOT compilation unit and a top-level `let` is E0204.
+// There is therefore no cell for `vecwidth_stats_last()` to read.  Rather than
+// fabricate one, the pass takes its statistics as an explicit out-parameter —
+// the integrator owns the root module and can hold the cell — and the
+// `_last()` accessors below return the zeroed struct and are documented as such.
+// `report` is an allocated string, not storage, so it has exactly the same
+// problem and the same answer.
+fn vecwidth_stats_last() VecWidthStats {
+    return VecWidthStats{ .lowered = 0, .split = 0, .rejected = 0, .chunks_max = 0, .report = "" };
+}
+fn vecwidth_report_text() []u8 { return ""; }
+
+fn vecw_reset(st: *VecWidthStats) void {
+    st.*.lowered = 0;
+    st.*.split = 0;
+    st.*.rejected = 0;
+    st.*.chunks_max = 0;
+    st.*.report = "";
+}
+fn vecw_note(st: *VecWidthStats, msg: []u8) void {
+    st.*.report = _zag_str_concat(st.*.report, msg);
+}
+fn vecw_note_i(st: *VecWidthStats, msg: []u8, v: i32) void {
+    st.*.report = _zag_str_concat(st.*.report, msg);
+    st.*.report = _zag_str_concat(st.*.report, _zag_i64_to_str(v as i64));
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 2. THE OPERAND CONTRACT, READ OUT OF isa.zag's FIELD LAYOUT TABLE
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// isa.zag documents, per kind, which of `dst` / `src` / `lbl` / `disp` carry
+// vector registers and which carry GPRs, a label, a lane index, an element
+// width or an imm8.  Getting that wrong is a silent miscompile (a GPR number
+// renamed as if it were a vector, a lane index renamed as a register), so the
+// table is written out kind by kind and the bits are:
+//
+//   1 = dst holds a vector register
+//   2 = src holds a vector register
+//   4 = lbl holds a vector register        (for these kinds `lbl` is src2/rm)
+//   8 = disp holds a vector register       (only the extract scratch + VSELECT
+//                                           mask; `disp` is an imm8/element
+//                                           width/lane index for other kinds)
+//
+// vregalloc.zag imports these two functions rather than re-deriving them: two
+// copies of a table this shape WILL drift, and the drift would show up as one
+// pass renaming an operand the other pass does not.
+fn vecw_fields(k: i32) i32 {
+    // 3-operand VEX.NDS / EVEX.NDS packed ops: dst = result, src = vvvv, lbl = rm
+    if (k == K_VPADDD() || k == K_VPSUBD() || k == K_VPAND() || k == K_VPOR() || k == K_VPXOR()) { return 7; }
+    if (k == K_VPADDQ() || k == K_VPSUBQ() || k == K_VPMULLD() || k == K_VPMULLQ()) { return 7; }
+    if (k == K_VPSLLD() || k == K_VPSLLQ() || k == K_VPSRLD() || k == K_VPSRLQ()) { return 7; }
+    if (k == K_VPCMPEQI() || k == K_VPCMPGTI()) { return 7; }
+    // k-mask compares: dst is a k-register number (0..7), NOT a vector.
+    if (k == K_VPCMPNEI() || k == K_VPCMPGTU() || k == K_VCMPIK()) { return 6; }
+    if (k == K_VADDPS() || k == K_VADDPD() || k == K_VSUBPS() || k == K_VSUBPD()) { return 7; }
+    if (k == K_VMULPS() || k == K_VMULPD() || k == K_VDIVPS() || k == K_VDIVPD()) { return 7; }
+    if (k == K_VANDPS() || k == K_VANDPD() || k == K_VANDNPS() || k == K_VANDNPD()) { return 7; }
+    if (k == K_VORPS()  || k == K_VORPD()  || k == K_VXORPS()  || k == K_VXORPD())  { return 7; }
+    if (k == K_VCMPF()) { return 7; }
+    // 2-operand unary: dst = vvvv, src = rm.
+    if (k == K_VSQRTPS() || k == K_VSQRTPD()) { return 3; }
+    // GPR -> all lanes: src is a GPR, not a vector.
+    if (k == K_VSPLAT32() || k == K_VSPLAT64()) { return 1; }
+    // m32/m64 -> all lanes: src is a base GPR, not a vector.
+    if (k == K_VBROADCAST32() || k == K_VBROADCAST64()) { return 1; }
+    // vec -> GPR: dst is a GPR, lbl is a lane index, disp is a scratch VECTOR.
+    if (k == K_VEXTRACT32() || k == K_VEXTRACT64()) { return 10; }
+    // vec, GPR, lane -> vec: lbl is a GPR, disp is a lane index.
+    if (k == K_VINSERT32() || k == K_VINSERT64()) { return 3; }
+    if (k == K_VSHUF32()) { return 3; }          // imm8 lives in imm bits 8-15
+    if (k == K_VSHUFB()) { return 7; }
+    if (k == K_VZERO())  { return 7; }          // vpxor vec,vec,vec
+    if (k == K_VSELECT()) { return 15; }        // disp = the vector mask
+    if (k == K_VSELECTK()) { return 7; }        // disp = a k-register
+    // memory forms: dst is the vector, src is a base GPR (lbl an index GPR).
+    if (k == K_VMOVDQU_LOAD() || k == K_VMOVDQU_STORE()) { return 1; }
+    if (k == K_VMOVDQU_LOAD_IDX() || k == K_VMOVDQU_STORE_IDX()) { return 1; }
+    return 0;
+}
+
+// Which vector field(s) this kind WRITES.  0 means "writes no vector register",
+// which is not the same as "has no vector field": an extract writes a GPR and a
+// k-mask compare writes a k register, while both still READ vectors.  Every
+// kind here writes at most one vector register, in `dst`; the single exception
+// is K_VZERO, whose `vpxor vec,vec,vec` form reads the destination's own old
+// bits but whose result does not depend on them, so treating it as a pure
+// definition (and therefore as reading nothing) is exact and lets the zeroed
+// register's predecessor die.
+fn vecw_def_fields(k: i32) i32 {
+    if (vecw_fields(k) == 0) { return 0; }
+    if (k == K_VEXTRACT32() || k == K_VEXTRACT64()) { return 0; }
+    if (k == K_VPCMPNEI() || k == K_VPCMPGTU() || k == K_VCMPIK()) { return 0; }
+    if (k == K_VMOVDQU_STORE() || k == K_VMOVDQU_STORE_IDX()) { return 0; }
+    return 1;
+}
+
+// Which vector field(s) this kind READS.  `fields - defs` is right for every kind
+// except K_VZERO, whose `vpxor vec,vec,vec` names the destination three times:
+// the result does not depend on the old bits, so the zeroed register's previous
+// value is dead the moment the op executes.  Reporting no reads is what lets a
+// value be reused immediately after a zero, and it is EXACT (not a
+// conservative guess) because x86's own definition of the opcode is
+// `vec[lo:hi] = vec1 XOR vec2` with the destination as src1.
+fn vecw_use_fields(k: i32) i32 {
+    let f: i32 = vecw_fields(k);
+    if (f == 0) { return 0; }
+    if (k == K_VZERO()) { return 0; }
+    return f - vecw_def_fields(k);
+}
+
+// Can this kind be expressed as N independent native-width ops?  See the
+// WIDTH-SLICING LEMMA in the header for the argument for each accepting family
+// and FAIL CLOSED for the rejects.
+fn vecw_splittable(k: i32) i32 {
+    if (vecw_fields(k) == 0) { return 0; }
+    if (k == K_VEXTRACT32() || k == K_VEXTRACT64()) { return 0; }
+    if (k == K_VINSERT32() || k == K_VINSERT64()) { return 0; }
+    if (k == K_VPCMPNEI() || k == K_VPCMPGTU() || k == K_VCMPIK()) { return 0; }
+    return 1;
+}
+
+// Every register field of `k` that isa.zag says is a GPR / k-register / lane /
+// label rather than a vector must in fact be PHYSICAL.  A virtual number in a
+// ModRM.reg, SIB.base, vvvv or k field is not encodable, and renaming it (or
+// ignoring it) would both be wrong; the pass rejects instead.
+fn vecw_gpr_fields_ok(k: i32, ins: Instr) i32 {
+    // memory forms: src = base GPR, lbl = index GPR (IDX only)
+    if (k == K_VMOVDQU_LOAD() || k == K_VMOVDQU_STORE()) {
+        if (R_IS_VREG(ins.src) == 1) { return 0; }
+    }
+    if (k == K_VMOVDQU_LOAD_IDX() || k == K_VMOVDQU_STORE_IDX()) {
+        if (R_IS_VREG(ins.src) == 1) { return 0; }
+        if (R_IS_VREG(ins.lbl) == 1) { return 0; }
+    }
+    if (k == K_VSPLAT32() || k == K_VSPLAT64() || k == K_VBROADCAST32() || k == K_VBROADCAST64()) {
+        if (R_IS_VREG(ins.src) == 1) { return 0; }
+    }
+    if (k == K_VINSERT32() || k == K_VINSERT64()) {
+        if (R_IS_VREG(ins.lbl) == 1) { return 0; }
+    }
+    if (k == K_VEXTRACT32() || k == K_VEXTRACT64()) {
+        if (R_IS_VREG(ins.dst) == 1) { return 0; }
+    }
+    if (k == K_VPCMPNEI() || k == K_VPCMPGTU() || k == K_VCMPIK()) {
+        if (R_IS_VREG(ins.dst) == 1) { return 0; }
+    }
+    if (k == K_VSELECTK()) {
+        if (R_IS_VREG(ins.disp) == 1) { return 0; }
+    }
+    return 1;
+}
+
+fn vecw_kind_name(k: i32) []u8 {
+    if (k == K_VPADDD()) { return "vpaddd"; }
+    if (k == K_VPSUBD()) { return "vpsubd"; }
+    if (k == K_VPAND())  { return "vpand"; }
+    if (k == K_VPOR())   { return "vpor"; }
+    if (k == K_VPXOR())  { return "vpxor"; }
+    if (k == K_VPADDQ()) { return "vpaddq"; }
+    if (k == K_VPSUBQ()) { return "vpsubq"; }
+    if (k == K_VPMULLD()) { return "vpmulld"; }
+    if (k == K_VPMULLQ()) { return "vpmullq"; }
+    if (k == K_VPSLLD()) { return "vpslld"; }
+    if (k == K_VPSLLQ()) { return "vpsllq"; }
+    if (k == K_VPSRLD()) { return "vpsrld"; }
+    if (k == K_VPSRLQ()) { return "vpsrlq"; }
+    if (k == K_VPCMPEQI()) { return "vpcmpeq"; }
+    if (k == K_VPCMPGTI()) { return "vpcmpgt"; }
+    if (k == K_VPCMPNEI()) { return "vpcmpne-k"; }
+    if (k == K_VPCMPGTU()) { return "vpcmpgtu-k"; }
+    if (k == K_VCMPIK())   { return "vcmpik"; }
+    if (k == K_VADDPS()) { return "vaddps"; }
+    if (k == K_VADDPD()) { return "vaddpd"; }
+    if (k == K_VSUBPS()) { return "vsubps"; }
+    if (k == K_VSUBPD()) { return "vsubpd"; }
+    if (k == K_VMULPS()) { return "vmulps"; }
+    if (k == K_VMULPD()) { return "vmulpd"; }
+    if (k == K_VDIVPS()) { return "vdivps"; }
+    if (k == K_VDIVPD()) { return "vdivpd"; }
+    if (k == K_VSQRTPS()) { return "vsqrtps"; }
+    if (k == K_VSQRTPD()) { return "vsqrtpd"; }
+    if (k == K_VANDPS()) { return "vandps"; }
+    if (k == K_VANDPD()) { return "vandpd"; }
+    if (k == K_VANDNPS()) { return "vandnps"; }
+    if (k == K_VANDNPD()) { return "vandnpd"; }
+    if (k == K_VORPS()) { return "vorps"; }
+    if (k == K_VORPD()) { return "vorpd"; }
+    if (k == K_VXORPS()) { return "vxorps"; }
+    if (k == K_VXORPD()) { return "vxorpd"; }
+    if (k == K_VCMPF()) { return "vcmpf"; }
+    if (k == K_VSPLAT32()) { return "vsplat32"; }
+    if (k == K_VSPLAT64()) { return "vsplat64"; }
+    if (k == K_VBROADCAST32()) { return "vbroadcast32"; }
+    if (k == K_VBROADCAST64()) { return "vbroadcast64"; }
+    if (k == K_VEXTRACT32()) { return "vextract32"; }
+    if (k == K_VEXTRACT64()) { return "vextract64"; }
+    if (k == K_VINSERT32()) { return "vinsert32"; }
+    if (k == K_VINSERT64()) { return "vinsert64"; }
+    if (k == K_VSHUF32()) { return "vshuf32"; }
+    if (k == K_VSHUFB()) { return "vshufb"; }
+    if (k == K_VZERO()) { return "vzero"; }
+    if (k == K_VSELECT()) { return "vselect"; }
+    if (k == K_VSELECTK()) { return "vselectk"; }
+    if (k == K_VMOVDQU_LOAD()) { return "vmovdqu_load"; }
+    if (k == K_VMOVDQU_STORE()) { return "vmovdqu_store"; }
+    if (k == K_VMOVDQU_LOAD_IDX()) { return "vmovdqu_load_idx"; }
+    if (k == K_VMOVDQU_STORE_IDX()) { return "vmovdqu_store_idx"; }
+    return "vec?";
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 3. THE SHARED CHUNK ARITHMETIC  (also used by vregalloc.zag)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Byte offset, from the start of the logical vector's memory image, of chunk
+// `k` of a value whose pieces are `zvec_wclass_bytes(w)` wide.  This is the
+// number the memory forms add to their displacement — see the header for the
+// proof that `k*bytes(w)` and `k*per*scale` are the same address.
+fn vecw_chunk_bytes(k: i32, w: i32) i32 { return k * zvec_wclass_bytes(w); }
+
+// How many native-width machine registers chunk k must span.  `vecw_piece` uses
+// it to decide the destination width of a split, and vregalloc uses it to know
+// how wide one logical value became (it reports the resulting pressure).
+fn vecw_chunk_lanes(w: i32) i32 { return zvec_wclass_lanes(w); }
+
+// The target's native width class, and the lane ceiling that goes with it.
+fn vecw_native_w(target: i32) i32 { return zt_width_class(target); }
+fn vecw_ceiling(target: i32) i32 { return zt_lane_ceiling(target); }
+
+// Only the four contract target ids may be lowered for.  An unknown id gets NO
+// lowering (every vector op is rejected) rather than `zt_width_class`'s
+// default-128-bit answer, because "the target is not one I know" and "the
+// target is the 128-bit baseline" are different facts and only one of them is
+// safe to guess.
+fn vecw_target_valid(target: i32) i32 {
+    if (target == ZT_SSE2()) { return 1; }
+    if (target == ZT_AVX2()) { return 1; }
+    if (target == ZT_AVX512()) { return 1; }
+    if (target == ZT_NEON()) { return 1; }
+    return 0;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 4. VIRTUAL REGISTER RENAMING
+// ══════════════════════════════════════════════════════════════════════════════
+
+//
+// The mapping has to be a MEMO, not a counter: two instructions that both read
+// chunk 2 of the same logical value must name the SAME virtual register, or the
+// value is written by one and read from a different, never-initialised register.
+// That is why `map` exists and why the piece number is part of the key.
+struct VecwRen { next: i32, overflow: i32, map: ArrayList[i32] }
+
+// The widest chunk index the ladder can produce is 15 (a 16-lane value on a
+// 1-lane-per-register target), and 16 slots are reserved for headroom.
+fn vecw_kmax() i32 { return 17; }
+
+// `next` starts strictly above every virtual number in the input, so a minted
+// piece can never collide with a name the frontend already used.  Every one of
+// the four register fields of every instruction is scanned, not just the ones a
+// vector kind owns: a virtual number in an unexpected field is malformed
+// input, and starting above it costs nothing and removes a whole class of
+// collision.
+fn vecw_ren_init(prog: ArrayList[Instr]) VecwRen {
+    let hi: i32 = 0 - 1;
+    let n: i32 = len[Instr](prog);
+    let i: i32 = 0;
+    while (i < n) {
+        let ins: Instr = get[Instr](prog, i);
+        if (R_IS_VREG(ins.dst) == 1) { if (R_VREG_IDX(ins.dst) > hi) { hi = R_VREG_IDX(ins.dst); } }
+        if (R_IS_VREG(ins.src) == 1) { if (R_VREG_IDX(ins.src) > hi) { hi = R_VREG_IDX(ins.src); } }
+        if (R_IS_VREG(ins.lbl) == 1) { if (R_VREG_IDX(ins.lbl) > hi) { hi = R_VREG_IDX(ins.lbl); } }
+        if (R_IS_VREG(ins.disp) == 1) { if (R_VREG_IDX(ins.disp) > hi) { hi = R_VREG_IDX(ins.disp); } }
+        i = i + 1;
+    }
+    let m: ArrayList[i32] = make[i32](R_VREG_MAX() * vecw_kmax());
+    let z: i32 = 0;
+    while (z < R_VREG_MAX() * vecw_kmax()) { set[i32](&m, z, 0 - 1); z = z + 1; }
+    return VecwRen{ .next = hi + 1, .overflow = 0, .map = m };
+}
+
+fn vecw_ren_free(ren: *VecwRen) void { free[i32](&ren.*.map); }
+
+// THE MAPPING FUNCTION, shared with the allocator by construction: the pieces
+// of one logical value are exactly `vecw_piece(ren, v, 0..n-1)`, they are
+// pairwise distinct, `vecw_piece(ren, v, 0) == v`, and — the property that makes
+// the whole split correct — `vecw_piece(ren, v, k)` is the SAME number for every
+// instruction in the program, so a value written by one chunk-k op is read by
+// the chunk-k op three instructions later.  Running out of virtual registers is
+// recorded, not worked around: `overflow` makes the whole pass discard its
+// output.
+fn vecw_piece(ren: *VecwRen, vreg: i32, k: i32) i32 {
+    if (k <= 0) { return vreg; }
+    if (R_IS_VREG(vreg) == 0) { return vreg; }
+    let vi: i32 = R_VREG_IDX(vreg);
+    if (vi < 0 || vi >= R_VREG_MAX() || k >= vecw_kmax()) { ren.*.overflow = 1; return vreg; }
+    let slot: i32 = vi * vecw_kmax() + k;
+    let got: i32 = get[i32](ren.*.map, slot);
+    if (got >= 0) { return R_VREG(got); }
+    if (ren.*.next >= R_VREG_MAX()) { ren.*.overflow = 1; return vreg; }
+    let n: i32 = ren.*.next;
+    ren.*.next = ren.*.next + 1;
+    set[i32](&ren.*.map, slot, n);
+    return R_VREG(n);
+}
+
+// Is every vector field of `ins` a virtual register?  A split can only rename
+// virtual names; a PHYSICAL vector register would need N distinct physical
+// registers and the pass has no authority to pick them (that is the
+// allocator's job, and it runs on virtual names only).  A wide op that already
+// names physical registers is therefore rejected — which also means the pass can
+// never manufacture N copies of one physical register, i.e. it can never
+// create a silent aliasing.
+fn vecw_all_vec_are_vreg(k: i32, ins: Instr) i32 {
+    let f: i32 = vecw_fields(k);
+    if (f == 0) { return 0; }
+    if ((f & 1) == 1) { if (R_IS_VREG(ins.dst) != 1) { return 0; } }
+    if ((f & 2) == 2) { if (R_IS_VREG(ins.src) != 1) { return 0; } }
+    if ((f & 4) == 4) { if (R_IS_VREG(ins.lbl) != 1) { return 0; } }
+    if ((f & 8) == 8) { if (R_IS_VREG(ins.disp) != 1) { return 0; } }
+    return 1;
+}
+
+// Replace the width class in `imm` bits 0-1 and leave every other bit alone:
+// the SIB scale log (bits 2-3) and the compare/shuffle imm8 (bits 8-15) must
+// survive.  `imm - (imm % 4)` clears exactly bits 0-1.
+fn vecw_reclass(imm: i64, w: i32) i64 { return (imm - (imm % 4)) + (w as i64); }
+
+// Is `d` still a representable signed 32-bit displacement after the widening?
+fn vecw_disp_ok(d: i64) i32 {
+    if (d > 2147483647) { return 0; }
+    if (d < 0 - 2147483647 - 1) { return 0; }
+    return 1;
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 5. THE PASS
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Is this kind's `disp` a byte offset (i.e. is it a memory form's address)?
+// Every other vector kind uses `disp` for an element width, an unsigned-compare
+// flag, a lane index, a shuffle scratch register or a k-register, none of which
+// may be offset by a chunk count.
+fn vecw_is_mem_form(k: i32) i32 {
+    if (k == K_VMOVDQU_LOAD() || k == K_VMOVDQU_STORE()) { return 1; }
+    if (k == K_VMOVDQU_LOAD_IDX() || k == K_VMOVDQU_STORE_IDX()) { return 1; }
+    return 0;
+}
+
+// Emit the pieces of one over-wide vector op.  Called only after every guard has
+// already passed, so nothing here can fail — which is the point: a guard that
+// failed halfway through would leave a half-split program in `out`, and that is
+// a miscompile.  All five guards are therefore evaluated before the FIRST piece
+// is pushed:
+//
+//   G1  the kind is splittable at all (else it needs a recombination we do not
+//       have),
+//   G2  every vector field is a virtual register (else the pieces could not be
+//       given distinct names, and duplicating one physical name would alias),
+//   G3  every field isa.zag calls a GPR / k-register really is physical (a
+//       virtual number cannot be encoded in ModRM.reg, SIB.base or vvvv),
+//   G4  the largest chunk's displacement still fits in the signed 32-bit `disp`,
+//   G5  the rename has not run past R_VREG_MAX() — checked after the loop by the
+//       caller, which discards the whole output if it has.
+fn vecw_emit_pieces(out: *ArrayList[Instr], ins: Instr, ren: *VecwRen, nw: i32, n: i32, st: *VecWidthStats) void {
+    let f: i32 = vecw_fields(ins.kind);
+    let memf: i32 = vecw_is_mem_form(ins.kind);
+    let k: i32 = 0;
+    while (k < n) {
+        let e: Instr = ins;
+        // Only bits 0-1 change: the SIB scale log and the compare/shuffle imm8
+        // live above them and must survive untouched.
+        e.imm = vecw_reclass(ins.imm, nw);
+        // Every vector field of a piece is the k-th chunk of the corresponding
+        // logical value — for a USE (a store's source, a select's mask) exactly
+        // as much as for a definition.  Fields the kind does not own are never
+        // touched, which is what keeps the base/index GPRs and the lane indices
+        // intact.
+        if ((f & 1) == 1) { e.dst = vecw_piece(ren, ins.dst, k); }
+        if ((f & 2) == 2) { e.src = vecw_piece(ren, ins.src, k); }
+        if ((f & 4) == 4) { e.lbl = vecw_piece(ren, ins.lbl, k); }
+        if ((f & 8) == 8) { e.disp = vecw_piece(ren, ins.disp, k); }
+        if (memf == 1) { e.disp = ins.disp + vecw_chunk_bytes(k, nw); }
+        push[Instr](out, e);
+        st.*.lowered = st.*.lowered + 1;
+        k = k + 1;
+    }
+}
+
+fn vecw_report_split(st: *VecWidthStats, ins: Instr, target: i32, lanes: i32, need: i32, nw: i32) void {
+    vecw_note(st, "split: ");
+    vecw_note(st, vecw_kind_name(ins.kind));
+    vecw_note_i(st, " ", lanes);
+    vecw_note(st, " lanes -> ");
+    vecw_note_i(st, "", need);
+    vecw_note(st, " x ");
+    vecw_note_i(st, "", zvec_wclass_lanes(nw));
+    vecw_note(st, "-lane ops on ");
+    vecw_note(st, zt_name(target));
+    vecw_note(st, "\n");
+}
+
+fn vecw_report_reject(st: *VecWidthStats, ins: Instr, why: []u8) void {
+    st.*.rejected = st.*.rejected + 1;
+    vecw_note(st, "rejected: ");
+    vecw_note(st, vecw_kind_name(ins.kind));
+    vecw_note(st, why);
+    vecw_note(st, "\n");
+}
+
+// Decide one instruction.  Emits it verbatim (counting why) or, when it is a
+// splittable over-wide vector op on a known target, emits its pieces.
+fn vecw_one(out: *ArrayList[Instr], ins: Instr, target: i32, ren: *VecwRen, st: *VecWidthStats) void {
+    let k: i32 = ins.kind;
+    if (vecw_fields(k) == 0) {
+        // Not a vector op, or a kind this file does not know.  Copied
+        // byte-for-byte: the pass has no business touching scalar code, and a
+        // kind it has never heard of is not one it may rewrite.
+        push[Instr](out, ins);
+        return;
+    }
+    if (vecw_target_valid(target) == 0) {
+        vecw_report_reject(st, ins, ": target is not one of sse2/avx2/avx512/neon");
+        push[Instr](out, ins);
+        return;
+    }
+    let lw: i32 = x86vec_wclass(ins.imm);
+    if (x86vec_wclass_valid(lw) == 0) {
+        vecw_report_reject(st, ins, ": width class in imm bits 0-1 is not a ladder rung");
+        push[Instr](out, ins);
+        return;
+    }
+    let nw: i32 = vecw_native_w(target);
+    let lanes: i32 = zvec_wclass_lanes(lw);
+    let need: i32 = zvec_reg_count(lanes, nw);
+    if (need <= 1) {
+        // At or below the target's ceiling.  A NARROWER-than-native op stays
+        // narrow on purpose: re-tagging it would widen the register and expose
+        // uninitialised upper lanes to every later read.
+        push[Instr](out, ins);
+        return;
+    }
+    if (vecw_splittable(k) == 0) {
+        vecw_report_reject(st, ins, ": names a lane / whole-vector mask of the logical vector; no recombination available");
+        push[Instr](out, ins);
+        return;
+    }
+    if (vecw_all_vec_are_vreg(k, ins) == 0) {
+        vecw_report_reject(st, ins, ": already names a physical vector register; pieces could not be given distinct names");
+        push[Instr](out, ins);
+        return;
+    }
+    if (vecw_gpr_fields_ok(k, ins) == 0) {
+        vecw_report_reject(st, ins, ": a GPR / k-register field holds a virtual number");
+        push[Instr](out, ins);
+        return;
+    }
+    if (vecw_is_mem_form(k) == 1) {
+        let dmax: i64 = (ins.disp as i64) + (vecw_chunk_bytes(need - 1, nw) as i64);
+        if (vecw_disp_ok(dmax) == 0) {
+            vecw_report_reject(st, ins, ": the last chunk's displacement leaves the signed 32-bit disp field");
+            push[Instr](out, ins);
+            return;
+        }
+    }
+    vecw_emit_pieces(out, ins, ren, nw, need, st);
+    st.*.split = st.*.split + 1;
+    if (need > st.*.chunks_max) { st.*.chunks_max = need; }
+    vecw_report_split(st, ins, target, lanes, need, nw);
+}
+
+// The authoritative entry point.  `st` receives the statistics; see the note
+// above `vecwidth_stats_last()` for why they are an out-parameter rather than a
+// module cell.  The input list is never mutated.
+fn vecwidth_lower_st(prog: ArrayList[Instr], target: i32, st: *VecWidthStats) ArrayList[Instr] {
+    let n: i32 = len[Instr](prog);
+    let out: ArrayList[Instr] = make[Instr](n + 16);
+    let ren: VecwRen = vecw_ren_init(prog);
+    vecw_reset(st);
+
+    let i: i32 = 0;
+    while (i < n) {
+        vecw_one(&out, get[Instr](prog, i), target, &ren, st);
+        i = i + 1;
+    }
+
+    if (ren.overflow == 1) {
+        // Ran out of virtual register numbers (guard G5).  A partially renamed
+        // program is a miscompile, so the whole output is discarded and the
+        // input is copied back byte-for-byte; `rejected` tells the caller not to
+        // emit this function.
+        free[Instr](&out);
+        st.*.rejected = st.*.rejected + 1;
+        vecw_note(st, "rejected: out of virtual vector registers; nothing was lowered\n");
+        let copy: ArrayList[Instr] = make[Instr](n + 1);
+        let j: i32 = 0;
+        while (j < n) { push[Instr](&copy, get[Instr](prog, j)); j = j + 1; }
+        vecw_ren_free(&ren);
+        return copy;
+    }
+    vecw_ren_free(&ren);
+    return out;
+}
+
+// Convenience form.  Statistics are discarded — see the note above
+// `vecwidth_stats_last()`; use `vecwidth_lower_st` when the caller needs them.
+fn vecwidth_lower(prog: ArrayList[Instr], target: i32) ArrayList[Instr] {
+    let st: VecWidthStats = VecWidthStats{ .lowered = 0, .split = 0, .rejected = 0, .chunks_max = 0, .report = "" };
+    return vecwidth_lower_st(prog, target, &st);
+}

@@ -34,7 +34,7 @@ if (cd "$tmp/unsafe" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-c
     echo "futex outside unsafe unexpectedly compiled" >&2
     exit 1
 fi
-grep -q 'atomic futex operation requires unsafe' "$tmp/unsafe/log"
+grep -q 'atomic wait/wake operation requires unsafe' "$tmp/unsafe/log"
 
 mkdir -p "$tmp/type"
 printf 'name = "futextype"\nversion = "0"\nedition = "2027"\n' >"$tmp/type/zag.mod"
@@ -43,7 +43,7 @@ if (cd "$tmp/type" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-cac
     echo "non-i32 futex pointer unexpectedly compiled" >&2
     exit 1
 fi
-grep -q 'futex operation requires an explicitly aligned' "$tmp/type/log"
+grep -q 'wait/wake operation requires an explicitly aligned' "$tmp/type/log"
 
 mkdir -p "$tmp/value"
 printf 'name = "futexvalue"\nversion = "0"\nedition = "2027"\n' >"$tmp/value/zag.mod"
@@ -52,7 +52,7 @@ if (cd "$tmp/value" && "$ZNC" main.zag --no-zagd --no-analyze --no-foreground-ca
     echo "non-i32 futex value unexpectedly compiled" >&2
     exit 1
 fi
-grep -q 'futex expected value/count must be i32' "$tmp/value/log"
+grep -q 'wait/wake expected value/count must be i32' "$tmp/value/log"
 
 mkdir -p "$tmp/pure"
 printf 'name = "futexpure"\nversion = "0"\nedition = "2027"\n' >"$tmp/pure/zag.mod"

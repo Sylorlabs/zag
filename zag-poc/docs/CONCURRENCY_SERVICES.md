@@ -1,4 +1,25 @@
-# Linux concurrency services
+# Native concurrency services
+
+## Portable supervision primitive
+
+Process supervision uses `selfhost/std/process_platform.zag`, whose
+`process_platform_wait_readable(fd, timeout_ms)` operation is the source-level
+API. The backend owns the kernel primitive and descriptor layout. Shared
+process code must consume the typed capability record and this wait operation;
+it must not select timerfd/epoll versus kqueue itself.
+
+The capability record declares process-group control, nonblocking observation,
+and finite deadline waiting. Linux x86-64 uses poll, Linux ARM64 uses ppoll, and
+Darwin ARM64 uses an explicit Darwin poll trap. EINTR returns control to the
+shared deadline loop. Focused execution coverage is `tests/run_process_platform.sh`.
+
+**Process groups are not security isolation.** Both backends advertise no kernel
+sandbox. A typed `SecuritySandbox` requirement is rejected before fork;
+`SupervisionOnly` retains ordinary process authority. See
+[`ZAGSCRIPT_PROCESS_BOUNDARY.md`](ZAGSCRIPT_PROCESS_BOUNDARY.md) for the exact
+contract, platform tests, and signal-test limitations.
+
+## Linux x86-64
 
 Zag's current Linux x86-64 application foundation includes two deliberately
 bounded concurrency modules:
@@ -45,3 +66,24 @@ This evidence is not language async/await, automatic cancellation propagation,
 a scheduler, a general worker pool, MPMC channels, portable concurrency, or
 automatic race-freedom and lifetime inference. Those remain separate
 language/runtime work.
+
+
+## Apple Silicon macOS
+
+`std:macos_channel_i64` provides the same bounded SPSC `i64` channel contract
+for Darwin workers. Its shared state uses anonymous Darwin memory, release and
+acquire atomics publish the ring indices, and separate `EVFILT_USER` kqueue
+notifications wake the producer and consumer without Linux futex, eventfd, or
+epoll assumptions. The channel capacity is limited to 1 through 64, waits are
+finite and capped, and close/invalid-state behavior remains explicit.
+
+The macOS counterpart at
+`tests/reference_apps/async_worker/macos_main.zag` uses two channels and one
+real `@threadSpawn`/`@threadJoin` worker.
+`tests/run_macos_concurrency_services.sh` also runs a direct kqueue kernel probe,
+checks deterministic signed Mach-O output, verifies native pthread imports,
+executes the worker, and proves the bounded timeout path.
+
+Darwin's kqueue, pthread, and Mach-O mechanisms are the native implementation
+of this portable service. Linux-only mechanisms such as futex, eventfd, and
+epoll remain implementation details of the Linux module.

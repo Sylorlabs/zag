@@ -22,11 +22,22 @@ jobs:
           cache: npm
           cache-dependency-path: editors/vscode/package-lock.json
       - run: npm ci
-      - run: npm run package
+      - name: Build byte-reproducible VSIX
+        run: |
+          npm run package
+          cp zag-lang.vsix "$RUNNER_TEMP/zag-lang-first.vsix"
+          npm run package
+          cmp "$RUNNER_TEMP/zag-lang-first.vsix" zag-lang.vsix
+          unzip -tq zag-lang.vsix
+          unzip -p zag-lang.vsix extension/out/extension.js | \
+            awk 'index($0, "vscode-languageclient") { found=1 } END { exit !found }'
+          unzip -p zag-lang.vsix extension/out/extension.js | \
+            awk 'index($0, "zag-lsp") { found=1 } END { exit !found }'
       - uses: actions/upload-artifact@v4
         with:
           name: zag-vscode-${{ github.sha }}
           path: editors/vscode/zag-lang.vsix
+          if-no-files-found: error
 
   test:
     name: v1 native backend (Linux x86_64)
@@ -92,8 +103,15 @@ jobs:
       - name: Install release-evidence tracing
         run: sudo apt-get update -qq && sudo apt-get install -y -qq strace
 
-      - name: Bootstrap (rebuild znc from seed)
-        run: ./bootstrap.sh
+      - name: Bootstrap (rebuild znc from pinned seed)
+        env:
+          ZAG_BOOTSTRAP_MEMORY_GUARD: off
+        run: |
+          seed="$PWD/znc"
+          seed_sha=$(sha256sum "$seed" | cut -d' ' -f1)
+          manifest="$RUNNER_TEMP/zag-bootstrap.mod"
+          printf 'name = "zag-ci-bootstrap"\nedition = "2026"\n[toolchain]\ncompiler = "sha256:%s"\n' "$seed_sha" >"$manifest"
+          ZAG_BOOTSTRAP_SEED="$seed" ZAG_BOOTSTRAP_MANIFEST="$manifest" ./bootstrap.sh
 
       # ── Fixpoint check ────────────────────────────────────────────────────
       - name: Fixpoint check (three native generations, byte-identical)
@@ -127,6 +145,25 @@ jobs:
       # ── arm64 backend (emulated) ─────────────────────────────────────────
       - name: Install qemu-user-static
         run: sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static
+
+      - name: Enable ARM64 Docker execution
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Root-cause and native-evidence gates
+        env:
+          ZNC: ${{ github.workspace }}/zag-poc/znc
+          PROCESS_TEST_CLI: ${{ github.workspace }}/zag-poc/znc
+          PROCESS_TEST_LINUX: "1"
+          ZAGSCRIPT_RELEASE_EVIDENCE: "1"
+        run: |
+          bash tests/run_toolchain_identity.sh
+          bash tests/run_source_closure.sh
+          bash tests/run_package_resolution.sh
+          bash tests/run_evidence_codec.sh
+          bash tests/run_native_evidence.sh
+          bash tests/run_process_platform.sh
 
       - name: arm64 backend suite (qemu-user)
         run: bash tests/run_native_arm64.sh
@@ -195,12 +232,13 @@ jobs:
       - name: Upload macOS arm64 compiler
         uses: actions/upload-artifact@v4
         with:
-          name: zag-znc-macos-arm64-${{ github.sha }}
+          name: zag-znc-macos-arm64-cross-${{ github.sha }}
           path: zag-poc/znc-macos-arm64
+          if-no-files-found: error
           retention-days: 7
 
-  # Cross-compilation checks the Mach-O layout and supplies this job's trusted
-  # starting artifact, while a GPU-capable physical Apple-Silicon runner
+  # Cross-compilation checks the Mach-O layout and supplies this job's bootstrap
+  # precursor, while a GPU-capable physical Apple-Silicon runner
   # exercises the Darwin loader, Metal, raw syscall ABI, embedded ad-hoc
   # signature, and self-hosting fixpoint. The xlarge label is intentional:
   # standard virtual macOS runners cannot produce the physical-Metal evidence
@@ -228,14 +266,39 @@ jobs:
       - name: Download cross-built macOS arm64 compiler
         uses: actions/download-artifact@v4
         with:
-          name: zag-znc-macos-arm64-${{ github.sha }}
+          name: zag-znc-macos-arm64-cross-${{ github.sha }}
           path: zag-poc
 
       - name: Native macOS arm64 release gate
         run: |
           chmod +x znc-macos-arm64 tests/run_macos_arm64_release.sh
           test "$(file -b znc-macos-arm64)" = 'Mach-O 64-bit executable arm64'
-          ZNC="$PWD/znc-macos-arm64" bash tests/run_macos_arm64_release.sh
+          verified_dir="$RUNNER_TEMP/zag-macos-arm64-verified"
+          mkdir "$verified_dir"
+          ZNC="$PWD/znc-macos-arm64" \
+          ZAG_MACOS_VERIFIED_COMPILER_OUTPUT="$verified_dir/znc-macos-arm64" \
+            bash tests/run_macos_arm64_release.sh
+          (
+            cd "$verified_dir"
+            shasum -a 256 znc-macos-arm64 | tee znc-macos-arm64.sha256
+            printf '%s\n' "$GITHUB_SHA" >SOURCE_COMMIT
+          )
+          {
+            printf '### Native-gate-verified macOS seed\n\n'
+            printf 'Source commit: `%s`\n\n' "$GITHUB_SHA"
+            printf 'SHA-256: `%s`\n' "$(awk '{ print $1 }' "$verified_dir/znc-macos-arm64.sha256")"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Upload native-gate-verified macOS seed
+        uses: actions/upload-artifact@v4
+        with:
+          name: zag-znc-macos-arm64-verified-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/zag-macos-arm64-verified/znc-macos-arm64
+            ${{ runner.temp }}/zag-macos-arm64-verified/znc-macos-arm64.sha256
+            ${{ runner.temp }}/zag-macos-arm64-verified/SOURCE_COMMIT
+          if-no-files-found: error
+          retention-days: 30
 
   # Real ARM silicon — no qemu. Catches what user-mode emulation structurally
   # cannot: the kernel's actual ELF loader (page-size congruence of PT_LOAD
@@ -270,3 +333,46 @@ jobs:
 
       - name: arm64 self-hosting fixpoint (native)
         run: ZNC=$PWD/znc-arm64 bash tests/run_arm64_selfhost.sh
+
+  # Windows is intentionally a contract and portability gate, not a native
+  # compiler claim. The support contract currently marks Windows unsupported:
+  # there is no PE/COFF backend or Windows compiler host. This job ensures that
+  # CI does not accidentally advertise or dispatch the Linux seed on Windows,
+  # while checking the portable source tree and shell-test syntax.
+  windows-contract:
+    name: Windows unsupported-target contract
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate unsupported-target contract
+        run: |
+          $support = Get-Content -Raw zag-poc/docs/SUPPORT.md
+          if ($support -notmatch '(?m)^\| Windows, BSD, RISC-V \| unsupported \|') {
+            throw 'Windows support contract is missing or no longer explicitly unsupported'
+          }
+          $versioning = Get-Content -Raw zag-poc/VERSIONING.md
+          if ($versioning -notmatch '(?m)^\| Windows \| Not planned \| Requires PE/COFF backend') {
+            throw 'Windows versioning boundary is missing or changed without a backend'
+          }
+          if (Test-Path zag-poc/znc.exe) {
+            throw 'A Windows compiler binary appeared without a support-contract update'
+          }
+
+      - name: Validate pure-Zag tree with Git Bash
+        shell: bash
+        run: bash zag-poc/tests/check_pure_zag_tree.sh
+
+      - name: Syntax-check portable shell gates with Git Bash
+        shell: bash
+        run: |
+          bash -n zag-poc/bootstrap.sh
+          bash -n zag-poc/tests/run_toolchain_identity.sh
+          bash -n zag-poc/tests/run_source_closure.sh
+          bash -n zag-poc/tests/run_evidence_codec.sh
+          bash -n zag-poc/tests/run_native_evidence.sh
+          bash -n zag-poc/tests/run_process_platform.sh

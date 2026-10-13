@@ -33,6 +33,46 @@ cp "$product_zagd" "$tmp/bin/zagd"
 printf 'name = "zagd-product-test"\n' > "$tmp/project/zag.mod"
 printf 'fn main() i32 { return 0; }\n' > "$tmp/project/src/deep/main.zag"
 
+# The daemon is also a public executable. Direct callers receive the same
+# fail-closed mode policy as `znc watch`, before singleton/status state exists.
+mkdir "$tmp/direct-invalid"
+if "$tmp/bin/zagd" --root "$tmp/direct-invalid" --mode nonsense \
+    >"$tmp/direct-invalid.out" 2>"$tmp/direct-invalid.err"; then
+    echo "direct daemon invalid mode unexpectedly accepted" >&2
+    exit 1
+fi
+grep -q '^zagd: mode must be off, light, adaptive, or deep$' \
+    "$tmp/direct-invalid.err"
+test ! -e "$tmp/direct-invalid/.zagd.lock"
+test ! -e "$tmp/direct-invalid/.zagd.status"
+
+assert_direct_reject() {
+    expected=$1
+    shift
+    if "$tmp/bin/zagd" --root "$tmp/direct-invalid" "$@" \
+        >"$tmp/direct-invalid.out" 2>"$tmp/direct-invalid.err"; then
+        echo "direct daemon invalid policy unexpectedly accepted: $*" >&2
+        exit 1
+    fi
+    grep -Fq -- "$expected" "$tmp/direct-invalid.err"
+    test ! -e "$tmp/direct-invalid/.zagd.lock"
+    test ! -e "$tmp/direct-invalid/.zagd.status"
+}
+
+assert_direct_reject 'idle_deep must be true or false' --idle-deep maybe
+assert_direct_reject 'difficulty must be simple, explained, explicit, or native' --difficulty impossible
+assert_direct_reject 'script_optimization must be automatic, review, or off' --script-optimization unsafe
+assert_direct_reject 'regular_optimization must be review, automatic, or off' --regular-optimization unsafe
+assert_direct_reject 'this build supports objective=runtime' --objective size
+assert_direct_reject 'trust_mode must be stable, reviewed, or autonomous' --trust-mode blind
+assert_direct_reject 'unsupported macOS CPU profile' --cpu x86-64-v1
+assert_direct_reject '--window-ms must be 1..60000' --window-ms 0
+assert_direct_reject '--max-memory-bytes must be 67108864..2147483648' --max-memory-bytes 1
+assert_direct_reject '--max-cache-bytes must be 1048576..2147483648' --max-cache-bytes 1
+assert_direct_reject 'this build supports exactly one quiet worker' --max-workers 2
+assert_direct_reject '--notifications must be errors_only or advisory' --notifications noisy
+assert_direct_reject 'unknown or incomplete argument: --unknown' --unknown value
+
 wait_for_mode() {
     expected=$1
     for _ in $(seq 1 500); do
@@ -47,12 +87,21 @@ wait_for_mode() {
     return 1
 }
 
-# A source command from a nested directory finds zag.mod and auto-starts.
-(cd "$tmp/project/src/deep" && "$tmp/bin/znc" main.zag -o app --no-analyze >/dev/null)
+# A source command from a nested directory finds zag.mod and auto-starts even
+# when its startup environment lies about the working directory. Native cwd
+# discovery, not PWD, owns project and semantic-module identity.
+(cd "$tmp/project/src/deep" && env PWD=/zag-intentionally-spoofed-cwd \
+    "$tmp/bin/znc" main.zag -o app --no-analyze >/dev/null)
 test -f "$tmp/project/.zagd.lock"
 wait_for_mode adaptive
 first_pid=$(sed -n 's/^pid=//p' "$tmp/project/.zagd.status")
 test "$first_pid" -gt 1
+# The daemon's sibling check runs from the nested foreground compiler cwd, but
+# its semantic graph must use project-relative names. This caught Darwin's old
+# `.` cwd placeholder, which published `main.zag` and made suggestions from a
+# different project subdirectory reject the graph as stale.
+grep -q '^module=src/deep/main.zag$' "$tmp/project/.zag-cache/zagd/semantic.record"
+grep -q '^module_node=src/deep/main.zag[[:space:]]' "$tmp/project/.zag-cache/zagd/semantic.record"
 grep -q '^idle_deep=true$' "$tmp/project/.zagd.status"
 grep -q '^difficulty=simple$' "$tmp/project/.zagd.status"
 grep -q '^script_optimization=automatic$' "$tmp/project/.zagd.status"
@@ -103,7 +152,11 @@ grep -q '^max_cache_bytes=104857600$' "$tmp/project/.zagd.status"
 grep -q '^max_workers=1$' "$tmp/project/.zagd.status"
 grep -q '^notifications=errors_only$' "$tmp/project/.zagd.status"
 grep -q '^trust_mode_scope=policy-only$' "$tmp/project/.zagd.status"
-grep -q '^optimizer_generation=unimplemented$' "$tmp/project/.zagd.status"
+grep -q '^optimizer_generation=bounded-finite-sandbox$' "$tmp/project/.zagd.status"
+grep -q '^policy_validation=enforced$' "$tmp/project/.zagd.status"
+grep -q '^stability_window_enforced=true$' "$tmp/project/.zagd.status"
+grep -q '^memory_limit_enforced=allocator-peak-guard$' "$tmp/project/.zagd.status"
+grep -q '^max_workers_enforced=true$' "$tmp/project/.zagd.status"
 
 # With no explicit --mode, watch uses project policy instead of a hidden light
 # fallback. Explicit --mode tests below retain higher precedence.
@@ -118,16 +171,6 @@ grep -q '^state=idle$' <<<"$status_text"
 suggest_json=$(cd "$tmp/project/src" && "$tmp/bin/znc" suggest --format json)
 printf '%s\n' "$suggest_json" | grep -q '"advisory":true'
 printf '%s\n' "$suggest_json" | grep -q '"source_changes":false'
-if [ "$(uname -s):$(uname -m)" = Darwin:arm64 ]; then
-    # Darwin exposes the advisory watcher/status surface but not the Linux
-    # semantic-manifest planner, so no checksum-bound suggestion exists.
-    printf '%s\n' "$suggest_json" | grep -q '"available":false'
-    "$tmp/bin/znc" shutdown >/dev/null
-    trap - EXIT
-    rm -rf "$tmp"
-    echo 'zagd product: macOS advisory watcher pass'
-    exit 0
-fi
 printf '%s\n' "$suggest_json" | grep -q '"checksum_bound":true'
 printf '%s\n' "$suggest_json" | grep -q '"id":"constant-return-fold"'
 printf '%s\n' "$suggest_json" | grep -q '"id":"constant-return-fold","supported":false,"automatic":false'
@@ -189,7 +232,19 @@ if printf '%s\n' "$constant_notice" | grep -q '^znc: advisory:'; then
     echo "unsupported planner scaffolding emitted a normal-Zag warning" >&2; exit 1
 fi
 printf 'extern fn _zag_malloc(n:i64) *u8\nfn allocate() i32 { let p:*u8 = _zag_malloc(8); return 0; }\nfn main() i32 { return allocate(); }\n' > "$tmp/project/src/deep/main.zag"
-allocation_notice=$(cd "$tmp/project/src/deep" && "$tmp/bin/znc" check main.zag --no-analyze 2>&1)
+# The foreground check publishes immediately; the advisory daemon intentionally
+# waits for the configured stable-content window before consuming that record.
+# Poll the public behavior because a policy-triggered daemon replacement may
+# legitimately reset its local event counter to zero.
+allocation_notice=
+for _ in $(seq 1 500); do
+    allocation_notice=$(cd "$tmp/project/src/deep" && "$tmp/bin/znc" check main.zag --no-analyze 2>&1)
+    if printf '%s\n' "$allocation_notice" | \
+       grep -q '^znc: advisory: [1-9][0-9]* allocation-effect declaration(s) available for review;'; then
+        break
+    fi
+    sleep 0.01
+done
 printf '%s\n' "$allocation_notice" | grep -q '^znc: advisory: [1-9][0-9]* allocation-effect declaration(s) available for review;'
 allocation_suggest=$(cd "$tmp/project/src" && "$tmp/bin/znc" suggest --format json)
 printf '%s\n' "$allocation_suggest" | grep -q '"id":"allocation-review","supported":true,"automatic":false'

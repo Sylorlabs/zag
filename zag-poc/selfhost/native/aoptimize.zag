@@ -1,0 +1,1085 @@
+// selfhost/native/aoptimize.zag — a correctness-preserving LOCAL OPTIMIZER for
+// Zag's from-scratch native AArch64 backend. It removes the remaining overhead of
+// the STACK MACHINE that acodegen.zag emits: expression temporaries shuttled
+// through the expression stack (push/pop), constants left unfolded, and the
+// register writes those rewrites strand.
+//
+// It runs on the flat ArrayList[AInstr] (see aisa.zag) AFTER any register
+// allocation and BEFORE aarch64.zag encodes it. An optimization that changes
+// behavior is a CATASTROPHIC bug, so EVERY rewrite here is required to be
+// observationally equivalent (same architectural state at every point control can
+// be observed) and each carries a soundness argument.
+//
+// ── THE STRAIGHT-LINE RUN (the unit of analysis) ─────────────────────────────
+// A "run" is a maximal sequence of instructions containing NO control-flow and
+// NO call ("breakers"): AK_LABEL, AK_FN_LABEL, AK_CALL, AK_CALL_REG,
+// AK_CALL_EXT, AK_EXTERN_CALL, AK_JMP, AK_JE, AK_JNE, AK_JL, AK_JLE, AK_JG,
+// AK_JGE, AK_RET, AK_SVC, AK_SYSCALL, AK_SYSCALL_REG, AK_DARWIN_SYSCALL.
+// Like peephole.zag on x86-64 we NEVER reason across a breaker. Within a run,
+// control enters only at the top and leaves only at the bottom, so a rewrite that
+// preserves the run's exit state (GPRs + memory + the expression stack pointer
+// + any live flags) is safe. Across a breaker we reset ALL analysis state
+// (constants forgotten, model stack emptied) — the conservative, provably-safe
+// choice.
+//
+// ── THE EXPRESSION STACK ON AARCH64 IS X28, NOT THE HARDWARE SP ───────────────
+// aarch64.zag encodes AK_PUSH as `str dst,[x28,#0]` + `add x28,x28,#8` and
+// AK_POP as `sub x28,x28,#8` + `ldr dst,[x28,#0]`: the stack pointer GROWS
+// UPWARD out of A_X28(). The architectural SP (A_SP(), 31) is a DIFFERENT
+// register and push/pop never touch it. Three consequences the x86 port's
+// assumptions do NOT carry over, each enforced below:
+//
+//   1. X28 IS EXCLUDED FROM EVERY REGISTER OPTIMIZATION. `aopt_reserved()` marks
+//      X28 (expression stack pointer), X29 (frame pointer), X30 (link register)
+//      and 31 (SP in memory operands / XZR in `orr dst,xzr,src`) as
+//      untouchable: a push or pop of one of them is never removed, rematerialized
+//      or folded, and DCE can never delete a write to one of them. acodegen does
+//      write X28 outside push/pop (it saves/restores it around calls and bumps it
+//      with AK_ADD_IMM when opening a frame), so this exclusion is load-bearing,
+//      not theoretical.
+//   2. THE REGISTER FILE IS UNIFIED. AArch64 has ONE file: `v0` IS `x0`. A float
+//      or vector instruction that names register N writes x(N)'s storage as well.
+//      So every AK_F* / AK_V* kind invalidates the WHOLE constant map, and DCE
+//      treats them conservatively rather than assuming "a separate xmm file".
+//   3. THE IMMEDIATE FORMS ARE MUCH NARROWER. AK_ADD_IMM/AK_SUB_IMM encode
+//      imm12 (unsigned 0..4095; larger values are split into a shifted pair, and
+//      a NEGATIVE value is NOT encodable at all), while x86's add_ri takes a
+//      full sign-extended imm32. `aopt_fits_imm12()` is the gate. AK_CMP_IMM is
+//      different again: aarch64.zag routes any immediate outside 0..4095 through
+//      a scratch mov + cmp, so it is exact for every i64 and needs no gate.
+//
+// ── OPT 1 · CONSTANT-STACK ELIMINATION (the big one) ─────────────────────────
+// The stack machine evaluates `a OP b` as <push a> ; <push b> ; pop r ; OP.
+// Constants therefore flow THROUGH the expression stack. We model it
+// symbolically per run: a `push r` whose register holds a KNOWN CONSTANT and
+// whose matching `pop` lies in the SAME run (over a gap that names x28 only via
+// balanced push/pop) is DELETED and its matching pop is replaced by
+// `mov r, const`. The constant is REMATERIALIZED — it needs no register and no
+// stack slot. Exactly equivalent: the original stored the constant at [x28] and
+// read it back; writing the same constant into the pop's destination yields the
+// identical register value, push/pop came in a balanced pair so x28 is unchanged
+// across the span, and nothing in the gap observes the transient slot or x28 (we
+// prove the gap x28-clean). A push of an UNKNOWN value, or one whose pop is in
+// another run, is KEPT verbatim — we never juggle a live unknown value through a
+// scratch register (that needs liveness we do not have here).
+//
+// The same reasoning, with the constant replaced by a still-live REGISTER, gives
+// the second, optional rewrite: a `push r` fed by an ADJACENT `mov r, R` where R
+// provably survives the whole gap unwritten is deleted and the pop becomes
+// `mov rY, R` (re-reading a register whose value did not change). The feeding
+// `mov` then dies in DCE. If any gap instruction might write R we keep the push.
+//
+// ── OPT 2 · CONSTANT FOLDING ────────────────────────────────────────────────
+// Once constants are rematerialized at their pops, a register-tracking forward
+// pass FOLDS register-register arithmetic with both operands constant into
+// `mov dst, <folded>` (wrapping i64, matching opt_fold on x86), and folds a
+// constant right-hand operand into the IMMEDIATE form (AK_ADD_RR/AK_SUB_RR →
+// AK_ADD_IMM/AK_SUB_IMM) — which drops the dependency on the source register
+// without changing instruction count. The immediate form is gated on the freed
+// source register being provably killed inside the run, so it never strands a
+// dead `mov src,c` and never grows the program.
+// Folding a FLAG-SETTING instruction into a `mov` is only legal when the flags
+// it would set are DEAD. `aopt_prescan_flags` computes that backward: NZCV on
+// AArch64 is read by EXACTLY ONE class of instruction, the conditional branches,
+// and those are all breakers — so "dead" means "no branch consumes these flags
+// before the next writer". The analysis is deliberately pessimistic at the three
+// points where flags really can cross a run boundary: a run ending in a
+// conditional branch, one ending in AK_JMP, and one ending at a LABEL (control
+// can ARRIVE at a label by fall-through with the flags the preceding run set —
+// e.g. a loop whose condition block is a bare label followed by `jl`). Treating
+// those as live-out only costs missed folds; treating them as dead would
+// miscompile.
+//
+// ── OPT 3 · DEAD PURE-REGISTER-WRITE ELIMINATION (cleanup) ───────────────────
+// Folding and rematerialization leave behind register writes (the now-unread
+// `mov r, const`, the feeding `mov r, R`) that are dead. A backward, run-scoped
+// liveness pass removes a `mov_imm`/`mov_rr` whose destination is provably dead
+// — overwritten later in the run before any read. Live-out of a run is assumed
+// to be ALL registers (conservative: we only remove a write killed WITHIN its
+// run), and any instruction we do not model as a pure register write is treated
+// as reading EVERY register, so nothing it might consume is removed. Only
+// flag-free, memory-free pure writes are ever removed, so flags and memory are
+// never disturbed. Push/pop are NOT pure writes (they move x28), so they are
+// never candidates.
+//
+// ── SOUNDNESS OF THE STACK MODEL (why the LIFO matching is exact) ───────────
+// A pre-scan pairs each `push` with its matching `pop` using a run-scoped index
+// stack (push → record index; pop → pop the index, recording the pair; cleared
+// at each breaker). The forward pass maintains a model stack in LOCKSTEP, so
+// its depth equals the pre-scan's at every point and the entry a pop consumes is
+// exactly the push the pre-scan paired. We only DELETE a push the pre-scan paired
+// INSIDE the run, so every CONST model entry is consumed by its pop before the
+// run ends — never stranded across a breaker (where the real expression stack
+// must be intact). Kept (unknown) pushes stay real on the stack and are popped,
+// in later runs, as ordinary "external" pops. The LIFO property also proves that
+// every push inside a matched gap is itself matched inside that gap, so the gap
+// is stack-balanced without a second scan.
+//
+// LANGUAGE SUBSET: stmts end ';'. No `<<`/`>>`, no bitwise `|`/`^` (we fold only
+// +,-,* — never bitwise), no break/continue (flag-guarded while loops only).
+// Deref a pointer field as `p.*.field`.
+
+@import("../../std/list.zag")
+@import("aisa.zag")
+
+// The register-state arrays are indexed by the architectural register number, so
+// they have 32 entries — not x86's 16. Numbers outside 0..31 (A_SP()'s 31, or a
+// virtual vector register >= 256 before an allocator has run) are NEVER used as
+// an index: every access goes through the range-checked helpers below, because an
+// out-of-range index here would be an out-of-bounds memory write.
+fn aopt_nregs() i32 { return 32; }
+
+// ── run-breaker / classification helpers ─────────────────────────────────────
+
+fn aopt_is_breaker(k: i32) i32 {
+    if (k == AK_LABEL())            { return 1; }
+    if (k == AK_FN_LABEL())         { return 1; }
+    if (k == AK_CALL())             { return 1; }
+    if (k == AK_CALL_REG())         { return 1; }
+    if (k == AK_CALL_EXT())         { return 1; }
+    if (k == AK_EXTERN_CALL())      { return 1; }
+    if (k == AK_JMP())              { return 1; }
+    if (k == AK_JE())               { return 1; }
+    if (k == AK_JNE())              { return 1; }
+    if (k == AK_JL())               { return 1; }
+    if (k == AK_JLE())              { return 1; }
+    if (k == AK_JG())               { return 1; }
+    if (k == AK_JGE())              { return 1; }
+    if (k == AK_RET())              { return 1; }
+    if (k == AK_SVC())              { return 1; }
+    if (k == AK_SYSCALL())          { return 1; }
+    if (k == AK_SYSCALL_REG())      { return 1; }
+    if (k == AK_DARWIN_SYSCALL())   { return 1; }
+    return 0;
+}
+
+// A conditional branch READS the flags set by the run it terminates.
+fn aopt_is_jcc(k: i32) i32 {
+    if (k == AK_JE())  { return 1; }
+    if (k == AK_JNE()) { return 1; }
+    if (k == AK_JL())  { return 1; }
+    if (k == AK_JLE()) { return 1; }
+    if (k == AK_JG())  { return 1; }
+    if (k == AK_JGE()) { return 1; }
+    return 0;
+}
+
+// CAN the flags a run ends with survive into the next run? Pessimistic at the
+// three transfer shapes that can carry them across a boundary:
+//   * a conditional branch consumes them (and control continues at the target);
+//   * an unconditional jump moves the NEXT run's start to the target, so a run
+//     ending in AK_JMP can hand live flags to a run reached only by that jump;
+//   * a label is where control ARRIVES — including by fall-through out of the
+//     run in front of it, which is the shape a loop-closing `jl` behind a bare
+//     condition label produces.
+// Every other breaker (call, ret, svc, syscall) destroys or abandons the flags,
+// so flags are dead at those boundaries.
+fn aopt_flags_survive(k: i32) i32 {
+    if (aopt_is_jcc(k) == 1)  { return 1; }
+    if (k == AK_JMP())        { return 1; }
+    if (k == AK_LABEL())      { return 1; }
+    if (k == AK_FN_LABEL())   { return 1; }
+    return 0;
+}
+
+// Does this instruction DEFINE NZCV? On A64 the flag-setting integer forms are
+// the (S) variants: ADD/SUB (including their immediate forms), CMP (SUBS), and
+// NEG (encoded as `sub dst, xzr, src`). MUL (MADD), SDIV, the logical forms
+// (AND/ORR/EOR are the non-flag-setting encodings), shifts, loads/stores and
+// moves do NOT. FCMP writes NZCV too and is listed, because on AArch64 an
+// fcmp's result IS consumed by b.cond — the two flag domains are the same
+// physical register.
+fn aopt_writes_flags(k: i32) i32 {
+    if (k == AK_ADD_RR())   { return 1; }
+    if (k == AK_SUB_RR())   { return 1; }
+    if (k == AK_ADD_IMM())  { return 1; }
+    if (k == AK_SUB_IMM())  { return 1; }
+    if (k == AK_CMP_RR())   { return 1; }
+    if (k == AK_CMP_IMM())  { return 1; }
+    if (k == AK_NEG())      { return 1; }
+    if (k == AK_FCMP())     { return 1; }
+    return 0;
+}
+
+// Does this instruction READ NZCV? Nothing in aisa.zag does: A64's flag readers
+// are the conditional branches (breakers, handled through a run's live-out) plus
+// CSEL/CSET-family instructions, and this ISA defines no such kind. If one is
+// ever added it must be added here, or the flag-dead analysis will fold an
+// instruction whose flags that kind consumed.
+fn aopt_reads_flags(k: i32) i32 { return 0; }
+
+// Is register number r one this pass must never reason about?
+//   28  x28 — the EXPRESSION STACK POINTER (push/pop adjust it)
+//   29  x29 — the frame pointer
+//   30  x30 — the link register (return address)
+//   31  A_SP() in memory operands, XZR in `orr dst,xzr,src`
+// plus anything that is not an architectural GPR number at all (negative, or a
+// virtual vector register from the >= 256 pool that has not been allocated yet).
+// Every rewrite below consults this first.
+fn aopt_reserved(r: i32) i32 {
+    if (r == A_X28()) { return 1; }
+    if (r == A_X29()) { return 1; }
+    if (r == A_X30()) { return 1; }
+    if (r == A_SP())  { return 1; }
+    if (r < 0)        { return 1; }
+    if (r >= aopt_nregs()) { return 1; }
+    return 0;
+}
+
+// A register this pass may freely track, fold and delete writes to.
+fn aopt_free(r: i32) i32 {
+    if (aopt_reserved(r) == 1) { return 0; }
+    return 1;
+}
+
+// The third GPR operand of the kinds that carry one in `imm` (MADD/SDIV encode
+// their second source as a register number; STLXR encodes its base). -1 = none.
+fn aopt_third_reg(ins: AInstr) i32 {
+    if (ins.kind == AK_MUL_RR()) { return ins.imm as i32; }
+    if (ins.kind == AK_SDIV())   { return ins.imm as i32; }
+    if (ins.kind == AK_STLXR())  { return ins.imm as i32; }
+    return 0 - 1;
+}
+
+// ── 32-entry register-state arrays (range-checked; out-of-range reads 0) ─────
+fn aopt_mk_i32() ArrayList[i32] {
+    let a: ArrayList[i32] = make[i32](aopt_nregs());
+    let i: i32 = 0;
+    while (i < aopt_nregs()) { push[i32](&a, 0); i = i + 1; }
+    return a;
+}
+fn aopt_mk_i64() ArrayList[i64] {
+    let a: ArrayList[i64] = make[i64](aopt_nregs());
+    let i: i32 = 0;
+    while (i < aopt_nregs()) { push[i64](&a, 0); i = i + 1; }
+    return a;
+}
+fn aopt_reset_i32(known: *ArrayList[i32]) void {
+    let i: i32 = 0;
+    while (i < aopt_nregs()) { set[i32](known, i, 0); i = i + 1; }
+}
+// Range-checked constant-map accessors. A reserved or out-of-range register is
+// simply "not known", which is the safe answer everywhere.
+fn aopt_known_get(known: ArrayList[i32], r: i32) i32 {
+    if (aopt_free(r) == 0) { return 0; }
+    return get[i32](known, r);
+}
+fn aopt_val_get(cval: ArrayList[i64], r: i32) i64 {
+    if (aopt_free(r) == 0) { return 0; }
+    return get[i64](cval, r);
+}
+
+// Forget a register: it no longer holds a known constant.
+fn aopt_forget(known: *ArrayList[i32], r: i32) void {
+    if (r < 0) { return; }
+    if (r >= aopt_nregs()) { return; }
+    set[i32](known, r, 0);
+}
+
+// Remember `r == v` as a known constant.
+fn aopt_remember(known: *ArrayList[i32], cval: *ArrayList[i64], r: i32, v: i64) void {
+    if (aopt_free(r) == 0) { return; }
+    set[i32](known, r, 1);
+    set[i64](cval, r, v);
+}
+
+// Reset pass-local stacks in place. Replacing these lists at every breaker would
+// retain one allocation per label/call in large input programs.
+fn aopt_clear_i32(xs: *ArrayList[i32]) void { xs.*.len = 0; }
+fn aopt_clear_i64(xs: *ArrayList[i64]) void { xs.*.len = 0; }
+
+// Does the AK_ADD_IMM / AK_SUB_IMM encoding accept this constant? imm12 is
+// UNSIGNED 0..4095. A negative value is not encodable by either form (aarch64
+// would encode the bit pattern and produce a wrong result), and the encoder's
+// >4095 path is two instructions — fine for a plain ADD, but we keep the gate
+// tight so a rewrite can never be larger than what it replaces.
+fn aopt_fits_imm12(v: i64) i32 {
+    if (v < 0)        { return 0; }
+    if (v > 4095)     { return 0; }
+    return 1;
+}
+
+// Wrapping i64 fold for the foldable binary ops. The host's +,-,* and A64's
+// ADD/SUB/MADD all compute modulo 2^64, so host folding matches the hardware
+// bit for bit.
+fn aopt_fold(k: i32, a: i64, b: i64) i64 {
+    if (k == AK_ADD_RR())  { return a + b; }
+    if (k == AK_SUB_RR())  { return a - b; }
+    if (k == AK_MUL_RR())  { return a * b; }
+    return 0;
+}
+
+// ── gap x28-cleanliness ──────────────────────────────────────────────────────
+// A constant push at index `p` with matching pop at index `q` (p < q, same run)
+// is only deletable if NOTHING in the open gap (p, q) touches x28 except
+// balanced push/pop. Deleting the pair leaves x28 8 higher across the gap; the
+// only instructions sensitive to x28's absolute value are push/pop (modeled
+// consistently — every kept pair shifts by the same 8 and stays balanced) and any
+// x28-named instruction. acodegen additionally bumps x28 directly when it opens
+// a frame and saves/restores it around calls, and aarch64.zag materializes the
+// AK_AND_IMM / wide-AK_CMP_IMM masks through the x9/x10 scratch, so the check is
+// a WHITELIST: only kinds whose every register field we have verified (GPR-only
+// register ops, and loads/stores whose base is not x28) are accepted. Anything
+// else — a barrier (AK_DMB), an atomic, a vector kind with a register hidden in
+// its operand descriptor, an unknown kind — rejects the gap and the push is
+// kept. Being this strict only costs missed rematerialization.
+fn aopt_gap_kind_ok(ins: AInstr) i32 {
+    let k: i32 = ins.kind;
+    // Vector kinds can name a GPR through the index register packed into `imm`,
+    // and are excluded from this pass wholesale.
+    if (a_is_veclike(k) == 1) { return 0; }
+    // Two-address GPR forms: dst and src must not be x28.
+    if (k == AK_MOV_RR() || k == AK_ADD_RR() || k == AK_SUB_RR() ||
+        k == AK_XOR_RR() || k == AK_OR_RR()  || k == AK_ANDR_RR() ||
+        k == AK_SHL_RR() || k == AK_SHR_RR() || k == AK_LSHR_RR() ||
+        k == AK_CMP_RR() || k == AK_PUSH()  || k == AK_POP()) {
+        if (ins.dst == A_X28()) { return 0; }
+        if (ins.src == A_X28()) { return 0; }
+        return 1;
+    }
+    // Three-source GPR forms: the second source lives in `imm`.
+    if (k == AK_MUL_RR() || k == AK_SDIV()) {
+        if (ins.dst == A_X28()) { return 0; }
+        if (ins.src == A_X28()) { return 0; }
+        if (aopt_third_reg(ins) == A_X28()) { return 0; }
+        return 1;
+    }
+    // One-source / immediate GPR forms. The read-modify-write immediate kinds
+    // name x28 through dst, which is exactly the frame-bump we must reject.
+    if (k == AK_MOV_IMM() || k == AK_ADD_IMM() || k == AK_SUB_IMM() ||
+        k == AK_AND_IMM() || k == AK_NEG()    || k == AK_SXTW()   ||
+        k == AK_SXTB()   || k == AK_SXTH()    || k == AK_LSL_IMM()||
+        k == AK_REV64()  || k == AK_CLZ64()   || k == AK_RBIT64() ||
+        k == AK_CMP_IMM()|| k == AK_DATA_ADDR()|| k == AK_LEA_LBL()||
+        k == AK_MRS_CNTVCT() || k == AK_MRS_CNTFRQ()) {
+        if (ins.dst == A_X28()) { return 0; }
+        if (ins.src == A_X28()) { return 0; }
+        return 1;
+    }
+    // Loads: dst is written, src is the base. A base of A_SP() is the hardware
+    // SP, which push/pop never move, so it is fine here.
+    if (k == AK_LOAD() || k == AK_LOADB() || k == AK_LOADH() || k == AK_LOADW()) {
+        if (ins.src == A_X28()) { return 0; }
+        return 1;
+    }
+    // Stores: dst is the base, src the value. Memory written through any base
+    // other than x28 is untouched by the expression stack.
+    if (k == AK_STORE() || k == AK_STOREB() || k == AK_STOREH() || k == AK_STOREW()) {
+        if (ins.dst == A_X28()) { return 0; }
+        return 1;
+    }
+    // Scalar float forms name GPRs only in dst/src, both of which are checked.
+    // (The unified file means a float write DOES clobber x(dst) — but x28 is
+    // still only touched if it is named, which is what this check tests.)
+    if (k == AK_FMOV_DX() || k == AK_FMOV_XD() || k == AK_FMOV_SW() ||
+        k == AK_FMOV_WS() || k == AK_FCVT_SD() || k == AK_FCVT_DS() ||
+        k == AK_SCVTF()   || k == AK_FCVTZS()) {
+        if (ins.dst == A_X28()) { return 0; }
+        if (ins.src == A_X28()) { return 0; }
+        return 1;
+    }
+    if (k == AK_FADD() || k == AK_FSUB() || k == AK_FMUL() ||
+        k == AK_FDIV() || k == AK_FCMP()) {
+        if (ins.dst == A_X28()) { return 0; }
+        if (ins.src == A_X28()) { return 0; }
+        return 1;
+    }
+    return 0;
+}
+
+fn aopt_gap_clean(prog: ArrayList[AInstr], p: i32, q: i32) i32 {
+    let i: i32 = p + 1;
+    while (i < q) {
+        let ins: AInstr = get[AInstr](prog, i);
+        if (aopt_is_breaker(ins.kind) == 1) { return 0; }
+        if (aopt_gap_kind_ok(ins) == 0) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// ── PRE-SCAN: pair pushes↔pops (run-scoped LIFO), record matched + pop index ──
+// matched[i]==1  ⟺  prog[i] is a push whose matching pop is in the same run.
+// pop_of[i]      =  that pop's index (or -1).
+// This LIFO also proves every push strictly inside a matched gap is itself
+// matched inside that gap, so the gap is stack-balanced without a second scan.
+fn aopt_prescan_matched(prog: ArrayList[AInstr], n: i32, matched: *ArrayList[i32], pop_of: *ArrayList[i32]) void {
+    let stk: ArrayList[i32] = make[i32](16);   // indices of open pushes
+    let i: i32 = 0;
+    while (i < n) {
+        let k: i32 = get[AInstr](prog, i).kind;
+        if (aopt_is_breaker(k) == 1) {
+            aopt_clear_i32(&stk);               // reuse storage at run boundary
+        } else {
+            if (k == AK_PUSH()) {
+                push[i32](&stk, i);
+            } else {
+                if (k == AK_POP()) {
+                    if (len[i32](stk) > 0) {
+                        let j: i32 = pop[i32](&stk);
+                        set[i32](matched, j, 1);
+                        set[i32](pop_of, j, i);
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    free[i32](&stk);
+}
+
+// ── PRE-SCAN: backward flag liveness → flags_dead[i] for flag-writers ────────
+// flags_dead[i]==1  ⟺  the NZCV that instruction i defines are never read
+// before being overwritten or the run crossing a boundary that destroys them.
+fn aopt_prescan_flags(prog: ArrayList[AInstr], n: i32, flags_dead: *ArrayList[i32]) void {
+    let live: i32 = 0;                          // flags live AFTER current position
+    let i: i32 = n - 1;
+    while (i >= 0) {
+        let k: i32 = get[AInstr](prog, i).kind;
+        if (aopt_is_breaker(k) == 1) {
+            // This breaker determines the flag live-out of the run before it.
+            live = aopt_flags_survive(k);
+        } else {
+            let w: i32 = aopt_writes_flags(k);
+            let r: i32 = aopt_reads_flags(k);
+            if (w == 1) {
+                if (live == 0) { set[i32](flags_dead, i, 1); }
+            }
+            // live-in of i (= live-out of i-1): a reader makes flags live; a pure
+            // writer kills upward liveness; anything else leaves it unchanged.
+            if (r == 1) { live = 1; }
+            else { if (w == 1) { live = 0; } }
+        }
+        i = i - 1;
+    }
+}
+
+// ── invalidate the constant-knowledge an OPAQUE instruction destroys ─────────
+// For instructions the forward pass does not interpret, we forget the constant
+// value of every GPR they may write. Kinds whose GPR write-set is known exactly
+// invalidate just those — including the two kinds that aarch64.zag lowers
+// through the x9/x10 scratch (AK_AND_IMM's mask, and a wide AK_CMP_IMM's
+// immediate). AArch64 has ONE register file, so every float or vector kind
+// clobbers the GPRs it names, and we do not attempt to track which: those fall
+// through to the safe default of forgetting EVERYTHING. We never keep a stale
+// constant, which is the only failure mode that would miscompile.
+fn aopt_invalidate(known: *ArrayList[i32], ins: AInstr) void {
+    let k: i32 = ins.kind;
+    if (k == AK_LOAD() || k == AK_LOADB() || k == AK_LOADH() || k == AK_LOADW()) {
+        aopt_forget(known, ins.dst); return;
+    }
+    if (k == AK_SXTW() || k == AK_SXTB() || k == AK_SXTH() || k == AK_REV64() ||
+        k == AK_CLZ64() || k == AK_RBIT64() || k == AK_LSL_IMM()) {
+        aopt_forget(known, ins.dst); return;
+    }
+    if (k == AK_LDAR() || k == AK_LDAXR() || k == AK_MRS_CNTVCT() || k == AK_MRS_CNTFRQ()) {
+        aopt_forget(known, ins.dst); return;
+    }
+    if (k == AK_STLXR()) { aopt_forget(known, ins.dst); return; }
+    if (k == AK_LEA_LBL() || k == AK_DATA_ADDR()) { aopt_forget(known, ins.dst); return; }
+    if (k == AK_STORE() || k == AK_STOREB() || k == AK_STOREH() || k == AK_STOREW() ||
+        k == AK_STLR() || k == AK_PREFETCH() || k == AK_PUSH() || k == AK_DMB()) {
+        return;                                    // writes memory only
+    }
+    if (k == AK_CMP_RR()) { return; }              // writes no GPR
+    if (k == AK_CMP_IMM()) {
+        // aarch64.zag materializes an immediate outside 0..4095 in x9/x10.
+        aopt_forget(known, A_X9());
+        aopt_forget(known, A_X10());
+        return;
+    }
+    if (k == AK_AND_IMM()) {
+        // aarch64.zag materializes the mask through x9, or x10 when dst is x9.
+        aopt_forget(known, A_X9());
+        aopt_forget(known, A_X10());
+        aopt_forget(known, ins.dst);
+        return;
+    }
+    // Float/vector kinds: the unified register file means `v(dst)` IS `x(dst)`,
+    // and FMOV_XD additionally clobbers the GPR whose number names the source
+    // vector register. Unknown kinds join them: forget everything.
+    aopt_reset_i32(known);
+}
+
+// ── does instruction `ins` READ register r? (GPR read-set, conservative) ─────
+// Used only to GATE the immediate form (a decision that is semantics-neutral
+// either way), so an over-approximation merely misses an optimization — it can
+// never miscompile. Unknown kinds are treated as reading r.
+fn aopt_reads_reg(ins: AInstr, r: i32) i32 {
+    let k: i32 = ins.kind;
+    let d: i32 = ins.dst;
+    let s: i32 = ins.src;
+    if (k == AK_MOV_IMM() || k == AK_MOV_RR()) { return 0; }
+    if (k == AK_ADD_RR() || k == AK_SUB_RR() || k == AK_XOR_RR() || k == AK_OR_RR() ||
+        k == AK_ANDR_RR() || k == AK_SHL_RR() || k == AK_SHR_RR() || k == AK_LSHR_RR()) {
+        if (d == r) { return 1; } if (s == r) { return 1; } return 0;
+    }
+    if (k == AK_ADD_IMM() || k == AK_SUB_IMM() || k == AK_AND_IMM()) { if (d == r) { return 1; } return 0; }
+    if (k == AK_CMP_RR())  { if (d == r) { return 1; } if (s == r) { return 1; } return 0; }
+    if (k == AK_CMP_IMM()) { if (d == r) { return 1; } return 0; }
+    if (k == AK_MUL_RR() || k == AK_SDIV()) {
+        if (s == r) { return 1; } if (aopt_third_reg(ins) == r) { return 1; } return 0;
+    }
+    if (k == AK_NEG())     { if (s == r) { return 1; } return 0; }
+    if (k == AK_PUSH())    { if (d == r) { return 1; } return 0; }
+    if (k == AK_POP())     { return 0; }
+    if (k == AK_LOAD() || k == AK_LOADB() || k == AK_LOADH() || k == AK_LOADW()) {
+        if (s == r) { return 1; } return 0;
+    }
+    if (k == AK_STORE() || k == AK_STOREB() || k == AK_STOREH() || k == AK_STOREW()) {
+        if (d == r) { return 1; } if (s == r) { return 1; } return 0;
+    }
+    if (k == AK_STLR()) { if (d == r) { return 1; } if (s == r) { return 1; } return 0; }
+    if (k == AK_SXTW() || k == AK_SXTB() || k == AK_SXTH() || k == AK_REV64() ||
+        k == AK_CLZ64() || k == AK_RBIT64() || k == AK_LSL_IMM()) {
+        if (s == r) { return 1; } return 0;
+    }
+    if (k == AK_SCVTF() || k == AK_FCVTZS()) { if (s == r) { return 1; } return 0; }
+    if (k == AK_PREFETCH()) { if (s == r) { return 1; } return 0; }
+    return 1;   // unknown → assume it reads r (gate stays off — safe)
+}
+
+// ── does instruction `ins` OVERWRITE register r without reading it first? ───
+// (Used only for the immediate-form gate.) A clean kill makes r's prior value
+// dead, so the constant load that fed it becomes removable.
+fn aopt_writes_reg(ins: AInstr, r: i32) i32 {
+    let k: i32 = ins.kind;
+    if (k == AK_MOV_IMM() || k == AK_MOV_RR() || k == AK_POP() ||
+        k == AK_LOAD() || k == AK_LOADB() || k == AK_LOADH() || k == AK_LOADW() ||
+        k == AK_SXTW() || k == AK_SXTB() || k == AK_SXTH() || k == AK_REV64() ||
+        k == AK_CLZ64() || k == AK_RBIT64() || k == AK_LSL_IMM() ||
+        k == AK_LDAR() || k == AK_LDAXR() || k == AK_MRS_CNTVCT() ||
+        k == AK_MRS_CNTFRQ() || k == AK_LEA_LBL() || k == AK_DATA_ADDR()) {
+        if (ins.dst == r) { return 1; } return 0;
+    }
+    if (k == AK_AND_IMM()) {
+        if (ins.dst == r) { return 1; }
+        if (r == A_X9()) { return 1; }
+        if (r == A_X10()) { return 1; }
+        return 0;
+    }
+    if (k == AK_CMP_IMM()) {
+        if (r == A_X9()) { return 1; }
+        if (r == A_X10()) { return 1; }
+        return 0;
+    }
+    if (k == AK_MUL_RR() || k == AK_SDIV()) { if (ins.dst == r) { return 1; } return 0; }
+    if (k == AK_NEG())   { if (ins.dst == r) { return 1; } return 0; }
+    if (k == AK_STLXR()) { if (ins.dst == r) { return 1; } return 0; }
+    return 0;
+}
+
+// ── could instruction `ins` WRITE register R? (CONSERVATIVE over-approx) ─────
+// Used to prove a copy source survives a push→pop gap unchanged: if this ever
+// answers 1 for any instruction in the gap, we DO NOT rematerialize.
+// Unknown kinds and breakers answer 1 (assume they clobber R) — safe.
+fn aopt_reg_written(ins: AInstr, R: i32) i32 {
+    let k: i32 = ins.kind;
+    if (k == AK_MOV_IMM() || k == AK_MOV_RR() || k == AK_ADD_RR() || k == AK_SUB_RR() ||
+        k == AK_MUL_RR() || k == AK_SDIV()  || k == AK_XOR_RR() || k == AK_OR_RR()  ||
+        k == AK_ANDR_RR() || k == AK_SHL_RR() || k == AK_SHR_RR() || k == AK_LSHR_RR() ||
+        k == AK_ADD_IMM() || k == AK_SUB_IMM() || k == AK_POP()  || k == AK_LOAD() ||
+        k == AK_LOADB() || k == AK_LOADH() || k == AK_LOADW() || k == AK_NEG()  ||
+        k == AK_SXTW() || k == AK_SXTB() || k == AK_SXTH() || k == AK_REV64() ||
+        k == AK_CLZ64() || k == AK_RBIT64() || k == AK_LSL_IMM() || k == AK_LEA_LBL() ||
+        k == AK_DATA_ADDR() || k == AK_LDAR() || k == AK_LDAXR() || k == AK_MRS_CNTVCT() ||
+        k == AK_MRS_CNTFRQ()) {
+        if (ins.dst == R) { return 1; }
+        if (k == AK_MUL_RR() || k == AK_SDIV()) { if (aopt_third_reg(ins) == R) { return 1; } }
+        return 0;
+    }
+    if (k == AK_AND_IMM()) {
+        if (ins.dst == R) { return 1; }
+        if (R == A_X9()) { return 1; }
+        if (R == A_X10()) { return 1; }
+        return 0;
+    }
+    if (k == AK_STLXR()) {
+        if (ins.dst == R) { return 1; }
+        if (aopt_third_reg(ins) == R) { return 1; }
+        return 0;
+    }
+    if (k == AK_CMP_RR() || k == AK_CMP_IMM() || k == AK_PUSH() || k == AK_STORE() ||
+        k == AK_STOREB() || k == AK_STOREH() || k == AK_STOREW() || k == AK_STLR() ||
+        k == AK_PREFETCH() || k == AK_DMB()) {
+        // Flag-only, memory-only and pure-read kinds write no GPR of their own;
+        // the two scratch-using encodings (aarch64.zag lowering AK_AND_IMM and a
+        // wide AK_CMP_IMM through x9/x10) are handled above and so never reach
+        // this list. Vector kinds are NOT listed: the unified register file
+        // means a vector op writing v(R) writes x(R).
+        return 0;
+    }
+    return 1;   // breaker / float / vector / unknown → assume it writes R
+}
+
+// Is register R possibly written anywhere in the OPEN gap (p, q)?
+fn aopt_reg_written_in(prog: ArrayList[AInstr], p: i32, q: i32, R: i32) i32 {
+    let i: i32 = p + 1;
+    while (i < q) {
+        if (aopt_reg_written(get[AInstr](prog, i), R) == 1) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ── will the source register's constant-load be REMOVABLE after immediate form?
+// We only convert `op dst, src` (src a known constant) to its immediate form when
+// the freed `src` register is OVERWRITTEN before any read AND before the run's
+// next breaker — i.e. the constant load that fed it is dead and the run-scoped
+// DCE will delete it. Otherwise the immediate form would strand a now-dead (and,
+// near a call/branch, un-removable) `mov src, c`, GROWING the code; in that case
+// we keep the register form (where that same load is still used) — no regression.
+fn aopt_src_killed_in_run(prog: ArrayList[AInstr], op: i32, src: i32, n: i32) i32 {
+    let i: i32 = op + 1;
+    let res: i32 = 0;
+    let going: i32 = 1;
+    while (going == 1 && i < n) {
+        let ins: AInstr = get[AInstr](prog, i);
+        if (aopt_is_breaker(ins.kind) == 1) { going = 0; }
+        else {
+            if (aopt_reads_reg(ins, src) == 1) { going = 0; }                    // still needed
+            else { if (aopt_writes_reg(ins, src) == 1) { res = 1; going = 0; } } // killed → removable
+        }
+        i = i + 1;
+    }
+    return res;
+}
+
+// ── THE FORWARD PASS: stack elimination + constant folding + immediate form ──
+fn aopt_fold_pass(prog: ArrayList[AInstr]) ArrayList[AInstr] {
+    let n: i32 = len[AInstr](prog);
+    let out: ArrayList[AInstr] = make[AInstr](n + 16);
+
+    // pre-computed analyses
+    let matched: ArrayList[i32] = make[i32](n + 1);
+    let pop_of:  ArrayList[i32] = make[i32](n + 1);
+    let flagsd:  ArrayList[i32] = make[i32](n + 1);
+    let z: i32 = 0;
+    while (z < n) {
+        push[i32](&matched, 0);
+        push[i32](&pop_of, 0 - 1);
+        push[i32](&flagsd, 0);
+        z = z + 1;
+    }
+    aopt_prescan_matched(prog, n, &matched, &pop_of);
+    aopt_prescan_flags(prog, n, &flagsd);
+
+    // forward register/stack state
+    let known: ArrayList[i32] = aopt_mk_i32();   // 1 ⟺ cval[r] is a known const
+    let cval:  ArrayList[i64] = aopt_mk_i64();   // the known constant
+    let ms_tag: ArrayList[i32] = make[i32](16);  // model stack: 1=CONST, 2=COPY, 0=KEEP
+    let ms_val: ArrayList[i64] = make[i64](16);
+
+    let i: i32 = 0;
+    while (i < n) {
+        let ins: AInstr = get[AInstr](prog, i);
+        let k: i32 = ins.kind;
+
+        if (aopt_is_breaker(k) == 1) {
+            // Cross a run boundary: emit verbatim, forget all constants, empty
+            // the model stack (any leftover entries are KEEP pushes whose real
+            // value still sits on the expression stack for a later run to pop).
+            push[AInstr](&out, ins);
+            aopt_reset_i32(&known);
+            aopt_clear_i32(&ms_tag);
+            aopt_clear_i64(&ms_val);
+
+        } else { if (k == AK_PUSH()) {
+            let r: i32 = ins.dst;
+            let done: i32 = 0;
+            // A push of a RESERVED register is never touched: x28 is the
+            // expression stack pointer itself and 29/30/31 carry meaning we do
+            // not model. Keep the push, keep the model entry as KEEP.
+            if (aopt_free(r) == 0) {
+                push[i32](&ms_tag, 0);
+                push[i64](&ms_val, 0);
+                push[AInstr](&out, ins);
+
+            } else {
+                // (1) CONSTANT rematerialization: r holds a known constant and
+                //     its pop is in-run over an x28-clean gap → delete, remat the
+                //     pop as `mov r, const`.
+                if (done == 0 && get[i32](matched, i) == 1 && aopt_known_get(known, r) == 1) {
+                    if (aopt_gap_clean(prog, i, get[i32](pop_of, i)) == 1) {
+                        push[i32](&ms_tag, 1);
+                        push[i64](&ms_val, aopt_val_get(cval, r));
+                        done = 1;
+                    }
+                }
+                // (2) REGISTER-COPY rematerialization: the push is fed by an
+                //     adjacent `mov r, R` and R survives the whole (x28-clean)
+                //     gap unwritten → delete, remat the pop as `mov rY, R`.
+                //     Equivalent: the pushed value WAS R's value, R is unchanged
+                //     at the pop, so reloading rY from R reproduces it. The
+                //     feeding mov then dies in DCE.
+                if (done == 0 && get[i32](matched, i) == 1 && i > 0) {
+                    let prev: AInstr = get[AInstr](prog, i - 1);
+                    if (prev.kind == AK_MOV_RR() && prev.dst == r && aopt_free(prev.src) == 1 && prev.src != r) {
+                        let q: i32 = get[i32](pop_of, i);
+                        if (aopt_gap_clean(prog, i, q) == 1 && aopt_reg_written_in(prog, i, q, prev.src) == 0) {
+                            push[i32](&ms_tag, 2);
+                            push[i64](&ms_val, prev.src as i64);
+                            done = 1;
+                        }
+                    }
+                }
+                // (3) KEEP: emit the real push, record a placeholder model entry.
+                if (done == 0) {
+                    push[i32](&ms_tag, 0);
+                    push[i64](&ms_val, 0);
+                    push[AInstr](&out, ins);
+                }
+            }
+
+        } else { if (k == AK_POP()) {
+            let r: i32 = ins.dst;
+            // A pop into a reserved register is emitted verbatim: there is no
+            // constant knowledge to propagate and none may be invented.
+            if (aopt_free(r) == 0) {
+                push[AInstr](&out, ins);
+                aopt_forget(&known, r);
+            } else {
+                if (len[i32](ms_tag) > 0) {
+                    let tag: i32 = pop[i32](&ms_tag);
+                    let v:   i64 = pop[i64](&ms_val);
+                    if (tag == 1) {
+                        // matching push was a deleted constant — rematerialize it.
+                        push[AInstr](&out, ai_mov_imm(r, v));
+                        aopt_remember(&known, &cval, r, v);
+                    } else { if (tag == 2) {
+                        // matching push was a deleted register copy — reload from R.
+                        push[AInstr](&out, ai_mov_rr(r, v as i32));
+                        aopt_forget(&known, r);
+                    } else {
+                        push[AInstr](&out, ins);
+                        aopt_forget(&known, r);
+                    } }
+                } else {
+                    // external pop (matches a push from before this run) — keep it.
+                    push[AInstr](&out, ins);
+                    aopt_forget(&known, r);
+                }
+            }
+
+        } else { if (k == AK_ADD_RR() || k == AK_SUB_RR()) {
+            let d: i32 = ins.dst;
+            let s: i32 = ins.src;
+            let dk: i32 = aopt_known_get(known, d);
+            let sk: i32 = aopt_known_get(known, s);
+            if (dk == 1 && sk == 1 && get[i32](flagsd, i) == 1) {
+                // Both operands constant and the flags we would drop are dead →
+                // fold to `mov d, <folded>`. `mov` writes no NZCV, which is
+                // exactly why the flags-dead gate is required.
+                let fv: i64 = aopt_fold(k, aopt_val_get(cval, d), aopt_val_get(cval, s));
+                push[AInstr](&out, ai_mov_imm(d, fv));
+                aopt_remember(&known, &cval, d, fv);
+            } else { if (sk == 1 && aopt_free(d) == 1 && aopt_fits_imm12(aopt_val_get(cval, s)) == 1 && aopt_src_killed_in_run(prog, i, s, n) == 1) {
+                // Source constant AND its load is dead afterwards → immediate
+                // form (drops the source-register dependency; the load is DCE'd).
+                // AK_ADD_IMM/AK_SUB_IMM set NZCV exactly like the register form,
+                // so flag semantics are preserved and no deadness gate applies.
+                // The immediates are the same value the encoding can express
+                // (aopt_fits_imm12) and dst is not a reserved register, so the
+                // result cannot be larger than what it replaces.
+                if (k == AK_ADD_RR()) { push[AInstr](&out, ai_add_imm(d, aopt_val_get(cval, s))); }
+                else                 { push[AInstr](&out, ai_sub_imm(d, aopt_val_get(cval, s))); }
+                // dst is both source and destination here, so a known dst stays
+                // known with the folded-in value.
+                if (dk == 1) {
+                    if (k == AK_ADD_RR()) { aopt_remember(&known, &cval, d, aopt_val_get(cval, d) + aopt_val_get(cval, s)); }
+                    else                 { aopt_remember(&known, &cval, d, aopt_val_get(cval, d) - aopt_val_get(cval, s)); }
+                } else {
+                    aopt_forget(&known, d);
+                }
+            } else {
+                push[AInstr](&out, ins);
+                aopt_forget(&known, d);
+            } }
+
+        } else { if (k == AK_MUL_RR() || k == AK_SDIV()) {
+            let d2: i32 = ins.dst;
+            let s2: i32 = ins.src;
+            let b2: i32 = aopt_third_reg(ins);
+            let dk2: i32 = aopt_known_get(known, s2);
+            let sk2: i32 = aopt_known_get(known, b2);
+            // MADD/SDIV write no NZCV, so no deadness gate is needed for the
+            // fold: the only thing the register form defines is dst.
+            let folded: i64 = 0;
+            let do_fold: i32 = 0;
+            if (dk2 == 1 && sk2 == 1 && aopt_free(d2) == 1) {
+                if (k == AK_MUL_RR()) {
+                    folded = aopt_val_get(cval, s2) * aopt_val_get(cval, b2);
+                    do_fold = 1;
+                } else {
+                    let dv: i64 = aopt_val_get(cval, b2);
+                    // SDIV by zero, and SDIV of INT64_MIN by -1, are not folded:
+                    // the host would trap where the hardware returns a value.
+                    let minv: i64 = 0 - 9223372036854775807 - 1;
+                    if (dv != 0) {
+                        if (aopt_val_get(cval, s2) == minv && dv == 0 - 1) {
+                            do_fold = 0;
+                        } else {
+                            folded = aopt_val_get(cval, s2) / dv;
+                            do_fold = 1;
+                        }
+                    }
+                }
+            }
+            if (do_fold == 1) {
+                push[AInstr](&out, ai_mov_imm(d2, folded));
+                aopt_remember(&known, &cval, d2, folded);
+            } else {
+                push[AInstr](&out, ins);
+                aopt_forget(&known, d2);
+            }
+
+        } else { if (k == AK_AND_IMM() || k == AK_XOR_RR() || k == AK_OR_RR() ||
+                      k == AK_ANDR_RR() || k == AK_SHL_RR() || k == AK_SHR_RR() ||
+                      k == AK_LSHR_RR() || k == AK_NEG()) {
+            // Not folded: we avoid bitwise folds (and NEG, whose flags would
+            // have to be dead as well) — matching the x86 pass, which folds only
+            // +,-,*. AK_AND_IMM additionally clobbers the x9/x10 scratch.
+            push[AInstr](&out, ins);
+            aopt_forget(&known, ins.dst);
+            if (k == AK_AND_IMM()) {
+                aopt_forget(&known, A_X9());
+                aopt_forget(&known, A_X10());
+            }
+
+        } else { if (k == AK_CMP_RR()) {
+            // cmp writes no register, so the constant state is unchanged. An
+            // immediate compare yields identical NZCV and frees the source
+            // register; AK_CMP_IMM is exact for any i64 in aarch64.zag (a wide
+            // immediate goes through a scratch mov), so no range gate is needed.
+            // Gated so the freed source's load is provably removable.
+            if (aopt_known_get(known, ins.src) == 1 && aopt_src_killed_in_run(prog, i, ins.src, n) == 1) {
+                push[AInstr](&out, ai_cmp_imm(ins.dst, aopt_val_get(cval, ins.src)));
+            } else {
+                push[AInstr](&out, ins);
+            }
+
+        } else { if (k == AK_MOV_IMM()) {
+            push[AInstr](&out, ins);
+            aopt_remember(&known, &cval, ins.dst, ins.imm);
+
+        } else { if (k == AK_MOV_RR()) {
+            // Emit verbatim, but PROPAGATE the source's known-ness so downstream
+            // folds can fire (the mov itself becomes dead and is dropped by DCE).
+            push[AInstr](&out, ins);
+            if (aopt_known_get(known, ins.src) == 1) {
+                aopt_remember(&known, &cval, ins.dst, aopt_val_get(cval, ins.src));
+            } else {
+                aopt_forget(&known, ins.dst);
+            }
+
+        } else { if (k == AK_ADD_IMM() || k == AK_SUB_IMM()) {
+            let d3: i32 = ins.dst;
+            // The immediate-form encoding is only faithful for 0..4095 (see
+            // aopt_fits_imm12), so folding d + imm to `mov d, c + imm` — which
+            // reads the FULL i64 out of the AInstr — is only legal inside that
+            // range. Outside it the instruction is emitted verbatim and d is
+            // forgotten. AK_MOV_IMM itself has no such limit (emit_mov_imm64
+            // decomposes all 64 bits into movz/movk), which is why the folded
+            // VALUE may be any i64 while the folded immediate may not.
+            if (aopt_known_get(known, d3) == 1 && get[i32](flagsd, i) == 1 && aopt_fits_imm12(ins.imm) == 1) {
+                let nv: i64 = aopt_val_get(cval, d3);
+                if (k == AK_ADD_IMM()) { nv = nv + ins.imm; } else { nv = nv - ins.imm; }
+                push[AInstr](&out, ai_mov_imm(d3, nv));
+                aopt_remember(&known, &cval, d3, nv);
+            } else {
+                push[AInstr](&out, ins);
+                aopt_forget(&known, d3);
+            }
+
+        } else {
+            // OPAQUE (loads/stores/lea/atomics/float/vector/...): emit verbatim
+            // and forget the constants it may clobber.
+            push[AInstr](&out, ins);
+            aopt_invalidate(&known, ins);
+        } } } } } } } } } }
+
+        i = i + 1;
+    }
+
+    free[i32](&matched);
+    free[i32](&pop_of);
+    free[i32](&flagsd);
+    free[i32](&known);
+    free[i64](&cval);
+    free[i32](&ms_tag);
+    free[i64](&ms_val);
+    return out;
+}
+
+// ── BACKWARD DCE: drop dead pure-register writes (run-scoped) ─────────────────
+// Removes a `mov_imm`/`mov_rr` whose destination register is dead — overwritten
+// later in the run before any read. Live-out of a run is ALL registers
+// (conservative). Any instruction not modeled as a pure register write is
+// treated as reading all registers (so nothing it might consume is removed). We
+// only ever remove flag-free, memory-free moves, so flags and memory are intact.
+//
+// The reserved registers (x28 stack pointer, x29 frame pointer, x30 link
+// register, 31) are pinned live for the whole sweep: a `mov` targeting one is
+// never removable, whatever the surrounding analysis says.
+fn aopt_dce_live_set(live: *ArrayList[i32], r: i32) void {
+    if (aopt_free(r) == 0) { return; }
+    set[i32](live, r, 1);
+}
+fn aopt_dce_live_clear(live: *ArrayList[i32], r: i32) void {
+    if (aopt_free(r) == 0) { return; }
+    set[i32](live, r, 0);
+}
+fn aopt_dce_live_all(live: *ArrayList[i32]) void {
+    let r: i32 = 0;
+    while (r < aopt_nregs()) { set[i32](live, r, 1); r = r + 1; }
+}
+
+// Update register liveness for a KEPT, non-removable instruction (write-set
+// killed first, then read-set made live; a register both read and written stays
+// live). Unknown kinds are treated as reading every register (safe
+// over-approximation). Note the UNIFICATION: every AK_F*/AK_V* kind falls into
+// that default, so a float or vector instruction is never assumed to leave a GPR
+// alone.
+fn aopt_dce_liveness(live: *ArrayList[i32], ins: AInstr) void {
+    let k: i32 = ins.kind;
+    let d: i32 = ins.dst;
+    let s: i32 = ins.src;
+    if (k == AK_MOV_IMM()) { aopt_dce_live_clear(live, d); return; }
+    if (k == AK_MOV_RR())  { aopt_dce_live_clear(live, d); aopt_dce_live_set(live, s); return; }
+    // push/pop move x28, so they are never removable — model that by pinning
+    // x28 live and giving the other operand its read/write behaviour.
+    if (k == AK_PUSH()) { aopt_dce_live_set(live, d); return; }
+    if (k == AK_POP())  { aopt_dce_live_clear(live, d); return; }
+    // read-modify-write two-address GPR forms
+    //
+    // These two families LOOK alike in the IR but not in the encoding, and
+    // conflating them silently miscompiles. The eight `_RR` forms encode
+    // `add xd, xd, xm` -- dst is destination AND first source, and `src` is a
+    // genuine second source (aarch64.zag:1089 and the eor/orr/and/lslv/asrv/
+    // lsrv rows). The three `_IMM` forms encode `add xd, xd, #imm`, which reads
+    // dst only and has no source register at all.
+    //
+    // So `_RR` must mark `src` live. Omitting that made a rematerialized
+    // `mov x1, C` look dead in front of `add x0, x1`, and DCE deleted it --
+    // leaving `add` to read an unwritten x1. That is a wrong-answer bug with no
+    // crash and no diagnostic: `b = b + 5000` evaluated to `b`.
+    if (k == AK_ADD_RR() || k == AK_SUB_RR() || k == AK_XOR_RR() || k == AK_OR_RR() ||
+        k == AK_ANDR_RR() || k == AK_SHL_RR() || k == AK_SHR_RR() || k == AK_LSHR_RR()) {
+        aopt_dce_live_set(live, d);
+        aopt_dce_live_set(live, s);
+        return;
+    }
+    if (k == AK_ADD_IMM() || k == AK_SUB_IMM()) {
+        aopt_dce_live_set(live, d);
+        return;
+    }
+    if (k == AK_AND_IMM()) {
+        aopt_dce_live_set(live, d);
+        // aarch64.zag materializes the mask through x9 (or x10 if dst is x9).
+        aopt_dce_live_set(live, A_X9());
+        aopt_dce_live_set(live, A_X10());
+        return;
+    }
+    if (k == AK_CMP_RR())  { aopt_dce_live_set(live, d); aopt_dce_live_set(live, s); return; }
+    if (k == AK_CMP_IMM()) {
+        aopt_dce_live_set(live, d);
+        aopt_dce_live_set(live, A_X9());
+        aopt_dce_live_set(live, A_X10());
+        return;
+    }
+    if (k == AK_MUL_RR() || k == AK_SDIV()) {
+        aopt_dce_live_clear(live, d);
+        aopt_dce_live_set(live, s);
+        aopt_dce_live_set(live, aopt_third_reg(ins));
+        return;
+    }
+    if (k == AK_NEG()) { aopt_dce_live_clear(live, d); aopt_dce_live_set(live, s); return; }
+    // loads: dst written, src (base) read
+    if (k == AK_LOAD() || k == AK_LOADB() || k == AK_LOADH() || k == AK_LOADW() ||
+        k == AK_LDAR() || k == AK_LDAXR()) {
+        aopt_dce_live_clear(live, d);
+        aopt_dce_live_set(live, s);
+        return;
+    }
+    // one-source pure GPR ops
+    if (k == AK_SXTW() || k == AK_SXTB() || k == AK_SXTH() || k == AK_REV64() ||
+        k == AK_CLZ64() || k == AK_RBIT64() || k == AK_LSL_IMM() ||
+        k == AK_LEA_LBL() || k == AK_DATA_ADDR() || k == AK_MRS_CNTVCT() ||
+        k == AK_MRS_CNTFRQ()) {
+        aopt_dce_live_clear(live, d);
+        aopt_dce_live_set(live, s);
+        return;
+    }
+    // stores and other pure reads: every register they name stays live
+    if (k == AK_STORE() || k == AK_STOREB() || k == AK_STOREH() || k == AK_STOREW() ||
+        k == AK_STLR()) {
+        aopt_dce_live_set(live, d);
+        aopt_dce_live_set(live, s);
+        return;
+    }
+    if (k == AK_STLXR()) {
+        aopt_dce_live_clear(live, d);
+        aopt_dce_live_set(live, s);
+        aopt_dce_live_set(live, aopt_third_reg(ins));
+        return;
+    }
+    if (k == AK_PREFETCH()) { aopt_dce_live_set(live, s); return; }
+    if (k == AK_DMB()) { return; }
+    // Unknown, float, vector, or any kind this pass does not model: assume it
+    // reads every register, so nothing before it can be considered dead.
+    aopt_dce_live_all(live);
+}
+
+fn aopt_dce(prog: ArrayList[AInstr]) ArrayList[AInstr] {
+    let n: i32 = len[AInstr](prog);
+    let keep: ArrayList[i32] = make[i32](n + 1);
+    let live: ArrayList[i32] = aopt_mk_i32();
+    let z: i32 = 0;
+    while (z < n) { push[i32](&keep, 1); z = z + 1; }
+
+    // assume every register live at end of program
+    aopt_dce_live_all(&live);
+
+    let i: i32 = n - 1;
+    while (i >= 0) {
+        let ins: AInstr = get[AInstr](prog, i);
+        let k: i32 = ins.kind;
+
+        if (aopt_is_breaker(k) == 1) {
+            // run boundary → conservative live-out (all registers live)
+            aopt_dce_live_all(&live);
+        } else { if ((k == AK_MOV_IMM() || k == AK_MOV_RR()) && aopt_free(ins.dst) == 1) {
+            let d: i32 = ins.dst;
+            if (get[i32](live, d) == 0) {
+                set[i32](&keep, i, 0);             // dead pure write → remove
+            } else {
+                // kept: kill dst, then mark the source read
+                aopt_dce_live_clear(&live, d);
+                if (k == AK_MOV_RR()) { aopt_dce_live_set(&live, ins.src); }
+            }
+        } else {
+            // any other kept instruction: apply its GPR read/write liveness
+            aopt_dce_liveness(&live, ins);
+        } }
+
+        i = i - 1;
+    }
+
+    let out: ArrayList[AInstr] = make[AInstr](n + 1);
+    let j: i32 = 0;
+    while (j < n) {
+        if (get[i32](keep, j) == 1) { push[AInstr](&out, get[AInstr](prog, j)); }
+        j = j + 1;
+    }
+    free[i32](&keep);
+    free[i32](&live);
+    return out;
+}
+
+// ── public entry: fold pass then dead-code elimination ───────────────────────
+fn aoptimize(prog: ArrayList[AInstr]) ArrayList[AInstr] {
+    let folded: ArrayList[AInstr] = aopt_fold_pass(prog);
+    let cleaned: ArrayList[AInstr] = aopt_dce(folded);
+    free[AInstr](&folded);
+    return cleaned;
+}

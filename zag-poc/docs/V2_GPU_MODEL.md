@@ -21,7 +21,8 @@ override and reset-risk acknowledgement even for that preflight, and the
 preflight still reports native submission as unimplemented. The MLIR path
 remains a development frontend, not a runtime API. Vulkan, OpenGL, and OpenCL
 compat paths have bounded loader-backed runtime gates and a shared typed
-launch/readback contract; they remain separate from native DRM. On this card,
+launch/readback contract; Apple Silicon Metal uses the same contract through
+its native Metal.framework adapter. They remain separate from native DRM. On this card,
 tests use tiny buffers, external subprocess timeouts, and explicit opt-in.
 Missing compatible hardware is an explicit skip; MLIR emission is reported
 separately from target binary, load, launch, and correct output.
@@ -61,7 +62,7 @@ emitted, MLIR verified, target binary produced, runtime loaded, kernel launched,
 results checked, and performance measured.  Current GPU bundle/VM facilities
 are not a physical GPU runtime.
 
-### Compat tier runtime verification status (2026-08-04)
+### Loader-backed and first-class Metal runtime verification status (2026-09-06)
 
 | Target | Encoder validated | Runtime loaded | Kernel launched | Output verified | Test machine |
 |--------|:-:|:-:|:-:|:-:|---|
@@ -69,7 +70,8 @@ are not a physical GPU runtime.
 | **opengl-compat** | GLSL structural checks; generated EGL harness compiles | verified | verified | verified (1024/1024) | AMD RX 5700 XT, Mesa 4.6 Core, EGL 1.5 |
 | **opencl-compat** | spirv-val opencl2.0; pure-Zag source fallback and generated ICD probe compile | verified | verified | verified (1024/1024, source fallback) | AMD RX 5700 XT, ROCm OpenCL 2.1 |
 | **cuda-compat** | structural checks | NO | NO | NO | Needs contributor with NVIDIA GPU |
-| **metal-compat** | structural checks | NO | NO | NO | Needs contributor with macOS/Metal |
+| **gpu-metal** | deterministic fill/depth/blend MSL plus runtime source compilation | verified | verified | verified (1024/1024 fill plus depth and alpha 0/128/256 blend witnesses) | Apple Silicon macOS, native Metal.framework adapter |
+| **metal-compat** | same compiler-owned MSL encoder through the legacy target spelling | verified | verified | verified (same adapter) | Apple Silicon macOS; compatibility alias for `gpu-metal` |
 
 The `tests/run_gpu_runtime.sh` gate generates transient C harnesses; the
 checked-in `tests/run_gpu_zag_runtime.sh` links the public pure-Zag loaders
@@ -87,11 +89,13 @@ that cannot afford worker threads after the generated Linux `exit` may call
 the explicit shutdown-process helper, which closes the context then uses
 `exit_group`.
 
-**Vulkan, OpenGL, and OpenCL are runtime-verified on this machine; CUDA and
-Metal are intentionally fail-closed here.** The public Vulkan, OpenGL, and
-OpenCL loader names are thin imports of their compileable `*_runtime.zag`
-adapters. CUDA and Metal remain artifact-only because this Linux machine has
-neither the required NVIDIA driver/hardware nor Apple's Metal framework.
+**Vulkan, OpenGL, and OpenCL are runtime-verified on the Linux reference
+machine; first-class `gpu-metal` is runtime-verified on physical Apple
+Silicon.** The public loader adapters enforce bounded launch/readback contracts
+at their native driver boundaries. Metal additionally has exact physical
+depth-write and fixed-point packed-RGB blend parity witnesses. CUDA remains
+artifact-only until a compatible NVIDIA host supplies physical execution
+evidence.
 
 **We need contributors with the right hardware to help.** Specifically:
 
@@ -104,20 +108,17 @@ neither the required NVIDIA driver/hardware nor Apple's Metal framework.
   to actually probe for `libcuda.so.1`, and verify the PTX kernel runs and
   produces correct output.
 
-- **Metal:** Someone with a Mac (M-series or Intel). The task is to
-  implement the real Objective-C dispatch in `std/metal_loader.zag`
-  (replacing the stub), run `tests/run_metal_mac.sh`, and verify the MSL
-  kernel runs and produces correct output on the physical GPU.
-
 If you have one of these machines and want to help, please open an issue or
 pull request. The Vulkan and OpenGL backends serve as the reference
 implementation for what a verified backend looks like.
 
-## Compat tier known quirks and blockers
+## Loader-backed tier known quirks and blockers
 
-The compat fallback tier emits code for system GPU APIs (Vulkan, OpenCL, Metal,
-OpenGL, CUDA) via pure-Zag encoders.  The emitted binaries are validated where
-tooling is available, but several platform-level quirks affect runtime loading:
+The loader-backed targets emit code for system GPU APIs (Vulkan, OpenCL,
+OpenGL, CUDA) via pure-Zag encoders. Metal uses the same model underneath its
+first-class `gpu-metal` target; `metal-compat` remains an alias. The emitted
+artifacts are validated where tooling is available, but several platform-level
+quirks affect runtime loading:
 
 ### SPIR-V (Vulkan)
 
@@ -168,18 +169,20 @@ tooling is available, but several platform-level quirks affect runtime loading:
   on macOS 10.11+ accept this.  `metal_stdlib` is included via
   `#include <metal_stdlib>`.
 
-* **Device enumeration.** On macOS, `MTLCreateSystemDefaultDevice()` returns
-  the default GPU.  For multi-GPU systems (e.g., MacBook Pro with integrated
-  + discrete), `MTLCopyAllDevices()` enumerates all available Metal devices.
-  The loader documents this in `std/metal_loader.zag`.
+* **Device and memory capability probing.** The Apple-Silicon adapter uses
+  `MTLCreateSystemDefaultDevice()`, validates command-queue creation, records
+  the registry ID, unified-memory status, maximum buffer length, and recommended
+  working-set size, and performs the same bounded 4 KiB CPU-visible memory
+  roundtrip envelope used by the Linux native preflight. Metal does not expose
+  DRM/GEM GPU virtual addresses, so no fake GPUVA handle is invented.
 
-* **Runtime testing on Apple Silicon.** A test script
-  (`tests/run_metal_mac.sh`) is provided for running on macOS with an M-series
-  chip.  It compiles the emitted MSL with `xcrun -sdk macosx metal`, produces
-  a `.metallib`, and runs the kernel via a Swift harness that verifies output
-  correctness on the physical GPU. **This Linux checkout cannot run that
-  path:** Metal remains an explicit fail-closed artifact-only target and its
-  dispatch function returns -201 until a macOS implementation is supplied.
+* **Runtime testing on Apple Silicon.** `tests/run_macos_metal_loader.sh` is the
+  authoritative dependency-light gate: the signed Zag executable asks
+  Metal.framework to compile MSL source, creates the pipeline and shared buffer,
+  submits 1024 work items, waits for completion, verifies every output, and
+  releases owned resources. `tests/run_metal_mac.sh` additionally cross-checks
+  the emitted MSL with Xcode's offline `metal`/`metallib` tools when those
+  optional tools are installed; native runtime support does not depend on them.
 
 ### OpenGL (GLSL)
 

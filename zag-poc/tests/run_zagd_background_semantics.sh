@@ -42,7 +42,8 @@ trap cleanup EXIT
 ln -s "$compiler" "$tmp/znc"
 mkdir "$tmp/project"
 printf '[package]\nname = "background-sema"\nversion = "0.0.1"\n' > "$tmp/project/zag.mod"
-printf 'pub fn initial() i32 { return 1; }\nfn main() i32 { return initial(); }\n' > "$tmp/project/app.zag"
+printf 'pub fn imported_value() i32 { return 7; }\n' > "$tmp/project/lib.zag"
+printf '@import("lib.zag")\npub fn initial() i32 { return imported_value(); }\nfn main() i32 { return initial(); }\n' > "$tmp/project/app.zag"
 
 # No foreground check seeds this project. The daemon owns the first manifest.
 (cd "$tmp/project" && "$tmp/znc" watch app.zag --mode light >/dev/null)
@@ -50,23 +51,51 @@ for _ in $(seq 1 1000); do
     grep -q '^state=idle$' "$tmp/project/.zagd.status" 2>/dev/null && break
     sleep 0.01
 done
-if [ "$(uname -s):$(uname -m)" = Darwin:arm64 ]; then
-    # The Darwin daemon is a supported advisory kqueue watcher, but semantic
-    # planner manifests remain Linux-only. Verify its explicit boundary and
-    # clean shutdown rather than treating a Linux planner record as portable.
-    grep -q '^target=macos-arm64$' "$tmp/project/.zagd.status"
-    grep -q '^semantic_manifest=false$' "$tmp/project/.zagd.status"
-    test ! -e "$tmp/project/.zag-cache/zagd/semantic.record"
-    printf stop > "$tmp/project/.zagd.stop"
-    for _ in $(seq 1 1000); do
-        grep -q '^state=stopped$' "$tmp/project/.zagd.status" 2>/dev/null && break
-        sleep 0.01
-    done
-    grep -q '^state=stopped$' "$tmp/project/.zagd.status"
-    echo 'zagd background semantics: macOS advisory watcher pass'
-    exit 0
-fi
 test -e "$tmp/project/.zag-cache/zagd/semantic.record"
+
+# Imported modules and dependency metadata are compiler inputs even when the
+# selected root's bytes do not change. The Darwin adapter combines exact vnode
+# watches with the same bounded input-fingerprint fallback, so this regression
+# applies to both native daemons.
+before_module=$(grep '^module_node=lib.zag' "$tmp/project/.zag-cache/zagd/semantic.record")
+before_events=$(sed -n 's/^events=//p' "$tmp/project/.zagd.status")
+printf '// imported dependency edit\npub fn imported_value() i32 { return 11; }\n' > "$tmp/project/lib.zag"
+for _ in $(seq 1 1000); do
+    current_module=$(grep '^module_node=lib.zag' "$tmp/project/.zag-cache/zagd/semantic.record" 2>/dev/null || true)
+    current_events=$(sed -n 's/^events=//p' "$tmp/project/.zagd.status" 2>/dev/null || true)
+    if [ -n "$current_module" ] && [ "$current_module" != "$before_module" ] &&
+       [ "${current_events:-0}" -gt "${before_events:-0}" ]; then
+        break
+    fi
+    sleep 0.01
+done
+test "$(grep '^module_node=lib.zag' "$tmp/project/.zag-cache/zagd/semantic.record")" != "$before_module"
+test "$(sed -n 's/^events=//p' "$tmp/project/.zagd.status")" -gt "$before_events"
+grep -q '^semantic_manifest=true$' "$tmp/project/.zagd.status"
+
+if [ "$(uname -s):$(uname -m)" = Darwin:arm64 ]; then
+    # Rearming must survive more than one atomic editor save of the same
+    # imported vnode. A parent-directory event catches each rename, and the
+    # replacement file receives a fresh exact watch before the next edit.
+    for value in 13 17; do
+        atomic_module=$(grep '^module_node=lib.zag' "$tmp/project/.zag-cache/zagd/semantic.record")
+        atomic_events=$(sed -n 's/^events=//p' "$tmp/project/.zagd.status")
+        printf '// successive atomic dependency edit\npub fn imported_value() i32 { return %s; }\n' "$value" \
+            >"$tmp/project/.lib.next"
+        mv "$tmp/project/.lib.next" "$tmp/project/lib.zag"
+        for _ in $(seq 1 1000); do
+            next_module=$(grep '^module_node=lib.zag' "$tmp/project/.zag-cache/zagd/semantic.record" 2>/dev/null || true)
+            next_events=$(sed -n 's/^events=//p' "$tmp/project/.zagd.status" 2>/dev/null || true)
+            if [ -n "$next_module" ] && [ "$next_module" != "$atomic_module" ] &&
+               [ "${next_events:-0}" -gt "${atomic_events:-0}" ]; then
+                break
+            fi
+            sleep 0.01
+        done
+        test "$(grep '^module_node=lib.zag' "$tmp/project/.zag-cache/zagd/semantic.record")" != "$atomic_module"
+        test "$(sed -n 's/^events=//p' "$tmp/project/.zagd.status")" -gt "$atomic_events"
+    done
+fi
 
 # Simulate an agent's partial write immediately followed by its final save.
 printf 'pub fn broken( i32 {\n' > "$tmp/project/app.zag"
@@ -93,6 +122,25 @@ done
 grep -q '^complete=true$' "$tmp/project/.zag-cache/zagd/semantic.record"
 grep -q '^public_fn=fn authority_value->i32!' "$tmp/project/.zag-cache/zagd/semantic.record"
 
+if [ "$(uname -s):$(uname -m)" = Darwin:arm64 ]; then
+    # A missing selected root is an early check failure. It must still remove
+    # the old manifest, then recover after an atomic rename restores the file.
+    mv "$tmp/project/app.zag" "$tmp/project/app.zag.saved"
+    for _ in $(seq 1 1000); do
+        test ! -e "$tmp/project/.zag-cache/zagd/semantic.record" &&
+            grep -q '^last_check_status=127$' "$tmp/project/.zagd.status" 2>/dev/null && break
+        sleep 0.01
+    done
+    test ! -e "$tmp/project/.zag-cache/zagd/semantic.record"
+    grep -q '^semantic_manifest=false$' "$tmp/project/.zagd.status"
+    mv "$tmp/project/app.zag.saved" "$tmp/project/app.zag"
+    for _ in $(seq 1 1000); do
+        grep -q '^public_fn=fn authority_value->i32!' "$tmp/project/.zag-cache/zagd/semantic.record" 2>/dev/null && break
+        sleep 0.01
+    done
+    grep -q '^semantic_manifest=true$' "$tmp/project/.zagd.status"
+fi
+
 # A stable invalid source must remove, not retain, the prior valid manifest.
 printf 'pub fn incomplete( i32 {\n' > "$tmp/project/app.zag"
 for _ in $(seq 1 1000); do
@@ -103,10 +151,57 @@ done
 test ! -e "$tmp/project/.zag-cache/zagd/semantic.record"
 grep -q '^semantic_manifest=false$' "$tmp/project/.zagd.status"
 
+if [ "$(uname -s):$(uname -m)" = Darwin:arm64 ]; then
+    # Exceed the fixed vnode descriptor budget. The adapter must close every
+    # partial kqueue watch, report its bounded polling fallback, and continue
+    # noticing both root recovery and later imported-module-only edits.
+    # Build the oversized topology before a fresh start: steady-state compiler
+    # input tracking intentionally ignores empty-directory churn.
+    printf stop > "$tmp/project/.zagd.stop"
+    for _ in $(seq 1 1000); do
+        test ! -e "$tmp/project/.zagd.lock" && break
+        sleep 0.01
+    done
+    test ! -e "$tmp/project/.zagd.lock"
+    for i in $(seq 1 520); do mkdir "$tmp/project/cap-$i"; done
+    (cd "$tmp/project" && "$tmp/znc" watch app.zag --mode light >/dev/null)
+    for _ in $(seq 1 1000); do
+        grep -q '^watcher=polling-project-inputs$' "$tmp/project/.zagd.status" 2>/dev/null && break
+        sleep 0.01
+    done
+    grep -q '^watcher=polling-project-inputs$' "$tmp/project/.zagd.status"
+    grep -q '^input_scan_complete=true$' "$tmp/project/.zagd.status"
+
+    printf '@import("lib.zag")\npub fn recovered() i32 { return imported_value(); }\nfn main() i32 { return recovered(); }\n' > "$tmp/project/app.zag"
+    for _ in $(seq 1 1000); do
+        grep -q '^public_fn=fn recovered->i32!' "$tmp/project/.zag-cache/zagd/semantic.record" 2>/dev/null && break
+        sleep 0.01
+    done
+    grep -q '^semantic_manifest=true$' "$tmp/project/.zagd.status"
+    cap_module=$(grep '^module_node=lib.zag' "$tmp/project/.zag-cache/zagd/semantic.record")
+    cap_events=$(sed -n 's/^events=//p' "$tmp/project/.zagd.status")
+    printf '// polling fallback dependency edit\npub fn imported_value() i32 { return 19; }\n' > "$tmp/project/lib.zag"
+    for _ in $(seq 1 1000); do
+        next_module=$(grep '^module_node=lib.zag' "$tmp/project/.zag-cache/zagd/semantic.record" 2>/dev/null || true)
+        next_events=$(sed -n 's/^events=//p' "$tmp/project/.zagd.status" 2>/dev/null || true)
+        if [ -n "$next_module" ] && [ "$next_module" != "$cap_module" ] &&
+           [ "${next_events:-0}" -gt "${cap_events:-0}" ]; then
+            break
+        fi
+        sleep 0.01
+    done
+    test "$(grep '^module_node=lib.zag' "$tmp/project/.zag-cache/zagd/semantic.record")" != "$cap_module"
+    test "$(sed -n 's/^events=//p' "$tmp/project/.zagd.status")" -gt "$cap_events"
+fi
+
 printf stop > "$tmp/project/.zagd.stop"
 for _ in $(seq 1 1000); do
     grep -q '^state=stopped$' "$tmp/project/.zagd.status" 2>/dev/null && break
     sleep 0.01
 done
 grep -q '^state=stopped$' "$tmp/project/.zagd.status"
+
+if [ "$(uname -s):$(uname -m)" = Darwin:arm64 ]; then
+    env ZNC="$compiler" bash tests/run_zagd_macos_resource_stress.sh
+fi
 echo 'zagd background semantics: pass'

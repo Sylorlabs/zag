@@ -18,8 +18,13 @@ archive before it can be published.
 - Provide a trusted seed matching that exact host. Linux x86-64 uses the
   committed `./znc`; Linux AArch64 uses `./znc-linux-arm64` (or
   `seeds/linux-arm64/znc`); Apple Silicon uses `./znc-macos-arm64` (or
-  `seeds/macos-arm64/znc`). No Python, C, or Zig compiler is accepted as a
-  fallback.
+  `seeds/macos-arm64/znc`). A clean Mac checkout may first use
+  `tools/bootstrap-macos-seed.sh` with the checksum-paired artifact from a
+  successful physical-Mac native gate. The Linux cross-only artifact is not
+  eligible. No Python, C, or Zig compiler is accepted as a fallback.
+- Node.js 22+ and npm are release-packaging dependencies for the locked,
+  byte-reproducible VS Code extension. They are checked before compiler work or
+  release mutation and are not dependencies of the Zag compiler.
 - `release.sh` validates the seed identity and selects the matching native
   target. The GPU MLIR (`--target gpu-*`) and WASM (`--target wasm`) backends
   remain integrated compiler targets; `selfhost/native/znc_target.zag` is
@@ -203,10 +208,13 @@ git tag -s v2026.06.0 -m "$(head -15 CHANGELOG.md)"
 
 ### 10. Build release tarball
 
-`release.sh` assembles `zag-$VERSION-$PLATFORM.tar.gz`; do not maintain a
-second hand-written copy recipe. The standalone archive contains:
+`release.sh` delegates to `tools/package-release.sh` to assemble
+`zag-$VERSION-$PLATFORM.tar.gz`; do not maintain a second copy recipe. The
+standalone archive contains:
 
 - native `znc`, `zagd`, and `zag-lsp` executables;
+- `znc.sha256`, binding the normalized compiler used by clean-checkout seed
+  intake after the release archive itself has been verified;
 - `bootstrap.sh`, `Makefile`, and `zag.mod` as one coherent bootstrap/install
   surface;
 - the `selfhost`, `std`, `examples`, `programs`, `tests`, `tools`, `docs`, and `editors`
@@ -218,7 +226,9 @@ Before writing the checksum, the release flow validates the staged tree,
 extracts the tarball into a fresh directory, compares it with staging, and
 validates the extracted tree again. Validation includes required content and
 permissions, native executable identity, `zag.mod`/compiler version agreement,
-a non-writing `make install` expansion, a native compile/run smoke test, and a
+a non-writing `make install` expansion, the actual production install recipe
+in a temporary prefix, installed standard-library and native compile/run
+smoke tests, and a
 fail-closed check for AppleDouble files. Archive creation disables both
 copyfile AppleDouble metadata and tar xattr records on macOS while remaining
 compatible with GNU tar on Linux; the layout self-test injects a real macOS
@@ -229,6 +239,33 @@ or creating a release:
 ```sh
 bash tests/run_release_package_layout.sh
 ```
+
+The real packaging recipe can also be exercised with explicitly selected
+native binaries and an already-built VSIX, without release-side Git actions:
+
+```sh
+package_dir=$(mktemp -d "${TMPDIR:-/tmp}/zag-package-check.XXXXXX")
+. ./tests/portable.sh
+package_version=$(zag_compiler_version ./znc-macos-arm64)
+bash tools/package-release.sh "$package_version" macos-arm64 \
+  ./znc-macos-arm64 ./zagd-macos-arm64 ../editors/vscode/zag-lang.vsix \
+  "$package_dir"
+```
+
+The helper refuses an existing archive/checksum, validates a real extraction
+and installation, and never modifies Git or installs globally. This produces
+development packaging evidence, not a release authorization: the preceding
+native qualification gates, clean tree, and signed tag are still mandatory.
+
+`make test-release-package-roundtrip` runs that same recipe in temporary
+directories, checks real extraction/installation and archive checksums,
+poisons Git, and verifies that existing archives cannot be overwritten. Set
+`ZNC`, `ZAGD`, and `ZAG_VSIX` to select the exact artifacts under test.
+
+The editor source includes `package-lock.json`, a pinned VSIX packager, a
+bundled runtime client, and a fixed ZIP timestamp. `release.sh` runs `npm ci`,
+packages twice, and requires byte-identical VSIX hashes before it can stamp the
+changelog, commit, or tag.
 
 The `macos-arm64` archive is evidence for the scoped native development target
 described in `docs/SUPPORT.md`; it is not a notarized end-user distribution.

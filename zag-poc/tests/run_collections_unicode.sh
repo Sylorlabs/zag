@@ -4,19 +4,36 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-compiler=${ZNC:-"$root/znc"}
-case "$compiler" in
+. "$root/tests/portable.sh"
+real_compiler=${ZNC:-"$root/znc"}
+case "$real_compiler" in
     /*) ;;
-    *) compiler="$root/${compiler#./}" ;;
+    *) real_compiler="$root/${real_compiler#./}" ;;
 esac
 
-if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
-    echo 'Collections and Unicode: unsupported host (requires Linux x86-64)' >&2
-    exit 2
-fi
+platform=$(zag_native_platform) || exit 2
+case "$platform" in
+    linux-x86_64)
+        target_args=()
+        artifact_description='static ELF64 x86-64'
+        ;;
+    macos-arm64)
+        target_args=(--target macos-arm64)
+        artifact_description='signed Mach-O arm64'
+        ;;
+    *)
+        echo "Collections and Unicode: unsupported host ($platform)" >&2
+        exit 2
+        ;;
+esac
 
 tmp=$(mktemp -d /tmp/zag-collections-unicode.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT
+mkdir -p "$tmp/compiler"
+ln -s "$real_compiler" "$tmp/compiler/znc"
+ln -s "$root/selfhost" "$tmp/compiler/selfhost"
+ln -s "$root/std" "$tmp/compiler/std"
+compiler="$tmp/compiler/znc"
 mkdir -p "$tmp/project" "$tmp/unrelated"
 printf '%s\n' \
     'name = "collections-unicode"' \
@@ -40,11 +57,9 @@ record() {
     fi
 }
 
-static_elf() {
+native_executable() {
     local artifact=$1
-    file "$artifact" | grep -q 'ELF 64-bit LSB executable, x86-64' &&
-        file "$artifact" | grep -q 'statically linked' &&
-        ! readelf -l "$artifact" 2>/dev/null | grep -q 'INTERP'
+    zag_assert_native_executable "$artifact"
 }
 
 mixed_type_diagnostic() {
@@ -70,21 +85,23 @@ for module in hashmap set range iterator utf8; do
         "@import(\"std:${module}\") as checked" \
         'fn main()i32{return 0;}' >"$module_dir/main.zag"
     record "public std:${module} module type-checks" \
-        timeout 180 "$compiler" check "$module_dir/main.zag" \
+        zag_run_bounded 180 "$compiler" check "$module_dir/main.zag" \
+            "${target_args[@]}" \
             --no-zagd --no-analyze --no-foreground-cache
 done
 
 build_native() {
     local output=$1
-    (cd "$tmp/unrelated" && timeout 300 "$compiler" \
+    (cd "$tmp/unrelated" && zag_run_bounded 300 "$compiler" \
         "$tmp/project/main.zag" -o "$output" \
+        "${target_args[@]}" \
         --safety=checked --no-zagd --no-analyze --no-foreground-cache) \
         >"$output.build.out" 2>"$output.build.err"
 }
 
 if build_native "$tmp/collections-unicode"; then
     set +e
-    timeout 30 "$tmp/collections-unicode" \
+    zag_run_bounded 30 "$tmp/collections-unicode" \
         >"$tmp/native.out" 2>"$tmp/native.err"
     native_status=$?
     set -e
@@ -93,8 +110,8 @@ if build_native "$tmp/collections-unicode"; then
     record 'strict native corpus emits exact output' \
         cmp -s "$tmp/native.expected" "$tmp/native.out"
     record 'strict native corpus emits no diagnostics' test ! -s "$tmp/native.err"
-    record 'strict native corpus is static ELF64 x86-64' \
-        static_elf "$tmp/collections-unicode"
+    record "strict native corpus is $artifact_description" \
+        native_executable "$tmp/collections-unicode"
 else
     echo '  XX  strict native corpus compiles'
     sed -n '1,160p' "$tmp/collections-unicode.build.out" >&2
@@ -112,20 +129,26 @@ else
     fail=$((fail + 1))
 fi
 
-if (cd "$tmp/unrelated" && timeout 240 "$compiler" \
+if (cd "$tmp/unrelated" && zag_run_bounded 240 "$compiler" \
         "$tmp/project/script.zag" -o "$tmp/script" \
+        "${target_args[@]}" \
         --safety=checked --no-zagd --no-analyze --no-foreground-cache) \
         >"$tmp/script.build.out" 2>"$tmp/script.build.err"; then
     set +e
-    timeout 30 "$tmp/script" >"$tmp/script.out" 2>"$tmp/script.err"
+    zag_run_bounded 30 "$tmp/script" >"$tmp/script.out" 2>"$tmp/script.err"
     script_status=$?
     set -e
+    if [ "$script_status" -ne 0 ]; then
+        sed -n '1,80p' "$tmp/script.out" >&2
+        sed -n '1,80p' "$tmp/script.err" >&2
+    fi
     record 'allocation-free Script range/UTF-8 consumer executes' \
         test "$script_status" -eq 0
     record 'Script consumer emits no output or diagnostics' \
         sh -c 'test ! -s "$1" && test ! -s "$2"' \
             _ "$tmp/script.out" "$tmp/script.err"
-    record 'Script consumer is static ELF64 x86-64' static_elf "$tmp/script"
+    record "Script consumer is $artifact_description" \
+        native_executable "$tmp/script"
 else
     echo '  XX  allocation-free Script range/UTF-8 consumer compiles'
     sed -n '1,160p' "$tmp/script.build.out" >&2
@@ -134,8 +157,9 @@ else
 fi
 
 set +e
-(cd "$tmp/unrelated" && timeout 180 "$compiler" \
+(cd "$tmp/unrelated" && zag_run_bounded 180 "$compiler" \
     "$tmp/project/mixed-bad.zag" -o "$tmp/mixed-bad" \
+    "${target_args[@]}" \
     --safety=checked --no-zagd --no-analyze --no-foreground-cache) \
     >"$tmp/mixed-bad.out" 2>"$tmp/mixed-bad.err"
 mixed_status=$?

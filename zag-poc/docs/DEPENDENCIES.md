@@ -80,4 +80,5 @@ modules use explicit paths. Imports fail closed when a file is missing or a
 module cycle is detected.
 
 See `docs/LOCAL_PACKAGE_IMPORTS.md` for the exact path rules, canonical lock
-format, bounds, provenance behavior, and executable evidence.
+format, recursive closure API, toolchain identity pins, bounds, provenance
+behavior, and executable evidence.

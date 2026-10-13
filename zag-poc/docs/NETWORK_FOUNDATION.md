@@ -1,17 +1,19 @@
-# Linux IPv4 networking foundation
+# Native IPv4 networking foundation
 
 Zag's current public networking foundation is intentionally bounded. It gives
-native Linux x86-64 programs resource-safe TCP and UDP IPv4 primitives plus a
-DNS A-query wire codec. It is evidence for those primitives only, not for the
-larger application networking stack.
+native Linux x86-64 and Apple Silicon macOS programs resource-safe TCP and UDP
+IPv4 primitives plus a DNS A-query wire codec. It is evidence for those
+primitives only, not for the larger application networking stack.
 
 ## Public modules
 
 `std:net_ipv4` exposes host-order `NetIpv4Endpoint` values and distinct
 `NetTcpListener`, `NetTcpStream`, and `NetUdpSocket` resources. A successful
-constructor returns `{ ok = 1, code = 0, value = ... }`; Linux syscall failures
-retain their negative errno, while validation and state failures use the
-documented `net_status_*` values.
+constructor returns `{ ok = 1, code = 0, value = ... }`. Validation, state,
+timeout, and framing failures use stable `net_status_*` values. Connection
+completion normalizes EINPROGRESS and the common timeout/refusal/routing
+outcomes used by the portable state machine. Other syscall failures retain the
+negative errno of the target kernel and must not be compared across targets.
 
 Every resource contains an `open` state. Its close function invalidates the
 descriptor before issuing `close(2)`, so a second close through the same value
@@ -25,10 +27,20 @@ TCP send-all and receive-exact operations take explicit byte, syscall-count,
 and per-syscall bounds. Their convenience forms retain a 1 MiB operation bound.
 The syscall cap is also useful for deterministic testing of partial-operation
 loops. UDP preserves datagram boundaries, caps payloads at the IPv4 UDP maximum,
-and uses `MSG_TRUNC` so an oversized datagram is reported rather than accepted
-as a silent prefix. Socket receive and send timeouts are required and limited to
-1 through 60,000 milliseconds. Listener and datagram port `0` uses
-`getsockname(2)` to report the kernel-selected ephemeral port.
+and reports an oversized datagram rather than accepting a silent prefix. Linux
+uses `MSG_TRUNC` directly; Darwin uses the result flags from one bounded
+`recvmsg(2)` call to preserve that same public result. Socket receive and send
+timeouts are required and limited to 1 through 60,000 milliseconds. Connect
+uses a nonblocking poll/SO_ERROR completion sequence, and accept polls before
+entering the kernel, because Darwin does not apply socket send/receive timeouts
+to those two operations. Listener and datagram port `0` uses `getsockname(2)`
+to report the kernel-selected ephemeral port.
+
+The Darwin adapter translates only this module's audited IPv4 syscall tuples.
+It converts the `sockaddr_in` length/family prefix, socket option and message
+flags, and emulates close-on-exec creation with a checked `fcntl(2)` step.
+Unknown families, options, flags, or argument shapes return `ENOSYS` before an
+XNU trap. This is a platform adapter, not a general Darwin raw-syscall promise.
 
 `std:dns_ipv4` encodes one recursive A/IN query and decodes bounded A responses.
 The decoder validates the complete question and resource-record envelopes,
@@ -46,14 +58,16 @@ Run:
 bash tests/run_network_foundation.sh
 ```
 
-The focused gate builds static Linux x86-64 binaries. The network probe binds
-TCP and UDP sockets only to `127.0.0.1` on kernel-assigned ephemeral ports,
-applies one-second socket timeouts, forces multi-syscall TCP send/receive loops,
-checks UDP source addresses and truncation, and exercises invalid/double-close
-states. It makes no external network request. The DNS probe is a local wire
-corpus covering a compressed A answer plus wrong IDs, limits, truncation,
-malformed labels/pointers, no-A responses, and a compression cycle. Both probes
-check allocator cleanup for their owned buffers.
+The focused gate builds native artifacts: static ELF64 on Linux x86-64 and
+signed Mach-O arm64 on Apple Silicon. The network probes bind TCP and UDP only
+to `127.0.0.1` on kernel-assigned ephemeral ports, apply bounded socket and
+accept timeouts, force multi-syscall TCP send/receive loops, check UDP source
+addresses and the exact 18-byte-to-4-byte truncation contract, and exercise
+invalid/double-close states. They make no external network request. The DNS
+probe is a local wire corpus covering a compressed A answer plus wrong IDs,
+limits, truncation, malformed labels/pointers, no-A responses, and a
+compression cycle. The ownership probes check allocator cleanup for their
+buffers.
 
 ## Non-claims
 

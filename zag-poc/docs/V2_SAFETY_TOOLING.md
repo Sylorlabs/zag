@@ -1,18 +1,20 @@
 # Zag v2 safety tooling (draft)
 
 Status: `--safety=checked` and the partial `--sanitize=memory` mode are
-implemented for edition-2027 native x86-64 output. They trap null and
+implemented for bounded edition-2027 native x86-64 and ARM64 executable
+output, with physical Apple Silicon macOS release-gate evidence. They trap null and
 misaligned raw-pointer dereferences/indexes, and check bounds and freed-state
 for ordinary allocator regions tracked by the native runtime. Memory sanitizer
 mode additionally fails process exit when the ordinary allocator's live-capacity
-witness is nonzero. Both modes are rejected on every other target rather than
-silently downgrading. Other sanitizer modes remain rejected.
+witness is nonzero. Outputs outside the implemented native slices reject these
+modes rather than silently downgrading. Other sanitizer modes remain rejected.
 
 ## Modes
 
 - `--safety=checked` preserves language traps and currently enables dynamic
   raw-pointer null/alignment checks plus bounds and freed-region checks for
-  up to 3,072 ordinary `_zag_malloc`/`new`/`_zag_realloc` allocations on native x86-64.
+  up to 3,072 ordinary `_zag_malloc`/`new`/`_zag_realloc` allocations on the
+  implemented native x86-64 and ARM64 paths.
   The table records allocator capacity (small blocks are class-rounded), so an
   access whose root and final address stay within that tracked live region is
   allowed; a one-past or wider access traps before the load/store. A tracked
@@ -40,20 +42,28 @@ silently downgrading. Other sanitizer modes remain rejected.
   allocation's exact requested length rather than its class-rounded physical
   capacity, so a checked raw access into small-block class slack traps at the
   access site. It also fails process exit on a nonzero ordinary-allocation live
-  witness. Dedicated ordinary allocations larger than 512 KiB additionally
-  reserve one trailing 4 KiB `PROT_NONE` guard page on native Linux x86-64; the
-  allocation fails closed if that setup fails and free reconstructs the full
-  guarded mapping before `munmap`. This is a coarse trailing boundary only:
+  witness. Dedicated sanitizer allocations larger than 512 KiB additionally
+  reserve one trailing `PROT_NONE` guard page: 4 KiB on the native x86-64
+  backend and 16 KiB on Apple Silicon macOS. ARM64 lowering uses the target's
+  native allocator page contract, and the allocation fails closed if guard
+  setup fails; free reconstructs the full guarded mapping before `munmap`.
+  Physical Apple Silicon coverage independently proves Darwin `mprotect` and
+  then faults through libSystem `qsort` on the allocator-owned guard page.
+  This is a coarse trailing boundary only:
   page-rounding leaves up to one accessible page of slack after the exact
-  request, so it does not replace the logical provenance check. Small ordinary
-  allocations reserve a distinct 16-byte trailing red zone, initialize it to
-  `0xD3`, and validate it before poisoning or free-list reuse. This detects
-  writes performed outside Zag's instrumented access path, including the
-  verified libc `memset` boundary. It does not yet provide leading red zones,
+  request, so it does not replace the logical provenance check. Native x86-64
+  and ARM64 small ordinary allocations reserve a distinct 16-byte trailing red zone,
+  initialize it to `0xD3`, and validate it before reuse or quarantine.
+  Linux x86-64 verifies the boundary with a libc `memset` witness; physical
+  Apple Silicon macOS verifies it through the already-audited libSystem
+  `qsort` path, which mutates across the logical end without using Zag's
+  checked raw-access lowering. It does not yet provide leading red zones,
   allocation-site reports, stack/global instrumentation, or custom-allocator
-  tracking. On every ordinary free under sanitizer
-  mode it provides deterministic byte poisoning (`0xA5`)
-  before the block is quarantined or unmapped; this is useful evidence
+  tracking. Native x86-64 poisons ordinary freed payload bytes with `0xA5`;
+  ARM64 applies the same deterministic poison to quarantined small allocations
+  before retirement and to the exact logical payload of dedicated allocations
+  immediately before unmap. Physical macOS verifies the quarantined-small
+  pattern through a stale libSystem `strlen` read. This is useful evidence
   when a stale alias escapes the provenance table, but it is not a red-zone or
   general use-after-free proof. Its SystemAllocator-handle checks retain the same generation and
   allocator-identity validation as checked mode. Ordinary checked allocations
@@ -93,4 +103,5 @@ not yet have an independent source-level leak execution regression.
 The release gate requires execution tests for OOB, null, misalignment, invalid
 shift, divide-by-zero, use-after-free where detectable, double/invalid-free,
 leaks, invalid tags, and a deliberate race report before any mode is marked
-supported.  Current status remains unsupported.
+supported as a complete sanitizer/debug-allocator contract. Current status remains unsupported
+for that complete row; the bounded native slices above are executable support.
