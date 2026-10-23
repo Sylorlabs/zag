@@ -2,8 +2,11 @@
 # Every target shares declared-type resolution and fails before artifact output.
 set -eu
 cd "$(dirname "$0")/.."
+. ./tests/portable.sh
 
-ZNC=${ZNC:-./znc}
+# Never select the tracked Linux x86-64 seed on an ARM host: it cannot execute
+# there. A caller-supplied ZNC still wins.
+ZNC=${ZNC:-$(zag_native_compiler "$PWD")}
 case "$ZNC" in /*) ;; *) ZNC="$PWD/${ZNC#./}" ;; esac
 tmp=$(mktemp -d /tmp/zag-typed.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT

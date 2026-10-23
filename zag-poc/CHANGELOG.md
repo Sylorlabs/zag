@@ -27,6 +27,29 @@ Pacific Time. Tags are listed in chronological order; all tags preceded
     boundaries, so a label is a breaker.
 
 ### Fixed
+- **Unsigned 64-bit comparisons, division, modulo, and `print_u64` were lowered as
+  signed on both production backends.** A `u64` with bit 63 set compared *below*
+  small values, `top / 2` returned a negative quotient, and `print_u64` printed
+  `-9223372036854775808`. Comparisons now select the carry-flag condition family
+  (`cg_cmp_cc_u` on x86-64, `ac_push_jcc_false_u` on AArch64); `/` and `%` lower
+  to `UDIV` on AArch64 and `xor edx,edx; div` on x86-64 when the left operand is
+  an unsigned type; and `print_u64`/`print_u32` call a new unsigned decimal
+  routine. `emit_udiv` emits `0x9AC00800` — the initial spelling added `0x4000`
+  to `SDIV`, which encodes `CRC32X` and printed garbage digits instead of failing
+  — and its remainder fixup needs the unsigned `n - q*10`, not `q*10 - n`.
+  `K_DIV` is now part of the x86 flag/clobber/liveness model so the peephole and
+  DCE passes cannot treat it as side-effect free. A literal magnitude above
+  `i64::MAX` (`18446744073709551615`, `0xFFFFFFFFFFFFFFFF`) is u64 by
+  construction even when both operands are literals: `18446744073709551615 / 2`
+  returned `0` and `% 10` returned `-1` because the pair was typed signed. Gated
+  by `tests/semantic/unsigned_numeric.zag`, `unsigned_print.zag` (exact stdout),
+  and the cross-backend `tests/differential/t59_unsigned_output.zag`.
+- **Four release-gate scripts selected the tracked Linux x86-64 seed on ARM
+  hosts.** `run_typed_authority.sh`, `run_aarch64_optimizer.sh`,
+  `run_vector_pipeline.sh`, and `run_vector_equiv_x86_64.sh` defaulted `ZNC` to
+  `./znc`, which cannot execute on Apple Silicon or Linux AArch64; they now use
+  the shared `zag_native_compiler` host selector, so the gates also run outside
+  `make`, which was previously the only caller exporting `ZNC` for them.
 - **A wrong-answer bug in the new AArch64 optimizer's liveness model**, found
   during review before the pass was wired in. `add x0, x1` encodes as
   `add xd, xd, xm`, so the destination is also the first source and `src` is a
