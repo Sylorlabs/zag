@@ -31,7 +31,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 . ./tests/portable.sh
 
-ZNC=${ZNC:-./znc}
+ZNC=${ZNC:-$(zag_native_compiler "$PWD")}
 case "$ZNC" in /*) ;; *) ZNC="$PWD/${ZNC#./}";; esac
 tmp=$(mktemp -d /tmp/zag-veq.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT

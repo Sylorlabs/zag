@@ -441,7 +441,9 @@ struct Cg {
     rl_lbl: i32,    // label of the __realloc support routine (_zag_realloc)
     fr_lbl: i32,    // label of the __free support routine (_zag_free / delete)
     pf_lbl: i32,    // label of the __print_f64 support routine (print_f64/print_f32)
+    pu_lbl: i32,    // label of the __print_uint support routine (print_u64/print_u32)
     use_pi: i32,    // 1 if __print_int is referenced
+    use_pu: i32,    // 1 if __print_uint is referenced
     use_pf: i32,    // 1 if __print_f64 is referenced
     use_ps: i32,    // 1 if __print_str is referenced
     use_al: i32,    // 1 if __alloc is referenced
@@ -2744,6 +2746,31 @@ fn cg_lower_vsa_bin(out: *ArrayList[Instr], bb: Bin, lty: []u8, rty: []u8,
 }
 
 // ── binary operators (incl. short-circuit && / ||, optional orelse) ──────────
+// Is a binary operand pair UNSIGNED? A positive integer literal is comptime:
+// it adopts the type of the slot/operand it flows into, so `1 < top` with
+// `top: u64` is an unsigned comparison even though the literal itself has no
+// declared signedness. Only the literal-left case consults the right operand,
+// so two signedness-declared variables keep the existing left-operand rule.
+fn cg_bin_unsigned_int(l: *Node, r: *Node, env: *Env, syms: ArrayList[FnSym], cg: *Cg) i32 {
+    if (cg_is_unsigned_int_type(cg_expr_type(l, env, syms, cg)) == 1) { return 1; }
+    let literal: i32 = 0;
+    switch (l.*) {
+        .ilit => |x| {
+            // A magnitude above i64 max is only representable as u64.
+            if (int_literal_exceeds_i64(x.text) == 1) { return 1; }
+            if (cg_is_float_text(x.text) == 0) { literal = 1; }
+        }
+        else => { }
+    }
+    switch (r.*) {
+        .ilit => |x| { if (int_literal_exceeds_i64(x.text) == 1) { return 1; } }
+        else => { }
+    }
+    if (literal == 0) { return 0; }
+    if (cg_is_unsigned_int_type(cg_expr_type(r, env, syms, cg)) == 1) { return 1; }
+    return 0;
+}
+
 fn cg_lower_bin(out: *ArrayList[Instr], bb: Bin, env: *Env, syms: ArrayList[FnSym], cg: *Cg) void {
     // `opt orelse default` — unwrap the optional or take the default.
     if (@strEq(bb.op, "orelse")) {
@@ -2993,7 +3020,13 @@ fn cg_lower_bin(out: *ArrayList[Instr], bb: Bin, env: *Env, syms: ArrayList[FnSy
 
     if (cg_is_cmp_op(bb.op) == 1) {
         push[Instr](out, i_cmp(R_RAX(), R_RCX()));
-        push[Instr](out, i_setcc(R_RAX(), cg_cmp_cc(bb.op)));
+        // Unsigned integer types compare with the BELOW/ABOVE (CF) family so
+        // values with bit 63 set order correctly; signed types use L/LE/G/GE.
+        if (cg_bin_unsigned_int(bb.l, bb.r, env, syms, cg) == 1) {
+            push[Instr](out, i_setcc(R_RAX(), cg_cmp_cc_u(bb.op)));
+        } else {
+            push[Instr](out, i_setcc(R_RAX(), cg_cmp_cc(bb.op)));
+        }
         push[Instr](out, i_push(R_RAX()));
         return;
     }
@@ -3006,23 +3039,46 @@ fn cg_lower_bin(out: *ArrayList[Instr], bb: Bin, env: *Env, syms: ArrayList[FnSy
     } else if (@strEq(bb.op, "/")) {
         // DEFINED division: /0 panics (__div0); x/-1 = -x (wraps at i64 min,
         // matching AArch64 SDIV) — hardware idiv would fault on both.
-        let l_dnz: i32 = cg_fresh(cg);
-        let l_ddo: i32 = cg_fresh(cg);
-        let l_dm1: i32 = cg_fresh(cg);
-        push[Instr](out, i_cmp_imm(R_RCX(), 0));
-        push[Instr](out, i_jne(l_dnz));
-        cg.*.use_dz = 1;
-        push[Instr](out, i_call(cg.*.dz_lbl));
-        push[Instr](out, i_label(l_dnz));
-        push[Instr](out, i_cmp_imm(R_RCX(), 0 - 1));
-        push[Instr](out, i_jne(l_dm1));
-        push[Instr](out, i_neg(R_RAX()));
-        push[Instr](out, i_jmp(l_ddo));
-        push[Instr](out, i_label(l_dm1));
-        push[Instr](out, i_idiv(R_RCX()));                 // cqo+idiv; quotient → rax
-        push[Instr](out, i_label(l_ddo));
+        if (cg_bin_unsigned_int(bb.l, bb.r, env, syms, cg) == 1) {
+            // Unsigned: xor edx,edx + div; no -1 special case (u64 max is an
+            // ordinary divisor) and no sign-extension of the dividend.
+            let l_undz: i32 = cg_fresh(cg);
+            push[Instr](out, i_cmp_imm(R_RCX(), 0));
+            push[Instr](out, i_jne(l_undz));
+            cg.*.use_dz = 1;
+            push[Instr](out, i_call(cg.*.dz_lbl));
+            push[Instr](out, i_label(l_undz));
+            push[Instr](out, i_div(R_RCX()));                 // xor edx,edx; div; → rax
+        } else {
+            let l_dnz: i32 = cg_fresh(cg);
+            let l_ddo: i32 = cg_fresh(cg);
+            let l_dm1: i32 = cg_fresh(cg);
+            push[Instr](out, i_cmp_imm(R_RCX(), 0));
+            push[Instr](out, i_jne(l_dnz));
+            cg.*.use_dz = 1;
+            push[Instr](out, i_call(cg.*.dz_lbl));
+            push[Instr](out, i_label(l_dnz));
+            push[Instr](out, i_cmp_imm(R_RCX(), 0 - 1));
+            push[Instr](out, i_jne(l_dm1));
+            push[Instr](out, i_neg(R_RAX()));
+            push[Instr](out, i_jmp(l_ddo));
+            push[Instr](out, i_label(l_dm1));
+            push[Instr](out, i_idiv(R_RCX()));                 // cqo+idiv; quotient → rax
+            push[Instr](out, i_label(l_ddo));
+        }
     } else if (@strEq(bb.op, "%")) {
         // DEFINED modulo: %0 panics; x % -1 = 0 (AArch64 semantics).
+        if (cg_bin_unsigned_int(bb.l, bb.r, env, syms, cg) == 1) {
+            // Unsigned: remainder via div; u64-max divisor needs no special case.
+            let l_undz: i32 = cg_fresh(cg);
+            push[Instr](out, i_cmp_imm(R_RCX(), 0));
+            push[Instr](out, i_jne(l_undz));
+            cg.*.use_dz = 1;
+            push[Instr](out, i_call(cg.*.dz_lbl));
+            push[Instr](out, i_label(l_undz));
+            push[Instr](out, i_div(R_RCX()));                 // remainder → rdx
+            push[Instr](out, i_mov_rr(R_RAX(), R_RDX()));
+        } else {
         let l_mnz: i32 = cg_fresh(cg);
         let l_mdo: i32 = cg_fresh(cg);
         let l_mm1: i32 = cg_fresh(cg);
@@ -3039,6 +3095,7 @@ fn cg_lower_bin(out: *ArrayList[Instr], bb: Bin, env: *Env, syms: ArrayList[FnSy
         push[Instr](out, i_idiv(R_RCX()));                 // remainder → rdx
         push[Instr](out, i_mov_rr(R_RAX(), R_RDX()));
         push[Instr](out, i_label(l_mdo));
+        }
     } else if (@strEq(bb.op, "&")) {
         push[Instr](out, i_and(R_RAX(), R_RCX()));
     } else if (@strEq(bb.op, "^")) {
@@ -3097,6 +3154,13 @@ fn cg_is_print_int_nl(name: []u8) i32 {
 // i32 overflow or an i_any printed via print_i32 matches printf %d/%u exactly).
 fn cg_is_print_i32_w(name: []u8) i32 { if (@strEq(name, "print_i32")) { return 1; } return 0; }
 fn cg_is_print_u32_w(name: []u8) i32 { if (@strEq(name, "print_u32")) { return 1; } return 0; }
+// Unsigned 64-bit-width prints: values with bit 63 set must print their exact
+// unsigned magnitude (up to 20 digits), never a negative decimal.
+fn cg_is_print_u64_w(name: []u8) i32 {
+    if (@strEq(name, "print_u64"))      { return 1; }
+    if (@strEq(name, "_zag_print_u64")) { return 1; }
+    return 0;
+}
 fn cg_is_print_str(name: []u8) i32 {
     if (@strEq(name, "print_str")) { return 1; }
     if (@strEq(name, "_zag_print")) { return 1; }
@@ -3130,8 +3194,15 @@ fn cg_lower_print(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, syms:
         if (cg_type_is_slice(cg, script_ty) == 0) {
             cg_lower_expr(out, script_arg, env, syms, cg);
             push[Instr](out, i_pop(R_RDI()));
-            cg.*.use_pi = 1;
-            push[Instr](out, i_call(cg.*.pi_lbl));
+            // Unsigned script integers print via the unsigned decimal routine
+            // so values ≥ 2^63 (u64) / 2^31 (u32) are not shown negative.
+            if (cg_is_unsigned_int_type(script_ty) == 1) {
+                cg.*.use_pu = 1;
+                push[Instr](out, i_call(cg.*.pu_lbl));
+            } else {
+                cg.*.use_pi = 1;
+                push[Instr](out, i_call(cg.*.pi_lbl));
+            }
             let nloff: i32 = cg_intern_str(cg, "", 1);
             push[Instr](out, i_mov_imm(R_RSI(), DATA_VBASE() + (nloff as i64)));
             push[Instr](out, i_mov_imm(R_RDX(), 1));
@@ -3181,8 +3252,15 @@ fn cg_lower_print(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, syms:
             push[Instr](out, i_mov_imm(R_RCX(), 4294967295));      // zero-extend low 32
             push[Instr](out, i_and(R_RDI(), R_RCX()));
         }
-        cg.*.use_pi = 1;
-        push[Instr](out, i_call(cg.*.pi_lbl));                     // decimal digits
+        // Unsigned decimal prints (u32/u64) use the UNSIGNED routine; the
+        // signed one would print bit-63-set (or ≥2^31) values negative.
+        if (cg_is_print_u32_w(fname) == 1 || cg_is_print_u64_w(fname) == 1) {
+            cg.*.use_pu = 1;
+            push[Instr](out, i_call(cg.*.pu_lbl));                 // decimal digits
+        } else {
+            cg.*.use_pi = 1;
+            push[Instr](out, i_call(cg.*.pi_lbl));                 // decimal digits
+        }
         // trailing '\n' (matches the C backend's "%llu\n") via __print_str.
         let nloff: i32 = cg_intern_str(cg, "", 1);                 // interns just '\n'
         push[Instr](out, i_mov_imm(R_RSI(), DATA_VBASE() + (nloff as i64)));
@@ -8133,6 +8211,70 @@ fn cg_emit_print_int(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     push[Instr](out, i_ret());
 }
 
+// ── OUTPUT support routine: __print_uint(rdi=n) ────────────────────────────────
+// Convert the UNSIGNED 64-bit n to decimal ASCII and write(1, buf, len).
+// Same skeleton as __print_int minus sign handling, using xor edx,edx + div
+// (unsigned) so values with bit 63 set print their exact unsigned magnitude.
+fn cg_emit_print_uint(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
+    let l_loop:  i32 = cg_fresh(cg);   // digit-peel loop top
+    let l_zero:  i32 = cg_fresh(cg);   // n == 0 special case
+    let l_after: i32 = cg_fresh(cg);   // after digit collection
+    let l_wtop:  i32 = cg_fresh(cg);   // pop+store loop top
+    let l_wdone: i32 = cg_fresh(cg);   // pop+store loop done
+
+    push[Instr](out, i_label(lbl));
+    push[Instr](out, i_push(R_RBP()));
+    push[Instr](out, i_mov_rr(R_RBP(), R_RSP()));
+    push[Instr](out, i_sub_imm(R_RSP(), 64));        // 64-byte digit buffer
+
+    push[Instr](out, i_mov_rr(R_RAX(), R_RDI()));    // rax = working value n
+    push[Instr](out, i_mov_imm(R_R9(), 0));          // r9 = digit count
+    push[Instr](out, i_cmp_imm(R_RAX(), 0));
+    push[Instr](out, i_je(l_zero));
+
+    // digit-peel loop: while rax != 0 { rcx=10; xor edx,edx; div → rax=quot
+    //                                   rdx=rem; push rem+'0'; r9++ }
+    push[Instr](out, i_label(l_loop));
+    push[Instr](out, i_cmp_imm(R_RAX(), 0));
+    push[Instr](out, i_je(l_after));
+    push[Instr](out, i_mov_imm(R_RCX(), 10));
+    push[Instr](out, i_xor(R_RDX(), R_RDX()));       // hi half = 0
+    push[Instr](out, i_div(R_RCX()));                // rax=quotient, rdx=remainder
+    push[Instr](out, i_add_imm(R_RDX(), 48));        // + '0'
+    push[Instr](out, i_push(R_RDX()));               // push digit char
+    push[Instr](out, i_add_imm(R_R9(), 1));          // r9++
+    push[Instr](out, i_jmp(l_loop));
+
+    push[Instr](out, i_label(l_zero));
+    push[Instr](out, i_mov_imm(R_R8(), 48));         // '0'
+    push[Instr](out, i_push(R_R8()));
+    push[Instr](out, i_mov_imm(R_R9(), 1));
+
+    push[Instr](out, i_label(l_after));
+    push[Instr](out, i_lea(R_RSI(), R_RBP(), 0 - 64));   // rsi = write ptr
+    push[Instr](out, i_mov_rr(R_RCX(), R_R9()));         // rcx = remaining count
+    push[Instr](out, i_label(l_wtop));
+    push[Instr](out, i_cmp_imm(R_RCX(), 0));
+    push[Instr](out, i_je(l_wdone));
+    push[Instr](out, i_pop(R_RAX()));                    // next char (MS-first)
+    push[Instr](out, i_store(R_RSI(), 0, R_RAX()));      // [rsi] = char (low byte)
+    push[Instr](out, i_add_imm(R_RSI(), 1));             // ptr++
+    push[Instr](out, i_sub_imm(R_RCX(), 1));             // count--
+    push[Instr](out, i_jmp(l_wtop));
+    push[Instr](out, i_label(l_wdone));
+
+    // write(1, buf, r9). r9 still holds len; re-lea the buffer start.
+    push[Instr](out, i_mov_imm(R_RAX(), 1));             // sys_write
+    push[Instr](out, i_mov_imm(R_RDI(), 1));             // fd = stdout
+    push[Instr](out, i_lea(R_RSI(), R_RBP(), 0 - 64));   // buf
+    push[Instr](out, i_mov_rr(R_RDX(), R_R9()));         // len
+    push[Instr](out, i_syscall());
+
+    push[Instr](out, i_mov_rr(R_RSP(), R_RBP()));
+    push[Instr](out, i_pop(R_RBP()));
+    push[Instr](out, i_ret());
+}
+
 // ── OUTPUT support routine: __print_f64(rdi = double bit pattern) ─────────────
 // Converts a 64-bit IEEE-754 double to a decimal string in the SAME format the C
 // backend uses (printf "%g", 6 significant digits) and write(1,..)s it with a
@@ -11809,10 +11951,11 @@ fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *Ar
     let pf_lbl: i32 = next_id + 6;
     let dz_lbl: i32 = next_id + 7;
     let fr_lbl: i32 = next_id + 8;
+    let pu_lbl: i32 = next_id + 9;
     // NATIVE SYSCALL RUNTIME: a contiguous block of RT_COUNT() labels for the
     // `_zag_*` routines, minted above the heap/print/streq routine labels. Their
     // `rt_used` flags (one per routine, init 0) gate body emission like use_*.
-    let rt_base: i32 = next_id + 9;
+    let rt_base: i32 = next_id + 10;
     let rt_used: ArrayList[i32] = make[i32](RT_COUNT() + 1);
     let rti: i32 = 0;
     while (rti < RT_COUNT()) { push[i32](&rt_used, 0); rti = rti + 1; }
@@ -11831,7 +11974,9 @@ fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *Ar
         .rl_lbl = rl_lbl,
         .fr_lbl = fr_lbl,
         .pf_lbl = pf_lbl,
+        .pu_lbl = pu_lbl,
         .use_pi = 0,
+        .use_pu = 0,
         .use_pf = 0,
         .use_ps = 0,
         .use_al = 0,
@@ -11938,6 +12083,7 @@ fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *Ar
     if (cg.use_rl == 1) { cg.use_ml = 1; cg.use_fr = 1; }   // realloc = malloc+copy+free
     if (cg.use_ml == 1) { cg.use_al = 1; }
     if (cg.use_pi == 1) { cg_emit_print_int(&out, cg.pi_lbl, &cg); }
+    if (cg.use_pu == 1) { cg_emit_print_uint(&out, cg.pu_lbl, &cg); }
     if (cg.use_pf == 1) { cg_emit_print_f64(&out, cg.pf_lbl, &cg); }
     if (cg.use_ps == 1) { cg_emit_print_str(&out, cg.ps_lbl); }
     if (cg.use_al == 1) { cg_emit_alloc(&out, cg.al_lbl, &cg); }

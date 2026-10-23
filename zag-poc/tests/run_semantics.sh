@@ -65,6 +65,32 @@ reject() {
     fi
 }
 
+# ok_out <name> <source> <expected-exit> <expected-stdout>: exact decimal output
+# matters for the unsigned print routines, where a wrong (signed) lowering
+# still exits 0 but prints a negative value.
+ok_out() {
+    local name=$1 source=$2 expected=$3 expected_out=$4 binary="$TMP/$1"
+    if ! "$ZNC" "$ROOT/tests/semantic/$source" -o "$binary" >"$TMP/$name.compile" 2>&1; then
+        echo "  XX  $name (compile failed)"
+        sed -n '1,12p' "$TMP/$name.compile"
+        fail=$((fail + 1))
+        return
+    fi
+    "$binary" >"$TMP/$name.run" 2>&1
+    local actual=$?
+    local actual_out
+    actual_out=$(cat "$TMP/$name.run")
+    if [ "$actual" -eq "$expected" ] && [ "$actual_out" = "$expected_out" ]; then
+        echo "  ok  $name (exit $actual, stdout exact)"
+        pass=$((pass + 1))
+    else
+        echo "  XX  $name (exit $actual, expected $expected; stdout mismatch)"
+        printf '      got:  %s\n' "$actual_out"
+        printf '      want: %s\n' "$expected_out"
+        fail=$((fail + 1))
+    fi
+}
+
 echo "-- v1 core: accepted semantics --"
 ok scoping-import-shadow scoping_import_shadow.zag 42
 ok nested-block-shadow scoping_block_shadow.zag 41
@@ -80,6 +106,8 @@ ok prefix-declaration-annotations prefix_declaration_annotations.zag 42
 ok prefix-enum-pub-import prefix_enum_pub_import.zag 42
 ok memory-value-pointer memory_value_pointer.zag 42
 ok edge-control-values edge_control_values.zag 42
+ok unsigned-numeric unsigned_numeric.zag 42
+ok_out unsigned-print unsigned_print.zag 42 $'9223372036854775808\n18446744073709551615\n4000000000\n0\n-9223372036854775808'
 ok_strict imported-const-flat import_const_flat.zag 42
 ok_strict imported-const-qualified import_const_qualified.zag 42
 
