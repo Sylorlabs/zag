@@ -41,7 +41,9 @@ Pacific Time. Tags are listed in chronological order; all tags preceded
   DCE passes cannot treat it as side-effect free. A literal magnitude above
   `i64::MAX` (`18446744073709551615`, `0xFFFFFFFFFFFFFFFF`) is u64 by
   construction even when both operands are literals: `18446744073709551615 / 2`
-  returned `0` and `% 10` returned `-1` because the pair was typed signed. Gated
+  returned `0` and `% 10` returned `-1` because the pair was typed signed. A
+  literal above `i64::MAX` on either operand now selects the unsigned path in
+  both native backends. Gated
   by `tests/semantic/unsigned_numeric.zag`, `unsigned_print.zag` (exact stdout),
   and the cross-backend `tests/differential/t59_unsigned_output.zag`.
 - **Four release-gate scripts selected the tracked Linux x86-64 seed on ARM
