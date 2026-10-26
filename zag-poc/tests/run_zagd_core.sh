@@ -21,5 +21,8 @@ set +e
 "$tmp/raw_fs_syscall_adapter"
 raw_fs_status=$?
 set -e
-test "$raw_fs_status" -eq 42
+if [ "$raw_fs_status" -ne 42 ]; then
+    echo "zagd raw fs syscall adapter failed (exit=$raw_fs_status; expected=42)" >&2
+    exit 1
+fi
 echo "zagd core pass"
