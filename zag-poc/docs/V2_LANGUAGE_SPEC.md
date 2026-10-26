@@ -100,8 +100,12 @@ contract: edition 2027 rejects directly invalid literal left/right shift
 counts, and guards variable shifts in both checked and release builds when
 the count is negative or at least the declared width of the left operand
 (8, 16, 32, or 64 bits). Edition 2026 retains hardware-masked shifts for
-compatibility. Full overflow and division-by-zero checking remains pending;
-see `V2_FINAL_VERIFICATION.md` for the tested conversion subset.
+compatibility. Edition 2027 also rejects directly known zero divisors for
+integer division and remainder at compilation; dynamic zero divisors retain the
+existing runtime panic in both checked and release modes. Edition 2026 retains
+its historical runtime panic for zero divisors. Full integer overflow checking
+and analysis of folded constant expressions remain pending; see
+`V2_FINAL_VERIFICATION.md` for the tested conversion subset.
 
 Narrowing conversion is checked; bit reinterpretation is a named, unsafe
 operation when it can expose invalid representation or target byte order.
