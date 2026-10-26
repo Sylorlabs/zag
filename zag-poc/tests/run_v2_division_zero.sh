@@ -54,6 +54,24 @@ case_run() {
   fi
   pass=$((pass + 1)); echo "  ok  $name"
 }
+# Large nonzero literals may currently wrap during integer lowering; future
+# range diagnostics can reject them. Neither outcome may call their *spelling*
+# a zero divisor (the old cg_parse_i64 predicate did so after overflow).
+case_nonzero_literal() {
+  local name=$1 mode=$2 source=$3
+  mkdir -p "$tmp/$name"
+  printf 'name = "v2div0"\nversion = "0"\nedition = "2027"\n' >"$tmp/$name/zag.mod"
+  printf '%s\n' "$source" >"$tmp/$name/main.zag"
+  local -a args=()
+  if [ "$target" = macos-arm64 ]; then args+=(--target macos-arm64); fi
+  if [ "$mode" = checked ]; then args+=(--safety=checked); fi
+  (cd "$tmp/$name" && "$ZNC" main.zag "${args[@]}" --no-zagd --no-analyze --no-foreground-cache -o out >build.log 2>&1) || true
+  if grep -Fq 'v2: integer division by zero' "$tmp/$name/build.log"; then
+    echo "XX $name misdiagnosed nonzero literal" >&2
+    exit 1
+  fi
+  pass=$((pass + 1)); echo "  ok  $name"
+}
 for mode in release checked; do
   case_run "$mode-i64-div-positive" 2027 "$mode" 42 'fn div(x:i64,y:i64) i64 { return x/y; } fn main() i32 { return div(126,3) as i32; }'
   case_run "$mode-i64-mod-positive" 2027 "$mode" 42 'fn rem(x:i64,y:i64) i64 { return x%y; } fn main() i32 { return rem(142,100) as i32; }'
@@ -62,6 +80,10 @@ for mode in release checked; do
   case_run "$mode-direct-div-zero" 2027 "$mode" reject 'fn main() i32 { return 42 / 0; }'
   case_run "$mode-direct-mod-zero" 2027 "$mode" reject 'fn main() i32 { return 42 % 0; }'
   case_run "$mode-direct-negative-zero" 2027 "$mode" reject 'fn main() i32 { return 42 / -0; }'
+  case_run "$mode-direct-hex-zero" 2027 "$mode" reject 'fn main() i32 { return 42 % 0x0000; }'
+  case_run "$mode-direct-separated-zero" 2027 "$mode" reject 'fn main() i32 { return 42 / 0_0_0; }'
+  case_nonzero_literal "$mode-large-decimal-nonzero" "$mode" 'fn main() i32 { return 42 / 18446744073709551616; }'
+  case_nonzero_literal "$mode-large-hex-nonzero" "$mode" 'fn main() i32 { return 42 % 0x10000000000000000; }'
   case_run "$mode-direct-unsigned-zero" 2027 "$mode" reject 'fn main() i32 { let x:u64=42; return (x % 0) as i32; }'
   case_run "$mode-dynamic-i64-div-zero" 2027 "$mode" trap 'fn div(x:i64,y:i64) i64 { return x/y; } fn main() i32 { return div(42,0) as i32; }'
   case_run "$mode-dynamic-i64-mod-zero" 2027 "$mode" trap 'fn rem(x:i64,y:i64) i64 { return x%y; } fn main() i32 { return rem(42,0) as i32; }'
