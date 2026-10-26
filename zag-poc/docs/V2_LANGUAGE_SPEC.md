@@ -95,6 +95,14 @@ alternative: wrapping is modulo 2^N, saturating clamps to the destination
 range, and checked returns an error/optional result.  The optimizer may replace
 a check only when it preserves the same value-or-trap behavior.
 
+The currently implemented native integer slice is narrower than this normative
+contract: edition 2027 rejects directly invalid literal left/right shift
+counts, and guards variable shifts in both checked and release builds when
+the count is negative or at least the declared width of the left operand
+(8, 16, 32, or 64 bits). Edition 2026 retains hardware-masked shifts for
+compatibility. Full overflow and division-by-zero checking remains pending;
+see `V2_FINAL_VERIFICATION.md` for the tested conversion subset.
+
 Narrowing conversion is checked; bit reinterpretation is a named, unsafe
 operation when it can expose invalid representation or target byte order.
 Signed values use two's-complement representation.  Floating-point operations
