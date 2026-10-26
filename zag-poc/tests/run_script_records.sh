@@ -28,4 +28,11 @@ for fields in 'left: 1' 'left: 1, right: true, extra: 2' 'left: "wrong", right: 
     if "$tmp/parser" "$tmp/bad.zag" >"$tmp/out" 2>"$tmp/err"; then echo "invalid record accepted: $fields"; exit 1; fi
     if ! test -s "$tmp/err" && ! test -s "$tmp/out"; then echo 'missing record diagnostic'; exit 1; fi
 done
-echo 'script records: PASS (native projection and five rejection cases)'
+# Named `.field = value` literals must type-check each supplied value.
+printf 'struct Pair { left: i64, right: bool }\nfn main() i32 { let x = Pair{ .left = 1, .right = "no" }; return 0; }\n' >"$tmp/bad-named.zag"
+rm -f "$tmp/bad-named"
+if "$compiler" "$tmp/bad-named.zag" -o "$tmp/bad-named" --no-zagd --no-analyze --no-foreground-cache >"$tmp/bad-named.log" 2>&1 || [ -e "$tmp/bad-named" ]; then
+    echo 'named record wrong-type value was accepted or emitted'; exit 1
+fi
+grep -q 'E0203' "$tmp/bad-named.log" || { echo 'missing E0203 for named record wrong type'; exit 1; }
+echo 'script records: PASS (native projection, five rejection cases, named wrong-type rejection)'
