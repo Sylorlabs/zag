@@ -56,11 +56,30 @@ pass=0
 fail=0
 total=0
 expected_total=101
-if ! log_dir=$(mktemp -d "${TMPDIR:-/tmp}/zag-script-release.XXXXXX"); then
-    echo "cannot create release-gate log directory" >&2
-    exit 1
+# A CI shard reports its own result; only the complete, unsharded run is a
+# standalone first-release certification.  The CI aggregate requires every
+# numbered shard to pass against the identical compiler and source commit.
+shard_start=${ZAGSCRIPT_RELEASE_SHARD_START:-1}
+shard_end=${ZAGSCRIPT_RELEASE_SHARD_END:-$expected_total}
+if ! [[ $shard_start =~ ^[0-9]+$ && $shard_end =~ ^[0-9]+$ ]] ||
+   (( shard_start < 1 || shard_start > shard_end || shard_end > expected_total )); then
+    echo 'invalid ZagScript release shard interval' >&2
+    exit 2
 fi
-trap 'rm -rf "$log_dir"' EXIT
+selected=0
+selected_expected=$((shard_end - shard_start + 1))
+if [[ -n ${ZAGSCRIPT_RELEASE_LOG_DIR:-} ]]; then
+    log_dir=$ZAGSCRIPT_RELEASE_LOG_DIR
+    mkdir -p "$log_dir" || exit 1
+    cleanup_log_dir=0
+else
+    cleanup_log_dir=1
+    if ! log_dir=$(mktemp -d "${TMPDIR:-/tmp}/zag-script-release.XXXXXX"); then
+        echo "cannot create release-gate log directory" >&2
+        exit 1
+    fi
+fi
+if [[ $cleanup_log_dir -eq 1 ]]; then trap 'rm -rf "$log_dir"' EXIT; fi
 
 pass_case() {
     echo "  ok  $1"
@@ -76,6 +95,10 @@ run_gate() {
     name=$1
     shift
     total=$((total + 1))
+    if (( total < shard_start || total > shard_end )); then
+        return 0
+    fi
+    selected=$((selected + 1))
     log="$log_dir/$total.log"
     echo "── [$total] $name"
     if "$@" >"$log" 2>&1; then
@@ -515,4 +538,15 @@ if [[ $total -ne $expected_total ]]; then
         "$expected_total" "$total" >&2
     exit 1
 fi
-test "$pass" -eq "$expected_total" && test "$fail" -eq 0
+if (( selected != selected_expected )); then
+    printf 'release shard inventory drift: expected %d selected suites, ran %d\n' \
+        "$selected_expected" "$selected" >&2
+    exit 1
+fi
+if (( shard_start != 1 || shard_end != expected_total )); then
+    printf 'SHARD-ONLY first-release range=%d-%d pass=%d fail=%d expected=%d\n' \
+        "$shard_start" "$shard_end" "$pass" "$fail" "$selected_expected"
+    test "$pass" -eq "$selected_expected" && test "$fail" -eq 0
+else
+    test "$pass" -eq "$expected_total" && test "$fail" -eq 0
+fi
