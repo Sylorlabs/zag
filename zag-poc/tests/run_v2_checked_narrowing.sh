@@ -55,7 +55,15 @@ for mode in release checked; do
   case_run "${mode}-signed-over-max" 2027 trap 'fn narrow(x:i64) i32 { return x as i32; } fn main() i32 { return narrow(2147483648); }' "$mode"
   case_run "${mode}-signed-under-min" 2027 trap 'fn narrow(x:i64) i32 { return x as i32; } fn main() i32 { return narrow(-2147483649); }' "$mode"
   case_run "${mode}-unsigned-over-max" 2027 trap 'fn narrow(x:u64) u32 { return x as u32; } fn main() i32 { let x:u32=narrow(4294967296); return x as i32; }' "$mode"
+  # Cross-signedness 64-to-32 casts must also retain the full mathematical value.
+  case_run "${mode}-signed-to-unsigned-max" 2027 42 'fn narrow(x:i64) u32 { return x as u32; } fn main() i32 { if (narrow(4294967295) == 4294967295) { return 42; } return 9; }' "$mode"
+  case_run "${mode}-signed-to-unsigned-negative" 2027 trap 'fn narrow(x:i64) u32 { return x as u32; } fn main() i32 { return narrow(-1) as i32; }' "$mode"
+  case_run "${mode}-signed-to-unsigned-over" 2027 trap 'fn narrow(x:i64) u32 { return x as u32; } fn main() i32 { return narrow(4294967296) as i32; }' "$mode"
+  case_run "${mode}-unsigned-to-signed-max" 2027 42 'fn narrow(x:u64) i32 { return x as i32; } fn main() i32 { if (narrow(2147483647) == 2147483647) { return 42; } return 9; }' "$mode"
+  case_run "${mode}-unsigned-to-signed-over" 2027 trap 'fn narrow(x:u64) i32 { return x as i32; } fn main() i32 { return narrow(2147483648); }' "$mode"
 done
 case_run 'v1-signed-wrap' 2026 42 'fn narrow(x:i64) i32 { return x as i32; } fn main() i32 { if (narrow(2147483648) < 0) { return 42; } return 9; }' release
 case_run 'v1-unsigned-wrap' 2026 42 'fn narrow(x:u64) u32 { return x as u32; } fn main() i32 { if (narrow(4294967296) == 0) { return 42; } return 9; }' release
+case_run 'v1-signed-to-unsigned-wrap' 2026 42 'fn narrow(x:i64) u32 { return x as u32; } fn main() i32 { if (narrow(-1) == 4294967295) { return 42; } return 9; }' release
+case_run 'v1-unsigned-to-signed-wrap' 2026 42 'fn narrow(x:u64) i32 { return x as i32; } fn main() i32 { if (narrow(2147483648) < 0) { return 42; } return 9; }' release
 printf 'v2-narrowing pass=%d fail=0\n' "$pass"
