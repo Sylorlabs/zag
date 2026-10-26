@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Edition-2027 signed/unsigned 64 -> 32-bit casts must trap on value loss,
-# including without --safety=checked. Edition 2026 retains wrapping casts.
+# Edition-2027 signed/unsigned 64 -> 32-bit and 32/64 -> 8-bit casts
+# must trap on value loss, including without --safety=checked.
+# Edition 2026 retains wrapping casts.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ZNC=${ZNC:-}
@@ -61,9 +62,31 @@ for mode in release checked; do
   case_run "${mode}-signed-to-unsigned-over" 2027 trap 'fn narrow(x:i64) u32 { return x as u32; } fn main() i32 { return narrow(4294967296) as i32; }' "$mode"
   case_run "${mode}-unsigned-to-signed-max" 2027 42 'fn narrow(x:u64) i32 { return x as i32; } fn main() i32 { if (narrow(2147483647) == 2147483647) { return 42; } return 9; }' "$mode"
   case_run "${mode}-unsigned-to-signed-over" 2027 trap 'fn narrow(x:u64) i32 { return x as i32; } fn main() i32 { return narrow(2147483648); }' "$mode"
+  # Signed bytes must keep their sign, and both target signednesses must
+  # reject values outside their mathematical range before truncating.
+  case_run "${mode}-i64-to-i8-min" 2027 42 'fn narrow(x:i64) i8 { return x as i8; } fn main() i32 { if (narrow(-128) < 0) { return 42; } return 9; }' "$mode"
+  case_run "${mode}-i64-to-i8-max" 2027 42 'fn narrow(x:i64) i8 { return x as i8; } fn main() i32 { if (narrow(127) == 127) { return 42; } return 9; }' "$mode"
+  case_run "${mode}-i64-to-i8-under" 2027 trap 'fn narrow(x:i64) i8 { return x as i8; } fn main() i32 { return narrow(-129) as i32; }' "$mode"
+  case_run "${mode}-i64-to-i8-over" 2027 trap 'fn narrow(x:i64) i8 { return x as i8; } fn main() i32 { return narrow(128) as i32; }' "$mode"
+  case_run "${mode}-u64-to-i8-max" 2027 42 'fn narrow(x:u64) i8 { return x as i8; } fn main() i32 { if (narrow(127) == 127) { return 42; } return 9; }' "$mode"
+  case_run "${mode}-u64-to-i8-over" 2027 trap 'fn narrow(x:u64) i8 { return x as i8; } fn main() i32 { return narrow(128) as i32; }' "$mode"
+  case_run "${mode}-i64-to-u8-max" 2027 42 'fn narrow(x:i64) u8 { return x as u8; } fn main() i32 { if (narrow(255) == 255) { return 42; } return 9; }' "$mode"
+  case_run "${mode}-i64-to-u8-negative" 2027 trap 'fn narrow(x:i64) u8 { return x as u8; } fn main() i32 { return narrow(-1) as i32; }' "$mode"
+  case_run "${mode}-i64-to-u8-over" 2027 trap 'fn narrow(x:i64) u8 { return x as u8; } fn main() i32 { return narrow(256) as i32; }' "$mode"
+  case_run "${mode}-u64-to-u8-max" 2027 42 'fn narrow(x:u64) u8 { return x as u8; } fn main() i32 { if (narrow(255) == 255) { return 42; } return 9; }' "$mode"
+  case_run "${mode}-u64-to-u8-over" 2027 trap 'fn narrow(x:u64) u8 { return x as u8; } fn main() i32 { return narrow(256) as i32; }' "$mode"
+  case_run "${mode}-i32-to-i8-min" 2027 42 'fn narrow(x:i32) i8 { return x as i8; } fn main() i32 { if (narrow(-128) < 0) { return 42; } return 9; }' "$mode"
+  case_run "${mode}-i32-to-i8-over" 2027 trap 'fn narrow(x:i32) i8 { return x as i8; } fn main() i32 { return narrow(128) as i32; }' "$mode"
+  case_run "${mode}-u32-to-i8-over" 2027 trap 'fn narrow(x:u32) i8 { return x as i8; } fn main() i32 { return narrow(128) as i32; }' "$mode"
+  case_run "${mode}-u32-to-u8-max" 2027 42 'fn narrow(x:u32) u8 { return x as u8; } fn main() i32 { if (narrow(255) == 255) { return 42; } return 9; }' "$mode"
+  case_run "${mode}-u32-to-u8-over" 2027 trap 'fn narrow(x:u32) u8 { return x as u8; } fn main() i32 { return narrow(256) as i32; }' "$mode"
+  case_run "${mode}-i32-to-u8-negative" 2027 trap 'fn narrow(x:i32) u8 { return x as u8; } fn main() i32 { return narrow(-1) as i32; }' "$mode"
 done
 case_run 'v1-signed-wrap' 2026 42 'fn narrow(x:i64) i32 { return x as i32; } fn main() i32 { if (narrow(2147483648) < 0) { return 42; } return 9; }' release
 case_run 'v1-unsigned-wrap' 2026 42 'fn narrow(x:u64) u32 { return x as u32; } fn main() i32 { if (narrow(4294967296) == 0) { return 42; } return 9; }' release
 case_run 'v1-signed-to-unsigned-wrap' 2026 42 'fn narrow(x:i64) u32 { return x as u32; } fn main() i32 { if (narrow(-1) == 4294967295) { return 42; } return 9; }' release
 case_run 'v1-unsigned-to-signed-wrap' 2026 42 'fn narrow(x:u64) i32 { return x as i32; } fn main() i32 { if (narrow(2147483648) < 0) { return 42; } return 9; }' release
+case_run 'v1-i64-to-u8-wrap' 2026 42 'fn narrow(x:i64) u8 { return x as u8; } fn main() i32 { if (narrow(256) == 0) { return 42; } return 9; }' release
+case_run 'v1-i64-to-i8-wrap' 2026 42 'fn narrow(x:i64) i8 { return x as i8; } fn main() i32 { if (narrow(257) == 1) { return 42; } return 9; }' release
+case_run 'v1-u32-to-u8-wrap' 2026 42 'fn narrow(x:u32) u8 { return x as u8; } fn main() i32 { if (narrow(256) == 0) { return 42; } return 9; }' release
 printf 'v2-narrowing pass=%d fail=0\n' "$pass"
