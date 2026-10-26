@@ -102,9 +102,13 @@ the count is negative or at least the declared width of the left operand
 (8, 16, 32, or 64 bits). Edition 2026 retains hardware-masked shifts for
 compatibility. Edition 2027 also rejects directly known zero divisors for
 integer division and remainder at compilation; dynamic zero divisors retain the
-existing runtime panic in both checked and release modes. Edition 2026 retains
-its historical runtime panic for zero divisors. Full integer overflow checking
-and analysis of folded constant expressions remain pending; see
+existing runtime panic in both checked and release modes. Edition 2027 also
+traps signed `i64` division of the minimum value by `-1` (release and checked
+modes) before the target instruction can silently wrap or fault. This trap
+does not apply to signed remainder or unsigned division. Edition 2026 retains
+its historical runtime panic for zero divisors and wrapping `i64` minimum
+divided by `-1`. Other integer overflow checking and analysis of folded
+constant expressions remain pending; see
 `V2_FINAL_VERIFICATION.md` for the tested conversion subset.
 
 Narrowing conversion is checked; bit reinterpretation is a named, unsafe
