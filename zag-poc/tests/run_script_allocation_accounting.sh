@@ -48,7 +48,11 @@ printf 'script;\nlet first:[]u8=read_file("sparse-over-limit.bin");\nlet second:
 printf 'script;\nlet data:[]u8=read_file("does-not-exist");\nif(data.len>=0){return 1;}\nif(script_alloc_used()!=0){return 2;}\nreturn 0;\n' >"$tmp_dir/read_missing.zag"
 (cd "$tmp_dir" && "$znc_bin" read_missing.zag -o read_missing --no-zagd >/dev/null && ./read_missing)
 
-printf 'script;\nlet result=process_run_timeout("printf bounded",1000,1048400);\nif(process_result_state(result)!=process_state_exited()){return 1;}\nif(!@strEq(process_result_output(result),"bounded")){return 2;}\nif(script_alloc_used()!=1048520){return 3;}\nreturn 0;\n' >"$tmp_dir/process_ok.zag"
+# The exact witness is the documented capture charge for this command:
+#   pair(8) + cmd NUL bridge(15) + argv(32) + envp(8) + buffer(max_output+1=
+#   1048401) + statusp(8) + 32-byte script result handle = 1048504 bytes.
+# Verified identical on native macOS-arm64 and linux-x86_64 (docker-amd64).
+printf 'script;\nlet result=process_run_timeout("printf bounded",1000,1048400);\nif(process_result_state(result)!=process_state_exited()){return 1;}\nif(!@strEq(process_result_output(result),"bounded")){return 2;}\nif(script_alloc_used()!=1048504){return 3;}\nreturn 0;\n' >"$tmp_dir/process_ok.zag"
 (cd "$tmp_dir" && "$znc_bin" process_ok.zag -o process_ok --no-zagd >/dev/null && ./process_ok)
 
 printf 'script;\nlet result=process_run_timeout("printf blocked",1000,1048576);\nreturn 0;\n' >"$tmp_dir/process_over.zag"
