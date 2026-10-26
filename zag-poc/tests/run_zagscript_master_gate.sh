@@ -20,6 +20,13 @@ bash tests/run_zagscript_1_0_matrix_selftest.sh
 bash tests/run_zagscript_1_0_matrix.sh --release
 
 echo
+echo "── preflight: guarded-memory certification host readiness"
+# The master gate is intentionally fail-closed on hosts without writable
+# cgroup-v2 limits, a usable user systemd manager, and active earlyoom. Probe
+# before lengthy compiler rebuilds so unsupported hosts fail promptly.
+bash tests/run_native_memory_regression.sh --probe
+
+echo
 echo "── [1/7] fixed-point self-host bootstrap"
 /usr/bin/time -f 'bootstrap elapsed=%E peak_rss_kib=%M' bash bootstrap.sh
 
@@ -48,7 +55,6 @@ echo "── [6/7] bounded three-stage memory regression"
 # The memory gate refuses to run without a working user cgroup and active
 # earlyoom. A skip is intentionally a master-gate failure: it means the
 # workstation-safety claim was not proven in this environment.
-bash tests/run_native_memory_regression.sh --probe
 ZAG_RUN_HEAVY_MEMORY_GATE=1 \
     /usr/bin/time -f 'memory-gate elapsed=%E coordinator_peak_rss_kib=%M' \
     bash tests/run_native_memory_regression.sh
