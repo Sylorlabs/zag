@@ -290,7 +290,7 @@ cat >"$tmp/certified-add.zag" <<'ZAG'
 fn main() i32 { let x:i32=2147483647+1; if (x<0) { return 42; } else { return 1; } }
 ZAG
 "$compiler" view "$tmp/certified-add.zag" --level native --no-zagd >"$tmp/certified-native.txt"
-grep -q '^// native-target=linux-x86_64 cpu=.* lowering=zir-direct ir-verifier=def-before-use-v1 artifact_ir_consumed=1$' \
+grep -q '^// native-target=x86_64 host=[^ ]* cpu=.* lowering=zir-direct ir-verifier=def-before-use-v1 artifact_ir_consumed=1$' \
     "$tmp/certified-native.txt"
 grep -q '^// semantic-transform-status=verified_no_transform rule=none checker=not-run transform_count=0 artifact_transform_consumed=0$' \
     "$tmp/certified-native.txt"
@@ -318,7 +318,7 @@ cp "$tmp/certified-add.zag" "$tmp/certified-v2/certified-add.zag"
 "$compiler" view "$tmp/certified-v2/certified-add.zag" --level native --no-zagd \
     --sanitize=memory >"$tmp/certified-native-sanitize.txt"
 for view in "$tmp/certified-native-checked.txt" "$tmp/certified-native-sanitize.txt"; do
-    grep -q '^// native-target=linux-x86_64 cpu=.* lowering=verified-ast-bridge ir-verifier=def-before-use-v1 artifact_ir_consumed=0$' "$view"
+    grep -q '^// native-target=x86_64 host=[^ ]* cpu=.* lowering=verified-ast-bridge ir-verifier=def-before-use-v1 artifact_ir_consumed=0$' "$view"
     grep -q '^// semantic-transform-status=verified_no_transform rule=none checker=not-run transform_count=0 artifact_transform_consumed=0$' "$view"
 done
 
@@ -357,7 +357,7 @@ check_public_contextual_bridge() {
     "$compiler" view "$source" --level native --no-zagd >"$tmp/public-$name.native"
     grep -q '^// schema=zag-ir-v1 transform=zag-transform-v1 coverage_complete=1 coverage_errors=0 origin_complete=1 origin_exact=1$' \
         "$tmp/public-$name.native"
-    grep -q '^// native-target=linux-x86_64 cpu=.* lowering=verified-ast-bridge ir-verifier=def-before-use-v1 artifact_ir_consumed=0$' \
+    grep -q '^// native-target=x86_64 host=[^ ]* cpu=.* lowering=verified-ast-bridge ir-verifier=def-before-use-v1 artifact_ir_consumed=0$' \
         "$tmp/public-$name.native"
     grep -q '^// semantic-transform-status=verified_no_transform rule=none checker=not-run transform_count=0 artifact_transform_consumed=0$' \
         "$tmp/public-$name.native"
@@ -380,7 +380,7 @@ check_public_ast_bridge() {
     "$compiler" view "$source" --level native --no-zagd >"$tmp/public-$name.native"
     grep -q '^// schema=zag-ir-v1 transform=zag-transform-v1 coverage_complete=0 coverage_errors=[1-9][0-9]* origin_complete=1 origin_exact=1$' \
         "$tmp/public-$name.native"
-    grep -q '^// native-target=linux-x86_64 cpu=.* lowering=verified-ast-bridge ir-verifier=def-before-use-v1 artifact_ir_consumed=0$' \
+    grep -q '^// native-target=x86_64 host=[^ ]* cpu=.* lowering=verified-ast-bridge ir-verifier=def-before-use-v1 artifact_ir_consumed=0$' \
         "$tmp/public-$name.native"
     grep -q '^// semantic-transform-status=verified_raw_ast_bridge_incomplete rule=none checker=not-run transform_count=0 artifact_transform_consumed=0$' \
         "$tmp/public-$name.native"
@@ -405,7 +405,7 @@ test "$public_source_order_shadow_rc" -eq 42
     >"$tmp/public-source-order-shadow.native"
 grep -q '^// schema=zag-ir-v1 transform=zag-transform-v1 coverage_complete=1 coverage_errors=0 origin_complete=1 origin_exact=1$' \
     "$tmp/public-source-order-shadow.native"
-grep -q '^// native-target=linux-x86_64 cpu=.* lowering=zir-direct ir-verifier=def-before-use-v1 artifact_ir_consumed=1$' \
+grep -q '^// native-target=x86_64 host=[^ ]* cpu=.* lowering=zir-direct ir-verifier=def-before-use-v1 artifact_ir_consumed=1$' \
     "$tmp/public-source-order-shadow.native"
 grep -q '^// semantic-transform-status=verified_no_transform rule=none checker=not-run transform_count=0 artifact_transform_consumed=0$' \
     "$tmp/public-source-order-shadow.native"

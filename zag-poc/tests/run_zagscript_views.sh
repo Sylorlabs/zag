@@ -6,6 +6,7 @@ caller_dir=$PWD
 cd "$script_dir"
 . tests/portable.sh
 
+# Never default to the tracked Linux x86-64 seed on an ARM host.
 compiler=${ZNC:-$(zag_native_compiler "$script_dir")}
 case "$compiler" in
     /*) ;;
@@ -34,13 +35,13 @@ grep -q '^module {' "$tmp/native"
 grep -q 'func.func' "$tmp/native"
 grep -q '^// schema=zag-ir-v1 transform=zag-transform-v1' "$tmp/native"
 view_host=$(zag_native_platform)
-# Both the historical Linux-labeled header and the host-qualified header
-# describe the x86 instruction view; neither implies native ARM execution.
-grep -Eq "^// native-target=(linux-x86_64|x86_64 host=$view_host) cpu=" "$tmp/native"
+# The native view is x86 instruction lowering; the host names actual execution.
+grep -q "^// native-target=x86_64 host=$view_host cpu=" "$tmp/native"
 grep -Eq ' lowering=(zir-direct|verified-ast-bridge)( refusal=[^ ]+)? ir-verifier=def-before-use-v1 artifact_ir_consumed=[01]$' \
     "$tmp/native"
 grep -Eq '^// semantic-transform-status=(verified_no_transform|verified_raw_ast_bridge_incomplete) rule=none checker=not-run transform_count=0 artifact_transform_consumed=0$' \
     "$tmp/native"
+# Bridge routes may carry a refusal reason before ir-verifier.
 native_route=$(sed -n 's/^\/\/ native-target=.* lowering=\([^ ]*\).* ir-verifier=.*/\1/p' "$tmp/native")
 native_status=$(sed -n 's/^\/\/ semantic-transform-status=\([^ ]*\).*/\1/p' "$tmp/native")
 native_ir_consumed=$(sed -n 's/^\/\/ native-target=.* artifact_ir_consumed=\([01]\)$/\1/p' "$tmp/native")
