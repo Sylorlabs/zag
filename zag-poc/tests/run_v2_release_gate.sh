@@ -36,6 +36,7 @@ run_gate "v1 native execution" bash tests/run_native.sh
 run_gate "shared declared-type authority" bash tests/run_typed_authority.sh
 run_gate "v2 edition boundary" bash tests/run_v2_edition.sh
 run_gate "v2 checked signed/unsigned integer narrowing" bash tests/run_v2_checked_narrowing.sh
+run_gate "v2 shift count checks and v1 compatibility" bash tests/run_v2_shift_counts.sh
 run_gate "unsafe lexical and raw-pointer boundary" bash tests/run_v2_edition.sh
 run_gate "try-wrapped borrow identity" bash tests/run_v2_try_borrow.sh
 run_gate "mutation-aware aggregate provenance" bash tests/run_v2_aggregate_provenance.sh
