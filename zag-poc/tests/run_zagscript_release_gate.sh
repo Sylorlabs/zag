@@ -43,6 +43,15 @@ if ! bash tests/run_zagscript_1_0_matrix.sh --release; then
     exit 1
 fi
 
+# The first-release contract is Linux x86-64. On other hosts, the checked-in
+# ELF compiler cannot execute; avoid collecting misleading downstream failures.
+if [[ $(uname -s):$(uname -m) != Linux:x86_64 ]]; then
+    printf 'ZagScript Linux release gate requires Linux x86-64 (host=%s:%s).\n' \
+        "$(uname -s)" "$(uname -m)" >&2
+    printf 'On Apple Silicon macOS run: bash tests/run_zagscript_1_0_completion.sh\n' >&2
+    exit 2
+fi
+
 pass=0
 fail=0
 total=0
