@@ -3,6 +3,24 @@ set -u
 
 cd "$(dirname "$0")/.."
 
+# Select the host-native compiler before running any expensive bootstrap or
+# truncating an existing completion log. Unsupported hosts fail explicitly.
+host="$(uname -s):$(uname -m)"
+case "$host" in
+    Darwin:arm64)
+        native_compiler=znc-macos-arm64
+        native_daemon=zagd-macos-arm64
+        ;;
+    Linux:x86_64|Linux:amd64)
+        native_compiler=znc
+        native_daemon=zagd
+        ;;
+    *)
+        echo "ZagScript 1.0 completion: unsupported host: $host" >&2
+        exit 2
+        ;;
+esac
+
 log=${ZAGSCRIPT_1_0_COMPLETION_LOG:-"$PWD/zagscript-1.0-completion.log"}
 : >"$log"
 exec > >(tee -a "$log") 2>&1
@@ -22,15 +40,21 @@ run() {
 }
 
 echo '== ZagScript 1.0: clean self-host bootstrap =='
-ZAG_BOOTSTRAP_MEMORY_GUARD=off bash bootstrap.sh
+if [ "$host" = Darwin:arm64 ]; then
+    # macOS has no Linux memory cgroup. Bootstrap still bounds each stage.
+    ZAG_BOOTSTRAP_MEMORY_GUARD=off bash bootstrap.sh
+else
+    # Preserve Linux workstation memory guards.
+    bash bootstrap.sh
+fi
 bootstrap_rc=$?
 if [ "$bootstrap_rc" -ne 0 ]; then
     echo "ZagScript 1.0 completion: bootstrap failed rc=$bootstrap_rc" >&2
     exit "$bootstrap_rc"
 fi
 
-export ZNC="$PWD/znc-macos-arm64"
-export ZAGD="$PWD/zagd-macos-arm64"
+export ZNC="$PWD/$native_compiler"
+export ZAGD="$PWD/$native_daemon"
 
 for binary in "$ZNC" "$ZAGD"; do
     if [ ! -x "$binary" ]; then

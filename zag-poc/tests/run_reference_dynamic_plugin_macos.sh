@@ -21,6 +21,30 @@ real_compiler=$compiler
 cc_bin=${CC:-clang}
 command -v "$cc_bin" >/dev/null
 
+# Some newer SDKs advertise arm64e.x1-macos in libSystem's TAPI stub, which
+# the installed Apple linker cannot parse. Use another installed macOS SDK
+# for this test's C dylib and SDK symbol lookup when that target is present.
+sdk_root=${SDKROOT:-$(xcrun --sdk macosx --show-sdk-path)}
+if [ -f "$sdk_root/usr/lib/libSystem.B.tbd" ] &&
+    grep -Fq 'arm64e.x1-macos' "$sdk_root/usr/lib/libSystem.B.tbd"; then
+    sdk_dir=$(dirname "$sdk_root")
+    compatible_sdk=
+    for candidate in "$sdk_dir"/MacOSX*.sdk; do
+        [ -f "$candidate/usr/lib/libSystem.B.tbd" ] || continue
+        if ! grep -Fq 'arm64e.x1-macos' "$candidate/usr/lib/libSystem.B.tbd"; then
+            compatible_sdk=$(cd "$candidate" && pwd -P)
+            break
+        fi
+    done
+    if [ -z "$compatible_sdk" ]; then
+        echo "macOS dynamic plugin reference: no installed TAPI-compatible SDK (selected: $sdk_root)" >&2
+        exit 2
+    fi
+    echo "macOS dynamic plugin reference: using compatible SDK $compatible_sdk" >&2
+    sdk_root=$compatible_sdk
+fi
+export SDKROOT=$sdk_root
+
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/zag-reference-dynamic-plugin-macos.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 # A freshly rebuilt compiler commonly lives in an isolated temporary directory.

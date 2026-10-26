@@ -34,13 +34,15 @@ grep -q '"candidate_compilable":true' "$tmp/explicit"
 grep -q '^module {' "$tmp/native"
 grep -q 'func.func' "$tmp/native"
 grep -q '^// schema=zag-ir-v1 transform=zag-transform-v1' "$tmp/native"
-grep -q '^// native-target=x86_64 host=[^ ]* cpu=' "$tmp/native"
-grep -Eq ' lowering=(zir-direct|verified-ast-bridge)( refusal=[^ ]*)? ir-verifier=def-before-use-v1 artifact_ir_consumed=[01]$' \
+view_host=$(zag_native_platform)
+# The native view is x86 instruction lowering; the host names actual execution.
+grep -q "^// native-target=x86_64 host=$view_host cpu=" "$tmp/native"
+grep -Eq ' lowering=(zir-direct|verified-ast-bridge)( refusal=[^ ]+)? ir-verifier=def-before-use-v1 artifact_ir_consumed=[01]$' \
     "$tmp/native"
 grep -Eq '^// semantic-transform-status=(verified_no_transform|verified_raw_ast_bridge_incomplete) rule=none checker=not-run transform_count=0 artifact_transform_consumed=0$' \
     "$tmp/native"
-# The bridge route may carry a `refusal=<reason>` field before ir-verifier.
-native_route=$(sed -n 's#^.* lowering=\([^ ]*\).*#\1#p' "$tmp/native")
+# Bridge routes may carry a refusal reason before ir-verifier.
+native_route=$(sed -n 's/^\/\/ native-target=.* lowering=\([^ ]*\).* ir-verifier=.*/\1/p' "$tmp/native")
 native_status=$(sed -n 's/^\/\/ semantic-transform-status=\([^ ]*\).*/\1/p' "$tmp/native")
 native_ir_consumed=$(sed -n 's/^\/\/ native-target=.* artifact_ir_consumed=\([01]\)$/\1/p' "$tmp/native")
 case "$native_route:$native_status" in
