@@ -94,3 +94,11 @@ bash tests/run_macos_dylib.sh
 ```
 
 The full native ARM64 release gate is a separate qualification. All raw local logs are retained under `.sentinel-build/` outside the tracked report.
+
+## Fourth full release attempt: historical dynamic-loader fixture missing
+
+With the strict native-manifest classification fix, the fourth native ARM64 full release attempt passed self-host fixpoint, narrow casts, the corrected `@repr(C)` fixture, and the **complete** `run_macos_dylib.sh` production linker suite. It stopped at `run_macos_dylib_format.sh` when Apple clang could not find `tests/fixtures/macos_dylib_loader.c`. This C test witness was absent in the current checked-out tree but survives **unchanged** in historical Zag commit `bb37154` (`ZagScript 1.0 qualification snapshot`), so this is a pre-existing missing-fixture packaging defect rather than a new compiler-lowering failure.
+
+The exact historical fixture was restored using `git show bb37154:zag-poc/tests/fixtures/macos_dylib_loader.c` to the same path on the isolated review branch. Historical/current SHA-256: `1ac47bb3cf608ceb3cb81f565740f3657ce91b21f5a8a2f610fd7723e99cc62f`. Under the manifest-corrected compiler with SDK 26.5, **the complete** `tests/run_macos_dylib_format.sh` passed: three `dlopen`/`dlsym`/`dlclose` cycles, 305 exports, function/data rebase/bind, deterministic signed dylibs, FAT/thin dependency parsing and invalid input checks. This is an exact archived fixture recovery, not reconstruction or a claim that other missing files exist.
+
+Reproduce from `zag-poc/` with `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk ZNC=/absolute/path/to/znc-manifest-fixed-gen1 bash tests/run_macos_dylib_format.sh`. The subsequent **full** native ARM64 release gate is separately required and is not implied by this suite pass.
