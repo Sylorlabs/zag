@@ -36,3 +36,23 @@ ZNC_BIN=/absolute/path/to/znc-macos-arm64 bash zag-poc/tests/run_sentinel_narrow
 ```
 
 The file `fixtures/sentinel_narrow_cast_matrix.expected` is the *fixed mathematical oracle*, not an output updated to match a failing compiler. `run_macos_arm64_release.sh` includes the regression for subsequent release qualification; running the new test alone does not establish the full release gate's success.
+
+## Independent macOS release-gate environment diagnosis (2026-10-26)
+
+The complete native macOS ARM64 release gate was executed using the fixed-point patched compiler (`12ccffdd6486049b9b2282a2c16c5367c9fd413a5545d137ca7735eb5ddd74cc`). Its first run reached the Mach-O/C interoperability phase after rebuilding byte-identical generation-1 and generation-2 compilers, passing all 25 narrow-cast fixture lines, passing the native dyld/Objective-C cases, and passing the 25-case live hot-reload check. The complete gate **exited 1** in `tests/run_macos_object.sh` when `xcrun clang` attempted to link `caller.c` with generated Zag Mach-O object files. The installed CLT macOS **27.0** SDK's `libSystem.tbd` contained an architecture string the Apple linker rejected:
+
+```text
+ld: tapi error: malformed file
+/Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk/usr/lib/libSystem.B.tbd:4:20: error: unknown architecture
+                   arm64e.x1-macos, arm64e.x1-maccatalyst ]
+```
+
+`xcrun --show-sdk-path` resolved `MacOSX27.0.sdk`; `clang --version` identified Apple clang 21.0.0 (clang-2100.1.1.101). As an independent environment control, the same `int main(void) { return 0; }` C source **linked successfully** with `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk` and **failed** with `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk`. With SDK 26.5 explicitly selected, the complete `tests/run_macos_object.sh` Zag/C ABI interoperability suite **passed** using the same patched compiler SHA. Therefore this original full-gate failure is at the external Apple SDK/linker boundary; it is not evidence of a Zag narrow-cast regression. The overall release-gate qualification requires a complete run with a usable SDK.
+
+Reproduce the controlled external-link stage without editing installed SDKs or changing compiler source:
+
+```sh
+SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk \
+ZNC=/absolute/path/to/patched-znc \
+bash zag-poc/tests/run_macos_object.sh
+```
