@@ -29,6 +29,7 @@ esac
     --no-zagd --no-analyze --no-foreground-cache >/dev/null
 mkdir -p "$tmp/native-artifacts"
 "$tmp/zir_native_backend_test" "$tmp/native-artifacts"
+trap - ERR
 set +e
 "$tmp/native-artifacts/native-scalar"
 zir_scalar_rc=$?
@@ -73,6 +74,7 @@ zir_divzero_rc=$?
 "$tmp/native-artifacts/native-void"
 zir_void_rc=$?
 set -e
+trap 'rc=$?; printf "zir authority failure: line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
 test "$zir_scalar_rc" -eq 42
 test "$zir_loop_rc" -eq 10
 test "$zir_raw_overflow_rc" -eq 42

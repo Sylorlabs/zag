@@ -6,6 +6,9 @@ tmp=$(mktemp -d /tmp/zagd-buffer-lifetime.XXXXXX)
 daemon_pid=
 cleanup() {
     if [ -n "$daemon_pid" ]; then
+        # A failed stale-record assertion must not leave a stopped daemon
+        # blocking cleanup's wait.
+        kill -CONT "$daemon_pid" 2>/dev/null || true
         printf stop > "$tmp/project/.zagd.stop" 2>/dev/null || true
         wait "$daemon_pid" 2>/dev/null || true
     fi
@@ -72,9 +75,21 @@ grep -q '"source_changes":false' "$tmp/suggest.json"
 
 # A filesystem event is only a hint. Until the foreground compiler publishes a
 # checksum-bound record for the new bytes, the old record must be rejected.
+kill -STOP "$daemon_pid"
+daemon_state=
+for _ in $(seq 1 100); do
+    daemon_state=$(ps -o state= -p "$daemon_pid" 2>/dev/null | tr -d '[:space:]')
+    case "$daemon_state" in T*) break ;; esac
+    sleep 0.01
+done
+case "$daemon_state" in
+    T*) ;;
+    *) echo 'zagd did not stop before the stale-record check' >&2; exit 1 ;;
+esac
 printf '\n// comment-only stable edit\n' >> "$tmp/project/app.zag"
 (cd "$tmp/project" && "$compiler" suggest --format json > "$tmp/stale.json")
 grep -q '"available":false,"reason":"stale-module-graph"' "$tmp/stale.json"
+kill -CONT "$daemon_pid"
 
 printf stop > "$tmp/project/.zagd.stop"
 wait "$daemon_pid"
@@ -88,6 +103,7 @@ test "$before_source" != "$after_source"
 test "$before_graph" = "$after_graph"
 test "$before_fact" = "$after_fact"
 
+rm -f "$tmp/project/.zag-cache/zagd/candidates.record"
 "$daemon" --root "$tmp/project" --root-source app.zag --mode adaptive --window-ms 20 &
 daemon_pid=$!
 for _ in $(seq 1 1000); do

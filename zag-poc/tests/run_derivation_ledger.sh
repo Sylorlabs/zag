@@ -60,7 +60,7 @@ if "$compiler" unexpand "$tmp/project/edited.zag" \
     echo 'derivation ledger accepted edited promoted source for exact reversal' >&2
     exit 1
 fi
-grep -q 'edited projection is unavailable or ambiguous' "$tmp/edited.log"
+grep -q 'znc unexpand: structural projection conflict at derived bytes' "$tmp/edited.log"
 test ! -e "$tmp/project/edited-restored.zag"
 
 echo 'derivation ledger: PASS codec + prepared semantic evidence + exact promote/unexpand + tamper rejection'
