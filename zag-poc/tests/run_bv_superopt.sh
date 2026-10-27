@@ -65,4 +65,3 @@ fi
 grep -q 'returned unknown' "$tmp/invalid"
 
 echo 'bv-superopt: PASS (4 widths, proven rewrites, counterexamples, search, replay and fail-closed cases)'
-

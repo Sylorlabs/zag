@@ -184,4 +184,3 @@ if [[ -n $proof_file ]]; then cp "$temp/query.smt2" "$proof_file"; fi
 printf 'width=%s\nreference=%s\nselected=%s\noriginal_nodes=%s\nselected_nodes=%s\nselection=%s\nchecked=%s\nproof=unsat\n' \
     "$bits" "$reference" "$selected" "$reference_cost" "$selected_cost" "$selected_kind" "$checked"
 echo 'scope=pure-unsigned-wrapping-bv; grammar=leaf-or-binary-leaves; cost=postfix-nodes'
-

@@ -57,4 +57,3 @@ compiled C/Rust equivalents.
 The GitHub Linux CI job installs `z3`, so the release gate runs the test
 suite. Developer environments without Z3 skip only the optional offline proof
 gate; `bash tests/run_bv_superopt.sh` itself fails if the solver is absent.
-
