@@ -122,3 +122,18 @@ ZNC_BIN=/absolute/path/to/native-znc bash tests/run_sentinel_narrow_cast_matrix.
 ```
 
 Raw local evidence remains outside Git in `.sentinel-build/aggregate-scaling-{baseline,patched,isolation,cache-fix}.json`, `.sentinel-build/aggregate-provenance-fixed-2.{stdout,stderr}`, `.sentinel-build/{before,cached}-field-mismatch.stderr`, `.sentinel-build/full-release-restored-loader.{stdout,stderr}`, and `.sentinel-build/deep-aggregate-sample.txt`. These development tests do not establish a completed **full** ARM64 release-gate pass; that requires a fresh exit status 0 and `fail=0`.
+
+## Sixth gate blocker: macOS link-options test retained invalid source state
+
+The next full ARM64 gate progressed through signed self-host compilation, native narrow casts, dynamic library suites and the once-blocking 64-level aggregate provenance stage, but exited 1 in `tests/run_macos_link_options.sh`. This runner first created a root source-package reference `helper = { path = "vendor/helper" }` without writing the imported package's required `vendor/helper/zag.mod`. The stricter, correct manifest-closure checker rejected that malformed test fixture. A first correction supplied the child manifest but exposed a second test setup bug: the later hot-patch phase restored the root `zag.mod` without restoring the original `src/main.zag`, so its remaining `pkg:helper/value.zag` import was undeclared. The hot-patch checks then failed for the wrong reason, before option validation could occur.
+
+Only the test fixture runner was corrected: create a valid child package manifest for the source-only import, append the native dependency declaration to that existing child manifest for the negative tests, and restore **both** original root manifest and standalone `main.zag` before the hot-patch validation loop. The native linker restrictions and package-closure checker are unchanged. The corrected script SHA-256 is `d0f1cdeb26671a4b79299b2a31e6f0eaa35148c707fb0f6cd73ba1d2d9029e5c`.
+
+With SDK26.5, both independent exact compiler identities — pre-fix `f83ff168fd0e03cf5c68fc9233064308a5213a07629f2b17c747e42bbd838214` and all-patched native ARM64 `6b5e7b6e6816f4a3f661251f5489d850d329618bf44db3cb8106b8ab8c9a9fc1` — passed **59/59** link-options checks with `exit 0`, byte-identical stdout SHA-256 `d426f7ba2dd18adbfbd49822264cd950a732a0d86503d1791ae1d0be90ed9c34`, and empty stderr. This independently identifies a pre-existing runner fixture problem, not an observed release-linker regression. Reproduce from `zag-poc/`:
+
+```sh
+SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk \
+ZNC=/absolute/path/to/old-or-corrected-znc bash tests/run_macos_link_options.sh
+```
+
+Raw logs: `.sentinel-build/macos-link-options-{old-compiler,fixed-3}.{stdout,stderr}`. A complete fresh ARM64 release gate with the corrected runner was started subsequently; its final qualification outcome must be recorded from that attempt's exit status.
