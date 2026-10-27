@@ -5,4 +5,5 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 bash tests/run_script_interpolation_parser.sh
 bash tests/run_script_interpolation.sh
+bash tests/run_script_projection.sh
 echo 'typed interpolation projection integration: PASS'

@@ -23,6 +23,13 @@ def main():
         assert list(Path(scratch).iterdir()) == [], "invalid run published output"
 
         env["RUNS"] = "30"
+        env["RUN_TIMEOUT_SECONDS"] = "0"
+        rejected = subprocess.run([sys.executable, str(BENCHMARK)], env=env, capture_output=True)
+        assert rejected.returncode != 0
+        assert b"RUN_TIMEOUT_SECONDS must be >= 1" in rejected.stderr, rejected.stderr
+        assert list(Path(scratch).iterdir()) == [], "invalid timeout published output"
+        env["RUN_TIMEOUT_SECONDS"] = "60"
+
         finished = subprocess.run([sys.executable, str(BENCHMARK)], env=env, capture_output=True)
         assert finished.returncode == 0, finished.stdout + finished.stderr
         raw, = Path(scratch).glob("*.cross-language.raw.csv")
@@ -42,6 +49,8 @@ def main():
         assert all(int(row["runs"]) == 30 for row in summary_rows)
         assert metadata["iterations_per_run"] == 10001
         assert metadata["runs_per_language"] == 30
+        assert metadata["run_timeout_seconds"] == 60
+        assert metadata["build_timeout_seconds"] == 180
         assert len(metadata["source_sha256"]) == 4
         assert all(len(digest) == 64 for digest in metadata["source_sha256"].values())
     print("cross-language benchmark: PASS (parity, 30 runs each, metadata, rejection)")

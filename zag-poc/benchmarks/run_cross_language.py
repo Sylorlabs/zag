@@ -33,8 +33,16 @@ def positive_setting(name, default, minimum):
     return value
 
 
-def command_output(command):
-    result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def command_output(command, timeout_seconds=180):
+    try:
+        result = subprocess.run(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"command timed out after {timeout_seconds}s: {command!r}"
+        ) from exc
     if result.returncode:
         raise RuntimeError(
             f"command failed ({result.returncode}): {command!r}\n"
@@ -72,6 +80,8 @@ def cpu_model():
 def main():
     runs = positive_setting("RUNS", 30, 30)
     iterations = positive_setting("ITERATIONS", 2_000_000, 1)
+    build_timeout = positive_setting("BUILD_TIMEOUT_SECONDS", 180, 1)
+    run_timeout = positive_setting("RUN_TIMEOUT_SECONDS", 60, 1)
     # Resolve against the caller's directory before changing working directories.
     out_dir = Path(os.environ.get("OUT", ROOT / "benchmarks" / "results")).expanduser().resolve()
     default_compiler = (
@@ -99,6 +109,8 @@ def main():
         "cpu_model": cpu_model(),
         "logical_cpu_count": os.cpu_count(),
         "runs_per_language": runs,
+        "build_timeout_seconds": build_timeout,
+        "run_timeout_seconds": run_timeout,
         "warmups_per_language": 3,
         "iterations_per_run": iterations,
         "timing": "perf_counter_ns around child process (spawn + execution + stdout/stderr capture)",
@@ -162,7 +174,7 @@ def main():
             else:
                 build = None  # Python is interpreted; no ahead-of-time build.
             if build is not None:
-                command_output(build)
+                command_output(build, timeout_seconds=build_timeout)
                 if not artifact.is_file() or not os.access(artifact, os.X_OK):
                     raise RuntimeError(f"{language}: compiler returned success without an executable")
             commands[language] = (
@@ -174,7 +186,17 @@ def main():
 
         def execute(language, phase, number, position):
             start = time.perf_counter_ns()
-            result = subprocess.run(commands[language], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                result = subprocess.run(
+                    commands[language], stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, timeout=run_timeout,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    f"{language} {phase} {number}: timed out after "
+                    f"{run_timeout}s (increase RUN_TIMEOUT_SECONDS for "
+                    "larger ITERATIONS)"
+                ) from exc
             elapsed = time.perf_counter_ns() - start
             if result.returncode != 0 or result.stdout != expected or result.stderr != b"":
                 raise RuntimeError(

@@ -21,7 +21,11 @@ RUNS=30 ITERATIONS=2000000 python3 benchmarks/run_cross_language.py
 `RUNS` must be **at least 30**. `ITERATIONS` defaults to 2 million and is
 embedded as the same literal in each compiled/interpreted source. `ZNC` may
 point to a compatible **native** compiler binary elsewhere; `CC`, `RUSTC`,
-and `OUT` override the tool paths/output directory. Default compiler names
+and `OUT` override the tool paths/output directory. `BUILD_TIMEOUT_SECONDS`
+(default 180) bounds each compiler and tool-version invocation;
+`RUN_TIMEOUT_SECONDS` (default 60) bounds each measured process. Increase the
+run timeout when increasing `ITERATIONS`. A timeout fails the run before results
+are published; both limits are recorded in metadata. Default compiler names
 are `znc` on Linux x86-64, `znc-linux-arm64` on Linux arm64, and
 `znc-macos-arm64` on Apple Silicon. The checkout's committed `znc` seed
 is Linux x86-64 and cannot run directly on macOS. An external `ZNC` is
@@ -66,7 +70,8 @@ compiler provenance and each language's different execution model.
 Run the opt-in smoke test with
 `python3 benchmarks/test_cross_language.py`. It exercises 30 verified runs
 per language at a short iteration count and also checks that `RUNS=29` is
-rejected. It requires the same compilers and honors `ZNC`/`SDKROOT`.
+rejected along with a zero run timeout. It requires the same compilers and
+honors `ZNC`/`SDKROOT`.
 
 ## Zag-only compiler, daemon, and allocation protocol
 
