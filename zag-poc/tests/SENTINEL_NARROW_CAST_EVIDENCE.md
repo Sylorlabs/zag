@@ -74,3 +74,23 @@ ZNC_TARGET=macos-arm64 bash zag-poc/tests/run_repr_c_layout.sh
 ```
 
 The entire macOS release gate remains a separate qualification requirement; do not infer a full pass from this targeted fixture control.
+
+## Third full release attempt: source-package closure rejects native library manifests
+
+With the corrected ownership fixture and SDK 26.5, a third full gate reached `tests/run_macos_dylib.sh` after passing the previously failing stages. It exited 1 when compiling a manifest-linked executable: `znc: cannot verify toolchain identity: dependency manifest closure is invalid`. This was independently reproduced with both the before-narrow-cast and after-narrow-cast compilers, so it is not a narrow-cast regression. The test manifest declares `[deps] helper = { link = "helper", path = "../libs" }` and the test's actual `../libs` contains a native dynamic library, not a source package manifest.
+
+In `selfhost/package_resolve.zag`, `package_manifest_parse` previously classified any dependency with a `path` field as a local source edge even when a `link` field was also present. `package_manifest_closure_visit` then attempted to read `../libs/zag.mod` and rejected a valid linker-only manifest. The compiler's existing `znc_macos_manifest_links` separately recognizes `link` plus optional `path` and passes them to the native linker. This inconsistent classification broke toolchain-identity validation before the linker could run.
+
+On the isolated SENTINEL Zag branch, `package_manifest_link_table_valid` now accepts **exactly one** nonempty quoted `link` field and at most one nonempty quoted `path` field in either order, and rejects duplicate/unknown fields. The package-closure parser classifies the strictly validated native linker entry outside source-package edges. It continues to validate source package paths and vendor modes separately. Four added native package-closure tests reproduce the failure (the original parser scored **9 pass, 2 fail** across the 11 cases) and pass after the fix (**11/11**). These are new development tests; no frozen evidence changed.
+
+An independently generated signed native ARM64 compiler, SHA-256 `6e98eb65ce7ad45098ba211db2d0d900358f7d627f727516b8724d9c7e18a5bd`, passed the **complete** `tests/run_macos_dylib.sh` with `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk`. This includes executable `manifest-link` and transitive `imported-manifest` cases plus **33 negative cases**, signing, dynamic libraries, dylib symbol/ABI interop, SDK/framework resolution, and relocation. Captured stdout SHA-256 `ffb832b3b5a8d3aac12015bd76c07a836e224247555ea3db137f3dcfc43ba75a`; stderr is empty (SHA-256 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`). Source SHA-256: `selfhost/package_resolve.zag` `10c9b955f989e4184ee54c2d2da33529f4758ab7400af157458b7417e7b2b212`; `selfhost/package_closure_test.zag` `953857959a460d253f21be04531ae0905f6007de646c6cb7c8c11c004df00955`.
+
+Reproduce the targeted result from the `zag-poc` directory using the newly built corrected compiler:
+
+```sh
+ZNC=/absolute/path/to/znc-manifest-fixed-gen1 \
+SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk \
+bash tests/run_macos_dylib.sh
+```
+
+The full native ARM64 release gate is a separate qualification. All raw local logs are retained under `.sentinel-build/` outside the tracked report.
