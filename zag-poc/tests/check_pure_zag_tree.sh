@@ -14,6 +14,9 @@ while IFS= read -r file; do
         ./tests/reference_apps/dynamic_plugin/answer_plugin.c|./tests/fixtures/macos_dylib_loader.c|\
         ./benchmarks/cross_language/kernel.c|./benchmarks/cross_language/kernel.py|\
         ./benchmarks/cross_language/kernel.rs|./benchmarks/run_cross_language.py|\
+        ./benchmarks/cross_language/branch.c|./benchmarks/cross_language/branch.py|\
+        ./benchmarks/cross_language/branch.rs|./benchmarks/cross_language/call.c|\
+        ./benchmarks/cross_language/call.py|./benchmarks/cross_language/call.rs|\
         ./benchmarks/test_cross_language.py|./tests/test_arm64_const_mod.py) ;;
         *) forbidden_files=$'\n'"$file"$forbidden_files ;;
     esac

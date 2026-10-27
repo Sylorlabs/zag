@@ -334,7 +334,11 @@ cp "$tmp/certified-add.zag" "$tmp/certified-v2/certified-add.zag"
 "$compiler" view "$tmp/certified-v2/certified-add.zag" --level native --no-zagd \
     --sanitize=memory >"$tmp/certified-native-sanitize.txt"
 for view in "$tmp/certified-native-checked.txt" "$tmp/certified-native-sanitize.txt"; do
-    grep -q '^// native-target=x86_64 host=[^ ]* cpu=.* lowering=verified-ast-bridge ir-verifier=def-before-use-v1 artifact_ir_consumed=0$' "$view"
+    case "$view" in
+        *-checked.txt) bridge_refusal=checked-safety ;;
+        *-sanitize.txt) bridge_refusal=memory-sanitizer ;;
+    esac
+    grep -q "^// native-target=x86_64 host=[^ ]* cpu=.* lowering=verified-ast-bridge refusal=$bridge_refusal ir-verifier=def-before-use-v1 artifact_ir_consumed=0$" "$view"
     grep -q '^// semantic-transform-status=verified_no_transform rule=none checker=not-run transform_count=0 artifact_transform_consumed=0$' "$view"
 done
 
@@ -373,7 +377,7 @@ check_public_contextual_bridge() {
     "$compiler" view "$source" --level native --no-zagd >"$tmp/public-$name.native"
     grep -q '^// schema=zag-ir-v1 transform=zag-transform-v1 coverage_complete=1 coverage_errors=0 origin_complete=1 origin_exact=1$' \
         "$tmp/public-$name.native"
-    grep -q '^// native-target=x86_64 host=[^ ]* cpu=.* lowering=verified-ast-bridge ir-verifier=def-before-use-v1 artifact_ir_consumed=0$' \
+    grep -Eq '^// native-target=x86_64 host=[^ ]* cpu=.* lowering=verified-ast-bridge refusal=[^ ]+ ir-verifier=def-before-use-v1 artifact_ir_consumed=0$' \
         "$tmp/public-$name.native"
     grep -q '^// semantic-transform-status=verified_no_transform rule=none checker=not-run transform_count=0 artifact_transform_consumed=0$' \
         "$tmp/public-$name.native"
@@ -396,7 +400,7 @@ check_public_ast_bridge() {
     "$compiler" view "$source" --level native --no-zagd >"$tmp/public-$name.native"
     grep -q '^// schema=zag-ir-v1 transform=zag-transform-v1 coverage_complete=0 coverage_errors=[1-9][0-9]* origin_complete=1 origin_exact=1$' \
         "$tmp/public-$name.native"
-    grep -q '^// native-target=x86_64 host=[^ ]* cpu=.* lowering=verified-ast-bridge ir-verifier=def-before-use-v1 artifact_ir_consumed=0$' \
+    grep -Eq '^// native-target=x86_64 host=[^ ]* cpu=.* lowering=verified-ast-bridge refusal=[^ ]+ ir-verifier=def-before-use-v1 artifact_ir_consumed=0$' \
         "$tmp/public-$name.native"
     grep -q '^// semantic-transform-status=verified_raw_ast_bridge_incomplete rule=none checker=not-run transform_count=0 artifact_transform_consumed=0$' \
         "$tmp/public-$name.native"
