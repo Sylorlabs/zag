@@ -1,5 +1,75 @@
 # Zag Script benchmark protocol
 
+## Matched C / Rust / Python process-runtime comparison
+
+The separate `run_cross_language.py` recorder closes a gap in the Zag-only
+protocol below: it executes **the same bounded integer recurrence** in
+ZagScript, C, Rust, and Python. The four source templates live in
+`benchmarks/cross_language/`. All use 64-bit integers where fixed-width
+types exist, seed `x=17`, advance `x=(109*x+1021)%65521`, accumulate
+`checksum=(checksum+x)%1000000007`, and print the final decimal checksum and
+newline. Intermediate values stay within signed 64-bit range, so the reference
+does not depend on language-specific overflow semantics.
+
+From `zag-poc/`, on a host with native `znc`, `clang`, `rustc`, and
+`python3` installed:
+
+```sh
+RUNS=30 ITERATIONS=2000000 python3 benchmarks/run_cross_language.py
+```
+
+`RUNS` must be **at least 30**. `ITERATIONS` defaults to 2 million and is
+embedded as the same literal in each compiled/interpreted source. `ZNC` may
+point to a compatible **native** compiler binary elsewhere; `CC`, `RUSTC`,
+and `OUT` override the tool paths/output directory. Default compiler names
+are `znc` on Linux x86-64, `znc-linux-arm64` on Linux arm64, and
+`znc-macos-arm64` on Apple Silicon. The checkout's committed `znc` seed
+is Linux x86-64 and cannot run directly on macOS. An external `ZNC` is
+copied into a temporary compiler bundle alongside symlinks to **this
+checkout's** `std/` and `selfhost/`; its actual source path and SHA-256
+are recorded, and results from it cannot be attributed to the checkout's
+compiler revision without independent provenance.
+
+On a macOS host where the default SDK/linker combination is incompatible,
+select an installed working SDK using `SDKROOT=/path/to/MacOSX.sdk`. This
+setting is inherited by the C and Rust compiler invocations and captured
+in the metadata. On the macOS test host, the default MacOSX27.0 SDK failed
+to link C; selecting the installed MacOSX26.5 SDK allowed the comparison to
+complete. This does not change the ZagScript compiler target.
+
+The recorder compiles C using `clang -O2 -std=c11`, Rust using
+`rustc -C opt-level=2 -C target-cpu=generic`, and ZagScript using
+`--no-zagd --no-analyze --no-foreground-cache`. Python runs under
+`python3 -I -B`. It **checks stdout bytes, empty stderr, and zero exit
+status against an independently computed result** for every warmup and
+measured run. On any mismatch or failed build it stops without publishing
+results. It warms each language three times, then rotates their order across
+30 or more measured rounds. Measurements use `perf_counter_ns` around each
+subprocess; **process creation, runtime initialization, computation and
+output capture are included**. Compilation, import-time environment setup
+outside the child, memory usage, and steady-state in-process kernel execution
+are **not measured**. This is a whole-command comparison, not a pure
+instruction throughput or cold-compile comparison. Small kernels can be
+dominated by process launch; increase `ITERATIONS` for a workload-dependent
+comparison, and keep run counts and machine load comparable.
+
+Three untracked files are written to `benchmarks/results/` by default:
+`*.cross-language.raw.csv` (every sample with execution position and output
+hashes), `*.cross-language.summary.csv` (count, min, median, max, mean,
+population standard deviation in nanoseconds), and `*.cross-language.meta.json`
+(compiler identity/hash, host, tool versions, SHA-256 of generated inputs,
+exact build/run command arrays, timing semantics, reference output and sample
+counts). The `benchmarks/results/` directory is ignored by git. Do not
+publish speed ratios without examining raw distributions, the machine,
+compiler provenance and each language's different execution model.
+
+Run the opt-in smoke test with
+`python3 benchmarks/test_cross_language.py`. It exercises 30 verified runs
+per language at a short iteration count and also checks that `RUNS=29` is
+rejected. It requires the same compilers and honors `ZNC`/`SDKROOT`.
+
+## Zag-only compiler, daemon, and allocation protocol
+
 Run `RUNS=30 benchmarks/run_zagscript.sh` from a clean checkout. Results are
 written beneath `benchmarks/results/`, which is intentionally not source
 evidence and should not be committed without review.
