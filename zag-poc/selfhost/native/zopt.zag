@@ -8,7 +8,8 @@
 //
 // Passes (each rebuilds the IR immutably, MLIR-style, returning new IR):
 //   opt_fold     — constant folding to a FIXPOINT: addi/subi/muli/divsi and
-//                  cmpi. Complements zir.zag's fold_module by also folding
+//                  cmpi, plus reflexive integer comparisons (%x cmp %x).
+//                  Complements zir.zag's fold_module by also folding
 //                  comparisons and by iterating to a fixpoint. Never folds x/0.
 //   opt_simplify — algebraic identities / strength reduction with guards:
 //                  x+0,0+x,x-0 → x ; x*1,1*x → x ; x*0,0*x,x-x → 0 ; x/1 → x.
@@ -67,7 +68,8 @@ fn opt_resolve(rws: ArrayList[OptRw], v: ZVal) ZVal {
 // rebuild an op with each operand passed through the rewrite map.
 fn opt_rewrite_operands(o: ZOp, rws: ArrayList[OptRw]) ZOp {
     let no: ZOp = ZOp{ .name = o.name, .results = o.results, .operands = make[ZVal](2),
-                       .attrs = o.attrs, .regions = o.regions };
+                       .attrs = o.attrs, .regions = o.regions, .effects = o.effects,
+                       .reads = o.reads, .writes = o.writes, .origin = o.origin };
     let i: i32 = 0;
     while (i < len[ZVal](o.operands)) {
         push[ZVal](&no.operands, opt_resolve(rws, get[ZVal](o.operands, i)));
@@ -126,6 +128,25 @@ fn opt_eval_cmp(pred: []u8, a: i64, b: i64, ok: *i32) i64 {
     return 0;
 }
 
+// Every integer value compares equal to itself at every width. This rule does
+// not inspect a truncated i64 constant or rely on the edition's overflow mode.
+// It does NOT apply to floating-point cmpf: NaN is not equal to itself.
+fn opt_eval_reflexive_cmpi(pred: []u8, ok: *i32) i64 {
+    ok.* = 1;
+    if (@strEq(pred, "eq") || @strEq(pred, "sle") || @strEq(pred, "sge")) { return 1; }
+    if (@strEq(pred, "ne") || @strEq(pred, "slt") || @strEq(pred, "sgt")) { return 0; }
+    ok.* = 0;
+    return 0;
+}
+
+fn opt_known_int_cmp_type(ty: []u8) i32 {
+    if (@strEq(ty, "i8") || @strEq(ty, "i16") || @strEq(ty, "i32") ||
+        @strEq(ty, "i64") || @strEq(ty, "u8") || @strEq(ty, "u16") ||
+        @strEq(ty, "u32") || @strEq(ty, "u64") || @strEq(ty, "isize") ||
+        @strEq(ty, "usize")) { return 1; }
+    return 0;
+}
+
 fn opt_is_int_binop(name: []u8) i32 {
     if (@strEq(name, "arith.addi"))  { return 1; }
     if (@strEq(name, "arith.subi"))  { return 1; }
@@ -181,13 +202,35 @@ fn opt_fold_block(blk: ZBlock, cs: *ArrayList[OptConst], changed: *i32) ZBlock {
                 push[ZOp](&out.ops, opt_fold_regions(o, cs, changed));
             }
         } else if (@strEq(o.name, "arith.cmpi") && len[ZVal](o.operands) == 2 && len[ZVal](o.results) == 1) {
+            let lhs: ZVal = get[ZVal](o.operands, 0);
+            let rhs: ZVal = get[ZVal](o.operands, 1);
+            let res: ZVal = get[ZVal](o.results, 0);
             let f1: i32 = 0; let f2: i32 = 0;
-            let a: i64 = opt_const_lookup(cs.*, get[ZVal](o.operands, 0).name, &f1);
-            let b: i64 = opt_const_lookup(cs.*, get[ZVal](o.operands, 1).name, &f2);
+            let a: i64 = opt_const_lookup(cs.*, lhs.name, &f1);
+            let b: i64 = opt_const_lookup(cs.*, rhs.name, &f2);
             let ok: i32 = 0;
             let v: i64 = opt_eval_cmp(opt_attr_val(o, "predicate"), a, b, &ok);
-            if (f1 == 1 && f2 == 1 && ok == 1) {
-                let res: ZVal = get[ZVal](o.results, 0);
+            let self_ok: i32 = 0;
+            let self_v: i64 = 0;
+            // Only replace a plain, side-effect-free, well-shaped integer cmp.
+            // The result's SSA metadata and the op's source origin survive.
+            if (@strEq(lhs.name, rhs.name) && @strEq(lhs.ty, rhs.ty) &&
+                opt_known_int_cmp_type(lhs.ty) == 1 &&
+                @strEq(res.ty, "bool") && o.effects == 0 &&
+                @strEq(o.reads, "none") && @strEq(o.writes, "none") &&
+                len[ZRegion](o.regions) == 0 && len[ZAttr](o.attrs) == 1 &&
+                @strEq(get[ZAttr](o.attrs, 0).key, "predicate")) {
+                self_v = opt_eval_reflexive_cmpi(opt_attr_val(o, "predicate"), &self_ok);
+            }
+            if (self_ok == 1) {
+                let c: ZOp = opt_mk_const(res, self_v);
+                c.origin = o.origin;
+                c.reads = o.reads;
+                c.writes = o.writes;
+                push[ZOp](&out.ops, c);
+                push[OptConst](cs, OptConst{ .name = res.name, .val = self_v });
+                changed.* = changed.* + 1;
+            } else if (f1 == 1 && f2 == 1 && ok == 1) {
                 push[ZOp](&out.ops, opt_mk_const(res, v));
                 push[OptConst](cs, OptConst{ .name = res.name, .val = v });
                 changed.* = changed.* + 1;
