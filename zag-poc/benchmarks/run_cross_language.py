@@ -136,9 +136,9 @@ def main():
             "python_executable": sys.executable,
         },
         "versions": {
-            "znc": command_output([str(compiler), "version"]).decode().strip(),
-            "clang": command_output([clang, "--version"]).decode().splitlines()[0],
-            "rustc": command_output([rustc, "--version"]).decode().strip(),
+            "znc": command_output([str(compiler), "version"], build_timeout).decode().strip(),
+            "clang": command_output([clang, "--version"], build_timeout).decode().splitlines()[0],
+            "rustc": command_output([rustc, "--version"], build_timeout).decode().strip(),
             "python": sys.version.splitlines()[0],
         },
         "source_sha256": {},
@@ -149,7 +149,7 @@ def main():
         metadata["baseline_compiler_path"] = str(baseline)
         metadata["baseline_compiler_sha256"] = sha256(baseline.read_bytes())
         metadata["versions"]["znc_baseline"] = command_output(
-            [str(baseline), "version"]
+            [str(baseline), "version"], build_timeout
         ).decode().strip()
 
     rows = []

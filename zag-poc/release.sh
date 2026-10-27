@@ -197,7 +197,8 @@ fi
 echo ""
 if [ "$RELEASE_PLATFORM" = linux-x86_64 ]; then
     echo "── step 2b: strict ZagScript 1.0 Linux x86-64 release gate ──"
-    if ! bash tests/run_zagscript_release_gate.sh; then
+    if ! env -u ZAGSCRIPT_RELEASE_SHARD_START -u ZAGSCRIPT_RELEASE_SHARD_END \
+        bash tests/run_zagscript_release_gate.sh; then
         echo "" >&2
         echo "ERROR: run_zagscript_release_gate.sh FAILED — release aborted." >&2
         echo "       Complete every frozen ZagScript 1.0 capability before release." >&2

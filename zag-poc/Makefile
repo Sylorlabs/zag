@@ -280,7 +280,7 @@ test-macos-dyld-import:
 	bash tests/run_macos_dyld_import.sh
 
 test-zagscript-release:
-	bash tests/run_zagscript_release_gate.sh
+	env -u ZAGSCRIPT_RELEASE_SHARD_START -u ZAGSCRIPT_RELEASE_SHARD_END bash tests/run_zagscript_release_gate.sh
 
 # Deliberately manual and sequential: this workstation evidence gate requires
 # a user cgroup, active earlyoom, the i686 boundary, and 30-run benchmarks. It
