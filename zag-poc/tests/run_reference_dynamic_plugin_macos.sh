@@ -27,13 +27,11 @@ trap 'rm -rf "$tmp"' EXIT
 # Stage its executable beside the current std/selfhost trees so absolute-source
 # builds resolve imports identically from the repository and unrelated CWDs.
 mkdir -p "$tmp/compiler"
-ln -s "$real_compiler" "$tmp/compiler/znc"
-# The compiler may be a wrapper script that resolves the real compiler RELATIVE to
-# its own argv[0] (`wrapper_dir=${0%/*}; real="$wrapper_dir/znc-real"`), which is
-# what the macOS release gate passes in. Staging `znc` alone therefore relocates
-# the wrapper away from the `znc-real` it depends on and it exits 127. Stage
-# `znc-real` here too, exactly as run_macos_zagscript_authority.sh does.
-ln -s "$real_compiler" "$tmp/compiler/znc-real"
+# A release gate may pass a compiler wrapper with a relative znc-real sibling.
+# Calling the original absolute path preserves artifact logging and avoids
+# recursively executing a relocated wrapper as its own znc-real.
+printf '#!/bin/bash\nexec %q "$@"\n' "$real_compiler" >"$tmp/compiler/znc"
+chmod +x "$tmp/compiler/znc"
 ln -s "$root/std" "$tmp/compiler/std"
 ln -s "$root/selfhost" "$tmp/compiler/selfhost"
 compiler="$tmp/compiler/znc"

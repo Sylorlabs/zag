@@ -13,7 +13,10 @@ repo_root=$PWD
 tmp_dir=$(mktemp -d /tmp/zag-script-accounting.XXXXXX)
 trap 'rm -rf "$tmp_dir"' EXIT
 mkdir -p "$tmp_dir/compiler"
-ln -s "$znc_bin" "$tmp_dir/compiler/znc"
+# Invoke the original compiler path so a signature-auditing wrapper can locate
+# its own znc-real and record every artifact without recursive relocation.
+printf '#!/bin/bash\nexec %q "$@"\n' "$znc_bin" >"$tmp_dir/compiler/znc"
+chmod +x "$tmp_dir/compiler/znc"
 ln -s "$repo_root/selfhost" "$tmp_dir/compiler/selfhost"
 ln -s "$repo_root/std" "$tmp_dir/compiler/std"
 znc_bin="$tmp_dir/compiler/znc"
@@ -48,7 +51,11 @@ printf 'script;\nlet first:[]u8=read_file("sparse-over-limit.bin");\nlet second:
 printf 'script;\nlet data:[]u8=read_file("does-not-exist");\nif(data.len>=0){return 1;}\nif(script_alloc_used()!=0){return 2;}\nreturn 0;\n' >"$tmp_dir/read_missing.zag"
 (cd "$tmp_dir" && "$znc_bin" read_missing.zag -o read_missing --no-zagd >/dev/null && ./read_missing)
 
-printf 'script;\nlet result=process_run_timeout("printf bounded",1000,1048400);\nif(process_result_state(result)!=process_state_exited()){return 1;}\nif(!@strEq(process_result_output(result),"bounded")){return 2;}\nif(script_alloc_used()!=1048520){return 3;}\nreturn 0;\n' >"$tmp_dir/process_ok.zag"
+# The arena policy charges the 32-byte result handle, with no additional
+# ownership header: pair 8 + command 15 + argv 32 + envp 8 + capture 1048401
+# + wait status 8 + result handle 32 = 1048504. A 16-byte ownership header is
+# exclusive to bounded-heap policy 2.
+printf 'script;\nlet result=process_run_timeout("printf bounded",1000,1048400);\nif(process_result_state(result)!=process_state_exited()){return 1;}\nif(!@strEq(process_result_output(result),"bounded")){return 2;}\nif(script_alloc_used()!=1048504){return 3;}\nreturn 0;\n' >"$tmp_dir/process_ok.zag"
 (cd "$tmp_dir" && "$znc_bin" process_ok.zag -o process_ok --no-zagd >/dev/null && ./process_ok)
 
 printf 'script;\nlet result=process_run_timeout("printf blocked",1000,1048576);\nreturn 0;\n' >"$tmp_dir/process_over.zag"
