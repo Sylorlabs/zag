@@ -1,5 +1,5 @@
 ; QF_BV obligations for the experimental signed ZIR constant folder and
-; its x / 1 simplification. SMT-LIB bvsdiv rounds toward zero; bvsrem keeps
+; its x / 1 and x % (+/-1) simplifications. SMT-LIB bvsdiv rounds toward zero; bvsrem keeps
 ; the dividend's sign. These are bit-vector identities, not a proof that the
 ; broad zopt pipeline preserves metadata, effects, widths, or traps.
 (set-logic QF_BV)
