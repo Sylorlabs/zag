@@ -3,13 +3,15 @@
 ## Matched C / Rust / Python process-runtime comparison
 
 The separate `run_cross_language.py` recorder closes a gap in the Zag-only
-protocol below: it executes **the same bounded integer recurrence** in
-ZagScript, C, Rust, and Python. The four source templates live in
-`benchmarks/cross_language/`. All use 64-bit integers where fixed-width
-types exist, seed `x=17`, advance `x=(109*x+1021)%65521`, accumulate
-`checksum=(checksum+x)%1000000007`, and print the final decimal checksum and
-newline. Intermediate values stay within signed 64-bit range, so the reference
-does not depend on language-specific overflow semantics.
+protocol below: it executes **three deterministic kernels** in ZagScript,
+C, Rust, and Python: a bounded integer recurrence, a data-dependent
+four-way branch, and two helper calls per iteration. Their templates live in
+`benchmarks/cross_language/` as `kernel.*`, `branch.*`, and `call.*`.
+All variants seed `x=17`, advance `x=(109*x+1021)%65521`, and accumulate
+a checksum modulo `1000000007`. Branch uses a checksum update chosen by
+`x%4`; call uses named `advance` and `accumulate` helpers, which the
+language toolchain may inline. All intermediate values fit signed 64-bit
+integers; every output is checked independently per kernel.
 
 From `zag-poc/`, on a host with native `znc`, `clang`, `rustc`, and
 `python3` installed:
@@ -18,7 +20,9 @@ From `zag-poc/`, on a host with native `znc`, `clang`, `rustc`, and
 RUNS=30 ITERATIONS=2000000 python3 benchmarks/run_cross_language.py
 ```
 
-`RUNS` must be **at least 30**. `ITERATIONS` defaults to 2 million and is
+`RUNS` must be **at least 30**. `KERNELS` optionally selects a distinct
+comma-separated subset of `recurrence,branch,call`; all three run by default.
+`ITERATIONS` defaults to 2 million and is
 embedded as the same literal in each compiled/interpreted source. `ZNC` may
 point to a compatible **native** compiler binary elsewhere; `CC`, `RUSTC`,
 and `OUT` override the tool paths/output directory. `BUILD_TIMEOUT_SECONDS`
@@ -43,8 +47,9 @@ ZNC=/path/to/new/znc ZNC_BASELINE=/path/to/old/znc \
 ```
 
 This adds `zagscript_baseline` as a fifth measured variant. It compiles the
-identical ZagScript source with each compiler in separate source-compatible
-bundles and rotates all five programs through every measured round. The
+identical ZagScript source for each kernel with both compilers in separate
+source-compatible bundles. Every measured round rotates language order and
+kernel order, with three warmups per language and kernel. The
 baseline compiler path, version, and SHA-256 are recorded alongside the
 candidate's. Omit `ZNC_BASELINE` for the original four-variant protocol.
 
@@ -62,7 +67,7 @@ The recorder compiles C using `clang -O2 -std=c11`, Rust using
 status against an independently computed result** for every warmup and
 measured run. On any mismatch or failed build it stops without publishing
 results. It warms each language three times, then rotates their order across
-30 or more measured rounds. Measurements use `perf_counter_ns` around each
+30 or more measured rounds per kernel. Measurements use `perf_counter_ns` around each
 subprocess; **process creation, runtime initialization, computation and
 output capture are included**. Compilation, import-time environment setup
 outside the child, memory usage, and steady-state in-process kernel execution
@@ -73,19 +78,20 @@ comparison, and keep run counts and machine load comparable.
 
 Three untracked files are written to `benchmarks/results/` by default:
 `*.cross-language.raw.csv` (every sample with execution position and output
-hashes), `*.cross-language.summary.csv` (count, min, median, max, mean,
-population standard deviation in nanoseconds), and `*.cross-language.meta.json`
-(compiler identity/hash, host, tool versions, SHA-256 of generated inputs,
-exact build/run command arrays, timing semantics, reference output and sample
-counts). The `benchmarks/results/` directory is ignored by git. Do not
+hashes and the kernel name), `*.cross-language.summary.csv` (one row
+per kernel/language, count, min, median, max, mean, population standard
+deviation in nanoseconds), and `*.cross-language.meta.json` (compiler
+identity/hash, host, tool versions, SHA-256 of each generated input, exact
+build/run command arrays, timing semantics, independent reference output
+for each kernel, and sample counts). The `benchmarks/results/` directory is ignored by git. Do not
 publish speed ratios without examining raw distributions, the machine,
 compiler provenance and each language's different execution model.
 
 Run the opt-in smoke test with
 `python3 benchmarks/test_cross_language.py`. It exercises 30 verified runs
-per language at a short iteration count for both the default and optional
-baseline comparison, and also checks that `RUNS=29` is rejected along with a
-zero run timeout. It requires the same compilers and honors `ZNC`/`SDKROOT`.
+per kernel/language at a short iteration count for both the default and
+optional baseline comparison, and also checks that `RUNS=29`, invalid
+`KERNELS`, and a zero run timeout are rejected. It requires the same compilers and honors `ZNC`/`SDKROOT`.
 
 ## Zag-only compiler, daemon, and allocation protocol
 

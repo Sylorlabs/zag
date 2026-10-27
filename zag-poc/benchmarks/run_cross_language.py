@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = ROOT / "benchmarks" / "cross_language"
 LANGUAGES = ("zagscript", "c", "rust", "python")
+KERNELS = ("recurrence", "branch", "call")
 EXTENSIONS = {"zagscript": "zag", "zagscript_baseline": "zag",
               "c": "c", "rust": "rs", "python": "py"}
 
@@ -57,11 +58,26 @@ def sha256(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def reference_checksum(iterations):
+def reference_checksum(kernel, iterations):
     x, checksum = 17, 0
     for _ in range(iterations):
         x = (x * 109 + 1021) % 65521
-        checksum = (checksum + x) % 1000000007
+        if kernel == "recurrence":
+            checksum = (checksum + x) % 1000000007
+        elif kernel == "call":
+            checksum = (checksum + x * 7 + 3) % 1000000007
+        elif kernel == "branch":
+            branch = x % 4
+            if branch == 0:
+                checksum = (checksum + x * 7 + 3) % 1000000007
+            elif branch == 1:
+                checksum = (checksum + x * 11 + 5) % 1000000007
+            elif branch == 2:
+                checksum = (checksum + x * 13 + 7) % 1000000007
+            else:
+                checksum = (checksum + x * 17 + 9) % 1000000007
+        else:
+            raise ValueError(f"unknown kernel: {kernel}")
     return f"{checksum}\n".encode("ascii")
 
 
@@ -81,6 +97,9 @@ def cpu_model():
 def main():
     runs = positive_setting("RUNS", 30, 30)
     iterations = positive_setting("ITERATIONS", 2_000_000, 1)
+    kernels = tuple(os.environ.get("KERNELS", ",".join(KERNELS)).split(","))
+    if not kernels or any(k not in KERNELS for k in kernels) or len(set(kernels)) != len(kernels):
+        raise SystemExit("benchmark: KERNELS must list distinct names from " + ",".join(KERNELS))
     build_timeout = positive_setting("BUILD_TIMEOUT_SECONDS", 180, 1)
     run_timeout = positive_setting("RUN_TIMEOUT_SECONDS", 60, 1)
     # Resolve against the caller's directory before changing working directories.
@@ -103,9 +122,10 @@ def main():
     if not clang or not rustc:
         raise SystemExit("benchmark: both clang (or CC) and rustc (or RUSTC) are required")
 
-    expected = reference_checksum(iterations)
+    expected = {kernel: reference_checksum(kernel, iterations) for kernel in kernels}
     metadata = {
-        "protocol": "zagscript-cross-language-v1",
+        "protocol": "zagscript-cross-language-v2",
+        "kernels": list(kernels),
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "source_checkout_commit": command_output(
             ["git", "-C", str(ROOT), "rev-parse", "HEAD"]
@@ -121,8 +141,12 @@ def main():
         "iterations_per_run": iterations,
         "timing": "perf_counter_ns around child process (spawn + execution + stdout/stderr capture)",
         "interleaving": "rotate starting language each measured round",
-        "expected_stdout": expected.decode("ascii"),
-        "expected_stdout_sha256": sha256(expected),
+        "expected_stdout_by_kernel": {
+            kernel: value.decode("ascii") for kernel, value in expected.items()
+        },
+        "expected_stdout_sha256_by_kernel": {
+            kernel: sha256(value) for kernel, value in expected.items()
+        },
         "expected_stderr": "",
         "expected_exit_status": 0,
         "compiler_path": str(compiler),
@@ -172,99 +196,109 @@ def main():
             (baseline_dir / "selfhost").symlink_to(ROOT / "selfhost", target_is_directory=True)
 
         commands = {}
-        for language in languages:
-            template = (SOURCES / f"kernel.{EXTENSIONS[language]}").read_text()
-            if template.count("__ITERATIONS__") != 1:
-                raise RuntimeError(f"{language}: expected exactly one iteration placeholder")
-            source = tmp / f"kernel.{EXTENSIONS[language]}"
-            source.write_text(template.replace("__ITERATIONS__", str(iterations)))
-            metadata["source_sha256"][language] = sha256(source.read_bytes())
-            artifact = tmp / language
-            if language in ("zagscript", "zagscript_baseline"):
-                build = [
-                    str(baseline_znc if language == "zagscript_baseline" else bundled_znc),
-                    str(source), "-o", str(artifact),
-                    "--no-zagd", "--no-analyze", "--no-foreground-cache",
-                ]
-            elif language == "c":
-                build = [clang, "-O2", "-std=c11", str(source), "-o", str(artifact)]
-            elif language == "rust":
-                build = [
-                    rustc, "-C", "opt-level=2", "-C", "target-cpu=generic",
-                    str(source), "-o", str(artifact),
-                ]
-            else:
-                build = None  # Python is interpreted; no ahead-of-time build.
-            if build is not None:
-                command_output(build, timeout_seconds=build_timeout)
-                if not artifact.is_file() or not os.access(artifact, os.X_OK):
-                    raise RuntimeError(f"{language}: compiler returned success without an executable")
-            commands[language] = (
-                [sys.executable, "-I", "-B", str(source)]
-                if language == "python" else [str(artifact)]
-            )
-            metadata["build_commands"][language] = build
-            metadata["run_commands"][language] = commands[language]
+        for kernel in kernels:
+            for language in languages:
+                key = f"{kernel}:{language}"
+                basename = "kernel" if kernel == "recurrence" else kernel
+                template = (SOURCES / f"{basename}.{EXTENSIONS[language]}").read_text()
+                if template.count("__ITERATIONS__") != 1:
+                    raise RuntimeError(f"{key}: expected exactly one iteration placeholder")
+                source = tmp / f"{basename}.{EXTENSIONS[language]}"
+                source.write_text(template.replace("__ITERATIONS__", str(iterations)))
+                metadata["source_sha256"][key] = sha256(source.read_bytes())
+                artifact = tmp / f"{kernel}-{language}"
+                if language in ("zagscript", "zagscript_baseline"):
+                    build = [
+                        str(baseline_znc if language == "zagscript_baseline" else bundled_znc),
+                        str(source), "-o", str(artifact),
+                        "--no-zagd", "--no-analyze", "--no-foreground-cache",
+                    ]
+                elif language == "c":
+                    build = [clang, "-O2", "-std=c11", str(source), "-o", str(artifact)]
+                elif language == "rust":
+                    build = [
+                        rustc, "-C", "opt-level=2", "-C", "target-cpu=generic",
+                        str(source), "-o", str(artifact),
+                    ]
+                else:
+                    build = None
+                if build is not None:
+                    command_output(build, timeout_seconds=build_timeout)
+                    if not artifact.is_file() or not os.access(artifact, os.X_OK):
+                        raise RuntimeError(f"{key}: compiler returned success without an executable")
+                commands[key] = (
+                    [sys.executable, "-I", "-B", str(source)]
+                    if language == "python" else [str(artifact)]
+                )
+                metadata["build_commands"][key] = build
+                metadata["run_commands"][key] = commands[key]
 
-        def execute(language, phase, number, position):
+        def execute(kernel, language, phase, number, position):
+            key = f"{kernel}:{language}"
             start = time.perf_counter_ns()
             try:
                 result = subprocess.run(
-                    commands[language], stdout=subprocess.PIPE,
+                    commands[key], stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE, timeout=run_timeout,
                 )
             except subprocess.TimeoutExpired as exc:
                 raise RuntimeError(
-                    f"{language} {phase} {number}: timed out after "
-                    f"{run_timeout}s (increase RUN_TIMEOUT_SECONDS for "
-                    "larger ITERATIONS)"
+                    f"{key} {phase} {number}: timed out after "
+                    f"{run_timeout}s (increase RUN_TIMEOUT_SECONDS for larger ITERATIONS)"
                 ) from exc
             elapsed = time.perf_counter_ns() - start
-            if result.returncode != 0 or result.stdout != expected or result.stderr != b"":
+            if result.returncode != 0 or result.stdout != expected[kernel] or result.stderr != b"":
                 raise RuntimeError(
-                    f"{language} {phase} {number}: parity failure: "
+                    f"{key} {phase} {number}: parity failure: "
                     f"exit={result.returncode}, stdout={result.stdout!r}, stderr={result.stderr!r}, "
-                    f"expected_stdout={expected!r}"
+                    f"expected_stdout={expected[kernel]!r}"
                 )
             if phase == "measured":
-                rows.append([number, position, language, elapsed, result.returncode,
+                rows.append([kernel, number, position, language, elapsed, result.returncode,
                              sha256(result.stdout), sha256(result.stderr)])
 
+        # Rotate implementation order within each kernel. Rotate kernel order
+        # between rounds too, so time/load drift cannot favor a fixed workload.
         for warmup in range(1, 4):
-            for position, language in enumerate(languages, 1):
-                execute(language, "warmup", warmup, position)
+            for kernel in kernels:
+                for position, language in enumerate(languages, 1):
+                    execute(kernel, language, "warmup", warmup, position)
         for round_number in range(1, runs + 1):
             rotation = (round_number - 1) % len(languages)
-            for position, language in enumerate(
-                languages[rotation:] + languages[:rotation], 1
-            ):
-                execute(language, "measured", round_number, position)
+            kernel_rotation = (round_number - 1) % len(kernels)
+            for kernel in kernels[kernel_rotation:] + kernels[:kernel_rotation]:
+                for position, language in enumerate(
+                    languages[rotation:] + languages[:rotation], 1
+                ):
+                    execute(kernel, language, "measured", round_number, position)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     base = out_dir / f"{stamp}.cross-language"
     with base.with_suffix(".cross-language.raw.csv").open("x", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["round", "position", "language", "elapsed_ns",
+        writer.writerow(["kernel", "round", "position", "language", "elapsed_ns",
                          "exit_status", "stdout_sha256", "stderr_sha256"])
         writer.writerows(rows)
     with base.with_suffix(".cross-language.summary.csv").open("x", newline="") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["language", "runs", "min_ns", "median_ns", "max_ns",
+        writer.writerow(["kernel", "language", "runs", "min_ns", "median_ns", "max_ns",
                          "mean_ns", "pstdev_ns"])
-        for language in languages:
-            samples = [row[3] for row in rows if row[2] == language]
-            if len(samples) != runs:
-                raise RuntimeError(f"{language}: missing measured samples")
-            writer.writerow([language, len(samples), min(samples),
-                             f"{statistics.median(samples):.1f}", max(samples),
-                             f"{statistics.mean(samples):.1f}",
-                             f"{statistics.pstdev(samples):.1f}"])
+        for kernel in kernels:
+            for language in languages:
+                samples = [row[4] for row in rows if row[0] == kernel and row[3] == language]
+                if len(samples) != runs:
+                    raise RuntimeError(f"{kernel}:{language}: missing measured samples")
+                writer.writerow([kernel, language, len(samples), min(samples),
+                                 f"{statistics.median(samples):.1f}", max(samples),
+                                 f"{statistics.mean(samples):.1f}",
+                                 f"{statistics.pstdev(samples):.1f}"])
     with base.with_suffix(".cross-language.meta.json").open("x") as handle:
         json.dump(metadata, handle, indent=2)
         handle.write("\n")
-    print(f"Matched stdout for all {len(languages)} variants: {expected.decode().strip()}")
-    print(f"Measured {runs} interleaved runs per language (3 warmups each)")
+    for kernel, value in expected.items():
+        print(f"{kernel}: matched stdout for all {len(languages)} variants: {value.decode().strip()}")
+    print(f"Measured {runs} interleaved runs per kernel/language (3 warmups each)")
     print(f"Raw:     {base.with_suffix('.cross-language.raw.csv')}")
     print(f"Summary: {base.with_suffix('.cross-language.summary.csv')}")
     print(f"Meta:    {base.with_suffix('.cross-language.meta.json')}")

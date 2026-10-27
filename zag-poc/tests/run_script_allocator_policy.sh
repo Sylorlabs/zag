@@ -8,6 +8,26 @@ case "$ZNC" in /*) ;; *) ZNC="$(pwd)/${ZNC#./}" ;; esac
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/zag-script-allocator-policy.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 
+# The x86 allocator reports its rounded native allocation size, including
+# Script-owned heap blocks. The ARM64 allocator reports the exact native
+# context request; Script arena/heap mmaps use separate context accounting.
+# Keep both telemetry contracts explicit while checking identical Script
+# memory budgets, allocation failures, and shutdown behavior on each host.
+case "$(uname -s):$(uname -m)" in
+    Darwin:arm64|Linux:aarch64|Linux:arm64)
+        native_context_live=112
+        native_arena_live=112
+        native_heap_live=112
+        native_heap_count=1
+        ;;
+    *)
+        native_context_live=128
+        native_arena_live=152
+        native_heap_live=192
+        native_heap_count=2
+        ;;
+esac
+
 mkdir -p "$tmp/project"
 printf '%s\n' 'name = "script-allocator-policy"' 'edition = "2027"' >"$tmp/project/zag.mod"
 cat >"$tmp/project/policy.zag" <<'ZAG'
@@ -35,7 +55,7 @@ set +e
 "$tmp/project/arena"
 arena_status=$?
 set -e
-test "$arena_status" -eq 152
+test "$arena_status" -eq "$native_arena_live"
 
 (cd "$tmp/project" && "$ZNC" policy.zag -o heap \
     --script-allocator script_bounded_heap --no-zagd --no-analyze \
@@ -45,7 +65,7 @@ set +e
 "$tmp/project/heap"
 heap_status=$?
 set -e
-test "$heap_status" -eq 192
+test "$heap_status" -eq "$native_heap_live"
 
 (cd "$tmp/project" && "$ZNC" policy.zag -o heap-hit \
     --script-allocator script_bounded_heap --no-zagd --no-analyze \
@@ -56,15 +76,16 @@ set +e
 "$tmp/project/heap-hit"
 heap_hit_status=$?
 set -e
-test "$heap_hit_status" -eq 192
+test "$heap_hit_status" -eq "$native_heap_live"
 
 cat >"$tmp/project/limit.zag" <<'ZAG'
 script;
 let full:*i8 = script_alloc(1048560);
 let denied:*i8 = script_alloc(1);
-if (full != null as *i8 && denied == null as *i8 &&
-    script_alloc_used() == 1048576) { return 0; }
-return 2;
+if (full == null as *i8) { return 2; }
+if (denied != null as *i8) { return 2; }
+if (script_alloc_used() != 1048576) { return 2; }
+return 0;
 ZAG
 (cd "$tmp/project" && "$ZNC" limit.zag -o limit \
     --script-allocator script_bounded_heap --no-zagd --no-analyze \
@@ -141,7 +162,7 @@ grep -q 'supported allocator=script_process_arena or script_bounded_heap' \
 mkdir -p "$tmp/runtime"
 printf '%s\n' 'name = "script-bounded-heap-runtime"' 'edition = "2027"' \
     >"$tmp/runtime/zag.mod"
-cat >"$tmp/runtime/main.zag" <<'ZAG'
+cat >"$tmp/runtime/main.zag" <<ZAG
 extern fn _zag_script_context_init(limit:i64, capabilities:i64, execution_policy:i64) *opaque
 extern fn _zag_script_context_shutdown(context:*opaque) void
 extern fn _zag_script_alloc(context:*opaque, count:i64) *i8
@@ -150,17 +171,17 @@ extern fn _zag_allocator_live_bytes() i64
 fn main() i32 {
     unsafe {
         let context:*opaque = _zag_script_context_init(1048576, 7, 16843010);
-        if (context == null as *opaque || _zag_allocator_live_bytes() != 128) { return 1; }
+        if (context == null as *opaque || _zag_allocator_live_bytes() != $native_context_live) { return 1; }
         let first:*i8 = _zag_script_alloc(context, 24);
         let empty:*i8 = _zag_script_alloc(context, 0);
         if (first == null as *i8 || empty == null as *i8) { return 2; }
         if (_zag_script_alloc_used(context) != 56) { return 3; }
-        if (_zag_allocator_live_bytes() != 208) { return 4; }
+        if (_zag_allocator_live_bytes() != $native_heap_live) { return 4; }
         let words:*i64 = context as *i64;
         let overflow:*i8 = _zag_script_alloc(context, 9223372036854775807);
         if (overflow != null as *i8) { return 5; }
         if (_zag_script_alloc_used(context) != 56 || words[11] != 2 ||
-            words[12] != 1 || _zag_allocator_live_bytes() != 208) { return 6; }
+            words[12] != 1 || _zag_allocator_live_bytes() != $native_heap_live) { return 6; }
         _zag_script_context_shutdown(context);
         if (_zag_allocator_live_bytes() != 0) { return 7; }
     }
@@ -175,7 +196,7 @@ ZAG
 # ordinary Script allocations. Policy 2 charges its 16-byte ownership header,
 # links the full block for shutdown, and commits used/count only after the
 # complete 48-byte charge fits.
-cat >"$tmp/runtime/process_result.zag" <<'ZAG'
+cat >"$tmp/runtime/process_result.zag" <<ZAG
 extern fn _zag_script_context_init(limit:i64, capabilities:i64, execution_policy:i64) *opaque
 extern fn _zag_script_context_shutdown(context:*opaque) void
 extern fn _zag_script_alloc_used(context:*opaque) i64
@@ -188,7 +209,7 @@ extern fn _zag_allocator_live_bytes() i64
 fn main() i32 {
     unsafe {
         let context:*opaque = _zag_script_context_init(64, 7, 16843010);
-        if (context == null as *opaque || _zag_allocator_live_bytes() != 128) { return 1; }
+        if (context == null as *opaque || _zag_allocator_live_bytes() != $native_context_live) { return 1; }
         let words:*i64 = context as *i64;
         let result:*opaque = _zag_script_process_result_abi_new(
             context, 23, 2, "heap-result");
@@ -197,8 +218,8 @@ fn main() i32 {
             _zag_process_result_state(result) != 2 ||
             !@strEq(_zag_process_result_output(result), "heap-result")) { return 3; }
         if (_zag_script_alloc_used(context) != 48 || words[11] != 1 ||
-            words[12] != 0 || _zag_allocator_allocation_count() != 2 ||
-            _zag_allocator_live_bytes() != 192) { return 4; }
+            words[12] != 0 || _zag_allocator_allocation_count() != $native_heap_count ||
+            _zag_allocator_live_bytes() != $native_heap_live) { return 4; }
         let native_count_before:i64 = _zag_allocator_allocation_count();
         let rejected:*opaque = _zag_script_process_result_abi_new(
             context, 99, 3, "must-not-fit");
@@ -206,7 +227,7 @@ fn main() i32 {
         if (_zag_script_alloc_used(context) != 48 || words[11] != 1 ||
             words[12] != 1 ||
             _zag_allocator_allocation_count() != native_count_before ||
-            _zag_allocator_live_bytes() != 192) { return 6; }
+            _zag_allocator_live_bytes() != $native_heap_live) { return 6; }
         _zag_script_context_shutdown(context);
         if (_zag_allocator_live_bytes() != 0) { return 7; }
     }

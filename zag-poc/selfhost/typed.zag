@@ -5885,8 +5885,46 @@ fn zt_check_borrow_body(body:ArrayList[*Node],parent_env:ArrayList[ZTBind],alias
         else=>{}
     }i=i+1;}zt_borrow_end_scope_locals(env,parent_env.len,aliases,borrows,initial_aliases,initial_borrows);free[ZTBind](&env);free[ZTOwnAlias](&initial_aliases);free[ZTBorrowAlias](&initial_borrows);return errors;
 }
+// The body checker must also run at *call sites*: a plain `main()` can hold
+// a loan returned by a contracted function even though none of its own
+// parameters carry a borrow. Avoid walking every ordinary self-hosting body
+// by first locating only calls to a borrow-aware callee.
+fn zt_borrow_call_site_expr(n:*Node,callees:ArrayList[[]u8])i32{
+    switch(n.*){
+        .call=>|x|{if(zt_in_names(callees,zt_direct_name(x.callee))==1){return 1;}let i:i32=0;while(i<x.args.len){if(zt_borrow_call_site_expr(x.args.data[i],callees)==1){return 1;}i=i+1;}return zt_borrow_call_site_expr(x.callee,callees);}
+        .bin=>|x|{return zt_borrow_call_site_expr(x.l,callees)|zt_borrow_call_site_expr(x.r,callees);}
+        .un=>|x|{return zt_borrow_call_site_expr(x.e,callees);}
+        .cast_=>|x|{return zt_borrow_call_site_expr(x.expr,callees);}
+        .idx=>|x|{return zt_borrow_call_site_expr(x.base,callees)|zt_borrow_call_site_expr(x.idx,callees);}
+        .fld=>|x|{return zt_borrow_call_site_expr(x.base,callees);}
+        .slice_=>|x|{let found:i32=zt_borrow_call_site_expr(x.base,callees)|zt_borrow_call_site_expr(x.lo,callees);if(x.has_hi==1){found=found|zt_borrow_call_site_expr(x.hi,callees);}return found;}
+        .slit_=>|x|{let i:i32=0;while(i<x.fields.len){if(zt_borrow_call_site_expr(x.fields.data[i].val,callees)==1){return 1;}i=i+1;}}
+        else=>{}
+    }
+    return 0;
+}
+fn zt_borrow_call_site_body(body:ArrayList[*Node],callees:ArrayList[[]u8])i32{
+    let i:i32=0;while(i<body.len){switch(body.data[i].*){
+        .let_=>|x|{if(x.has_init==1&&zt_borrow_call_site_expr(x.expr,callees)==1){return 1;}}
+        .ret=>|x|{if(x.has_expr==1&&zt_borrow_call_site_expr(x.expr,callees)==1){return 1;}}
+        .assign=>|x|{if(zt_borrow_call_site_expr(x.target,callees)==1||zt_borrow_call_site_expr(x.expr,callees)==1){return 1;}}
+        .estmt=>|x|{if(zt_borrow_call_site_expr(x.expr,callees)==1){return 1;}}
+        .defer_=>|x|{if(zt_borrow_call_site_expr(x.expr,callees)==1){return 1;}}
+        .unsafe_=>|x|{if(zt_borrow_call_site_body(x.body,callees)==1){return 1;}}
+        .if_=>|x|{if(zt_borrow_call_site_expr(x.cond,callees)==1||zt_borrow_call_site_body(x.then_body,callees)==1||zt_borrow_call_site_body(x.els_body,callees)==1){return 1;}}
+        .while_=>|x|{if(zt_borrow_call_site_expr(x.cond,callees)==1||zt_borrow_call_site_body(x.body,callees)==1){return 1;}}
+        .switch_=>|x|{if(zt_borrow_call_site_expr(x.subject,callees)==1||zt_borrow_call_site_body(x.els_body,callees)==1){return 1;}let ai:i32=0;while(ai<x.arms.len){if(zt_borrow_call_site_body(x.arms.data[ai].body,callees)==1){return 1;}ai=ai+1;}}
+        else=>{}
+    }i=i+1;}
+    return 0;
+}
 fn zt_check_v2_borrow_contracts(decls:ArrayList[*Node],file:[]u8)i32{
     let v2:i32=@strEq(v2_project_edition(file),"2027") as i32;
+    let callees:ArrayList[[]u8]=make[[]u8](8);
+    if(v2==1){let j:i32=0;while(j<decls.len){switch(decls.data[j].*){
+        .fn_decl=>|f|{let relevant:i32=zt_fn_has_retained_param(decls,f.name)|zt_fn_has_legacy_borrow(decls,f.name);let k:i32=0;while(k<f.params.len){if(@strEq(f.params.data[k].contract,"@borrows")||@strEq(f.params.data[k].contract,"@borrows_mut")||@strEq(f.params.data[k].contract,"@retained_by_return")){relevant=1;}k=k+1;}if(relevant==1&&zt_in_names(callees,f.name)==0){push[[]u8](&callees,f.name);}}
+        else=>{}
+    }j=j+1;}}
     let errors:i32=0;let i:i32=0;
     while(i<decls.len){switch(decls.data[i].*){
         .fn_decl=>|f|{
@@ -5942,20 +5980,17 @@ fn zt_check_v2_borrow_contracts(decls:ArrayList[*Node],file:[]u8)i32{
                 ci=ci+1;
             }
             let return_mode:i32=mode;if(zt_fn_has_retained_param(decls,f.name)==1){return_mode=1;}
-            // The borrow body walk is only authoritative for functions whose
-            // signature can carry a lifetime/resource relation.  Running the
-            // full recursive provenance pass over every ordinary function in
-            // a large module graph was both redundant and a self-hosting
-            // compile-time cliff; the separate resource/typed passes still
-            // validate ordinary functions and all explicit/resource-bearing
-            // signatures remain covered here.
+            // A plain signature may nevertheless create or consume a loan
+            // through a contracted call in its body.
             let needs_body:i32=((mode>0||explicit==1||return_mode!=0) as i32);
             if(needs_body==0&&v2==1){let ri:i32=0;while(ri<f.params.len){if(zt_resource_type(f.params.data[ri].pty,decls)==1){needs_body=1;}ri=ri+1;}}
+            if(needs_body==0&&v2==1&&callees.len>0){needs_body=zt_borrow_call_site_body(f.body,callees);}
             if(v2==1&&needs_body==1){errors=errors+zt_check_borrow_body(f.body,env,&aliases,&borrows,decls,return_mode,context);}
             free[ZTBind](&env);free[ZTOwnAlias](&aliases);free[ZTBorrowAlias](&borrows);
         }
         else=>{}
     }i=i+1;}
+    free[[]u8](&callees);
     return errors;
 }
 

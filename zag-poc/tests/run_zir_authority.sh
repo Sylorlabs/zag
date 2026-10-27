@@ -169,8 +169,10 @@ set -e
 test "$optin_checked_rc" -ne 0
 test ! -e "$tmp/optin-checked"
 grep -q 'requires regular unsanitized x86-64 Zag' "$tmp/optin-checked.out"
+# A variable operand cannot satisfy the two-literal checked transform rule.
+# The previous 1+2 fixture was a valid match and wrongly expected rejection.
 cat >"$tmp/optin-no-match.zag" <<'ZAG'
-fn main() i32 { let x:i32=1+2; return x; }
+fn main() i32 { let a:i32=1; let x:i32=a+2; return x; }
 ZAG
 set +e
 "$compiler" "$tmp/optin-no-match.zag" -o "$tmp/optin-no-match" \
