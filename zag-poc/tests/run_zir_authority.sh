@@ -4,6 +4,9 @@ cd "$(dirname "$0")/.."
 compiler=${ZNC:-./znc}
 tmp=$(mktemp -d /tmp/zag-zir-authority.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT
+# Preserve the failing assertion location in CI stage artifacts, where a plain
+# `test` exits silently and discards the temporary native executables.
+trap 'rc=$?; printf "zir authority failure: line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
 repo=$PWD
 case "$compiler" in
     /*) compiler_abs=$compiler ;;
