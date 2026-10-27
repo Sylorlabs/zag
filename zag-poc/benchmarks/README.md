@@ -34,6 +34,20 @@ checkout's** `std/` and `selfhost/`; its actual source path and SHA-256
 are recorded, and results from it cannot be attributed to the checkout's
 compiler revision without independent provenance.
 
+For an interleaved before/after compiler comparison, set `ZNC` to the
+candidate and `ZNC_BASELINE` to a runnable compiler for the same native host:
+
+```sh
+ZNC=/path/to/new/znc ZNC_BASELINE=/path/to/old/znc \
+  RUNS=30 ITERATIONS=2000000 python3 benchmarks/run_cross_language.py
+```
+
+This adds `zagscript_baseline` as a fifth measured variant. It compiles the
+identical ZagScript source with each compiler in separate source-compatible
+bundles and rotates all five programs through every measured round. The
+baseline compiler path, version, and SHA-256 are recorded alongside the
+candidate's. Omit `ZNC_BASELINE` for the original four-variant protocol.
+
 On a macOS host where the default SDK/linker combination is incompatible,
 select an installed working SDK using `SDKROOT=/path/to/MacOSX.sdk`. This
 setting is inherited by the C and Rust compiler invocations and captured
@@ -69,9 +83,9 @@ compiler provenance and each language's different execution model.
 
 Run the opt-in smoke test with
 `python3 benchmarks/test_cross_language.py`. It exercises 30 verified runs
-per language at a short iteration count and also checks that `RUNS=29` is
-rejected along with a zero run timeout. It requires the same compilers and
-honors `ZNC`/`SDKROOT`.
+per language at a short iteration count for both the default and optional
+baseline comparison, and also checks that `RUNS=29` is rejected along with a
+zero run timeout. It requires the same compilers and honors `ZNC`/`SDKROOT`.
 
 ## Zag-only compiler, daemon, and allocation protocol
 

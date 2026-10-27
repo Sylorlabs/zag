@@ -19,7 +19,8 @@ from datetime import datetime, timezone
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = ROOT / "benchmarks" / "cross_language"
 LANGUAGES = ("zagscript", "c", "rust", "python")
-EXTENSIONS = {"zagscript": "zag", "c": "c", "rust": "rs", "python": "py"}
+EXTENSIONS = {"zagscript": "zag", "zagscript_baseline": "zag",
+              "c": "c", "rust": "rs", "python": "py"}
 
 
 def positive_setting(name, default, minimum):
@@ -92,6 +93,11 @@ def main():
     compiler = Path(os.environ.get("ZNC", ROOT / default_compiler)).expanduser().resolve()
     if not compiler.is_file() or not os.access(compiler, os.X_OK):
         raise SystemExit(f"benchmark: native compiler missing: {compiler} (set ZNC)")
+    baseline_setting = os.environ.get("ZNC_BASELINE")
+    baseline = Path(baseline_setting).expanduser().resolve() if baseline_setting else None
+    if baseline is not None and (not baseline.is_file() or not os.access(baseline, os.X_OK)):
+        raise SystemExit(f"benchmark: baseline compiler missing: {baseline}")
+    languages = LANGUAGES + (("zagscript_baseline",) if baseline is not None else ())
     clang = shutil.which(os.environ.get("CC", "clang"))
     rustc = shutil.which(os.environ.get("RUSTC", "rustc"))
     if not clang or not rustc:
@@ -139,6 +145,12 @@ def main():
         "build_commands": {},
         "run_commands": {},
     }
+    if baseline is not None:
+        metadata["baseline_compiler_path"] = str(baseline)
+        metadata["baseline_compiler_sha256"] = sha256(baseline.read_bytes())
+        metadata["versions"]["znc_baseline"] = command_output(
+            [str(baseline), "version"]
+        ).decode().strip()
 
     rows = []
     with tempfile.TemporaryDirectory(prefix="zag-cross-language-") as scratch:
@@ -150,8 +162,17 @@ def main():
         (tmp / "std").symlink_to(ROOT / "std", target_is_directory=True)
         (tmp / "selfhost").symlink_to(ROOT / "selfhost", target_is_directory=True)
 
+        baseline_znc = None
+        if baseline is not None:
+            baseline_dir = tmp / "baseline_bundle"
+            baseline_dir.mkdir()
+            baseline_znc = baseline_dir / "znc"
+            shutil.copy2(baseline, baseline_znc)
+            (baseline_dir / "std").symlink_to(ROOT / "std", target_is_directory=True)
+            (baseline_dir / "selfhost").symlink_to(ROOT / "selfhost", target_is_directory=True)
+
         commands = {}
-        for language in LANGUAGES:
+        for language in languages:
             template = (SOURCES / f"kernel.{EXTENSIONS[language]}").read_text()
             if template.count("__ITERATIONS__") != 1:
                 raise RuntimeError(f"{language}: expected exactly one iteration placeholder")
@@ -159,9 +180,10 @@ def main():
             source.write_text(template.replace("__ITERATIONS__", str(iterations)))
             metadata["source_sha256"][language] = sha256(source.read_bytes())
             artifact = tmp / language
-            if language == "zagscript":
+            if language in ("zagscript", "zagscript_baseline"):
                 build = [
-                    str(bundled_znc), str(source), "-o", str(artifact),
+                    str(baseline_znc if language == "zagscript_baseline" else bundled_znc),
+                    str(source), "-o", str(artifact),
                     "--no-zagd", "--no-analyze", "--no-foreground-cache",
                 ]
             elif language == "c":
@@ -209,12 +231,12 @@ def main():
                              sha256(result.stdout), sha256(result.stderr)])
 
         for warmup in range(1, 4):
-            for position, language in enumerate(LANGUAGES, 1):
+            for position, language in enumerate(languages, 1):
                 execute(language, "warmup", warmup, position)
         for round_number in range(1, runs + 1):
-            rotation = (round_number - 1) % len(LANGUAGES)
+            rotation = (round_number - 1) % len(languages)
             for position, language in enumerate(
-                LANGUAGES[rotation:] + LANGUAGES[:rotation], 1
+                languages[rotation:] + languages[:rotation], 1
             ):
                 execute(language, "measured", round_number, position)
 
@@ -230,7 +252,7 @@ def main():
         writer = csv.writer(handle)
         writer.writerow(["language", "runs", "min_ns", "median_ns", "max_ns",
                          "mean_ns", "pstdev_ns"])
-        for language in LANGUAGES:
+        for language in languages:
             samples = [row[3] for row in rows if row[2] == language]
             if len(samples) != runs:
                 raise RuntimeError(f"{language}: missing measured samples")
@@ -241,7 +263,7 @@ def main():
     with base.with_suffix(".cross-language.meta.json").open("x") as handle:
         json.dump(metadata, handle, indent=2)
         handle.write("\n")
-    print(f"Matched stdout for all four languages: {expected.decode().strip()}")
+    print(f"Matched stdout for all {len(languages)} variants: {expected.decode().strip()}")
     print(f"Measured {runs} interleaved runs per language (3 warmups each)")
     print(f"Raw:     {base.with_suffix('.cross-language.raw.csv')}")
     print(f"Summary: {base.with_suffix('.cross-language.summary.csv')}")

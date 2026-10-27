@@ -6,7 +6,7 @@ tmp=$(mktemp -d /tmp/zag-zir-authority.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT
 # Preserve the failing assertion location in CI stage artifacts, where a plain
 # `test` exits silently and discards the temporary native executables.
-trap 'rc=$?; printf "zir authority failure: line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+trap 'rc=$?; if [[ $- == *e* ]]; then printf "zir authority failure: line %s (exit %s)\n" "$LINENO" "$rc" >&2; fi' ERR
 repo=$PWD
 case "$compiler" in
     /*) compiler_abs=$compiler ;;
@@ -74,7 +74,7 @@ zir_divzero_rc=$?
 "$tmp/native-artifacts/native-void"
 zir_void_rc=$?
 set -e
-trap 'rc=$?; printf "zir authority failure: line %s (exit %s)\n" "$LINENO" "$rc" >&2' ERR
+trap 'rc=$?; if [[ $- == *e* ]]; then printf "zir authority failure: line %s (exit %s)\n" "$LINENO" "$rc" >&2; fi' ERR
 test "$zir_scalar_rc" -eq 42
 test "$zir_loop_rc" -eq 10
 test "$zir_raw_overflow_rc" -eq 42
@@ -151,8 +151,17 @@ test "$optin_simple_rc" -ne 0
 test "$optin_check_rc" -ne 0
 grep -q 'foreground-transform is supported only with --level native' "$tmp/optin-simple.out"
 grep -q 'foreground-transform is a build/view option, not a check option' "$tmp/optin-check.out"
+# Checked safety is an edition-2027 feature.  A frozen-edition fixture is
+# rejected before reaching the foreground transform's own policy guard.
+mkdir -p "$tmp/optin-v2"
+cat >"$tmp/optin-v2/zag.mod" <<'MOD'
+name = "zir-transform-checked"
+version = "0"
+edition = "2027"
+MOD
+cp "$tmp/optin-add.zag" "$tmp/optin-v2/optin-add.zag"
 set +e
-"$compiler" "$tmp/optin-add.zag" -o "$tmp/optin-checked" \
+"$compiler" "$tmp/optin-v2/optin-add.zag" -o "$tmp/optin-checked" \
     --foreground-transform const-i32-add-v1 --safety=checked \
     --no-zagd --no-analyze >"$tmp/optin-checked.out" 2>&1
 optin_checked_rc=$?

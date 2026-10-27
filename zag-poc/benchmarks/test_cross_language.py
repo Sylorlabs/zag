@@ -17,6 +17,7 @@ BENCHMARK = Path(__file__).resolve().parent / "run_cross_language.py"
 def main():
     with tempfile.TemporaryDirectory(prefix="zag-cross-language-test-") as scratch:
         env = dict(os.environ, OUT=scratch, ITERATIONS="10001", RUNS="29")
+        env.pop("ZNC_BASELINE", None)
         rejected = subprocess.run([sys.executable, str(BENCHMARK)], env=env, capture_output=True)
         assert rejected.returncode != 0
         assert b"RUNS must be >= 30" in rejected.stderr, rejected.stderr
@@ -53,6 +54,22 @@ def main():
         assert metadata["build_timeout_seconds"] == 180
         assert len(metadata["source_sha256"]) == 4
         assert all(len(digest) == 64 for digest in metadata["source_sha256"].values())
+        with tempfile.TemporaryDirectory(prefix="zag-cross-language-paired-test-") as paired:
+            env["OUT"] = paired
+            env["ZNC_BASELINE"] = metadata["compiler_path"]
+            finished = subprocess.run([sys.executable, str(BENCHMARK)], env=env,
+                                      capture_output=True)
+            assert finished.returncode == 0, finished.stdout + finished.stderr
+            paired_raw, = Path(paired).glob("*.cross-language.raw.csv")
+            paired_meta, = Path(paired).glob("*.cross-language.meta.json")
+            paired_rows = list(csv.DictReader(paired_raw.open(newline="")))
+            counts = collections.Counter(row["language"] for row in paired_rows)
+            assert counts == {"zagscript": 30, "zagscript_baseline": 30,
+                              "c": 30, "rust": 30, "python": 30}, counts
+            paired_metadata = json.loads(paired_meta.read_text())
+            assert paired_metadata["baseline_compiler_sha256"] == metadata["compiler_sha256"]
+            assert all(row["stdout_sha256"] == paired_metadata["expected_stdout_sha256"]
+                       for row in paired_rows)
     print("cross-language benchmark: PASS (parity, 30 runs each, metadata, rejection)")
 
 

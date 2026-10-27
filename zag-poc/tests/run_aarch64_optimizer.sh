@@ -49,6 +49,18 @@ if ! "$tmp/aopt"; then
     exit 1
 fi
 
+echo "── aarch64 scalar assignment regression ──"
+if ! "$ZNC" tests/arm64_scalar_local_assign.zag -o "$tmp/assign" "${FLAGS[@]}" >"$tmp/assign-build.log" 2>&1; then
+    echo "aarch64 scalar assignment: compilation failed" >&2
+    cat "$tmp/assign-build.log" >&2
+    exit 1
+fi
+if ! "$tmp/assign"; then
+    echo "aarch64 scalar assignment: runtime regression" >&2
+    exit 1
+fi
+echo "aarch64 scalar assignment: pass"
+
 # ── (2) differential against the unoptimized baseline ────────────────────────
 BASE=${AOPT_BASELINE:-}
 echo "── aarch64 optimizer: differential vs baseline ──"
