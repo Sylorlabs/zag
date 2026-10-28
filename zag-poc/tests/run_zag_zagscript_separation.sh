@@ -36,16 +36,32 @@ grep -q 'source is already regular Zag; no script profile to expand' "$tmp/stric
 # Check observable behavior as well as compiler acceptance. A nonzero exit
 # status matters: the migration contract covers errors and application status,
 # not merely programs that happen to print the same successful output.
+run_bounded() {
+    # Timeouts prevent a shared lowering bug from hanging both implementations
+    # indefinitely and accidentally appearing as successful migration parity.
+    python3 - "$1" "$2" "$3" <<'PY'
+import subprocess, sys
+try:
+    with open(sys.argv[2], 'wb') as stdout, open(sys.argv[3], 'wb') as stderr:
+        result = subprocess.run([sys.argv[1]], stdout=stdout, stderr=stderr, timeout=10)
+    sys.exit(result.returncode)
+except subprocess.TimeoutExpired:
+    print(f'migration runtime timed out: {sys.argv[1]}', file=sys.stderr)
+    sys.exit(124)
+PY
+}
+
 assert_runtime_parity() {
     local label=$1 script_bin=$2 zag_bin=$3
     local script_rc zag_rc
     set +e
-    "$script_bin" >"$tmp/$label.script.out" 2>"$tmp/$label.script.err"
+    run_bounded "$script_bin" "$tmp/$label.script.out" "$tmp/$label.script.err"
     script_rc=$?
-    "$zag_bin" >"$tmp/$label.zag.out" 2>"$tmp/$label.zag.err"
+    run_bounded "$zag_bin" "$tmp/$label.zag.out" "$tmp/$label.zag.err"
     zag_rc=$?
     set -e
-    if [ "$script_rc" -ne "$zag_rc" ] || \
+    if [ "$script_rc" -eq 124 ] || [ "$zag_rc" -eq 124 ] || \
+       [ "$script_rc" -ne "$zag_rc" ] || \
        ! cmp -s "$tmp/$label.script.out" "$tmp/$label.zag.out" || \
        ! cmp -s "$tmp/$label.script.err" "$tmp/$label.zag.err"; then
         echo "ZagScript-to-Zag behavior mismatch: $label (script=$script_rc zag=$zag_rc)" >&2
@@ -106,5 +122,58 @@ if "$ZNC" harden "$tmp/inferred.explicit.zag" --no-zagd >"$tmp/inferred-harden.l
     exit 1
 fi
 grep -q 'source is already regular Zag; no script profile to expand' "$tmp/inferred-harden.log"
+
+cat >"$tmp/loops.zag" <<'ZAG'
+script;
+let total = 0
+for i in range(6):
+    total = total + i
+let j: i64 = 0
+while j < 3:
+    total = total + j
+    j = j + 1
+if total != 18:
+    return 7
+say("loop-pass")
+return 3
+ZAG
+"$ZNC" expand "$tmp/loops.zag" --to explicit --output "$tmp/loops.explicit.zag" --no-zagd >/dev/null
+"$ZNC" "$tmp/loops.zag" --no-zagd --no-analyze --no-foreground-cache -o "$tmp/loops.script.bin" >/dev/null
+"$ZNC" "$tmp/loops.explicit.zag" --no-zagd --no-analyze --no-foreground-cache -o "$tmp/loops.zag.bin" >/dev/null
+assert_runtime_parity loops "$tmp/loops.script.bin" "$tmp/loops.zag.bin"
+set +e
+"$tmp/loops.zag.bin" >"$tmp/loops.check" 2>"$tmp/loops.error"
+loop_rc=$?
+set -e
+[ "$loop_rc" -eq 3 ]
+[ "$(cat "$tmp/loops.check")" = loop-pass ]
+[ ! -s "$tmp/loops.error" ]
+
+cat >"$tmp/scopes.zag" <<'ZAG'
+script;
+let before = 1
+def f(x):
+    return x + 1
+before = f(before)
+let after = 3
+def g(x):
+    return x + 2
+after = g(after)
+if before + after != 7:
+    return 8
+say("scope-pass")
+return 4
+ZAG
+"$ZNC" expand "$tmp/scopes.zag" --to explicit --output "$tmp/scopes.explicit.zag" --no-zagd >/dev/null
+"$ZNC" "$tmp/scopes.zag" --no-zagd --no-analyze --no-foreground-cache -o "$tmp/scopes.script.bin" >/dev/null
+"$ZNC" "$tmp/scopes.explicit.zag" --no-zagd --no-analyze --no-foreground-cache -o "$tmp/scopes.zag.bin" >/dev/null
+assert_runtime_parity scopes "$tmp/scopes.script.bin" "$tmp/scopes.zag.bin"
+set +e
+run_bounded "$tmp/scopes.zag.bin" "$tmp/scopes.check" "$tmp/scopes.error"
+scope_rc=$?
+set -e
+[ "$scope_rc" -eq 4 ]
+[ "$(cat "$tmp/scopes.check")" = scope-pass ]
+[ ! -s "$tmp/scopes.error" ]
 
 echo 'Zag/ZagScript profile separation and migration parity: PASS'

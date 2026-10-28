@@ -1,6 +1,6 @@
 # Zag Script guide
 
-Zag Script is Zag's built-in low-friction profile. It provides concise safe
+ZagScript is Zag's sibling language for low-friction programming. It provides concise safe
 defaults for short programs and experiments while preserving a direct path into
 explicit native Zag through inspection and hardening. “Safe defaults” here
 means bounded, documented, and fail-closed behavior at the implemented Script
@@ -41,8 +41,10 @@ publication. Use provenance-backed `promote` for human-owned expanded source. Se
 `ZAGSCRIPT_HARDENING.md` for the exact supported boundary.
 
 All three select the same `ModuleProfile.script`, parser, AST, semantic
-analysis, runtime, and native backend. `.zs` is a convenience, not a second
-language or a claim that arbitrary Python files are source-compatible. The
+analysis, runtime, and native backend. ZagScript and Zag are distinct language
+surfaces with distinct authoring contracts, not separate compiler stacks.
+The `.zs` suffix is a convenience and is not a claim that arbitrary Python files
+are source-compatible. The
 current `.zs` frontend preserves compact bytes and bounded line-oriented
 origin records through Script normalization; it is not yet a full
 token/trivia/layout CST shared with the regular lexer. Normalized output has

@@ -32,11 +32,14 @@ profile; it is not a claim of general ownership, borrowing, or memory safety.
 ./znc check examples/script_hello.zag --strict
 ```
 
-See [the Zag Script guide](docs/ZAGSCRIPT_GUIDE.md), [its exact semantics and
+See [the Zag/ZagScript sibling roadmap](docs/ZAG_ZAGSCRIPT_SIBLINGS.md),
+[the Zag Script guide](docs/ZAGSCRIPT_GUIDE.md), [its exact semantics and
 safety boundary](docs/ZAGSCRIPT_SEMANTICS.md), and [the `zagd`
 guide](docs/ZAGD_GUIDE.md). A `.zag` file containing `script;` selects the same
-compiler profile as `znc script`; Zag Script is not a second compiler or type
-system.
+compiler profile as `znc script`. ZagScript and Zag are two sibling language
+surfaces with different defaults and levels of explicit control. They share the
+same compiler, type system, core semantics, native backend, and libraries so
+ZagScript programs can be expanded into reviewable strict Zag.
 
 ```sh
 ./znc examples/numeric.zag -o numeric --run

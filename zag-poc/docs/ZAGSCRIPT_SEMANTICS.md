@@ -10,7 +10,8 @@ remain outside the Script profile's guarantees.
 
 ## Profile activation
 
-Zag Script is a compilation profile of Zag, not a separate language. A root
+ZagScript is a sibling language of Zag, implemented as a distinct compilation
+profile over the shared compiler and type system. A root
 `.zag` file activates it with exactly one declaration:
 
 ```zag
