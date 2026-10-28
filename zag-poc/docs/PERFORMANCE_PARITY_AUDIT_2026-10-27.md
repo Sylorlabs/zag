@@ -169,6 +169,61 @@ The current QF_BV signed-div/mod and compare proofs support a few exact identiti
 
 **Ship / PR policy:** draft PRs with source/benchmark evidence, fixed input/output checks, full relevant tests and reproducibility artifacts. Strict v2 release gate remains fail-closed until its required `UNSUPPORTED` rows are satisfied. No broad "faster than C/Rust" messaging before the score ladder is met on a diverse corpus.
 
+### Executed ARM64 unsigned power-of-two remainder lowering
+
+The next narrowly scoped native backend change recognizes a **bare positive
+decimal power-of-two literal with at most 18 digits**, and only when the left
+operand has an explicitly unsigned integer type. With a constant `2^k`, the
+compiler now lowers `x % 2^k` to `x & (2^k - 1)` using the already evaluated
+divisor register. For modulus one the result is zero. Signed negative operands,
+non-power-of-two literals, dynamic divisors, hex literal forms, and unsafe
+out-of-range literal spellings keep their previous lowering and checks. This
+is a bit-vector identity for all 64-bit unsigned values; it does not require
+assuming the high bit is clear. `tests/run_pow2_remainder_proof.sh`
+checked seven `unsat` QF_BV obligations across 8/32/64-bit operands
+and one expected `sat` signed counterexample using Z3. The proof is
+shared with the ZagScript branch and is wired into the opt-in v2 Z3 CI job.
+
+The new `tests/run_v2_arm64_pow2_remainder.sh` ran 11 source-level fixtures
+against the rebuilt compiler `/tmp/zag-v2-pow2-znc-20261027` and the previous
+optimized compiler `/tmp/zag-v2-matched-opt-znc-20261027`: all 11 independently
+specified exit oracles and exact stdout/stderr comparisons passed, and seven
+executable images changed. `tests/run_v2_division_zero.sh` passed **43/43**
+in release/checked and cross-edition cases; signed division overflow passed
+**11/11**. The full ARM64 optimizer unit and semantic-differential gate passed
+**768** instruction cases and **10** built program comparisons. These are
+correctness and code-generation checks, **not** measured runtime improvements;
+dedicated hot-loop timing is still required before assigning a speedup.
+
+ZagScript v1 retains its separate exact high-half-multiplication lowering for
+other bounded constant divisors. The final rebuilt Script compiler
+`/tmp/zag-script-pow2-final-znc-20261027` passed 321 independent remainder
+oracles, the Script-to-explicit-Zag migration parity suite, and its scoped
+Z3/automatic optimizer authority suite. The rebuilt v2 compiler
+`/tmp/zag-v2-pow2-final-znc-20261027` repeated all 11 pow2 remainder
+differential fixtures (seven changed binary images), 43 division-zero
+fixtures, and 11 signed-overflow fixtures. Both compilers built from the
+final guarded source with no external compiler/linker tools.
+
+A narrow exploratory Apple Silicon benchmark exercised **10 million iterations**
+of an unsigned modulo-256 recurrence, with four binaries independently checked
+against the exact checksum `1274991808`. Process-inclusive medians across
+30 rotating rounds, after three warmups, were:
+
+| Compiler profile | Older artifact | Rebuilt artifact | Rebuilt/older |
+| --- | ---: | ---: | ---: |
+| Zag v2 | 76.509 ms | 48.804 ms | 0.638x |
+| ZagScript v1 | 35.256 ms | 18.804 ms | 0.533x |
+
+Raw 30-round times and source/compiler/executable SHA-256 are retained in
+`/tmp/zag-pow2-benchmark-20261027.json` on the validation machine. This is
+a *specialized* hot-loop screen, with process launch included and no controlled
+`-O2` C/Rust baseline in this experiment. The older compiler artifacts were
+not rebuilt from a rigorously matched source with only this pass disabled;
+therefore these ratios must not be attributed solely to this rewrite, nor
+generalized to language-wide performance. The separate prior three-kernel
+C/Rust parity audit remains the applicable broad performance evidence.
+
 ## 8. Audit limitations
 
 This review examines a large compiler through selective source inspection, existing project audits, local targeted tests, new cross-language measurements and CI statuses. It does **not** certify an exhaustive per-function code audit, prove the whole language safe, inspect every emitted instruction or test all supported target/feature combinations. Some historic documents were written against older or dirty trees and are used as hypotheses to remeasure. The separate host-native ZagScript compiler's build provenance should be independently established before publication. Future profiling is necessary to turn suspected hot spots into proven ones.
