@@ -207,4 +207,42 @@ set -e
 [ "$(cat "$tmp/scopes.check")" = scope-pass ]
 [ ! -s "$tmp/scopes.error" ]
 
+# Mutation survives nested loop back-edges, a second loop, and an inferred
+# function call when the Script frontend emits an ordinary strict Zag program.
+# Independent expected status/output prevents identical miscompilation from
+# passing the two-compiler comparison.
+cat >"$tmp/transfer.zag" <<'ZAG'
+script;
+let total = 7
+for i in range(5):
+    if i % 2 == 0:
+        total = total * 2 + i
+    else:
+        total = total + 3
+let k = 0
+while k < 2:
+    total = total - 5
+    k = k + 1
+def bump(x):
+    return x + 4
+total = bump(total)
+if total != 76:
+    return 7
+say("transfer-pass")
+return 6
+ZAG
+cp "$tmp/transfer.zag" "$tmp/transfer.before"
+"$ZNC" expand "$tmp/transfer.zag" --to explicit --output "$tmp/transfer.explicit.zag" --no-zagd >/dev/null
+cmp "$tmp/transfer.zag" "$tmp/transfer.before"
+"$ZNC" "$tmp/transfer.zag" --no-zagd --no-analyze --no-foreground-cache -o "$tmp/transfer.script.bin" >/dev/null
+"$ZNC" "$tmp/transfer.explicit.zag" --no-zagd --no-analyze --no-foreground-cache -o "$tmp/transfer.zag.bin" >/dev/null
+assert_runtime_parity transfer "$tmp/transfer.script.bin" "$tmp/transfer.zag.bin"
+set +e
+run_bounded "$tmp/transfer.zag.bin" "$tmp/transfer.check" "$tmp/transfer.error"
+transfer_rc=$?
+set -e
+[ "$transfer_rc" -eq 6 ]
+[ "$(cat "$tmp/transfer.check")" = transfer-pass ]
+[ ! -s "$tmp/transfer.error" ]
+
 echo 'Zag/ZagScript profile separation and migration parity: PASS'
