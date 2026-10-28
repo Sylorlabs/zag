@@ -49,6 +49,19 @@ if ! "$tmp/aopt"; then
     exit 1
 fi
 
+# Execute both the original and optimized AInstr streams on the same bounded
+# register/NZCV/x28 model, including wide-CMP scratch side effects. This does
+# not replace a full compiler-to-compiler differential when BASE is available.
+if ! "$ZNC" selfhost/native/aoptimize_differential_test.zag -o "$tmp/aopt-diff" "${FLAGS[@]}" >"$tmp/diff-build.log" 2>&1; then
+    echo "could not build the optimizer semantic differential" >&2
+    cat "$tmp/diff-build.log" >&2
+    exit 1
+fi
+if ! "$tmp/aopt-diff"; then
+    echo "aarch64 optimizer: FAIL (semantic differential)" >&2
+    exit 1
+fi
+
 # ── (2) differential against the unoptimized baseline ────────────────────────
 BASE=${AOPT_BASELINE:-}
 echo "── aarch64 optimizer: differential vs baseline ──"
