@@ -2146,6 +2146,32 @@ fn ac_bin_unsigned_int(l: *Node, r: *Node, env: *AEnv, syms: ArrayList[AFnSym], 
     return 0;
 }
 
+// Return a literal positive power of two that fits signed i64, or zero.
+// Restrict the fast path to at most 18 decimal digits: ac_parse_i64 wraps
+// oversized literals, and a wrapped magnitude must never justify a rewrite.
+// The right operand must be a bare literal, so skipping its zero guard cannot
+// hide side effects or a dynamically zero divisor.
+fn ac_literal_unsigned_pow2(n: *Node) i64 {
+    switch (n.*) {
+        .ilit => |lit| {
+            let s: []u8 = lit.text;
+            if (s.len == 0) { return 0; }
+            let digits: i32 = 0;
+            let i: i32 = 0;
+            while (i < s.len) {
+                if (s[i] >= '0' && s[i] <= '9') { digits = digits + 1; }
+                else { return 0; }
+                i = i + 1;
+            }
+            if (digits == 0 || digits > 18) { return 0; }
+            let v: i64 = ac_parse_i64(s);
+            if (v > 0 && (v & (v - 1)) == 0) { return v; }
+        }
+        else => { }
+    }
+    return 0;
+}
+
 fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) void {
     switch (n.*) {
         .ilit => |x| {
@@ -2541,20 +2567,47 @@ fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
                 if (ac_bin_unsigned_int(b.l, b.r, env, syms, cg) == 1) {
                     push[AInstr](out, ai_udiv(A_X0(), A_X0(), A_X1()));
                 } else {
+                    if (cg.*.v2_edition == 1) {
+                        // AArch64 SDIV silently wraps min_i64 / -1. Enforce the
+                        // edition-2027 overflow trap before lowering SDIV.
+                        let l_safe: i32 = ac_fresh(cg);
+                        push[AInstr](out, ai_cmp_imm(A_X1(), 0 - 1));
+                        push[AInstr](out, ai_jne(l_safe));
+                        push[AInstr](out, ai_mov_imm(A_X9(), (0 - 9223372036854775807) - 1));
+                        push[AInstr](out, ai_cmp(A_X0(), A_X9()));
+                        push[AInstr](out, ai_jne(l_safe));
+                        ac_emit_panic(out, "zag safety: signed integer division overflow", l_safe, cg);
+                    }
                     push[AInstr](out, ai_sdiv(A_X0(), A_X0(), A_X1()));
                 }
             } else if (@strEq(b.op, "%")) {
                 if (cg.*.v2_edition == 1 && cg_static_zero_divisor(b.r) == 1) {
                     ac_err(cg, "v2: integer division by zero");
                 }
-                ac_emit_div0_guard(out, cg);
-                if (ac_bin_unsigned_int(b.l, b.r, env, syms, cg) == 1) {
-                    push[AInstr](out, ai_udiv(A_X9(), A_X0(), A_X1()));
-                } else {
-                    push[AInstr](out, ai_sdiv(A_X9(), A_X0(), A_X1()));
+                // For unsigned x and constant 2^k, x % 2^k == x & (2^k-1)
+                // for every 64-bit x (including the high bit).  x1 already
+                // holds the evaluated literal: subtract 1 and use a single
+                // AND instruction.  This eliminates the division and its
+                // unreachable zero guard without changing expression order.
+                let pow2: i64 = 0;
+                if (cg_is_unsigned_int_type(ac_expr_type(b.l, env, syms, cg)) == 1) {
+                    pow2 = ac_literal_unsigned_pow2(b.r);
                 }
-                push[AInstr](out, ai_mul(A_X9(), A_X9(), A_X1()));
-                push[AInstr](out, ai_sub(A_X0(), A_X9()));
+                if (pow2 == 1) {
+                    push[AInstr](out, ai_mov_imm(A_X0(), 0));
+                } else if (pow2 > 1) {
+                    push[AInstr](out, ai_sub_imm(A_X1(), 1));
+                    push[AInstr](out, ai_andr(A_X0(), A_X1()));
+                } else {
+                    ac_emit_div0_guard(out, cg);
+                    if (ac_bin_unsigned_int(b.l, b.r, env, syms, cg) == 1) {
+                        push[AInstr](out, ai_udiv(A_X9(), A_X0(), A_X1()));
+                    } else {
+                        push[AInstr](out, ai_sdiv(A_X9(), A_X0(), A_X1()));
+                    }
+                    push[AInstr](out, ai_mul(A_X9(), A_X9(), A_X1()));
+                    push[AInstr](out, ai_sub(A_X0(), A_X9()));
+                }
             } else if (@strEq(b.op, "&")) {
                 push[AInstr](out, ai_andr(A_X0(), A_X1()));
             } else if (@strEq(b.op, "^")) {
@@ -6617,6 +6670,28 @@ fn ac_lower_stmt(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
                     layout_width = ac_layout_field_width(cg, esn, ef.fname);
                 }
                 else => { }
+            }
+            // A scalar local lives at a fixed frame offset. Evaluating its
+            // address, stacking that pointer across the RHS, and then loading
+            // it back only to store the result creates unnecessary traffic in
+            // tight loops. The address of an ordinary local has no effects;
+            // a byref slot, global, field, index, aggregate, and the optional
+            // wrapping cases above continue through the general lvalue path.
+            let local_disp: i32 = 0;
+            switch (a.target.*) {
+                .id => |tid| {
+                    let disp: i32 = ac_slot_find(env, tid.name);
+                    if (disp != 0 && ac_slot_byref(env, tid.name) == 0) {
+                        local_disp = disp;
+                    }
+                }
+                else => { }
+            }
+            if (local_disp != 0 && ac_is_aggregate(cg, tty) == 0) {
+                ac_lower_expr(out, a.expr, env, syms, cg);
+                push[AInstr](out, ai_pop(A_X0()));
+                push[AInstr](out, ai_store(A_X29(), local_disp, A_X0()));
+                return;
             }
             ac_lower_addr(out, a.target, env, syms, cg);
             ac_lower_expr(out, a.expr, env, syms, cg);

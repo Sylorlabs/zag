@@ -77,6 +77,12 @@ for mode in release checked; do
   case_run "$mode-i64-mod-positive" 2027 "$mode" 42 'fn rem(x:i64,y:i64) i64 { return x%y; } fn main() i32 { return rem(142,100) as i32; }'
   case_run "$mode-u64-div-positive" 2027 "$mode" 42 'fn div(x:u64,y:u64) u64 { return x/y; } fn main() i32 { return div(126,3) as i32; }'
   case_run "$mode-u64-mod-positive" 2027 "$mode" 42 'fn rem(x:u64,y:u64) u64 { return x%y; } fn main() i32 { return rem(142,100) as i32; }'
+  # Values with bit 63 set must use unsigned division/remainder, even though
+  # the native register representation would be negative as a signed i64.
+  case_run "$mode-u64-high-bit-div-two" 2027 "$mode" 42 'fn div(x:u64,y:u64) u64 { return x/y; } fn main() i32 { if (div(9223372036854775808,2)==4611686018427387904) { return 42; } return 9; }'
+  case_run "$mode-u64-max-div-two" 2027 "$mode" 42 'fn div(x:u64,y:u64) u64 { return x/y; } fn main() i32 { if (div(18446744073709551615,2)==9223372036854775807) { return 42; } return 9; }'
+  case_run "$mode-u64-high-bit-mod-three" 2027 "$mode" 42 'fn rem(x:u64,y:u64) u64 { return x%y; } fn main() i32 { if (rem(9223372036854775808,3)==2) { return 42; } return 9; }'
+  case_run "$mode-u64-max-mod-ten" 2027 "$mode" 42 'fn rem(x:u64,y:u64) u64 { return x%y; } fn main() i32 { if (rem(18446744073709551615,10)==5) { return 42; } return 9; }'
   case_run "$mode-direct-div-zero" 2027 "$mode" reject 'fn main() i32 { return 42 / 0; }'
   case_run "$mode-direct-mod-zero" 2027 "$mode" reject 'fn main() i32 { return 42 % 0; }'
   case_run "$mode-direct-negative-zero" 2027 "$mode" reject 'fn main() i32 { return 42 / -0; }'

@@ -17,7 +17,10 @@
 # single evidence stream even when callers pass `-j`; GNU make 3.81 supports
 # this global special target on the oldest macOS toolchain in scope.
 .NOTPARALLEL:
-.PHONY: test-process-platform test-source-closure test-evidence-codec test-native-evidence
+.PHONY: test-process-platform test-source-closure test-evidence-codec test-native-evidence test-v2-arm64-pow2-remainder test-pow2-remainder-proof
+
+test-pow2-remainder-proof:
+	bash tests/run_pow2_remainder_proof.sh
 
 test-source-closure:
 	bash tests/run_source_closure.sh
@@ -306,6 +309,13 @@ test-abi-layout:
 test-arm64:
 	@echo "── portable arm64 backend suite ──"
 	bash tests/run_native_arm64.sh
+
+# Verify the ARM64 unsigned power-of-two modulo reduction and its signed,
+# dynamic, and non-power-of-two fallbacks. Set POW2_BASELINE to the compiler
+# built from the same source immediately before enabling the rewrite.
+test-v2-arm64-pow2-remainder:
+	@echo "── arm64 unsigned power-of-two remainder ──"
+	bash tests/run_v2_arm64_pow2_remainder.sh
 
 test-arm64-cabi-object:
 	@echo "── arm64 scalar C ABI ET_REL boundary ──"

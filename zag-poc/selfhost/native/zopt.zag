@@ -8,7 +8,8 @@
 //
 // Passes (each rebuilds the IR immutably, MLIR-style, returning new IR):
 //   opt_fold     — constant folding to a FIXPOINT: addi/subi/muli/divsi and
-//                  cmpi. Complements zir.zag's fold_module by also folding
+//                  cmpi, plus reflexive integer comparisons (%x cmp %x).
+//                  Complements zir.zag's fold_module by also folding
 //                  comparisons and by iterating to a fixpoint. Never folds x/0.
 //   opt_simplify — algebraic identities / strength reduction with guards:
 //                  x+0,0+x,x-0 → x ; x*1,1*x → x ; x*0,0*x,x-x → 0 ; x/1 → x.
@@ -23,7 +24,7 @@
 //
 // Prototype integer folding currently assumes wrapping i64. That does not
 // establish the declared result width of an arbitrary ZIR operation. Division
-// by zero is not folded, but later prototype DCE is not yet trap-aware.
+// by zero is not folded; DCE/CSE conservatively retain division/remainder.
 
 @import("../zir.zag")
 
@@ -37,10 +38,24 @@ fn opt_is_pure_arith(name: []u8) i32 {
     if (@strEq(name, "arith.addi"))     { return 1; }
     if (@strEq(name, "arith.subi"))     { return 1; }
     if (@strEq(name, "arith.muli"))     { return 1; }
-    if (@strEq(name, "arith.divsi"))    { return 1; }
-    if (@strEq(name, "arith.remsi"))    { return 1; }
+    // divsi/remsi may trap on a zero divisor (and divsi on MIN / -1
+    // in edition-2027). DCE/CSE cannot erase either without proving safety.
     if (@strEq(name, "arith.cmpi"))     { return 1; }
     return 0;
+}
+
+// Rewrites must not discard side effects, memory dependencies, or regions.
+// Experimental arithmetic ops are eligible only with their standard shape.
+fn opt_can_rewrite(o: ZOp) i32 {
+    if (o.effects != 0 || !@strEq(o.reads, "none") ||
+        !@strEq(o.writes, "none") || len[ZRegion](o.regions) != 0) { return 0; }
+    if (@strEq(o.name, "arith.cmpi")) {
+        if (len[ZAttr](o.attrs) == 1 &&
+            @strEq(get[ZAttr](o.attrs, 0).key, "predicate")) { return 1; }
+        return 0;
+    }
+    if (len[ZAttr](o.attrs) != 0 && !@strEq(o.name, "arith.constant")) { return 0; }
+    return 1;
 }
 
 // ── value-rewrite map: old SSA name → surviving value ────────────────────────
@@ -67,7 +82,8 @@ fn opt_resolve(rws: ArrayList[OptRw], v: ZVal) ZVal {
 // rebuild an op with each operand passed through the rewrite map.
 fn opt_rewrite_operands(o: ZOp, rws: ArrayList[OptRw]) ZOp {
     let no: ZOp = ZOp{ .name = o.name, .results = o.results, .operands = make[ZVal](2),
-                       .attrs = o.attrs, .regions = o.regions };
+                       .attrs = o.attrs, .regions = o.regions, .effects = o.effects,
+                       .reads = o.reads, .writes = o.writes, .origin = o.origin };
     let i: i32 = 0;
     while (i < len[ZVal](o.operands)) {
         push[ZVal](&no.operands, opt_resolve(rws, get[ZVal](o.operands, i)));
@@ -99,7 +115,15 @@ fn opt_eval_int(name: []u8, a: i64, b: i64, ok: *i32) i64 {
     if (@strEq(name, "arith.addi"))  { return a + b; }      // i64 wrap
     if (@strEq(name, "arith.subi"))  { return a - b; }      // i64 wrap
     if (@strEq(name, "arith.muli"))  { return a * b; }      // i64 wrap
-    if (@strEq(name, "arith.divsi")) { if (b == 0) { ok.* = 0; return 0; } return a / b; }
+    if (@strEq(name, "arith.divsi")) {
+        // The prototype has no edition/overflow policy. Preserve the signed
+        // MIN / -1 operation so edition-2027's required trap cannot be folded
+        // into the edition-2026 wrapping result.
+        if (b == 0 || (a == (0 - 9223372036854775807) - 1 && b == -1)) {
+            ok.* = 0; return 0;
+        }
+        return a / b;
+    }
     if (@strEq(name, "arith.remsi")) { if (b == 0) { ok.* = 0; return 0; } return a % b; }
     ok.* = 0;
     return 0;
@@ -115,6 +139,25 @@ fn opt_eval_cmp(pred: []u8, a: i64, b: i64, ok: *i32) i64 {
     if (@strEq(pred, "sle")) { if (a <= b) { return 1; } return 0; }
     if (@strEq(pred, "sge")) { if (a >= b) { return 1; } return 0; }
     ok.* = 0;
+    return 0;
+}
+
+// Every integer value compares equal to itself at every width. This rule does
+// not inspect a truncated i64 constant or rely on the edition's overflow mode.
+// It does NOT apply to floating-point cmpf: NaN is not equal to itself.
+fn opt_eval_reflexive_cmpi(pred: []u8, ok: *i32) i64 {
+    ok.* = 1;
+    if (@strEq(pred, "eq") || @strEq(pred, "sle") || @strEq(pred, "sge")) { return 1; }
+    if (@strEq(pred, "ne") || @strEq(pred, "slt") || @strEq(pred, "sgt")) { return 0; }
+    ok.* = 0;
+    return 0;
+}
+
+fn opt_known_int_cmp_type(ty: []u8) i32 {
+    if (@strEq(ty, "i8") || @strEq(ty, "i16") || @strEq(ty, "i32") ||
+        @strEq(ty, "i64") || @strEq(ty, "u8") || @strEq(ty, "u16") ||
+        @strEq(ty, "u32") || @strEq(ty, "u64") || @strEq(ty, "isize") ||
+        @strEq(ty, "usize")) { return 1; }
     return 0;
 }
 
@@ -147,6 +190,12 @@ fn opt_mk_const(res: ZVal, v: i64) ZOp {
     return c;
 }
 
+fn opt_mk_const_from(o: ZOp, res: ZVal, v: i64) ZOp {
+    let c: ZOp = opt_mk_const(res, v);
+    c.origin = o.origin;
+    return c;
+}
+
 // fold one block (single sweep). `changed` is bumped on every rewrite so the
 // caller can iterate to a fixpoint.
 fn opt_fold_block(blk: ZBlock, cs: *ArrayList[OptConst], changed: *i32) ZBlock {
@@ -164,23 +213,42 @@ fn opt_fold_block(blk: ZBlock, cs: *ArrayList[OptConst], changed: *i32) ZBlock {
             let b: i64 = opt_const_lookup(cs.*, get[ZVal](o.operands, 1).name, &f2);
             let ok: i32 = 0;
             let v: i64 = opt_eval_int(o.name, a, b, &ok);
-            if (f1 == 1 && f2 == 1 && ok == 1) {
+            if (f1 == 1 && f2 == 1 && ok == 1 && opt_can_rewrite(o) == 1) {
                 let res: ZVal = get[ZVal](o.results, 0);
-                push[ZOp](&out.ops, opt_mk_const(res, v));
+                push[ZOp](&out.ops, opt_mk_const_from(o, res, v));
                 push[OptConst](cs, OptConst{ .name = res.name, .val = v });
                 changed.* = changed.* + 1;
             } else {
                 push[ZOp](&out.ops, opt_fold_regions(o, cs, changed));
             }
         } else if (@strEq(o.name, "arith.cmpi") && len[ZVal](o.operands) == 2 && len[ZVal](o.results) == 1) {
+            let lhs: ZVal = get[ZVal](o.operands, 0);
+            let rhs: ZVal = get[ZVal](o.operands, 1);
+            let res: ZVal = get[ZVal](o.results, 0);
             let f1: i32 = 0; let f2: i32 = 0;
-            let a: i64 = opt_const_lookup(cs.*, get[ZVal](o.operands, 0).name, &f1);
-            let b: i64 = opt_const_lookup(cs.*, get[ZVal](o.operands, 1).name, &f2);
+            let a: i64 = opt_const_lookup(cs.*, lhs.name, &f1);
+            let b: i64 = opt_const_lookup(cs.*, rhs.name, &f2);
             let ok: i32 = 0;
             let v: i64 = opt_eval_cmp(opt_attr_val(o, "predicate"), a, b, &ok);
-            if (f1 == 1 && f2 == 1 && ok == 1) {
-                let res: ZVal = get[ZVal](o.results, 0);
-                push[ZOp](&out.ops, opt_mk_const(res, v));
+            let self_ok: i32 = 0;
+            let self_v: i64 = 0;
+            // Only replace a plain, side-effect-free, well-shaped integer cmp.
+            // The result's SSA metadata and the op's source origin survive.
+            if (@strEq(lhs.name, rhs.name) && @strEq(lhs.ty, rhs.ty) &&
+                opt_known_int_cmp_type(lhs.ty) == 1 &&
+                @strEq(res.ty, "bool") && o.effects == 0 &&
+                @strEq(o.reads, "none") && @strEq(o.writes, "none") &&
+                len[ZRegion](o.regions) == 0 && len[ZAttr](o.attrs) == 1 &&
+                @strEq(get[ZAttr](o.attrs, 0).key, "predicate")) {
+                self_v = opt_eval_reflexive_cmpi(opt_attr_val(o, "predicate"), &self_ok);
+            }
+            if (self_ok == 1 && opt_can_rewrite(o) == 1) {
+                let c: ZOp = opt_mk_const_from(o, res, self_v);
+                push[ZOp](&out.ops, c);
+                push[OptConst](cs, OptConst{ .name = res.name, .val = self_v });
+                changed.* = changed.* + 1;
+            } else if (f1 == 1 && f2 == 1 && ok == 1 && opt_can_rewrite(o) == 1) {
+                push[ZOp](&out.ops, opt_mk_const_from(o, res, v));
                 push[OptConst](cs, OptConst{ .name = res.name, .val = v });
                 changed.* = changed.* + 1;
             } else {
@@ -198,14 +266,25 @@ fn opt_fold_block(blk: ZBlock, cs: *ArrayList[OptConst], changed: *i32) ZBlock {
 fn opt_fold_regions(o: ZOp, cs: *ArrayList[OptConst], changed: *i32) ZOp {
     if (len[ZRegion](o.regions) == 0) { return o; }
     let no: ZOp = ZOp{ .name = o.name, .results = o.results, .operands = o.operands,
-                       .attrs = o.attrs, .regions = make[ZRegion](1) };
+                       .attrs = o.attrs, .regions = make[ZRegion](1),
+                       .effects = o.effects, .reads = o.reads, .writes = o.writes,
+                       .origin = o.origin };
     let rg: i32 = 0;
     while (rg < len[ZRegion](o.regions)) {
         let reg: ZRegion = get[ZRegion](o.regions, rg);
         let nr: ZRegion = ZRegion{ .blocks = make[ZBlock](1) };
         let bb: i32 = 0;
         while (bb < len[ZBlock](reg.blocks)) {
-            push[ZBlock](&nr.blocks, opt_fold_block(get[ZBlock](reg.blocks, bb), cs, changed));
+            // Parent constants dominate a nested block, but block-local
+            // definitions do not dominate siblings or the enclosing block.
+            // Keep a separate environment for each nested block.
+            let scoped: ArrayList[OptConst] = make[OptConst](len[OptConst](cs.*) + 2);
+            let j: i32 = 0;
+            while (j < len[OptConst](cs.*)) {
+                push[OptConst](&scoped, get[OptConst](cs.*, j));
+                j = j + 1;
+            }
+            push[ZBlock](&nr.blocks, opt_fold_block(get[ZBlock](reg.blocks, bb), &scoped, changed));
             bb = bb + 1;
         }
         push[ZRegion](&no.regions, nr);
@@ -239,7 +318,7 @@ fn opt_fold(m: ZModule) ZModule {
 // ═════════════════════════════════════════════════════════════════════════════
 //  PASS 2: opt_simplify — algebraic identities / strength reduction.
 //   x+0,0+x,x-0,x*1,1*x,x/1 → surviving operand (drop op, rewire uses)
-//   x*0,0*x,x-x            → constant 0 (op becomes arith.constant 0, name kept)
+//   x*0,0*x,x-x,x%(+/-1)  → constant 0 (op becomes arith.constant 0, name kept)
 //  Guards: only fires when the constant operand is a KNOWN integer constant of
 //  the matching value; x-x only when both operand NAMES are identical.
 // ═════════════════════════════════════════════════════════════════════════════
@@ -257,7 +336,8 @@ fn opt_simplify_block(blk: ZBlock, changed: *i32) ZBlock {
             push[OptConst](&cs, OptConst{ .name = get[ZVal](o.results, 0).name,
                                           .val = parse_i64(opt_attr_val(o, "value")) });
             push[ZOp](&out.ops, o);
-        } else if (len[ZVal](o.operands) == 2 && len[ZVal](o.results) == 1) {
+        } else if (len[ZVal](o.operands) == 2 && len[ZVal](o.results) == 1 &&
+                   opt_can_rewrite(o) == 1) {
             let lhs: ZVal = get[ZVal](o.operands, 0);
             let rhs: ZVal = get[ZVal](o.operands, 1);
             let res: ZVal = get[ZVal](o.results, 0);
@@ -300,6 +380,14 @@ fn opt_simplify_block(blk: ZBlock, changed: *i32) ZBlock {
                     push[OptRw](&rws, OptRw{ .from = res.name, .to = lhs });
                     changed.* = changed.* + 1; handled = 1;
                 }
+            } else if (@strEq(o.name, "arith.remsi")) {
+                // Remainder by +/-1 is exactly zero, including MIN % -1.
+                // Keep the zero-divisor case so its required trap survives.
+                if (rf == 1 && (rv == 1 || rv == -1)) {
+                    push[ZOp](&out.ops, opt_mk_const(res, 0));
+                    push[OptConst](&cs, OptConst{ .name = res.name, .val = 0 });
+                    changed.* = changed.* + 1; handled = 1;
+                }
             }
 
             if (handled == 0) { push[ZOp](&out.ops, opt_simplify_regions(o, changed)); }
@@ -314,7 +402,9 @@ fn opt_simplify_block(blk: ZBlock, changed: *i32) ZBlock {
 fn opt_simplify_regions(o: ZOp, changed: *i32) ZOp {
     if (len[ZRegion](o.regions) == 0) { return o; }
     let no: ZOp = ZOp{ .name = o.name, .results = o.results, .operands = o.operands,
-                       .attrs = o.attrs, .regions = make[ZRegion](1) };
+                       .attrs = o.attrs, .regions = make[ZRegion](1),
+                       .effects = o.effects, .reads = o.reads, .writes = o.writes,
+                       .origin = o.origin };
     let rg: i32 = 0;
     while (rg < len[ZRegion](o.regions)) {
         let reg: ZRegion = get[ZRegion](o.regions, rg);
@@ -397,7 +487,8 @@ fn opt_dce_block(blk: ZBlock, used: ArrayList[[]u8], changed: *i32) ZBlock {
         let drop: i32 = 0;
         // Only PURE, single-result, region-free ops are removable, and only if
         // their result is referenced nowhere.
-        if (opt_is_pure_arith(o.name) == 1 && len[ZVal](o.results) == 1 && len[ZRegion](o.regions) == 0) {
+        if (opt_is_pure_arith(o.name) == 1 && len[ZVal](o.results) == 1 &&
+            opt_can_rewrite(o) == 1) {
             if (opt_name_in(used, get[ZVal](o.results, 0).name) == 0) { drop = 1; }
         }
         if (drop == 1) { changed.* = changed.* + 1; } else { push[ZOp](&out.ops, o); }
@@ -409,7 +500,9 @@ fn opt_dce_block(blk: ZBlock, used: ArrayList[[]u8], changed: *i32) ZBlock {
 fn opt_dce_regions(o: ZOp, used: ArrayList[[]u8], changed: *i32) ZOp {
     if (len[ZRegion](o.regions) == 0) { return o; }
     let no: ZOp = ZOp{ .name = o.name, .results = o.results, .operands = o.operands,
-                       .attrs = o.attrs, .regions = make[ZRegion](1) };
+                       .attrs = o.attrs, .regions = make[ZRegion](1),
+                       .effects = o.effects, .reads = o.reads, .writes = o.writes,
+                       .origin = o.origin };
     let rg: i32 = 0;
     while (rg < len[ZRegion](o.regions)) {
         let reg: ZRegion = get[ZRegion](o.regions, rg);
@@ -460,13 +553,15 @@ fn opt_dce(m: ZModule) ZModule {
 struct OptCseEnt { key: []u8, val: ZVal }
 
 fn opt_cse_key(o: ZOp) []u8 {
-    // name | predicate(if any) | op0 | op1 ...   (operand NAMES, order-sensitive)
-    let s: []u8 = o.name;
+    // name | result type | predicate(if any) | operand name/type pairs.
+    let s: []u8 = _zag_str_concat(_zag_str_concat(o.name, "|"), get[ZVal](o.results, 0).ty);
     let pred: []u8 = opt_attr_val(o, "predicate");
     if (pred.len > 0) { s = _zag_str_concat(_zag_str_concat(s, "#"), pred); }
     let i: i32 = 0;
     while (i < len[ZVal](o.operands)) {
-        s = _zag_str_concat(_zag_str_concat(s, "|"), get[ZVal](o.operands, i).name);
+        s = _zag_str_concat(_zag_str_concat(_zag_str_concat(s, "|"),
+            get[ZVal](o.operands, i).name),
+            _zag_str_concat("|", get[ZVal](o.operands, i).ty));
         i = i + 1;
     }
     return s;
@@ -496,7 +591,8 @@ fn opt_cse_block(blk: ZBlock, changed: *i32) ZBlock {
         // here (the fold pass already canonicalizes those); focus on computed
         // expressions, which is where the win is.
         let cseable: i32 = 0;
-        if (opt_is_pure_arith(o.name) == 1 && (!@strEq(o.name, "arith.constant")) && len[ZVal](o.results) == 1) {
+        if (opt_is_pure_arith(o.name) == 1 && (!@strEq(o.name, "arith.constant")) &&
+            len[ZVal](o.results) == 1 && opt_can_rewrite(o) == 1) {
             cseable = 1;
         }
         if (cseable == 1) {
@@ -523,7 +619,9 @@ fn opt_cse_block(blk: ZBlock, changed: *i32) ZBlock {
 fn opt_cse_regions(o: ZOp, changed: *i32) ZOp {
     if (len[ZRegion](o.regions) == 0) { return o; }
     let no: ZOp = ZOp{ .name = o.name, .results = o.results, .operands = o.operands,
-                       .attrs = o.attrs, .regions = make[ZRegion](1) };
+                       .attrs = o.attrs, .regions = make[ZRegion](1),
+                       .effects = o.effects, .reads = o.reads, .writes = o.writes,
+                       .origin = o.origin };
     let rg: i32 = 0;
     while (rg < len[ZRegion](o.regions)) {
         let reg: ZRegion = get[ZRegion](o.regions, rg);

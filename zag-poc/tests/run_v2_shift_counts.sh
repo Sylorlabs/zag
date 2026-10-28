@@ -64,6 +64,10 @@ for mode in release checked; do
   case_run "$mode-u32-right" 2027 "$mode" 42 'fn shift(x:u32,n:i32) u32 { return x >> n; } fn main() i32 { if (shift(2147483648,31)==1) { return 42; } return 9; }'
   case_run "$mode-u64-max" 2027 "$mode" 42 'fn shift(x:u64,n:i32) u64 { return x << n; } fn main() i32 { if (shift(1,63) > 0) { return 42; } return 9; }'
   case_run "$mode-i64-right-max" 2027 "$mode" 42 'fn shift(x:i64,n:i64) i64 { return x >> n; } fn main() i32 { if (shift(-1,63)==-1) { return 42; } return 9; }'
+  # Logical right shift must fill with zero for unsigned values whose high
+  # bit is set; arithmetic right shift would produce a different result.
+  case_run "$mode-u64-right-high-bit" 2027 "$mode" 42 'fn shift(x:u64,n:i64) u64 { return x >> n; } fn main() i32 { if (shift(9223372036854775808,63)==1) { return 42; } return 9; }'
+  case_run "$mode-u64-right-top-two" 2027 "$mode" 42 'fn shift(x:u64,n:i64) u64 { return x >> n; } fn main() i32 { if (shift(13835058055282163712,62)==3) { return 42; } return 9; }'
   case_run "$mode-u16-max" 2027 "$mode" 42 'fn shift(x:u16,n:i32) u16 { return x << n; } fn main() i32 { if (shift(1,15)==32768) { return 42; } return 9; }'
   # Parameter values are unknown at compile time and must trap at runtime.
   case_run "$mode-i32-width" 2027 "$mode" trap 'fn shift(x:i32,n:i32) i32 { return x << n; } fn main() i32 { return shift(1,32); }'

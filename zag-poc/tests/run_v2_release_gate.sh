@@ -9,16 +9,23 @@ cd "$(dirname "$0")/.."
 
 pass=0
 fail=0
+# Concurrent qualification runs must not overwrite each other's failing-suite
+# evidence. A fixed /tmp filename could print another runner's diagnostics.
+if ! gate_log=$(mktemp "${TMPDIR:-/tmp}/zag-v2-gate.XXXXXX"); then
+  echo 'v2 release gate: unable to create isolated diagnostic log' >&2
+  exit 2
+fi
+trap 'rm -f -- "$gate_log"' EXIT
 
 pass_case() { echo "  ok  $1"; pass=$((pass + 1)); }
 fail_case() { echo "  XX  $1"; fail=$((fail + 1)); }
 run_gate() {
   local name=$1; shift
-  if "$@" >/tmp/zag-v2-gate.log 2>&1; then
+  if "$@" >"$gate_log" 2>&1; then
     pass_case "$name"
   else
     fail_case "$name"
-    sed -n '1,10p' /tmp/zag-v2-gate.log
+    sed -n '1,10p' "$gate_log"
   fi
 }
 unsupported() {
@@ -38,6 +45,7 @@ run_gate "v2 edition boundary" bash tests/run_v2_edition.sh
 run_gate "v2 checked signed/unsigned integer narrowing" bash tests/run_v2_checked_narrowing.sh
 run_gate "v2 shift count checks and v1 compatibility" bash tests/run_v2_shift_counts.sh
 run_gate "v2 integer zero-divisor diagnostics and compatibility" bash tests/run_v2_division_zero.sh
+run_gate "v2 signed division overflow and edition-2026 compatibility" bash tests/run_v2_signed_division_overflow.sh
 run_gate "unsafe lexical and raw-pointer boundary" bash tests/run_v2_edition.sh
 run_gate "try-wrapped borrow identity" bash tests/run_v2_try_borrow.sh
 run_gate "mutation-aware aggregate provenance" bash tests/run_v2_aggregate_provenance.sh
