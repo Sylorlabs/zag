@@ -3,6 +3,7 @@
 
 import collections
 import csv
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -41,6 +42,13 @@ def main():
         assert list(Path(scratch).iterdir()) == [], "invalid timeout published output"
         env["RUN_TIMEOUT_SECONDS"] = "60"
 
+        env["RETAIN_ARTIFACTS"] = "invalid"
+        rejected = subprocess.run([sys.executable, str(BENCHMARK)], env=env, capture_output=True)
+        assert rejected.returncode != 0
+        assert b"RETAIN_ARTIFACTS must be 0 or 1" in rejected.stderr
+        assert list(Path(scratch).iterdir()) == [], "invalid artifact mode published output"
+        env["RETAIN_ARTIFACTS"] = "1"
+
         finished = subprocess.run([sys.executable, str(BENCHMARK)], env=env, capture_output=True)
         assert finished.returncode == 0, finished.stdout + finished.stderr
         raw, = Path(scratch).glob("*.cross-language.raw.csv")
@@ -69,6 +77,21 @@ def main():
         assert metadata["kernels"] == list(KERNELS)
         assert len(metadata["source_sha256"]) == len(KERNELS) * len(LANGUAGES)
         assert all(len(digest) == 64 for digest in metadata["source_sha256"].values())
+        artifact_dir = Path(metadata["artifacts_directory"])
+        assert artifact_dir.is_dir()
+        assert len(metadata["retained_artifacts"]) == len(KERNELS) * len(LANGUAGES)
+        for key, entry in metadata["retained_artifacts"].items():
+            retained_source = artifact_dir / entry["source"]
+            assert hashlib.sha256(retained_source.read_bytes()).hexdigest() == entry["source_sha256"]
+            assert entry["source_sha256"] == metadata["source_sha256"][key]
+            if "binary" in entry:
+                retained_binary = artifact_dir / entry["binary"]
+                assert retained_binary.is_file() and os.access(retained_binary, os.X_OK)
+                assert hashlib.sha256(retained_binary.read_bytes()).hexdigest() == entry["binary_sha256"]
+                kernel = key.split(":", 1)[0]
+                result = subprocess.run([str(retained_binary)], capture_output=True)
+                assert result.returncode == 0 and not result.stderr
+                assert result.stdout.decode() == metadata["expected_stdout_by_kernel"][kernel]
         with tempfile.TemporaryDirectory(prefix="zag-cross-language-paired-test-") as paired:
             env["OUT"] = paired
             env["ZNC_BASELINE"] = metadata["compiler_path"]

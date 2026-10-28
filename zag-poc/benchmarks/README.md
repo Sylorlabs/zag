@@ -87,6 +87,13 @@ for each kernel, and sample counts). The `benchmarks/results/` directory is igno
 publish speed ratios without examining raw distributions, the machine,
 compiler provenance and each language's different execution model.
 
+Set `RETAIN_ARTIFACTS=1` to keep the exact generated sources and verified
+executables used in the timed runs under a timestamped `*.cross-language.artifacts/`
+directory alongside the CSV results. The metadata lists each retained file
+and its SHA-256, allowing `otool`, `objdump`, `size`, and other inspection tools
+to attribute machine-code differences. The default is `0` (no retained
+artifacts). Invalid values fail before building or measuring.
+
 Run the opt-in smoke test with
 `python3 benchmarks/test_cross_language.py`. It exercises 30 verified runs
 per kernel/language at a short iteration count for both the default and

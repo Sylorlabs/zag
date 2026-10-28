@@ -102,6 +102,10 @@ def main():
         raise SystemExit("benchmark: KERNELS must list distinct names from " + ",".join(KERNELS))
     build_timeout = positive_setting("BUILD_TIMEOUT_SECONDS", 180, 1)
     run_timeout = positive_setting("RUN_TIMEOUT_SECONDS", 60, 1)
+    retain_setting = os.environ.get("RETAIN_ARTIFACTS", "0")
+    if retain_setting not in ("0", "1"):
+        raise SystemExit("benchmark: RETAIN_ARTIFACTS must be 0 or 1")
+    retain_artifacts = retain_setting == "1"
     # Resolve against the caller's directory before changing working directories.
     out_dir = Path(os.environ.get("OUT", ROOT / "benchmarks" / "results")).expanduser().resolve()
     default_compiler = (
@@ -166,6 +170,7 @@ def main():
             "python": sys.version.splitlines()[0],
         },
         "source_sha256": {},
+        "retained_artifacts": {},
         "build_commands": {},
         "run_commands": {},
     }
@@ -177,6 +182,7 @@ def main():
         ).decode().strip()
 
     rows = []
+    artifacts_dir = None
     with tempfile.TemporaryDirectory(prefix="zag-cross-language-") as scratch:
         tmp = Path(scratch)
         # The Zag compiler resolves its shipped modules relative to its own
@@ -272,8 +278,34 @@ def main():
                 ):
                     execute(kernel, language, "measured", round_number, position)
 
+        # Preserve only verified, fully executed variants. The same exact
+        # binary and generated source bytes were used for the timed run.
+        if retain_artifacts:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+            artifacts_dir = out_dir / f"{stamp}.cross-language.artifacts"
+            artifacts_dir.mkdir()
+            for kernel in kernels:
+                for language in languages:
+                    key = f"{kernel}:{language}"
+                    basename = "kernel" if kernel == "recurrence" else kernel
+                    ext = EXTENSIONS[language]
+                    source = tmp / f"{basename}.{ext}"
+                    retained_source = artifacts_dir / f"{kernel}-{language}.source.{ext}"
+                    shutil.copy2(source, retained_source)
+                    entry = {"source": retained_source.name,
+                             "source_sha256": sha256(retained_source.read_bytes())}
+                    if language != "python":
+                        binary = artifacts_dir / f"{kernel}-{language}"
+                        shutil.copy2(tmp / f"{kernel}-{language}", binary)
+                        entry["binary"] = binary.name
+                        entry["binary_sha256"] = sha256(binary.read_bytes())
+                    metadata["retained_artifacts"][key] = entry
+            metadata["artifacts_directory"] = str(artifacts_dir)
+
     out_dir.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    if not retain_artifacts:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
     base = out_dir / f"{stamp}.cross-language"
     with base.with_suffix(".cross-language.raw.csv").open("x", newline="") as handle:
         writer = csv.writer(handle)
@@ -302,6 +334,8 @@ def main():
     print(f"Raw:     {base.with_suffix('.cross-language.raw.csv')}")
     print(f"Summary: {base.with_suffix('.cross-language.summary.csv')}")
     print(f"Meta:    {base.with_suffix('.cross-language.meta.json')}")
+    if artifacts_dir is not None:
+        print(f"Artifacts: {artifacts_dir}")
 
 
 if __name__ == "__main__":
