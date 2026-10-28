@@ -52,6 +52,14 @@ if [[ $(uname -s):$(uname -m) != Linux:x86_64 ]]; then
     exit 2
 fi
 
+# Proof validation is a mandatory prerequisite for every shard. Keep it out of
+# the numbered 101-suite inventory so installing Z3 never changes shard IDs.
+# Missing solvers or inconclusive proofs must fail the release gate closed.
+if ! bash tests/run_bv_superopt.sh; then
+    echo 'ZagScript offline bit-vector proof preflight failed; release refused' >&2
+    exit 1
+fi
+
 pass=0
 fail=0
 total=0
@@ -417,11 +425,6 @@ run_gate "typed JSON document convenience" bash tests/run_script_json_document.s
 run_gate "exhaustively checked finite auto engine" bash tests/run_script_auto.sh
 run_gate "finite auto CLI and evidence replay" bash tests/run_script_auto_cli.sh
 run_gate "source auto opt-in lowering" bash tests/run_script_auto_lower.sh
-if command -v "${Z3:-z3}" >/dev/null 2>&1; then
-    run_gate "Z3 native-width bounded bit-vector superoptimization proofs" bash tests/run_bv_superopt.sh
-else
-    echo "SKIP Z3 offline optimization proofs (install Z3 to enable)"
-fi
 run_gate "JSON root convenience and shadowing" bash tests/run_script_json_root.sh
 run_gate "typed interpolation and map projection" bash tests/run_script_interpolation_project.sh
 run_gate "deterministic local package-import foundation" \

@@ -390,5 +390,30 @@ printf '%s\n' \
   >"$WORK/address_index_return/main.zag"
 check_reject address_index_return "address-of an indexed borrowed field remains tied to the container" 'cannot escape through return'
 
+# Borrow-aware calls in control-flow expressions require exactly the same
+# escape checks as calls in let, return and expression statements.
+for control in if while switch; do
+  project "condition_escape_$control" 2027
+  case "$control" in
+    if) control_body='if (escape(value) == 1) { return 0; }' ;;
+    while) control_body='while (escape(value) == 1) { return 0; }' ;;
+    switch) control_body='switch (escape(value)) { 1 => { return 0; } else => { return 0; } }' ;;
+  esac
+  printf '%s\n' \
+    'fn escape(value:*u8)i32 { return 1; }' \
+    "fn bad(value:@borrows *u8)i32 { $control_body return 0; }" \
+    'fn main()i32{return 0;}' \
+    >"$WORK/condition_escape_$control/main.zag"
+  check_reject "condition_escape_$control" "uncontracted borrow escapes through $control condition" 'escapes through uncontracted call `escape`'
+done
+
+project condition_contracts 2027
+printf '%s\n' \
+  'fn inspect(value:@borrows *u8)i32 { return 1; }' \
+  'fn valid(value:@borrows *u8)i32 { if (inspect(value)==1) { } while (inspect(value)==0) { } switch (inspect(value)) { 1 => { } else => { } } return 0; }' \
+  'fn main()i32{return 0;}' \
+  >"$WORK/condition_contracts/main.zag"
+check_ok condition_contracts "contracted borrow calls are accepted in if, while, and switch conditions"
+
 echo "param contracts: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

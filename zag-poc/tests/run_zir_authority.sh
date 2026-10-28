@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 compiler=${ZNC:-./znc}
 tmp=$(mktemp -d /tmp/zag-zir-authority.XXXXXX)

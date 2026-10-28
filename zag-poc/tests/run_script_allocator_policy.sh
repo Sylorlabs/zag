@@ -18,12 +18,14 @@ case "$(uname -s):$(uname -m)" in
         native_context_live=112
         native_arena_live=112
         native_heap_live=112
+        native_two_heap_live=112
         native_heap_count=1
         ;;
     *)
         native_context_live=128
         native_arena_live=152
         native_heap_live=192
+        native_two_heap_live=208
         native_heap_count=2
         ;;
 esac
@@ -176,12 +178,12 @@ fn main() i32 {
         let empty:*i8 = _zag_script_alloc(context, 0);
         if (first == null as *i8 || empty == null as *i8) { return 2; }
         if (_zag_script_alloc_used(context) != 56) { return 3; }
-        if (_zag_allocator_live_bytes() != $native_heap_live) { return 4; }
+        if (_zag_allocator_live_bytes() != $native_two_heap_live) { return 4; }
         let words:*i64 = context as *i64;
         let overflow:*i8 = _zag_script_alloc(context, 9223372036854775807);
         if (overflow != null as *i8) { return 5; }
         if (_zag_script_alloc_used(context) != 56 || words[11] != 2 ||
-            words[12] != 1 || _zag_allocator_live_bytes() != $native_heap_live) { return 6; }
+            words[12] != 1 || _zag_allocator_live_bytes() != $native_two_heap_live) { return 6; }
         _zag_script_context_shutdown(context);
         if (_zag_allocator_live_bytes() != 0) { return 7; }
     }
@@ -237,6 +239,30 @@ ZAG
 (cd "$tmp/runtime" && "$ZNC" process_result.zag -o process_result \
     --no-zagd --no-analyze --no-foreground-cache >/dev/null)
 "$tmp/runtime/process_result"
+
+# ARM64 checked releases consult the exact requested-size registry. A Script
+# context must be registered on creation, then retired during shutdown.
+case "$(uname -m)" in
+    arm64|aarch64)
+        cat >"$tmp/runtime/sanitized_context.zag" <<'ZAG'
+extern fn _zag_script_context_init(limit:i64, capabilities:i64, execution_policy:i64) *opaque
+extern fn _zag_script_context_shutdown(context:*opaque) void
+extern fn _zag_allocator_live_bytes() i64
+fn main() i32 {
+    unsafe {
+        let context:*opaque = _zag_script_context_init(4096, 7, 16843010);
+        if (context == null as *opaque) { return 1; }
+        _zag_script_context_shutdown(context);
+        if (_zag_allocator_live_bytes() != 0) { return 2; }
+    }
+    return 0;
+}
+ZAG
+        (cd "$tmp/runtime" && "$ZNC" sanitized_context.zag -o sanitized_context \
+            --sanitize=memory --no-zagd --no-analyze --no-foreground-cache >/dev/null)
+        "$tmp/runtime/sanitized_context"
+        ;;
+esac
 
 cat >"$tmp/runtime/invalid.zag" <<'ZAG'
 extern fn _zag_script_context_init(limit:i64, capabilities:i64, execution_policy:i64) *opaque
