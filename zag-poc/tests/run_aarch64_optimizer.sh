@@ -23,7 +23,9 @@
 #
 # Layer (2) needs the baseline compiler. Set AOPT_BASELINE to its path; if it is
 # absent the differential layer is SKIPPED, not failed, because the gate must
-# still be runnable on a fresh checkout.
+# still be runnable on a fresh checkout. For a one-rewrite differential, set
+# AOPT_BASELINE to the narrowly patched control and AOPT_WIRING_BASELINE to a
+# fully unoptimized compiler so the independent pass-wiring check stays valid.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 . ./tests/portable.sh
@@ -102,8 +104,11 @@ fi
 # emitted image DIFFERS from the unoptimized baseline -- not that it is SMALLER.
 # Size is the wrong proxy: the pass deletes stack traffic (str/ldr pairs around
 # x28) and replaces it with a mov of the same width, so code size barely moves.
-# Byte difference proves the pass ran; layer 2 proves it was correct.
+# Byte difference proves the pass ran; layer 2 checks observable behavior.
+# Comparing to an adjacent-only control can legitimately yield identical code
+# if the witness program does not contain the targeted nonadjacent pattern.
 echo "── aarch64 optimizer: the pass is actually wired in ──"
+WIRING_BASE=${AOPT_WIRING_BASELINE:-$BASE}
 probe=$(mktemp -d /tmp/zag-aopt-probe.XXXXXX)
 cat > "$probe/p.zag" <<'EOF'
 fn f(a: i32, b: i32) i32 {
@@ -123,7 +128,7 @@ if [ "$rc" -ne 13 ]; then
     rm -rf "$probe"; exit 1
 fi
 
-if [ -n "$BASE" ] && [ -x "$BASE" ]; then
+if [ -n "$WIRING_BASE" ] && [ -x "$WIRING_BASE" ]; then
     cat > "$probe/p.zag" <<'EOF'
 fn f(a: i32, b: i32) i32 {
     let t: i32 = 5;
@@ -133,7 +138,7 @@ fn f(a: i32, b: i32) i32 {
 }
 fn main() i32 { return f(1, 2); }
 EOF
-    "$BASE" "$probe/p.zag" -o "$probe/old" "${FLAGS[@]}" >/dev/null 2>&1
+    "$WIRING_BASE" "$probe/p.zag" -o "$probe/old" "${FLAGS[@]}" >/dev/null 2>&1
     if cmp -s "$probe/old" "$probe/new"; then
         echo "aarch64 optimizer: FAIL -- the optimizing compiler emitted a byte-identical" >&2
         echo "  image; the aoptimize() call is almost certainly no longer wired in." >&2
