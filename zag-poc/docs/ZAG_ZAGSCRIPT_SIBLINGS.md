@@ -62,3 +62,28 @@ Distinct language identities do **not** require two independent compilers.
 The executable sibling boundary is `tests/run_zag_zagscript_separation.sh`.
 The AST and compact-source boundary are covered by
 `tests/run_script_cst.sh` and `tests/run_script_inference.sh`.
+
+## Benchmarking the migration boundary
+
+The cross-language benchmark has an opt-in `COMPARE_EXPLICIT=1` profile that
+compiles each benchmark's Script source through the ordinary Script frontend
+and independently generates strict Zag using `znc expand --to explicit`. The
+expanded source is then compiled using the **same** compiler, flags, workload,
+and checksum oracle as the original. Both variants run in each alternating
+measurement round alongside C, Rust, and Python. Run it with:
+
+```sh
+COMPARE_EXPLICIT=1 RETAIN_ARTIFACTS=1 RUNS=30 ITERATIONS=2000000 \
+  ZNC=/path/to/host-native/znc python3 benchmarks/run_cross_language.py
+```
+
+The result metadata retains compiler hashes, separately hashed Script and
+generated strict-Zag sources, native executable hashes, raw process-inclusive
+times, and the independent expected stdout. The runner rejects an expansion
+that leaves a Script directive and verifies each archived source hash against
+the exact source compiled. A near-one runtime ratio on this limited benchmark
+is evidence that the migration does not introduce a performance cliff **for
+these workloads**; it does not certify equivalence of runtime policy,
+allocation cost, diagnostics, or every language feature. The semantic release
+gate remains `tests/run_zag_zagscript_separation.sh`, including nested loop
+and conditional updates with independently specified output and exit status.

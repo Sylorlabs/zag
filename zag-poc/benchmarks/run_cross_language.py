@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import statistics
 import subprocess
@@ -20,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCES = ROOT / "benchmarks" / "cross_language"
 LANGUAGES = ("zagscript", "c", "rust", "python")
 KERNELS = ("recurrence", "branch", "call")
-EXTENSIONS = {"zagscript": "zag", "zagscript_baseline": "zag",
+EXTENSIONS = {"zagscript": "zag", "zagscript_baseline": "zag", "zag_explicit": "zag",
               "c": "c", "rust": "rs", "python": "py"}
 
 
@@ -106,6 +107,10 @@ def main():
     if retain_setting not in ("0", "1"):
         raise SystemExit("benchmark: RETAIN_ARTIFACTS must be 0 or 1")
     retain_artifacts = retain_setting == "1"
+    compare_explicit_setting = os.environ.get("COMPARE_EXPLICIT", "0")
+    if compare_explicit_setting not in ("0", "1"):
+        raise SystemExit("benchmark: COMPARE_EXPLICIT must be 0 or 1")
+    compare_explicit = compare_explicit_setting == "1"
     # Resolve against the caller's directory before changing working directories.
     out_dir = Path(os.environ.get("OUT", ROOT / "benchmarks" / "results")).expanduser().resolve()
     default_compiler = (
@@ -120,7 +125,8 @@ def main():
     baseline = Path(baseline_setting).expanduser().resolve() if baseline_setting else None
     if baseline is not None and (not baseline.is_file() or not os.access(baseline, os.X_OK)):
         raise SystemExit(f"benchmark: baseline compiler missing: {baseline}")
-    languages = LANGUAGES + (("zagscript_baseline",) if baseline is not None else ())
+    languages = (LANGUAGES + (("zag_explicit",) if compare_explicit else ())
+                 + (("zagscript_baseline",) if baseline is not None else ()))
     clang = shutil.which(os.environ.get("CC", "clang"))
     rustc = shutil.which(os.environ.get("RUSTC", "rustc"))
     if not clang or not rustc:
@@ -143,6 +149,7 @@ def main():
         "run_timeout_seconds": run_timeout,
         "warmups_per_language": 3,
         "iterations_per_run": iterations,
+        "compares_expanded_strict_zag": compare_explicit,
         "timing": "perf_counter_ns around child process (spawn + execution + stdout/stderr capture)",
         "interleaving": "rotate starting language each measured round",
         "expected_stdout_by_kernel": {
@@ -209,11 +216,23 @@ def main():
                 template = (SOURCES / f"{basename}.{EXTENSIONS[language]}").read_text()
                 if template.count("__ITERATIONS__") != 1:
                     raise RuntimeError(f"{key}: expected exactly one iteration placeholder")
-                source = tmp / f"{basename}.{EXTENSIONS[language]}"
-                source.write_text(template.replace("__ITERATIONS__", str(iterations)))
+                source = (tmp / f"{basename}.explicit.zag" if language == "zag_explicit"
+                          else tmp / f"{basename}.{EXTENSIONS[language]}")
+                if language == "zag_explicit":
+                    # Normalize the exact generated Script source via the
+                    # official migration path, with one shared native compiler.
+                    original = tmp / f"{basename}.zag"
+                    command_output([
+                        str(bundled_znc), "expand", str(original), "--to", "explicit",
+                        "--output", str(source), "--no-zagd",
+                    ], timeout_seconds=build_timeout)
+                    if re.search(r"(?m)^\s*script\s*;", source.read_text()):
+                        raise RuntimeError(f"{key}: expansion retained Script profile")
+                else:
+                    source.write_text(template.replace("__ITERATIONS__", str(iterations)))
                 metadata["source_sha256"][key] = sha256(source.read_bytes())
                 artifact = tmp / f"{kernel}-{language}"
-                if language in ("zagscript", "zagscript_baseline"):
+                if language in ("zagscript", "zagscript_baseline", "zag_explicit"):
                     build = [
                         str(baseline_znc if language == "zagscript_baseline" else bundled_znc),
                         str(source), "-o", str(artifact),
@@ -290,11 +309,14 @@ def main():
                     key = f"{kernel}:{language}"
                     basename = "kernel" if kernel == "recurrence" else kernel
                     ext = EXTENSIONS[language]
-                    source = tmp / f"{basename}.{ext}"
+                    source = (tmp / f"{basename}.explicit.zag" if language == "zag_explicit"
+                              else tmp / f"{basename}.{ext}")
                     retained_source = artifacts_dir / f"{kernel}-{language}.source.{ext}"
                     shutil.copy2(source, retained_source)
                     entry = {"source": retained_source.name,
                              "source_sha256": sha256(retained_source.read_bytes())}
+                    if entry["source_sha256"] != metadata["source_sha256"][key]:
+                        raise RuntimeError(f"{key}: retained source differs from compiled source")
                     if language != "python":
                         binary = artifacts_dir / f"{kernel}-{language}"
                         shutil.copy2(tmp / f"{kernel}-{language}", binary)
