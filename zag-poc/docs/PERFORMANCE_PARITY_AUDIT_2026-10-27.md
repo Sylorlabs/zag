@@ -51,6 +51,21 @@ The exact timed Mach-O binaries were inspected with `/usr/bin/otool -tvV`. Each 
 
 **Historical compile-time profile** in `docs/PERFORMANCE.md`: on a 4.26 MB import closure (~4,150 functions), one macOS ARM64 `znc` build stage improved from 294.8 s to ~248 s after Mach-O bulk-copy/rotate fixes. A synthetic declaration-count experiment found superlinear compile-time scaling, while body statement count scaled roughly linearly. These measurements are historic, not today's compiler benchmark. The same doc records earlier AArch64 generated code with 42.3% memory operations and 21.8% uses of the stack pointer `x28`; adding `aoptimize.zag` showed ~1.36× on one compute loop and 9–10% smaller text on a specific sort benchmark. Re-profile *current* output before prioritizing each alleged remaining stack pattern.
 
+### Follow-up compiler and formal peephole qualification, October 27 (evening)
+
+A fresh macOS ARM64 self-hosted compiler built successfully from the current Zag v2 worktree, including a narrowly scoped optimization of an **adjacent**, same-run `AK_PUSH`/`AK_POP` of an unknown GPR value into `AK_MOV_RR`. Both registers must be nonreserved. `tests/run_aarch64_optimizer.sh` passed with this rebuilt compiler (unit checks and smoke; its unoptimized-baseline differential is explicitly skipped). An independent nine-program old/new native executable differential passed with identical stdout, stderr and exit statuses. `tests/run_aopt_adjacent_push_pop_proof.sh` returned three expected `unsat` proof obligations and one expected `sat` witness demonstrating that the vacated expression-stack memory slot may differ: stack memory privacy is an essential precondition, **not** an unconditional whole-memory equivalence theorem. The proof has an opt-in GitHub CI hook.
+
+The follow-up cross-language run used the new v2 compiler `/tmp/zag-v2-adjacent-transfer-20261027` and the separately built ZagScript compiler `/tmp/zag-script-review-fixes-znc-20261027` against the **same ZagScript benchmark sources** at Script commit `0451729`, on Apple M5 ARM64. For the host Clang link, `SDKROOT` was pinned to the installed `MacOSX26.5.sdk`; the default 27.0 SDK's `libSystem.tbd` was rejected by the current host linker. All five variants matched independent checksums; 30 rotating measured rounds and three warmups per variant were recorded, with executable/source SHA-256 and raw data in `/private/tmp/zag-v2-adjacent-bench-20261027/20261028T034414.697439Z.cross-language.*`.
+
+| Kernel (process-inclusive median) | Rebuilt Zag v2 compiler | Separate ZagScript compiler | Clang C | Rust |
+|---|---:|---:|---:|---:|
+| Integer recurrence | 26.357 ms | 20.250 ms | 12.685 ms | 13.081 ms |
+| Four-way branch | 32.346 ms | 27.043 ms | 14.677 ms | 13.995 ms |
+| Helper calls | 32.091 ms | 26.937 ms | 11.251 ms | 13.554 ms |
+| **Geometric-mean rebuilt compiler slowdown** | — | **1.229×** | **2.355×** | **2.226×** |
+
+**Do not attribute this difference to the new adjacent-pair rewrite.** The compiler binaries came from **different compiler source branches** and were not built as a one-change control pair. The rewritten compiler does not yet meet the performance-promotion exit gate. A longest-backward-branch static span inspection of the retained binaries found rebuilt-v2 recurrence `90 instructions/28 memory operations/43 x28 mentions/2 bl`, branch `296/86/140/8`, calls `58/20/26/2`; the separate Script compiler yielded `85/20/27/0`, `308/64/96/0`, `35/14/14/2`. These are static code regions selected by an automated backward-branch heuristic, not execution-weighted hardware measurements. Rebuild an exact-source unpatched control compiler and investigate extra helper calls and x28 operations before any claim that this change improves speed. The scoped peephole remains a correctness-qualified candidate only.
+
 **Missing coverage:** real application throughput; steady-state isolated kernels; allocation-intensive programs; large arrays and SIMD; hash maps/strings/Unicode; IO; syscalls; FFI; numeric/floating point; concurrency; allocator effects; memory footprint/RSS; binary size; cold/incremental compiler latency; Linux x86-64 parity. Three integer kernels cannot answer the full competitiveness question.
 
 ## 2. Production architecture audit
