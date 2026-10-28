@@ -149,6 +149,37 @@ set -e
 [ "$(cat "$tmp/loops.check")" = loop-pass ]
 [ ! -s "$tmp/loops.error" ]
 
+# A binding assigned through both arms of an indentation-based conditional
+# inside a loop must remain the same binding after Script-to-Zag expansion.
+# A shared shadowing bug would otherwise pass a pure Script/Zag differential,
+# so check the independent expected result and nonzero process status too.
+cat >"$tmp/nested.zag" <<'ZAG'
+script;
+let total = 0
+for i in range(4):
+    if i % 2 == 0:
+        total = total + i
+    else:
+        total = total + 10
+if total != 22:
+    return 7
+say("nested-pass")
+return 5
+ZAG
+cp "$tmp/nested.zag" "$tmp/nested.before"
+"$ZNC" expand "$tmp/nested.zag" --to explicit --output "$tmp/nested.explicit.zag" --no-zagd >/dev/null
+cmp "$tmp/nested.before" "$tmp/nested.zag"
+"$ZNC" "$tmp/nested.zag" --no-zagd --no-analyze --no-foreground-cache -o "$tmp/nested.script.bin" >/dev/null
+"$ZNC" "$tmp/nested.explicit.zag" --no-zagd --no-analyze --no-foreground-cache -o "$tmp/nested.zag.bin" >/dev/null
+assert_runtime_parity nested "$tmp/nested.script.bin" "$tmp/nested.zag.bin"
+set +e
+run_bounded "$tmp/nested.zag.bin" "$tmp/nested.check" "$tmp/nested.error"
+nested_rc=$?
+set -e
+[ "$nested_rc" -eq 5 ]
+[ "$(cat "$tmp/nested.check")" = nested-pass ]
+[ ! -s "$tmp/nested.error" ]
+
 cat >"$tmp/scopes.zag" <<'ZAG'
 script;
 let before = 1
