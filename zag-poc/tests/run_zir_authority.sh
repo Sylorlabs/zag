@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 cd "$(dirname "$0")/.."
 compiler=${ZNC:-./znc}
 tmp=$(mktemp -d /tmp/zag-zir-authority.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT
+# Preserve the failing assertion location in CI stage artifacts, where a plain
+# `test` exits silently and discards the temporary native executables.
+trap 'rc=$?; if [[ $- == *e* ]]; then printf "zir authority failure: line %s (exit %s)\n" "$LINENO" "$rc" >&2; fi' ERR
 repo=$PWD
 case "$compiler" in
     /*) compiler_abs=$compiler ;;
@@ -26,6 +29,7 @@ esac
     --no-zagd --no-analyze --no-foreground-cache >/dev/null
 mkdir -p "$tmp/native-artifacts"
 "$tmp/zir_native_backend_test" "$tmp/native-artifacts"
+trap - ERR
 set +e
 "$tmp/native-artifacts/native-scalar"
 zir_scalar_rc=$?
@@ -70,6 +74,7 @@ zir_divzero_rc=$?
 "$tmp/native-artifacts/native-void"
 zir_void_rc=$?
 set -e
+trap 'rc=$?; if [[ $- == *e* ]]; then printf "zir authority failure: line %s (exit %s)\n" "$LINENO" "$rc" >&2; fi' ERR
 test "$zir_scalar_rc" -eq 42
 test "$zir_loop_rc" -eq 10
 test "$zir_raw_overflow_rc" -eq 42
@@ -146,8 +151,17 @@ test "$optin_simple_rc" -ne 0
 test "$optin_check_rc" -ne 0
 grep -q 'foreground-transform is supported only with --level native' "$tmp/optin-simple.out"
 grep -q 'foreground-transform is a build/view option, not a check option' "$tmp/optin-check.out"
+# Checked safety is an edition-2027 feature.  A frozen-edition fixture is
+# rejected before reaching the foreground transform's own policy guard.
+mkdir -p "$tmp/optin-v2"
+cat >"$tmp/optin-v2/zag.mod" <<'MOD'
+name = "zir-transform-checked"
+version = "0"
+edition = "2027"
+MOD
+cp "$tmp/optin-add.zag" "$tmp/optin-v2/optin-add.zag"
 set +e
-"$compiler" "$tmp/optin-add.zag" -o "$tmp/optin-checked" \
+"$compiler" "$tmp/optin-v2/optin-add.zag" -o "$tmp/optin-checked" \
     --foreground-transform const-i32-add-v1 --safety=checked \
     --no-zagd --no-analyze >"$tmp/optin-checked.out" 2>&1
 optin_checked_rc=$?
@@ -155,8 +169,10 @@ set -e
 test "$optin_checked_rc" -ne 0
 test ! -e "$tmp/optin-checked"
 grep -q 'requires regular unsanitized x86-64 Zag' "$tmp/optin-checked.out"
+# A variable operand cannot satisfy the two-literal checked transform rule.
+# The previous 1+2 fixture was a valid match and wrongly expected rejection.
 cat >"$tmp/optin-no-match.zag" <<'ZAG'
-fn main() i32 { let x:i32=1+2; return x; }
+fn main() i32 { let a:i32=1; let x:i32=a+2; return x; }
 ZAG
 set +e
 "$compiler" "$tmp/optin-no-match.zag" -o "$tmp/optin-no-match" \
@@ -318,7 +334,11 @@ cp "$tmp/certified-add.zag" "$tmp/certified-v2/certified-add.zag"
 "$compiler" view "$tmp/certified-v2/certified-add.zag" --level native --no-zagd \
     --sanitize=memory >"$tmp/certified-native-sanitize.txt"
 for view in "$tmp/certified-native-checked.txt" "$tmp/certified-native-sanitize.txt"; do
-    grep -q '^// native-target=x86_64 host=[^ ]* cpu=.* lowering=verified-ast-bridge ir-verifier=def-before-use-v1 artifact_ir_consumed=0$' "$view"
+    case "$view" in
+        *-checked.txt) bridge_refusal=checked-safety ;;
+        *-sanitize.txt) bridge_refusal=memory-sanitizer ;;
+    esac
+    grep -q "^// native-target=x86_64 host=[^ ]* cpu=.* lowering=verified-ast-bridge refusal=$bridge_refusal ir-verifier=def-before-use-v1 artifact_ir_consumed=0$" "$view"
     grep -q '^// semantic-transform-status=verified_no_transform rule=none checker=not-run transform_count=0 artifact_transform_consumed=0$' "$view"
 done
 
@@ -357,7 +377,7 @@ check_public_contextual_bridge() {
     "$compiler" view "$source" --level native --no-zagd >"$tmp/public-$name.native"
     grep -q '^// schema=zag-ir-v1 transform=zag-transform-v1 coverage_complete=1 coverage_errors=0 origin_complete=1 origin_exact=1$' \
         "$tmp/public-$name.native"
-    grep -q '^// native-target=x86_64 host=[^ ]* cpu=.* lowering=verified-ast-bridge ir-verifier=def-before-use-v1 artifact_ir_consumed=0$' \
+    grep -Eq '^// native-target=x86_64 host=[^ ]* cpu=.* lowering=verified-ast-bridge refusal=[^ ]+ ir-verifier=def-before-use-v1 artifact_ir_consumed=0$' \
         "$tmp/public-$name.native"
     grep -q '^// semantic-transform-status=verified_no_transform rule=none checker=not-run transform_count=0 artifact_transform_consumed=0$' \
         "$tmp/public-$name.native"
@@ -380,7 +400,7 @@ check_public_ast_bridge() {
     "$compiler" view "$source" --level native --no-zagd >"$tmp/public-$name.native"
     grep -q '^// schema=zag-ir-v1 transform=zag-transform-v1 coverage_complete=0 coverage_errors=[1-9][0-9]* origin_complete=1 origin_exact=1$' \
         "$tmp/public-$name.native"
-    grep -q '^// native-target=x86_64 host=[^ ]* cpu=.* lowering=verified-ast-bridge ir-verifier=def-before-use-v1 artifact_ir_consumed=0$' \
+    grep -Eq '^// native-target=x86_64 host=[^ ]* cpu=.* lowering=verified-ast-bridge refusal=[^ ]+ ir-verifier=def-before-use-v1 artifact_ir_consumed=0$' \
         "$tmp/public-$name.native"
     grep -q '^// semantic-transform-status=verified_raw_ast_bridge_incomplete rule=none checker=not-run transform_count=0 artifact_transform_consumed=0$' \
         "$tmp/public-$name.native"

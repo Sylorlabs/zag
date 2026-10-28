@@ -1,5 +1,9 @@
 # Compiler performance
 
+An offline Z3 search for native-width pure integer expressions is documented in
+[ZagScript bit-vector superoptimization](ZAGSCRIPT_BV_SUPEROPT.md). It verifies
+rewrite semantics; its node-count results are not machine speed measurements.
+
 Measured on an Apple-Silicon host with `znc` compiling `selfhost/native/znc.zag`
 (4.26 MB import closure, ~4150 top-level functions). Unless stated otherwise,
 numbers are `--target macos-arm64 --no-analyze --no-zagd --no-foreground-cache`.

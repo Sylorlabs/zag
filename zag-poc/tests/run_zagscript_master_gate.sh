@@ -43,7 +43,8 @@ echo "── [3/7] remaining existing v1 compatibility authority"
 echo
 echo "── [4/7] Linux x86-64 Zag Script release gate"
 /usr/bin/time -f 'release elapsed=%E peak_rss_kib=%M' \
-    bash tests/run_zagscript_release_gate.sh
+    env -u ZAGSCRIPT_RELEASE_SHARD_START -u ZAGSCRIPT_RELEASE_SHARD_END \
+        bash tests/run_zagscript_release_gate.sh
 
 echo
 echo "── [5/7] authoritative Linux/i686 target boundary"

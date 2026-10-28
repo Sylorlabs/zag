@@ -109,5 +109,7 @@ reject_expr argument-mismatch 'fn take(x:i32) i32 { return x; } fn main() i32 { 
 reject_expr assignment-mismatch 'fn main() i32 { let x:i32=1; x="wrong"; return x; }'
 reject_expr operator-mismatch 'fn main() i32 { let x:bool=true; return x + 1; }'
 
+bash tests/run_typed_nested_literals.sh
+
 echo "════ typed-authority pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]

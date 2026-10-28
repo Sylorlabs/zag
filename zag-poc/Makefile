@@ -18,6 +18,10 @@
 # this global special target on the oldest macOS toolchain in scope.
 .NOTPARALLEL:
 .PHONY: test-process-platform test-source-closure test-evidence-codec test-native-evidence
+.PHONY: test-pow2-remainder-proof
+
+test-pow2-remainder-proof:
+	bash tests/run_pow2_remainder_proof.sh
 
 test-source-closure:
 	bash tests/run_source_closure.sh
@@ -280,7 +284,7 @@ test-macos-dyld-import:
 	bash tests/run_macos_dyld_import.sh
 
 test-zagscript-release:
-	bash tests/run_zagscript_release_gate.sh
+	env -u ZAGSCRIPT_RELEASE_SHARD_START -u ZAGSCRIPT_RELEASE_SHARD_END bash tests/run_zagscript_release_gate.sh
 
 # Deliberately manual and sequential: this workstation evidence gate requires
 # a user cgroup, active earlyoom, the i686 boundary, and 30-run benchmarks. It
@@ -490,6 +494,7 @@ install: znc zagd zag-lsp
 	$(INSTALL) -m644 examples/zagd.conf "$(DESTDIR)$(DATADIR)/zag/zagd.conf.example"
 	$(INSTALL) -m644 std/*.zag "$(DESTDIR)$(LIBDIR)/zag/std/"
 	$(INSTALL) -m644 selfhost/std/process.zag "$(DESTDIR)$(LIBDIR)/zag/std/process.zag"
+	$(INSTALL) -m644 selfhost/std/process_platform.zag "$(DESTDIR)$(LIBDIR)/zag/std/process_platform.zag"
 	$(INSTALL) -m644 selfhost/std/script_io.zag "$(DESTDIR)$(LIBDIR)/zag/std/script_io.zag"
 	$(INSTALL) -m644 selfhost/std/script_input.zag "$(DESTDIR)$(LIBDIR)/zag/std/script_input.zag"
 	$(INSTALL) -m644 selfhost/std/script_string_builder.zag "$(DESTDIR)$(LIBDIR)/zag/std/script_string_builder.zag"

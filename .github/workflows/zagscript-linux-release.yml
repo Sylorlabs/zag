@@ -1,0 +1,176 @@
+name: ZagScript Linux x86-64 release qualification
+
+# A native x86_64 builder creates a verified compiler fixed point. Independent
+# first-release shards then test the same commit and the exact same compiler.
+# A separate master gate still requires memory-cgroup and earlyoom evidence.
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'codex/zagscript-linux-native-ci-*'
+    paths:
+      - '.github/workflows/zagscript-linux-release.yml'
+      - 'zag-poc/**'
+
+permissions:
+  contents: read
+
+env:
+  ZAG_SELFHOST_TIMEOUT_SECONDS: '1800'
+  ZAG_BOOTSTRAP_STAGE_TIMEOUT_SECONDS: '3600'
+
+jobs:
+  bootstrap:
+    name: Native compiler fixed point
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        working-directory: zag-poc
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Record host and trusted seed
+        run: |
+          set -euo pipefail
+          test "$(uname -s):$(uname -m)" = Linux:x86_64
+          if grep -q 'QEMU TCG' /proc/cpuinfo; then
+            echo 'QEMU TCG emulation cannot certify native x86-64' >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/evidence"
+          {
+            echo "source=$GITHUB_SHA"
+            uname -a
+            grep -m1 'model name' /proc/cpuinfo
+            file znc zagd
+            sha256sum znc zagd
+          } | tee "$RUNNER_TEMP/evidence/host.txt"
+          test -x znc
+          test -x zagd
+          file -b znc | grep -Eq '^ELF 64-bit.*x86-64.*statically linked'
+      - name: Build compiler and daemon to byte-identical fixed point
+        env:
+          ZAG_BOOTSTRAP_MEMORY_GUARD: 'off'
+        run: |
+          set -euo pipefail
+          seed="$PWD/znc"
+          seed_sha=$(sha256sum "$seed" | cut -d' ' -f1)
+          # Reviewed compiler seed identity, independent of the generated manifest.
+          expected_seed_sha=498abcb5ab346f8cb246222a1ca63699d035a4277dedfba4782e1373137e58ef
+          if [ "$seed_sha" != "$expected_seed_sha" ]; then
+            echo "bootstrap: compiler seed differs from reviewed SHA-256" >&2
+            exit 1
+          fi
+          manifest="$RUNNER_TEMP/zag-ci-bootstrap.mod"
+          printf 'name = "zag-linux-release"\nedition = "2026"\n[toolchain]\ncompiler = "sha256:%s"\n' "$seed_sha" > "$manifest"
+          ZAG_BOOTSTRAP_SEED="$seed" ZAG_BOOTSTRAP_MANIFEST="$manifest" \
+            bash bootstrap.sh 2>&1 | tee "$RUNNER_TEMP/evidence/bootstrap.log"
+          file znc zagd | tee "$RUNNER_TEMP/evidence/bootstrap-artifacts.txt"
+          sha256sum znc zagd | tee "$RUNNER_TEMP/evidence/generated.sha256"
+          cp znc zagd "$RUNNER_TEMP/evidence/"
+      - name: Upload exact generated compiler and bootstrap logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: zagscript-native-bootstrap-${{ github.sha }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: error
+          retention-days: 30
+
+  first-release:
+    name: First-release checks ${{ matrix.start }}-${{ matrix.end }}
+    needs: bootstrap
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { start: 1, end: 25 }
+          - { start: 26, end: 50 }
+          - { start: 51, end: 75 }
+          - { start: 76, end: 101 }
+    defaults:
+      run:
+        working-directory: zag-poc
+        shell: bash
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Validate physical runner and install tools
+        run: |
+          set -euo pipefail
+          test "$(uname -s):$(uname -m)" = Linux:x86_64
+          if grep -q 'QEMU TCG' /proc/cpuinfo; then
+            echo 'QEMU TCG emulation cannot certify native x86-64' >&2
+            exit 1
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq strace libssl-dev libsqlite3-dev sqlite3 ripgrep qemu-user-static z3
+      - name: Download independently verified native compiler
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: zagscript-native-bootstrap-${{ github.sha }}
+          path: ${{ runner.temp }}/bootstrap/
+      - name: Verify fixed-point binary identity
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/bootstrap/znc" "$RUNNER_TEMP/bootstrap/zagd" .
+          chmod +x znc zagd
+          cp "$RUNNER_TEMP/bootstrap/generated.sha256" .
+          sha256sum -c generated.sha256
+          file -b znc | grep -Eq '^ELF 64-bit.*x86-64.*statically linked'
+          echo "source=$GITHUB_SHA" > "$RUNNER_TEMP/shard-source.txt"
+          sha256sum znc zagd >> "$RUNNER_TEMP/shard-source.txt"
+          mkdir -p "$RUNNER_TEMP/shard-evidence"
+          cp "$RUNNER_TEMP/shard-source.txt" "$RUNNER_TEMP/shard-evidence/"
+      - name: Qualify bounded slice of complete first-release gate
+        env:
+          ZAGSCRIPT_RELEASE_SHARD_START: ${{ matrix.start }}
+          ZAGSCRIPT_RELEASE_SHARD_END: ${{ matrix.end }}
+        run: |
+          set -euo pipefail
+          export ZAGSCRIPT_RELEASE_LOG_DIR="$RUNNER_TEMP/shard-evidence/stages"
+          bash tests/run_zagscript_release_gate.sh 2>&1 | \
+            tee "$RUNNER_TEMP/shard-evidence/shard-gate.log"
+      - name: Report shard scope
+        if: always()
+        run: |
+          {
+            echo "### First-release shard ${{ matrix.start }}-${{ matrix.end }}"
+            echo "Source: \`$GITHUB_SHA\`"
+            echo "Native x86-64, checked compiler SHA-256."
+            echo 'A shard PASS certifies only its stated range; complete qualification requires all four.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Preserve per-suite logs even when the shard fails
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: zagscript-linux-stage-${{ matrix.start }}-${{ matrix.end }}-${{ github.sha }}
+          path: ${{ runner.temp }}/shard-evidence/
+          if-no-files-found: warn
+          retention-days: 30
+
+  qualify:
+    name: First-release aggregate certification
+    if: always()
+    needs: [bootstrap, first-release]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require successful bootstrap and all 101 staged checks
+        env:
+          BUILD: ${{ needs.bootstrap.result }}
+          STAGES: ${{ needs.first-release.result }}
+        run: |
+          set -euo pipefail
+          printf 'bootstrap=%s gate-shards=%s\n' "$BUILD" "$STAGES"
+          {
+            echo '### ZagScript native Linux x86-64 first-release'
+            echo "Source: \`$GITHUB_SHA\`"
+            echo "Bootstrap: $BUILD"
+            echo "101 release checks (four disjoint shards): $STAGES"
+            echo 'The separate full master gate (guarded cgroup + earlyoom + 30 benchmarks) is not certified here.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          test "$BUILD" = success
+          test "$STAGES" = success
+          echo 'PASS: native Linux x86-64 first-release gate, 101/101 checks.'

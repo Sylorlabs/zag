@@ -9,7 +9,13 @@ case "$ZNC" in
 esac
 tmp=$(mktemp -d /tmp/zag-v2-aggregate-provenance.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT
-export ZAG_AGG_TEST_ZNC="$ZNC"
+# The generated projects run outside the source tree. Stage a compiler path
+# with its repository standard library so std: imports use the same code under
+# test rather than falling through to an unrelated /tmp/std directory.
+ln -s "$ZNC" "$tmp/znc-bundled"
+ln -s "$PWD/std" "$tmp/std"
+ln -s "$PWD/selfhost" "$tmp/selfhost"
+export ZAG_AGG_TEST_ZNC="$tmp/znc-bundled"
 ZNC="$tmp/znc-no-zagd"
 printf '%s\n' '#!/usr/bin/env bash' 'exec "$ZAG_AGG_TEST_ZNC" "$@" --no-zagd --no-analyze' >"$ZNC"
 chmod +x "$ZNC"

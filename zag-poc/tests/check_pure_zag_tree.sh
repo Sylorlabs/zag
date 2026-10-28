@@ -5,12 +5,19 @@ cd "$(dirname "$0")/.."
 
 fail=0
 
-# These two external-loader fixtures provide independent C ABI oracles. Keep
-# the exceptions exact: production compiler and runtime code remains Zag.
+# Explicit test-only exceptions: independent C ABI fixtures, cross-language
+# performance kernels/recorders, and a native ARM64 differential oracle.
+# No production compiler, backend or runtime implementation is exempt.
 forbidden_files=
 while IFS= read -r file; do
     case "$file" in
-        ./tests/reference_apps/dynamic_plugin/answer_plugin.c|./tests/fixtures/macos_dylib_loader.c) ;;
+        ./tests/reference_apps/dynamic_plugin/answer_plugin.c|./tests/fixtures/macos_dylib_loader.c|\
+        ./benchmarks/cross_language/kernel.c|./benchmarks/cross_language/kernel.py|\
+        ./benchmarks/cross_language/kernel.rs|./benchmarks/run_cross_language.py|\
+        ./benchmarks/cross_language/branch.c|./benchmarks/cross_language/branch.py|\
+        ./benchmarks/cross_language/branch.rs|./benchmarks/cross_language/call.c|\
+        ./benchmarks/cross_language/call.py|./benchmarks/cross_language/call.rs|\
+        ./benchmarks/test_cross_language.py|./tests/test_arm64_const_mod.py) ;;
         *) forbidden_files=$'\n'"$file"$forbidden_files ;;
     esac
 done <<EOF
@@ -24,7 +31,7 @@ if [ -n "$forbidden_files" ]; then
     echo "$forbidden_files"
     fail=1
 else
-    echo "ok no non-Zag implementation files; only the two explicit C ABI fixtures are allowed"
+    echo "ok production Zag-only; explicit test and cross-language benchmark fixtures allowed"
 fi
 
 for path in zagc selfhost/zagc selfhost/zagc.zag selfhost/codegen.zag std/runtime.c \

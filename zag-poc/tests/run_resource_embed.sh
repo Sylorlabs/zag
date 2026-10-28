@@ -40,7 +40,11 @@ expect_exit() {
     if [ -n "$runner" ]; then "$runner" "$binary"; else "$binary"; fi
     actual=$?
     set -e
-    test "$actual" -eq "$expected"
+    if [ "$actual" -ne "$expected" ]; then
+        printf 'resource embedding execution mismatch: %s returned %s, expected %s (runner=%s)\n' \
+            "$binary" "$actual" "$expected" "${runner:-native}" >&2
+        return 1
+    fi
 }
 
 expect_embed_error() {
