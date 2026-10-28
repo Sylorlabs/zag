@@ -224,6 +224,41 @@ therefore these ratios must not be attributed solely to this rewrite, nor
 generalized to language-wide performance. The separate prior three-kernel
 C/Rust parity audit remains the applicable broad performance evidence.
 
+### Matched scalar-local assignment follow-up, October 27 (night)
+
+The ZagScript backend's existing scalar-local assignment path was carried into
+Zag v2 on ARM64. For an ordinary frame-resident scalar identifier, assignment
+now evaluates the RHS once, consumes its expression result, and writes directly
+to the known frame slot. Optional wrapping, indirect/by-reference parameters,
+fields, indexing and aggregates retain their established lvalue/address path.
+Zag and ZagScript remain separately surfaced languages using matching native
+lowering rules.
+
+The new `tests/run_v2_arm64_scalar_local.sh` passes **5/5** independently
+specified native exit-status oracles with empty stdout/stderr, against the
+previous compiler built from the adjacent unchanged compiler source. Every
+case emitted different native bytes. The cases exercise loop-carried updates,
+lexical shadowing, address-taken locals, RHS function mutation of the target,
+and signed scalar updates. The rebuilt compiler also passes the existing
+**11/11** unsigned-power-of-two fixtures, **43/43** division-zero checks,
+**11/11** signed-overflow checks, and the AArch64 optimizer suite (**768**
+instruction-level cases, **10** output-matched built programs, no mismatches;
+**6** host-unbuildable fixtures).
+
+A controlled A/B test compiling the **same** 2,000,003-iteration Zag v2 scalar
+loop with the preceding versus modified compiler produced exact independent
+exit status **131**, zero stdout/stderr and changed binary SHA-256. Thirty
+alternating process-inclusive timings after three warmup rounds gave
+**15.270 ms** before versus **15.181 ms** after (modified/control **0.994x**).
+This difference is too small to establish a measurable speed advantage on
+this host. Full timing samples, compiler/source/executable hashes and exact
+build flags are in `/tmp/zag-scalar-local-bench-20261027.json` on the test
+machine. The pass remains a scoped correctness-qualified reduction in generated
+assignment work; it does **not** satisfy the audit's >10% promotion gate or
+support a C/Rust parity claim. Next priority remains multi-block register
+promotion and value reuse, with actual hot-loop instruction evidence and
+multi-target confirmation.
+
 ## 8. Audit limitations
 
 This review examines a large compiler through selective source inspection, existing project audits, local targeted tests, new cross-language measurements and CI statuses. It does **not** certify an exhaustive per-function code audit, prove the whole language safe, inspect every emitted instruction or test all supported target/feature combinations. Some historic documents were written against older or dirty trees and are used as hypotheses to remeasure. The separate host-native ZagScript compiler's build provenance should be independently established before publication. Future profiling is necessary to turn suspected hot spots into proven ones.
