@@ -63,6 +63,34 @@ The executable sibling boundary is `tests/run_zag_zagscript_separation.sh`.
 The AST and compact-source boundary are covered by
 `tests/run_script_cst.sh` and `tests/run_script_inference.sh`.
 
+## Shared backend optimization, separately enforced language behavior
+
+The ARM64 backend now uses the same exact unsigned power-of-two remainder
+identity in both sibling compiler branches: `x % 2^k` becomes
+`x & (2^k - 1)` for an explicitly unsigned left operand and a bare,
+positive decimal divisor of at most 18 digits. The signed, dynamic,
+non-power-of-two, oversized, and other unsupported literal forms retain their
+original checks and lowerings. ZagScript also keeps its existing verified
+high-half reciprocal division path for other bounded constant divisors.
+
+The shared `tests/run_pow2_remainder_proof.sh` was executed using Z3:
+seven QF_BV equality counterexample searches returned `unsat`, and an
+intentional signed counterexample returned `sat`. The ZagScript final
+compiler `/tmp/zag-script-pow2-final-znc-20261027` passed **321** exact
+constant-remainder output cases and the Script/expanded Zag executable
+migration parity gate. This proof is mandatory in the Linux Script release
+preflight, while Zag v2 executes it in its opt-in QF_BV workflow.
+
+A focused 10-million-iteration unsigned modulo-256 process-inclusive test
+ran 30 alternating rounds after three warmups on Apple Silicon. The earlier
+ZagScript compiler artifact produced a 35.256 ms median and the rebuilt
+compiler a 18.804 ms median (0.533x), with exact checksum checks. The
+comparison source and compiler hashes and raw timings are archived locally
+at `/tmp/zag-pow2-benchmark-20261027.json`. The baseline artifacts were
+not independently rebuilt as a strict one-change comparison, so this is
+screening evidence for a single kernel, not a quantified pass-only speedup
+or proof of general language parity.
+
 ## Benchmarking the migration boundary
 
 The cross-language benchmark has an opt-in `COMPARE_EXPLICIT=1` profile that

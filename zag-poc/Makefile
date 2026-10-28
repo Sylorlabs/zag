@@ -18,6 +18,10 @@
 # this global special target on the oldest macOS toolchain in scope.
 .NOTPARALLEL:
 .PHONY: test-process-platform test-source-closure test-evidence-codec test-native-evidence
+.PHONY: test-pow2-remainder-proof
+
+test-pow2-remainder-proof:
+	bash tests/run_pow2_remainder_proof.sh
 
 test-source-closure:
 	bash tests/run_source_closure.sh

@@ -59,6 +59,10 @@ if ! bash tests/run_bv_superopt.sh; then
     echo 'ZagScript offline bit-vector proof preflight failed; release refused' >&2
     exit 1
 fi
+if ! bash tests/run_pow2_remainder_proof.sh; then
+    echo 'ZagScript unsigned remainder proof preflight failed; release refused' >&2
+    exit 1
+fi
 
 pass=0
 fail=0
