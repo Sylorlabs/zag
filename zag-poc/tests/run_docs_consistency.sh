@@ -112,6 +112,14 @@ else
   bad "Zag Script prelude documentation is stale or contradicts env and args implementation"
 fi
 
+if rg -q 'bounded portable exact `unexpand` contract' docs/ZAGSCRIPT_GUIDE.md && \
+   rg -q 'release view gate exercises promotion, exact restoration' docs/ZAGSCRIPT_GUIDE.md && \
+   ! rg -q 'unexpand` contract \(currently unavailable\)|foreground prepared-evidence integration remains runtime-disabled' docs/ZAGSCRIPT_GUIDE.md; then
+  ok "Zag Script guide reflects the exercised v2 reversible-view boundary"
+else
+  bad "Zag Script guide is stale about promotion/unexpansion support"
+fi
+
 if [ -x tests/run_i686_release_gate.sh ] && \
    rg -q 'run_i686_release_gate.sh' README.md docs/X86_TARGET_POLICY.md docs/X86_FEATURES.md tests/run_zagscript_master_gate.sh && \
    rg -q 'ZAG_I686_REFERENCE_TOOLS=0' tests/run_i686_release_gate.sh && \

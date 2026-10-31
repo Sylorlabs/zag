@@ -1,0 +1,895 @@
+// Bounded compiler-owned map convenience for Zag Script.
+//
+// This is intentionally a narrow first slice: integer keys and integer values
+// only, no dynamic values, and no resource-bearing elements.  All
+// backing storage is retained by ScriptContext until generated
+// shutdown, just like ScriptList; callers never receive an ordinary allocator
+// pointer and never free the arrays themselves.
+
+struct ScriptMapI32 {
+    keys: *i32,
+    values: *i32,
+    used: *u8,
+    cap: i32,
+    count: i32,
+    tombstones: i32,
+    context: *opaque,
+    failed: i32,
+}
+
+fn script_map_new(context: *opaque) ScriptMapI32 {
+    let cap: i32 = 8;
+    // Keep the raw null test lexical, but return outside the unsafe block so
+    // the constructor remains a normal context producer to lifetime checks.
+    let null_context: i32 = 0;
+    unsafe {
+        if (context == null as *opaque) { null_context = 1; }
+    }
+    if (null_context != 0) {
+        return ScriptMapI32{.keys = null as *i32, .values = null as *i32,
+            .used = null as *u8, .cap = cap, .count = 0,
+            .tombstones = 0, .context = context, .failed = 1};
+    }
+    let i32_size: i64 = @sizeOf[i32]() as i64;
+    let keys: *i32 = _zag_script_alloc(context, (cap as i64) * i32_size) as *i32;
+    let values: *i32 = _zag_script_alloc(context, (cap as i64) * i32_size) as *i32;
+    let used: *u8 = _zag_script_alloc(context, cap as i64) as *u8;
+    let failed: i32 = (keys == null as *i32 || values == null as *i32 ||
+        used == null as *u8) as i32;
+    let result: ScriptMapI32 = ScriptMapI32{
+        .keys = keys, .values = values, .used = used, .cap = cap,
+        .count = 0, .tombstones = 0, .context = context, .failed = failed,
+    };
+    if (failed != 0) { return result; }
+    let i: i32 = 0;
+    while (i < cap) { used[i] = 0; i = i + 1; }
+    return result;
+}
+
+fn script_map_valid(map: ScriptMapI32) bool {
+    // Validate descriptor metadata and raw backing pointers before any table
+    // scan.  Rehash is a public pointer-taking helper, so callers can forge a
+    // descriptor independently of the constructor.
+    unsafe {
+        if (map.failed != 0 || map.context == null as *opaque ||
+            map.cap < 8 || map.cap > 1048576 ||
+            (map.cap & (map.cap - 1)) != 0 ||
+            map.count < 0 || map.count > map.cap || map.tombstones < 0 ||
+            map.tombstones > map.cap - map.count ||
+            map.keys == null as *i32 || map.values == null as *i32 ||
+            map.used == null as *u8) {
+            return false;
+        }
+    }
+    // This complete state scan is intentional.  It makes every public
+    // operation fail closed on forged or concurrently-corrupted descriptors,
+    // at a bounded O(cap) cost (cap is limited above).  In particular, a
+    // metadata-only check must not permit a lookup to walk an invalid state
+    // byte or a mutation to publish a partial table update.
+    let live: i32 = 0;
+    let tombstones: i32 = 0;
+    let i: i32 = 0;
+    while (i < map.cap) {
+        if (map.used[i] == 1) { live = live + 1; }
+        else if (map.used[i] == 2) { tombstones = tombstones + 1; }
+        else if (map.used[i] != 0) { return false; }
+        i = i + 1;
+    }
+    return live == map.count && tombstones == map.tombstones;
+}
+
+// Rebuild a table at a requested capacity.  State 0 is empty, state 1 is a
+// live entry, and state 2 is a tombstone.  Tombstones are deliberately not
+// copied: a rebuild restores an empty probe terminator and keeps lookup
+// bounded even after repeated delete/reinsert cycles.  All replacement arrays
+// remain ScriptContext-owned, like the original arrays.
+fn script_map_rehash(map: @borrows_mut *ScriptMapI32, next_cap: i32) i32 {
+    unsafe {
+        if (map == null as *ScriptMapI32) { return 1; }
+    }
+    let null_context: i32 = 0;
+    unsafe {
+        if (map.*.context == null as *opaque) { null_context = 1; }
+    }
+    if (map.*.failed != 0 || null_context != 0 ||
+        map.*.cap < 8 || map.*.cap > 1048576 ||
+        (map.*.cap & (map.*.cap - 1)) != 0 || map.*.count < 0 ||
+        map.*.count > map.*.cap || map.*.tombstones < 0 ||
+        map.*.tombstones > map.*.cap - map.*.count ||
+        map.*.keys == null as *i32 || map.*.values == null as *i32 ||
+        map.*.used == null as *u8 || next_cap < 8 ||
+        next_cap > 1048576 || (next_cap & (next_cap - 1)) != 0 ||
+        map.*.count > next_cap) {
+        map.*.failed = 1;
+        return 1;
+    }
+    let valid_live: i32 = 0;
+    let valid_tombstones: i32 = 0;
+    let valid_i: i32 = 0;
+    while (valid_i < map.*.cap) {
+        if (map.*.used[valid_i] == 1) { valid_live = valid_live + 1; }
+        else if (map.*.used[valid_i] == 2) {
+            valid_tombstones = valid_tombstones + 1;
+        }
+        else if (map.*.used[valid_i] != 0) {
+            map.*.failed = 1;
+            return 1;
+        }
+        valid_i = valid_i + 1;
+    }
+    if (valid_live != map.*.count ||
+        valid_tombstones != map.*.tombstones) {
+        map.*.failed = 1;
+        return 1;
+    }
+    let old_cap: i32 = map.*.cap;
+    let i32_size: i64 = @sizeOf[i32]() as i64;
+    let keys: *i32 = _zag_script_alloc(map.*.context,
+        (next_cap as i64) * i32_size) as *i32;
+    let values: *i32 = _zag_script_alloc(map.*.context,
+        (next_cap as i64) * i32_size) as *i32;
+    let used: *u8 = _zag_script_alloc(map.*.context, next_cap as i64) as *u8;
+    if (keys == null as *i32 || values == null as *i32 ||
+        used == null as *u8) {
+        map.*.failed = 1;
+        return 1;
+    }
+    let i: i32 = 0;
+    while (i < next_cap) { used[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < old_cap) {
+        if (map.*.used[i] == 1) {
+            let key: i32 = map.*.keys[i];
+            let idx: i32 = (key & 2147483647) % next_cap;
+            let probes: i32 = 0;
+            while (probes < next_cap && used[idx] != 0) {
+                idx = idx + 1;
+                if (idx >= next_cap) { idx = 0; }
+                probes = probes + 1;
+            }
+            if (probes >= next_cap) {
+                map.*.failed = 1;
+                return 1;
+            }
+            keys[idx] = key;
+            values[idx] = map.*.values[i];
+            used[idx] = 1;
+        }
+        i = i + 1;
+    }
+    map.*.keys = keys;
+    map.*.values = values;
+    map.*.used = used;
+    map.*.cap = next_cap;
+    map.*.tombstones = 0;
+    return 0;
+}
+
+fn script_map_grow(map: @borrows_mut *ScriptMapI32) i32 {
+    unsafe {
+        if (map == null as *ScriptMapI32) { return 1; }
+    }
+    // Validate the complete descriptor and table state before deriving the
+    // doubled capacity.  In particular, do not evaluate cap * 2 for a
+    // forged negative/extreme cap: the precondition makes that arithmetic
+    // bounded and keeps growth fail closed without a wraparound.
+    let null_context: i32 = 0;
+    unsafe {
+        if (map.*.context == null as *opaque) { null_context = 1; }
+    }
+    if (map.*.failed != 0 || null_context != 0 || map.*.cap < 8 ||
+        map.*.cap > 524288 || (map.*.cap & (map.*.cap - 1)) != 0 ||
+        map.*.count < 0 || map.*.count > map.*.cap ||
+        map.*.tombstones < 0 ||
+        map.*.tombstones > map.*.cap - map.*.count ||
+        map.*.keys == null as *i32 || map.*.values == null as *i32 ||
+        map.*.used == null as *u8) {
+        map.*.failed = 1;
+        return 1;
+    }
+    let live: i32 = 0;
+    let tombstones: i32 = 0;
+    let i: i32 = 0;
+    while (i < map.*.cap) {
+        if (map.*.used[i] == 1) { live = live + 1; }
+        else if (map.*.used[i] == 2) { tombstones = tombstones + 1; }
+        else if (map.*.used[i] != 0) {
+            map.*.failed = 1;
+            return 1;
+        }
+        i = i + 1;
+    }
+    if (live != map.*.count || tombstones != map.*.tombstones) {
+        map.*.failed = 1;
+        return 1;
+    }
+    return script_map_rehash(map, map.*.cap * 2);
+}
+
+fn script_map_put(map: @borrows_mut *ScriptMapI32, key: i32, value: i32) i32 {
+    unsafe {
+        if (map == null as *ScriptMapI32) { return 1; }
+    }
+    // Keep the pointer-taking mutation path self-contained for the ownership
+    // checker: validating a copied context-bearing descriptor through another
+    // call would look like an uncontracted context escape in nested Script
+    // expressions. This is the same complete bounded validator as
+    // script_map_valid, performed before any backing write.
+    let null_context: i32 = 0;
+    unsafe {
+        if (map.*.context == null as *opaque) { null_context = 1; }
+    }
+    if (map.*.failed != 0 || null_context != 0 ||
+        map.*.cap < 8 || map.*.cap > 1048576 ||
+        (map.*.cap & (map.*.cap - 1)) != 0 || map.*.count < 0 ||
+        map.*.count > map.*.cap || map.*.tombstones < 0 ||
+        map.*.tombstones > map.*.cap - map.*.count ||
+        map.*.keys == null as *i32 || map.*.values == null as *i32 ||
+        map.*.used == null as *u8) {
+        map.*.failed = 1;
+        return 1;
+    }
+    let valid_live: i32 = 0;
+    let valid_tombstones: i32 = 0;
+    let valid_i: i32 = 0;
+    while (valid_i < map.*.cap) {
+        if (map.*.used[valid_i] == 1) { valid_live = valid_live + 1; }
+        else if (map.*.used[valid_i] == 2) {
+            valid_tombstones = valid_tombstones + 1;
+        }
+        else if (map.*.used[valid_i] != 0) {
+            map.*.failed = 1;
+            return 1;
+        }
+        valid_i = valid_i + 1;
+    }
+    if (valid_live != map.*.count ||
+        valid_tombstones != map.*.tombstones) {
+        map.*.failed = 1;
+        return 1;
+    }
+    let idx: i32 = (key & 2147483647) % map.*.cap;
+    let first_tombstone: i32 = -1;
+    let probes: i32 = 0;
+    while (probes < map.*.cap && map.*.used[idx] != 0) {
+        if (map.*.used[idx] == 1 && map.*.keys[idx] == key) {
+            map.*.values[idx] = value;
+            return 0;
+        }
+        if (map.*.used[idx] == 2 && first_tombstone < 0) {
+            first_tombstone = idx;
+        }
+        idx = idx + 1;
+        if (idx >= map.*.cap) { idx = 0; }
+        probes = probes + 1;
+    }
+    if (first_tombstone >= 0) {
+        idx = first_tombstone;
+        // The full probe only established that no live/empty slot preceded
+        // this reusable tombstone.  The insertion itself is now bounded to
+        // the selected slot; do not interpret the discovery probe as a
+        // failed insertion.
+        probes = 0;
+    } else if ((map.*.count + 1) * 10 >= map.*.cap * 7) {
+        if (script_map_grow(map) != 0) { return 1; }
+        idx = (key & 2147483647) % map.*.cap;
+        probes = 0;
+        while (probes < map.*.cap && map.*.used[idx] != 0) {
+            idx = idx + 1;
+            if (idx >= map.*.cap) { idx = 0; }
+            probes = probes + 1;
+        }
+    }
+    if (probes >= map.*.cap) {
+        map.*.failed = 1;
+        return 1;
+    }
+    map.*.keys[idx] = key;
+    map.*.values[idx] = value;
+    map.*.used[idx] = 1;
+    map.*.count = map.*.count + 1;
+    if (first_tombstone >= 0) { map.*.tombstones = map.*.tombstones - 1; }
+    return 0;
+}
+
+fn script_map_has(map: @borrows ScriptMapI32, key: i32) bool {
+    let null_context: i32 = 0;
+    unsafe {
+        if (map.context == null as *opaque) { null_context = 1; }
+    }
+    if (map.failed != 0 || null_context != 0 || map.cap < 8 ||
+        map.cap > 1048576 || (map.cap & (map.cap - 1)) != 0 ||
+        map.count < 0 || map.count > map.cap || map.tombstones < 0 ||
+        map.tombstones > map.cap - map.count || map.keys == null as *i32 ||
+        map.values == null as *i32 || map.used == null as *u8) { return false; }
+    let valid_live: i32 = 0;
+    let valid_tombstones: i32 = 0;
+    let valid_i: i32 = 0;
+    while (valid_i < map.cap) {
+        if (map.used[valid_i] == 1) { valid_live = valid_live + 1; }
+        else if (map.used[valid_i] == 2) {
+            valid_tombstones = valid_tombstones + 1;
+        }
+        else if (map.used[valid_i] != 0) { return false; }
+        valid_i = valid_i + 1;
+    }
+    if (valid_live != map.count || valid_tombstones != map.tombstones) {
+        return false;
+    }
+    let idx: i32 = (key & 2147483647) % map.cap;
+    let probes: i32 = 0;
+    while (probes < map.cap && map.used[idx] != 0) {
+        if (map.used[idx] == 1 && map.keys[idx] == key) { return true; }
+        idx = idx + 1;
+        if (idx >= map.cap) { idx = 0; }
+        probes = probes + 1;
+    }
+    return false;
+}
+
+fn script_map_get(map: @borrows ScriptMapI32, key: i32) i32 {
+    let null_context: i32 = 0;
+    unsafe {
+        if (map.context == null as *opaque) { null_context = 1; }
+    }
+    if (map.failed != 0 || null_context != 0 || map.cap < 8 ||
+        map.cap > 1048576 || (map.cap & (map.cap - 1)) != 0 ||
+        map.count < 0 || map.count > map.cap || map.tombstones < 0 ||
+        map.tombstones > map.cap - map.count || map.keys == null as *i32 ||
+        map.values == null as *i32 || map.used == null as *u8) {
+        _zag_eprintln("Zag Script map state is invalid");
+        _zag_exit(1);
+    }
+    let valid_live: i32 = 0;
+    let valid_tombstones: i32 = 0;
+    let valid_i: i32 = 0;
+    while (valid_i < map.cap) {
+        if (map.used[valid_i] == 1) { valid_live = valid_live + 1; }
+        else if (map.used[valid_i] == 2) {
+            valid_tombstones = valid_tombstones + 1;
+        }
+        else if (map.used[valid_i] != 0) {
+            _zag_eprintln("Zag Script map state is invalid");
+            _zag_exit(1);
+        }
+        valid_i = valid_i + 1;
+    }
+    if (valid_live != map.count || valid_tombstones != map.tombstones) {
+        _zag_eprintln("Zag Script map state is invalid");
+        _zag_exit(1);
+    }
+    let idx: i32 = (key & 2147483647) % map.cap;
+    let probes: i32 = 0;
+    while (probes < map.cap && map.used[idx] != 0) {
+        if (map.used[idx] == 1 && map.keys[idx] == key) { return map.values[idx]; }
+        idx = idx + 1;
+        if (idx >= map.cap) { idx = 0; }
+        probes = probes + 1;
+    }
+    _zag_eprintln("Zag Script map key is absent");
+    _zag_exit(1);
+    return 0;
+}
+
+// Delete is an integer-only, status-returning operation.  An absent key is a
+// normal miss (status 1) and does not poison an otherwise valid map; malformed
+// descriptors fail closed through map.failed and also return status 1.
+fn script_map_del(map: @borrows_mut *ScriptMapI32, key: i32) i32 {
+    unsafe {
+        if (map == null as *ScriptMapI32) { return 1; }
+    }
+    // See script_map_put: pointer-taking mutations validate the full table
+    // inline so the context-bearing descriptor cannot escape by value.
+    let null_context: i32 = 0;
+    unsafe {
+        if (map.*.context == null as *opaque) { null_context = 1; }
+    }
+    if (map.*.failed != 0 || null_context != 0 ||
+        map.*.cap < 8 || map.*.cap > 1048576 ||
+        (map.*.cap & (map.*.cap - 1)) != 0 || map.*.count < 0 ||
+        map.*.count > map.*.cap || map.*.tombstones < 0 ||
+        map.*.tombstones > map.*.cap - map.*.count ||
+        map.*.keys == null as *i32 || map.*.values == null as *i32 ||
+        map.*.used == null as *u8) {
+        map.*.failed = 1;
+        return 1;
+    }
+    let valid_live: i32 = 0;
+    let valid_tombstones: i32 = 0;
+    let valid_i: i32 = 0;
+    while (valid_i < map.*.cap) {
+        if (map.*.used[valid_i] == 1) { valid_live = valid_live + 1; }
+        else if (map.*.used[valid_i] == 2) {
+            valid_tombstones = valid_tombstones + 1;
+        }
+        else if (map.*.used[valid_i] != 0) {
+            map.*.failed = 1;
+            return 1;
+        }
+        valid_i = valid_i + 1;
+    }
+    if (valid_live != map.*.count ||
+        valid_tombstones != map.*.tombstones) {
+        map.*.failed = 1;
+        return 1;
+    }
+    let idx: i32 = (key & 2147483647) % map.*.cap;
+    let probes: i32 = 0;
+    while (probes < map.*.cap && map.*.used[idx] != 0) {
+        if (map.*.used[idx] == 1 && map.*.keys[idx] == key) {
+            map.*.used[idx] = 2;
+            map.*.count = map.*.count - 1;
+            map.*.tombstones = map.*.tombstones + 1;
+            return 0;
+        }
+        idx = idx + 1;
+        if (idx >= map.*.cap) { idx = 0; }
+        probes = probes + 1;
+    }
+    return 1;
+}
+
+// Clear all visible entries while retaining the ScriptContext-owned table
+// arrays.  Validate the complete bounded descriptor before touching any
+// backing slot so malformed or forged descriptors fail closed without a
+// partial scrub.  Integer keys and values are zeroed even for tombstones;
+// this is deterministic reuse, not per-entry reclamation.
+fn script_map_clear(map: @borrows_mut *ScriptMapI32) i32 {
+    unsafe {
+    // Comparing a pointer to a compound descriptor is an explicitly unsafe
+    // raw-pointer boundary in strict Zag; keep it lexical and fail closed
+    // before any dereference.
+    unsafe {
+        if (map == null as *ScriptMapI32) { return 1; }
+    }
+    if (map.*.failed != 0 || map.*.context == null as *opaque ||
+        map.*.cap < 8 || map.*.cap > 1048576 ||
+        (map.*.cap & (map.*.cap - 1)) != 0 ||
+        map.*.count < 0 || map.*.count > map.*.cap ||
+        map.*.tombstones < 0 ||
+        map.*.tombstones > map.*.cap - map.*.count ||
+        map.*.keys == null as *i32 ||
+        map.*.values == null as *i32 || map.*.used == null as *u8) {
+        map.*.failed = 1;
+        return 1;
+    }
+    // A non-state byte is a malformed table, not an entry to erase.  Scan
+    // before writes so callers can rely on all-or-nothing failure behavior.
+    let check: i32 = 0;
+    let live: i32 = 0;
+    let tombstones: i32 = 0;
+    while (check < map.*.cap) {
+        if (map.*.used[check] > 2) {
+            map.*.failed = 1;
+            return 1;
+        }
+        if (map.*.used[check] == 1) { live = live + 1; }
+        else if (map.*.used[check] == 2) { tombstones = tombstones + 1; }
+        check = check + 1;
+    }
+    if (live != map.*.count || tombstones != map.*.tombstones) {
+        map.*.failed = 1;
+        return 1;
+    }
+    let i: i32 = 0;
+    while (i < map.*.cap) {
+        map.*.keys[i] = 0;
+        map.*.values[i] = 0;
+        map.*.used[i] = 0;
+        i = i + 1;
+    }
+    map.*.count = 0;
+    map.*.tombstones = 0;
+    return 0;
+    }
+}
+
+fn script_map_len(map: @borrows ScriptMapI32) i32 {
+    let null_context: i32 = 0;
+    unsafe {
+        if (map.context == null as *opaque) { null_context = 1; }
+    }
+    if (map.failed != 0 || null_context != 0 || map.cap < 8 ||
+        map.cap > 1048576 || (map.cap & (map.cap - 1)) != 0 ||
+        map.count < 0 || map.count > map.cap || map.tombstones < 0 ||
+        map.tombstones > map.cap - map.count || map.keys == null as *i32 ||
+        map.values == null as *i32 || map.used == null as *u8) { return 0; }
+    let valid_live: i32 = 0;
+    let valid_tombstones: i32 = 0;
+    let valid_i: i32 = 0;
+    while (valid_i < map.cap) {
+        if (map.used[valid_i] == 1) { valid_live = valid_live + 1; }
+        else if (map.used[valid_i] == 2) {
+            valid_tombstones = valid_tombstones + 1;
+        }
+        else if (map.used[valid_i] != 0) { return 0; }
+        valid_i = valid_i + 1;
+    }
+    if (valid_live != map.count || valid_tombstones != map.tombstones) {
+        return 0;
+    }
+    return map.count;
+}
+
+fn script_map_failed(map: ScriptMapI32) i32 { return map.failed; }
+
+// A separate bounded text dictionary slice.  Unlike the integer map above,
+// both key and value are []u8, and every non-empty byte payload is copied into
+// ScriptContext before the entry becomes visible.  Superseded payloads are
+// intentionally retained until Script shutdown, just like superseded table
+// arrays: there is no per-entry free operation that could outlive or bypass
+// the context allocator.
+//
+// This is deliberately an explicit `text_map*` API.  It does not change the
+// existing `map()` integer contract, add dynamic values, or infer an
+// ownership policy for arbitrary user aggregates.
+struct ScriptMapText {
+    keys: *[]u8,
+    values: *[]u8,
+    used: *u8,
+    cap: i32,
+    count: i32,
+    tombstones: i32,
+    context: *opaque,
+    failed: i32,
+}
+
+fn script_map_text_slice_valid(value: @borrows []u8) bool {
+    if (value.len < 0) { return false; }
+    if (value.len > 0 && _zag_slice_ptr(value) == null as *i8) {
+        return false;
+    }
+    return true;
+}
+
+fn script_map_text_hash(key: @borrows []u8) i32 {
+    // FNV-1a in the same bounded two's-complement arithmetic used by the
+    // ordinary strict string map.  The sign bit is masked at the table edge.
+    let hash: i32 = -2128831035;
+    let i: i32 = 0;
+    while (i < key.len) {
+        hash = (hash ^ (key[i] as i32)) * 16777619;
+        i = i + 1;
+    }
+    return hash;
+}
+
+fn script_map_text_copy(context: @borrows *opaque,
+    source: @borrows []u8) []u8 {
+    if (!script_map_text_slice_valid(source)) {
+        return (null as *u8)[0..0];
+    }
+    // No bytes need ownership for an empty value.  Keeping the empty slice
+    // canonical also avoids relying on allocator-specific zero-byte pointers.
+    if (source.len == 0) { return ""; }
+    let source_len: i32 = source.len;
+    let data: *u8 = _zag_script_alloc(context, source.len as i64) as *u8;
+    if (data == null as *u8) { return data[0..0]; }
+    let i: i32 = 0;
+    while (i < source_len) { data[i] = source[i]; i = i + 1; }
+    return data[0..source_len];
+}
+
+fn script_map_text_new(context: *opaque) ScriptMapText {
+    let cap: i32 = 8;
+    let null_context: i32 = 0;
+    unsafe {
+        if (context == null as *opaque) { null_context = 1; }
+    }
+    if (null_context != 0) {
+        return ScriptMapText{.keys = null as *[]u8,
+            .values = null as *[]u8, .used = null as *u8, .cap = cap,
+            .count = 0, .tombstones = 0, .context = context, .failed = 1};
+    }
+    let slice_size: i64 = @sizeOf[[]u8]() as i64;
+    if (slice_size <= 0 || (cap as i64) > 2147483647 / slice_size) {
+        return ScriptMapText{.keys = null as *[]u8, .values = null as *[]u8,
+            .used = null as *u8, .cap = cap, .count = 0,
+            .tombstones = 0, .context = context, .failed = 1};
+    }
+    let keys: *[]u8 = _zag_script_alloc(context,
+        (cap as i64) * slice_size) as *[]u8;
+    let values: *[]u8 = _zag_script_alloc(context,
+        (cap as i64) * slice_size) as *[]u8;
+    let used: *u8 = _zag_script_alloc(context, cap as i64) as *u8;
+    let failed: i32 = (keys == null as *[]u8 || values == null as *[]u8 ||
+        used == null as *u8) as i32;
+    let result: ScriptMapText = ScriptMapText{
+        .keys = keys, .values = values, .used = used, .cap = cap,
+        .count = 0, .tombstones = 0, .context = context, .failed = failed,
+    };
+    if (failed != 0) { return result; }
+    let i: i32 = 0;
+    while (i < cap) { used[i] = 0; i = i + 1; }
+    return result;
+}
+
+fn script_map_text_valid(map: @borrows ScriptMapText) bool {
+    let slice_size: i64 = @sizeOf[[]u8]() as i64;
+    // Null checks on the compiler-owned raw backing arrays are the one
+    // pointer operation in this shape validator; keep it lexically unsafe
+    // without widening the public ScriptMapText API.
+    unsafe {
+        if (!(map.failed == 0 && map.context != null as *opaque &&
+            map.cap >= 8 && map.cap <= 1048576 &&
+            (map.cap & (map.cap - 1)) == 0 && slice_size > 0 &&
+            (map.cap as i64) <= 2147483647 / slice_size &&
+            map.count >= 0 && map.count <= map.cap && map.tombstones >= 0 &&
+            map.tombstones <= map.cap - map.count &&
+            map.keys != null as *[]u8 && map.values != null as *[]u8 &&
+            map.used != null as *u8)) {
+            return false;
+        }
+    }
+    // Reconcile metadata with every state byte before any lookup, mutation,
+    // or rehash can observe or modify the table.  This deliberately costs
+    // bounded O(cap) per public operation; the capacity ceiling above keeps
+    // validation finite even for forged descriptors.
+    let live: i32 = 0;
+    let tombstones: i32 = 0;
+    let i: i32 = 0;
+    while (i < map.cap) {
+        if (map.used[i] == 1) {
+            if (!script_map_text_slice_valid(map.keys[i]) ||
+                !script_map_text_slice_valid(map.values[i])) { return false; }
+            live = live + 1;
+        }
+        else if (map.used[i] == 2) { tombstones = tombstones + 1; }
+        else if (map.used[i] != 0) { return false; }
+        i = i + 1;
+    }
+    return live == map.count && tombstones == map.tombstones;
+}
+
+fn script_map_text_rehash(map: @borrows_mut *ScriptMapText, next_cap: i32) i32 {
+    unsafe {
+        if (map == null as *ScriptMapText) { return 1; }
+    }
+    if (!script_map_text_valid(map.*) || next_cap < 8 ||
+        next_cap > 1048576 || (next_cap & (next_cap - 1)) != 0 ||
+        map.*.count > next_cap) {
+        map.*.failed = 1;
+        return 1;
+    }
+    let slice_size: i64 = @sizeOf[[]u8]() as i64;
+    if (slice_size <= 0 || (next_cap as i64) > 2147483647 / slice_size) {
+        map.*.failed = 1;
+        return 1;
+    }
+    let context: *opaque = map.*.context;
+    let keys: *[]u8 = _zag_script_alloc(map.*.context,
+        (next_cap as i64) * slice_size) as *[]u8;
+    let values: *[]u8 = _zag_script_alloc(map.*.context,
+        (next_cap as i64) * slice_size) as *[]u8;
+    let used: *u8 = _zag_script_alloc(map.*.context,
+        next_cap as i64) as *u8;
+    if (keys == null as *[]u8 || values == null as *[]u8 ||
+        used == null as *u8) {
+        map.*.failed = 1;
+        return 1;
+    }
+    let i: i32 = 0;
+    while (i < next_cap) { used[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < map.*.cap) {
+        if (map.*.used[i] == 1) {
+            let key: []u8 = map.*.keys[i];
+            let idx: i32 = (script_map_text_hash(key) & 2147483647) % next_cap;
+            let probes: i32 = 0;
+            while (probes < next_cap && used[idx] != 0) {
+                idx = idx + 1;
+                if (idx >= next_cap) { idx = 0; }
+                probes = probes + 1;
+            }
+            if (probes >= next_cap) {
+                map.*.failed = 1;
+                return 1;
+            }
+            // Re-copy arena payloads into the replacement table so no
+            // borrowed view from the old descriptor is stored in a new
+            // aggregate.  The copy is still ScriptContext-owned and keeps
+            // rehash safe if a future context implementation changes arena
+            // generations.
+            let copied_key: []u8 = script_map_text_copy(context, key);
+            let copied_value: []u8 = script_map_text_copy(context,
+                map.*.values[i]);
+            if ((key.len > 0 && copied_key.len == 0) ||
+                (map.*.values[i].len > 0 && copied_value.len == 0)) {
+                map.*.failed = 1;
+                return 1;
+            }
+            keys[idx] = copied_key;
+            values[idx] = copied_value;
+            used[idx] = 1;
+        }
+        i = i + 1;
+    }
+    map.*.keys = keys;
+    map.*.values = values;
+    map.*.used = used;
+    map.*.cap = next_cap;
+    map.*.tombstones = 0;
+    return 0;
+}
+
+fn script_map_text_grow(map: @borrows_mut *ScriptMapText) i32 {
+    unsafe {
+        if (map == null as *ScriptMapText) { return 1; }
+    }
+    if (!script_map_text_valid(map.*) || map.*.cap > 524288) {
+        map.*.failed = 1;
+        return 1;
+    }
+    return script_map_text_rehash(map, map.*.cap * 2);
+}
+
+fn script_map_text_lookup(map: @borrows ScriptMapText,
+    key: @borrows []u8) i32 {
+    if (!script_map_text_slice_valid(key) ||
+        !script_map_text_valid(map)) { return -2; }
+    let idx: i32 = (script_map_text_hash(key) & 2147483647) % map.cap;
+    let probes: i32 = 0;
+    while (probes < map.cap && map.used[idx] != 0) {
+        if (map.used[idx] == 1 && @strEq(map.keys[idx], key)) { return idx; }
+        idx = idx + 1;
+        if (idx >= map.cap) { idx = 0; }
+        probes = probes + 1;
+    }
+    return -1;
+}
+
+fn script_map_text_put(map: @borrows_mut *ScriptMapText,
+    key: @borrows []u8, value: @borrows []u8) i32 {
+    unsafe {
+        if (map == null as *ScriptMapText) { return 1; }
+    }
+    // Reject malformed caller slices before descriptor failure marking,
+    // lookup, allocation, or any table write.  A bad input is not a bad map.
+    if (!script_map_text_slice_valid(key) ||
+        !script_map_text_slice_valid(value)) { return 1; }
+    if (!script_map_text_valid(map.*)) {
+        map.*.failed = 1;
+        return 1;
+    }
+    let context: *opaque = map.*.context;
+    let existing: i32 = script_map_text_lookup(map.*, key);
+    if (existing == -2) { map.*.failed = 1; return 1; }
+    if (existing >= 0) {
+        let copied_value: []u8 = script_map_text_copy(context, value);
+        if (value.len > 0 && copied_value.len == 0) {
+            map.*.failed = 1;
+            return 1;
+        }
+        map.*.values[existing] = copied_value;
+        return 0;
+    }
+    let idx: i32 = (script_map_text_hash(key) & 2147483647) % map.*.cap;
+    let first_tombstone: i32 = -1;
+    let probes: i32 = 0;
+    while (probes < map.*.cap && map.*.used[idx] != 0) {
+        if (map.*.used[idx] == 2 && first_tombstone < 0) {
+            first_tombstone = idx;
+        }
+        idx = idx + 1;
+        if (idx >= map.*.cap) { idx = 0; }
+        probes = probes + 1;
+    }
+    if (first_tombstone < 0 && (map.*.count + 1) * 10 >= map.*.cap * 7) {
+        if (script_map_text_grow(map) != 0) { return 1; }
+        idx = (script_map_text_hash(key) & 2147483647) % map.*.cap;
+        probes = 0;
+        while (probes < map.*.cap && map.*.used[idx] != 0) {
+            idx = idx + 1;
+            if (idx >= map.*.cap) { idx = 0; }
+            probes = probes + 1;
+        }
+    } else if (first_tombstone >= 0) {
+        idx = first_tombstone;
+        probes = 0;
+    }
+    if (probes >= map.*.cap) { map.*.failed = 1; return 1; }
+    let copied_key: []u8 = script_map_text_copy(context, key);
+    let copied_value: []u8 = script_map_text_copy(context, value);
+    if ((key.len > 0 && copied_key.len == 0) ||
+        (value.len > 0 && copied_value.len == 0)) {
+        map.*.failed = 1;
+        return 1;
+    }
+    map.*.keys[idx] = copied_key;
+    map.*.values[idx] = copied_value;
+    map.*.used[idx] = 1;
+    map.*.count = map.*.count + 1;
+    if (first_tombstone >= 0) { map.*.tombstones = map.*.tombstones - 1; }
+    return 0;
+}
+
+fn script_map_text_has(map: @borrows ScriptMapText,
+    key: @borrows []u8) bool {
+    return script_map_text_lookup(map, key) >= 0;
+}
+
+fn script_map_text_get(map: @borrows ScriptMapText,
+    key: @borrows []u8) []u8 {
+    if (!script_map_text_valid(map)) {
+        _zag_eprintln("Zag Script text map state is invalid");
+        _zag_exit(1);
+    }
+    let slot: i32 = script_map_text_lookup(map, key);
+    if (slot < 0) {
+        _zag_eprintln("Zag Script text map key is absent");
+        _zag_exit(1);
+    }
+    return map.values[slot];
+}
+
+fn script_map_text_del(map: @borrows_mut *ScriptMapText,
+    key: @borrows []u8) i32 {
+    unsafe {
+        if (map == null as *ScriptMapText) { return 1; }
+    }
+    if (!script_map_text_slice_valid(key)) { return 1; }
+    if (!script_map_text_valid(map.*)) {
+        map.*.failed = 1;
+        return 1;
+    }
+    let slot: i32 = script_map_text_lookup(map.*, key);
+    if (slot < 0) { return 1; }
+    map.*.used[slot] = 2;
+    map.*.count = map.*.count - 1;
+    map.*.tombstones = map.*.tombstones + 1;
+    return 0;
+}
+
+// Clear all visible entries while retaining the ScriptContext-owned table
+// arrays. Validate the complete bounded descriptor and table-state counts
+// before touching any slot so malformed or forged descriptors fail closed
+// without a partial scrub. Keys and values are then scrubbed before their
+// slots become empty so a later diagnostic or accidental stale-slot read
+// cannot observe old payload; the payload allocations themselves remain
+// arena-owned until Script shutdown. This is reuse, not per-entry reclamation.
+fn script_map_text_clear(map: @borrows_mut *ScriptMapText) i32 {
+    // Raw compound-pointer comparison is an explicitly unsafe boundary in
+    // strict Zag. Return before dereferencing a null target.
+    unsafe {
+        if (map == null as *ScriptMapText) { return 1; }
+    }
+    if (!script_map_text_valid(map.*)) {
+        map.*.failed = 1;
+        return 1;
+    }
+    let check: i32 = 0;
+    let live: i32 = 0;
+    let tombstones: i32 = 0;
+    while (check < map.*.cap) {
+        if (map.*.used[check] > 2) {
+            map.*.failed = 1;
+            return 1;
+        }
+        if (map.*.used[check] == 1) { live = live + 1; }
+        else if (map.*.used[check] == 2) { tombstones = tombstones + 1; }
+        check = check + 1;
+    }
+    if (live != map.*.count || tombstones != map.*.tombstones) {
+        map.*.failed = 1;
+        return 1;
+    }
+    let i: i32 = 0;
+    while (i < map.*.cap) {
+        map.*.keys[i] = "";
+        map.*.values[i] = "";
+        map.*.used[i] = 0;
+        i = i + 1;
+    }
+    map.*.count = 0;
+    map.*.tombstones = 0;
+    return 0;
+}
+
+fn script_map_text_len(map: @borrows ScriptMapText) i32 {
+    if (!script_map_text_valid(map)) { return 0; }
+    return map.count;
+}
+
+fn script_map_text_failed(map: @borrows ScriptMapText) i32 {
+    return map.failed;
+}

@@ -41,6 +41,17 @@ reject() {
   fi
 }
 
+reject_check() {
+  name=$1 label=$2 diagnostic=$3
+  if (cd "$tmp/$name" && "$ZNC" check main.zag) >"$tmp/$name/log" 2>&1; then
+    echo "  XX  $label"; sed -n '1,10p' "$tmp/$name/log"; fail=$((fail + 1))
+  elif grep -q "$diagnostic" "$tmp/$name/log"; then
+    echo "  ok  $label"; pass=$((pass + 1))
+  else
+    echo "  XX  $label (missing diagnostic)"; sed -n '1,10p' "$tmp/$name/log"; fail=$((fail + 1))
+  fi
+}
+
 echo "── edition-2027 aggregate provenance ──"
 
 project owner-nested-pass
@@ -175,10 +186,11 @@ reject stack-field-return "field-assigned stack address cannot return" 'address 
 
 project stack-pass
 printf '%s\n' \
-  'struct Box { ptr:*const i32 } fn retain(value:Box) void { }' \
+  'struct Box { ptr:*const i32 }' \
+  'fn retain(value:Box) void { }' \
   'fn main() i32 { let x:i32=42; unsafe { let value:Box=Box{.ptr=(&x) as *const i32}; retain(value); } return 0; }' \
   >"$tmp/stack-pass/main.zag"
-reject stack-pass "aggregate stack address cannot pass to an uncontracted call" 'escapes through aggregate argument to uncontracted call `retain`'
+reject_check stack-pass "aggregate stack address cannot pass to an uncontracted call" 'escapes through aggregate argument to uncontracted call `retain`'
 
 project stack-extract-return
 printf '%s\n' \
@@ -195,6 +207,30 @@ printf '%s\n' \
   'fn main() i32 { return 0; }' \
   >"$tmp/stack-safe-clear/main.zag"
 accept stack-safe-clear "overwriting a stack-address field permits a safe aggregate return"
+
+# A borrowed aggregate result may contain a scalar snapshot copied from its
+# source. The snapshot must not retain the source frame address and poison a
+# later checked call that receives only that scalar field.
+project stack-scalar-snapshot
+printf '%s\n' \
+  'struct Snapshot { value:i32 }' \
+  'fn read(source:@borrows *i32) Snapshot { return Snapshot{.value=source.*}; }' \
+  'fn consume(source:@borrows *i32, value:i32) void { let _same:bool=source.*==value; }' \
+  'fn main() i32 { let local:i32=7; let snapshot:Snapshot=read(&local); consume(&local,snapshot.value); return 0; }' \
+  >"$tmp/stack-scalar-snapshot/main.zag"
+accept stack-scalar-snapshot "scalar snapshots do not retain borrowed stack provenance"
+
+# std:list is the canonical structural @resource whose `make` producer first
+# exists as a plain raw local and is then consumed by the owned `data` field.
+# This guards the split between the raw-producer ledger and aggregate
+# provenance against regressions that either reject the construction or count
+# the same malloc pointer twice.
+project raw-producer-resource-list
+printf '%s\n' \
+  '@import("std:list") as list' \
+  'fn main() i32 { unsafe { let values:list.ArrayList[i32]=list.make[i32](2); list.free[i32](&values); } return 0; }' \
+  >"$tmp/raw-producer-resource-list/main.zag"
+accept raw-producer-resource-list "fresh raw producer initializes and releases a structural resource"
 
 project edition-2026-compat 2026
 printf '%s\n' \

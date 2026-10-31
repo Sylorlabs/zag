@@ -38,6 +38,8 @@ run_gate "v2 edition boundary" bash tests/run_v2_edition.sh
 run_gate "unsafe lexical and raw-pointer boundary" bash tests/run_v2_edition.sh
 run_gate "try-wrapped borrow identity" bash tests/run_v2_try_borrow.sh
 run_gate "mutation-aware aggregate provenance" bash tests/run_v2_aggregate_provenance.sh
+run_gate "resource contract syntax and identity" bash tests/run_resource_contract_syntax.sh
+run_gate "affine resources and retained views" bash tests/run_resource_affine.sh
 run_gate "fixed-buffer checked runtime authority" bash tests/run_fixed_buffer_runtime.sh
 run_gate "retained arena allocator authority" bash tests/run_arena_allocator.sh
 run_gate "v2 atomic i64 operations" bash tests/run_v2_atomic_exchange.sh

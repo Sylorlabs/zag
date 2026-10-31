@@ -56,6 +56,8 @@ struct ObjSym {
     name:       []u8,
     sec_idx:    i32,   // ELF section index (0 = SHN_UNDEF)
     offset:     i64,   // st_value: byte offset within its section
+    size:       i64,   // st_size: zero means unspecified
+    type_:      i32,   // low nibble of st_info (STT_FUNC = 2)
     is_global:  i32,   // 1 if STB_GLOBAL, else 0
     is_defined: i32,   // 1 if sec_idx != SHN_UNDEF, else 0
 }
@@ -74,6 +76,7 @@ struct ObjSec {
     name:   []u8,   // section name (e.g. ".text", ".rela.text")
     data:   []u8,   // slice of the raw section bytes inside the original buffer
     type_:  i32,    // sh_type (1=PROGBITS, 2=SYMTAB, 3=STRTAB, 4=RELA, ...)
+    align:  i64,    // sh_addralign (0 and 1 mean no additional alignment)
 }
 
 // Parsed ELF relocatable object.
@@ -81,6 +84,7 @@ struct ObjFile {
     secs:   ArrayList[ObjSec],
     syms:   ArrayList[ObjSym],
     relocs: ArrayList[ObjReloc],
+    valid:  i32,
 }
 
 // A resolved symbol address: name -> virtual address in the final binary.
@@ -130,6 +134,18 @@ fn elf_obj_i64le(buf: []u8, off: i64) i64 {
     return lo + hi * 4294967296;
 }
 
+fn elf_obj_range_ok(buf: []u8, off: i64, size: i64) i32 {
+    if (off < 0 || size < 0 || off > buf.len as i64) { return 0; }
+    if (size > (buf.len as i64) - off) { return 0; }
+    return 1;
+}
+
+fn elf_obj_alignment_ok(align: i64) i32 {
+    if (align == 0 || align == 1) { return 1; }
+    if (align < 0 || align > 4096) { return 0; }
+    return ((align & (align - 1)) == 0) as i32;
+}
+
 // ── string-table helper ────────────────────────────────────────────────────────
 
 // Read a null-terminated C string from buf starting at byte offset `off`.
@@ -152,6 +168,7 @@ fn elf_obj_parse(buf: []u8) ObjFile {
         .secs   = make[ObjSec](8),
         .syms   = make[ObjSym](16),
         .relocs = make[ObjReloc](16),
+        .valid  = 0,
     };
 
     // Need at least 64 bytes for the ELF header.
@@ -162,13 +179,16 @@ fn elf_obj_parse(buf: []u8) ObjFile {
     if ((buf[1] as i32) != 69)  { return obj; }
     if ((buf[2] as i32) != 76)  { return obj; }
     if ((buf[3] as i32) != 70)  { return obj; }
+    if ((buf[4] as i32) != 2 || (buf[5] as i32) != 1 || (buf[6] as i32) != 1) { return obj; }
+    if (elf_obj_u16le(buf, 16) != 1 || elf_obj_u16le(buf, 18) != 62) { return obj; }
+    if (elf_obj_u16le(buf, 52) != 64 || elf_obj_u16le(buf, 58) != 64) { return obj; }
 
     // Read section-header table location and dimensions.
     let shoff:    i64 = elf_obj_u64le(buf, 40);  // e_shoff
     let shnum:    i64 = elf_obj_u16le(buf, 60);  // e_shnum
     let shstrndx: i64 = elf_obj_u16le(buf, 62);  // e_shstrndx
 
-    if (shoff == 0 || shnum == 0) { return obj; }
+    if (shoff == 0 || shnum == 0 || elf_obj_range_ok(buf, shoff, shnum * 64) == 0) { return obj; }
 
     // ── Read the section-name string table (.shstrtab) ────────────────────────
     let shstrtab: []u8 = "";
@@ -176,12 +196,11 @@ fn elf_obj_parse(buf: []u8) ObjFile {
         let ss_base: i64 = shoff + shstrndx * 64;
         let ss_off:  i64 = elf_obj_u64le(buf, ss_base + 24);
         let ss_sz:   i64 = elf_obj_u64le(buf, ss_base + 32);
+        if (elf_obj_range_ok(buf, ss_off, ss_sz) == 0) { return obj; }
         let ss_s: i32 = ss_off as i32;
         let ss_e: i32 = (ss_off + ss_sz) as i32;
-        if (ss_s >= 0 && ss_e <= buf.len) {
-            shstrtab = buf[ss_s..ss_e];
-        }
-    }
+        shstrtab = buf[ss_s..ss_e];
+    } else { return obj; }
 
     // ── Pass 1: read all sections into obj.secs ───────────────────────────────
     // Push one ObjSec per ELF section index so index i == ELF section index i.
@@ -192,18 +211,22 @@ fn elf_obj_parse(buf: []u8) ObjFile {
         let sh_type: i64 = elf_obj_u32le(buf, sh_base + 4);
         let sh_off:  i64 = elf_obj_u64le(buf, sh_base + 24);
         let sh_sz:   i64 = elf_obj_u64le(buf, sh_base + 32);
+        let sh_align:i64 = elf_obj_u64le(buf, sh_base + 48);
+        if (elf_obj_alignment_ok(sh_align) == 0) { return obj; }
 
         let sec_name: []u8 = elf_obj_cstr(shstrtab, sh_name as i32);
-        let sec_s: i32 = sh_off as i32;
-        let sec_e: i32 = (sh_off + sh_sz) as i32;
         let sec_data: []u8 = "";
-        if (sec_s >= 0 && sec_e <= buf.len && sec_e >= sec_s) {
+        if (sh_type != 8) {
+            if (elf_obj_range_ok(buf, sh_off, sh_sz) == 0) { return obj; }
+            let sec_s: i32 = sh_off as i32;
+            let sec_e: i32 = (sh_off + sh_sz) as i32;
             sec_data = buf[sec_s..sec_e];
         }
         push[ObjSec](&obj.secs, ObjSec{
             .name  = sec_name,
             .data  = sec_data,
             .type_ = sh_type as i32,
+            .align = sh_align,
         });
         si = si + 1;
     }
@@ -211,29 +234,31 @@ fn elf_obj_parse(buf: []u8) ObjFile {
     // ── Pass 2: find SYMTAB and read symbols ──────────────────────────────────
     let symtab_idx:  i64 = 0 - 1;
     let symtab_link: i64 = 0;
+    let symtab_count:i32 = 0;
     let si2: i64 = 0;
     while (si2 < shnum) {
         let sh_base2: i64 = shoff + si2 * 64;
         let sh_type2: i64 = elf_obj_u32le(buf, sh_base2 + 4);
         if (sh_type2 == 2) {
+            symtab_count = symtab_count + 1;
             symtab_idx  = si2;
             symtab_link = elf_obj_u32le(buf, sh_base2 + 40);
         }
         si2 = si2 + 1;
     }
+    if (symtab_count > 1) { return obj; }
 
     // Read the STRTAB for symbol names (linked from the SYMTAB).
     let sym_strtab: []u8 = "";
-    if (symtab_link > 0 && symtab_link < shnum) {
+    if (symtab_idx >= 0 && symtab_link > 0 && symtab_link < shnum) {
         let st_base: i64 = shoff + symtab_link * 64;
         let st_off:  i64 = elf_obj_u64le(buf, st_base + 24);
         let st_sz:   i64 = elf_obj_u64le(buf, st_base + 32);
+        if (elf_obj_range_ok(buf, st_off, st_sz) == 0) { return obj; }
         let st_s: i32 = st_off as i32;
         let st_e: i32 = (st_off + st_sz) as i32;
-        if (st_s >= 0 && st_e <= buf.len) {
-            sym_strtab = buf[st_s..st_e];
-        }
-    }
+        sym_strtab = buf[st_s..st_e];
+    } else if (symtab_idx >= 0) { return obj; }
 
     // Read all symbols from the SYMTAB section.
     if (symtab_idx >= 0) {
@@ -241,7 +266,8 @@ fn elf_obj_parse(buf: []u8) ObjFile {
         let sym_sh_off:  i64 = elf_obj_u64le(buf, sym_sh_base + 24);
         let sym_sh_sz:   i64 = elf_obj_u64le(buf, sym_sh_base + 32);
         let sym_entsize: i64 = elf_obj_u64le(buf, sym_sh_base + 56);
-        if (sym_entsize <= 0) { sym_entsize = 24; }
+        if (sym_entsize < 24 || (sym_sh_sz % sym_entsize) != 0 ||
+            elf_obj_range_ok(buf, sym_sh_off, sym_sh_sz) == 0) { return obj; }
 
         let nsyms: i64 = sym_sh_sz / sym_entsize;
         let symi: i64 = 0;
@@ -251,21 +277,25 @@ fn elf_obj_parse(buf: []u8) ObjFile {
             let st_info:  i64 = elf_obj_u8at(buf,  sym_base + 4);
             let st_shndx: i64 = elf_obj_u16le(buf, sym_base + 6);
             let st_value: i64 = elf_obj_u64le(buf, sym_base + 8);
+            let st_size:  i64 = elf_obj_u64le(buf, sym_base + 16);
 
             // STB_GLOBAL = 1 (high nibble of st_info)
             let st_bind: i64 = st_info / 16;
+            let st_type: i64 = st_info % 16;
             let is_global: i32 = 0;
             if (st_bind == 1) { is_global = 1; }
 
             // SHN_UNDEF = 0; SHN_ABS/COMMON >= 0xff00 (65280)
             let is_defined: i32 = 0;
-            if (st_shndx > 0 && st_shndx < 65280) { is_defined = 1; }
+            if (st_shndx > 0 && st_shndx < shnum) { is_defined = 1; }
 
             let sym_name: []u8 = elf_obj_cstr(sym_strtab, st_name as i32);
             push[ObjSym](&obj.syms, ObjSym{
                 .name       = sym_name,
                 .sec_idx    = st_shndx as i32,
                 .offset     = st_value,
+                .size       = st_size,
+                .type_      = st_type as i32,
                 .is_global  = is_global,
                 .is_defined = is_defined,
             });
@@ -281,9 +311,13 @@ fn elf_obj_parse(buf: []u8) ObjFile {
         if (sh_type3 == 4) {
             let sh_off3:     i64 = elf_obj_u64le(buf, sh_base3 + 24);
             let sh_sz3:      i64 = elf_obj_u64le(buf, sh_base3 + 32);
+            let sh_link3:    i64 = elf_obj_u32le(buf, sh_base3 + 40);
             let sh_info3:    i64 = elf_obj_u32le(buf, sh_base3 + 44);
             let sh_entsize3: i64 = elf_obj_u64le(buf, sh_base3 + 56);
-            if (sh_entsize3 <= 0) { sh_entsize3 = 24; }
+            if (symtab_idx < 0 || sh_link3 != symtab_idx ||
+                sh_info3 < 0 || sh_info3 >= shnum || sh_entsize3 < 24 ||
+                (sh_sz3 % sh_entsize3) != 0 ||
+                elf_obj_range_ok(buf, sh_off3, sh_sz3) == 0) { return obj; }
 
             let nrelocs: i64 = sh_sz3 / sh_entsize3;
             let ri: i64 = 0;
@@ -310,6 +344,7 @@ fn elf_obj_parse(buf: []u8) ObjFile {
         si3 = si3 + 1;
     }
 
+    obj.valid = 1;
     return obj;
 }
 
@@ -349,6 +384,7 @@ fn obj_patch_i64(ml: *MergedLib, off: i64, val: i64) void {
 //
 // text_base — the virtual address where ml.text[0] is mapped in the final binary.
 fn merge_obj(ml: *MergedLib, obj: ObjFile, text_base: i64) void {
+    if (obj.valid == 0) { return; }
     // Find the .text section (SHT_PROGBITS = 1, name = ".text").
     let text_sec_idx: i32 = 0 - 1;
     let i: i32 = 0;
@@ -362,6 +398,12 @@ fn merge_obj(ml: *MergedLib, obj: ObjFile, text_base: i64) void {
     if (text_sec_idx < 0) { return; }
 
     let sec: ObjSec = get[ObjSec](obj.secs, text_sec_idx);
+    let text_align: i64 = sec.align;
+    if (text_align <= 0) { text_align = 1; }
+    if (elf_obj_alignment_ok(text_align) == 0) { return; }
+    while (((ml.*.text_base + (ml.*.text.len as i64)) % text_align) != 0) {
+        push[u8](&ml.*.text, 144 as u8);
+    }
     // Byte offset within ml.text where this object's code starts.
     let sec_start: i64 = ml.*.text.len as i64;
 
@@ -376,7 +418,10 @@ fn merge_obj(ml: *MergedLib, obj: ObjFile, text_base: i64) void {
     let si: i32 = 0;
     while (si < len[ObjSym](obj.syms)) {
         let sym: ObjSym = get[ObjSym](obj.syms, si);
-        if (sym.is_global == 1 && sym.is_defined == 1 && sym.sec_idx == text_sec_idx) {
+        if (sym.is_global == 1 && sym.is_defined == 1 && sym.type_ == 2 &&
+            sym.name.len > 0 && sym.sec_idx == text_sec_idx && sym.offset >= 0 &&
+            sym.offset < sec.data.len as i64 && sym.size >= 0 &&
+            (sym.size == 0 || sym.size <= (sec.data.len as i64) - sym.offset)) {
             let addr: i64 = text_base + sec_start + sym.offset;
             push[SymAddr](&ml.*.sym_addrs, SymAddr{ .name = sym.name, .addr = addr });
         }
@@ -410,52 +455,81 @@ fn merge_obj(ml: *MergedLib, obj: ObjFile, text_base: i64) void {
 //
 // Relocation types handled:
 //   R_X86_64_64   (1):  8-byte absolute   = sym_addr + addend
-//   R_X86_64_PC32 (2):  4-byte PC-rel     = sym_addr + addend - (site_vaddr + 4)
+//   R_X86_64_PC32 (2):  4-byte PC-rel     = sym_addr + addend - site_vaddr
 //   R_X86_64_PLT32(4):  same as PC32 for static linking
 //   R_X86_64_32S  (11): 4-byte sign-ext   = sym_addr + addend (low 32 bits)
-fn apply_relocs(ml: *MergedLib, extern_addrs: ArrayList[SymAddr]) void {
+// Returns the number of unresolved, ambiguous, malformed, unsupported, or
+// out-of-range relocations. A static executable must reject any non-zero result.
+fn apply_relocs(ml: *MergedLib, extern_addrs: ArrayList[SymAddr]) i32 {
     let text_base: i64 = ml.*.text_base;
+    let failures: i32 = 0;
     let i: i32 = 0;
     while (i < len[PendingReloc](ml.*.relocs)) {
         let r: PendingReloc = get[PendingReloc](ml.*.relocs, i);
 
         // Resolve symbol address (library-internal first, then external).
         let sym_addr: i64 = 0;
-        let found: i32 = 0;
+        let matches: i32 = 0;
 
         let j: i32 = 0;
         while (j < len[SymAddr](ml.*.sym_addrs)) {
             let sa: SymAddr = get[SymAddr](ml.*.sym_addrs, j);
-            if (@strEq(sa.name, r.sym_name)) { sym_addr = sa.addr; found = 1; }
+            if (@strEq(sa.name, r.sym_name)) { sym_addr = sa.addr; matches = matches + 1; }
             j = j + 1;
         }
-        if (found == 0) {
+        if (matches == 0) {
             let k: i32 = 0;
             while (k < len[SymAddr](extern_addrs)) {
                 let ea: SymAddr = get[SymAddr](extern_addrs, k);
-                if (@strEq(ea.name, r.sym_name)) { sym_addr = ea.addr; found = 1; }
+                if (@strEq(ea.name, r.sym_name)) { sym_addr = ea.addr; matches = matches + 1; }
                 k = k + 1;
             }
         }
 
-        if (found == 1) {
-            let patch_off: i64 = r.patch_off;
-            let type_: i32 = r.type_;
-            if (type_ == 2 || type_ == 4) {
-                // R_X86_64_PC32 or R_X86_64_PLT32
+        let patch_off: i64 = r.patch_off;
+        let type_: i32 = r.type_;
+        if (matches != 1) {
+            failures = failures + 1;
+        } else if (type_ == 2 || type_ == 4) {
+            if (patch_off < 0 || patch_off > (ml.*.text.len as i64) - 4) {
+                failures = failures + 1;
+            } else {
+                // R_X86_64_PC32 or R_X86_64_PLT32 use the ELF formula
+                // S + A - P, where P is the address of the relocation field.
+                // A call relocation normally carries A=-4, accounting once
+                // for the four-byte immediate before the next instruction.
                 let site_vaddr: i64 = text_base + patch_off;
-                let val: i64 = sym_addr + r.addend - site_vaddr - 4;
-                obj_patch_i32(ml, patch_off, val);
-            } else if (type_ == 1) {
-                // R_X86_64_64
+                let val: i64 = sym_addr + r.addend - site_vaddr;
+                if (val < (0 - 2147483648) || val > 2147483647) {
+                    failures = failures + 1;
+                } else {
+                    obj_patch_i32(ml, patch_off, val);
+                }
+            }
+        } else if (type_ == 1) {
+            // R_X86_64_64
+            if (patch_off < 0 || patch_off > (ml.*.text.len as i64) - 8) {
+                failures = failures + 1;
+            } else {
                 let val: i64 = sym_addr + r.addend;
                 obj_patch_i64(ml, patch_off, val);
-            } else if (type_ == 11) {
-                // R_X86_64_32S
-                let val: i64 = sym_addr + r.addend;
-                obj_patch_i32(ml, patch_off, val);
             }
+        } else if (type_ == 11) {
+            // R_X86_64_32S
+            if (patch_off < 0 || patch_off > (ml.*.text.len as i64) - 4) {
+                failures = failures + 1;
+            } else {
+                let val: i64 = sym_addr + r.addend;
+                if (val < (0 - 2147483648) || val > 2147483647) {
+                    failures = failures + 1;
+                } else {
+                    obj_patch_i32(ml, patch_off, val);
+                }
+            }
+        } else {
+            failures = failures + 1;
         }
         i = i + 1;
     }
+    return failures;
 }

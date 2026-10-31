@@ -69,9 +69,14 @@ ok scoping-import-shadow scoping_import_shadow.zag 42
 ok nested-block-shadow scoping_block_shadow.zag 41
 ok capture-shadow scoping_capture_shadow.zag 42
 ok numeric-types-casts types_numeric.zag 42
+ok cast-followed-by-comparison cast_comparison.zag 42
+ok direct-function-values direct_function_values.zag 42
 ok error-propagation errors_propagation.zag 42
 ok error-union-struct-storage error_union_struct_storage.zag 42
+ok error-union-storage error_union_storage.zag 42
 ok generic-monomorphization generics_monomorphization.zag 42
+ok prefix-declaration-annotations prefix_declaration_annotations.zag 42
+ok prefix-enum-pub-import prefix_enum_pub_import.zag 42
 ok memory-value-pointer memory_value_pointer.zag 42
 ok edge-control-values edge_control_values.zag 42
 ok_strict imported-const-flat import_const_flat.zag 42
@@ -85,6 +90,7 @@ reject mixed-posit-arithmetic reject_mixed_posit.zag
 ok hexadecimal-literal accept_hex_literal.zag 42
 reject escaping-capturing-closure reject_closure_escape.zag
 reject general-type-mismatch reject_type_mismatch.zag
+reject prefix-enum-private-filter reject_prefix_enum_private_import.zag
 
 echo "==== semantics pass=$pass fail=$fail known_gaps=0 ===="
 [ "$fail" -eq 0 ]

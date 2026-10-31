@@ -1,0 +1,394 @@
+// Deterministic local registry-index protocol for the bounded package layer.
+//
+// This is an index/query codec, not a network client and not a signature
+// verifier.  The index binds a package name, exact SemVer, traversal-free
+// source path, and the existing raw-byte checksum tuple.  A caller must still
+// read the selected bytes and compare the tuple before compiling them.  The
+// explicit signature=none field prevents this format from being mistaken for
+// an authenticity primitive.
+
+@import("package_resolve.zag")
+
+extern fn _zag_i64_to_str(v: i64) []u8
+
+enum PackageRegistryError {
+    none,
+    invalid_index,
+    invalid_query,
+    package_not_found,
+    version_not_found,
+}
+
+struct PackageRegistryEntry {
+    name: []u8,
+    version: []u8,
+    source: []u8,
+    checksum: PackageRawChecksum,
+    artifact_signature: []u8,
+    valid: i32,
+}
+
+struct PackageRegistryLookup {
+    found: i32,
+    name: []u8,
+    version: []u8,
+    source: []u8,
+    checksum: PackageRawChecksum,
+    artifact_signature: []u8,
+    error: PackageRegistryError,
+}
+
+fn package_registry_empty_checksum() PackageRawChecksum {
+    return PackageRawChecksum{.first = 0, .second = 0, .bytes = 0};
+}
+
+fn package_registry_bad_entry() PackageRegistryEntry {
+    return PackageRegistryEntry{.name = "", .version = "", .source = "",
+        .checksum = package_registry_empty_checksum(), .artifact_signature = "",
+        .valid = 0};
+}
+
+fn package_registry_bad_lookup(error: PackageRegistryError) PackageRegistryLookup {
+    return PackageRegistryLookup{.found = 0, .name = "", .version = "",
+        .source = "", .checksum = package_registry_empty_checksum(),
+        .artifact_signature = "",
+        .error = error};
+}
+
+fn package_registry_line(text: []u8, wanted: i32) []u8 {
+    let start: i32 = 0;
+    let line_no: i32 = 0;
+    let i: i32 = 0;
+    while (i < text.len) {
+        if (text[i] == '\n') {
+            if (line_no == wanted) { return text[start..i]; }
+            line_no = line_no + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (line_no == wanted && start <= text.len) { return text[start..text.len]; }
+    return "";
+}
+
+fn package_registry_part(fields: []u8, wanted: i32) []u8 {
+    let start: i32 = 0;
+    let field: i32 = 0;
+    let i: i32 = 0;
+    while (i < fields.len) {
+        if (fields[i] == '\t') {
+            if (field == wanted) { return fields[start..i]; }
+            field = field + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (field == wanted && start <= fields.len) { return fields[start..fields.len]; }
+    return "";
+}
+
+fn package_registry_part_count(fields: []u8) i32 {
+    if (fields.len == 0) { return 0; }
+    let count: i32 = 1;
+    let i: i32 = 0;
+    while (i < fields.len) {
+        if (fields[i] == '\t') { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+fn package_registry_checksum_mark(text: []u8) i32 {
+    let marker: []u8 = "checksum=";
+    let i: i32 = 0;
+    while (i + marker.len <= text.len) {
+        if ((i == 0 || text[i - 1] == '\n') &&
+            @strEq(text[i..i + marker.len], marker)) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn package_registry_checksum_text(text: []u8) []u8 {
+    let mark: i32 = package_registry_checksum_mark(text);
+    if (mark < 0) { return ""; }
+    let line: []u8 = text[mark..text.len];
+    if (line.len < 11 || line[line.len - 1] != '\n') { return ""; }
+    return line[9..line.len - 1];
+}
+
+fn package_registry_entry(line: []u8) PackageRegistryEntry {
+    let bad: PackageRegistryEntry = package_registry_bad_entry();
+    if (line.len < 7 || !@strEq(line[0..6], "entry=")) { return bad; }
+    let fields: []u8 = line[6..line.len];
+    let field_count: i32 = package_registry_part_count(fields);
+    if (field_count != 4 && field_count != 5) { return bad; }
+    let name: []u8 = package_registry_part(fields, 0);
+    let version: []u8 = package_registry_part(fields, 1);
+    let source: []u8 = package_registry_part(fields, 2);
+    let parsed: PackageChecksumParse = package_lock_checksum(
+        package_registry_part(fields, 3));
+    let artifact_signature: []u8 = "";
+    if (field_count == 5) {
+        artifact_signature = package_registry_part(fields, 4);
+        if (package_import_artifact_safe(artifact_signature) == 0) { return bad; }
+    }
+    if (package_import_safe_name(name) == 0 ||
+        package_semver_parse(version).valid == 0 ||
+        package_import_artifact_safe(source) == 0 || parsed.valid == 0) {
+        return bad;
+    }
+    return PackageRegistryEntry{.name = name, .version = version,
+        .source = source, .checksum = parsed.checksum,
+        .artifact_signature = artifact_signature, .valid = 1};
+}
+
+fn package_registry_entry_after(a: PackageRegistryEntry,
+    b: PackageRegistryEntry) i32 {
+    let order: i32 = package_lock_compare(a.name, b.name);
+    if (order != 0) { return (order > 0) as i32; }
+    return (package_semver_compare(package_semver_parse(a.version),
+        package_semver_parse(b.version)) > 0) as i32;
+}
+
+// Validate the complete canonical record.  No unknown keys, duplicate names
+// or duplicate versions are accepted.  The checksum covers every byte before
+// the final checksum line, including comments if a future version introduces
+// them; v1 has no comments or extension keys.
+fn package_registry_index_valid(text: []u8) i32 {
+    if (text.len <= 0 || text.len > 1048576 || text[text.len - 1] != '\n') {
+        return 0;
+    }
+    let mark: i32 = package_registry_checksum_mark(text);
+    if (mark <= 0 || mark >= text.len) { return 0; }
+    if (package_registry_checksum_text(text).len == 0 ||
+        package_lock_checksum(package_registry_checksum_text(text)).valid == 0) {
+        return 0;
+    }
+    if (mark + 9 + package_registry_checksum_text(text).len + 1 != text.len) {
+        return 0;
+    }
+    let claimed: PackageChecksumParse = package_lock_checksum(
+        package_registry_checksum_text(text));
+    if (package_raw_checksum_equal(package_raw_checksum(text[0..mark]),
+        claimed.checksum) == 0) { return 0; }
+    if (!@strEq(package_registry_line(text, 0),
+        "format=zag-registry-index-v1") ||
+        !@strEq(package_registry_line(text, 1),
+        "authority=local-file-v1") ||
+        !@strEq(package_registry_line(text, 2), "signature=none")) {
+        return 0;
+    }
+
+    let previous: PackageRegistryEntry = package_registry_bad_entry();
+    let entries: i32 = 0;
+    let line_no: i32 = 3;
+    while (line_no < text.len) {
+        let line: []u8 = package_registry_line(text, line_no);
+        if (line.len == 0) { break; }
+        // The checksum line is excluded from the record body and must be the
+        // final line.  A checksum marker anywhere else is an unknown record.
+        if (line.len >= 9 && @strEq(line[0..9], "checksum=")) {
+            if (line_no != 3 + entries) { return 0; }
+            break;
+        }
+        let entry: PackageRegistryEntry = package_registry_entry(line);
+        if (entry.valid == 0) { return 0; }
+        if (previous.valid != 0 && package_registry_entry_after(entry, previous) == 0) {
+            return 0;
+        }
+        previous = entry;
+        entries = entries + 1;
+        if (entries > 256) { return 0; }
+        line_no = line_no + 1;
+    }
+    if (entries <= 0 || line_no != 3 + entries) { return 0; }
+    let final_line: []u8 = package_registry_line(text, line_no);
+    if (final_line.len < 9 || !@strEq(final_line[0..9], "checksum=")) { return 0; }
+    return 1;
+}
+
+fn package_registry_finalize(body: []u8) []u8 {
+    if (body.len == 0 || body[body.len - 1] != '\n' ||
+        package_registry_line(body, 0).len == 0) { return ""; }
+    let checksum: PackageRawChecksum = package_raw_checksum(body);
+    let first: []u8 = _zag_i64_to_str(checksum.first);
+    let second: []u8 = _zag_i64_to_str(checksum.second);
+    let bytes: []u8 = _zag_i64_to_str(checksum.bytes);
+    let p1: []u8 = _zag_str_concat(first, ",");
+    let p2: []u8 = _zag_str_concat(p1, second); _zag_str_free(p1);
+    let p3: []u8 = _zag_str_concat(p2, ","); _zag_str_free(p2);
+    let p4: []u8 = _zag_str_concat(p3, bytes); _zag_str_free(p3);
+    let p5: []u8 = _zag_str_concat(p4, "\n"); _zag_str_free(p4);
+    let line: []u8 = _zag_str_concat("checksum=", p5); _zag_str_free(p5);
+    let result: []u8 = _zag_str_concat(body, line);
+    _zag_str_free(first); _zag_str_free(second); _zag_str_free(bytes);
+    _zag_str_free(line);
+    return result;
+}
+
+// Validate the signed-index envelope without treating the detached signature
+// as verified.  The ordinary resolver intentionally accepts only
+// `signature=none`; this shape check is for the explicit Ed25519 verifier and
+// binds the checksum to the exact bytes that will be authenticated.
+fn package_registry_signed_index_shape_valid(text: []u8) i32 {
+    if (text.len <= 0 || text.len > 1048576 || text[text.len - 1] != '\n' ||
+        !@strEq(package_registry_line(text, 0), "format=zag-registry-index-v1") ||
+        !@strEq(package_registry_line(text, 1), "authority=local-file-v1") ||
+        !@strEq(package_registry_line(text, 2), "signature=ed25519")) {
+        return 0;
+    }
+    let mark: i32 = package_registry_checksum_mark(text);
+    if (mark <= 0 || mark >= text.len) { return 0; }
+    let claimed_text: []u8 = package_registry_checksum_text(text);
+    let claimed: PackageChecksumParse = package_lock_checksum(claimed_text);
+    if (claimed.valid == 0 ||
+        mark + 9 + claimed_text.len + 1 != text.len ||
+        package_raw_checksum_equal(package_raw_checksum(text[0..mark]),
+            claimed.checksum) == 0) {
+        return 0;
+    }
+
+    // Reuse the canonical unsigned parser for entry/order/path validation by
+    // replacing only the signed header and recomputing that derived envelope's
+    // checksum.  The original checksum above remains bound to the signed
+    // bytes; this normalization cannot make a malformed signed record valid.
+    let newline_count: i32 = 0;
+    let body_start: i32 = 0;
+    let i: i32 = 0;
+    while (i < mark && newline_count < 3) {
+        if (text[i] == '\n') {
+            newline_count = newline_count + 1;
+            if (newline_count == 3) { body_start = i + 1; }
+        }
+        i = i + 1;
+    }
+    if (newline_count != 3 || body_start >= mark) { return 0; }
+    let normalized_body: []u8 = _zag_str_concat(
+        "format=zag-registry-index-v1\nauthority=local-file-v1\nsignature=none\n",
+        text[body_start..mark]);
+    let normalized: []u8 = package_registry_finalize(normalized_body);
+    let valid: i32 = package_registry_index_valid(normalized);
+    _zag_str_free(normalized_body);
+    _zag_str_free(normalized);
+    return valid;
+}
+
+fn package_registry_lookup(index: []u8, name: []u8,
+    requirement: []u8) PackageRegistryLookup {
+    let bad: PackageRegistryLookup = package_registry_bad_lookup(
+        PackageRegistryError.invalid_index);
+    if (package_registry_index_valid(index) == 0) { return bad; }
+    if (package_import_safe_name(name) == 0 ||
+        (requirement.len > 0 && package_version_requirement_valid(requirement) == 0)) {
+        return package_registry_bad_lookup(PackageRegistryError.invalid_query);
+    }
+    let out: PackageRegistryLookup = package_registry_bad_lookup(
+        PackageRegistryError.package_not_found);
+    let line_no: i32 = 3;
+    while (line_no < index.len) {
+        let line: []u8 = package_registry_line(index, line_no);
+        if (line.len == 0 || (line.len >= 9 && @strEq(line[0..9], "checksum="))) {
+            break;
+        }
+        let entry: PackageRegistryEntry = package_registry_entry(line);
+        if (@strEq(entry.name, name) &&
+            (requirement.len == 0 || package_version_satisfies(requirement,
+                entry.version) == 1)) {
+            if (out.found == 0 || package_semver_compare(
+                package_semver_parse(entry.version),
+                package_semver_parse(out.version)) > 0) {
+                out.found = 1; out.name = entry.name; out.version = entry.version;
+                out.source = entry.source; out.checksum = entry.checksum;
+                out.artifact_signature = entry.artifact_signature;
+                out.error = PackageRegistryError.none;
+            }
+        }
+        line_no = line_no + 1;
+    }
+    if (out.found == 0) {
+        let any: i32 = 0; let cursor: i32 = 3;
+        while (cursor < index.len) {
+            let line: []u8 = package_registry_line(index, cursor);
+            if (line.len == 0 || (line.len >= 9 && @strEq(line[0..9], "checksum="))) { break; }
+            let entry: PackageRegistryEntry = package_registry_entry(line);
+            if (@strEq(entry.name, name)) { any = 1; }
+            cursor = cursor + 1;
+        }
+        if (any == 1) { out.error = PackageRegistryError.version_not_found; }
+    }
+    return out;
+}
+
+// Select one highest indexed version that satisfies every requirement in a
+// newline-delimited set.  This is the bounded intersection primitive used by
+// a future graph solver: it does not fetch, rewrite locks, or choose revisions.
+// An empty set retains the ordinary unconstrained lookup behavior.  The input
+// is capped at the index's 256-entry bound and each line must be one complete
+// canonical requirement (no blank lines or trailing newline).
+fn package_registry_lookup_all(index: []u8, name: []u8,
+    requirements: []u8) PackageRegistryLookup {
+    if (requirements.len == 0) {
+        return package_registry_lookup(index, name, "");
+    }
+    if (package_registry_index_valid(index) == 0 ||
+        package_import_safe_name(name) == 0) {
+        return package_registry_bad_lookup(PackageRegistryError.invalid_query);
+    }
+    let requirement_count: i32 = 1;
+    let i: i32 = 0;
+    while (i < requirements.len) {
+        if (requirements[i] == '\n') { requirement_count = requirement_count + 1; }
+        i = i + 1;
+    }
+    if (requirements[requirements.len - 1] == '\n' ||
+        requirement_count > 256) {
+        return package_registry_bad_lookup(PackageRegistryError.invalid_query);
+    }
+    let out: PackageRegistryLookup = package_registry_bad_lookup(
+        PackageRegistryError.package_not_found);
+    let any: i32 = 0;
+    let line_no: i32 = 0;
+    while (line_no < requirement_count) {
+        let line: []u8 = package_registry_line(requirements, line_no);
+        if (line.len == 0 || package_version_requirement_valid(line) == 0) {
+            return package_registry_bad_lookup(PackageRegistryError.invalid_query);
+        }
+        line_no = line_no + 1;
+    }
+    let line_no_index: i32 = 3;
+    while (line_no_index < index.len) {
+        let record: []u8 = package_registry_line(index, line_no_index);
+        if (record.len == 0 || (record.len >= 9 &&
+            @strEq(record[0..9], "checksum="))) { break; }
+        let entry: PackageRegistryEntry = package_registry_entry(record);
+        if (@strEq(entry.name, name)) {
+            let satisfies: i32 = 1;
+            let requirement_no: i32 = 0;
+            while (requirement_no < requirement_count) {
+                let requirement: []u8 = package_registry_line(
+                    requirements, requirement_no);
+                if (package_version_satisfies(requirement, entry.version) == 0) {
+                    satisfies = 0;
+                    break;
+                }
+                requirement_no = requirement_no + 1;
+            }
+            if (satisfies != 0 && (out.found == 0 ||
+                package_semver_compare(package_semver_parse(entry.version),
+                    package_semver_parse(out.version)) > 0)) {
+                out.found = 1; out.name = entry.name; out.version = entry.version;
+                out.source = entry.source; out.checksum = entry.checksum;
+                out.artifact_signature = entry.artifact_signature;
+                out.error = PackageRegistryError.none;
+            }
+            any = 1;
+        }
+        line_no_index = line_no_index + 1;
+    }
+    if (out.found == 0) {
+        if (any != 0) { out.error = PackageRegistryError.version_not_found; }
+        else { out.error = PackageRegistryError.package_not_found; }
+    }
+    return out;
+}

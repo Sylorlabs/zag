@@ -29,6 +29,23 @@ amount to already configured swap. The RAM ceiling remains hard, the stages
 remain sequential, and the selected swap ceiling is printed before compilation.
 This is a workstation-safety escape valve, not a no-swap memory certification.
 
+Each compiler generation is also bounded by
+`ZAG_BOOTSTRAP_STAGE_TIMEOUT_SECONDS` (default `3600`). A timeout fails the
+bootstrap before any generated compiler is installed and identifies the stage
+in the log; set a larger reviewed value only when the current source graph and
+host load justify it.
+
+Long stages emit a bounded progress line with elapsed seconds and the wrapper
+RSS every `ZAG_BOOTSTRAP_HEARTBEAT_SECONDS` (default `30`). The independent
+empty-`PATH` reproducibility gate uses the matching
+`ZAG_SELFHOST_HEARTBEAT_SECONDS` variable and bounds each stage with
+`ZAG_SELFHOST_STAGE_TIMEOUT_SECONDS` (default `3600`). Interrupting either wrapper kills
+its active stage before temporary outputs are removed, so a timed-out or
+cancelled attempt cannot leave an orphaned compiler consuming the workstation.
+The daemon is compiled from the same candidate fixed-point compiler before
+that compiler is installed, so a failed daemon build does not leave a new
+compiler paired with an older planner.
+
 This guard protects routine self-hosting; it is not a peak-memory
 certification. Use the regression harness below for recorded stage-by-stage
 process RSS, cgroup RAM and swap peaks, timeout, and fixpoint evidence.

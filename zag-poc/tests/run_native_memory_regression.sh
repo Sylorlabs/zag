@@ -22,6 +22,7 @@ skip() {
 
 command -v systemd-run >/dev/null 2>&1 || skip "systemd-run is unavailable"
 command -v /usr/bin/time >/dev/null 2>&1 || skip "GNU time is unavailable"
+command -v timeout >/dev/null 2>&1 || skip "timeout(1) is unavailable"
 systemctl --user is-system-running >/dev/null 2>&1 || skip "the user systemd manager is unavailable"
 
 # A cgroup cap at or above physical RAM does not protect an interactive
@@ -73,15 +74,55 @@ if command -v systemctl >/dev/null 2>&1 && ! systemctl is-active --quiet earlyoo
 fi
 
 probe_file=$(mktemp "${TMPDIR:-/tmp}/zag-memory-probe.XXXXXX")
-if ! systemd-run --user --quiet --wait --collect --pipe \
+probe_unit="zag-native-memory-probe-$$-${RANDOM}"
+probe_pid=""
+probe_cleanup() {
+    if [ -n "$probe_unit" ]; then
+        systemctl --user kill --kill-who=all --signal=TERM \
+            "$probe_unit.service" 2>/dev/null || true
+        if ! timeout --foreground 10 systemctl --user stop \
+            "$probe_unit.service" >/dev/null 2>&1; then
+            systemctl --user kill --kill-who=all --signal=KILL \
+                "$probe_unit.service" 2>/dev/null || true
+            timeout --foreground 10 systemctl --user stop \
+                "$probe_unit.service" >/dev/null 2>&1 || true
+        fi
+        probe_unit=""
+    fi
+    if [ -n "$probe_pid" ]; then
+        kill "$probe_pid" 2>/dev/null || true
+        wait "$probe_pid" 2>/dev/null || true
+        probe_pid=""
+    fi
+    if [ -n "$probe_file" ]; then
+        unlink "$probe_file" 2>/dev/null || true
+        probe_file=""
+    fi
+}
+probe_signal() {
+    probe_cleanup
+    exit 130
+}
+trap probe_cleanup EXIT
+trap probe_signal HUP INT TERM
+systemd-run --user --unit="$probe_unit" --quiet --wait --collect --pipe \
     -p Type=exec -p MemoryMax=67108864 -p MemorySwapMax=0 \
+    -p KillMode=control-group -p TimeoutStopSec=5s \
     -p CPUWeight=1 -p IOWeight=1 -p Nice=15 \
-    /usr/bin/time -f 'peak_rss_kib=%M' -o "$probe_file" /usr/bin/true; then
-    unlink "$probe_file"
+    /usr/bin/time -f 'peak_rss_kib=%M' -o "$probe_file" /usr/bin/true &
+probe_pid=$!
+if wait "$probe_pid"; then
+    probe_pid=""
+    probe_unit=""
+else
+    probe_pid=""
+    probe_cleanup
     skip "the user manager cannot enforce memory controls"
 fi
 grep -q '^peak_rss_kib=' "$probe_file" || { unlink "$probe_file"; skip "peak RSS measurement failed"; }
 unlink "$probe_file"
+probe_file=""
+trap - EXIT HUP INT TERM
 
 if [ "${1:-}" = "--probe" ]; then
     echo "native memory gate: supported (no compiler was run)"
@@ -102,7 +143,42 @@ esac
 [ -x "$seed" ] || { echo "native memory gate: seed is not executable: $seed" >&2; exit 1; }
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/zag-native-memory.XXXXXX")
-trap 'find "$tmp" -type f -delete 2>/dev/null || true; rmdir "$tmp/empty-path" "$tmp" 2>/dev/null || true' EXIT HUP INT TERM
+active_unit=""
+active_pid=""
+stop_active_unit() {
+    if [ -z "$active_unit" ]; then
+        return
+    fi
+    # A coordinator signal can interrupt systemd-run --wait before the
+    # transient service has exited. Stop and, if necessary, kill the entire
+    # named unit before removing files shared with the compiler.
+    systemctl --user kill --kill-who=all --signal=TERM \
+        "$active_unit.service" 2>/dev/null || true
+    if ! timeout --foreground 10 systemctl --user stop \
+        "$active_unit.service" >/dev/null 2>&1; then
+        systemctl --user kill --kill-who=all --signal=KILL \
+            "$active_unit.service" 2>/dev/null || true
+        timeout --foreground 10 systemctl --user stop \
+            "$active_unit.service" >/dev/null 2>&1 || true
+    fi
+    active_unit=""
+}
+memory_cleanup() {
+    stop_active_unit
+    if [ -n "$active_pid" ]; then
+        kill "$active_pid" 2>/dev/null || true
+        wait "$active_pid" 2>/dev/null || true
+        active_pid=""
+    fi
+    find "$tmp" -type f -delete 2>/dev/null || true
+    rmdir "$tmp/empty-path" "$tmp" 2>/dev/null || true
+}
+memory_signal() {
+    memory_cleanup
+    exit 130
+}
+trap memory_cleanup EXIT
+trap memory_signal HUP INT TERM
 mkdir "$tmp/empty-path"
 mkdir -p "$(dirname -- "$report")"
 printf 'stage\tprocess_peak_rss_kib\tcgroup_memory_peak_bytes\tcgroup_swap_peak_bytes\tworking_set_peak_kib\tbudget_kib\tlimit_bytes\tswap_limit_bytes\trequested_limit_bytes\tphysical_percent\treserve_bytes\n' >"$report"
@@ -148,15 +224,28 @@ build_stage() {
     label=$3
     metric="$tmp/$label.metric"
     log="$tmp/$label.log"
+    active_unit="zag-native-memory-$$-${label}-${RANDOM}"
 
     echo "native memory gate: running $label (hard limit $limit_bytes bytes)"
-    if ! systemd-run --user --quiet --wait --collect --pipe \
+    systemd-run --user --unit="$active_unit" --quiet --wait --collect --pipe \
         -p Type=exec -p "MemoryMax=$limit_bytes" \
         -p "MemorySwapMax=$swap_limit_bytes" \
+        -p KillMode=control-group -p TimeoutStopSec=5s \
         -p CPUWeight=1 -p IOWeight=1 -p Nice=15 \
         -p "RuntimeMaxSec=$timeout_sec" \
         "$stage_runner" "$compiler" "$source_file" "$output" "$metric" \
-        "$tmp/empty-path" >"$log" 2>&1; then
+        "$tmp/empty-path" >"$log" 2>&1 &
+    active_pid=$!
+    if wait "$active_pid"; then
+        stage_status=0
+        active_pid=""
+        active_unit=""
+    else
+        stage_status=$?
+        active_pid=""
+        stop_active_unit
+    fi
+    if [ "$stage_status" -ne 0 ]; then
         echo "native memory gate: FAIL: $label exceeded a safety bound or compilation failed" >&2
         sed -n '1,40p' "$log" >&2
         return 1

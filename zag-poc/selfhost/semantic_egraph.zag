@@ -1,0 +1,348 @@
+// Bounded equality-saturation substrate for pure scalar regions.
+//
+// This is an analysis/proof component, not an executable optimizer.  It admits
+// bounded i32 or explicitly selected i64 constants, add, subtract, multiply,
+// division, remainder, width-preserving XOR, integer AND, integer OR, and
+// checked signed shifts; the separate bool constructor admits exact pure
+// `not`, eager `and`/`or`, and `eq`/`ne` predicates over constants. The bool
+// operation names are canonical eager ZIR forms (`arith.not`, `arith.andi`,
+// `arith.ori`, and `arith.cmpi` with `eq`/`ne`), not source-level
+// short-circuit control flow. Division/remainder are admitted only when their
+// concrete safety conditions are known. There are no effects, memory regions,
+// calls, overflow policy, or ownership edges in this domain.  A
+// caller must require `saturated==1` and independently validate the source
+// region before using any equivalence.  Unknown operations and budget
+// exhaustion fail closed.
+
+@import("../std/list.zag")
+
+struct ZeNode { op:i32, lhs:i32, rhs:i32, imm:i64 }
+struct ZeClass { parent:i32, rank:i32 }
+struct ZeGraph {
+    nodes:ArrayList[ZeNode],
+    classes:ArrayList[ZeClass],
+    max_nodes:i32,
+    rewrites:i32,
+    iterations:i32,
+    integer_width:i32,
+    valid:i32,
+    saturated:i32,
+}
+
+fn ze_op_const()i32{return 0;}
+fn ze_op_add()i32{return 1;}
+fn ze_op_mul()i32{return 2;}
+fn ze_op_sub()i32{return 3;}
+fn ze_op_div()i32{return 4;}
+fn ze_op_rem()i32{return 5;}
+fn ze_op_not()i32{return 6;}
+fn ze_op_and()i32{return 7;}
+fn ze_op_or()i32{return 8;}
+fn ze_op_eq()i32{return 9;}
+fn ze_op_ne()i32{return 10;}
+fn ze_op_neg()i32{return 11;}
+// Integer XOR is a pure width-preserving operation. It remains in the
+// non-authoritative graph until an independent typed ZIR/native contract is
+// checked by the caller.
+fn ze_op_xor()i32{return 12;}
+// Integer OR is separate from boolean eager OR so the typed integer and bool
+// domains cannot be widened into one another by operation name alone.
+fn ze_op_ior()i32{return 13;}
+// Signed shifts are distinct from the boolean and bitwise domains.  They are
+// admitted only with a concrete, in-range count; left shifts additionally
+// require a proof that the signed result remains representable.
+fn ze_op_shl()i32{return 14;}
+fn ze_op_shr()i32{return 15;}
+fn ze_i32_min()i64{return 0-2147483648;}
+fn ze_i32_max()i64{return 2147483647;}
+fn ze_i64_min()i64{return 0-9223372036854775807-1;}
+fn ze_i64_max()i64{return 9223372036854775807;}
+
+fn ze_graph_new(max_nodes:i32)ZeGraph{
+    if(max_nodes<1||max_nodes>256){return ZeGraph{.nodes=make[ZeNode](1),.classes=make[ZeClass](1),.max_nodes=0,.rewrites=0,.iterations=0,.integer_width=32,.valid=0,.saturated=0};}
+    return ZeGraph{.nodes=make[ZeNode](max_nodes),.classes=make[ZeClass](max_nodes),.max_nodes=max_nodes,.rewrites=0,.iterations=0,.integer_width=32,.valid=1,.saturated=0};
+}
+// The i64 constructor is explicit so a caller cannot accidentally widen an
+// existing i32 proof by changing a literal's host type.  The graph remains
+// pure and non-authoritative; callers still need an independent typed ZIR
+// contract before using an equivalence.
+fn ze_graph_new_i64(max_nodes:i32)ZeGraph{
+    if(max_nodes<1||max_nodes>256){return ZeGraph{.nodes=make[ZeNode](1),.classes=make[ZeClass](1),.max_nodes=0,.rewrites=0,.iterations=0,.integer_width=64,.valid=0,.saturated=0};}
+    return ZeGraph{.nodes=make[ZeNode](max_nodes),.classes=make[ZeClass](max_nodes),.max_nodes=max_nodes,.rewrites=0,.iterations=0,.integer_width=64,.valid=1,.saturated=0};
+}
+// Bool is a deliberately separate domain. It shares bounded graph storage and
+// saturation bookkeeping, but admits only the exact pure predicate operations
+// below; callers must provide a typed bool ZIR contract and a terminal return,
+// so an integer proof cannot be widened by accident.
+fn ze_graph_new_bool(max_nodes:i32)ZeGraph{
+    if(max_nodes<1||max_nodes>256){return ZeGraph{.nodes=make[ZeNode](1),.classes=make[ZeClass](1),.max_nodes=0,.rewrites=0,.iterations=0,.integer_width=1,.valid=0,.saturated=0};}
+    return ZeGraph{.nodes=make[ZeNode](max_nodes),.classes=make[ZeClass](max_nodes),.max_nodes=max_nodes,.rewrites=0,.iterations=0,.integer_width=1,.valid=1,.saturated=0};
+}
+fn ze_graph_free(g:*ZeGraph)void{free[ZeNode](&g.*.nodes);free[ZeClass](&g.*.classes);g.*.valid=0;g.*.saturated=0;}
+
+fn ze_value_min(g:*ZeGraph)i64{return (g.*.integer_width==64) as i64*ze_i64_min()+(g.*.integer_width==1) as i64*0+(g.*.integer_width!=64&&g.*.integer_width!=1) as i64*ze_i32_min();}
+fn ze_value_max(g:*ZeGraph)i64{return (g.*.integer_width==64) as i64*ze_i64_max()+(g.*.integer_width==1) as i64*1+(g.*.integer_width!=64&&g.*.integer_width!=1) as i64*ze_i32_max();}
+fn ze_value_in_range(g:*ZeGraph,value:i64)i32{return (value>=ze_value_min(g)&&value<=ze_value_max(g)) as i32;}
+
+fn ze_bool_binary_op(op:i32)i32{
+    return (op==ze_op_and()||op==ze_op_or()||op==ze_op_eq()||op==ze_op_ne()) as i32;
+}
+fn ze_bool_op(op:i32)i32{return (op==ze_op_not()||ze_bool_binary_op(op)==1) as i32;}
+fn ze_integer_op(op:i32)i32{
+    return (op==ze_op_add()||op==ze_op_mul()||op==ze_op_sub()||op==ze_op_div()||
+        op==ze_op_rem()||op==ze_op_neg()||op==ze_op_xor()||op==ze_op_and()||
+        op==ze_op_ior()||op==ze_op_shl()||op==ze_op_shr()) as i32;
+}
+
+fn ze_shift_width(g:*ZeGraph)i32{return g.*.integer_width;}
+fn ze_shift_left_value(g:*ZeGraph,value:i64,count:i64,result:*i64)i32{
+    let width:i32=ze_shift_width(g);
+    // Compare in the original i64 domain. Narrowing first lets values such
+    // as 2147483648 wrap negative and accidentally pass the width check.
+    if((width!=32&&width!=64)||count<0||count>=(width as i64)||ze_value_in_range(g,value)==0){return -1;}
+    let current:i64=value;let step:i32=0;
+    // Repeated checked doubling avoids constructing 1<<63 and therefore never
+    // relies on signed host shifts or overflowing intermediate expressions.
+    while(step<(count as i32)){
+        let minimum:i64=ze_value_min(g);let maximum:i64=ze_value_max(g);
+        if(current<minimum/2||current>maximum/2){return -1;}
+        current=current*2;step=step+1;
+    }
+    result.*=current;return 1;
+}
+fn ze_shift_right_value(g:*ZeGraph,value:i64,count:i64,result:*i64)i32{
+    let width:i32=ze_shift_width(g);
+    // Keep the count wide until after the bound check; an i64 count must not
+    // be narrowed to i32 before rejecting values outside the shift domain.
+    if((width!=32&&width!=64)||count<0||count>=(width as i64)||ze_value_in_range(g,value)==0){return -1;}
+    let current:i64=value;let step:i32=0;
+    // Signed division truncates toward zero.  Correct the negative odd case
+    // to obtain arithmetic (flooring) shift semantics without >> on negatives.
+    while(step<(count as i32)){
+        let quotient:i64=current/2;let remainder:i64=current%2;
+        if(current<0&&remainder!=0){current=quotient-1;}else{current=quotient;}
+        step=step+1;
+    }
+    result.*=current;return 1;
+}
+
+// Evaluate a concrete operation without ever executing a signed-overflowing
+// host expression.  This keeps the wider i64 proof valid on targets whose
+// native arithmetic traps or wraps differently.
+fn ze_binary_value(g:*ZeGraph,op:i32,a:i64,b:i64,result:*i64)i32{
+    if(g.*.integer_width==1){
+        if(ze_value_in_range(g,a)==0||ze_value_in_range(g,b)==0||
+           ze_bool_binary_op(op)==0){return 0;}
+        if(op==ze_op_and()){result.*=(a==1&&b==1) as i64;return 1;}
+        if(op==ze_op_or()){result.*=(a==1||b==1) as i64;return 1;}
+        if(op==ze_op_eq()){result.*=(a==b) as i64;return 1;}
+        if(op==ze_op_ne()){result.*=(a!=b) as i64;return 1;}
+        return 0;
+    }
+    let minimum:i64=ze_value_min(g);let maximum:i64=ze_value_max(g);
+    if(op==ze_op_add()){
+        if((b>0&&a>maximum-b)||(b<0&&a<minimum-b)){return -1;}
+        result.*=a+b;return 1;
+    }
+    if(op==ze_op_sub()){
+        if((b>0&&a<minimum+b)||(b<0&&a>maximum+b)){return -1;}
+        result.*=a-b;return 1;
+    }
+    if(op==ze_op_mul()){
+        if(a==0||b==0){result.*=0;return 1;}
+        if(a==0-1){if(b==minimum){return -1;}result.*=0-b;return 1;}
+        if(b==0-1){if(a==minimum){return -1;}result.*=0-a;return 1;}
+        if(a>0){if(b>0&&a>maximum/b){return -1;}if(b<0&&b<minimum/a){return -1;}}
+        else if(b>0){if(a<minimum/b){return -1;}}
+        else if(a<maximum/b){return -1;}
+        result.*=a*b;return 1;
+    }
+    if(op==ze_op_div()||op==ze_op_rem()){
+        if(b==0||(a==minimum&&b==0-1)){return -1;}
+        if(op==ze_op_div()){result.*=a/b;}else{result.*=a%b;}
+        return 1;
+    }
+    if(op==ze_op_xor()){
+        result.*=a^b;return (ze_value_in_range(g,result.*)==1) as i32;
+    }
+    if(op==ze_op_and()){
+        result.*=a&b;return (ze_value_in_range(g,result.*)==1) as i32;
+    }
+    if(op==ze_op_ior()){
+        result.*=a|b;return (ze_value_in_range(g,result.*)==1) as i32;
+    }
+    if(op==ze_op_shl()){return ze_shift_left_value(g,a,b,result);}
+    if(op==ze_op_shr()){return ze_shift_right_value(g,a,b,result);}
+    return 0;
+}
+
+fn ze_unary_value(g:*ZeGraph,op:i32,a:i64,result:*i64)i32{
+    if(ze_value_in_range(g,a)==0){return 0;}
+    if(op==ze_op_not()){
+        if(g.*.integer_width!=1){return 0;}
+        result.*=(a==0) as i64;return 1;
+    }
+    if(op==ze_op_neg()){
+        if(g.*.integer_width==1||a==ze_value_min(g)){return 0;}
+        result.*=0-a;return 1;
+    }
+    return 0;
+}
+
+fn ze_find(g:*ZeGraph,id:i32)i32{
+    if(id<0||id>=g.*.classes.len){return -1;}
+    let root:i32=id;
+    while(g.*.classes.data[root].parent!=root){root=g.*.classes.data[root].parent;}
+    let cur:i32=id;
+    while(g.*.classes.data[cur].parent!=cur){let next:i32=g.*.classes.data[cur].parent;g.*.classes.data[cur].parent=root;cur=next;}
+    return root;
+}
+fn ze_union(g:*ZeGraph,left:i32,right:i32)i32{
+    let a:i32=ze_find(g,left);let b:i32=ze_find(g,right);if(a<0||b<0){g.*.valid=0;return 0;}if(a==b){return 0;}
+    if(g.*.classes.data[a].rank<g.*.classes.data[b].rank){g.*.classes.data[a].parent=b;}
+    else if(g.*.classes.data[a].rank>g.*.classes.data[b].rank){g.*.classes.data[b].parent=a;}
+    else{g.*.classes.data[b].parent=a;g.*.classes.data[a].rank=g.*.classes.data[a].rank+1;}
+    return 1;
+}
+fn ze_const_in_class(g:*ZeGraph,id:i32,value:*i64)i32{
+    let root:i32=ze_find(g,id);if(root<0){return 0;}let i:i32=0;
+    while(i<g.*.nodes.len){if(ze_find(g,i)==root&&g.*.nodes.data[i].op==ze_op_const()){value.*=g.*.nodes.data[i].imm;return 1;}i=i+1;}
+    return 0;
+}
+fn ze_add_node(g:*ZeGraph,op:i32,lhs:i32,rhs:i32,imm:i64)i32{
+    // Operation IDs are deliberately shared for boolean and integer AND,
+    // but every other domain-specific ID must be rejected at graph ingress.
+    // Range checks alone would let a bool-only predicate enter an integer
+    // graph (or arithmetic enter a bool graph) before saturation.
+    if(g.*.valid==0||g.*.saturated==1||op<ze_op_const()||
+       (op!=ze_op_const()&&((g.*.integer_width==1&&ze_bool_op(op)==0)||
+                            (g.*.integer_width!=1&&ze_integer_op(op)==0)))){g.*.valid=0;return -1;}
+    if(op==ze_op_const()){
+        if(ze_value_in_range(g,imm)==0){g.*.valid=0;return -1;}
+    }else{
+        let unary:i32=(op==ze_op_not()||op==ze_op_neg()) as i32;
+        if(lhs<0||ze_find(g,lhs)<0||(unary==0&&(rhs<0||ze_find(g,rhs)<0))||
+           (unary==1&&rhs!=-1)){g.*.valid=0;return -1;}
+        lhs=ze_find(g,lhs);if(unary==0){rhs=ze_find(g,rhs);}
+        // Addition and multiplication are commutative in this deliberately
+        // pure domain. Canonical operand order makes construction deterministic.
+        // Subtraction, division, and remainder retain operand order.
+        if((op==ze_op_add()||op==ze_op_mul()||op==ze_op_and()||op==ze_op_xor()||op==ze_op_ior()||
+            (g.*.integer_width==1&&ze_bool_binary_op(op)==1))&&lhs>rhs){let swap:i32=lhs;lhs=rhs;rhs=swap;}
+        // Do not admit a statically-provable trap or signed-overflow edge.
+        // Composed constants are checked again during saturation after their
+        // classes have acquired constant representatives.
+        if(g.*.integer_width==1){
+            if(ze_bool_op(op)==0){g.*.valid=0;return -1;}
+            if(op==ze_op_not()||op==ze_op_neg()){
+                let value:i64=0;if(ze_const_in_class(g,lhs,&value)==1&&ze_unary_value(g,op,value,&value)==0){g.*.valid=0;return -1;}
+            }else{
+                let a:i64=0;let b:i64=0;
+                if(ze_const_in_class(g,lhs,&a)==1&&ze_const_in_class(g,rhs,&b)==1){let value:i64=0;if(ze_binary_value(g,op,a,b,&value)==0){g.*.valid=0;return -1;}}
+            }
+        }else if(op==ze_op_neg()){
+            let value:i64=0;
+            if(ze_const_in_class(g,lhs,&value)==1&&ze_unary_value(g,op,value,&value)==0){g.*.valid=0;return -1;}
+        }else if(op==ze_op_div()||op==ze_op_rem()){
+            let divisor:i64=0;let numerator:i64=0;
+            if(ze_const_in_class(g,rhs,&divisor)==1&&divisor==0){g.*.valid=0;return -1;}
+            if(ze_const_in_class(g,lhs,&numerator)==1&&ze_const_in_class(g,rhs,&divisor)==1&&numerator==ze_value_min(g)&&divisor==0-1){g.*.valid=0;return -1;}
+        }else if(op==ze_op_add()||op==ze_op_sub()||op==ze_op_mul()||op==ze_op_xor()||op==ze_op_and()||op==ze_op_ior()){
+            let a:i64=0;let b:i64=0;let concrete:i32=(ze_const_in_class(g,lhs,&a)==1&&ze_const_in_class(g,rhs,&b)==1) as i32;
+            if(concrete==1){let result:i64=0;if(ze_binary_value(g,op,a,b,&result)<0){g.*.valid=0;return -1;}}
+        }else if(op==ze_op_shl()||op==ze_op_shr()){
+            // A dynamic count is outside this bounded proof domain.  Requiring
+            // a constant representative also makes [0,width) checkable before
+            // saturation and keeps malformed shifts fail-closed.
+            let count:i64=0;if(ze_const_in_class(g,rhs,&count)==0){g.*.valid=0;return -1;}
+            let value:i64=0;if(ze_const_in_class(g,lhs,&value)==1){let result:i64=0;if(ze_binary_value(g,op,value,count,&result)<0){g.*.valid=0;return -1;}}
+        }
+    }
+    let i:i32=0;while(i<g.*.nodes.len){let n:ZeNode=g.*.nodes.data[i];
+        if(n.op==op&&n.imm==imm){
+            if(op==ze_op_const()||
+               ((op==ze_op_not()||op==ze_op_neg())&&ze_find(g,n.lhs)==lhs)||
+               (op!=ze_op_const()&&op!=ze_op_not()&&op!=ze_op_neg()&&
+                ze_find(g,n.lhs)==lhs&&ze_find(g,n.rhs)==rhs)){return ze_find(g,i);}
+        }
+        i=i+1;
+    }
+    if(g.*.nodes.len>=g.*.max_nodes){g.*.valid=0;return -1;}
+    let id:i32=g.*.nodes.len;push[ZeNode](&g.*.nodes,ZeNode{.op=op,.lhs=lhs,.rhs=rhs,.imm=imm});push[ZeClass](&g.*.classes,ZeClass{.parent=id,.rank=0});return id;
+}
+fn ze_add_const(g:*ZeGraph,value:i64)i32{return ze_add_node(g,ze_op_const(),-1,-1,value);}
+fn ze_add_binary(g:*ZeGraph,op:i32,lhs:i32,rhs:i32)i32{return ze_add_node(g,op,lhs,rhs,0);}
+fn ze_add_unary(g:*ZeGraph,op:i32,value:i32)i32{return ze_add_node(g,op,value,-1,0);}
+
+fn ze_fold_pair(g:*ZeGraph,root:i32,left:i32,right:i32,op:i32)i32{
+    let a:i64=0;let b:i64=0;if(ze_const_in_class(g,left,&a)==0||ze_const_in_class(g,right,&b)==0){return 0;}
+    let value:i64=0;
+    let evaluated:i32=ze_binary_value(g,op,a,b,&value);if(evaluated<=0){if(evaluated<0){g.*.valid=0;return -1;}return 0;}
+    let folded:i32=ze_add_const(g,value);if(folded<0){return 0;}return ze_union(g,root,folded);
+}
+fn ze_fold_unary(g:*ZeGraph,root:i32,value_id:i32,op:i32)i32{
+    let value:i64=0;if(ze_const_in_class(g,value_id,&value)==0){return 0;}
+    let result:i64=0;let evaluated:i32=ze_unary_value(g,op,value,&result);
+    if(evaluated<=0){if(evaluated<0){g.*.valid=0;}return 0;}
+    let folded:i32=ze_add_const(g,result);if(folded<0){return 0;}return ze_union(g,root,folded);
+}
+fn ze_saturate(g:*ZeGraph)i32{
+    if(g.*.valid==0||g.*.nodes.len==0){return 0;}
+    let changed:i32=1;let rounds:i32=0;
+    while(changed==1&&rounds<16&&g.*.valid==1){changed=0;let snapshot:i32=g.*.nodes.len;let i:i32=0;
+        while(i<snapshot&&g.*.valid==1){let n:ZeNode=g.*.nodes.data[i];let root:i32=ze_find(g,i);
+            if((n.op==ze_op_not()&&g.*.integer_width==1)||
+               (n.op==ze_op_neg()&&g.*.integer_width!=1)){
+                let left:i32=ze_find(g,n.lhs);let folded:i32=ze_fold_unary(g,root,left,n.op);
+                if(folded<0){g.*.valid=0;}else if(folded==1){changed=1;}
+            }else if(n.op==ze_op_add()||n.op==ze_op_sub()||n.op==ze_op_mul()||n.op==ze_op_div()||n.op==ze_op_rem()||n.op==ze_op_xor()||n.op==ze_op_ior()||n.op==ze_op_shl()||n.op==ze_op_shr()||
+                     (g.*.integer_width!=1&&n.op==ze_op_and())||
+                     (g.*.integer_width==1&&ze_bool_binary_op(n.op)==1)){
+                let left:i32=ze_find(g,n.lhs);let right:i32=ze_find(g,n.rhs);let zero:i64=0;let one:i64=0;
+                if(n.op==ze_op_and()&&ze_const_in_class(g,right,&zero)==1&&zero==0){if(ze_union(g,root,right)==1){changed=1;}}
+                else if(n.op==ze_op_and()&&ze_const_in_class(g,left,&zero)==1&&zero==0){if(ze_union(g,root,left)==1){changed=1;}}
+                // `x & 1 == x` and boolean OR identities are one-bit-only.
+                // The integer AND zero identity above remains width-safe;
+                // omit the wider `& 1` claim rather than treating integers as
+                // booleans.
+                else if(g.*.integer_width==1&&n.op==ze_op_and()&&ze_const_in_class(g,right,&one)==1&&one==1){if(ze_union(g,root,left)==1){changed=1;}}
+                else if(g.*.integer_width==1&&n.op==ze_op_and()&&ze_const_in_class(g,left,&one)==1&&one==1){if(ze_union(g,root,right)==1){changed=1;}}
+                else if(g.*.integer_width==1&&n.op==ze_op_or()&&ze_const_in_class(g,right,&one)==1&&one==1){if(ze_union(g,root,right)==1){changed=1;}}
+                else if(g.*.integer_width==1&&n.op==ze_op_or()&&ze_const_in_class(g,left,&one)==1&&one==1){if(ze_union(g,root,left)==1){changed=1;}}
+                else if(g.*.integer_width==1&&n.op==ze_op_or()&&ze_const_in_class(g,right,&zero)==1&&zero==0){if(ze_union(g,root,left)==1){changed=1;}}
+                else if(g.*.integer_width==1&&n.op==ze_op_or()&&ze_const_in_class(g,left,&zero)==1&&zero==0){if(ze_union(g,root,right)==1){changed=1;}}
+                else if(n.op==ze_op_ior()&&ze_const_in_class(g,right,&zero)==1&&zero==0){if(ze_union(g,root,left)==1){changed=1;}}
+                else if(n.op==ze_op_ior()&&ze_const_in_class(g,left,&zero)==1&&zero==0){if(ze_union(g,root,right)==1){changed=1;}}
+                // Bitwise XOR and signed shifts are pure width-preserving
+                // operations in this graph.  Their zero-count/zero-operand
+                // identities are safe only after the typed domain and
+                // concrete shift bounds were admitted at graph ingress.
+                else if(n.op==ze_op_xor()&&ze_const_in_class(g,right,&zero)==1&&zero==0){if(ze_union(g,root,left)==1){changed=1;}}
+                else if(n.op==ze_op_xor()&&ze_const_in_class(g,left,&zero)==1&&zero==0){if(ze_union(g,root,right)==1){changed=1;}}
+                else if((n.op==ze_op_shl()||n.op==ze_op_shr())&&ze_const_in_class(g,right,&zero)==1&&zero==0){if(ze_union(g,root,left)==1){changed=1;}}
+                else if(n.op==ze_op_eq()||n.op==ze_op_ne()){
+                    if(ze_find(g,left)==ze_find(g,right)){
+                        let value:i64=(n.op==ze_op_eq()) as i64;let folded:i32=ze_add_const(g,value);
+                        if(folded>=0&&ze_union(g,root,folded)==1){changed=1;}
+                    }else{let folded:i32=ze_fold_pair(g,root,left,right,n.op);if(folded<0){g.*.valid=0;}else if(folded==1){changed=1;}}
+                }
+                else if(n.op==ze_op_add()&&ze_const_in_class(g,right,&zero)==1&&zero==0){if(ze_union(g,root,left)==1){changed=1;}}
+                else if(n.op==ze_op_add()&&ze_const_in_class(g,left,&zero)==1&&zero==0){if(ze_union(g,root,right)==1){changed=1;}}
+                else if(n.op==ze_op_sub()&&ze_const_in_class(g,right,&zero)==1&&zero==0){if(ze_union(g,root,left)==1){changed=1;}}
+                else if(n.op==ze_op_sub()&&ze_find(g,left)==ze_find(g,right)){let zero_id:i32=ze_add_const(g,0);if(zero_id>=0&&ze_union(g,root,zero_id)==1){changed=1;}}
+                else if(n.op==ze_op_mul()&&ze_const_in_class(g,right,&one)==1&&one==1){if(ze_union(g,root,left)==1){changed=1;}}
+                else if(n.op==ze_op_mul()&&ze_const_in_class(g,left,&one)==1&&one==1){if(ze_union(g,root,right)==1){changed=1;}}
+                else if(n.op==ze_op_mul()&&ze_const_in_class(g,left,&zero)==1&&zero==0){if(ze_union(g,root,left)==1){changed=1;}}
+                else if(n.op==ze_op_mul()&&ze_const_in_class(g,right,&zero)==1&&zero==0){if(ze_union(g,root,right)==1){changed=1;}}
+                else{let folded:i32=ze_fold_pair(g,root,left,right,n.op);if(folded<0){g.*.valid=0;}else if(folded==1){changed=1;}}
+            }
+            i=i+1;
+        }
+        if(changed==1){g.*.rewrites=g.*.rewrites+1;}
+        rounds=rounds+1;
+    }
+    g.*.iterations=rounds;g.*.saturated=(changed==0&&g.*.valid==1) as i32;return g.*.saturated;
+}
+fn ze_equivalent(g:*ZeGraph,left:i32,right:i32)i32{return (g.*.valid==1&&g.*.saturated==1&&ze_find(g,left)>=0&&ze_find(g,left)==ze_find(g,right)) as i32;}
+fn ze_equivalent_before_saturation(g:*ZeGraph,left:i32,right:i32)i32{return (g.*.valid==1&&ze_find(g,left)>=0&&ze_find(g,left)==ze_find(g,right)) as i32;}
+fn ze_class_value(g:*ZeGraph,id:i32,value:*i64)i32{return (g.*.valid==1&&ze_const_in_class(g,id,value)==1) as i32;}

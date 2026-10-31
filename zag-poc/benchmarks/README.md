@@ -1,5 +1,11 @@
 # Zag Script benchmark protocol
 
+The cross-language compiler comparison is a separate bounded protocol. Run
+`benchmarks/run_compiler_comparison.sh`; its fixtures, methodology, result
+schema, and interpretation limits are documented in
+[`compiler-comparison/README.md`](compiler-comparison/README.md). It does not
+replace the Zag Script/zagd protocol below.
+
 Run `RUNS=30 benchmarks/run_zagscript.sh` from a clean checkout. Results are
 written beneath `benchmarks/results/`, which is intentionally not source
 evidence and should not be committed without review.

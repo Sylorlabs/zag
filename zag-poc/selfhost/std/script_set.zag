@@ -1,0 +1,269 @@
+@import("std:script_map")
+
+// Bounded Script-owned homogeneous i32 set.
+//
+// The compact profile exposes this as set()/set_add()/set_has()/set_del().
+// Backing arrays and all growth generations belong to ScriptContext; there is
+// no per-entry free operation and malformed descriptors fail closed.
+
+struct ScriptSetI32 {
+    keys: *i32,
+    used: *u8,
+    cap: i32,
+    count: i32,
+    tombstones: i32,
+    context: *opaque,
+    failed: i32,
+}
+
+fn script_set_valid(set: ScriptSetI32) bool {
+    // Reject malformed descriptors before scanning backing storage. The
+    // constructor starts at eight slots and rehashes by doubling, so a valid
+    // table always has a bounded power-of-two capacity and Script context.
+    unsafe {
+        if (set.failed != 0 || set.context == null as *opaque ||
+            set.cap < 8 || set.cap > 1048576 ||
+            (set.cap & (set.cap - 1)) != 0 ||
+            set.count < 0 || set.count > set.cap || set.tombstones < 0 ||
+            set.tombstones > set.cap - set.count ||
+            set.keys == null as *i32 || set.used == null as *u8) {
+            return false;
+        }
+    }
+    let live: i32 = 0;
+    let tombstones: i32 = 0;
+    let i: i32 = 0;
+    while (i < set.cap) {
+        if (set.used[i] == 1) { live = live + 1; }
+        else if (set.used[i] == 2) { tombstones = tombstones + 1; }
+        else if (set.used[i] != 0) { return false; }
+        i = i + 1;
+    }
+    return live == set.count && tombstones == set.tombstones;
+}
+
+fn script_set_new(context: *opaque) ScriptSetI32 {
+    let cap: i32 = 8;
+    // Do not pass a null owner into the context allocator.  The returned
+    // descriptor is deliberately inspectable and failed, matching the map
+    // constructor's fail-closed contract.
+    let null_context: i32 = 0;
+    unsafe {
+        if (context == null as *opaque) { null_context = 1; }
+    }
+    if (null_context != 0) {
+        return ScriptSetI32{.keys = null as *i32, .used = null as *u8,
+            .cap = cap, .count = 0, .tombstones = 0,
+            .context = context, .failed = 1};
+    }
+    let keys: *i32 = _zag_script_alloc(context,
+        (cap as i64) * (@sizeOf[i32]() as i64)) as *i32;
+    let used: *u8 = _zag_script_alloc(context, cap as i64) as *u8;
+    let failed: i32 = (keys == null as *i32 || used == null as *u8) as i32;
+    let result: ScriptSetI32 = ScriptSetI32{.keys = keys, .used = used,
+        .cap = cap, .count = 0, .tombstones = 0, .context = context,
+        .failed = failed};
+    if (failed != 0) { return result; }
+    let i: i32 = 0;
+    while (i < cap) { used[i] = 0; i = i + 1; }
+    return result;
+}
+
+fn script_set_rehash(set: *ScriptSetI32, next_cap: i32) i32 {
+    unsafe {
+        if (set == null as *ScriptSetI32) { return 1; }
+    }
+    if (!script_set_valid(set.*) || next_cap < 8 || next_cap > 1048576 ||
+        (next_cap & (next_cap - 1)) != 0 ||
+        next_cap < set.*.count * 2) {
+        set.*.failed = 1; return 1;
+    }
+    let keys: *i32 = _zag_script_alloc(set.*.context,
+        (next_cap as i64) * (@sizeOf[i32]() as i64)) as *i32;
+    let used: *u8 = _zag_script_alloc(set.*.context, next_cap as i64) as *u8;
+    if (keys == null as *i32 || used == null as *u8) {
+        set.*.failed = 1; return 1;
+    }
+    let i: i32 = 0;
+    while (i < next_cap) { used[i] = 0; i = i + 1; }
+    i = 0;
+    while (i < set.*.cap) {
+        if (set.*.used[i] == 1) {
+            let key: i32 = set.*.keys[i];
+            let slot: i32 = (key & 2147483647) % next_cap;
+            let probes: i32 = 0;
+            while (probes < next_cap && used[slot] != 0) {
+                slot = slot + 1; if (slot >= next_cap) { slot = 0; }
+                probes = probes + 1;
+            }
+            if (probes >= next_cap) { set.*.failed = 1; return 1; }
+            keys[slot] = key; used[slot] = 1;
+        }
+        i = i + 1;
+    }
+    set.*.keys = keys; set.*.used = used; set.*.cap = next_cap;
+    set.*.tombstones = 0;
+    return 0;
+}
+
+fn script_set_add(set: *ScriptSetI32, key: i32) i32 {
+    unsafe {
+        if (set == null as *ScriptSetI32) { return 1; }
+    }
+    if (!script_set_valid(set.*)) { set.*.failed = 1; return 1; }
+    let slot: i32 = (key & 2147483647) % set.*.cap;
+    let first_tombstone: i32 = -1;
+    let probes: i32 = 0;
+    while (probes < set.*.cap && set.*.used[slot] != 0) {
+        if (set.*.used[slot] == 1 && set.*.keys[slot] == key) { return 2; }
+        if (set.*.used[slot] == 2 && first_tombstone < 0) { first_tombstone = slot; }
+        slot = slot + 1; if (slot >= set.*.cap) { slot = 0; }
+        probes = probes + 1;
+    }
+    if (first_tombstone >= 0) {
+        slot = first_tombstone; probes = 0;
+    } else if ((set.*.count + set.*.tombstones + 1) * 10 >= set.*.cap * 7) {
+        if (script_set_rehash(set, set.*.cap * 2) != 0) { return 1; }
+        slot = (key & 2147483647) % set.*.cap; probes = 0;
+        while (probes < set.*.cap && set.*.used[slot] != 0) {
+            slot = slot + 1; if (slot >= set.*.cap) { slot = 0; }
+            probes = probes + 1;
+        }
+    }
+    if (probes >= set.*.cap) { set.*.failed = 1; return 1; }
+    set.*.keys[slot] = key; set.*.used[slot] = 1;
+    set.*.count = set.*.count + 1;
+    if (first_tombstone >= 0) { set.*.tombstones = set.*.tombstones - 1; }
+    return 0;
+}
+
+fn script_set_has(set: ScriptSetI32, key: i32) bool {
+    if (!script_set_valid(set)) { return false; }
+    let slot: i32 = (key & 2147483647) % set.cap;
+    let probes: i32 = 0;
+    while (probes < set.cap && set.used[slot] != 0) {
+        if (set.used[slot] == 1 && set.keys[slot] == key) { return true; }
+        slot = slot + 1; if (slot >= set.cap) { slot = 0; }
+        probes = probes + 1;
+    }
+    return false;
+}
+
+fn script_set_del(set: *ScriptSetI32, key: i32) i32 {
+    unsafe {
+        if (set == null as *ScriptSetI32) { return 1; }
+    }
+    if (!script_set_valid(set.*)) { set.*.failed = 1; return 1; }
+    let slot: i32 = (key & 2147483647) % set.*.cap;
+    let probes: i32 = 0;
+    while (probes < set.*.cap && set.*.used[slot] != 0) {
+        if (set.*.used[slot] == 1 && set.*.keys[slot] == key) {
+            set.*.used[slot] = 2; set.*.count = set.*.count - 1;
+            set.*.tombstones = set.*.tombstones + 1; return 0;
+        }
+        slot = slot + 1; if (slot >= set.*.cap) { slot = 0; }
+        probes = probes + 1;
+    }
+    return 1;
+}
+
+// Clear all visible entries while retaining the ScriptContext-owned table
+// arrays. Validate the complete bounded descriptor before touching any slot
+// so malformed or forged descriptors fail closed without a partial scrub.
+// Integer keys are zeroed for every retained slot, including tombstones.
+fn script_set_clear(set: *ScriptSetI32) i32 {
+    unsafe {
+    // Raw compound-pointer null comparison is an explicitly unsafe boundary
+    // in strict Zag; return before dereferencing a null target.
+    unsafe {
+        if (set == null as *ScriptSetI32) { return 1; }
+    }
+    if (set.*.failed != 0 || set.*.context == null as *opaque ||
+        set.*.cap < 8 || set.*.cap > 1048576 ||
+        (set.*.cap & (set.*.cap - 1)) != 0 ||
+        set.*.count < 0 || set.*.count > set.*.cap ||
+        set.*.tombstones < 0 ||
+        set.*.tombstones > set.*.cap - set.*.count ||
+        set.*.keys == null as *i32 || set.*.used == null as *u8) {
+        set.*.failed = 1;
+        return 1;
+    }
+    // Validate all state bytes and reconcile descriptor counts before writes.
+    let check: i32 = 0;
+    let live: i32 = 0;
+    let tombstones: i32 = 0;
+    while (check < set.*.cap) {
+        if (set.*.used[check] > 2) {
+            set.*.failed = 1;
+            return 1;
+        }
+        if (set.*.used[check] == 1) { live = live + 1; }
+        else if (set.*.used[check] == 2) { tombstones = tombstones + 1; }
+        check = check + 1;
+    }
+    if (live != set.*.count || tombstones != set.*.tombstones) {
+        set.*.failed = 1;
+        return 1;
+    }
+    let i: i32 = 0;
+    while (i < set.*.cap) {
+        set.*.keys[i] = 0;
+        set.*.used[i] = 0;
+        i = i + 1;
+    }
+    set.*.count = 0;
+    set.*.tombstones = 0;
+    return 0;
+    }
+}
+
+fn script_set_len(set: ScriptSetI32) i32 {
+    if (!script_set_valid(set)) { return 0; }
+    return set.count;
+}
+
+fn script_set_failed(set: ScriptSetI32) i32 { return set.failed; }
+
+// A text-key set reuses the independently checked ScriptMapText storage
+// contract with an empty retained value.  This keeps key copying, hashing,
+// tombstone reuse, descriptor validation, and ScriptContext accounting in one
+// authority instead of creating a second byte-map implementation.  The empty
+// value is never exposed: this facade is a set, not a dynamic-value map.
+struct ScriptSetText {
+    map: ScriptMapText,
+}
+
+fn script_set_text_new(context: *opaque) ScriptSetText {
+    return ScriptSetText{.map = script_map_text_new(context)};
+}
+
+fn script_set_text_add(set: *ScriptSetText, key: @borrows []u8) i32 {
+    if (set == null as *ScriptSetText) { return 1; }
+    if (script_map_text_failed(set.*.map) != 0) { return 1; }
+    if (script_map_text_has(set.*.map, key)) { return 2; }
+    return script_map_text_put(&set.*.map, key, "");
+}
+
+fn script_set_text_has(set: @borrows ScriptSetText,
+    key: @borrows []u8) bool {
+    return script_map_text_failed(set.map) == 0 &&
+        script_map_text_has(set.map, key);
+}
+
+fn script_set_text_len(set: @borrows ScriptSetText) i32 {
+    return script_map_text_len(set.map);
+}
+
+fn script_set_text_failed(set: @borrows ScriptSetText) i32 {
+    return script_map_text_failed(set.map);
+}
+
+fn script_set_text_del(set: *ScriptSetText, key: @borrows []u8) i32 {
+    if (set == null as *ScriptSetText) { return 1; }
+    return script_map_text_del(&set.*.map, key);
+}
+
+fn script_set_text_clear(set: *ScriptSetText) i32 {
+    if (set == null as *ScriptSetText) { return 1; }
+    return script_map_text_clear(&set.*.map);
+}

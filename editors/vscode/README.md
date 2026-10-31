@@ -2,7 +2,16 @@
 
 Syntax highlighting, diagnostics, completion, hover, and go to definition for Zag.
 
-## Requirements
+## Release installation
+
+Install the `zag-lang.vsix` attached to a Zag release, then ensure `zag-lsp` is
+on `PATH`. `sudo make install` from `zag-poc/` installs the language server.
+
+```sh
+code --install-extension zag-lang.vsix
+```
+
+## Building the client from source
 
 VS Code 1.85 or later, and the Zag LSP binary on your PATH.
 
@@ -16,15 +25,17 @@ cp zag-lsp ~/.local/bin/
 
 If the binary lives somewhere else, set `zag.serverPath` in VS Code settings.
 
-## Install the extension
+The repository pins the client build through `package-lock.json`; no global
+`vsce` install is required:
 
 ```sh
 cd editors/vscode
-npm install
-npm run compile
-vsce package
-code --install-extension zag-lang-0.1.0.vsix
+npm ci
+npm run install:local
 ```
+
+Node.js is required only to rebuild the VS Code client. It is not a Zag
+compiler, bootstrap, or application dependency.
 
 ## Settings
 

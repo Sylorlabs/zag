@@ -83,6 +83,19 @@ used again. `tests/run_x86_thread_spawn.sh` uses `strace -f` to observe actual
 rejecting safe-scope spawn/join, wrong worker/handle shapes, `@pure` use, and
 an unjoined handle.
 
+The language now has a deliberately narrow `async fn(i64) i64`,
+`await(handle)`, and explicit `cancel(handle)` spelling over the TaskI64 ABI.
+It requires an explicit unsafe
+boundary and exact captureless worker signature; it is not a scheduler,
+generic future/result type, or automatic cancellation propagation. Fresh native
+evidence is collected separately by `tests/run_async_surface.sh` and
+`tests/run_task_i64_library.sh`; the latter also proves non-consuming
+result-state polling and an explicit borrow-only parent-to-child cancellation
+poll before the one consuming await, plus a bounded consuming
+`TaskI64JoinResult` status/value handoff. Those gates
+passes for the bounded Linux x86-64 spelling, so the language row is partial
+while the general contract remains unavailable.
+
 This is not a general atomic or concurrency API: `AtomicI64` is only a bounded
 native storage primitive; there are no general atomic types, pointer/aggregate worker arguments or returns, detach, mutexes, condition variables, TLS,
 or race detector. The raw

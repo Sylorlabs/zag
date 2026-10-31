@@ -160,6 +160,215 @@ fn process_run_bounded_internal(context: *opaque, scripted: i32, command: []u8, 
     }
 }
 
+// Run one executable directly with a bounded borrowed argument vector.  This
+// is deliberately separate from process_run_bounded: the latter is an
+// explicit shell boundary, while this function never interprets argument
+// bytes as shell syntax.  The executable path and every argument are copied
+// into a private NUL-terminated storage block before fork, then passed to
+// execve as argv[0..n].  The direct syscall deliberately passes a null envp,
+// so the child receives an empty environment.  Callers that require ambient
+// environment setup must make that policy explicit (or use the separate shell
+// boundary); this API never silently imports process environment state.
+//
+// Bounds are intentionally small and target-specific: at most 31 arguments,
+// 4095 bytes per path/argument, and 64 KiB of combined copied argv bytes.
+// The same monotonic timeout, process-group kill, stdout cap, and typed result
+// ABI as process_run_bounded are retained.  This is not PATH lookup, shell
+// expansion, stderr capture, stdin transport, or a general supervisor.
+fn process_run_argv_internal(context: *opaque, scripted: i32,
+    executable: []u8, argument_data: @borrows *[]u8, argument_len: i32,
+    timeout_ms: i64, max_output: i64) ProcessResult {
+    unsafe {
+    if (timeout_ms < 1 || max_output < 1 || max_output > 1048576 ||
+        executable.len <= 0 || executable.len > 4095 || argument_len < 0 ||
+        argument_len > 31 ||
+        (argument_len > 0 && argument_data == null as *[]u8)) {
+        return ProcessResult{ .handle = process_result_new(context, scripted,
+            0 - 1, process_state_runtime_error(), "") };
+    }
+    let storage_bytes: i64 = (executable.len as i64) + 1;
+    let argument_i: i32 = 0;
+    while (argument_i < argument_len) {
+        let argument: []u8 = argument_data[argument_i];
+        if (argument.len < 0 || argument.len > 4095) {
+            return ProcessResult{ .handle = process_result_new(context,
+                scripted, 0 - 1, process_state_runtime_error(), "") };
+        }
+        storage_bytes = storage_bytes + (argument.len as i64) + 1;
+        if (storage_bytes > 65536) {
+            return ProcessResult{ .handle = process_result_new(context,
+                scripted, 0 - 1, process_state_runtime_error(), "") };
+        }
+        let byte_i: i32 = 0;
+        while (byte_i < argument.len) {
+            if (argument[byte_i] == 0) {
+                return ProcessResult{ .handle = process_result_new(context,
+                    scripted, 0 - 1, process_state_runtime_error(), "") };
+            }
+            byte_i = byte_i + 1;
+        }
+        argument_i = argument_i + 1;
+    }
+    let executable_i: i32 = 0;
+    while (executable_i < executable.len) {
+        if (executable[executable_i] == 0) {
+            return ProcessResult{ .handle = process_result_new(context,
+                scripted, 0 - 1, process_state_runtime_error(), "") };
+        }
+        executable_i = executable_i + 1;
+    }
+
+    let pair: *i64 = process_alloc(context, scripted, 8) as *i64;
+    if (pair == null as *i64) {
+        _zag_eprintln("Zag Script memory limit exceeded by process setup");
+        return ProcessResult{ .handle = null as *opaque };
+    }
+    if (_zag_raw_syscall(293, pair as i64, 2048, 0, 0, 0, 0) < 0) {
+        return ProcessResult{ .handle = process_result_new(context, scripted,
+            0 - 1, process_state_runtime_error(), "") };
+    }
+    let packed: i64 = pair[0];
+    let read_fd: i64 = packed & 4294967295;
+    let write_fd: i64 = packed >> 32;
+    let storage: *i8 = process_alloc(context, scripted, storage_bytes);
+    let argv: **i8 = process_alloc(context, scripted,
+        ((argument_len + 2) as i64) * 8) as **i8;
+    if (storage == null as *i8 || argv == null as **i8) {
+        let _close_read: i64 = _zag_raw_syscall(3, read_fd, 0, 0, 0, 0, 0);
+        let _close_write: i64 = _zag_raw_syscall(3, write_fd, 0, 0, 0, 0, 0);
+        _zag_eprintln("Zag Script memory limit exceeded by process argv");
+        return ProcessResult{ .handle = null as *opaque };
+    }
+    let cursor: i64 = 0;
+    let copy_i: i32 = 0;
+    while (copy_i < executable.len) {
+        storage[cursor as i32] = executable[copy_i];
+        cursor = cursor + 1;
+        copy_i = copy_i + 1;
+    }
+    storage[cursor as i32] = 0;
+    cursor = cursor + 1;
+    argv[0] = storage;
+    let argv_i: i32 = 0;
+    while (argv_i < argument_len) {
+        let argument: []u8 = argument_data[argv_i];
+        argv[argv_i + 1] = ((storage as i64) + cursor) as *i8;
+        let byte_i: i32 = 0;
+        while (byte_i < argument.len) {
+            storage[cursor as i32] = argument[byte_i];
+            cursor = cursor + 1;
+            byte_i = byte_i + 1;
+        }
+        storage[cursor as i32] = 0;
+        cursor = cursor + 1;
+        argv_i = argv_i + 1;
+    }
+    argv[argument_len + 1] = null as *i8;
+
+    let pid: i64 = _zag_raw_syscall(57, 0, 0, 0, 0, 0, 0);
+    if (pid == 0) {
+        let _group: i64 = _zag_raw_syscall(109, 0, 0, 0, 0, 0, 0);
+        let _dup: i64 = _zag_raw_syscall(33, write_fd, 1, 0, 0, 0, 0);
+        let _close_child_read: i64 = _zag_raw_syscall(3, read_fd, 0, 0, 0, 0, 0);
+        let _close_child_write: i64 = _zag_raw_syscall(3, write_fd, 0, 0, 0, 0, 0);
+        let _exec: i64 = _zag_raw_syscall(59, storage as i64,
+            argv as i64, 0, 0, 0, 0);
+        _zag_exit(127);
+    }
+    if (pid < 0) {
+        let _close_parent_read: i64 = _zag_raw_syscall(3, read_fd, 0, 0, 0, 0, 0);
+        let _close_parent_write: i64 = _zag_raw_syscall(3, write_fd, 0, 0, 0, 0, 0);
+        return ProcessResult{ .handle = process_result_new(context, scripted,
+            0 - 1, process_state_runtime_error(), "") };
+    }
+    let _pg: i64 = _zag_raw_syscall(109, pid, pid, 0, 0, 0, 0);
+    let _closew: i64 = _zag_raw_syscall(3, write_fd, 0, 0, 0, 0, 0);
+    let buffer: *i8 = process_alloc(context, scripted, max_output + 1);
+    let statusp: *i64 = process_alloc(context, scripted, 8) as *i64;
+    let sleep_ts: *i64 = process_alloc(context, scripted, 16) as *i64;
+    if (buffer == null as *i8 || statusp == null as *i64 || sleep_ts == null as *i64) {
+        _zag_eprintln("Zag Script memory limit exceeded by process capture");
+        let _kill_alloc: i64 = _zag_raw_syscall(62, 0 - pid, 9, 0, 0, 0, 0);
+        let _reap_alloc: i64 = _zag_raw_syscall(61, pid, 0, 0, 0, 0, 0);
+        let _close_capture_read: i64 = _zag_raw_syscall(3, read_fd, 0, 0, 0, 0, 0);
+        return ProcessResult{ .handle = null as *opaque };
+    }
+    sleep_ts[0] = 0; sleep_ts[1] = 1000000;
+    let start: i64 = _zag_clock_monotonic_ms();
+    let total: i64 = 0;
+    let state: i32 = process_state_exited();
+    let done: i32 = 0;
+    let eof: i32 = 0;
+    let reaped: i32 = 0;
+    while (done == 0) {
+        if (total > max_output) {
+            state = process_state_output_limit(); total = max_output; done = 1;
+        } else if (eof == 0) {
+            let nr: i64 = _zag_raw_syscall(0, read_fd,
+                (buffer as i64) + total, (max_output + 1) - total, 0, 0, 0);
+            if (nr > 0) { total = total + nr; }
+            else if (nr == 0) { eof = 1; }
+            else if (nr != 0 - 11 && nr != 0 - 4) {
+                state = process_state_runtime_error(); done = 1;
+            }
+        }
+        if (done == 0 && reaped == 0) {
+            let waited: i64 = _zag_raw_syscall(61, pid, statusp as i64,
+                1, 0, 0, 0);
+            if (waited == pid) { reaped = 1; }
+            else if (waited < 0 && waited != 0 - 4) {
+                state = process_state_runtime_error(); done = 1;
+            }
+        }
+        if (done == 0 && eof == 1 && reaped == 1) { done = 1; }
+        let now: i64 = _zag_clock_monotonic_ms();
+        if (done == 0 && (now < 0 || now - start >= timeout_ms)) {
+            state = process_state_timed_out(); done = 1;
+        }
+        if (done == 0) {
+            let _nap: i64 = _zag_raw_syscall(35, sleep_ts as i64, 0, 0, 0, 0, 0);
+        }
+    }
+    if (state != process_state_exited()) {
+        let _kill: i64 = _zag_raw_syscall(62, 0 - pid, 9, 0, 0, 0, 0);
+    }
+    if (reaped == 0) { let _reap: i64 = _zag_raw_syscall(61, pid, statusp as i64, 0, 0, 0, 0); }
+    let _closer: i64 = _zag_raw_syscall(3, read_fd, 0, 0, 0, 0, 0);
+    let exit_status: i32 = ((statusp[0] >> 8) & 255) as i32;
+    return ProcessResult{ .handle = process_result_new(context, scripted,
+        exit_status, state, buffer[0..total as i32]) };
+    }
+}
+
+fn process_run_argv_bounded(executable: []u8,
+    arguments: @borrows ArrayList[[]u8], timeout_ms: i64,
+    max_output: i64) ProcessResult {
+    unsafe {
+        return process_run_argv_internal(null as *opaque, 0, executable,
+            arguments.data, arguments.len, timeout_ms, max_output);
+    }
+}
+
+// Script's list() returns a context-owned ScriptList rather than the strict
+// ArrayList used by the regular API. Keep this bridge compiler-owned and
+// fail-closed on any malformed descriptor before entering the shared raw-
+// syscall implementation. The public Script surface therefore gets direct
+// argv semantics without exposing allocator or ABI plumbing.
+fn process_run_argv_bounded_script(context: *opaque, executable: []u8,
+    argument_data: @borrows *[]u8, argument_len: i32, argument_cap: i32,
+    argument_failed: i32, timeout_ms: i64, max_output: i64) ProcessResult {
+    if (argument_failed != 0 || argument_len < 0 || argument_cap < 0 ||
+        argument_len > argument_cap ||
+        (argument_len > 0 && argument_data == null as *[]u8)) {
+        return ProcessResult{ .handle = process_result_new(context, 1, 0 - 1,
+            process_state_runtime_error(), "") };
+    }
+    unsafe {
+        return process_run_argv_internal(context, 1, executable,
+            argument_data, argument_len, timeout_ms, max_output);
+    }
+}
+
 fn process_run_bounded(command: []u8, timeout_ms: i64, max_output: i64) ProcessResult {
     unsafe {
         return process_run_bounded_internal(null as *opaque, 0, command, timeout_ms, max_output);

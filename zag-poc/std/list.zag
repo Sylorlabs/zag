@@ -6,14 +6,15 @@
 //   let n: i32 = list.get[i32](xs, 0);
 //   list.free[i32](&xs);
 //
-// Effects: make/push are Alloc+Panic (via _zag_malloc/_zag_realloc); the rest
-// are pure. Effects propagate automatically from the rt bindings — no manual
-// annotations needed on these functions.
+// Effects: make/push/push_move/insert_move/move_all are Alloc+Panic (via
+// _zag_malloc/_zag_realloc); the rest are pure. Effects propagate
+// automatically from the rt bindings — no manual annotations needed here.
 
 @import("rt.zag")
 
+@resource
 struct ArrayList[T] {
-    data: *T,
+    data: @owned(_zag_free) *T,
     len:  i32,
     cap:  i32,
 }
@@ -26,8 +27,11 @@ fn make[T](cap: i32) ArrayList[T] {
     return ArrayList[T]{ .data = raw as *T, .len = 0, .cap = c };
 }
 
-// Append a value, doubling capacity when full.
-fn push[T](xs: @borrows_mut *ArrayList[T], val: T) void {
+// Append a value, doubling capacity when full. `val` is `@consumes` in the
+// generic signature, but resource-valued instantiations are rejected by the
+// type checker until ArrayList has per-element move/drop semantics. Otherwise
+// `free` could release only the backing buffer and leak nested resources.
+fn push[T](xs: @borrows_mut *ArrayList[T], val: @consumes T) void {
     if (xs.*.len >= xs.*.cap) {
         let nc: i32 = xs.*.cap * 2;
         if (nc < 4) { nc = 4; }
@@ -38,14 +42,183 @@ fn push[T](xs: @borrows_mut *ArrayList[T], val: T) void {
     xs.*.len = xs.*.len + 1;
 }
 
+// Move one affine value into the next live slot. Unlike ordinary push, this
+// entry point is compiler-origin-bound to std:list and is available when T is
+// a resource: the named source owner is consumed exactly once and the list
+// becomes its sole container. A resource-valued list must eventually use
+// drain/clear_with/pop_with/take_with with an exact consuming callback; plain
+// free remains unavailable because it releases only backing storage.
+fn push_move[T](xs: @borrows_mut *ArrayList[T], val: @consumes T) void {
+    if (xs.*.len >= xs.*.cap) {
+        let nc: i32 = xs.*.cap * 2;
+        if (nc < 4) { nc = 4; }
+        xs.*.data = _zag_realloc(xs.*.data as *i8, nc * @sizeOf[T]()) as *T;
+        xs.*.cap = nc;
+    }
+    xs.*.data[xs.*.len] = val;
+    xs.*.len = xs.*.len + 1;
+}
+
+// Insert one affine value into a checked live-prefix position. Existing live
+// bytes move backwards so overlapping relocation cannot duplicate a resource;
+// the named value is then consumed into the newly opened slot. The compiler
+// admits resource instantiations only for this exact std:list declaration.
+fn insert_move[T](xs: @borrows_mut *ArrayList[T], index: i32,
+                  val: @consumes T) void {
+    if (index < 0 || index > xs.*.len) {
+        _zag_eprintln("resource ArrayList insert index is out of bounds");
+        _zag_exit(1);
+    }
+    if (xs.*.len >= xs.*.cap) {
+        let nc: i32 = xs.*.cap * 2;
+        if (nc < 4) { nc = 4; }
+        xs.*.data = _zag_realloc(xs.*.data as *i8, nc * @sizeOf[T]()) as *T;
+        xs.*.cap = nc;
+    }
+    let size: i32 = @sizeOf[T]();
+    let raw: *u8 = xs.*.data as *u8;
+    let begin: i32 = index * size;
+    let i: i32 = (xs.*.len * size) - 1;
+    while (i >= begin) {
+        raw[i + size] = raw[i];
+        i = i - 1;
+    }
+    xs.*.data[index] = val;
+    xs.*.len = xs.*.len + 1;
+}
+
+// Move every live element from `src` onto `dst` while consuming src's backing
+// allocation. Resource elements are relocated byte-for-byte, never copied as
+// source values, and src has no live slot after return. The compiler admits
+// resource instantiations only for this exact std:list declaration.
+fn move_all[T](dst: @borrows_mut *ArrayList[T], src: @consumes *ArrayList[T]) void {
+    if ((dst as *i8) == (src as *i8)) {
+        _zag_eprintln("resource ArrayList cannot move into itself");
+        _zag_exit(1);
+    }
+    let needed: i32 = dst.*.len + src.*.len;
+    if (needed < dst.*.len || needed < src.*.len) {
+        _zag_eprintln("resource ArrayList move size overflow");
+        _zag_exit(1);
+    }
+    if (needed > dst.*.cap) {
+        let nc: i32 = dst.*.cap;
+        if (nc < 4) { nc = 4; }
+        while (nc < needed) {
+            if (nc > 1073741823) {
+                _zag_eprintln("resource ArrayList move capacity overflow");
+                _zag_exit(1);
+            }
+            nc = nc * 2;
+        }
+        dst.*.data = _zag_realloc(dst.*.data as *i8, nc * @sizeOf[T]()) as *T;
+        dst.*.cap = nc;
+    }
+    let bytes: i32 = src.*.len * @sizeOf[T]();
+    let from: *u8 = src.*.data as *u8;
+    let into: *u8 = dst.*.data as *u8;
+    let offset: i32 = dst.*.len * @sizeOf[T]();
+    let i: i32 = 0;
+    while (i < bytes) {
+        into[offset + i] = from[i];
+        i = i + 1;
+    }
+    dst.*.len = needed;
+    _zag_free(src.*.data as *i8);
+}
+
+// Dispose of a resource-valued ArrayList: visit every live element exactly
+// once, in strictly increasing index order, handing each to `release` by
+// value, then free the backing buffer. `release` is an indirect call
+// through a local parameter, so it is never contract-matched against a
+// same-named global declaration; this loop is the one place that is allowed
+// to read a resource-valued element straight out of `data[i]` without a
+// named-owner proof, because the shape here is fixed and manually verified:
+// each index is visited once, `len` elements are visited total, and the
+// buffer is freed only after the last one. Non-resource `T` may also use
+// this, but plain `free[T]` remains simpler when no per-element release is
+// needed. At a resource-valued call site, `release` must be a direct defined
+// non-generic `void` function whose one parameter is exactly `@consumes T`;
+// unknown, indirect, external, or merely observational callbacks are rejected
+// before the list itself is consumed.
+fn drain[T](xs: @consumes *ArrayList[T], release: fn(@consumes T) void) void {
+    let i: i32 = 0;
+    while (i < xs.*.len) {
+        release(xs.*.data[i]);
+        i = i + 1;
+    }
+    _zag_free(xs.*.data as *i8);
+}
+
+// Release every live element of a list while retaining its backing storage for
+// reuse. The callback must consume each element exactly once. Once released,
+// the live element bytes are cleared before len is reset so stale resource
+// fields cannot be recovered through the public data pointer. Resource-valued
+// call sites are admitted only with the same direct consuming callback proof as
+// drain; ordinary clear remains restricted to non-resource elements.
+fn clear_with[T](xs: @borrows_mut *ArrayList[T], release: fn(@consumes T) void) void {
+    let i: i32 = 0;
+    while (i < xs.*.len) {
+        release(xs.*.data[i]);
+        i = i + 1;
+    }
+    let bytes: i32 = xs.*.len * @sizeOf[T]();
+    let raw: *u8 = xs.*.data as *u8;
+    let j: i32 = 0;
+    while (j < bytes) {
+        raw[j] = 0;
+        j = j + 1;
+    }
+    xs.*.len = 0;
+}
+
+// Consume a resource-valued list while giving one selected element a distinct
+// consuming callback. Every other live element is handed to the release
+// callback and the backing buffer is released afterwards. This is intentionally
+// a whole-list operation: ArrayList still has no per-element occupancy/drop
+// bitmap, so leaving a partially live list behind would make ordinary free
+// unsound. The compiler admits this operation only for a concrete resource T
+// and two direct, non-generic `fn(@consumes T) void` callbacks. Invalid indexes
+// terminate before any element is consumed.
+fn take_with[T](xs: @consumes *ArrayList[T], index: i32,
+                selected: fn(@consumes T) void,
+                release: fn(@consumes T) void) void {
+    if (index < 0 || index >= xs.*.len) {
+        _zag_eprintln("resource ArrayList take index is out of bounds");
+        _zag_exit(1);
+    }
+    let i: i32 = 0;
+    while (i < xs.*.len) {
+        if (i == index) { selected(xs.*.data[i]); }
+        else { release(xs.*.data[i]); }
+        i = i + 1;
+    }
+    _zag_free(xs.*.data as *i8);
+}
+
 // Element at index (no bounds check — caller ensures i < len).
-fn get[T](xs: ArrayList[T], i: i32) T {
+// Reading an element never transfers ownership of the list. If `T` carries a
+// borrowed view, the result remains tied to the list's backing allocation.
+// A resource-bearing T is returned as a retained shared view: it may be read,
+// but cannot be consumed, stored beyond the list, or used after the list dies.
+// Ordinary push/set/pop remain unavailable for affine T. push_move is the
+// explicit insertion path; clear_with and pop_with are explicit drop paths
+// when the backing storage should be retained for reuse.
+fn get[T](xs: @retained_by_return ArrayList[T], i: i32) T {
     return xs.data[i];
 }
 
 // Overwrite element at index.
 fn set[T](xs: @borrows_mut *ArrayList[T], i: i32, val: T) void {
     xs.*.data[i] = val;
+}
+
+// Reset a non-resource list for reuse without releasing its backing buffer.
+// Resource-valued lists are rejected by the compiler because clearing them
+// without visiting each element would leak nested ownership. Use clear_with
+// when each live element has an explicit consuming drop callback.
+fn clear[T](xs: @borrows_mut *ArrayList[T]) void {
+    xs.*.len = 0;
 }
 
 // Remove and return the last element.
@@ -56,22 +229,75 @@ fn pop[T](xs: @borrows_mut *ArrayList[T]) T {
     return v;
 }
 
-fn len[T](xs: ArrayList[T]) i32 {
+// Drop only the final live element while retaining the backing storage for
+// reuse. The callback consumes that element exactly once. Empty lists fail
+// before the callback is entered, and the removed element's bytes are cleared
+// before len is decremented so stale resource fields cannot be recovered via
+// the public data pointer. Resource-valued call sites are admitted only with
+// the same direct consuming callback proof as clear_with.
+fn pop_with[T](xs: @borrows_mut *ArrayList[T], release: fn(@consumes T) void) void {
+    if (xs.*.len <= 0) {
+        _zag_eprintln("resource ArrayList pop index is out of bounds");
+        _zag_exit(1);
+    }
+    let last: i32 = xs.*.len - 1;
+    release(xs.*.data[last]);
+    let raw: *u8 = xs.*.data as *u8;
+    let begin: i32 = last * @sizeOf[T]();
+    let end: i32 = begin + @sizeOf[T]();
+    let i: i32 = begin;
+    while (i < end) {
+        raw[i] = 0;
+        i = i + 1;
+    }
+    xs.*.len = last;
+}
+
+// Drop one selected live element and relocate the remaining suffix down by one
+// slot. The selected callback consumes exactly that element; forward byte
+// movement is safe because the destination precedes the source, and the old
+// final slot is zeroed before len shrinks. Resource calls are origin-bound to
+// this implementation and require a direct concrete consuming callback.
+fn remove_with[T](xs: @borrows_mut *ArrayList[T], index: i32,
+                  release: fn(@consumes T) void) void {
+    if (index < 0 || index >= xs.*.len) {
+        _zag_eprintln("resource ArrayList remove index is out of bounds");
+        _zag_exit(1);
+    }
+    release(xs.*.data[index]);
+    let raw: *u8 = xs.*.data as *u8;
+    let size: i32 = @sizeOf[T]();
+    let begin: i32 = index * size;
+    let live_bytes: i32 = xs.*.len * size;
+    let i: i32 = begin;
+    while (i + size < live_bytes) {
+        raw[i] = raw[i + size];
+        i = i + 1;
+    }
+    let clear_start: i32 = live_bytes - size;
+    i = clear_start;
+    while (i < live_bytes) {
+        raw[i] = 0;
+        i = i + 1;
+    }
+    xs.*.len = xs.*.len - 1;
+}
+
+fn len[T](xs: @borrows ArrayList[T]) i32 {
     return xs.len;
 }
 
-fn cap[T](xs: ArrayList[T]) i32 {
+fn cap[T](xs: @borrows ArrayList[T]) i32 {
     return xs.cap;
 }
 
-fn is_empty[T](xs: ArrayList[T]) bool {
+fn is_empty[T](xs: @borrows ArrayList[T]) bool {
     return xs.len == 0;
 }
 
-// Release the backing buffer; the list must not be used afterwards.
-fn free[T](xs: *ArrayList[T]) void {
+// Release the backing buffer; the list must not be used afterwards. Resource
+// element types are rejected because this function cannot visit nested owners;
+// use drain with an exact consuming callback, including for an empty list.
+fn free[T](xs: @consumes *ArrayList[T]) void {
     _zag_free(xs.*.data as *i8);
-    xs.*.data = null as *T;
-    xs.*.len = 0;
-    xs.*.cap = 0;
 }

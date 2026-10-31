@@ -1,6 +1,6 @@
 # Zag Script bounded-process boundary
 
-Status: native supervisor and stable result ABI implemented, 2026-07-18.
+Status: native supervisor and stable result ABI implemented, 2026-08-20.
 
 Zag Script exposes `process_run_timeout`; strict Zag uses
 `std:process.process_run_bounded`. The existing native `_zag_exec_capture` is
@@ -40,6 +40,31 @@ runtime ABI. The supervisor constructs this handle directly. A root Script owns
 the handle through its selected allocator: the arena charges 32 bytes, while
 the bounded heap charges 48 bytes and links the complete header-plus-payload
 block for deterministic shutdown reclamation.
+
+## Direct argv boundary
+
+The strict-Zag `std:process.process_run_argv_bounded` declaration and the
+Script convenience `process_run_argv(executable, arguments, timeout_ms,
+max_output)` provide a smaller shell-free boundary. The executable path and
+each `[]u8` argument are copied into bounded NUL-terminated storage and passed
+as an `execve` argv vector. Argument bytes therefore remain literal: there is
+no shell parsing, quoting, expansion, or command-string reconstruction. The
+path must be an executable path (normally absolute); this slice deliberately
+does not perform `PATH` lookup.
+
+The Linux x86-64 implementation accepts at most 31 arguments, 4095 bytes per
+path or argument, and 64 KiB of combined copied argv storage. It uses the same
+nonblocking stdout capture, monotonic deadline, process-group cleanup, output
+cap, typed result states, and zombie-reaping behavior as the shell boundary.
+The raw syscall passes a null `envp`, so the child receives an empty
+environment; ambient environment is never imported implicitly. Stderr and
+stdin are not transported by this API. Malformed list descriptors, embedded
+NUL bytes, empty paths, and out-of-range limits fail closed with the runtime
+error state. The focused native fixture covers literal metacharacters,
+timeout, output overflow, missing executable, and validation rejection in
+`tests/process_argv_native.zag`, while `tests/run_process_argv.sh` verifies a
+static Linux x86-64 executable. This is a bounded process primitive, not a
+general shell-free supervisor or a cross-platform process contract.
 
 Adding only a timer around the current call,
 killing only the shell PID, or returning partial output as success would be an

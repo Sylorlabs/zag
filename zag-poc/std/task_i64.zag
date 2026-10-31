@@ -1,0 +1,289 @@
+// Bounded task/result ABI marker for Linux x86-64.
+//
+// The executable surface is compiler-owned @taskSpawn/@taskAwait/
+// @taskCancel/@taskInput/@taskCancelled. A task worker must remain a direct,
+// captureless `fn(i64) i64`; this type intentionally provides no generic or
+// function-value wrapper that could imply broader async semantics.
+@import("std:cancel_token_i64") as cancel
+
+struct TaskI64Handle { raw:*opaque }
+
+// Poll states are plain values rather than a generic future type. The result
+// word is read only after the compiler-owned child-tid word reports completion;
+// task_i64_await remains the sole operation that releases the handle.  The
+// cancellation_requested bit is deliberately separate from state: requesting
+// cancellation is cooperative and does not prove that a worker has stopped or
+// that its result is already available.
+struct TaskI64PollResult {
+    // `ok=0` is reserved for a rejected observation (currently only a null
+    // or invalid handle). A pending task is not an error: it has ok=1 and
+    // state=pending, so callers cannot mistake a zero result value for a
+    // failed poll.
+    ok: i32,
+    code: i64,
+    state: i32,
+    value: i64,
+    cancellation_requested: i32,
+}
+
+// A consuming completion handoff for callers that need one stable result
+// record after the affine handle is joined.  `ok=1` means that the bounded
+// worker result was obtained; cancellation_requested remains separate because
+// a cooperative cancellation request is not itself proof that the worker
+// failed or stopped before returning its i64 value.  Invalid handles are
+// reported with ok=0.  This is a TaskI64 record, not a generic future/result
+// transport.
+struct TaskI64JoinResult {
+    ok: i32,
+    code: i64,
+    value: i64,
+    cancellation_requested: i32,
+}
+
+// A borrow-only parent/child observation.  `propagated` records that this
+// call saw a cancelled parent and successfully requested cancellation of the
+// child; it does not claim that an arbitrary worker stopped at that instant.
+// The child remains affine and must still be consumed exactly once with
+// @taskAwait.  This is the smallest useful cancellation-propagation seam for
+// the proven TaskI64 ABI; it is not a scheduler, generic future, or destructor.
+struct TaskI64CascadePollResult {
+    state: i32,
+    value: i64,
+    parent_cancelled: i32,
+    child_cancelled: i32,
+    propagated: i32,
+}
+
+fn task_i64_poll_invalid() i32 { return 0; }
+fn task_i64_poll_pending() i32 { return 1; }
+fn task_i64_poll_ready() i32 { return 2; }
+fn task_i64_poll_invalid_parent_child() i32 { return 3; }
+fn task_i64_poll_status_ok() i64 { return 0; }
+fn task_i64_poll_status_invalid_handle() i64 { return 0 - 7701; }
+fn task_i64_poll_status_invalid_timeout() i64 { return 0 - 7702; }
+fn task_i64_poll_status_invalid_token() i64 { return 0 - 7703; }
+fn task_i64_poll_status_cancel_failed() i64 { return 0 - 7704; }
+fn task_i64_poll_status_invalid_output() i64 { return 0 - 7705; }
+
+// The worker declaration and spawn operation remain compiler-owned and must
+// stay direct/captureless. These helpers make cancellation and observation
+// explicit at the library boundary; consuming await remains visibly direct so
+// the ownership checker can account for the result-producing handoff.
+fn task_i64_valid(handle:@borrows *opaque) i32 {
+    unsafe { return (handle != null as *opaque) as i32; }
+}
+
+fn task_i64_cancel(handle:@borrows_mut *opaque) i64 {
+    unsafe { return @taskCancel(handle); }
+}
+
+fn task_i64_cancelled(handle:@borrows *opaque) i32 {
+    unsafe { return @taskCancelled(handle); }
+}
+
+// Non-consuming completion poll backed by the compiler-owned child-tid word.
+// Await remains the sole operation that releases the handle and obtains the
+// worker result.
+fn task_i64_ready(handle:@borrows *opaque) i32 {
+    unsafe { return @taskReady(handle); }
+}
+
+// Linux x86-64 TaskI64 ABI observation. The compiler-owned handle stores the
+// worker result at byte offset 32 (word 4), immediately after the readiness
+// word at offset 0. This is intentionally target-specific and non-consuming;
+// callers must still use @taskAwait exactly once to release the handle.
+fn task_i64_result_borrowed(handle:@borrows *opaque) i64 {
+    if (task_i64_valid(handle) == 0) { return 0; }
+    unsafe {
+        let words: *i64 = handle as *i64;
+        return words[4];
+    }
+}
+
+// Consume one completed or cancellable TaskI64 handle into a caller-owned
+// result record.  The worker's cancellation bit is sampled before the handle
+// is released.  A valid @consumes handle is always discharged exactly once,
+// including the invalid-output case; a null handle is rejected without an
+// await because there is no allocation to discharge.
+fn task_i64_await_into(handle:@consumes *opaque,
+    out:@borrows_mut *TaskI64JoinResult) i64 {
+    unsafe {
+        if (handle == null as *opaque) { return task_i64_poll_status_invalid_handle(); }
+        let cancellation_requested: i32 = @taskCancelled(handle);
+        let value: i64 = @taskAwait(handle);
+        if (out == null as *TaskI64JoinResult) { return task_i64_poll_status_invalid_output(); }
+        out.* = TaskI64JoinResult{.ok = 1,
+            .code = task_i64_poll_status_ok(), .value = value,
+            .cancellation_requested = cancellation_requested};
+        return task_i64_poll_status_ok();
+    }
+}
+
+fn task_i64_poll(handle:@borrows *opaque) TaskI64PollResult {
+    unsafe {
+        if (task_i64_valid(handle) == 0) {
+            return TaskI64PollResult{.ok = 0,
+                .code = task_i64_poll_status_invalid_handle(),
+                .state = task_i64_poll_invalid(), .value = 0,
+                .cancellation_requested = 0};
+        }
+        let cancellation_requested: i32 = @taskCancelled(handle);
+        if (@taskReady(handle) == 0) {
+            return TaskI64PollResult{.ok = 1,
+                .code = task_i64_poll_status_ok(),
+                .state = task_i64_poll_pending(), .value = 0,
+                .cancellation_requested = cancellation_requested};
+        }
+        let value: i64 = task_i64_result_borrowed(handle);
+        return TaskI64PollResult{.ok = 1,
+            .code = task_i64_poll_status_ok(),
+            .state = task_i64_poll_ready(), .value = value,
+            .cancellation_requested = cancellation_requested};
+    }
+}
+
+// Wait for a bounded interval without consuming the affine handle. This is
+// intentionally a small cooperative observation helper, not a scheduler or a
+// future: it samples the compiler-owned readiness word, yields between
+// samples, and returns the same pending/ready result shape as task_i64_poll.
+// The caller must still use @taskAwait exactly once, including after a
+// timeout. A timeout of zero performs one immediate observation; negative and
+// >5-second intervals are rejected so this cannot become an unbounded blocker.
+fn task_i64_wait(handle:@borrows *opaque, timeout_ms:i32)
+    TaskI64PollResult {
+    if (task_i64_valid(handle) == 0) {
+        return TaskI64PollResult{.ok = 0,
+            .code = task_i64_poll_status_invalid_handle(),
+            .state = task_i64_poll_invalid(), .value = 0,
+            .cancellation_requested = 0};
+    }
+    if (timeout_ms < 0 || timeout_ms > 5000) {
+        return TaskI64PollResult{.ok = 0,
+            .code = task_i64_poll_status_invalid_timeout(),
+            .state = task_i64_poll_invalid(), .value = 0,
+            .cancellation_requested = 0};
+    }
+    let observed: TaskI64PollResult = task_i64_poll(handle);
+    if (observed.state != task_i64_poll_pending() || timeout_ms == 0) {
+        return observed;
+    }
+    let started: i64 = _zag_clock_monotonic_ms();
+    let elapsed: i64 = 0;
+    while (elapsed < timeout_ms as i64) {
+        unsafe {
+            // Linux x86-64 sched_yield; this keeps bounded observation from
+            // monopolizing a core while the child makes progress.
+            let _yielded: i64 = _zag_raw_syscall(24, 0, 0, 0, 0, 0, 0);
+        }
+        let next: TaskI64PollResult = task_i64_poll(handle);
+        if (next.state != task_i64_poll_pending()) { return next; }
+        elapsed = _zag_clock_monotonic_ms() - started;
+        if (elapsed < 0) { elapsed = 0; }
+    }
+    return task_i64_poll(handle);
+}
+
+// Wait with a caller-owned one-shot cancellation token.  This is a bounded
+// bridge between two already-proven Linux x86-64 primitives: it checks the
+// token before each readiness observation and requests cooperative task
+// cancellation when the token is set.  It does not stop a worker in flight,
+// consume either handle, or add scheduler/future semantics; the caller still
+// must use @taskAwait exactly once.
+fn task_i64_wait_cancel(handle:@borrows_mut *opaque,
+    token:@borrows *cancel.CancelTokenI64, timeout_ms:i32)
+    TaskI64PollResult {
+    if (task_i64_valid(handle) == 0) {
+        return TaskI64PollResult{.ok = 0,
+            .code = task_i64_poll_status_invalid_handle(),
+            .state = task_i64_poll_invalid(), .value = 0,
+            .cancellation_requested = 0};
+    }
+    if (cancel.cancel_token_i64_valid(token) == 0) {
+        return TaskI64PollResult{.ok = 0,
+            .code = task_i64_poll_status_invalid_token(),
+            .state = task_i64_poll_invalid(), .value = 0,
+            .cancellation_requested = 0};
+    }
+    if (timeout_ms < 0 || timeout_ms > 5000) {
+        return TaskI64PollResult{.ok = 0,
+            .code = task_i64_poll_status_invalid_timeout(),
+            .state = task_i64_poll_invalid(), .value = 0,
+            .cancellation_requested = 0};
+    }
+    if (cancel.cancel_token_i64_is_requested(token) == 1) {
+        if (task_i64_cancel(handle) != 0) {
+            return TaskI64PollResult{.ok = 0,
+                .code = task_i64_poll_status_cancel_failed(),
+                .state = task_i64_poll_invalid(), .value = 0,
+                .cancellation_requested = 0};
+        }
+        return task_i64_poll(handle);
+    }
+    let observed: TaskI64PollResult = task_i64_poll(handle);
+    if (observed.state != task_i64_poll_pending() || timeout_ms == 0) {
+        return observed;
+    }
+    let started: i64 = _zag_clock_monotonic_ms();
+    let elapsed: i64 = 0;
+    while (elapsed < timeout_ms as i64) {
+        if (cancel.cancel_token_i64_is_requested(token) == 1) {
+            if (task_i64_cancel(handle) != 0) {
+                return TaskI64PollResult{.ok = 0,
+                    .code = task_i64_poll_status_cancel_failed(),
+                    .state = task_i64_poll_invalid(), .value = 0,
+                    .cancellation_requested = 0};
+            }
+            return task_i64_poll(handle);
+        }
+        unsafe {
+            // Linux x86-64 sched_yield; this keeps bounded observation from
+            // monopolizing a core while the child makes progress.
+            let _yielded: i64 = _zag_raw_syscall(24, 0, 0, 0, 0, 0, 0);
+        }
+        let next: TaskI64PollResult = task_i64_poll(handle);
+        if (next.state != task_i64_poll_pending()) { return next; }
+        elapsed = _zag_clock_monotonic_ms() - started;
+        if (elapsed < 0) { elapsed = 0; }
+    }
+    if (cancel.cancel_token_i64_is_requested(token) == 1) {
+        if (task_i64_cancel(handle) != 0) {
+            return TaskI64PollResult{.ok = 0,
+                .code = task_i64_poll_status_cancel_failed(),
+                .state = task_i64_poll_invalid(), .value = 0,
+                .cancellation_requested = 0};
+        }
+    }
+    return task_i64_poll(handle);
+}
+
+// Observe a child while propagating an already-visible parent cancellation.
+// Both handles are borrowed; neither operation releases storage.  A null or
+// aliased pair is rejected so the function cannot accidentally treat one
+// affine handle as both owner and child.  Cancellation is idempotent, and the
+// result reports the state observed after the request rather than promising a
+// synchronous worker stop.
+fn task_i64_poll_cascaded(parent:@borrows *opaque,
+    child:@borrows_mut *opaque) TaskI64CascadePollResult {
+    if (task_i64_valid(parent) == 0 || task_i64_valid(child) == 0 ||
+        parent == child) {
+        return TaskI64CascadePollResult{
+            .state = task_i64_poll_invalid_parent_child(), .value = 0,
+            .parent_cancelled = 0, .child_cancelled = 0, .propagated = 0};
+    }
+    let parent_cancelled: i32 = task_i64_cancelled(parent);
+    if (parent_cancelled == 1) {
+        let cancel_rc: i64 = task_i64_cancel(child);
+        if (cancel_rc != 0) {
+            return TaskI64CascadePollResult{
+                .state = task_i64_poll_invalid_parent_child(), .value = 0,
+                .parent_cancelled = 1,
+                .child_cancelled = task_i64_cancelled(child), .propagated = 0};
+        }
+    }
+    let observed: TaskI64PollResult = task_i64_poll(child);
+    return TaskI64CascadePollResult{
+        .state = observed.state, .value = observed.value,
+        .parent_cancelled = parent_cancelled,
+        .child_cancelled = task_i64_cancelled(child),
+        .propagated = (parent_cancelled == 1) as i32};
+}

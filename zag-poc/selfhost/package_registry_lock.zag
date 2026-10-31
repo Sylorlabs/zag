@@ -1,0 +1,324 @@
+// Canonical offline registry-resolution lock codec.
+//
+// This module is deliberately validation-only in the current edition.  It
+// does not change package_import_resolve, perform filesystem access, fetch a
+// registry, or invoke Git.  A future resolver integration can use the exact
+// lookup/match contract here without making the existing unlocked local-index
+// mode implicitly require a new sidecar.
+//
+// The lock binds all inputs needed to replay one local registry selection:
+//
+//   entry=<alias>\t<index-path>\t<index-checksum>\t<version>\t<source>\t<artifact-checksum>[\t<artifact-signature>]
+//
+// Checksums use PackageRawChecksum's deterministic raw-byte tuple.  The
+// canonical checksum line protects the lock record itself; callers provide
+// the exact index and artifact bytes to package_registry_lock_match.
+
+@import("package_resolve.zag")
+
+extern fn _zag_i64_to_str(v: i64) []u8
+
+enum PackageRegistryLockError {
+    none,
+    invalid_lock,
+    invalid_query,
+    entry_not_found,
+    version_mismatch,
+    source_mismatch,
+    index_checksum_mismatch,
+    artifact_checksum_mismatch,
+    artifact_signature_mismatch,
+}
+
+struct PackageRegistryLockEntry {
+    alias: []u8,
+    index_path: []u8,
+    index_checksum: PackageRawChecksum,
+    version: []u8,
+    source: []u8,
+    artifact_checksum: PackageRawChecksum,
+    artifact_signature: []u8,
+    valid: i32,
+}
+
+struct PackageRegistryLockLookup {
+    found: i32,
+    entry: PackageRegistryLockEntry,
+    error: PackageRegistryLockError,
+}
+
+fn package_registry_lock_zero_checksum() PackageRawChecksum {
+    return PackageRawChecksum{.first = 0, .second = 0, .bytes = 0};
+}
+
+fn package_registry_lock_bad_entry() PackageRegistryLockEntry {
+    return PackageRegistryLockEntry{
+        .alias = "", .index_path = "",
+        .index_checksum = package_registry_lock_zero_checksum(),
+        .version = "", .source = "",
+        .artifact_checksum = package_registry_lock_zero_checksum(),
+        .artifact_signature = "",
+        .valid = 0,
+    };
+}
+
+fn package_registry_lock_bad_lookup(error: PackageRegistryLockError)
+    PackageRegistryLockLookup {
+    return PackageRegistryLockLookup{
+        .found = 0, .entry = package_registry_lock_bad_entry(), .error = error,
+    };
+}
+
+fn package_registry_lock_line(text: []u8, wanted: i32) []u8 {
+    let start: i32 = 0;
+    let line_no: i32 = 0;
+    let i: i32 = 0;
+    while (i < text.len) {
+        if (text[i] == '\n') {
+            if (line_no == wanted) { return text[start..i]; }
+            line_no = line_no + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (line_no == wanted && start <= text.len) { return text[start..text.len]; }
+    return "";
+}
+
+fn package_registry_lock_part(fields: []u8, wanted: i32) []u8 {
+    let start: i32 = 0;
+    let field: i32 = 0;
+    let i: i32 = 0;
+    while (i < fields.len) {
+        if (fields[i] == '\t') {
+            if (field == wanted) { return fields[start..i]; }
+            field = field + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (field == wanted && start <= fields.len) { return fields[start..fields.len]; }
+    return "";
+}
+
+fn package_registry_lock_parts_exact(text: []u8, count: i32) i32 {
+    if (count <= 0) { return 0; }
+    let fields: i32 = 1;
+    let i: i32 = 0;
+    while (i < text.len) {
+        if (text[i] == '\t') { fields = fields + 1; }
+        i = i + 1;
+    }
+    return (fields == count) as i32;
+}
+
+fn package_registry_lock_entry(line: []u8) PackageRegistryLockEntry {
+    let bad: PackageRegistryLockEntry = package_registry_lock_bad_entry();
+    if (line.len < 7 || !@strEq(line[0..6], "entry=")) { return bad; }
+    let fields: []u8 = line[6..line.len];
+    let has_plain_shape: i32 = package_registry_lock_parts_exact(fields, 6);
+    let has_signed_shape: i32 = package_registry_lock_parts_exact(fields, 7);
+    if (has_plain_shape == 0 && has_signed_shape == 0) { return bad; }
+    let alias: []u8 = package_registry_lock_part(fields, 0);
+    let index_path: []u8 = package_registry_lock_part(fields, 1);
+    let index_parse: PackageChecksumParse = package_lock_checksum(
+        package_registry_lock_part(fields, 2));
+    let version: []u8 = package_registry_lock_part(fields, 3);
+    let source: []u8 = package_registry_lock_part(fields, 4);
+    let artifact_parse: PackageChecksumParse = package_lock_checksum(
+        package_registry_lock_part(fields, 5));
+    let artifact_signature: []u8 = "";
+    if (has_signed_shape != 0) {
+        artifact_signature = package_registry_lock_part(fields, 6);
+        if (package_import_artifact_safe(artifact_signature) == 0) {
+            return bad;
+        }
+    }
+    if (package_import_safe_name(alias) == 0 ||
+        package_import_artifact_safe(index_path) == 0 ||
+        package_semver_parse(version).valid == 0 ||
+        package_import_module_safe(source) == 0 ||
+        index_parse.valid == 0 || artifact_parse.valid == 0) {
+        return bad;
+    }
+    return PackageRegistryLockEntry{
+        .alias = alias, .index_path = index_path,
+        .index_checksum = index_parse.checksum,
+        .version = version, .source = source,
+        .artifact_checksum = artifact_parse.checksum,
+        .artifact_signature = artifact_signature,
+        .valid = 1,
+    };
+}
+
+// Return 1 only when `a` is strictly after `b` in canonical lock order.
+fn package_registry_lock_entry_after(a: PackageRegistryLockEntry,
+    b: PackageRegistryLockEntry) i32 {
+    let order: i32 = package_lock_compare(a.alias, b.alias);
+    if (order != 0) { return (order > 0) as i32; }
+    order = package_lock_compare(a.index_path, b.index_path);
+    if (order != 0) { return (order > 0) as i32; }
+    order = package_semver_compare(package_semver_parse(a.version),
+        package_semver_parse(b.version));
+    if (order != 0) { return (order > 0) as i32; }
+    // One alias/index/version is one selected registry result.  Allowing a
+    // second source at the same key would make lookup order observable and
+    // would silently turn a malformed lock into an ambiguous one.
+    return 0;
+}
+
+fn package_registry_lock_checksum_mark(text: []u8) i32 {
+    let marker: []u8 = "checksum=";
+    let i: i32 = 0;
+    while (i + marker.len <= text.len) {
+        if ((i == 0 || text[i - 1] == '\n') &&
+            @strEq(text[i..i + marker.len], marker)) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn package_registry_lock_checksum_text(text: []u8) []u8 {
+    let mark: i32 = package_registry_lock_checksum_mark(text);
+    if (mark < 0) { return ""; }
+    let line: []u8 = text[mark..text.len];
+    if (line.len < 11 || line[line.len - 1] != '\n') { return ""; }
+    return line[9..line.len - 1];
+}
+
+// Validate the complete canonical lock, including its own checksum and
+// strict alias/index/version/source ordering.  No filesystem state is read.
+fn package_registry_lock_valid(text: []u8) i32 {
+    if (text.len <= 0 || text.len > 1048576 || text[text.len - 1] != '\n') {
+        return 0;
+    }
+    if (!@strEq(package_registry_lock_line(text, 0),
+        "format=zag-registry-lock-v1")) { return 0; }
+    let mark: i32 = package_registry_lock_checksum_mark(text);
+    if (mark <= 0 || mark >= text.len) { return 0; }
+    let claimed_text: []u8 = package_registry_lock_checksum_text(text);
+    let claimed: PackageChecksumParse = package_lock_checksum(claimed_text);
+    if (claimed.valid == 0 ||
+        mark + 9 + claimed_text.len + 1 != text.len ||
+        package_raw_checksum_equal(package_raw_checksum(text[0..mark]),
+            claimed.checksum) == 0) { return 0; }
+
+    let previous: PackageRegistryLockEntry = package_registry_lock_bad_entry();
+    let entries: i32 = 0;
+    let line_no: i32 = 1;
+    while (line_no < text.len) {
+        let line: []u8 = package_registry_lock_line(text, line_no);
+        if (line.len == 0 || (line.len >= 9 &&
+            @strEq(line[0..9], "checksum="))) { break; }
+        let entry: PackageRegistryLockEntry = package_registry_lock_entry(line);
+        if (entry.valid == 0) { return 0; }
+        if (previous.valid != 0 &&
+            package_registry_lock_entry_after(entry, previous) == 0) { return 0; }
+        previous = entry;
+        entries = entries + 1;
+        if (entries > 256) { return 0; }
+        line_no = line_no + 1;
+    }
+    if (entries <= 0 || line_no != entries + 1) { return 0; }
+    let final_line: []u8 = package_registry_lock_line(text, line_no);
+    return (final_line.len >= 9 && @strEq(final_line[0..9], "checksum=")) as i32;
+}
+
+fn package_registry_lock_checksum_line(checksum: PackageRawChecksum) []u8 {
+    let first: []u8 = _zag_i64_to_str(checksum.first);
+    let second: []u8 = _zag_i64_to_str(checksum.second);
+    let bytes: []u8 = _zag_i64_to_str(checksum.bytes);
+    let p1: []u8 = _zag_str_concat(first, ",");
+    let p2: []u8 = _zag_str_concat(p1, second); _zag_str_free(p1);
+    let p3: []u8 = _zag_str_concat(p2, ","); _zag_str_free(p2);
+    let p4: []u8 = _zag_str_concat(p3, bytes); _zag_str_free(p3);
+    let p5: []u8 = _zag_str_concat(p4, "\n"); _zag_str_free(p4);
+    let line: []u8 = _zag_str_concat("checksum=", p5); _zag_str_free(p5);
+    _zag_str_free(first); _zag_str_free(second); _zag_str_free(bytes);
+    return line;
+}
+
+// Append the canonical lock checksum to a body that already ends in LF.
+// Invalid bodies return an empty slice rather than guessing at normalization.
+fn package_registry_lock_finalize(body: []u8) []u8 {
+    if (body.len == 0 || body[body.len - 1] != '\n' ||
+        !@strEq(package_registry_lock_line(body, 0),
+            "format=zag-registry-lock-v1")) { return ""; }
+    let line: []u8 = package_registry_lock_checksum_line(
+        package_raw_checksum(body));
+    let result: []u8 = _zag_str_concat(body, line);
+    _zag_str_free(line);
+    return result;
+}
+
+fn package_registry_lock_lookup(text: []u8, alias: []u8,
+    index_path: []u8) PackageRegistryLockLookup {
+    if (package_registry_lock_valid(text) == 0) {
+        return package_registry_lock_bad_lookup(
+            PackageRegistryLockError.invalid_lock);
+    }
+    if (package_import_safe_name(alias) == 0 ||
+        package_import_artifact_safe(index_path) == 0) {
+        return package_registry_lock_bad_lookup(
+            PackageRegistryLockError.invalid_query);
+    }
+    let line_no: i32 = 1;
+    while (line_no < text.len) {
+        let line: []u8 = package_registry_lock_line(text, line_no);
+        if (line.len == 0 || (line.len >= 9 &&
+            @strEq(line[0..9], "checksum="))) { break; }
+        let entry: PackageRegistryLockEntry = package_registry_lock_entry(line);
+        if (@strEq(entry.alias, alias) &&
+            @strEq(entry.index_path, index_path)) {
+            return PackageRegistryLockLookup{
+                .found = 1, .entry = entry,
+                .error = PackageRegistryLockError.none,
+            };
+        }
+        line_no = line_no + 1;
+    }
+    return package_registry_lock_bad_lookup(
+        PackageRegistryLockError.entry_not_found);
+}
+
+// Match one selected registry result, including the optional detached
+// artifact-signature path, against the exact lock entry and bytes that were
+// read for the index and artifact.  This is the future resolver handoff seam;
+// the current package resolver does not call it.
+fn package_registry_lock_match_signed(text: []u8, alias: []u8,
+    index_path: []u8, version: []u8, source: []u8, index_bytes: []u8,
+    artifact_bytes: []u8, artifact_signature: []u8)
+    PackageRegistryLockError {
+    let lookup: PackageRegistryLockLookup = package_registry_lock_lookup(
+        text, alias, index_path);
+    if (lookup.error != PackageRegistryLockError.none) { return lookup.error; }
+    if (!@strEq(lookup.entry.version, version)) {
+        return PackageRegistryLockError.version_mismatch;
+    }
+    if (!@strEq(lookup.entry.source, source)) {
+        return PackageRegistryLockError.source_mismatch;
+    }
+    if (package_raw_checksum_equal(lookup.entry.index_checksum,
+        package_raw_checksum(index_bytes)) == 0) {
+        return PackageRegistryLockError.index_checksum_mismatch;
+    }
+    if (package_raw_checksum_equal(lookup.entry.artifact_checksum,
+        package_raw_checksum(artifact_bytes)) == 0) {
+        return PackageRegistryLockError.artifact_checksum_mismatch;
+    }
+    if (!@strEq(lookup.entry.artifact_signature, artifact_signature)) {
+        return PackageRegistryLockError.artifact_signature_mismatch;
+    }
+    return PackageRegistryLockError.none;
+}
+
+// Backward-compatible matcher for unsigned six-field locks.  A signed lock
+// cannot be silently accepted through this API: its non-empty signature path
+// produces artifact_signature_mismatch and callers must opt into the signed
+// matcher above.
+fn package_registry_lock_match(text: []u8, alias: []u8, index_path: []u8,
+    version: []u8, source: []u8, index_bytes: []u8,
+    artifact_bytes: []u8) PackageRegistryLockError {
+    return package_registry_lock_match_signed(text, alias, index_path,
+        version, source, index_bytes, artifact_bytes, "");
+}

@@ -1,0 +1,647 @@
+// Dependency-neutral reader for the optional registry-resolution lock.
+//
+// This file intentionally has no import of package_resolve.zag.  The
+// package_registry_lock.zag validation facade predates resolver consumption
+// and imports the resolver for shared helpers; production resolution uses
+// this prefixed, borrowed-slice codec instead so the dependency graph stays
+// acyclic.  The wire format and matching rules are the same:
+//
+// v1 entries use:
+//   entry=<alias>\t<index-path>\t<index-checksum>\t<version>\t<source>\t
+//         <artifact-checksum>[\t<artifact-signature>]
+// v2 entries prepend a manifest scope and are parsed by the scoped helpers
+// at the end of this file.
+//
+// No filesystem state is trusted by this module.  Callers provide the exact
+// bytes read for the index and selected artifact and perform signature
+// verification through the resolver's existing no-follow verifier.
+
+enum PackageRegistryLockCoreError {
+    none,
+    invalid_lock,
+    invalid_query,
+    entry_not_found,
+    version_mismatch,
+    source_mismatch,
+    index_checksum_mismatch,
+    artifact_checksum_mismatch,
+    artifact_signature_mismatch,
+}
+
+struct PackageRegistryLockCoreChecksum {
+    first: i64,
+    second: i64,
+    bytes: i64,
+    // Parsing must distinguish the all-zero sentinel from a valid tuple.
+    // The dependency-neutral resolver uses this field before matching a
+    // lock; without it, an out-of-range tuple could be normalized to zero
+    // and survive the structural entry check.
+    valid: i32,
+}
+
+struct PackageRegistryLockCoreEntry {
+    alias: []u8,
+    index_path: []u8,
+    index_checksum: PackageRegistryLockCoreChecksum,
+    version: []u8,
+    source: []u8,
+    artifact_checksum: PackageRegistryLockCoreChecksum,
+    artifact_signature: []u8,
+    valid: i32,
+}
+
+struct PackageRegistryLockCoreLookup {
+    found: i32,
+    entry: PackageRegistryLockCoreEntry,
+    error: PackageRegistryLockCoreError,
+}
+
+fn package_registry_lock_core_zero_checksum() PackageRegistryLockCoreChecksum {
+    return PackageRegistryLockCoreChecksum{.first = 0, .second = 0, .bytes = 0,
+        .valid = 0};
+}
+
+fn package_registry_lock_core_bad_entry() PackageRegistryLockCoreEntry {
+    return PackageRegistryLockCoreEntry{
+        .alias = "", .index_path = "",
+        .index_checksum = package_registry_lock_core_zero_checksum(),
+        .version = "", .source = "",
+        .artifact_checksum = package_registry_lock_core_zero_checksum(),
+        .artifact_signature = "", .valid = 0,
+    };
+}
+
+fn package_registry_lock_core_bad_lookup(
+    error: PackageRegistryLockCoreError) PackageRegistryLockCoreLookup {
+    return PackageRegistryLockCoreLookup{
+        .found = 0, .entry = package_registry_lock_core_bad_entry(),
+        .error = error,
+    };
+}
+
+fn package_registry_lock_core_line(text: []u8, wanted: i32) []u8 {
+    let start: i32 = 0; let line_no: i32 = 0; let i: i32 = 0;
+    while (i < text.len) {
+        if (text[i] == '\n') {
+            if (line_no == wanted) { return text[start..i]; }
+            line_no = line_no + 1; start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (line_no == wanted && start <= text.len) { return text[start..text.len]; }
+    return "";
+}
+
+fn package_registry_lock_core_part(fields: []u8, wanted: i32) []u8 {
+    let start: i32 = 0; let field: i32 = 0; let i: i32 = 0;
+    while (i < fields.len) {
+        if (fields[i] == '\t') {
+            if (field == wanted) { return fields[start..i]; }
+            field = field + 1; start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (field == wanted && start <= fields.len) { return fields[start..fields.len]; }
+    return "";
+}
+
+fn package_registry_lock_core_parts_exact(text: []u8, count: i32) i32 {
+    if (count <= 0) { return 0; }
+    let fields: i32 = 1; let i: i32 = 0;
+    while (i < text.len) {
+        if (text[i] == '\t') { fields = fields + 1; }
+        i = i + 1;
+    }
+    return (fields == count) as i32;
+}
+
+fn package_registry_lock_core_checksum_parts_exact(text: []u8) i32 {
+    let fields: i32 = 1; let i: i32 = 0;
+    while (i < text.len) {
+        if (text[i] == ',') { fields = fields + 1; }
+        i = i + 1;
+    }
+    return (fields == 3) as i32;
+}
+
+fn package_registry_lock_core_checksum_part(text: []u8, wanted: i32) []u8 {
+    let start: i32 = 0; let field: i32 = 0; let i: i32 = 0;
+    while (i < text.len) {
+        if (text[i] == ',') {
+            if (field == wanted) { return text[start..i]; }
+            field = field + 1; start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (field == wanted && start <= text.len) { return text[start..text.len]; }
+    return "";
+}
+
+fn package_registry_lock_core_uint(text: []u8, maximum: i64) i64 {
+    if (text.len == 0 || (text.len > 1 && text[0] == '0')) { return -1; }
+    let value: i64 = 0; let i: i32 = 0;
+    while (i < text.len) {
+        if (text[i] < '0' || text[i] > '9') { return -1; }
+        let digit: i64 = (text[i] as i64) - 48;
+        if (value > (maximum - digit) / 10) { return -1; }
+        value = value * 10 + digit; i = i + 1;
+    }
+    return value;
+}
+
+fn package_registry_lock_core_checksum_parse(
+    text: []u8) PackageRegistryLockCoreChecksum {
+    let bad: PackageRegistryLockCoreChecksum =
+        package_registry_lock_core_zero_checksum();
+    if (package_registry_lock_core_checksum_parts_exact(text) == 0) { return bad; }
+    let first: i64 = package_registry_lock_core_uint(
+        package_registry_lock_core_checksum_part(text, 0), 1000000006);
+    let second: i64 = package_registry_lock_core_uint(
+        package_registry_lock_core_checksum_part(text, 1), 1000000008);
+    let bytes: i64 = package_registry_lock_core_uint(
+        package_registry_lock_core_checksum_part(text, 2), 8388608);
+    if (first < 0 || second < 0 || bytes < 0) { return bad; }
+    return PackageRegistryLockCoreChecksum{.first = first, .second = second,
+        .bytes = bytes, .valid = 1};
+}
+
+fn package_registry_lock_core_checksum_valid(text: []u8) i32 {
+    let parsed: PackageRegistryLockCoreChecksum =
+        package_registry_lock_core_checksum_parse(text);
+    return (parsed.valid != 0 &&
+        package_registry_lock_core_checksum_parts_exact(text) == 1) as i32;
+}
+
+fn package_registry_lock_core_checksum(data: []u8)
+    PackageRegistryLockCoreChecksum {
+    let first: i64 = 216613626; let second: i64 = 131542391; let i: i32 = 0;
+    while (i < data.len) {
+        let byte: i64 = data[i] as i64;
+        first = (first * 257 + byte + 1) % 1000000007;
+        second = (second * 263 + byte + 1) % 1000000009;
+        i = i + 1;
+    }
+    return PackageRegistryLockCoreChecksum{.first = first, .second = second,
+        .bytes = data.len, .valid = 1};
+}
+
+fn package_registry_lock_core_checksum_equal(
+    a: PackageRegistryLockCoreChecksum,
+    b: PackageRegistryLockCoreChecksum) i32 {
+    return (a.first == b.first && a.second == b.second && a.bytes == b.bytes) as i32;
+}
+
+fn package_registry_lock_core_safe_segment(segment: []u8) i32 {
+    return (segment.len > 0 && !@strEq(segment, ".") &&
+        !@strEq(segment, "..")) as i32;
+}
+
+fn package_registry_lock_core_safe_name(name: []u8) i32 {
+    if (name.len == 0 || name.len > 64) { return 0; }
+    let i: i32 = 0;
+    while (i < name.len) {
+        let c: u8 = name[i];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            (c >= '0' && c <= '9') || c == '_' || c == '-')) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn package_registry_lock_core_safe_path(path: []u8, module: i32) i32 {
+    if (path.len == 0 || path.len > 1024 || path[0] == '/' ||
+        path[path.len - 1] == '/') { return 0; }
+    let start: i32 = 0; let i: i32 = 0;
+    while (i < path.len) {
+        if (path[i] == '/') {
+            if (package_registry_lock_core_safe_segment(path[start..i]) == 0) { return 0; }
+            start = i + 1;
+        } else {
+            let c: u8 = path[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')) { return 0; }
+        }
+        i = i + 1;
+    }
+    if (package_registry_lock_core_safe_segment(path[start..path.len]) == 0) { return 0; }
+    if (module == 1 && (path.len < 5 || path[path.len - 4] != '.' ||
+        path[path.len - 3] != 'z' || path[path.len - 2] != 'a' ||
+        path[path.len - 1] != 'g')) { return 0; }
+    return 1;
+}
+
+fn package_registry_lock_core_version_part(text: []u8, lo: i32, hi: i32) i64 {
+    if (lo < 0 || hi <= lo || hi - lo > 10 ||
+        (hi - lo > 1 && text[lo] == '0')) { return -1; }
+    let value: i64 = 0; let i: i32 = lo;
+    while (i < hi) {
+        if (text[i] < '0' || text[i] > '9') { return -1; }
+        let digit: i64 = (text[i] as i64) - 48;
+        if (value > (2147483647 - digit) / 10) { return -1; }
+        value = value * 10 + digit; i = i + 1;
+    }
+    return value;
+}
+
+fn package_registry_lock_core_version(text: []u8) i32 {
+    if (text.len < 5 || text.len > 64) { return 0; }
+    let second: i32 = -1; let third: i32 = -1; let dots: i32 = 0; let i: i32 = 0;
+    while (i < text.len) {
+        if (text[i] == '.') {
+            dots = dots + 1;
+            if (dots == 1) { second = i; } else if (dots == 2) { third = i; }
+            else { return 0; }
+        }
+        i = i + 1;
+    }
+    if (dots != 2 || second <= 0 || third <= second + 1 || third >= text.len - 1) { return 0; }
+    return (package_registry_lock_core_version_part(text, 0, second) >= 0 &&
+        package_registry_lock_core_version_part(text, second + 1, third) >= 0 &&
+        package_registry_lock_core_version_part(text, third + 1, text.len) >= 0) as i32;
+}
+
+fn package_registry_lock_core_version_compare(a: []u8, b: []u8) i32 {
+    let ad: i32 = 0; let bd: i32 = 0; let ai: i32 = 0; let bi: i32 = 0;
+    while (ai < a.len) { if (a[ai] == '.') { ad = ad + 1; if (ad == 1) { break; } } ai = ai + 1; }
+    while (bi < b.len) { if (b[bi] == '.') { bd = bd + 1; if (bd == 1) { break; } } bi = bi + 1; }
+    let a2: i32 = ai + 1; let b2: i32 = bi + 1; let aj: i32 = a2; let bj: i32 = b2;
+    while (aj < a.len && a[aj] != '.') { aj = aj + 1; }
+    while (bj < b.len && b[bj] != '.') { bj = bj + 1; }
+    let ak: i32 = aj + 1; let bk: i32 = bj + 1;
+    let av0: i64 = package_registry_lock_core_version_part(a, 0, ai);
+    let bv0: i64 = package_registry_lock_core_version_part(b, 0, bi);
+    let av1: i64 = package_registry_lock_core_version_part(a, a2, aj);
+    let bv1: i64 = package_registry_lock_core_version_part(b, b2, bj);
+    let av2: i64 = package_registry_lock_core_version_part(a, ak, a.len);
+    let bv2: i64 = package_registry_lock_core_version_part(b, bk, b.len);
+    if (av0 != bv0) { return (av0 > bv0) as i32 * 2 - 1; }
+    if (av1 != bv1) { return (av1 > bv1) as i32 * 2 - 1; }
+    if (av2 != bv2) { return (av2 > bv2) as i32 * 2 - 1; }
+    return 0;
+}
+
+fn package_registry_lock_core_entry(line: []u8) PackageRegistryLockCoreEntry {
+    let bad: PackageRegistryLockCoreEntry = package_registry_lock_core_bad_entry();
+    if (line.len < 7 || !@strEq(line[0..6], "entry=")) { return bad; }
+    let fields: []u8 = line[6..line.len];
+    let plain: i32 = package_registry_lock_core_parts_exact(fields, 6);
+    let signed: i32 = package_registry_lock_core_parts_exact(fields, 7);
+    if (plain == 0 && signed == 0) { return bad; }
+    let alias: []u8 = package_registry_lock_core_part(fields, 0);
+    let index_path: []u8 = package_registry_lock_core_part(fields, 1);
+    let version: []u8 = package_registry_lock_core_part(fields, 3);
+    let source: []u8 = package_registry_lock_core_part(fields, 4);
+    let signature: []u8 = "";
+    if (signed == 1) { signature = package_registry_lock_core_part(fields, 6); }
+    if (package_registry_lock_core_safe_name(alias) == 0 ||
+        package_registry_lock_core_safe_path(index_path, 0) == 0 ||
+        package_registry_lock_core_version(version) == 0 ||
+        package_registry_lock_core_safe_path(source, 1) == 0 ||
+        package_registry_lock_core_checksum_valid(
+            package_registry_lock_core_part(fields, 2)) == 0 ||
+        package_registry_lock_core_checksum_valid(
+            package_registry_lock_core_part(fields, 5)) == 0 ||
+        (signed == 1 && package_registry_lock_core_safe_path(signature, 0) == 0)) {
+        return bad;
+    }
+    return PackageRegistryLockCoreEntry{.alias = alias, .index_path = index_path,
+        .index_checksum = package_registry_lock_core_checksum_parse(
+            package_registry_lock_core_part(fields, 2)),
+        .version = version, .source = source,
+        .artifact_checksum = package_registry_lock_core_checksum_parse(
+            package_registry_lock_core_part(fields, 5)),
+        .artifact_signature = signature, .valid = 1};
+}
+
+fn package_registry_lock_core_entry_after(
+    a: PackageRegistryLockCoreEntry, b: PackageRegistryLockCoreEntry) i32 {
+    let order: i32 = 0;
+    if (!@strEq(a.alias, b.alias)) {
+        let i: i32 = 0; while (i < a.alias.len && i < b.alias.len && a.alias[i] == b.alias[i]) { i = i + 1; }
+        if (i == b.alias.len || (i < a.alias.len && a.alias[i] > b.alias[i])) { return 1; }
+        return 0;
+    }
+    if (!@strEq(a.index_path, b.index_path)) {
+        let i: i32 = 0; while (i < a.index_path.len && i < b.index_path.len && a.index_path[i] == b.index_path[i]) { i = i + 1; }
+        if (i == b.index_path.len || (i < a.index_path.len && a.index_path[i] > b.index_path[i])) { return 1; }
+        return 0;
+    }
+    order = package_registry_lock_core_version_compare(a.version, b.version);
+    return (order > 0) as i32;
+}
+
+fn package_registry_lock_core_valid(text: []u8) i32 {
+    if (text.len <= 0 || text.len > 1048576 || text[text.len - 1] != '\n' ||
+        !@strEq(package_registry_lock_core_line(text, 0), "format=zag-registry-lock-v1")) { return 0; }
+    let checksum_line: []u8 = package_registry_lock_core_line(text, text.len);
+    let mark: i32 = -1; let i: i32 = 0; let line_no: i32 = 1; let entries: i32 = 0;
+    while (i < text.len) {
+        if ((i == 0 || text[i - 1] == '\n') && i + 9 <= text.len &&
+            @strEq(text[i..i + 9], "checksum=")) { mark = i; break; }
+        i = i + 1;
+    }
+    if (mark <= 0) { return 0; }
+    checksum_line = text[mark..text.len];
+    if (checksum_line.len < 11 || checksum_line[checksum_line.len - 1] != '\n' ||
+        package_registry_lock_core_checksum_valid(checksum_line[9..checksum_line.len - 1]) == 0 ||
+        package_registry_lock_core_checksum_equal(
+            package_registry_lock_core_checksum(text[0..mark]),
+            package_registry_lock_core_checksum_parse(checksum_line[9..checksum_line.len - 1])) == 0) { return 0; }
+    let previous: PackageRegistryLockCoreEntry = package_registry_lock_core_bad_entry();
+    while (line_no < text.len) {
+        let line: []u8 = package_registry_lock_core_line(text, line_no);
+        if (line.len == 0 || (line.len >= 9 && @strEq(line[0..9], "checksum="))) { break; }
+        let entry: PackageRegistryLockCoreEntry = package_registry_lock_core_entry(line);
+        if (entry.valid == 0 || (previous.valid != 0 &&
+            package_registry_lock_core_entry_after(entry, previous) == 0)) { return 0; }
+        previous = entry; entries = entries + 1; line_no = line_no + 1;
+        if (entries > 256) { return 0; }
+    }
+    return (entries > 0 && line_no == entries + 1 &&
+        mark == text.len - checksum_line.len &&
+        @strEq(package_registry_lock_core_line(text, line_no),
+            checksum_line[0..checksum_line.len - 1])) as i32;
+}
+
+fn package_registry_lock_core_lookup(text: []u8, alias: []u8,
+    index_path: []u8) PackageRegistryLockCoreLookup {
+    if (package_registry_lock_core_valid(text) == 0) {
+        return package_registry_lock_core_bad_lookup(
+            PackageRegistryLockCoreError.invalid_lock);
+    }
+    if (package_registry_lock_core_safe_name(alias) == 0 ||
+        package_registry_lock_core_safe_path(index_path, 0) == 0) {
+        return package_registry_lock_core_bad_lookup(
+            PackageRegistryLockCoreError.invalid_query);
+    }
+    let line_no: i32 = 1;
+    while (line_no < text.len) {
+        let line: []u8 = package_registry_lock_core_line(text, line_no);
+        if (line.len == 0 || (line.len >= 9 && @strEq(line[0..9], "checksum="))) { break; }
+        let entry: PackageRegistryLockCoreEntry = package_registry_lock_core_entry(line);
+        if (@strEq(entry.alias, alias) && @strEq(entry.index_path, index_path)) {
+            return PackageRegistryLockCoreLookup{.found = 1, .entry = entry,
+                .error = PackageRegistryLockCoreError.none};
+        }
+        line_no = line_no + 1;
+    }
+    return package_registry_lock_core_bad_lookup(
+        PackageRegistryLockCoreError.entry_not_found);
+}
+
+fn package_registry_lock_core_match_signed(text: []u8, alias: []u8,
+    index_path: []u8, version: []u8, source: []u8, index_bytes: []u8,
+    artifact_bytes: []u8, artifact_signature: []u8)
+    PackageRegistryLockCoreError {
+    let lookup: PackageRegistryLockCoreLookup =
+        package_registry_lock_core_lookup(text, alias, index_path);
+    if (lookup.error != PackageRegistryLockCoreError.none) { return lookup.error; }
+    if (!@strEq(lookup.entry.version, version)) { return PackageRegistryLockCoreError.version_mismatch; }
+    if (!@strEq(lookup.entry.source, source)) { return PackageRegistryLockCoreError.source_mismatch; }
+    if (package_registry_lock_core_checksum_equal(lookup.entry.index_checksum,
+        package_registry_lock_core_checksum(index_bytes)) == 0) { return PackageRegistryLockCoreError.index_checksum_mismatch; }
+    if (package_registry_lock_core_checksum_equal(lookup.entry.artifact_checksum,
+        package_registry_lock_core_checksum(artifact_bytes)) == 0) { return PackageRegistryLockCoreError.artifact_checksum_mismatch; }
+    if (!@strEq(lookup.entry.artifact_signature, artifact_signature)) { return PackageRegistryLockCoreError.artifact_signature_mismatch; }
+    return PackageRegistryLockCoreError.none;
+}
+
+// Scoped v2 lock records extend the v1 selection tuple with the canonical
+// manifest scope relative to the lockfile directory.  v1 remains untouched
+// above for compatibility; v2 is required when one lock covers nested
+// manifests whose aliases or relative index paths may otherwise collide.
+//
+//   entry=<scope>\t<alias>\t<index-path>\t<index-checksum>\t<version>\t
+//         <source>\t<artifact-checksum>[\t<artifact-signature>]
+
+struct PackageRegistryLockCoreV2Entry {
+    scope: []u8,
+    alias: []u8,
+    index_path: []u8,
+    index_checksum: PackageRegistryLockCoreChecksum,
+    version: []u8,
+    source: []u8,
+    artifact_checksum: PackageRegistryLockCoreChecksum,
+    artifact_signature: []u8,
+    valid: i32,
+}
+
+struct PackageRegistryLockCoreV2Lookup {
+    found: i32,
+    entry: PackageRegistryLockCoreV2Entry,
+    error: PackageRegistryLockCoreError,
+}
+
+fn package_registry_lock_core_v2_bad_entry()
+    PackageRegistryLockCoreV2Entry {
+    return PackageRegistryLockCoreV2Entry{
+        .scope = "", .alias = "", .index_path = "",
+        .index_checksum = package_registry_lock_core_zero_checksum(),
+        .version = "", .source = "",
+        .artifact_checksum = package_registry_lock_core_zero_checksum(),
+        .artifact_signature = "", .valid = 0,
+    };
+}
+
+fn package_registry_lock_core_v2_bad_lookup(
+    error: PackageRegistryLockCoreError) PackageRegistryLockCoreV2Lookup {
+    return PackageRegistryLockCoreV2Lookup{
+        .found = 0, .entry = package_registry_lock_core_v2_bad_entry(),
+        .error = error,
+    };
+}
+
+fn package_registry_lock_core_v2_scope_safe(scope: []u8) i32 {
+    if (scope.len == 0 || scope.len > 1024 || scope[0] == '/' ||
+        scope[scope.len - 1] == '/') { return 0; }
+    if (@strEq(scope, "root")) { return 1; }
+    let start: i32 = 0; let i: i32 = 0;
+    while (i < scope.len) {
+        if (scope[i] == '/') {
+            if (package_registry_lock_core_safe_segment(scope[start..i]) == 0) {
+                return 0;
+            }
+            start = i + 1;
+        } else {
+            let c: u8 = scope[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')) {
+                return 0;
+            }
+        }
+        i = i + 1;
+    }
+    return package_registry_lock_core_safe_segment(scope[start..scope.len]);
+}
+
+fn package_registry_lock_core_v2_entry(line: []u8)
+    PackageRegistryLockCoreV2Entry {
+    let bad: PackageRegistryLockCoreV2Entry =
+        package_registry_lock_core_v2_bad_entry();
+    if (line.len < 7 || !@strEq(line[0..6], "entry=")) { return bad; }
+    let fields: []u8 = line[6..line.len];
+    let plain: i32 = package_registry_lock_core_parts_exact(fields, 7);
+    let signed: i32 = package_registry_lock_core_parts_exact(fields, 8);
+    if (plain == 0 && signed == 0) { return bad; }
+    let scope: []u8 = package_registry_lock_core_part(fields, 0);
+    let alias: []u8 = package_registry_lock_core_part(fields, 1);
+    let index_path: []u8 = package_registry_lock_core_part(fields, 2);
+    let version: []u8 = package_registry_lock_core_part(fields, 4);
+    let source: []u8 = package_registry_lock_core_part(fields, 5);
+    let signature: []u8 = "";
+    if (signed == 1) { signature = package_registry_lock_core_part(fields, 7); }
+    if (package_registry_lock_core_v2_scope_safe(scope) == 0 ||
+        package_registry_lock_core_safe_name(alias) == 0 ||
+        package_registry_lock_core_safe_path(index_path, 0) == 0 ||
+        package_registry_lock_core_version(version) == 0 ||
+        package_registry_lock_core_safe_path(source, 1) == 0 ||
+        package_registry_lock_core_checksum_valid(
+            package_registry_lock_core_part(fields, 3)) == 0 ||
+        package_registry_lock_core_checksum_valid(
+            package_registry_lock_core_part(fields, 6)) == 0 ||
+        (signed == 1 && package_registry_lock_core_safe_path(signature, 0) == 0)) {
+        return bad;
+    }
+    return PackageRegistryLockCoreV2Entry{
+        .scope = scope, .alias = alias, .index_path = index_path,
+        .index_checksum = package_registry_lock_core_checksum_parse(
+            package_registry_lock_core_part(fields, 3)),
+        .version = version, .source = source,
+        .artifact_checksum = package_registry_lock_core_checksum_parse(
+            package_registry_lock_core_part(fields, 6)),
+        .artifact_signature = signature, .valid = 1,
+    };
+}
+
+fn package_registry_lock_core_v2_entry_after(
+    a: PackageRegistryLockCoreV2Entry,
+    b: PackageRegistryLockCoreV2Entry) i32 {
+    let order: i32 = 0;
+    order = package_registry_lock_core_cmp(a.scope, b.scope);
+    if (order != 0) { return (order > 0) as i32; }
+    order = package_registry_lock_core_cmp(a.alias, b.alias);
+    if (order != 0) { return (order > 0) as i32; }
+    order = package_registry_lock_core_cmp(a.index_path, b.index_path);
+    if (order != 0) { return (order > 0) as i32; }
+    order = package_registry_lock_core_version_compare(a.version, b.version);
+    return (order > 0) as i32;
+}
+
+fn package_registry_lock_core_cmp(a: []u8, b: []u8) i32 {
+    let common: i32 = a.len;
+    if (b.len < common) { common = b.len; }
+    let i: i32 = 0;
+    while (i < common) {
+        if (a[i] < b[i]) { return 0 - 1; }
+        if (a[i] > b[i]) { return 1; }
+        i = i + 1;
+    }
+    if (a.len < b.len) { return 0 - 1; }
+    if (a.len > b.len) { return 1; }
+    return 0;
+}
+
+fn package_registry_lock_core_v2_checksum_mark(text: []u8) i32 {
+    let i: i32 = 0;
+    while (i + 9 <= text.len) {
+        if ((i == 0 || text[i - 1] == '\n') &&
+            @strEq(text[i..i + 9], "checksum=")) { return i; }
+        i = i + 1;
+    }
+    return 0 - 1;
+}
+
+fn package_registry_lock_core_v2_valid(text: []u8) i32 {
+    if (text.len <= 0 || text.len > 1048576 || text[text.len - 1] != '\n' ||
+        !@strEq(package_registry_lock_core_line(text, 0),
+            "format=zag-registry-lock-v2")) { return 0; }
+    let mark: i32 = package_registry_lock_core_v2_checksum_mark(text);
+    if (mark <= 0 || mark >= text.len) { return 0; }
+    let checksum_line: []u8 = text[mark..text.len];
+    if (checksum_line.len < 11 || checksum_line[checksum_line.len - 1] != '\n' ||
+        package_registry_lock_core_checksum_valid(
+            checksum_line[9..checksum_line.len - 1]) == 0 ||
+        package_registry_lock_core_checksum_equal(
+            package_registry_lock_core_checksum(text[0..mark]),
+            package_registry_lock_core_checksum_parse(
+                checksum_line[9..checksum_line.len - 1])) == 0) { return 0; }
+    let previous: PackageRegistryLockCoreV2Entry =
+        package_registry_lock_core_v2_bad_entry();
+    let entries: i32 = 0; let line_no: i32 = 1;
+    while (line_no < text.len) {
+        let line: []u8 = package_registry_lock_core_line(text, line_no);
+        if (line.len == 0 || (line.len >= 9 &&
+            @strEq(line[0..9], "checksum="))) { break; }
+        let entry: PackageRegistryLockCoreV2Entry =
+            package_registry_lock_core_v2_entry(line);
+        if (entry.valid == 0 || (previous.valid != 0 &&
+            package_registry_lock_core_v2_entry_after(entry, previous) == 0)) {
+            return 0;
+        }
+        previous = entry; entries = entries + 1; line_no = line_no + 1;
+        if (entries > 256) { return 0; }
+    }
+    return (entries > 0 && line_no == entries + 1 &&
+        mark == text.len - checksum_line.len &&
+        @strEq(package_registry_lock_core_line(text, line_no),
+            checksum_line[0..checksum_line.len - 1])) as i32;
+}
+
+fn package_registry_lock_core_v2_lookup(text: []u8, scope: []u8,
+    alias: []u8, index_path: []u8) PackageRegistryLockCoreV2Lookup {
+    if (package_registry_lock_core_v2_valid(text) == 0) {
+        return package_registry_lock_core_v2_bad_lookup(
+            PackageRegistryLockCoreError.invalid_lock);
+    }
+    if (package_registry_lock_core_v2_scope_safe(scope) == 0 ||
+        package_registry_lock_core_safe_name(alias) == 0 ||
+        package_registry_lock_core_safe_path(index_path, 0) == 0) {
+        return package_registry_lock_core_v2_bad_lookup(
+            PackageRegistryLockCoreError.invalid_query);
+    }
+    let line_no: i32 = 1;
+    while (line_no < text.len) {
+        let line: []u8 = package_registry_lock_core_line(text, line_no);
+        if (line.len == 0 || (line.len >= 9 &&
+            @strEq(line[0..9], "checksum="))) { break; }
+        let entry: PackageRegistryLockCoreV2Entry =
+            package_registry_lock_core_v2_entry(line);
+        if (@strEq(entry.scope, scope) && @strEq(entry.alias, alias) &&
+            @strEq(entry.index_path, index_path)) {
+            return PackageRegistryLockCoreV2Lookup{.found = 1,
+                .entry = entry, .error = PackageRegistryLockCoreError.none};
+        }
+        line_no = line_no + 1;
+    }
+    return package_registry_lock_core_v2_bad_lookup(
+        PackageRegistryLockCoreError.entry_not_found);
+}
+
+fn package_registry_lock_core_v2_match_signed(text: []u8, scope: []u8,
+    alias: []u8, index_path: []u8, version: []u8, source: []u8,
+    index_bytes: []u8, artifact_bytes: []u8, artifact_signature: []u8)
+    PackageRegistryLockCoreError {
+    let lookup: PackageRegistryLockCoreV2Lookup =
+        package_registry_lock_core_v2_lookup(text, scope, alias, index_path);
+    if (lookup.error != PackageRegistryLockCoreError.none) {
+        return lookup.error;
+    }
+    if (!@strEq(lookup.entry.version, version)) {
+        return PackageRegistryLockCoreError.version_mismatch;
+    }
+    if (!@strEq(lookup.entry.source, source)) {
+        return PackageRegistryLockCoreError.source_mismatch;
+    }
+    if (package_registry_lock_core_checksum_equal(lookup.entry.index_checksum,
+        package_registry_lock_core_checksum(index_bytes)) == 0) {
+        return PackageRegistryLockCoreError.index_checksum_mismatch;
+    }
+    if (package_registry_lock_core_checksum_equal(lookup.entry.artifact_checksum,
+        package_registry_lock_core_checksum(artifact_bytes)) == 0) {
+        return PackageRegistryLockCoreError.artifact_checksum_mismatch;
+    }
+    if (!@strEq(lookup.entry.artifact_signature, artifact_signature)) {
+        return PackageRegistryLockCoreError.artifact_signature_mismatch;
+    }
+    return PackageRegistryLockCoreError.none;
+}

@@ -49,6 +49,11 @@ kernel/realtime restriction may forbid the effect, and diagnostics must show
 the call chain and source operation that introduced it.  Imported symbols with
 no machine-checkable contract are `Unsafe + FFI` by default.
 
+Complete rendered call-chain diagnostics are implemented for capability
+violations. They retain callback and closure identity, include imported module
+origins, render every violated effect separately, and terminate safely across
+recursive call graphs.
+
 ## Defined unsafe contracts versus undefined behavior
 
 Unsafe APIs must state preconditions in terms of pointer validity, alignment,

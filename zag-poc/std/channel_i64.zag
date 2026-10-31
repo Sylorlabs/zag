@@ -1,0 +1,422 @@
+// std/channel_i64.zag -- fixed-capacity Linux x86-64 SPSC i64 channel.
+//
+// Exactly one producer may call send operations and exactly one consumer may
+// call receive operations for a channel.  Capacity is fixed at creation in
+// the inclusive range 1..64.  Slots are published with release stores and
+// observed with acquire loads.  Full/empty waits use Linux futexes,
+// a caller-provided timeout no greater than five seconds, and at most 64 wait
+// attempts per operation.  The backing page is owned and unmapped by close.
+//
+// This contract does not infer race freedom, make the handle noncopyable,
+// support MPMC use, close concurrently with an operation, provide select or
+// cancellation, or implement a scheduler/async-await runtime.
+
+@import("rt.zag")
+
+struct ChannelI64State {
+    magic: i64,
+    capacity: i64,
+    head: i64,
+    tail: i64,
+    readable_epoch: i64,
+    writable_epoch: i64,
+    reserved0: i64,
+    reserved1: i64,
+}
+
+struct ChannelI64 {
+    state: *ChannelI64State,
+    open: i32,
+}
+
+struct ChannelI64Result {
+    ok: i32,
+    code: i64,
+    value: ChannelI64,
+}
+
+struct ChannelI64SendResult {
+    ok: i32,
+    code: i64,
+    wait_calls: i32,
+    elapsed_ms: i64,
+}
+
+struct ChannelI64ReceiveResult {
+    ok: i32,
+    code: i64,
+    value: i64,
+    wait_calls: i32,
+    elapsed_ms: i64,
+}
+
+struct ChannelI64Timespec {
+    seconds: i64,
+    nanoseconds: i64,
+}
+
+fn channel_i64_status_ok() i64 { return 0; }
+fn channel_i64_status_invalid_argument() i64 { return 0 - 7401; }
+fn channel_i64_status_invalid_state() i64 { return 0 - 7402; }
+fn channel_i64_status_full() i64 { return 0 - 7403; }
+fn channel_i64_status_empty() i64 { return 0 - 7404; }
+fn channel_i64_status_timeout() i64 { return 0 - 7405; }
+fn channel_i64_status_limit() i64 { return 0 - 7406; }
+
+fn channel_i64_magic() i64 { return 6510615555426900570; }
+
+fn channel_i64_invalid() ChannelI64 {
+    return ChannelI64{ .state = null as *ChannelI64State, .open = 0 };
+}
+
+fn channel_i64_create(capacity: i32) ChannelI64Result {
+    if (capacity < 1 || capacity > 64) {
+        return ChannelI64Result{
+            .ok = 0, .code = channel_i64_status_invalid_argument(),
+            .value = channel_i64_invalid(),
+        };
+    }
+    let address: i64 = _zag_raw_syscall(9, 0, 4096, 3, 34, 0 - 1, 0);
+    if (address < 0) {
+        return ChannelI64Result{
+            .ok = 0, .code = address, .value = channel_i64_invalid(),
+        };
+    }
+    let state: *ChannelI64State = address as *ChannelI64State;
+    state.*.magic = channel_i64_magic();
+    state.*.capacity = capacity as i64;
+    state.*.head = 0;
+    state.*.tail = 0;
+    state.*.readable_epoch = 0;
+    state.*.writable_epoch = 0;
+    state.*.reserved0 = 0;
+    state.*.reserved1 = 0;
+    return ChannelI64Result{
+        .ok = 1, .code = channel_i64_status_ok(),
+        .value = ChannelI64{ .state = state, .open = 1 },
+    };
+}
+
+// Initialize caller-owned, non-stack-escaping handle storage directly.  This
+// is useful for a context placed in shared mmap memory before thread spawn.
+// The destination must not already contain an open channel.
+fn channel_i64_create_into(destination: @borrows_mut *ChannelI64, capacity: i32) i64 {
+    if (destination == null as *ChannelI64 || capacity < 1 || capacity > 64) {
+        return channel_i64_status_invalid_argument();
+    }
+    if (destination.*.open != 0 ||
+        destination.*.state != null as *ChannelI64State) {
+        return channel_i64_status_invalid_state();
+    }
+    let address: i64 = _zag_raw_syscall(9, 0, 4096, 3, 34, 0 - 1, 0);
+    if (address < 0) { return address; }
+    let state: *ChannelI64State = address as *ChannelI64State;
+    state.*.magic = channel_i64_magic();
+    state.*.capacity = capacity as i64;
+    state.*.head = 0;
+    state.*.tail = 0;
+    state.*.readable_epoch = 0;
+    state.*.writable_epoch = 0;
+    state.*.reserved0 = 0;
+    state.*.reserved1 = 0;
+    destination.*.state = state;
+    destination.*.open = 1;
+    return channel_i64_status_ok();
+}
+
+// The result carrier is invalidated before the handle is returned.  The
+// retained-return contract records that the returned handle carries the
+// carrier's pointer-bearing state; callers must not use the carrier as an
+// independent live owner after taking it.
+fn channel_i64_take(result: @retained_by_return *ChannelI64Result) ChannelI64 {
+    if (result == null as *ChannelI64Result || result.*.ok == 0 ||
+        result.*.value.open == 0) {
+        return channel_i64_invalid();
+    }
+    let value: ChannelI64 = result.*.value;
+    result.*.ok = 0;
+    result.*.code = channel_i64_status_invalid_state();
+    result.*.value = channel_i64_invalid();
+    return value;
+}
+
+fn channel_i64_valid(channel: @borrows *ChannelI64) i32 {
+    if (channel == null as *ChannelI64 || channel.*.open == 0 ||
+        channel.*.state == null as *ChannelI64State) { return 0; }
+    if (channel.*.state.*.magic != channel_i64_magic() ||
+        channel.*.state.*.capacity < 1 || channel.*.state.*.capacity > 64) {
+        return 0;
+    }
+    return 1;
+}
+
+fn channel_i64_close(channel: @borrows_mut *ChannelI64) i64 {
+    if (channel_i64_valid(channel) == 0) {
+        return channel_i64_status_invalid_state();
+    }
+    let state: *ChannelI64State = channel.*.state;
+    let rc: i64 = _zag_raw_syscall(11, state as i64, 4096, 0, 0, 0, 0);
+    if (rc == 0) {
+        channel.*.state = null as *ChannelI64State;
+        channel.*.open = 0;
+    }
+    return rc;
+}
+
+fn channel_i64_slots(state: @borrows *ChannelI64State) *i64 {
+    return ((state as i64) + 64) as *i64;
+}
+
+fn channel_i64_elapsed(start: i64) i64 {
+    let elapsed: i64 = _zag_clock_monotonic_ms() - start;
+    if (elapsed < 0) { return 0; }
+    return elapsed;
+}
+
+fn channel_i64_futex_wait(epoch: @borrows *i64, expected: i64,
+                          timeout_ms: i64) i64 {
+    if (timeout_ms <= 0) { return 0 - 110; }
+    let timeout: ChannelI64Timespec = ChannelI64Timespec{
+        .seconds = timeout_ms / 1000,
+        .nanoseconds = (timeout_ms % 1000) * 1000000,
+    };
+    // futex(FUTEX_WAIT).  The compiler's checked @atomicWake32 currently uses
+    // FUTEX_WAKE, so the timed raw wait deliberately uses the matching shared
+    // futex key rather than FUTEX_WAIT_PRIVATE.  The epoch is an aligned i64;
+    // Linux x86-64 waits on its low i32 word.  Epoch wrap is harmless because
+    // every wake is followed by a fresh head/tail acquire load.
+    return _zag_raw_syscall(
+        202, epoch as i64, 0, (expected & 4294967295) as i32,
+        (&timeout) as i64, 0, 0
+    );
+}
+
+fn channel_i64_wake(epoch: @borrows_mut *i64) void {
+    unsafe {
+        let word: *mut i32 = epoch as *mut i32;
+        let _woken: i64 = @atomicWake32(word, 1);
+    }
+}
+
+fn channel_i64_send_wait(channel: @borrows_mut *ChannelI64, value: i64,
+                         timeout_ms: i32) ChannelI64SendResult {
+    let start: i64 = _zag_clock_monotonic_ms();
+    if (channel_i64_valid(channel) == 0) {
+        return ChannelI64SendResult{
+            .ok = 0, .code = channel_i64_status_invalid_state(),
+            .wait_calls = 0, .elapsed_ms = 0,
+        };
+    }
+    if (timeout_ms < 0 || timeout_ms > 5000) {
+        return ChannelI64SendResult{
+            .ok = 0, .code = channel_i64_status_invalid_argument(),
+            .wait_calls = 0, .elapsed_ms = 0,
+        };
+    }
+    let state: *ChannelI64State = channel.*.state;
+    unsafe {
+        let head_pointer: *const i64 = (&state.*.head) as *const i64;
+        let tail_pointer: *mut i64 = (&state.*.tail) as *mut i64;
+        let readable_pointer: *mut i64 =
+            (&state.*.readable_epoch) as *mut i64;
+        let writable_pointer: *mut i64 =
+            (&state.*.writable_epoch) as *mut i64;
+        let wait_calls: i32 = 0;
+        let attempts: i32 = 0;
+        while (attempts < 64) {
+            // Sample the notification before checking queue state.  A
+            // consumer publication after this load either changes the futex
+            // word before wait (EAGAIN) or wakes the waiter; it cannot be
+            // missed between the condition check and epoch sampling.
+            let epoch: i64 = @atomicLoad64Order(
+                writable_pointer as *const i64, 1
+            );
+            let tail: i64 = @atomicLoad64Order(
+                tail_pointer as *const i64, 0
+            );
+            let head: i64 = @atomicLoad64Order(head_pointer, 1);
+            if (head < 0 || tail < head ||
+                tail - head > state.*.capacity) {
+                return ChannelI64SendResult{
+                    .ok = 0, .code = channel_i64_status_invalid_state(),
+                    .wait_calls = wait_calls,
+                    .elapsed_ms = channel_i64_elapsed(start),
+                };
+            }
+            if (tail - head < state.*.capacity) {
+                if (tail == 9223372036854775807) {
+                    return ChannelI64SendResult{
+                        .ok = 0, .code = channel_i64_status_limit(),
+                        .wait_calls = wait_calls,
+                        .elapsed_ms = channel_i64_elapsed(start),
+                    };
+                }
+                let index: i32 = (tail % state.*.capacity) as i32;
+                channel_i64_slots(state)[index] = value;
+                @atomicStore64Order(tail_pointer, tail + 1, 2);
+                let _epoch: i64 =
+                    @atomicFetchAdd64Order(readable_pointer, 1, 2);
+                channel_i64_wake(readable_pointer);
+                return ChannelI64SendResult{
+                    .ok = 1, .code = channel_i64_status_ok(),
+                    .wait_calls = wait_calls,
+                    .elapsed_ms = channel_i64_elapsed(start),
+                };
+            }
+            if (timeout_ms == 0) {
+                return ChannelI64SendResult{
+                    .ok = 0, .code = channel_i64_status_full(),
+                    .wait_calls = wait_calls,
+                    .elapsed_ms = channel_i64_elapsed(start),
+                };
+            }
+            let elapsed: i64 = channel_i64_elapsed(start);
+            if (elapsed >= timeout_ms) {
+                return ChannelI64SendResult{
+                    .ok = 0, .code = channel_i64_status_timeout(),
+                    .wait_calls = wait_calls,
+                    .elapsed_ms = elapsed,
+                };
+            }
+            let wait_rc: i64 = channel_i64_futex_wait(
+                writable_pointer, epoch, (timeout_ms as i64) - elapsed
+            );
+            wait_calls = wait_calls + 1;
+            if (wait_rc != 0 && wait_rc != (0 - 11) &&
+                wait_rc != (0 - 4) && wait_rc != (0 - 110)) {
+                return ChannelI64SendResult{
+                    .ok = 0, .code = wait_rc, .wait_calls = wait_calls,
+                    .elapsed_ms = channel_i64_elapsed(start),
+                };
+            }
+            attempts = attempts + 1;
+        }
+        return ChannelI64SendResult{
+            .ok = 0, .code = channel_i64_status_limit(),
+            .wait_calls = wait_calls,
+            .elapsed_ms = channel_i64_elapsed(start),
+        };
+    }
+}
+
+fn channel_i64_try_send(channel: @borrows_mut *ChannelI64, value: i64)
+    ChannelI64SendResult {
+    return channel_i64_send_wait(channel, value, 0);
+}
+
+fn channel_i64_receive_wait(channel: @borrows_mut *ChannelI64, timeout_ms: i32)
+    ChannelI64ReceiveResult {
+    let start: i64 = _zag_clock_monotonic_ms();
+    if (channel_i64_valid(channel) == 0) {
+        return ChannelI64ReceiveResult{
+            .ok = 0, .code = channel_i64_status_invalid_state(), .value = 0,
+            .wait_calls = 0, .elapsed_ms = 0,
+        };
+    }
+    if (timeout_ms < 0 || timeout_ms > 5000) {
+        return ChannelI64ReceiveResult{
+            .ok = 0, .code = channel_i64_status_invalid_argument(),
+            .value = 0, .wait_calls = 0, .elapsed_ms = 0,
+        };
+    }
+    let state: *ChannelI64State = channel.*.state;
+    unsafe {
+        let head_pointer: *mut i64 = (&state.*.head) as *mut i64;
+        let tail_pointer: *const i64 = (&state.*.tail) as *const i64;
+        let readable_pointer: *mut i64 =
+            (&state.*.readable_epoch) as *mut i64;
+        let writable_pointer: *mut i64 =
+            (&state.*.writable_epoch) as *mut i64;
+        let wait_calls: i32 = 0;
+        let attempts: i32 = 0;
+        while (attempts < 64) {
+            // Sample the notification before checking queue state.  A
+            // producer publication after this load either changes the futex
+            // word before wait (EAGAIN) or wakes the waiter; it cannot be
+            // missed between the condition check and epoch sampling.
+            let epoch: i64 = @atomicLoad64Order(
+                readable_pointer as *const i64, 1
+            );
+            let head: i64 = @atomicLoad64Order(
+                head_pointer as *const i64, 0
+            );
+            let tail: i64 = @atomicLoad64Order(tail_pointer, 1);
+            if (head < 0 || tail < head ||
+                tail - head > state.*.capacity) {
+                return ChannelI64ReceiveResult{
+                    .ok = 0, .code = channel_i64_status_invalid_state(),
+                    .value = 0, .wait_calls = wait_calls,
+                    .elapsed_ms = channel_i64_elapsed(start),
+                };
+            }
+            if (head < tail) {
+                let index: i32 = (head % state.*.capacity) as i32;
+                let value: i64 = channel_i64_slots(state)[index];
+                @atomicStore64Order(head_pointer, head + 1, 2);
+                let _epoch: i64 =
+                    @atomicFetchAdd64Order(writable_pointer, 1, 2);
+                channel_i64_wake(writable_pointer);
+                return ChannelI64ReceiveResult{
+                    .ok = 1, .code = channel_i64_status_ok(), .value = value,
+                    .wait_calls = wait_calls,
+                    .elapsed_ms = channel_i64_elapsed(start),
+                };
+            }
+            if (timeout_ms == 0) {
+                return ChannelI64ReceiveResult{
+                    .ok = 0, .code = channel_i64_status_empty(), .value = 0,
+                    .wait_calls = wait_calls,
+                    .elapsed_ms = channel_i64_elapsed(start),
+                };
+            }
+            let elapsed: i64 = channel_i64_elapsed(start);
+            if (elapsed >= timeout_ms) {
+                return ChannelI64ReceiveResult{
+                    .ok = 0, .code = channel_i64_status_timeout(), .value = 0,
+                    .wait_calls = wait_calls, .elapsed_ms = elapsed,
+                };
+            }
+            let wait_rc: i64 = channel_i64_futex_wait(
+                readable_pointer, epoch, (timeout_ms as i64) - elapsed
+            );
+            wait_calls = wait_calls + 1;
+            if (wait_rc != 0 && wait_rc != (0 - 11) &&
+                wait_rc != (0 - 4) && wait_rc != (0 - 110)) {
+                return ChannelI64ReceiveResult{
+                    .ok = 0, .code = wait_rc, .value = 0,
+                    .wait_calls = wait_calls,
+                    .elapsed_ms = channel_i64_elapsed(start),
+                };
+            }
+            attempts = attempts + 1;
+        }
+        return ChannelI64ReceiveResult{
+            .ok = 0, .code = channel_i64_status_limit(), .value = 0,
+            .wait_calls = wait_calls,
+            .elapsed_ms = channel_i64_elapsed(start),
+        };
+    }
+}
+
+fn channel_i64_try_receive(channel: @borrows_mut *ChannelI64)
+    ChannelI64ReceiveResult {
+    return channel_i64_receive_wait(channel, 0);
+}
+
+fn channel_i64_count(channel: @borrows *ChannelI64) i64 {
+    if (channel_i64_valid(channel) == 0) {
+        return channel_i64_status_invalid_state();
+    }
+    unsafe {
+        let head: i64 = @atomicLoad64Order(
+            (&channel.*.state.*.head) as *const i64, 1
+        );
+        let tail: i64 = @atomicLoad64Order(
+            (&channel.*.state.*.tail) as *const i64, 1
+        );
+        if (tail < head || tail - head > channel.*.state.*.capacity) {
+            return channel_i64_status_invalid_state();
+        }
+        return tail - head;
+    }
+}

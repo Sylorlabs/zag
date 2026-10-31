@@ -284,7 +284,11 @@ callback, aggregate, import, or destructor contract. The compiler's
 remaining BSS is private allocator/runtime state, and top-level `const` is a
 nullary-function desugaring rather than a static object. Aggregate, callback,
 and optional globals remain rejected until initialization ordering, destruction,
-and lifetime/provenance contracts are implemented.
+and lifetime/provenance contracts are implemented. The bounded unsafe
+thread/runtime boundary may also assign a direct raw-pointer value (including
+null or an mmap-derived address) to a declared pointer cell; tracked owners,
+borrowed views, stack addresses, and aggregate values remain rejected at that
+non-local store.
 
 ## Implemented volatile/MMIO byte, halfword, dword, and word slice
 
@@ -333,13 +337,21 @@ Captureless callbacks are ordinary function values. A scalar by-value capture
 uses a heap environment that is an owned v2 resource: it may be transferred by
 an owned return or must be released with `close(callback)` on every path. The
 native close operation clears the fat-function environment before returning it
-to the allocator. Pointer captures remain rejected because they retain a
-defining-frame address, and aggregate captures remain rejected because their
-separate heap copies do not yet have a destruction protocol. Aggregate globals,
-pointer captures, and aggregate captures therefore remain explicit unsupported
-lifetime paths rather than ambient unsafe behavior. The narrow raw-pointer
-global cell above is an exception with no initializer or destructor protocol;
-it is not a general pointer-bearing global object model.
+to the allocator. A capturing closure may also copy a function value when the
+compiler proves that the copied function is a direct, non-generic,
+non-extern, captureless declaration (its environment word is exactly zero).
+That proof is recomputed after every typed function-value assignment;
+reassignment from an owning closure, parameter, or unknown function return
+invalidates it and remains fail-closed.
+Owning nested function values remain rejected because their separate heap
+environments do not yet have a destruction protocol. Pointer captures remain
+rejected because they retain a defining-frame address; this includes both the
+explicit `fn[&value]` form and a pointer variable captured by value. Pointer-
+bearing or otherwise non-trivially-copyable aggregate captures remain rejected.
+Aggregate globals, pointer captures, and owning nested closures therefore remain explicit
+unsupported lifetime paths rather than ambient unsafe behavior. The narrow
+raw-pointer global cell above is an exception with no initializer or destructor
+protocol; it is not a general pointer-bearing global object model.
 
 The native x86-64 default unchecked allocator marks a small allocation's size
 header as freed before linking that allocation into a free list, and restores the live

@@ -1,3 +1,3 @@
 name = "package-resolution-toolkit"
-version = "0"
+version = "1.4.2"
 edition = "2026"

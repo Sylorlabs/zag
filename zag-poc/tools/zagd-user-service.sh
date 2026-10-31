@@ -37,11 +37,17 @@ fi
 
 source_path=$(realpath -- "$source_arg")
 test -f "$source_path" || { echo "zagd service: root source must be a regular file" >&2; exit 2; }
-project_root=$(dirname "$source_path")
-while test "$project_root" != / && test ! -d "$project_root/.git" && test ! -f "$project_root/zag.mod"; do
-    project_root=$(dirname "$project_root")
+source_root=$(dirname "$source_path")
+project_root=
+probe_root=$source_root
+while test "$probe_root" != /; do
+    if test -f "$probe_root/zag.mod"; then
+        project_root=$probe_root
+        break
+    fi
+    probe_root=$(dirname "$probe_root")
 done
-test "$project_root" != / || project_root=$(dirname "$source_path")
+test -n "$project_root" || project_root=$source_root
 
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 zagd_path="$repo_root/zagd"
@@ -55,6 +61,33 @@ if test ! -x "$zagd_path"; then
     if test -x "$installed_sibling"; then zagd_path="$installed_sibling"; fi
 fi
 planner_config="$project_root/.zagd.conf"
+
+validate_config_keys() {
+    test -f "$planner_config" || return 0
+    awk '
+        function trim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            return value
+        }
+        BEGIN {
+            split("mode idle_deep difficulty script_optimization regular_optimization objective trust_mode allocator device layout cpu notifications script_memory_bytes allow_filesystem_read allow_filesystem_write allow_process environment_allow max_workers stability_window_ms max_memory_bytes max_cache_bytes", names, " ")
+            for (i in names) { known[names[i]] = 1 }
+        }
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            equals = index(line, "=")
+            key = equals > 0 ? trim(substr(line, 1, equals - 1)) : ""
+            if (equals <= 1 || !(key in known) || seen[key]++) { exit 1 }
+        }
+    ' "$planner_config" || {
+        echo "zagd service: invalid .zagd.conf syntax, unknown key, or duplicate key" >&2
+        return 1
+    }
+}
 
 config_value() {
     local key=$1
@@ -80,10 +113,57 @@ config_value() {
     ' "$planner_config"
 }
 
+config_key_present() {
+    local key=$1
+    test -f "$planner_config" || return 1
+    awk -v wanted="$key" '
+        function trim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            sub(/[[:space:]]+$/, "", value)
+            return value
+        }
+        /^[[:space:]]*#/ { next }
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            equals = index(line, "=")
+            if (equals > 0 && trim(substr(line, 1, equals - 1)) == wanted) {
+                found = 1
+            }
+        }
+        END { exit found ? 0 : 1 }
+    ' "$planner_config"
+}
+
+choice_config() {
+    local key=$1 fallback=$2 value allowed matched=0
+    shift 2
+    value=$(config_value "$key")
+    if test -z "$value"; then
+        if config_key_present "$key"; then
+            echo "zagd service: $key must not be empty" >&2
+            return 1
+        fi
+        value=$fallback
+    fi
+    for allowed in "$@"; do
+        if test "$value" = "$allowed"; then matched=1; break; fi
+    done
+    if test "$matched" -ne 1; then
+        printf 'zagd service: invalid %s=%s\n' "$key" "$value" >&2
+        return 1
+    fi
+    printf '%s' "$value"
+}
+
 decimal_config() {
     local key=$1 minimum=$2 maximum=$3 fallback=$4 value
     value=$(config_value "$key")
     if test -z "$value"; then
+        if config_key_present "$key"; then
+            echo "zagd service: $key must not be empty" >&2
+            return 1
+        fi
         printf '%s' "$fallback"
         return 0
     fi
@@ -101,10 +181,16 @@ decimal_config() {
 read_service_config() {
     # $1 is a unit-owned fallback. A project setting deliberately overrides it
     # on the next restart, so toggling mode is not an uninstall/reinstall task.
+    validate_config_keys
     service_mode=$1
     local configured_mode
     configured_mode=$(config_value mode)
-    if test -n "$configured_mode"; then service_mode=$configured_mode; fi
+    if test -n "$configured_mode"; then service_mode=$configured_mode
+    elif config_key_present mode; then
+        echo "zagd service: mode must not be empty" >&2
+        return 1
+    fi
+    if test "$service_mode" = advisory; then service_mode=light; fi
     case "$service_mode" in off|light|adaptive|deep) ;; *)
         echo "zagd service: mode must be off, light, adaptive, or deep" >&2
         return 1
@@ -117,12 +203,49 @@ read_service_config() {
     if (( service_memory_high_bytes < 67108864 )); then service_memory_high_bytes=67108864; fi
     service_window_ms=$(decimal_config stability_window_ms 1 60000 75)
     service_cache_bytes=$(decimal_config max_cache_bytes 1048576 2147483648 2147483648)
-    service_notifications=$(config_value notifications)
-    if test -z "$service_notifications"; then service_notifications=advisory; fi
-    case "$service_notifications" in errors_only|advisory) ;; *)
-        echo "zagd service: notifications must be errors_only or advisory" >&2
+    service_notifications=$(choice_config notifications advisory \
+        errors_only advisory)
+    service_idle_deep=$(choice_config idle_deep true true false)
+    service_difficulty=$(choice_config difficulty simple \
+        simple explained explicit native)
+    service_script_optimization=$(choice_config script_optimization automatic \
+        automatic review off)
+    service_regular_optimization=$(choice_config regular_optimization review \
+        review automatic off)
+    service_objective=$(choice_config objective runtime runtime)
+    service_trust_mode=$(choice_config trust_mode stable \
+        stable reviewed autonomous)
+    service_cpu=$(choice_config cpu generic \
+        generic native runtime x86-64 x86-64-v1)
+    # Validate the foreground-only policy fields too. The service does not
+    # transport them to zagd, but it must not activate from a file that `znc`
+    # would reject as malformed.
+    local ignored environment_allow
+    ignored=$(choice_config allocator script_process_arena \
+        script_process_arena script_bounded_heap)
+    ignored=$(choice_config device cpu cpu)
+    ignored=$(choice_config layout compiler_owned compiler_owned)
+    ignored=$(decimal_config script_memory_bytes 1048576 2147483648 67108864)
+    ignored=$(choice_config allow_filesystem_read true true false)
+    ignored=$(choice_config allow_filesystem_write true true false)
+    ignored=$(choice_config allow_process true true false)
+    ignored=$(choice_config max_workers 1 1)
+    environment_allow=$(config_value environment_allow)
+    if test -n "$environment_allow" && {
+        test "${#environment_allow}" -gt 512 ||
+        ! printf '%s' "$environment_allow" | awk -F, '
+            {
+                for (i = 1; i <= NF; i++) {
+                    if (length($i) > 128 || $i !~ /^[A-Za-z_][A-Za-z0-9_]*$/) {
+                        exit 1
+                    }
+                }
+            }
+        '
+    }; then
+        echo "zagd service: environment_allow must be comma-separated variable names" >&2
         return 1
-    esac
+    fi
 }
 
 release_project_singleton() {
@@ -139,6 +262,13 @@ release_project_singleton() {
         --root "$project_root" \
         --root-source "$source_path" \
         --mode off \
+        --idle-deep "$service_idle_deep" \
+        --difficulty "$service_difficulty" \
+        --script-optimization "$service_script_optimization" \
+        --regular-optimization "$service_regular_optimization" \
+        --objective "$service_objective" \
+        --trust-mode "$service_trust_mode" \
+        --cpu "$service_cpu" \
         --window-ms "$service_window_ms" \
         --max-memory-bytes "$service_memory_bytes" \
         --max-cache-bytes "$service_cache_bytes" \
@@ -278,6 +408,13 @@ run_service() {
         --root "$project_root" \
         --root-source "$source_path" \
         --mode "$service_mode" \
+        --idle-deep "$service_idle_deep" \
+        --difficulty "$service_difficulty" \
+        --script-optimization "$service_script_optimization" \
+        --regular-optimization "$service_regular_optimization" \
+        --objective "$service_objective" \
+        --trust-mode "$service_trust_mode" \
+        --cpu "$service_cpu" \
         --window-ms "$service_window_ms" \
         --max-memory-bytes "$service_memory_bytes" \
         --max-cache-bytes "$service_cache_bytes" \

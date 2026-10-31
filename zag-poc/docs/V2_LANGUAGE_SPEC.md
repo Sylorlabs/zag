@@ -104,3 +104,8 @@ Diagnostics include the source location, relevant type/operation, violated
 rule, and a smallest intentional alternative where one exists (for example,
 `unsafe`, `wrapping_add`, or a checked slice operation).  Capability diagnostics
 also include their complete effect witness chain.
+
+The renderer follows named calls, generic callback substitutions, hoisted
+closures, and imported declarations, emits one path for each violated effect,
+and skips recursive back-edges while continuing to search for the concrete
+source operation.

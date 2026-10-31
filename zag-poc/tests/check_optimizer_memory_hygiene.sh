@@ -7,6 +7,7 @@ ra="$root/selfhost/native/regalloc.zag"
 ph="$root/selfhost/native/peephole.zag"
 znc="$root/selfhost/native/znc.zag"
 nc="$root/selfhost/native/ncodegen.zag"
+nc_env="$root/selfhost/native/ncodegen_env.zag"
 typed="$root/selfhost/typed.zag"
 smf="$root/selfhost/semantic_manifest_format.zag"
 smp="$root/selfhost/semantic_manifest_publish.zag"
@@ -33,7 +34,13 @@ grep -q 'free\[Instr\](&opt)' "$znc" || fail "foreground peephole generation is 
 # release only after instruction emission is finished; AST nodes and text stay
 # borrowed. Keep the static boundary explicit so a future refactor does not
 # silently restore per-function/per-call retained backing arrays.
-grep -Fq 'fn cg_env_dispose' "$nc" || fail "native lowering environment disposer is missing"
+# The native backend is modular: ownership helpers live beside their owning
+# structures, while call sites remain in ncodegen.zag. Check both halves of
+# that boundary so extraction does not look like a removed disposer.
+grep -Fq 'fn cg_env_dispose' "$nc_env" || fail "native lowering environment disposer is missing"
+grep -Fq 'free[[]u8](&env.*.names)' "$nc_env" || fail "native lowering name map is retained"
+grep -Fq 'free[*Node](&env.*.defer_exprs)' "$nc_env" || fail "native defer list is retained"
+grep -Fq 'free[*Node](&env.*.errdefer_exprs)' "$nc_env" || fail "native errdefer list is retained"
 grep -Fq 'free[[]u8](&sc.names)' "$nc" || fail "native scan name map is retained"
 grep -Fq 'free[[]u8](&sc.frets)' "$nc" || fail "native scan return map is retained"
 grep -Fq 'free[[]u8](&seen)' "$nc" || fail "native scan seen set is retained"
@@ -45,7 +52,7 @@ grep -Fq 'free[*Node](&rargs)' "$nc" || fail "synthetic RNS call arguments are r
 grep -Fq 'free[*Node](&alloc_args)' "$nc" || fail "synthetic Script allocation arguments are retained"
 grep -Fq 'free[*Node](&qargs)' "$nc" || fail "synthetic quire call arguments are retained"
 grep -Fq 'free[*Node](&const_args)' "$nc" || fail "synthetic const call arguments are retained"
-grep -Fq 'fn cg_release_program_indexes' "$nc" || fail "top-level native index disposer is missing"
+grep -Fq 'fn cg_release_program_indexes' "$nc_env" || fail "top-level native index disposer is missing"
 [ "$(grep -Fc 'cg_release_program_indexes(&syms,&rt_used,&dynamic_names)' "$nc")" -eq 2 ] || fail "top-level native indexes are not released on both exits"
 
 # Edition-2027 typed ownership analysis repeatedly clones branch-flow state,

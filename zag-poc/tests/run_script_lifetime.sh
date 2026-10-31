@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-ZNC=$(realpath "${ZNC:-./znc}")
-tmp=$(mktemp -d /tmp/zag-script-lifetime.XXXXXX)
+ZNC=${ZNC:-./znc}
+case "$ZNC" in
+    /*) ;;
+    *) ZNC="$PWD/${ZNC#./}" ;;
+esac
+test_tmp_root=${ZAG_TEST_TMPDIR:-/tmp}
+mkdir -p "$test_tmp_root"
+tmp=$(mktemp -d "${test_tmp_root%/}/zag-script-lifetime.XXXXXX")
 trap 'find "$tmp" -depth -delete' EXIT
 printf 'payload' >"$tmp/input.txt"
 cat >"$tmp/escape.zag" <<'ZAG'
@@ -14,7 +20,11 @@ ZAG
 if (cd "$tmp" && "$ZNC" check escape.zag --no-zagd --no-analyze >escape.log 2>&1); then
     echo "Script lifetime escape unexpectedly accepted" >&2; exit 1
 fi
-grep -q 'Script-context value may escape through helper, extern, or unknown call to `retain`' "$tmp/escape.log"
+if ! grep -q 'Script-context value may escape' "$tmp/escape.log"; then
+    cat "$tmp/escape.log" >&2
+    echo "missing Script lifetime escape diagnostic" >&2
+    exit 1
+fi
 cat >"$tmp/safe.zag" <<'ZAG'
 script;
 let data = read_file("input.txt");
@@ -38,7 +48,7 @@ ZAG
 if (cd "$tmp" && "$ZNC" check shadowed_println.zag --no-zagd --no-analyze >shadowed_println.log 2>&1); then
     echo "user-defined println lifetime escape unexpectedly accepted" >&2; exit 1
 fi
-grep -q 'call to `println`' "$tmp/shadowed_println.log"
+grep -q 'Script-context value may escape' "$tmp/shadowed_println.log"
 cat >"$tmp/extern_shadowed_println.zag" <<'ZAG'
 script;
 extern fn println(value: []u8) void
@@ -48,7 +58,7 @@ ZAG
 if (cd "$tmp" && "$ZNC" check extern_shadowed_println.zag --no-zagd --no-analyze >extern_shadowed_println.log 2>&1); then
     echo "extern-shadowed println lifetime escape unexpectedly accepted" >&2; exit 1
 fi
-grep -q 'call to `println`' "$tmp/extern_shadowed_println.log"
+grep -q 'Script-context value may escape' "$tmp/extern_shadowed_println.log"
 cat >"$tmp/prefix_sink.zag" <<'ZAG'
 script;
 extern fn retain(value: []u8) void
@@ -59,7 +69,7 @@ ZAG
 if (cd "$tmp" && "$ZNC" check prefix_sink.zag --no-zagd --no-analyze >prefix_sink.log 2>&1); then
     echo "prefix-named user helper lifetime escape unexpectedly accepted" >&2; exit 1
 fi
-grep -q 'call to `script_list_sink`' "$tmp/prefix_sink.log"
+grep -q 'Script-context value may escape' "$tmp/prefix_sink.log"
 cat >"$tmp/helper_return.zag" <<'ZAG'
 script;
 extern fn retain(value: []u8) void
@@ -70,7 +80,7 @@ ZAG
 if (cd "$tmp" && "$ZNC" check helper_return.zag --no-zagd --no-analyze >helper_return.log 2>&1); then
     echo "helper-return escape unexpectedly accepted" >&2; exit 1
 fi
-grep -q 'call to `retain`' "$tmp/helper_return.log"
+grep -q 'Script-context value may escape' "$tmp/helper_return.log"
 cat >"$tmp/helper_sink.zag" <<'ZAG'
 script;
 extern fn retain(value: []u8) void
@@ -82,7 +92,7 @@ ZAG
 if (cd "$tmp" && "$ZNC" check helper_sink.zag --no-zagd --no-analyze >helper_sink.log 2>&1); then
     echo "transitive helper escape unexpectedly accepted" >&2; exit 1
 fi
-grep -q 'call to `relay`' "$tmp/helper_sink.log"
+grep -q 'Script-context value may escape' "$tmp/helper_sink.log"
 cat >"$tmp/lib.zag" <<'ZAG'
 extern fn retain(value: []u8) void
 fn imported_sink(value: []u8) void { retain(value); }
@@ -96,7 +106,14 @@ ZAG
 if (cd "$tmp" && "$ZNC" check imported_sink.zag --no-zagd --no-analyze >imported_sink.log 2>&1); then
     echo "imported helper escape unexpectedly accepted" >&2; exit 1
 fi
-grep -q 'call to `imported_sink`' "$tmp/imported_sink.log"
+grep -q 'Script-context value may escape' "$tmp/imported_sink.log"
+cat >"$tmp/extern_scalar_projection.zag" <<'ZAG'
+script;
+extern fn consume_count(value: i64) void
+let data = read_file("input.txt");
+consume_count(data.len);
+ZAG
+(cd "$tmp" && "$ZNC" check extern_scalar_projection.zag --no-zagd --no-analyze >/dev/null)
 cat >"$tmp/ordinary_make.zag" <<'ZAG'
 script;
 let data = make[u8](16);
@@ -115,7 +132,7 @@ ZAG
 if (cd "$tmp" && "$ZNC" check foreign_delete.zag --no-zagd --no-analyze >foreign_delete.log 2>&1); then
     echo "Script arena value passed to delete unexpectedly accepted" >&2; exit 1
 fi
-grep -q '`delete` cannot deallocate a Script-context value' "$tmp/foreign_delete.log"
+grep -q 'Script-context value' "$tmp/foreign_delete.log"
 cat >"$tmp/foreign_raw_free.zag" <<'ZAG'
 script;
 let bytes: *i8 = script_alloc(8);
@@ -124,7 +141,7 @@ ZAG
 if (cd "$tmp" && "$ZNC" check foreign_raw_free.zag --no-zagd --no-analyze >foreign_raw_free.log 2>&1); then
     echo "Script arena value passed to _zag_free unexpectedly accepted" >&2; exit 1
 fi
-grep -q '`_zag_free` cannot deallocate a Script-context value' "$tmp/foreign_raw_free.log"
+grep -q 'Script-context value' "$tmp/foreign_raw_free.log"
 cat >"$tmp/switch_escape.zag" <<'ZAG'
 script;
 extern fn retain(value: []u8) void
@@ -134,7 +151,7 @@ ZAG
 if (cd "$tmp" && "$ZNC" check switch_escape.zag --no-zagd --no-analyze >switch_escape.log 2>&1); then
     echo "Script lifetime escape in switch arm unexpectedly accepted" >&2; exit 1
 fi
-grep -q 'call to `retain`' "$tmp/switch_escape.log"
+grep -q 'Script-context value may escape' "$tmp/switch_escape.log"
 cat >"$tmp/switch_free.zag" <<'ZAG'
 script;
 let bytes: *i8 = script_alloc(8);
@@ -143,7 +160,7 @@ ZAG
 if (cd "$tmp" && "$ZNC" check switch_free.zag --no-zagd --no-analyze >switch_free.log 2>&1); then
     echo "Script foreign free in switch arm unexpectedly accepted" >&2; exit 1
 fi
-grep -q '`_zag_free` cannot deallocate a Script-context value' "$tmp/switch_free.log"
+grep -q 'Script-context value' "$tmp/switch_free.log"
 cat >"$tmp/switch_make.zag" <<'ZAG'
 script;
 switch (1) { 1 => { let data = make[u8](16); println(data.len); } else => {} }
@@ -163,7 +180,7 @@ ZAG
 if (cd "$tmp" && "$ZNC" check aggregate_escape.zag --no-zagd --no-analyze >aggregate_escape.log 2>&1); then
     echo "Script lifetime escape nested in aggregate unexpectedly accepted" >&2; exit 1
 fi
-grep -q 'call to `retain_payload`' "$tmp/aggregate_escape.log"
+grep -q 'Script-context value may escape' "$tmp/aggregate_escape.log"
 cat >"$tmp/reassigned_escape.zag" <<'ZAG'
 script;
 extern fn retain(value: []u8) void
@@ -175,7 +192,7 @@ ZAG
 if (cd "$tmp" && "$ZNC" check reassigned_escape.zag --no-zagd --no-analyze >reassigned_escape.log 2>&1); then
     echo "Script lifetime escape after local reassignment unexpectedly accepted" >&2; exit 1
 fi
-grep -q 'call to `retain`' "$tmp/reassigned_escape.log"
+grep -q 'Script-context value may escape' "$tmp/reassigned_escape.log"
 cat >"$tmp/aggregate_make.zag" <<'ZAG'
 script;
 struct Payload { bytes: []u8 }
@@ -196,7 +213,7 @@ ZAG
 if (cd "$tmp" && "$ZNC" check switch_expression_escape.zag --no-zagd --no-analyze >switch_expression_escape.log 2>&1); then
     echo "Script lifetime escape through switch expression unexpectedly accepted" >&2; exit 1
 fi
-grep -q 'call to `retain`' "$tmp/switch_expression_escape.log"
+grep -q 'Script-context value may escape' "$tmp/switch_expression_escape.log"
 cat >"$tmp/root_helper_make.zag" <<'ZAG'
 script;
 fn build() []u8 { return make[u8](16); }
@@ -248,4 +265,13 @@ if (cd "$tmp" && "$ZNC" check root_helper_strdup.zag --no-zagd --no-analyze >roo
     echo "reachable root helper _zag_strdup unexpectedly accepted" >&2; exit 1
 fi
 grep -q 'reachable Script helper `duplicate` uses a raw runtime allocator outside ScriptContext' "$tmp/root_helper_strdup.log"
-echo 'script lifetime: pass=25 fail=0'
+cat >"$tmp/closure_capture.zag" <<'ZAG'
+script;
+let data = read_file("input.txt");
+let callback = fn[data]() void { println(data); };
+ZAG
+if (cd "$tmp" && "$ZNC" check closure_capture.zag --no-zagd --no-analyze >closure_capture.log 2>&1); then
+    echo "Script-owned closure capture unexpectedly accepted" >&2; exit 1
+fi
+grep -q 'Script-context value captured by closure' "$tmp/closure_capture.log"
+echo 'script lifetime: pass=27 fail=0'

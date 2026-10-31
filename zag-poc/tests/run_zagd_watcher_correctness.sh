@@ -29,10 +29,15 @@ done
 # the published event count or snapshot.
 printf 'fn churn() i32 { return 0; }\n' >"$project/churn.zag"
 for _ in $(seq 1 300); do
-    grep -q 'file=churn.zag' "$project/.zag-cache/zagd/snapshot.record" 2>/dev/null && break
+    if grep -q 'file=churn.zag' "$project/.zag-cache/zagd/snapshot.record" 2>/dev/null &&
+       grep -q '^state=idle$' "$project/.zagd.status" 2>/dev/null &&
+       grep -q 'last_file=.*/churn.zag$' "$project/.zagd.status" 2>/dev/null; then
+        break
+    fi
     sleep 0.01
 done
 grep -q 'file=churn.zag' "$project/.zag-cache/zagd/snapshot.record"
+grep -q '^state=idle$' "$project/.zagd.status"
 before_snapshot=$(sed -n 's/^snapshot_first=//p' "$project/.zagd.status")
 (
     for i in $(seq 1 200); do
@@ -92,8 +97,32 @@ if grep -q 'linked' "$project/.zag-cache/zagd/snapshot.record"; then
     exit 1
 fi
 
-printf stop >"$project/.zagd.stop"
+# Stop must preempt a queued write storm even when the stop marker is buried
+# among many inotify records. The daemon checks a fixed work-unit budget while
+# draining the batch and also checks inside the stable-source wait/rescan path;
+# this regression intentionally uses state, not a wall-clock threshold, as its
+# pass condition.
+(
+    for i in $(seq 1 1200); do
+        printf 'fn storm_%s() i32 { return %s; }\n' "$i" "$i" >"$project/storm-$i.zag"
+        if [ "$i" -eq 200 ]; then printf stop >"$project/.zagd.stop"; fi
+    done
+) &
+writer_pid=$!
+for _ in $(seq 1 1000); do
+    grep -q '^state=stopped$' "$project/.zagd.status" 2>/dev/null && break
+    sleep 0.01
+done
+grep -q '^state=stopped$' "$project/.zagd.status"
 wait "$daemon_pid"
 daemon_pid=
-grep -q '^state=stopped$' "$project/.zagd.status"
+wait "$writer_pid"
+writer_pid=
+
+# The terminal state is published only after descriptor/record cleanup. Keep
+# these assertions separate from the state poll so a stale status file cannot
+# make a crashed or wedged daemon look like a clean stop.
+test ! -e "$project/.zagd.lock"
+test ! -e "$project/.zagd.stop"
+
 echo "zagd watcher correctness: pass"

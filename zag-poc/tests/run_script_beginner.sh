@@ -7,6 +7,7 @@ tmp=$(mktemp -d /tmp/zag-script-beginner.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT
 
 "$compiler" "$root/tests/script_frontend/beginner_collections.zag" -o "$tmp/beginner" --no-zagd --no-analyze >/dev/null
+test -x "$tmp/beginner"
 output=$("$tmp/beginner")
 if [ "$output" != "4" ]; then
     echo "script beginner: expected list length 4, got: $output" >&2
@@ -22,6 +23,7 @@ if "$compiler" "$tmp/arity.zag" -o "$tmp/bad" --no-zagd --no-analyze >"$tmp/arit
     echo "script beginner: append arity error unexpectedly compiled" >&2
     exit 1
 fi
+test ! -e "$tmp/bad"
 grep -q 'Zag Script append expects a list and one value' "$tmp/arity.log"
 
 echo "script beginner: PASS"

@@ -14,8 +14,10 @@ trap 'rm -rf "$tmp"' EXIT
 # F3 0F 6F /r and F3 0F 7F /r are MOVDQU load/store.  They are SSE2 baseline
 # instructions, not AVX/VEX encodings; this proves the generated runtime path
 # is present in both permitted x86-64 profiles.
-bytes=$(od -An -tx1 -v "$tmp/generic" | tr '\n' ' ')
-grep -q 'f3 0f 6f' <<<"$bytes"
-grep -q 'f3 0f 7f' <<<"$bytes"
+# Search the ELF bytes directly. Keeping the entire image in one shell
+# variable made the second probe unreliable as binaries grew, even when both
+# instruction sequences were visibly present in the dump.
+LC_ALL=C grep -aFq $'\xf3\x0f\x6f' "$tmp/generic"
+LC_ALL=C grep -aFq $'\xf3\x0f\x7f' "$tmp/generic"
 cmp -s "$tmp/generic" "$tmp/native"
 echo "x86 SSE2 memcpy: generic/native execution and MOVDQU emission pass"

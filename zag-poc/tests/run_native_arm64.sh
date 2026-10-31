@@ -110,6 +110,7 @@ nt "opt orelse"      'fn main() i32 { let o: ?i32 = null; let a: i32 = o orelse 
 nt "opt fn return"   'fn find(k: i32) ?i32 { if (k > 0) { return k * 2; } return null; } fn main() i32 { let a: i32 = find(21) orelse 0; let b: i32 = find(0 - 1) orelse 100; return a - b + 100; }' 42
 nt "while-let"       'fn main() i32 { let o: ?i32 = 3; let s: i32 = 0; while (o) |v| { s = s + v; if (v == 1) { o = null; } else { o = v - 1; } } return s * 7; }' 42
 nt "scoped shadow"   'fn main() i32 { let x: i32 = 40; if (x > 0) { let x: i32 = 2; if (x != 2) { return 1; } } return x + 2; }' 42
+nt "parameter shadow keeps ABI slot" 'struct P { x: i32 } fn read(value: *P) i32 { let before: i32 = value.*.x; let value: i32 = 2; return before + value; } fn main() i32 { let p: P = P{ .x = 40 }; return read(&p); }' 42
 
 echo "── generics (monomorphization) + string builtins ──"
 nt "generic identity" 'fn id[T](x: T) T { return x; } fn main() i32 { return id[i32](42); }' 42
@@ -210,6 +211,15 @@ else
     echo "  XX  emitted ELF static/no-interp check"; fail=$((fail+1))
 fi
 rm -f $WORK/nt_elf $SRC
+
+echo "── architecture-specific open/openat flags ──"
+if env ZNC="$ZNC" QEMU="$QEMU" bash tests/run_arm64_open_flags.sh; then
+    echo "  ok  x86-64 open flags translate to AArch64"
+    pass=$((pass+1))
+else
+    echo "  XX  x86-64 open flags translate to AArch64"
+    fail=$((fail+1))
+fi
 
 echo "════ arm64 pass=$pass fail=$fail ════"
 [ "$fail" -eq 0 ]

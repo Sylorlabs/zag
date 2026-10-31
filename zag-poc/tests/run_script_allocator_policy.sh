@@ -8,7 +8,7 @@ tmp=$(mktemp -d "${TMPDIR:-/tmp}/zag-script-allocator-policy.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 
 mkdir -p "$tmp/project"
-printf '%s\n' 'name = "script-allocator-policy"' >"$tmp/project/zag.mod"
+printf '%s\n' 'name = "script-allocator-policy"' 'edition = "2027"' >"$tmp/project/zag.mod"
 cat >"$tmp/project/policy.zag" <<'ZAG'
 script;
 extern fn _zag_allocator_live_bytes() i64
@@ -106,6 +106,9 @@ grep -q '"allocator_policy":{"value":"script_bounded_heap","id":2,"basis":"expli
 grep -q '^// allocator policy: script_bounded_heap$' "$tmp/project/hardened.zag"
 grep -q '^const __zag_hardened_allocator_policy_id: i32 = 2;$' \
     "$tmp/project/hardened.zag"
+(cd "$tmp/project" && "$ZNC" hardened.zag -o hardened \
+    --no-zagd --no-analyze --no-foreground-cache >/dev/null)
+"$tmp/project/hardened"
 
 # A project may choose the bounded heap as its automatic Script default.
 sed -i 's/allocator=script_process_arena/allocator=script_bounded_heap/' \

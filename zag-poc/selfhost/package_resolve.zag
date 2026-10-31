@@ -7,8 +7,30 @@
 //   @import("pkg:zagkit/src/zagkit.zag") as zagkit
 //
 // Dependency paths are resolved relative to the nearest ancestor zag.mod.
-// There is no environment search path, registry lookup, download, version
-// solving, or implicit entry-point convention in this layer.
+// An explicit `mode = "vendor"` or `mode = "sibling"` dependency additionally
+// requires a canonical zag.lock beside that manifest.  The lock binds the
+// dependency alias, declared root, explicit module path, and the module's raw
+// bytes.  Sibling mode is deliberately one parent-relative safe root
+// (`../<safe-name>`) and direct-entry only: it does not claim transitive
+// relative-import or resource locking. There is no environment search path,
+// network download, revision solving, or implicit entry-point convention in
+// this layer. A declared
+// exact/caret/tilde/wildcard requirement is checked against the dependency's
+// own top-level version before its module is loaded.
+
+@import("../std/list.zag")
+@import("package_registry_lock_core.zag")
+
+// Package containment is checked by the host compiler on Linux x86-64 before
+// a locked vendor/registry byte stream is admitted.  The compiler's own
+// runtime is host-targeted even when it emits an ARM/i686 artifact, so this
+// syscall remains a property of the resolver host rather than the output
+// target.  Unlocked local dependencies intentionally do not use it.
+extern fn _zag_raw_syscall(num: i64, a1: i64, a2: i64, a3: i64,
+    a4: i64, a5: i64, a6: i64) i64
+extern fn _zag_slice_ptr(s: []u8) *i8
+extern fn _zag_exec_cmd(cmd: []u8) i32 @io
+extern fn _zag_clock_monotonic_ms() i64 @io
 
 enum PackageImportError {
     none,
@@ -19,27 +41,247 @@ enum PackageImportError {
     duplicate_dependency,
     invalid_dependency_path,
     module_not_found,
+    invalid_vendor_dependency,
+    lockfile_not_found,
+    invalid_lockfile,
+    lock_entry_not_found,
+    checksum_mismatch,
+    invalid_version_requirement,
+    dependency_version_conflict,
+    dependency_version_mismatch,
+    dependency_input_changed,
+    registry_module_mismatch,
+    registry_lock_mismatch,
+    symlink_dependency,
+    invalid_signature,
+}
+
+// Two bounded modular accumulators avoid target-dependent overflow semantics.
+// This is a deterministic raw-byte checksum, not a signature or a
+// cryptographic authenticity claim.
+struct PackageRawChecksum {
+    first: i64,
+    second: i64,
+    bytes: i64,
 }
 
 struct PackageImportResolution {
     matched: i32,
     path: []u8,
     manifest: []u8,
+    manifest_source: []u8,
+    manifest_source_owned: i32,
     dependency: []u8,
     specifier: []u8,
+    lockfile: []u8,
+    lockfile_source: []u8,
+    lockfile_source_owned: i32,
+    // Registry selections are pinned by the local index plus an optional
+    // registry.lock sidecar. Retain that sidecar as an owned compilation
+    // resource so semantic-manifest freshness observes edits after resolve.
+    registry_lockfile: []u8,
+    registry_lockfile_source: []u8,
+    registry_lockfile_source_owned: i32,
+    module_source: []u8,
+    module_source_owned: i32,
+    locked: i32,
+    sibling_mode: i32,
+    registry_mode: i32,
+    // Registry selection metadata is retained as borrowed slices into the
+    // owned index snapshot.  The explicit graph-lock authority seam compares
+    // all three selected tuple components before a caller may admit the
+    // result; ordinary resolution remains unchanged and leaves the flag at 0.
+    registry_version: []u8,
+    registry_source: []u8,
+    // The fifth registry-index field is the detached artifact-signature
+    // pathname. Keep its retained value separate from the resolved filesystem
+    // path below: caller-opt-in graph authority needs to compare the exact
+    // signed-index tuple even when signature verification was not requested.
+    registry_artifact_signature: []u8,
+    graph_authorized: i32,
+    checksum: PackageRawChecksum,
+    signature_key_path: []u8,
+    signature_key_source: []u8,
+    signature_key_source_owned: i32,
+    signature_path: []u8,
+    signature_source: []u8,
+    signature_source_owned: i32,
+    artifact_signature_path: []u8,
+    artifact_signature_source: []u8,
+    artifact_signature_source_owned: i32,
+    artifact_signature_verified: i32,
     error: PackageImportError,
+}
+
+// A locked package input is opened and read through one descriptor.  The
+// resolver uses this result for the module that will actually be parsed,
+// rather than validating one path read and later opening that path again.
+// `openat2` with RESOLVE_NO_SYMLINKS is a Linux x86-64 host contract: an
+// unsupported kernel or any malformed/oversized input fails closed.
+struct PackageNoFollowRead {
+    bytes: []u8,
+    ok: i32,
+}
+
+fn package_import_nofollow_bad() PackageNoFollowRead {
+    // A failed no-follow read has no owned buffer.  Keep its sentinel as a
+    // null, zero-length slice so the common release path can distinguish it
+    // from a successfully read empty file (which still owns an allocation).
+    return PackageNoFollowRead{.bytes = (null as *u8)[0..0], .ok = 0};
+}
+
+fn package_import_read_nofollow(path: []u8) PackageNoFollowRead {
+    let bad: PackageNoFollowRead = package_import_nofollow_bad();
+    if (path.len == 0 || path.len > 16384) { return bad; }
+    // The allocator ABI is i32-sized even though the raw syscall lengths below
+    // are i64.  Keep the conversion explicit so large-buffer ownership stays
+    // registered with the native allocator registry.
+    let cpath: *u8 = _zag_malloc(path.len + 1) as *u8;
+    if (cpath == null as *u8) { return bad; }
+    let i: i32 = 0;
+    while (i < path.len) { cpath[i] = path[i]; i = i + 1; }
+    cpath[path.len] = 0;
+    // struct open_how { flags, mode, resolve }, all little-endian u64.
+    // RESOLVE_NO_SYMLINKS is bit 2; zeroing the other bytes keeps this
+    // independent of host padding and rejects future ABI drift.
+    let how: *u8 = _zag_malloc(24) as *u8;
+    if (how == null as *u8) {
+        _zag_free(cpath as *i8); return bad;
+    }
+    let h: i32 = 0;
+    while (h < 24) { how[h] = 0; h = h + 1; }
+    how[16] = 4;
+    // x86-64 Linux: openat2=437, AT_FDCWD=-100, sizeof(open_how)=24.
+    let fd: i64 = _zag_raw_syscall(437, 0 - 100, cpath as i64,
+        how as i64, 24, 0, 0);
+    _zag_free(cpath as *i8); _zag_free(how as *i8);
+    if (fd < 0) { return bad; }
+    let cap: i64 = 65536;
+    let total: i64 = 0;
+    let buffer: *u8 = _zag_malloc(cap as i32) as *u8;
+    if (buffer == null as *u8) {
+        let _close: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+        return bad;
+    }
+    let done: i32 = 0;
+    while (done == 0) {
+        let n: i64 = _zag_raw_syscall(0, fd,
+            ((buffer as i64) + total) as i64, cap - total, 0, 0, 0);
+        if (n < 0) {
+            _zag_free(buffer as *i8);
+            let _close: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+            return bad;
+        }
+        if (n == 0) { done = 1; }
+        else {
+            total = total + n;
+            if (total > 8388608) {
+                _zag_free(buffer as *i8);
+                let _close: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+                return bad;
+            }
+            if (total == cap) {
+                let next: i64 = cap * 2;
+                let bounded: i64 = (next < 8388609) as i64 * next +
+                    (next >= 8388609) as i64 * 8388609;
+                let grown: *u8 = _zag_realloc(buffer as *i8, bounded as i32) as *u8;
+                if (grown == null as *u8) {
+                    _zag_free(buffer as *i8);
+                    let _close: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+                    return bad;
+                }
+                buffer = grown; cap = bounded;
+            }
+        }
+    }
+    let _close: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+    return PackageNoFollowRead{.bytes = buffer[0..total], .ok = 1};
 }
 
 struct PackageManifestDependency {
     path: []u8,
+    mode: []u8,
+    registry: []u8,
+    version: []u8,
+    registry_key: []u8,
+    registry_signature: []u8,
+    registry_artifact_policy: []u8,
+    registry_lock: []u8,
     count: i32,
     valid: i32,
 }
 
+struct PackageVersionDecl {
+    path: []u8,
+    version: []u8,
+}
+
+struct PackageChecksumParse {
+    checksum: PackageRawChecksum,
+    valid: i32,
+}
+
+struct PackageLockCheck {
+    checksum: PackageRawChecksum,
+    found: i32,
+    mismatch: i32,
+    valid: i32,
+}
+
+// A generator entry is deliberately separate from PackageLockCheck.  The
+// validator consumes an existing lock and therefore requires the lockfile to
+// exist; the bounded `znc package lock` command collects the same exact
+// manifest/dependency/module tuple before a lock exists.  All text fields are
+// owned by the returned entry and must be released by the caller.
+struct PackageLockGeneratedEntry {
+    alias: []u8,
+    root: []u8,
+    module: []u8,
+    mode: []u8,
+    checksum: PackageRawChecksum,
+    valid: i32,
+}
+
+fn package_lock_generated_bad() PackageLockGeneratedEntry {
+    return PackageLockGeneratedEntry{
+        .alias = "", .root = "", .module = "", .mode = "",
+        .checksum = PackageRawChecksum{ .first = 0, .second = 0, .bytes = 0 },
+        .valid = 0,
+    };
+}
+
+fn package_lock_generated_release(entry: *PackageLockGeneratedEntry) void {
+    if (entry.*.alias.len > 0) { _zag_str_free(entry.*.alias); }
+    if (entry.*.root.len > 0) { _zag_str_free(entry.*.root); }
+    if (entry.*.module.len > 0) { _zag_str_free(entry.*.module); }
+    if (entry.*.mode.len > 0) { _zag_str_free(entry.*.mode); }
+    entry.*.alias = ""; entry.*.root = ""; entry.*.module = "";
+    entry.*.mode = "";
+    entry.*.valid = 0;
+}
+
 fn package_import_result(specifier: []u8) PackageImportResolution {
     return PackageImportResolution{
-        .matched = 0, .path = "", .manifest = "", .dependency = "",
-        .specifier = specifier, .error = PackageImportError.none,
+        .matched = 0, .path = "", .manifest = "", .manifest_source = "",
+        .manifest_source_owned = 0,
+        .dependency = "", .specifier = specifier, .lockfile = "",
+        .lockfile_source = "", .lockfile_source_owned = 0,
+        .registry_lockfile = "", .registry_lockfile_source = "",
+        .registry_lockfile_source_owned = 0,
+        .module_source = "", .module_source_owned = 0, .locked = 0,
+        .sibling_mode = 0,
+        .registry_mode = 0,
+        .registry_version = "", .registry_source = "",
+        .registry_artifact_signature = "",
+        .graph_authorized = 0,
+        .checksum = PackageRawChecksum{ .first = 0, .second = 0, .bytes = 0 },
+        .signature_key_path = "", .signature_key_source = "",
+        .signature_key_source_owned = 0, .signature_path = "",
+        .signature_source = "", .signature_source_owned = 0,
+        .artifact_signature_path = "", .artifact_signature_source = "",
+        .artifact_signature_source_owned = 0,
+        .artifact_signature_verified = 0,
+        .error = PackageImportError.none,
     };
 }
 
@@ -77,6 +319,105 @@ fn package_import_join(base: []u8, child: []u8) []u8 {
     return joined;
 }
 
+// package_resolve is also compiled as a standalone dependency-neutral module
+// by the resolver and package-lock tests.  The parser's canon_path helper is
+// intentionally local to parse.zag, so keep the same lexical normalization
+// here instead of relying on an undeclared cross-module symbol.  This is a
+// lexical identity only: symlink and filesystem containment checks remain the
+// separate no-follow resolver contract.
+fn package_import_canon_path(path: []u8) []u8 {
+    let segments: ArrayList[[]u8] = make[[]u8](8);
+    let absolute: i32 = (path.len > 0 && path[0] == '/') as i32;
+    let start: i32 = 0;
+    let i: i32 = 0;
+    while (i < path.len) {
+        if (path[i] == '/') {
+            if (i > start) {
+                let segment: []u8 = path[start..i];
+                if (@strEq(segment, ".")) {
+                    // discard the current-directory marker
+                } else if (@strEq(segment, "..")) {
+                    if (segments.len > 0 &&
+                        !@strEq(segments.data[segments.len - 1], "..")) {
+                        let _removed: []u8 = pop[[]u8](&segments);
+                    } else if (absolute == 0) {
+                        push[[]u8](&segments, segment);
+                    }
+                } else {
+                    push[[]u8](&segments, segment);
+                }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (start < path.len) {
+        let segment: []u8 = path[start..path.len];
+        if (@strEq(segment, ".")) {
+            // discard the current-directory marker
+        } else if (@strEq(segment, "..")) {
+            if (segments.len > 0 &&
+                !@strEq(segments.data[segments.len - 1], "..")) {
+                let _removed: []u8 = pop[[]u8](&segments);
+            } else if (absolute == 0) {
+                push[[]u8](&segments, segment);
+            }
+        } else {
+            push[[]u8](&segments, segment);
+        }
+    }
+    let out: []u8 = "";
+    if (absolute == 1) { out = "/"; }
+    let j: i32 = 0;
+    while (j < segments.len) {
+        if (out.len > 0 && !@strEq(out, "/")) {
+            let joined:[]u8=_zag_str_concat(out,"/");
+            _zag_str_free(out);out=joined;
+        }
+        let appended:[]u8=_zag_str_concat(out,segments.data[j]);
+        if(out.len>0&&!@strEq(out,"/")){_zag_str_free(out);}
+        out=appended;
+        j = j + 1;
+    }
+    if (out.len == 0) {
+        if (absolute == 1) { out = _zag_str_concat("", "/"); }
+        else { out = _zag_str_concat("", "."); }
+    }
+    free[[]u8](&segments);
+    return out;
+}
+
+// Return the manifest directory relative to the directory containing an
+// explicit registry lock.  `root` is the stable spelling for the lock
+// owner's manifest; nested manifests use traversal-free slash-separated
+// directory segments.  The v2 lock uses this scope to distinguish identical
+// aliases and relative index paths in different package manifests.
+fn package_registry_lock_scope(manifest_path: []u8,
+    lock_path: []u8) []u8 {
+    let manifest_dir: []u8 = package_import_dir(manifest_path);
+    let lock_dir: []u8 = package_import_dir(lock_path);
+    let manifest_canon: []u8 = package_import_canon_path(manifest_dir);
+    let lock_canon: []u8 = package_import_canon_path(lock_dir);
+    let result: []u8 = "";
+    if (@strEq(manifest_canon, lock_canon)) {
+        result = _zag_str_concat("", "root");
+    } else if (@strEq(lock_canon, ".")) {
+        // A nested manifest may point one or more parents up to the root
+        // sidecar (for example `registry/../registry.lock`).  Relative
+        // canonical paths have no leading `./`, so the common-root relation
+        // is represented by the lock directory `.` rather than a textual
+        // prefix.  Keep the nested manifest directory as its v2 scope.
+        result = _zag_str_concat("", manifest_canon);
+    } else if (manifest_canon.len > lock_canon.len &&
+        @strEq(manifest_canon[0..lock_canon.len], lock_canon) &&
+        manifest_canon[lock_canon.len] == '/') {
+        result = _zag_str_concat("",
+            manifest_canon[lock_canon.len + 1..manifest_canon.len]);
+    }
+    _zag_str_free(manifest_canon); _zag_str_free(lock_canon);
+    return result;
+}
+
 fn package_import_trim(text: []u8) []u8 {
     let start: i32 = 0;
     while (start < text.len && (text[start] == ' ' || text[start] == '\t')) {
@@ -112,6 +453,228 @@ fn package_import_safe_name(name: []u8) i32 {
     return 1;
 }
 
+// Dependency versions use a deliberately bounded SemVer subset.  This is
+// local compatibility checking, not registry solving: versions are exact
+// major.minor.patch triples and requirements may be exact, caret, tilde, or
+// the wildcard intervals `*`, `M.*`, and `M.m.*`. Pre-release/build metadata
+// and arbitrary comparator expressions remain rejected until the package graph
+// has a version-source authority.
+struct PackageSemver { major:i64, minor:i64, patch:i64, valid:i32 }
+
+fn package_semver_bad() PackageSemver {
+    return PackageSemver{.major=0,.minor=0,.patch=0,.valid=0};
+}
+
+fn package_semver_part(text:[]u8,lo:i32,hi:i32) i64 {
+    if(lo<0||hi<=lo||hi-lo>10||(hi-lo>1&&text[lo]=='0')){return 0-1;}
+    let value:i64=0;let i:i32=lo;
+    while(i<hi){
+        if(text[i]<'0'||text[i]>'9'){return 0-1;}
+        let digit:i64=(text[i] as i64)-48;
+        if(value>(2147483647-digit)/10){return 0-1;}
+        value=value*10+digit;i=i+1;
+    }
+    return value;
+}
+
+fn package_semver_parse(text:[]u8) PackageSemver {
+    let bad:PackageSemver=package_semver_bad();
+    if(text.len<5||text.len>64){return bad;}
+    let first:i32=0;let second:i32=0-1;let third:i32=0-1;let dots:i32=0;
+    let i:i32=0;
+    while(i<text.len){
+        if(text[i]=='.'){
+            dots=dots+1;
+            if(dots==1){second=i;}else if(dots==2){third=i;}else{return bad;}
+        }
+        i=i+1;
+    }
+    if(dots!=2||second<=0||third<=second+1||third>=text.len-1){return bad;}
+    let major:i64=package_semver_part(text,first,second);
+    let minor:i64=package_semver_part(text,second+1,third);
+    let patch:i64=package_semver_part(text,third+1,text.len);
+    if(major<0||minor<0||patch<0){return bad;}
+    return PackageSemver{.major=major,.minor=minor,.patch=patch,.valid=1};
+}
+
+fn package_semver_compare(a:PackageSemver,b:PackageSemver)i32{
+    if(a.major!=b.major){return (a.major>b.major) as i32*2-1;}
+    if(a.minor!=b.minor){return (a.minor>b.minor) as i32*2-1;}
+    if(a.patch!=b.patch){return (a.patch>b.patch) as i32*2-1;}
+    return 0;
+}
+
+// Return 1 for `*`, 2 for `M.*`, and 3 for `M.m.*`. Wildcards are deliberately
+// a suffix-only grammar; accepting `^*`, `1.x`, or mixed comparator syntax
+// would imply a broader range solver than this local resolver provides.
+fn package_version_wildcard_kind(requirement:[]u8)i32{
+    if(requirement.len==1&&requirement[0]=='*'){return 1;}
+    if(requirement.len<3||requirement[requirement.len-2]!='.'||
+       requirement[requirement.len-1]!='*'){return 0;}
+    let prefix_end:i32=requirement.len-2;
+    let dot:i32=0-1;let dots:i32=0;let i:i32=0;
+    while(i<prefix_end){if(requirement[i]=='.'){dot=i;dots=dots+1;}i=i+1;}
+    if(dots==0){return (package_semver_part(requirement,0,prefix_end)>=0) as i32*2;}
+    if(dots!=1||dot<=0||dot>=prefix_end-1){return 0;}
+    return (package_semver_part(requirement,0,dot)>=0&&
+        package_semver_part(requirement,dot+1,prefix_end)>=0) as i32*3;
+}
+
+fn package_version_requirement_valid(requirement:[]u8)i32{
+    if(requirement.len==0||requirement.len>65){return 0;}
+    let body:[]u8=requirement;
+    let prefixed:i32=0;
+    if(requirement[0]=='^'||requirement[0]=='~'){body=requirement[1..requirement.len];prefixed=1;}
+    let wildcard:i32=package_version_wildcard_kind(body);
+    if(wildcard>0){return (prefixed==0) as i32;}
+    return package_semver_parse(body).valid;
+}
+
+fn package_version_satisfies(requirement:[]u8,actual:[]u8)i32{
+    if(package_version_requirement_valid(requirement)==0){return 0;}
+    let want:[]u8=requirement;
+    let kind:u8=0;
+    if(requirement[0]=='^'||requirement[0]=='~'){kind=requirement[0];want=requirement[1..requirement.len];}
+    let wildcard:i32=package_version_wildcard_kind(want);
+    let requested:PackageSemver=package_semver_parse(want);
+    let resolved:PackageSemver=package_semver_parse(actual);
+    if(resolved.valid==0){return 0;}
+    if(wildcard==1){return 1;}
+    if(wildcard==2){
+        let major: i64=package_semver_part(want,0,want.len-2);
+        return (resolved.major==major) as i32;
+    }
+    if(wildcard==3){
+        let dot:i32=0;while(dot<want.len-2&&want[dot]!='.'){dot=dot+1;}
+        let major:i64=package_semver_part(want,0,dot);
+        let minor:i64=package_semver_part(want,dot+1,want.len-2);
+        return (resolved.major==major&&resolved.minor==minor) as i32;
+    }
+    if(kind==0){return (package_semver_compare(requested,resolved)==0) as i32;}
+    if(package_semver_compare(resolved,requested)<0){return 0;}
+    let upper:PackageSemver=requested;
+    if(kind=='~'){
+        upper.minor=upper.minor+1;upper.patch=0;
+    }else if(requested.major>0){
+        upper.major=upper.major+1;upper.minor=0;upper.patch=0;
+    }else if(requested.minor>0){
+        upper.minor=upper.minor+1;upper.patch=0;
+    }else{
+        upper.patch=upper.patch+1;
+    }
+    return (package_semver_compare(resolved,upper)<0) as i32;
+}
+
+// Return the inclusive lower and exclusive upper bounds for the bounded
+// exact/caret/tilde requirement grammar. This is an interval helper only;
+// it does not select a version or inspect a registry.
+fn package_version_requirement_bounds(requirement:[]u8,
+    lower:*PackageSemver, upper:*PackageSemver)i32{
+    if(package_version_requirement_valid(requirement)==0){return 0;}
+    let body:[]u8=requirement;let kind:u8=0;
+    if(requirement[0]=='^'||requirement[0]=='~'){
+        kind=requirement[0];body=requirement[1..requirement.len];
+    }
+    let wildcard:i32=package_version_wildcard_kind(body);
+    if(wildcard>0){
+        lower.*=PackageSemver{.major=0,.minor=0,.patch=0,.valid=1};
+        upper.*=PackageSemver{.major=2147483647,.minor=2147483647,
+            .patch=2147483647,.valid=1};
+        if(wildcard==2){
+            let major:i64=package_semver_part(body,0,body.len-2);
+            if(major<0||major>=2147483647){return 0;}
+            lower.*.major=major;upper.*.major=major+1;
+            upper.*.minor=0;upper.*.patch=0;
+        }else if(wildcard==3){
+            let dot:i32=0;while(dot<body.len-2&&body[dot]!='.'){dot=dot+1;}
+            let major:i64=package_semver_part(body,0,dot);
+            let minor:i64=package_semver_part(body,dot+1,body.len-2);
+            if(major<0||minor<0||minor>=2147483647){return 0;}
+            lower.*.major=major;lower.*.minor=minor;
+            upper.*.major=major;upper.*.minor=minor+1;upper.*.patch=0;
+        }
+        return 1;
+    }
+    let value:PackageSemver=package_semver_parse(body);
+    if(value.valid==0){return 0;}
+    lower.*=value;upper.*=value;
+    if(kind=='~'){
+        upper.*.minor=upper.*.minor+1;upper.*.patch=0;
+    }else if(kind=='^'&&value.major>0){
+        upper.*.major=upper.*.major+1;upper.*.minor=0;upper.*.patch=0;
+    }else if(kind=='^'&&value.minor>0){
+        upper.*.minor=upper.*.minor+1;upper.*.patch=0;
+    }else if(kind=='^'){
+        upper.*.patch=upper.*.patch+1;
+    }else{
+        // Exact/exact and exact/range are handled by the existing point
+        // check because an exclusive upper endpoint cannot encode equality.
+        return 1;
+    }
+    return 1;
+}
+
+// Compare two requirements only where this bounded resolver can prove a
+// conflict. Exact requirements are checked against exact/caret/tilde
+// requirements; caret/tilde pairs use interval intersection. This remains a
+// compatibility check, not a version-selection or graph solver.
+fn package_version_requirements_compatible(a:[]u8,b:[]u8)i32{
+    if(a.len==0||b.len==0){return 1;}
+    let a_exact:i32=((a[0]!='^'&&a[0]!='~'&&package_version_wildcard_kind(a)==0)) as i32;
+    let b_exact:i32=((b[0]!='^'&&b[0]!='~'&&package_version_wildcard_kind(b)==0)) as i32;
+    if(a_exact!=0){return package_version_satisfies(b,a);}
+    if(b_exact!=0){return package_version_satisfies(a,b);}
+    let al:PackageSemver=package_semver_bad();let au:PackageSemver=package_semver_bad();
+    let bl:PackageSemver=package_semver_bad();let bu:PackageSemver=package_semver_bad();
+    if(package_version_requirement_bounds(a,&al,&au)==0||
+       package_version_requirement_bounds(b,&bl,&bu)==0){return 1;}
+    let lower:PackageSemver=al;if(package_semver_compare(bl,lower)>0){lower=bl;}
+    let upper:PackageSemver=au;if(package_semver_compare(bu,upper)<0){upper=bu;}
+    return (package_semver_compare(lower,upper)<0) as i32;
+}
+
+// Detect only same-declared-root conflicts that can be proven without
+// inventing a registry/version-selection graph. Canonical root solving stays
+// outside this local resolver's authority.
+fn package_manifest_version_conflict(source:[]u8)i32{
+    if(source.len<0||source.len>1048576){return 0;}
+    let entries:ArrayList[PackageVersionDecl]=make[PackageVersionDecl](8);
+    let in_deps:i32=0;let position:i32=0;
+    while(position<=source.len){
+        let end:i32=position;while(end<source.len&&source[end]!='\n'){end=end+1;}
+        let line:[]u8=package_import_trim(source[position..end]);
+        if(line.len>0&&line[0]!='#'){
+            if(line[0]=='['){
+                let close:i32=1;while(close<line.len&&line[close]!=']'){close=close+1;}
+                if(close>=line.len){free[PackageVersionDecl](&entries);return 0;}
+                in_deps=(@strEq(package_import_trim(line[1..close]),"deps")) as i32;
+            }else if(in_deps!=0){
+                let equals:i32=0;while(equals<line.len&&line[equals]!='='){equals=equals+1;}
+                if(equals<line.len){
+                    let raw:[]u8=package_import_trim(line[equals+1..line.len]);
+                    if(raw.len>0&&raw[0]=='{'){
+                        let path:[]u8=package_import_field(raw,"path");
+                        let version:[]u8=package_import_field(raw,"version");
+                        if(path.len>0&&version.len>0&&package_version_requirement_valid(version)!=0){
+                            let i:i32=0;
+                            while(i<entries.len){
+                                if(@strEq(entries.data[i].path,path)&&
+                                    package_version_requirements_compatible(entries.data[i].version,version)==0){
+                                    free[PackageVersionDecl](&entries);return 1;
+                                }
+                                i=i+1;
+                            }
+                            if(entries.len<64){push[PackageVersionDecl](&entries,PackageVersionDecl{.path=path,.version=version});}
+                        }
+                    }
+                }
+            }
+        }
+        if(end>=source.len){position=source.len+1;}else{position=end+1;}
+    }
+    free[PackageVersionDecl](&entries);return 0;
+}
+
 fn package_import_safe_segment(segment: []u8) i32 {
     return (segment.len > 0 && !@strEq(segment, ".") &&
         !@strEq(segment, "..")) as i32;
@@ -141,6 +704,127 @@ fn package_import_module_safe(module: []u8) i32 {
     return package_import_safe_segment(module[segment_start..module.len]);
 }
 
+// Vendored embedded resources share the same traversal-free segment contract
+// as modules but are not required to use the `.zag` suffix.
+fn package_import_artifact_safe(path: []u8) i32 {
+    if (path.len == 0 || path.len > 1024 || path[0] == '/' ||
+        path[path.len - 1] == '/') { return 0; }
+    let segment_start: i32 = 0;
+    let i: i32 = 0;
+    while (i < path.len) {
+        if (path[i] == '/') {
+            if (package_import_safe_segment(path[segment_start..i]) == 0) { return 0; }
+            segment_start = i + 1;
+        } else {
+            let c: u8 = path[i];
+            let safe: i32 = ((c >= 'a' && c <= 'z') ||
+                (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                c == '_' || c == '-' || c == '.') as i32;
+            if (safe == 0) { return 0; }
+        }
+        i = i + 1;
+    }
+    return package_import_safe_segment(path[segment_start..path.len]);
+}
+
+// An explicit registry lock may be shared by a nested registry manifest.  Its
+// spelling is still bounded and lexical: absolute/home/drive/URL forms,
+// empty or current-directory segments, and parent traversal after the first
+// non-parent segment are rejected.  A small parent budget is intentional; the
+// no-follow filesystem check below remains the authority for the resolved
+// path, while this parser prevents an unbounded or opaque lock identity.
+fn package_import_registry_lock_safe(path: []u8) i32 {
+    if (path.len == 0 || path.len > 1024 || path[0] == '/' ||
+        path[0] == '~' || path[path.len - 1] == '/' || path[path.len - 1] == '\\') {
+        return 0;
+    }
+    let segment_start: i32 = 0;
+    let parent_count: i32 = 0;
+    let seen_child: i32 = 0;
+    let i: i32 = 0;
+    while (i < path.len) {
+        if (path[i] == '/') {
+            if (i == segment_start) { return 0; }
+            let segment: []u8 = path[segment_start..i];
+            if (@strEq(segment, "..")) {
+                if (seen_child != 0) { return 0; }
+                parent_count = parent_count + 1;
+                if (parent_count > 8) { return 0; }
+            } else {
+                if (@strEq(segment, ".") ||
+                    package_import_safe_segment(segment) == 0) { return 0; }
+                seen_child = 1;
+            }
+            segment_start = i + 1;
+        } else {
+            let c: u8 = path[i];
+            if (c == '\\' || c == ':') { return 0; }
+        }
+        i = i + 1;
+    }
+    if (segment_start == path.len) { return 0; }
+    let final_segment: []u8 = path[segment_start..path.len];
+    if (@strEq(final_segment, "..")) {
+        if (seen_child != 0) { return 0; }
+        parent_count = parent_count + 1;
+        if (parent_count > 8) { return 0; }
+    } else if (@strEq(final_segment, ".") ||
+        package_import_safe_segment(final_segment) == 0) {
+        return 0;
+    } else {
+        seen_child = 1;
+    }
+    return (seen_child != 0) as i32;
+}
+
+// Return 0 when any existing path component is a symlink.  `newfstatat` with
+// AT_SYMLINK_NOFOLLOW is applied to every lexical prefix, not just the final
+// file, so a symlinked directory cannot redirect a locked package outside its
+// reviewed root.  Missing prefixes are left to the normal resolver error
+// (module/index not found); only an observed symlink rejects the input.
+fn package_import_path_prefix_no_symlink(prefix: []u8) i32 {
+    if (prefix.len == 0) { return 1; }
+    let cpath: ArrayList[u8] = make[u8](prefix.len + 1);
+    let i: i32 = 0;
+    while (i < prefix.len) { push[u8](&cpath, prefix[i]); i = i + 1; }
+    push[u8](&cpath, 0 as u8);
+    let stat: ArrayList[u8] = make[u8](144);
+    while (stat.len < 144) { push[u8](&stat, 0 as u8); }
+    // Linux x86-64: newfstatat=262, AT_FDCWD=-100,
+    // AT_SYMLINK_NOFOLLOW=0x100.  st_mode is at byte offset 24.
+    let rc: i64 = _zag_raw_syscall(262, 0 - 100,
+        _zag_slice_ptr(cpath.data[0..cpath.len]) as i64,
+        _zag_slice_ptr(stat.data[0..stat.len]) as i64, 256, 0, 0);
+    let symlink: i32 = 0;
+    if (rc == 0) {
+        let mode: i64 = (stat.data[24] as i64) +
+            (stat.data[25] as i64) * 256 +
+            (stat.data[26] as i64) * 65536 +
+            (stat.data[27] as i64) * 16777216;
+        symlink = (((mode / 4096) % 16) == 10) as i32;
+    }
+    free[u8](&cpath);
+    free[u8](&stat);
+    return (symlink == 0) as i32;
+}
+
+fn package_import_path_no_symlink(path: []u8) i32 {
+    if (path.len == 0 || path.len > 16384) { return 0; }
+    let start: i32 = 0;
+    let i: i32 = 0;
+    while (i < path.len) {
+        if (path[i] == '/') {
+            if (i > start && package_import_path_prefix_no_symlink(
+                path[0..i]) == 0) { return 0; }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (path.len > start && package_import_path_prefix_no_symlink(
+        path[0..path.len]) == 0) { return 0; }
+    return 1;
+}
+
 fn package_import_local_path_safe(path: []u8) i32 {
     if (path.len == 0 || path.len > 4096 || path[0] == '/' ||
         path[0] == '~') { return 0; }
@@ -155,6 +839,480 @@ fn package_import_local_path_safe(path: []u8) i32 {
     return 1;
 }
 
+// Sibling mode is intentionally narrower than ordinary local dependencies:
+// exactly one parent segment followed by one package-safe root name. This
+// keeps the lock identity a direct sibling rather than an arbitrary ancestor,
+// nested path, or path that happens to contain a sibling-looking segment.
+fn package_import_sibling_path_safe(path: []u8) i32 {
+    if (path.len < 4 || path.len > 67 || !@strEq(path[0..3], "../")) {
+        return 0;
+    }
+    return package_import_safe_name(path[3..path.len]);
+}
+
+fn package_import_vendor_path_safe(path: []u8) i32 {
+    if (package_import_starts_with(path, "vendor/") == 0 ||
+        package_import_local_path_safe(path) == 0) { return 0; }
+    let segment_start: i32 = 0;
+    let i: i32 = 0;
+    while (i < path.len) {
+        if (path[i] == '/') {
+            let segment: []u8 = path[segment_start..i];
+            if (package_import_safe_segment(segment) == 0) { return 0; }
+            let j: i32 = 0;
+            while (j < segment.len) {
+                let c: u8 = segment[j];
+                let safe: i32 = ((c >= 'a' && c <= 'z') ||
+                    (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                    c == '_' || c == '-' || c == '.') as i32;
+                if (safe == 0) { return 0; }
+                j = j + 1;
+            }
+            segment_start = i + 1;
+        }
+        i = i + 1;
+    }
+    let final_segment: []u8 = path[segment_start..path.len];
+    if (package_import_safe_segment(final_segment) == 0) { return 0; }
+    let j: i32 = 0;
+    while (j < final_segment.len) {
+        let c: u8 = final_segment[j];
+        let safe: i32 = ((c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            c == '_' || c == '-' || c == '.') as i32;
+        if (safe == 0) { return 0; }
+        j = j + 1;
+    }
+    return 1;
+}
+
+fn package_import_field_mentioned(table: []u8, field: []u8) i32 {
+    let i: i32 = 0;
+    while (i + field.len <= table.len) {
+        let before: i32 = (i == 0 || table[i - 1] == '{' ||
+            table[i - 1] == ',' || table[i - 1] == ' ' ||
+            table[i - 1] == '\t') as i32;
+        let matched: i32 = before;
+        let j: i32 = 0;
+        while (j < field.len && matched != 0) {
+            if (table[i + j] != field[j]) { matched = 0; }
+            j = j + 1;
+        }
+        if (matched != 0) {
+            let after: i32 = i + field.len;
+            if (after == table.len || table[after] == '=' ||
+                table[after] == ' ' || table[after] == '\t') { return 1; }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Local lock declarations intentionally use a tiny strict inline-table
+// grammar. Exactly one quoted `path`, one quoted requested mode, and an
+// optional quoted semver requirement are accepted; duplicate, unknown, or
+// malformed fields fail closed. Sibling mode permits a bounded relative root;
+// its exact path is still bound into zag.lock and opened with no-follow I/O.
+fn package_import_local_lock_table_valid(raw: []u8,
+    requested_mode: []u8) i32 {
+    let table: []u8 = package_import_trim(raw);
+    if (table.len < 5 || table[0] != '{' ||
+        table[table.len - 1] != '}') { return 0; }
+    let body: []u8 = package_import_trim(table[1..table.len - 1]);
+    if (body.len == 0) { return 0; }
+    let path_count: i32 = 0;
+    let mode_count: i32 = 0;
+    let version_count: i32 = 0;
+    let pair_count: i32 = 0;
+    let position: i32 = 0;
+    while (position <= body.len) {
+        let end: i32 = position;
+        while (end < body.len && body[end] != ',') { end = end + 1; }
+        let pair: []u8 = package_import_trim(body[position..end]);
+        if (pair.len == 0) { return 0; }
+        let equals: i32 = 0 - 1;
+        let equals_count: i32 = 0;
+        let i: i32 = 0;
+        while (i < pair.len) {
+            if (pair[i] == '=') { equals = i; equals_count = equals_count + 1; }
+            i = i + 1;
+        }
+        if (equals_count != 1 || equals <= 0) { return 0; }
+        let key: []u8 = package_import_trim(pair[0..equals]);
+        let value: []u8 = package_import_unquote(pair[equals + 1..pair.len]);
+        if (value.len == 0) { return 0; }
+        if (@strEq(key, "path")) {
+            path_count = path_count + 1;
+        } else if (@strEq(key, "mode")) {
+            mode_count = mode_count + 1;
+            if (!@strEq(value, requested_mode)) { return 0; }
+        } else if (@strEq(key, "version")) {
+            version_count = version_count + 1;
+            if (package_version_requirement_valid(value) == 0) { return 0; }
+        } else {
+            return 0;
+        }
+        pair_count = pair_count + 1;
+        if (end >= body.len) { position = body.len + 1; }
+        else { position = end + 1; }
+    }
+    return (pair_count >= 2 && pair_count <= 3 && path_count == 1 &&
+        mode_count == 1 && version_count <= 1) as i32;
+}
+
+fn package_import_vendor_table_valid(raw: []u8) i32 {
+    return package_import_local_lock_table_valid(raw, "vendor");
+}
+
+fn package_import_sibling_table_valid(raw: []u8) i32 {
+    return (package_import_local_lock_table_valid(raw, "sibling") == 1 &&
+        package_import_sibling_path_safe(package_import_field(raw, "path")) == 1) as i32;
+}
+
+// Registry dependencies use a local index path as their `path`; the index
+// itself selects the source module. Optional `public_key`/`signature` fields
+// verify that exact local index; explicit `registry_lock` pins the selected
+// alias, index, version, source, raw bytes, and optional artifact signature.
+fn package_import_registry_table_valid(raw: []u8) i32 {
+    let table: []u8 = package_import_trim(raw);
+    if (table.len < 5 || table[0] != '{' || table[table.len - 1] != '}') { return 0; }
+    let body: []u8 = package_import_trim(table[1..table.len - 1]);
+    if (body.len == 0) { return 0; }
+    let path_count: i32 = 0; let mode_count: i32 = 0; let version_count: i32 = 0;
+    let key_count: i32 = 0; let signature_count: i32 = 0;
+    let artifact_policy_count: i32 = 0; let registry_lock_count: i32 = 0;
+    let pair_count: i32 = 0; let position: i32 = 0;
+    while (position <= body.len) {
+        let end: i32 = position;
+        while (end < body.len && body[end] != ',') { end = end + 1; }
+        let pair: []u8 = package_import_trim(body[position..end]);
+        if (pair.len == 0) { return 0; }
+        let equals: i32 = 0 - 1; let equals_count: i32 = 0; let i: i32 = 0;
+        while (i < pair.len) {
+            if (pair[i] == '=') { equals = i; equals_count = equals_count + 1; }
+            i = i + 1;
+        }
+        if (equals_count != 1 || equals <= 0) { return 0; }
+        let key: []u8 = package_import_trim(pair[0..equals]);
+        let value: []u8 = package_import_unquote(pair[equals + 1..pair.len]);
+        if (value.len == 0) { return 0; }
+        if (@strEq(key, "path")) {
+            path_count = path_count + 1;
+            if (package_import_artifact_safe(value) == 0) { return 0; }
+        } else if (@strEq(key, "mode")) {
+            mode_count = mode_count + 1;
+            if (!@strEq(value, "registry")) { return 0; }
+        } else if (@strEq(key, "version")) {
+            version_count = version_count + 1;
+            if (package_version_requirement_valid(value) == 0) { return 0; }
+        } else if (@strEq(key, "public_key")) {
+            key_count = key_count + 1;
+            if (package_import_artifact_safe(value) == 0) { return 0; }
+        } else if (@strEq(key, "signature")) {
+            signature_count = signature_count + 1;
+            if (package_import_artifact_safe(value) == 0) { return 0; }
+        } else if (@strEq(key, "artifact_signatures")) {
+            artifact_policy_count = artifact_policy_count + 1;
+            if (!@strEq(value, "required")) { return 0; }
+        } else if (@strEq(key, "registry_lock")) {
+            registry_lock_count = registry_lock_count + 1;
+            if (package_import_registry_lock_safe(value) == 0) { return 0; }
+        } else {
+            return 0;
+        }
+        pair_count = pair_count + 1;
+        if (end >= body.len) { position = body.len + 1; }
+        else { position = end + 1; }
+    }
+    return (pair_count >= 2 && pair_count <= 7 && path_count == 1 &&
+        mode_count == 1 && version_count <= 1 && key_count <= 1 &&
+        signature_count <= 1 && key_count == signature_count &&
+        artifact_policy_count <= 1 && registry_lock_count <= 1 &&
+        (artifact_policy_count == 0 || (key_count == 1 && signature_count == 1))) as i32;
+}
+
+fn package_raw_checksum(data: []u8) PackageRawChecksum {
+    let a: i64 = 216613626;
+    let b: i64 = 131542391;
+    let i: i32 = 0;
+    while (i < data.len) {
+        let byte: i64 = data[i] as i64;
+        a = (a * 257 + byte + 1) % 1000000007;
+        b = (b * 263 + byte + 1) % 1000000009;
+        i = i + 1;
+    }
+    return PackageRawChecksum{ .first = a, .second = b, .bytes = data.len };
+}
+
+fn package_raw_checksum_equal(a: PackageRawChecksum,
+    b: PackageRawChecksum) i32 {
+    return (a.first == b.first && a.second == b.second &&
+        a.bytes == b.bytes) as i32;
+}
+
+fn package_lock_part(text: []u8, want: i32, separator: u8) []u8 {
+    let field: i32 = 0;
+    let start: i32 = 0;
+    let i: i32 = 0;
+    while (i < text.len) {
+        if (text[i] == separator) {
+            if (field == want) { return text[start..i]; }
+            field = field + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (field == want) { return text[start..text.len]; }
+    return "";
+}
+
+fn package_lock_parts_exact(text: []u8, count: i32, separator: u8) i32 {
+    if (count <= 0) { return 0; }
+    let fields: i32 = 1;
+    let i: i32 = 0;
+    while (i < text.len) {
+        if (text[i] == separator) { fields = fields + 1; }
+        i = i + 1;
+    }
+    return (fields == count) as i32;
+}
+
+fn package_lock_uint(text: []u8, maximum: i64) i64 {
+    if (text.len == 0 || (text.len > 1 && text[0] == '0')) { return 0 - 1; }
+    let value: i64 = 0;
+    let i: i32 = 0;
+    while (i < text.len) {
+        if (text[i] < '0' || text[i] > '9') { return 0 - 1; }
+        let digit: i64 = (text[i] as i64) - 48;
+        if (value > (maximum - digit) / 10) { return 0 - 1; }
+        value = value * 10 + digit;
+        i = i + 1;
+    }
+    return value;
+}
+
+fn package_lock_checksum(text: []u8) PackageChecksumParse {
+    let bad: PackageChecksumParse = PackageChecksumParse{
+        .checksum = PackageRawChecksum{ .first = 0, .second = 0, .bytes = 0 },
+        .valid = 0,
+    };
+    if (package_lock_parts_exact(text, 3, ',') == 0) { return bad; }
+    let first: i64 = package_lock_uint(package_lock_part(text, 0, ','), 1000000006);
+    let second: i64 = package_lock_uint(package_lock_part(text, 1, ','), 1000000008);
+    let bytes: i64 = package_lock_uint(package_lock_part(text, 2, ','), 8388608);
+    if (first < 0 || second < 0 || bytes < 0) { return bad; }
+    return PackageChecksumParse{
+        .checksum = PackageRawChecksum{ .first = first, .second = second, .bytes = bytes },
+        .valid = 1,
+    };
+}
+
+// The transitive registry graph-lock is also accepted as the explicit
+// `registry_lock` sidecar used by the default resolver.  Keep this small
+// parser here (rather than importing the transitive graph module) so the
+// resolver remains dependency-neutral and can validate a selected tuple
+// before admitting its module bytes to the parse graph.
+fn package_import_graph_lock_line(text: []u8, wanted: i32) []u8 {
+    let line_no: i32 = 0;
+    let start: i32 = 0;
+    let i: i32 = 0;
+    while (i < text.len) {
+        if (text[i] == '\n') {
+            if (line_no == wanted) { return text[start..i]; }
+            line_no = line_no + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (line_no == wanted && start <= text.len) {
+        return text[start..text.len];
+    }
+    return "";
+}
+
+fn package_import_graph_lock_valid(lock: []u8) i32 {
+    if (lock.len <= 0 || lock.len > 1048576 || lock[lock.len - 1] != '\n' ||
+        !@strEq(package_import_graph_lock_line(lock, 0),
+            "format=zag-registry-graph-lock-v1")) { return 0; }
+    let mark: i32 = 0 - 1;
+    let line_no: i32 = 1;
+    let entries: i32 = 0;
+    let previous: []u8 = "";
+    let i: i32 = 0;
+    while (i + 9 <= lock.len) {
+        if ((i == 0 || lock[i - 1] == '\n') &&
+            @strEq(lock[i..i + 9], "checksum=")) {
+            mark = i; break;
+        }
+        i = i + 1;
+    }
+    if (mark <= 0 || mark >= lock.len || mark + 9 >= lock.len ||
+        lock[lock.len - 1] != '\n') { return 0; }
+    let claimed: PackageChecksumParse = package_lock_checksum(
+        lock[mark + 9..lock.len - 1]);
+    if (claimed.valid == 0 ||
+        package_raw_checksum_equal(package_raw_checksum(lock[0..mark]),
+            claimed.checksum) == 0) { return 0; }
+
+    let position: i32 = 1;
+    while (position < lock.len && position < mark) {
+        let line: []u8 = package_import_graph_lock_line(lock, line_no);
+        if (line.len == 0 || line_no == 0) { return 0; }
+        if (line.len <= 7 || !@strEq(line[0..6], "entry=") ||
+            package_lock_parts_exact(line[6..line.len], 4, '\t') == 0) {
+            return 0;
+        }
+        let fields: []u8 = line[6..line.len];
+        let name: []u8 = package_lock_part(fields, 0, '\t');
+        let version: []u8 = package_lock_part(fields, 1, '\t');
+        let source: []u8 = package_lock_part(fields, 2, '\t');
+        let checksum: PackageChecksumParse = package_lock_checksum(
+            package_lock_part(fields, 3, '\t'));
+        if (package_import_safe_name(name) == 0 ||
+            package_semver_parse(version).valid == 0 ||
+            package_import_artifact_safe(source) == 0 || checksum.valid == 0 ||
+            (entries > 0 && package_lock_compare(name, previous) <= 0)) {
+            return 0;
+        }
+        previous = name;
+        entries = entries + 1;
+        if (entries > 256) { return 0; }
+        line_no = line_no + 1;
+        // Every entry line, including its newline, must precede checksum=.
+        position = 0;
+        while (position < mark && lock[position] != '\n') { position = position + 1; }
+        while (position < mark && lock[position] == '\n') { position = position + 1; }
+        // Recompute the consumed prefix from the line number without relying
+        // on a separate line-count convention for the trailing newline.
+        position = 0; let consumed: i32 = 0;
+        while (position < mark && consumed < line_no) {
+            if (lock[position] == '\n') { consumed = consumed + 1; }
+            position = position + 1;
+        }
+    }
+    return (entries > 0 && position == mark && line_no == entries + 1) as i32;
+}
+
+fn package_import_graph_lock_match(lock: []u8, name: []u8,
+    version: []u8, source: []u8, checksum: PackageRawChecksum) i32 {
+    if (package_import_graph_lock_valid(lock) == 0) { return 0; }
+    let line_no: i32 = 1;
+    while (line_no < 257) {
+        let line: []u8 = package_import_graph_lock_line(lock, line_no);
+        if (line.len == 0 || (line.len >= 9 &&
+            @strEq(line[0..9], "checksum="))) { break; }
+        let fields: []u8 = line[6..line.len];
+        if (@strEq(package_lock_part(fields, 0, '\t'), name) &&
+            @strEq(package_lock_part(fields, 1, '\t'), version) &&
+            @strEq(package_lock_part(fields, 2, '\t'), source) &&
+            package_raw_checksum_equal(package_lock_checksum(
+                package_lock_part(fields, 3, '\t')).checksum, checksum) == 1) {
+            return 1;
+        }
+        line_no = line_no + 1;
+    }
+    return 0;
+}
+
+// Validate graph-lock coverage against the parser-owned `from<TAB>to<TAB>req`
+// stream. Tuple bytes are checked by package_import_graph_lock_match during
+// each import; this second pass rejects omitted or extra graph entries and
+// requirement drift before the compilation unit is admitted.
+fn package_import_graph_lock_edges_valid(lock: []u8, edges: []u8) i32 {
+    if (package_import_graph_lock_valid(lock) == 0 || edges.len == 0 ||
+        edges[edges.len - 1] == '\n') { return 0; }
+    let edge_count: i32 = 1;
+    let i: i32 = 0;
+    while (i < edges.len) {
+        if (edges[i] == '\n') { edge_count = edge_count + 1; }
+        i = i + 1;
+    }
+    if (edge_count > 256) { return 0; }
+    let target_count: i32 = 0;
+    let edge_no: i32 = 0;
+    while (edge_no < edge_count) {
+        let edge: []u8 = package_import_graph_lock_line(edges, edge_no);
+        if (package_lock_parts_exact(edge, 3, '\t') == 0) { return 0; }
+        let target: []u8 = package_lock_part(edge, 1, '\t');
+        let requirement: []u8 = package_lock_part(edge, 2, '\t');
+        if (package_import_safe_name(package_lock_part(edge, 0, '\t')) == 0 ||
+            package_import_safe_name(target) == 0 ||
+            (requirement.len > 0 &&
+             package_version_requirement_valid(requirement) == 0)) { return 0; }
+        let prior: i32 = 0; let prior_no: i32 = 0;
+        while (prior_no < edge_no) {
+            let prior_edge: []u8 = package_import_graph_lock_line(edges, prior_no);
+            if (@strEq(package_lock_part(prior_edge, 1, '\t'), target)) {
+                prior = 1; break;
+            }
+            prior_no = prior_no + 1;
+        }
+        if (prior == 0) {
+            let found: i32 = 0; let lock_no: i32 = 1;
+            while (lock_no < 257) {
+                let line: []u8 = package_import_graph_lock_line(lock, lock_no);
+                if (line.len == 0 || (line.len >= 9 &&
+                    @strEq(line[0..9], "checksum="))) { break; }
+                let fields: []u8 = line[6..line.len];
+                if (@strEq(package_lock_part(fields, 0, '\t'), target)) {
+                    let version: []u8 = package_lock_part(fields, 1, '\t');
+                    if (requirement.len > 0 &&
+                        package_version_satisfies(requirement, version) == 0) {
+                        return 0;
+                    }
+                    found = 1; break;
+                }
+                lock_no = lock_no + 1;
+            }
+            if (found == 0) { return 0; }
+            target_count = target_count + 1;
+        }
+        edge_no = edge_no + 1;
+    }
+    let lock_count: i32 = 0; let lock_no: i32 = 1;
+    while (lock_no < 257) {
+        let line: []u8 = package_import_graph_lock_line(lock, lock_no);
+        if (line.len == 0 || (line.len >= 9 &&
+            @strEq(line[0..9], "checksum="))) { break; }
+        lock_count = lock_count + 1;
+        let target: []u8 = package_lock_part(line[6..line.len], 0, '\t');
+        let seen: i32 = 0; let edge_no2: i32 = 0;
+        while (edge_no2 < edge_count) {
+            let edge: []u8 = package_import_graph_lock_line(edges, edge_no2);
+            if (@strEq(package_lock_part(edge, 1, '\t'), target)) {
+                seen = 1; break;
+            }
+            edge_no2 = edge_no2 + 1;
+        }
+        if (seen == 0) { return 0; }
+        lock_no = lock_no + 1;
+    }
+    return (lock_count == target_count) as i32;
+}
+
+fn package_lock_compare(a: []u8, b: []u8) i32 {
+    let common: i32 = a.len;
+    if (b.len < common) { common = b.len; }
+    let i: i32 = 0;
+    while (i < common) {
+        if (a[i] < b[i]) { return 0 - 1; }
+        if (a[i] > b[i]) { return 1; }
+        i = i + 1;
+    }
+    if (a.len < b.len) { return 0 - 1; }
+    if (a.len > b.len) { return 1; }
+    return 0;
+}
+
+fn package_lock_tuple_after(alias: []u8, root: []u8, module: []u8,
+    previous_alias: []u8, previous_root: []u8, previous_module: []u8) i32 {
+    let order: i32 = package_lock_compare(alias, previous_alias);
+    if (order != 0) { return (order > 0) as i32; }
+    order = package_lock_compare(root, previous_root);
+    if (order != 0) { return (order > 0) as i32; }
+    return (package_lock_compare(module, previous_module) > 0) as i32;
+}
+
 fn package_import_manifest(base_dir: []u8) []u8 {
     let current: []u8 = base_dir;
     if (current.len == 0) { current = "."; }
@@ -162,6 +1320,7 @@ fn package_import_manifest(base_dir: []u8) []u8 {
     while (depth < 64) {
         let candidate: []u8 = package_import_join(current, "zag.mod");
         if (_zag_file_exists(candidate) == 1) { return candidate; }
+        _zag_str_free(candidate);
         let parent: []u8 = package_import_dir(current);
         if (parent.len == 0) {
             if (@strEq(current, ".")) { return ""; }
@@ -170,6 +1329,38 @@ fn package_import_manifest(base_dir: []u8) []u8 {
             if (@strEq(parent, current)) { return ""; }
             current = parent;
         }
+        depth = depth + 1;
+    }
+    return "";
+}
+
+// A registry dependency may use the conventional `registry.lock` sidecar
+// without repeating a manifest field. Search from the nearest manifest toward
+// the project root so nested registry modules consume the same root-owned
+// lock when they do not provide a nearer sidecar. The first existing path is
+// returned even when it is a symlink or malformed; the normal no-follow and
+// format validators then reject it instead of silently falling back to an
+// unlocked registry selection.
+fn package_import_default_registry_lock(manifest_path: []u8) []u8 {
+    if (manifest_path.len == 0) { return ""; }
+    let current: []u8 = package_import_dir(manifest_path);
+    let depth: i32 = 0;
+    while (depth < 64) {
+        let candidate: []u8 = package_import_join(current, "registry.lock");
+        if (_zag_file_exists(candidate) == 1) { return candidate; }
+        _zag_str_free(candidate);
+        let parent: []u8 = package_import_dir(current);
+        if (parent.len == 0 || @strEq(parent, current)) {
+            return "";
+        }
+        // Do not climb above the project/package manifest chain. A random
+        // `registry.lock` in an unrelated parent directory must never become
+        // an implicit dependency authority for this compilation.
+        let parent_manifest: []u8 = package_import_join(parent, "zag.mod");
+        let parent_has_manifest: i32 = (_zag_file_exists(parent_manifest) == 1) as i32;
+        _zag_str_free(parent_manifest);
+        if (parent_has_manifest == 0) { return ""; }
+        current = parent;
         depth = depth + 1;
     }
     return "";
@@ -211,7 +1402,9 @@ fn package_import_field(table: []u8, field: []u8) []u8 {
 fn package_manifest_dependency(source: []u8,
     dependency: []u8) PackageManifestDependency {
     let result: PackageManifestDependency = PackageManifestDependency{
-        .path = "", .count = 0, .valid = 1,
+        .path = "", .mode = "", .registry = "", .version = "",
+        .registry_key = "", .registry_signature = "",
+        .registry_artifact_policy = "", .registry_lock = "", .count = 0, .valid = 1,
     };
     if (source.len < 0 || source.len > 1048576) {
         result.valid = 0; return result;
@@ -236,14 +1429,67 @@ fn package_manifest_dependency(source: []u8,
                 if (@strEq(key, dependency)) {
                     let raw: []u8 = package_import_trim(line[equals + 1..line.len]);
                     let path: []u8 = "";
+                    let mode: []u8 = "";
+                    let registry: []u8 = "";
+                    let version: []u8 = "";
+                    let registry_key: []u8 = "";
+                    let registry_signature: []u8 = "";
+                    let registry_artifact_policy: []u8 = "";
+                    let registry_lock: []u8 = "";
                     if (raw.len > 0 && raw[0] == '{') {
                         path = package_import_field(raw, "path");
+                        mode = package_import_field(raw, "mode");
+                        registry = package_import_field(raw, "registry");
+                        version = package_import_field(raw, "version");
+                        registry_key = package_import_field(raw, "public_key");
+                        registry_signature = package_import_field(raw, "signature");
+                        registry_artifact_policy = package_import_field(raw, "artifact_signatures");
+                        registry_lock = package_import_field(raw, "registry_lock");
+                        if (package_import_field_mentioned(raw, "version") != 0 &&
+                            package_version_requirement_valid(version) == 0) {
+                            result.valid = 0;
+                        }
+                        if (package_import_field_mentioned(raw, "mode") != 0 &&
+                            package_import_vendor_table_valid(raw) == 0 &&
+                            package_import_sibling_table_valid(raw) == 0 &&
+                            package_import_registry_table_valid(raw) == 0) {
+                            result.valid = 0;
+                        }
+                        if ((package_import_field_mentioned(raw, "public_key") != 0 ||
+                             package_import_field_mentioned(raw, "signature") != 0) &&
+                            (package_import_field_mentioned(raw, "public_key") == 0 ||
+                             package_import_field_mentioned(raw, "signature") == 0)) {
+                            result.valid = 0;
+                        }
+                        if (package_import_field_mentioned(raw, "artifact_signatures") != 0 &&
+                            !@strEq(registry_artifact_policy, "required")) {
+                            result.valid = 0;
+                        }
+                        if (package_import_field_mentioned(raw, "registry_lock") != 0 &&
+                            package_import_registry_lock_safe(registry_lock) == 0) {
+                            result.valid = 0;
+                        }
+                        if (package_import_field_mentioned(raw, "registry_lock") != 0 &&
+                            !@strEq(mode, "registry")) {
+                            result.valid = 0;
+                        }
                     } else {
                         path = package_import_unquote(raw);
                     }
                     result.count = result.count + 1;
-                    if (path.len == 0) { result.valid = 0; }
+                    if (path.len == 0 && registry.len == 0) { result.valid = 0; }
+        if (mode.len > 0 && @strEq(mode, "registry") &&
+            (path.len == 0 || package_import_artifact_safe(path) == 0)) {
+                        result.valid = 0;
+                    }
                     result.path = path;
+                    result.mode = mode;
+                    result.registry = registry;
+                    result.version = version;
+                    result.registry_key = registry_key;
+                    result.registry_signature = registry_signature;
+                    result.registry_artifact_policy = registry_artifact_policy;
+                    result.registry_lock = registry_lock;
                 }
             }
         }
@@ -251,6 +1497,650 @@ fn package_manifest_dependency(source: []u8,
         else { position = end + 1; }
     }
     return result;
+}
+
+// Read only the package's top-level version field.  A dependency requirement
+// is checked against the dependency root's own manifest bytes, never against
+// the caller's name or path.  The existing v1 fixtures use version="0" for
+// unconstrained local packages; that legacy value is deliberately invalid
+// when a real semver requirement is requested.
+fn package_manifest_project_version(source:[]u8)[]u8{
+    if(source.len<0||source.len>1048576){return "";}
+    let in_deps:i32=0;let found:i32=0;let value:[]u8="";let position:i32=0;
+    while(position<=source.len){
+        let end:i32=position;while(end<source.len&&source[end]!='\n'){end=end+1;}
+        let line:[]u8=package_import_trim(source[position..end]);
+        if(line.len>0&&line[0]!='#'){
+            if(line[0]=='['){
+                let close:i32=1;while(close<line.len&&line[close]!=']'){close=close+1;}
+                if(close>=line.len){return "";}
+                in_deps=(@strEq(package_import_trim(line[1..close]),"deps")) as i32;
+            }else if(in_deps==0){
+                let equals:i32=0;while(equals<line.len&&line[equals]!='='){equals=equals+1;}
+                if(equals<line.len&&@strEq(package_import_trim(line[0..equals]),"version")){
+                    if(found!=0){return "";}
+                    value=package_import_unquote(line[equals+1..line.len]);
+                    if(value.len==0){return "";}
+                    found=1;
+                }
+            }
+        }
+        if(end>=source.len){position=source.len+1;}else{position=end+1;}
+    }
+    if(found==0){return "";}
+    return value;
+}
+
+fn package_dependency_version_matches(root:[]u8,requirement:[]u8)i32{
+    if(requirement.len==0){return 1;}
+    if(package_version_requirement_valid(requirement)==0){return 0;}
+    let manifest:[]u8=package_import_join(root,"zag.mod");
+    if(_zag_file_exists(manifest)==0){_zag_str_free(manifest);return 0;}
+    let manifest_read:PackageNoFollowRead=package_import_read_nofollow(manifest);
+    let source:[]u8=manifest_read.bytes;_zag_str_free(manifest);
+    if(manifest_read.ok==0){return 0;}
+    let actual:[]u8=package_manifest_project_version(source);
+    let ok:i32=package_version_satisfies(requirement,actual);
+    package_import_free_read(source);
+    return ok;
+}
+
+fn package_lock_validate(lock: []u8, manifest_source: []u8,
+    manifest_path: []u8, requested_alias: []u8, requested_root: []u8,
+    requested_module: []u8) PackageLockCheck {
+    let bad: PackageLockCheck = PackageLockCheck{
+        .checksum = PackageRawChecksum{ .first = 0, .second = 0, .bytes = 0 },
+        .found = 0, .mismatch = 0, .valid = 0,
+    };
+    let result: PackageLockCheck = bad;
+    if (lock.len <= 0 || lock.len > 1048576 || lock[lock.len - 1] != '\n') {
+        return bad;
+    }
+    let header_end: i32 = 0;
+    while (header_end < lock.len && lock[header_end] != '\n') {
+        header_end = header_end + 1;
+    }
+    if (header_end >= lock.len ||
+        !@strEq(lock[0..header_end], "format=zag-local-lock-v1")) { return bad; }
+
+    let previous_alias: []u8 = "";
+    let previous_root: []u8 = "";
+    let previous_module: []u8 = "";
+    let entries: i32 = 0;
+    let total_bytes: i64 = 0;
+    let position: i32 = header_end + 1;
+    while (position < lock.len) {
+        let end: i32 = position;
+        while (end < lock.len && lock[end] != '\n') { end = end + 1; }
+        if (end >= lock.len) { return bad; }
+        let line: []u8 = lock[position..end];
+        // Comments are provenance bytes, not records. Requiring one space and
+        // printable ASCII keeps their spelling canonical while allowing a
+        // comment-only lock edit to remain a valid, identity-changing input.
+        if (line.len >= 2 && line[0] == '#' && line[1] == ' ') {
+            let ci: i32 = 2;
+            while (ci < line.len) {
+                if (line[ci] < 32 || line[ci] > 126) { return bad; }
+                ci = ci + 1;
+            }
+        } else {
+            if (line.len <= 6 || !@strEq(line[0..6], "entry=")) { return bad; }
+            let fields: []u8 = line[6..line.len];
+            if (package_lock_parts_exact(fields, 4, '\t') == 0) { return bad; }
+            let alias: []u8 = package_lock_part(fields, 0, '\t');
+            let root: []u8 = package_lock_part(fields, 1, '\t');
+            let module: []u8 = package_lock_part(fields, 2, '\t');
+            let parsed: PackageChecksumParse = package_lock_checksum(
+                package_lock_part(fields, 3, '\t'));
+            if (package_import_safe_name(alias) == 0 ||
+                package_import_local_path_safe(root) == 0 ||
+                package_import_artifact_safe(module) == 0 || parsed.valid == 0) {
+                return bad;
+            }
+            if (entries > 0 && package_lock_tuple_after(alias, root, module,
+                previous_alias, previous_root, previous_module) == 0) { return bad; }
+            previous_alias = alias;
+            previous_root = root;
+            previous_module = module;
+            entries = entries + 1;
+            if (entries > 256) { return bad; }
+
+            let declared: PackageManifestDependency = package_manifest_dependency(
+                manifest_source, alias);
+            let declared_root_valid: i32 = 0;
+            if (declared.valid == 1 && declared.count == 1 &&
+                @strEq(declared.mode, "vendor")) {
+                declared_root_valid = (package_import_vendor_path_safe(root) == 1 &&
+                    @strEq(declared.path, root)) as i32;
+            } else if (declared.valid == 1 && declared.count == 1 &&
+                @strEq(declared.mode, "sibling")) {
+                declared_root_valid = (package_import_sibling_path_safe(root) == 1 &&
+                    @strEq(declared.path, root)) as i32;
+            }
+            if (declared.valid == 0 || declared.count != 1 ||
+                declared_root_valid == 0) {
+                return bad;
+            }
+
+            let dependency_root: []u8 = package_import_join(
+                package_import_dir(manifest_path), root);
+            let module_path: []u8 = package_import_join(dependency_root, module);
+            _zag_str_free(dependency_root);
+            // Validate every lock entry through the same no-follow reader used
+            // for the selected module.  A requested module can be regular
+            // while an unrelated locked resource is a symlink; ordinary
+            // `_zag_read_file` would silently follow that redirect during
+            // complete-lock validation.
+            let module_read: PackageNoFollowRead =
+                package_import_read_nofollow(module_path);
+            _zag_str_free(module_path);
+            if (module_read.ok == 0) {
+                return bad;
+            }
+            let bytes: []u8 = module_read.bytes;
+            total_bytes = total_bytes + bytes.len;
+            if (total_bytes > 67108864) {
+                package_import_free_read(bytes);
+                return bad;
+            }
+            let actual: PackageRawChecksum = package_raw_checksum(bytes);
+            package_import_free_read(bytes);
+            if (package_raw_checksum_equal(actual, parsed.checksum) == 0) {
+                result.mismatch = 1;
+            }
+            if (@strEq(alias, requested_alias) && @strEq(root, requested_root) &&
+                @strEq(module, requested_module)) {
+                result.found = result.found + 1;
+                result.checksum = parsed.checksum;
+            }
+        }
+        position = end + 1;
+    }
+    result.valid = 1;
+    return result;
+}
+
+struct PackageRegistryIndexEntry {
+    name: []u8,
+    version: []u8,
+    source: []u8,
+    checksum: PackageRawChecksum,
+    artifact_signature: []u8,
+    valid: i32,
+}
+
+struct PackageRegistryIndexLookup {
+    found: i32,
+    version: []u8,
+    source: []u8,
+    checksum: PackageRawChecksum,
+    artifact_signature: []u8,
+    error: PackageImportError,
+}
+
+fn package_registry_index_line(text: []u8, wanted: i32) []u8 {
+    let start: i32 = 0; let line_no: i32 = 0; let i: i32 = 0;
+    while (i < text.len) {
+        if (text[i] == '\n') {
+            if (line_no == wanted) { return text[start..i]; }
+            line_no = line_no + 1; start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (line_no == wanted && start <= text.len) { return text[start..text.len]; }
+    return "";
+}
+
+fn package_registry_index_part(fields: []u8, wanted: i32) []u8 {
+    let start: i32 = 0; let field: i32 = 0; let i: i32 = 0;
+    while (i < fields.len) {
+        if (fields[i] == '\t') {
+            if (field == wanted) { return fields[start..i]; }
+            field = field + 1; start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (field == wanted && start <= fields.len) { return fields[start..fields.len]; }
+    return "";
+}
+
+fn package_registry_index_entry(line: []u8) PackageRegistryIndexEntry {
+    let bad: PackageRegistryIndexEntry = PackageRegistryIndexEntry{
+        .name = "", .version = "", .source = "",
+        .checksum = PackageRawChecksum{.first = 0, .second = 0, .bytes = 0},
+        .artifact_signature = "", .valid = 0};
+    if (line.len < 7 || !@strEq(line[0..6], "entry=")) { return bad; }
+    let fields: []u8 = line[6..line.len];
+    let field_count: i32 = package_lock_parts_exact(fields, 4, '\t');
+    let field_count_extended: i32 = package_lock_parts_exact(fields, 5, '\t');
+    if (field_count == 0 && field_count_extended == 0) { return bad; }
+    let name: []u8 = package_registry_index_part(fields, 0);
+    let version: []u8 = package_registry_index_part(fields, 1);
+    let source: []u8 = package_registry_index_part(fields, 2);
+    let parsed: PackageChecksumParse = package_lock_checksum(
+        package_registry_index_part(fields, 3));
+    let artifact_signature: []u8 = "";
+    if (field_count_extended != 0) {
+        artifact_signature = package_registry_index_part(fields, 4);
+        if (package_import_artifact_safe(artifact_signature) == 0) { return bad; }
+    }
+    if (package_import_safe_name(name) == 0 || package_semver_parse(version).valid == 0 ||
+        package_import_artifact_safe(source) == 0 || parsed.valid == 0) { return bad; }
+    return PackageRegistryIndexEntry{.name = name, .version = version,
+        .source = source, .checksum = parsed.checksum,
+        .artifact_signature = artifact_signature, .valid = 1};
+}
+
+fn package_registry_index_valid_local_mode(text: []u8, allow_signed: i32) i32 {
+    if (text.len <= 0 || text.len > 1048576 || text[text.len - 1] != '\n') { return 0; }
+    let mark: i32 = 0 - 1; let i: i32 = 0;
+    while (i + 9 <= text.len) {
+        if ((i == 0 || text[i - 1] == '\n') && @strEq(text[i..i + 9], "checksum=")) {
+            mark = i; break;
+        }
+        i = i + 1;
+    }
+    let signature_line: []u8 = package_registry_index_line(text, 2);
+    let signature_ok: i32 = (@strEq(signature_line, "signature=none") ||
+        (allow_signed == 1 && @strEq(signature_line, "signature=ed25519"))) as i32;
+    if (mark <= 0 || mark >= text.len || signature_ok == 0 ||
+        !@strEq(package_registry_index_line(text, 0), "format=zag-registry-index-v1") ||
+        !@strEq(package_registry_index_line(text, 1), "authority=local-file-v1")) { return 0; }
+    let claimed_text: []u8 = text[mark + 9..text.len - 1];
+    let claimed: PackageChecksumParse = package_lock_checksum(claimed_text);
+    if (claimed.valid == 0 || mark + 9 + claimed_text.len + 1 != text.len ||
+        package_raw_checksum_equal(package_raw_checksum(text[0..mark]), claimed.checksum) == 0) {
+        return 0;
+    }
+    let previous: PackageRegistryIndexEntry = PackageRegistryIndexEntry{
+        .name = "", .version = "", .source = "",
+        .checksum = PackageRawChecksum{.first = 0, .second = 0, .bytes = 0},
+        .artifact_signature = "", .valid = 0};
+    let entries: i32 = 0; let line_no: i32 = 3;
+    while (line_no < text.len) {
+        let line: []u8 = package_registry_index_line(text, line_no);
+        if (line.len == 0 || (line.len >= 9 && @strEq(line[0..9], "checksum="))) { break; }
+        let entry: PackageRegistryIndexEntry = package_registry_index_entry(line);
+        if (entry.valid == 0) { return 0; }
+        if (previous.valid != 0) {
+            let order: i32 = package_lock_compare(entry.name, previous.name);
+            if (order < 0 || (order == 0 && package_semver_compare(
+                package_semver_parse(entry.version), package_semver_parse(previous.version)) <= 0)) {
+                return 0;
+            }
+        }
+        previous = entry; entries = entries + 1;
+        if (entries > 256) { return 0; }
+        line_no = line_no + 1;
+    }
+    return (entries > 0 && line_no == 3 + entries &&
+        package_registry_index_line(text, line_no).len >= 9 &&
+        @strEq(package_registry_index_line(text, line_no)[0..9], "checksum=")) as i32;
+}
+
+fn package_registry_index_valid_local(text: []u8) i32 {
+    return package_registry_index_valid_local_mode(text, 0);
+}
+
+fn package_registry_verify_cstring(s: []u8) ArrayList[u8] {
+    let out: ArrayList[u8] = make[u8](s.len + 1);
+    let i: i32 = 0;
+    while (i < s.len) { push[u8](&out, s[i]); i = i + 1; }
+    push[u8](&out, 0 as u8);
+    return out;
+}
+
+fn package_registry_verify_unlink(path: []u8) i32 {
+    let c: ArrayList[u8] = package_registry_verify_cstring(path);
+    let rc: i64 = _zag_raw_syscall(87,
+        _zag_slice_ptr(c.data[0..c.len]) as i64, 0, 0, 0, 0, 0);
+    free[u8](&c);
+    return (rc == 0 || rc == (0 - 2)) as i32;
+}
+
+fn package_registry_verify_write_new(path: []u8, bytes: []u8) i32 {
+    let c: ArrayList[u8] = package_registry_verify_cstring(path);
+    let fd: i64 = _zag_raw_syscall(2,
+        _zag_slice_ptr(c.data[0..c.len]) as i64, 655553, 384, 0, 0, 0);
+    free[u8](&c);
+    if (fd < 0) { return 0; }
+    let off: i32 = 0; let remaining: i32 = bytes.len; let ok: i32 = 1;
+    while (remaining != 0) {
+        let wrote: i64 = _zag_raw_syscall(1, fd,
+            _zag_slice_ptr(bytes[off..bytes.len]) as i64, remaining, 0, 0, 0);
+        if (wrote == (0 - 4)) { continue; }
+        if (wrote <= 0) { ok = 0; break; }
+        let step: i32 = wrote as i32;
+        if (step > remaining) { ok = 0; break; }
+        off = off + step; remaining = remaining - step;
+    }
+    if (ok == 1 && _zag_raw_syscall(74, fd, 0, 0, 0, 0, 0) != 0) { ok = 0; }
+    let _close: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+    if (ok == 0) { let _removed: i32 = package_registry_verify_unlink(path); }
+    return ok;
+}
+
+fn package_registry_verify_quote(value: []u8) []u8 {
+    let out: []u8 = _zag_str_concat("", "");
+    let quoted: []u8 = _zag_str_concat(out, "'"); _zag_str_free(out);
+    let i: i32 = 0; let current: []u8 = quoted;
+    while (i < value.len) {
+        let next: []u8 = "";
+        if (value[i] == '\'') { next = _zag_str_concat(current, "'\\''"); }
+        else { next = _zag_str_concat(current, value[i..i + 1]); }
+        _zag_str_free(current); current = next; i = i + 1;
+    }
+    let result: []u8 = _zag_str_concat(current, "'");
+    _zag_str_free(current);
+    return result;
+}
+
+fn package_registry_verify_temp(stem: []u8, nonce: i64) []u8 {
+    let n: []u8 = _zag_i64_to_str(nonce);
+    let dn: []u8 = _zag_str_concat(".", n); _zag_str_free(n);
+    let sn: []u8 = _zag_str_concat(stem, dn); _zag_str_free(dn);
+    let result: []u8 = _zag_str_concat("/tmp/zag-registry-signature.", sn);
+    _zag_str_free(sn); return result;
+}
+
+// Verify a signed local index from the resolver itself.  The index, key, and
+// detached signature are opened without symlink traversal, then copied one at
+// a time into create-only snapshots before OpenSSL sees them.  Unsigned local
+// registry mode never reaches this path.
+fn package_registry_signed_index_verified(index_path: []u8, key_path: []u8,
+    signature_path: []u8) i32 {
+    if (index_path.len == 0 || key_path.len == 0 || signature_path.len == 0) { return 0; }
+    let index_tmp: []u8 = package_registry_verify_temp("index", _zag_clock_monotonic_ms());
+    let key_tmp: []u8 = package_registry_verify_temp("key", _zag_clock_monotonic_ms() + 1);
+    let signature_tmp: []u8 = package_registry_verify_temp("signature", _zag_clock_monotonic_ms() + 2);
+    let index: PackageNoFollowRead = package_import_read_nofollow(index_path);
+    let staged: i32 = 0;
+    if (index.ok == 1 &&
+        @strEq(package_registry_index_line(index.bytes, 2), "signature=ed25519") &&
+        package_registry_index_valid_local_mode(index.bytes, 1) == 1) {
+        staged = package_registry_verify_write_new(index_tmp, index.bytes);
+    }
+    package_import_free_read(index.bytes);
+    if (staged == 1) {
+        let key: PackageNoFollowRead = package_import_read_nofollow(key_path);
+        if (key.ok == 0 || package_registry_verify_write_new(key_tmp, key.bytes) == 0) { staged = 0; }
+        package_import_free_read(key.bytes);
+    }
+    if (staged == 1) {
+        let signature: PackageNoFollowRead = package_import_read_nofollow(signature_path);
+        if (signature.ok == 0 || signature.bytes.len != 64 ||
+            package_registry_verify_write_new(signature_tmp, signature.bytes) == 0) { staged = 0; }
+        package_import_free_read(signature.bytes);
+    }
+    let result: i32 = 0;
+    if (staged == 1) {
+        let qi: []u8 = package_registry_verify_quote(index_tmp);
+        let qk: []u8 = package_registry_verify_quote(key_tmp);
+        let qs: []u8 = package_registry_verify_quote(signature_tmp);
+        let c1: []u8 = _zag_str_concat("openssl pkeyutl -verify -pubin -inkey ", qk);
+        let c2: []u8 = _zag_str_concat(c1, " -rawin -in "); _zag_str_free(c1);
+        let c3: []u8 = _zag_str_concat(c2, qi); _zag_str_free(c2);
+        let c4: []u8 = _zag_str_concat(c3, " -sigfile "); _zag_str_free(c3);
+        let c5: []u8 = _zag_str_concat(c4, qs); _zag_str_free(c4);
+        let command: []u8 = _zag_str_concat(c5, " >/dev/null 2>/dev/null"); _zag_str_free(c5);
+        result = (_zag_exec_cmd(command) == 0) as i32;
+        _zag_str_free(qi); _zag_str_free(qk); _zag_str_free(qs); _zag_str_free(command);
+    }
+    let _ri: i32 = package_registry_verify_unlink(index_tmp);
+    let _rk: i32 = package_registry_verify_unlink(key_tmp);
+    let _rs: i32 = package_registry_verify_unlink(signature_tmp);
+    _zag_str_free(index_tmp); _zag_str_free(key_tmp); _zag_str_free(signature_tmp);
+    return result;
+}
+
+// Verify one selected artifact against a detached Ed25519 signature over the
+// exact retained bytes that the parser will compile.  The public key and
+// signature are read through no-follow descriptors and all three inputs are
+// copied to create-only snapshots before OpenSSL sees them.  This is the
+// executable artifact-signature witness; a registry entry may name the
+// signature, but no entry is trusted merely because that path is present.
+fn package_registry_artifact_verified(bytes: []u8, key_path: []u8,
+    signature_path: []u8) i32 {
+    if (key_path.len == 0 || signature_path.len == 0 || bytes.len > 8388608) { return 0; }
+    let nonce: i64 = _zag_clock_monotonic_ms();
+    let artifact_tmp: []u8 = package_registry_verify_temp("artifact", nonce);
+    let key_tmp: []u8 = package_registry_verify_temp("artifact-key", nonce + 1);
+    let signature_tmp: []u8 = package_registry_verify_temp("artifact-signature", nonce + 2);
+    let staged: i32 = package_registry_verify_write_new(artifact_tmp, bytes);
+    if (staged == 1) {
+        let key: PackageNoFollowRead = package_import_read_nofollow(key_path);
+        if (key.ok == 0 || package_registry_verify_write_new(key_tmp, key.bytes) == 0) {
+            staged = 0;
+        }
+        package_import_free_read(key.bytes);
+    }
+    if (staged == 1) {
+        let signature: PackageNoFollowRead = package_import_read_nofollow(signature_path);
+        if (signature.ok == 0 || signature.bytes.len != 64 ||
+            package_registry_verify_write_new(signature_tmp, signature.bytes) == 0) {
+            staged = 0;
+        }
+        package_import_free_read(signature.bytes);
+    }
+    let result: i32 = 0;
+    if (staged == 1) {
+        let qa: []u8 = package_registry_verify_quote(artifact_tmp);
+        let qk: []u8 = package_registry_verify_quote(key_tmp);
+        let qs: []u8 = package_registry_verify_quote(signature_tmp);
+        let c1: []u8 = _zag_str_concat("openssl pkeyutl -verify -pubin -inkey ", qk);
+        let c2: []u8 = _zag_str_concat(c1, " -rawin -in "); _zag_str_free(c1);
+        let c3: []u8 = _zag_str_concat(c2, qa); _zag_str_free(c2);
+        let c4: []u8 = _zag_str_concat(c3, " -sigfile "); _zag_str_free(c3);
+        let c5: []u8 = _zag_str_concat(c4, qs); _zag_str_free(c4);
+        let command: []u8 = _zag_str_concat(c5, " >/dev/null 2>/dev/null"); _zag_str_free(c5);
+        result = (_zag_exec_cmd(command) == 0) as i32;
+        _zag_str_free(qa); _zag_str_free(qk); _zag_str_free(qs); _zag_str_free(command);
+    }
+    let _ra: i32 = package_registry_verify_unlink(artifact_tmp);
+    let _rk: i32 = package_registry_verify_unlink(key_tmp);
+    let _rs: i32 = package_registry_verify_unlink(signature_tmp);
+    _zag_str_free(artifact_tmp); _zag_str_free(key_tmp); _zag_str_free(signature_tmp);
+    return result;
+}
+
+fn package_registry_index_select(text: []u8, name: []u8,
+    requirement: []u8, allow_signed: i32) PackageRegistryIndexLookup {
+    let bad: PackageRegistryIndexLookup = PackageRegistryIndexLookup{
+        .found = 0, .version = "", .source = "",
+        .checksum = PackageRawChecksum{.first = 0, .second = 0, .bytes = 0},
+        .artifact_signature = "",
+        .error = PackageImportError.invalid_lockfile};
+    if (package_registry_index_valid_local_mode(text, allow_signed) == 0 ||
+        package_import_safe_name(name) == 0 ||
+        (requirement.len > 0 && package_version_requirement_valid(requirement) == 0)) {
+        return bad;
+    }
+    let out: PackageRegistryIndexLookup = bad; out.error = PackageImportError.dependency_not_found;
+    let line_no: i32 = 3;
+    while (line_no < text.len) {
+        let line: []u8 = package_registry_index_line(text, line_no);
+        if (line.len == 0 || (line.len >= 9 && @strEq(line[0..9], "checksum="))) { break; }
+        let entry: PackageRegistryIndexEntry = package_registry_index_entry(line);
+        if (@strEq(entry.name, name) && (requirement.len == 0 ||
+            package_version_satisfies(requirement, entry.version) == 1)) {
+            if (out.found == 0 || package_semver_compare(package_semver_parse(entry.version),
+                package_semver_parse(out.version)) > 0) {
+                out.found = 1; out.version = entry.version; out.source = entry.source;
+                out.checksum = entry.checksum;
+                out.artifact_signature = entry.artifact_signature;
+                out.error = PackageImportError.none;
+            }
+        }
+        line_no = line_no + 1;
+    }
+    if (out.found == 0) {
+        let line_no2: i32 = 3; let any: i32 = 0;
+        while (line_no2 < text.len) {
+            let line: []u8 = package_registry_index_line(text, line_no2);
+            if (line.len == 0 || (line.len >= 9 && @strEq(line[0..9], "checksum="))) { break; }
+            if (@strEq(package_registry_index_entry(line).name, name)) { any = 1; }
+            line_no2 = line_no2 + 1;
+        }
+        if (any == 1) { out.error = PackageImportError.dependency_version_mismatch; }
+    }
+    return out;
+}
+
+// Select the highest indexed version satisfying every requirement in a
+// newline-delimited set.  This is the shared resolver's bounded intersection
+// primitive: callers still own graph traversal, lock publication, and source
+// checksum validation, but they cannot accidentally select a version that
+// satisfies only the first edge in a converging dependency graph.
+fn package_registry_index_select_all(text: []u8, name: []u8,
+    requirements: []u8, allow_signed: i32) PackageRegistryIndexLookup {
+    let bad: PackageRegistryIndexLookup = PackageRegistryIndexLookup{
+        .found = 0, .version = "", .source = "",
+        .checksum = PackageRawChecksum{.first = 0, .second = 0, .bytes = 0},
+        .artifact_signature = "",
+        .error = PackageImportError.invalid_lockfile};
+    if (package_registry_index_valid_local_mode(text, allow_signed) == 0 ||
+        package_import_safe_name(name) == 0 || requirements.len == 0 ||
+        requirements[requirements.len - 1] == '\n') {
+        return bad;
+    }
+    let requirement_count: i32 = 1;
+    let i: i32 = 0;
+    while (i < requirements.len) {
+        if (requirements[i] == '\n') { requirement_count = requirement_count + 1; }
+        i = i + 1;
+    }
+    if (requirement_count > 256) { return bad; }
+    let requirement_no: i32 = 0;
+    while (requirement_no < requirement_count) {
+        let requirement: []u8 = package_registry_index_line(requirements,
+            requirement_no);
+        if (requirement.len == 0 ||
+            package_version_requirement_valid(requirement) == 0) {
+            return bad;
+        }
+        requirement_no = requirement_no + 1;
+    }
+    let out: PackageRegistryIndexLookup = bad;
+    out.error = PackageImportError.dependency_not_found;
+    let line_no: i32 = 3;
+    let any: i32 = 0;
+    while (line_no < text.len) {
+        let line: []u8 = package_registry_index_line(text, line_no);
+        if (line.len == 0 || (line.len >= 9 &&
+            @strEq(line[0..9], "checksum="))) { break; }
+        let entry: PackageRegistryIndexEntry = package_registry_index_entry(line);
+        if (@strEq(entry.name, name)) {
+            any = 1;
+            let satisfies: i32 = 1;
+            let req: i32 = 0;
+            while (req < requirement_count) {
+                let requirement: []u8 = package_registry_index_line(
+                    requirements, req);
+                if (package_version_satisfies(requirement, entry.version) == 0) {
+                    satisfies = 0;
+                    break;
+                }
+                req = req + 1;
+            }
+            if (satisfies == 1 && (out.found == 0 ||
+                package_semver_compare(package_semver_parse(entry.version),
+                    package_semver_parse(out.version)) > 0)) {
+                out.found = 1;
+                out.version = entry.version;
+                out.source = entry.source;
+                out.checksum = entry.checksum;
+                out.artifact_signature = entry.artifact_signature;
+                out.error = PackageImportError.none;
+            }
+        }
+        line_no = line_no + 1;
+    }
+    if (out.found == 0 && any == 1) {
+        out.error = PackageImportError.dependency_version_mismatch;
+    }
+    return out;
+}
+
+fn package_import_free_read(bytes: []u8) void {
+    let ptr:*i8 = _zag_slice_ptr(bytes);
+    if (ptr != null as *i8) { _zag_free(ptr); }
+}
+
+// Resolution paths and successful manifest/lock snapshots are owned by the
+// result; specifier/dependency slices are borrowed from the caller. The parser
+// may transfer successful snapshot buffers into CompilationUnit.resources;
+// direct-library and error callers release everything here.
+fn package_import_resolution_release(result: *PackageImportResolution) void {
+    if (result.*.path.len > 0) { _zag_str_free(result.*.path); }
+    if (result.*.manifest.len > 0) { _zag_str_free(result.*.manifest); }
+    if (result.*.lockfile.len > 0) { _zag_str_free(result.*.lockfile); }
+    if (result.*.manifest_source_owned != 0) {
+        package_import_free_read(result.*.manifest_source);
+    }
+    if (result.*.lockfile_source_owned != 0) {
+        package_import_free_read(result.*.lockfile_source);
+    }
+    if (result.*.registry_lockfile_source_owned != 0) {
+        package_import_free_read(result.*.registry_lockfile_source);
+    }
+    if (result.*.module_source_owned != 0) {
+        package_import_free_read(result.*.module_source);
+    }
+    if (result.*.signature_key_source_owned != 0) {
+        package_import_free_read(result.*.signature_key_source);
+    }
+    if (result.*.signature_source_owned != 0) {
+        package_import_free_read(result.*.signature_source);
+    }
+    if (result.*.artifact_signature_source_owned != 0) {
+        package_import_free_read(result.*.artifact_signature_source);
+    }
+    result.*.path = "";
+    result.*.manifest = "";
+    result.*.manifest_source = "";
+    result.*.manifest_source_owned = 0;
+    result.*.lockfile = "";
+    result.*.lockfile_source = "";
+    result.*.lockfile_source_owned = 0;
+    if (result.*.registry_lockfile.len > 0) {
+        _zag_str_free(result.*.registry_lockfile);
+    }
+    result.*.registry_lockfile = "";
+    result.*.registry_lockfile_source = "";
+    result.*.registry_lockfile_source_owned = 0;
+    result.*.module_source = "";
+    result.*.module_source_owned = 0;
+    result.*.sibling_mode = 0;
+    result.*.registry_version = "";
+    result.*.registry_source = "";
+    result.*.registry_artifact_signature = "";
+    result.*.graph_authorized = 0;
+    result.*.signature_key_path = "";
+    result.*.signature_key_source = "";
+    result.*.signature_key_source_owned = 0;
+    result.*.signature_path = "";
+    result.*.signature_source = "";
+    result.*.signature_source_owned = 0;
+    result.*.artifact_signature_path = "";
+    result.*.artifact_signature_source = "";
+    result.*.artifact_signature_source_owned = 0;
+    result.*.artifact_signature_verified = 0;
+}
+
+// The command-line lock generator must be able to parse the exact vendored
+// graph before its first zag.lock exists.  This private mode is enabled only
+// by the `znc package lock` dispatcher; ordinary foreground compilation never
+// bypasses a vendor lock validation.
+fn package_import_lock_generation_mode() i32 {
+    let i: i32 = 0;
+    while (i < _zag_argc()) {
+        if (@strEq(_zag_arg(i), "--package-lock")) { return 1; }
+        i = i + 1;
+    }
+    if (_zag_argc() >= 3 && @strEq(_zag_arg(1), "package") &&
+        (@strEq(_zag_arg(2), "lock") ||
+         @strEq(_zag_arg(2), "registry-lock"))) { return 1; }
+    return 0;
 }
 
 fn package_import_resolve(specifier: []u8,
@@ -273,28 +2163,685 @@ fn package_import_resolve(specifier: []u8,
     if (result.manifest.len == 0) {
         result.error = PackageImportError.manifest_not_found; return result;
     }
-    let source: []u8 = _zag_read_file(result.manifest);
+    let manifest_read: PackageNoFollowRead = package_import_read_nofollow(result.manifest);
+    let source: []u8 = manifest_read.bytes;
+    if (manifest_read.ok == 0) {
+        result.error = PackageImportError.manifest_not_found; return result;
+    }
+    if (package_manifest_version_conflict(source) != 0) {
+        package_import_free_read(source);
+        result.error = PackageImportError.dependency_version_conflict; return result;
+    }
     let declared: PackageManifestDependency =
         package_manifest_dependency(source, result.dependency);
     if (declared.valid == 0) {
-        result.error = PackageImportError.invalid_manifest; return result;
+        let sibling_path_invalid: i32 = (@strEq(declared.mode, "sibling") &&
+            declared.path.len > 0 &&
+            package_import_sibling_path_safe(declared.path) == 0) as i32;
+        package_import_free_read(source);
+        if (sibling_path_invalid == 1) {
+            result.error = PackageImportError.invalid_dependency_path;
+        } else {
+            result.error = PackageImportError.invalid_manifest;
+        }
+        return result;
     }
     if (declared.count == 0) {
+        package_import_free_read(source);
         result.error = PackageImportError.dependency_not_found; return result;
     }
     if (declared.count != 1) {
+        package_import_free_read(source);
         result.error = PackageImportError.duplicate_dependency; return result;
     }
     if (package_import_local_path_safe(declared.path) == 0) {
+        package_import_free_read(source);
         result.error = PackageImportError.invalid_dependency_path; return result;
+    }
+    if (declared.mode.len > 0 && !@strEq(declared.mode, "vendor") &&
+        !@strEq(declared.mode, "sibling") &&
+        !@strEq(declared.mode, "registry")) {
+        package_import_free_read(source);
+        result.error = PackageImportError.invalid_manifest; return result;
+    }
+    if (@strEq(declared.mode, "vendor") &&
+        package_import_vendor_path_safe(declared.path) == 0) {
+        package_import_free_read(source);
+        result.error = PackageImportError.invalid_vendor_dependency; return result;
+    }
+    if (@strEq(declared.mode, "sibling")) {
+        result.sibling_mode = 1;
+        if (package_import_sibling_path_safe(declared.path) == 0) {
+            package_import_free_read(source);
+            result.error = PackageImportError.invalid_dependency_path; return result;
+        }
+    }
+    if ((declared.registry_key.len > 0 || declared.registry_signature.len > 0) &&
+        !@strEq(declared.mode, "registry")) {
+        package_import_free_read(source);
+        result.error = PackageImportError.invalid_manifest; return result;
+    }
+
+    // A registry dependency names a checked local index in `path`.  The
+    // index is queried deterministically, then the selected source bytes are
+    // checked against the tuple before the result becomes compilable.  This
+    // is intentionally offline: a signed index is accepted only when its
+    // manifest explicitly supplies both a public key and detached signature.
+    if (@strEq(declared.mode, "registry")) {
+        result.registry_mode = 1;
+        let index_path: []u8 = package_import_join(
+            package_import_dir(result.manifest), declared.path);
+        if (_zag_file_exists(index_path) == 0) {
+            _zag_str_free(index_path); package_import_free_read(source);
+            result.error = PackageImportError.lockfile_not_found; return result;
+        }
+        if (package_import_path_no_symlink(index_path) == 0) {
+            _zag_str_free(index_path); package_import_free_read(source);
+            result.error = PackageImportError.symlink_dependency; return result;
+        }
+        let index_read: PackageNoFollowRead = package_import_read_nofollow(index_path);
+        let index: []u8 = index_read.bytes;
+        if (index_read.ok == 0) {
+            _zag_str_free(index_path); package_import_free_read(source);
+            result.error = PackageImportError.lockfile_not_found; return result;
+        }
+        let signed_required: i32 = (declared.registry_key.len > 0 &&
+            declared.registry_signature.len > 0) as i32;
+        let artifact_required: i32 = @strEq(
+            declared.registry_artifact_policy, "required") as i32;
+        if (artifact_required == 1 && signed_required == 0) {
+            package_import_free_read(index); _zag_str_free(index_path);
+            package_import_free_read(source);
+            result.error = PackageImportError.invalid_manifest; return result;
+        }
+        if (signed_required == 1) {
+            let key_path: []u8 = package_import_join(
+                package_import_dir(result.manifest), declared.registry_key);
+            let signature_path: []u8 = package_import_join(
+                package_import_dir(result.manifest), declared.registry_signature);
+            let key_safe: i32 = package_import_path_no_symlink(key_path);
+            let signature_safe: i32 = package_import_path_no_symlink(signature_path);
+            let verified: i32 = 0;
+            if (key_safe == 1 && signature_safe == 1) {
+                verified = package_registry_signed_index_verified(index_path,
+                    key_path, signature_path);
+            }
+            _zag_str_free(key_path); _zag_str_free(signature_path);
+            if (verified == 0) {
+                package_import_free_read(index); _zag_str_free(index_path);
+                package_import_free_read(source); result.error = PackageImportError.invalid_signature; return result;
+            }
+        }
+        let selected: PackageRegistryIndexLookup = package_registry_index_select(
+            index, result.dependency, declared.version, signed_required);
+        if (selected.found == 0) {
+            package_import_free_read(index); _zag_str_free(index_path);
+            package_import_free_read(source); result.error = selected.error; return result;
+        }
+        // The import names an explicit module path.  A registry index is not
+        // allowed to redirect that spelling to an unrelated selected source;
+        // one entry per name/version must bind exactly the requested module.
+        if (!@strEq(selected.source, module)) {
+            package_import_free_read(index); _zag_str_free(index_path);
+            package_import_free_read(source); result.error = PackageImportError.registry_module_mismatch; return result;
+        }
+        // Registry entry paths are rooted at the index file, not at the
+        // importing project's manifest. Keeping this basis explicit makes a
+        // relocated/nested offline index deterministic and prevents an entry
+        // from accidentally selecting a sibling artifact with the same
+        // spelling elsewhere in the project.
+        let index_dir: []u8 = package_import_dir(index_path);
+        result.path = package_import_join(index_dir, selected.source);
+        if (_zag_file_exists(result.path) == 0) {
+            package_import_free_read(index); _zag_str_free(index_path);
+            package_import_free_read(source);
+            result.error = PackageImportError.module_not_found; return result;
+        }
+        if (package_import_path_no_symlink(result.path) == 0) {
+            package_import_free_read(index); _zag_str_free(index_path);
+            package_import_free_read(source); _zag_str_free(result.path);
+            result.path = "";
+            result.error = PackageImportError.symlink_dependency; return result;
+        }
+        let selected_read: PackageNoFollowRead = package_import_read_nofollow(result.path);
+        let selected_bytes: []u8 = selected_read.bytes;
+        if (selected_read.ok == 0 || package_raw_checksum_equal(
+            package_raw_checksum(selected_bytes), selected.checksum) == 0) {
+            if (selected_read.ok != 0) { package_import_free_read(selected_bytes); }
+            package_import_free_read(index); _zag_str_free(index_path);
+            package_import_free_read(source); result.error = PackageImportError.checksum_mismatch; return result;
+        }
+        // A registry lock pins the selected version/source/raw bytes before
+        // the module enters the parse graph. An explicit manifest path wins;
+        // otherwise the conventional `registry.lock` sidecar is discovered
+        // from the nearest manifest toward the project root. The core matcher
+        // is dependency-neutral; signature bytes are still verified by the
+        // existing artifact verifier below when required. A present default
+        // sidecar is authoritative even when malformed, so resolution never
+        // silently falls back to an unlocked selection.
+        let registry_lock_path: []u8 = "";
+        let registry_lock_present: i32 = 0;
+        if (declared.registry_lock.len > 0) {
+            registry_lock_path = package_import_join(
+                package_import_dir(result.manifest), declared.registry_lock);
+            registry_lock_present = 1;
+        } else {
+            registry_lock_path = package_import_default_registry_lock(result.manifest);
+            registry_lock_present = (registry_lock_path.len > 0) as i32;
+        }
+        if (registry_lock_present == 1 &&
+            package_import_lock_generation_mode() == 0) {
+            if (package_import_path_no_symlink(registry_lock_path) == 0) {
+                _zag_str_free(registry_lock_path); package_import_free_read(selected_bytes);
+                package_import_free_read(index); _zag_str_free(index_path);
+                package_import_free_read(source);
+                result.error = PackageImportError.registry_lock_mismatch; return result;
+            }
+            let registry_lock_read: PackageNoFollowRead =
+                package_import_read_nofollow(registry_lock_path);
+            let registry_lock_scope: []u8 = package_registry_lock_scope(
+                result.manifest, registry_lock_path);
+            let registry_lock_error: PackageRegistryLockCoreError =
+                PackageRegistryLockCoreError.invalid_lock;
+            if (registry_lock_read.ok != 0) {
+                // A graph-lock sidecar uses the same explicit manifest
+                // `registry_lock` opt-in. It pins the complete selected
+                // tuple (name/version/source/raw checksum) while retaining
+                // the ordinary resolver's local-index and signature checks.
+                // This branch is intentionally before v1/v2 registry-lock
+                // parsing so graph-lock bytes cannot be mistaken for a
+                // per-manifest lock with a weaker interpretation.
+                if (package_import_graph_lock_valid(registry_lock_read.bytes) != 0) {
+                    let graph_match: i32 = package_import_graph_lock_match(
+                        registry_lock_read.bytes, result.dependency,
+                        selected.version, selected.source, selected.checksum);
+                    if (graph_match == 1) {
+                        registry_lock_error = PackageRegistryLockCoreError.none;
+                    } else {
+                        registry_lock_error = PackageRegistryLockCoreError.version_mismatch;
+                    }
+                } else if (package_registry_lock_core_v2_valid(
+                    registry_lock_read.bytes) != 0 && registry_lock_scope.len > 0) {
+                    registry_lock_error =
+                        package_registry_lock_core_v2_match_signed(
+                            registry_lock_read.bytes, registry_lock_scope,
+                            result.dependency, declared.path, selected.version,
+                            selected.source, index, selected_bytes,
+                            selected.artifact_signature);
+                } else if (package_registry_lock_core_v2_valid(
+                    registry_lock_read.bytes) == 0) {
+                    // Preserve the v1 API and its existing root/nested
+                    // compatibility behavior when the sidecar is v1.
+                    registry_lock_error =
+                        package_registry_lock_core_match_signed(
+                            registry_lock_read.bytes, result.dependency,
+                            declared.path, selected.version, selected.source,
+                            index, selected_bytes, selected.artifact_signature);
+                }
+            }
+            if (registry_lock_read.ok == 0 ||
+                registry_lock_error != PackageRegistryLockCoreError.none) {
+                package_import_free_read(registry_lock_read.bytes);
+                _zag_str_free(registry_lock_scope);
+                _zag_str_free(registry_lock_path);
+                package_import_free_read(selected_bytes);
+                package_import_free_read(index); _zag_str_free(index_path);
+                package_import_free_read(source);
+                result.error = PackageImportError.registry_lock_mismatch; return result;
+            }
+            // Keep the validated sidecar bytes alive until the parser adopts
+            // them into CompilationUnit.resources. This makes registry-lock
+            // edits invalidate semantic artifacts instead of disappearing
+            // after the resolver's tuple check.
+            result.registry_lockfile = registry_lock_path;
+            result.registry_lockfile_source = registry_lock_read.bytes;
+            result.registry_lockfile_source_owned = 1;
+            _zag_str_free(registry_lock_scope);
+        }
+        if (artifact_required == 1) {
+            if (selected.artifact_signature.len == 0 ||
+                package_import_artifact_safe(selected.artifact_signature) == 0) {
+                package_import_free_read(selected_bytes);
+                package_import_free_read(index); _zag_str_free(index_path);
+                package_import_free_read(source);
+                result.error = PackageImportError.invalid_signature; return result;
+            }
+            let key_path: []u8 = package_import_join(
+                package_import_dir(result.manifest), declared.registry_key);
+            let artifact_signature_path: []u8 = package_import_join(
+                index_dir, selected.artifact_signature);
+            let key_safe: i32 = package_import_path_no_symlink(key_path);
+            let artifact_signature_safe: i32 = package_import_path_no_symlink(
+                artifact_signature_path);
+            let verified: i32 = (key_safe == 1 && artifact_signature_safe == 1 &&
+                package_registry_artifact_verified(selected_bytes, key_path,
+                    artifact_signature_path) == 1) as i32;
+            if (verified == 0) {
+                _zag_str_free(key_path); _zag_str_free(artifact_signature_path);
+                package_import_free_read(selected_bytes);
+                package_import_free_read(index); _zag_str_free(index_path);
+                package_import_free_read(source);
+                result.error = PackageImportError.invalid_signature; return result;
+            }
+            let key_read: PackageNoFollowRead = package_import_read_nofollow(key_path);
+            let index_signature_path: []u8 = package_import_join(
+                package_import_dir(result.manifest), declared.registry_signature);
+            let index_signature_read: PackageNoFollowRead =
+                package_import_read_nofollow(index_signature_path);
+            let sidecars_ok: i32 = (key_read.ok == 1 &&
+                index_signature_read.ok == 1 && index_signature_read.bytes.len == 64) as i32;
+            if (sidecars_ok == 0) {
+                package_import_free_read(key_read.bytes);
+                package_import_free_read(index_signature_read.bytes);
+                _zag_str_free(key_path); _zag_str_free(artifact_signature_path);
+                _zag_str_free(index_signature_path);
+                package_import_free_read(selected_bytes);
+                package_import_free_read(index); _zag_str_free(index_path);
+                package_import_free_read(source);
+                result.error = PackageImportError.invalid_signature; return result;
+            }
+            let artifact_signature_read: PackageNoFollowRead =
+                package_import_read_nofollow(artifact_signature_path);
+            if (artifact_signature_read.ok == 0 ||
+                artifact_signature_read.bytes.len != 64) {
+                package_import_free_read(artifact_signature_read.bytes);
+                package_import_free_read(key_read.bytes);
+                package_import_free_read(index_signature_read.bytes);
+                _zag_str_free(key_path); _zag_str_free(artifact_signature_path);
+                _zag_str_free(index_signature_path);
+                package_import_free_read(selected_bytes);
+                package_import_free_read(index); _zag_str_free(index_path);
+                _zag_str_free(index_dir); package_import_free_read(source);
+                result.error = PackageImportError.invalid_signature; return result;
+            }
+            result.signature_key_path = key_path;
+            result.signature_key_source = key_read.bytes;
+            result.signature_key_source_owned = 1;
+            result.signature_path = index_signature_path;
+            result.signature_source = index_signature_read.bytes;
+            result.signature_source_owned = 1;
+            result.artifact_signature_path = artifact_signature_path;
+            result.artifact_signature_source = artifact_signature_read.bytes;
+            result.artifact_signature_source_owned = 1;
+            result.artifact_signature_verified = 1;
+        }
+        result.module_source = selected_bytes;
+        result.module_source_owned = 1;
+        result.registry_version = selected.version;
+        result.registry_source = selected.source;
+        result.registry_artifact_signature = selected.artifact_signature;
+        result.checksum = selected.checksum;
+        result.locked = 1;
+        result.lockfile = index_path;
+        result.lockfile_source = index;
+        result.lockfile_source_owned = 1;
+        result.manifest_source = source; result.manifest_source_owned = 1;
+        return result;
     }
     let dependency_root: []u8 = package_import_join(
         package_import_dir(result.manifest), declared.path);
+    if (declared.version.len > 0 &&
+        package_dependency_version_matches(dependency_root, declared.version) == 0) {
+        _zag_str_free(dependency_root);
+        package_import_free_read(source);
+        result.error = PackageImportError.dependency_version_mismatch; return result;
+    }
     result.path = package_import_join(dependency_root, module);
+    _zag_str_free(dependency_root);
     if (_zag_file_exists(result.path) == 0) {
+        package_import_free_read(source);
         result.error = PackageImportError.module_not_found; return result;
     }
+    if (@strEq(declared.mode, "vendor") ||
+        @strEq(declared.mode, "sibling")) {
+        result.lockfile = package_import_join(
+            package_import_dir(result.manifest), "zag.lock");
+        if (package_import_path_no_symlink(result.path) == 0 ||
+            package_import_path_no_symlink(result.lockfile) == 0) {
+            package_import_free_read(source);
+            _zag_str_free(result.path); result.path = "";
+            _zag_str_free(result.lockfile); result.lockfile = "";
+            result.error = PackageImportError.symlink_dependency; return result;
+        }
+        if (package_import_lock_generation_mode() == 1) {
+            result.manifest_source = source;
+            result.manifest_source_owned = 1;
+            return result;
+        }
+        if (_zag_file_exists(result.lockfile) == 0) {
+            package_import_free_read(source);
+            result.error = PackageImportError.lockfile_not_found; return result;
+        }
+        let lock_read: PackageNoFollowRead = package_import_read_nofollow(result.lockfile);
+        let lock: []u8 = lock_read.bytes;
+        if (lock_read.ok == 0) {
+            package_import_free_read(source);
+            result.error = PackageImportError.invalid_lockfile; return result;
+        }
+        let checked: PackageLockCheck = package_lock_validate(lock, source,
+            result.manifest, result.dependency, declared.path, module);
+        if (checked.valid == 0) {
+            package_import_free_read(lock);
+            package_import_free_read(source);
+            result.error = PackageImportError.invalid_lockfile; return result;
+        }
+        if (checked.found != 1) {
+            package_import_free_read(lock);
+            package_import_free_read(source);
+            result.error = PackageImportError.lock_entry_not_found; return result;
+        }
+        if (checked.mismatch != 0) {
+            package_import_free_read(lock);
+            package_import_free_read(source);
+            result.error = PackageImportError.checksum_mismatch; return result;
+        }
+        result.locked = 1;
+        result.checksum = checked.checksum;
+        result.lockfile_source = lock;
+        result.lockfile_source_owned = 1;
+        let module_read: PackageNoFollowRead = package_import_read_nofollow(result.path);
+        if (module_read.ok == 0 || package_raw_checksum_equal(
+            package_raw_checksum(module_read.bytes), checked.checksum) == 0) {
+            if (module_read.ok != 0) { package_import_free_read(module_read.bytes); }
+            package_import_free_read(source); package_import_free_read(lock);
+            result.lockfile_source = ""; result.lockfile_source_owned = 0;
+            result.error = PackageImportError.checksum_mismatch; return result;
+        }
+        result.module_source = module_read.bytes;
+        result.module_source_owned = 1;
+    }
+    result.manifest_source = source;
+    result.manifest_source_owned = 1;
     return result;
+}
+
+// Collect one canonical lock entry without reading an existing zag.lock.
+// This is intentionally limited to explicit `pkg:` imports whose declared
+// dependency is already `mode = "vendor"` or `mode = "sibling"`. Sibling
+// mode binds only the direct entry module; ordinary unlocked imports remain
+// outside this artifact-granular generator contract.
+fn package_lock_generated_entry(specifier: []u8,
+    importer: []u8) PackageLockGeneratedEntry {
+    let bad: PackageLockGeneratedEntry = package_lock_generated_bad();
+    if (package_import_starts_with(specifier, "pkg:") == 0) { return bad; }
+    let slash: i32 = 4;
+    while (slash < specifier.len && specifier[slash] != '/') { slash = slash + 1; }
+    if (slash >= specifier.len) { return bad; }
+    let alias: []u8 = specifier[4..slash];
+    let module: []u8 = specifier[slash + 1..specifier.len];
+    if (package_import_safe_name(alias) == 0 ||
+        package_import_module_safe(module) == 0) { return bad; }
+
+    let base_dir: []u8 = package_import_dir(importer);
+    let manifest: []u8 = package_import_manifest(base_dir);
+    if (manifest.len == 0) { return bad; }
+    let manifest_read: PackageNoFollowRead = package_import_read_nofollow(manifest);
+    let source: []u8 = manifest_read.bytes;
+    if (manifest_read.ok == 0) {
+        _zag_str_free(manifest);
+        return bad;
+    }
+    if (package_manifest_version_conflict(source) != 0) {
+        package_import_free_read(source); _zag_str_free(manifest); return bad;
+    }
+    let declared: PackageManifestDependency = package_manifest_dependency(source, alias);
+    let root_valid: i32 = 0;
+    if (declared.valid == 1 && declared.count == 1 &&
+        @strEq(declared.mode, "vendor")) {
+        root_valid = package_import_vendor_path_safe(declared.path);
+    } else if (declared.valid == 1 && declared.count == 1 &&
+        @strEq(declared.mode, "sibling")) {
+        root_valid = package_import_sibling_path_safe(declared.path);
+    }
+    if (root_valid == 0) {
+        package_import_free_read(source); _zag_str_free(manifest);
+        return bad;
+    }
+    let root_copy: []u8 = _zag_str_concat("", declared.path);
+    let dependency_root: []u8 = package_import_join(
+        package_import_dir(manifest), declared.path);
+    if (declared.version.len > 0 &&
+        package_dependency_version_matches(dependency_root, declared.version) == 0) {
+        _zag_str_free(dependency_root); _zag_str_free(root_copy);
+        package_import_free_read(source); _zag_str_free(manifest); return bad;
+    }
+    let module_path: []u8 = package_import_join(dependency_root, module);
+    _zag_str_free(dependency_root);
+    if (_zag_file_exists(module_path) == 0) {
+        _zag_str_free(module_path); _zag_str_free(root_copy);
+        package_import_free_read(source);
+        _zag_str_free(manifest); return bad;
+    }
+    if (package_import_path_no_symlink(module_path) == 0) {
+        _zag_str_free(module_path); _zag_str_free(root_copy);
+        package_import_free_read(source);
+        _zag_str_free(manifest); return bad;
+    }
+    let module_read: PackageNoFollowRead = package_import_read_nofollow(module_path);
+    let bytes: []u8 = module_read.bytes;
+    _zag_str_free(module_path); package_import_free_read(source);
+    _zag_str_free(manifest);
+    if (module_read.ok == 0 || bytes.len > 8388608) {
+        if (module_read.ok != 0) { package_import_free_read(bytes); }
+        _zag_str_free(root_copy);
+        return bad;
+    }
+    let result: PackageLockGeneratedEntry = PackageLockGeneratedEntry{
+        .alias = _zag_str_concat("", alias),
+        .root = root_copy,
+        .module = _zag_str_concat("", module),
+        .mode = _zag_str_concat("", declared.mode),
+        .checksum = package_raw_checksum(bytes),
+        .valid = 1,
+    };
+    package_import_free_read(bytes);
+    return result;
+}
+
+// Collect an artifact discovered inside an already-declared vendored package.
+// The parser records canonical importer/imported paths for every transitive
+// edge and embedded resource; binding the suffix under the existing vendor
+// root makes those inputs reproducible without inventing a new package alias
+// or accepting a path outside that root.
+fn package_lock_path_suffix(path: []u8, root: []u8) []u8 {
+    if (root.len == 0) { return ""; }
+    let i: i32 = 0;
+    while (i + root.len <= path.len) {
+        if (@strEq(path[i..i + root.len], root) &&
+            (i == 0 || path[i - 1] == '/') &&
+            (i + root.len == path.len || path[i + root.len] == '/')) {
+            let start: i32 = i + root.len;
+            if (start < path.len && path[start] == '/') { start = start + 1; }
+            if (start < path.len) { return path[start..path.len]; }
+        }
+        i = i + 1;
+    }
+    return "";
+}
+
+fn package_lock_generated_relative_entry(imported: []u8,
+    base: PackageLockGeneratedEntry) PackageLockGeneratedEntry {
+    let bad: PackageLockGeneratedEntry = package_lock_generated_bad();
+    if (!@strEq(base.mode, "vendor")) { return bad; }
+    let module: []u8 = package_lock_path_suffix(imported, base.root);
+    if (module.len == 0 || package_import_module_safe(module) == 0 ||
+        @strEq(module, base.module) || package_import_path_no_symlink(imported) == 0) { return bad; }
+    let module_read: PackageNoFollowRead = package_import_read_nofollow(imported);
+    let bytes: []u8 = module_read.bytes;
+    if (module_read.ok == 0 || bytes.len > 8388608) {
+        if (module_read.ok != 0) { package_import_free_read(bytes); }
+        return bad;
+    }
+    let result: PackageLockGeneratedEntry = PackageLockGeneratedEntry{
+        .alias = _zag_str_concat("", base.alias),
+        .root = _zag_str_concat("", base.root),
+        .module = _zag_str_concat("", module),
+        .mode = _zag_str_concat("", base.mode),
+        .checksum = package_raw_checksum(bytes),
+        .valid = 1,
+    };
+    package_import_free_read(bytes);
+    return result;
+}
+
+fn package_lock_generated_resource_entry(imported: []u8,
+    base: PackageLockGeneratedEntry) PackageLockGeneratedEntry {
+    let bad: PackageLockGeneratedEntry = package_lock_generated_bad();
+    if (!@strEq(base.mode, "vendor")) { return bad; }
+    let resource: []u8 = package_lock_path_suffix(imported, base.root);
+    if (resource.len == 0 || package_import_artifact_safe(resource) == 0) {
+        return bad;
+    }
+    if (package_import_path_no_symlink(imported) == 0) { return bad; }
+    let resource_read: PackageNoFollowRead = package_import_read_nofollow(imported);
+    let bytes: []u8 = resource_read.bytes;
+    if (resource_read.ok == 0 || bytes.len > 8388608) {
+        if (resource_read.ok != 0) { package_import_free_read(bytes); }
+        return bad;
+    }
+    let result: PackageLockGeneratedEntry = PackageLockGeneratedEntry{
+        .alias = _zag_str_concat("", base.alias),
+        .root = _zag_str_concat("", base.root),
+        .module = _zag_str_concat("", resource),
+        .mode = _zag_str_concat("", base.mode),
+        .checksum = package_raw_checksum(bytes),
+        .valid = 1,
+    };
+    package_import_free_read(bytes);
+    return result;
+}
+
+// The resolver checks the path's bytes before load.  The parser calls this
+// again on the exact source slice it retained for compilation, closing the
+// check/read race without transferring source ownership into the resolver.
+fn package_import_locked_bytes_match(result: PackageImportResolution,
+    source: []u8) i32 {
+    if (result.locked == 0) { return 1; }
+    return package_raw_checksum_equal(package_raw_checksum(source),
+        result.checksum);
+}
+
+// Relative imports originating inside a declared vendor root are part of the
+// same reproducible package graph as their `pkg:` entry point.  The generator
+// records these entries; foreground compilation must require the exact lock
+// tuple too, otherwise a vendored module could silently load an unlocked file.
+// Non-vendor relative imports retain the ordinary local-source contract.
+fn package_import_vendor_relative_valid(importer: []u8, imported: []u8,
+    is_resource: i32, retained: *[]u8, retained_present: *i32) i32 {
+    retained.* = "";
+    retained_present.* = 0;
+    let marker: i32 = 0 - 1;
+    if (importer.len >= 7 && @strEq(importer[0..7], "vendor/")) {
+        marker = 0;
+    } else {
+        let i: i32 = 0;
+        while (i + 8 <= importer.len) {
+            if (importer[i] == '/' && @strEq(importer[i + 1..i + 8], "vendor/")) {
+                marker = i + 1; break;
+            }
+            i = i + 1;
+        }
+    }
+    if (marker < 0) { return 1; }
+    let alias_start: i32 = marker + 7;
+    let alias_end: i32 = alias_start;
+    while (alias_end < importer.len && importer[alias_end] != '/') { alias_end = alias_end + 1; }
+    if (alias_end <= alias_start || alias_end >= importer.len) { return 0; }
+    let root_rel: []u8 = importer[marker..alias_end];
+    let alias: []u8 = importer[alias_start..alias_end];
+    // A vendored module may have its own descriptive zag.mod.  The lock
+    // authority is the manifest immediately above vendor/<alias>, not that
+    // nested module manifest.
+    let manifest_base: []u8 = importer[0..marker];
+    if (manifest_base.len > 0 && manifest_base[manifest_base.len - 1] == '/') {
+        manifest_base = manifest_base[0..manifest_base.len - 1];
+    }
+    if (manifest_base.len == 0) { manifest_base = "."; }
+    let manifest: []u8 = package_import_manifest(manifest_base);
+    if (manifest.len == 0) { return 0; }
+    let manifest_read: PackageNoFollowRead = package_import_read_nofollow(manifest);
+    let manifest_source: []u8 = manifest_read.bytes;
+    if (manifest_read.ok == 0) { _zag_str_free(manifest); return 0; }
+    let declared: PackageManifestDependency = package_manifest_dependency(manifest_source, alias);
+    if (declared.valid == 0 || declared.count != 1 ||
+        !@strEq(declared.mode, "vendor") || !@strEq(declared.path, root_rel)) {
+        package_import_free_read(manifest_source); _zag_str_free(manifest); return 0;
+    }
+    let manifest_dir: []u8 = package_import_dir(manifest);
+    let root_path: []u8 = package_import_join(manifest_dir, root_rel);
+    let importer_inside: i32 = (importer.len > root_path.len &&
+        @strEq(importer[0..root_path.len], root_path) &&
+        importer[root_path.len] == '/') as i32;
+    if (importer_inside == 0) {
+        _zag_str_free(root_path); package_import_free_read(manifest_source);
+        _zag_str_free(manifest); return 1;
+    }
+    let imported_inside: i32 = (imported.len > root_path.len &&
+        @strEq(imported[0..root_path.len], root_path) &&
+        imported[root_path.len] == '/') as i32;
+    if (imported_inside == 0) {
+        _zag_eprintln("zag: error: relative import escapes its declared vendor root");
+        _zag_str_free(root_path); package_import_free_read(manifest_source);
+        _zag_str_free(manifest); return 0;
+    }
+    if (package_import_path_no_symlink(imported) == 0) {
+        _zag_eprintln("zag: error: locked package path contains a symlink");
+        _zag_str_free(root_path); package_import_free_read(manifest_source);
+        _zag_str_free(manifest); return 0;
+    }
+    let module: []u8 = imported[root_path.len + 1..imported.len];
+    let path_valid: i32 = package_import_module_safe(module);
+    if (is_resource != 0) { path_valid = package_import_artifact_safe(module); }
+    if (path_valid == 0) {
+        if (is_resource != 0) {
+            _zag_eprintln("zag: error: vendored resource has an invalid artifact path");
+        } else {
+            _zag_eprintln("zag: error: relative vendor import has an invalid module path");
+        }
+        _zag_str_free(root_path); package_import_free_read(manifest_source);
+        _zag_str_free(manifest); return 0;
+    }
+    let lockfile: []u8 = package_import_join(manifest_dir, "zag.lock");
+    if (_zag_file_exists(lockfile) == 0) {
+        _zag_eprintln("zag: error: vendored input requires its canonical zag.lock entry");
+        _zag_str_free(lockfile); _zag_str_free(root_path);
+        package_import_free_read(manifest_source); _zag_str_free(manifest); return 0;
+    }
+    if (package_import_path_no_symlink(lockfile) == 0) {
+        _zag_eprintln("zag: error: locked package path contains a symlink");
+        _zag_str_free(lockfile); _zag_str_free(root_path);
+        package_import_free_read(manifest_source); _zag_str_free(manifest); return 0;
+    }
+    let lock_read: PackageNoFollowRead = package_import_read_nofollow(lockfile);
+    let lock: []u8 = lock_read.bytes;
+    if (lock_read.ok == 0) {
+        _zag_str_free(lockfile); _zag_str_free(root_path);
+        package_import_free_read(manifest_source); _zag_str_free(manifest); return 0;
+    }
+    let checked: PackageLockCheck = package_lock_validate(lock, manifest_source,
+        manifest, alias, root_rel, module);
+    let module_read: PackageNoFollowRead = package_import_read_nofollow(imported);
+    let module_matches: i32 = (module_read.ok != 0 &&
+        package_raw_checksum_equal(package_raw_checksum(module_read.bytes), checked.checksum)) as i32;
+    let valid: i32 = (checked.valid == 1 && checked.found == 1 &&
+        checked.mismatch == 0 && module_matches != 0) as i32;
+    if (valid == 0) {
+        if (is_resource != 0) {
+            _zag_eprintln("zag: error: vendored resource is absent or mismatched in zag.lock");
+        } else {
+            _zag_eprintln("zag: error: relative vendor import is absent or mismatched in zag.lock");
+        }
+    }
+    let transferred: i32 = (valid != 0 && module_read.ok != 0) as i32;
+    if (transferred != 0) {
+        retained.* = module_read.bytes;
+        retained_present.* = 1;
+    } else if (module_read.ok != 0) {
+        package_import_free_read(module_read.bytes);
+    }
+    package_import_free_read(lock); _zag_str_free(lockfile); _zag_str_free(root_path);
+    package_import_free_read(manifest_source); _zag_str_free(manifest);
+    return valid;
 }
 
 fn package_import_report(result: PackageImportResolution) void {
@@ -318,6 +2865,57 @@ fn package_import_report(result: PackageImportResolution) void {
         _zag_println("dependency path must be relative and use '/' without '~', ':', or backslash");
     } else if (result.error == PackageImportError.module_not_found) {
         _zag_print("resolved module does not exist at "); _zag_println(result.path);
+    } else if (result.error == PackageImportError.registry_module_mismatch) {
+        _zag_println("registry index source does not match the requested module path");
+    } else if (result.error == PackageImportError.registry_lock_mismatch) {
+        _zag_println("explicit registry_lock does not match the selected registry bytes or signature path");
+    } else if (result.error == PackageImportError.invalid_signature) {
+        _zag_println("signed registry index failed detached Ed25519 verification");
+    } else if (result.error == PackageImportError.symlink_dependency) {
+        _zag_println("locked package path contains a symlink");
+    } else if (result.error == PackageImportError.invalid_vendor_dependency) {
+        _zag_println("vendor dependency path must be a traversal-free vendor/<name> root");
+    } else if (result.error == PackageImportError.lockfile_not_found) {
+        if (result.registry_mode == 1) {
+            _zag_print("registry dependency requires canonical local index ");
+        } else if (result.sibling_mode == 1) {
+            _zag_print("sibling dependency requires canonical lockfile ");
+        } else {
+            _zag_print("vendor dependency requires canonical lockfile ");
+        }
+        _zag_println(result.lockfile);
+    } else if (result.error == PackageImportError.invalid_lockfile) {
+        if (result.registry_mode == 1) {
+            _zag_print("invalid canonical local registry index ");
+        } else if (result.sibling_mode == 1) {
+            _zag_print("invalid canonical sibling lockfile ");
+        } else {
+            _zag_print("invalid canonical vendor lockfile ");
+        }
+        _zag_println(result.lockfile);
+    } else if (result.error == PackageImportError.lock_entry_not_found) {
+        if (result.sibling_mode == 1) {
+            _zag_print("canonical sibling lockfile has no exact alias/root/module entry in ");
+        } else {
+            _zag_print("canonical vendor lockfile has no exact alias/root/module entry in ");
+        }
+        _zag_println(result.lockfile);
+    } else if (result.error == PackageImportError.checksum_mismatch) {
+        if (result.sibling_mode == 1) {
+            _zag_print("sibling module raw checksum mismatch under ");
+        } else {
+            _zag_print("vendor module raw checksum mismatch under ");
+        }
+        _zag_println(result.lockfile);
+    } else if (result.error == PackageImportError.invalid_version_requirement) {
+        _zag_println("dependency version requirement must be exact, ^major.minor.patch, or ~major.minor.patch");
+    } else if (result.error == PackageImportError.dependency_version_conflict) {
+        _zag_println("declared exact dependency versions conflict for the same local root");
+    } else if (result.error == PackageImportError.dependency_version_mismatch) {
+        _zag_print("dependency version does not satisfy the declared requirement in ");
+        _zag_println(result.manifest);
+    } else if (result.error == PackageImportError.dependency_input_changed) {
+        _zag_println("manifest or lock bytes changed during this compilation");
     } else {
         _zag_println("resolution failed");
     }

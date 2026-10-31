@@ -1,7 +1,7 @@
 # `zagd` architecture
 
 Status: Linux light-mode implementation with bounded advisory-planner
-foundations, 2026-07-24. Recursive inotify watching, stable content hashing,
+foundations, 2026-08-28. Recursive inotify watching, stable content hashing,
 transactional advisory snapshots, restart validation, status, suggestion,
 shutdown, source-command auto-start, semantic declaration/caller/layout
 identities, and conservative invalidation are implemented. General
@@ -18,8 +18,45 @@ The daemon never rewrites source. Regular Zag receives facts and suggestions.
 Zag Script currently applies only the documented allocator policies, CPU,
 device, and compiler-owned-layout defaults selected directly from configuration
 when the corresponding CLI choice is unspecified. Foreground compilation does not consume
-daemon candidate or deep-measurement records; doing so remains blocked until a
-real transformation and end-to-end equivalence revalidation exist.
+daemon candidate or deep-measurement records. Deep publication invokes the checked
+benchmark policy and writes a separate checksummed `benchmark-policy.record`
+containing the exact warmup, calibration, and paired samples used by that decision.
+The human-facing legacy three-pair record remains `policy_status=verified_no_win`
+because it is not the full evidence artifact. Both records are advisory only; no
+daemon record has foreground authority.
+
+## Stable generation metadata boundary
+
+`selfhost/zagd_generation.zag` is a checked storage/state-machine foundation
+used by the production daemon only for read-only stable-session metadata. It defines strict
+checksummed records for immutable flat content-addressed manifests, current and
+last-known-good pointers, a bounded three-success canary, and three-consecutive-
+crash quarantine with rollback and predecessor retention. Manifests contain no
+payload, all records deny executable authority, and every invalid or stale state
+selects the release-linked foreground fallback.
+
+The daemon loads the registry after acquiring its singleton and marks a
+stable session dirty until clean shutdown; corrupt, stale, or interrupted
+state still falls back to the release-linked foreground identity. Status keeps
+reporting `optimizer_generation=metadata-only`, every record remains
+`generation_execution=disabled`, and no stored generation is executed. There
+is no synthesized worker, isolated generation execution, adversarial canary
+build, verifier replacement, or automatic promotion. This lifecycle
+integration does not satisfy the executable self-modification contract, but it
+supports the matrix row's bounded `partial` status for metadata persistence,
+session crash accounting, and rollback. Synthesis, isolated execution,
+verifier replacement, and automatic promotion remain unavailable.
+
+Reviewed-mode approval is exposed through `znc verifier approve
+FIRST:SECOND:BYTES [--root PROJECT]`. The compiler transports this bounded
+request to the sibling daemon; the daemon validates the selected generation,
+compiler identity, and manifest checksum before publishing only a metadata
+record. Approval does not alter generation pointers and cannot enable
+execution, so it does not change the foreground fallback boundary.
+Status reports whether reviewed approval is `required` or `current`; stable and
+autonomous modes explicitly report that only linked foreground execution is
+available and that no autonomous generation execution is installed.
+
 
 ## Persistent user-service boundary
 
@@ -189,9 +226,13 @@ placement.
 The service states are starting, idle, stabilizing, analyzing-light,
 analyzing-adaptive, analyzing-deep, cancelling, recovering and stopped. At most
 one snapshot is current; results name their snapshot and validity conditions.
-The event loop remains blocking while idle. A stop file created in the narrow
-interval after singleton publication but before inotify setup is checked once
-before the first blocking read, so immediate shutdown is deterministic without
+Light and explicit deep modes retain a blocking inotify read while idle. In
+adaptive mode with `idle_deep=true`, the watcher uses a one-second kernel
+`poll(2)` timeout and enters the existing bounded deep-control measurement path
+once after 30 seconds with no project event; any event or stop resets/cancels
+that attempt. Interrupted waits (`EINTR`) reset the quiet clock and do not count
+as inactivity. A stop file created in the narrow interval after singleton
+publication but before inotify setup is checked once before the first read, so immediate shutdown is deterministic without
 introducing polling.
 
 ## Cache records
@@ -200,25 +241,38 @@ Cache keys include compiler/version/schema, source and dependency hashes,
 module/declaration identity, semantic options, target and feature profile, and
 relevant runtime policy. Records include provenance (`proven`, `derived`,
 `measured`, `estimated`, `unknown`) and validity conditions. Writes are
-transactional: temporary record, checksum, atomic rename. Bad schema, checksum,
+transactional: writer/payload-scoped temporary record, checksum, atomic rename;
+the generation registry never shares one fixed staging pathname between writers.
+Bad schema, checksum,
 missing dependency or impossible graph edge causes record rejection and local
 recomputation. Cache deletion changes performance only.
 
 ## Resource policy
 
-Default operation is one low-priority worker, no network, no GPU, no deep
-search, advisory notifications, bounded memory and disk cache, and prompt
-cancellation. Projects may opt down to `notifications=errors_only`; normal Zag
-gets one unobtrusive warning only when a supported human-review suggestion
-exists. Rejected or unsupported planner scaffolding remains silent. The event
-loop blocks in the kernel when idle, so idle CPU should approach zero.
+Default operation is one low-priority adaptive worker, no network, no GPU,
+`idle_deep=true`, advisory notifications, bounded memory and disk cache, and
+prompt cancellation. Idle-deep scheduling reaches only the existing
+advisory/deep measurement path; it is not evidence that an unavailable
+transformation, foreground winner, or optimizer generation is implemented.
+Projects may opt down to `notifications=errors_only`; normal Zag gets one
+unobtrusive warning only when a supported human-review suggestion exists.
+Rejected or unsupported planner scaffolding remains silent. The event loop
+blocks in the kernel when no eligible work exists, so idle CPU should approach
+zero.
+The one bounded executable handoff is explicit rather than daemon-driven:
+`znc optimize --accept const-i32-add-v1|const-i32-neg-v1|const-i64-add-v1|const-bool-cmp-v1 source.zag -o
+artifact` revalidates the source-policy certificate in a fresh foreground
+compiler, checks the native ET_EXEC result, and publishes it create-only without
+editing source. It does not consume a daemon finalist, and it does not make
+profile evidence or deep measurements executable authority.
 Foreground builds and tests take priority. Cache eviction is content-record
 eviction, never source deletion.
 
 An initial project configuration file may set mode, stability interval,
-workers, memory/cache budgets, ignore rules, deep-search policy and notification
-level. Unsupported or malformed settings fail closed to documented quiet
-defaults and produce a diagnostic.
+workers, memory/cache budgets, progressive difficulty, Script/regular
+optimization policy, runtime objective, trust mode, deep-search policy and
+notification level. Unsupported or malformed settings produce a diagnostic and
+fail closed; only a missing file selects documented defaults.
 
 ## Commands and protocol
 
@@ -277,13 +331,30 @@ module, or invalid configuration fails closed. Its identity combines the
 canonical semantic declaration/effect/layout facts, module-graph topology,
 compiler version, and active CPU cache key.
 
-Deep measurements are accepted only for three explicitly supplied bounded runs
-and exact whole-semantic/module-graph plus active-CPU target identities. Every
-module hash is reread before and between finalist executions. Stale, malformed,
-cancelled, non-deep, target-mismatched, or witness-mismatched measurements are
-ignored and any prior record is removed. The record explicitly states
-`foreground_consumption=false`; timings never authorize source rewrites or
-bypass foreground compilation.
+The candidate envelope is wired through the same foreground boundary used by
+production metadata consumers: `compiler_identity` hashes the sibling
+foreground `znc` image (not the daemon executable), the record carries exactly
+one target identity, and every non-selected row has `validity=unavailable` plus
+an explicit `rejected_reason`. `zagd_foreground_candidate_consume` accepts a
+record only after those fields, the compiler/version/target keys, semantic
+identity, row count, and checksum agree. `tests/run_zagd_daemon.sh` exercises
+this with a freshly compiled consumer. The result remains advisory metadata;
+it does not authorize an optimizer rewrite or replace foreground proof.
+
+Deep measurements retain a legacy three-pair compatibility summary, but the
+daemon also performs three warmups, 30 reference/reference calibration pairs,
+and 30 reference/finalist pairs before invoking the checked 99% selector. It
+records child peak memory and finalist size, binds the evidence to the complete
+semantic/module graph and active-CPU target, and records `verified_best_measured`
+or `verified_no_win`. The checksummed policy record additionally binds the
+reference and finalist executable byte hashes, target identity, and
+`foreground_consumption=none`. Its decoder enforces the status/result
+invariants: a winner must be 99%-confident with no regression, while a no-win
+record has no winner or confidence. Currentness rereads the semantic record and
+both executable byte hashes, so a changed witness or source graph becomes a
+miss. Stale, malformed, cancelled, non-deep, target-mismatched, or
+witness-mismatched evidence is rejected. Timings never authorize source
+rewrites or bypass foreground compilation.
 
 Profile ingestion uses the bounded `zagd-profile-v1` record. A record is
 accepted only when its checksum and exact compiler-binary, semantic-source and
@@ -383,6 +454,30 @@ conservative rather than under-invalidated. Adaptive/deep runs use hard
 deterministic budgets and accept only proven manifest facts; deep mode is not a
 completed superoptimizer, profile-guided tuner, or benchmarking engine.
 
+The current equality-saturation substrate is deliberately narrower than that
+roadmap. `selfhost/semantic_egraph.zag` admits only pure i32 constants, add,
+subtract, multiply, division, and remainder, with canonical operand order for
+commutative operations, bounded node storage, and fail-closed statically
+provable divide-by-zero and signed-overflow cases. Its ZIR bridge also requires
+a complete, error-free enclosing i32 function contract before extracting a
+region. `selfhost/semantic_egraph_zir.zag` accepts a
+contiguous top-level ZIR region only when every value has an exact origin and
+the operations have no effects, reads, writes, nested regions, or calls. The
+two focused gates prove saturation and rejection behavior, but both results
+remain `executable_authority=0`; no daemon candidate or foreground artifact is
+selected from this substrate yet.
+
+The adjacent `zagd-transform-proposal-v1` envelope is a bounded handoff seam,
+not a relaxation of that boundary. It can carry only the existing
+`const-i32-add-v1` rule, exact source/semantic/target/compiler identities,
+operation origin IDs, canonical i32 operands, and the independently recomputed
+wrapping result. Its decoder rejects unknown or duplicate fields, malformed
+checksums, stale identity bindings, noncanonical numbers, and inconsistent
+results. Successful decoding reports `foreground_consumption=checker-only` and
+`executable_authority=false`; no daemon record, IR payload, or machine code is
+accepted as an executable winner. General transform families, measured winner
+selection, and automatic foreground consumption remain unavailable.
+
 ## Incremental declaration records
 
 Light mode has a versioned, checksummed `zagd-incremental-index-v2` advisory
@@ -434,7 +529,8 @@ seccomp claim. Only equivalent output witnesses may become measured plan facts.
 
 The daemon integration uses `.zagd.deep-reference` and `.zagd.deep-finalist` as
 the explicit execution checkpoint. For one stable semantic/module-graph and
-active-CPU identity it runs three bounded reference/finalist pairs, rereads all
+active-CPU identity it runs the legacy three bounded reference/finalist pairs
+plus three warmups, 30 calibration pairs, and 30 selector pairs, rereads all
 module hashes before and between executions, observes the stop file between
 runs, and transactionally persists a measured record only after exact witness
 equality for every pair. A root or imported-module change, cancellation,

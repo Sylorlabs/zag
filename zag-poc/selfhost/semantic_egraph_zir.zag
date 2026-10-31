@@ -1,0 +1,708 @@
+// ZIR-to-equality-saturation bridge for the deliberately pure region domain.
+//
+// This bridge is stricter than the standalone e-graph: it accepts only a
+// contiguous top-level ZIR body made of exact i32/i64 constants and arithmetic
+// (including width-preserving XOR),
+// or the exact-bool constant/predicate/return domain, with complete exact
+// origins and no effects, reads, or writes. Bool predicates are canonical eager
+// `arith.not`, `arith.andi`, `arith.ori`, and `arith.cmpi` eq/ne operations;
+// short-circuit control-flow regions are not admitted. It reports an
+// equivalence substrate, never executable authority; statically provable
+// division traps and signed overflow are rejected.
+
+@import("zir_contract.zag")
+@import("semantic_egraph.zag")
+
+struct ZeZirBinding { name:[]u8, class:i32 }
+struct ZeZirRegionResult {
+    graph:ZeGraph,
+    valid:i32,
+    complete:i32,
+    saturated:i32,
+    executable_authority:i32,
+    accepted_ops:i32,
+    rejected_ops:i32,
+    first_result_class:i32,
+    last_result_class:i32,
+}
+
+fn ze_zir_bad_result()ZeZirRegionResult{
+    return ZeZirRegionResult{.graph=ze_graph_new(0),.valid=0,.complete=0,.saturated=0,.executable_authority=0,.accepted_ops=0,.rejected_ops=0,.first_result_class=-1,.last_result_class=-1};
+}
+fn ze_zir_attr(op:ZOp,key:[]u8)[]u8{let i:i32=0;while(i<op.attrs.len){if(@strEq(op.attrs.data[i].key,key)){return op.attrs.data[i].val;}i=i+1;}return "";}
+fn ze_zir_binding(bindings:ArrayList[ZeZirBinding],name:[]u8)i32{let i:i32=0;while(i<bindings.len){if(@strEq(bindings.data[i].name,name)){return bindings.data[i].class;}i=i+1;}return -1;}
+fn ze_zir_add_binding(bindings:*ArrayList[ZeZirBinding],name:[]u8,class:i32)i32{if(name.len==0||ze_zir_binding(bindings.*,name)>=0){return 0;}push[ZeZirBinding](bindings,ZeZirBinding{.name=name,.class=class});return 1;}
+fn ze_zir_exact_origin(o:ZOrigin)i32{return (o.complete==1&&o.exact==1&&o.stable_id!=0&&o.byte_start>=0&&o.byte_end>=o.byte_start) as i32;}
+fn ze_zir_exact_i32(v:ZVal)i32{return (@strEq(v.ty,"i32")&&ze_zir_exact_origin(v.origin)==1) as i32;}
+fn ze_zir_exact_i64(v:ZVal)i32{return (@strEq(v.ty,"i64")&&ze_zir_exact_origin(v.origin)==1) as i32;}
+fn ze_zir_exact_bool(v:ZVal)i32{return (@strEq(v.ty,"bool")&&ze_zir_exact_origin(v.origin)==1) as i32;}
+fn ze_zir_parse_i32(text:[]u8,value:*i64)i32{
+    if(text.len==0||text[0]=='+'){return 0;}
+    let negative:i32=0;let start:i32=0;let limit:i64=2147483647;
+    if(text[0]=='-'){negative=1;start=1;limit=2147483648;if(text.len==1){return 0;}}
+    if(text.len-start>1&&text[start]=='0'){return 0;}
+    let magnitude:i64=0;let i:i32=start;
+    while(i<text.len){if(text[i]<'0'||text[i]>'9'){return 0;}let digit:i64=(text[i] as i64)-48;if(magnitude>(limit-digit)/10){return 0;}magnitude=magnitude*10+digit;i=i+1;}
+    if(negative==1){if(magnitude==0){return 0;}value.*=0-magnitude;}else{value.*=magnitude;}return 1;
+}
+// Parse a canonical signed i64 literal without ever constructing a positive
+// magnitude larger than i64::MAX. Negative values accumulate from zero so
+// INT64_MIN remains representable and malformed/overflowing text fails closed.
+fn ze_zir_parse_i64(text:[]u8,value:*i64)i32{
+    if(text.len==0||text[0]=='+'){return 0;}
+    let negative:i32=0;let start:i32=0;
+    if(text[0]=='-'){negative=1;start=1;if(text.len==1){return 0;}}
+    if(text.len-start>1&&text[start]=='0'){return 0;}
+    if(negative==1){let accumulated:i64=0;let minimum:i64=ze_i64_min();let i:i32=start;
+        while(i<text.len){if(text[i]<'0'||text[i]>'9'){return 0;}let digit:i64=(text[i] as i64)-48;
+            if(accumulated<(minimum+digit)/10){return 0;}
+            accumulated=accumulated*10-digit;i=i+1;}
+        value.*=accumulated;return 1;}
+    let magnitude:i64=0;let limit:i64=ze_i64_max();let i:i32=start;
+    while(i<text.len){if(text[i]<'0'||text[i]>'9'){return 0;}let digit:i64=(text[i] as i64)-48;
+        if(magnitude>(limit-digit)/10){return 0;}magnitude=magnitude*10+digit;i=i+1;}
+    value.*=magnitude;return 1;
+}
+fn ze_zir_parse_bool(text:[]u8,value:*i64)i32{
+    if(@strEq(text,"0")){value.*=0;return 1;}
+    if(@strEq(text,"1")){value.*=1;return 1;}
+    return 0;
+}
+fn ze_zir_clean_op(op:ZOp)i32{return (op.effects==0&&@strEq(op.reads,"none")&&@strEq(op.writes,"none")&&op.regions.len==0&&ze_zir_exact_origin(op.origin)==1) as i32;}
+fn ze_zir_bool_no_attrs(op:ZOp)i32{return (op.attrs.len==0) as i32;}
+// Every operation in the integer bridge has a closed attribute schema.  In
+// particular, constants are not allowed to hide a second value (or an
+// unknown attribute) behind ze_zir_attr's first-match lookup.
+fn ze_zir_constant_attr(op:ZOp)i32{return (op.attrs.len==1&&@strEq(op.attrs.data[0].key,"value")) as i32;}
+fn ze_zir_bool_predicate(op:ZOp,predicate:[]u8)i32{
+    return (op.attrs.len==1&&@strEq(op.attrs.data[0].key,"predicate")&&
+        @strEq(op.attrs.data[0].val,predicate)) as i32;
+}
+// Shift width is an explicit ZIR attribute, rather than an inference from a
+// host integer.  The bridge accepts exactly one width attribute and requires
+// it to agree with both operand/result types at the caller boundary.
+fn ze_zir_shift_width(op:ZOp,width:i32)i32{
+    if(op.attrs.len!=1||!@strEq(op.attrs.data[0].key,"width")){return 0;}
+    if(width==32){return @strEq(op.attrs.data[0].val,"32") as i32;}
+    if(width==64){return @strEq(op.attrs.data[0].val,"64") as i32;}
+    return 0;
+}
+
+fn ze_zir_extract_function(f:ZFunc,max_nodes:i32)ZeZirRegionResult{
+    let out:ZeZirRegionResult=ZeZirRegionResult{.graph=ze_graph_new(max_nodes),.valid=1,.complete=1,.saturated=0,.executable_authority=0,.accepted_ops=0,.rejected_ops=0,.first_result_class=-1,.last_result_class=-1};
+    // The bridge is a pure i32 region authority only when the enclosing
+    // function independently declares a complete, error-free, i32 contract.
+    // Do not let operation-local metadata hide function-level effects or an
+    // incomplete source projection.
+    if(ze_zir_exact_origin(f.origin)==0||f.effects!=0||!@strEq(f.ret,"i32")||f.coverage_complete!=1||f.coverage_errors!=0){out.valid=0;out.complete=0;out.rejected_ops=1;return out;}
+    let bindings:ArrayList[ZeZirBinding]=make[ZeZirBinding](16);let i:i32=0;let saw_return:i32=0;let last_result_name:[]u8="";
+    while(i<f.body.ops.len&&out.valid==1){let op:ZOp=f.body.ops.data[i];let accepted:i32=0;
+        if(ze_zir_clean_op(op)==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}
+        else if(@strEq(op.name,"arith.constant")){
+            if(op.results.len!=1||op.operands.len!=0||ze_zir_constant_attr(op)==0||ze_zir_exact_i32(op.results.data[0])==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}
+            else{let value:i64=0;if(ze_zir_parse_i32(ze_zir_attr(op,"value"),&value)==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}else{let class:i32=ze_add_const(&out.graph,value);if(class<0||ze_zir_add_binding(&bindings,op.results.data[0].name,class)==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}else{out.last_result_class=class;last_result_name=op.results.data[0].name;accepted=1;}}}
+        }else if(@strEq(op.name,"arith.negsi")){
+            if(op.results.len!=1||op.operands.len!=1||ze_zir_bool_no_attrs(op)==0||ze_zir_exact_i32(op.results.data[0])==0||ze_zir_exact_i32(op.operands.data[0])==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}
+            else{let value:i32=ze_zir_binding(bindings,op.operands.data[0].name);let class:i32=ze_add_unary(&out.graph,ze_op_neg(),value);if(class<0||ze_zir_add_binding(&bindings,op.results.data[0].name,class)==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}else{if(out.first_result_class<0){out.first_result_class=class;}out.last_result_class=class;last_result_name=op.results.data[0].name;accepted=1;}}
+        }else if(@strEq(op.name,"arith.addi")||@strEq(op.name,"arith.subi")||@strEq(op.name,"arith.muli")||@strEq(op.name,"arith.divsi")||@strEq(op.name,"arith.remsi")||@strEq(op.name,"arith.xori")||@strEq(op.name,"arith.andsi")||@strEq(op.name,"arith.orsi")){
+            if(op.results.len!=1||op.operands.len!=2||ze_zir_bool_no_attrs(op)==0||ze_zir_exact_i32(op.results.data[0])==0||ze_zir_exact_i32(op.operands.data[0])==0||ze_zir_exact_i32(op.operands.data[1])==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}
+            else{let left:i32=ze_zir_binding(bindings,op.operands.data[0].name);let right:i32=ze_zir_binding(bindings,op.operands.data[1].name);let kind:i32=ze_op_add();if(@strEq(op.name,"arith.subi")){kind=ze_op_sub();}else if(@strEq(op.name,"arith.muli")){kind=ze_op_mul();}else if(@strEq(op.name,"arith.divsi")){kind=ze_op_div();}else if(@strEq(op.name,"arith.remsi")){kind=ze_op_rem();}else if(@strEq(op.name,"arith.xori")){kind=ze_op_xor();}else if(@strEq(op.name,"arith.andsi")){kind=ze_op_and();}else if(@strEq(op.name,"arith.orsi")){kind=ze_op_ior();}let class:i32=ze_add_binary(&out.graph,kind,left,right);if(class<0||ze_zir_add_binding(&bindings,op.results.data[0].name,class)==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}else{if(out.first_result_class<0){out.first_result_class=class;}out.last_result_class=class;last_result_name=op.results.data[0].name;accepted=1;}}
+        }else if(@strEq(op.name,"arith.shli")||@strEq(op.name,"arith.shrsi")){
+            if(op.results.len!=1||op.operands.len!=2||ze_zir_shift_width(op,32)==0||ze_zir_exact_i32(op.results.data[0])==0||ze_zir_exact_i32(op.operands.data[0])==0||ze_zir_exact_i32(op.operands.data[1])==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}
+            else{let left:i32=ze_zir_binding(bindings,op.operands.data[0].name);let right:i32=ze_zir_binding(bindings,op.operands.data[1].name);let kind:i32=ze_op_shl();if(@strEq(op.name,"arith.shrsi")){kind=ze_op_shr();}let class:i32=ze_add_binary(&out.graph,kind,left,right);if(class<0||ze_zir_add_binding(&bindings,op.results.data[0].name,class)==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}else{if(out.first_result_class<0){out.first_result_class=class;}out.last_result_class=class;last_result_name=op.results.data[0].name;accepted=1;}}
+        }else if(@strEq(op.name,"func.return")){
+            if(saw_return==1||i!=f.body.ops.len-1||op.attrs.len!=0||op.operands.len!=1||!@strEq(op.operands.data[0].name,last_result_name)||ze_zir_binding(bindings,op.operands.data[0].name)!=out.last_result_class||ze_zir_exact_i32(op.operands.data[0])==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}else{saw_return=1;accepted=1;}
+        }else{out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}
+        if(accepted==1){out.accepted_ops=out.accepted_ops+1;}i=i+1;
+    }
+    if(saw_return==0||i!=f.body.ops.len||out.graph.valid==0||out.valid==0){out.valid=0;out.complete=0;}
+    if(out.valid==1){out.saturated=ze_saturate(&out.graph);if(out.saturated==0){out.complete=0;}}
+    free[ZeZirBinding](&bindings);return out;
+}
+fn ze_zir_result_free(result:*ZeZirRegionResult)void{ze_graph_free(&result.*.graph);result.*.valid=0;result.*.complete=0;}
+
+// The i64 bridge is intentionally a separate entry point. Keeping the type
+// width in the function contract prevents a caller from widening an existing
+// i32 proof by changing only the graph constructor; it also keeps the current
+// candidate/checker seam explicitly i32-only.
+fn ze_zir_extract_function_i64(f:ZFunc,max_nodes:i32)ZeZirRegionResult{
+    let out:ZeZirRegionResult=ZeZirRegionResult{.graph=ze_graph_new_i64(max_nodes),.valid=1,.complete=1,.saturated=0,.executable_authority=0,.accepted_ops=0,.rejected_ops=0,.first_result_class=-1,.last_result_class=-1};
+    if(ze_zir_exact_origin(f.origin)==0||f.effects!=0||!@strEq(f.ret,"i64")||f.coverage_complete!=1||f.coverage_errors!=0){out.valid=0;out.complete=0;out.rejected_ops=1;return out;}
+    let bindings:ArrayList[ZeZirBinding]=make[ZeZirBinding](16);let i:i32=0;let saw_return:i32=0;let last_result_name:[]u8="";
+    while(i<f.body.ops.len&&out.valid==1){let op:ZOp=f.body.ops.data[i];let accepted:i32=0;
+        if(ze_zir_clean_op(op)==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}
+        else if(@strEq(op.name,"arith.constant")){
+            if(op.results.len!=1||op.operands.len!=0||ze_zir_constant_attr(op)==0||ze_zir_exact_i64(op.results.data[0])==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}
+            else{let value:i64=0;if(ze_zir_parse_i64(ze_zir_attr(op,"value"),&value)==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}else{let class:i32=ze_add_const(&out.graph,value);if(class<0||ze_zir_add_binding(&bindings,op.results.data[0].name,class)==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}else{out.last_result_class=class;last_result_name=op.results.data[0].name;accepted=1;}}}
+        }else if(@strEq(op.name,"arith.negsi")){
+            if(op.results.len!=1||op.operands.len!=1||ze_zir_bool_no_attrs(op)==0||ze_zir_exact_i64(op.results.data[0])==0||ze_zir_exact_i64(op.operands.data[0])==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}
+            else{let value:i32=ze_zir_binding(bindings,op.operands.data[0].name);let class:i32=ze_add_unary(&out.graph,ze_op_neg(),value);if(class<0||ze_zir_add_binding(&bindings,op.results.data[0].name,class)==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}else{if(out.first_result_class<0){out.first_result_class=class;}out.last_result_class=class;last_result_name=op.results.data[0].name;accepted=1;}}
+        }else if(@strEq(op.name,"arith.addi")||@strEq(op.name,"arith.subi")||@strEq(op.name,"arith.muli")||@strEq(op.name,"arith.divsi")||@strEq(op.name,"arith.remsi")||@strEq(op.name,"arith.xori")||@strEq(op.name,"arith.andsi")||@strEq(op.name,"arith.orsi")){
+            if(op.results.len!=1||op.operands.len!=2||ze_zir_bool_no_attrs(op)==0||ze_zir_exact_i64(op.results.data[0])==0||ze_zir_exact_i64(op.operands.data[0])==0||ze_zir_exact_i64(op.operands.data[1])==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}
+            else{let left:i32=ze_zir_binding(bindings,op.operands.data[0].name);let right:i32=ze_zir_binding(bindings,op.operands.data[1].name);let kind:i32=ze_op_add();if(@strEq(op.name,"arith.subi")){kind=ze_op_sub();}else if(@strEq(op.name,"arith.muli")){kind=ze_op_mul();}else if(@strEq(op.name,"arith.divsi")){kind=ze_op_div();}else if(@strEq(op.name,"arith.remsi")){kind=ze_op_rem();}else if(@strEq(op.name,"arith.xori")){kind=ze_op_xor();}else if(@strEq(op.name,"arith.andsi")){kind=ze_op_and();}else if(@strEq(op.name,"arith.orsi")){kind=ze_op_ior();}let class:i32=ze_add_binary(&out.graph,kind,left,right);if(class<0||ze_zir_add_binding(&bindings,op.results.data[0].name,class)==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}else{if(out.first_result_class<0){out.first_result_class=class;}out.last_result_class=class;last_result_name=op.results.data[0].name;accepted=1;}}
+        }else if(@strEq(op.name,"arith.shli")||@strEq(op.name,"arith.shrsi")){
+            if(op.results.len!=1||op.operands.len!=2||ze_zir_shift_width(op,64)==0||ze_zir_exact_i64(op.results.data[0])==0||ze_zir_exact_i64(op.operands.data[0])==0||ze_zir_exact_i64(op.operands.data[1])==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}
+            else{let left:i32=ze_zir_binding(bindings,op.operands.data[0].name);let right:i32=ze_zir_binding(bindings,op.operands.data[1].name);let kind:i32=ze_op_shl();if(@strEq(op.name,"arith.shrsi")){kind=ze_op_shr();}let class:i32=ze_add_binary(&out.graph,kind,left,right);if(class<0||ze_zir_add_binding(&bindings,op.results.data[0].name,class)==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}else{if(out.first_result_class<0){out.first_result_class=class;}out.last_result_class=class;last_result_name=op.results.data[0].name;accepted=1;}}
+        }else if(@strEq(op.name,"func.return")){
+            if(saw_return==1||i!=f.body.ops.len-1||op.attrs.len!=0||op.operands.len!=1||!@strEq(op.operands.data[0].name,last_result_name)||ze_zir_binding(bindings,op.operands.data[0].name)!=out.last_result_class||ze_zir_exact_i64(op.operands.data[0])==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}else{saw_return=1;accepted=1;}
+        }else{out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}
+        if(accepted==1){out.accepted_ops=out.accepted_ops+1;}i=i+1;
+    }
+    if(saw_return==0||i!=f.body.ops.len||out.graph.valid==0||out.valid==0){out.valid=0;out.complete=0;}
+    if(out.valid==1){out.saturated=ze_saturate(&out.graph);if(out.saturated==0){out.complete=0;}}
+    free[ZeZirBinding](&bindings);return out;
+}
+
+// The bool bridge admits constants, canonical eager predicates, and a terminal
+// return only. Source-level short-circuit operators lower through control-flow
+// regions and remain rejected by the clean-op/no-region contract.
+fn ze_zir_extract_function_bool(f:ZFunc,max_nodes:i32)ZeZirRegionResult{
+    let out:ZeZirRegionResult=ZeZirRegionResult{.graph=ze_graph_new_bool(max_nodes),.valid=1,.complete=1,.saturated=0,.executable_authority=0,.accepted_ops=0,.rejected_ops=0,.first_result_class=-1,.last_result_class=-1};
+    if(ze_zir_exact_origin(f.origin)==0||f.effects!=0||!@strEq(f.ret,"bool")||f.coverage_complete!=1||f.coverage_errors!=0){out.valid=0;out.complete=0;out.rejected_ops=1;return out;}
+    let bindings:ArrayList[ZeZirBinding]=make[ZeZirBinding](4);let i:i32=0;let saw_return:i32=0;let last_result_name:[]u8="";
+    while(i<f.body.ops.len&&out.valid==1){let op:ZOp=f.body.ops.data[i];let accepted:i32=0;
+        if(ze_zir_clean_op(op)==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}
+        else if(@strEq(op.name,"arith.constant")){
+            if(op.results.len!=1||op.operands.len!=0||ze_zir_constant_attr(op)==0||ze_zir_exact_bool(op.results.data[0])==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}
+            else{let value:i64=0;if(ze_zir_parse_bool(ze_zir_attr(op,"value"),&value)==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}else{let class:i32=ze_add_const(&out.graph,value);if(class<0||ze_zir_add_binding(&bindings,op.results.data[0].name,class)==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}else{out.last_result_class=class;last_result_name=op.results.data[0].name;accepted=1;}}}
+        }else if(@strEq(op.name,"arith.not")){
+            if(op.results.len!=1||op.operands.len!=1||ze_zir_bool_no_attrs(op)==0||
+               ze_zir_exact_bool(op.results.data[0])==0||ze_zir_exact_bool(op.operands.data[0])==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}
+            else{let value:i32=ze_zir_binding(bindings,op.operands.data[0].name);let class:i32=ze_add_unary(&out.graph,ze_op_not(),value);if(class<0||ze_zir_add_binding(&bindings,op.results.data[0].name,class)==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}else{if(out.first_result_class<0){out.first_result_class=class;}out.last_result_class=class;last_result_name=op.results.data[0].name;accepted=1;}}
+        }else if(@strEq(op.name,"arith.andi")||@strEq(op.name,"arith.ori")){
+            if(op.results.len!=1||op.operands.len!=2||ze_zir_bool_no_attrs(op)==0||
+               ze_zir_exact_bool(op.results.data[0])==0||ze_zir_exact_bool(op.operands.data[0])==0||
+               ze_zir_exact_bool(op.operands.data[1])==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}
+            else{let left:i32=ze_zir_binding(bindings,op.operands.data[0].name);let right:i32=ze_zir_binding(bindings,op.operands.data[1].name);let kind:i32=ze_op_and();if(@strEq(op.name,"arith.ori")){kind=ze_op_or();}let class:i32=ze_add_binary(&out.graph,kind,left,right);if(class<0||ze_zir_add_binding(&bindings,op.results.data[0].name,class)==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}else{if(out.first_result_class<0){out.first_result_class=class;}out.last_result_class=class;last_result_name=op.results.data[0].name;accepted=1;}}
+        }else if(@strEq(op.name,"arith.cmpi")){
+            if(op.results.len!=1||op.operands.len!=2||ze_zir_exact_bool(op.results.data[0])==0||
+               ze_zir_exact_bool(op.operands.data[0])==0||ze_zir_exact_bool(op.operands.data[1])==0||
+               (ze_zir_bool_predicate(op,"eq")==0&&ze_zir_bool_predicate(op,"ne")==0)){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}
+            else{let left:i32=ze_zir_binding(bindings,op.operands.data[0].name);let right:i32=ze_zir_binding(bindings,op.operands.data[1].name);let kind:i32=ze_op_eq();if(ze_zir_bool_predicate(op,"ne")==1){kind=ze_op_ne();}let class:i32=ze_add_binary(&out.graph,kind,left,right);if(class<0||ze_zir_add_binding(&bindings,op.results.data[0].name,class)==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}else{if(out.first_result_class<0){out.first_result_class=class;}out.last_result_class=class;last_result_name=op.results.data[0].name;accepted=1;}}
+        }else if(@strEq(op.name,"func.return")){
+            if(saw_return==1||i!=f.body.ops.len-1||op.attrs.len!=0||op.operands.len!=1||!@strEq(op.operands.data[0].name,last_result_name)||ze_zir_binding(bindings,op.operands.data[0].name)!=out.last_result_class||ze_zir_exact_bool(op.operands.data[0])==0){out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}else{saw_return=1;accepted=1;}
+        }else{out.valid=0;out.complete=0;out.rejected_ops=out.rejected_ops+1;}
+        if(accepted==1){out.accepted_ops=out.accepted_ops+1;}i=i+1;
+    }
+    if(saw_return==0||i!=f.body.ops.len||out.graph.valid==0||out.valid==0){out.valid=0;out.complete=0;}
+    if(out.valid==1){out.saturated=ze_saturate(&out.graph);if(out.saturated==0){out.complete=0;}}
+    free[ZeZirBinding](&bindings);return out;
+}
+
+// ── bounded test-only candidate/checker seam ────────────────────────────────
+// This envelope is intentionally not imported by the production ZIR selector.
+// It demonstrates the handoff required before an equality graph can become an
+// executable transform: one explicit opt-in, one top-level pure-i32 operation,
+// a cloned candidate, stable replacement/SSA/origin identities, source/policy
+// facts, and a checker that independently re-derives the result.
+struct ZeEgraphCertificate {
+    format:[]u8, rule:[]u8, checker:[]u8, source_context:[]u8,
+    policy_target:[]u8, policy_edition:[]u8, arithmetic_policy:[]u8,
+    explicit_opt_in:i32, automatic_selection:i32,
+    before:ZirSemanticIdentity, after:ZirSemanticIdentity,
+    function_name:[]u8, function_origin:ZOrigin, op_origin:ZOrigin,
+    op_index:i32, lhs_def_index:i32, rhs_def_index:i32,
+    lhs_ssa:[]u8, rhs_ssa:[]u8, result_ssa:[]u8, result_type:[]u8,
+    lhs_origin:ZOrigin, rhs_origin:ZOrigin, result_origin:ZOrigin,
+    lhs_value:i64, rhs_value:i64, result_value:i64, valid:i32,
+}
+struct ZeEgraphProposal { candidate:ZFunc, certificate:ZeEgraphCertificate, proposed:i32 }
+struct ZeEgraphCheck { accepted:i32, reason:[]u8 }
+struct ZeEgraphSelection { selected:i32, fallback:i32, reason:[]u8 }
+struct ZeEgraphReviewedSelection {
+    selected:i32, fallback:i32, checked:i32, reviewed:i32, reason:[]u8
+}
+
+fn ze_egraph_cert_none()ZeEgraphCertificate{
+    let unknown:ZOrigin=ZOrigin{.module="",.line=0,.byte_start=0,.byte_end=0,.stable_id=0,.complete=0,.exact=0};
+    return ZeEgraphCertificate{.format="",.rule="",.checker="",.source_context="",.policy_target="",.policy_edition="",.arithmetic_policy="",
+        .explicit_opt_in=0,.automatic_selection=0,.before=zir_identity_empty(),.after=zir_identity_empty(),.function_name="",.function_origin=unknown,.op_origin=unknown,
+        .op_index=-1,.lhs_def_index=-1,.rhs_def_index=-1,.lhs_ssa="",.rhs_ssa="",.result_ssa="",.result_type="",.lhs_origin=unknown,.rhs_origin=unknown,.result_origin=unknown,
+        .lhs_value=0,.rhs_value=0,.result_value=0,.valid=0};
+}
+fn ze_egraph_reject(reason:[]u8)ZeEgraphCheck{return ZeEgraphCheck{.accepted=0,.reason=reason};}
+fn ze_egraph_origin_equal(a:ZOrigin,b:ZOrigin)i32{return (@strEq(a.module,b.module)&&a.line==b.line&&a.byte_start==b.byte_start&&a.byte_end==b.byte_end&&a.stable_id==b.stable_id&&a.complete==b.complete&&a.exact==b.exact) as i32;}
+fn ze_egraph_value_equal(a:ZVal,b:ZVal)i32{return (@strEq(a.name,b.name)&&@strEq(a.ty,b.ty)&&@strEq(a.ownership,b.ownership)&&@strEq(a.alias_region,b.alias_region)&&@strEq(a.lifetime,b.lifetime)&&@strEq(a.layout,b.layout)&&ze_egraph_origin_equal(a.origin,b.origin)==1) as i32;}
+fn ze_egraph_op_equal(a:ZOp,b:ZOp)i32{
+    if(!@strEq(a.name,b.name)||a.effects!=b.effects||!@strEq(a.reads,b.reads)||!@strEq(a.writes,b.writes)||ze_egraph_origin_equal(a.origin,b.origin)==0||a.results.len!=b.results.len||a.operands.len!=b.operands.len||a.attrs.len!=b.attrs.len||a.regions.len!=b.regions.len){return 0;}
+    let i:i32=0;while(i<a.results.len){if(ze_egraph_value_equal(a.results.data[i],b.results.data[i])==0){return 0;}i=i+1;}i=0;while(i<a.operands.len){if(ze_egraph_value_equal(a.operands.data[i],b.operands.data[i])==0){return 0;}i=i+1;}i=0;while(i<a.attrs.len){if(!@strEq(a.attrs.data[i].key,b.attrs.data[i].key)||!@strEq(a.attrs.data[i].val,b.attrs.data[i].val)){return 0;}i=i+1;}return (a.regions.len==0) as i32;
+}
+fn ze_egraph_unchanged_except(raw:ZFunc,candidate:ZFunc,changed:i32)i32{
+    if(!@strEq(raw.name,candidate.name)||!@strEq(raw.ret,candidate.ret)||raw.effects!=candidate.effects||raw.coverage_complete!=candidate.coverage_complete||raw.coverage_errors!=candidate.coverage_errors||ze_egraph_origin_equal(raw.origin,candidate.origin)==0||raw.params.len!=candidate.params.len||raw.body.ops.len!=candidate.body.ops.len){return 0;}
+    let i:i32=0;while(i<raw.params.len){if(ze_egraph_value_equal(raw.params.data[i],candidate.params.data[i])==0){return 0;}i=i+1;}i=0;while(i<raw.body.ops.len){if(i!=changed&&ze_egraph_op_equal(raw.body.ops.data[i],candidate.body.ops.data[i])==0){return 0;}i=i+1;}return 1;
+}
+fn ze_egraph_clone_val(v:ZVal)ZVal{return ZVal{.name=v.name,.ty=v.ty,.ownership=v.ownership,.alias_region=v.alias_region,.lifetime=v.lifetime,.layout=v.layout,.origin=v.origin};}
+fn ze_egraph_clone_block(b:ZBlock)ZBlock;
+fn ze_egraph_clone_region(r:ZRegion)ZRegion{
+    let out:ZRegion=ZRegion{.blocks=make[ZBlock](r.blocks.len+1)};let i:i32=0;while(i<r.blocks.len){push[ZBlock](&out.blocks,ze_egraph_clone_block(r.blocks.data[i]));i=i+1;}return out;
+}
+fn ze_egraph_clone_op(o:ZOp)ZOp{
+    let out:ZOp=ZOp{.name=o.name,.results=make[ZVal](o.results.len+1),.operands=make[ZVal](o.operands.len+1),.attrs=make[ZAttr](o.attrs.len+1),.regions=make[ZRegion](o.regions.len+1),.effects=o.effects,.reads=o.reads,.writes=o.writes,.origin=o.origin};
+    let i:i32=0;while(i<o.results.len){push[ZVal](&out.results,ze_egraph_clone_val(o.results.data[i]));i=i+1;}i=0;while(i<o.operands.len){push[ZVal](&out.operands,ze_egraph_clone_val(o.operands.data[i]));i=i+1;}i=0;while(i<o.attrs.len){push[ZAttr](&out.attrs,o.attrs.data[i]);i=i+1;}i=0;while(i<o.regions.len){push[ZRegion](&out.regions,ze_egraph_clone_region(o.regions.data[i]));i=i+1;}return out;
+}
+fn ze_egraph_clone_block(b:ZBlock)ZBlock{
+    let out:ZBlock=ZBlock{.ops=make[ZOp](b.ops.len+1)};let i:i32=0;while(i<b.ops.len){push[ZOp](&out.ops,ze_egraph_clone_op(b.ops.data[i]));i=i+1;}return out;
+}
+fn ze_egraph_clone_func(f:ZFunc)ZFunc{
+    let out:ZFunc=ZFunc{.name=f.name,.params=make[ZVal](f.params.len+1),.ret=f.ret,.body=ze_egraph_clone_block(f.body),.effects=f.effects,.origin=f.origin,.coverage_complete=f.coverage_complete,.coverage_errors=f.coverage_errors};
+    let i:i32=0;while(i<f.params.len){push[ZVal](&out.params,ze_egraph_clone_val(f.params.data[i]));i=i+1;}return out;
+}
+fn ze_egraph_func_identity(f:ZFunc)ZirSemanticIdentity{
+    let funcs:ArrayList[ZFunc]=make[ZFunc](1);push[ZFunc](&funcs,f);
+    let module:ZModule=ZModule{.funcs=funcs,.schema_version="zag-ir-v1",.transform_version="zag-transform-v1",.coverage_complete=f.coverage_complete,.coverage_errors=f.coverage_errors,.origin_complete=1,.origin_exact=1};
+    let identity:ZirSemanticIdentity=zir_semantic_identity(module);free[ZFunc](&funcs);return identity;
+}
+fn ze_egraph_free_op(o:*ZOp)void{let i:i32=0;while(i<o.*.regions.len){let region:*ZRegion=&o.*.regions.data[i];let b:i32=0;while(b<region.*.blocks.len){let block:*ZBlock=&region.*.blocks.data[b];let j:i32=0;while(j<block.*.ops.len){ze_egraph_free_op(&block.*.ops.data[j]);j=j+1;}free[ZOp](&block.*.ops);b=b+1;}free[ZBlock](&region.*.blocks);i=i+1;}free[ZRegion](&o.*.regions);free[ZVal](&o.*.results);free[ZVal](&o.*.operands);free[ZAttr](&o.*.attrs);}
+fn ze_egraph_free_func(f:*ZFunc)void{let i:i32=0;while(i<f.*.body.ops.len){ze_egraph_free_op(&f.*.body.ops.data[i]);i=i+1;}free[ZOp](&f.*.body.ops);free[ZVal](&f.*.params);}
+fn ze_egraph_no_proposal(f:ZFunc)ZeEgraphProposal{return ZeEgraphProposal{.candidate=ze_egraph_clone_func(f),.certificate=ze_egraph_cert_none(),.proposed=0};}
+fn ze_egraph_const_before(f:ZFunc,before:i32,name:[]u8,value:*i64,index:*i32)i32{
+    let hits:i32=0;let i:i32=0;while(i<before){let o:ZOp=f.body.ops.data[i];if(@strEq(o.name,"arith.constant")&&o.results.len==1&&@strEq(o.results.data[0].name,name)&&o.attrs.len==1&&@strEq(o.attrs.data[0].key,"value")){let parsed:i64=0;if(ze_zir_parse_i32(o.attrs.data[0].val,&parsed)==0){return 0;}hits=hits+1;value.*=parsed;index.*=i;}i=i+1;}return (hits==1) as i32;
+}
+fn ze_egraph_propose_const_i32_fold(f:ZFunc,max_nodes:i32)ZeEgraphProposal{
+    // Producer domain: exactly two literal definitions, one pure top-level
+    // arithmetic op, and a return.  The graph still performs the proof/fold.
+    if(f.params.len!=0||f.body.ops.len!=4){return ze_egraph_no_proposal(f);}
+    let extracted:ZeZirRegionResult=ze_zir_extract_function(f,max_nodes);if(extracted.valid==0||extracted.complete==0||extracted.saturated==0){ze_zir_result_free(&extracted);return ze_egraph_no_proposal(f);}
+    let fold:ZOp=f.body.ops.data[2];let left:i64=0;let right:i64=0;let li:i32=-1;let ri:i32=-1;
+    if((@strEq(fold.name,"arith.addi")||@strEq(fold.name,"arith.subi")||@strEq(fold.name,"arith.muli")||@strEq(fold.name,"arith.divsi")||@strEq(fold.name,"arith.remsi"))==0||fold.results.len!=1||fold.operands.len!=2||ze_egraph_const_before(f,2,fold.operands.data[0].name,&left,&li)==0||ze_egraph_const_before(f,2,fold.operands.data[1].name,&right,&ri)==0){ze_zir_result_free(&extracted);return ze_egraph_no_proposal(f);}
+    let result:i64=0;if(ze_class_value(&extracted.graph,extracted.last_result_class,&result)==0){ze_zir_result_free(&extracted);return ze_egraph_no_proposal(f);}
+    let candidate:ZFunc=ze_egraph_clone_func(f);let old:ZOp=candidate.body.ops.data[2];let replacement:ZOp=ZOp{.name="arith.constant",.results=old.results,.operands=make[ZVal](1),.attrs=make[ZAttr](2),.regions=make[ZRegion](1),.effects=old.effects,.reads=old.reads,.writes=old.writes,.origin=old.origin};
+    // The replacement takes ownership of the old result list.  Retire the
+    // old operation's other owned containers before overwriting its slot;
+    // attribute values/origins are borrowed source slices, not allocations
+    // owned by this operation.
+    free[ZVal](&old.operands);free[ZAttr](&old.attrs);free[ZRegion](&old.regions);
+    push[ZAttr](&replacement.attrs,ZAttr{.key="value",.val=_zag_i64_to_str(result)});candidate.body.ops.data[2]=replacement;
+    let cert:ZeEgraphCertificate=ZeEgraphCertificate{.format="const-i32-egraph-certificate-v1",.rule="const-i32-egraph-fold-v1",.checker="const-i32-egraph-fold-check-v1",.source_context="direct-top-level-pure-i32-v1",.policy_target="linux-x86_64",.policy_edition="2026",.arithmetic_policy="i32-no-overflow-v1",.explicit_opt_in=1,.automatic_selection=0,.before=ze_egraph_func_identity(f),.after=ze_egraph_func_identity(candidate),.function_name=f.name,.function_origin=f.origin,.op_origin=fold.origin,.op_index=2,.lhs_def_index=li,.rhs_def_index=ri,.lhs_ssa=fold.operands.data[0].name,.rhs_ssa=fold.operands.data[1].name,.result_ssa=fold.results.data[0].name,.result_type="i32",.lhs_origin=fold.operands.data[0].origin,.rhs_origin=fold.operands.data[1].origin,.result_origin=fold.results.data[0].origin,.lhs_value=left,.rhs_value=right,.result_value=result,.valid=1};
+    ze_zir_result_free(&extracted);return ZeEgraphProposal{.candidate=candidate,.certificate=cert,.proposed=1};
+}
+fn ze_egraph_const_before_i64(f:ZFunc,before:i32,name:[]u8,value:*i64,index:*i32)i32{
+    let hits:i32=0;let i:i32=0;while(i<before){let o:ZOp=f.body.ops.data[i];
+        if(@strEq(o.name,"arith.constant")&&o.results.len==1&&
+            @strEq(o.results.data[0].name,name)&&o.attrs.len==1&&
+            @strEq(o.attrs.data[0].key,"value")){let parsed:i64=0;
+            if(ze_zir_parse_i64(o.attrs.data[0].val,&parsed)==0){return 0;}
+            hits=hits+1;value.*=parsed;index.*=i;}
+        i=i+1;}
+    return (hits==1) as i32;
+}
+// Source-only i64 candidate producer. The explicit policy/certificate names
+// keep this domain separate from the existing i32 checker; no native selector
+// imports or consumes either proposal automatically.
+fn ze_egraph_propose_const_i64_fold(f:ZFunc,max_nodes:i32)ZeEgraphProposal{
+    if(f.params.len!=0||f.body.ops.len!=4){return ze_egraph_no_proposal(f);}
+    let extracted:ZeZirRegionResult=ze_zir_extract_function_i64(f,max_nodes);
+    if(extracted.valid==0||extracted.complete==0||extracted.saturated==0){
+        ze_zir_result_free(&extracted);return ze_egraph_no_proposal(f);}
+    let fold:ZOp=f.body.ops.data[2];let left:i64=0;let right:i64=0;
+    let li:i32=-1;let ri:i32=-1;
+    if((@strEq(fold.name,"arith.addi")||@strEq(fold.name,"arith.subi")||
+        @strEq(fold.name,"arith.muli")||@strEq(fold.name,"arith.divsi")||
+        @strEq(fold.name,"arith.remsi"))==0||fold.results.len!=1||
+        fold.operands.len!=2||ze_egraph_const_before_i64(f,2,
+        fold.operands.data[0].name,&left,&li)==0||
+        ze_egraph_const_before_i64(f,2,fold.operands.data[1].name,&right,&ri)==0){
+        ze_zir_result_free(&extracted);return ze_egraph_no_proposal(f);}
+    let result:i64=0;
+    if(ze_class_value(&extracted.graph,extracted.last_result_class,&result)==0){
+        ze_zir_result_free(&extracted);return ze_egraph_no_proposal(f);}
+    let candidate:ZFunc=ze_egraph_clone_func(f);let old:ZOp=candidate.body.ops.data[2];
+    let replacement:ZOp=ZOp{.name="arith.constant",.results=old.results,
+        .operands=make[ZVal](1),.attrs=make[ZAttr](2),
+        .regions=make[ZRegion](1),.effects=old.effects,.reads=old.reads,
+        .writes=old.writes,.origin=old.origin};
+    free[ZVal](&old.operands);free[ZAttr](&old.attrs);free[ZRegion](&old.regions);
+    push[ZAttr](&replacement.attrs,ZAttr{.key="value",.val=_zag_i64_to_str(result)});
+    candidate.body.ops.data[2]=replacement;
+    let cert:ZeEgraphCertificate=ZeEgraphCertificate{
+        .format="const-i64-egraph-certificate-v1",.rule="const-i64-egraph-fold-v1",
+        .checker="const-i64-egraph-fold-check-v1",.source_context="direct-top-level-pure-i64-v1",
+        .policy_target="linux-x86_64",.policy_edition="2026",
+        .arithmetic_policy="i64-no-overflow-v1",.explicit_opt_in=1,
+        .automatic_selection=0,.before=ze_egraph_func_identity(f),
+        .after=ze_egraph_func_identity(candidate),.function_name=f.name,
+        .function_origin=f.origin,.op_origin=fold.origin,.op_index=2,
+        .lhs_def_index=li,.rhs_def_index=ri,.lhs_ssa=fold.operands.data[0].name,
+        .rhs_ssa=fold.operands.data[1].name,.result_ssa=fold.results.data[0].name,
+        .result_type="i64",.lhs_origin=fold.operands.data[0].origin,
+        .rhs_origin=fold.operands.data[1].origin,
+        .result_origin=fold.results.data[0].origin,.lhs_value=left,
+        .rhs_value=right,.result_value=result,.valid=1};
+    ze_zir_result_free(&extracted);
+    return ZeEgraphProposal{.candidate=candidate,.certificate=cert,.proposed=1};
+}
+fn ze_egraph_const_before_bool(f:ZFunc,before:i32,name:[]u8,value:*i64,index:*i32)i32{
+    let hits:i32=0;let i:i32=0;while(i<before){let o:ZOp=f.body.ops.data[i];
+        if(@strEq(o.name,"arith.constant")&&o.results.len==1&&
+            @strEq(o.results.data[0].name,name)&&o.attrs.len==1&&
+            @strEq(o.attrs.data[0].key,"value")){let parsed:i64=0;
+            if(ze_zir_parse_bool(o.attrs.data[0].val,&parsed)==0){return 0;}
+            hits=hits+1;value.*=parsed;index.*=i;}
+        i=i+1;}
+    return (hits==1) as i32;
+}
+// Source-only bool predicate candidate.  This is a separate e-graph domain
+// from integer arithmetic: exact bool literals, one eager eq/ne predicate,
+// and a terminal bool return only.  It is explicit-opt-in and is not imported
+// by any production selector.
+fn ze_egraph_propose_const_bool_cmp_fold(f:ZFunc,max_nodes:i32)ZeEgraphProposal{
+    if(f.params.len!=0||f.body.ops.len!=4){return ze_egraph_no_proposal(f);}
+    let extracted:ZeZirRegionResult=ze_zir_extract_function_bool(f,max_nodes);
+    if(extracted.valid==0||extracted.complete==0||extracted.saturated==0){
+        ze_zir_result_free(&extracted);return ze_egraph_no_proposal(f);}
+    let fold:ZOp=f.body.ops.data[2];let left:i64=0;let right:i64=0;
+    let li:i32=-1;let ri:i32=-1;
+    if(!@strEq(fold.name,"arith.cmpi")||fold.results.len!=1||
+       fold.operands.len!=2||fold.attrs.len!=1||
+       !@strEq(fold.attrs.data[0].key,"predicate")||
+       (@strEq(fold.attrs.data[0].val,"eq")==0&&
+        @strEq(fold.attrs.data[0].val,"ne")==0)||
+       ze_egraph_const_before_bool(f,2,fold.operands.data[0].name,&left,&li)==0||
+       ze_egraph_const_before_bool(f,2,fold.operands.data[1].name,&right,&ri)==0){
+        ze_zir_result_free(&extracted);return ze_egraph_no_proposal(f);}
+    let result:i64=0;
+    if(ze_class_value(&extracted.graph,extracted.last_result_class,&result)==0){
+        ze_zir_result_free(&extracted);return ze_egraph_no_proposal(f);}
+    let candidate:ZFunc=ze_egraph_clone_func(f);let old:ZOp=candidate.body.ops.data[2];
+    let replacement:ZOp=ZOp{.name="arith.constant",.results=old.results,
+        .operands=make[ZVal](1),.attrs=make[ZAttr](2),
+        .regions=make[ZRegion](1),.effects=old.effects,.reads=old.reads,
+        .writes=old.writes,.origin=old.origin};
+    free[ZVal](&old.operands);free[ZAttr](&old.attrs);free[ZRegion](&old.regions);
+    push[ZAttr](&replacement.attrs,ZAttr{.key="value",.val=_zag_i64_to_str(result)});
+    candidate.body.ops.data[2]=replacement;
+    let cert:ZeEgraphCertificate=ZeEgraphCertificate{
+        .format="const-bool-egraph-certificate-v1",.rule="const-bool-cmp-egraph-fold-v1",
+        .checker="const-bool-cmp-egraph-fold-check-v1",
+        .source_context="direct-top-level-pure-bool-cmp-v1",
+        .policy_target="linux-x86_64",.policy_edition="2026",
+        .arithmetic_policy="bool-predicate-v1",.explicit_opt_in=1,
+        .automatic_selection=0,.before=ze_egraph_func_identity(f),
+        .after=ze_egraph_func_identity(candidate),.function_name=f.name,
+        .function_origin=f.origin,.op_origin=fold.origin,.op_index=2,
+        .lhs_def_index=li,.rhs_def_index=ri,
+        .lhs_ssa=fold.operands.data[0].name,.rhs_ssa=fold.operands.data[1].name,
+        .result_ssa=fold.results.data[0].name,.result_type="bool",
+        .lhs_origin=fold.operands.data[0].origin,
+        .rhs_origin=fold.operands.data[1].origin,
+        .result_origin=fold.results.data[0].origin,.lhs_value=left,
+        .rhs_value=right,.result_value=result,.valid=1};
+    ze_zir_result_free(&extracted);
+    return ZeEgraphProposal{.candidate=candidate,.certificate=cert,.proposed=1};
+}
+fn ze_egraph_check_parse_i32(text:[]u8,value:*i64)i32{
+    if(text.len==0||text[0]=='+'){return 0;}let negative:i32=0;let start:i32=0;let limit:i64=2147483647;if(text[0]=='-'){negative=1;start=1;limit=2147483648;if(text.len==1){return 0;}}if(text.len-start>1&&text[start]=='0'){return 0;}let magnitude:i64=0;let i:i32=start;while(i<text.len){if(text[i]<'0'||text[i]>'9'){return 0;}let digit:i64=(text[i] as i64)-48;if(magnitude>(limit-digit)/10){return 0;}magnitude=magnitude*10+digit;i=i+1;}if(negative==1){if(magnitude==0){return 0;}value.*=0-magnitude;}else{value.*=magnitude;}return 1;
+}
+fn ze_egraph_check_parse_bool(text:[]u8,value:*i64)i32{
+    if(@strEq(text,"0")){value.*=0;return 1;}
+    if(@strEq(text,"1")){value.*=1;return 1;}
+    return 0;
+}
+// Checker-local i32 reference arithmetic.  This deliberately duplicates the
+// contract rather than constructing a ZeGraph or calling its evaluator.
+fn ze_egraph_check_eval(op:[]u8,a:i64,b:i64,value:*i64)i32{
+    let minimum:i64=0-2147483648;let maximum:i64=2147483647;
+    if(a<minimum||a>maximum||b<minimum||b>maximum){return 0;}
+    if((@strEq(op,"arith.addi")||@strEq(op,"arith.subi")||@strEq(op,"arith.muli")||@strEq(op,"arith.divsi")||@strEq(op,"arith.remsi")||@strEq(op,"arith.xori")||@strEq(op,"arith.andsi")||@strEq(op,"arith.orsi"))==0){return 0;}
+    if((@strEq(op,"arith.divsi")||@strEq(op,"arith.remsi"))&&(b==0||(a==minimum&&b==(0-1)))){return 0;}
+    let result:i64=0;
+    if(@strEq(op,"arith.addi")){
+        if((b>0&&a>maximum-b)||(b<0&&a<minimum-b)){return 0;}result=a+b;
+    }else if(@strEq(op,"arith.subi")){
+        if((b>0&&a<minimum+b)||(b<0&&a>maximum+b)){return 0;}result=a-b;
+    }else if(@strEq(op,"arith.muli")){
+        if(a==0||b==0){result=0;}
+        else if(a==(0-1)){if(b==minimum){return 0;}result=0-b;}
+        else if(b==(0-1)){if(a==minimum){return 0;}result=0-a;}
+        else if(a>0){if(b>0&&a>maximum/b){return 0;}if(b<0&&b<minimum/a){return 0;}result=a*b;}
+        else if(b>0){if(a<minimum/b){return 0;}result=a*b;}
+        else{if(a<maximum/b){return 0;}result=a*b;}
+    }else if(@strEq(op,"arith.divsi")){result=a/b;
+    }else if(@strEq(op,"arith.remsi")){result=a%b;
+    }else if(@strEq(op,"arith.xori")){result=a^b;
+    }else if(@strEq(op,"arith.andsi")){result=a&b;
+    }else{result=a|b;}
+    if(result<minimum||result>maximum){return 0;}value.*=result;return 1;
+}
+fn ze_egraph_check_eval_unary(op:[]u8,a:i64,value:*i64)i32{
+    let minimum:i64=0-2147483648;let maximum:i64=2147483647;
+    if(!@strEq(op,"arith.negsi")||a<minimum||a>maximum||a==minimum){return 0;}
+    value.*=0-a;return 1;
+}
+// Independent shift checker. It is a checker-local reference implementation:
+// it does not construct a producer graph or call the graph evaluator. The
+// bounds and arithmetic below are deliberately duplicated so a bug in graph
+// admission/evaluation cannot validate its own certificate.
+fn ze_egraph_check_eval_shift(op:[]u8,a:i64,count:i64,width:i32,value:*i64)i32{
+    if((width!=32&&width!=64)||(@strEq(op,"arith.shli")==0&&@strEq(op,"arith.shrsi")==0)){return 0;}
+    let minimum:i64=0-2147483648;let maximum:i64=2147483647;
+    if(width==64){minimum=0-9223372036854775807-1;maximum=9223372036854775807;}
+    // Do not narrow count before checking it. This is especially important
+    // for i64 counts such as 2147483648 and INT64_MAX.
+    if(a<minimum||a>maximum||count<0||count>=(width as i64)){return 0;}
+    let current:i64=a;let step:i64=0;
+    if(@strEq(op,"arith.shli")){
+        // Checked doubling avoids signed host shifts and overflow. At each
+        // step current*2 is representable exactly when it lies in these
+        // half-range bounds.
+        while(step<count){
+            if(current<minimum/2||current>maximum/2){return 0;}
+            current=current*2;step=step+1;
+        }
+    }else{
+        // Division truncates toward zero. Correct negative odd quotients to
+        // obtain the specified arithmetic (flooring) right shift.
+        while(step<count){
+            let quotient:i64=current/2;let remainder:i64=current%2;
+            if(current<0&&remainder!=0){current=quotient-1;}else{current=quotient;}
+            step=step+1;
+        }
+    }
+    value.*=current;return 1;
+}
+fn ze_egraph_check_origin(o:ZOrigin)i32{return (o.complete==1&&o.exact==1&&o.stable_id!=0&&o.byte_start>=0&&o.byte_end>=o.byte_start) as i32;}
+fn ze_egraph_check_constant_def(o:ZOp,name:[]u8,value:*i64)i32{
+    if(!@strEq(o.name,"arith.constant")||o.results.len!=1||o.operands.len!=0||o.attrs.len!=1||o.regions.len!=0||o.effects!=0||!@strEq(o.reads,"none")||!@strEq(o.writes,"none")||!@strEq(o.attrs.data[0].key,"value")||!@strEq(o.results.data[0].ty,"i32")||!@strEq(o.results.data[0].name,name)||ze_egraph_check_origin(o.origin)==0||ze_egraph_check_origin(o.results.data[0].origin)==0||o.results.data[0].origin.stable_id!=o.origin.stable_id){return 0;}
+    return ze_egraph_check_parse_i32(o.attrs.data[0].val,value);
+}
+fn ze_egraph_check_constant_at(raw:ZFunc,index:i32,name:[]u8,value:*i64)i32{
+    if(index<0||index>=raw.body.ops.len||index>=2){return 0;}
+    return ze_egraph_check_constant_def(raw.body.ops.data[index],name,value);
+}
+fn ze_egraph_check_candidate_constant(o:ZOp,raw:ZVal,value:i64)i32{
+    if(!@strEq(o.name,"arith.constant")||o.results.len!=1||o.operands.len!=0||o.attrs.len!=1||o.regions.len!=0||o.effects!=0||!@strEq(o.reads,"none")||!@strEq(o.writes,"none")||!@strEq(o.attrs.data[0].key,"value")||ze_egraph_value_equal(o.results.data[0],raw)==0||ze_egraph_check_origin(o.origin)==0){return 0;}
+    let parsed:i64=0;return (ze_egraph_check_parse_i32(o.attrs.data[0].val,&parsed)==1&&parsed==value) as i32;
+}
+fn ze_egraph_check_constant_def_i64(o:ZOp,name:[]u8,value:*i64)i32{
+    if(!@strEq(o.name,"arith.constant")||o.results.len!=1||o.operands.len!=0||
+        o.attrs.len!=1||o.regions.len!=0||o.effects!=0||
+        !@strEq(o.reads,"none")||!@strEq(o.writes,"none")||
+        !@strEq(o.attrs.data[0].key,"value")||
+        !@strEq(o.results.data[0].ty,"i64")||
+        !@strEq(o.results.data[0].name,name)||
+        ze_egraph_check_origin(o.origin)==0||
+        ze_egraph_check_origin(o.results.data[0].origin)==0||
+        o.results.data[0].origin.stable_id!=o.origin.stable_id){return 0;}
+    return ze_zir_parse_i64(o.attrs.data[0].val,value);
+}
+fn ze_egraph_check_constant_at_i64(raw:ZFunc,index:i32,name:[]u8,value:*i64)i32{
+    if(index<0||index>=raw.body.ops.len||index>=2){return 0;}
+    return ze_egraph_check_constant_def_i64(raw.body.ops.data[index],name,value);
+}
+fn ze_egraph_check_candidate_constant_i64(o:ZOp,raw:ZVal,value:i64)i32{
+    if(!@strEq(o.name,"arith.constant")||o.results.len!=1||o.operands.len!=0||
+        o.attrs.len!=1||o.regions.len!=0||o.effects!=0||
+        !@strEq(o.reads,"none")||!@strEq(o.writes,"none")||
+        !@strEq(o.attrs.data[0].key,"value")||
+        ze_egraph_value_equal(o.results.data[0],raw)==0||
+        ze_egraph_check_origin(o.origin)==0||
+        !@strEq(o.results.data[0].ty,"i64")){return 0;}
+    let parsed:i64=0;return (ze_zir_parse_i64(o.attrs.data[0].val,&parsed)==1&&parsed==value) as i32;
+}
+fn ze_egraph_check_constant_def_bool(o:ZOp,name:[]u8,value:*i64)i32{
+    if(!@strEq(o.name,"arith.constant")||o.results.len!=1||o.operands.len!=0||
+        o.attrs.len!=1||o.regions.len!=0||o.effects!=0||
+        !@strEq(o.reads,"none")||!@strEq(o.writes,"none")||
+        !@strEq(o.attrs.data[0].key,"value")||
+        !@strEq(o.results.data[0].ty,"bool")||
+        !@strEq(o.results.data[0].name,name)||
+        ze_egraph_check_origin(o.origin)==0||
+        ze_egraph_check_origin(o.results.data[0].origin)==0||
+        o.results.data[0].origin.stable_id!=o.origin.stable_id){return 0;}
+    return ze_egraph_check_parse_bool(o.attrs.data[0].val,value);
+}
+fn ze_egraph_check_constant_at_bool(raw:ZFunc,index:i32,name:[]u8,value:*i64)i32{
+    if(index<0||index>=raw.body.ops.len||index>=2){return 0;}
+    return ze_egraph_check_constant_def_bool(raw.body.ops.data[index],name,value);
+}
+fn ze_egraph_check_candidate_constant_bool(o:ZOp,raw:ZVal,value:i64)i32{
+    if(!@strEq(o.name,"arith.constant")||o.results.len!=1||o.operands.len!=0||
+        o.attrs.len!=1||o.regions.len!=0||o.effects!=0||
+        !@strEq(o.reads,"none")||!@strEq(o.writes,"none")||
+        !@strEq(o.attrs.data[0].key,"value")||
+        ze_egraph_value_equal(o.results.data[0],raw)==0||
+        !@strEq(o.results.data[0].ty,"bool")||
+        ze_egraph_check_origin(o.origin)==0){return 0;}
+    let parsed:i64=0;
+    return (ze_egraph_check_parse_bool(o.attrs.data[0].val,&parsed)==1&&parsed==value) as i32;
+}
+fn ze_egraph_check_bool_predicate(op:[]u8,a:i64,b:i64,value:*i64)i32{
+    if((@strEq(op,"eq")||@strEq(op,"ne"))==0||
+       a<0||a>1||b<0||b>1){return 0;}
+    if(@strEq(op,"eq")){value.*=(a==b) as i64;}
+    else{value.*=(a!=b) as i64;}
+    return 1;
+}
+fn ze_egraph_check_eval_i64(op:[]u8,a:i64,b:i64,value:*i64)i32{
+    let minimum:i64=0-9223372036854775807-1;let maximum:i64=9223372036854775807;
+    if(a<minimum||a>maximum||b<minimum||b>maximum){return 0;}
+    if((@strEq(op,"arith.addi")||@strEq(op,"arith.subi")||@strEq(op,"arith.muli")||@strEq(op,"arith.divsi")||@strEq(op,"arith.remsi")||@strEq(op,"arith.xori")||@strEq(op,"arith.andsi")||@strEq(op,"arith.orsi"))==0){return 0;}
+    if((@strEq(op,"arith.divsi")||@strEq(op,"arith.remsi"))&&(b==0||(a==minimum&&b==(0-1)))){return 0;}
+    let result:i64=0;
+    if(@strEq(op,"arith.addi")){
+        if((b>0&&a>maximum-b)||(b<0&&a<minimum-b)){return 0;}result=a+b;
+    }else if(@strEq(op,"arith.subi")){
+        if((b>0&&a<minimum+b)||(b<0&&a>maximum+b)){return 0;}result=a-b;
+    }else if(@strEq(op,"arith.muli")){
+        if(a==0||b==0){result=0;}
+        else if(a==(0-1)){if(b==minimum){return 0;}result=0-b;}
+        else if(b==(0-1)){if(a==minimum){return 0;}result=0-a;}
+        else if(a>0){if(b>0&&a>maximum/b){return 0;}if(b<0&&b<minimum/a){return 0;}result=a*b;}
+        else if(b>0){if(a<minimum/b){return 0;}result=a*b;}
+        else{if(a<maximum/b){return 0;}result=a*b;}
+    }else if(@strEq(op,"arith.divsi")){result=a/b;
+    }else if(@strEq(op,"arith.remsi")){result=a%b;
+    }else if(@strEq(op,"arith.xori")){result=a^b;
+    }else if(@strEq(op,"arith.andsi")){result=a&b;
+    }else{result=a|b;}
+    if(result<minimum||result>maximum){return 0;}value.*=result;return 1;
+}
+fn ze_egraph_check_eval_unary_i64(op:[]u8,a:i64,value:*i64)i32{
+    let minimum:i64=0-9223372036854775807-1;
+    if(!@strEq(op,"arith.negsi")||a==minimum){return 0;}
+    value.*=0-a;return 1;
+}
+fn ze_egraph_check_bool_proposal(raw:ZFunc,p:ZeEgraphProposal)ZeEgraphCheck{
+    let c:ZeEgraphCertificate=p.certificate;
+    if(c.valid!=1||!@strEq(c.format,"const-bool-egraph-certificate-v1")||
+        !@strEq(c.rule,"const-bool-cmp-egraph-fold-v1")||
+        !@strEq(c.checker,"const-bool-cmp-egraph-fold-check-v1")||
+        !@strEq(c.source_context,"direct-top-level-pure-bool-cmp-v1")||
+        !@strEq(c.policy_target,"linux-x86_64")||!@strEq(c.policy_edition,"2026")||
+        !@strEq(c.arithmetic_policy,"bool-predicate-v1")||
+        c.explicit_opt_in!=1||c.automatic_selection!=0){return ze_egraph_reject("bool-certificate-policy");}
+    let before:ZirSemanticIdentity=ze_egraph_func_identity(raw);
+    let after:ZirSemanticIdentity=ze_egraph_func_identity(p.candidate);
+    if(before.first!=c.before.first||before.second!=c.before.second||before.bytes!=c.before.bytes||
+       after.first!=c.after.first||after.second!=c.after.second||after.bytes!=c.after.bytes){
+        return ze_egraph_reject("bool-stale-identity");}
+    if(raw.params.len!=0||raw.body.ops.len!=4||p.candidate.body.ops.len!=4||
+       !@strEq(raw.ret,"bool")||!@strEq(p.candidate.ret,"bool")||c.op_index!=2||
+       c.lhs_def_index<0||c.rhs_def_index<0||c.lhs_def_index>=2||c.rhs_def_index>=2||
+       !@strEq(c.function_name,raw.name)||raw.effects!=0||raw.coverage_complete!=1||
+       raw.coverage_errors!=0||ze_egraph_check_origin(raw.origin)==0||
+       ze_egraph_origin_equal(raw.origin,c.function_origin)==0||
+       ze_egraph_unchanged_except(raw,p.candidate,2)==0){
+        return ze_egraph_reject("bool-function-domain");}
+    let fold:ZOp=raw.body.ops.data[2];let lhs:i64=0;let rhs:i64=0;let expected:i64=0;
+    if(fold.results.len!=1||fold.operands.len!=2||fold.attrs.len!=1||
+       !@strEq(fold.name,"arith.cmpi")||
+       !@strEq(fold.attrs.data[0].key,"predicate")||
+       ze_egraph_check_origin(fold.origin)==0||fold.effects!=0||
+       !@strEq(fold.reads,"none")||!@strEq(fold.writes,"none")||
+       fold.regions.len!=0||!@strEq(fold.results.data[0].ty,"bool")||
+       !@strEq(fold.operands.data[0].ty,"bool")||
+       !@strEq(fold.operands.data[1].ty,"bool")||
+       !@strEq(c.result_type,"bool")||
+       ze_egraph_check_origin(fold.results.data[0].origin)==0||
+       ze_egraph_check_origin(fold.operands.data[0].origin)==0||
+       ze_egraph_check_origin(fold.operands.data[1].origin)==0||
+       fold.results.data[0].origin.stable_id!=fold.origin.stable_id||
+       !@strEq(c.result_ssa,fold.results.data[0].name)||
+       !@strEq(c.lhs_ssa,fold.operands.data[0].name)||
+       !@strEq(c.rhs_ssa,fold.operands.data[1].name)||
+       ze_egraph_origin_equal(c.lhs_origin,fold.operands.data[0].origin)==0||
+       ze_egraph_origin_equal(c.rhs_origin,fold.operands.data[1].origin)==0||
+       ze_egraph_check_constant_at_bool(raw,c.lhs_def_index,c.lhs_ssa,&lhs)==0||
+       ze_egraph_check_constant_at_bool(raw,c.rhs_def_index,c.rhs_ssa,&rhs)==0||
+       ze_egraph_check_bool_predicate(fold.attrs.data[0].val,lhs,rhs,&expected)==0||
+       c.lhs_value!=lhs||c.rhs_value!=rhs||c.result_value!=expected){
+        return ze_egraph_reject("bool-forged-facts");}
+    let candidate_op:ZOp=p.candidate.body.ops.data[2];
+    if(ze_egraph_check_candidate_constant_bool(candidate_op,fold.results.data[0],expected)==0||
+       ze_egraph_origin_equal(candidate_op.origin,fold.origin)==0||
+       ze_egraph_origin_equal(c.op_origin,fold.origin)==0||
+       ze_egraph_origin_equal(c.result_origin,fold.results.data[0].origin)==0){
+        return ze_egraph_reject("bool-candidate-result");}
+    return ZeEgraphCheck{.accepted=1,.reason="bool-egraph-source-policy-checked"};
+}
+fn ze_egraph_check_i64_proposal(raw:ZFunc,p:ZeEgraphProposal)ZeEgraphCheck{
+    let c:ZeEgraphCertificate=p.certificate;
+    if(c.valid!=1||!@strEq(c.format,"const-i64-egraph-certificate-v1")||
+        !@strEq(c.rule,"const-i64-egraph-fold-v1")||
+        !@strEq(c.checker,"const-i64-egraph-fold-check-v1")||
+        !@strEq(c.source_context,"direct-top-level-pure-i64-v1")||
+        !@strEq(c.policy_target,"linux-x86_64")||!@strEq(c.policy_edition,"2026")||
+        !@strEq(c.arithmetic_policy,"i64-no-overflow-v1")||
+        c.explicit_opt_in!=1||c.automatic_selection!=0){return ze_egraph_reject("i64-certificate-policy");}
+    let before:ZirSemanticIdentity=ze_egraph_func_identity(raw);
+    let after:ZirSemanticIdentity=ze_egraph_func_identity(p.candidate);
+    if(before.first!=c.before.first||before.second!=c.before.second||before.bytes!=c.before.bytes||
+        after.first!=c.after.first||after.second!=c.after.second||after.bytes!=c.after.bytes){return ze_egraph_reject("i64-stale-identity");}
+    if(raw.params.len!=0||raw.body.ops.len!=4||p.candidate.body.ops.len!=4||
+        !@strEq(raw.ret,"i64")||!@strEq(p.candidate.ret,"i64")||c.op_index!=2||
+        c.lhs_def_index<0||c.rhs_def_index<0||c.lhs_def_index>=2||c.rhs_def_index>=2||
+        !@strEq(c.function_name,raw.name)||raw.effects!=0||raw.coverage_complete!=1||
+        raw.coverage_errors!=0||ze_egraph_check_origin(raw.origin)==0||
+        ze_egraph_origin_equal(raw.origin,c.function_origin)==0||
+        ze_egraph_unchanged_except(raw,p.candidate,2)==0){return ze_egraph_reject("i64-function-domain");}
+    let fold:ZOp=raw.body.ops.data[2];let lhs:i64=0;let rhs:i64=0;let expected:i64=0;
+    if(fold.results.len!=1||fold.operands.len!=2||fold.attrs.len!=0||fold.regions.len!=0||
+        fold.effects!=0||!@strEq(fold.reads,"none")||!@strEq(fold.writes,"none")||
+        !@strEq(fold.results.data[0].ty,"i64")||!@strEq(fold.operands.data[0].ty,"i64")||
+        !@strEq(fold.operands.data[1].ty,"i64")||!@strEq(c.result_type,"i64")||
+        ze_egraph_check_origin(fold.origin)==0||
+        ze_egraph_check_origin(fold.results.data[0].origin)==0||
+        ze_egraph_check_origin(fold.operands.data[0].origin)==0||
+        ze_egraph_check_origin(fold.operands.data[1].origin)==0||
+        fold.results.data[0].origin.stable_id!=fold.origin.stable_id||
+        !@strEq(c.result_ssa,fold.results.data[0].name)||
+        !@strEq(c.lhs_ssa,fold.operands.data[0].name)||
+        !@strEq(c.rhs_ssa,fold.operands.data[1].name)||
+        ze_egraph_origin_equal(c.lhs_origin,fold.operands.data[0].origin)==0||
+        ze_egraph_origin_equal(c.rhs_origin,fold.operands.data[1].origin)==0||
+        ze_egraph_check_constant_at_i64(raw,c.lhs_def_index,c.lhs_ssa,&lhs)==0||
+        ze_egraph_check_constant_at_i64(raw,c.rhs_def_index,c.rhs_ssa,&rhs)==0||
+        ze_egraph_check_eval_i64(fold.name,lhs,rhs,&expected)==0||
+        c.lhs_value!=lhs||c.rhs_value!=rhs||c.result_value!=expected){return ze_egraph_reject("i64-forged-facts");}
+    let candidate_op:ZOp=p.candidate.body.ops.data[2];
+    if(ze_egraph_check_candidate_constant_i64(candidate_op,fold.results.data[0],expected)==0||
+        ze_egraph_origin_equal(candidate_op.origin,fold.origin)==0||
+        ze_egraph_origin_equal(c.op_origin,fold.origin)==0||
+        ze_egraph_origin_equal(c.result_origin,fold.results.data[0].origin)==0){return ze_egraph_reject("i64-candidate-result");}
+    return ZeEgraphCheck{.accepted=1,.reason="i64-egraph-source-policy-checked"};
+}
+fn ze_egraph_check_proposal(raw:ZFunc,p:ZeEgraphProposal)ZeEgraphCheck{
+    let c:ZeEgraphCertificate=p.certificate;if(p.proposed!=1){return ze_egraph_reject("proposal-count");}
+    if(@strEq(c.format,"const-bool-egraph-certificate-v1")){return ze_egraph_check_bool_proposal(raw,p);}
+    if(@strEq(c.format,"const-i64-egraph-certificate-v1")){return ze_egraph_check_i64_proposal(raw,p);}
+    if(c.valid!=1||!@strEq(c.format,"const-i32-egraph-certificate-v1")||!@strEq(c.rule,"const-i32-egraph-fold-v1")||!@strEq(c.checker,"const-i32-egraph-fold-check-v1")||!@strEq(c.source_context,"direct-top-level-pure-i32-v1")||!@strEq(c.policy_target,"linux-x86_64")||!@strEq(c.policy_edition,"2026")||!@strEq(c.arithmetic_policy,"i32-no-overflow-v1")||c.explicit_opt_in!=1||c.automatic_selection!=0){return ze_egraph_reject("certificate-policy");}
+    if(ze_egraph_func_identity(raw).first!=c.before.first||ze_egraph_func_identity(raw).second!=c.before.second||ze_egraph_func_identity(raw).bytes!=c.before.bytes||ze_egraph_func_identity(p.candidate).first!=c.after.first||ze_egraph_func_identity(p.candidate).second!=c.after.second||ze_egraph_func_identity(p.candidate).bytes!=c.after.bytes){return ze_egraph_reject("stale-identity");}
+    if(raw.params.len!=0||raw.body.ops.len!=4||p.candidate.body.ops.len!=4||!@strEq(raw.ret,"i32")||!@strEq(p.candidate.ret,"i32")||c.op_index!=2||c.lhs_def_index<0||c.rhs_def_index<0||c.lhs_def_index>=2||c.rhs_def_index>=2||!@strEq(c.function_name,raw.name)||raw.effects!=0||raw.coverage_complete!=1||raw.coverage_errors!=0||ze_egraph_check_origin(raw.origin)==0||ze_egraph_origin_equal(raw.origin,c.function_origin)==0||ze_egraph_unchanged_except(raw,p.candidate,2)==0){return ze_egraph_reject("function-domain");}
+    let fold:ZOp=raw.body.ops.data[2];let lhs:i64=0;let rhs:i64=0;let expected:i64=0;if(fold.results.len!=1||fold.operands.len!=2||fold.attrs.len!=0||fold.regions.len!=0||fold.effects!=0||!@strEq(fold.reads,"none")||!@strEq(fold.writes,"none")||!@strEq(fold.results.data[0].ty,"i32")||!@strEq(fold.operands.data[0].ty,"i32")||!@strEq(fold.operands.data[1].ty,"i32")||!@strEq(c.result_type,"i32")||ze_egraph_check_origin(fold.origin)==0||ze_egraph_check_origin(fold.results.data[0].origin)==0||ze_egraph_check_origin(fold.operands.data[0].origin)==0||ze_egraph_check_origin(fold.operands.data[1].origin)==0||fold.results.data[0].origin.stable_id!=fold.origin.stable_id||!@strEq(c.result_ssa,fold.results.data[0].name)||!@strEq(c.lhs_ssa,fold.operands.data[0].name)||!@strEq(c.rhs_ssa,fold.operands.data[1].name)||ze_egraph_origin_equal(c.lhs_origin,fold.operands.data[0].origin)==0||ze_egraph_origin_equal(c.rhs_origin,fold.operands.data[1].origin)==0||ze_egraph_check_constant_at(raw,c.lhs_def_index,c.lhs_ssa,&lhs)==0||ze_egraph_check_constant_at(raw,c.rhs_def_index,c.rhs_ssa,&rhs)==0||ze_egraph_check_eval(fold.name,lhs,rhs,&expected)==0||c.lhs_value!=lhs||c.rhs_value!=rhs||c.result_value!=expected){return ze_egraph_reject("forged-facts");}
+    let candidate_op:ZOp=p.candidate.body.ops.data[2];if(ze_egraph_check_candidate_constant(candidate_op,fold.results.data[0],expected)==0||ze_egraph_origin_equal(candidate_op.origin,fold.origin)==0||ze_egraph_origin_equal(c.op_origin,fold.origin)==0||ze_egraph_origin_equal(c.result_origin,fold.results.data[0].origin)==0){return ze_egraph_reject("candidate-result");}
+    // The checker is intentionally independent of the e-graph producer: it
+    // re-parses raw literals, evaluates the operation, and checks the exact
+    // replacement slot/SSA/origin/policy facts above.
+    return ZeEgraphCheck{.accepted=1,.reason="egraph-source-policy-checked"};
+}
+fn ze_egraph_proposal_free(p:*ZeEgraphProposal)void{
+    // A proposed replacement owns the decimal value allocated by
+    // `_zag_i64_to_str`; ordinary source-originated attributes remain
+    // borrowed slices and are released only with their container.
+    if(p.*.proposed==1&&p.*.candidate.body.ops.len>2&&p.*.candidate.body.ops.data[2].attrs.len>0){_zag_str_free(p.*.candidate.body.ops.data[2].attrs.data[0].val);p.*.candidate.body.ops.data[2].attrs.data[0].val="";}
+    ze_egraph_free_func(&p.*.candidate);p.*.proposed=0;p.*.certificate.valid=0;
+}
+// Test-only handoff predicate.  It models the eventual foreground boundary:
+// only an explicit caller opt-in and an independently accepted certificate may
+// select the candidate; every other state is an ordinary raw fallback.  No
+// production selector imports or calls this helper yet.
+fn ze_egraph_select_explicit(raw:ZFunc,p:ZeEgraphProposal,explicit_opt_in:i32)ZeEgraphSelection{
+    if(explicit_opt_in!=1){return ZeEgraphSelection{.selected=0,.fallback=1,.reason="explicit-opt-in-required"};}
+    let checked:ZeEgraphCheck=ze_egraph_check_proposal(raw,p);
+    if(checked.accepted!=1){return ZeEgraphSelection{.selected=0,.fallback=1,.reason=checked.reason};}
+    return ZeEgraphSelection{.selected=1,.fallback=0,.reason="explicit-egraph-candidate-accepted"};
+}
+// Reviewed foreground boundary for the independently checked bool domain.
+// The review bit is a human/project-policy approval distinct from the
+// proposal's explicit opt-in.  This handoff returns a candidate decision for
+// a caller that owns the foreground route; it does not alter the production
+// selector and cannot turn a background proposal into automatic selection.
+fn ze_egraph_select_reviewed_foreground_bool(raw:ZFunc,p:ZeEgraphProposal,review_approval:i32)ZeEgraphReviewedSelection{
+    if(review_approval!=1){return ZeEgraphReviewedSelection{.selected=0,.fallback=1,.checked=0,.reviewed=0,.reason="review-approval-required"};}
+    if(p.proposed!=1||!@strEq(p.certificate.format,"const-bool-egraph-certificate-v1")){
+        return ZeEgraphReviewedSelection{.selected=0,.fallback=1,.checked=0,.reviewed=1,.reason="reviewed-bool-domain-required"};}
+    let checked:ZeEgraphCheck=ze_egraph_check_bool_proposal(raw,p);
+    if(checked.accepted!=1){return ZeEgraphReviewedSelection{.selected=0,.fallback=1,.checked=0,.reviewed=1,.reason=checked.reason};}
+    return ZeEgraphReviewedSelection{.selected=1,.fallback=0,.checked=1,.reviewed=1,.reason="reviewed-foreground-bool-egraph-accepted"};
+}

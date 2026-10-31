@@ -21,7 +21,12 @@ for required in \
     selfhost/std/script_string_builder.zag \
     selfhost/std/script_list.zag \
     selfhost/std/script_string.zag \
-    selfhost/std/script_path.zag
+    selfhost/std/script_path.zag \
+    selfhost/std/script_map.zag \
+    selfhost/std/script_json.zag \
+    selfhost/std/script_csv.zag \
+    selfhost/std/script_set.zag \
+    selfhost/std/script_range.zag
 do
     grep -Fq "$required" <<<"$install_plan"
 done
@@ -40,6 +45,11 @@ cp selfhost/std/process.zag \
    selfhost/std/script_list.zag \
    selfhost/std/script_string.zag \
    selfhost/std/script_path.zag \
+   selfhost/std/script_map.zag \
+   selfhost/std/script_json.zag \
+   selfhost/std/script_csv.zag \
+   selfhost/std/script_set.zag \
+   selfhost/std/script_range.zag \
    "$prefix/lib/zag/std/"
 
 cat >"$project/all-prelude.zag" <<'ZAG'
@@ -73,10 +83,20 @@ script;
 println("installed Zag Script");
 ZAG
 
+cat >"$project/range.zag" <<'ZAG'
+script;
+let values = range(2, 8, 2);
+if (script_list_len[i64](values) != 3 ||
+    script_list_get[i64](values, 2) != 6) { return 1; }
+return 0;
+ZAG
+
 (cd "$project" && "$prefix/bin/znc" all-prelude.zag -o all-prelude --no-zagd --no-analyze >/dev/null)
 (cd "$project" && "$prefix/bin/znc" json.zag -o json --no-zagd --no-analyze >/dev/null)
 (cd "$project" && "$prefix/bin/znc" hello.zag -o hello --no-zagd --no-analyze >/dev/null)
+(cd "$project" && "$prefix/bin/znc" range.zag -o range --no-zagd --no-analyze >/dev/null)
 test "$("$project/hello")" = "installed Zag Script"
 "$project/json"
+"$project/range"
 
 echo "Zag Script staged install layout: pass"

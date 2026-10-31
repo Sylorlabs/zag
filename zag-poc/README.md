@@ -5,6 +5,10 @@ WebAssembly (`--target wasm`), or GPU MLIR frontend output (`--target gpu-*`).
 GPU MLIR output is not a GPU executable or dispatch runtime. No `cc`, no `as`,
 no `ld`, no libc, no Zig, no LLVM.
 
+Platform, package, ownership, concurrency, ABI, and memory-safety claims are
+scoped by the authoritative [support contract](docs/SUPPORT.md). Zag v2 remains
+a fail-closed development edition even when an individual v2 slice passes.
+
 ## Zag Script
 
 Zag Script is Zag's built-in low-friction profile. It provides concise safe
@@ -64,6 +68,49 @@ current bounded DWARF metadata.  `-g`, parameterized/alternate debug spellings,
 strip controls, and assembly/IR-output requests are rejected rather than
 silently writing an ordinary executable.
 
+## Pure-Zag driver foundation
+
+New driver work starts from the single typed [`std:driver` contract](docs/DRIVER_CONTRACT.md): affine opaque handles, target-aware layouts, typed MMIO, atomics and effects, DMA ownership, interrupts, the generic emulator, and thin Linux adapters. The initial boundary is Linux 6.1/6.6 LTS on x86-64, ARM64, and i686. Run the claim-producing gate with:
+
+```sh
+make test-driver-foundation
+```
+
+The checked-in [support matrix](docs/DRIVER_SUPPORT_MATRIX.md) is deliberately
+fail-closed. Emulator, source-backend, and standalone ET_REL proofs are useful
+regressions, but they do not claim a loadable kernel module or physical-device
+support; those require the exact Kbuild and six-row QEMU evidence described in
+the contract.
+
+## Static Analyzer
+
+`znc` runs a built-in static analyzer on every compile. Findings are warnings
+on stderr (never affect the output binary) unless `--analyze-strict` upgrades
+them to errors.
+
+**Lint families:**
+- **L0xxx** — resource leaks (memory, file, socket, GPU)
+- **E0xxx** — efficiency issues (multiply by 0/1, strength reduction)
+- **B0xxx** — bloat (dead code, redundant patterns, duplication)
+- **A0xxx** — agent-bugs (off-by-one, ignored returns, wrong operators)
+
+**Key flags:**
+- `--analyze-pedantic` — enable tier-2 lints (B0102, B0111, B0112, B0114, B0115, A0110, A0112)
+- `--analyze-bloat=off` — disable B0xxx lints
+- `--analyze-agent=off` — disable A0xxx lints
+- `--analyze-complexity=N` — set function complexity threshold (default 15)
+- `--analyze-strict` — treat warnings as errors
+- `--no-analyze` — silence all analyzer warnings
+
+**Suppression:** `// znc:allow CODE` on a line, or `// znc:allow-file CODE`
+for file-wide suppression.
+
+```sh
+./znc examples/lint_bloat.zag -o /tmp/lint_bloat      # see B0xxx warnings
+./znc examples/lint_agent.zag -o /tmp/lint_agent      # see A0xxx warnings
+bash tests/run_native_lint.sh                          # lint test gate
+```
+
 ## LSP
 
 Build the language server:
@@ -78,7 +125,7 @@ The VS Code client is in `../editors/vscode/`.
 
 ```sh
 ./znc examples/audio_render.zag -o audio_render --run
-./znc examples/audio_render_bad.zag -o /tmp/bad        # should fail with a witness chain
+./znc examples/audio_render_bad.zag -o /tmp/bad        # fails with E0002 capability diagnostics
 ./znc examples/embedded_sensor.zag -o embedded_sensor --run
 ```
 
@@ -86,18 +133,24 @@ Larger programs under `programs/` are documented in [programs/GAPS.md](programs/
 
 ## Tests
 
-Release gates (these must pass before a release):
+The one release-blocking closure is:
 
 ```sh
-make test                              # full v1 release gates (includes programs)
-bash tests/run_zagscript_release_gate.sh # Zag Script Linux x86-64 first release
-bash tests/run_zagscript_master_gate.sh  # expensive sequential local evidence gate
-bash tests/run_i686_release_gate.sh      # authoritative bounded Linux/i686 gate
-bash tests/run_programs.sh             # programs/*.zag integration gate only
+make release-check
+```
+
+It owns the frozen ZagScript matrix, bootstrap/fixpoint, complete v1 suite,
+compatibility, authoritative Linux/i686 subset, daemon, driver, package, and
+strict ZagScript checks. These commands are focused development reruns, not
+additional release steps:
+
+```sh
+bash tests/run_programs.sh
 bash tests/run_native_authority.sh
 bash tests/run_semantics.sh
 bash tests/run_diag.sh
 bash tests/run_native.sh
+bash tests/run_i686_release_gate.sh
 ```
 
 The Zag Script gate fails if any required focused or existing release suite
@@ -106,13 +159,17 @@ roadmap, or physical GPU execution. `run_i686_release_gate.sh` is the single
 authority for the documented bounded Linux/i686 target: mandatory evidence
 uses the compiler's own ELF32 emitter, archive writer, and linker with host
 `ld`, `ar`, `cc`, `readelf`, and `objdump` disabled, then executes natively or
-through `qemu-i386`. The master gate additionally rebuilds to a fixpoint, runs
-the remaining distinct v1 compatibility authority (including existing ARM
-compatibility gates), then runs that i686 authority, exercises the default no-swap or explicitly recorded
-bounded-swap memory gate, and records 30-run benchmarks. It still does not
+through `qemu-i386`. The optional master gate repeats the fixpoint,
+compatibility, ARM, and i686 authorities, then exercises the default no-swap or
+explicitly recorded bounded-swap memory gate and records 30-run benchmarks. It
+still does not
 promote the documented i686 subset to complete language/public-C-ABI,
 dynamic/TLS, or external-distribution parity, or turn unsupported v2/GPU work
 into a release claim.
+
+The master gate is intentionally manual and workstation-only. Its
+cgroup/earlyoom proof and 30-run benchmark phase are qualification evidence,
+not a second release closure; `release.sh` invokes `make release-check` only.
 
 Zag v2 is an active, fail-closed development track rather than a production
 release. Its matrix and executable gate are in
@@ -121,9 +178,8 @@ release. Its matrix and executable gate are in
 that gate failing until their implementation and execution evidence exist. The
 release gate is intentionally fail-closed while required capability rows
 remain unsupported; it is not a C replacement or a production-v2 claim yet.
-The latest authoritative local run (2026-07-29) completed all 38 executable
-rows and then failed the 9 required unsupported rows. That is strong
-development evidence, not a production release result.
+The latest local run blocked the expected unsupported rows as intended; that is
+evidence, not a production release result.
 The passing slices include
 checked native word and byte volatile transactions, fixed unsafe i64 atomic
 load/store/exchange/compare-exchange/fetch-add/sub/and/or/xor operations, bounded Linux futex wait/wake building blocks, a guarded direct-worker Linux spawn/join boundary, scalar plus bounded `f64` `@cabi` dynamic imports, validated x86

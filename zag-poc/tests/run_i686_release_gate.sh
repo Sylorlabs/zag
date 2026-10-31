@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Authoritative low-memory gate for the implemented Linux/i686 milestone.
 #
-# Mandatory results use only znc's ELF32 emitter, archive writer, and linker.
-# readelf, objdump, host ld/ar/cc, and similar reference tools are disabled.
+# Mandatory build/link results use only znc's ELF32 emitter, archive writer,
+# and linker. readelf is required only for read-only stack-policy inspection;
+# objdump and host ld/ar/cc remain disabled.
 # Execution is native when the kernel supports i386 and otherwise uses
 # qemu-i386. This certifies the documented target subset, not full language,
 # public C ABI, dynamic/TLS, or ARM parity.
@@ -18,6 +19,9 @@ fail() {
     exit 1
 }
 
+command -v readelf >/dev/null 2>&1 ||
+    fail "readelf is required for i686 stack-policy certification"
+
 elf_identity() {
     local path=$1 expected_class=$2 expected_machine=$3
     local class machine
@@ -25,6 +29,45 @@ elf_identity() {
     machine=$(od -An -tu1 -j18 -N2 "$path" | xargs)
     test "$class" = "$expected_class" || fail "$path has ELF class $class, expected $expected_class"
     test "$machine" = "$expected_machine" || fail "$path has machine $machine, expected $expected_machine"
+}
+
+assert_exec_stack_policy() {
+    local path=$1 label=$2 headers
+    headers="$tmp/$(basename "$path").phdrs"
+    readelf -lW "$path" >"$headers" || fail "$label is not readable ELF"
+    awk '
+        $1 == "GNU_STACK" {
+            count += 1
+            if ($0 ~ / RW[[:space:]]/ && $0 !~ /RWE/ && $0 !~ /R E/) { good += 1 }
+        }
+        END { exit(count == 1 && good == 1 ? 0 : 1) }
+    ' "$headers" || fail "$label lacks exactly one RW non-executable GNU_STACK"
+    if awk '$1 == "LOAD" && ($0 ~ /RWE/ || $0 ~ /W E/) { bad = 1 } END { exit(bad ? 0 : 1) }' "$headers"; then
+        fail "$label contains a writable executable LOAD segment"
+    fi
+    echo "  ok  $label has one RW non-executable GNU_STACK"
+}
+
+assert_object_stack_policy() {
+    local path=$1 label=$2 sections
+    sections="$tmp/$(basename "$path").sections"
+    readelf -SW "$path" >"$sections" || fail "$label is not readable ELF"
+    awk '
+        {
+            for (i = 1; i <= NF; i += 1) {
+                if ($i == ".note.GNU-stack") {
+                    count += 1
+                    clean = ($(i + 1) == "PROGBITS" && $(i + 4) ~ /^0+$/)
+                    for (j = i + 6; j <= NF; j += 1) {
+                        if ($j ~ /[WAX]/) { clean = 0 }
+                    }
+                    if (clean == 1) { good += 1 }
+                }
+            }
+        }
+        END { exit(count == 1 && good == 1 ? 0 : 1) }
+    ' "$sections" || fail "$label lacks one empty non-allocating non-executable .note.GNU-stack"
+    echo "  ok  $label has one empty non-executable .note.GNU-stack"
 }
 
 i686_exec() {
@@ -53,7 +96,7 @@ reject_without_artifact() {
 }
 
 echo "════ Linux/i686 authority gate ════"
-echo "Mandatory host ld/ar/cc/readelf/objdump use: disabled"
+echo "Mandatory host ld/ar/cc/objdump use: disabled; readelf policy inspection: enabled"
 
 echo
 echo "── [1/4] compiler and target identity"
@@ -67,6 +110,7 @@ echo "  ok  compiler identity: $version"
 for alias in i686 x86 linux-i686; do
     "$ZNC" tests/i686_literal.zag --target "$alias" -o "$tmp/$alias" --no-analyze --no-zagd >/dev/null
     elf_identity "$tmp/$alias" 1 "3 0"
+    assert_exec_stack_policy "$tmp/$alias" "--target $alias executable"
     set +e
     i686_exec "$tmp/$alias"
     rc=$?
@@ -74,6 +118,18 @@ for alias in i686 x86 linux-i686; do
     test "$rc" -eq 42 || fail "--target $alias execution status=$rc"
 done
 echo "  ok  i686/x86/linux-i686 select executable ELF32 EM_386"
+
+"$ZNC" tests/i686_stack_policy_driver.zag -o "$tmp/literal-writer" \
+    --no-analyze --no-zagd --no-foreground-cache >/dev/null
+"$tmp/literal-writer" "$tmp/literal-direct"
+elf_identity "$tmp/literal-direct" 1 "3 0"
+assert_exec_stack_policy "$tmp/literal-direct" "literal-only i686 executable writer"
+set +e
+i686_exec "$tmp/literal-direct"
+literal_rc=$?
+set -e
+test "$literal_rc" -eq 42 || fail "literal-only writer execution status=$literal_rc"
+echo "  ok  literal-only i686 writer executes with hardened stack policy"
 
 "$ZNC" tests/i686_literal.zag --target x86_64 -o "$tmp/x86_64" --no-analyze --no-zagd >/dev/null
 elf_identity "$tmp/x86_64" 2 "62 0"
@@ -94,6 +150,20 @@ ZAG_I686_REFERENCE_TOOLS=0 ZNC_REAL="$ZNC" ZNC=tests/i686_znc_no_zagd.sh \
 
 echo
 echo "── [3/4] pure-Zag object, archive, relocation, and multi-object link path"
+"$ZNC" tests/i686_literal.zag --target i686 --emit-obj -o "$tmp/stack-policy.o" \
+    --no-analyze --no-zagd >/dev/null
+elf_identity "$tmp/stack-policy.o" 1 "3 0"
+assert_object_stack_policy "$tmp/stack-policy.o" "compiler-owned i686 ET_REL"
+"$ZNC" "$tmp/stack-policy.o" --target i686 --link-i686 \
+    -o "$tmp/stack-policy-linked" --no-analyze --no-zagd >/dev/null
+assert_exec_stack_policy "$tmp/stack-policy-linked" "pure-Zag linked i686 executable"
+set +e
+i686_exec "$tmp/stack-policy-linked"
+linked_policy_rc=$?
+set -e
+test "$linked_policy_rc" -eq 42 ||
+    fail "stack-policy linked executable status=$linked_policy_rc"
+echo "  ok  compiler-owned ET_REL links and executes with hardened stack policy"
 ZAG_I686_REFERENCE_TOOLS=0 ZNC_REAL="$ZNC" ZNC=tests/i686_znc_no_zagd.sh \
     bash tests/run_i686_multi_object.sh
 
@@ -114,7 +184,8 @@ echo
 echo "Certified: ELF32 EM_386; implemented SysV i386 scalar, aggregate, narrow,"
 echo "wide-integer, float, slice, and error-union boundaries; 32-bit pointer/usize;"
 echo "bounded stack-spill behavior; Linux int-0x80 exit/write/mmap2/munmap;"
-echo "pure-Zag ET_REL/archive/multi-object linking; fail-closed target identity;"
+echo "pure-Zag ET_REL/archive/multi-object linking; non-executable stack metadata;"
+echo "fail-closed target identity;"
 echo "and native-or-qemu execution."
 echo "Not certified: full language/public C ABI parity, dynamic/TLS linking, ARM,"
 echo "or external 32-bit distribution compatibility."

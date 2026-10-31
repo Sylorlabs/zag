@@ -17,7 +17,7 @@ bad() { echo "  XX  $1"; fail=$((fail + 1)); }
 if "$ZNC_BIN" selfhost/resource_contract_syntax_test.zag -o "$WORK/contract-test" \
     --no-zagd --no-analyze --no-foreground-cache >"$WORK/build.log" 2>&1 &&
    "$WORK/contract-test" >"$WORK/run.log" 2>&1 &&
-   grep -q '^resource syntax: 23/23$' "$WORK/run.log"; then
+   grep -q '^resource syntax: 39/39$' "$WORK/run.log"; then
     ok "parser, formatter, AST JSON, import qualification, and manifest identity"
 else
     bad "parser, formatter, AST JSON, import qualification, and manifest identity"

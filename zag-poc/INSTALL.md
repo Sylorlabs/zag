@@ -2,21 +2,64 @@
 
 ## Prerequisites
 
-- **x86-64 Linux or ARM64 Linux** — native ELF is supported on both targets;
-  x86-64 can cross-compile ARM64 and verify it through qemu-user
-- **No other build tools required** — no `cc`, no `zig`, no `llvm`, no `make`
+- **Linux x86-64** — host for the committed compiler seed and primary release
+- **Linux AArch64** — scoped supported target and CI host; x86-64 can
+  cross-compile it and verify it through qemu-user
+- **No compiler toolchain required** — no `cc`, no `zig`, no `llvm`, no
+  assembler, and no system linker. The documented install targets use POSIX
+  `make` and `install`; the equivalent manual copy commands are below.
 - Tested on: Ubuntu 22.04, Ubuntu 24.04, Fedora 40, Arch Linux (rolling)
 
-The committed `./znc` binary is the only bootstrap dependency.
+The committed `./znc` is the x86-64 bootstrap seed. A native AArch64 source
+bootstrap requires a separately verified AArch64 seed; installing the matching
+signed release archive does not require a bootstrap compiler.
+Read [`docs/SUPPORT.md`](docs/SUPPORT.md) before choosing a target; support is
+scoped by output mode and language edition rather than claimed as universal
+backend parity.
 
 ---
 
-## Quick start (pre-built binaries)
+## Quick start (release archive)
+
+```sh
+version=YYYY.MM.PATCH  # replace with the published stable CalVer
+case "$(uname -m)" in
+  x86_64|amd64) arch=x86_64 ;;
+  aarch64|arm64) arch=aarch64 ;;
+  *) echo 'unsupported release host architecture' >&2; exit 1 ;;
+esac
+archive="zag-$version-$arch-linux.tar.gz"
+sha256sum -c "$archive.sha256"
+tar -xzf "$archive"
+cd "${archive%.tar.gz}"
+sudo make install
+```
+
+Release archives already contain `znc`, `zagd`, and `zag-lsp`. `make install`
+is copy-only: it never bootstraps or executes a compiler under `sudo`.
+For authenticity rather than checksum-only integrity, compare the archive hash
+with the matching entry in the verified signed tag as described in
+[`RELEASES.md`](RELEASES.md#review-and-publish).
+
+For a source checkout, build as your normal user and elevate only the copy.
+These commands assume `./znc` is executable on the host: that is the committed
+seed on x86-64 or the separately verified native seed on AArch64.
 
 ```sh
 git clone https://github.com/Sylorlabs/zag zag
 cd zag/zag-poc
-chmod +x znc bootstrap.sh tests/*.sh
+chmod +x znc bootstrap.sh release.sh tests/*.sh
+make build-tools
+sudo make install-only
+```
+
+Create a project:
+
+```sh
+mkdir my-zag-app && cd my-zag-app
+znc init --name my-zag-app
+znc src/main.zag -o app --run
+znc tests/smoke.zag -o smoke --run
 ```
 
 Compile and run a Zag program:
@@ -54,19 +97,17 @@ bash tests/check_native_bootstrap_repro.sh
 
 ## Run the test suite
 
-### v1 release gate (authoritative)
+### Canonical release gate
 
 ```sh
-# Poisons cc/gcc/clang/as/ld in PATH, self-rebuilds znc, smoke-tests.
-bash tests/run_native_authority.sh
-
-# Native semantic, diagnostic, and backend suites.
-bash tests/run_semantics.sh
-bash tests/run_diag.sh
-bash tests/run_native.sh
+make release-check
 ```
 
-All four gates above must be green before shipping a release.
+This is the sole release-blocking closure. It starts with the frozen ZagScript
+matrix so incomplete capabilities refuse release before bootstrap, then runs
+the complete v1, compatibility, daemon, driver, and strict ZagScript gates.
+Individual `tests/run_*.sh` scripts remain useful for focused development, but
+no hand-selected subset is a release pass.
 
 ### Cross-target native gates
 
@@ -77,23 +118,36 @@ bash tests/run_arm64_selfhost.sh
 ```
 
 On x86-64 these use qemu-user only to execute ARM64 output. The compiler remains
-pure Zag and does not use Python, C, or Zig.
+pure Zag and does not use Python, C, or Zig. These commands are focused reruns;
+the canonical release closure already includes them.
 
 ---
 
 ## Permanent install
 
 ```sh
-sudo make install
-# Installs znc, zagd, and zagd-user-service → /usr/local/bin
+make build-tools          # normal user; omit for a pre-built release archive
+sudo make install-only   # `make install` is the same copy-only operation
+# Installs znc, zagd, zag-lsp, and zagd-user-service → /usr/local/bin
 # Installs the strict and Script standard-library modules → /usr/local/lib/zag/std
 # Installs the editable project policy template → /usr/local/share/zag/zagd.conf.example
+```
+
+The destination is configurable without editing the Makefile:
+
+```sh
+# Install directly under /opt/zag.
+sudo make install-only PREFIX=/opt/zag
+
+# Build a distro package root without touching the live filesystem.
+make install-only PREFIX=/usr DESTDIR="$PWD/pkgroot"
 ```
 
 Or manually:
 
 ```sh
-sudo install -m755 znc zagd /usr/local/bin/
+./znc selfhost/lsp/zag-lsp.zag -o zag-lsp --no-zagd
+sudo install -m755 znc zagd zag-lsp /usr/local/bin/
 sudo install -m755 tools/zagd-user-service.sh /usr/local/bin/zagd-user-service
 sudo install -d /usr/local/lib/zag/std
 sudo install -m644 std/*.zag /usr/local/lib/zag/std/
@@ -127,9 +181,11 @@ template rather than editing installed files:
 cp /usr/local/share/zag/zagd.conf.example .zagd.conf
 ```
 
-The default `mode=light` keeps the daemon resident; change only `mode=off` to
-make a persistent opt-out. Explicit compiler choices still override Script
-defaults in the file, and normal Zag remains advisory-only.
+The default `mode=adaptive` keeps one bounded daemon resident and permits
+deeper analysis only under the configured policy. Change `mode=off` to make a
+persistent opt-out. Explicit compiler choices still override Script defaults,
+normal Zag remains review-only, and the capability matrix—not the policy
+setting—is the authority on which optimizer behaviors are implemented.
 
 To keep a project planner active across login and restart it after an
 unexpected exit, install its bounded systemd user service:

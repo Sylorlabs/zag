@@ -55,10 +55,17 @@ reject_script mixed_collection 'script; let xs = [1, "two"]; say(xs)'
 reject_script bad_try 'script; let value = try; say(value)'
 reject_script bad_python_block 'script; if true:\n    say("missing real newline")'
 reject_script generated_name_collision 'script; fn __zag_compiler_script_body_7f3a() i32 { return 0; }'
+# Keep malformed async forms in the corpus: the bounded surface accepts only
+# exact TaskI64 workers and parenthesized handles, so an invalid signature or
+# handle must not silently become an ordinary function/call.
+reject_script async_surface 'async fn main() i32 { return 0; }'
+reject_script await_surface 'fn main() i32 { return await(1); }'
 
 printf '\377script;\nshow("bad")\n' > "$tmp/invalid_utf8.zag"
 printf 'script;\nshow("bad")\000\n' > "$tmp/nul_byte.zag"
-for name in invalid_utf8 nul_byte; do
+printf 'script;\n\342\202' > "$tmp/truncated_utf8.zag"
+printf 'script;\n\342A\200' > "$tmp/bad_continuation.zag"
+for name in invalid_utf8 nul_byte truncated_utf8 bad_continuation; do
     set +e
     timeout 8 "$ZNC" script "$tmp/$name.zag" -o "$tmp/$name.bin" \
         --no-zagd --no-foreground-cache >"$tmp/$name.log" 2>&1

@@ -23,9 +23,16 @@ redundancy in `explain`; it must not create two script bodies.
 
 The optional `.zs` suffix also selects that same profile. It may omit the
 physical `script;` marker; the compiler activates the profile in memory and
-does not rewrite the file. The indentation-oriented surface is normalized to
-ordinary Zag tokens before the existing parser. It does not introduce a second
-AST, type system, module graph, package ecosystem, or backend.
+does not rewrite the file. The indentation-oriented surface first enters a
+lossless CST that retains exact bytes, CRLF/LF choice, comments, trailing
+whitespace, indentation, byte spans, and deterministic origin IDs. A projection
+with complete generated-range coverage then emits ordinary Zag tokens for the
+existing parser. It does not introduce a second AST, type system, module graph,
+package ecosystem, or backend. Parser nodes project through that ledger into
+compact-source byte ranges across root and imported modules. Byte-identical
+segments carry `exact=1`; rewritten indentation constructs carry `exact=0` and
+a sound enclosing compact range. Compiler-synthesized wrappers remain
+explicitly unlocated rather than receiving invented source locations.
 
 `script;` may follow comments and file directives but must precede executable
 root statements. A duplicate is an error. A script root that declares a
@@ -140,12 +147,14 @@ pointer provenance or a language-wide ownership proof.
 The compiler computes bounded, monotone lifetime summaries for every defined
 helper reachable in the merged module graph. A summary records whether a helper
 returns a Script-lifetime value or may retain one through a field, pointer,
-nonlocal assignment, extern/unknown call, or another escaping helper. This
-covers helper chains, returned values, and imported source helpers. Recursion is
-handled by a declaration-count-bounded fixed point. Passing a Script value to
-an extern or unresolved function remains a conservative error. These summaries
-prove only those escape classes; they are not general ownership or borrow
-checking.
+nonlocal assignment, extern/unknown call, or another escaping helper. Scalar
+content such as a capacity, length, or index does not itself create address
+provenance; unresolved, pointer, slice, aggregate, and generic parameter types
+remain conservative. This covers helper chains, returned values, and imported
+source helpers. Recursion is handled by a declaration-count-bounded fixed point.
+Passing a Script value to an extern or unresolved function remains a conservative
+error. These summaries prove only those escape classes; they are not general
+ownership or borrow checking.
 
 Edition-2027 strict Zag additionally has an opt-in static ownership slice for
 named allocation origins and explicit `@consumes`, `@borrows`, and
@@ -164,11 +173,14 @@ documented Zag declaration with an explicit strict-Zag equivalent. The implement
 allowlist is `print`, `println`, `say`, `input`, `env`, `read_file`,
 `write_file`, `args_len`, `arg`, `args`, `path_join`, `path_basename`,
 `path_dirname`, `path_extension`, `string_concat`, `script_alloc`,
-`script_alloc_used`, `process_run_timeout`, `string_builder`, and `list`.
+`script_alloc_used`, `process_run_timeout`, `string_builder`, `list`,
+`append`, `set_at`, `length`, `len`, `item_at`, `pop`, `clear`, and `new`,
+together with the documented `map*`, `text_map*`, `set*`, `text_set*`,
+`range*`, bounded `json_*`, bounded `csv_*`, and `process_run_argv` families.
 `args()` materializes a typed `ScriptList[[]u8]` charged to the Script
 allocator; argument bytes continue to borrow immutable process storage.
-Implicit JSON bindings are not provided: basic JSON remains an ordinary,
-explicit standard-library API.
+Each convenience maps to an ordinary standard-library declaration; this
+allowlist does not expose arbitrary module names or dynamic dispatch.
 
 Collections remain statically typed. The compiler may infer one element type
 when unambiguous. Mixed incompatible elements are rejected. Growth, copies and
@@ -178,6 +190,56 @@ The implemented `ScriptList[T]` grows geometrically, charges each replacement
 buffer to the Script context, and retains superseded Script allocations until
 generated shutdown. Construction accepts one to four values of a single
 inferred type.
+
+`clear(list)` is the checked ScriptList reuse operation. It validates the
+descriptor's non-null context, failure bit, capacity, length, element-size
+bound, and backing pointer before scrubbing the live prefix and setting `len` to zero;
+the backing allocation and capacity remain available to `append`. A null,
+failed, forged, or otherwise out-of-bounds descriptor returns status `1` and
+marks a non-null descriptor failed. ScriptList is copy-semantic and has no
+per-element drop state, so resource-valued clear is rejected by the ownership
+checker rather than silently discarding nested resources. The bounded runtime
+check proves the descriptor is self-consistent; it does not claim to authenticate
+an arbitrary non-null context pointer supplied by a caller. A root declaration
+named `clear` takes precedence over this convenience binding.
+
+`map()` is the bounded integer dictionary convenience. `map_clear(map)` is its
+checked reuse operation: it validates a non-null target, non-null context and
+backing arrays, a bounded power-of-two capacity, exact live/tombstone counts,
+and valid table-state bytes before zeroing every retained key, value,
+and state slot. It then resets `count` and `tombstones` while retaining the
+ScriptContext-owned arrays and capacity. A malformed descriptor or null target
+returns status `1`; a non-null malformed descriptor is marked failed and no
+table slot is written. The descriptor check is a self-consistency boundary, not
+authentication of an arbitrary non-null context pointer. A root declaration
+named `map_clear` takes precedence over the convenience binding.
+
+`set()` is the bounded homogeneous `i32` set. `set_clear(set)` validates the
+non-null target and context, bounded power-of-two capacity, non-null key/state
+arrays, valid state bytes, and exact live/tombstone counts before scrubbing all
+retained key/state slots. It then resets `count` and `tombstones` while retaining
+the ScriptContext-owned arrays and capacity. Invalid descriptors and null
+targets return status `1`; non-null failures set `failed` and perform no slot
+writes. This context check is a self-consistency invariant, not authentication
+of an arbitrary non-null pointer. A user declaration named `set_clear` wins over
+the root convenience binding.
+
+`text_map()` and `text_set()` are bounded homogeneous byte-slice collections
+backed by `ScriptMapText`. Their clear operations validate a non-null target,
+non-null context and backing arrays, bounded power-of-two capacity, every
+`0`/`1`/`2` state byte, and exact live/tombstone counts before any write. On
+success they replace every retained key/value slice with the empty slice, zero
+the state table, reset both counts, and preserve backing pointers and capacity
+for reuse. A malformed non-null descriptor is marked failed and returns `1`
+without a partial scrub; a null target returns `1`. Retained payload allocations
+remain owned by ScriptContext until shutdown, and this self-consistency check
+does not authenticate an arbitrary forged non-null context pointer. User
+declarations named `text_map_clear` or `text_set_clear` retain precedence.
+Pointer-taking text-map put/delete and text-set add/delete operations likewise
+reject null targets before dereference. Exact resolver-owned list/map/set
+constructors are compiler ScriptContext producers, not inferred user-borrow
+relations; a project function with the same name or basename receives no such
+exception.
 
 ## Errors and effects
 
@@ -235,16 +297,23 @@ imported strict libraries.
 `harden` is non-destructive by default. Its first implementation may produce a
 preview, patch, candidate source, assumptions, required parity tests and honest
 unsupported items. It must not pretend an incomplete conversion is strict Zag.
-`--output` writes a separate file. `--apply` requires an unchanged source
-snapshot, an explicit parity-test command, a rollback copy, and restores the
-original automatically when validation fails. It never silently skips the
-parity test. A clean Git worktree is still recommended but is not fabricated as
-compiler proof.
+`--output` writes a separate create-only derived artifact and never replaces
+compact source. The legacy `--apply` mode is removed and rejects before source
+loading, publication, or parity-command execution. Provenance-backed `promote`
+is the only workflow that creates human-owned expanded source and its ledger. A
+clean Git worktree is still recommended but is not fabricated as compiler proof.
 
 When Script-context prelude calls remain, the report marks the preview
-`partial` and `candidate_compilable=false`; `--apply` refuses it. This is an
+`partial` and `candidate_compilable=false`; promotion refuses it. This is an
 honest boundary until allocator and capability expansion can produce ordinary
 strict Zag without guessing policy.
+
+For an accepted preview, `candidate_checked=true` and the compatibility field
+`candidate_compilable=true` currently report the same foreground
+syntax/type/effect/analyzer result. Neither field alone proves that every native
+lowering, register-allocation, encoding, or final ELF boundary succeeds.
+Focused view gates compile and execute generated candidates as separate
+evidence; a general backend-only candidate validator is still incomplete.
 
 `check --strict` rejects unresolved script conveniences, including implicit
 allocator or capabilities, unbounded process execution, implicit randomness,

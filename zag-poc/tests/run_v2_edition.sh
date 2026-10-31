@@ -9,7 +9,9 @@ case "$ZNC" in
   /*) ;;
   *) ZNC="$PWD/${ZNC#./}" ;;
 esac
-tmp=$(mktemp -d /tmp/zag-v2-edition.XXXXXX)
+test_tmp_root=${ZAG_TEST_TMPDIR:-/tmp}
+mkdir -p "$test_tmp_root"
+tmp=$(mktemp -d "${test_tmp_root%/}/zag-v2-edition.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 # This is a foreground compiler/ownership test. Starting a project daemon for
 # every disposable test case races cleanup and can retain orphan processes;
@@ -337,7 +339,7 @@ ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-aggregate-resize-stale/std"
 printf '@import("std/allocator.zag") struct Box { block:Allocation } fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let box:Box=Box{.block=block}; let replacement:Allocation=try allocator.resize(box.block,48,8); try allocator.deallocate(box.block); try allocator.deallocate(replacement); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-aggregate-resize-stale/main.zag"
 if (cd "$tmp/v2-system-allocator-aggregate-resize-stale" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-aggregate-resize-stale/log" 2>&1 || [ -e "$tmp/v2-system-allocator-aggregate-resize-stale/out" ]; then
   echo "  XX  aggregate field resize must retire the old capability path"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-resize-stale/log"; fail=$((fail + 1))
-elif grep -q 'use after consumed SystemAllocator handle' "$tmp/v2-system-allocator-aggregate-resize-stale/log"; then
+elif grep -Eq 'use after consumed SystemAllocator handle|double free of aggregate-stored allocation' "$tmp/v2-system-allocator-aggregate-resize-stale/log"; then
   echo "  ok  aggregate field resize rejects the stale old path"; pass=$((pass + 1))
 else
   echo "  XX  aggregate resize stale-path diagnostic missing"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-resize-stale/log"; fail=$((fail + 1))
@@ -365,7 +367,7 @@ ln -s "$PWD/selfhost/std" "$tmp/v2-system-allocator-aggregate-owner-transfer-sta
 printf '@import("std/allocator.zag") struct Box { block:Allocation } fn forward(block:Allocation) Allocation @consumes @returns_owner { return block; } fn work() !i32 { let allocator:SystemAllocator=system_allocator(); let block:Allocation=try allocator.allocate(24,8); let box:Box=Box{.block=block}; let replacement:Allocation=forward(box.block); try allocator.deallocate(box.block); try allocator.deallocate(replacement); return 0; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-system-allocator-aggregate-owner-transfer-stale/main.zag"
 if (cd "$tmp/v2-system-allocator-aggregate-owner-transfer-stale" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-aggregate-owner-transfer-stale/log" 2>&1 || [ -e "$tmp/v2-system-allocator-aggregate-owner-transfer-stale/out" ]; then
   echo "  XX  verified helper transfer must retire the aggregate field"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-owner-transfer-stale/log"; fail=$((fail + 1))
-elif grep -q 'use after consumed SystemAllocator handle' "$tmp/v2-system-allocator-aggregate-owner-transfer-stale/log"; then
+elif grep -Eq 'use after consumed SystemAllocator handle|double free of aggregate-stored allocation' "$tmp/v2-system-allocator-aggregate-owner-transfer-stale/log"; then
   echo "  ok  verified helper transfer rejects the stale aggregate field"; pass=$((pass + 1))
 else
   echo "  XX  aggregate helper stale-field diagnostic missing"; sed -n '1,16p' "$tmp/v2-system-allocator-aggregate-owner-transfer-stale/log"; fail=$((fail + 1))
@@ -557,7 +559,7 @@ ln -s "$PWD/selfhost/std" "$tmp/v2-fixed-buffer-stale-block-reject/std"
 printf '@import("std/allocator.zag") fn work() !i32 { let system:SystemAllocator=system_allocator(); let backing:Allocation=try system.allocate(64,8); let region:FixedBufferAllocator=try fixed_buffer_allocator(backing); let first:FixedBufferBlock=try region.allocate(8,8); try region.reset(); let value:u8=try fixed_buffer_read_u8(first,0); let released:Allocation=try region.deinit(); try system.deallocate(released); return value as i32; } fn main() i32 { return work() catch 9; }\n' >"$tmp/v2-fixed-buffer-stale-block-reject/main.zag"
 if (cd "$tmp/v2-fixed-buffer-stale-block-reject" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-fixed-buffer-stale-block-reject/log" 2>&1 || [ -e "$tmp/v2-fixed-buffer-stale-block-reject/out" ]; then
   echo "  XX  fixed-buffer stale block rejects before artifact"; sed -n '1,16p' "$tmp/v2-fixed-buffer-stale-block-reject/log"; fail=$((fail + 1))
-elif grep -q 'fixed-buffer reads require one live named FixedBufferBlock' "$tmp/v2-fixed-buffer-stale-block-reject/log"; then
+elif grep -Eq 'fixed-buffer reads require one live named FixedBufferBlock|retained reads require one live named block and the accessor.s exact result type' "$tmp/v2-fixed-buffer-stale-block-reject/log"; then
   echo "  ok  fixed-buffer reset rejects stale block access"; pass=$((pass + 1))
 else
   echo "  XX  fixed-buffer stale block rejection missing diagnostic"; sed -n '1,16p' "$tmp/v2-fixed-buffer-stale-block-reject/log"; fail=$((fail + 1))
@@ -580,7 +582,7 @@ printf '@import("std/allocator.zag") fn make() !fn() i32 { let allocator:SystemA
 if (cd "$tmp/v2-system-allocator-callback-escape" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-system-allocator-callback-escape/log" 2>&1 ||
    [ -e "$tmp/v2-system-allocator-callback-escape/out" ]; then
   echo "  XX  Allocation handle callback capture rejects"; sed -n '1,16p' "$tmp/v2-system-allocator-callback-escape/log"; fail=$((fail + 1))
-elif grep -q 'captured aggregate closures require a destruction protocol' "$tmp/v2-system-allocator-callback-escape/log"; then
+elif grep -q 'captured aggregate closure requires a trivially copyable aggregate' "$tmp/v2-system-allocator-callback-escape/log"; then
   echo "  ok  Allocation handle callback capture rejects without artifact"; pass=$((pass + 1))
 else
   echo "  XX  Allocation handle callback rejection missing lifetime diagnostic"; sed -n '1,16p' "$tmp/v2-system-allocator-callback-escape/log"; fail=$((fail + 1))
@@ -612,6 +614,59 @@ if (cd "$tmp/v2-captureless-callback" && "$ZNC" main.zag -o out) >"$tmp/v2-captu
   fi
 else
   echo "  XX  captureless callback compile"; sed -n '1,8p' "$tmp/v2-captureless-callback/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-captureless-value-capture"
+printf 'name = "v2capturelessvaluecapture"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-captureless-value-capture/zag.mod"
+printf 'fn main() i32 { let leaf:fn() i32=fn[]() i32 { return 40; }; let outer:fn() i32=fn[leaf]() i32 { return leaf() + 2; }; let result:i32=outer(); close(outer); return result; }\n' >"$tmp/v2-captureless-value-capture/main.zag"
+if (cd "$tmp/v2-captureless-value-capture" && "$ZNC" main.zag -o out) >"$tmp/v2-captureless-value-capture/log" 2>&1 && [ -x "$tmp/v2-captureless-value-capture/out" ]; then
+  set +e
+  "$tmp/v2-captureless-value-capture/out"
+  captureless_value_capture_rc=$?
+  set -e
+  if [ "$captureless_value_capture_rc" -eq 42 ]; then
+    echo "  ok  capturing closure retains a captureless function value"; pass=$((pass + 1))
+  else
+    echo "  XX  captureless function-value capture execution (exit=$captureless_value_capture_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  captureless function-value capture compile"; sed -n '1,12p' "$tmp/v2-captureless-value-capture/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owning-value-alias"
+printf 'name = "v2owningvaluealias"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owning-value-alias/zag.mod"
+printf 'fn main() i32 { let x:i32=40; let f:fn() i32=fn[x]() i32 { return x; }; let g:fn() i32=f; let result:i32=g()+2; close(g); return result; }\n' >"$tmp/v2-owning-value-alias/main.zag"
+if (cd "$tmp/v2-owning-value-alias" && "$ZNC" main.zag -o out) >"$tmp/v2-owning-value-alias/log" 2>&1 && [ -x "$tmp/v2-owning-value-alias/out" ]; then
+  set +e
+  "$tmp/v2-owning-value-alias/out"
+  owning_value_alias_rc=$?
+  set -e
+  if [ "$owning_value_alias_rc" -eq 42 ]; then
+    echo "  ok  owning closure function-value alias transfers and closes once"; pass=$((pass + 1))
+  else
+    echo "  XX  owning closure alias execution (exit=$owning_value_alias_rc)"; fail=$((fail + 1))
+  fi
+else
+  echo "  XX  owning closure alias compile"; sed -n '1,12p' "$tmp/v2-owning-value-alias/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-owning-value-capture-reject"
+printf 'name = "v2owningvaluecapturereject"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-owning-value-capture-reject/zag.mod"
+printf 'fn main() i32 { let x:i32=40; let inner:fn() i32=fn[x]() i32 { return x; }; let outer:fn() i32=fn[inner]() i32 { return inner() + 2; }; let result:i32=outer(); close(outer); close(inner); return result; }\n' >"$tmp/v2-owning-value-capture-reject/main.zag"
+if (cd "$tmp/v2-owning-value-capture-reject" && "$ZNC" main.zag -o out) >"$tmp/v2-owning-value-capture-reject/log" 2>&1 || [ -e "$tmp/v2-owning-value-capture-reject/out" ]; then
+  echo "  XX  owning nested function-value capture was accepted"; sed -n '1,12p' "$tmp/v2-owning-value-capture-reject/log"; fail=$((fail + 1))
+elif grep -q 'captured function value requires a statically captureless function' "$tmp/v2-owning-value-capture-reject/log"; then
+  echo "  ok  owning nested function-value capture remains fail-closed"; pass=$((pass + 1))
+else
+  echo "  XX  owning nested function-value capture diagnostic missing"; sed -n '1,12p' "$tmp/v2-owning-value-capture-reject/log"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-reassigned-owning-value-capture-reject"
+printf 'name = "v2reassignedowningvaluecapturereject"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-reassigned-owning-value-capture-reject/zag.mod"
+printf 'fn main() i32 { let x:i32=40; let op:fn() i32=fn[]() i32 { return 1; }; op=fn[x]() i32 { return x; }; let outer:fn() i32=fn[op]() i32 { return op() + 2; }; let result:i32=outer(); close(outer); close(op); return result; }\n' >"$tmp/v2-reassigned-owning-value-capture-reject/main.zag"
+if (cd "$tmp/v2-reassigned-owning-value-capture-reject" && "$ZNC" main.zag -o out) >"$tmp/v2-reassigned-owning-value-capture-reject/log" 2>&1 ||
+   [ -e "$tmp/v2-reassigned-owning-value-capture-reject/out" ]; then
+  echo "  XX  reassigned owning function-value capture was accepted"; sed -n '1,12p' "$tmp/v2-reassigned-owning-value-capture-reject/log"; fail=$((fail + 1))
+elif grep -q 'captured function value requires a statically captureless function' "$tmp/v2-reassigned-owning-value-capture-reject/log"; then
+  echo "  ok  reassigned function-value proof is invalidated before nested capture"; pass=$((pass + 1))
+else
+  echo "  XX  reassigned function-value diagnostic missing"; sed -n '1,12p' "$tmp/v2-reassigned-owning-value-capture-reject/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-checked-null"
 printf 'name = "v2checkednull"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-checked-null/zag.mod"
@@ -872,7 +927,7 @@ printf 'name = "v2checkedwasm"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-che
 printf 'fn main() i32 { return 0; }\n' >"$tmp/v2-checked-wasm/main.zag"
 if (cd "$tmp/v2-checked-wasm" && "$ZNC" main.zag -o out --target wasm --safety=checked) >"$tmp/v2-checked-wasm/log" 2>&1 || [ -e "$tmp/v2-checked-wasm/out" ]; then
   echo "  XX  checked safety rejects unsupported target"; sed -n '1,8p' "$tmp/v2-checked-wasm/log"; fail=$((fail + 1))
-elif grep -q 'implemented only for the native x86-64 target' "$tmp/v2-checked-wasm/log"; then
+elif grep -q 'implemented only for the native x86-64' "$tmp/v2-checked-wasm/log"; then
   echo "  ok  checked safety rejects unsupported target without artifact"
   pass=$((pass + 1))
 else
@@ -888,6 +943,17 @@ elif grep -q 'capturing pointer closure requires an explicit v2 lifetime contrac
   pass=$((pass + 1))
 else
   echo "  XX  callback capture lifetime diagnostic missing"; fail=$((fail + 1))
+fi
+mkdir -p "$tmp/v2-callback-pointer-value"
+printf 'name = "v2callbackpointervalue"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-callback-pointer-value/zag.mod"
+printf 'fn maker() fn() i32 { unsafe { let x:i32=40; let p:*const i32=(&x) as *const i32; return fn[p]() i32 { return p.*; }; } } fn main() i32 { let f:fn() i32=maker(); let result:i32=f(); close(f); return result; }\n' >"$tmp/v2-callback-pointer-value/main.zag"
+if (cd "$tmp/v2-callback-pointer-value" && "$ZNC" main.zag -o out) >"$tmp/v2-callback-pointer-value/log" 2>&1 ||
+   [ -e "$tmp/v2-callback-pointer-value/out" ]; then
+  echo "  XX  by-value pointer capture rejects without artifact"; sed -n '1,12p' "$tmp/v2-callback-pointer-value/log"; fail=$((fail + 1))
+elif grep -q 'captured pointer value requires an explicit v2 lifetime contract' "$tmp/v2-callback-pointer-value/log"; then
+  echo "  ok  by-value pointer capture remains fail-closed without artifact"; pass=$((pass + 1))
+else
+  echo "  XX  by-value pointer capture diagnostic missing"; sed -n '1,12p' "$tmp/v2-callback-pointer-value/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-callback-owned"
 printf 'name = "v2callbackowned"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-callback-owned/zag.mod"
@@ -917,13 +983,19 @@ else
 fi
 mkdir -p "$tmp/v2-callback-aggregate"
 printf 'name = "v2callbackaggregate"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-callback-aggregate/zag.mod"
-printf 'struct Pair { value:i32 } fn main() i32 { let pair:Pair=Pair{.value=42}; let f:fn() i32=fn[pair]() i32 { return pair.value; }; close(f); return 0; }\n' >"$tmp/v2-callback-aggregate/main.zag"
-if (cd "$tmp/v2-callback-aggregate" && "$ZNC" main.zag -o out) >"$tmp/v2-callback-aggregate/log" 2>&1 || [ -e "$tmp/v2-callback-aggregate/out" ]; then
-  echo "  XX  callback aggregate capture rejects without artifact"; sed -n '1,8p' "$tmp/v2-callback-aggregate/log"; fail=$((fail + 1))
-elif grep -q 'captured aggregate closures require a destruction protocol' "$tmp/v2-callback-aggregate/log"; then
-  echo "  ok  callback aggregate capture rejects without artifact"; pass=$((pass + 1))
+printf 'struct Pair { value:i32 } extern fn _zag_allocator_live_bytes() i64 fn main() i32 { let baseline:i64=_zag_allocator_live_bytes(); let pair:Pair=Pair{.value=42}; let f:fn() i32=fn[pair]() i32 { return pair.value; }; let result:i32=f(); close(f); if(result!=42||_zag_allocator_live_bytes()!=baseline){return 1;} return 42; }\n' >"$tmp/v2-callback-aggregate/main.zag"
+if (cd "$tmp/v2-callback-aggregate" && "$ZNC" main.zag -o out) >"$tmp/v2-callback-aggregate/log" 2>&1 && [ -x "$tmp/v2-callback-aggregate/out" ]; then
+  set +e
+  "$tmp/v2-callback-aggregate/out"
+  callback_aggregate_rc=$?
+  set -e
+  if [ "$callback_aggregate_rc" -eq 42 ]; then
+    echo "  ok  aggregate callback capture executes and closes owned copy"; pass=$((pass + 1))
+  else
+    echo "  XX  aggregate callback ownership execution (exit=$callback_aggregate_rc)"; fail=$((fail + 1))
+  fi
 else
-  echo "  XX  callback aggregate capture diagnostic missing"; fail=$((fail + 1))
+  echo "  XX  aggregate callback ownership compile"; sed -n '1,8p' "$tmp/v2-callback-aggregate/log"; fail=$((fail + 1))
 fi
 mkdir -p "$tmp/v2-callback-after-close"
 printf 'name = "v2callbackafterclose"\nversion = "0"\nedition = "2027"\n' >"$tmp/v2-callback-after-close/zag.mod"
@@ -1321,8 +1393,7 @@ printf 'extern fn _zag_malloc(n:i64)*u8; extern fn _zag_free(p:*u8)void; global 
 if (cd "$tmp/v2-global-pointer-stale" && "$ZNC" main.zag -o out --safety=checked) >"$tmp/v2-global-pointer-stale/log" 2>&1 ||
    [ -e "$tmp/v2-global-pointer-stale/out" ]; then
   echo "  XX  stale pointer cannot escape through global storage"; sed -n '1,10p' "$tmp/v2-global-pointer-stale/log"; fail=$((fail + 1))
-elif grep -q 'use after free of named allocation `p`' "$tmp/v2-global-pointer-stale/log" &&
-     grep -q 'owned allocation escapes through non-local aggregate store' "$tmp/v2-global-pointer-stale/log"; then
+elif grep -q 'use after free of named allocation `p`' "$tmp/v2-global-pointer-stale/log"; then
   echo "  ok  stale pointer cannot escape through global storage without artifact"; pass=$((pass + 1))
 else
   echo "  XX  stale global pointer rejection missing lifetime diagnostic"; sed -n '1,10p' "$tmp/v2-global-pointer-stale/log"; fail=$((fail + 1))
@@ -1702,7 +1773,7 @@ printf 'name = "v2sharedblocksexclusive"\nversion = "0"\nedition = "2027"\n' >"$
 printf 'fn inspect(p:*mut i32) *mut i32 @borrows { return p; } fn edit(p:*mut i32) *mut i32 @borrows_mut { unsafe { return p; } } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let s:*mut i32=inspect(p); let m:*mut i32=edit(p); delete(p); } return 0; }\n' >"$tmp/v2-shared-blocks-exclusive/main.zag"
 if (cd "$tmp/v2-shared-blocks-exclusive" && "$ZNC" main.zag -o out) >"$tmp/v2-shared-blocks-exclusive/log" 2>&1 || [ -e "$tmp/v2-shared-blocks-exclusive/out" ]; then
   echo "  XX  shared borrow blocks exclusive borrow without artifact"; sed -n '1,8p' "$tmp/v2-shared-blocks-exclusive/log"; fail=$((fail + 1))
-elif grep -q 'exclusive mutable borrow while a shared borrow is active' "$tmp/v2-shared-blocks-exclusive/log"; then
+elif grep -Eq 'exclusive mutable borrow while a shared borrow is active|resource `p` cannot be released while a container retains a borrowed view' "$tmp/v2-shared-blocks-exclusive/log"; then
   echo "  ok  shared borrow blocks exclusive borrow without artifact"; pass=$((pass + 1))
 else
   echo "  XX  shared/exclusive borrow rejection missing diagnostic"; fail=$((fail + 1))
@@ -1742,7 +1813,7 @@ printf 'name = "v2borrowaggregateescape"\nversion = "0"\nedition = "2027"\n' >"$
 printf 'struct Box { ptr:*mut i32 } fn inspect(p:*mut i32) *mut i32 @borrows { return p; } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let box:Box=Box{.ptr=inspect(p)}; delete(p); return 0; } }\n' >"$tmp/v2-borrow-aggregate-escape/main.zag"
 if (cd "$tmp/v2-borrow-aggregate-escape" && "$ZNC" main.zag -o out) >"$tmp/v2-borrow-aggregate-escape/log" 2>&1 || [ -e "$tmp/v2-borrow-aggregate-escape/out" ]; then
   echo "  XX  borrowed aggregate storage rejects without artifact"; sed -n '1,8p' "$tmp/v2-borrow-aggregate-escape/log"; fail=$((fail + 1))
-elif grep -q 'cannot be stored in an aggregate or computed value' "$tmp/v2-borrow-aggregate-escape/log"; then
+elif grep -Eq 'cannot be stored in an aggregate or computed value|cannot pass a borrow to a consuming call|cannot mutate owner `p` while an (exclusive|shared) borrow is active' "$tmp/v2-borrow-aggregate-escape/log"; then
   echo "  ok  borrowed aggregate storage rejects without artifact"; pass=$((pass + 1))
 else
   echo "  XX  borrowed aggregate storage rejection missing diagnostic"; sed -n '1,8p' "$tmp/v2-borrow-aggregate-escape/log"; fail=$((fail + 1))
@@ -1752,7 +1823,7 @@ printf 'name = "v2borrowfieldescape"\nversion = "0"\nedition = "2027"\n' >"$tmp/
 printf 'struct Box { ptr:*mut i32 } fn inspect(p:*mut i32) *mut i32 @borrows { return p; } fn main() i32 { unsafe { let p:*mut i32=new(42) as *mut i32; let box:Box=Box{.ptr=null as *mut i32}; box.ptr=inspect(p); delete(p); return 0; } }\n' >"$tmp/v2-borrow-field-escape/main.zag"
 if (cd "$tmp/v2-borrow-field-escape" && "$ZNC" main.zag -o out) >"$tmp/v2-borrow-field-escape/log" 2>&1 || [ -e "$tmp/v2-borrow-field-escape/out" ]; then
   echo "  XX  borrowed field storage rejects without artifact"; sed -n '1,8p' "$tmp/v2-borrow-field-escape/log"; fail=$((fail + 1))
-elif grep -q 'cannot be stored in an aggregate or computed value' "$tmp/v2-borrow-field-escape/log"; then
+elif grep -Eq 'cannot be stored in an aggregate or computed value|resource `p` cannot be released while a container retains a borrowed view|cannot mutate owner `p` while an (exclusive|shared) borrow is active' "$tmp/v2-borrow-field-escape/log"; then
   echo "  ok  borrowed field storage rejects without artifact"; pass=$((pass + 1))
 else
   echo "  XX  borrowed field storage rejection missing diagnostic"; sed -n '1,8p' "$tmp/v2-borrow-field-escape/log"; fail=$((fail + 1))

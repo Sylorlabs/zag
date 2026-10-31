@@ -9,6 +9,12 @@ ZNC=${ZNC:-./znc}
 case "$ZNC" in /*) ;; *) ZNC="$PWD/${ZNC#./}";; esac
 tmp=$(mktemp -d /tmp/zag-compat-opengl.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT
+cat >"$tmp/znc-no-zagd" <<EOF
+#!/usr/bin/env bash
+exec "$ZNC" "\$@" --no-zagd
+EOF
+chmod +x "$tmp/znc-no-zagd"
+ZNC="$tmp/znc-no-zagd"
 pass=0
 fail=0
 

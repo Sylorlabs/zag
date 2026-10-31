@@ -69,17 +69,40 @@ if "$znc_bin" tests/script_frontend/duplicate.zag -o "$tmp_dir/duplicate" --no-a
     exit 1
 fi
 grep -q 'duplicate `script;` declaration' "$tmp_dir/dup.out"
+test ! -e "$tmp_dir/duplicate"
 
 if "$znc_bin" tests/script_frontend/conflicting_main.zag -o "$tmp_dir/conflict" --no-analyze >"$tmp_dir/conflict.out" 2>&1; then
     echo "script plus user main unexpectedly compiled" >&2
     exit 1
 fi
 grep -q 'conflicts with user-defined `main`' "$tmp_dir/conflict.out"
+test ! -e "$tmp_dir/conflict"
 
 if "$znc_bin" tests/script_frontend/reserved_symbol.zag -o "$tmp_dir/reserved" --no-analyze >"$tmp_dir/reserved.out" 2>&1; then
     echo "compiler-owned script symbol unexpectedly accepted" >&2
     exit 1
 fi
 grep -q 'compiler-owned script symbol' "$tmp_dir/reserved.out"
+test ! -e "$tmp_dir/reserved"
+
+# Async syntax is now a bounded TaskI64 surface, but malformed signatures and
+# unsafe/invalid handle use must remain fail-closed.  Accept the legacy
+# reserved-syntax diagnostic from a stale compiler during bootstrap as well as
+# the new typed diagnostics from the current source.
+printf '%s\n' 'async fn main() i32 { return 0; }' >"$tmp_dir/async-decl.zag"
+if "$znc_bin" "$tmp_dir/async-decl.zag" -o "$tmp_dir/async-decl" --no-analyze >"$tmp_dir/async-decl.out" 2>&1; then
+    echo "async declaration unexpectedly compiled" >&2
+    exit 1
+fi
+grep -Eq 'async.*syntax is not available|async fn requires' "$tmp_dir/async-decl.out"
+test ! -e "$tmp_dir/async-decl"
+
+printf '%s\n' 'fn main() i32 { return await(1); }' >"$tmp_dir/await-expr.zag"
+if "$znc_bin" "$tmp_dir/await-expr.zag" -o "$tmp_dir/await-expr" --no-analyze >"$tmp_dir/await-expr.out" 2>&1; then
+    echo "await expression unexpectedly compiled" >&2
+    exit 1
+fi
+grep -Eq 'await.*syntax is not available|task handle operation' "$tmp_dir/await-expr.out"
+test ! -e "$tmp_dir/await-expr"
 
 echo "script frontend: PASS"

@@ -1,0 +1,151 @@
+// Explicit detached Ed25519 verification for a canonical registry index.
+//
+// This helper is intentionally separate from ordinary package import
+// resolution. The foreground resolver has its own equivalent bounded verifier
+// and invokes it only for explicitly opted-in local mode="registry"
+// dependencies; unsigned/default registry metadata remains allowed. Signed
+// selections require verified signature state before admission.
+
+@import("package_registry.zag")
+
+extern fn _zag_exec_cmd(cmd: []u8) i32 @io
+extern fn _zag_clock_monotonic_ms() i64 @io
+
+fn package_signature_cstring(s: []u8) ArrayList[u8] {
+    let out: ArrayList[u8] = make[u8](s.len + 1);
+    let i: i32 = 0;
+    while (i < s.len) { push[u8](&out, s[i]); i = i + 1; }
+    push[u8](&out, 0 as u8);
+    return out;
+}
+
+fn package_signature_unlink(path: []u8) i32 {
+    let c: ArrayList[u8] = package_signature_cstring(path);
+    let rc: i64 = _zag_raw_syscall(87,
+        _zag_slice_ptr(c.data[0..c.len]) as i64, 0, 0, 0, 0, 0);
+    free[u8](&c);
+    return (rc == 0 || rc == (0 - 2)) as i32;
+}
+
+// O_EXCL|O_NOFOLLOW and fsync make the bytes authenticated by OpenSSL the
+// bytes read from the descriptor, not a later path replacement.
+fn package_signature_write_new(path: []u8, bytes: []u8) i32 {
+    let c: ArrayList[u8] = package_signature_cstring(path);
+    let fd: i64 = _zag_raw_syscall(2,
+        _zag_slice_ptr(c.data[0..c.len]) as i64, 655553, 384, 0, 0, 0);
+    free[u8](&c);
+    if (fd < 0) { return 0; }
+    let off: i32 = 0;
+    let remaining: i32 = bytes.len;
+    let ok: i32 = 1;
+    while (remaining != 0) {
+        let wrote: i64 = _zag_raw_syscall(1, fd,
+            _zag_slice_ptr(bytes[off..bytes.len]) as i64,
+            remaining, 0, 0, 0);
+        if (wrote == (0 - 4)) { continue; }
+        if (wrote <= 0) { ok = 0; break; }
+        let step: i32 = wrote as i32;
+        if (step > remaining) { ok = 0; break; }
+        off = off + step;
+        remaining = remaining - step;
+    }
+    if (ok == 1 && _zag_raw_syscall(74, fd, 0, 0, 0, 0, 0) != 0) { ok = 0; }
+    let _close: i64 = _zag_raw_syscall(3, fd, 0, 0, 0, 0, 0);
+    if (ok == 0) { let _removed: i32 = package_signature_unlink(path); }
+    return ok;
+}
+
+fn package_signature_release(read: *PackageNoFollowRead) void {
+    if (read.*.ok == 1) {
+        _zag_free(_zag_slice_ptr(read.*.bytes));
+        read.*.bytes = "";
+        read.*.ok = 0;
+    }
+}
+
+fn package_signature_shell_quote(value: []u8) []u8 {
+    let out: []u8 = _zag_str_concat("", "'");
+    let i: i32 = 0;
+    while (i < value.len) {
+        let next: []u8 = "";
+        if (value[i] == '\'') { next = _zag_str_concat(out, "'\\''"); }
+        else { next = _zag_str_concat(out, value[i..i + 1]); }
+        _zag_str_free(out); out = next;
+        i = i + 1;
+    }
+    let result: []u8 = _zag_str_concat(out, "'");
+    _zag_str_free(out);
+    return result;
+}
+
+fn package_signature_temp(stem: []u8, nonce: i64) []u8 {
+    let nonce_text: []u8 = _zag_i64_to_str(nonce);
+    let dot_nonce: []u8 = _zag_str_concat(".", nonce_text);
+    _zag_str_free(nonce_text);
+    let stem_nonce: []u8 = _zag_str_concat(stem, dot_nonce);
+    _zag_str_free(dot_nonce);
+    let result: []u8 = _zag_str_concat("/tmp/zag-package-signature.", stem_nonce);
+    _zag_str_free(stem_nonce);
+    return result;
+}
+
+// Verify exact detached Ed25519 signature bytes using the host's OpenSSL
+// provider.  Paths are opened once with RESOLVE_NO_SYMLINKS, copied into
+// create-only temporary files, and only those immutable snapshots are passed
+// to the verifier.  The return value is the sole authority signal; no
+// registry resolver state is changed by this function.
+fn package_signature_verify_files(index_path: []u8, key_path: []u8,
+    signature_path: []u8) i32 {
+    if (index_path.len == 0 || key_path.len == 0 || signature_path.len == 0) { return 0; }
+    let nonce: i64 = _zag_clock_monotonic_ms();
+    let index_tmp: []u8 = package_signature_temp("index", nonce);
+    let key_tmp: []u8 = package_signature_temp("key", nonce + 1);
+    let signature_tmp: []u8 = package_signature_temp("signature", nonce + 2);
+    // Read, snapshot, and release one large input at a time.  The native
+    // allocator keeps a bounded large-allocation registry; retaining three
+    // 64-KiB read buffers would turn a valid verifier into an avoidable
+    // registry-exhaustion failure.
+    let index: PackageNoFollowRead = package_import_read_nofollow(index_path);
+    let staged: i32 = 0;
+    if (index.ok == 1 && package_registry_signed_index_shape_valid(index.bytes) == 1) {
+        staged = package_signature_write_new(index_tmp, index.bytes);
+    }
+    package_signature_release(&index);
+    if (staged == 1) {
+        let key: PackageNoFollowRead = package_import_read_nofollow(key_path);
+        if (key.ok == 0 || package_signature_write_new(key_tmp, key.bytes) == 0) { staged = 0; }
+        package_signature_release(&key);
+    }
+    if (staged == 1) {
+        let signature: PackageNoFollowRead = package_import_read_nofollow(signature_path);
+        if (signature.ok == 0 || signature.bytes.len != 64 ||
+            package_signature_write_new(signature_tmp, signature.bytes) == 0) { staged = 0; }
+        package_signature_release(&signature);
+    }
+    let result: i32 = 0;
+    if (staged == 1) {
+        let qi: []u8 = package_signature_shell_quote(index_tmp);
+        let qk: []u8 = package_signature_shell_quote(key_tmp);
+        let qs: []u8 = package_signature_shell_quote(signature_tmp);
+        let c1: []u8 = _zag_str_concat(
+            "openssl pkeyutl -verify -pubin -inkey ", qk);
+        let c2: []u8 = _zag_str_concat(c1, " -rawin -in ");
+        _zag_str_free(c1);
+        let c3: []u8 = _zag_str_concat(c2, qi);
+        _zag_str_free(c2);
+        let c4: []u8 = _zag_str_concat(c3, " -sigfile ");
+        _zag_str_free(c3);
+        let c5: []u8 = _zag_str_concat(c4, qs);
+        _zag_str_free(c4);
+        let command: []u8 = _zag_str_concat(c5, " >/dev/null 2>/dev/null");
+        _zag_str_free(c5);
+        result = (_zag_exec_cmd(command) == 0) as i32;
+        _zag_str_free(qi); _zag_str_free(qk); _zag_str_free(qs);
+        _zag_str_free(command);
+    }
+    let _ri: i32 = package_signature_unlink(index_tmp);
+    let _rk: i32 = package_signature_unlink(key_tmp);
+    let _rs: i32 = package_signature_unlink(signature_tmp);
+    _zag_str_free(index_tmp); _zag_str_free(key_tmp); _zag_str_free(signature_tmp);
+    return result;
+}

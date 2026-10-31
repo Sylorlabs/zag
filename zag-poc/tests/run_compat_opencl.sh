@@ -15,6 +15,12 @@ ZNC=${ZNC:-./znc}
 case "$ZNC" in /*) ;; *) ZNC="$PWD/${ZNC#./}";; esac
 tmp=$(mktemp -d /tmp/zag-compat-opencl.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT
+cat >"$tmp/znc-no-zagd" <<EOF
+#!/usr/bin/env bash
+exec "$ZNC" "\$@" --no-zagd
+EOF
+chmod +x "$tmp/znc-no-zagd"
+ZNC="$tmp/znc-no-zagd"
 pass=0
 fail=0
 
@@ -120,6 +126,25 @@ if command -v spirv-dis >/dev/null 2>&1 && [ -f "$tmp/fill.spv" ]; then
     fi
 else
     ok "spirv-dis not installed — skipping entry point name check (skipped)"
+fi
+
+# ── 9. OpenCL C source fallback emission ────────────────────────────────────
+if "$ZNC" "$PWD/tests/opencl_c_emit.zag" --no-analyze --no-zagd -o "$tmp/opencl_c_emit" >/dev/null 2>&1 &&
+   "$tmp/opencl_c_emit" "$tmp/fill.zag" "$tmp/fill.cl" >/dev/null 2>&1 &&
+   [ -f "$tmp/fill.cl" ] && grep -q '^__kernel void fillKernel' "$tmp/fill.cl" &&
+   grep -q 'get_global_id(0)' "$tmp/fill.cl"; then
+    ok "pure-Zag OpenCL C emitter emits a bounded fallback kernel"
+else
+    xx "pure-Zag OpenCL C emitter failed to emit the fallback kernel"
+fi
+
+if [ -x "$tmp/opencl_c_emit" ] &&
+   "$tmp/opencl_c_emit" "$tmp/fill.zag" "$tmp/fill-c-a.cl" >/dev/null 2>&1 &&
+   "$tmp/opencl_c_emit" "$tmp/fill.zag" "$tmp/fill-c-b.cl" >/dev/null 2>&1 &&
+   cmp -s "$tmp/fill-c-a.cl" "$tmp/fill-c-b.cl"; then
+    ok "pure-Zag OpenCL C source emission is deterministic"
+else
+    xx "pure-Zag OpenCL C source emission is not deterministic"
 fi
 
 echo "════ compat-opencl pass=$pass fail=$fail ════"

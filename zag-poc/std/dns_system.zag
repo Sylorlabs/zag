@@ -1,0 +1,248 @@
+// std/dns_system.zag -- bounded Linux system-name resolution.
+//
+// This is an explicit libc boundary, not a DNS wire client or a transparent
+// hostname-to-socket shortcut. It accepts one bounded host/service query,
+// returns at most sixteen IPv4/IPv6 addresses, and owns only the copied result
+// array. The libc addrinfo chain is released before the function returns.
+// Consumers must request the exact dynamic dependency:
+//
+//   znc app.zag --dynamic --needed libc.so.6 -o app
+//
+// IDNA, search domains, DNSSEC, asynchronous resolution, and arbitrary
+// addrinfo flags remain outside this small contract.
+
+@import("rt.zag")
+@import("list.zag")
+
+extern fn getaddrinfo(node: *u8, service: *u8, hints: *u8,
+                      result: **u8) i32 @io;
+extern fn freeaddrinfo(result: *u8) void @io;
+
+struct DnsSystemAddress {
+    family: i32,
+    socktype: i32,
+    protocol: i32,
+    port: i32,
+    high: u64,
+    low: u64,
+    scope: i32,
+}
+
+struct DnsSystemResult {
+    ok: i32,
+    code: i64,
+    count: i32,
+    values: ArrayList[DnsSystemAddress],
+}
+
+fn dns_system_status_ok() i64 { return 0; }
+fn dns_system_status_invalid_argument() i64 { return 0 - 7801; }
+fn dns_system_status_limit() i64 { return 0 - 7802; }
+fn dns_system_status_malformed() i64 { return 0 - 7803; }
+fn dns_system_status_backend() i64 { return 0 - 7804; }
+
+fn dns_system_empty(code: i64) DnsSystemResult {
+    return DnsSystemResult{.ok = 0, .code = code, .count = 0,
+        .values = ArrayList[DnsSystemAddress]{
+            .data = null as *DnsSystemAddress, .len = 0, .cap = 0,
+        }};
+}
+
+fn dns_system_text_valid(value: []u8, maximum: i32) i32 {
+    if (value.len <= 0 || value.len > maximum) { return 0; }
+    let i: i32 = 0;
+    while (i < value.len) {
+        let c: u8 = value[i];
+        if (c == 0 || c < 32 || c > 126) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn dns_system_host_valid(host: []u8) i32 {
+    if (dns_system_text_valid(host, 253) == 0) { return 0; }
+    let i: i32 = 0;
+    while (i < host.len) {
+        let c: u8 = host[i];
+        let alpha: i32 = ((c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z')) as i32;
+        let digit: i32 = (c >= '0' && c <= '9') as i32;
+        if (alpha == 0 && digit == 0 && c != '.' && c != '-' &&
+            c != ':' && c != '%') { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn dns_system_service_valid(service: []u8) i32 {
+    if (dns_system_text_valid(service, 32) == 0) { return 0; }
+    let first_alpha: i32 = ((service[0] >= 'a' && service[0] <= 'z') ||
+        (service[0] >= 'A' && service[0] <= 'Z')) as i32;
+    let i: i32 = 0;
+    while (i < service.len) {
+        let c: u8 = service[i];
+        let alpha: i32 = ((c >= 'a' && c <= 'z') ||
+            (c >= 'A' && c <= 'Z')) as i32;
+        let digit: i32 = (c >= '0' && c <= '9') as i32;
+        if (alpha == 0 && digit == 0 && c != '-') { return 0; }
+        i = i + 1;
+    }
+    if (first_alpha == 1) { return 1; }
+    if (service.len > 5) { return 0; }
+    i = 0;
+    while (i < service.len) {
+        if (service[i] < '0' || service[i] > '9') { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn dns_system_c_string(value: []u8) *u8 {
+    let output: *u8 = _zag_malloc((value.len + 1) as i64) as *u8;
+    if (output == null as *u8) { return null as *u8; }
+    let i: i32 = 0;
+    while (i < value.len) { output[i] = value[i]; i = i + 1; }
+    output[value.len] = 0;
+    return output;
+}
+
+fn dns_system_u16_be(raw: *u8, offset: i32) i32 {
+    return (((raw[offset] as i32) << 8) | raw[offset + 1] as i32);
+}
+fn dns_system_u16_le(raw: *u8, offset: i32) i32 {
+    return (raw[offset] as i32) | ((raw[offset + 1] as i32) << 8);
+}
+fn dns_system_i32_le(raw: *u8, offset: i32) i32 {
+    return (raw[offset] as i32) | ((raw[offset + 1] as i32) << 8) |
+        ((raw[offset + 2] as i32) << 16) | ((raw[offset + 3] as i32) << 24);
+}
+fn dns_system_put_i32_le(raw: *u8, offset: i32, value: i32) void {
+    raw[offset] = value as u8; raw[offset + 1] = (value >> 8) as u8;
+    raw[offset + 2] = (value >> 16) as u8; raw[offset + 3] = (value >> 24) as u8;
+}
+fn dns_system_read_ptr(raw: *u8, offset: i32) *u8 {
+    let slot: **u8 = ((raw as i64) + offset as i64) as **u8;
+    return slot.*;
+}
+fn dns_system_u32_be(raw: *u8, offset: i32) u64 {
+    return ((raw[offset] as u64) << 24) | ((raw[offset + 1] as u64) << 16) |
+        ((raw[offset + 2] as u64) << 8) | (raw[offset + 3] as u64);
+}
+fn dns_system_u32_le(raw: *u8, offset: i32) i32 {
+    return (raw[offset] as i32) | ((raw[offset + 1] as i32) << 8) |
+        ((raw[offset + 2] as i32) << 16) | ((raw[offset + 3] as i32) << 24);
+}
+fn dns_system_u64_be(raw: *u8, offset: i32) u64 {
+    return ((raw[offset] as u64) << 56) | ((raw[offset + 1] as u64) << 48) |
+        ((raw[offset + 2] as u64) << 40) | ((raw[offset + 3] as u64) << 32) |
+        ((raw[offset + 4] as u64) << 24) | ((raw[offset + 5] as u64) << 16) |
+        ((raw[offset + 6] as u64) << 8) | (raw[offset + 7] as u64);
+}
+
+fn dns_system_parse(raw: *u8, out: *DnsSystemAddress) i32 {
+    if (raw == null as *u8) { return 0; }
+    let family_declared: i32 = dns_system_i32_le(raw, 4);
+    let socktype: i32 = dns_system_i32_le(raw, 8);
+    let protocol: i32 = dns_system_i32_le(raw, 12);
+    let addrlen: i32 = dns_system_i32_le(raw, 16);
+    let bytes: *u8 = dns_system_read_ptr(raw, 24);
+    if (bytes == null as *u8 || addrlen < 2 ||
+        (family_declared != 2 && family_declared != 10)) { return 0; }
+    // sockaddr family is a host-order u16; ports and address bytes are
+    // network-order fields.
+    let family: i32 = dns_system_u16_le(bytes, 0);
+    if (family != family_declared) { return 0; }
+    let port: i32 = dns_system_u16_be(bytes, 2);
+    if (family == 2) {
+        if (addrlen < 16) { return 0; }
+        out.* = DnsSystemAddress{.family = family,
+            .socktype = socktype, .protocol = protocol,
+            .port = port, .high = 0,
+            .low = dns_system_u32_be(bytes, 4), .scope = 0};
+        return 1;
+    }
+    if (addrlen < 28) { return 0; }
+    out.* = DnsSystemAddress{.family = family,
+        .socktype = socktype, .protocol = protocol,
+        .port = port, .high = dns_system_u64_be(bytes, 8),
+        .low = dns_system_u64_be(bytes, 16),
+        .scope = dns_system_u32_le(bytes, 24)};
+    return 1;
+}
+
+fn dns_system_free(result: *DnsSystemResult) void {
+    if (result == null as *DnsSystemResult) { return; }
+    if (result.*.values.data != null as *DnsSystemAddress) {
+        free[DnsSystemAddress](&result.*.values);
+    }
+    result.*.values = ArrayList[DnsSystemAddress]{
+        .data = null as *DnsSystemAddress, .len = 0, .cap = 0};
+    result.*.count = 0; result.*.ok = 0;
+    result.*.code = dns_system_status_backend();
+}
+
+fn dns_system_resolve(host: []u8, service: []u8,
+                      family: i32, socktype: i32) DnsSystemResult {
+    if (dns_system_host_valid(host) == 0 ||
+        dns_system_service_valid(service) == 0 ||
+        (family != 0 && family != 2 && family != 10) ||
+        (socktype != 0 && socktype != 1 && socktype != 2)) {
+        return dns_system_empty(dns_system_status_invalid_argument());
+    }
+    let node: *u8 = dns_system_c_string(host);
+    let port: *u8 = dns_system_c_string(service);
+    if (node == null as *u8 || port == null as *u8) {
+        if (node != null as *u8) { _zag_free(node as *i8); }
+        if (port != null as *u8) { _zag_free(port as *i8); }
+        return dns_system_empty(dns_system_status_backend());
+    }
+    // Zag's ordinary i32 struct layout is intentionally wider than the C
+    // addrinfo layout, so construct the 48-byte hints prefix as raw bytes.
+    let hints: *u8 = _zag_malloc(48) as *u8;
+    if (hints == null as *u8) {
+        _zag_free(node as *i8); _zag_free(port as *i8);
+        return dns_system_empty(dns_system_status_backend());
+    }
+    let hi: i32 = 0;
+    while (hi < 48) { hints[hi] = 0; hi = hi + 1; }
+    dns_system_put_i32_le(hints, 4, family);
+    dns_system_put_i32_le(hints, 8, socktype);
+    let output: **u8 = _zag_malloc(8) as **u8;
+    if (output == null as **u8) {
+        _zag_free(node as *i8); _zag_free(port as *i8); _zag_free(hints as *i8);
+        return dns_system_empty(dns_system_status_backend());
+    }
+    output.* = null as *u8;
+    let rc: i32 = getaddrinfo(node, port, hints, output);
+    _zag_free(node as *i8); _zag_free(port as *i8); _zag_free(hints as *i8);
+    if (rc != 0 || output.* == null as *u8) {
+        _zag_free(output as *i8);
+        if (rc == 0) { return dns_system_empty(dns_system_status_malformed()); }
+        return dns_system_empty(0 - (rc as i64));
+    }
+    let values: ArrayList[DnsSystemAddress] = make[DnsSystemAddress](16);
+    if (values.data == null as *DnsSystemAddress) {
+        freeaddrinfo(output.*); _zag_free(output as *i8);
+        return dns_system_empty(dns_system_status_backend());
+    }
+    let cursor: *u8 = output.*;
+    let count: i32 = 0; let malformed: i32 = 0;
+    while (cursor != null as *u8 && count < 16) {
+        let parsed: DnsSystemAddress = DnsSystemAddress{.family = 0,
+            .socktype = 0, .protocol = 0, .port = 0, .high = 0,
+            .low = 0, .scope = 0};
+        if (dns_system_parse(cursor, &parsed) == 0) {
+            malformed = 1;
+        } else { push[DnsSystemAddress](&values, parsed); count = count + 1; }
+        cursor = dns_system_read_ptr(cursor, 40);
+    }
+    let too_many: i32 = (cursor != null as *u8) as i32;
+    freeaddrinfo(output.*); _zag_free(output as *i8);
+    if (malformed != 0 || too_many != 0 || count <= 0) {
+        free[DnsSystemAddress](&values);
+        if (too_many != 0) { return dns_system_empty(dns_system_status_limit()); }
+        return dns_system_empty(dns_system_status_malformed());
+    }
+    return DnsSystemResult{.ok = 1, .code = dns_system_status_ok(),
+        .count = count, .values = values};
+}

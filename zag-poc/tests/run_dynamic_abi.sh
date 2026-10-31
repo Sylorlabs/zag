@@ -49,7 +49,7 @@ if "$ZNC_BIN" "$WORK/float.zag" --dynamic --needed libm.so.6 \
     --no-analyze -o "$WORK/float" >"$WORK/float.log" 2>&1; then
     bad "unsupported float ABI accepted"
 else
-    grep -q 'dynamic extern ABI supports scalar integers' "$WORK/float.log" && ok "legacy float ABI remains rejected without @cabi" || bad "missing ABI rejection diagnostic"
+    grep -q 'foreign ABI supports scalar integers' "$WORK/float.log" && ok "legacy float ABI remains rejected without @cabi" || bad "missing ABI rejection diagnostic"
 fi
 
 # Edition-2027 foreign calls require an explicit C-ABI contract and an unsafe
@@ -228,7 +228,7 @@ printf 'extern fn getpid() i64 @cabi; fn main() i32 { return 0; }\n' >"$WORK/v2-
 if (cd "$WORK/v2-cabi" && "$ZNC_BIN" main.zag --no-zagd --no-analyze -o nodynamic) >"$WORK/v2-cabi/nodynamic.log" 2>&1; then
     bad "v2 @cabi accepted without dynamic mode"
 else
-    grep -q 'v2 @cabi imports require --dynamic' "$WORK/v2-cabi/nodynamic.log" && ok "v2 @cabi rejects without dynamic mode" || bad "missing dynamic-mode diagnostic"
+    grep -q 'v2 @cabi imports require an explicit dynamic library or static archive' "$WORK/v2-cabi/nodynamic.log" && ok "v2 @cabi rejects without dynamic mode" || bad "missing dynamic-mode diagnostic"
 fi
 
 # `--emit-obj` has a real i686 ET_REL path, but it is not evidence for the

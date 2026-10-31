@@ -1,0 +1,188 @@
+// std/opencl_runtime.zag — bounded OpenCL compute runtime for Zag.
+//
+// The adapter uses the OpenCL ICD through the v2 scalar C ABI.  It tries the
+// emitted SPIR-V IL first and falls back to emitted OpenCL C when the device
+// accepts OpenCL but does not expose usable IL entry points.  The public
+// dispatch is intentionally bounded and copies the ICD's packed i32 results
+// into Zag's eight-byte native scalar slots.
+
+@import("gpu_compat_contract.zag")
+
+extern fn _zag_raw_syscall(n:i64,a:i64,b:i64,c:i64,d:i64,e:i64,f:i64) i64;
+
+extern fn mmap(addr:*u8, len:i64, prot:i32, flags:i32, fd:i32, offset:i64) *u8 @cabi;
+extern fn munmap(addr:*u8, len:i64) i32 @cabi @borrows_mut;
+
+extern fn clGetPlatformIDs(entries:i64, platforms:i64, count:i64) i32 @cabi;
+extern fn clGetDeviceIDs(platform:i64, device_type:i64, entries:i64, devices:i64, count:i64) i32 @cabi;
+extern fn clCreateContext(properties:i64, device_count:i64, devices:i64, notify:i64, user:i64, error:i64) i64 @cabi;
+extern fn clReleaseContext(context:i64) i32 @cabi;
+extern fn clCreateCommandQueueWithProperties(context:i64, device:i64, properties:i64, error:i64) i64 @cabi;
+extern fn clReleaseCommandQueue(queue:i64) i32 @cabi;
+extern fn clCreateBuffer(context:i64, flags:i64, size:i64, host:i64, error:i64) i64 @cabi;
+extern fn clReleaseMemObject(buffer:i64) i32 @cabi;
+extern fn clCreateProgramWithIL(context:i64, il:i64, length:i64, error:i64) i64 @cabi;
+extern fn clCreateProgramWithSource(context:i64, count:i64, strings:i64, lengths:i64, error:i64) i64 @cabi;
+extern fn clBuildProgram(program:i64, device_count:i64, devices:i64, options:i64, notify:i64, user:i64) i32 @cabi;
+extern fn clReleaseProgram(program:i64) i32 @cabi;
+extern fn clCreateKernel(program:i64, name:i64, error:i64) i64 @cabi;
+extern fn clReleaseKernel(kernel:i64) i32 @cabi;
+extern fn clSetKernelArg(kernel:i64, index:i64, size:i64, value:i64) i32 @cabi;
+extern fn clEnqueueNDRangeKernel(queue:i64, kernel:i64, dimensions:i64, offset:i64, global_size:i64, local_size:i64, events:i64, event_list:i64, event:i64) i32 @cabi;
+extern fn clEnqueueReadBuffer(queue:i64, buffer:i64, blocking:i64, offset:i64, size:i64, host:i64, events:i64, event_list:i64, event:i64) i32 @cabi;
+extern fn clFinish(queue:i64) i32 @cabi;
+
+struct ZagOpenCLCompatContext {
+    platform:i64,
+    device:i64,
+    context:i64,
+    queue:i64,
+    available:bool,
+    error_code:i32,
+}
+
+fn cl_ok(rc:i32) bool { return rc==0; }
+
+fn zag_opencl_compat_open() ZagOpenCLCompatContext @compatLoad {
+    let ctx:ZagOpenCLCompatContext=ZagOpenCLCompatContext{.platform=0,.device=0,.context=0,.queue=0,.available=false,.error_code=0};
+    unsafe {
+        let platform_count:u32=0;
+        let rc_platforms:i32=clGetPlatformIDs(0,0,(&platform_count) as i64);
+        if (!cl_ok(rc_platforms)||platform_count==0) { ctx.error_code=-100; return ctx; }
+        let platform_mem:*u8=mmap(null as *u8,8,3,34,-1,0);
+        let platform_out:*i64=platform_mem as *i64;
+        let rc_platform:i32=clGetPlatformIDs(1,platform_mem as i64,0);
+        if (!cl_ok(rc_platform)) { munmap(platform_mem,8); ctx.error_code=rc_platform; return ctx; }
+        ctx.platform=platform_out[0];
+        let device_count:u32=0;
+        let rc_devices:i32=clGetDeviceIDs(ctx.platform,4,0,0,(&device_count) as i64);
+        if (!cl_ok(rc_devices)||device_count==0) { munmap(platform_mem,8); ctx.error_code=-101; return ctx; }
+        let device_mem:*u8=mmap(null as *u8,8,3,34,-1,0);
+        let device_out:*i64=device_mem as *i64;
+        let rc_device:i32=clGetDeviceIDs(ctx.platform,4,1,device_mem as i64,0);
+        munmap(platform_mem,8);
+        if (!cl_ok(rc_device)) { munmap(device_mem,8); ctx.error_code=rc_device; return ctx; }
+        ctx.device=device_out[0];
+        let error:i32=0;
+        let context_handle:i64=clCreateContext(0,1,device_mem as i64,0,0,(&error) as i64);
+        ctx.context=context_handle;
+        munmap(device_mem,8);
+        if (error!=0||ctx.context==0) { ctx.error_code=error; return ctx; }
+        let queue_handle:i64=clCreateCommandQueueWithProperties(ctx.context,ctx.device,0,(&error) as i64);
+        ctx.queue=queue_handle;
+        if (error!=0||ctx.queue==0) { clReleaseContext(ctx.context); ctx.context=0; ctx.error_code=error; return ctx; }
+        ctx.available=true;
+        return ctx;
+    }
+}
+
+fn zag_opencl_compat_close(ctx:*ZagOpenCLCompatContext) void @compatLoad {
+    unsafe {
+        if (ctx.queue!=0) { clFinish(ctx.queue); clReleaseCommandQueue(ctx.queue); ctx.queue=0; }
+        if (ctx.context!=0) { clReleaseContext(ctx.context); ctx.context=0; }
+        ctx.available=false;
+    }
+}
+
+// ROCm may retain worker threads after the compiler-owned Linux `exit`
+// syscall.  Hosts that need a process-level boundary can use this explicit
+// finalizer after the last OpenCL dispatch; it drains/releases the context and
+// terminates the complete process group with Linux exit_group.  It is never
+// called implicitly by the adapter.
+fn zag_opencl_compat_shutdown_process(ctx:*ZagOpenCLCompatContext,status:i32) void {
+    zag_opencl_compat_close(ctx);
+    unsafe { _zag_raw_syscall(231,status as i64,0,0,0,0,0); }
+}
+
+fn cl_fill_name() *u8 {
+    unsafe {
+        let mem:*u8=mmap(null as *u8,16,3,34,-1,0);
+        mem[0]='f'; mem[1]='i'; mem[2]='l'; mem[3]='l'; mem[4]='K'; mem[5]='e'; mem[6]='r'; mem[7]='n'; mem[8]='e'; mem[9]='l'; mem[10]=0;
+        return mem;
+    }
+}
+
+fn cl_unmap_source(source_mem:*u8, source_len_mem:*u8) void {
+    unsafe {
+        if (source_mem!=null as *u8) { munmap(source_len_mem,8); munmap(source_mem,8); }
+    }
+}
+
+fn zag_opencl_compat_dispatch(ctx:*ZagOpenCLCompatContext, spirv_code:*u8, spirv_size:u64, opencl_source:*u8, opencl_source_size:u64, kernel_name:*u8, output_buffer:*i32, output_count:u32, value:i32, count:i32, global_work_size:u64, local_work_size:u64, timeout_ns:u64) i32 @compatDispatch {
+    if (!ctx.available) { return -200; }
+    let contract_rc:i32=zag_gpu_compat_validate(
+        ZagGpuCompatReadback{.output_buffer=output_buffer,.output_count=output_count},
+        ZagGpuCompatLaunch{.group_count_x=global_work_size as u32,.group_count_y=1,.group_count_z=1,.local_work_size=local_work_size,.timeout_ns=timeout_ns});
+    if (contract_rc!=0) { return contract_rc; }
+    if (global_work_size==0 || global_work_size>1048576) { return -203; }
+    if ((spirv_code==null as *u8 || spirv_size==0) && (opencl_source==null as *u8 || opencl_source_size==0)) { return -204; }
+    if (opencl_source_size>1048576) { return -205; }
+    unsafe {
+        let error:i32=0;
+        let buffer:i64=clCreateBuffer(ctx.context,1,(output_count as i64)*4,0,(&error) as i64);
+        if (error!=0||buffer==0) { return error; }
+        let program:i64=0;
+        if (spirv_code!=null as *u8 && spirv_size>0) {
+            program=clCreateProgramWithIL(ctx.context,spirv_code as i64,spirv_size as i64,(&error) as i64);
+        }
+        let source_available:bool=opencl_source!=null as *u8 && opencl_source_size>0;
+        let source_mem:*u8=null as *u8;
+        let source_len_mem:*u8=null as *u8;
+        if (source_available) {
+            source_mem=mmap(null as *u8,8,3,34,-1,0);
+            let source_slot:*i64=source_mem as *i64;
+            source_slot[0]=opencl_source as i64;
+            source_len_mem=mmap(null as *u8,8,3,34,-1,0);
+            let source_len:*i64=source_len_mem as *i64;
+            source_len[0]=opencl_source_size as i64;
+        }
+        let build_device_mem:*u8=mmap(null as *u8,8,3,34,-1,0);
+        let build_device:*i64=build_device_mem as *i64;
+        build_device[0]=ctx.device;
+        let active_program:i64=program;
+        let built:i32=-1;
+        if (program!=0&&error==0) { built=clBuildProgram(program,1,build_device_mem as i64,0,0,0); }
+        if (program==0||error!=0||built!=0) {
+            if (program!=0) { clReleaseProgram(program); }
+            if (!source_available) { munmap(build_device_mem,8); clReleaseMemObject(buffer); return -206; }
+            active_program=clCreateProgramWithSource(ctx.context,1,source_mem as i64,source_len_mem as i64,(&error) as i64);
+            if (error!=0||active_program==0) { munmap(build_device_mem,8); cl_unmap_source(source_mem,source_len_mem); clReleaseMemObject(buffer); return error; }
+            let source_build:i32=clBuildProgram(active_program,1,build_device_mem as i64,0,0,0);
+            if (source_build!=0) { clReleaseProgram(active_program); munmap(build_device_mem,8); cl_unmap_source(source_mem,source_len_mem); clReleaseMemObject(buffer); return source_build; }
+        }
+        munmap(build_device_mem,8);
+        let name_mem:*u8=kernel_name;
+        if (name_mem==null as *u8) { name_mem=cl_fill_name(); }
+        let kernel:i64=clCreateKernel(active_program,name_mem as i64,(&error) as i64);
+        if (kernel==0||error!=0) { clReleaseProgram(active_program); cl_unmap_source(source_mem,source_len_mem); if (name_mem!=kernel_name) { munmap(name_mem,16); } clReleaseMemObject(buffer); return error; }
+        let rc_arg0:i32=clSetKernelArg(kernel,0,8,(&buffer) as i64);
+        let rc_arg1:i32=clSetKernelArg(kernel,1,4,(&value) as i64);
+        let rc_arg2:i32=clSetKernelArg(kernel,2,4,(&count) as i64);
+        if (rc_arg0!=0||rc_arg1!=0||rc_arg2!=0) { clReleaseKernel(kernel); clReleaseProgram(active_program); cl_unmap_source(source_mem,source_len_mem); if (name_mem!=kernel_name) { munmap(name_mem,16); } clReleaseMemObject(buffer); return -210; }
+        let global_mem:*u8=mmap(null as *u8,8,3,34,-1,0);
+        let global:*i64=global_mem as *i64; global[0]=global_work_size as i64;
+        let local_mem:*u8=mmap(null as *u8,8,3,34,-1,0);
+        let local:*i64=local_mem as *i64; local[0]=local_work_size as i64;
+        let local_arg:i64=0;
+        if (local_work_size!=0) { local_arg=local_mem as i64; }
+        let rc_enqueue:i32=clEnqueueNDRangeKernel(ctx.queue,kernel,1,0,global_mem as i64,local_arg,0,0,0);
+        if (rc_enqueue!=0) { munmap(local_mem,8); munmap(global_mem,8); clReleaseKernel(kernel); clReleaseProgram(active_program); cl_unmap_source(source_mem,source_len_mem); if (name_mem!=kernel_name) { munmap(name_mem,16); } clReleaseMemObject(buffer); return rc_enqueue; }
+        let packed_mem:*u8=mmap(null as *u8,(output_count as i64)*4,3,34,-1,0);
+        let rc_read:i32=clEnqueueReadBuffer(ctx.queue,buffer,1,0,(output_count as i64)*4,packed_mem as i64,0,0,0);
+        let rc_finish:i32=clFinish(ctx.queue);
+        if (rc_read!=0||rc_finish!=0) { munmap(packed_mem,(output_count as i64)*4); munmap(local_mem,8); munmap(global_mem,8); clReleaseKernel(kernel); clReleaseProgram(active_program); cl_unmap_source(source_mem,source_len_mem); if (name_mem!=kernel_name && name_mem!=null as *u8) { munmap(name_mem,16); } clReleaseMemObject(buffer); if (rc_read!=0) { return rc_read; } return rc_finish; }
+        let packed:*u8=packed_mem as *u8;
+        let dst:*u8=output_buffer as *u8;
+        let i:u32=0;
+        while (i<output_count) { let si:i32=(i as i32)*4; let di:i32=(i as i32)*8; dst[di]=packed[si]; dst[di+1]=packed[si+1]; dst[di+2]=packed[si+2]; dst[di+3]=packed[si+3]; dst[di+4]=0; dst[di+5]=0; dst[di+6]=0; dst[di+7]=0; i=i+1; }
+        munmap(packed_mem,(output_count as i64)*4); munmap(local_mem,8); munmap(global_mem,8); clReleaseKernel(kernel); clReleaseProgram(active_program); cl_unmap_source(source_mem,source_len_mem); if (name_mem!=kernel_name && name_mem!=null as *u8) { munmap(name_mem,16); } clReleaseMemObject(buffer);
+        return 0;
+    }
+}
+
+fn zag_opencl_compat_available() bool @compatLoad {
+    let ctx:ZagOpenCLCompatContext=zag_opencl_compat_open();
+    let ok:bool=ctx.available;
+    zag_opencl_compat_close(&ctx);
+    return ok;
+}

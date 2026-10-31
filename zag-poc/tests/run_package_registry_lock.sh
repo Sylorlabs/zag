@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+ZNC_BIN=${ZNC:-./znc}
+case "$ZNC_BIN" in
+    /*) ;;
+    *) ZNC_BIN="$PWD/${ZNC_BIN#./}" ;;
+esac
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/zag-package-registry-lock.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+
+"$ZNC_BIN" check selfhost/package_registry_lock.zag --analyze-strict \
+    --no-zagd --no-foreground-cache >"$tmp/check.log" 2>&1
+grep -q 'znc: OK — all capability claims proven' "$tmp/check.log"
+
+"$ZNC_BIN" selfhost/package_registry_lock_test.zag -o "$tmp/test" \
+    --no-zagd --no-analyze --no-foreground-cache >"$tmp/build.log" 2>&1
+test -x "$tmp/test"
+"$tmp/test" >"$tmp/out"
+grep -qx 'package registry lock: 18/18' "$tmp/out"
+
+echo 'package registry lock: pass=18 fail=0 (validation-only offline pin codec)'
