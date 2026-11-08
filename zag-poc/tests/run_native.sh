@@ -475,6 +475,20 @@ else
     echo "  ok  native edge-case battery (all edge cases pass)"; pass=$((pass+1))
 fi
 
+echo "── process_exit integration test ──"
+OUT=$("$ZNC" tests/test_process_exit.zag -o "$WORK/zag_test_process_exit" --no-analyze --no-zagd --no-foreground-cache 2>&1)
+if echo "$OUT" | grep -q "error\|aborted"; then
+    echo "  XX  process_exit test compile failed"; echo "$OUT" | head -8; fail=$((fail+1))
+else
+    RES=$("$WORK/zag_test_process_exit" 2>&1)
+    if echo "$RES" | grep -q "FAIL"; then
+        echo "  XX  process_exit: $(echo "$RES" | grep FAIL | head -5)"; fail=$((fail+1))
+    else
+        echo "  ok  process_exit: subprocess exit code handling (0, 42, 125)"; pass=$((pass+1))
+    fi
+fi
+rm -f "$WORK/zag_test_process_exit"
+
 echo "── #embed compile-time binary file inclusion ──"
 printf 'Hello from embed!' > "$WORK/embed_data.bin"
 cat > "$WORK/embed_test.zag" <<'ZAGEOF'
