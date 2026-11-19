@@ -227,9 +227,27 @@ fn cg_sign_bit() i64 { return (0 - cg_i64_max()) - 1; }
 // exact rational num/den, take its integer part's bits, then peel fractional
 // bits by binary long division (remainder×2 / den — overflow-safe since the
 // remainder stays < den ≤ 10^18 < 2^60), collect 54 bits (53 + round), and
-// round-to-nearest-even. Magnitudes whose num/den would overflow i64 are
-// REJECTED LOUDLY (cg_err) — never mis-encoded. Bit-exact vs strtod across a
-// 32-value cross-check (0.5,1.5,3.14,0.0001,0.0219929,6.022e23,1e-10,…).
+// round-to-nearest-even. Bit-exact vs strtod across a 32-value cross-check
+// (0.5,1.5,3.14,0.0001,0.0219929,6.022e23,1e-10,…). Magnitudes whose num/den
+// would overflow i64 (|decExp| > 18 or num·10^decExp overflowing) fall back to
+// correctly-rounded f64 scaling by powers of ten — a few ulp at most, and it
+// reaches every magnitude including inf and denormals instead of rejecting.
+// Correctly-rounded f64 bit patterns of 10^(2^i), i = 0..8. Used by
+// zf64_bits_core to scale literals whose decimal exponent lies outside the
+// exact-integer window; literals cannot appear here (this file parses them),
+// so the powers arrive as raw IEEE-754 bit patterns punned to f64.
+fn zf64_pow10_bits(i: i32) i64 {
+    if (i == 0) { return 0x4024000000000000; }        // 1e1
+    if (i == 1) { return 0x4059000000000000; }        // 1e2
+    if (i == 2) { return 0x40c3880000000000; }        // 1e4
+    if (i == 3) { return 0x4197d78400000000; }        // 1e8
+    if (i == 4) { return 0x4341c37937e08000; }        // 1e16
+    if (i == 5) { return 0x4693b8b5b5056e17; }        // 1e32
+    if (i == 6) { return 0x4d384f03e93ff9f5; }        // 1e64
+    if (i == 7) { return 0x5a827748f9301d32; }        // 1e128
+    return 0x75154fdd7f73bf3c;                        // 1e256
+}
+
 fn zf64_bits_core(s: []u8, errflag: *i32) i64 {
     let n: i32 = s.len;
     let i: i32 = 0;
@@ -294,24 +312,62 @@ fn zf64_bits_core(s: []u8, errflag: *i32) i64 {
     let dexp: i32 = expval - fracdigits;
     let imax: i64 = cg_i64_max();
 
-    // form num/den (one of them is 1) with overflow guards.
+    // The exact-integer path forms num/den = m·10^|dexp| inside i64, which
+    // only fits while |dexp| <= 18 and m·10^dexp does not overflow. Beyond
+    // that window — 1.5e-300, 1e40, subnormals — the value is evaluated in
+    // f64 with one correctly-rounded operation per power-of-ten bit (≤ a few
+    // ulp total), which covers every magnitude including inf and denormals.
+    let p10: i64 = 1;
+    let exact_ok: i32 = 1;
+    if (dexp > 18 || dexp < -18) { exact_ok = 0; }
+    else if (dexp >= 0) {
+        let k0: i32 = 0;
+        while (k0 < dexp) { p10 = p10 * 10; k0 = k0 + 1; }
+        if (m > imax / p10) { exact_ok = 0; }
+    } else {
+        let k0b: i32 = 0;
+        let kb: i32 = 0 - dexp;
+        while (k0b < kb) { p10 = p10 * 10; k0b = k0b + 1; }
+    }
+    if (exact_ok == 0) {
+        // val = m · 10^dexp, applied one f64 mul/div per 10^(2^i) factor.
+        let val: f64 = m as f64;
+        let ea: i32 = dexp;
+        if (ea < 0) { ea = 0 - ea; }
+        if (ea > 511) {
+            // beyond the table: overflows to ±inf or underflows to ±0
+            if (dexp > 0) {
+                let ib: i64 = (2047 as i64) * cg_pow2(52);
+                if (neg == 1) { return ib + cg_sign_bit(); }
+                return ib;
+            }
+            if (neg == 1) { return cg_sign_bit(); }
+            return 0;
+        }
+        let pi: i32 = 0;
+        while (pi < 9) {
+            if ((ea % 2) == 1) {
+                let fb: i64 = zf64_pow10_bits(pi);
+                let fp: *f64 = (&fb) as *f64;
+                let f: f64 = fp.*;
+                if (dexp > 0) { val = val * f; } else { val = val / f; }
+            }
+            ea = ea / 2;
+            pi = pi + 1;
+        }
+        let vp: *i64 = (&val) as *i64;
+        let vbits: i64 = vp.*;
+        if (neg == 1) { vbits = vbits + cg_sign_bit(); }
+        return vbits;
+    }
+
+    // form num/den (one of them is 1); both fit i64 on this path.
     let num: i64 = m;
     let den: i64 = 1;
     if (dexp >= 0) {
-        let k: i32 = 0;
-        while (k < dexp) {
-            if (num > imax / 10) { errflag.* = 1; return 0; }
-            num = num * 10;
-            k = k + 1;
-        }
+        num = m * p10;
     } else {
-        let k2: i32 = 0;
-        let kk: i32 = 0 - dexp;
-        while (k2 < kk) {
-            if (den > imax / 10) { errflag.* = 1; return 0; }
-            den = den * 10;
-            k2 = k2 + 1;
-        }
+        den = p10;
     }
 
     // binary long division → 54-bit significand (top bit set) + sticky.
@@ -863,6 +919,13 @@ fn cg_expr_type(n: *Node, env: *Env, syms: ArrayList[FnSym], cg: *Cg) []u8 {
                             @strEq(cid.name, "@vsaDimension") || @strEq(cid.name, "@vsaWordCount")) { return "i64"; }
                         // cache builtins that return a slice type.
                         if (@strEq(cid.name[1..], "cacheAlignedAlloc")) { return "[]f32"; }
+                        // packed-f32 SIMD builtins: scalar-returning forms are
+                        // f64 (the widened accumulator); the rest are void.
+                        if (@strEq(cid.name, "@simdF32Dot") || @strEq(cid.name, "@simdF32Sum")) { return "f64"; }
+                        if (@strEq(cid.name, "@simdF32Dot4") || @strEq(cid.name, "@simdF32Axpy") ||
+                            @strEq(cid.name, "@simdF32Add") || @strEq(cid.name, "@simdF32Sub") ||
+                            @strEq(cid.name, "@simdF32Mul") || @strEq(cid.name, "@simdF32Scale") ||
+                            @strEq(cid.name, "@simdF32Copy")) { return "void"; }
                         return "";
                     } }
                     // native-runtime externs (_zag_*) → their syscall return type.
@@ -989,7 +1052,7 @@ fn cg_expr_type(n: *Node, env: *Env, syms: ArrayList[FnSym], cg: *Cg) []u8 {
             // []u8. A *u8 pointer base (e.g. ArrayList[u8].data) yields []u8.
             // A word-stride numeric slice []E yields []E (same element type).
             let bt: []u8 = cg_expr_type(sl.base, env, syms, cg);
-            if (cg_slice_is_word(bt) == 1) { return bt; }   // []i32, []sat_i16, etc.
+            if (cg_slice_elem_stride(cg, bt) > 1) { return bt; }   // []i32, []f32, []sat_i16, etc.
             if (cg_type_is_slice(cg, bt) == 1) { return "[]u8"; }
             switch (sl.base.*) { .slit => |_s| { return "[]u8"; } else => { } }
             let pointer_slice: []u8 = cg_pointer_slice_type(cg, bt);
@@ -1377,8 +1440,7 @@ fn cg_lower_addr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
             // stride*i. The base aggregate's data pointer lives at word 0. stride
             // is 1 for a []u8/[]i8 byte slice, 8 for a word-stride numeric slice.
             if (cg_type_is_slice(cg, ixt) == 1) {
-                let wstride: i32 = 1;
-                if (cg_slice_is_word(ixt) == 1) { wstride = 8; }
+                let wstride: i32 = cg_slice_elem_stride(cg, ixt);   // 1 byte / 4 packed f32 / 8 word
                 cg_push_base_addr(out, ix.base, env, syms, cg);   // pushes block base
                 push[Instr](out, i_pop(R_R8()));                   // r8 = block base
                 push[Instr](out, i_load(R_RDX(), R_R8(), 8));     // rdx = len
@@ -1890,7 +1952,14 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                 push[Instr](out,i_mov_rr(R_RDI(),R_RAX()));
                 let align:i32=1;if(pet.len>0){align=cg_type_alignment(cg,pet);}
                 cg_emit_checked_raw_access(out,cg,align,cg_elem_stride(cg,pet));
-                push[Instr](out, i_load(R_RAX(), R_RAX(), 0));
+                if (cg_elem_is_f32(cg_norm_type(pet)) == 1) {
+                    // packed f32 cell: movss + widen to the internal f64 repr
+                    push[Instr](out, i_fmovss_load(R_XMM0(), R_RAX(), 0));
+                    push[Instr](out, i_fss2sd(R_XMM0(), R_XMM0()));
+                    push[Instr](out, i_fmovq_xg(R_RAX(), R_XMM0()));
+                } else {
+                    push[Instr](out, i_load(R_RAX(), R_RAX(), 0));
+                }
                 push[Instr](out, i_push(R_RAX()));
                 return;
             }
@@ -1968,7 +2037,7 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
             // element is the full 8-byte word at [data + 8*i].
             let ixt: []u8 = cg_expr_type(ix.base, env, syms, cg);
             if (cg_type_is_slice(cg, ixt) == 1) {
-                let word: i32 = cg_slice_is_word(ixt);
+                let estride: i32 = cg_slice_elem_stride(cg, ixt);   // 1 / 4 / 8
                 cg_push_base_addr(out, ix.base, env, syms, cg);     // pushes block base
                 push[Instr](out, i_pop(R_R8()));                     // r8 = block base
                 push[Instr](out, i_load(R_RDX(), R_R8(), 8));       // rdx = len
@@ -1991,15 +2060,20 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                 cg_emit_panic(out, "panic: slice index out of bounds", l_dead_idx, cg);
                 push[Instr](out, i_label(l_ok_idx));
                 push[Instr](out, i_pop(R_RAX()));               // rax = data ptr
-                if (word == 1) {
-                    push[Instr](out, i_mov_imm(R_RDX(), 8));
-                    push[Instr](out, i_imul(R_RCX(), R_RDX()));  // rcx = 8*i
+                if (estride != 1) {
+                    push[Instr](out, i_mov_imm(R_RDX(), estride as i64));
+                    push[Instr](out, i_imul(R_RCX(), R_RDX()));  // rcx = stride*i
                 }
                 push[Instr](out, i_add(R_RAX(), R_RCX()));      // rax = ptr + stride*i
-                if (word == 0) {
-                    push[Instr](out, i_load8(R_RAX(), R_RAX(), 0));
-                } else {
+                if (estride == 4) {
+                    // packed f32 element: movss + widen to the internal f64 repr
+                    push[Instr](out, i_fmovss_load(R_XMM0(), R_RAX(), 0));
+                    push[Instr](out, i_fss2sd(R_XMM0(), R_XMM0()));
+                    push[Instr](out, i_fmovq_xg(R_RAX(), R_XMM0()));
+                } else if (estride == 8) {
                     push[Instr](out, i_load(R_RAX(), R_RAX(), 0));
+                } else {
+                    push[Instr](out, i_load8(R_RAX(), R_RAX(), 0));
                 }
                 push[Instr](out, i_push(R_RAX()));
                 return;
@@ -2025,6 +2099,12 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                         push[Instr](out, i_push(R_RAX()));
                     } else if (cg_elem_is_byte(elemty) == 1) {
                         push[Instr](out, i_load8(R_RAX(), R_RAX(), 0));
+                        push[Instr](out, i_push(R_RAX()));
+                    } else if (cg_elem_is_f32(elemty) == 1) {
+                        // packed f32 cell: movss + widen to the internal f64 repr
+                        push[Instr](out, i_fmovss_load(R_XMM0(), R_RAX(), 0));
+                        push[Instr](out, i_fss2sd(R_XMM0(), R_XMM0()));
+                        push[Instr](out, i_fmovq_xg(R_RAX(), R_XMM0()));
                         push[Instr](out, i_push(R_RAX()));
                     } else {
                         push[Instr](out, i_load(R_RAX(), R_RAX(), 0));  // scalar word
@@ -2077,10 +2157,12 @@ fn cg_lower_slice(out: *ArrayList[Instr], sl: Slice, env: *Env, syms: ArrayList[
     }
     if (handled == 0) {
         let bt: []u8 = cg_expr_type(sl.base, env, syms, cg);
-        if (cg_slice_is_word(bt) == 1) {
-            // WORD-stride numeric slice ([]sat_i16, []fixed_I_F, []posit32, etc.).
-            // Each element occupies 8 bytes in memory.  The new sub-slice is:
-            //   ptr = base.ptr + lo * 8
+        let sst: i32 = cg_slice_elem_stride(cg, bt);
+        if (sst > 1) {
+            // WIDE-stride numeric slice ([]sat_i16, []fixed_I_F, []posit32, []f64,
+            // packed []f32).  Each element occupies `sst` bytes in memory.  The
+            // new sub-slice is:
+            //   ptr = base.ptr + lo * sst
             //   len = hi - lo
             // We load the base {ptr,len} block, compute lo/hi, then build the
             // result block exactly like the []u8 path below but multiply lo by 8
@@ -2105,12 +2187,12 @@ fn cg_lower_slice(out: *ArrayList[Instr], sl: Slice, env: *Env, syms: ArrayList[
                 push[Instr](out, i_load(R_RAX(), R_RBP(), src + 8));   // hi = base len
             }
             push[Instr](out, i_store(R_RBP(), hislot_w, R_RAX()));
-            // Build result: ptr = base_ptr + lo*8, len = hi - lo
+            // Build result: ptr = base_ptr + lo*sst, len = hi - lo
             let res_w: i32 = cg_slot_scratch_n(env, 2);
             push[Instr](out, i_load(R_RAX(), R_RBP(), src + 0));   // base ptr
             push[Instr](out, i_load(R_RCX(), R_RBP(), loslot_w));  // lo
-            push[Instr](out, i_mov_imm(R_RDX(), 8));
-            push[Instr](out, i_imul(R_RCX(), R_RDX()));             // rcx = lo * 8
+            push[Instr](out, i_mov_imm(R_RDX(), sst as i64));
+            push[Instr](out, i_imul(R_RCX(), R_RDX()));             // rcx = lo * sst
             push[Instr](out, i_add(R_RAX(), R_RCX()));              // rax = ptr + lo*8
             push[Instr](out, i_store(R_RBP(), res_w + 0, R_RAX()));
             push[Instr](out, i_load(R_RAX(), R_RBP(), hislot_w));   // hi
@@ -2147,7 +2229,7 @@ fn cg_lower_slice(out: *ArrayList[Instr], sl: Slice, env: *Env, syms: ArrayList[
             push[Instr](out, i_mov_imm(R_RAX(), 0));           // len placeholder (unused: has_hi)
             push[Instr](out, i_store(R_RBP(), src + 8, R_RAX()));
             let pointer_slice: []u8 = cg_pointer_slice_type(cg, bt);
-            if (cg_slice_is_word(pointer_slice) == 1) { element_stride = 8; }
+            element_stride = cg_slice_elem_stride(cg, pointer_slice);
         } else {
             cg_err(cg, "native: slice base must be a supported slice, pointer, or string literal");
             push[Instr](out, i_mov_imm(R_RAX(), 0));
@@ -2349,7 +2431,7 @@ fn cg_materialize_struct_into(out: *ArrayList[Instr], pslot: i32, off: i32, s: S
                 cg_lower_expr(out, fi.val, env, syms, cg);
                 push[Instr](out, i_pop(R_RAX()));
                 cg_emit_store_scalar_width_at(out, pslot, off + foff,
-                    cg_c_leaf_size(fty), R_RAX());
+                    cg_c_leaf_size(fty), R_RAX(), fty);
             } else {
                 cg_materialize_into(out, pslot, off + foff, fi.val, fty, env, syms, cg);
             }
@@ -2593,25 +2675,45 @@ fn cg_emit_sext_narrow_reg(out: *ArrayList[Instr], reg: i32, bits: i32) void {
 
 // Width zero selects ordinary Zag's one-word scalar representation.
 fn cg_emit_load_scalar_width(out: *ArrayList[Instr], dst: i32, base: i32, width: i32, ty0: []u8) void {
+    let ty: []u8 = cg_norm_type(ty0);
+    if (width == 4 && @strEq(ty, "f32") == 1) {
+        // packed f32 cell: movss + widen to the internal f64 repr
+        push[Instr](out, i_fmovss_load(R_XMM0(), base, 0));
+        push[Instr](out, i_fss2sd(R_XMM0(), R_XMM0()));
+        push[Instr](out, i_fmovq_xg(dst, R_XMM0()));
+        return;
+    }
     if (width == 1) { push[Instr](out, i_load8(dst, base, 0)); }
     else if (width == 2) { push[Instr](out, i_load16(dst, base, 0)); }
     else if (width == 4) { push[Instr](out, i_load32(dst, base, 0)); }
     else { push[Instr](out, i_load(dst, base, 0)); return; }
-    let ty: []u8 = cg_norm_type(ty0);
     if (@strEq(ty, "i8")) { cg_emit_sext_narrow_reg(out, dst, 8); }
     else if (@strEq(ty, "i16")) { cg_emit_sext_narrow_reg(out, dst, 16); }
     else if (@strEq(ty, "i32")) { cg_emit_sext_narrow_reg(out, dst, 32); }
 }
 
-fn cg_emit_store_scalar_width(out: *ArrayList[Instr], base: i32, width: i32, src: i32) void {
+fn cg_emit_store_scalar_width(out: *ArrayList[Instr], base: i32, width: i32, src: i32, ty0: []u8) void {
+    if (width == 4 && @strEq(cg_norm_type(ty0), "f32") == 1) {
+        // packed f32 cell: narrow f64 repr via cvtsd2ss, then movss
+        push[Instr](out, i_fmovq_gx(R_XMM0(), src));
+        push[Instr](out, i_fsd2ss(R_XMM0(), R_XMM0()));
+        push[Instr](out, i_fmovss_store(base, 0, R_XMM0()));
+        return;
+    }
     if (width == 1) { push[Instr](out, i_store8(base, 0, src)); }
     else if (width == 2) { push[Instr](out, i_store16(base, 0, src)); }
     else if (width == 4) { push[Instr](out, i_store32(base, 0, src)); }
     else { push[Instr](out, i_store(base, 0, src)); }
 }
 
-fn cg_emit_store_scalar_width_at(out: *ArrayList[Instr], pslot: i32, off: i32, width: i32, src: i32) void {
+fn cg_emit_store_scalar_width_at(out: *ArrayList[Instr], pslot: i32, off: i32, width: i32, src: i32, ty0: []u8) void {
     push[Instr](out, i_load(R_RCX(), R_RBP(), pslot));
+    if (width == 4 && @strEq(cg_norm_type(ty0), "f32") == 1) {
+        push[Instr](out, i_fmovq_gx(R_XMM0(), src));
+        push[Instr](out, i_fsd2ss(R_XMM0(), R_XMM0()));
+        push[Instr](out, i_fmovss_store(R_RCX(), off, R_XMM0()));
+        return;
+    }
     if (width == 1) { push[Instr](out, i_store8(R_RCX(), off, src)); }
     else if (width == 2) { push[Instr](out, i_store16(R_RCX(), off, src)); }
     else if (width == 4) { push[Instr](out, i_store32(R_RCX(), off, src)); }
@@ -3004,39 +3106,49 @@ fn cg_lower_bin(out: *ArrayList[Instr], bb: Bin, env: *Env, syms: ArrayList[FnSy
     } else if (@strEq(bb.op, "*")) {
         push[Instr](out, i_imul(R_RAX(), R_RCX()));
     } else if (@strEq(bb.op, "/")) {
-        // DEFINED division: /0 panics (__div0); x/-1 = -x (wraps at i64 min,
-        // matching AArch64 SDIV) — hardware idiv would fault on both.
+        // DEFINED division: /0 panics (__div0). Signed: x/-1 = -x (wraps at
+        // i64 min, matching AArch64 SDIV) — hardware idiv would fault on both.
+        // UNSIGNED operands (u64/usize/u32…) need `div`, not `idiv`: u64::MAX
+        // is -1 as an i64, so the signed form computes -1/d and yields 0.
         let l_dnz: i32 = cg_fresh(cg);
         let l_ddo: i32 = cg_fresh(cg);
-        let l_dm1: i32 = cg_fresh(cg);
         push[Instr](out, i_cmp_imm(R_RCX(), 0));
         push[Instr](out, i_jne(l_dnz));
         cg.*.use_dz = 1;
         push[Instr](out, i_call(cg.*.dz_lbl));
         push[Instr](out, i_label(l_dnz));
-        push[Instr](out, i_cmp_imm(R_RCX(), 0 - 1));
-        push[Instr](out, i_jne(l_dm1));
-        push[Instr](out, i_neg(R_RAX()));
-        push[Instr](out, i_jmp(l_ddo));
-        push[Instr](out, i_label(l_dm1));
-        push[Instr](out, i_idiv(R_RCX()));                 // cqo+idiv; quotient → rax
+        if (cg_is_unsigned_int_type(cg_expr_type(bb.l, env, syms, cg)) == 1) {
+            push[Instr](out, i_div(R_RCX()));              // xor edx,edx+div; quotient → rax
+        } else {
+            let l_dm1: i32 = cg_fresh(cg);
+            push[Instr](out, i_cmp_imm(R_RCX(), 0 - 1));
+            push[Instr](out, i_jne(l_dm1));
+            push[Instr](out, i_neg(R_RAX()));
+            push[Instr](out, i_jmp(l_ddo));
+            push[Instr](out, i_label(l_dm1));
+            push[Instr](out, i_idiv(R_RCX()));             // cqo+idiv; quotient → rax
+        }
         push[Instr](out, i_label(l_ddo));
     } else if (@strEq(bb.op, "%")) {
-        // DEFINED modulo: %0 panics; x % -1 = 0 (AArch64 semantics).
+        // DEFINED modulo: %0 panics; signed x % -1 = 0 (AArch64 semantics).
         let l_mnz: i32 = cg_fresh(cg);
         let l_mdo: i32 = cg_fresh(cg);
-        let l_mm1: i32 = cg_fresh(cg);
         push[Instr](out, i_cmp_imm(R_RCX(), 0));
         push[Instr](out, i_jne(l_mnz));
         cg.*.use_dz = 1;
         push[Instr](out, i_call(cg.*.dz_lbl));
         push[Instr](out, i_label(l_mnz));
-        push[Instr](out, i_cmp_imm(R_RCX(), 0 - 1));
-        push[Instr](out, i_jne(l_mm1));
-        push[Instr](out, i_mov_imm(R_RAX(), 0));
-        push[Instr](out, i_jmp(l_mdo));
-        push[Instr](out, i_label(l_mm1));
-        push[Instr](out, i_idiv(R_RCX()));                 // remainder → rdx
+        if (cg_is_unsigned_int_type(cg_expr_type(bb.l, env, syms, cg)) == 1) {
+            push[Instr](out, i_div(R_RCX()));              // unsigned; remainder → rdx
+        } else {
+            let l_mm1: i32 = cg_fresh(cg);
+            push[Instr](out, i_cmp_imm(R_RCX(), 0 - 1));
+            push[Instr](out, i_jne(l_mm1));
+            push[Instr](out, i_mov_imm(R_RAX(), 0));
+            push[Instr](out, i_jmp(l_mdo));
+            push[Instr](out, i_label(l_mm1));
+            push[Instr](out, i_idiv(R_RCX()));             // remainder → rdx
+        }
         push[Instr](out, i_mov_rr(R_RAX(), R_RDX()));
         push[Instr](out, i_label(l_mdo));
     } else if (@strEq(bb.op, "&")) {
@@ -4818,9 +4930,444 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
         return;
     }
 
+    // ── packed-f32 SIMD builtins (@simdF32*) ─────────────────────────────────
+    // AVX2+FMA fast paths over packed f32 storage (4-byte elements). Each
+    // builtin pops its args into fixed GPRs, runs an 8-wide ymm main loop
+    // (the dot products unroll 4× to cover FMA latency), then a scalar
+    // f64-widened tail. The vector loops are emitted only when the target
+    // policy allows AVX2 (+FMA: every permitted-AVX2 profile also carries FMA);
+    // on a baseline target the
+    // shared scalar loop covers the whole n — identical semantics either
+    // way. Loads/stores are raw: no probes, no allocation, in or out.
+    //   @simdF32Dot(a,b,n)            → f64   a[k]·b[k]
+    //   @simdF32Dot4(o,a,b,bs,n)      → void  o[j] = Σ_k a[k]·b[j·bs+k], j<4
+    //   @simdF32Axpy(c,s,b,n)         → void  c[i] += f32(s)·b[i]
+    //   @simdF32Add/Sub/Mul(c,a,b,n)  → void  c[i] = a[i] op b[i]
+    //   @simdF32Scale(c,a,s,n)        → void  c[i] = a[i]·f32(s)
+    //   @simdF32Sum(a,n)              → f64   Σ a[i]
+    //   @simdF32Copy(d,s,n)           → void  d[i] = s[i]
+    if (@strEq(b, "simdF32Dot") || @strEq(b, "simdF32Dot4") ||
+        @strEq(b, "simdF32Axpy") ||
+        @strEq(b, "simdF32Add") || @strEq(b, "simdF32Sub") ||
+        @strEq(b, "simdF32Mul") || @strEq(b, "simdF32Scale") ||
+        @strEq(b, "simdF32Sum") || @strEq(b, "simdF32Copy")) {
+        cg_lower_simd_f32(out, b, c, env, syms, cg);
+        return;
+    }
+
     cg_err(cg, "native: unsupported @-builtin");
     push[Instr](out, i_mov_imm(R_RAX(), 0));
     push[Instr](out, i_push(R_RAX()));
+}
+
+// ── @simdF32* emission helpers ───────────────────────────────────────────────
+// Fold a ymm f32 accumulator into an f64 in xmm `acc` (vextractf128 + addps
+// + 2× haddps + cvtss2sd). Clobbers xmm9.
+// Fold a ymm accumulator into one f64 in xmm`acc`: extract hi128 into the
+// scratch reg `tmp` (MUST differ from `acc` — extracting into the acc itself
+// would clobber the low half before it is added), add halves, hadd twice.
+fn cg_simd_f32_fold(out: *ArrayList[Instr], acc: i32, tmp: i32) void {
+    push[Instr](out, i_vextractf128(tmp, acc, 1));
+    push[Instr](out, i_vaddps(acc, acc, tmp, VW_128()));
+    push[Instr](out, i_vhaddps(acc, acc, acc, VW_128()));
+    push[Instr](out, i_vhaddps(acc, acc, acc, VW_128()));
+    push[Instr](out, i_fss2sd(acc, acc));
+}
+// Emit the shared scalar tail for a f32 dot-product: while rdx > 0,
+// xmm`dacc` += f32[rdi]·f32[rsi]; rdi += 4, rsi += 4, rdx -= 1.
+fn cg_simd_f32_dot_tail(out: *ArrayList[Instr], dacc: i32, l_top: i32, l_done: i32) void {
+    push[Instr](out, i_label(l_top));
+    push[Instr](out, i_cmp_imm(R_RDX(), 0));
+    push[Instr](out, i_jle(l_done));
+    push[Instr](out, i_fmovss_load(0, R_RDI(), 0));
+    push[Instr](out, i_fss2sd(0, 0));
+    push[Instr](out, i_fmovss_load(1, R_RSI(), 0));
+    push[Instr](out, i_fss2sd(1, 1));
+    push[Instr](out, i_fmul(0, 1));
+    push[Instr](out, i_fadd(dacc, 0));
+    push[Instr](out, i_add_imm(R_RDI(), 4));
+    push[Instr](out, i_add_imm(R_RSI(), 4));
+    push[Instr](out, i_add_imm(R_RDX(), 0 - 1));
+    push[Instr](out, i_jmp(l_top));
+    push[Instr](out, i_label(l_done));
+}
+// Emit the shared scalar tail for an elementwise write: while rdx > 0,
+// f32[dst] = fold-to-f32(xmm_w); dst += 4, srcs += 4, rdx -= 1.
+// `emit` is not parametric in Zag, so each caller writes its own loop body
+// but uses this fixed register layout: xmm0 = widened a-lane, xmm1 = widened
+// b/s lane, xmm0 = narrowed result.
+fn cg_lower_simd_f32(out: *ArrayList[Instr], b: []u8, c: Call, env: *Env, syms: ArrayList[FnSym], cg: *Cg) void {
+    let nargs: i32 = len[*Node](c.args);
+    let avx2: i32 = cg.*.allow_avx2;
+    let l_top: i32 = cg_fresh(cg);
+    let l_v8: i32 = cg_fresh(cg);
+    let l_tail: i32 = cg_fresh(cg);
+    let l_done: i32 = cg_fresh(cg);
+    // Reductions only: the point where vector work ends and the horizontal
+    // fold must run BEFORE the scalar tail.  `l_tail` is the scalar tail
+    // itself, so a jl targeting it must not skip the fold.
+    let l_fold: i32 = cg_fresh(cg);
+    let j: i32 = 0;
+    let i: i32 = 0;
+    while (i < nargs) { cg_lower_expr(out, get[*Node](c.args, i), env, syms, cg); i = i + 1; }
+
+    if (@strEq(b, "simdF32Dot")) {
+        if (nargs != 3) { cg_err(cg, "native: @simdF32Dot expects (a: *f32, b: *f32, n: i64)"); push[Instr](out,i_mov_imm(R_RAX(),0)); push[Instr](out,i_push(R_RAX())); return; }
+        push[Instr](out, i_pop(R_RDX()));  // n remaining
+        push[Instr](out, i_pop(R_RSI()));  // b
+        push[Instr](out, i_pop(R_RDI()));  // a
+        if (avx2 >= 1) {
+            push[Instr](out, i_vzero(8, VW_256())); push[Instr](out, i_vzero(9, VW_256()));
+            push[Instr](out, i_vzero(10, VW_256())); push[Instr](out, i_vzero(11, VW_256()));
+            push[Instr](out, i_label(l_top));
+            push[Instr](out, i_cmp_imm(R_RDX(), 32));
+            push[Instr](out, i_jl(l_v8));
+            j = 0;
+            while (j < 4) {
+                push[Instr](out, i_vmovdqu_load_w(j, R_RDI(), j * 32, VW_256()));
+                push[Instr](out, i_vmovdqu_load_w(4 + j, R_RSI(), j * 32, VW_256()));
+                push[Instr](out, i_vfmadd231ps(8 + j, j, 4 + j));
+                j = j + 1;
+            }
+            push[Instr](out, i_add_imm(R_RDI(), 128));
+            push[Instr](out, i_add_imm(R_RSI(), 128));
+            push[Instr](out, i_add_imm(R_RDX(), 0 - 32));
+            push[Instr](out, i_jmp(l_top));
+            push[Instr](out, i_label(l_v8));
+            push[Instr](out, i_cmp_imm(R_RDX(), 8));
+            push[Instr](out, i_jl(l_fold));
+            push[Instr](out, i_vmovdqu_load_w(0, R_RDI(), 0, VW_256()));
+            push[Instr](out, i_vmovdqu_load_w(4, R_RSI(), 0, VW_256()));
+            push[Instr](out, i_vfmadd231ps(8, 0, 4));
+            push[Instr](out, i_add_imm(R_RDI(), 32));
+            push[Instr](out, i_add_imm(R_RSI(), 32));
+            push[Instr](out, i_add_imm(R_RDX(), 0 - 8));
+            push[Instr](out, i_jmp(l_v8));
+            push[Instr](out, i_label(l_fold));
+            push[Instr](out, i_vaddps(8, 8, 9, VW_256()));
+            push[Instr](out, i_vaddps(10, 10, 11, VW_256()));
+            push[Instr](out, i_vaddps(8, 8, 10, VW_256()));
+            cg_simd_f32_fold(out, 8, 9);
+        } else {
+            push[Instr](out, i_fxorps(8, 8));
+        }
+        cg_simd_f32_dot_tail(out, 8, l_tail, l_done);
+        push[Instr](out, i_fmovq_xg(R_RAX(), 8));
+        push[Instr](out, i_push(R_RAX()));
+        return;
+    }
+
+    if (@strEq(b, "simdF32Dot4")) {
+        if (nargs != 5) { cg_err(cg, "native: @simdF32Dot4 expects (o: *f32, a: *f32, b: *f32, bs: i64, n: i64)"); push[Instr](out,i_mov_imm(R_RAX(),0)); push[Instr](out,i_push(R_RAX())); return; }
+        push[Instr](out, i_pop(R_RDX()));  // n remaining
+        push[Instr](out, i_pop(R_R10()));  // bs (elements → bytes)
+        push[Instr](out, i_pop(R_RSI()));  // b base (col j at rsi + j*r10)
+        push[Instr](out, i_pop(R_RDI()));  // a
+        push[Instr](out, i_pop(R_R8()));   // o
+        push[Instr](out, i_mov_imm(R_R11(), 4));
+        push[Instr](out, i_imul(R_R10(), R_R11()));
+        // xmm12-15 = f64 tail accumulators for j = 0..3
+        push[Instr](out, i_fxorps(12, 12)); push[Instr](out, i_fxorps(13, 13));
+        push[Instr](out, i_fxorps(14, 14)); push[Instr](out, i_fxorps(15, 15));
+        if (avx2 >= 1) {
+            j = 0;
+            while (j < 4) { push[Instr](out, i_vzero(8 + j, VW_256())); j = j + 1; }
+            push[Instr](out, i_label(l_top));
+            push[Instr](out, i_cmp_imm(R_RDX(), 8));
+            push[Instr](out, i_jl(l_tail));
+            push[Instr](out, i_vmovdqu_load_w(0, R_RDI(), 0, VW_256()));
+            push[Instr](out, i_mov_rr(R_R11(), R_RSI()));
+            j = 0;
+            while (j < 4) {
+                push[Instr](out, i_vmovdqu_load_w(1 + j, R_R11(), 0, VW_256()));
+                push[Instr](out, i_vfmadd231ps(8 + j, 0, 1 + j));
+                push[Instr](out, i_add(R_R11(), R_R10()));
+                j = j + 1;
+            }
+            push[Instr](out, i_add_imm(R_RDI(), 32));
+            push[Instr](out, i_add_imm(R_RSI(), 32));
+            push[Instr](out, i_add_imm(R_RDX(), 0 - 8));
+            push[Instr](out, i_jmp(l_top));
+            push[Instr](out, i_label(l_tail));
+            // scalar tail: xmm0 = widened a[k]; for j: xmm{12+j} += a·b_j[k]
+            push[Instr](out, i_cmp_imm(R_RDX(), 0));
+            push[Instr](out, i_jle(l_done));
+            push[Instr](out, i_fmovss_load(0, R_RDI(), 0));
+            push[Instr](out, i_fss2sd(0, 0));
+            push[Instr](out, i_mov_rr(R_R11(), R_RSI()));
+            j = 0;
+            while (j < 4) {
+                push[Instr](out, i_fmovss_load(1, R_R11(), 0));
+                push[Instr](out, i_fss2sd(1, 1));
+                push[Instr](out, i_fmul(1, 0));
+                push[Instr](out, i_fadd(12 + j, 1));
+                push[Instr](out, i_add(R_R11(), R_R10()));
+                j = j + 1;
+            }
+            push[Instr](out, i_add_imm(R_RDI(), 4));
+            push[Instr](out, i_add_imm(R_RSI(), 4));
+            push[Instr](out, i_add_imm(R_RDX(), 0 - 1));
+            push[Instr](out, i_jmp(l_tail));
+            push[Instr](out, i_label(l_done));
+            // fold each accumulator → widen, add tail acc, narrow, store f32
+            j = 0;
+            while (j < 4) {
+                cg_simd_f32_fold(out, 8 + j, 0);
+                push[Instr](out, i_fadd(8 + j, 12 + j));
+                push[Instr](out, i_fsd2ss(8 + j, 8 + j));
+                push[Instr](out, i_fmovss_store(R_R8(), j * 4, 8 + j));
+                j = j + 1;
+            }
+        } else {
+            // scalar-only path: same loop as the tail, then store the f64 accs
+            push[Instr](out, i_label(l_tail));
+            push[Instr](out, i_cmp_imm(R_RDX(), 0));
+            push[Instr](out, i_jle(l_done));
+            push[Instr](out, i_fmovss_load(0, R_RDI(), 0));
+            push[Instr](out, i_fss2sd(0, 0));
+            push[Instr](out, i_mov_rr(R_R11(), R_RSI()));
+            j = 0;
+            while (j < 4) {
+                push[Instr](out, i_fmovss_load(1, R_R11(), 0));
+                push[Instr](out, i_fss2sd(1, 1));
+                push[Instr](out, i_fmul(1, 0));
+                push[Instr](out, i_fadd(12 + j, 1));
+                push[Instr](out, i_add(R_R11(), R_R10()));
+                j = j + 1;
+            }
+            push[Instr](out, i_add_imm(R_RDI(), 4));
+            push[Instr](out, i_add_imm(R_RSI(), 4));
+            push[Instr](out, i_add_imm(R_RDX(), 0 - 1));
+            push[Instr](out, i_jmp(l_tail));
+            push[Instr](out, i_label(l_done));
+            j = 0;
+            while (j < 4) {
+                push[Instr](out, i_fsd2ss(12 + j, 12 + j));
+                push[Instr](out, i_fmovss_store(R_R8(), j * 4, 12 + j));
+                j = j + 1;
+            }
+        }
+        push[Instr](out, i_mov_imm(R_RAX(), 0));
+        push[Instr](out, i_push(R_RAX()));
+        return;
+    }
+
+    if (@strEq(b, "simdF32Axpy")) {
+        if (nargs != 4) { cg_err(cg, "native: @simdF32Axpy expects (c: *f32, s: f64, b: *f32, n: i64)"); push[Instr](out,i_mov_imm(R_RAX(),0)); push[Instr](out,i_push(R_RAX())); return; }
+        push[Instr](out, i_pop(R_RDX()));  // n
+        push[Instr](out, i_pop(R_RSI()));  // b
+        push[Instr](out, i_pop(R_RAX()));  // s (f64 bits)
+        push[Instr](out, i_pop(R_RDI()));  // c
+        push[Instr](out, i_fmovq_gx(15, R_RAX()));   // xmm15 = s (f64)
+        if (avx2 >= 1) {
+            push[Instr](out, i_fsd2ss(7, 15));
+            push[Instr](out, i_vbroadcastss_x(7, 7, VW_256()));
+            push[Instr](out, i_label(l_top));
+            push[Instr](out, i_cmp_imm(R_RDX(), 8));
+            push[Instr](out, i_jl(l_tail));
+            push[Instr](out, i_vmovdqu_load_w(1, R_RDI(), 0, VW_256()));
+            push[Instr](out, i_vmovdqu_load_w(0, R_RSI(), 0, VW_256()));
+            push[Instr](out, i_vfmadd231ps(1, 7, 0));   // c += s*b
+            push[Instr](out, i_vmovdqu_store_w(R_RDI(), 0, 1, VW_256()));
+            push[Instr](out, i_add_imm(R_RDI(), 32));
+            push[Instr](out, i_add_imm(R_RSI(), 32));
+            push[Instr](out, i_add_imm(R_RDX(), 0 - 8));
+            push[Instr](out, i_jmp(l_top));
+            push[Instr](out, i_label(l_tail));
+        } else {
+            push[Instr](out, i_label(l_tail));
+        }
+        push[Instr](out, i_cmp_imm(R_RDX(), 0));
+        push[Instr](out, i_jle(l_done));
+        push[Instr](out, i_fmovss_load(0, R_RSI(), 0));
+        push[Instr](out, i_fss2sd(0, 0));
+        push[Instr](out, i_fmul(0, 15));
+        push[Instr](out, i_fmovss_load(1, R_RDI(), 0));
+        push[Instr](out, i_fss2sd(1, 1));
+        push[Instr](out, i_fadd(0, 1));
+        push[Instr](out, i_fsd2ss(0, 0));
+        push[Instr](out, i_fmovss_store(R_RDI(), 0, 0));
+        push[Instr](out, i_add_imm(R_RDI(), 4));
+        push[Instr](out, i_add_imm(R_RSI(), 4));
+        push[Instr](out, i_add_imm(R_RDX(), 0 - 1));
+        push[Instr](out, i_jmp(l_tail));
+        push[Instr](out, i_label(l_done));
+        push[Instr](out, i_mov_imm(R_RAX(), 0));
+        push[Instr](out, i_push(R_RAX()));
+        return;
+    }
+
+    if (@strEq(b, "simdF32Add") || @strEq(b, "simdF32Sub") || @strEq(b, "simdF32Mul")) {
+        if (nargs != 4) { cg_err(cg, "native: @simdF32{Add,Sub,Mul} expects (c: *f32, a: *f32, b: *f32, n: i64)"); push[Instr](out,i_mov_imm(R_RAX(),0)); push[Instr](out,i_push(R_RAX())); return; }
+        push[Instr](out, i_pop(R_RDX()));  // n
+        push[Instr](out, i_pop(R_RSI()));  // b
+        push[Instr](out, i_pop(R_RDI()));  // a
+        push[Instr](out, i_pop(R_R8()));   // c
+        if (avx2 >= 1) {
+            push[Instr](out, i_label(l_top));
+            push[Instr](out, i_cmp_imm(R_RDX(), 8));
+            push[Instr](out, i_jl(l_tail));
+            push[Instr](out, i_vmovdqu_load_w(0, R_RDI(), 0, VW_256()));
+            push[Instr](out, i_vmovdqu_load_w(1, R_RSI(), 0, VW_256()));
+            if (@strEq(b, "simdF32Add")) { push[Instr](out, i_vaddps(0, 0, 1, VW_256())); }
+            if (@strEq(b, "simdF32Sub")) { push[Instr](out, i_vsubps(0, 0, 1, VW_256())); }
+            if (@strEq(b, "simdF32Mul")) { push[Instr](out, i_vmulps(0, 0, 1, VW_256())); }
+            push[Instr](out, i_vmovdqu_store_w(R_R8(), 0, 0, VW_256()));
+            push[Instr](out, i_add_imm(R_RDI(), 32));
+            push[Instr](out, i_add_imm(R_RSI(), 32));
+            push[Instr](out, i_add_imm(R_R8(), 32));
+            push[Instr](out, i_add_imm(R_RDX(), 0 - 8));
+            push[Instr](out, i_jmp(l_top));
+            push[Instr](out, i_label(l_tail));
+        } else {
+            push[Instr](out, i_label(l_tail));
+        }
+        push[Instr](out, i_cmp_imm(R_RDX(), 0));
+        push[Instr](out, i_jle(l_done));
+        push[Instr](out, i_fmovss_load(0, R_RDI(), 0));
+        push[Instr](out, i_fss2sd(0, 0));
+        push[Instr](out, i_fmovss_load(1, R_RSI(), 0));
+        push[Instr](out, i_fss2sd(1, 1));
+        if (@strEq(b, "simdF32Add")) { push[Instr](out, i_fadd(0, 1)); }
+        if (@strEq(b, "simdF32Sub")) { push[Instr](out, i_fsub(0, 1)); }
+        if (@strEq(b, "simdF32Mul")) { push[Instr](out, i_fmul(0, 1)); }
+        push[Instr](out, i_fsd2ss(0, 0));
+        push[Instr](out, i_fmovss_store(R_R8(), 0, 0));
+        push[Instr](out, i_add_imm(R_RDI(), 4));
+        push[Instr](out, i_add_imm(R_RSI(), 4));
+        push[Instr](out, i_add_imm(R_R8(), 4));
+        push[Instr](out, i_add_imm(R_RDX(), 0 - 1));
+        push[Instr](out, i_jmp(l_tail));
+        push[Instr](out, i_label(l_done));
+        push[Instr](out, i_mov_imm(R_RAX(), 0));
+        push[Instr](out, i_push(R_RAX()));
+        return;
+    }
+
+    if (@strEq(b, "simdF32Scale")) {
+        if (nargs != 4) { cg_err(cg, "native: @simdF32Scale expects (c: *f32, a: *f32, s: f64, n: i64)"); push[Instr](out,i_mov_imm(R_RAX(),0)); push[Instr](out,i_push(R_RAX())); return; }
+        push[Instr](out, i_pop(R_RDX()));  // n
+        push[Instr](out, i_pop(R_RAX()));  // s (f64 bits)
+        push[Instr](out, i_pop(R_RDI()));  // a
+        push[Instr](out, i_pop(R_R8()));   // c
+        push[Instr](out, i_fmovq_gx(15, R_RAX()));
+        if (avx2 >= 1) {
+            push[Instr](out, i_fsd2ss(7, 15));
+            push[Instr](out, i_vbroadcastss_x(7, 7, VW_256()));
+            push[Instr](out, i_label(l_top));
+            push[Instr](out, i_cmp_imm(R_RDX(), 8));
+            push[Instr](out, i_jl(l_tail));
+            push[Instr](out, i_vmovdqu_load_w(0, R_RDI(), 0, VW_256()));
+            push[Instr](out, i_vmulps(0, 7, 0, VW_256()));
+            push[Instr](out, i_vmovdqu_store_w(R_R8(), 0, 0, VW_256()));
+            push[Instr](out, i_add_imm(R_RDI(), 32));
+            push[Instr](out, i_add_imm(R_R8(), 32));
+            push[Instr](out, i_add_imm(R_RDX(), 0 - 8));
+            push[Instr](out, i_jmp(l_top));
+            push[Instr](out, i_label(l_tail));
+        } else {
+            push[Instr](out, i_label(l_tail));
+        }
+        push[Instr](out, i_cmp_imm(R_RDX(), 0));
+        push[Instr](out, i_jle(l_done));
+        push[Instr](out, i_fmovss_load(0, R_RDI(), 0));
+        push[Instr](out, i_fss2sd(0, 0));
+        push[Instr](out, i_fmul(0, 15));
+        push[Instr](out, i_fsd2ss(0, 0));
+        push[Instr](out, i_fmovss_store(R_R8(), 0, 0));
+        push[Instr](out, i_add_imm(R_RDI(), 4));
+        push[Instr](out, i_add_imm(R_R8(), 4));
+        push[Instr](out, i_add_imm(R_RDX(), 0 - 1));
+        push[Instr](out, i_jmp(l_tail));
+        push[Instr](out, i_label(l_done));
+        push[Instr](out, i_mov_imm(R_RAX(), 0));
+        push[Instr](out, i_push(R_RAX()));
+        return;
+    }
+
+    if (@strEq(b, "simdF32Sum")) {
+        if (nargs != 2) { cg_err(cg, "native: @simdF32Sum expects (a: *f32, n: i64)"); push[Instr](out,i_mov_imm(R_RAX(),0)); push[Instr](out,i_push(R_RAX())); return; }
+        push[Instr](out, i_pop(R_RDX()));  // n
+        push[Instr](out, i_pop(R_RDI()));  // a
+        if (avx2 >= 1) {
+            push[Instr](out, i_vzero(8, VW_256())); push[Instr](out, i_vzero(9, VW_256()));
+            push[Instr](out, i_vzero(10, VW_256())); push[Instr](out, i_vzero(11, VW_256()));
+            push[Instr](out, i_label(l_top));
+            push[Instr](out, i_cmp_imm(R_RDX(), 32));
+            push[Instr](out, i_jl(l_v8));
+            j = 0;
+            while (j < 4) {
+                push[Instr](out, i_vmovdqu_load_w(j, R_RDI(), j * 32, VW_256()));
+                push[Instr](out, i_vaddps(8 + j, 8 + j, j, VW_256()));
+                j = j + 1;
+            }
+            push[Instr](out, i_add_imm(R_RDI(), 128));
+            push[Instr](out, i_add_imm(R_RDX(), 0 - 32));
+            push[Instr](out, i_jmp(l_top));
+            push[Instr](out, i_label(l_v8));
+            push[Instr](out, i_cmp_imm(R_RDX(), 8));
+            push[Instr](out, i_jl(l_fold));
+            push[Instr](out, i_vmovdqu_load_w(0, R_RDI(), 0, VW_256()));
+            push[Instr](out, i_vaddps(8, 8, 0, VW_256()));
+            push[Instr](out, i_add_imm(R_RDI(), 32));
+            push[Instr](out, i_add_imm(R_RDX(), 0 - 8));
+            push[Instr](out, i_jmp(l_v8));
+            push[Instr](out, i_label(l_fold));
+            push[Instr](out, i_vaddps(8, 8, 9, VW_256()));
+            push[Instr](out, i_vaddps(10, 10, 11, VW_256()));
+            push[Instr](out, i_vaddps(8, 8, 10, VW_256()));
+            cg_simd_f32_fold(out, 8, 9);
+        } else {
+            push[Instr](out, i_fxorps(8, 8));
+        }
+        // scalar tail: xmm8 += widened a[k]
+        push[Instr](out, i_label(l_tail));
+        push[Instr](out, i_cmp_imm(R_RDX(), 0));
+        push[Instr](out, i_jle(l_done));
+        push[Instr](out, i_fmovss_load(0, R_RDI(), 0));
+        push[Instr](out, i_fss2sd(0, 0));
+        push[Instr](out, i_fadd(8, 0));
+        push[Instr](out, i_add_imm(R_RDI(), 4));
+        push[Instr](out, i_add_imm(R_RDX(), 0 - 1));
+        push[Instr](out, i_jmp(l_tail));
+        push[Instr](out, i_label(l_done));
+        push[Instr](out, i_fmovq_xg(R_RAX(), 8));
+        push[Instr](out, i_push(R_RAX()));
+        return;
+    }
+
+    if (@strEq(b, "simdF32Copy")) {
+        if (nargs != 3) { cg_err(cg, "native: @simdF32Copy expects (d: *f32, s: *f32, n: i64)"); push[Instr](out,i_mov_imm(R_RAX(),0)); push[Instr](out,i_push(R_RAX())); return; }
+        push[Instr](out, i_pop(R_RDX()));  // n
+        push[Instr](out, i_pop(R_RDI()));  // s
+        push[Instr](out, i_pop(R_RSI()));  // d
+        if (avx2 >= 1) {
+            push[Instr](out, i_label(l_top));
+            push[Instr](out, i_cmp_imm(R_RDX(), 8));
+            push[Instr](out, i_jl(l_tail));
+            push[Instr](out, i_vmovdqu_load_w(0, R_RDI(), 0, VW_256()));
+            push[Instr](out, i_vmovdqu_store_w(R_RSI(), 0, 0, VW_256()));
+            push[Instr](out, i_add_imm(R_RDI(), 32));
+            push[Instr](out, i_add_imm(R_RSI(), 32));
+            push[Instr](out, i_add_imm(R_RDX(), 0 - 8));
+            push[Instr](out, i_jmp(l_top));
+            push[Instr](out, i_label(l_tail));
+        } else {
+            push[Instr](out, i_label(l_tail));
+        }
+        push[Instr](out, i_cmp_imm(R_RDX(), 0));
+        push[Instr](out, i_jle(l_done));
+        push[Instr](out, i_fmovss_load(0, R_RDI(), 0));
+        push[Instr](out, i_fmovss_store(R_RSI(), 0, 0));
+        push[Instr](out, i_add_imm(R_RDI(), 4));
+        push[Instr](out, i_add_imm(R_RSI(), 4));
+        push[Instr](out, i_add_imm(R_RDX(), 0 - 1));
+        push[Instr](out, i_jmp(l_tail));
+        push[Instr](out, i_label(l_done));
+        push[Instr](out, i_mov_imm(R_RAX(), 0));
+        push[Instr](out, i_push(R_RAX()));
+        return;
+    }
 }
 
 // ── runtime heap externs (native, mmap-backed) ───────────────────────────────
@@ -7239,7 +7786,29 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                     push[Instr](out, i_pop(R_RAX()));
                     cg_emit_norm_scalar_for_ty(out, tty, R_RAX());
                     push[Instr](out, i_pop(R_RCX()));
-                    cg_emit_store_scalar_width(out, R_RCX(), cwidth, R_RAX());
+                    cg_emit_store_scalar_width(out, R_RCX(), cwidth, R_RAX(), tty);
+                    return;
+                }
+                // PACKED-f32 element store: `p[i] = v` / `s[i] = v` on *f32 or
+                // []f32, or `p.* = v` on *f32. The memory cell is 4 bytes, so a
+                // full 8-byte store of the f64 repr would clobber the adjacent
+                // element — narrow via cvtsd2ss and store with movss instead.
+                let packed_f32: i32 = 0;
+                if (@strEq(cg_norm_type(tty), "f32") == 1) {
+                    switch (a.target.*) {
+                        .idx => |_pf| { packed_f32 = 1; }
+                        .fld => |pf2| { if (@strEq(pf2.fname, "*") == 1) { packed_f32 = 1; } }
+                        else => { }
+                    }
+                }
+                if (packed_f32 == 1) {
+                    cg_lower_addr(out, a.target, env, syms, cg);
+                    cg_lower_expr(out, a.expr, env, syms, cg);
+                    push[Instr](out, i_pop(R_RAX()));               // rax = value (f64 bits)
+                    push[Instr](out, i_fmovq_gx(R_XMM0(), R_RAX()));
+                    push[Instr](out, i_fsd2ss(R_XMM0(), R_XMM0()));
+                    push[Instr](out, i_pop(R_RCX()));               // rcx = &target
+                    push[Instr](out, i_fmovss_store(R_RCX(), 0, R_XMM0()));
                     return;
                 }
                 // BYTE-element lvalue (`xs.data[i] = b` for a *u8/*i8 array, or a
@@ -12699,7 +13268,14 @@ fn zir_native_emit_block(out:*ArrayList[Instr],blk:ZBlock,slots:map.StringMap[i3
                 push[Instr](out,i_imul(R_RCX(),R_RDX()));
                 push[Instr](out,i_add(R_RAX(),R_RCX()));
             }
-            push[Instr](out,i_load32(R_RCX(),R_RAX(),0));
+            if(@strEq(o.operands.data[0].ty[1..],"f32")){
+                // packed f32 cell: movss + widen to the internal f64 repr
+                push[Instr](out,i_fmovss_load(R_XMM0(),R_RAX(),0));
+                push[Instr](out,i_fss2sd(R_XMM0(),R_XMM0()));
+                push[Instr](out,i_fmovq_xg(R_RCX(),R_XMM0()));
+            }else{
+                push[Instr](out,i_load32(R_RCX(),R_RAX(),0));
+            }
             push[Instr](out,i_store(R_RBP(),zir_native_disp(slots,o.results.data[0].name),R_RCX()));
         }else if(@strEq(o.name,"vector.splat")){
             let vr:i32=zir_native_vreg(o.results.data[0].name);

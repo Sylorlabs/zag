@@ -170,6 +170,31 @@ nto "print_f64 int"   'fn main() i32 { print_f64(440.0); return 0; }' "440" 0
 nto "print_f64 neg"   'fn main() i32 { let x: f64 = 1.5; print_f64(-x); return 0; }' "-1.5" 0
 nto "print_f32"       'fn main() i32 { print_f32(0.25); return 0; }' "0.25" 0
 
+# Regression: float literals outside the |decExp|<=18 exact-integer window used
+# to be REJECTED ("magnitude out of supported range"); now they are scaled in
+# f64. Checks: the literal compiles, lands in the right band, and -0 works.
+nt  "float lit tiny exp" 'fn main() i32 { let f: f64 = 1.5e-300; if (f > 1.0e-300 && f < 2.0e-300) { return 0; } return 1; }' 0
+nt  "float lit big exp"  'fn main() i32 { let f: f64 = 2.5e200; if (f > 2.0e200 && f < 3.0e200) { return 0; } return 1; }' 0
+nt  "float lit e-16"     'fn main() i32 { let f: f64 = 1.11e-16; if (f > 1.0e-16 && f < 1.2e-16) { return 0; } return 1; }' 0
+nt  "float lit underflow" 'fn main() i32 { let f: f64 = 1.0e-400; if (f == 0.0) { return 0; } return 1; }' 0
+nt  "float lit overflow" 'fn main() i32 { let f: f64 = 1.0e400; if (f > 1.0e308) { return 0; } return 1; }' 0
+nt  "float lit neg tiny" 'fn main() i32 { let f: f64 = 0.0 - 1.5e-300; if (f < -1.0e-300 && f > -2.0e-300) { return 0; } return 1; }' 0
+nt  "float lit denormal" 'fn main() i32 { let f: f64 = 4.9e-324; if (f > 0.0 && f < 1.0e-320) { return 0; } return 1; }' 0
+
+# Regression: u64 `/`, `%` used signed idiv (u64::MAX/2^30 computed -1/d → 0)
+# and `>>` used an arithmetic shift (u64::MAX>>60 → -1). Both must be unsigned.
+nt  "u64 div unsigned" 'fn main() i32 { let a: u64 = 18446744073709551615; if (a / 1073741824 != 17179869183) { return 1; } if (a % 1073741824 != 1073741823) { return 2; } return 0; }' 0
+nt  "u64 shr logical"  'fn main() i32 { let a: u64 = 18446744073709551615; if ((a >> 60) != 15) { return 1; } let b: u64 = 9223372036854775808; if ((b >> 63) != 1) { return 2; } return 0; }' 0
+nt  "u64 div0 panic"   'fn main() i32 { let a: u64 = 7; let z: u64 = 0; return (a / z) as i32; }' 134
+nt  "i64 div still signed" 'fn main() i32 { let a: i64 = 0 - 100; if (a / 7 != -14) { return 1; } if (a % 7 != -2) { return 2; } return 0; }' 0
+
+# Regression: `*f32`/`[]f32` elements are now PACKED 4-byte cells (movss +
+# cvtsd2ss/cvtss2sd). Old code used an 8-byte stride storing the f64 repr — and
+# `xs[i]` (slice) vs `xs.data[i]` (pointer) disagreed on where element i lived.
+nt  "f32 slice packed sub-slice" 'fn main() i32 { let s: []f32 = zalloc(4); s[0] = 1.5; s[1] = 9.25; s[2] = 2.0; s[3] = 7.0; let s2: []f32 = s[1..3]; if (s2.len != 2) { return 1; } if (s2[0] != 9.25 || s2[1] != 2.0) { return 2; } if (s[0] + s[1] + s[2] + s[3] != 19.75) { return 3; } return 0; }' 0
+nt  "f32 packed roundtrip" '@import("std/list.zag") fn main() i32 { let xs: ArrayList[f32] = make[f32](8); let i: i32 = 0; while (i < 8) { push[f32](&xs, (i * 7 + 1) as f32); i = i + 1; } let j: i32 = 0; while (j < 8) { if (xs.data[j] != (j * 7 + 1) as f32) { return j + 1; } j = j + 1; } return 0; }' 0
+nto "f32 packed bytes" '@import("std/list.zag") fn main() i32 { let xs: ArrayList[f32] = make[f32](2); push[f32](&xs, 1.5); push[f32](&xs, 2.5); let q: *u8 = xs.data as *u8; let w0: i32 = q.* as i32; let w4: i32 = (q + 4).* as i32; let w3: i32 = (q + 3).* as i32; print_i64(w0 as i64); print_i64(w4 as i64); print_i64(w3 as i64); return 0; }' "1069547520\n1075838976\n536870975" 0
+
 echo "── posits (p8/p16/p32/p64 — Zag posit runtime, native, no libc) ──"
 # Round-trip: @floatToPosit then @positToFloat → exact for 0.5.
 nto "p32 round-trip 0.5"  'fn main() i32 { let h: p32 = @floatToPosit(0.5); print_f64(@positToFloat(h)); return 0; }' "0.5" 0

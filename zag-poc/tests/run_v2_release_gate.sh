@@ -72,6 +72,7 @@ run_gate "bounded MMIO-region authority" bash tests/run_mmio_region.sh
 run_gate "validated x86 SSE2 SIMD add" bash tests/run_x86_simd_add_i32x4.sh
 run_gate "validated x86 SSE2 SIMD subtract" bash tests/run_x86_simd_sub_i32x4.sh
 run_gate "validated x86 SSE2 SIMD bitwise" bash tests/run_x86_simd_bitwise_i32x4.sh
+run_gate "validated x86 AVX2 packed-f32 intrinsics" bash tests/run_x86_simd_f32.sh
 
 unsupported "pointer and memory model" "checked ordinary allocations quarantine address reuse and raw pointer categories plus lexical checks exist, but identity-carrying provenance, untracked allocator coverage, and general reference lifetimes remain incomplete"
 unsupported "allocator and reclamation" "opaque checked SystemAllocator capabilities and bounded retained fixed-buffer/arena regions exist, but custom/debug allocators and a general lifetime model are incomplete"
