@@ -10,6 +10,7 @@ trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/valid"
 printf 'name = "simdf32"\nversion = "0"\nedition = "2027"\n' > "$tmp/valid/zag.mod"
 cp tests/x86_simd_f32.zag "$tmp/valid/main.zag"
+ln -s "$PWD/std" "$tmp/valid/std"
 (cd "$tmp/valid" && "$ZNC" main.zag --cpu=x86-64-v3 --safety=checked -o app --no-zagd --no-analyze >/dev/null)
 "$tmp/valid/app"
 
