@@ -922,7 +922,8 @@ fn cg_expr_type(n: *Node, env: *Env, syms: ArrayList[FnSym], cg: *Cg) []u8 {
                         // packed-f32 SIMD builtins: scalar-returning forms are
                         // f64 (the widened accumulator); the rest are void.
                         if (@strEq(cid.name, "@simdF32Dot") || @strEq(cid.name, "@simdF32Sum")) { return "f64"; }
-                        if (@strEq(cid.name, "@simdF32Dot4") || @strEq(cid.name, "@simdF32Axpy") ||
+                        if (@strEq(cid.name, "@simdF32Dot4") || @strEq(cid.name, "@simdF32Dot8") ||
+                            @strEq(cid.name, "@simdF32Axpy") ||
                             @strEq(cid.name, "@simdF32Add") || @strEq(cid.name, "@simdF32Sub") ||
                             @strEq(cid.name, "@simdF32Mul") || @strEq(cid.name, "@simdF32Scale") ||
                             @strEq(cid.name, "@simdF32Copy")) { return "void"; }
@@ -4941,12 +4942,14 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
     // way. Loads/stores are raw: no probes, no allocation, in or out.
     //   @simdF32Dot(a,b,n)            → f64   a[k]·b[k]
     //   @simdF32Dot4(o,a,b,bs,n)      → void  o[j] = Σ_k a[k]·b[j·bs+k], j<4
+    //   @simdF32Dot8(o,a,b,bs,n)      → void  o[j] = Σ_k a[k]·b[j·bs+k], j<8
     //   @simdF32Axpy(c,s,b,n)         → void  c[i] += f32(s)·b[i]
     //   @simdF32Add/Sub/Mul(c,a,b,n)  → void  c[i] = a[i] op b[i]
     //   @simdF32Scale(c,a,s,n)        → void  c[i] = a[i]·f32(s)
     //   @simdF32Sum(a,n)              → f64   Σ a[i]
     //   @simdF32Copy(d,s,n)           → void  d[i] = s[i]
     if (@strEq(b, "simdF32Dot") || @strEq(b, "simdF32Dot4") ||
+        @strEq(b, "simdF32Dot8") ||
         @strEq(b, "simdF32Axpy") ||
         @strEq(b, "simdF32Add") || @strEq(b, "simdF32Sub") ||
         @strEq(b, "simdF32Mul") || @strEq(b, "simdF32Scale") ||
@@ -4971,20 +4974,31 @@ fn cg_simd_f32_fold(out: *ArrayList[Instr], acc: i32, tmp: i32) void {
     push[Instr](out, i_vaddps(acc, acc, tmp, VW_128()));
     push[Instr](out, i_vhaddps(acc, acc, acc, VW_128()));
     push[Instr](out, i_vhaddps(acc, acc, acc, VW_128()));
-    push[Instr](out, i_fss2sd(acc, acc));
+    push[Instr](out, i_vcvtss2sd(acc, acc, acc));
 }
 // Emit the shared scalar tail for a f32 dot-product: while rdx > 0,
 // xmm`dacc` += f32[rdi]·f32[rsi]; rdi += 4, rsi += 4, rdx -= 1.
-fn cg_simd_f32_dot_tail(out: *ArrayList[Instr], dacc: i32, l_top: i32, l_done: i32) void {
+// avx2 >= 1 emits the VEX-scalar forms so the tail does not drag the core
+// into the dirty-upper state on its way to the caller's vzeroupper.
+fn cg_simd_f32_dot_tail(out: *ArrayList[Instr], dacc: i32, l_top: i32, l_done: i32, avx2: i32) void {
     push[Instr](out, i_label(l_top));
     push[Instr](out, i_cmp_imm(R_RDX(), 0));
     push[Instr](out, i_jle(l_done));
-    push[Instr](out, i_fmovss_load(0, R_RDI(), 0));
-    push[Instr](out, i_fss2sd(0, 0));
-    push[Instr](out, i_fmovss_load(1, R_RSI(), 0));
-    push[Instr](out, i_fss2sd(1, 1));
-    push[Instr](out, i_fmul(0, 1));
-    push[Instr](out, i_fadd(dacc, 0));
+    if (avx2 >= 1) {
+        push[Instr](out, i_vmovss_load(0, R_RDI(), 0));
+        push[Instr](out, i_vcvtss2sd(0, 0, 0));
+        push[Instr](out, i_vmovss_load(1, R_RSI(), 0));
+        push[Instr](out, i_vcvtss2sd(1, 1, 1));
+        push[Instr](out, i_vmulsd(0, 0, 1));
+        push[Instr](out, i_vaddsd(dacc, dacc, 0));
+    } else {
+        push[Instr](out, i_fmovss_load(0, R_RDI(), 0));
+        push[Instr](out, i_fss2sd(0, 0));
+        push[Instr](out, i_fmovss_load(1, R_RSI(), 0));
+        push[Instr](out, i_fss2sd(1, 1));
+        push[Instr](out, i_fmul(0, 1));
+        push[Instr](out, i_fadd(dacc, 0));
+    }
     push[Instr](out, i_add_imm(R_RDI(), 4));
     push[Instr](out, i_add_imm(R_RSI(), 4));
     push[Instr](out, i_add_imm(R_RDX(), 0 - 1));
@@ -5051,7 +5065,8 @@ fn cg_lower_simd_f32(out: *ArrayList[Instr], b: []u8, c: Call, env: *Env, syms: 
         } else {
             push[Instr](out, i_fxorps(8, 8));
         }
-        cg_simd_f32_dot_tail(out, 8, l_tail, l_done);
+        cg_simd_f32_dot_tail(out, 8, l_tail, l_done, avx2);
+        if (avx2 >= 1) { push[Instr](out, i_vzeroupper()); }
         push[Instr](out, i_fmovq_xg(R_RAX(), 8));
         push[Instr](out, i_push(R_RAX()));
         return;
@@ -5067,8 +5082,8 @@ fn cg_lower_simd_f32(out: *ArrayList[Instr], b: []u8, c: Call, env: *Env, syms: 
         push[Instr](out, i_mov_imm(R_R11(), 4));
         push[Instr](out, i_imul(R_R10(), R_R11()));
         // xmm12-15 = f64 tail accumulators for j = 0..3
-        push[Instr](out, i_fxorps(12, 12)); push[Instr](out, i_fxorps(13, 13));
-        push[Instr](out, i_fxorps(14, 14)); push[Instr](out, i_fxorps(15, 15));
+        push[Instr](out, i_vzero(12, VW_128())); push[Instr](out, i_vzero(13, VW_128()));
+        push[Instr](out, i_vzero(14, VW_128())); push[Instr](out, i_vzero(15, VW_128()));
         if (avx2 >= 1) {
             j = 0;
             while (j < 4) { push[Instr](out, i_vzero(8 + j, VW_256())); j = j + 1; }
@@ -5092,15 +5107,15 @@ fn cg_lower_simd_f32(out: *ArrayList[Instr], b: []u8, c: Call, env: *Env, syms: 
             // scalar tail: xmm0 = widened a[k]; for j: xmm{12+j} += a·b_j[k]
             push[Instr](out, i_cmp_imm(R_RDX(), 0));
             push[Instr](out, i_jle(l_done));
-            push[Instr](out, i_fmovss_load(0, R_RDI(), 0));
-            push[Instr](out, i_fss2sd(0, 0));
+            push[Instr](out, i_vmovss_load(0, R_RDI(), 0));
+            push[Instr](out, i_vcvtss2sd(0, 0, 0));
             push[Instr](out, i_mov_rr(R_R11(), R_RSI()));
             j = 0;
             while (j < 4) {
-                push[Instr](out, i_fmovss_load(1, R_R11(), 0));
-                push[Instr](out, i_fss2sd(1, 1));
-                push[Instr](out, i_fmul(1, 0));
-                push[Instr](out, i_fadd(12 + j, 1));
+                push[Instr](out, i_vmovss_load(1, R_R11(), 0));
+                push[Instr](out, i_vcvtss2sd(1, 1, 1));
+                push[Instr](out, i_vmulsd(1, 1, 0));
+                push[Instr](out, i_vaddsd(12 + j, 12 + j, 1));
                 push[Instr](out, i_add(R_R11(), R_R10()));
                 j = j + 1;
             }
@@ -5113,9 +5128,9 @@ fn cg_lower_simd_f32(out: *ArrayList[Instr], b: []u8, c: Call, env: *Env, syms: 
             j = 0;
             while (j < 4) {
                 cg_simd_f32_fold(out, 8 + j, 0);
-                push[Instr](out, i_fadd(8 + j, 12 + j));
-                push[Instr](out, i_fsd2ss(8 + j, 8 + j));
-                push[Instr](out, i_fmovss_store(R_R8(), j * 4, 8 + j));
+                push[Instr](out, i_vaddsd(8 + j, 8 + j, 12 + j));
+                push[Instr](out, i_vcvtsd2ss(8 + j, 8 + j, 8 + j));
+                push[Instr](out, i_vmovss_store(R_R8(), j * 4, 8 + j));
                 j = j + 1;
             }
         } else {
@@ -5147,6 +5162,117 @@ fn cg_lower_simd_f32(out: *ArrayList[Instr], b: []u8, c: Call, env: *Env, syms: 
                 j = j + 1;
             }
         }
+        if (avx2 >= 1) { push[Instr](out, i_vzeroupper()); }
+        push[Instr](out, i_mov_imm(R_RAX(), 0));
+        push[Instr](out, i_push(R_RAX()));
+        return;
+    }
+
+    if (@strEq(b, "simdF32Dot8")) {
+        if (nargs != 5) { cg_err(cg, "native: @simdF32Dot8 expects (o: *f32, a: *f32, b: *f32, bs: i64, n: i64)"); push[Instr](out,i_mov_imm(R_RAX(),0)); push[Instr](out,i_push(R_RAX())); return; }
+        push[Instr](out, i_pop(R_RDX()));  // n remaining
+        push[Instr](out, i_pop(R_R10()));  // bs (elements → bytes)
+        push[Instr](out, i_pop(R_RSI()));  // b base (col j at rsi + j*r10)
+        push[Instr](out, i_pop(R_RDI()));  // a
+        push[Instr](out, i_pop(R_R8()));   // o
+        push[Instr](out, i_mov_imm(R_R11(), 4));
+        push[Instr](out, i_imul(R_R10(), R_R11()));
+        if (avx2 >= 1) {
+            j = 0;
+            while (j < 8) { push[Instr](out, i_vzero(8 + j, VW_256())); j = j + 1; }
+            push[Instr](out, i_label(l_top));
+            push[Instr](out, i_cmp_imm(R_RDX(), 8));
+            push[Instr](out, i_jl(l_tail));
+            push[Instr](out, i_vmovdqu_load_w(0, R_RDI(), 0, VW_256()));
+            push[Instr](out, i_mov_rr(R_R11(), R_RSI()));
+            j = 0;
+            while (j < 8) {
+                push[Instr](out, i_vmovdqu_load_w(1, R_R11(), 0, VW_256()));
+                push[Instr](out, i_vfmadd231ps(8 + j, 0, 1));
+                push[Instr](out, i_add(R_R11(), R_R10()));
+                j = j + 1;
+            }
+            push[Instr](out, i_add_imm(R_RDI(), 32));
+            push[Instr](out, i_add_imm(R_RSI(), 32));
+            push[Instr](out, i_add_imm(R_RDX(), 0 - 8));
+            push[Instr](out, i_jmp(l_top));
+            push[Instr](out, i_label(l_tail));
+            // scalar tail in f32, per column: accumulate into xmm0, then ONE
+            // vaddps into the acc's lane 0.  Writing a ymm acc's xmm half with
+            // a VEX-128 op would zero ymm bits 128-255 and lose the vector
+            // part — the fold below must see all 8 lanes.
+            push[Instr](out, i_mov_rr(R_R11(), R_RSI()));
+            j = 0;
+            while (j < 8) {
+                let l_j: i32 = cg_fresh(cg);
+                let l_jd: i32 = cg_fresh(cg);
+                push[Instr](out, i_vzero(0, VW_256()));   // ymm0 = 0 (all 8 lanes)
+                push[Instr](out, i_mov_rr(R_RCX(), R_RDX()));
+                push[Instr](out, i_mov_imm(R_R9(), 0));    // r9 = byte offset 0
+                push[Instr](out, i_label(l_j));
+                push[Instr](out, i_cmp_imm(R_RCX(), 0));
+                push[Instr](out, i_jle(l_jd));
+                push[Instr](out, i_mov_rr(R_RAX(), R_RDI()));
+                push[Instr](out, i_add(R_RAX(), R_R9()));
+                push[Instr](out, i_vmovss_load(1, R_RAX(), 0));
+                push[Instr](out, i_mov_rr(R_RAX(), R_R11()));
+                push[Instr](out, i_add(R_RAX(), R_R9()));
+                push[Instr](out, i_vmovss_load(2, R_RAX(), 0));
+                push[Instr](out, i_vmulps(2, 2, 1, VW_128()));
+                push[Instr](out, i_vaddps(0, 0, 2, VW_128()));
+                push[Instr](out, i_add_imm(R_R9(), 4));
+                push[Instr](out, i_add_imm(R_RCX(), 0 - 1));
+                push[Instr](out, i_jmp(l_j));
+                push[Instr](out, i_label(l_jd));
+                // ymm merge: a 128-bit vaddps would zero the acc's high half.
+                push[Instr](out, i_vaddps(8 + j, 8 + j, 0, VW_256()));
+                push[Instr](out, i_add(R_R11(), R_R10()));
+                j = j + 1;
+            }
+            push[Instr](out, i_label(l_done));
+            // fold each accumulator → widen, narrow, store f32
+            j = 0;
+            while (j < 8) {
+                cg_simd_f32_fold(out, 8 + j, 0);
+                push[Instr](out, i_vcvtsd2ss(8 + j, 8 + j, 8 + j));
+                push[Instr](out, i_vmovss_store(R_R8(), j * 4, 8 + j));
+                j = j + 1;
+            }
+        } else {
+            // scalar-only path: per-column f64 dot in xmm12. rcx = elements
+            // left, r9 = byte offset, r11 = column base, rax = addr scratch.
+            push[Instr](out, i_mov_rr(R_R11(), R_RSI()));
+            j = 0;
+            while (j < 8) {
+                let l_st: i32 = cg_fresh(cg);
+                let l_sd: i32 = cg_fresh(cg);
+                push[Instr](out, i_fxorps(12, 12));
+                push[Instr](out, i_mov_rr(R_RCX(), R_RDX()));
+                push[Instr](out, i_mov_imm(R_R9(), 0));    // r9 = 0
+                push[Instr](out, i_label(l_st));
+                push[Instr](out, i_cmp_imm(R_RCX(), 0));
+                push[Instr](out, i_jle(l_sd));
+                push[Instr](out, i_mov_rr(R_RAX(), R_RDI()));
+                push[Instr](out, i_add(R_RAX(), R_R9()));
+                push[Instr](out, i_fmovss_load(0, R_RAX(), 0));
+                push[Instr](out, i_fss2sd(0, 0));
+                push[Instr](out, i_mov_rr(R_RAX(), R_R11()));
+                push[Instr](out, i_add(R_RAX(), R_R9()));
+                push[Instr](out, i_fmovss_load(1, R_RAX(), 0));
+                push[Instr](out, i_fss2sd(1, 1));
+                push[Instr](out, i_fmul(1, 0));
+                push[Instr](out, i_fadd(12, 1));
+                push[Instr](out, i_add_imm(R_R9(), 4));
+                push[Instr](out, i_add_imm(R_RCX(), 0 - 1));
+                push[Instr](out, i_jmp(l_st));
+                push[Instr](out, i_label(l_sd));
+                push[Instr](out, i_fsd2ss(12, 12));
+                push[Instr](out, i_fmovss_store(R_R8(), j * 4, 12));
+                push[Instr](out, i_add(R_R11(), R_R10()));
+                j = j + 1;
+            }
+        }
+        if (avx2 >= 1) { push[Instr](out, i_vzeroupper()); }
         push[Instr](out, i_mov_imm(R_RAX(), 0));
         push[Instr](out, i_push(R_RAX()));
         return;
@@ -5160,7 +5286,7 @@ fn cg_lower_simd_f32(out: *ArrayList[Instr], b: []u8, c: Call, env: *Env, syms: 
         push[Instr](out, i_pop(R_RDI()));  // c
         push[Instr](out, i_fmovq_gx(15, R_RAX()));   // xmm15 = s (f64)
         if (avx2 >= 1) {
-            push[Instr](out, i_fsd2ss(7, 15));
+            push[Instr](out, i_vcvtsd2ss(7, 7, 15));
             push[Instr](out, i_vbroadcastss_x(7, 7, VW_256()));
             push[Instr](out, i_label(l_top));
             push[Instr](out, i_cmp_imm(R_RDX(), 8));
@@ -5179,19 +5305,28 @@ fn cg_lower_simd_f32(out: *ArrayList[Instr], b: []u8, c: Call, env: *Env, syms: 
         }
         push[Instr](out, i_cmp_imm(R_RDX(), 0));
         push[Instr](out, i_jle(l_done));
-        push[Instr](out, i_fmovss_load(0, R_RSI(), 0));
-        push[Instr](out, i_fss2sd(0, 0));
-        push[Instr](out, i_fmul(0, 15));
-        push[Instr](out, i_fmovss_load(1, R_RDI(), 0));
-        push[Instr](out, i_fss2sd(1, 1));
-        push[Instr](out, i_fadd(0, 1));
-        push[Instr](out, i_fsd2ss(0, 0));
-        push[Instr](out, i_fmovss_store(R_RDI(), 0, 0));
+        if (avx2 >= 1) {
+            push[Instr](out, i_vmovss_load(0, R_RSI(), 0));
+            push[Instr](out, i_vmulps(0, 7, 0, VW_128()));
+            push[Instr](out, i_vmovss_load(1, R_RDI(), 0));
+            push[Instr](out, i_vaddps(0, 0, 1, VW_128()));
+            push[Instr](out, i_vmovss_store(R_RDI(), 0, 0));
+        } else {
+            push[Instr](out, i_fmovss_load(0, R_RSI(), 0));
+            push[Instr](out, i_fss2sd(0, 0));
+            push[Instr](out, i_fmul(0, 15));
+            push[Instr](out, i_fmovss_load(1, R_RDI(), 0));
+            push[Instr](out, i_fss2sd(1, 1));
+            push[Instr](out, i_fadd(0, 1));
+            push[Instr](out, i_fsd2ss(0, 0));
+            push[Instr](out, i_fmovss_store(R_RDI(), 0, 0));
+        }
         push[Instr](out, i_add_imm(R_RDI(), 4));
         push[Instr](out, i_add_imm(R_RSI(), 4));
         push[Instr](out, i_add_imm(R_RDX(), 0 - 1));
         push[Instr](out, i_jmp(l_tail));
         push[Instr](out, i_label(l_done));
+        if (avx2 >= 1) { push[Instr](out, i_vzeroupper()); }
         push[Instr](out, i_mov_imm(R_RAX(), 0));
         push[Instr](out, i_push(R_RAX()));
         return;
@@ -5224,21 +5359,31 @@ fn cg_lower_simd_f32(out: *ArrayList[Instr], b: []u8, c: Call, env: *Env, syms: 
         }
         push[Instr](out, i_cmp_imm(R_RDX(), 0));
         push[Instr](out, i_jle(l_done));
-        push[Instr](out, i_fmovss_load(0, R_RDI(), 0));
-        push[Instr](out, i_fss2sd(0, 0));
-        push[Instr](out, i_fmovss_load(1, R_RSI(), 0));
-        push[Instr](out, i_fss2sd(1, 1));
-        if (@strEq(b, "simdF32Add")) { push[Instr](out, i_fadd(0, 1)); }
-        if (@strEq(b, "simdF32Sub")) { push[Instr](out, i_fsub(0, 1)); }
-        if (@strEq(b, "simdF32Mul")) { push[Instr](out, i_fmul(0, 1)); }
-        push[Instr](out, i_fsd2ss(0, 0));
-        push[Instr](out, i_fmovss_store(R_R8(), 0, 0));
+        if (avx2 >= 1) {
+            push[Instr](out, i_vmovss_load(0, R_RDI(), 0));
+            push[Instr](out, i_vmovss_load(1, R_RSI(), 0));
+            if (@strEq(b, "simdF32Add")) { push[Instr](out, i_vaddps(0, 0, 1, VW_128())); }
+            if (@strEq(b, "simdF32Sub")) { push[Instr](out, i_vsubps(0, 0, 1, VW_128())); }
+            if (@strEq(b, "simdF32Mul")) { push[Instr](out, i_vmulps(0, 0, 1, VW_128())); }
+            push[Instr](out, i_vmovss_store(R_R8(), 0, 0));
+        } else {
+            push[Instr](out, i_fmovss_load(0, R_RDI(), 0));
+            push[Instr](out, i_fss2sd(0, 0));
+            push[Instr](out, i_fmovss_load(1, R_RSI(), 0));
+            push[Instr](out, i_fss2sd(1, 1));
+            if (@strEq(b, "simdF32Add")) { push[Instr](out, i_fadd(0, 1)); }
+            if (@strEq(b, "simdF32Sub")) { push[Instr](out, i_fsub(0, 1)); }
+            if (@strEq(b, "simdF32Mul")) { push[Instr](out, i_fmul(0, 1)); }
+            push[Instr](out, i_fsd2ss(0, 0));
+            push[Instr](out, i_fmovss_store(R_R8(), 0, 0));
+        }
         push[Instr](out, i_add_imm(R_RDI(), 4));
         push[Instr](out, i_add_imm(R_RSI(), 4));
         push[Instr](out, i_add_imm(R_R8(), 4));
         push[Instr](out, i_add_imm(R_RDX(), 0 - 1));
         push[Instr](out, i_jmp(l_tail));
         push[Instr](out, i_label(l_done));
+        if (avx2 >= 1) { push[Instr](out, i_vzeroupper()); }
         push[Instr](out, i_mov_imm(R_RAX(), 0));
         push[Instr](out, i_push(R_RAX()));
         return;
@@ -5252,7 +5397,7 @@ fn cg_lower_simd_f32(out: *ArrayList[Instr], b: []u8, c: Call, env: *Env, syms: 
         push[Instr](out, i_pop(R_R8()));   // c
         push[Instr](out, i_fmovq_gx(15, R_RAX()));
         if (avx2 >= 1) {
-            push[Instr](out, i_fsd2ss(7, 15));
+            push[Instr](out, i_vcvtsd2ss(7, 7, 15));
             push[Instr](out, i_vbroadcastss_x(7, 7, VW_256()));
             push[Instr](out, i_label(l_top));
             push[Instr](out, i_cmp_imm(R_RDX(), 8));
@@ -5270,16 +5415,23 @@ fn cg_lower_simd_f32(out: *ArrayList[Instr], b: []u8, c: Call, env: *Env, syms: 
         }
         push[Instr](out, i_cmp_imm(R_RDX(), 0));
         push[Instr](out, i_jle(l_done));
-        push[Instr](out, i_fmovss_load(0, R_RDI(), 0));
-        push[Instr](out, i_fss2sd(0, 0));
-        push[Instr](out, i_fmul(0, 15));
-        push[Instr](out, i_fsd2ss(0, 0));
-        push[Instr](out, i_fmovss_store(R_R8(), 0, 0));
+        if (avx2 >= 1) {
+            push[Instr](out, i_vmovss_load(0, R_RDI(), 0));
+            push[Instr](out, i_vmulps(0, 7, 0, VW_128()));
+            push[Instr](out, i_vmovss_store(R_R8(), 0, 0));
+        } else {
+            push[Instr](out, i_fmovss_load(0, R_RDI(), 0));
+            push[Instr](out, i_fss2sd(0, 0));
+            push[Instr](out, i_fmul(0, 15));
+            push[Instr](out, i_fsd2ss(0, 0));
+            push[Instr](out, i_fmovss_store(R_R8(), 0, 0));
+        }
         push[Instr](out, i_add_imm(R_RDI(), 4));
         push[Instr](out, i_add_imm(R_R8(), 4));
         push[Instr](out, i_add_imm(R_RDX(), 0 - 1));
         push[Instr](out, i_jmp(l_tail));
         push[Instr](out, i_label(l_done));
+        if (avx2 >= 1) { push[Instr](out, i_vzeroupper()); }
         push[Instr](out, i_mov_imm(R_RAX(), 0));
         push[Instr](out, i_push(R_RAX()));
         return;
@@ -5324,13 +5476,20 @@ fn cg_lower_simd_f32(out: *ArrayList[Instr], b: []u8, c: Call, env: *Env, syms: 
         push[Instr](out, i_label(l_tail));
         push[Instr](out, i_cmp_imm(R_RDX(), 0));
         push[Instr](out, i_jle(l_done));
-        push[Instr](out, i_fmovss_load(0, R_RDI(), 0));
-        push[Instr](out, i_fss2sd(0, 0));
-        push[Instr](out, i_fadd(8, 0));
+        if (avx2 >= 1) {
+            push[Instr](out, i_vmovss_load(0, R_RDI(), 0));
+            push[Instr](out, i_vcvtss2sd(0, 0, 0));
+            push[Instr](out, i_vaddsd(8, 8, 0));
+        } else {
+            push[Instr](out, i_fmovss_load(0, R_RDI(), 0));
+            push[Instr](out, i_fss2sd(0, 0));
+            push[Instr](out, i_fadd(8, 0));
+        }
         push[Instr](out, i_add_imm(R_RDI(), 4));
         push[Instr](out, i_add_imm(R_RDX(), 0 - 1));
         push[Instr](out, i_jmp(l_tail));
         push[Instr](out, i_label(l_done));
+        if (avx2 >= 1) { push[Instr](out, i_vzeroupper()); }
         push[Instr](out, i_fmovq_xg(R_RAX(), 8));
         push[Instr](out, i_push(R_RAX()));
         return;
@@ -5357,13 +5516,19 @@ fn cg_lower_simd_f32(out: *ArrayList[Instr], b: []u8, c: Call, env: *Env, syms: 
         }
         push[Instr](out, i_cmp_imm(R_RDX(), 0));
         push[Instr](out, i_jle(l_done));
-        push[Instr](out, i_fmovss_load(0, R_RDI(), 0));
-        push[Instr](out, i_fmovss_store(R_RSI(), 0, 0));
+        if (avx2 >= 1) {
+            push[Instr](out, i_vmovss_load(0, R_RDI(), 0));
+            push[Instr](out, i_vmovss_store(R_RSI(), 0, 0));
+        } else {
+            push[Instr](out, i_fmovss_load(0, R_RDI(), 0));
+            push[Instr](out, i_fmovss_store(R_RSI(), 0, 0));
+        }
         push[Instr](out, i_add_imm(R_RDI(), 4));
         push[Instr](out, i_add_imm(R_RSI(), 4));
         push[Instr](out, i_add_imm(R_RDX(), 0 - 1));
         push[Instr](out, i_jmp(l_tail));
         push[Instr](out, i_label(l_done));
+        if (avx2 >= 1) { push[Instr](out, i_vzeroupper()); }
         push[Instr](out, i_mov_imm(R_RAX(), 0));
         push[Instr](out, i_push(R_RAX()));
         return;
