@@ -382,7 +382,7 @@ fn aopt_gap_kind_ok(ins: AInstr) i32 {
     // still only touched if it is named, which is what this check tests.)
     if (k == AK_FMOV_DX() || k == AK_FMOV_XD() || k == AK_FMOV_SW() ||
         k == AK_FMOV_WS() || k == AK_FCVT_SD() || k == AK_FCVT_DS() ||
-        k == AK_SCVTF()   || k == AK_FCVTZS()) {
+        k == AK_SCVTF()   || k == AK_FCVTZS() || k == AK_FSQRT()) {
         if (ins.dst == A_X28()) { return 0; }
         if (ins.src == A_X28()) { return 0; }
         return 1;
@@ -405,6 +405,115 @@ fn aopt_gap_clean(prog: ArrayList[AInstr], p: i32, q: i32) i32 {
         i = i + 1;
     }
     return 1;
+}
+
+// ── OPT 4 · REGISTER-CACHED EXPRESSION-STACK SLOTS ──────────────────────────
+// The dominant cost of the stack-machine lowering is not constants but LIVE
+// values: `str r,[x28]` + `add x28,#8` to push, `sub x28,#8` + `ldr rY,[x28]`
+// to pop — four instructions and two memory accesses per binary-op operand.
+// A matched push/pop pair inside one run is replaced here by
+//   push r   →  fmov d_t, r        (stash the value in a scratch FPR)
+//   pop  rY  →  fmov rY, d_t       (read it back)
+// — two instructions, no memory access, and x28 is left exactly where the
+// stack machine left it (the pair was already x28-neutral).
+//
+// THE BANK IS THE FLOAT/VECTOR FILE, NOT MORE GPRs. AArch64's FPRs are a
+// physically separate register file: `fmov d_t, x` / `fmov x, d_t` move 64
+// bits bit-exact, so any expression-stack word (int, pointer, or f64 bits,
+// which acodegen already shuttles through GPRs) round-trips losslessly.
+// d16..d30 are CALLER-SAVED under the AAPCS64 variant Zag uses, so caching a
+// value there across a gap requires no prologue save — and a cached slot can
+// never outlive its run, because only matched in-run pairs are rewritten, so
+// no call (a breaker) can observe it. d8..d15 are callee-saved (skip them:
+// using them would corrupt the caller's registers); d31 is acodegen's FP
+// scratch; d0..d7 carry FP args/results. GPR bank candidates do not exist:
+// x16/x17 are aarch64.zag's invisible encoder scratch (syscalls, GOT calls,
+// scaled vector mem), x18 is platform-reserved, x19..x27 are callee-saved.
+//
+// SOUNDNESS of a cached pair requires:
+//   1. the pop is matched in-run (pre-scan) and targets a FREE GPR — a
+//      reserved pop destination cannot be rewritten, so its push must stay a
+//      real memory write (this also closes a latent hazard: a deleted push
+//      whose memory slot a reserved pop would have consumed);
+//   2. the gap is x28-clean (`aopt_gap_clean`), the same requirement every
+//      deleted push already meets, so kept pushes/pops see x28 exactly where
+//      the stack machine put it;
+//   3. the bank register is free for the whole FUNCTION: a per-region scan
+//      disqualifies d16..d30 whenever a scalar-FP instruction names it in an
+//      FPR operand field, and disqualifies the entire bank whenever a
+//      vector-kind instruction appears (a v-reg may be allocated to it later;
+//      the operand descriptor can also hide a GPR index in `imm`). GPR-only
+//      functions — the overwhelming majority — get the full 15-deep bank.
+// Within the run, bank registers are handed out from `bank_free` in LIFO
+// order and returned by their pops, so a nested cached push always takes a
+// different register than any still-open outer slot. Depths beyond the bank
+// (observed max in step1 is 11, typical 1..2) simply fall back to the real
+// push — the model entry is a KEEP tag, so the pop stays a real load.
+
+// Bit for FPR number r inside the 15-bit bank mask (r must be in 16..30).
+fn aopt_fbit(r: i32) i32 {
+    if (r < 16)  { return 0; }
+    if (r > 30)  { return 0; }
+    return 1 << (r - 16);
+}
+
+// Is kind k one of the scalar floating-point forms whose dst/src fields name
+// FPRs? (The GPR side of a move/cvt is a different file and is NOT checked.)
+fn aopt_is_fp_kind(k: i32) i32 {
+    if (k == AK_FMOV_DX() || k == AK_FMOV_XD() || k == AK_FMOV_SW() ||
+        k == AK_FMOV_WS() || k == AK_FCVT_SD() || k == AK_FCVT_DS() ||
+        k == AK_SCVTF()   || k == AK_FCVTZS() || k == AK_FADD()   ||
+        k == AK_FSUB()    || k == AK_FMUL()   || k == AK_FDIV()   ||
+        k == AK_FSQRT()   || k == AK_FCMP()) { return 1; }
+    return 0;
+}
+
+// Bank-mask bits of the FPRs `ins` uses in its FPR operand fields. Mixed
+// forms contribute only their FPR side: fmov d,x uses dst, fmov x,d uses src,
+// scvtf d,x uses dst, fcvtzs x,d uses src.
+fn aopt_fp_bits(ins: AInstr) i32 {
+    let k: i32 = ins.kind;
+    if (k == AK_FMOV_DX() || k == AK_FMOV_SW() || k == AK_SCVTF()) {
+        return aopt_fbit(ins.dst);
+    }
+    if (k == AK_FMOV_XD() || k == AK_FMOV_WS() || k == AK_FCVTZS()) {
+        return aopt_fbit(ins.src);
+    }
+    if (aopt_is_fp_kind(k) == 1) {
+        return aopt_fbit(ins.dst) | aopt_fbit(ins.src);
+    }
+    return 0;
+}
+
+// The FPR bank available to the function region containing index `i`: scan
+// forward to the next AK_FN_LABEL (or end), clearing a bit for every FPR a
+// scalar-FP instruction names and emptying the bank on any vector kind.
+fn aopt_fn_bank(prog: ArrayList[AInstr], i: i32, n: i32) i32 {
+    let mask: i32 = 32767;             // d16..d30 all free
+    let j: i32 = i;
+    let going: i32 = 1;
+    while (going == 1 && j < n) {
+        let ins: AInstr = get[AInstr](prog, j);
+        if (j > i && ins.kind == AK_FN_LABEL()) { going = 0; }
+        else {
+            if (a_is_veclike(ins.kind) == 1) { mask = 0; going = 0; }
+            else { mask = mask & (32767 - aopt_fp_bits(ins)); }
+            j = j + 1;
+        }
+    }
+    return mask;
+}
+
+// Take the lowest-numbered free bank register out of *free. Caller checks
+// *free != 0 first, so this always returns a register in 16..30.
+fn aopt_bank_take(free: *i32) i32 {
+    let t: i32 = 16;
+    while (t <= 30) {
+        let b: i32 = 1 << (t - 16);
+        if ((free.* & b) != 0) { free.* = free.* - b; return t; }
+        t = t + 1;
+    }
+    return 16;
 }
 
 // ── PRE-SCAN: pair pushes↔pops (run-scoped LIFO), record matched + pop index ──
@@ -676,8 +785,10 @@ fn aopt_fold_pass(prog: ArrayList[AInstr]) ArrayList[AInstr] {
     // forward register/stack state
     let known: ArrayList[i32] = aopt_mk_i32();   // 1 ⟺ cval[r] is a known const
     let cval:  ArrayList[i64] = aopt_mk_i64();   // the known constant
-    let ms_tag: ArrayList[i32] = make[i32](16);  // model stack: 1=CONST, 2=COPY, 0=KEEP
+    let ms_tag: ArrayList[i32] = make[i32](16);  // model stack: 1=CONST, 2=COPY, 3=CACHED, 0=KEEP
     let ms_val: ArrayList[i64] = make[i64](16);
+    let cur_bank:  i32 = 0;                      // FPR bank mask of the fn region we are in
+    let bank_free: i32 = 0;                      // bank regs still unassigned in this run
 
     let i: i32 = 0;
     while (i < n) {
@@ -692,6 +803,8 @@ fn aopt_fold_pass(prog: ArrayList[AInstr]) ArrayList[AInstr] {
             aopt_reset_i32(&known);
             aopt_clear_i32(&ms_tag);
             aopt_clear_i64(&ms_val);
+            if (k == AK_FN_LABEL()) { cur_bank = aopt_fn_bank(prog, i, n); }
+            bank_free = cur_bank;
 
         } else { if (k == AK_PUSH()) {
             let r: i32 = ins.dst;
@@ -705,10 +818,20 @@ fn aopt_fold_pass(prog: ArrayList[AInstr]) ArrayList[AInstr] {
                 push[AInstr](&out, ins);
 
             } else {
+                // Shared gate for every push-deleting form: the matching pop
+                // must lie in the same run AND target a register we may
+                // rematerialize into. A pop into a RESERVED register cannot be
+                // rewritten, so its push must stay a real memory write — its
+                // slot is consumed verbatim, and this also keeps the model
+                // stack from desynchronizing at a reserved pop.
+                let popok: i32 = 0;
+                if (get[i32](matched, i) == 1) {
+                    if (aopt_free(get[AInstr](prog, get[i32](pop_of, i)).dst) == 1) { popok = 1; }
+                }
                 // (1) CONSTANT rematerialization: r holds a known constant and
                 //     its pop is in-run over an x28-clean gap → delete, remat the
                 //     pop as `mov r, const`.
-                if (done == 0 && get[i32](matched, i) == 1 && aopt_known_get(known, r) == 1) {
+                if (done == 0 && popok == 1 && aopt_known_get(known, r) == 1) {
                     if (aopt_gap_clean(prog, i, get[i32](pop_of, i)) == 1) {
                         push[i32](&ms_tag, 1);
                         push[i64](&ms_val, aopt_val_get(cval, r));
@@ -721,7 +844,7 @@ fn aopt_fold_pass(prog: ArrayList[AInstr]) ArrayList[AInstr] {
                 //     Equivalent: the pushed value WAS R's value, R is unchanged
                 //     at the pop, so reloading rY from R reproduces it. The
                 //     feeding mov then dies in DCE.
-                if (done == 0 && get[i32](matched, i) == 1 && i > 0) {
+                if (done == 0 && popok == 1 && i > 0) {
                     let prev: AInstr = get[AInstr](prog, i - 1);
                     if (prev.kind == AK_MOV_RR() && prev.dst == r && aopt_free(prev.src) == 1 && prev.src != r) {
                         let q: i32 = get[i32](pop_of, i);
@@ -732,7 +855,20 @@ fn aopt_fold_pass(prog: ArrayList[AInstr]) ArrayList[AInstr] {
                         }
                     }
                 }
-                // (3) KEEP: emit the real push, record a placeholder model entry.
+                // (3) REGISTER-CACHE: a free GPR whose in-run pop is itself free
+                //     and whose bank register is available → stash the value in
+                //     scratch FPR d_t (`fmov d_t, r`), reload it at the pop.
+                //     See the OPT-4 header for the bank and soundness argument.
+                if (done == 0 && popok == 1 && bank_free != 0) {
+                    if (aopt_gap_clean(prog, i, get[i32](pop_of, i)) == 1) {
+                        let t: i32 = aopt_bank_take(&bank_free);
+                        push[i32](&ms_tag, 3);
+                        push[i64](&ms_val, t as i64);
+                        push[AInstr](&out, ai_fmov_dx(t, r));
+                        done = 1;
+                    }
+                }
+                // (4) KEEP: emit the real push, record a placeholder model entry.
                 if (done == 0) {
                     push[i32](&ms_tag, 0);
                     push[i64](&ms_val, 0);
@@ -759,10 +895,16 @@ fn aopt_fold_pass(prog: ArrayList[AInstr]) ArrayList[AInstr] {
                         // matching push was a deleted register copy — reload from R.
                         push[AInstr](&out, ai_mov_rr(r, v as i32));
                         aopt_forget(&known, r);
+                    } else { if (tag == 3) {
+                        // matching push was stashed in bank FPR v — read it back
+                        // and hand the bank register back to this run's pool.
+                        push[AInstr](&out, ai_fmov_xd(r, v as i32));
+                        bank_free = bank_free + aopt_fbit(v as i32);
+                        aopt_forget(&known, r);
                     } else {
                         push[AInstr](&out, ins);
                         aopt_forget(&known, r);
-                    } }
+                    } } }
                 } else {
                     // external pop (matches a push from before this run) — keep it.
                     push[AInstr](&out, ins);
