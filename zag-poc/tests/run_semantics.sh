@@ -107,6 +107,7 @@ ok prefix-enum-pub-import prefix_enum_pub_import.zag 42
 ok memory-value-pointer memory_value_pointer.zag 42
 ok edge-control-values edge_control_values.zag 42
 ok unsigned-numeric unsigned_numeric.zag 42
+ok sqrt-numeric sqrt_numeric.zag 42
 ok_out unsigned-print unsigned_print.zag 42 $'9223372036854775808\n18446744073709551615\n4000000000\n0\n-9223372036854775808'
 ok_strict imported-const-flat import_const_flat.zag 42
 ok_strict imported-const-qualified import_const_qualified.zag 42

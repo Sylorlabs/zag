@@ -122,6 +122,30 @@ set -e
 [ "$dyld_status" -eq 42 ]
 echo "  ok  native dyld libSystem import and ARM64 stub"; pass=$((pass + 1))
 
+# libm through the C ABI: log/exp have no AArch64 hardware instruction and
+# resolve to libSystem via the dyld bind stream (whitelisted f64 ABI).
+"$test_compiler" tests/macos_arm64_libm.zag --target macos-arm64 --dynamic --no-zagd --no-analyze -o "$tmpdir/libm"
+require_macho_arm64 "$tmpdir/libm"
+require_signed "$tmpdir/libm"
+set +e
+"$tmpdir/libm"
+libm_status=$?
+set -e
+[ "$libm_status" -eq 42 ]
+echo "  ok  libm imports (log/exp) through the C ABI"; pass=$((pass + 1))
+
+# G11 regression: typed `*T + n` / `- n` must scale by the element stride so
+# `p + n` computes `&p[n]`, not p advanced by n bytes.
+"$test_compiler" tests/macos_arm64_ptr_stride.zag --target macos-arm64 --no-zagd --no-analyze -o "$tmpdir/ptr-stride"
+require_macho_arm64 "$tmpdir/ptr-stride"
+require_signed "$tmpdir/ptr-stride"
+set +e
+"$tmpdir/ptr-stride"
+stride_status=$?
+set -e
+[ "$stride_status" -eq 42 ]
+echo "  ok  typed pointer arithmetic scales by element stride"; pass=$((pass + 1))
+
 # Edition 2027 uses the explicit @cabi spelling for the same closed dyld
 # executable boundary. This must not fall back to v1 lowering merely because
 # the selected target is Mach-O.
