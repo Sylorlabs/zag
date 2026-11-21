@@ -2,6 +2,18 @@
 set -u
 cd "$(dirname "$0")/.."
 
+# This suite builds dynamic ELF executables (SONAME/PT_INTERP/readelf) and
+# runs them. On a non-Linux-x86-64 host every case reports "cannot execute
+# binary file", which is a platform mismatch, not an ABI failure; the macOS
+# dynamic-linking authorities live in tests/run_macos_dylib*.sh.
+case "$(uname -s):$(uname -m)" in
+    Linux:x86_64|Linux:amd64) ;;
+    *)
+        echo "dynamic ABI: dynamic ELF execution requires Linux x86-64" >&2
+        exit 2
+        ;;
+esac
+
 ZNC_BIN="${ZNC:-./znc}"
 case "$ZNC_BIN" in
     /*) ;;

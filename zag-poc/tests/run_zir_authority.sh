@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# This suite emits x86-64 ELF artifacts and executes them. On any other host
+# the foreign binaries fail before the first assertion, and the exit status
+# reports a platform mismatch as a compiler failure — the portable gate routes
+# non-Linux hosts through tests/run_zir_authority_portable.sh instead.
+case "$(uname -s):$(uname -m)" in
+    Linux:x86_64|Linux:amd64) ;;
+    *)
+        echo "zir authority: ELF artifact execution requires Linux x86-64; use tests/run_zir_authority_portable.sh" >&2
+        exit 2
+        ;;
+esac
 compiler=${ZNC:-./znc}
 tmp=$(mktemp -d /tmp/zag-zir-authority.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT
