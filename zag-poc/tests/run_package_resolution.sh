@@ -4,7 +4,7 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 . "$root/tests/portable.sh"
 caller_dir=$PWD
-znc=${ZNC:-"$root/znc"}
+znc=${ZNC:-$(zag_native_compiler "$root")}
 case "$znc" in
     /*) ;;
     *) znc="$caller_dir/$znc" ;;

@@ -13,7 +13,10 @@ repo_root=$PWD
 tmp_dir=$(mktemp -d /tmp/zag-script-accounting.XXXXXX)
 trap 'rm -rf "$tmp_dir"' EXIT
 mkdir -p "$tmp_dir/compiler"
-ln -s "$znc_bin" "$tmp_dir/compiler/znc"
+# Invoke the original compiler path so a signature-auditing wrapper can locate
+# its own znc-real and record every artifact without recursive relocation.
+printf '#!/bin/bash\nexec %q "$@"\n' "$znc_bin" >"$tmp_dir/compiler/znc"
+chmod +x "$tmp_dir/compiler/znc"
 ln -s "$repo_root/selfhost" "$tmp_dir/compiler/selfhost"
 ln -s "$repo_root/std" "$tmp_dir/compiler/std"
 znc_bin="$tmp_dir/compiler/znc"

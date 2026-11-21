@@ -74,6 +74,8 @@ done
 
 # A source-only dependency's path is NOT an external library search path.
 printf '\n[deps]\nhelper = { path = "vendor/helper" }\n' >>"$work/project/zag.mod"
+printf 'name = "helper"\nversion = "0"\nedition = "2027"\n' \
+    >"$work/project/vendor/helper/zag.mod"
 printf 'pub fn value() i64 { return 42; }\n' >"$work/project/vendor/helper/value.zag"
 cat >"$work/project/src/main.zag" <<'ZAG'
 @import("pkg:helper/value.zag") as helper
@@ -88,7 +90,6 @@ build "$work/source-dependency.o" >/dev/null
 pass=$((pass + 2))
 
 # A linked dependency's own manifest is part of the source graph too.
-cp "$work/manifest" "$work/project/vendor/helper/zag.mod"
 printf '\n[deps]\nnative = { link = "not-a-zag-library" }\n' \
     >>"$work/project/vendor/helper/zag.mod"
 for mode in executable object archive; do
@@ -100,6 +101,11 @@ for mode in executable object archive; do
     reject imported-module-manifest
 done
 rm "$work/project/vendor/helper/zag.mod"
+cp "$work/manifest" "$work/project/zag.mod"
+cat >"$work/project/src/main.zag" <<'ZAG'
+pub fn answer() i64 @cabi_export { return 42; }
+fn main() i32 { return 0; }
+ZAG
 
 # Hot replacement must not bypass the same option/manifest validation. It
 # must reject before staging any text, even without pre-existing hot metadata.

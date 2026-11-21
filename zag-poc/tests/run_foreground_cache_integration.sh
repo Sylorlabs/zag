@@ -2,7 +2,8 @@
 set -euo pipefail
 . "$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/portable.sh"
 
-compiler="${ZNC:-./znc}"
+root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+compiler="${ZNC:-$(zag_native_compiler "$root")}"
 case "$compiler" in /*) ;; *) compiler="$(pwd)/${compiler#./}" ;; esac
 work="$(mktemp -d)"
 cleanup() {

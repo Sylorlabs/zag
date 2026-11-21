@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
-ZNC=${ZNC:-./znc}
+source tests/portable.sh
+ZNC=${ZNC:-$(zag_native_compiler .)}
 case "$ZNC" in
     /*) ;;
     *) ZNC="$PWD/${ZNC#./}" ;;
@@ -10,7 +11,9 @@ repo_root=$PWD
 tmp=$(mktemp -d /tmp/zag-script-lifetime.XXXXXX)
 trap 'find "$tmp" -depth -delete' EXIT
 mkdir -p "$tmp/compiler"
-ln -s "$ZNC" "$tmp/compiler/znc"
+# Preserve the caller's wrapper location when ZNC is a release audit wrapper.
+printf '#!/bin/bash\nexec %q "$@"\n' "$ZNC" >"$tmp/compiler/znc"
+chmod +x "$tmp/compiler/znc"
 ln -s "$repo_root/selfhost" "$tmp/compiler/selfhost"
 ln -s "$repo_root/std" "$tmp/compiler/std"
 ZNC="$tmp/compiler/znc"

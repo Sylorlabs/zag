@@ -14,7 +14,10 @@ case "$edition" in 2026|2027) ;; *) echo "JSON_EDITION must be 2026 or 2027" >&2
 tmp=$(mktemp -d /tmp/zag-script-json-root.XXXXXX)
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/compiler"
-ln -s "$compiler" "$tmp/compiler/znc"
+# Forward to the original compiler path; symlinking a wrapper relocates its
+# relative znc-real lookup and bypasses the signed-artifact audit.
+printf '#!/bin/bash\nexec %q "$@"\n' "$compiler" >"$tmp/compiler/znc"
+chmod +x "$tmp/compiler/znc"
 ln -s "$repo_root/selfhost" "$tmp/compiler/selfhost"
 ln -s "$repo_root/std" "$tmp/compiler/std"
 compiler="$tmp/compiler/znc"

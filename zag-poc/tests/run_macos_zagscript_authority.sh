@@ -254,8 +254,7 @@ ZAG
 script;
 let values = list(7);
 values.len = 9;
-if (script_list_append(&values, 8) != 1 ||
-    script_list_failed(values) != 1) { return 1; }
+if (script_list_append(&values, 8) != 1 || script_list_failed(values) != 1) { return 1; }
 return 0;
 ZAG
     "$compiler" "$list_dir/invalid.zag" -o "$list_dir/invalid" \

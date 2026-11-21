@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 . ./tests/portable.sh
-compiler="${ZNC:-./znc}"
+compiler="${ZNC:-$(zag_native_compiler "$PWD")}"
 case "$compiler" in /*) ;; *) compiler="$(pwd)/${compiler#./}" ;; esac
 work="$(mktemp -d)"
 native_target_args=()
