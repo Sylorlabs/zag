@@ -89,6 +89,14 @@ fi
 test_compiler="$tmpdir/znc-gen2"
 pass=$((pass + 1))
 
+# Explicit narrowing must preserve low-bit truncation and signed extension.
+# The original ARM64 .cast_ lowering kept high bits for u16/i16 and treated
+# i8 as unsigned. Run the independent exact-output regression on the
+# fixed-point compiler before qualifying a release artifact.
+ZNC_BIN="$test_compiler" bash tests/run_sentinel_narrow_cast_matrix.sh
+echo "  ok  signed/unsigned narrow-cast normalization (25 outputs)"
+pass=$((pass + 1))
+
 # Exercise the signer independently of the compiler-sized artifact.
 "$test_compiler" selfhost/native/macho_arm64_test.zag --target macos-arm64 --no-zagd --no-analyze -o "$tmpdir/macho-sign-test"
 require_macho_arm64 "$tmpdir/macho-sign-test"
