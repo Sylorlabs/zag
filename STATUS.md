@@ -77,7 +77,8 @@ run_optimize.sh removed (0701e2a).
 ## Final state
 
 - [x] fresh Darwin-arm64 matrix: all 55 DEFAULT_TEST_TARGETS run on the
-      final fixpoint — 54 PASS + 1 transient (C-024, serial-verified pass x2)
+      final fixpoint — 54 PASS + 1 transient (C-024, serial-verified pass;
+      retained rerun log /tmp/zagd-product-rerun.log)
 - [x] test-macos-arm64-release: pass=69 fail=0 (twice: standalone gate
       run + embedded in the matrix)
 - [x] bootstrap fixpoint re-verified at stage 3 after every selfhost
@@ -88,12 +89,14 @@ run_optimize.sh removed (0701e2a).
 - [x] docs gates green: pure-tree, docs-truth, host-selection
 - [x] generated cruft removed; git status clean except this file pair
 
-VERDICT: 24 complaints (C-001..C-024) found — 12 REAL-BUGs fixed and
-verified (3 genuine compiler defects: manifest link-dep closure 4f0a979,
-exponential aggregate typecheck 6d35521, ARM64 narrow-cast lowering
-fd4bdbf; plus repository/test/fixture defects), 5 PLATFORM-ARTIFACTs
-(foreign-seed ELF runs, Docker VEX translator, SDK27/ld-1267,
-zagd-product load flakes x2), 3 STALE-DOC/test removals, 1 NOT-A-BUG
-(historical GAPS all hold), remainder infrastructure/completion rows —
-every complaint closed and re-verified on the final fixpoint.
+VERDICT: 24 complaints (C-001..C-024) found — literal COMPLAINTS.md
+tags: 13 REAL-BUG (all fixed+verified: 3 genuine compiler defects —
+manifest link-dep closure 4f0a979, exponential aggregate typecheck
+6d35521, ARM64 narrow-cast lowering fd4bdbf — plus 10 repository/
+test/fixture defects), 7 PLATFORM-ARTIFACT (stale log row, foreign-ELF
+seed runs, sibling-seed lint env, Docker VEX translator, SDK27/ld-1267,
+zagd-product load flakes x2), 2 STALE-DOC (dead zagc suite, GAPS-4
+repro), 1 NOT-A-BUG (historical GAPS all hold), 1 CLOSED tracking row
+(C-011 matrix completion) — every complaint closed and re-verified on
+the final fixpoint.
 DONE 2026-11-21T17:08:34Z

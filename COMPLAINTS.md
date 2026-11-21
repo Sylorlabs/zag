@@ -191,9 +191,10 @@ native compiler/daemon/LSP, installed std)".
 PLATFORM-ARTIFACT (load contention) — CLOSED
 Evidence: matrix run at 04:07:57 exited 2 while a parallel fixpoint
 bootstrap (the C-014 verification re-run) was executing — the zagd
-lock/daemon lifecycle suite is timing-sensitive. A direct serial re-run
-of `tests/run_zagd_product.sh` printed `zagd product: pass` rc=0, and a
-second serial re-run post-matrix also passed. No product defect.
+lock/daemon lifecycle suite is timing-sensitive. Two direct serial
+re-runs of `tests/run_zagd_product.sh` each printed `zagd product: pass`
+rc=0 (console output, same session — not tee'd to a retained file).
+No product defect.
 
 ### C-016 — `test-macos-arm64-release` dies at C-oracle link: host SDK/ld
 mismatch — PLATFORM-ARTIFACT — FIXED b6bd973
@@ -363,7 +364,9 @@ Evidence: the fresh 55-target Darwin matrix run recorded FAIL(2) for
 `test-zagd-product` immediately after the suite's embedded 3-stage
 bootstrap (~20 min) while the machine was still saturated. Two direct
 serial re-runs of `tests/run_zagd_product.sh` each printed
-`zagd product: pass` rc=0. Same class as C-015 — daemon lifecycle timing
+`zagd product: pass` rc=0 (first retained at
+`/tmp/zagd-product-rerun.log`; second printed the same line to console,
+not tee'd to a file). Same class as C-015 — daemon lifecycle timing
 under load, not a product defect.
 
 ### Matrix outcome (fresh, final fixpoint)
