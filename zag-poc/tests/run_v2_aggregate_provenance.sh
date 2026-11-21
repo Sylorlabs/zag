@@ -2,7 +2,8 @@
 # Edition-2027 mutation-aware aggregate ownership/stack provenance.
 set -eu
 cd "$(dirname "$0")/.."
-ZNC=${ZNC:-"$PWD/znc"}
+source tests/portable.sh
+ZNC=${ZNC:-$(zag_native_compiler "$PWD")}
 case "$ZNC" in
   /*) ;;
   *) ZNC="$PWD/${ZNC#./}" ;;
