@@ -462,7 +462,21 @@ fn opt_fold_pass(prog: ArrayList[Instr]) ArrayList[Instr] {
                     }
                 }
             }
-            // (3) KEEP: emit the real push, record a placeholder model entry.
+            // (3) LIVE-VALUE rematerialization: r is provably UNWRITTEN across the
+            //     whole (rsp-clean) in-run gap, so at the matching pop r still
+            //     holds exactly the pushed value → delete the push and remat the
+            //     pop as `mov rY, r` (nothing at all when rY==r). The transient
+            //     stack slot is unobservable (gap is rsp-clean), so this is the
+            //     same read a load would produce — with no memory round-trip.
+            if (done == 0 && get[i32](matched, i) == 1 && r != R_RSP()) {
+                let q3: i32 = get[i32](pop_of, i);
+                if (opt_gap_clean(prog, i, q3) == 1 && opt_reg_written_in(prog, i, q3, r) == 0) {
+                    push[i32](&ms_tag, 3);
+                    push[i64](&ms_val, r as i64);
+                    done = 1;
+                }
+            }
+            // (4) KEEP: emit the real push, record a placeholder model entry.
             if (done == 0) {
                 push[i32](&ms_tag, 0);
                 push[i64](&ms_val, 0);
@@ -483,10 +497,16 @@ fn opt_fold_pass(prog: ArrayList[Instr]) ArrayList[Instr] {
                     // matching push was a deleted register copy — reload from R.
                     push[Instr](&out, i_mov_rr(r, v as i32));
                     set[i32](&known, r, 0);
+                } else { if (tag == 3) {
+                    // matching push was a deleted live value — re-copy from the
+                    // still-live register (a `pop r; ...` into the same register
+                    // collapses to nothing).
+                    if (v as i32 != r) { push[Instr](&out, i_mov_rr(r, v as i32)); }
+                    set[i32](&known, r, 0);
                 } else {
                     push[Instr](&out, ins);
                     set[i32](&known, r, 0);
-                } }
+                } } }
             } else {
                 // external pop (matches a push from before this run) — keep it.
                 push[Instr](&out, ins);
@@ -608,10 +628,13 @@ fn opt_dce(prog: ArrayList[Instr]) ArrayList[Instr] {
             // run boundary → conservative live-out (all registers live)
             let rr: i32 = 0;
             while (rr < 16) { set[i32](&live, rr, 1); rr = rr + 1; }
-        } else { if (k == K_MOV_IMM() || k == K_MOV_RR()) {
+        } else { if (k == K_MOV_IMM() || k == K_MOV_RR() || k == K_SETCC()) {
             let d: i32 = ins.dst;
             if (get[i32](live, d) == 0) {
                 set[i32](&keep, i, 0);             // dead pure write → remove
+                // (a setcc reads only flags — never a GPR — so a dead one is
+                //  always removable; after cc-fusion the materialized boolean
+                //  is usually dead and this drops the leftover setcc.)
             } else {
                 // kept: kill dst, then mark source(s) read
                 set[i32](&live, d, 0);
@@ -675,10 +698,185 @@ fn opt_dce_liveness(live: *ArrayList[i32], ins: Instr) void {
     while (r < 16) { set[i32](live, r, 1); r = r + 1; }
 }
 
-// ── public entry: fold pass then dead-code elimination ───────────────────────
+// ── OPT 3 · setcc/cmp0/Jcc FUSION ────────────────────────────────────────────
+// ncodegen materializes every comparison as a boolean register: `cmp a,b ;
+// setcc r ; <uses optional> ; cmp r,0 ; je/jne L`. The cmp0+Jcc re-decode the
+// boolean the setcc already computed from the ORIGINAL cmp's flags. When (a)
+// the Jcc's flag-writer is exactly `cmp r,0`, (b) walking back over
+// flag-preserving instructions finds `setcc r`, (c) r is unwritten between the
+// setcc and the cmp0, and (d) no other flag-writer sits between the setcc and
+// the Jcc, then the Jcc can test the original flags directly: JE jumps when
+// the boolean was 0 → jump on the INVERTED cc; JNE jumps on the cc itself.
+// The `cmp r,0` is deleted; the setcc is KEPT (any live boolean stays exact).
+fn opt_cc_inv(cc: i32) i32 {
+    if (cc == CC_E())  { return CC_NE(); }
+    if (cc == CC_NE()) { return CC_E(); }
+    if (cc == CC_L())  { return CC_GE(); }
+    if (cc == CC_LE()) { return CC_G(); }
+    if (cc == CC_G())  { return CC_LE(); }
+    if (cc == CC_GE()) { return CC_L(); }
+    return 0 - 1;
+}
+fn opt_jcc_for_cc(cc: i32) i32 {
+    if (cc == CC_E())  { return K_JE(); }
+    if (cc == CC_NE()) { return K_JNE(); }
+    if (cc == CC_L())  { return K_JL(); }
+    if (cc == CC_LE()) { return K_JLE(); }
+    if (cc == CC_G())  { return K_JG(); }
+    if (cc == CC_GE()) { return K_JGE(); }
+    return 0 - 1;   // unsigned/float ccs (B/BE/A/AE) have no Jcc kind — skip
+}
+fn opt_fuse_cc(prog: ArrayList[Instr]) ArrayList[Instr] {
+    let n: i32 = len[Instr](prog);
+    let drop: ArrayList[i32] = make[i32](n + 1);
+    let fuse: ArrayList[i32] = make[i32](n + 1);
+    let z: i32 = 0;
+    while (z < n) { push[i32](&drop, 0); push[i32](&fuse, 0 - 1); z = z + 1; }
+
+    let i: i32 = 0;
+    while (i < n) {
+        let k: i32 = get[Instr](prog, i).kind;
+        if (k == K_JE() || k == K_JNE()) {
+            // (a) walk back over flag-preserving instrs to this jump's flag-writer
+            let jcmp: i32 = 0 - 1;
+            let j: i32 = i - 1;
+            while (j >= 0 && jcmp < 0) {
+                let kj: i32 = get[Instr](prog, j).kind;
+                if (opt_is_breaker(kj) == 1) { j = 0 - 1; }
+                else { if (opt_writes_flags(kj) == 1) { jcmp = j; }
+                else { j = j - 1; } }
+            }
+            if (jcmp >= 0) {
+                let jc: Instr = get[Instr](prog, jcmp);
+                if (jc.kind == K_CMP_RI() && jc.imm == 0) {
+                    let r: i32 = jc.dst;
+                    // (b) walk back for `setcc r` before any flag-writer/breaker
+                    let scc: i32 = 0 - 1;
+                    let s: i32 = jcmp - 1;
+                    while (s >= 0 && scc < 0) {
+                        let si: Instr = get[Instr](prog, s);
+                        if (opt_is_breaker(si.kind) == 1) { s = 0 - 1; }
+                        else { if (opt_writes_flags(si.kind) == 1) { s = 0 - 1; }
+                        else { if (si.kind == K_SETCC() && si.dst == r) { scc = s; }
+                        else { s = s - 1; } } }
+                    }
+                    if (scc >= 0) {
+                        // (c) r unwritten in the open gap (scc, jcmp)
+                        let ok: i32 = 1;
+                        let t: i32 = scc + 1;
+                        while (ok == 1 && t < jcmp) {
+                            if (opt_reg_written(get[Instr](prog, t), r) == 1) { ok = 0; }
+                            t = t + 1;
+                        }
+                        if (ok == 1) {
+                            let cc: i32 = get[Instr](prog, scc).imm as i32;
+                            if (k == K_JE()) { cc = opt_cc_inv(cc); }
+                            let nk: i32 = opt_jcc_for_cc(cc);
+                            if (nk >= 0) {
+                                set[i32](&drop, jcmp, 1);
+                                set[i32](&fuse, i, nk);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    let out: ArrayList[Instr] = make[Instr](n + 1);
+    let m: i32 = 0;
+    while (m < n) {
+        if (get[i32](drop, m) == 0) {
+            let ins: Instr = get[Instr](prog, m);
+            let fk: i32 = get[i32](fuse, m);
+            if (fk >= 0) { ins.kind = fk; }
+            push[Instr](&out, ins);
+        }
+        m = m + 1;
+    }
+    free[i32](&drop);
+    free[i32](&fuse);
+    return out;
+}
+
+// ── frameless-function elision ────────────────────────────────────────────────
+// After promotion, many functions reference NO rbp-relative slot at all: every
+// local lives in a register. Such a function's entire frame machinery —
+// `push rbp; mov rbp,rsp; sub rsp,N` and the matching `mov rsp,rbp; pop rbp`
+// in EVERY epilogue — is dead weight on the call path (which is where the cost
+// hurts most: recursion pays it per call). A region between two `push rbp`
+// prologues that contains no rbp operand other than the 5 frame instructions
+// is frameless: drop all of them. Labels never sit on those instructions (the
+// epilogue jump target is the register-restore block, which stays).
+fn opt_frameless(prog: ArrayList[Instr]) ArrayList[Instr] {
+    let n: i32 = len[Instr](prog);
+    let drop: ArrayList[i32] = make[i32](n + 1);
+    let z: i32 = 0;
+    while (z < n) { push[i32](&drop, 0); z = z + 1; }
+    let p: i32 = 0;
+    while (p < n) {
+        let isPro: i32 = 0;
+        if (p + 2 < n) {
+            let i0: Instr = get[Instr](prog, p);
+            let i1: Instr = get[Instr](prog, p + 1);
+            let i2: Instr = get[Instr](prog, p + 2);
+            if (i0.kind == K_PUSH() && i0.dst == R_RBP() &&
+                i1.kind == K_MOV_RR() && i1.dst == R_RBP() && i1.src == R_RSP() &&
+                i2.kind == K_SUB_RI() && i2.dst == R_RSP()) { isPro = 1; }
+        }
+        if (isPro == 1) {
+            // region = (p+3, next `push rbp` or end)
+            let e: i32 = p + 3;
+            let fnd: i32 = 0;
+            while (e < n && fnd == 0) {
+                let ie: Instr = get[Instr](prog, e);
+                if (ie.kind == K_PUSH() && ie.dst == R_RBP()) { fnd = 1; }
+                else { e = e + 1; }
+            }
+            let eend: i32 = e;
+            // clean iff the only rbp operands in the region are the epilogue's
+            let clean: i32 = 1;
+            let q: i32 = p + 3;
+            while (q < eend && clean == 1) {
+                let iq: Instr = get[Instr](prog, q);
+                let isEpi: i32 = 0;
+                if (iq.kind == K_MOV_RR() && iq.dst == R_RSP() && iq.src == R_RBP()) { isEpi = 1; }
+                if (iq.kind == K_POP() && iq.dst == R_RBP()) { isEpi = 1; }
+                if (isEpi == 0 && (iq.dst == R_RBP() || iq.src == R_RBP())) { clean = 0; }
+                q = q + 1;
+            }
+            if (clean == 1) {
+                set[i32](&drop, p, 1); set[i32](&drop, p + 1, 1); set[i32](&drop, p + 2, 1);
+                let q2: i32 = p + 3;
+                while (q2 < eend) {
+                    let iq2: Instr = get[Instr](prog, q2);
+                    if (iq2.kind == K_MOV_RR() && iq2.dst == R_RSP() && iq2.src == R_RBP()) { set[i32](&drop, q2, 1); }
+                    if (iq2.kind == K_POP() && iq2.dst == R_RBP()) { set[i32](&drop, q2, 1); }
+                    q2 = q2 + 1;
+                }
+            }
+            p = eend;
+        } else { p = p + 1; }
+    }
+    let out: ArrayList[Instr] = make[Instr](n);
+    let i: i32 = 0;
+    while (i < n) {
+        if (get[i32](drop, i) == 0) { push[Instr](&out, get[Instr](prog, i)); }
+        i = i + 1;
+    }
+    free[i32](&drop);
+    return out;
+}
+
+// ── public entry: fold pass, then cc fusion, DCE, then frame elision ──────────
 fn optimize(prog: ArrayList[Instr]) ArrayList[Instr] {
     let folded: ArrayList[Instr] = opt_fold_pass(prog);
-    let cleaned: ArrayList[Instr] = opt_dce(folded);
+    let fused:  ArrayList[Instr] = opt_fuse_cc(folded);
     free[Instr](&folded);
-    return cleaned;
+    let cleaned: ArrayList[Instr] = opt_dce(fused);
+    free[Instr](&fused);
+    let slim: ArrayList[Instr] = opt_frameless(cleaned);
+    free[Instr](&cleaned);
+    return slim;
 }

@@ -140,6 +140,13 @@ struct Env {
     async_task_disps: ArrayList[i32],  // Script @asyncSpawn local slots; auto cancel+join at fn exit
     pre_epilogue:  i32,    // label: cleanup chain before epilogue (returns jump here)
     is_err_slot:   i32,    // frame slot: 1 = error return, 0 = success return
+    // `swords` (parallel to names/disps/types) records the word count each
+    // named slot was allocated with — 1 for scalars, N for aggregates. The
+    // post-lowering pass cg_remap_deep_scalars uses it to find promotable
+    // scalars. `anames` holds locals whose address is taken (&x): they must
+    // keep their original positions.
+    swords:      ArrayList[i32],
+    anames:      ArrayList[[]u8], // locals whose address is taken (&x) — pinned
 }
 
 fn cg_env_new(epilogue: i32) Env {
@@ -151,6 +158,8 @@ fn cg_env_new(epilogue: i32) Env {
         .count = 0,
         .scope_base = 0,
         .frame_words = 0,
+        .swords = make[i32](8),
+        .anames = make[[]u8](4),
         .epilogue = epilogue,
         .sret_disp = 0 - 2147483647,
         .sret_words = 0,
@@ -178,6 +187,8 @@ fn cg_env_dispose(env: *Env) void {
     free[*Node](&env.*.defer_exprs);
     free[*Node](&env.*.errdefer_exprs);
     free[i32](&env.*.async_task_disps);
+    free[i32](&env.*.swords);
+    free[[]u8](&env.*.anames);
 }
 
 struct CgScopeMark { count: i32, scope_base: i32 }
@@ -197,6 +208,7 @@ fn cg_scope_end(env: *Env, mark: CgScopeMark) void {
         let _d: i32 = pop[i32](&env.*.disps);
         let _t: []u8 = pop[[]u8](&env.*.types);
         let _b: i32 = pop[i32](&env.*.byref);
+        let _w: i32 = pop[i32](&env.*.swords);
     }
     env.*.count = mark.count;
     env.*.scope_base = mark.scope_base;
@@ -254,6 +266,112 @@ fn cg_slot_type(env: Env, name: []u8) []u8 {
 // the first word lives at the most-negative address of the block so that, with
 // our struct field offsets being POSITIVE (base + 8*idx), field accesses stay
 // inside the block.
+// Is `name` a local whose address is taken (&x)? Those are pinned in place —
+// they can never be promoted, so the deep-scalar remap leaves them alone.
+fn cg_env_addr_taken(env: *Env, name: []u8) i32 {
+    let i: i32 = 0;
+    while (i < len[[]u8](env.*.anames)) {
+        if (@strEq(get[[]u8](env.*.anames, i), name)) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Allocate a block of `words` at the next free word index (monotone).
+// Returns the disp of the block's FIRST word (most-negative addr).
+fn cg_env_block(env: *Env, words: i32) i32 {
+    let first: i32 = env.*.frame_words;
+    env.*.frame_words = env.*.frame_words + words;
+    return 0 - (8 * (first + words));
+}
+
+// ── deep-scalar remapping (for regalloc promotion) ───────────────────────────
+// regalloc promotes a frame slot only when its disp is DEEPER than every `lea`
+// base in the function (`d < min_lea`): a lea'd address escapes, so any slot at
+// or above the shallowest lea'd block might be aliased through it. Allocation
+// order interleaves scalars and aggregates, though, so most scalars land ABOVE
+// some lea'd block and promotion never fires — the hot-loop killer.
+//
+// Once a function's body is fully emitted we know the true high-water mark:
+// move every promotable scalar — a named 1-word slot that is not address-taken
+// — to a fresh word index BELOW the entire frame, then rewrite every
+// rbp-relative memory reference to its old disp. The rewrite is uniform across
+// load/store/lea/x87 forms, so even a lea'd scalar would stay consistent; the
+// addr-taken filter is just a heuristic to keep lea'd slots in the shallow
+// end. Slots env holds in auxiliary fields (sret, is_err, async task handles)
+// are either scratch (unnamed) or tracked and updated here.
+fn cg_remap_deep_scalars(out: *ArrayList[Instr], env: *Env, start: i32) void {
+    let nj: i32 = len[[]u8](env.*.names);
+    if (nj == 0) { return; }
+    let moved: i32 = 0;
+    let old_w: ArrayList[i32] = make[i32](8);
+    let new_w: ArrayList[i32] = make[i32](8);
+    let j: i32 = 0;
+    while (j < nj) {
+        if (get[i32](env.*.swords, j) == 1 &&
+            cg_env_addr_taken(env, get[[]u8](env.*.names, j)) == 0) {
+            let od: i32 = get[i32](env.*.disps, j);
+            if (od < 0 && ((0 - od) % 8) == 0) {
+                let ow: i32 = ((0 - od) / 8) - 1;
+                let nw: i32 = env.*.frame_words + moved;
+                set[i32](&env.*.disps, j, 0 - (8 * (nw + 1)));
+                push[i32](&old_w, ow);
+                push[i32](&new_w, nw);
+                moved = moved + 1;
+            }
+        }
+        j = j + 1;
+    }
+    if (moved == 0) { free[i32](&old_w); free[i32](&new_w); return; }
+    env.*.frame_words = env.*.frame_words + moved;
+    // Slots referenced through auxiliary env fields must follow the same map.
+    let ai: i32 = 0;
+    while (ai < len[i32](env.*.async_task_disps)) {
+        let td: i32 = get[i32](env.*.async_task_disps, ai);
+        if (td < 0 && ((0 - td) % 8) == 0) {
+            let tw: i32 = ((0 - td) / 8) - 1;
+            let m: i32 = 0;
+            while (m < moved) {
+                if (get[i32](old_w, m) == tw) {
+                    set[i32](&env.*.async_task_disps, ai, 0 - (8 * (get[i32](new_w, m) + 1)));
+                    m = moved;
+                } else { m = m + 1; }
+            }
+        }
+        ai = ai + 1;
+    }
+    if (env.*.is_err_slot < 0 && ((0 - env.*.is_err_slot) % 8) == 0) {
+        let ew: i32 = ((0 - env.*.is_err_slot) / 8) - 1;
+        let m2: i32 = 0;
+        while (m2 < moved) {
+            if (get[i32](old_w, m2) == ew) {
+                env.*.is_err_slot = 0 - (8 * (get[i32](new_w, m2) + 1));
+                m2 = moved;
+            } else { m2 = m2 + 1; }
+        }
+    }
+    // Rewrite every rbp-relative memory reference in [start, len).
+    let i: i32 = start;
+    while (i < len[Instr](out.*)) {
+        let ins: Instr = get[Instr](out.*, i);
+        if (ins.disp < 0 && (ins.dst == R_RBP() || ins.src == R_RBP()) &&
+            ((0 - ins.disp) % 8) == 0) {
+            let w: i32 = ((0 - ins.disp) / 8) - 1;
+            let m: i32 = 0;
+            while (m < moved) {
+                if (get[i32](old_w, m) == w) {
+                    ins.disp = 0 - (8 * (get[i32](new_w, m) + 1));
+                    set[Instr](out.*, i, ins);
+                    m = moved;
+                } else { m = m + 1; }
+            }
+        }
+        i = i + 1;
+    }
+    free[i32](&old_w);
+    free[i32](&new_w);
+}
+
 fn cg_slot_alloc_br(env: *Env, name: []u8, ty: []u8, words: i32, byref: i32) i32 {
     let i: i32 = env.*.scope_base;
     while (i < len[[]u8](env.*.names)) {
@@ -264,16 +382,13 @@ fn cg_slot_alloc_br(env: *Env, name: []u8, ty: []u8, words: i32, byref: i32) i32
         }
         i = i + 1;
     }
-    let first: i32 = env.*.frame_words;
-    // Block occupies words [first .. first+words-1]; the first word sits at the
-    // lowest address: disp = -(8*(first+words)). Field k is at disp + 8*k.
-    let disp: i32 = 0 - (8 * (first + words));
+    let disp: i32 = cg_env_block(env, words);
     push[[]u8](&env.*.names, name);
     push[i32](&env.*.disps, disp);
     push[[]u8](&env.*.types, ty);
     push[i32](&env.*.byref, byref);
+    push[i32](&env.*.swords, words);
     env.*.count = env.*.count + 1;
-    env.*.frame_words = env.*.frame_words + words;
     return disp;
 }
 
@@ -285,20 +400,16 @@ fn cg_slot_alloc_typed(env: *Env, name: []u8, ty: []u8, words: i32) i32 {
 
 // Allocate a single anonymous scratch word (no name), returning its disp. Used
 // for argument-copy temps and sret result blocks; the pre-scan reserves these.
+// Scratch is SHALLOW-zone: scratch blocks are routinely `lea`'d (sret, slice
+// materialization, stat buffers), so they must never sit in the scalar zone.
 fn cg_slot_scratch(env: *Env) i32 {
-    let first: i32 = env.*.frame_words;
-    let disp: i32 = 0 - (8 * (first + 1));
-    env.*.frame_words = env.*.frame_words + 1;
-    return disp;
+    return cg_env_block(env, 1);
 }
 
 // Reserve `words` contiguous anonymous scratch words; return the LOWEST disp
 // (word 0). Field k sits at disp + 8*k, matching the struct layout contract.
 fn cg_slot_scratch_n(env: *Env, words: i32) i32 {
-    let first: i32 = env.*.frame_words;
-    let disp: i32 = 0 - (8 * (first + words));
-    env.*.frame_words = env.*.frame_words + words;
-    return disp;
+    return cg_env_block(env, words);
 }
 
 // Allocate a single scalar slot for `name` (unknown type), returning its disp.
@@ -328,6 +439,7 @@ fn cg_slot_rebind(env: *Env, name: []u8, disp: i32, ty: []u8, byref: i32) void {
             set[i32](&env.*.disps, i, disp);
             set[[]u8](&env.*.types, i, ty);
             set[i32](&env.*.byref, i, byref);
+            set[i32](&env.*.swords, i, 0);   // rebound alias: never promote
             return;
         }
         i = i - 1;
@@ -336,6 +448,7 @@ fn cg_slot_rebind(env: *Env, name: []u8, disp: i32, ty: []u8, byref: i32) void {
     push[i32](&env.*.disps, disp);
     push[[]u8](&env.*.types, ty);
     push[i32](&env.*.byref, byref);
+    push[i32](&env.*.swords, 0);           // rebound alias: never promote
     env.*.count = env.*.count + 1;
 }
 
