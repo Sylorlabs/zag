@@ -27,6 +27,18 @@
 #
 # It runs the x86-64 binary under Docker, so it needs an amd64 emulator and is
 # therefore SKIPPED, not failed, when one is unavailable.
+#
+# An emulator can also be present but WRONG, not merely missing instructions:
+# the amd64 translator Docker Desktop uses on Apple Silicon hoists a
+# loop-invariant `vmovdqu` of a fixed frame slot above the stores that write
+# it, so a slot-carried vector accumulator reads stale register garbage. The
+# emitted code is byte-correct -- the identical binary exits 0 on real
+# hardware and under qemu-x86_64 -- so a disagreement there cannot tell a
+# compiler bug from an emulator bug. A 296-byte capability probe (embedded
+# below) exercises exactly that pattern: scalar-init a vector slot, load it
+# inside a loop, add, store back, fold. When the probe fails, vectorized
+# runtime disagreement degrades to BUILD-ONLY like a missing ISA; a
+# scalar-build disagreement contains no VEX ops and still fails.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 . ./tests/portable.sh
@@ -52,6 +64,19 @@ run_x86_64() {
     docker run --rm --platform linux/amd64 -i alpine:3.20 \
         sh -c 'cat > /tmp/a && chmod +x /tmp/a && timeout 300 /tmp/a; echo "exit=$?"' < "$1"
 }
+
+# Static ELF probe, entry _start: stores [5,6] to a frame slot with scalar
+# stores, loops { load slot into xmm0, add a[i..i+1], store back }, folds and
+# exits 0 iff the total is the correct 41 (a mistranslated loop load yields 30).
+printf '%s\n' 'f0VMRgIBAQAAAAAAAAAAAAIAPgABAAAAeABAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAEAAOAABAAAAAAAAAAEAAAAFAAAAAAAAAAAAAAAAAEAAAAAAAAAAQAAAAAAAKAEAAAAAAAAoAQAAAAAAAAAQAAAAAAAAVUiJ5UiB7OgAAABIx0XgAAAAAEjHRcgCAAAASMdFuAUAAABIx0XABgAAAEiNHW4AAABIi0XgSANFyEiD+AJ/KsThem+FuP///8Them8LxOH51NHE4Xp/lbj///9Ii0XgSANFyEiJReDryMThem+FuP///8RheXD4TsRhgdT4xGP5FvkASDHASAHISIP4KXQHvwEAAADrAjH/uDwAAAAPBQoAAAAAAAAAFAAAAAAAAAA=' \
+    | base64 -d > "$tmp/vex_exec_probe" || {
+        echo "could not decode the executor capability probe" >&2; exit 1; }
+exec_proves=1
+if [ "$(run_x86_64 "$tmp/vex_exec_probe" | tail -1)" != "exit=0" ]; then
+    exec_proves=0
+    echo "vector equivalence: host amd64 emulator misexecutes loop-invariant VEX loads" >&2
+    echo "vector equivalence: vectorized-run disagreement is unprovable here; degrading to BUILD-ONLY" >&2
+fi
 
 executed=0
 build_only=0
@@ -93,13 +118,28 @@ for rung in $RUNGS; do
                     "$mode" "$level" "$want_target"
                 ;;
             *)
-                echo "the $mode build for $level did not agree with its own scalar reference: $out" >&2
-                exit 1
+                # A vectorized disagreement is attributable to codegen only
+                # when the probe proved this executor faithful; a defective
+                # emulator degrades the rung like a missing ISA. The scalar
+                # build uses no VEX ops, so its disagreement always means a
+                # compiler bug.
+                if [ "$mode" = on ] && [ "$exec_proves" = 0 ]; then
+                    build_only=$((build_only + 1))
+                    printf 'vectorize=%-4s %-12s BUILD-ONLY (host emulator misexecutes VEX loads; %s lanes=%s)\n' \
+                        "$mode" "$level" "$want_target" "$want_lanes"
+                else
+                    echo "the $mode build for $level did not agree with its own scalar reference: $out" >&2
+                    exit 1
+                fi
                 ;;
         esac
-        [ "$code" = 132 ] || executed=$((executed + 1))
-        [ "$code" = 132 ] || printf 'vectorize=%-4s %-12s PASS (%s lanes=%s)\n' \
-            "$mode" "$level" "$want_target" "$want_lanes"
+        case "$code" in
+            0)
+                executed=$((executed + 1))
+                printf 'vectorize=%-4s %-12s PASS (%s lanes=%s)\n' \
+                    "$mode" "$level" "$want_target" "$want_lanes"
+                ;;
+        esac
     done
 done
 
