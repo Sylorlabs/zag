@@ -212,6 +212,13 @@ fn main() i32 {
 }
 ```
 
+*Verification note (2026-11): the generic container builtins now live in the
+`std:list` module — the repro above needs `@import("std:list")` (or the
+qualified `list.ArrayList`/`list.make`/`list.push` spellings) to compile.
+With the import, nested `ArrayList[ArrayList[i32]]` instantiates and runs
+correctly; without it the failure is a clean `error[E0202]: unknown type
+'ArrayList'` diagnostic, not the original codegen crash.*
+
 ```
 $ znc /tmp/test_nested_generic.zag -o /tmp/out 2>&1
 znc: error in main (line 1): native: call to unknown function
