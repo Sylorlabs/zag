@@ -490,6 +490,7 @@ install: znc zagd zag-lsp
 	$(INSTALL) -m644 examples/zagd.conf "$(DESTDIR)$(DATADIR)/zag/zagd.conf.example"
 	$(INSTALL) -m644 std/*.zag "$(DESTDIR)$(LIBDIR)/zag/std/"
 	$(INSTALL) -m644 selfhost/std/process.zag "$(DESTDIR)$(LIBDIR)/zag/std/process.zag"
+	$(INSTALL) -m644 selfhost/std/process_platform.zag "$(DESTDIR)$(LIBDIR)/zag/std/process_platform.zag"
 	$(INSTALL) -m644 selfhost/std/script_io.zag "$(DESTDIR)$(LIBDIR)/zag/std/script_io.zag"
 	$(INSTALL) -m644 selfhost/std/script_input.zag "$(DESTDIR)$(LIBDIR)/zag/std/script_input.zag"
 	$(INSTALL) -m644 selfhost/std/script_string_builder.zag "$(DESTDIR)$(LIBDIR)/zag/std/script_string_builder.zag"

@@ -42,6 +42,7 @@ for required in \
     /usr/local/bin/zagd-launchd-service \
     /usr/local/share/zag/zagd.conf.example \
     selfhost/std/process.zag \
+    selfhost/std/process_platform.zag \
     selfhost/std/script_io.zag \
     selfhost/std/script_input.zag \
     selfhost/std/script_string_builder.zag \
