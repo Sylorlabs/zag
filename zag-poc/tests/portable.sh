@@ -364,3 +364,35 @@ zag_assert_native_executable() {
         *) return 1 ;;
     esac
 }
+
+# zag_select_macos_sdk — export SDKROOT for a usable macOS C toolchain.
+# A newer SDK can ship libSystem.tbd entries the installed ld cannot parse
+# (Xcode 27's arm64e.x1 vs ld-1267), so newest is not proof of usability.
+# Probe by linking a trivial program against libSystem: first the default
+# SDK, then every installed SDK newest-name-last. Callers exit 2 when no
+# SDK works, matching the other "host cannot provide the oracle" gates.
+# No-op off Darwin.
+zag_select_macos_sdk() {
+    [ "$(uname -s)" = Darwin ] || return 0
+    command -v xcrun >/dev/null 2>&1 || return 1
+    local probe sdk
+    probe=$(mktemp -d "${TMPDIR:-/tmp}/zag-sdk-probe.XXXXXX") || return 1
+    printf 'int main(void) { return 0; }\n' >"$probe/probe.c"
+    if xcrun clang "$probe/probe.c" -o "$probe/probe" >/dev/null 2>&1; then
+        rm -rf "$probe"
+        return 0
+    fi
+    for sdk in /Library/Developer/CommandLineTools/SDKs/MacOSX*.sdk \
+               /Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX*.sdk; do
+        [ -d "$sdk" ] || continue
+        if SDKROOT="$sdk" xcrun clang "$probe/probe.c" -o "$probe/probe" >/dev/null 2>&1; then
+            export SDKROOT="$sdk"
+            echo "zag test: default SDK cannot link the C oracle; using SDKROOT=$sdk" >&2
+            rm -rf "$probe"
+            return 0
+        fi
+    done
+    rm -rf "$probe"
+    echo "zag test: no installed macOS SDK can link a C oracle binary" >&2
+    return 1
+}

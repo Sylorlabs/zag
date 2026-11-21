@@ -11,6 +11,7 @@ fi
 compiler=${ZNC:-$(zag_native_compiler "$PWD")}
 test -x "$compiler"
 command -v xcrun >/dev/null
+zag_select_macos_sdk || exit 2
 work=$(mktemp -d "${TMPDIR:-/tmp}/zag-macos-object.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 mkdir "$work/project"

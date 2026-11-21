@@ -4,6 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 . tests/portable.sh
 if [ "$(uname -s):$(uname -m)" != Darwin:arm64 ]; then exit 2; fi
+zag_select_macos_sdk || exit 2
 compiler=${ZNC:-$(zag_native_compiler "$PWD")}
 work=$(mktemp -d "${TMPDIR:-/tmp}/zag-macos-dylib-format.XXXXXX")
 cleanup() {

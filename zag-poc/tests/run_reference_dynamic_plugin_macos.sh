@@ -13,6 +13,7 @@ if [ "$(uname -s):$(uname -m)" != Darwin:arm64 ]; then
     echo 'macOS dynamic plugin reference requires Apple Silicon macOS' >&2
     exit 2
 fi
+zag_select_macos_sdk || exit 2
 
 compiler=${ZNC:-"$root/znc-macos-arm64"}
 case "$compiler" in /*) ;; *) compiler="$root/${compiler#./}" ;; esac
