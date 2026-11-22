@@ -398,13 +398,70 @@ fn opt_reg_written_in(prog: ArrayList[Instr], p: i32, q: i32, R: i32) i32 {
 // DCE will delete it. Otherwise the immediate form would strand a now-dead (and,
 // near a call/branch, un-removable) `mov src, c`, GROWING the code; in that case
 // we keep the register form (where that same load is still used) — no regression.
+// At a run-ending breaker, does `r`'s value survive past it? 1 = still needed
+// (read by the breaker or carried through it), 0 = dead.  Call handling uses
+// the same arity rule as opt_dead_at: an arg reg is live only when its SysV
+// position is under the marked arity (imm<0 = unknown → all argregs live).
+// r10/r11 follow opt_cs: never args, always clobbered by a call.
+fn opt_live_past_breaker(ins: Instr, r: i32) i32 {
+    let k: i32 = ins.kind;
+    if (k == K_CALL() || k == K_CALL_EXT()) {
+        if (opt_cs(r) == 0) { return 1; }
+        if (r == R_RDI() || r == R_RSI() || r == R_RDX() || r == R_RCX() ||
+            r == R_R8() || r == R_R9()) {
+            if (ins.imm >= 0 && (opt_argpos(r) as i64) >= ins.imm) { return 0; }
+            return 1;
+        }
+        return 0;
+    }
+    if (k == K_CALL_REG()) {
+        if (ins.dst == r) { return 1; }
+        if (opt_cs(r) == 0) { return 1; }
+        if (r == R_RDI() || r == R_RSI() || r == R_RDX() || r == R_RCX() ||
+            r == R_R8() || r == R_R9()) { return 1; }
+        return 0;
+    }
+    if (k == K_RET()) {
+        if (r == R_RAX()) { return 1; }
+        return 0;
+    }
+    if (k == K_SYSCALL()) {
+        // reads rax + rdi rsi rdx r10 r8 r9; clobbers rax rcx r11
+        if (r == R_RAX() || r == R_RDI() || r == R_RSI() || r == R_RDX() ||
+            r == R_R10() || r == R_R8() || r == R_R9()) { return 1; }
+        if (r == R_RCX() || r == R_R11()) { return 0; }
+        return 1;
+    }
+    return 1;   // labels/jumps: successor unknown → live
+}
+
+// Forward deadness scan: is `r` dead immediately after instr index `pos`?
+// A read keeps it live, a clean write kills it, and a breaker decides through
+// opt_live_past_breaker (calls clobber caller-saved regs, ret kills all but
+// rax).  Reaching the end without a verdict answers live (conservative).
+fn opt_dead_after(prog: ArrayList[Instr], pos: i32, r: i32, n: i32) i32 {
+    let j: i32 = pos + 1;
+    while (j < n) {
+        let ins: Instr = get[Instr](prog, j);
+        if (opt_is_breaker(ins.kind) == 1) { return 1 - opt_live_past_breaker(ins, r); }
+        if (opt_reads_reg(ins, r) == 1) { return 0; }
+        if (opt_writes_reg(ins, r) == 1) { return 1; }
+        j = j + 1;
+    }
+    return 0;
+}
+
 fn opt_src_killed_in_run(prog: ArrayList[Instr], op: i32, src: i32, n: i32) i32 {
     let i: i32 = op + 1;
     let res: i32 = 0;
     let going: i32 = 1;
     while (going == 1 && i < n) {
         let ins: Instr = get[Instr](prog, i);
-        if (opt_is_breaker(ins.kind) == 1) { going = 0; }
+        if (opt_is_breaker(ins.kind) == 1) {
+            // a call/ret can kill the value outright → the feeding load is dead
+            if (opt_live_past_breaker(ins, src) == 0) { res = 1; }
+            going = 0;
+        }
         else {
             if (opt_reads_reg(ins, src) == 1) { going = 0; }                    // still needed
             else { if (opt_writes_reg(ins, src) == 1) { res = 1; going = 0; } } // killed → removable
@@ -639,9 +696,37 @@ fn opt_dce(prog: ArrayList[Instr]) ArrayList[Instr] {
         let k: i32 = ins.kind;
 
         if (opt_is_breaker(k) == 1) {
-            // run boundary → conservative live-out (all registers live)
-            let rr: i32 = 0;
-            while (rr < 16) { set[i32](&live, rr, 1); rr = rr + 1; }
+            if (k == K_CALL()) {
+                // A call's live set is precise: its result in rax, everything
+                // callee-saved (rbx rbp rsp r12-r15), and the arg registers it
+                // reads — imm = marked arity, imm<0 = unknown → all six.
+                // Other caller-saved regs are provably dead at the call, so a
+                // now-unused staged constant (`mov rcx,imm` whose consumer was
+                // folded to an immediate form) is removable.
+                let rr: i32 = 0;
+                while (rr < 16) { set[i32](&live, rr, 0); rr = rr + 1; }
+                set[i32](&live, R_RAX(), 1);
+                set[i32](&live, R_RBX(), 1); set[i32](&live, R_RBP(), 1);
+                set[i32](&live, R_RSP(), 1);
+                set[i32](&live, R_R12(), 1); set[i32](&live, 13, 1);
+                set[i32](&live, 14, 1); set[i32](&live, 15, 1);
+                let ar: i32 = ins.imm as i32;
+                if (ar < 0) {
+                    set[i32](&live, R_RDI(), 1); set[i32](&live, R_RSI(), 1);
+                    set[i32](&live, R_RDX(), 1); set[i32](&live, R_RCX(), 1);
+                    set[i32](&live, R_R8(), 1);  set[i32](&live, R_R9(), 1);
+                } else {
+                    let aj: i32 = 0;
+                    while (aj < ar && aj < 6) {
+                        set[i32](&live, arg_reg(aj), 1);
+                        aj = aj + 1;
+                    }
+                }
+            } else {
+                // other run boundary → conservative live-out (all registers live)
+                let rr: i32 = 0;
+                while (rr < 16) { set[i32](&live, rr, 1); rr = rr + 1; }
+            }
         } else { if (k == K_MOV_IMM() || k == K_MOV_RR() || k == K_SETCC()) {
             let d: i32 = ins.dst;
             if (get[i32](live, d) == 0) {
@@ -1673,6 +1758,65 @@ fn opt_sib_accum(prog: ArrayList[Instr]) ArrayList[Instr] {
     return out2;
 }
 
+// Are the EFLAGS written by instruction `pos`-1 dead right after `pos`?
+// Scanning forward: the next flag-writer means dead (overwritten), a flag
+// reader (setcc inside the run, a jcc at the boundary) means live, and a
+// call/syscall clobbers them outright.  Jumps, labels and ret are taken as
+// unread-but-unknowable → live (we refuse the fold rather than lose flags).
+fn opt_flags_dead_from(prog: ArrayList[Instr], pos: i32, n: i32) i32 {
+    let j: i32 = pos;
+    while (j < n) {
+        let k: i32 = get[Instr](prog, j).kind;
+        if (opt_writes_flags(k) == 1) { return 1; }
+        if (opt_reads_flags(k) == 1)  { return 0; }
+        if (opt_is_breaker(k) == 1) {
+            if (k == K_CALL() || k == K_CALL_REG() || k == K_CALL_EXT() ||
+                k == K_SYSCALL()) { return 1; }
+            return 0;
+        }
+        j = j + 1;
+    }
+    return 0;
+}
+
+// ── lea fold: `mov rT,rB ; add/sub_imm rT,c ; mov rD,rT` → `lea rD,[rB±c]` ───
+// The const-offset arg-staging idiom (arg = slot ± imm) the call-side lowering
+// emits.  Fires only when the temp reg is dead after the final mov — which,
+// post-fold, it is right up to the call that consumes rD — AND when the ALU
+// op's EFLAGS are provably dead (lea sets none).  rB is read by the lea and
+// was unmodified across the adjacent triple by construction; the temp must be
+// neither rD nor rB.  INT32_MIN's negation does not fit a lea disp, so a
+// -(-2^31) fold is refused.
+fn opt_lea_fold(prog: ArrayList[Instr]) ArrayList[Instr] {
+    let n: i32 = len[Instr](prog);
+    let out: ArrayList[Instr] = make[Instr](n + 1);
+    let i: i32 = 0;
+    while (i < n) {
+        let a: Instr = get[Instr](prog, i);
+        let did: i32 = 0;
+        if (i + 2 < n && a.kind == K_MOV_RR()) {
+            let b: Instr = get[Instr](prog, i + 1);
+            let c: Instr = get[Instr](prog, i + 2);
+            if ((b.kind == K_ADD_RI() || b.kind == K_SUB_RI()) &&
+                b.dst == a.dst &&
+                c.kind == K_MOV_RR() && c.src == a.dst &&
+                a.dst != c.dst && a.dst != a.src &&
+                opt_dead_after(prog, i + 2, a.dst, n) == 1 &&
+                opt_flags_dead_from(prog, i + 3, n) == 1) {
+                let disp: i64 = b.imm;
+                if (b.kind == K_SUB_RI()) { disp = 0 - disp; }
+                if (opt_fits32(disp) == 1) {
+                    push[Instr](&out, i_lea(c.dst, a.src, disp as i32));
+                    did = 1;
+                    i = i + 3;
+                }
+            }
+        }
+        if (did == 0) { push[Instr](&out, a); i = i + 1; }
+    }
+    return out;
+}
+
 // ── public entry: fold, cc fusion, DCE, frame elision, SIB peephole ──────────
 fn optimize(prog: ArrayList[Instr]) ArrayList[Instr] {
     let folded: ArrayList[Instr] = opt_fold_pass(prog);
@@ -1680,8 +1824,10 @@ fn optimize(prog: ArrayList[Instr]) ArrayList[Instr] {
     free[Instr](&folded);
     let cleaned: ArrayList[Instr] = opt_dce(fused);
     free[Instr](&fused);
-    let slim: ArrayList[Instr] = opt_frameless(cleaned);
+    let leafold: ArrayList[Instr] = opt_lea_fold(cleaned);
     free[Instr](&cleaned);
+    let slim: ArrayList[Instr] = opt_frameless(leafold);
+    free[Instr](&leafold);
     let sib: ArrayList[Instr] = opt_sib(slim);
     free[Instr](&slim);
     let ren: ArrayList[Instr] = opt_rename(sib);
