@@ -308,6 +308,11 @@ fn opt_reads_reg(ins: Instr, r: i32) i32 {
     if (k == K_STORE()) { if (d == r) { return 1; } if (s == r) { return 1; } return 0; }
     if (k == K_LOAD())  { if (s == r) { return 1; } return 0; }
     if (k == K_LEA())   { if (s == r) { return 1; } return 0; }
+    // SIB forms: LOAD_SIB dst,[src+lbl*s] reads base+index; STORE_SIB
+    // [dst+lbl*s],src reads base+index+val; ADD_SIB dst,[src+lbl*s] reads all.
+    if (k == K_LOAD_SIB())  { if (s == r) { return 1; } if (ins.lbl == r) { return 1; } return 0; }
+    if (k == K_STORE_SIB()) { if (d == r) { return 1; } if (s == r) { return 1; } if (ins.lbl == r) { return 1; } return 0; }
+    if (k == K_ADD_SIB())   { if (d == r) { return 1; } if (s == r) { return 1; } if (ins.lbl == r) { return 1; } return 0; }
     if (k == K_IDIV())  { if (r == R_RAX()) { return 1; } if (r == R_RDX()) { return 1; } if (s == r) { return 1; } return 0; }
     if (k == K_FMOVQ_GX()) { if (s == r) { return 1; } return 0; }
     if (k == K_FSI2SD())   { if (s == r) { return 1; } return 0; }
@@ -324,6 +329,11 @@ fn opt_reads_reg(ins: Instr, r: i32) i32 {
     if (k == K_FSD2SS()) { return 0; }
     if (k == K_FSS2SD()) { return 0; }
     if (k == K_FXORPS()) { return 0; }
+    // control flow and labels read no GPR (jcc reads EFLAGS only)
+    if (k == K_LABEL() || k == K_JMP() || k == K_JE() || k == K_JNE() ||
+        k == K_JL() || k == K_JLE() || k == K_JG() || k == K_JGE()) {
+        return 0;
+    }
     return 1;   // unknown → assume it reads r (gate stays off — safe)
 }
 
@@ -339,6 +349,7 @@ fn opt_writes_reg(ins: Instr, r: i32) i32 {
         if (d == r) { return 1; } return 0;
     }
     if (k == K_IDIV()) { if (r == R_RAX()) { return 1; } if (r == R_RDX()) { return 1; } return 0; }
+    if (k == K_LOAD_SIB() || k == K_ADD_SIB()) { if (d == r) { return 1; } return 0; }
     return 0;
 }
 
@@ -775,6 +786,23 @@ fn opt_fuse_cc(prog: ArrayList[Instr]) ArrayList[Instr] {
                             if (nk >= 0) {
                                 set[i32](&drop, jcmp, 1);
                                 set[i32](&fuse, i, nk);
+                                // Also drop the setcc itself when its value reg
+                                // is dead everywhere after (the fused jump was
+                                // its only consumer). Scan forward: a read
+                                // blocks, an overwrite ends the search as dead.
+                                let dead: i32 = 1;
+                                let sc: i32 = scc + 1;
+                                while (sc < n && dead == 1) {
+                                    if (sc == jcmp) { sc = sc + 1; }
+                                    else { if (sc == i) { sc = sc + 1; }
+                                    else {
+                                        let si2: Instr = get[Instr](prog, sc);
+                                        if (opt_reads_reg(si2, r) == 1) { dead = 0; }
+                                        else { if (opt_writes_reg(si2, r) == 1) { sc = n; }
+                                        else { sc = sc + 1; } }
+                                    } }
+                                }
+                                if (dead == 1) { set[i32](&drop, scc, 1); }
                             }
                         }
                     }
@@ -869,7 +897,484 @@ fn opt_frameless(prog: ArrayList[Instr]) ArrayList[Instr] {
     return out;
 }
 
-// ── public entry: fold pass, then cc fusion, DCE, then frame elision ──────────
+// ── scaled-index + memory-operand peephole ───────────────────────────────────
+// The stack-machine emitter computes p[i] as `mov $k,t1; imul i,t1; add b,i;
+// [load|store] b,0` and `acc + p[i]` as load then a 4-mov ALU shuffle. Fold the
+// first into one SIB-addressed instruction (the scale byte does the multiply
+// for free) and the second into a single `add acc,[b+i*8]`:
+//
+//   mov_imm t1,k | imul rI,t1 | add rB,rI | load rT,rB,0   → load_sib rT,rB,rI,log2k
+//   … same head …           | store rB,0,rV               → store_sib rB,rI,log2k,0,rV
+//   load_sib t,b,i,s,d | mov c,t | mov a,d | add a,c | mov d,a → add_sib d,b,i,s,d
+// reg provably unused for the next `lim` instrs (read => live, write => dead).
+fn opt_dead_soon(prog: ArrayList[Instr], r: i32, from: i32, lim: i32) i32 {
+    let n: i32 = len[Instr](prog);
+    let sc: i32 = from;
+    let end: i32 = from + lim;
+    if (end > n) { end = n; }
+    let dead: i32 = 1;
+    let hitw: i32 = 0;
+    while (sc < end && dead == 1) {
+        let ins: Instr = get[Instr](prog, sc);
+        if (ins.kind == K_CALL() || ins.kind == K_CALL_REG() ||
+            ins.kind == K_CALL_EXT()) {
+            // SysV args rdi,rsi,rdx,rcx,r8,r9 are read by the callee — but
+            // ONLY if this call site actually set them up. This codegen emits
+            // arg setup as explicit pops/movs into the arg registers in the
+            // instructions just before the call, so scan back: if r was
+            // written since the last control-flow boundary, the callee reads
+            // it (live); otherwise its pre-call value is incidental and the
+            // call is a plain kill (caller-saved regs are clobbered). rax and
+            // r10/r11 are never args → always kills. Callee-saved pass through.
+            // K_CALL_REG reads dst as the call target, so it is never a kill.
+            if (ins.kind == K_CALL_REG() && ins.dst == r) { dead = 0; sc = end; }
+            else { if (r == R_RDI() || r == R_RSI() || r == R_RDX() || r == R_RCX() ||
+                r == R_R8()  || r == R_R9()) {
+                let bk: i32 = sc - 1;
+                let stop: i32 = sc - 24;
+                if (stop < 0) { stop = 0 - 1; }
+                let setup: i32 = 0;
+                while (bk > stop && setup == 0) {
+                    let pins: Instr = get[Instr](prog, bk);
+                    let pk: i32 = pins.kind;
+                    if (opt_writes_reg(pins, r) == 1) { setup = 1; }
+                    else { if (pk == K_CALL() || pk == K_CALL_REG() ||
+                        pk == K_CALL_EXT() || pk == K_LABEL() ||
+                        pk == K_JMP() || pk == K_JE() || pk == K_JNE() ||
+                        pk == K_JL() || pk == K_JLE() || pk == K_JG() ||
+                        pk == K_JGE()) { bk = stop; }
+                    else { bk = bk - 1; } }
+                }
+                if (setup == 1) { dead = 0; sc = end; }
+                else { hitw = 1; sc = end; }
+            }
+            else { if (r == R_RAX() || r == R_R10() || r == R_R11()) {
+                hitw = 1; sc = end;
+            } else { sc = sc + 1; } }
+        } }
+        else { if (opt_reads_reg(ins, r) == 1) { dead = 0; }
+        else { if (opt_writes_reg(ins, r) == 1) { hitw = 1; sc = end; }
+        else { sc = sc + 1; } } }
+    }
+    if (dead == 0) { return 0; }
+    if (hitw == 1) { return 1; }
+    if (end == n) { return 1; } // reaches end of program without a read
+    return 0;                    // window exhausted: cannot prove death
+}
+
+fn opt_sib(prog: ArrayList[Instr]) ArrayList[Instr] {
+    let n: i32 = len[Instr](prog);
+    let drop: ArrayList[i32] = make[i32](n + 1);
+    let ins: ArrayList[Instr] = make[Instr](n + 1);
+    let z: i32 = 0;
+    while (z < n) { push[i32](&drop, 0); push[Instr](&ins, get[Instr](prog, z)); z = z + 1; }
+
+    let i: i32 = 0;
+    while (i + 3 < n) {
+        let a: Instr = get[Instr](prog, i);
+        let b: Instr = get[Instr](prog, i + 1);
+        let c: Instr = get[Instr](prog, i + 2);
+        let d: Instr = get[Instr](prog, i + 3);
+        let ispw: i32 = 0;
+        if (a.imm == 2) { ispw = 1; }
+        if (a.imm == 4) { ispw = 1; }
+        if (a.imm == 8) { ispw = 1; }
+        if (a.kind == K_MOV_IMM() &&
+            b.kind == K_IMUL_RR() && b.src == a.dst &&
+            c.kind == K_ADD_RR() && c.src == b.dst &&
+            a.dst != b.dst && b.dst != c.dst && a.dst != c.dst &&
+            ispw == 1) {
+            // temps whose old value is consumed later bail the fold; a temp
+            // the mem op itself overwrites (d.dst aliases it) is dead by
+            // definition — later reads see the loaded value, which is correct.
+            let ded: i32 = 1;
+            if (a.dst != d.dst && opt_dead_soon(prog, a.dst, i + 4, 64) == 0) { ded = 0; }
+            if (b.dst != d.dst && opt_dead_soon(prog, b.dst, i + 4, 64) == 0) { ded = 0; }
+            if (c.dst != d.dst && opt_dead_soon(prog, c.dst, i + 4, 64) == 0) { ded = 0; }
+            if (ded == 0) { i = i + 1; }
+            if (ded == 1) {
+            let sl: i32 = a.imm as i32;
+            if (sl == 2) { sl = 1; } else { if (sl == 4) { sl = 2; } else { sl = 3; } }
+            if (d.kind == K_LOAD() && d.src == c.dst && d.disp == 0 &&
+                b.dst != R_RSP()) {
+                set[Instr](&ins, i, i_load_sib(d.dst, c.dst, b.dst, sl, 0));
+                set[i32](&drop, i + 1, 1); set[i32](&drop, i + 2, 1); set[i32](&drop, i + 3, 1);
+                i = i + 4;
+            } else { if (d.kind == K_STORE() && d.dst == c.dst && d.disp == 0 &&
+                b.dst != R_RSP() &&
+                d.src != a.dst && d.src != b.dst && d.src != c.dst) {
+                set[Instr](&ins, i, i_store_sib(c.dst, b.dst, sl, 0, d.src));
+                set[i32](&drop, i + 1, 1); set[i32](&drop, i + 2, 1); set[i32](&drop, i + 3, 1);
+                i = i + 4;
+            } else { if (d.kind == K_PUSH() && d.dst == c.dst) {
+                // add rB,rI; push rB; <mid>; pop rX; store rX,0,v
+                //   → store_sib rB0,rI,sl,0,v
+                // where rB0 is the register that produced rB's PRE-add value
+                // (found by looking back ≤4 instrs for `mov rB,rB0`). rB is
+                // free to be clobbered in the middle — that is what the push
+                // was for — but its producer rB0 must survive to store time.
+                let st: i32 = 0 - 1;
+                let lim: i32 = i + 12;
+                if (lim > n) { lim = n; }
+                let midok: i32 = 1;
+                let cwrot: i32 = 0;
+                let j: i32 = i + 4;
+                while (j < lim && midok == 1 && st < 0) {
+                    let mj: Instr = get[Instr](prog, j);
+                    if (mj.kind == K_POP() && j + 1 < lim &&
+                        get[Instr](prog, j + 1).kind == K_STORE() &&
+                        get[Instr](prog, j + 1).dst == mj.dst &&
+                        get[Instr](prog, j + 1).disp == 0) {
+                        st = j + 1;
+                        j = lim;
+                    }
+                    else { if (mj.kind == K_LABEL()) { midok = 0; }
+                    else { if (opt_reads_reg(mj, a.dst) == 1) { midok = 0; }
+                    else { if (opt_writes_reg(mj, a.dst) == 1) { midok = 0; }
+                    else { if (opt_reads_reg(mj, b.dst) == 1) { midok = 0; }
+                    else { if (opt_writes_reg(mj, b.dst) == 1) { midok = 0; }
+                    else { if (opt_reads_reg(mj, c.dst) == 1) { midok = 0; }
+                    else {
+                        if (opt_writes_reg(mj, c.dst) == 1) { cwrot = 1; }
+                        j = j + 1;
+                    } } } } } } }
+                }
+                let rB0: i32 = 0 - 1;
+                if (st >= 0 && midok == 1) {
+                    j = i - 1;
+                    let lo: i32 = i - 4;
+                    if (lo < 0) { lo = 0; }
+                    while (j >= lo && rB0 < 0) {
+                        let pj: Instr = get[Instr](prog, j);
+                        if (pj.kind == K_MOV_RR() && pj.dst == c.dst) { rB0 = pj.src; }
+                        else { if (opt_writes_reg(pj, c.dst) == 1) { j = 0 - 1; }
+                        else { j = j - 1; } }
+                    }
+                    if (rB0 == a.dst || rB0 == b.dst || rB0 == c.dst ||
+                        rB0 == R_RSP() || rB0 < 0) { rB0 = 0 - 1; }
+                    // rB0 must not be rewritten between its load and the store
+                    if (rB0 >= 0) {
+                        j = i - 1;
+                        while (j >= lo && get[Instr](prog, j).src != rB0) {
+                            let pj2: Instr = get[Instr](prog, j);
+                            if (opt_writes_reg(pj2, rB0) == 1) { rB0 = 0 - 1; j = lo; }
+                            else { j = j - 1; }
+                        }
+                        j = i + 4;
+                        while (rB0 >= 0 && j < st) {
+                            if (opt_writes_reg(get[Instr](prog, j), rB0) == 1) { rB0 = 0 - 1; }
+                            else { j = j + 1; }
+                        }
+                    }
+                }
+                if (st >= 0 && midok == 1 && rB0 >= 0) {
+                    let sv: Instr = get[Instr](prog, st);
+                    if (sv.src != a.dst && sv.src != b.dst && sv.src != rB0 &&
+                        (sv.src != c.dst || cwrot == 1) &&
+                        b.dst != R_RSP() &&
+                        opt_dead_soon(prog, a.dst, st + 1, 64) == 1 &&
+                        opt_dead_soon(prog, b.dst, st + 1, 64) == 1 &&
+                        opt_dead_soon(prog, c.dst, st + 1, 64) == 1) {
+                        // keep the middle instrs (they compute the value);
+                        // drop mov_imm, imul, add, push, pop and splice the
+                        // SIB store into the store's own position.
+                        set[i32](&drop, i, 1); set[i32](&drop, i + 1, 1);
+                        set[i32](&drop, i + 2, 1); set[i32](&drop, i + 3, 1);
+                        set[i32](&drop, st - 1, 1);
+                        set[Instr](&ins, st, i_store_sib(rB0, b.dst, sl, 0, sv.src));
+                        i = st + 1;
+                    } else { i = i + 1; }
+                } else { i = i + 1; }
+            } else { i = i + 1; } } } }
+        } else { i = i + 1; }
+    }
+
+    // materialize the fused stream
+    let out: ArrayList[Instr] = make[Instr](n + 1);
+    let m: i32 = 0;
+    while (m < n) {
+        if (get[i32](drop, m) == 0) { push[Instr](&out, get[Instr](ins, m)); }
+        m = m + 1;
+    }
+    free[i32](&drop);
+    free[Instr](&ins);
+    return out;
+}
+
+// register-rename folding: scalar promotion leaves chains of `mov` staging
+// copies around memory ops (load [rax+rcx*8] where rax/rcx are just copies of
+// the promoted arr/i registers). This pass retargets SIB operands to the
+// original registers, removes trivially dead moves, and folds the
+// `mov k,t ; mov acc,v ; add t,v ; mov v,acc` idiom into `add acc,k`.
+fn opt_cs(r: i32) i32 {
+    // caller-saved scratch: rax rcx rdx rsi rdi r8 r9 r10 r11
+    if (r == 0 || r == 1 || r == 2 || r == 6 || r == 7 || r == 8 ||
+        r == 9 || r == 10 || r == 11) { return 1; }
+    return 0;
+}
+fn opt_is_cf(k: i32) i32 {
+    // control-flow boundary: labels, jumps, branches, returns
+    if (k == K_LABEL() || k == K_JMP() || k == K_RET() || k == K_JE() ||
+        k == K_JNE() || k == K_JL() || k == K_JLE() || k == K_JG() ||
+        k == K_JGE()) { return 1; }
+    return 0;
+}
+// Block-scoped deadness: like opt_dead_soon but refuses to conclude anything
+// across a control-flow boundary. The linear scan in opt_dead_soon is fine for
+// the narrow fold windows it was written for, but a mov dropped on its verdict
+// can be a live value on another path (a `mov x,rax` before `jmp epilogue`
+// looks dead because unreachable code past the jmp rewrites rax — it is the
+// return value). Here only a kill/read inside the SAME basic block counts.
+fn opt_dead_soon_blk(prog: ArrayList[Instr], r: i32, from: i32, lim: i32) i32 {
+    let n: i32 = len[Instr](prog);
+    let sc: i32 = from;
+    let end: i32 = from + lim;
+    if (end > n) { end = n; }
+    let dead: i32 = 1;
+    let hitw: i32 = 0;
+    while (sc < end && dead == 1) {
+        let ins: Instr = get[Instr](prog, sc);
+        if (opt_is_cf(ins.kind) == 1) { dead = 0; sc = end; }
+        else { if (ins.kind == K_CALL() || ins.kind == K_CALL_REG() ||
+            ins.kind == K_CALL_EXT()) {
+            if (ins.kind == K_CALL_REG() && ins.dst == r) { dead = 0; sc = end; }
+            else { if (r == R_RDI() || r == R_RSI() || r == R_RDX() || r == R_RCX() ||
+                r == R_R8()  || r == R_R9()) {
+                // same-block backward scan for the arg setup (see opt_dead_soon)
+                let bk: i32 = sc - 1;
+                let stop: i32 = sc - 24;
+                if (stop < 0) { stop = 0 - 1; }
+                let setup: i32 = 0;
+                while (bk > stop && setup == 0) {
+                    let pins: Instr = get[Instr](prog, bk);
+                    let pk: i32 = pins.kind;
+                    if (opt_writes_reg(pins, r) == 1) { setup = 1; }
+                    else { if (opt_is_cf(pk) == 1 || pk == K_CALL() ||
+                        pk == K_CALL_REG() || pk == K_CALL_EXT()) { bk = stop; }
+                    else { bk = bk - 1; } }
+                }
+                if (setup == 1) { dead = 0; sc = end; }
+                else { hitw = 1; sc = end; }
+            }
+            else { if (r == R_RAX() || r == R_R10() || r == R_R11()) {
+                hitw = 1; sc = end;
+            } else { sc = sc + 1; } }
+        } }
+        else { if (opt_reads_reg(ins, r) == 1) { dead = 0; }
+        else { if (opt_writes_reg(ins, r) == 1) { hitw = 1; sc = end; }
+        else { sc = sc + 1; } } } }
+    }
+    if (dead == 0) { return 0; }
+    if (hitw == 1) { return 1; }
+    return 0;   // boundary or window reached without a kill: cannot prove
+}
+fn opt_is_sib(k: i32) i32 {
+    if (k == K_LOAD_SIB() || k == K_STORE_SIB() || k == K_ADD_SIB()) { return 1; }
+    return 0;
+}
+fn opt_rename(prog: ArrayList[Instr]) ArrayList[Instr] {
+    let out: ArrayList[Instr] = make[Instr](len[Instr](prog) + 1);
+    let n: i32 = len[Instr](prog);
+    let p: i32 = 0;
+    while (p < n) {
+        let a: Instr = get[Instr](prog, p);
+        let adv: i32 = 1;
+        let emit: i32 = 0;
+        if (a.kind == K_MOV_RR()) {
+            if (a.dst == a.src) { emit = 0 - 1; }
+            else { if (opt_cs(a.dst) == 1 &&
+                opt_dead_soon_blk(prog, a.dst, p + 1, 64) == 1) {
+                // dead move into a caller-saved scratch (callee-saved regs can
+                // carry values past a call, so they are never dropped here;
+                // the proof must complete inside this basic block)
+                emit = 0 - 1;
+            } else {
+                if (p + 2 < n) {
+                    let b: Instr = get[Instr](prog, p + 1);
+                    // scan forward to the first SIB, tolerating up to two gap
+                    // instrs that are themselves MOV_RR and touch nothing we
+                    // retarget (dead arg-setup copies like `mov rax,rdi` sit
+                    // between the staging movs and the SIB in emitted code)
+                    let ci: i32 = p + 2;
+                    let glen: i32 = 0;
+                    let cdone: i32 = 0;
+                    while (cdone == 0 && ci < n && glen <= 2 &&
+                           b.kind == K_MOV_RR()) {
+                        let t: Instr = get[Instr](prog, ci);
+                        if (opt_is_sib(t.kind) == 1) { cdone = 1; }
+                        else { if (t.kind == K_MOV_RR()) { glen = glen + 1; ci = ci + 1; }
+                        else { cdone = 0 - 1; } }
+                    }
+                    if (cdone == 1) {
+                        let c: Instr = get[Instr](prog, ci);
+                        // every gap instr must not write any reg we retarget
+                        let gok: i32 = 1;
+                        let g: i32 = p + 2;
+                        while (g < ci && gok == 1) {
+                            let gi: Instr = get[Instr](prog, g);
+                            if (opt_writes_reg(gi, a.dst) == 1 ||
+                                opt_writes_reg(gi, b.dst) == 1 ||
+                                opt_writes_reg(gi, a.src) == 1 ||
+                                opt_writes_reg(gi, b.src) == 1) { gok = 0; }
+                            else { g = g + 1; }
+                        }
+                        // a staging reg the SIB result overwrites is dead by
+                        // definition; otherwise it must die in this block
+                        let aok: i32 = 0;
+                        if (a.dst == c.dst && c.kind != K_STORE_SIB()) { aok = 1; }
+                        else { if (opt_dead_soon_blk(prog, a.dst, ci + 1, 64) == 1) { aok = 1; } }
+                        let bok: i32 = 0;
+                        if (b.dst == c.dst && c.kind != K_STORE_SIB()) { bok = 1; }
+                        else { if (opt_dead_soon_blk(prog, b.dst, ci + 1, 64) == 1) { bok = 1; } }
+                        // retargeted operands (index slot can never be rsp)
+                        let cs2: i32 = c.src;
+                        let cl2: i32 = c.lbl;
+                        let hit: i32 = 0;
+                        if (c.src == a.dst) { cs2 = a.src; hit = 1; }
+                        if (c.src == b.dst) { cs2 = b.src; hit = 1; }
+                        if (c.lbl == a.dst && a.src != R_RSP()) { cl2 = a.src; hit = 1; }
+                        if (c.lbl == b.dst && b.src != R_RSP()) { cl2 = b.src; hit = 1; }
+                        if (c.kind == K_STORE_SIB()) {
+                            // store dst slot is the base, not a result
+                            let cd2: i32 = c.dst;
+                            if (c.dst == a.dst && a.src != R_RSP() &&
+                                a.src != cs2 && a.src != cl2) { cd2 = a.src; hit = 1; }
+                            if (c.dst == b.dst && b.src != R_RSP() &&
+                                b.src != cs2 && b.src != cl2) { cd2 = b.src; hit = 1; }
+                            if (hit == 1 && gok == 1 && aok == 1 && bok == 1 &&
+                                b.src != a.dst && a.src != b.dst) {
+                                let g2: i32 = p + 2;
+                                while (g2 < ci) {
+                                    let gi2: Instr = get[Instr](prog, g2);
+                                    let gs: i32 = gi2.src;
+                                    if (gs == a.dst) { gs = a.src; }
+                                    if (gs == b.dst) { gs = b.src; }
+                                    push[Instr](&out, ins6(gi2.kind, gi2.dst, gs, gi2.imm, gi2.disp, gi2.lbl));
+                                    g2 = g2 + 1;
+                                }
+                                push[Instr](&out, ins6(c.kind, cd2, cs2, c.imm, c.disp, cl2));
+                                adv = (ci - p) + 1; emit = 1;
+                            }
+                        }
+                        else { if (hit == 1 && gok == 1 && aok == 1 && bok == 1 &&
+                            b.src != a.dst && a.src != b.dst) {
+                            let g2: i32 = p + 2;
+                            while (g2 < ci) {
+                                let gi2: Instr = get[Instr](prog, g2);
+                                let gs: i32 = gi2.src;
+                                if (gs == a.dst) { gs = a.src; }
+                                if (gs == b.dst) { gs = b.src; }
+                                push[Instr](&out, ins6(gi2.kind, gi2.dst, gs, gi2.imm, gi2.disp, gi2.lbl));
+                                g2 = g2 + 1;
+                            }
+                            push[Instr](&out, ins6(c.kind, c.dst, cs2, c.imm, c.disp, cl2));
+                            adv = (ci - p) + 1; emit = 1;
+                        } }
+                    }
+                }
+                if (emit == 0 && p + 1 < n) {
+                    let b: Instr = get[Instr](prog, p + 1);
+                    // same overwrite exemption: a.dst == result of LOAD/ADD_SIB
+                    if (opt_is_sib(b.kind) == 1 &&
+                        ((a.dst == b.dst && b.kind != K_STORE_SIB()) ||
+                         opt_dead_soon_blk(prog, a.dst, p + 2, 64) == 1)) {
+                        // single copy staging one SIB operand
+                        let bs: i32 = b.src;
+                        let bl: i32 = b.lbl;
+                        let bd: i32 = b.dst;
+                        let hit: i32 = 0;
+                        if (bs == a.dst && bl != a.dst &&
+                            a.src != R_RSP()) { bs = a.src; hit = 1; }
+                        if (bl == a.dst && b.src != a.dst &&
+                            a.src != R_RSP()) { bl = a.src; hit = 1; }
+                        if (b.kind == K_STORE_SIB() && bd == a.dst &&
+                            a.src != R_RSP() && a.src != bs && a.src != bl) { bd = a.src; hit = 1; }
+                        if (hit == 1) {
+                            push[Instr](&out, ins6(b.kind, bd, bs, b.imm, b.disp, bl));
+                            adv = 2; emit = 1;
+                        }
+                    }
+                }
+            } }
+        }
+        else {
+            if (a.kind == K_MOV_IMM() && p + 3 < n) {
+                let b: Instr = get[Instr](prog, p + 1);
+                let c: Instr = get[Instr](prog, p + 2);
+                let d: Instr = get[Instr](prog, p + 3);
+                if (b.kind == K_MOV_RR() && b.dst != b.src &&
+                    c.kind == K_ADD_RR() && c.dst == b.dst && c.src == a.dst &&
+                    d.kind == K_MOV_RR() && d.dst == b.src && d.src == b.dst &&
+                    a.dst != b.src && a.dst != b.dst &&
+                    a.imm > -2147483648 && a.imm < 2147483648 &&
+                    opt_dead_soon_blk(prog, a.dst, p + 4, 64) == 1 &&
+                    opt_dead_soon_blk(prog, b.dst, p + 4, 64) == 1) {
+                    // mov $k,t ; mov acc,v ; add t,v ; mov v,acc → add acc,$k
+                    // (add imm is a sign-extended i32 — wider constants bail)
+                    push[Instr](&out, i_add_imm(b.src, a.imm));
+                    adv = 4; emit = 1;
+                }
+            }
+        }
+        if (emit == 0) { push[Instr](&out, a); }
+        if (emit < 0) { adv = 1; }
+        p = p + adv;
+    }
+    return out;
+}
+
+// accumulate fold: runs after opt_rename so substituted SIB operands feed it.
+fn opt_sib_accum(prog: ArrayList[Instr]) ArrayList[Instr] {
+    let out: ArrayList[Instr] = prog;
+    let n2: i32 = len[Instr](out);
+    let out2: ArrayList[Instr] = make[Instr](n2 + 1);
+    let p: i32 = 0;
+    while (p < n2) {
+        let a: Instr = get[Instr](out, p);
+        if (a.kind == K_LOAD_SIB() && p + 4 < n2) {
+            let b: Instr = get[Instr](out, p + 1);
+            let c: Instr = get[Instr](out, p + 2);
+            let d: Instr = get[Instr](out, p + 3);
+            let e: Instr = get[Instr](out, p + 4);
+            if (b.kind == K_MOV_RR() && b.src == a.dst &&
+                c.kind == K_POP() &&
+                d.kind == K_ADD_RR() && d.dst == c.dst && d.src == b.dst) {
+                if (a.src != c.dst && a.lbl != c.dst &&
+                    a.lbl != R_RSP() && a.src != a.dst) {
+                    // load_sib t; mov u,t; pop acc; add acc,u
+                    //   →  pop acc; add acc, [base + idx*scale + disp]
+                    push[Instr](&out2, c);
+                    push[Instr](&out2, i_add_sib(c.dst, a.src, a.lbl, a.imm as i32, a.disp));
+                } else { if (b.dst != a.src && b.dst != c.dst &&
+                    b.dst != R_RSP()) {
+                    // the pop clobbers the base or index: keep the memory read
+                    // but retarget it into the copy's dst (the index/base is
+                    // read by the SIB byte before the pop runs) —
+                    //   load_sib u,[base+idx*s]; pop acc; add acc,u
+                    push[Instr](&out2, i_load_sib(b.dst, a.src, a.lbl, a.imm as i32, a.disp));
+                    push[Instr](&out2, c);
+                    push[Instr](&out2, i_add(c.dst, b.dst));
+                } else {
+                    push[Instr](&out2, a); push[Instr](&out2, b);
+                    push[Instr](&out2, c); push[Instr](&out2, d);
+                } }
+                p = p + 4;
+            } else { if (b.kind == K_MOV_RR() && b.src == a.dst &&
+                c.kind == K_MOV_RR() &&
+                d.kind == K_ADD_RR() && d.dst == c.dst && d.src == b.dst &&
+                e.kind == K_MOV_RR() && e.dst == c.src && e.src == c.dst &&
+                b.dst != a.src && b.dst != a.lbl && c.dst != a.src &&
+                c.dst != a.lbl &&
+                a.lbl != R_RSP() && a.src != a.dst) {
+                push[Instr](&out2, i_add_sib(c.src, a.src, a.lbl, a.imm as i32, a.disp));
+                p = p + 5;
+            } else { push[Instr](&out2, a); p = p + 1; } }
+        } else { push[Instr](&out2, a); p = p + 1; }
+    }
+    return out2;
+}
+
+// ── public entry: fold, cc fusion, DCE, frame elision, SIB peephole ──────────
 fn optimize(prog: ArrayList[Instr]) ArrayList[Instr] {
     let folded: ArrayList[Instr] = opt_fold_pass(prog);
     let fused:  ArrayList[Instr] = opt_fuse_cc(folded);
@@ -878,5 +1383,15 @@ fn optimize(prog: ArrayList[Instr]) ArrayList[Instr] {
     free[Instr](&fused);
     let slim: ArrayList[Instr] = opt_frameless(cleaned);
     free[Instr](&cleaned);
-    return slim;
+    let sib: ArrayList[Instr] = opt_sib(slim);
+    free[Instr](&slim);
+    let ren: ArrayList[Instr] = opt_rename(sib);
+    free[Instr](&sib);
+    // second sweep: dropped dead movs can restore mov;mov;SIB adjacency the
+    // first sweep's window could not see
+    let ren2: ArrayList[Instr] = opt_rename(ren);
+    free[Instr](&ren);
+    let acc: ArrayList[Instr] = opt_sib_accum(ren2);
+    free[Instr](&ren2);
+    return acc;
 }

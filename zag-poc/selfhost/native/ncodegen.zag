@@ -4049,8 +4049,8 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
         // Script async context is inherited through reserved r12. Strict
         // @threadSpawn workers receive a null context and keep explicit thread
         // semantics; Script workers see their compiler-owned handle.
-        if(@strEq(b,"asyncSpawn")){push[Instr](out,i_mov_rr(R_R12(),R_RDX()));}
-        else{push[Instr](out,i_mov_imm(R_R12(),0));}
+        if(@strEq(b,"asyncSpawn")){push[Instr](out,i_mov_imm(R_R10(),TASK_CTX_CELL()));push[Instr](out,i_store(R_R10(),0,R_RDX()));}
+        else{push[Instr](out,i_mov_imm(R_R10(),TASK_CTX_CELL()));push[Instr](out,i_mov_imm(R_R11(),0));push[Instr](out,i_store(R_R10(),0,R_R11()));}
         if(with_i64==1){push[Instr](out,i_load(R_RDI(),R_RDX(),24));}push[Instr](out,i_call(worker));
         push[Instr](out,i_mov_imm(R_RDI(),0));push[Instr](out,i_mov_imm(R_RAX(),60));push[Instr](out,i_syscall());
         // SYS_exit must not return. Loop if a hostile environment violates it,
@@ -4067,8 +4067,9 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
     if (@strEq(b,"asyncCancelled")) {
         if(nargs!=0){cg_err(cg,"native: @asyncCancelled expects no arguments");}
         let none:i32=cg_fresh(cg);let done_cancel:i32=cg_fresh(cg);
-        push[Instr](out,i_cmp_imm(R_R12(),0));push[Instr](out,i_je(none));
-        push[Instr](out,i_load32(R_RAX(),R_R12(),32));push[Instr](out,i_jmp(done_cancel));
+        push[Instr](out,i_mov_imm(R_R10(),TASK_CTX_CELL()));push[Instr](out,i_load(R_R11(),R_R10(),0));
+        push[Instr](out,i_cmp_imm(R_R11(),0));push[Instr](out,i_je(none));
+        push[Instr](out,i_load32(R_RAX(),R_R11(),32));push[Instr](out,i_jmp(done_cancel));
         push[Instr](out,i_label(none));push[Instr](out,i_mov_imm(R_RAX(),0));
         push[Instr](out,i_label(done_cancel));push[Instr](out,i_push(R_RAX()));return;
     }
@@ -5059,9 +5060,11 @@ fn cg_lower_native_rt(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, s
         push[Instr](out, i_store(R_RAX(), 0, R_RCX()));
         push[Instr](out, i_mov_imm(R_RCX(), 0));
         push[Instr](out, i_store(R_RAX(), 8, R_RCX()));
-        push[Instr](out, i_load(R_RCX(), 15, 0));
+        push[Instr](out, i_mov_imm(R_R10(), ARGV_BASE_CELL()));
+        push[Instr](out, i_load(R_R10(), R_R10(), 0));   // r10 = argv base
+        push[Instr](out, i_load(R_RCX(), R_R10(), 0));   // rcx = argc
         push[Instr](out, i_store(R_RAX(), 16, R_RCX()));
-        push[Instr](out, i_store(R_RAX(), 24, 15));
+        push[Instr](out, i_store(R_RAX(), 24, R_R10()));
         push[Instr](out, i_load(R_RCX(), R_RBP(), capability_slot));
         push[Instr](out, i_store(R_RAX(), 32, R_RCX()));
         // max_processes=4 in the low word, timeout_ms=30000 in the high word.
@@ -5349,7 +5352,9 @@ fn cg_lower_native_rt(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, s
     // ── _zag_argc() → load argc from [r15] ───────────────────────────────────
     if (@strEq(fname, "_zag_argc")) {
         if (nargs != 0) { cg_err(cg, "native: _zag_argc expects no arguments"); push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return 1; }
-        push[Instr](out, i_load(R_RAX(), 15, 0));      // rax = [r15] = argc
+        push[Instr](out, i_mov_imm(R_R10(), ARGV_BASE_CELL()));
+        push[Instr](out, i_load(R_R10(), R_R10(), 0));   // r10 = argv base
+        push[Instr](out, i_load(R_RAX(), R_R10(), 0));   // rax = argc
         push[Instr](out, i_push(R_RAX()));
         return 1;
     }
@@ -8580,6 +8585,12 @@ fn ALLOC_HEADS() i64 { return BSS_VBASE() + 16; }
 fn ALLOC_COUNT() i64 { return BSS_VBASE() + 144; }
 fn ALLOC_LIVE() i64 { return BSS_VBASE() + 152; }
 fn ALLOC_PEAK() i64 { return BSS_VBASE() + 160; }
+// Relocated globals: the kernel-stack base (argc/argv base, once pinned in
+// r15) and the async task-context pointer (once pinned in r12). Keeping them
+// in BSS frees r12/r15 for the callee-saved promotion pool; helpers below
+// read the cells through a scratch register instead of the pinned register.
+fn ARGV_BASE_CELL() i64 { return BSS_VBASE() + 168; }
+fn TASK_CTX_CELL() i64 { return BSS_VBASE() + 176; }
 // [BSS+512, BSS+33280) is a fixed table of {pointer,size} pairs for the
 // headerless raw word-slice mappings. Positive pointers are live; negative
 // pointers are tombstones. Keeping this separate from the ordinary allocator
@@ -10184,7 +10195,9 @@ fn cg_emit_rt_arg(out: *ArrayList[Instr], cg: *Cg) void {
     // bounds: if i < 0 → oob ; if i >= argc → oob
     push[Instr](out, i_cmp_imm(R_RDI(), 0));
     push[Instr](out, i_jl(l_oob));
-    push[Instr](out, i_load(R_R8(), 15, 0));          // r8 = argc
+    push[Instr](out, i_mov_imm(R_R10(), ARGV_BASE_CELL()));
+    push[Instr](out, i_load(R_R10(), R_R10(), 0));     // r10 = argv base
+    push[Instr](out, i_load(R_R8(), R_R10(), 0));      // r8 = argc
     push[Instr](out, i_cmp(R_RDI(), R_R8()));
     push[Instr](out, i_jge(l_oob));
     // &argv[i] = r15 + (8 + 8*i)  (load needs a constant disp, so add manually).
@@ -10192,7 +10205,8 @@ fn cg_emit_rt_arg(out: *ArrayList[Instr], cg: *Cg) void {
     push[Instr](out, i_mov_imm(R_RAX(), 8));
     push[Instr](out, i_imul(R_RCX(), R_RAX()));        // rcx = 8*i
     push[Instr](out, i_add_imm(R_RCX(), 8));           // rcx = 8 + 8*i
-    push[Instr](out, i_mov_rr(R_RSI(), 15));           // rsi = r15
+    push[Instr](out, i_mov_imm(R_R10(), ARGV_BASE_CELL()));
+    push[Instr](out, i_load(R_RSI(), R_R10(), 0));     // rsi = argv base
     push[Instr](out, i_add(R_RSI(), R_RCX()));         // rsi = &argv[i]
     push[Instr](out, i_load(R_RSI(), R_RSI(), 0));     // rsi = argv[i] cstr ptr
     // scan for NUL: rdx = 0 ; while ([rsi+rdx] != 0) rdx++
@@ -10238,12 +10252,14 @@ fn cg_emit_rt_getenv(out: *ArrayList[Instr], cg: *Cg) void {
     // r8 = name.ptr, r9 = name.len
     push[Instr](out, i_load(R_R8(), R_RDI(), 0));
     push[Instr](out, i_load(R_R9(), R_RDI(), 8));
-    // rdx = envp cursor = r15 + 16 + 8*argc
-    push[Instr](out, i_load(R_RDX(), 15, 0));
+    // rdx = envp cursor = argv_base + 16 + 8*argc
+    push[Instr](out, i_mov_imm(R_R10(), ARGV_BASE_CELL()));
+    push[Instr](out, i_load(R_R10(), R_R10(), 0));      // r10 = argv base
+    push[Instr](out, i_load(R_RDX(), R_R10(), 0));      // rdx = argc
     push[Instr](out, i_mov_imm(R_RCX(), 8));
     push[Instr](out, i_imul(R_RDX(), R_RCX()));
     push[Instr](out, i_add_imm(R_RDX(), 16));
-    push[Instr](out, i_mov_rr(R_RCX(), 15));
+    push[Instr](out, i_mov_rr(R_RCX(), R_R10()));       // rcx = argv base
     push[Instr](out, i_add(R_RDX(), R_RCX()));
     push[Instr](out, i_label(l_env));
     push[Instr](out, i_load(R_RSI(), R_RDX(), 0));     // rsi = envp[k]
@@ -10365,12 +10381,14 @@ fn cg_emit_rt_exec(out: *ArrayList[Instr], cg: *Cg) void {
     // terminator, then envp[0].. So envp = r15 + 8 + 8*(argc+1) = r15 + 16 + 8*argc.
     // Forwarding it lets the child (/bin/sh -c cmd) inherit PATH etc. (rax/rdi/rsi
     // already hold the syscall no/path/argv; we use rcx+rdx as scratch, r15 intact).
-    push[Instr](out, i_load(R_RDX(), 15, 0));         // rdx = argc = [r15]
+    push[Instr](out, i_mov_imm(R_R10(), ARGV_BASE_CELL()));
+    push[Instr](out, i_load(R_R10(), R_R10(), 0));     // r10 = argv base
+    push[Instr](out, i_load(R_RDX(), R_R10(), 0));     // rdx = argc
     push[Instr](out, i_mov_imm(R_RCX(), 8));
     push[Instr](out, i_imul(R_RDX(), R_RCX()));       // rdx = 8*argc
     push[Instr](out, i_add_imm(R_RDX(), 16));         // rdx = 16 + 8*argc
-    push[Instr](out, i_mov_rr(R_RCX(), 15));          // rcx = r15
-    push[Instr](out, i_add(R_RDX(), R_RCX()));        // rdx = r15 + 16 + 8*argc = envp
+    push[Instr](out, i_mov_rr(R_RCX(), R_R10()));     // rcx = argv base
+    push[Instr](out, i_add(R_RDX(), R_RCX()));        // rdx = argv_base + 16 + 8*argc = envp
     push[Instr](out, i_syscall());
     // execve failed → exit(127)
     push[Instr](out, i_mov_imm(R_RAX(), 60));
@@ -10519,11 +10537,13 @@ fn cg_emit_rt_execcap(out: *ArrayList[Instr], cg: *Cg) void {
     push[Instr](out, i_mov_imm(R_RAX(), 59));
     push[Instr](out, i_mov_imm(R_RDI(), DATA_VBASE() + (sh_off as i64)));
     push[Instr](out, i_lea(R_RSI(), R_RBP(), 0 - 96));
-    push[Instr](out, i_load(R_RDX(), 15, 0));
+    push[Instr](out, i_mov_imm(R_R10(), ARGV_BASE_CELL()));
+    push[Instr](out, i_load(R_R10(), R_R10(), 0));
+    push[Instr](out, i_load(R_RDX(), R_R10(), 0));
     push[Instr](out, i_mov_imm(R_RCX(), 8));
     push[Instr](out, i_imul(R_RDX(), R_RCX()));
     push[Instr](out, i_add_imm(R_RDX(), 16));
-    push[Instr](out, i_mov_rr(R_RCX(), 15));
+    push[Instr](out, i_mov_rr(R_RCX(), R_R10()));
     push[Instr](out, i_add(R_RDX(), R_RCX()));
     push[Instr](out, i_syscall());
     // execve failed → exit(127)
@@ -11887,10 +11907,14 @@ fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *Ar
         return out;
     }
     push[Instr](&out, i_mov_rr(15, R_RSP()));   // r15 = initial rsp (argc/argv base)
-    // r12 is reserved for a compiler-owned ZagScript async task context. A
-    // normal process/root function has no task, so make `cancelled()` reliably
-    // false rather than depending on unspecified process-entry register state.
-    push[Instr](&out, i_mov_imm(R_R12(), 0));
+    push[Instr](&out, i_mov_imm(R_R10(), ARGV_BASE_CELL()));
+    push[Instr](&out, i_store(R_R10(), 0, R_RSP()));   // argc/argv base -> BSS cell
+    // r12 is reserved for a compiler-owned ZagScript async task context, now
+    // stored in a BSS cell so r12 joins the callee-saved promotion pool. A
+    // normal process/root function has no task, so `cancelled()` stays false.
+    push[Instr](&out, i_mov_imm(R_R10(), TASK_CTX_CELL()));
+    push[Instr](&out, i_mov_imm(R_R11(), 0));
+    push[Instr](&out, i_store(R_R10(), 0, R_R11()));
     push[Instr](&out, i_call(main_lbl));
     if (cg.sanitize_memory == 1) {
         let leak_free: i32 = cg_fresh(&cg);
@@ -12887,7 +12911,7 @@ fn lower_zir_scalar_program(ir:ZirAuthority,dataout:*ArrayList[u8],route:*i32)Ar
     let out:ArrayList[Instr]=make[Instr](128);let fs:ArrayList[ZirNativeFn]=make[ZirNativeFn](ir.module.funcs.len+1);
     let i:i32=0;while(i<ir.module.funcs.len){let f:ZFunc=ir.module.funcs.data[i];
         push[ZirNativeFn](&fs,ZirNativeFn{.name=f.name,.lbl=i+1,.ret=f.ret,.params=f.params});i=i+1;}
-    let main_lbl:i32=zir_native_fn_label(fs,"main");push[Instr](&out,i_mov_rr(15,R_RSP()));
+    let main_lbl:i32=zir_native_fn_label(fs,"main");push[Instr](&out,i_mov_rr(15,R_RSP()));push[Instr](&out,i_mov_imm(R_R10(),ARGV_BASE_CELL()));push[Instr](&out,i_store(R_R10(),0,R_RSP()));
     push[Instr](&out,i_call(main_lbl));push[Instr](&out,i_mov_rr(R_RDI(),R_RAX()));
     push[Instr](&out,i_mov_imm(R_RAX(),60));push[Instr](&out,i_syscall());
     let next:i32=ir.module.funcs.len+1;let need_div0:i32=0;i=0;
