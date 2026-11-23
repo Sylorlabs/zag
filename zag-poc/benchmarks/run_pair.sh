@@ -44,27 +44,33 @@ raw="$tmp/results.csv"
 summary_tmp="$tmp/summary.csv"
 meta_tmp="$tmp/meta.txt"
 
+file_hash() {
+    local line
+    if command -v sha256sum >/dev/null 2>&1; then
+        line=$(sha256sum "$1")
+    elif command -v shasum >/dev/null 2>&1; then
+        line=$(shasum -a 256 "$1")
+    else
+        echo "benchmark: need sha256sum or shasum for input identity" >&2
+        return 1
+    fi
+    printf '%s' "${line%% *}"
+}
+
 run_one() {
-    local exe=$1 tag=$2 start end status
-    start=$(date +%s%N)
-    if "$exe" < "$input" >"$tmp/$tag.out" 2>"$tmp/$tag.err"; then
+    local exe=$1 tag=$2 status elapsed
+    local TIMEFORMAT='%R'
+    if { time "$exe" < "$input" >"$tmp/$tag.out" 2>"$tmp/$tag.err"; } 2>"$tmp/$tag.time"; then
         status=0
     else
         status=$?
     fi
-    end=$(date +%s%N)
-    case "$start:$end" in
-        *[!0-9:]*|:*|*:) echo "benchmark: timer did not return nanosecond timestamps" >&2; exit 1 ;;
+    elapsed=$(cat "$tmp/$tag.time")
+    case "$elapsed" in
+        ''|*[!0-9.]*|*.*.*) echo "benchmark: timer did not return a seconds value" >&2; exit 1 ;;
     esac
-    [ "$end" -ge "$start" ] || { echo "benchmark: clock moved backwards" >&2; exit 1; }
     printf '%s\n' "$status" > "$tmp/$tag.status"
-    printf '%s\n' "$((end - start))"
-}
-
-file_hash() {
-    local line
-    line=$(sha256sum "$1")
-    printf '%s' "${line%% *}"
+    printf '%s\n' "$elapsed"
 }
 
 check_witness() {
@@ -91,40 +97,54 @@ run_one "$zag" warm_zag >/dev/null
 run_one "$reference" warm_ref >/dev/null
 check_witness warm_zag warm_ref || exit 1
 
+cpu=unavailable
+if command -v lscpu >/dev/null 2>&1; then
+    cpu=$(LC_ALL=C lscpu 2>/dev/null | sed -n 's/^Model name:[[:space:]]*//p' | head -1 || true)
+fi
+if [ -z "$cpu" ] || [ "$cpu" = unavailable ]; then
+    if command -v sysctl >/dev/null 2>&1; then
+        cpu=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || sysctl -n hw.model 2>/dev/null || echo unavailable)
+    fi
+fi
+[ -n "$cpu" ] || cpu=unavailable
 {
     echo "compiler_commit=$(git rev-parse HEAD)"
-    echo "kernel=$(uname -srmo)"
+    echo "kernel=$(uname -srm)"
     echo "machine=$(uname -m)"
-    echo "cpu=$(LC_ALL=C lscpu 2>/dev/null | sed -n 's/^Model name:[[:space:]]*//p' | head -1 || echo unavailable)"
+    echo "cpu=$cpu"
     echo "cpu_count=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo unavailable)"
     echo "runs=$runs"
-    echo "input_sha256=$(sha256sum "$input" | awk '{print $1}')"
-    echo "zag_executable_sha256=$(sha256sum "$zag" | awk '{print $1}')"
-    echo "reference_executable_sha256=$(sha256sum "$reference" | awk '{print $1}')"
+    echo "input_sha256=$(file_hash "$input")"
+    echo "zag_executable_sha256=$(file_hash "$zag")"
+    echo "reference_executable_sha256=$(file_hash "$reference")"
     echo "execution=separate processes; no shared library, FFI, or C ABI"
-    echo "timing=external wall duration includes process startup and captured output"
+    echo "timing=Bash elapsed-seconds timer; includes process startup and captured output"
+    echo "timer_display_resolution=platform dependent; use workloads lasting well over 10 ms"
     echo "comparison=stdout, stderr, and successful exit status must match on every pair"
     echo "order=alternates Zag-first and reference-first"
-    echo "note=use workloads long enough that process startup and timer overhead are negligible"
+    echo "note=timing includes process launch; keep output to a small correctness witness"
 } > "$meta_tmp"
 
-echo 'run,order,zag_ns,reference_ns,reference_over_zag' > "$raw"
+echo 'run,order,zag_seconds,reference_seconds,reference_over_zag' > "$raw"
 i=1
 while [ "$i" -le "$runs" ]; do
     if [ $((i % 2)) -eq 1 ]; then
         order=zag-first
-        zag_ns=$(run_one "$zag" zag)
-        ref_ns=$(run_one "$reference" ref)
+        zag_seconds=$(run_one "$zag" zag)
+        ref_seconds=$(run_one "$reference" ref)
     else
         order=reference-first
-        ref_ns=$(run_one "$reference" ref)
-        zag_ns=$(run_one "$zag" zag)
+        ref_seconds=$(run_one "$reference" ref)
+        zag_seconds=$(run_one "$zag" zag)
     fi
     check_witness zag ref || { echo "benchmark: correctness witness failed on run $i" >&2; exit 1; }
-    [ "$zag_ns" -gt 0 ] || { echo "benchmark: Zag runtime below timer resolution" >&2; exit 1; }
-    [ "$ref_ns" -gt 0 ] || { echo "benchmark: reference runtime below timer resolution" >&2; exit 1; }
-    speedup=$(awk -v r="$ref_ns" -v z="$zag_ns" 'BEGIN { printf "%.6f", r / z }')
-    printf '%s,%s,%s,%s,%s\n' "$i" "$order" "$zag_ns" "$ref_ns" "$speedup" >> "$raw"
+    if ! awk -v t="$zag_seconds" 'BEGIN { exit !(t > 0) }' ||
+       ! awk -v t="$ref_seconds" 'BEGIN { exit !(t > 0) }'; then
+        echo "benchmark: workload is below the timer's display resolution; increase its work" >&2
+        exit 1
+    fi
+    speedup=$(awk -v r="$ref_seconds" -v z="$zag_seconds" 'BEGIN { printf "%.6f", r / z }')
+    printf '%s,%s,%s,%s,%s\n' "$i" "$order" "$zag_seconds" "$ref_seconds" "$speedup" >> "$raw"
     i=$((i + 1))
 done
 
@@ -145,8 +165,8 @@ awk -F, '
         vz=qz/n-(sz/n)*(sz/n); if(vz<0) vz=0
         vr=qr/n-(sr/n)*(sr/n); if(vr<0) vr=0
         vs=qs/n-(ss/n)*(ss/n); if(vs<0) vs=0
-        printf "zag_ns,%d,%.0f,%.1f,%.0f,%.1f,%.1f,ns\n", n,z[1],mz,z[n],sz/n,sqrt(vz)
-        printf "reference_ns,%d,%.0f,%.1f,%.0f,%.1f,%.1f,ns\n", n,r[1],mr,r[n],sr/n,sqrt(vr)
+        printf "zag_seconds,%d,%.6f,%.6f,%.6f,%.6f,%.6f,seconds\n", n,z[1],mz,z[n],sz/n,sqrt(vz)
+        printf "reference_seconds,%d,%.6f,%.6f,%.6f,%.6f,%.6f,seconds\n", n,r[1],mr,r[n],sr/n,sqrt(vr)
         printf "reference_over_zag,%d,%.6f,%.6f,%.6f,%.6f,%.6f,ratio\n", n,s[1],ms,s[n],ss/n,sqrt(vs)
     }
 ' "$raw" >> "$summary_tmp"
