@@ -51,21 +51,27 @@ standalone executable; that keeps C outside Zag's compiler, runtime, and measure
 program.
 
 ```sh
-RUNS=30 benchmarks/run_pair.sh INPUT.zag zag-program c-reference \
+RUNS=30 benchmarks/run_pair.sh /dev/null zag-program reference-program \
   benchmarks/results/workload.csv
 ```
 
 The input file is sent unchanged to both programs on stdin. The runner performs
 an untimed warm-up, alternates which executable runs first, requires both to
 exit successfully, and checks stdout and stderr equality on every pair. It
-records the input and executable hashes, host details, raw per-run times, and
-summary statistics beside the results file. Results are published only after
-the full campaign succeeds; a mismatch or failed run does not leave a partial
-CSV that could be mistaken for a valid result.
+records the input and executable hashes, host details, raw per-run times in
+seconds, and summary statistics beside the results file. Timing uses Bash's
+elapsed-time display, so precision depends on the platform. Keep each workload
+well over 10 ms; the timer includes process startup and captured output. Results
+are published only after the full campaign succeeds; a mismatch or failed run
+does not leave a partial CSV that could be mistaken for a valid result.
 
-These are end-to-end process timings: they include process startup and captured
-output. Use workloads long enough that those costs are negligible, and have
-both programs print only the same small correctness witness. This runner does
-not isolate kernel-only time or collect hardware counters. Run both binaries on
-the same physical machine and record their compiler versions and optimization
-flags separately. Do not treat emulated runs as performance evidence.
+The first paired kernel is `cases/loop_chain.zag` and its standalone C reference
+`cases/loop_chain.c`. It runs a 50-million-step, dependent 32-bit integer chain
+with no memory access, so it focuses on scalar arithmetic and loop control
+rather than memory layout or SIMD. Both programs print the same final value.
+Build each separately with optimization for the test machine, then run them
+through `run_pair.sh`; pass `/dev/null` as the input file. On Apple Silicon,
+build Zag with `--target macos-arm64`; on Linux x86-64, use the normal native
+Linux target. Record the exact compiler versions and optimization flags. This
+single kernel is a starting point for measurement, not evidence that Zag is
+faster across programs or workloads.
