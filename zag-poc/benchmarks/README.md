@@ -13,8 +13,8 @@ idle CPU ticks, cache size, generic/native runtime, and
 stable-file-change-to-snapshot latency. It writes raw CSV plus a summary
 containing sample count, minimum, median,
 maximum, mean, and population standard deviation. Never publish one run as a performance claim. Compare
-implementations only after checking equal stdout, stderr and exit status for the
-benchmark input.
+implementations only after checking equal stdout, stderr and exit status for
+the benchmark input.
 
 Compiler peak RSS uses Linux `/usr/bin/time`'s maximum-resident-set-size witness
 when available. `allocation_count` and `peak_live_allocation` come from
@@ -41,3 +41,31 @@ new content identity with a complete plan. It therefore includes the configured
 stability window, complete-file read/hash, invalidation, semantic recheck, and
 plan publication. The recorder does not claim a separately isolated parser-only
 or semantic-only latency.
+
+## Isolated executable comparisons
+
+`run_pair.sh` compares two already-built programs as separate processes. It
+never links them together and does not use a C ABI, shared library, or foreign
+function call. For a C comparison, build the reference separately and pass its
+standalone executable; that keeps C outside Zag's compiler, runtime, and measured
+program.
+
+```sh
+RUNS=30 benchmarks/run_pair.sh INPUT.zag zag-program c-reference \
+  benchmarks/results/workload.csv
+```
+
+The input file is sent unchanged to both programs on stdin. The runner performs
+an untimed warm-up, alternates which executable runs first, requires both to
+exit successfully, and checks stdout and stderr equality on every pair. It
+records the input and executable hashes, host details, raw per-run times, and
+summary statistics beside the results file. Results are published only after
+the full campaign succeeds; a mismatch or failed run does not leave a partial
+CSV that could be mistaken for a valid result.
+
+These are end-to-end process timings: they include process startup and captured
+output. Use workloads long enough that those costs are negligible, and have
+both programs print only the same small correctness witness. This runner does
+not isolate kernel-only time or collect hardware counters. Run both binaries on
+the same physical machine and record their compiler versions and optimization
+flags separately. Do not treat emulated runs as performance evidence.
