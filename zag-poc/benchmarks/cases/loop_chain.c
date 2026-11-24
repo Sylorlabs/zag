@@ -5,14 +5,15 @@
 #include <stdio.h>
 
 #define ITERATIONS UINT32_C(50000000)
-#define EXPECTED UINT32_C(686528917)
+#define MASK UINT32_C(16777215)
+#define EXPECTED UINT32_C(14333703)
 
 int main(void) {
-    uint32_t value = UINT32_C(123456789);
+    uint32_t value = UINT32_C(1234567);
     uint32_t i = 0;
     while (i < ITERATIONS) {
-        value = value * UINT32_C(1664525) + UINT32_C(1013904223);
-        value = value & UINT32_C(2147483647);
+        value = value * UINT32_C(33) + UINT32_C(17);
+        value = value & MASK;
         i = i + UINT32_C(1);
     }
     if (value != EXPECTED) return 1;
