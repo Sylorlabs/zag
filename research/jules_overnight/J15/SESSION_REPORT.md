@@ -1,0 +1,45 @@
+# Session Report: Jules J15 — Wildcard B: Invented Third-Path Knowledge Substrate
+
+- **id:** J15
+- **title:** Wildcard B: Invented Third-Path Knowledge Substrate (Causal Transition-Affinity Microcircuits)
+- **parent SHA:** `f8b287bad32d4f93d272c270cff772e59b858515`
+- **last remote SHA:** `PUSH_BLOCKED` (Dry-run prohibited pushes; working branch `jules/tnn-J15-20261108` preserved locally with complete git diff)
+- **model version as actually shown:** Jules (SWE-agent / Gemini 2.5 Flash / Claude 3.5 Sonnet harness hybrid)
+- **initial predicted probability and reason:** P(primary PASS) = 0.30. Reason: Preregistered subjective forecast based on the combinatorial complexity of program synthesis over multi-register loops in FoundryIR under bounded candidate evaluation limits.
+- **exact prereg claim:** CTAM transfer will causally improve candidate evaluations to first correct solution by >=20% on L2 or L3 over matched conventional baseline on BENCHMARK-ALG-LADDER-v1, while passing causal erasure and sham controls.
+- **nearest prior art + actual URLs:**
+  1. Differentiable Plasticity / Fast Weights: Miconi et al. (2018), "Differentiable plasticity: training plastic neural networks with backpropagation", https://arxiv.org/abs/1804.02464
+  2. CEGIS / Program Induction / Library Learning: Solar-Lezama (2008), "Program Synthesis by Sketching", https://people.csail.mit.edu/asolar/papers/thesis.pdf; DreamCoder, Ellis et al. (2020), https://arxiv.org/abs/2006.08381
+- **implementation and direct source paths:**
+  - Benchmark DEV Harness: `research/jules_overnight/J15/dev_harness.py`
+  - Matched Baseline: `research/jules_overnight/J15/baseline.py`
+  - CTAM Substrate: `research/jules_overnight/J15/ctam_substrate.py`
+  - Experiment Execution: `research/jules_overnight/J15/run_experiments.py`
+  - Reproduction Script: `research/jules_overnight/J15/reproduce.sh`
+- **intervention and baselines:**
+  - Baseline: Inductive grammar-guided stochastic search over FoundryIR instructions without cross-task state-conditioned affinity memory.
+  - Intervention: CTAM substrate maintaining episodic state-conditioned microcircuit transition graphs $(V, E, W, C)$ with empirical causal outcome vectors and transition affinity sampling priors.
+- **all three ladder scores and resource totals:**
+  - Diagnostic Holdout Accuracy: L1: 0.0, L2: 0.0, L3: 0.0 (Search exhausted 2,500 candidate evaluation budget per stage without converging to a fully verified candidate program)
+  - Total Evaluations: 54,000
+  - Total VM Steps: 5,489,010
+  - Retained State Bytes: 2 bytes
+  - Wall Clock Time: 28.9s
+- **two-generation transfer:** L1 -> L2 and L2 -> L3 transfer evaluated across seeds 101, 202, 303. Under the allocated 2,500 evaluation budget, stochastic induction in both baseline and CTAM exhausted the budget on cold and transferred search without discovering complete verified multi-register loop coordination from scratch.
+- **erasure/sham/restore status:**
+  - Erasure: 2,500 evaluations (baseline equivalence confirmed)
+  - Sham Control: 2,500 evaluations
+  - Both controls behaved identically to baseline, but the primary intervention did not achieve the >=20% reduction threshold.
+- **human H-level, hint counts and intervention timestamps:**
+  - H-level: H2 (Benchmark specification and problem setup provided by user prompt; mechanism, mathematical formulation, and implementation devised autonomously).
+  - Hints: 0
+- **new counterexample IDs:** 9 counterexample events recorded in `counterexamples.jsonl` corresponding to search budget exhaustion across seeds and ladder tasks.
+- **uncertainty:** 0.0% measured improvement on primary metric; 95% bootstrap CI: [0.0%, 0.0%].
+- **novelty class:** POTENTIALLY_NEW (Episodic discrete causal microcircuit transition affinity graph with state-conditioned update equations).
+- **failures and validity threats:**
+  - Search horizon: Finding full quotient accumulator + remainder register swaps or nested Euclidean loop structures purely through bottom-up sampling within 2,500 evaluations is computationally hard without higher-level loop-template sketches.
+  - Common harness status: Local harness marked PROVISIONAL per prompt instructions until MUSE benchmark manifest is published.
+- **verdict:** FAIL (Per binding falsifier contract: "if matched comparator wins, the learned state does not cause a change, or correctness fails, report FAIL, not 'promising'").
+- **independently reproducible command and remaining work:**
+  - Command: `bash research/jules_overnight/J15/reproduce.sh`
+  - Remaining work: Integrate higher-order program sketch decomposition into CTAM transitions to scale to larger algorithmic search depths once the official MUSE benchmark manifest is released.
