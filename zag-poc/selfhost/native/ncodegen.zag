@@ -670,7 +670,8 @@ fn RT_STR2I()    i32 { return 15; }  // _zag_str_to_i64(rdi=&s) -> i64
 fn RT_PATHBUF()  i32 { return 16; }  // helper: __rt_pathbuf(rdi=&slice) -> rax=cstr (mmap'd, NUL-term)
 fn RT_GETENV()   i32 { return 17; }  // _zag_getenv(rdi=&name) -> &{ptr,len} ({0,0} if unset)
 fn RT_EXECCAP()  i32 { return 18; }  // _zag_exec_capture(rdi=&cmd) -> &{ptr,len} (child stdout)
-fn RT_COUNT()    i32 { return 19; }  // number of runtime routines
+fn RT_CSTRSCMP() i32 { return 19; }  // _zag_cstr_slice_cmp(rdi=cstr, rsi=&slice) -> ord <0/0/>0
+fn RT_COUNT()    i32 { return 20; }  // number of runtime routines
 
 // Record an unsupported-construct error: warn loudly AND bump the count so the
 // driver ABORTS the build instead of ever emitting a silently-wrong binary.
@@ -689,6 +690,46 @@ fn cg_err(cg: *Cg, msg: []u8) void {
     out = _zag_str_concat(out, msg);
     _zag_eprintln(out);
     cg.*.err = cg.*.err + 1;
+}
+
+// Non-fatal diagnostic, same location formatting as cg_err but the build keeps
+// going. Used for constructs that are legal yet a classic silent-corruption
+// trap (e.g. the 8-byte word stride of `*i32` indexing).
+fn cg_note(cg: *Cg, msg: []u8) void {
+    let out: []u8 = "znc: note";
+    if (cg.*.cur_fn.len > 0) {
+        out = _zag_str_concat(out, " in ");
+        out = _zag_str_concat(out, cg.*.cur_fn);
+        if (cg.*.cur_fn_line > 0) {
+            out = _zag_str_concat(out, " (line ");
+            out = _zag_str_concat(out, _zag_i64_to_str(cg.*.cur_fn_line as i64));
+            out = _zag_str_concat(out, ")");
+        }
+    }
+    out = _zag_str_concat(out, ": ");
+    out = _zag_str_concat(out, msg);
+    _zag_eprintln(out);
+}
+
+// Is `ty` (already norm'd) a sub-word scalar whose *T element index advances 8
+// bytes under the word ABI — i.e. the type a C programmer assumes is 2- or
+// 4-byte packed? u8/i8 are byte-packed and safe; aggregates take their real
+// size. Indexing these with a C-style count*sizeof(T) allocation is the
+// heap-adjacent corruption class DC-C hit on pk_n.
+fn cg_is_subword_scalar(ty: []u8) i32 {
+    if (@strEq(ty, "i16")) { return 1; }
+    if (@strEq(ty, "u16")) { return 1; }
+    if (@strEq(ty, "i32")) { return 1; }
+    if (@strEq(ty, "u32")) { return 1; }
+    if (@strEq(ty, "f32")) { return 1; }
+    return 0;
+}
+
+// The C width a programmer assumes for a sub-word scalar (for diagnostics).
+fn cg_scalar_c_width(ty: []u8) i32 {
+    if (@strEq(ty, "i16")) { return 2; }
+    if (@strEq(ty, "u16")) { return 2; }
+    return 4;   // i32/u32/f32
 }
 
 fn cg_fresh(cg: *Cg) i32 {
@@ -1362,7 +1403,20 @@ fn cg_lower_addr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                     cg_err(cg,"native: *device/*workgroup indexing requires a GPU runtime");
                     push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;
                 }
-                let stride: i32 = cg_elem_stride(cg, cg_norm_type(ixt[1..]));
+                let sety: []u8 = cg_norm_type(ixt[1..]);
+                let stride: i32 = cg_elem_stride(cg, sety);
+                // Same word-ABI trap as the rvalue path: *i32/*u32/*i16/*u16/
+                // *f32 indexing advances 8 bytes, not sizeof(T).
+                if (cg_is_subword_scalar(sety) == 1) {
+                    let wmsg2: []u8 = "indexing `*";
+                    wmsg2 = _zag_str_concat(wmsg2, sety);
+                    wmsg2 = _zag_str_concat(wmsg2, "` advances 8 bytes per element (Zag word ABI), not ");
+                    wmsg2 = _zag_str_concat(wmsg2, _zag_i64_to_str(cg_scalar_c_width(sety) as i64));
+                    wmsg2 = _zag_str_concat(wmsg2, " — allocate count*8 bytes (or use *i64/[]");
+                    wmsg2 = _zag_str_concat(wmsg2, sety);
+                    wmsg2 = _zag_str_concat(wmsg2, "`)");
+                    cg_note(cg, wmsg2);
+                }
                 cg_lower_expr(out, ix.base, env, syms, cg);   // pushes ptr value
                 cg_lower_expr(out, ix.idx, env, syms, cg);    // pushes i
                 push[Instr](out, i_pop(R_RCX()));             // rcx = i
@@ -1998,6 +2052,10 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                 push[Instr](out, i_add(R_RAX(), R_RCX()));      // rax = ptr + stride*i
                 if (word == 0) {
                     push[Instr](out, i_load8(R_RAX(), R_RAX(), 0));
+                    // []i8 elements are SIGNED bytes — sign-extend, not movzx.
+                    if (@strEq(cg_slice_elem(ixt), "i8")) {
+                        cg_emit_sext_narrow_reg(out, R_RAX(), 8);
+                    }
                 } else {
                     push[Instr](out, i_load(R_RAX(), R_RAX(), 0));
                 }
@@ -2013,6 +2071,19 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                 if (ixt[0] == '*') {
                     let elemty: []u8 = cg_norm_type(ixt[1..]);
                     let stride: i32 = cg_elem_stride(cg, elemty);
+                    // *i16/*u16/*i32/*u32/*f32 indexing strides EIGHT bytes
+                    // (word ABI), not sizeof(T). Sizing the backing allocation
+                    // as count*sizeof(T) is silent heap corruption — flag it.
+                    if (cg_is_subword_scalar(elemty) == 1) {
+                        let wmsg: []u8 = "indexing `*";
+                        wmsg = _zag_str_concat(wmsg, elemty);
+                        wmsg = _zag_str_concat(wmsg, "` advances 8 bytes per element (Zag word ABI), not ");
+                        wmsg = _zag_str_concat(wmsg, _zag_i64_to_str(cg_scalar_c_width(elemty) as i64));
+                        wmsg = _zag_str_concat(wmsg, " — allocate count*8 bytes (or use *i64/[]");
+                        wmsg = _zag_str_concat(wmsg, elemty);
+                        wmsg = _zag_str_concat(wmsg, "`)");
+                        cg_note(cg, wmsg);
+                    }
                     cg_lower_expr(out, ix.base, env, syms, cg);     // pushes ptr value
                     cg_lower_expr(out, ix.idx, env, syms, cg);      // pushes i
                     push[Instr](out, i_pop(R_RCX()));               // rcx = i
@@ -2025,6 +2096,10 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                         push[Instr](out, i_push(R_RAX()));
                     } else if (cg_elem_is_byte(elemty) == 1) {
                         push[Instr](out, i_load8(R_RAX(), R_RAX(), 0));
+                        // *i8 elements are SIGNED bytes — sign-extend.
+                        if (@strEq(elemty, "i8")) {
+                            cg_emit_sext_narrow_reg(out, R_RAX(), 8);
+                        }
                         push[Instr](out, i_push(R_RAX()));
                     } else {
                         push[Instr](out, i_load(R_RAX(), R_RAX(), 0));  // scalar word
@@ -2985,6 +3060,67 @@ fn cg_lower_bin(out: *ArrayList[Instr], bb: Bin, env: *Env, syms: ArrayList[FnSy
         }
     }
 
+    // ── string comparisons: CONTENT compare, never address identity ──────────
+    // `a == b` on two slices used to compare the slice-block addresses, which
+    // is 1 only for the same object — `"abc" == "abc"` was false. Per the
+    // value-equality contract, equality on []u8/[]i8 lowers to __streq and
+    // ordering to _zag_strcmp_ord; a *i8/*u8 C-string against a slice lowers to
+    // _zag_cstr_slice_cmp (e.g. `argv[i] == "--flag"`).
+    if (cg_is_cmp_op(bb.op) == 1) {
+        let cml: []u8 = cg_norm_type(cg_expr_type(bb.l, env, syms, cg));
+        let cmr: []u8 = cg_norm_type(cg_expr_type(bb.r, env, syms, cg));
+        if (cg_is_byte_slice_ty(cml) == 1 && cg_is_byte_slice_ty(cmr) == 1) {
+            cg_lower_expr(out, bb.l, env, syms, cg);   // pushes &a
+            cg_lower_expr(out, bb.r, env, syms, cg);   // pushes &b
+            push[Instr](out, i_pop(R_RSI()));          // rsi = &b
+            push[Instr](out, i_pop(R_RDI()));          // rdi = &a
+            if (@strEq(bb.op, "==") || @strEq(bb.op, "!=")) {
+                cg.*.use_se = 1;
+                push[Instr](out, i_call(cg.*.se_lbl)); // __streq → 1 if equal
+                push[Instr](out, i_mov_imm(R_RCX(), 0));
+                push[Instr](out, i_cmp(R_RAX(), R_RCX()));
+                if (@strEq(bb.op, "==")) {
+                    push[Instr](out, i_setcc(R_RAX(), CC_NE()));  // 1 iff streq≠0
+                } else {
+                    push[Instr](out, i_setcc(R_RAX(), CC_E()));   // 1 iff streq=0
+                }
+            } else {
+                cg_rt_use(cg, RT_STRCMPO());
+                push[Instr](out, i_call(cg_rt_lbl(cg, RT_STRCMPO())));  // ord → <0/0/>0
+                push[Instr](out, i_mov_imm(R_RCX(), 0));
+                push[Instr](out, i_cmp(R_RAX(), R_RCX()));
+                push[Instr](out, i_setcc(R_RAX(), cg_cmp_cc(bb.op)));
+            }
+            push[Instr](out, i_push(R_RAX()));
+            return;
+        }
+        if (cg_is_cstr_slice_pair(cml, cmr) == 1) {
+            // One operand is a NUL-terminated byte pointer, the other a byte
+            // slice. _zag_cstr_slice_cmp(rdi=cstr, rsi=&slice) returns the
+            // signed order of (cstr, slice); a slice-left compare swaps args
+            // and negates so the result is always ord(l, r).
+            let swapped: i32 = 0;
+            if (cg_is_byte_slice_ty(cml) == 1) { swapped = 1; }
+            cg_lower_expr(out, bb.l, env, syms, cg);
+            cg_lower_expr(out, bb.r, env, syms, cg);
+            if (swapped == 0) {
+                push[Instr](out, i_pop(R_RSI()));      // rsi = &slice (r)
+                push[Instr](out, i_pop(R_RDI()));      // rdi = cstr   (l)
+            } else {
+                push[Instr](out, i_pop(R_RDI()));      // rdi = cstr   (r)
+                push[Instr](out, i_pop(R_RSI()));      // rsi = &slice (l)
+            }
+            cg_rt_use(cg, RT_CSTRSCMP());
+            push[Instr](out, i_call(cg_rt_lbl(cg, RT_CSTRSCMP())));
+            if (swapped == 1) { push[Instr](out, i_neg(R_RAX())); }
+            push[Instr](out, i_mov_imm(R_RCX(), 0));
+            push[Instr](out, i_cmp(R_RAX(), R_RCX()));
+            push[Instr](out, i_setcc(R_RAX(), cg_cmp_cc(bb.op)));
+            push[Instr](out, i_push(R_RAX()));
+            return;
+        }
+    }
+
     // ── strict binary ops: lower both, pop r=rcx, l=rax ──────────────────────
     cg_lower_expr(out, bb.l, env, syms, cg);   // pushes l
     cg_lower_expr(out, bb.r, env, syms, cg);   // pushes r
@@ -2992,8 +3128,15 @@ fn cg_lower_bin(out: *ArrayList[Instr], bb: Bin, env: *Env, syms: ArrayList[FnSy
     push[Instr](out, i_pop(R_RAX()));          // rax = l
 
     if (cg_is_cmp_op(bb.op) == 1) {
+        // Signedness follows the operand type: u64/usize/uN compare with the
+        // unsigned (CF) condition codes — same defect class as the sar-shift.
+        let cty: []u8 = cg_expr_type(bb.l, env, syms, cg);
         push[Instr](out, i_cmp(R_RAX(), R_RCX()));
-        push[Instr](out, i_setcc(R_RAX(), cg_cmp_cc(bb.op)));
+        if (cg_is_unsigned_int_type(cty) == 1) {
+            push[Instr](out, i_setcc(R_RAX(), cg_cmp_cc_u(bb.op)));
+        } else {
+            push[Instr](out, i_setcc(R_RAX(), cg_cmp_cc(bb.op)));
+        }
         push[Instr](out, i_push(R_RAX()));
         return;
     }
@@ -3004,40 +3147,55 @@ fn cg_lower_bin(out: *ArrayList[Instr], bb: Bin, env: *Env, syms: ArrayList[FnSy
     } else if (@strEq(bb.op, "*")) {
         push[Instr](out, i_imul(R_RAX(), R_RCX()));
     } else if (@strEq(bb.op, "/")) {
-        // DEFINED division: /0 panics (__div0); x/-1 = -x (wraps at i64 min,
-        // matching AArch64 SDIV) — hardware idiv would fault on both.
+        // DEFINED division: /0 panics (__div0). Signed x/-1 = -x (wraps at i64
+        // min, matching AArch64 SDIV) — hardware idiv would fault on both.
+        // UNSIGNED types (u64/usize) divide with div, not idiv: 0xFF.. /2 is
+        // 0x7FFF.., not 0 — the signed path was the same defect class as the
+        // u64 sar-shift bug.
         let l_dnz: i32 = cg_fresh(cg);
         let l_ddo: i32 = cg_fresh(cg);
         let l_dm1: i32 = cg_fresh(cg);
+        let udiv: i32 = cg_is_unsigned_int_type(cg_expr_type(bb.l, env, syms, cg));
         push[Instr](out, i_cmp_imm(R_RCX(), 0));
         push[Instr](out, i_jne(l_dnz));
         cg.*.use_dz = 1;
         push[Instr](out, i_call(cg.*.dz_lbl));
         push[Instr](out, i_label(l_dnz));
-        push[Instr](out, i_cmp_imm(R_RCX(), 0 - 1));
-        push[Instr](out, i_jne(l_dm1));
-        push[Instr](out, i_neg(R_RAX()));
-        push[Instr](out, i_jmp(l_ddo));
-        push[Instr](out, i_label(l_dm1));
-        push[Instr](out, i_idiv(R_RCX()));                 // cqo+idiv; quotient → rax
+        if (udiv == 1) {
+            push[Instr](out, i_udiv(R_RCX()));             // xor edx,edx + div; quot → rax
+        } else {
+            push[Instr](out, i_cmp_imm(R_RCX(), 0 - 1));
+            push[Instr](out, i_jne(l_dm1));
+            push[Instr](out, i_neg(R_RAX()));
+            push[Instr](out, i_jmp(l_ddo));
+            push[Instr](out, i_label(l_dm1));
+            push[Instr](out, i_idiv(R_RCX()));             // cqo+idiv; quotient → rax
+        }
         push[Instr](out, i_label(l_ddo));
     } else if (@strEq(bb.op, "%")) {
-        // DEFINED modulo: %0 panics; x % -1 = 0 (AArch64 semantics).
+        // DEFINED modulo: %0 panics; signed x % -1 = 0 (AArch64 semantics).
+        // Unsigned types take div (remainder → rdx) — same unsigned defect.
         let l_mnz: i32 = cg_fresh(cg);
         let l_mdo: i32 = cg_fresh(cg);
         let l_mm1: i32 = cg_fresh(cg);
+        let umod: i32 = cg_is_unsigned_int_type(cg_expr_type(bb.l, env, syms, cg));
         push[Instr](out, i_cmp_imm(R_RCX(), 0));
         push[Instr](out, i_jne(l_mnz));
         cg.*.use_dz = 1;
         push[Instr](out, i_call(cg.*.dz_lbl));
         push[Instr](out, i_label(l_mnz));
-        push[Instr](out, i_cmp_imm(R_RCX(), 0 - 1));
-        push[Instr](out, i_jne(l_mm1));
-        push[Instr](out, i_mov_imm(R_RAX(), 0));
-        push[Instr](out, i_jmp(l_mdo));
-        push[Instr](out, i_label(l_mm1));
-        push[Instr](out, i_idiv(R_RCX()));                 // remainder → rdx
-        push[Instr](out, i_mov_rr(R_RAX(), R_RDX()));
+        if (umod == 1) {
+            push[Instr](out, i_udiv(R_RCX()));             // xor edx,edx + div; rem → rdx
+            push[Instr](out, i_mov_rr(R_RAX(), R_RDX()));
+        } else {
+            push[Instr](out, i_cmp_imm(R_RCX(), 0 - 1));
+            push[Instr](out, i_jne(l_mm1));
+            push[Instr](out, i_mov_imm(R_RAX(), 0));
+            push[Instr](out, i_jmp(l_mdo));
+            push[Instr](out, i_label(l_mm1));
+            push[Instr](out, i_idiv(R_RCX()));             // remainder → rdx
+            push[Instr](out, i_mov_rr(R_RAX(), R_RDX()));
+        }
         push[Instr](out, i_label(l_mdo));
     } else if (@strEq(bb.op, "&")) {
         push[Instr](out, i_and(R_RAX(), R_RCX()));
@@ -10639,6 +10797,64 @@ fn cg_emit_rt_idxbyte(out: *ArrayList[Instr], cg: *Cg) void {
     push[Instr](out, i_ret());
 }
 
+// ── _zag_cstr_slice_cmp(rdi=cstr, rsi=&slice) -> rax = signed order ──────────
+// Lexicographic compare of a NUL-terminated byte pointer against a []u8/[]i8
+// slice block {ptr@0, len@8}. Returns a value <0, 0, or >0 with the sign of
+// ord(cstr, slice) (bytes are unsigned, so the byte difference fits an i64).
+//   r8 = slice.ptr ; r10 = slice.len ; rdx = i
+//   loop i over slice bytes: ca = cstr[i]
+//     ca == 0        -> -1   (cstr is a strict prefix)
+//     ca != slice[i] -> ca - slice[i]
+//   after len bytes: cstr[len] == 0 -> 0 else +1.
+fn cg_emit_rt_cstr_slice_cmp(out: *ArrayList[Instr], cg: *Cg) void {
+    let l_top: i32 = cg_fresh(cg);
+    let l_tail: i32 = cg_fresh(cg);
+    let l_neq: i32 = cg_fresh(cg);
+    let l_neg: i32 = cg_fresh(cg);
+    let l_zero: i32 = cg_fresh(cg);
+    let l_ret: i32 = cg_fresh(cg);
+    push[Instr](out, i_label(cg_rt_lbl(cg, RT_CSTRSCMP())));
+    push[Instr](out, i_load(R_R8(), R_RSI(), 0));    // r8  = slice.ptr
+    push[Instr](out, i_load(R_R10(), R_RSI(), 8));   // r10 = slice.len
+    push[Instr](out, i_mov_imm(R_RDX(), 0));         // i = 0
+    push[Instr](out, i_label(l_top));
+    push[Instr](out, i_cmp(R_RDX(), R_R10()));
+    push[Instr](out, i_jge(l_tail));
+    // ca = cstr[i]
+    push[Instr](out, i_mov_rr(R_RAX(), R_RDI()));
+    push[Instr](out, i_add(R_RAX(), R_RDX()));
+    push[Instr](out, i_load8(R_RAX(), R_RAX(), 0));
+    push[Instr](out, i_cmp_imm(R_RAX(), 0));
+    push[Instr](out, i_je(l_neg));                    // NUL before slice end
+    // cb = slice[i] into rsi scratch (&slice no longer needed)
+    push[Instr](out, i_mov_rr(R_RSI(), R_R8()));
+    push[Instr](out, i_add(R_RSI(), R_RDX()));
+    push[Instr](out, i_load8(R_RSI(), R_RSI(), 0));
+    push[Instr](out, i_cmp(R_RAX(), R_RSI()));
+    push[Instr](out, i_jne(l_neq));
+    push[Instr](out, i_add_imm(R_RDX(), 1));
+    push[Instr](out, i_jmp(l_top));
+    push[Instr](out, i_label(l_neq));
+    push[Instr](out, i_sub(R_RAX(), R_RSI()));        // ca - cb ∈ [-255, 255]
+    push[Instr](out, i_jmp(l_ret));
+    push[Instr](out, i_label(l_tail));
+    // consumed all slice bytes; equal iff cstr also ends here.
+    push[Instr](out, i_mov_rr(R_RAX(), R_RDI()));
+    push[Instr](out, i_add(R_RAX(), R_RDX()));
+    push[Instr](out, i_load8(R_RAX(), R_RAX(), 0));
+    push[Instr](out, i_cmp_imm(R_RAX(), 0));
+    push[Instr](out, i_je(l_zero));
+    push[Instr](out, i_mov_imm(R_RAX(), 1));          // cstr longer → cstr > slice
+    push[Instr](out, i_jmp(l_ret));
+    push[Instr](out, i_label(l_neg));
+    push[Instr](out, i_mov_imm(R_RAX(), 0 - 1));      // cstr shorter → -1
+    push[Instr](out, i_jmp(l_ret));
+    push[Instr](out, i_label(l_zero));
+    push[Instr](out, i_mov_imm(R_RAX(), 0));
+    push[Instr](out, i_label(l_ret));
+    push[Instr](out, i_ret());
+}
+
 // ── _zag_memcpy(rdi=dst, rsi=src, rdx=n) -> void ─────────────────────────────
 // SSE2 16-byte chunks, then words and a byte tail.  x86-64 requires SSE2, and
 // MOVDQU accepts every alignment, so this is a baseline optimization rather
@@ -10833,6 +11049,7 @@ fn cg_emit_native_rt(out: *ArrayList[Instr], cg: *Cg) void {
     if (cg_rt_is_used(cg, RT_MEMCPY()) == 1)  { cg_emit_rt_memcpy(out, cg); }
     if (cg_rt_is_used(cg, RT_MEMCMP()) == 1)  { cg_emit_rt_memcmp(out, cg); }
     if (cg_rt_is_used(cg, RT_STR2I()) == 1)   { cg_emit_rt_str2i(out, cg); }
+    if (cg_rt_is_used(cg, RT_CSTRSCMP()) == 1) { cg_emit_rt_cstr_slice_cmp(out, cg); }
 }
 
 // ── top-level entry: lower the whole program ─────────────────────────────────
