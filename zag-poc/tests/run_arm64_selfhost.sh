@@ -16,7 +16,7 @@ else
 fi
 
 if [ -z "${ZNC:-}" ]; then
-    if ! ./znc selfhost/native/znc.zag -o /tmp/znc_ash >/tmp/ash_build 2>&1; then
+    if ! ./znc selfhost/native/znc.zag --no-zagd --no-analyze --no-foreground-cache -o /tmp/znc_ash >/tmp/ash_build 2>&1; then
         echo "  XX  znc driver build"; sed -n '1,20p' /tmp/ash_build
         echo "════ arm64-selfhost pass=0 fail=1 ════"; exit 1
     fi
@@ -26,7 +26,7 @@ fi
 echo "── arm64 self-hosting: cross-compile, fixpoint, output parity ──"
 
 # gen1: x86-hosted compiler cross-compiles znc to arm64
-if "$ZNC" selfhost/native/znc.zag --target arm64 -o /tmp/znc_a1 >/tmp/ash1 2>&1 \
+if "$ZNC" selfhost/native/znc.zag --target arm64 --no-zagd --no-analyze --no-foreground-cache -o /tmp/znc_a1 >/tmp/ash1 2>&1 \
    && file /tmp/znc_a1 | grep -q 'ARM aarch64'; then
     echo "  ok  cross-compile znc → arm64"; pass=$((pass+1))
 else
@@ -35,7 +35,7 @@ else
 fi
 
 # gen2: the arm64 compiler compiles znc to arm64 — must equal gen1
-if $QEMU /tmp/znc_a1 selfhost/native/znc.zag --target arm64 -o /tmp/znc_a2 >/tmp/ash2 2>&1 \
+if $QEMU /tmp/znc_a1 selfhost/native/znc.zag --target arm64 --no-zagd --no-analyze --no-foreground-cache -o /tmp/znc_a2 >/tmp/ash2 2>&1 \
    && cmp -s /tmp/znc_a1 /tmp/znc_a2; then
     echo "  ok  arm64 fixpoint (gen2 byte-identical to gen1)"; pass=$((pass+1))
 else
@@ -48,15 +48,15 @@ cat > /tmp/ash_prog.zag <<'EOF'
 fn fib(n: i32) i32 { if (n < 2) { return n; } return fib(n - 1) + fib(n - 2); }
 fn main() i32 { let s: []u8 = _zag_str_concat("fib=", _zag_i64_to_str(fib(12) as i64)); _zag_println(s); return 0; }
 EOF
-"$ZNC" /tmp/ash_prog.zag -o /tmp/ash_x86_from_x86 >/dev/null 2>&1
-$QEMU /tmp/znc_a1 /tmp/ash_prog.zag -o /tmp/ash_x86_from_arm >/dev/null 2>&1
+"$ZNC" /tmp/ash_prog.zag --no-zagd --no-analyze --no-foreground-cache -o /tmp/ash_x86_from_x86 >/dev/null 2>&1
+$QEMU /tmp/znc_a1 /tmp/ash_prog.zag --no-zagd --no-analyze --no-foreground-cache -o /tmp/ash_x86_from_arm >/dev/null 2>&1
 if cmp -s /tmp/ash_x86_from_x86 /tmp/ash_x86_from_arm; then
     echo "  ok  x86 output parity (arm64-hosted == x86-hosted)"; pass=$((pass+1))
 else
     echo "  XX  x86 output parity"; fail=$((fail+1))
 fi
-"$ZNC" /tmp/ash_prog.zag --target arm64 -o /tmp/ash_arm_from_x86 >/dev/null 2>&1
-$QEMU /tmp/znc_a1 /tmp/ash_prog.zag --target arm64 -o /tmp/ash_arm_from_arm >/dev/null 2>&1
+"$ZNC" /tmp/ash_prog.zag --target arm64 --no-zagd --no-analyze --no-foreground-cache -o /tmp/ash_arm_from_x86 >/dev/null 2>&1
+$QEMU /tmp/znc_a1 /tmp/ash_prog.zag --target arm64 --no-zagd --no-analyze --no-foreground-cache -o /tmp/ash_arm_from_arm >/dev/null 2>&1
 if cmp -s /tmp/ash_arm_from_x86 /tmp/ash_arm_from_arm; then
     echo "  ok  arm64 output parity (arm64-hosted == x86-hosted)"; pass=$((pass+1))
 else
