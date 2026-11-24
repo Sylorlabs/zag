@@ -68,10 +68,22 @@ does not leave a partial CSV that could be mistaken for a valid result.
 The first paired kernel is `cases/loop_chain.zag` and its standalone C reference
 `cases/loop_chain.c`. It runs a 50-million-step, dependent 32-bit integer chain
 with no memory access, so it focuses on scalar arithmetic and loop control
-rather than memory layout or SIMD. Both programs print the same final value.
-Build each separately with optimization for the test machine, then run them
-through `run_pair.sh`; pass `/dev/null` as the input file. On Apple Silicon,
-build Zag with `--target macos-arm64`; on Linux x86-64, use the normal native
-Linux target. Record the exact compiler versions and optimization flags. This
-single kernel is a starting point for measurement, not evidence that Zag is
-faster across programs or workloads.
+rather than memory layout or SIMD. Both programs check the fixed expected value
+`686528917`, print it on success, and exit nonzero on any other result.
+
+From `zag-poc/`, build the pair separately. For Linux x86-64:
+
+```sh
+./znc benchmarks/cases/loop_chain.zag -o /tmp/zag-loop --cpu native \
+  --no-zagd --no-analyze --no-foreground-cache
+cc -O3 -march=native benchmarks/cases/loop_chain.c -o /tmp/c-loop
+RUNS=30 benchmarks/run_pair.sh /dev/null /tmp/zag-loop /tmp/c-loop \
+  benchmarks/results/loop_chain.csv
+```
+
+On Apple Silicon, add `--target macos-arm64` to the Zag build and use the
+host's supported optimized options for its C compiler. Keep the actual compiler
+versions, build commands, and flags with the result. The runner includes
+process startup and captured output, so this workload's long loop is intended
+to dominate those costs. This single kernel is a starting point for measurement,
+not evidence that Zag is faster across programs or workloads.
