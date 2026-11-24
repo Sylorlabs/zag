@@ -66,10 +66,12 @@ are published only after the full campaign succeeds; a mismatch or failed run
 does not leave a partial CSV that could be mistaken for a valid result.
 
 The first paired kernel is `cases/loop_chain.zag` and its standalone C reference
-`cases/loop_chain.c`. It runs a 50-million-step, dependent 32-bit integer chain
-with no memory access, so it focuses on scalar arithmetic and loop control
-rather than memory layout or SIMD. Both programs check the fixed expected value
-`686528917`, print it on success, and exit nonzero on any other result.
+`cases/loop_chain.c`. It runs a 50-million-step, dependent 24-bit recurrence
+using 32-bit integers, with no memory access; this focuses on scalar arithmetic
+and loop control rather than memory layout or SIMD. The state is masked to
+16,777,215 and the largest multiply-add intermediate is 553,648,112, safely
+within the signed 32-bit range. Both programs check the fixed expected value
+`14333703`, print it on success, and exit nonzero on any other result.
 
 From `zag-poc/`, build the pair separately. For Linux x86-64:
 
