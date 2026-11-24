@@ -13,8 +13,8 @@ idle CPU ticks, cache size, generic/native runtime, and
 stable-file-change-to-snapshot latency. It writes raw CSV plus a summary
 containing sample count, minimum, median,
 maximum, mean, and population standard deviation. Never publish one run as a performance claim. Compare
-implementations only after checking equal stdout, stderr and exit status for the
-benchmark input.
+implementations only after checking equal stdout, stderr and exit status for
+the benchmark input.
 
 Compiler peak RSS uses Linux `/usr/bin/time`'s maximum-resident-set-size witness
 when available. `allocation_count` and `peak_live_allocation` come from
@@ -41,3 +41,49 @@ new content identity with a complete plan. It therefore includes the configured
 stability window, complete-file read/hash, invalidation, semantic recheck, and
 plan publication. The recorder does not claim a separately isolated parser-only
 or semantic-only latency.
+
+## Isolated executable comparisons
+
+`run_pair.sh` compares two already-built programs as separate processes. It
+never links them together and does not use a C ABI, shared library, or foreign
+function call. For a C comparison, build the reference separately and pass its
+standalone executable; that keeps C outside Zag's compiler, runtime, and measured
+program.
+
+```sh
+RUNS=30 benchmarks/run_pair.sh /dev/null zag-program reference-program \
+  benchmarks/results/workload.csv
+```
+
+The input file is sent unchanged to both programs on stdin. The runner performs
+an untimed warm-up, alternates which executable runs first, requires both to
+exit successfully, and checks stdout and stderr equality on every pair. It
+records the input and executable hashes, host details, raw per-run times in
+seconds, and summary statistics beside the results file. Timing uses Bash's
+elapsed-time display, so precision depends on the platform. Keep each workload
+well over 10 ms; the timer includes process startup and captured output. Results
+are published only after the full campaign succeeds; a mismatch or failed run
+does not leave a partial CSV that could be mistaken for a valid result.
+
+The first paired kernel is `cases/loop_chain.zag` and its standalone C reference
+`cases/loop_chain.c`. It runs a 50-million-step, dependent 32-bit integer chain
+with no memory access, so it focuses on scalar arithmetic and loop control
+rather than memory layout or SIMD. Both programs check the fixed expected value
+`686528917`, print it on success, and exit nonzero on any other result.
+
+From `zag-poc/`, build the pair separately. For Linux x86-64:
+
+```sh
+./znc benchmarks/cases/loop_chain.zag -o /tmp/zag-loop --cpu native \
+  --no-zagd --no-analyze --no-foreground-cache
+cc -O3 -march=native benchmarks/cases/loop_chain.c -o /tmp/c-loop
+RUNS=30 benchmarks/run_pair.sh /dev/null /tmp/zag-loop /tmp/c-loop \
+  benchmarks/results/loop_chain.csv
+```
+
+On Apple Silicon, add `--target macos-arm64` to the Zag build and use the
+host's supported optimized options for its C compiler. Keep the actual compiler
+versions, build commands, and flags with the result. The runner includes
+process startup and captured output, so this workload's long loop is intended
+to dominate those costs. This single kernel is a starting point for measurement,
+not evidence that Zag is faster across programs or workloads.
