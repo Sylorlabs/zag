@@ -5,6 +5,7 @@
 #include <stdio.h>
 
 #define ITERATIONS UINT32_C(50000000)
+#define EXPECTED UINT32_C(686528917)
 
 int main(void) {
     uint32_t value = UINT32_C(123456789);
@@ -14,6 +15,7 @@ int main(void) {
         value = value & UINT32_C(2147483647);
         i = i + UINT32_C(1);
     }
+    if (value != EXPECTED) return 1;
     printf("%" PRIu32 "\n", value);
     return 0;
 }
