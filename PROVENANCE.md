@@ -59,3 +59,20 @@ Date: 2026-11-23 (DC-3 session devin-8d33167b54e14286beb0aa27d3fda0a5)
 - **stage2 and stage3 are BYTE-IDENTICAL → clean fixpoint reached at stage 3.**
 - `zagd` built from `selfhost/zagd_daemon.zag` with the fixed-point compiler (731,884 bytes).
 - Emitted only non-fatal `cg_note` word-ABI diagnostics (bug-3 guardrail working as designed).
+
+## FIXPOINT (macos-arm64, ABI-safety branch)
+
+`ZAG_BOOTSTRAP_MEMORY_GUARD=off ZAG_BOOTSTRAP_SEED=<macos-arm64 seed> bash bootstrap.sh`
+on `fix/znc-abi-safety-20261124` @ `f345e33` (2026-11-24), Apple Silicon host:
+
+- `znc-stage1` (seed `znc-macos-arm64-01ebe61` rebuilt from patched source):
+  14,251,172 bytes text + 616,116 bytes data
+- `znc-stage2` (stage1 self-compile): same size
+- `znc-stage3` (stage2 self-compile): **BYTE-IDENTICAL to stage-2 → clean
+  fixpoint at stage 3.**
+- Fixed-point `./znc-macos-arm64` sha256:
+  `31e8bd8107a97f8b56aca35ec7fa606c916954a2c6adf9d4e4997101754b05b3`
+- `./zagd-macos-arm64` built from `selfhost/zagd_macos_daemon.zag` with the
+  fixed-point compiler (435,764 bytes text + 83,461 bytes data).
+- Platform note: this record is the macos-arm64 equivalent of the x86-64
+  fixpoint above; the two ELF/Mach-O artifacts are not byte-comparable.
