@@ -448,6 +448,38 @@ observable field and padding is not a readable semantic value.  FFI exports
 must initialize any ABI-observable padding according to the selected ABI
 contract.
 
+## Typed allocation primitives and the word-ABI footgun
+
+Under the uniform word layout (see `selfhost/native/ncodegen_layout.zag`),
+every `*T` element except `u8`/`i8` occupies a whole 8-byte slot: `p[i]`
+advances `@elemStride[T]()` bytes — 8 for `i32`/`u16`/`f32`/pointers/enums,
+the aggregate size for structs — NOT the C `sizeof(T)` a programmer would
+guess. A `_zag_malloc(n * 4)` bound to `*i32` therefore under-allocates 2× and
+corrupts the heap; this was the uniform-word-ABI footgun.
+
+`_zag_alloc_array[T](count)` and `_zag_alloc_struct[T]()` are the typed
+allocation primitives. Both are compiler-lowered (the x86-64, ARM64, and i686
+backends implement them; they are declared for the typed front end in
+`std/rt.zag`): the compiler owns the element stride, so `p[i]` stays in
+bounds for every `i < count` by construction. Results are ordinary `*T`
+pointers from the same pool as `_zag_malloc` and are released by
+`_zag_free`/`delete`. A negative or overflowing `count` traps.
+
+`@sizeOf[T]()` (and its `@sizeof[T]()` alias) return the Zag uniform-layout
+byte size; `@elemStride[T]()` returns the `*T` pointer-arithmetic stride.
+Neither is a C `sizeof`: `@sizeOf[i32]()` is 8.
+
+A raw `_zag_malloc(SZ)`/`_zag_realloc(P, SZ)` bound — by cast, declared `let`
+type, or assignment target — to a `*T` whose element stride exceeds one byte
+must now PROVABLY hold a whole number of `T` elements: `SZ` must be provably a
+multiple of `stride(T)` for every runtime value (literal multiples,
+`count * @sizeOf[T]()`, `count << 3` for stride-8 elements, or products/sums
+of such). Anything else — including a C-sizeof guess like `n * 4` — is a hard
+compile error naming `_zag_alloc_array[T](count)` as the fix. `*u8`/`*i8`
+(stride 1) and `*opaque`/`*void` (no element indexing) are exempt. The proof
+is deliberately syntactic and conservative; an expression it cannot prove
+should be rewritten against the typed primitives rather than worked around.
+
 ## Allocation and bulk memory operations
 
 An allocator operation returns `!Allocation`/`!void` rather than null-on-error.

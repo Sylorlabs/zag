@@ -134,7 +134,7 @@ fi
 # free list. A stale raw dereference must therefore trap at the OS boundary;
 # this is a real runtime guard for the dedicated-map subset, not a claim of
 # general small-allocation use-after-free instrumentation.
-printf '%s\n' 'fn main() i32 { let p:*i32 = _zag_malloc(524289) as *i32; p.* = 42; _zag_free(p); return p.*; }' >"$tmp/large_stale_deref.zag"
+printf '%s\n' 'fn main() i32 { let p:*i32 = _zag_alloc_array[i32](65537); p.* = 42; _zag_free(p); return p.*; }' >"$tmp/large_stale_deref.zag"
 if "$ZNC" "$tmp/large_stale_deref.zag" -o "$tmp/large_stale_deref" --no-zagd --no-analyze --no-foreground-cache >"$tmp/large_stale_deref.log" 2>&1; then
   set +e
   "$tmp/large_stale_deref" >"$tmp/large_stale_deref.out" 2>"$tmp/large_stale_deref.err"

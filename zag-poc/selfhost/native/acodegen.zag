@@ -673,6 +673,133 @@ fn ac_type_width(cg: *ACg, ty: []u8) i32 {
     return ac_elem_stride(cg, ty);
 }
 
+// ── typed-allocation safety (word-ABI footgun elimination) ───────────────────
+// Mirror of the ncodegen.zag helpers: `_zag_malloc(SZ)`/`_zag_realloc(P,SZ)`
+// bound to a `*T` must PROVABLY hold a whole number of T elements (SZ a
+// multiple of ac_elem_stride(T) for every runtime value), else hard error —
+// a C-sizeof guess under-allocates under the uniform word ABI. The fix the
+// diagnostic names is `_zag_alloc_array[T](count)` / `count * @sizeOf[T]()`.
+fn ac_typed_alloc_exempt_elem(ety: []u8) i32 {
+    if (ac_elem_is_byte(ety) == 1) { return 1; }
+    if (@strEq(ety, "opaque") || @strEq(ety, "void")) { return 1; }
+    return 0;
+}
+
+fn ac_heap_alloc_size_arg(n: *Node) i32 {
+    switch (n.*) {
+        .call => |c| {
+            switch (c.callee.*) {
+                .id => |cid| {
+                    if (@strEq(cid.name, "_zag_malloc")) { return 0; }
+                    if (@strEq(cid.name, "_zag_realloc")) { return 1; }
+                }
+                else => { }
+            }
+        }
+        else => { }
+    }
+    return 0 - 1;
+}
+
+fn ac_size_whole_elems(cg: *ACg, n: *Node, stride: i32) i32 {
+    if (stride <= 1) { return 1; }
+    switch (n.*) {
+        .ilit => |x| {
+            let v: i64 = _zag_str_to_i64(x.text);
+            if (v % (stride as i64) == 0) { return 1; }
+            return 0;
+        }
+        .un => |u| {
+            if (@strEq(u.op, "-") || @strEq(u.op, "+")) {
+                return ac_size_whole_elems(cg, u.e, stride);
+            }
+            return 0;
+        }
+        .cast_ => |cst| { return ac_size_whole_elems(cg, cst.expr, stride); }
+        .bin => |b| {
+            if (@strEq(b.op, "*")) {
+                if (ac_size_whole_elems(cg, b.l, stride) == 1) { return 1; }
+                return ac_size_whole_elems(cg, b.r, stride);
+            }
+            if (@strEq(b.op, "+") || @strEq(b.op, "-")) {
+                if (ac_size_whole_elems(cg, b.l, stride) == 1 &&
+                    ac_size_whole_elems(cg, b.r, stride) == 1) { return 1; }
+                return 0;
+            }
+            if (@strEq(b.op, "<<")) {
+                // a << k == a * 2^k: provable when the lhs is provable, or
+                // when k is a literal and 2^k is itself a stride multiple
+                // (e.g. `count << 3` for stride-8 elements).
+                switch (b.r.*) {
+                    .ilit => |sh| {
+                        let shv: i64 = _zag_str_to_i64(sh.text);
+                        if (shv >= 0 && shv < 30) {
+                            if (((1 as i64) << (shv as i32)) % (stride as i64) == 0) { return 1; }
+                        }
+                    }
+                    else => { }
+                }
+                return ac_size_whole_elems(cg, b.l, stride);
+            }
+            return 0;
+        }
+        .call => |c| {
+            switch (c.callee.*) {
+                .id => |cid| {
+                    if (@strEq(cid.name, "@sizeOf") || @strEq(cid.name, "@sizeof") ||
+                        @strEq(cid.name, "@elemStride")) {
+                        if (len[[]u8](c.targs) == 1) {
+                            let tn: []u8 = cg_norm_type(get[[]u8](c.targs, 0));
+                            if (@strEq(cid.name, "@elemStride")) {
+                                if (ac_elem_stride(cg, tn) % stride == 0) { return 1; }
+                                return 0;
+                            }
+                            if (ac_type_size(cg, tn) % stride == 0) { return 1; }
+                            return 0;
+                        }
+                    }
+                }
+                else => { }
+            }
+            return 0;
+        }
+        else => { return 0; }
+    }
+    return 0;
+}
+
+fn ac_check_typed_alloc(cg: *ACg, n: *Node, pty: []u8) void {
+    let ty: []u8 = cg_norm_type(pty);
+    if (ty.len < 2 || ty[0] != '*') { return; }
+    let ety: []u8 = cg_norm_type(ty[1..]);
+    if (ac_typed_alloc_exempt_elem(ety) == 1) { return; }
+    let ai: i32 = ac_heap_alloc_size_arg(n);
+    if (ai < 0) { return; }
+    switch (n.*) {
+        .call => |c| {
+            if (ai >= len[*Node](c.args)) { return; }
+            let stride: i32 = ac_elem_stride(cg, ety);
+            if (ac_size_whole_elems(cg, get[*Node](c.args, ai), stride) == 0) {
+                let m: []u8 = "arm64: `_zag_malloc`/`_zag_realloc` byte count cannot be proven to hold a whole number of `";
+                m = _zag_str_concat(m, ty);
+                m = _zag_str_concat(m, "` elements — `*");
+                m = _zag_str_concat(m, ty[1..]);
+                m = _zag_str_concat(m, "` indexing advances ");
+                m = _zag_str_concat(m, _zag_i64_to_str(stride as i64));
+                m = _zag_str_concat(m, " bytes per element (Zag word ABI), not a C sizeof guess. Fix: use `_zag_alloc_array[");
+                m = _zag_str_concat(m, ty[1..]);
+                m = _zag_str_concat(m, "](count)` (element stride ");
+                m = _zag_str_concat(m, _zag_i64_to_str(stride as i64));
+                m = _zag_str_concat(m, " bytes), or size the allocation as `count * @sizeOf[");
+                m = _zag_str_concat(m, ty[1..]);
+                m = _zag_str_concat(m, "]()`");
+                ac_err(cg, m);
+            }
+        }
+        else => { }
+    }
+}
+
 fn ac_type_alignment(cg: *ACg, ty: []u8) i32 {
     let n: []u8 = cg_norm_type(ty);
     if (n.len == 0) { return 1; }
@@ -1797,6 +1924,13 @@ fn ac_expr_type(n: *Node, env: *AEnv, syms: ArrayList[AFnSym], cg: *ACg) []u8 {
                         return "*u8";
                     }
                     if (@strEq(fnid.name, "_zag_malloc") || @strEq(fnid.name, "_zag_realloc")) { return "*u8"; }
+                    // typed allocation primitives → `*T` pointer.
+                    if (@strEq(fnid.name, "_zag_alloc_array") || @strEq(fnid.name, "_zag_alloc_struct")) {
+                        if (len[[]u8](c.targs) == 1) {
+                            return _zag_str_concat("*", cg_norm_type(get[[]u8](c.targs, 0)));
+                        }
+                        return "*u8";
+                    }
                     if (@strEq(fnid.name, "_zag_i64_to_str") || @strEq(fnid.name, "_zag_u64_to_str")) { return "[]u8"; }
                     if (@strEq(fnid.name, "_zag_strcmp") || @strEq(fnid.name, "_zag_str_eq") || @strEq(fnid.name, "_zag_strlen") || @strEq(fnid.name, "_zag_str_len") || @strEq(fnid.name, "_zag_strcmp_ord") || @strEq(fnid.name, "_zag_str_index_of_byte") || @strEq(fnid.name, "_zag_memcmp")) { return "i32"; }
                     if (@strEq(fnid.name, "_zag_str_concat") || @strEq(fnid.name, "_zag_strdup") || @strEq(fnid.name, "_zag_arg") || @strEq(fnid.name, "_zag_getenv") || @strEq(fnid.name, "_zag_read_file") || @strEq(fnid.name, "_zag_current_executable_path") || @strEq(fnid.name, "_zag_script_env_get") || @strEq(fnid.name, "_zag_exec_capture") || @strEq(fnid.name, "_zag_process_result_output")) { return "[]u8"; }
@@ -2816,6 +2950,9 @@ fn ac_lower_expr(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
             push[AInstr](out, ai_push(A_X0()));
         }
         .cast_ => |cst| {
+            // `_zag_malloc(SZ) as *T`: the cast binds the byte count to whole
+            // T elements — require a syntactic proof (see ac_check_typed_alloc).
+            ac_check_typed_alloc(cg, cst.expr, cst.target);
             let csrc: []u8 = ac_expr_type(cst.expr, env, syms, cg);
             let sfl: i32 = ac_is_float(csrc);
             let tfl: i32 = ac_is_float(cg_norm_type(cst.target));
@@ -3906,6 +4043,12 @@ fn ac_lower_call(out: *ArrayList[AInstr], c: Call, env: *AEnv, syms: ArrayList[A
                 return;
             }
             let cname: []u8 = fnid.name;
+            // Compiler-owned typed allocation primitives take their element
+            // type via targs; intercept BEFORE generic mangling renames them.
+            if (@strEq(fnid.name, "_zag_alloc_array") || @strEq(fnid.name, "_zag_alloc_struct")) {
+                ac_lower_builtin(out, fnid.name, c, env, syms, cg);
+                return;
+            }
             if (len[[]u8](c.targs) > 0) {
                 cname = cg_mangle_generic_norm(fnid.name, c.targs);
             } else {
@@ -4616,6 +4759,48 @@ fn ac_lower_builtin(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv, s
         push[AInstr](out, ai_pop(A_X0()));
         cg.*.use_al = 1;
         // In safety mode, save the size for the acquire probe
+        if (cg.*.safety_checked == 1) {
+            push[AInstr](out, ai_mov_rr(A_X1(), A_X0()));   // x1 = size
+            push[AInstr](out, ai_call(cg.*.al_lbl));         // x0 = pointer
+            ac_emit_alloc_access_acquire(out, cg);
+        } else {
+            push[AInstr](out, ai_call(cg.*.al_lbl));
+        }
+        push[AInstr](out, ai_push(A_X0()));
+        return 1;
+    }
+    // ── typed allocation primitives ──────────────────────────────────────────
+    // `_zag_alloc_array[T](count)` / `_zag_alloc_struct[T]()`: the compiler
+    // owns the element size (ac_elem_stride under the uniform word ABI) so
+    // `p[i]` indexing can never overrun a correctly-counted request. The
+    // allocation comes from the same __alloc pool as _zag_malloc, so
+    // _zag_free/delete retires it identically.
+    if (@strEq(fname, "_zag_alloc_array") || @strEq(fname, "_zag_alloc_struct")) {
+        if (len[[]u8](c.targs) != 1) { ac_err(cg, "arm64: _zag_alloc_array/_zag_alloc_struct require exactly one type argument"); return 1; }
+        let ety: []u8 = cg_norm_type(get[[]u8](c.targs, 0));
+        let stride: i32 = ac_elem_stride(cg, ety);
+        if (@strEq(fname, "_zag_alloc_struct")) {
+            if (nargs != 0) { ac_err(cg, "arm64: _zag_alloc_struct takes no value arguments"); return 1; }
+            push[AInstr](out, ai_mov_imm(A_X0(), stride as i64));
+        } else {
+            if (nargs != 1) { ac_err(cg, "arm64: _zag_alloc_array expects one count argument"); return 1; }
+            let invalid: i32 = ac_fresh(cg); let count_ok: i32 = ac_fresh(cg);
+            ac_lower_expr(out, get[*Node](c.args, 0), env, syms, cg);
+            push[AInstr](out, ai_pop(A_X0()));
+            // Reject count < 0 and count > (2^60-1)/stride (byte-size overflow).
+            push[AInstr](out, ai_cmp_imm(A_X0(), 0));
+            push[AInstr](out, ai_jl(invalid));
+            push[AInstr](out, ai_mov_imm(A_X9(), 1152921504606846975 / (stride as i64)));
+            push[AInstr](out, ai_cmp(A_X0(), A_X9()));
+            push[AInstr](out, ai_jle(count_ok));
+            push[AInstr](out, ai_label(invalid));
+            ac_emit_panic(out, "zag runtime: invalid _zag_alloc_array count", count_ok, cg);
+            if (stride != 1) {
+                push[AInstr](out, ai_mov_imm(A_X9(), stride as i64));
+                push[AInstr](out, ai_mul(A_X0(), A_X0(), A_X9()));
+            }
+        }
+        cg.*.use_al = 1;
         if (cg.*.safety_checked == 1) {
             push[AInstr](out, ai_mov_rr(A_X1(), A_X0()));   // x1 = size
             push[AInstr](out, ai_call(cg.*.al_lbl));         // x0 = pointer
@@ -6253,10 +6438,21 @@ fn ac_lower_at_builtin(out: *ArrayList[AInstr], fname: []u8, c: Call, env: *AEnv
         push[AInstr](out, ai_push(A_X0()));
         return;
     }
-    if (@strEq(b, "sizeOf")) {
+    // @sizeOf[T]() / @sizeof[T]() → Zag uniform-layout byte size (NOT a C
+    // sizeof: i32 is 8). @elemStride[T]() → `*T` pointer-arithmetic stride.
+    if (@strEq(b, "sizeOf") || @strEq(b, "sizeof")) {
         let t: []u8 = "i32";
         if (len[[]u8](c.targs) > 0) { t = get[[]u8](c.targs, 0); }
         push[AInstr](out, ai_mov_imm(A_X0(), ac_type_size(cg, t) as i64));
+        push[AInstr](out, ai_push(A_X0()));
+        return;
+    }
+    if (@strEq(b, "elemStride")) {
+        if (len[[]u8](c.targs) != 1 || nargs != 0) {
+            ac_err(cg, "arm64: @elemStride expects one type argument and no values");
+            push[AInstr](out, ai_mov_imm(A_X0(), 0)); push[AInstr](out, ai_push(A_X0())); return;
+        }
+        push[AInstr](out, ai_mov_imm(A_X0(), ac_elem_stride(cg, cg_norm_type(get[[]u8](c.targs, 0))) as i64));
         push[AInstr](out, ai_push(A_X0()));
         return;
     }
@@ -6390,6 +6586,9 @@ fn ac_lower_stmt(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
             if (l.has_dty == 1) { ty = l.dty; }
             else if (l.has_init == 1) { ty = ac_expr_type(l.expr, env, syms, cg); }
             if (cg_is_fn_type(cg_norm_type(ty)) == 1) { ty = "fat_fn"; }
+            // `let p: *T = _zag_malloc(SZ)` (no cast): the declared pointer
+            // type binds SZ to whole T elements — same proof requirement.
+            if (l.has_dty == 1 && l.has_init == 1) { ac_check_typed_alloc(cg, l.expr, ty); }
             let w: i32 = ac_type_words(cg, ty);
             let disp: i32 = ac_slot_alloc_br(env, cg, l.name, ty, w, 0);
             if (l.has_init == 1) {
@@ -6460,6 +6659,8 @@ fn ac_lower_stmt(out: *ArrayList[AInstr], n: *Node, env: *AEnv, syms: ArrayList[
                 else => { }
             }
             let tty: []u8 = ac_expr_type(a.target, env, syms, cg);
+            // `p = _zag_malloc(SZ)` into a `*T` slot: same whole-element proof.
+            ac_check_typed_alloc(cg, a.expr, tty);
             if (ac_is_optional(tty) == 1 && ac_is_null_node(a.expr) == 1) {
                 ac_lower_addr(out, a.target, env, syms, cg);
                 push[AInstr](out, ai_pop(A_X10()));
