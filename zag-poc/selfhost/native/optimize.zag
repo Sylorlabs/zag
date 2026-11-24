@@ -2408,6 +2408,185 @@ fn opt_jmp_thread(prog: ArrayList[Instr]) ArrayList[Instr] {
     return out;
 }
 
+// ── opt_writeback: loop-aware write-back + copy-through folds ────────────────
+// opt_dead_at answers "live" at any jump, so inside a loop every scratch that
+// dies one iteration later looks immortal: the `mov t,d; OP t,x; mov d,t`
+// idiom the expression lowering emits for `dst = dst OP src` survives as
+// 3-4 instructions where one `OP d,x` does the job. This pass walks the CFG
+// with a visited set: r is dead iff EVERY path from `from` writes r before
+// reading it (fuel/visited bounds keep loops finite; anything unresolved is
+// live — conservative).
+fn opt_dead_fwd(prog: ArrayList[Instr], r: i32, from: i32, fuel: i32,
+                seen: ArrayList[i32]) i32 {
+    let n: i32 = len[Instr](prog);
+    let sc: i32 = from;
+    let fl: i32 = fuel;
+    while (sc < n && fl > 0) {
+        let ins: Instr = get[Instr](prog, sc);
+        let k: i32 = ins.kind;
+        if (opt_reads_reg(ins, r) == 1) { return 0; }
+        if (opt_writes_reg(ins, r) == 1) { return 1; }
+        if (r == R_RSP() && (k == K_PUSH() || k == K_POP() || k == K_RET() ||
+            k == K_CALL() || k == K_CALL_REG() || k == K_CALL_EXT() ||
+            k == K_SYSCALL())) { return 0; }
+        if (k == K_LABEL()) {
+            if (opt_in_i32(seen, sc) == 1) { return 0; }
+            push[i32](&seen, sc);
+        }
+        if (k == K_JMP()) {
+            let t: i32 = opt_lbl_idx(prog, ins.lbl);
+            if (t < 0) { return 0; }
+            if (opt_in_i32(seen, t) == 1) { return 1; }
+            push[i32](&seen, t);
+            sc = t + 1; fl = fl - 1;
+        } else { if (opt_is_jcc(k) == 1) {
+            let t2: i32 = opt_lbl_idx(prog, ins.lbl);
+            if (t2 < 0) { return 0; }
+            if (opt_in_i32(seen, t2) == 0 &&
+                opt_dead_fwd(prog, r, t2 + 1, fl - 4, seen) == 0) { return 0; }
+            sc = sc + 1; fl = fl - 1;
+        } else { if (k == K_RET()) {
+            if (r == R_RAX()) { return 0; }
+            return 1;
+        } else { if (k == K_CALL() || k == K_CALL_REG() || k == K_CALL_EXT() ||
+                     k == K_SYSCALL()) {
+            if (k == K_CALL_REG() && ins.dst == r) { return 0; }
+            if (r == R_RDI() || r == R_RSI() || r == R_RDX() || r == R_RCX() ||
+                r == R_R8() || r == R_R9()) {
+                if (ins.imm >= 0) {
+                    if ((opt_argpos(r) as i64) < ins.imm) { return 0; }
+                    return 1;
+                }
+                return 0;
+            }
+            if (r == R_RAX() || r == R_R10() || r == R_R11()) { return 1; }
+            sc = sc + 1;
+        } else { sc = sc + 1; fl = fl - 1; } } } }
+    }
+    return 0;
+}
+
+fn opt_wb_dead(prog: ArrayList[Instr], r: i32, from: i32) i32 {
+    // capacity must cover every push a path can make: a realloc inside a
+    // recursive call would free the buffer the parent's copy still points
+    // at (shared backing store, per-frame length) -> double free. 64 > fuel.
+    let seen: ArrayList[i32] = make[i32](64);
+    let res: i32 = opt_dead_fwd(prog, r, from, 48, seen);
+    free[i32](&seen);
+    return res;
+}
+
+// mov_imm t,k ; OP d,t  ->  OP_imm d,k  (t dies)
+fn opt_wb_opimm(k: i32) i32 {
+    if (k == K_ADD_RR()) { return K_ADD_RI(); }
+    if (k == K_SUB_RR()) { return K_SUB_RI(); }
+    if (k == K_CMP_RR()) { return K_CMP_RI(); }
+    return 0 - 1;
+}
+
+fn opt_writeback(prog: ArrayList[Instr]) ArrayList[Instr] {
+    let n: i32 = len[Instr](prog);
+    let out: ArrayList[Instr] = make[Instr](n + 1);
+    let i: i32 = 0;
+    while (i < n) {
+        let a: Instr = get[Instr](prog, i);
+        let did: i32 = 0;
+        // A) mov t1,x ; mov t0,d ; OP t0,t1 ; mov d,t0  ->  OP d,x
+        if (did == 0 && i + 3 < n && a.kind == K_MOV_RR()) {
+            let b: Instr = get[Instr](prog, i + 1);
+            let c: Instr = get[Instr](prog, i + 2);
+            let e: Instr = get[Instr](prog, i + 3);
+            if (b.kind == K_MOV_RR() &&
+                (c.kind == K_ADD_RR() || c.kind == K_SUB_RR()) &&
+                e.kind == K_MOV_RR() &&
+                c.dst == b.dst && c.src == a.dst &&
+                e.dst == b.src && e.src == c.dst &&
+                a.dst != b.dst && a.src != a.dst && a.src != b.dst &&
+                opt_wb_dead(prog, a.dst, i + 4) == 1 &&
+                opt_wb_dead(prog, b.dst, i + 4) == 1) {
+                push[Instr](&out, ins6(c.kind, b.src, a.src, 0, 0, -1));
+                did = 1; i = i + 4;
+            }
+        }
+        // B) mov t,d ; OP t,x ; mov d,t  ->  OP d,x   (x != t)
+        if (did == 0 && i + 2 < n && a.kind == K_MOV_RR()) {
+            let b: Instr = get[Instr](prog, i + 1);
+            let c: Instr = get[Instr](prog, i + 2);
+            if ((b.kind == K_ADD_RR() || b.kind == K_SUB_RR()) &&
+                c.kind == K_MOV_RR() &&
+                b.dst == a.dst && c.dst == a.src && c.src == a.dst &&
+                a.dst != a.src && b.src != a.dst &&
+                opt_wb_dead(prog, a.dst, i + 3) == 1) {
+                push[Instr](&out, ins6(b.kind, a.src, b.src, 0, 0, -1));
+                did = 1; i = i + 3;
+            }
+        }
+        // C) mov_imm t,k ; OP d,t  ->  OP_imm d,k
+        if (did == 0 && i + 1 < n && a.kind == K_MOV_IMM()) {
+            let b: Instr = get[Instr](prog, i + 1);
+            let nk: i32 = opt_wb_opimm(b.kind);
+            if (nk >= 0 && b.src == a.dst && a.dst != b.dst &&
+                opt_fits32(a.imm) == 1 &&
+                opt_wb_dead(prog, a.dst, i + 2) == 1) {
+                push[Instr](&out, ins6(nk, b.dst, 0, a.imm, 0, -1));
+                did = 1; i = i + 2;
+            }
+        }
+        // D) mov a,x ; (CMP|ADD|SUB) y,a  ->  (CMP|ADD|SUB) y,x  (a dies)
+        if (did == 0 && i + 1 < n && a.kind == K_MOV_RR()) {
+            let b: Instr = get[Instr](prog, i + 1);
+            if ((b.kind == K_CMP_RR() || b.kind == K_ADD_RR() ||
+                 b.kind == K_SUB_RR()) &&
+                b.src == a.dst && a.dst != a.src &&
+                b.dst != a.src && b.dst != a.dst &&
+                opt_wb_dead(prog, a.dst, i + 2) == 1) {
+                push[Instr](&out, ins6(b.kind, b.dst, a.src, b.imm, b.disp, b.lbl));
+                did = 1; i = i + 2;
+            }
+            // mov a,x ; cmp a,y  ->  cmp x,y   (cmp's dst is read-only)
+            if (did == 0 && b.kind == K_CMP_RR() &&
+                b.dst == a.dst && b.src != a.dst && a.dst != a.src &&
+                opt_wb_dead(prog, a.dst, i + 2) == 1) {
+                push[Instr](&out, ins6(b.kind, a.src, b.src, b.imm, b.disp, b.lbl));
+                did = 1; i = i + 2;
+            }
+        }
+        // DG) mov a,x ; m ; use-of-a  ->  m ; use-of-x   (m touches neither)
+        if (did == 0 && i + 2 < n && a.kind == K_MOV_RR()) {
+            let b: Instr = get[Instr](prog, i + 1);
+            let c: Instr = get[Instr](prog, i + 2);
+            if ((b.kind == K_MOV_RR() || b.kind == K_MOV_IMM()) &&
+                b.dst != a.dst && b.src != a.dst && b.dst != a.src &&
+                a.dst != a.src &&
+                opt_wb_dead(prog, a.dst, i + 3) == 1) {
+                if (c.kind == K_CMP_RR()) {
+                    if (c.src == a.dst && c.dst != a.dst) {
+                        push[Instr](&out, b);
+                        push[Instr](&out, ins6(c.kind, c.dst, a.src, c.imm, c.disp, c.lbl));
+                        did = 1; i = i + 3;
+                    } else { if (c.dst == a.dst && c.src != a.dst) {
+                        push[Instr](&out, b);
+                        push[Instr](&out, ins6(c.kind, a.src, c.src, c.imm, c.disp, c.lbl));
+                        did = 1; i = i + 3;
+                    } }
+                } else { if ((c.kind == K_ADD_RR() || c.kind == K_SUB_RR()) &&
+                    c.src == a.dst && c.dst != a.dst && c.dst != a.src) {
+                    push[Instr](&out, b);
+                    push[Instr](&out, ins6(c.kind, c.dst, a.src, c.imm, c.disp, c.lbl));
+                    did = 1; i = i + 3;
+                } }
+            }
+        }
+        // E) mov a,x with a provably dead -> gone
+        if (did == 0 && a.kind == K_MOV_RR() && a.dst != a.src &&
+            opt_wb_dead(prog, a.dst, i + 1) == 1) {
+            did = 1; i = i + 1;
+        }
+        if (did == 0) { push[Instr](&out, a); i = i + 1; }
+    }
+    return out;
+}
+
 fn optimize(prog: ArrayList[Instr]) ArrayList[Instr] {
     let folded: ArrayList[Instr] = opt_fold_pass(prog);
     let fused:  ArrayList[Instr] = opt_fuse_cc(folded);
@@ -2434,8 +2613,20 @@ fn optimize(prog: ArrayList[Instr]) ArrayList[Instr] {
     free[Instr](&inl);
     let dst: ArrayList[Instr] = opt_dead_st(jth);
     free[Instr](&jth);
-    let cmpi: ArrayList[Instr] = opt_cmp_fold(dst);
+    // writeback runs after dead_st: shadow frame stores still present before
+    // it make staged regs look live to opt_wb_dead. Bounded fixpoint: a fold
+    // can create the adjacency the next pattern needs (B exposes C).
+    let wb: ArrayList[Instr] = opt_writeback(dst);
     free[Instr](&dst);
+    let wbn: ArrayList[Instr] = opt_writeback(wb);
+    while (len[Instr](wbn) < len[Instr](wb)) {
+        free[Instr](&wb);
+        wb = wbn;
+        wbn = opt_writeback(wb);
+    }
+    free[Instr](&wbn);
+    let cmpi: ArrayList[Instr] = opt_cmp_fold(wb);
+    free[Instr](&wb);
     let sw: ArrayList[Instr] = opt_shrinkwrap(cmpi);
     free[Instr](&cmpi);
     return sw;
