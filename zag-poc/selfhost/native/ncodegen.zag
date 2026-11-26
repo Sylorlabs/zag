@@ -1697,8 +1697,10 @@ fn cg_lower_expr(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                     push[Instr](out, i_load(R_RAX(), R_RBP(), env.*.sret_disp));
                 }
                 // try error propagation: set is_err=1 for errdefer, jump to cleanup
-                push[Instr](out, i_mov_imm(R_R11(), 1));
+                if (len[*Node](&env.*.errdefer_exprs) > 0) {
+                    push[Instr](out, i_mov_imm(R_R11(), 1));
                 push[Instr](out, i_store(R_RBP(), env.*.is_err_slot, R_R11()));
+                }
                 push[Instr](out, i_jmp(env.*.pre_epilogue));
                 push[Instr](out, i_label(l_ok3));
                 let try_ty: []u8 = cg_expr_type(u.e, env, syms, cg);
@@ -2562,16 +2564,12 @@ fn cg_float_cmp_cc(op: []u8) i32 {
 // bits. After overflow the high dword is garbage unless we mask + sign/zero-
 // extend so `x as i64` and heap stores see the low 32 bits only.
 fn cg_emit_sext_i32_reg(out: *ArrayList[Instr], reg: i32) void {
-    // sign-extend low 32 bits: (xu & 0xFFFFFFFF) then (xu ^ 2^31) - 2^31
-    push[Instr](out, i_mov_imm(R_RCX(), 4294967295));      // 0xFFFFFFFF
-    push[Instr](out, i_and(reg, R_RCX()));
-    push[Instr](out, i_mov_imm(R_RCX(), 2147483648));      // 0x80000000
-    push[Instr](out, i_xor(reg, R_RCX()));
-    push[Instr](out, i_sub(reg, R_RCX()));
+    // sign-extend low 32 bits in ONE instruction: movsxd reg, reg.
+    push[Instr](out, i_movsxd(reg, reg));
 }
 fn cg_emit_zext_u32_reg(out: *ArrayList[Instr], reg: i32) void {
-    push[Instr](out, i_mov_imm(R_RCX(), 4294967295));      // zero-extend low 32
-    push[Instr](out, i_and(reg, R_RCX()));
+    // zero-extend low 32 bits in ONE instruction: mov reg32, reg32 (no REX.W).
+    push[Instr](out, i_zext32(reg, reg));
 }
 fn cg_emit_norm_scalar_for_ty(out: *ArrayList[Instr], ty: []u8, reg: i32) void {
     let nt: []u8 = cg_norm_type(ty);
@@ -3004,6 +3002,42 @@ fn cg_lower_bin(out: *ArrayList[Instr], bb: Bin, env: *Env, syms: ArrayList[FnSy
     } else if (@strEq(bb.op, "*")) {
         push[Instr](out, i_imul(R_RAX(), R_RCX()));
     } else if (@strEq(bb.op, "/")) {
+        // strength reduction: x / 2^k (positive constant power of two, k<=31)
+        // becomes an arithmetic-shift sequence — no idiv, no div-zero checks
+        // (the divisor is statically nonzero and not -1).
+        //   q = (x + ((x sar 63) & (C-1))) sar k   (truncation toward zero)
+        let dlv: i64 = 0;
+        let dislit: i32 = 0;
+        switch (bb.r.*) {
+            .ilit => |x| {
+                if (cg_is_int_text(x.text) == 1) {
+                    dlv = cg_parse_i64(x.text);
+                    dislit = 1;
+                }
+            }
+            else => { }
+        }
+        let dk: i32 = 0 - 1;
+        if (dislit == 1 && dlv >= 2 && dlv <= 2147483648) {
+            if ((dlv & (dlv - 1)) == 0) {
+                let kk: i32 = 0;
+                let vv: i64 = dlv;
+                while (vv > 1) {
+                    vv = vv / 2;
+                    kk = kk + 1;
+                }
+                if (kk <= 31) { dk = kk; }
+            }
+        }
+        if (dk >= 0) {
+            push[Instr](out, i_mov_rr(R_RDX(), R_RAX()));
+            push[Instr](out, i_mov_imm(R_RCX(), 63));
+            push[Instr](out, i_sar_cl(R_RDX()));
+            push[Instr](out, i_and_imm(R_RDX(), dlv - 1));
+            push[Instr](out, i_add(R_RAX(), R_RDX()));
+            push[Instr](out, i_mov_imm(R_RCX(), dk));
+            push[Instr](out, i_sar_cl(R_RAX()));
+        } else {
         // DEFINED division: /0 panics (__div0); x/-1 = -x (wraps at i64 min,
         // matching AArch64 SDIV) — hardware idiv would fault on both.
         let l_dnz: i32 = cg_fresh(cg);
@@ -3021,7 +3055,45 @@ fn cg_lower_bin(out: *ArrayList[Instr], bb: Bin, env: *Env, syms: ArrayList[FnSy
         push[Instr](out, i_label(l_dm1));
         push[Instr](out, i_idiv(R_RCX()));                 // cqo+idiv; quotient → rax
         push[Instr](out, i_label(l_ddo));
+        }
     } else if (@strEq(bb.op, "%")) {
+        // strength reduction: x % 2^k → mask for x>=0 (the hot path), idiv
+        // fallback for negative x to preserve truncation semantics.
+        let mlitv: i64 = 0;
+        let mislit: i32 = 0;
+        switch (bb.r.*) {
+            .ilit => |x| {
+                if (cg_is_int_text(x.text) == 1) {
+                    mlitv = cg_parse_i64(x.text);
+                    mislit = 1;
+                }
+            }
+            else => { }
+        }
+        let mk: i32 = 0 - 1;
+        if (mislit == 1 && mlitv >= 2 && mlitv <= 2147483648) {
+            if ((mlitv & (mlitv - 1)) == 0) {
+                let kk2: i32 = 0;
+                let vv2: i64 = mlitv;
+                while (vv2 > 1) {
+                    vv2 = vv2 / 2;
+                    kk2 = kk2 + 1;
+                }
+                if (kk2 <= 31) { mk = kk2; }
+            }
+        }
+        if (mk >= 0) {
+            let l_mslow: i32 = cg_fresh(cg);
+            let l_mfin: i32 = cg_fresh(cg);
+            push[Instr](out, i_cmp_imm(R_RAX(), 0));
+            push[Instr](out, i_jl(l_mslow));
+            push[Instr](out, i_and_imm(R_RAX(), mlitv - 1));
+            push[Instr](out, i_jmp(l_mfin));
+            push[Instr](out, i_label(l_mslow));
+            push[Instr](out, i_idiv(R_RCX()));             // negative x: truncation mod
+            push[Instr](out, i_mov_rr(R_RAX(), R_RDX()));
+            push[Instr](out, i_label(l_mfin));
+        } else {
         // DEFINED modulo: %0 panics; x % -1 = 0 (AArch64 semantics).
         let l_mnz: i32 = cg_fresh(cg);
         let l_mdo: i32 = cg_fresh(cg);
@@ -3039,6 +3111,7 @@ fn cg_lower_bin(out: *ArrayList[Instr], bb: Bin, env: *Env, syms: ArrayList[FnSy
         push[Instr](out, i_idiv(R_RCX()));                 // remainder → rdx
         push[Instr](out, i_mov_rr(R_RAX(), R_RDX()));
         push[Instr](out, i_label(l_mdo));
+        }
     } else if (@strEq(bb.op, "&")) {
         push[Instr](out, i_and(R_RAX(), R_RCX()));
     } else if (@strEq(bb.op, "^")) {
@@ -3472,10 +3545,17 @@ fn cg_emit_raw_slice_acquire(out:*ArrayList[Instr],cg:*Cg)void{
     // Scratch: rcx=index, r8=entry, r9=16, r10=&entry.
     let loop:i32=cg_fresh(cg);let insert:i32=cg_fresh(cg);let next:i32=cg_fresh(cg);
     let full:i32=cg_fresh(cg);let after_full:i32=cg_fresh(cg);let duplicate:i32=cg_fresh(cg);let done:i32=cg_fresh(cg);
+    // High-water scan: entries at or beyond [RAW_SLICE_HIW] are all zero, so
+    // the first-unused-slot search only walks the populated prefix. When no
+    // empty/tombstone slot exists below the mark, the mark itself is the slot
+    // and the mark advances — unless the table is genuinely full.
+    let at_hiw:i32=cg_fresh(cg);
+    push[Instr](out,i_mov_imm(R_R10(),RAW_SLICE_HIW()));
+    push[Instr](out,i_load(R_R11(),R_R10(),0));
     push[Instr](out,i_mov_imm(R_RCX(),0));
     push[Instr](out,i_label(loop));
-    push[Instr](out,i_cmp_imm(R_RCX(),RAW_SLICE_REGISTRY_CAP()));
-    push[Instr](out,i_jge(full));
+    push[Instr](out,i_cmp(R_RCX(),R_R11()));
+    push[Instr](out,i_jge(at_hiw));
     push[Instr](out,i_mov_rr(R_R10(),R_RCX()));
     push[Instr](out,i_mov_imm(R_R9(),16));
     push[Instr](out,i_imul(R_R10(),R_R9()));
@@ -3490,9 +3570,23 @@ fn cg_emit_raw_slice_acquire(out:*ArrayList[Instr],cg:*Cg)void{
     push[Instr](out,i_label(next));
     push[Instr](out,i_add_imm(R_RCX(),1));
     push[Instr](out,i_jmp(loop));
+    push[Instr](out,i_label(at_hiw));
+    push[Instr](out,i_cmp_imm(R_R11(),RAW_SLICE_REGISTRY_CAP()));
+    push[Instr](out,i_jge(full));
+    push[Instr](out,i_mov_rr(R_RCX(),R_R11()));
+    push[Instr](out,i_mov_rr(R_R10(),R_RCX()));
+    push[Instr](out,i_mov_imm(R_R9(),16));
+    push[Instr](out,i_imul(R_R10(),R_R9()));
+    push[Instr](out,i_add_imm(R_R10(),RAW_SLICE_REGISTRY()));
+    push[Instr](out,i_add_imm(R_R11(),1));
+    push[Instr](out,i_mov_rr(R_R8(),R_R11()));
+    push[Instr](out,i_mov_imm(R_R11(),RAW_SLICE_HIW()));
+    push[Instr](out,i_store(R_R11(),0,R_R8()));
     push[Instr](out,i_label(insert));
     push[Instr](out,i_store(R_R10(),0,R_RAX()));
-    push[Instr](out,i_store(R_R10(),8,R_RSI()));
+    push[Instr](out,i_mov_rr(R_R8(),R_RSI()));
+    push[Instr](out,i_add(R_R8(),R_RDX()));
+    push[Instr](out,i_store(R_R10(),8,R_R8()));
     push[Instr](out,i_jmp(done));
     push[Instr](out,i_label(full));
     cg_emit_panic(out,"zag runtime: raw slice allocation registry exhausted",after_full,cg);
@@ -3507,9 +3601,11 @@ fn cg_emit_raw_slice_release(out:*ArrayList[Instr],cg:*Cg)void{
     // the tombstone only after munmap succeeds.
     let loop:i32=cg_fresh(cg);let next:i32=cg_fresh(cg);let live:i32=cg_fresh(cg);
     let invalid:i32=cg_fresh(cg);let done:i32=cg_fresh(cg);
+    push[Instr](out,i_mov_imm(R_R10(),RAW_SLICE_HIW()));
+    push[Instr](out,i_load(R_R11(),R_R10(),0));
     push[Instr](out,i_mov_imm(R_RCX(),0));
     push[Instr](out,i_label(loop));
-    push[Instr](out,i_cmp_imm(R_RCX(),RAW_SLICE_REGISTRY_CAP()));
+    push[Instr](out,i_cmp(R_RCX(),R_R11()));
     push[Instr](out,i_jge(invalid));
     push[Instr](out,i_mov_rr(R_R10(),R_RCX()));
     push[Instr](out,i_mov_imm(R_R9(),16));
@@ -3528,9 +3624,14 @@ fn cg_emit_raw_slice_release(out:*ArrayList[Instr],cg:*Cg)void{
     push[Instr](out,i_cmp(R_R8(),R_RDI()));
     push[Instr](out,i_jne(next));
     push[Instr](out,i_load(R_R8(),R_R10(),8));
-    push[Instr](out,i_cmp(R_R8(),R_RSI()));
+    push[Instr](out,i_mov_rr(R_R9(),R_R8()));
+    push[Instr](out,i_mov_imm(R_R11(),0-8));
+    push[Instr](out,i_and(R_R9(),R_R11()));
+    push[Instr](out,i_cmp(R_R9(),R_RSI()));
     push[Instr](out,i_jne(invalid));
-    push[Instr](out,i_mov_rr(R_RSI(),R_R8()));
+    push[Instr](out,i_mov_rr(R_RSI(),R_R9()));
+    push[Instr](out,i_mov_imm(R_R11(),7));
+    push[Instr](out,i_and(R_R8(),R_R11()));
     push[Instr](out,i_jmp(done));
     push[Instr](out,i_label(next));
     push[Instr](out,i_add_imm(R_RCX(),1));
@@ -3539,7 +3640,7 @@ fn cg_emit_raw_slice_release(out:*ArrayList[Instr],cg:*Cg)void{
     cg_emit_panic(out,"zag runtime: invalid or double raw slice free",done,cg);
 }
 
-fn cg_lower_word_slice_alloc(out:*ArrayList[Instr],count:*Node,env:*Env,syms:ArrayList[FnSym],cg:*Cg)void{
+fn cg_lower_word_slice_alloc(out:*ArrayList[Instr],count:*Node,env:*Env,syms:ArrayList[FnSym],cg:*Cg,raw:i32)void{
     let slice_slot:i32=cg_slot_scratch_n(env,2);let invalid:i32=cg_fresh(cg);let count_ok:i32=cg_fresh(cg);let zero:i32=cg_fresh(cg);let done:i32=cg_fresh(cg);
     cg_lower_expr(out,count,env,syms,cg);push[Instr](out,i_pop(R_RCX()));push[Instr](out,i_store(R_RBP(),slice_slot+8,R_RCX()));
     // x86-64 CMP has no imm64 form: its immediate is sign-extended imm32.
@@ -3547,17 +3648,29 @@ fn cg_lower_word_slice_alloc(out:*ArrayList[Instr],count:*Node,env:*Env,syms:Arr
     // truncating it to -1 and rejecting every non-negative count.
     push[Instr](out,i_cmp_imm(R_RCX(),0));push[Instr](out,i_jl(invalid));push[Instr](out,i_mov_imm(R_RAX(),1152921504606846975));push[Instr](out,i_cmp(R_RCX(),R_RAX()));push[Instr](out,i_jle(count_ok));push[Instr](out,i_label(invalid));cg_emit_panic(out,"zag runtime: invalid word-slice allocation count",count_ok,cg);
     push[Instr](out,i_mov_rr(R_RDI(),R_RCX()));push[Instr](out,i_mov_imm(R_RAX(),8));push[Instr](out,i_imul(R_RDI(),R_RAX()));
-    push[Instr](out,i_cmp_imm(R_RDI(),0));push[Instr](out,i_je(zero));push[Instr](out,i_push(R_RDI()));cg.*.use_al=1;push[Instr](out,i_call(cg.*.al_lbl));push[Instr](out,i_pop(R_RSI()));cg_emit_raw_slice_acquire(out,cg);if(cg.*.safety_checked==1){cg_emit_alloc_access_acquire(out,cg);}cg_emit_allocator_acquire(out,R_RSI(),cg);push[Instr](out,i_jmp(done));
+    push[Instr](out,i_cmp_imm(R_RDI(),0));push[Instr](out,i_je(zero));push[Instr](out,i_push(R_RDI()));cg.*.use_al=1;push[Instr](out,i_mov_imm(R_RSI(),raw));push[Instr](out,i_call(cg.*.al_lbl));push[Instr](out,i_pop(R_RSI()));cg_emit_raw_slice_acquire(out,cg);if(cg.*.safety_checked==1){cg_emit_alloc_access_acquire(out,cg);}cg_emit_allocator_acquire(out,R_RSI(),cg);push[Instr](out,i_jmp(done));
     push[Instr](out,i_label(zero));push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_label(done));push[Instr](out,i_store(R_RBP(),slice_slot,R_RAX()));push[Instr](out,i_lea(R_RAX(),R_RBP(),slice_slot));push[Instr](out,i_push(R_RAX()));
 }
 
 fn cg_lower_word_slice_free(out:*ArrayList[Instr],value:*Node,env:*Env,syms:ArrayList[FnSym],cg:*Cg)void{
     let null_ok:i32=cg_fresh(cg);let count_ok:i32=cg_fresh(cg);let invalid:i32=cg_fresh(cg);let unmap_ok:i32=cg_fresh(cg);let done:i32=cg_fresh(cg);
+    let fl_push:i32=cg_fresh(cg);let fcl:i32=cg_fresh(cg);let fcf:i32=cg_fresh(cg);let unmap_fail:i32=cg_fresh(cg);
     cg_lower_expr(out,value,env,syms,cg);push[Instr](out,i_pop(R_RDX()));push[Instr](out,i_load(R_RDI(),R_RDX(),0));push[Instr](out,i_load(R_RSI(),R_RDX(),8));
     push[Instr](out,i_cmp_imm(R_RDI(),0));push[Instr](out,i_jne(count_ok));push[Instr](out,i_cmp_imm(R_RSI(),0));push[Instr](out,i_je(null_ok));push[Instr](out,i_jmp(invalid));
     push[Instr](out,i_label(count_ok));push[Instr](out,i_cmp_imm(R_RSI(),0));push[Instr](out,i_jle(invalid));push[Instr](out,i_mov_imm(R_RAX(),1152921504606846975));push[Instr](out,i_cmp(R_RSI(),R_RAX()));push[Instr](out,i_jg(invalid));push[Instr](out,i_mov_imm(R_RAX(),8));push[Instr](out,i_imul(R_RSI(),R_RAX()));
     push[Instr](out,i_push(R_RDX()));cg_emit_raw_slice_release(out,cg);push[Instr](out,i_pop(R_RDX()));
-    push[Instr](out,i_push(R_RDX()));push[Instr](out,i_mov_imm(R_RAX(),11));push[Instr](out,i_syscall());push[Instr](out,i_pop(R_RDX()));push[Instr](out,i_cmp_imm(R_RAX(),0));push[Instr](out,i_je(unmap_ok));cg_emit_panic(out,"zag runtime: raw slice unmap failed",unmap_ok,cg);
+    push[Instr](out,i_cmp_imm(R_R8(),0));push[Instr](out,i_jne(fl_push));
+    push[Instr](out,i_push(R_RDX()));push[Instr](out,i_mov_imm(R_RAX(),11));push[Instr](out,i_syscall());push[Instr](out,i_pop(R_RDX()));push[Instr](out,i_cmp_imm(R_RAX(),0));push[Instr](out,i_je(unmap_ok));cg_emit_panic(out,"zag runtime: raw slice unmap failed",unmap_fail,cg);push[Instr](out,i_jmp(unmap_ok));
+    push[Instr](out,i_label(fl_push));
+    // Arena block: same class ladder __alloc used; link the block onto the
+    // class free list (first word = next) and fall into the tombstone.
+    push[Instr](out,i_mov_imm(R_RCX(),0));push[Instr](out,i_mov_imm(R_R9(),16));
+    push[Instr](out,i_label(fcl));push[Instr](out,i_cmp(R_R9(),R_RSI()));push[Instr](out,i_jge(fcf));
+    push[Instr](out,i_add(R_R9(),R_R9()));push[Instr](out,i_add_imm(R_RCX(),1));push[Instr](out,i_jmp(fcl));
+    push[Instr](out,i_label(fcf));
+    push[Instr](out,i_mov_rr(R_R11(),R_RCX()));push[Instr](out,i_mov_imm(R_RAX(),8));push[Instr](out,i_imul(R_R11(),R_RAX()));push[Instr](out,i_add_imm(R_R11(),ALLOC2_HEADS()));
+    push[Instr](out,i_load(R_RAX(),R_R11(),0));push[Instr](out,i_store(R_RDI(),0,R_RAX()));push[Instr](out,i_store(R_R11(),0,R_RDI()));
+    push[Instr](out,i_label(unmap_ok));
     push[Instr](out,i_mov_rr(R_R9(),R_RDI()));push[Instr](out,i_neg(R_R9()));push[Instr](out,i_store(R_R10(),0,R_R9()));
     if(cg.*.safety_checked==1){cg_emit_alloc_access_release(out,cg);}
     cg_emit_allocator_release(out,R_RSI());push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_store(R_RDX(),0,R_RAX()));push[Instr](out,i_store(R_RDX(),8,R_RAX()));push[Instr](out,i_jmp(done));
@@ -4053,8 +4166,8 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
         // Script async context is inherited through reserved r12. Strict
         // @threadSpawn workers receive a null context and keep explicit thread
         // semantics; Script workers see their compiler-owned handle.
-        if(@strEq(b,"asyncSpawn")){push[Instr](out,i_mov_rr(R_R12(),R_RDX()));}
-        else{push[Instr](out,i_mov_imm(R_R12(),0));}
+        if(@strEq(b,"asyncSpawn")){push[Instr](out,i_mov_imm(R_R10(),TASK_CTX_CELL()));push[Instr](out,i_store(R_R10(),0,R_RDX()));}
+        else{push[Instr](out,i_mov_imm(R_R10(),TASK_CTX_CELL()));push[Instr](out,i_mov_imm(R_R11(),0));push[Instr](out,i_store(R_R10(),0,R_R11()));}
         if(with_i64==1){push[Instr](out,i_load(R_RDI(),R_RDX(),24));}push[Instr](out,i_call(worker));
         push[Instr](out,i_mov_imm(R_RDI(),0));push[Instr](out,i_mov_imm(R_RAX(),60));push[Instr](out,i_syscall());
         // SYS_exit must not return. Loop if a hostile environment violates it,
@@ -4071,8 +4184,9 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
     if (@strEq(b,"asyncCancelled")) {
         if(nargs!=0){cg_err(cg,"native: @asyncCancelled expects no arguments");}
         let none:i32=cg_fresh(cg);let done_cancel:i32=cg_fresh(cg);
-        push[Instr](out,i_cmp_imm(R_R12(),0));push[Instr](out,i_je(none));
-        push[Instr](out,i_load32(R_RAX(),R_R12(),32));push[Instr](out,i_jmp(done_cancel));
+        push[Instr](out,i_mov_imm(R_R10(),TASK_CTX_CELL()));push[Instr](out,i_load(R_R11(),R_R10(),0));
+        push[Instr](out,i_cmp_imm(R_R11(),0));push[Instr](out,i_je(none));
+        push[Instr](out,i_load32(R_RAX(),R_R11(),32));push[Instr](out,i_jmp(done_cancel));
         push[Instr](out,i_label(none));push[Instr](out,i_mov_imm(R_RAX(),0));
         push[Instr](out,i_label(done_cancel));push[Instr](out,i_push(R_RAX()));return;
     }
@@ -4809,7 +4923,7 @@ fn cg_lower_builtin(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, sym
     }
     if (@strEq(b, "cacheAlignedAlloc")) {
         if(nargs!=1){cg_err(cg,"native: @cacheAlignedAlloc expects one count");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;}
-        cg_lower_word_slice_alloc(out,get[*Node](c.args,0),env,syms,cg);
+        cg_lower_word_slice_alloc(out,get[*Node](c.args,0),env,syms,cg,1);
         return;
     }
     if (@strEq(b, "cacheAlignedFree")) {
@@ -5063,9 +5177,11 @@ fn cg_lower_native_rt(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, s
         push[Instr](out, i_store(R_RAX(), 0, R_RCX()));
         push[Instr](out, i_mov_imm(R_RCX(), 0));
         push[Instr](out, i_store(R_RAX(), 8, R_RCX()));
-        push[Instr](out, i_load(R_RCX(), 15, 0));
+        push[Instr](out, i_mov_imm(R_R10(), ARGV_BASE_CELL()));
+        push[Instr](out, i_load(R_R10(), R_R10(), 0));   // r10 = argv base
+        push[Instr](out, i_load(R_RCX(), R_R10(), 0));   // rcx = argc
         push[Instr](out, i_store(R_RAX(), 16, R_RCX()));
-        push[Instr](out, i_store(R_RAX(), 24, 15));
+        push[Instr](out, i_store(R_RAX(), 24, R_R10()));
         push[Instr](out, i_load(R_RCX(), R_RBP(), capability_slot));
         push[Instr](out, i_store(R_RAX(), 32, R_RCX()));
         // max_processes=4 in the low word, timeout_ms=30000 in the high word.
@@ -5099,6 +5215,7 @@ fn cg_lower_native_rt(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, s
         push[Instr](out, i_jne(backing_ready));
         push[Instr](out, i_load(R_RDI(), R_RCX(), 0));
         cg.*.use_al = 1;
+        push[Instr](out, i_mov_imm(R_RSI(), 1));
         push[Instr](out, i_call(cg.*.al_lbl));
         push[Instr](out, i_load(R_RCX(), R_RBP(), context_slot));
         push[Instr](out, i_store(R_RCX(), 64, R_RAX()));
@@ -5353,7 +5470,9 @@ fn cg_lower_native_rt(out: *ArrayList[Instr], fname: []u8, c: Call, env: *Env, s
     // ── _zag_argc() → load argc from [r15] ───────────────────────────────────
     if (@strEq(fname, "_zag_argc")) {
         if (nargs != 0) { cg_err(cg, "native: _zag_argc expects no arguments"); push[Instr](out, i_mov_imm(R_RAX(), 0)); push[Instr](out, i_push(R_RAX())); return 1; }
-        push[Instr](out, i_load(R_RAX(), 15, 0));      // rax = [r15] = argc
+        push[Instr](out, i_mov_imm(R_R10(), ARGV_BASE_CELL()));
+        push[Instr](out, i_load(R_R10(), R_R10(), 0));   // r10 = argv base
+        push[Instr](out, i_load(R_RAX(), R_R10(), 0));   // rax = argc
         push[Instr](out, i_push(R_RAX()));
         return 1;
     }
@@ -6356,7 +6475,7 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
     // []f64, etc. Each element takes the native backend's 8-byte word stride.
     if (@strEq(fname, "zalloc") || @strEq(fname, "zalloc_i")) {
         if(c.args.len!=1){cg_err(cg,"native: zalloc expects one count");push[Instr](out,i_mov_imm(R_RAX(),0));push[Instr](out,i_push(R_RAX()));return;}
-        cg_lower_word_slice_alloc(out,get[*Node](c.args,0),env,syms,cg);
+        cg_lower_word_slice_alloc(out,get[*Node](c.args,0),env,syms,cg,0);
         return;
     }
     if (@strEq(fname, "zfree") || @strEq(fname, "zfree_i")) {
@@ -6598,7 +6717,20 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
                 push[Instr](out, i_fmovq_xg(R_RAX(), R_XMM0()));
             }
         }
-        push[Instr](out, i_store(R_RBP(), sl, R_RAX()));     // aslot[i] = payload
+        if (dynamic_call == 0 && i < 6) {
+            // Internal call, register-bound arg: keep the payload on the CPU
+            // stack — it is popped straight into its arg register below,
+            // skipping the store+load through aslot entirely. The LAST reg
+            // arg skips the stack too: nothing after its eval can clobber
+            // the arg register, so a plain mov is enough.
+            if (i == nargs - 1) {
+                push[Instr](out, i_mov_rr(arg_reg(i), R_RAX()));
+            } else {
+                push[Instr](out, i_push(R_RAX()));
+            }
+        } else {
+            push[Instr](out, i_store(R_RBP(), sl, R_RAX()));     // aslot[i] = payload
+        }
         i = i + 1;
     }
 
@@ -6641,6 +6773,15 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
         }
     } else if (nargs > 6) { nstack = nargs - 6; }
     let pushed: i32 = nstack;
+    if (dynamic_call == 0) {
+        // Pop register-bound args into rdi..r9 in REVERSE eval order (the
+        // last-evaluated arg sits on top of the stack). Must run before the
+        // padding/stack-arg pushes below so we consume the right words. The
+        // last reg arg was moved directly into its register — stop before it.
+        let rp: i32 = nargs - 2;
+        if (nargs > 6) { rp = 5; }
+        while (rp >= 0) { push[Instr](out, i_pop(arg_reg(rp))); rp = rp - 1; }
+    }
     if (nstack % 2 == 1) {
         push[Instr](out, i_mov_imm(R_RAX(), 0));   // alignment padding
         push[Instr](out, i_push(R_RAX()));
@@ -6676,14 +6817,12 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
     }
     // Dynamic C calls classify integer and f64 registers independently under
     // SysV AMD64. Ordinary Zag calls retain their existing all-GPR convention.
+    let nreg: i32 = nargs;
+    if (nreg > 6) { nreg = 6; }
     if(dynamic_call==1){
         let r:i32=0;while(r<nargs){let pty:[]u8=cg_norm_type(cg_fn_param_type(cg,fname,r));if(@strEq(pty,"f64")==1){let xi:i32=cg_dynamic_f64_arg_index(cg,fname,r);if(xi>=4){cg_err(cg,"native: v2 f64 dynamic import supports at most four f64 arguments");}else{push[Instr](out,i_load(R_RAX(),R_RBP(),get[i32](aslot,r)));push[Instr](out,i_fmovq_gx(cg_dynamic_xmm_arg(xi),R_RAX()));}}else if(cg_dynamic_named_memory_aggregate_ok(cg.*.decls,pty)==0){let gi:i32=cg_dynamic_gpr_arg_index(cg,fname,r);if(gi<6){push[Instr](out,i_load(arg_reg(gi),R_RBP(),get[i32](aslot,r)));}}r=r+1;}
-    }else{
-        let r: i32 = 0;
-        let nreg: i32 = nargs;
-        if (nreg > 6) { nreg = 6; }
-        while (r < nreg) { push[Instr](out, i_load(arg_reg(r), R_RBP(), get[i32](aslot, r))); r = r + 1; }
     }
+    // Non-dynamic args already sit in their registers — popped above.
     // Instruction emission has consumed every compiler-side arg-slot index.
     // The machine code uses frame offsets, never this host-side array.
     free[i32](&aslot);
@@ -6712,7 +6851,7 @@ fn cg_lower_call(out: *ArrayList[Instr], c: Call, env: *Env, syms: ArrayList[FnS
             push[Instr](out, i_call_reg(R_RAX()));
         }
     } else {
-        push[Instr](out, i_call(lbl));
+        push[Instr](out, i_call_a(lbl, nreg));
     }
     if(dynamic_index>=0&&@strEq(cg_norm_type(rt),"f64")==1){push[Instr](out,i_fmovq_xg(R_RAX(),R_XMM0()));}
     // reclaim the stack args + padding we pushed (rsp += 8*pushed).
@@ -7345,8 +7484,10 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                         zi = zi + 1;
                     }
                     push[Instr](out, i_load(R_RAX(), R_RBP(), sps));
-                    push[Instr](out, i_mov_imm(R_R11(), 0));
+                    if (len[*Node](&env.*.errdefer_exprs) > 0) {
+                        push[Instr](out, i_mov_imm(R_R11(), 0));
                     push[Instr](out, i_store(R_RBP(), env.*.is_err_slot, R_R11()));
+                    }
                     push[Instr](out, i_jmp(env.*.pre_epilogue));
                     return;
                 }
@@ -7401,8 +7542,10 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                         push[Instr](out, i_store(R_RCX(), 0, R_RAX()));  // err = 0
                     }
                     push[Instr](out, i_load(R_RAX(), R_RBP(), sps));
-                    push[Instr](out, i_mov_imm(R_R11(), is_err_ret as i64));
+                    if (len[*Node](&env.*.errdefer_exprs) > 0) {
+                        push[Instr](out, i_mov_imm(R_R11(), is_err_ret as i64));
                     push[Instr](out, i_store(R_RBP(), env.*.is_err_slot, R_R11()));
+                    }
                     push[Instr](out, i_jmp(env.*.pre_epilogue));
                     return;
                 } else if (cg_type_is_opt(cg, rty) == 1) {
@@ -7429,8 +7572,10 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                     }
                 }
                 push[Instr](out, i_load(R_RAX(), R_RBP(), env.*.sret_disp));  // rax = dest
-                push[Instr](out, i_mov_imm(R_R11(), 0));
+                if (len[*Node](&env.*.errdefer_exprs) > 0) {
+                    push[Instr](out, i_mov_imm(R_R11(), 0));
                 push[Instr](out, i_store(R_RBP(), env.*.is_err_slot, R_R11()));
+                }
                 push[Instr](out, i_jmp(env.*.pre_epilogue));
                 return;
             }
@@ -7453,8 +7598,10 @@ fn cg_lower_stmt(out: *ArrayList[Instr], n: *Node, env: *Env, syms: ArrayList[Fn
                     else => { }
                 }
             }
-            push[Instr](out, i_mov_imm(R_R11(), non_sret_err as i64));
+            if (len[*Node](&env.*.errdefer_exprs) > 0) {
+                push[Instr](out, i_mov_imm(R_R11(), non_sret_err as i64));
             push[Instr](out, i_store(R_RBP(), env.*.is_err_slot, R_R11()));
+            }
             push[Instr](out, i_jmp(env.*.pre_epilogue));
         }
         .if_ => |iff| {
@@ -7726,6 +7873,7 @@ fn cg_lower_fn(out: *ArrayList[Instr], f: FnDecl, lbl: i32, syms: ArrayList[FnSy
         .seen = &seen, .words = &words,
         .names = make[[]u8](8), .types = make[[]u8](8),
         .fnames = make[[]u8](8), .frets = make[[]u8](8),
+        .anames = make[[]u8](8),
     };
     let si: i32 = 0;
     while (si < len[FnSym](syms)) {
@@ -7757,6 +7905,10 @@ fn cg_lower_fn(out: *ArrayList[Instr], f: FnDecl, lbl: i32, syms: ArrayList[FnSy
     let pre_epilogue: i32 = cg_fresh(cg);
     let env: Env = cg_env_new(epilogue);
     env.pre_epilogue = pre_epilogue;
+    // The scan's &x name set moves into the env (ownership — do not free
+    // sc.anames). cg_remap_deep_scalars uses it at end-of-body to keep lea'd
+    // scalars out of the promotable deep zone.
+    env.anames = sc.anames;
     let has_async_tasks: i32 = cg_body_has_async_spawn(f.body);
     let async_init_lbl: i32 = 0;
     let async_body_lbl: i32 = 0;
@@ -7789,9 +7941,11 @@ fn cg_lower_fn(out: *ArrayList[Instr], f: FnDecl, lbl: i32, syms: ArrayList[FnSy
     // ── allocate the error-return flag slot for defer/errdefer ──
     // This single word stores 1 for error returns, 0 for success returns.
     // The pre_epilogue cleanup chain reads it to decide whether to run errdefers.
-    env.is_err_slot = cg_slot_scratch(&env);
-    push[Instr](out, i_mov_imm(R_RAX(), 0));
-    push[Instr](out, i_store(R_RBP(), env.is_err_slot, R_RAX()));
+    if (len[*Node](&env.errdefer_exprs) > 0) {
+        env.is_err_slot = cg_slot_scratch(&env);
+        push[Instr](out, i_mov_imm(R_RAX(), 0));
+        push[Instr](out, i_store(R_RBP(), env.is_err_slot, R_RAX()));
+    }
 
     // ── closure: spill hidden env ptr (rdi) + shift user params ──
     // ONLY capturing closures receive the hidden env arg: the call site picks
@@ -7913,8 +8067,10 @@ fn cg_lower_fn(out: *ArrayList[Instr], f: FnDecl, lbl: i32, syms: ArrayList[FnSy
     // ── fall-through: success return → pre_epilogue ──
     // A void/no-explicit-return function falls through here. Set is_err=0 (success)
     // and jump to the cleanup chain. RAX holds whatever the body left (0 for void).
-    push[Instr](out, i_mov_imm(R_RAX(), 0));
-    push[Instr](out, i_store(R_RBP(), env.is_err_slot, R_RAX()));
+    if (len[*Node](&env.errdefer_exprs) > 0) {
+        push[Instr](out, i_mov_imm(R_RAX(), 0));
+        push[Instr](out, i_store(R_RBP(), env.is_err_slot, R_RAX()));
+    }
     push[Instr](out, i_jmp(pre_epilogue));
 
     // ── pre_epilogue: defer/errdefer cleanup chain ──
@@ -7998,6 +8154,12 @@ fn cg_lower_fn(out: *ArrayList[Instr], f: FnDecl, lbl: i32, syms: ArrayList[FnSy
     push[Instr](out, i_mov_rr(R_RSP(), R_RBP()));
     push[Instr](out, i_pop(R_RBP()));
     push[Instr](out, i_ret());
+
+    // Everything is emitted: relocate promotable scalars to word indices below
+    // the whole frame so regalloc's `d < min_lea` rule can lift them into
+    // registers, then grow the `sub rsp` reservation to cover the new words.
+    cg_remap_deep_scalars(out, &env, frame_sub_idx);
+    cg_patch_frame_size(out, frame_sub_idx, scanned_frame_size, env.frame_words);
     cg_env_dispose(&env);
 }
 
@@ -8443,9 +8605,17 @@ fn cg_emit_print_f64(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
 //   r10=0x22 (MAP_PRIVATE|MAP_ANONYMOUS) ; r8=-1 (fd) ; r9=0 (offset) ; syscall.
 // NOTE the kernel uses r10 for arg4 (NOT rcx). Leaf routine, no stack frame.
 fn cg_emit_alloc(out: *ArrayList[Instr], lbl: i32, cg:*Cg) void {
-    let zero:i32=cg_fresh(cg);
-    let size_ready:i32=cg_fresh(cg);
-    let ok:i32=cg_fresh(cg);
+    // __alloc(rdi=size, rsi=raw flag) -> rax=ptr, rdx=0 mmap | 1 arena block.
+    // Small arena-eligible requests (rsi==0, size<=ALLOC2_MAX) are served
+    // from a segregated free list over 1 MiB arenas instead of one mmap per
+    // call. Blocks carry no header; callers record {ptr,size|flag} in the
+    // raw-slice registry so free routes arena blocks back to the class free
+    // list (bit0 of the stored size marks arena provenance; sizes are always
+    // 8-byte multiples). Freelist pops are re-zeroed for zalloc semantics.
+    let zero:i32=cg_fresh(cg);let size_ready:i32=cg_fresh(cg);let ok:i32=cg_fresh(cg);
+    let mmap_path:i32=cg_fresh(cg);let cloop:i32=cg_fresh(cg);let found:i32=cg_fresh(cg);
+    let carve:i32=cg_fresh(cg);let grow:i32=cg_fresh(cg);let grow_ok:i32=cg_fresh(cg);
+    let zloop:i32=cg_fresh(cg);let zdone:i32=cg_fresh(cg);
     push[Instr](out, i_label(lbl));
     push[Instr](out, i_cmp_imm(R_RDI(), 0));
     push[Instr](out, i_jg(size_ready));
@@ -8455,6 +8625,85 @@ fn cg_emit_alloc(out: *ArrayList[Instr], lbl: i32, cg:*Cg) void {
     // address because the current slice representation is pointer+length.
     push[Instr](out, i_mov_imm(R_RDI(), 1));
     push[Instr](out, i_label(size_ready));
+    push[Instr](out, i_cmp_imm(R_RSI(), 0));
+    push[Instr](out, i_jne(mmap_path));
+    push[Instr](out, i_mov_imm(R_RAX(), ALLOC2_MAX()));
+    push[Instr](out, i_cmp(R_RDI(), R_RAX()));
+    push[Instr](out, i_jg(mmap_path));
+    // Class search: class c serves sizes <= 16<<c, c in 0..15.
+    push[Instr](out, i_mov_imm(R_RCX(), 0));
+    push[Instr](out, i_mov_imm(R_R9(), 16));
+    push[Instr](out, i_label(cloop));
+    push[Instr](out, i_cmp(R_R9(), R_RDI()));
+    push[Instr](out, i_jge(found));
+    push[Instr](out, i_add(R_R9(), R_R9()));
+    push[Instr](out, i_add_imm(R_RCX(), 1));
+    push[Instr](out, i_jmp(cloop));
+    push[Instr](out, i_label(found));
+    // r10 = &ALLOC2_HEADS[rcx]; pop when non-empty, else carve.
+    push[Instr](out, i_mov_rr(R_R10(), R_RCX()));
+    push[Instr](out, i_mov_imm(R_RAX(), 8));
+    push[Instr](out, i_imul(R_R10(), R_RAX()));
+    push[Instr](out, i_add_imm(R_R10(), ALLOC2_HEADS()));
+    push[Instr](out, i_load(R_RAX(), R_R10(), 0));
+    push[Instr](out, i_cmp_imm(R_RAX(), 0));
+    push[Instr](out, i_je(carve));
+    push[Instr](out, i_load(R_R8(), R_RAX(), 0));
+    push[Instr](out, i_store(R_R10(), 0, R_R8()));
+    // Zero the class-sized block (r9 bytes): freelist reuse must not leak
+    // stale bytes into a zalloc'd slice.
+    push[Instr](out, i_mov_imm(R_R8(), 0));
+    push[Instr](out, i_mov_imm(R_R11(), 0));
+    push[Instr](out, i_label(zloop));
+    push[Instr](out, i_cmp(R_R8(), R_R9()));
+    push[Instr](out, i_jge(zdone));
+    push[Instr](out, i_store_sib(R_RAX(), R_R8(), 0, 0, R_R11()));
+    push[Instr](out, i_add_imm(R_R8(), 8));
+    push[Instr](out, i_jmp(zloop));
+    push[Instr](out, i_label(zdone));
+    push[Instr](out, i_mov_imm(R_RDX(), 1));
+    push[Instr](out, i_ret());
+    // Carve off the current arena; grow a fresh one on overrun.
+    push[Instr](out, i_label(carve));
+    push[Instr](out, i_mov_imm(R_R10(), ALLOC2_CURSOR()));
+    push[Instr](out, i_load(R_RAX(), R_R10(), 0));
+    push[Instr](out, i_mov_rr(R_R8(), R_RAX()));
+    push[Instr](out, i_add(R_R8(), R_R9()));
+    push[Instr](out, i_mov_imm(R_R10(), ALLOC2_END()));
+    push[Instr](out, i_load(R_R10(), R_R10(), 0));
+    push[Instr](out, i_cmp(R_R8(), R_R10()));
+    push[Instr](out, i_jg(grow));
+    push[Instr](out, i_mov_imm(R_R10(), ALLOC2_CURSOR()));
+    push[Instr](out, i_store(R_R10(), 0, R_R8()));
+    push[Instr](out, i_mov_imm(R_RDX(), 1));
+    push[Instr](out, i_ret());
+    push[Instr](out, i_label(grow));
+    push[Instr](out, i_push(R_R9()));                // syscall clobbers r11; mmap seq clobbers r9
+    push[Instr](out, i_mov_imm(R_RSI(), ALLOC2_ARENA()));
+    push[Instr](out, i_mov_imm(R_RAX(), 9));
+    push[Instr](out, i_mov_imm(R_RDI(), 0));
+    push[Instr](out, i_mov_imm(R_RDX(), 3));
+    push[Instr](out, i_mov_imm(R_R10(), 34));
+    push[Instr](out, i_mov_imm(R_R8(), 0 - 1));
+    push[Instr](out, i_mov_imm(R_R9(), 0));
+    push[Instr](out, i_syscall());
+    push[Instr](out, i_pop(R_R9()));
+    push[Instr](out, i_cmp_imm(R_RAX(), 0));
+    push[Instr](out, i_jge(grow_ok));
+    cg_emit_panic(out, "zag runtime: allocation failed", grow_ok, cg);
+    push[Instr](out, i_mov_imm(R_R10(), ALLOC2_END()));
+    push[Instr](out, i_mov_rr(R_R8(), R_RAX()));
+    push[Instr](out, i_add_imm(R_R8(), ALLOC2_ARENA()));
+    push[Instr](out, i_store(R_R10(), 0, R_R8()));
+    push[Instr](out, i_mov_rr(R_R8(), R_RAX()));
+    push[Instr](out, i_add(R_R8(), R_R9()));
+    push[Instr](out, i_mov_imm(R_R10(), ALLOC2_CURSOR()));
+    push[Instr](out, i_store(R_R10(), 0, R_R8()));
+    push[Instr](out, i_mov_imm(R_RDX(), 1));
+    push[Instr](out, i_ret());
+    // Raw path: one mmap per call, page-aligned. rdx=0 tells acquire to
+    // record a plain size so free munmaps instead of pushing a free link.
+    push[Instr](out, i_label(mmap_path));
     push[Instr](out, i_mov_rr(R_RSI(), R_RDI()));     // rsi = length (requested size)
     push[Instr](out, i_mov_imm(R_RAX(), 9));          // sys_mmap
     push[Instr](out, i_mov_imm(R_RDI(), 0));          // addr = NULL
@@ -8466,6 +8715,7 @@ fn cg_emit_alloc(out: *ArrayList[Instr], lbl: i32, cg:*Cg) void {
     push[Instr](out, i_cmp_imm(R_RAX(), 0));
     push[Instr](out, i_jge(ok));
     cg_emit_panic(out, "zag runtime: allocation failed", ok, cg);
+    push[Instr](out, i_mov_imm(R_RDX(), 0));
     push[Instr](out, i_ret());
 }
 
@@ -8573,12 +8823,27 @@ fn ALLOC_HEADS() i64 { return BSS_VBASE() + 16; }
 fn ALLOC_COUNT() i64 { return BSS_VBASE() + 144; }
 fn ALLOC_LIVE() i64 { return BSS_VBASE() + 152; }
 fn ALLOC_PEAK() i64 { return BSS_VBASE() + 160; }
+// Relocated globals: the kernel-stack base (argc/argv base, once pinned in
+// r15) and the async task-context pointer (once pinned in r12). Keeping them
+// in BSS frees r12/r15 for the callee-saved promotion pool; helpers below
+// read the cells through a scratch register instead of the pinned register.
+fn ARGV_BASE_CELL() i64 { return BSS_VBASE() + 168; }
+fn TASK_CTX_CELL() i64 { return BSS_VBASE() + 176; }
 // [BSS+512, BSS+33280) is a fixed table of {pointer,size} pairs for the
 // headerless raw word-slice mappings. Positive pointers are live; negative
 // pointers are tombstones. Keeping this separate from the ordinary allocator
 // also preserves cacheAlignedAlloc's page-alignment contract.
 fn RAW_SLICE_REGISTRY() i64 { return BSS_VBASE() + 512; }
 fn RAW_SLICE_REGISTRY_CAP() i64 { return 2048; }
+// __alloc small-block allocator state: a bump cursor over 1 MiB arenas plus
+// 16 segregated free-list heads (class c serves sizes <= 16<<c). The raw
+// slice registry records the arena provenance bit per allocation, so free
+// routes blocks back to these heads instead of munmap.
+fn ALLOC2_CURSOR() i64 { return BSS_VBASE() + 184; }
+fn ALLOC2_END() i64 { return BSS_VBASE() + 192; }
+fn ALLOC2_HEADS() i64 { return BSS_VBASE() + 200; }
+fn ALLOC2_MAX() i64 { return 524288; }
+fn ALLOC2_ARENA() i64 { return 1048576; }
 // [BSS+33792, BSS+66560) is a second fixed table of {user_pointer,size}
 // pairs for dedicated ordinary malloc mappings larger than ALLOC_MAX_SMALL.
 // We must consult this table before reading ptr-8: after a successful munmap
@@ -8591,6 +8856,8 @@ fn RAW_SLICE_REGISTRY_CAP() i64 { return 2048; }
 // The table is intentionally bounded. If every slot is occupied by a distinct
 // live/tombstoned mapping, the next large allocation terminates with a clear
 // diagnostic rather than allocating recursive bookkeeping.
+fn RAW_SLICE_HIW() i64 { return BSS_VBASE() + 496; }
+fn LARGE_ALLOC_HIW() i64 { return BSS_VBASE() + 488; }
 fn LARGE_ALLOC_REGISTRY() i64 { return BSS_VBASE() + 33792; }
 fn LARGE_ALLOC_REGISTRY_CAP() i64 { return 2048; }
 // [BSS+66560, BSS+115712) is a fixed table of {user_pointer,size} pairs for
@@ -9069,10 +9336,13 @@ fn cg_emit_large_alloc_acquire(out:*ArrayList[Instr],cg:*Cg)void{
     let next:i32=cg_fresh(cg);let full:i32=cg_fresh(cg);let after_full:i32=cg_fresh(cg);
     let rejected_reuse:i32=cg_fresh(cg);let after_rejected_reuse:i32=cg_fresh(cg);
     let duplicate:i32=cg_fresh(cg);let done:i32=cg_fresh(cg);
+    let at_hiw2:i32=cg_fresh(cg);
+    push[Instr](out,i_mov_imm(R_R10(),LARGE_ALLOC_HIW()));
+    push[Instr](out,i_load(R_R11(),R_R10(),0));
     push[Instr](out,i_mov_imm(R_RCX(),0));
     push[Instr](out,i_label(loop));
-    push[Instr](out,i_cmp_imm(R_RCX(),LARGE_ALLOC_REGISTRY_CAP()));
-    push[Instr](out,i_jge(full));
+    push[Instr](out,i_cmp(R_RCX(),R_R11()));
+    push[Instr](out,i_jge(at_hiw2));
     push[Instr](out,i_mov_rr(R_R10(),R_RCX()));
     push[Instr](out,i_mov_imm(R_R9(),16));
     push[Instr](out,i_imul(R_R10(),R_R9()));
@@ -9095,6 +9365,18 @@ fn cg_emit_large_alloc_acquire(out:*ArrayList[Instr],cg:*Cg)void{
     push[Instr](out,i_label(next));
     push[Instr](out,i_add_imm(R_RCX(),1));
     push[Instr](out,i_jmp(loop));
+    push[Instr](out,i_label(at_hiw2));
+    push[Instr](out,i_cmp_imm(R_R11(),LARGE_ALLOC_REGISTRY_CAP()));
+    push[Instr](out,i_jge(full));
+    push[Instr](out,i_mov_rr(R_RCX(),R_R11()));
+    push[Instr](out,i_mov_rr(R_R10(),R_RCX()));
+    push[Instr](out,i_mov_imm(R_R9(),16));
+    push[Instr](out,i_imul(R_R10(),R_R9()));
+    push[Instr](out,i_add_imm(R_R10(),LARGE_ALLOC_REGISTRY()));
+    push[Instr](out,i_add_imm(R_R11(),1));
+    push[Instr](out,i_mov_rr(R_R8(),R_R11()));
+    push[Instr](out,i_mov_imm(R_R11(),LARGE_ALLOC_HIW()));
+    push[Instr](out,i_store(R_R11(),0,R_R8()));
     push[Instr](out,i_label(insert));
     push[Instr](out,i_store(R_R10(),0,R_RAX()));
     push[Instr](out,i_store(R_R10(),8,R_RSI()));
@@ -9119,9 +9401,11 @@ fn cg_emit_large_alloc_probe(out:*ArrayList[Instr],cg:*Cg)void{
     let loop:i32=cg_fresh(cg);let next:i32=cg_fresh(cg);let live:i32=cg_fresh(cg);
     let tomb:i32=cg_fresh(cg);let done:i32=cg_fresh(cg);
     push[Instr](out,i_mov_imm(R_R8(),0));
+    push[Instr](out,i_mov_imm(R_R10(),LARGE_ALLOC_HIW()));
+    push[Instr](out,i_load(R_R11(),R_R10(),0));
     push[Instr](out,i_mov_imm(R_RCX(),0));
     push[Instr](out,i_label(loop));
-    push[Instr](out,i_cmp_imm(R_RCX(),LARGE_ALLOC_REGISTRY_CAP()));
+    push[Instr](out,i_cmp(R_RCX(),R_R11()));
     push[Instr](out,i_jge(done));
     push[Instr](out,i_mov_rr(R_R10(),R_RCX()));
     push[Instr](out,i_mov_imm(R_R9(),16));
@@ -9163,9 +9447,11 @@ fn cg_emit_large_alloc_forget_small_reuse(out:*ArrayList[Instr],cg:*Cg)void{
     if(cg.*.safety_checked==1){return;}
     let loop:i32=cg_fresh(cg);let next:i32=cg_fresh(cg);
     let clear:i32=cg_fresh(cg);let done:i32=cg_fresh(cg);
+    push[Instr](out,i_mov_imm(R_R10(),LARGE_ALLOC_HIW()));
+    push[Instr](out,i_load(R_R11(),R_R10(),0));
     push[Instr](out,i_mov_imm(R_RCX(),0));
     push[Instr](out,i_label(loop));
-    push[Instr](out,i_cmp_imm(R_RCX(),LARGE_ALLOC_REGISTRY_CAP()));
+    push[Instr](out,i_cmp(R_RCX(),R_R11()));
     push[Instr](out,i_jge(done));
     push[Instr](out,i_mov_rr(R_R10(),R_RCX()));
     push[Instr](out,i_mov_imm(R_R9(),16));
@@ -9406,6 +9692,7 @@ fn cg_emit_malloc(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
         push[Instr](out,i_jge(l_large_map_ok));
         cg_emit_panic(out,"zag sanitizer: large allocation size exceeds guarded mapping limit",l_large_map_ok,cg);
     }else{push[Instr](out,i_add_imm(R_RDI(),8));}
+    push[Instr](out, i_mov_imm(R_RSI(), 1));
     push[Instr](out, i_call(cg.*.al_lbl));           // rax = mmap base
     push[Instr](out, i_pop(R_RCX()));
     if(cg.*.sanitize_memory==1){
@@ -9474,6 +9761,7 @@ fn cg_emit_malloc(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     // mmap a fresh arena (class+8 ≤ 512K+8 always fits in 1 MiB)
     push[Instr](out, i_push(R_RSI()));               // save class size
     push[Instr](out, i_mov_imm(R_RDI(), ALLOC_ARENA()));
+    push[Instr](out, i_mov_imm(R_RSI(), 1));
     push[Instr](out, i_call(cg.*.al_lbl));           // rax = arena base
     push[Instr](out, i_pop(R_RSI()));
     push[Instr](out, i_mov_imm(R_R10(), BSS_VBASE()));
@@ -9697,21 +9985,14 @@ fn cg_emit_realloc(out: *ArrayList[Instr], lbl: i32, cg: *Cg) void {
     push[Instr](out, i_jle(l_min));                  // oldsize <= newsize → keep
     push[Instr](out, i_mov_rr(R_RCX(), R_RSI()));    // else rcx = newsize
     push[Instr](out, i_label(l_min));
-    // copy rcx bytes as 8-byte words: r9 = byte offset, step 8.
-    push[Instr](out, i_mov_imm(R_R9(), 0));
-    push[Instr](out, i_label(l_loop));
-    push[Instr](out, i_cmp(R_R9(), R_RCX()));
-    push[Instr](out, i_jge(l_done));                 // r9 >= count → done
-    // r10 = [oldptr + r9] (8 bytes)
-    push[Instr](out, i_mov_rr(R_R10(), R_RDI()));
-    push[Instr](out, i_add(R_R10(), R_R9()));
-    push[Instr](out, i_load(R_R10(), R_R10(), 0));
-    // [newptr + r9] = r10  — newptr is rax; use rdx as the dest base scratch
-    push[Instr](out, i_mov_rr(R_RDX(), R_RAX()));
-    push[Instr](out, i_add(R_RDX(), R_R9()));
-    push[Instr](out, i_store(R_RDX(), 0, R_R10()));
-    push[Instr](out, i_add_imm(R_R9(), 8));          // next word
-    push[Instr](out, i_jmp(l_loop));
+    // rep movsb copy: one string instruction at cache bandwidth replaces the
+    // 8-instr-per-word loop. rsi=src, rdi=dst, rcx=count; rdx saves oldptr
+    // for the free below. Regions never overlap (fresh allocation).
+    push[Instr](out, i_mov_rr(R_RDX(), R_RDI()));
+    push[Instr](out, i_mov_rr(R_RSI(), R_RDI()));
+    push[Instr](out, i_mov_rr(R_RDI(), R_RAX()));
+    push[Instr](out, i_rep_movsb());
+    push[Instr](out, i_mov_rr(R_RDI(), R_RDX()));
     push[Instr](out, i_label(l_done));
     // release the old block (rdi still = oldptr); keep newptr across the call
     push[Instr](out, i_push(R_RAX()));
@@ -10177,7 +10458,9 @@ fn cg_emit_rt_arg(out: *ArrayList[Instr], cg: *Cg) void {
     // bounds: if i < 0 → oob ; if i >= argc → oob
     push[Instr](out, i_cmp_imm(R_RDI(), 0));
     push[Instr](out, i_jl(l_oob));
-    push[Instr](out, i_load(R_R8(), 15, 0));          // r8 = argc
+    push[Instr](out, i_mov_imm(R_R10(), ARGV_BASE_CELL()));
+    push[Instr](out, i_load(R_R10(), R_R10(), 0));     // r10 = argv base
+    push[Instr](out, i_load(R_R8(), R_R10(), 0));      // r8 = argc
     push[Instr](out, i_cmp(R_RDI(), R_R8()));
     push[Instr](out, i_jge(l_oob));
     // &argv[i] = r15 + (8 + 8*i)  (load needs a constant disp, so add manually).
@@ -10185,7 +10468,8 @@ fn cg_emit_rt_arg(out: *ArrayList[Instr], cg: *Cg) void {
     push[Instr](out, i_mov_imm(R_RAX(), 8));
     push[Instr](out, i_imul(R_RCX(), R_RAX()));        // rcx = 8*i
     push[Instr](out, i_add_imm(R_RCX(), 8));           // rcx = 8 + 8*i
-    push[Instr](out, i_mov_rr(R_RSI(), 15));           // rsi = r15
+    push[Instr](out, i_mov_imm(R_R10(), ARGV_BASE_CELL()));
+    push[Instr](out, i_load(R_RSI(), R_R10(), 0));     // rsi = argv base
     push[Instr](out, i_add(R_RSI(), R_RCX()));         // rsi = &argv[i]
     push[Instr](out, i_load(R_RSI(), R_RSI(), 0));     // rsi = argv[i] cstr ptr
     // scan for NUL: rdx = 0 ; while ([rsi+rdx] != 0) rdx++
@@ -10231,12 +10515,14 @@ fn cg_emit_rt_getenv(out: *ArrayList[Instr], cg: *Cg) void {
     // r8 = name.ptr, r9 = name.len
     push[Instr](out, i_load(R_R8(), R_RDI(), 0));
     push[Instr](out, i_load(R_R9(), R_RDI(), 8));
-    // rdx = envp cursor = r15 + 16 + 8*argc
-    push[Instr](out, i_load(R_RDX(), 15, 0));
+    // rdx = envp cursor = argv_base + 16 + 8*argc
+    push[Instr](out, i_mov_imm(R_R10(), ARGV_BASE_CELL()));
+    push[Instr](out, i_load(R_R10(), R_R10(), 0));      // r10 = argv base
+    push[Instr](out, i_load(R_RDX(), R_R10(), 0));      // rdx = argc
     push[Instr](out, i_mov_imm(R_RCX(), 8));
     push[Instr](out, i_imul(R_RDX(), R_RCX()));
     push[Instr](out, i_add_imm(R_RDX(), 16));
-    push[Instr](out, i_mov_rr(R_RCX(), 15));
+    push[Instr](out, i_mov_rr(R_RCX(), R_R10()));       // rcx = argv base
     push[Instr](out, i_add(R_RDX(), R_RCX()));
     push[Instr](out, i_label(l_env));
     push[Instr](out, i_load(R_RSI(), R_RDX(), 0));     // rsi = envp[k]
@@ -10358,12 +10644,14 @@ fn cg_emit_rt_exec(out: *ArrayList[Instr], cg: *Cg) void {
     // terminator, then envp[0].. So envp = r15 + 8 + 8*(argc+1) = r15 + 16 + 8*argc.
     // Forwarding it lets the child (/bin/sh -c cmd) inherit PATH etc. (rax/rdi/rsi
     // already hold the syscall no/path/argv; we use rcx+rdx as scratch, r15 intact).
-    push[Instr](out, i_load(R_RDX(), 15, 0));         // rdx = argc = [r15]
+    push[Instr](out, i_mov_imm(R_R10(), ARGV_BASE_CELL()));
+    push[Instr](out, i_load(R_R10(), R_R10(), 0));     // r10 = argv base
+    push[Instr](out, i_load(R_RDX(), R_R10(), 0));     // rdx = argc
     push[Instr](out, i_mov_imm(R_RCX(), 8));
     push[Instr](out, i_imul(R_RDX(), R_RCX()));       // rdx = 8*argc
     push[Instr](out, i_add_imm(R_RDX(), 16));         // rdx = 16 + 8*argc
-    push[Instr](out, i_mov_rr(R_RCX(), 15));          // rcx = r15
-    push[Instr](out, i_add(R_RDX(), R_RCX()));        // rdx = r15 + 16 + 8*argc = envp
+    push[Instr](out, i_mov_rr(R_RCX(), R_R10()));     // rcx = argv base
+    push[Instr](out, i_add(R_RDX(), R_RCX()));        // rdx = argv_base + 16 + 8*argc = envp
     push[Instr](out, i_syscall());
     // execve failed → exit(127)
     push[Instr](out, i_mov_imm(R_RAX(), 60));
@@ -10512,11 +10800,13 @@ fn cg_emit_rt_execcap(out: *ArrayList[Instr], cg: *Cg) void {
     push[Instr](out, i_mov_imm(R_RAX(), 59));
     push[Instr](out, i_mov_imm(R_RDI(), DATA_VBASE() + (sh_off as i64)));
     push[Instr](out, i_lea(R_RSI(), R_RBP(), 0 - 96));
-    push[Instr](out, i_load(R_RDX(), 15, 0));
+    push[Instr](out, i_mov_imm(R_R10(), ARGV_BASE_CELL()));
+    push[Instr](out, i_load(R_R10(), R_R10(), 0));
+    push[Instr](out, i_load(R_RDX(), R_R10(), 0));
     push[Instr](out, i_mov_imm(R_RCX(), 8));
     push[Instr](out, i_imul(R_RDX(), R_RCX()));
     push[Instr](out, i_add_imm(R_RDX(), 16));
-    push[Instr](out, i_mov_rr(R_RCX(), 15));
+    push[Instr](out, i_mov_rr(R_RCX(), R_R10()));
     push[Instr](out, i_add(R_RDX(), R_RCX()));
     push[Instr](out, i_syscall());
     // execve failed → exit(127)
@@ -11880,10 +12170,14 @@ fn lower_program_mode_cpu(decls0in: ArrayList[*Node], errout: *i32, dataout: *Ar
         return out;
     }
     push[Instr](&out, i_mov_rr(15, R_RSP()));   // r15 = initial rsp (argc/argv base)
-    // r12 is reserved for a compiler-owned ZagScript async task context. A
-    // normal process/root function has no task, so make `cancelled()` reliably
-    // false rather than depending on unspecified process-entry register state.
-    push[Instr](&out, i_mov_imm(R_R12(), 0));
+    push[Instr](&out, i_mov_imm(R_R10(), ARGV_BASE_CELL()));
+    push[Instr](&out, i_store(R_R10(), 0, R_RSP()));   // argc/argv base -> BSS cell
+    // r12 is reserved for a compiler-owned ZagScript async task context, now
+    // stored in a BSS cell so r12 joins the callee-saved promotion pool. A
+    // normal process/root function has no task, so `cancelled()` stays false.
+    push[Instr](&out, i_mov_imm(R_R10(), TASK_CTX_CELL()));
+    push[Instr](&out, i_mov_imm(R_R11(), 0));
+    push[Instr](&out, i_store(R_R10(), 0, R_R11()));
     push[Instr](&out, i_call(main_lbl));
     if (cg.sanitize_memory == 1) {
         let leak_free: i32 = cg_fresh(&cg);
@@ -12663,6 +12957,46 @@ fn zir_native_emit_block(out:*ArrayList[Instr],blk:ZBlock,slots:map.StringMap[i3
             else if(@strEq(o.name,"arith.subi")){push[Instr](out,i_sub(R_RAX(),R_RCX()));}
             else if(@strEq(o.name,"arith.muli")){push[Instr](out,i_imul(R_RAX(),R_RCX()));}
             else if(@strEq(o.name,"arith.divsi")||@strEq(o.name,"arith.remsi")){
+                // Strength reduction when the divisor is a compile-time constant
+                // in this block: powers of two (k<=31) become shift/mask sequences,
+                // other nonzero constants skip the div-by-zero and -1 checks.
+                let dconst:i64=0;let hasdconst:i32=0;
+                let ddi:i32=zir_native_find_def(blk,o.operands.data[1].name);
+                if(ddi>=0){let dop:ZOp=blk.ops.data[ddi];
+                    if(@strEq(dop.name,"arith.constant")){dconst=cg_parse_i64(attr_val(dop,"value"));hasdconst=1;}}
+                let dp2k:i32=0-1;
+                if(hasdconst==1&&dconst>=2&&dconst<=2147483648){
+                    if((dconst&(dconst-1))==0){
+                        let kk3:i32=0;let vv3:i64=dconst;
+                        while(vv3>1){vv3=vv3/2;kk3=kk3+1;}
+                        if(kk3<=31){dp2k=kk3;}
+                    }
+                }
+                if(dp2k>=0&&@strEq(o.name,"arith.divsi")){
+                    // q = (x + ((x sar 63) & (C-1))) sar k  (truncation toward zero)
+                    push[Instr](out,i_mov_rr(R_RDX(),R_RAX()));
+                    push[Instr](out,i_mov_imm(R_RCX(),63));
+                    push[Instr](out,i_sar_cl(R_RDX()));
+                    push[Instr](out,i_and_imm(R_RDX(),dconst-1));
+                    push[Instr](out,i_add(R_RAX(),R_RDX()));
+                    push[Instr](out,i_mov_imm(R_RCX(),dp2k));
+                    push[Instr](out,i_sar_cl(R_RAX()));
+                }else if(dp2k>=0){
+                    // x % 2^k: mask for x>=0 (hot path); idiv for negative x.
+                    let msl:i32=next.*;next.*=next.*+1;let mfi:i32=next.*;next.*=next.*+1;
+                    push[Instr](out,i_cmp_imm(R_RAX(),0));
+                    push[Instr](out,i_jl(msl));
+                    push[Instr](out,i_and_imm(R_RAX(),dconst-1));
+                    push[Instr](out,i_jmp(mfi));
+                    push[Instr](out,i_label(msl));
+                    push[Instr](out,i_idiv(R_RCX()));
+                    push[Instr](out,i_mov_rr(R_RAX(),R_RDX()));
+                    push[Instr](out,i_label(mfi));
+                }else if(hasdconst==1&&dconst!=0&&dconst!=0-1){
+                    // nonzero, non--1 constant: no checks possible, plain idiv.
+                    push[Instr](out,i_idiv(R_RCX()));
+                    if(@strEq(o.name,"arith.remsi")){push[Instr](out,i_mov_rr(R_RAX(),R_RDX()));}
+                }else{
                 let nonzero:i32=next.*;next.*=next.*+1;let normal:i32=next.*;next.*=next.*+1;
                 let done:i32=next.*;next.*=next.*+1;push[Instr](out,i_cmp_imm(R_RCX(),0));
                 push[Instr](out,i_jne(nonzero));push[Instr](out,i_call(div0_lbl));push[Instr](out,i_label(nonzero));
@@ -12672,6 +13006,7 @@ fn zir_native_emit_block(out:*ArrayList[Instr],blk:ZBlock,slots:map.StringMap[i3
                 push[Instr](out,i_jmp(done));push[Instr](out,i_label(normal));push[Instr](out,i_idiv(R_RCX()));
                 if(@strEq(o.name,"arith.remsi")){push[Instr](out,i_mov_rr(R_RAX(),R_RDX()));}
                 push[Instr](out,i_label(done));
+                }
             }
             else{push[Instr](out,i_cmp(R_RAX(),R_RCX()));push[Instr](out,i_setcc(R_RAX(),zir_native_pred_cc(attr_val(o,"predicate"))));}
             if(!@strEq(o.name,"arith.cmpi")){cg_emit_norm_scalar_for_ty(out,o.results.data[0].ty,R_RAX());}
@@ -12808,7 +13143,7 @@ fn zir_native_emit_block(out:*ArrayList[Instr],blk:ZBlock,slots:map.StringMap[i3
             }
         }else if(@strEq(o.name,"func.call")){
             let a:i32=0;while(a<o.operands.len){push[Instr](out,i_load(arg_reg(a),R_RBP(),zir_native_disp(slots,o.operands.data[a].name)));a=a+1;}
-            push[Instr](out,i_call(zir_native_fn_label(fs,attr_val(o,"callee"))));
+            let na:i32=o.operands.len;if(na>6){na=6;}push[Instr](out,i_call_a(zir_native_fn_label(fs,attr_val(o,"callee")),na));
             if(o.results.len==1){push[Instr](out,i_store(R_RBP(),zir_native_disp(slots,o.results.data[0].name),R_RAX()));}
         }else if(@strEq(o.name,"func.return")){
             if(o.operands.len==1){push[Instr](out,i_load(R_RAX(),R_RBP(),zir_native_disp(slots,o.operands.data[0].name)));}
@@ -12880,7 +13215,7 @@ fn lower_zir_scalar_program(ir:ZirAuthority,dataout:*ArrayList[u8],route:*i32)Ar
     let out:ArrayList[Instr]=make[Instr](128);let fs:ArrayList[ZirNativeFn]=make[ZirNativeFn](ir.module.funcs.len+1);
     let i:i32=0;while(i<ir.module.funcs.len){let f:ZFunc=ir.module.funcs.data[i];
         push[ZirNativeFn](&fs,ZirNativeFn{.name=f.name,.lbl=i+1,.ret=f.ret,.params=f.params});i=i+1;}
-    let main_lbl:i32=zir_native_fn_label(fs,"main");push[Instr](&out,i_mov_rr(15,R_RSP()));
+    let main_lbl:i32=zir_native_fn_label(fs,"main");push[Instr](&out,i_mov_rr(15,R_RSP()));push[Instr](&out,i_mov_imm(R_R10(),ARGV_BASE_CELL()));push[Instr](&out,i_store(R_R10(),0,R_RSP()));
     push[Instr](&out,i_call(main_lbl));push[Instr](&out,i_mov_rr(R_RDI(),R_RAX()));
     push[Instr](&out,i_mov_imm(R_RAX(),60));push[Instr](&out,i_syscall());
     let next:i32=ir.module.funcs.len+1;let need_div0:i32=0;i=0;

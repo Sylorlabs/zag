@@ -10,7 +10,7 @@ fail=0
 forbidden_files=
 while IFS= read -r file; do
     case "$file" in
-        ./tests/reference_apps/dynamic_plugin/answer_plugin.c|./tests/fixtures/macos_dylib_loader.c) ;;
+        ./tests/reference_apps/dynamic_plugin/answer_plugin.c|./tests/fixtures/macos_dylib_loader.c|./benchmarks/cases/*.c) ;;
         *) forbidden_files=$'\n'"$file"$forbidden_files ;;
     esac
 done <<EOF
