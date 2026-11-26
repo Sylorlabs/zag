@@ -1869,6 +1869,27 @@ fn sw_step(bk: ArrayList[i32], bv: ArrayList[i64], ins: Instr) i32 {
         } else { set[i32](&bk, ins.dst, 0); }
         return 1;
     }
+    if (k == K_ADD_RR() || k == K_SUB_RR()) {
+        // only the cases the two-value algebra can represent soundly:
+        // const op const, and +/- 0 identities. The identity case is what
+        // opt_recur's `add rax,acc` leaf combine folds to (acc inits to 0).
+        let dk: i32 = get[i32](bk, ins.dst);
+        let sk: i32 = get[i32](bk, ins.src);
+        let dv: i64 = get[i64](bv, ins.dst);
+        let sv: i64 = get[i64](bv, ins.src);
+        if (dk == 2 && sk == 2) {
+            if (k == K_ADD_RR()) { set[i64](&bv, ins.dst, dv + sv); }
+            else { set[i64](&bv, ins.dst, dv - sv); }
+            return 1;
+        }
+        if (sk == 2 && sv == 0) { return 1; }   // dst +/- 0 = dst, keep binding
+        if (k == K_ADD_RR() && dk == 2 && dv == 0) {
+            set[i32](&bk, ins.dst, sk); set[i64](&bv, ins.dst, sv);
+            return 1;
+        }
+        set[i32](&bk, ins.dst, 0);
+        return 1;
+    }
     // frame-slot stores are skipped by the prelude: they are dead on an
     // immediate-return path. Stores through ANY other base are real memory
     // writes the prelude cannot drop -> bail.
@@ -2010,11 +2031,18 @@ fn opt_shrinkwrap(prog: ArrayList[Instr]) ArrayList[Instr] {
                         } else { bail = 1; }
                         j = n;
                     } else {
-                        if (opt_is_breaker(k) == 1 || sw_step(bk, bv, ins) == 0 ||
-                            opt_writes_reg(ins, R_RBP()) == 1) {
-                            bail = 1;
+                        // labels are no-ops on the entry fallthrough path:
+                        // anything jumping INTO the stream lands after the
+                        // fast-path prelude, so scanning through is sound
+                        // (opt_recur's loop head sits before the leaf cmp).
+                        if (k == K_LABEL()) { j = j + 1; }
+                        else {
+                            if (opt_is_breaker(k) == 1 || sw_step(bk, bv, ins) == 0 ||
+                                opt_writes_reg(ins, R_RBP()) == 1) {
+                                bail = 1;
+                            }
+                            j = j + 1;
                         }
-                        j = j + 1;
                     }
                 }
                 if (cmppos >= 0) {
@@ -2485,6 +2513,160 @@ fn opt_wb_dead(prog: ArrayList[Instr], r: i32, from: i32) i32 {
     return res;
 }
 
+// ── exact backward liveness for the writeback pass ───────────────────────────
+// opt_wb_dead ran a 48-fuel CFG DFS per candidate instruction — O(n×fuel) per
+// fixpoint round, plus a 64-slot allocation per query — and dominated
+// self-compile time once pattern E started querying every mov_imm. Replace it
+// with one backward liveness pass per round: live_in[i] is a 16-bit reg mask
+// iterated to fixpoint over the label CFG. r dead at `from` ⟺ bit clear.
+
+fn opt_read_mask(ins: Instr) i32 {
+    let k: i32 = ins.kind;
+    if (k == K_MOV_RR())  { return 1 << (ins.src & 15); }
+    if (k == K_ADD_RR() || k == K_SUB_RR() || k == K_IMUL_RR() ||
+        k == K_AND_RR() || k == K_OR_RR()  || k == K_XOR_RR() ||
+        k == K_CMP_RR()) { return (1 << (ins.dst & 15)) | (1 << (ins.src & 15)); }
+    if (k == K_ADD_RI() || k == K_SUB_RI() || k == K_CMP_RI() || k == K_NEG() ||
+        k == K_AND_RI()) { return 1 << (ins.dst & 15); }
+    if (k == K_IMUL_IMM()) { return 1 << (ins.src & 15); }
+    if (k == K_PUSH())  { return (1 << (ins.dst & 15)) | (1 << R_RSP()); }
+    if (k == K_POP())   { return 1 << R_RSP(); }
+    if (k == K_STORE()) { return (1 << (ins.dst & 15)) | (1 << (ins.src & 15)); }
+    if (k == K_LOAD())  { return 1 << (ins.src & 15); }
+    if (k == K_LEA())   { return 1 << (ins.src & 15); }
+    if (k == K_LOAD_SIB()) { return (1 << (ins.src & 15)) | (1 << (ins.lbl & 15)); }
+    if (k == K_STORE_SIB() || k == K_ADD_SIB()) {
+        return (1 << (ins.dst & 15)) | (1 << (ins.src & 15)) | (1 << (ins.lbl & 15));
+    }
+    if (k == K_IDIV()) { return (1 << R_RAX()) | (1 << R_RDX()) | (1 << (ins.src & 15)); }
+    if (k == K_FMOVQ_GX() || k == K_FSI2SD()) { return 1 << (ins.src & 15); }
+    if (k == K_MOVSXD() || k == K_ZEXT32()) { return 1 << (ins.src & 15); }
+    if (k == K_CALL() || k == K_CALL_EXT() || k == K_CALL_REG()) {
+        let m: i32 = 0;
+        if (ins.imm >= 0) {
+            // arity-marked: only the first `imm` arg regs are read
+            if (ins.imm > 0) { m = m | (1 << R_RDI()); }
+            if (ins.imm > 1) { m = m | (1 << R_RSI()); }
+            if (ins.imm > 2) { m = m | (1 << R_RDX()); }
+            if (ins.imm > 3) { m = m | (1 << R_RCX()); }
+            if (ins.imm > 4) { m = m | (1 << R_R8()); }
+            if (ins.imm > 5) { m = m | (1 << R_R9()); }
+        } else {
+            m = (1 << R_RDI()) | (1 << R_RSI()) | (1 << R_RDX()) |
+                (1 << R_RCX()) | (1 << R_R8())  | (1 << R_R9());
+        }
+        if (k == K_CALL_REG()) { m = m | (1 << (ins.dst & 15)); }
+        return m | (1 << R_RSP());
+    }
+    if (k == K_SYSCALL()) {
+        return (1 << R_RAX()) | (1 << R_RDI()) | (1 << R_RSI()) |
+               (1 << R_RDX()) | (1 << R_R10()) | (1 << R_R8()) |
+               (1 << R_R9())  | (1 << R_RSP());
+    }
+    if (k == K_RET()) { return (1 << R_RAX()) | (1 << R_RSP()); }
+    if (k == K_LABEL() || k == K_JMP() || opt_is_jcc(k) == 1 ||
+        k == K_MOV_IMM() || k == K_SETCC() || k == K_FMOVQ_XG() ||
+        k == K_FTSD2SI() || k == K_FADD() || k == K_FSUB() || k == K_FMUL() ||
+        k == K_FDIV() || k == K_FUCOMI() || k == K_FSD2SS() ||
+        k == K_FSS2SD() || k == K_FXORPS()) { return 0; }
+    return 65535;   // unknown → reads everything (conservative)
+}
+
+fn opt_write_mask(ins: Instr) i32 {
+    let k: i32 = ins.kind;
+    if (k == K_MOV_IMM() || k == K_MOV_RR() || k == K_LOAD() || k == K_LEA() ||
+        k == K_SETCC() || k == K_FMOVQ_XG() || k == K_FTSD2SI() ||
+        k == K_MOVSXD() || k == K_ZEXT32() || k == K_IMUL_IMM() ||
+        k == K_LOAD_SIB()) { return 1 << (ins.dst & 15); }
+    if (k == K_POP()) { return (1 << (ins.dst & 15)) | (1 << R_RSP()); }
+    if (k == K_ADD_RR() || k == K_SUB_RR() || k == K_IMUL_RR() ||
+        k == K_AND_RR() || k == K_OR_RR()  || k == K_XOR_RR() ||
+        k == K_ADD_RI() || k == K_SUB_RI() || k == K_AND_RI() ||
+        k == K_NEG()    || k == K_ADD_SIB()) { return 1 << (ins.dst & 15); }
+    if (k == K_IDIV()) { return (1 << R_RAX()) | (1 << R_RDX()); }
+    if (k == K_PUSH()) { return 1 << R_RSP(); }
+    if (k == K_CALL() || k == K_CALL_EXT() || k == K_CALL_REG()) {
+        // the callee may clobber every caller-saved reg it is not handed
+        return (1 << R_RAX()) | (1 << R_RCX()) | (1 << R_RDX()) |
+               (1 << R_RSI()) | (1 << R_RDI()) | (1 << R_R8()) |
+               (1 << R_R9())  | (1 << R_R10()) | (1 << R_R11());
+    }
+    if (k == K_SYSCALL()) { return (1 << R_RAX()) | (1 << R_RCX()) | (1 << R_R11()); }
+    if (k == K_LABEL() || k == K_JMP() || opt_is_jcc(k) == 1 || k == K_RET() ||
+        k == K_STORE() || k == K_STORE_SIB() || k == K_CMP_RR() ||
+        k == K_CMP_RI() || k == K_FADD() || k == K_FSUB() || k == K_FMUL() ||
+        k == K_FDIV() || k == K_FUCOMI() || k == K_FSD2SS() ||
+        k == K_FSS2SD() || k == K_FXORPS() || k == K_FMOVQ_GX() ||
+        k == K_FSI2SD() || k == K_FSQRTSD()) { return 0; }
+    // unknown → writes NOTHING tracked. 65535 here would be the UNSOUND
+    // direction: it kills backward liveness propagation, making regs look
+    // dead above the instr and inviting writeback to delete live writes.
+    return 0;
+}
+
+fn opt_live_map(prog: ArrayList[Instr]) ArrayList[i32] {
+    let n: i32 = len[Instr](prog);
+    let live: ArrayList[i32] = make[i32](n + 4);
+    let i: i32 = 0;
+    while (i < n) { push[i32](&live, 0); i = i + 1; }
+    let maxl: i32 = 0;
+    i = 0;
+    while (i < n) {
+        let il: Instr = get[Instr](prog, i);
+        if (il.lbl > maxl) { maxl = il.lbl; }
+        i = i + 1;
+    }
+    let lblidx: ArrayList[i32] = opt_lbl_map(prog, n, maxl);
+    // backward fixpoint; structured CFGs settle in a handful of sweeps
+    let changed: i32 = 1;
+    let rounds: i32 = 0;
+    while (changed == 1 && rounds < 64) {
+        changed = 0;
+        i = n - 1;
+        while (i >= 0) {
+            let ins: Instr = get[Instr](prog, i);
+            let k: i32 = ins.kind;
+            let lo: i32 = 0;
+            if (k == K_RET()) {
+                lo = 0;
+            } else { if (k == K_JMP()) {
+                if (ins.lbl >= 0 && ins.lbl <= maxl) {
+                    let t: i32 = get[i32](lblidx, ins.lbl);
+                    if (t >= 0) { lo = get[i32](live, t); } else { lo = 65535; }
+                } else { lo = 65535; }
+            } else {
+                if (i + 1 < n) { lo = get[i32](live, i + 1); } else { lo = 65535; }
+                if (opt_is_jcc(k) == 1) {
+                    if (ins.lbl >= 0 && ins.lbl <= maxl) {
+                        let t2: i32 = get[i32](lblidx, ins.lbl);
+                        if (t2 >= 0) { lo = lo | get[i32](live, t2); }
+                        else { lo = 65535; }
+                    } else { lo = 65535; }
+                }
+            } }
+            let nw: i32 = opt_read_mask(ins) | (lo & (65535 - opt_write_mask(ins)));
+            if (nw != get[i32](live, i)) { set[i32](&live, i, nw); changed = 1; }
+            i = i - 1;
+        }
+        rounds = rounds + 1;
+    }
+    // an unconverged map under-approximates liveness, which would let
+    // writeback drop live writes — fall back to everything-live (no folds)
+    if (changed == 1) {
+        i = 0;
+        while (i < n) { set[i32](&live, i, 65535); i = i + 1; }
+    }
+    free[i32](&lblidx);
+    return live;
+}
+
+// is r dead at program position `from`? (0 = live)
+fn lv_dead(live: ArrayList[i32], r: i32, from: i32) i32 {
+    if (from >= len[i32](live)) { return 0; }
+    if ((get[i32](live, from) & (1 << (r & 15))) == 0) { return 1; }
+    return 0;
+}
+
 // mov_imm t,k ; OP d,t  ->  OP_imm d,k  (t dies)
 // ops the writeback patterns may fold through (rr forms that write dst).
 fn opt_wb_is_binop(k: i32) i32 {
@@ -2503,6 +2685,7 @@ fn opt_wb_opimm(k: i32) i32 {
 
 fn opt_writeback(prog: ArrayList[Instr]) ArrayList[Instr] {
     let n: i32 = len[Instr](prog);
+    let live: ArrayList[i32] = opt_live_map(prog);
     let out: ArrayList[Instr] = make[Instr](n + 1);
     let i: i32 = 0;
     while (i < n) {
@@ -2519,8 +2702,8 @@ fn opt_writeback(prog: ArrayList[Instr]) ArrayList[Instr] {
                 c.dst == b.dst && c.src == a.dst &&
                 e.dst == b.src && e.src == c.dst &&
                 a.dst != b.dst && a.src != a.dst && a.src != b.dst &&
-                opt_wb_dead(prog, a.dst, i + 4) == 1 &&
-                opt_wb_dead(prog, b.dst, i + 4) == 1) {
+                lv_dead(live, a.dst, i + 4) == 1 &&
+                lv_dead(live, b.dst, i + 4) == 1) {
                 push[Instr](&out, ins6(c.kind, b.src, a.src, 0, 0, -1));
                 did = 1; i = i + 4;
             }
@@ -2536,7 +2719,7 @@ fn opt_writeback(prog: ArrayList[Instr]) ArrayList[Instr] {
                 c.kind == K_MOV_RR() &&
                 b.dst == a.dst && c.dst == a.src && c.src == a.dst &&
                 a.dst != a.src && b.src != a.dst &&
-                opt_wb_dead(prog, a.dst, i + 3) == 1) {
+                lv_dead(live, a.dst, i + 3) == 1) {
                 push[Instr](&out, ins6(b.kind, a.src, b.src, 0, 0, -1));
                 did = 1; i = i + 3;
             }
@@ -2554,7 +2737,7 @@ fn opt_writeback(prog: ArrayList[Instr]) ArrayList[Instr] {
                     let wb2: Instr = get[Instr](prog, i + 2 + gap);
                     if (wb2.kind == K_MOV_RR() && wb2.dst == a.src &&
                         wb2.src == a.dst &&
-                        opt_wb_dead(prog, a.dst, i + 3 + gap) == 1) {
+                        lv_dead(live, a.dst, i + 3 + gap) == 1) {
                         push[Instr](&out, ins6(b.kind, a.src, b.src, 0, 0, -1));
                         push[Instr](&out, ins6(K_MOVSXD(), a.src, a.src, 0, 0, -1));
                         did = 1; i = i + 3 + gap;
@@ -2574,7 +2757,7 @@ fn opt_writeback(prog: ArrayList[Instr]) ArrayList[Instr] {
                 c.dst == b.dst && c.src == a.dst &&
                 a.dst != b.dst && a.dst != b.src && b.dst != b.src &&
                 opt_fits32(a.imm) == 1 &&
-                opt_wb_dead(prog, a.dst, i + 3) == 1) {
+                lv_dead(live, a.dst, i + 3) == 1) {
                 if (c.kind == K_IMUL_RR()) {
                     push[Instr](&out, i_imul_imm(b.dst, b.src, a.imm));
                     did = 1; i = i + 3;
@@ -2591,7 +2774,7 @@ fn opt_writeback(prog: ArrayList[Instr]) ArrayList[Instr] {
             let nk: i32 = opt_wb_opimm(b.kind);
             if (nk >= 0 && b.src == a.dst && a.dst != b.dst &&
                 opt_fits32(a.imm) == 1 &&
-                opt_wb_dead(prog, a.dst, i + 2) == 1) {
+                lv_dead(live, a.dst, i + 2) == 1) {
                 push[Instr](&out, ins6(nk, b.dst, 0, a.imm, 0, -1));
                 did = 1; i = i + 2;
             }
@@ -2602,14 +2785,14 @@ fn opt_writeback(prog: ArrayList[Instr]) ArrayList[Instr] {
             if ((b.kind == K_CMP_RR() || opt_wb_is_binop(b.kind) == 1) &&
                 b.src == a.dst && a.dst != a.src &&
                 b.dst != a.src && b.dst != a.dst &&
-                opt_wb_dead(prog, a.dst, i + 2) == 1) {
+                lv_dead(live, a.dst, i + 2) == 1) {
                 push[Instr](&out, ins6(b.kind, b.dst, a.src, b.imm, b.disp, b.lbl));
                 did = 1; i = i + 2;
             }
             // mov a,x ; cmp a,y  ->  cmp x,y   (cmp's dst is read-only)
             if (did == 0 && b.kind == K_CMP_RR() &&
                 b.dst == a.dst && b.src != a.dst && a.dst != a.src &&
-                opt_wb_dead(prog, a.dst, i + 2) == 1) {
+                lv_dead(live, a.dst, i + 2) == 1) {
                 push[Instr](&out, ins6(b.kind, a.src, b.src, b.imm, b.disp, b.lbl));
                 did = 1; i = i + 2;
             }
@@ -2621,7 +2804,7 @@ fn opt_writeback(prog: ArrayList[Instr]) ArrayList[Instr] {
             if ((b.kind == K_MOV_RR() || b.kind == K_MOV_IMM()) &&
                 b.dst != a.dst && b.src != a.dst && b.dst != a.src &&
                 a.dst != a.src &&
-                opt_wb_dead(prog, a.dst, i + 3) == 1) {
+                lv_dead(live, a.dst, i + 3) == 1) {
                 if (c.kind == K_CMP_RR()) {
                     if (c.src == a.dst && c.dst != a.dst) {
                         push[Instr](&out, b);
@@ -2662,16 +2845,432 @@ fn opt_writeback(prog: ArrayList[Instr]) ArrayList[Instr] {
                 did = 1; i = i + 2;
             }
         }
+        // B2) mov t,d ; OP_imm t,c ; mov d,t  ->  OP_imm d,c
+        //     the imm-form twin of B: pattern B only covered rr ops, so the
+        //     C-fold's own output (`add_imm t,c`) couldn't write back and left
+        //     the mov t,d ; mov d,t round-trip behind.
+        if (did == 0 && i + 2 < n && a.kind == K_MOV_RR() && a.dst != a.src) {
+            let b: Instr = get[Instr](prog, i + 1);
+            let c: Instr = get[Instr](prog, i + 2);
+            if (c.kind == K_MOV_RR() && b.dst == a.dst &&
+                c.dst == a.src && c.src == a.dst &&
+                lv_dead(live, a.dst, i + 3) == 1) {
+                if (b.kind == K_ADD_RI() || b.kind == K_SUB_RI() ||
+                    b.kind == K_AND_RI()) {
+                    push[Instr](&out, ins6(b.kind, a.src, 0, b.imm, 0, -1));
+                    did = 1; i = i + 3;
+                } else { if (b.kind == K_IMUL_IMM() && b.src == a.dst) {
+                    // mov t,d ; imul_imm t,t,c ; mov d,t -> imul_imm d,d,c
+                    push[Instr](&out, i_imul_imm(a.src, a.src, b.imm));
+                    did = 1; i = i + 3;
+                } }
+            }
+        }
+        // I) mov x,y ; mov y,x  ->  mov x,y   (2nd copies y's own value back)
+        if (did == 0 && i + 1 < n && a.kind == K_MOV_RR() && a.dst != a.src) {
+            let b: Instr = get[Instr](prog, i + 1);
+            if (b.kind == K_MOV_RR() && b.dst == a.src && b.src == a.dst) {
+                push[Instr](&out, a);
+                did = 1; i = i + 2;
+            }
+        }
+        // J) movsxd t,t before a low-32-correct op is dead weight: add/sub/
+        //    imul/and/or/xor produce the right low 32 bits on unnormalized
+        //    input, and the op's result is unnormalized either way — any
+        //    consumer needing sign-extension has its own movsxd.
+        if (did == 0 && i + 1 < n && a.kind == K_MOVSXD() &&
+            a.dst == a.src) {
+            let b: Instr = get[Instr](prog, i + 1);
+            let jok: i32 = 0;
+            if ((opt_wb_is_binop(b.kind) == 1 || b.kind == K_ADD_RI() ||
+                 b.kind == K_SUB_RI() || b.kind == K_AND_RI()) &&
+                b.dst == a.dst) { jok = 1; }
+            if (b.kind == K_IMUL_IMM() &&
+                (b.dst == a.dst || b.src == a.dst)) { jok = 1; }
+            if (jok == 1) { did = 1; i = i + 1; }
+        }
         // E) mov a,x / mov_imm a,c with a provably dead -> gone
         //    (dst!=src guards only the rr form: mov_imm's src field is unused,
         //     and a mov_imm into r0 with a dead r0 is still dead)
         if (did == 0 && (a.kind == K_MOV_RR() || a.kind == K_MOV_IMM()) &&
             (a.kind == K_MOV_IMM() || a.dst != a.src) &&
-            opt_wb_dead(prog, a.dst, i + 1) == 1) {
+            lv_dead(live, a.dst, i + 1) == 1) {
             did = 1; i = i + 1;
         }
         if (did == 0) { push[Instr](&out, a); i = i + 1; }
     }
+    free[i32](&live);
+    return out;
+}
+
+// ── opt_recur: self-call modulo-accumulator → iteration ─────────────────────
+// `return f(a) + f(b)` emits two real calls, but the SECOND is a tail call in
+// disguise: when the combine op is associative+commutative, the function can
+// accumulate one operand and iterate on the other:
+//     acc = id; head: body…; acc op= f(a); <args = b>; jmp head
+// This turns O(fib(n)) call-stack depth into O(1) and removes the second
+// call+ret+combine per level — the transform gcc uses to beat naive fib by 4×.
+// Every shape check is strict; anything unrecognised leaves the span alone.
+
+// does the label target at index t lead to the epilogue (teardown → ret)?
+fn opt_is_epi_tgt(prog: ArrayList[Instr], t: i32, n: i32) i32 {
+    let j: i32 = t;
+    let steps: i32 = 0;
+    while (j < n && steps < 10) {
+        let ins: Instr = get[Instr](prog, j);
+        let k: i32 = ins.kind;
+        if (k == K_RET()) { return 1; }
+        if (k == K_LABEL() || k == K_POP() || k == K_LOAD()) {
+            j = j + 1; steps = steps + 1;
+        } else {
+            if (k == K_MOV_RR() && ins.dst == R_RSP()) {
+                j = j + 1; steps = steps + 1;
+            } else { return 0; }
+        }
+    }
+    return 0;
+}
+
+// any use of register r in [fs, fe)?
+fn opt_reg_used(prog: ArrayList[Instr], fs: i32, fe: i32, r: i32) i32 {
+    let i: i32 = fs;
+    while (i < fe) {
+        let ins: Instr = get[Instr](prog, i);
+        if (ins.dst == r || ins.src == r) { return 1; }
+        if ((ins.kind == K_LOAD_SIB() || ins.kind == K_STORE_SIB() ||
+             ins.kind == K_ADD_SIB()) && ins.lbl == r) { return 1; }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// Transform span [fs,fe) of a function whose entry label is `elbl`, when it
+// contains exactly two self-calls whose results merge via one commutative
+// binop into the return value. Returns the rewritten instrs, or an EMPTY list
+// when the shape does not match (caller emits the span verbatim).
+fn opt_recur_span(prog: ArrayList[Instr], fs: i32, fe: i32, elbl: i32,
+                  lblidx: ArrayList[i32], tmin: ArrayList[i32],
+                  tmax: ArrayList[i32], fresh: i32) ArrayList[Instr] {
+    let out: ArrayList[Instr] = make[Instr](fe - fs + 8);
+    let n: i32 = len[Instr](prog);
+    // 1) framed prologue: push rbp; mov rbp,rsp; sub rsp,N; push*…
+    let ph: i32 = 0 - 1;
+    let i: i32 = fs + 1;
+    while (i + 2 < fe && ph < 0) {
+        let a: Instr = get[Instr](prog, i);
+        let b: Instr = get[Instr](prog, i + 1);
+        let c: Instr = get[Instr](prog, i + 2);
+        if (a.kind == K_PUSH() && a.dst == R_RBP() &&
+            b.kind == K_MOV_RR() && b.dst == R_RBP() && b.src == R_RSP() &&
+            c.kind == K_SUB_RI() && c.dst == R_RSP()) { ph = i; }
+        i = i + 1;
+    }
+    if (ph < 0) { free[Instr](&out); return out; }
+    let fsize: i64 = get[Instr](prog, ph + 2).imm;
+    let j: i32 = ph + 3;
+    let npush: i32 = 0;
+    while (j < fe && get[Instr](prog, j).kind == K_PUSH()) {
+        npush = npush + 1; j = j + 1;
+    }
+    let head: i32 = j;
+    // 2) exactly two self-calls inside the body
+    let c1: i32 = 0 - 1;
+    let c2: i32 = 0 - 1;
+    i = head;
+    while (i < fe) {
+        let ins: Instr = get[Instr](prog, i);
+        if (ins.kind == K_CALL() && ins.lbl == elbl) {
+            if (c1 < 0) { c1 = i; } else { if (c2 < 0) { c2 = i; }
+                else { free[Instr](&out); return out; } }
+        }
+        i = i + 1;
+    }
+    if (c1 < 0 || c2 < 0) { free[Instr](&out); return out; }
+    // 3) tail [c2+1, exitj): movsxd/zext/mov_rr/pop + ONE commutative binop,
+    //    then jmp → epilogue. No labels or calls. Record rax-normalizers.
+    let opk: i32 = 0 - 1;
+    let npop: i32 = 0;
+    let exitj: i32 = 0 - 1;
+    let normc: i32 = 0;
+    let normk1: i32 = 0;
+    let normk2: i32 = 0;
+    let j2: i32 = c2 + 1;
+    while (j2 < fe && exitj < 0) {
+        let ins: Instr = get[Instr](prog, j2);
+        let k: i32 = ins.kind;
+        if (k == K_MOV_RR()) { j2 = j2 + 1; }
+        else { if (k == K_POP()) { npop = npop + 1; j2 = j2 + 1; }
+        else { if ((k == K_MOVSXD() || k == K_ZEXT32()) && ins.dst == R_RAX() &&
+                   ins.src == R_RAX()) {
+            normc = normc + 1;
+            if (normk1 == 0) { normk1 = k; } else { normk2 = k; }
+            j2 = j2 + 1;
+        } else { if (opt_wb_is_binop(k) == 1 && k != K_SUB_RR() && opk < 0) {
+            opk = k; j2 = j2 + 1;
+        } else { if (k == K_JMP() && ins.lbl >= 0 &&
+                     ins.lbl < len[i32](lblidx)) {
+            let t: i32 = get[i32](lblidx, ins.lbl);
+            if (t >= 0 && opt_is_epi_tgt(prog, t, n) == 1) { exitj = j2; }
+            else { free[Instr](&out); return out; }
+        } else { free[Instr](&out); return out; } } } } }
+    }
+    if (exitj < 0 || opk < 0) { free[Instr](&out); return out; }
+    // 4) c1's result preserve must immediately follow the call (after any
+    //    normalize): push rax, or mov callee-saved,rax
+    let j3: i32 = c1 + 1;
+    let pvdone: i32 = 0;
+    while (j3 < c2 && pvdone == 0) {
+        let ins: Instr = get[Instr](prog, j3);
+        if ((ins.kind == K_MOVSXD() || ins.kind == K_ZEXT32()) &&
+            ins.dst == R_RAX()) { j3 = j3 + 1; } else { pvdone = 1; }
+    }
+    if (j3 >= c2) { free[Instr](&out); return out; }
+    let pv: Instr = get[Instr](prog, j3);
+    let pvpush: i32 = 0;
+    if (pv.kind == K_PUSH() && pv.dst == R_RAX()) { pvpush = 1; }
+    else {
+        if (pv.kind == K_MOV_RR() && pv.src == R_RAX() &&
+            opt_cs(pv.dst) == 0 && pv.dst != R_RSP() && pv.dst != R_RBP()) {
+            pvpush = 0;
+        } else { free[Instr](&out); return out; }
+    }
+    // tail pops must balance exactly the preserve pushes we drop
+    if (npop != pvpush) { free[Instr](&out); return out; }
+    // 5) arg staging [j3+1, c2): straight-line, stack-neutral, no exits
+    i = j3 + 1;
+    while (i < c2) {
+        let k: i32 = get[Instr](prog, i).kind;
+        if (k == K_PUSH() || k == K_POP() || k == K_JMP() || k == K_LABEL() ||
+            k == K_RET() || k == K_SYSCALL() || opt_is_jcc(k) == 1 ||
+            k == K_CALL_REG()) { free[Instr](&out); return out; }
+        i = i + 1;
+    }
+    // 6) loop region [head, c1): stack-neutral; internal branches only;
+    //    no inline ret (it could not restore acc); exits must be
+    //    jmp→epilogue (a jcc→epilogue can't be augmented on the taken edge)
+    let pushes: i32 = 0;
+    let pops: i32 = 0;
+    i = head;
+    while (i < c1) {
+        let ins: Instr = get[Instr](prog, i);
+        let k: i32 = ins.kind;
+        if (k == K_PUSH()) { pushes = pushes + 1; }
+        if (k == K_POP())  { pops = pops + 1; }
+        if (k == K_RET())  { free[Instr](&out); return out; }
+        if (k == K_MOV_RR() && ins.dst == R_RSP()) {
+            free[Instr](&out); return out;
+        }
+        if (k == K_JMP() || opt_is_jcc(k) == 1) {
+            if (ins.lbl < 0 || ins.lbl >= len[i32](lblidx)) {
+                free[Instr](&out); return out;
+            }
+            let t: i32 = get[i32](lblidx, ins.lbl);
+            if (opt_is_jcc(k) == 1) {
+                if (t < head || t > c1 || t < 0) {
+                    free[Instr](&out); return out;
+                }
+                if (t >= 0 && opt_is_epi_tgt(prog, t, n) == 1) {
+                    free[Instr](&out); return out;
+                }
+            } else {
+                if (t >= 0 && opt_is_epi_tgt(prog, t, n) == 0 &&
+                    (t < head || t > c1)) { free[Instr](&out); return out; }
+            }
+        }
+        i = i + 1;
+    }
+    if (pushes != pops) { free[Instr](&out); return out; }
+    // 7) nothing outside the loop may jump into [head, c2). tmin/tmax give
+    //    the first/last source instr jumping to each position, so an
+    //    outside source exists iff tmin<head or tmax>=c2.
+    i = head;
+    while (i < c2) {
+        let s0: i32 = get[i32](tmin, i);
+        if (s0 >= 0 && (s0 < head || get[i32](tmax, i) >= c2)) {
+            free[Instr](&out); return out;
+        }
+        i = i + 1;
+    }
+    // 8) every ret after the prologue must be behind a mov rsp,rbp teardown
+    //    (that is where the acc restore goes; a pop-based epilogue would leak
+    //    the clobbered callee-saved acc to the caller)
+    i = head;
+    let rspok: i32 = 1;
+    while (i < fe) {
+        let ins: Instr = get[Instr](prog, i);
+        if (ins.kind == K_RET()) {
+            let back: i32 = i - 1;
+            let seen: i32 = 0;
+            let st: i32 = 0;
+            while (back >= head && seen == 0 && st < 8) {
+                let bi: Instr = get[Instr](prog, back);
+                if (bi.kind == K_MOV_RR() && bi.dst == R_RSP() &&
+                    bi.src == R_RBP()) { seen = 1; }
+                back = back - 1; st = st + 1;
+            }
+            if (seen == 0) { rspok = 0; }
+        }
+        i = i + 1;
+    }
+    if (rspok == 0) { free[Instr](&out); return out; }
+    // 9) accumulator: a callee-saved reg unused anywhere in the function
+    //    (13=r13, 14=r14 preferred; r12/r15/rbx also legal — acc is pushed and
+    //    restored, so a reserved reg only disqualifies via opt_reg_used)
+    let acc: i32 = 0 - 1;
+    let cands: i32 = 13;
+    while (cands >= 0 && acc < 0) {
+        let cand: i32 = 13;
+        if (cands == 13) { cand = 13; }
+        if (cands == 12) { cand = 14; }
+        if (cands == 11) { cand = R_R12(); }
+        if (cands == 10) { cand = 15; }
+        if (cands == 9)  { cand = R_RBX(); }
+        if (opt_reg_used(prog, fs, fe, cand) == 0) { acc = cand; }
+        cands = cands - 1;
+        if (cands < 9) { cands = 0 - 1; }
+    }
+    if (acc < 0) { free[Instr](&out); return out; }
+    // acc's identity element for the combine op
+    let accinit: i64 = 0;
+    if (opk == K_IMUL_RR()) { accinit = 1; }
+    if (opk == K_AND_RR())  { accinit = 0 - 1; }
+    // acc's frame slot: it becomes prologue push #(npush+1)
+    let accdisp: i32 = (fsize as i32) + 8 * (npush + 1);
+    // ── emit ────────────────────────────────────────────────────────────────
+    i = fs;
+    while (i < head) { push[Instr](&out, get[Instr](prog, i)); i = i + 1; }
+    push[Instr](&out, i_push(acc));
+    push[Instr](&out, i_mov_imm(acc, accinit));
+    push[Instr](&out, i_label(fresh));
+    // loop region: copy [head, c1] augmenting exit jumps/rets with `op rax,acc`
+    i = head;
+    while (i <= c1) {
+        let ins: Instr = get[Instr](prog, i);
+        let isx: i32 = 0;
+        if (ins.kind == K_RET()) { isx = 1; }
+        if (ins.kind == K_JMP() && ins.lbl >= 0 && ins.lbl < len[i32](lblidx)) {
+            let t: i32 = get[i32](lblidx, ins.lbl);
+            if (t >= 0 && opt_is_epi_tgt(prog, t, n) == 1) { isx = 1; }
+        }
+        if (isx == 1) {
+            push[Instr](&out, ins6(opk, R_RAX(), acc, 0, 0, -1));
+            if (normc > 0) {
+                push[Instr](&out, ins6(normk1, R_RAX(), R_RAX(), 0, 0, -1));
+            }
+            if (normc > 1) {
+                push[Instr](&out, ins6(normk2, R_RAX(), R_RAX(), 0, 0, -1));
+            }
+        }
+        push[Instr](&out, ins);
+        i = i + 1;
+    }
+    // c1's normalize copies, then `acc op= rax` replaces the preserve
+    i = c1 + 1;
+    while (i < j3) { push[Instr](&out, get[Instr](prog, i)); i = i + 1; }
+    push[Instr](&out, ins6(opk, acc, R_RAX(), 0, 0, -1));
+    // arg staging for c2 verbatim, then iterate instead of calling
+    i = j3 + 1;
+    while (i < c2) { push[Instr](&out, get[Instr](prog, i)); i = i + 1; }
+    push[Instr](&out, i_jmp(fresh));
+    // epilogue verbatim + acc restore before every mov rsp,rbp
+    i = exitj + 1;
+    while (i < fe) {
+        let ins: Instr = get[Instr](prog, i);
+        if (ins.kind == K_MOV_RR() && ins.dst == R_RSP() &&
+            ins.src == R_RBP()) {
+            push[Instr](&out, i_load(acc, R_RBP(), 0 - accdisp));
+        }
+        push[Instr](&out, ins);
+        i = i + 1;
+    }
+    return out;
+}
+
+fn opt_recur(prog: ArrayList[Instr]) ArrayList[Instr] {
+    let n: i32 = len[Instr](prog);
+    let out: ArrayList[Instr] = make[Instr](n + 16);
+    let maxl: i32 = 0;
+    let i: i32 = 0;
+    while (i < n) {
+        let il: Instr = get[Instr](prog, i);
+        if (il.lbl > maxl) { maxl = il.lbl; }
+        i = i + 1;
+    }
+    let lblidx: ArrayList[i32] = opt_lbl_map(prog, n, maxl);
+    // tmin/tmax[t] = first/last jump-source index targeting position t
+    //    (built once; per-span external-jump checks stay O(span)).
+    let tmin: ArrayList[i32] = make[i32](n);
+    let tmax: ArrayList[i32] = make[i32](n);
+    i = 0;
+    while (i < n) { push[i32](&tmin, 0 - 1); push[i32](&tmax, 0); i = i + 1; }
+    i = 0;
+    while (i < n) {
+        let ji: Instr = get[Instr](prog, i);
+        if ((ji.kind == K_JMP() || opt_is_jcc(ji.kind) == 1) &&
+            ji.lbl >= 0 && ji.lbl < len[i32](lblidx)) {
+            let tp: i32 = get[i32](lblidx, ji.lbl);
+            if (tp >= 0 && tp < n) {
+                if (get[i32](tmin, tp) < 0) { set[i32](&tmin, tp, i); }
+                set[i32](&tmax, tp, i);
+            }
+        }
+        i = i + 1;
+    }
+    // called[l] = 1 when label id l is a direct-call target (a fn entry)
+    let called: ArrayList[i32] = make[i32](maxl + 2);
+    let z: i32 = 0;
+    while (z <= maxl + 1) { push[i32](&called, 0); z = z + 1; }
+    i = 0;
+    while (i < n) {
+        let ci: Instr = get[Instr](prog, i);
+        if (ci.kind == K_CALL() && ci.lbl >= 0 && ci.lbl <= maxl) {
+            set[i32](&called, ci.lbl, 1);
+        }
+        i = i + 1;
+    }
+    let fresh: i32 = maxl + 1;
+    i = 0;
+    while (i < n) {
+        let ins: Instr = get[Instr](prog, i);
+        let did: i32 = 0;
+        if (ins.kind == K_LABEL() && ins.lbl >= 0 && ins.lbl <= maxl &&
+            get[i32](called, ins.lbl) == 1) {
+            // span end: next label that is itself a call target
+            let fe: i32 = i + 1;
+            let stop: i32 = 0;
+            while (fe < n && stop == 0) {
+                let e2: Instr = get[Instr](prog, fe);
+                if (e2.kind == K_LABEL() && e2.lbl >= 0 && e2.lbl <= maxl &&
+                    get[i32](called, e2.lbl) == 1) { stop = 1; }
+                else {
+                    // zag returns jump to a shared epilogue, so the first
+                    // ret is the function end even when the NEXT fn is
+                    // never a call target (main): stop right after it.
+                    if (e2.kind == K_RET()) { stop = 1; fe = fe + 1; }
+                    else { fe = fe + 1; }
+                }
+            }
+            let sp: ArrayList[Instr] =
+                opt_recur_span(prog, i, fe, ins.lbl, lblidx, tmin, tmax,
+                               fresh);
+            if (len[Instr](sp) > 0) {
+                let k2: i32 = 0;
+                while (k2 < len[Instr](sp)) {
+                    push[Instr](&out, get[Instr](sp, k2));
+                    k2 = k2 + 1;
+                }
+                free[Instr](&sp);
+                fresh = fresh + 1;
+                i = fe;
+                did = 1;
+            }
+        }
+        if (did == 0) { push[Instr](&out, ins); i = i + 1; }
+    }
+    free[i32](&called);
+    free[i32](&tmin);
+    free[i32](&tmax);
+    free[i32](&lblidx);
     return out;
 }
 
@@ -2707,14 +3306,21 @@ fn optimize(prog: ArrayList[Instr]) ArrayList[Instr] {
     let wb: ArrayList[Instr] = opt_writeback(dst);
     free[Instr](&dst);
     let wbn: ArrayList[Instr] = opt_writeback(wb);
-    while (len[Instr](wbn) < len[Instr](wb)) {
+    let wbr: i32 = 0;
+    while (len[Instr](wbn) < len[Instr](wb) && wbr < 8) {
         free[Instr](&wb);
         wb = wbn;
         wbn = opt_writeback(wb);
+        wbr = wbr + 1;
     }
     free[Instr](&wbn);
-    let cmpi: ArrayList[Instr] = opt_cmp_fold(wb);
+    // modulo-accumulator AFTER writeback: its shape matchers were written
+    // against the folded stream, and the emitted loop is tight by
+    // construction, so it needs no further writeback cleanup
+    let rc: ArrayList[Instr] = opt_recur(wb);
     free[Instr](&wb);
+    let cmpi: ArrayList[Instr] = opt_cmp_fold(rc);
+    free[Instr](&rc);
     let sw: ArrayList[Instr] = opt_shrinkwrap(cmpi);
     free[Instr](&cmpi);
     return sw;
